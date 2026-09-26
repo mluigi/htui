@@ -602,6 +602,26 @@ fn skill_name_taken(err: sqlx::Error, name: &str) -> StoreError {
     }
 }
 
+/// `create_skill`'s `INSERT INTO skill` refusals in `MemStore`'s sentences: `skill_pkey`'s `23505`
+/// is [`already_exists`] on the id, then [`skill_name_taken`].
+fn skill_insert_refused(err: sqlx::Error, new: &NewSkill) -> StoreError {
+    match &err {
+        sqlx::Error::Database(db) if db.constraint() == Some("skill_pkey") => {
+            StoreError::Constraint(already_exists("skill", new.id))
+        }
+        _ => skill_name_taken(err, &new.name),
+    }
+}
+
+/// `MemStore`'s refusal of a `created_by` that names no `app_user`, the nil UUID worded apart.
+fn unknown_author(column: &str, id: UserId) -> String {
+    if id.as_uuid().is_nil() {
+        format!("{column} must reference an app_user; the nil UUID does not")
+    } else {
+        format!("{column} `{id}` references no app_user")
+    }
+}
+
 /// D89's classification of an append that wrote nothing, or of bad input before any write
 /// (`refusal`), from two reads: a head other than `expected` is `Stale(head)`; then an unknown
 /// skill is `NotFound`; then no version at all under a token other than `0` is `NotFound` on the
@@ -2568,14 +2588,29 @@ impl WriteStore for PgStore {
     }
 
     /// D92: one explicit transaction of two `INSERT`s, so no skill exists without its version 1.
-    /// The input rules first ([`new_skill_refusal`]); a taken name is `skill_name_key`'s `23505`,
-    /// which `skill_name_taken` words as `MemStore` does; a taken id and an unknown `created_by`
-    /// are [`map_sqlx`]'s `Constraint`. A failed statement drops the transaction, which rolls back.
+    /// `MemStore`'s order: the input rules first ([`new_skill_refusal`]); then an unknown
+    /// `created_by`, read before the insert because the foreign key is checked only after the
+    /// unique indexes (it would lose to a taken name); then a taken id (`skill_pkey`) and a taken
+    /// name (`skill_name_key`), both `23505`s worded as `MemStore` words them. The foreign key
+    /// stays the backstop. A failed statement drops the transaction, which rolls back.
     async fn create_skill(&self, new: NewSkill) -> Result<(Skill, SkillVersion)> {
         if let Some(refusal) = new_skill_refusal(&new.name, &new.description, &new.body) {
             return Err(StoreError::Constraint(refusal));
         }
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let known = sqlx::query_scalar!(
+            r#"SELECT EXISTS (SELECT 1 FROM app_user WHERE id = $1) AS "known!""#,
+            new.created_by.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if !known {
+            return Err(StoreError::Constraint(unknown_author(
+                "skill.created_by",
+                new.created_by,
+            )));
+        }
         let skill = sqlx::query_as!(
             Skill,
             r#"
@@ -2595,7 +2630,7 @@ impl WriteStore for PgStore {
         )
         .fetch_one(&mut *tx)
         .await
-        .map_err(|err| skill_name_taken(err, &new.name))?;
+        .map_err(|err| skill_insert_refused(err, &new))?;
         let version = sqlx::query_as!(
             SkillVersion,
             r#"
