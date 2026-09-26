@@ -379,7 +379,8 @@ pub enum EngineError {
     ClaimRefused {
         /// The run that stayed queued.
         run: RunId,
-        /// What `claim_run` answered; never [`Claim::Admitted`].
+        /// What `claim_run` answered; never [`Claim::Admitted`], and never
+        /// [`Claim::MissingTags`], which is [`EngineError::MissingTags`] (MOD-7 milestone 3, D85).
         claim: Claim,
     },
     /// `R-ORCH-10` (MOD-7 milestone 3, D84): the item requires tags this box has neither probed
@@ -388,7 +389,7 @@ pub enum EngineError {
     /// admission transaction and the engine noted it. Permanent until the box gains the tags or
     /// the item drops them, so it is **not** [`EngineError::ClaimRefused`] and nothing re-queues
     /// it.
-    #[error("item {item}: missing tags: {}", .missing.join(", "))]
+    #[error("item {item}: {}", htui_core::model::missing_tags_failure(.missing))]
     MissingTags {
         /// The item refused.
         item: ItemId,

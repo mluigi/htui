@@ -7,7 +7,7 @@
 
 use core::fmt;
 
-use htui_core::model::{GraphSnapshot, RunStep, StepId, StepStatus};
+use htui_core::model::{GraphSnapshot, RunStep, StepId, StepStatus, missing_tags_failure};
 
 /// The `run_step.fanout_index` a `fan_out = 1` phase walks, and the one every fan-out slot has.
 ///
@@ -136,7 +136,7 @@ impl fmt::Display for RunFailure {
             Self::PromptRefused { phase, reason } => {
                 write!(f, "prompt refused at `{phase}`: {reason}")
             }
-            Self::MissingTags(missing) => write!(f, "missing tags: {}", missing.join(", ")),
+            Self::MissingTags(missing) => f.write_str(&missing_tags_failure(missing)),
         }
     }
 }
