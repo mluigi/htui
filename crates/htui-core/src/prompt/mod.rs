@@ -94,7 +94,9 @@ pub struct PromptSpec {
     pub upstream: Vec<UpstreamEntry>,
     /// The §4.2 box projection. Carries no path, by type (`BoxProfile` drops `box_tool.path`).
     pub box_profile: BoxProfile,
-    /// The `R-SKL-2` resolution, already collapsed and ordered; `assemble()` re-sorts anyway.
+    /// The step's skill candidates, resolved by `model::skill::resolve`: global, project and phase
+    /// attachments, most specific winning, inactive ones included. The assembler collapses and
+    /// selects (MOD-9 D43).
     pub skills: Vec<BoundSkill>,
     /// §4.5's read and windowed excerpts, with the audit half the ranker filled.
     pub excerpts: ExcerptSet,
@@ -832,7 +834,7 @@ fn scrubbed_inputs(
 
     let mut upstream = spec.upstream.clone();
     UpstreamEntry::sort_canonical(&mut upstream);
-    let skills = BoundSkill::collapse(spec.skills.clone(), Vec::new());
+    let skills = BoundSkill::collapse(spec.skills.clone());
     let candidates = judge_candidates(&spec);
     Ok(ScrubbedInputs {
         spec,

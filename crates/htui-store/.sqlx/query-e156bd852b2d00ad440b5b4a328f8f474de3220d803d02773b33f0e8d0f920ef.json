@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT v.skill_id  AS \"skill_id: SkillId\",\n                   v.version,\n                   v.body,\n                   v.created_by AS \"created_by: htui_core::model::UserId\",\n                   v.created_at\n              FROM skill_version v\n             WHERE v.skill_id IN (SELECT skill_id FROM skill_binding WHERE project_id = $1)\n            ",
+  "query": "\n            SELECT v.skill_id   AS \"skill_id: SkillId\",\n                   v.version,\n                   v.body,\n                   v.source,\n                   v.created_by AS \"created_by: htui_core::model::UserId\",\n                   v.created_at\n              FROM skill_version v\n             WHERE v.skill_id IN (\n                   SELECT b.skill_id\n                     FROM skill_binding b\n                    WHERE b.project_id IS NULL\n                       OR (b.project_id = $1 AND (b.phase_id IS NULL OR b.phase_id = $2)))\n            ",
   "describe": {
     "columns": [
       {
@@ -38,6 +38,17 @@
       },
       {
         "ordinal": 3,
+        "name": "source",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "skill_version",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
         "name": "created_by: htui_core::model::UserId",
         "type_info": "Uuid",
         "origin": {
@@ -48,7 +59,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -61,6 +72,7 @@
     ],
     "parameters": {
       "Left": [
+        "Uuid",
         "Uuid"
       ]
     },
@@ -69,8 +81,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "5a620677c690bb35c9640ebd68b51efaf140f1e35ad5b2ab07be3f155c02cba7"
+  "hash": "e156bd852b2d00ad440b5b4a328f8f474de3220d803d02773b33f0e8d0f920ef"
 }

@@ -26,9 +26,9 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    AgentId, BoundSkill, BoxId, GateOutcome, ItemId, LinkNode, PhaseId, ProjectId, RunId, RunKind,
-    RunMode, RunStatus, RunStepSummary, RunSummary, SkillBinding, SkillBindingId, SkillId,
-    SkillVersion, Status, StepId, StepStatus, UpstreamEntry, VerifyOutcome,
+    Activation, AgentId, BoxId, GateOutcome, ItemId, LinkNode, PhaseId, ProjectId, RunId, RunKind,
+    RunMode, RunStatus, RunStepSummary, RunSummary, SkillBinding, SkillBindingId, SkillId, Status,
+    StepId, StepStatus, UpstreamEntry, VerifyOutcome,
 };
 use serde_json::Value;
 
@@ -246,27 +246,33 @@ impl UpstreamRow {
     }
 }
 
-/// One `skill_binding` row with `skill.name` joined: what one level of
-/// [`PgStore::bound_skills`](crate::PgStore::bound_skills) selects before `R-SKL-2` is resolved.
+/// One `skill_binding` row with `skill.name` joined: one attachment
+/// [`PgStore::bound_skills`](crate::PgStore::bound_skills) hands to
+/// `htui_core::model::skill::resolve`.
 ///
-/// Every `skill_binding` column is carried, not just the two
-/// [`SkillBinding::version_in_force`] reads, so [`bind`](SkillBindingRow::bind) can rebuild the
-/// real [`SkillBinding`] and call that method rather than re-deriving the pin rule from a pair of
-/// loose fields.
+/// Every `skill_binding` column is carried, so [`into_binding`](SkillBindingRow::into_binding)
+/// rebuilds the real [`SkillBinding`] and `resolve` applies the level and pin rules to it rather
+/// than a second copy of them living here.
 #[derive(Debug, Clone)]
 pub(crate) struct SkillBindingRow {
     /// `skill_binding.id`.
     pub(crate) id: SkillBindingId,
     /// `skill_binding.skill_id`.
     pub(crate) skill_id: SkillId,
-    /// `skill_binding.project_id`.
-    pub(crate) project_id: ProjectId,
-    /// `skill_binding.phase_id`; `None` is the project level.
+    /// `skill_binding.project_id`; `None` is a global attachment.
+    pub(crate) project_id: Option<ProjectId>,
+    /// `skill_binding.phase_id`; `None` is the project (or global) level.
     pub(crate) phase_id: Option<PhaseId>,
     /// `skill_binding.pinned_version`; `None` follows the latest version.
     pub(crate) pinned_version: Option<i32>,
     /// `skill_binding.position`.
     pub(crate) position: i32,
+    /// `skill_binding.activation`.
+    pub(crate) activation: Activation,
+    /// `skill_binding.globs`.
+    pub(crate) globs: Vec<String>,
+    /// `skill_binding.languages`.
+    pub(crate) languages: Vec<String>,
     /// `skill_binding.updated_at`.
     pub(crate) updated_at: DateTime<Utc>,
     /// `skill.name`, joined: the `<skill name="..">` attribute and the order's tie-break.
@@ -274,27 +280,23 @@ pub(crate) struct SkillBindingRow {
 }
 
 impl SkillBindingRow {
-    /// This binding resolved against `versions`, or `None` when the version in force is missing.
-    ///
-    /// `None` is `MemStore::State::bind`'s answer to the same input: a pin that cannot be honoured
-    /// renders nothing rather than quietly falling back to a body the binding did not ask for.
-    pub(crate) fn bind(self, versions: &[SkillVersion]) -> Option<BoundSkill> {
-        let binding = SkillBinding {
-            id: self.id,
-            skill_id: self.skill_id,
-            project_id: self.project_id,
-            phase_id: self.phase_id,
-            pinned_version: self.pinned_version,
-            position: self.position,
-            updated_at: self.updated_at,
-        };
-        let version = binding.version_in_force(versions)?;
-        Some(BoundSkill {
-            skill_id: binding.skill_id,
-            name: self.name,
-            version: version.version,
-            position: binding.position,
-            body: version.body.clone(),
-        })
+    /// The row as the model's [`SkillBinding`], paired with its joined `skill.name`: the shape
+    /// `resolve` takes.
+    pub(crate) fn into_binding(self) -> (SkillBinding, String) {
+        (
+            SkillBinding {
+                id: self.id,
+                skill_id: self.skill_id,
+                project_id: self.project_id,
+                phase_id: self.phase_id,
+                pinned_version: self.pinned_version,
+                position: self.position,
+                activation: self.activation,
+                globs: self.globs,
+                languages: self.languages,
+                updated_at: self.updated_at,
+            },
+            self.name,
+        )
     }
 }

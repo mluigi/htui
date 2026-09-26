@@ -1,15 +1,57 @@
 //! Skills, their versions and their bindings (`docs/ANA-9.md` §5.6), plus the `R-SKL-2`
 //! resolution the prompt's skills section renders (`docs/ANA-5.md` §4.2).
 //!
-//! Read-only in this milestone (plan D105): the three row types and the collapse land here so the
-//! assembler and every backend share one definition of "which skill, at which version, in which
-//! order"; `upsert_skill`, `add_skill_version` and `set_skill_binding` are MOD-9's and are
-//! deliberately absent.
+//! Read-only still: the writers are MOD-9 milestone 3's. Since MOD-9 milestone 2 (ANA-22 §6-§7) a
+//! skill attaches globally, to a project or to one phase; [`resolve`] picks the most specific
+//! attachment per skill, and [`select`] decides, per step, which winners render and records why.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::model::ids::{PhaseId, ProjectId, SkillBindingId, SkillId, UserId};
+
+str_enum!(
+    /// `skill_binding.activation` (ANA-22 §6 item 4): whether the winning attachment puts its
+    /// skill into a step's prompt.
+    Activation {
+        /// Always rendered. The column default, so every binding written before `0007` is
+        /// unchanged.
+        Always => "always",
+        /// Rendered when the step's file set matches `globs` (MOD-9 milestone 3). Until the matcher
+        /// lands, a `glob` winner is inactive and records `no_path` (plan D40, OQ-12).
+        Glob => "glob",
+        /// Attached more broadly but not here: a narrower `off` hides a broader attachment.
+        Off => "off",
+    }
+);
+
+/// Which level an attachment sits at (ANA-22 §6 item 2). **Declaration order is specificity**:
+/// `Global < Project < Phase`, so the attachment that wins is the `max` (`R-SKL-2` as amended).
+///
+/// Not a column — it is derived from the two nullable keys by [`SkillBinding::level`] — so it is a
+/// plain enum rather than a `str_enum!`, and its serde spelling is its [`as_str`](Self::as_str).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillLevel {
+    /// `project_id IS NULL`: every project.
+    Global,
+    /// `project_id` set, `phase_id IS NULL`.
+    Project,
+    /// Both set: one phase of one project.
+    Phase,
+}
+
+impl SkillLevel {
+    /// `global`, `project` or `phase`: the record's and the Prompt sub-tab's spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Project => "project",
+            Self::Phase => "phase",
+        }
+    }
+}
 
 /// A row of `skill` (§5.6): one entry of the global skill library. Scoping is by binding, so the
 /// row itself belongs to no project.
@@ -39,31 +81,41 @@ pub struct SkillVersion {
     pub version: i32,
     /// `skill_version.body`: the text inlined into the prompt's skills section verbatim.
     pub body: String,
+    /// `skill_version.source` (ANA-22 §6 item 11): import provenance and the raw frontmatter.
+    /// Never read by the prompt builder; `{}` for a version that was not imported.
+    pub source: serde_json::Value,
     /// `skill_version.created_by`.
     pub created_by: UserId,
     /// `skill_version.created_at`.
     pub created_at: DateTime<Utc>,
 }
 
-/// A row of `skill_binding` (§5.6): a skill attached to a project, or to one phase of it.
-///
-/// `phase_id: None` is the project level. `UNIQUE NULLS NOT DISTINCT (skill_id, project_id,
-/// phase_id)` is why a project and a phase binding of the same skill can coexist, and why
-/// [`BoundSkill::collapse`] has to resolve them.
+/// A row of `skill_binding` (§5.6 as amended by ANA-22 §7.1): one attachment of a skill,
+/// globally, to a project, or to one phase of it. `UNIQUE NULLS NOT DISTINCT (skill_id,
+/// project_id, phase_id)` allows one attachment per skill per level, which is why [`resolve`] has
+/// to pick one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillBinding {
     /// `skill_binding.id`.
     pub id: SkillBindingId,
     /// `skill_binding.skill_id`.
     pub skill_id: SkillId,
-    /// `skill_binding.project_id`.
-    pub project_id: ProjectId,
-    /// `skill_binding.phase_id`; `None` is the project level.
+    /// `skill_binding.project_id`; `None` is a global attachment (every project).
+    pub project_id: Option<ProjectId>,
+    /// `skill_binding.phase_id`; `None` is the project (or global) level. `Some` requires
+    /// `project_id` (`skill_binding_phase_needs_project`).
     pub phase_id: Option<PhaseId>,
     /// `skill_binding.pinned_version`; `None` follows the latest version.
     pub pinned_version: Option<i32>,
     /// `skill_binding.position`: ascending render order, `skill.name` bytes breaking the tie.
     pub position: i32,
+    /// `skill_binding.activation`.
+    pub activation: Activation,
+    /// `skill_binding.globs`: the effective globs, non-empty when `activation` is `Glob`
+    /// (`skill_binding_glob_needs_globs`). Nothing matches them before MOD-9 milestone 3.
+    pub globs: Vec<String>,
+    /// `skill_binding.languages`: as authored, display only; the matcher reads `globs`.
+    pub languages: Vec<String>,
     /// `skill_binding.updated_at`.
     pub updated_at: DateTime<Utc>,
 }
@@ -85,32 +137,49 @@ impl SkillBinding {
             None => mine.max_by_key(|v| v.version),
         }
     }
+
+    /// The level this attachment sits at, from its two nullable keys. A `(None, Some(_))` row is
+    /// refused by `skill_binding_phase_needs_project`; were one ever read, it is `Global`, the
+    /// same answer `PgStore`'s `WHERE b.project_id IS NULL` gives it.
+    #[must_use]
+    pub fn level(&self) -> SkillLevel {
+        todo!("MOD-9 T1 green")
+    }
 }
 
-/// The `R-SKL-2` resolution of one binding: the skill, the version in force, the position it
-/// renders at, and the body. Not a table.
+/// One step's candidate skill: the winning attachment of one skill, resolved to a version and a
+/// body. Not a table.
 ///
 /// This is what the prompt's skills section is built from, so it carries the joined `skill.name`
 /// and `skill_version.body` rather than the ids to look them up by: the assembler is pure and
 /// cannot reach a store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundSkill {
-    /// `skill.id`, the key the project/phase override is resolved on.
+    /// `skill.id`, the key the most-specific-wins collapse is resolved on.
     pub skill_id: SkillId,
     /// `skill.name`, rendered as the `<skill name="..">` attribute and the order's tie-break.
     pub name: String,
-    /// `skill_version.version` in force, rendered as the `version="N"` attribute.
-    pub version: i32,
-    /// `skill_binding.position` of the binding that won.
+    /// `skill_version.version` in force, rendered as `version="N"`. `None` when the winning
+    /// attachment's pin names no version, or the skill has none: the skill then renders nothing
+    /// and records `missing_version`, with no fallback to a broader attachment (plan D39, OQ-9).
+    pub version: Option<i32>,
+    /// `skill_binding.position` of the attachment that won.
     pub position: i32,
-    /// `skill_version.body`, inlined verbatim.
+    /// `skill_version.body`, inlined verbatim; empty when `version` is `None`.
     pub body: String,
+    /// The level of the attachment that won.
+    pub level: SkillLevel,
+    /// The winning attachment's activation, which [`select`] reads.
+    pub activation: Activation,
+    /// The winning attachment's globs, for MOD-9 milestone 3's matcher. Recorded nowhere yet.
+    pub globs: Vec<String>,
 }
 
 impl BoundSkill {
-    /// `docs/ANA-5.md` §4.2's collapse: a phase binding overrides the project binding of the same
-    /// `skill_id`, the result is ordered by `(position, name bytes)`, and **each skill appears
-    /// exactly once** even when both bindings exist.
+    /// `R-SKL-2` as amended (ANA-22 §6 item 3): per `skill_id`, the candidate at the **most
+    /// specific** level wins (phase over project over global) with its own pin, position and
+    /// activation; the result is ordered by `(position, name bytes)`; and **each skill appears
+    /// exactly once**.
     ///
     /// That last clause is the dedup OpenHands had to add after a reviewer asked "whether the
     /// microagent prompt would be included twice"
@@ -119,10 +188,17 @@ impl BoundSkill {
     /// Pure, and the single definition of the order: every backend's reader and the assembler call
     /// this rather than each sorting its own way, because the skills section is protected from
     /// trimming and its bytes land in the prompt digest.
+    ///
+    /// Two candidates of one skill at one level cannot come from a store — `UNIQUE NULLS NOT
+    /// DISTINCT (skill_id, project_id, phase_id)` and one project and at most one phase per read —
+    /// but the assembler re-collapses a caller's list, so the tie is defined: the first in input
+    /// order wins.
     #[must_use]
-    pub fn collapse(project: Vec<Self>, phase: Vec<Self>) -> Vec<Self> {
-        let mut resolved: Vec<Self> = Vec::with_capacity(project.len() + phase.len());
-        for skill in phase.into_iter().chain(project) {
+    pub fn collapse(mut skills: Vec<Self>) -> Vec<Self> {
+        // Most specific first. `sort_by` is stable, so equal levels keep their input order.
+        skills.sort_by(|a, b| b.level.cmp(&a.level));
+        let mut resolved: Vec<Self> = Vec::with_capacity(skills.len());
+        for skill in skills {
             if !resolved.iter().any(|kept| kept.skill_id == skill.skill_id) {
                 resolved.push(skill);
             }
@@ -138,6 +214,87 @@ impl BoundSkill {
     }
 }
 
+/// One step's candidates from its attachment rows (plan D39): each row, paired with its joined
+/// `skill.name`, becomes a [`BoundSkill`] at its own level with the version its own pin puts in
+/// force, and [`BoundSkill::collapse`] keeps the most specific per skill.
+///
+/// `rows` are every attachment that applies to the step — the global ones, the project's, and the
+/// phase's — and `versions` may hold any skill's rows, as [`SkillBinding::version_in_force`]
+/// allows. **The winner is picked by level before its version is looked at**: a winning pin that
+/// names no version yields `version: None` rather than the broader attachment's body (OQ-9). Both
+/// stores call this, so "which attachment wins" has one definition.
+#[must_use]
+pub fn resolve(rows: Vec<(SkillBinding, String)>, versions: &[SkillVersion]) -> Vec<BoundSkill> {
+    let _ = (rows, versions);
+    todo!("MOD-9 T1 green")
+}
+
+/// Why a candidate did or did not render (plan D40, ANA-22 §6 item 8). Serialised snake_case into
+/// `trim_record.skill_choices[].reason`. MOD-9 milestone 3 adds `matched` (with the path) and
+/// `no_match`; no variant here is renamed then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChoiceReason {
+    /// `activation = always`: rendered. The only active reason.
+    Always,
+    /// `activation = off` on the winning attachment.
+    Off,
+    /// `activation = glob` and no repo root resolves for the step (every step, until milestone 3).
+    NoPath,
+    /// The winning attachment's pin names no version, or the skill has none.
+    MissingVersion,
+    /// The template body places no `{{skills}}`, so nothing could render.
+    NotPlaced,
+}
+
+impl ChoiceReason {
+    /// The serde spelling: `always`, `off`, `no_path`, `missing_version`, `not_placed`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Off => "off",
+            Self::NoPath => "no_path",
+            Self::MissingVersion => "missing_version",
+            Self::NotPlaced => "not_placed",
+        }
+    }
+}
+
+/// One candidate's line in `trim_record.skill_choices` (plan D42): what was attached, at which
+/// level, and whether it rendered. `name` is the masked name — the assembler scrubs every
+/// candidate before it selects (plan D43).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillChoice {
+    /// `skill.id`.
+    pub skill: SkillId,
+    /// `skill.name`, masked.
+    pub name: String,
+    /// The version in force; `null` in the record when none is.
+    pub version: Option<i32>,
+    /// The winning attachment's level.
+    pub level: SkillLevel,
+    /// The winning attachment's activation.
+    pub activation: Activation,
+    /// Whether the skill rendered.
+    pub active: bool,
+    /// Why.
+    pub reason: ChoiceReason,
+}
+
+/// Plan D40: decides every candidate, in order, for one step. Pure.
+///
+/// The rules, first match wins: a body that does not place `{{skills}}` (`placed == false`) makes
+/// every candidate `not_placed`; `version: None` is `missing_version`; `Off` is `off`; `Glob` is
+/// `no_path` (no step resolves a root before milestone 3, OQ-12); `Always` is `always` and the only
+/// active outcome. Returns the active candidates in input order — which is collapse order, the
+/// render order — and one [`SkillChoice`] per candidate in the same order.
+#[must_use]
+pub fn select(candidates: Vec<BoundSkill>, placed: bool) -> (Vec<BoundSkill>, Vec<SkillChoice>) {
+    let _ = (candidates, placed);
+    todo!("MOD-9 T1 green")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,14 +303,24 @@ mod tests {
         DateTime::from_timestamp(1_788_393_600, 0).expect("a valid timestamp")
     }
 
-    /// One resolved binding, as a backend hands it to [`BoundSkill::collapse`].
-    fn bound(skill_id: SkillId, name: &str, version: i32, position: i32) -> BoundSkill {
+    /// One resolved candidate, as a backend hands it to [`BoundSkill::collapse`]: `Always`, with a
+    /// version and no globs.
+    fn bound(
+        skill_id: SkillId,
+        name: &str,
+        version: i32,
+        position: i32,
+        level: SkillLevel,
+    ) -> BoundSkill {
         BoundSkill {
             skill_id,
             name: name.to_owned(),
-            version,
+            version: Some(version),
             position,
             body: format!("# {name} v{version}"),
+            level,
+            activation: Activation::Always,
+            globs: Vec::new(),
         }
     }
 
@@ -161,12 +328,47 @@ mod tests {
         SkillBinding {
             id: SkillBindingId::new(),
             skill_id,
-            project_id: ProjectId::new(),
+            project_id: Some(ProjectId::new()),
             phase_id: None,
             pinned_version,
             position: 0,
+            activation: Activation::Always,
+            globs: Vec::new(),
+            languages: Vec::new(),
             updated_at: at(),
         }
+    }
+
+    /// One attachment row as a store hands it to [`resolve`]: the binding and its joined name.
+    fn attach(
+        skill_id: SkillId,
+        name: &str,
+        keys: (Option<ProjectId>, Option<PhaseId>),
+        pinned_version: Option<i32>,
+        position: i32,
+        activation: Activation,
+    ) -> (SkillBinding, String) {
+        let (project_id, phase_id) = keys;
+        let globs = if activation == Activation::Glob {
+            vec!["**/*.rs".to_owned()]
+        } else {
+            Vec::new()
+        };
+        (
+            SkillBinding {
+                id: SkillBindingId::new(),
+                skill_id,
+                project_id,
+                phase_id,
+                pinned_version,
+                position,
+                activation,
+                globs,
+                languages: Vec::new(),
+                updated_at: at(),
+            },
+            name.to_owned(),
+        )
     }
 
     fn version(skill_id: SkillId, version: i32) -> SkillVersion {
@@ -174,6 +376,7 @@ mod tests {
             skill_id,
             version,
             body: format!("v{version}"),
+            source: serde_json::json!({}),
             created_by: UserId::new(),
             created_at: at(),
         }
@@ -188,12 +391,12 @@ mod tests {
         let rust_style = SkillId::new();
         let tests = SkillId::new();
         let project = vec![
-            bound(rust_style, "rust-style", 1, 0),
-            bound(tests, "tests", 2, 1),
+            bound(rust_style, "rust-style", 1, 0, SkillLevel::Project),
+            bound(tests, "tests", 2, 1, SkillLevel::Project),
         ];
-        let phase = vec![bound(rust_style, "rust-style", 3, 5)];
+        let phase = vec![bound(rust_style, "rust-style", 3, 5, SkillLevel::Phase)];
 
-        let resolved = BoundSkill::collapse(project, phase);
+        let resolved = BoundSkill::collapse([project, phase].concat());
 
         assert_eq!(
             resolved.iter().filter(|s| s.skill_id == rust_style).count(),
@@ -203,8 +406,8 @@ mod tests {
         assert_eq!(
             resolved,
             vec![
-                bound(tests, "tests", 2, 1),
-                bound(rust_style, "rust-style", 3, 5),
+                bound(tests, "tests", 2, 1, SkillLevel::Project),
+                bound(rust_style, "rust-style", 3, 5, SkillLevel::Phase),
             ],
             "the phase binding's version and position are the ones in force"
         );
@@ -215,12 +418,12 @@ mod tests {
     #[test]
     fn equal_positions_break_on_name_bytes() {
         let project = vec![
-            bound(SkillId::new(), "apple", 1, 0),
-            bound(SkillId::new(), "Ångström", 1, 0),
-            bound(SkillId::new(), "Zebra", 1, 0),
+            bound(SkillId::new(), "apple", 1, 0, SkillLevel::Project),
+            bound(SkillId::new(), "Ångström", 1, 0, SkillLevel::Project),
+            bound(SkillId::new(), "Zebra", 1, 0, SkillLevel::Project),
         ];
 
-        let names: Vec<String> = BoundSkill::collapse(project, Vec::new())
+        let names: Vec<String> = BoundSkill::collapse(project)
             .into_iter()
             .map(|s| s.name)
             .collect();
@@ -265,6 +468,301 @@ mod tests {
             binding(SkillId::new(), None).version_in_force(&versions),
             None,
             "another skill's rows are not this skill's versions"
+        );
+    }
+
+    /// ANA-22 §6 item 3: phase over project over global, each level with its own pin and
+    /// position. Dropping the most specific row hands the skill to the next level down.
+    #[test]
+    fn phase_beats_project_beats_global() {
+        let skill = SkillId::new();
+        let project = ProjectId::new();
+        let phase = PhaseId::new();
+        let versions: Vec<SkillVersion> = (1..=3).map(|n| version(skill, n)).collect();
+        let global_row = attach(skill, "house", (None, None), Some(1), 7, Activation::Always);
+        let project_row = attach(
+            skill,
+            "house",
+            (Some(project), None),
+            Some(2),
+            5,
+            Activation::Always,
+        );
+        let phase_row = attach(
+            skill,
+            "house",
+            (Some(project), Some(phase)),
+            Some(3),
+            2,
+            Activation::Always,
+        );
+        let summary = |rows: Vec<(SkillBinding, String)>| {
+            resolve(rows, &versions)
+                .into_iter()
+                .map(|s| (s.level, s.version, s.position, s.body))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            summary(vec![
+                global_row.clone(),
+                project_row.clone(),
+                phase_row.clone()
+            ]),
+            vec![(SkillLevel::Phase, Some(3), 2, "v3".to_owned())],
+            "the phase attachment wins, with its own pin and position"
+        );
+        assert_eq!(
+            summary(vec![phase_row, global_row.clone(), project_row.clone()]),
+            vec![(SkillLevel::Phase, Some(3), 2, "v3".to_owned())],
+            "input order does not pick the winner; the level does"
+        );
+        assert_eq!(
+            summary(vec![global_row.clone(), project_row]),
+            vec![(SkillLevel::Project, Some(2), 5, "v2".to_owned())],
+            "without a phase row the project attachment wins"
+        );
+        assert_eq!(
+            summary(vec![global_row]),
+            vec![(SkillLevel::Global, Some(1), 7, "v1".to_owned())],
+            "without either, the global attachment stands"
+        );
+    }
+
+    /// ANA-22 §6 item 4: a narrower `off` wins like any other attachment, so the skill is out of
+    /// the step even though a broader level would have rendered it.
+    #[test]
+    fn off_at_a_narrower_level_wins_and_keeps_the_skill_out_of_broader_levels() {
+        let skill = SkillId::new();
+        let project = ProjectId::new();
+        let versions = vec![version(skill, 1)];
+        let candidates = resolve(
+            vec![
+                attach(skill, "house", (None, None), None, 0, Activation::Always),
+                attach(
+                    skill,
+                    "house",
+                    (Some(project), None),
+                    None,
+                    0,
+                    Activation::Off,
+                ),
+            ],
+            &versions,
+        );
+        assert_eq!(candidates.len(), 1, "one candidate per skill");
+        assert_eq!(
+            (candidates[0].level, candidates[0].activation),
+            (SkillLevel::Project, Activation::Off),
+            "the project's off wins over the global always"
+        );
+
+        let (active, choices) = select(candidates, true);
+        assert!(active.is_empty(), "an off winner renders nothing");
+        assert_eq!(
+            choices
+                .iter()
+                .map(|c| (c.active, c.reason, c.level))
+                .collect::<Vec<_>>(),
+            vec![(false, ChoiceReason::Off, SkillLevel::Project)],
+            "and is recorded off, at the level that switched it off"
+        );
+    }
+
+    /// OQ-9 (plan D39): the winner is chosen by level first; a winning pin that names no version
+    /// yields `version: None`, never the broader attachment's body.
+    #[test]
+    fn a_missing_pin_on_the_winner_does_not_fall_back() {
+        let skill = SkillId::new();
+        let project = ProjectId::new();
+        let phase = PhaseId::new();
+        let versions = vec![version(skill, 1)];
+        let resolved = resolve(
+            vec![
+                attach(
+                    skill,
+                    "house",
+                    (Some(project), None),
+                    Some(1),
+                    0,
+                    Activation::Always,
+                ),
+                attach(
+                    skill,
+                    "house",
+                    (Some(project), Some(phase)),
+                    Some(7),
+                    4,
+                    Activation::Always,
+                ),
+            ],
+            &versions,
+        );
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|s| (s.level, s.version, s.body.as_str(), s.position))
+                .collect::<Vec<_>>(),
+            vec![(SkillLevel::Phase, None, "", 4)],
+            "the phase attachment wins with no version, not the project's v1"
+        );
+    }
+
+    /// Global rows order like any other: `(position, name bytes)`, a negative position first.
+    #[test]
+    fn global_rows_order_by_position_then_name_bytes() {
+        let ids: Vec<SkillId> = (0..4).map(|_| SkillId::new()).collect();
+        let versions: Vec<SkillVersion> = ids.iter().map(|id| version(*id, 1)).collect();
+        let rows = vec![
+            attach(ids[0], "apple", (None, None), None, 0, Activation::Always),
+            attach(
+                ids[1],
+                "Ångström",
+                (None, None),
+                None,
+                0,
+                Activation::Always,
+            ),
+            attach(ids[2], "Zebra", (None, None), None, 0, Activation::Always),
+            attach(ids[3], "last", (None, None), None, -1, Activation::Always),
+        ];
+        let names: Vec<String> = resolve(rows, &versions)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["last", "Zebra", "apple", "Ångström"]);
+    }
+
+    /// `level` reads the two nullable keys; the row the check constraint refuses reads `Global`,
+    /// as `PgStore`'s `WHERE b.project_id IS NULL` would.
+    #[test]
+    fn level_of_a_binding_follows_its_nullable_keys() {
+        let level = |project_id: Option<ProjectId>, phase_id: Option<PhaseId>| {
+            SkillBinding {
+                project_id,
+                phase_id,
+                ..binding(SkillId::new(), None)
+            }
+            .level()
+        };
+        let project = Some(ProjectId::new());
+        let phase = Some(PhaseId::new());
+        assert_eq!(level(None, None), SkillLevel::Global);
+        assert_eq!(level(project, None), SkillLevel::Project);
+        assert_eq!(level(project, phase), SkillLevel::Phase);
+        assert_eq!(
+            level(None, phase),
+            SkillLevel::Global,
+            "a phase row with no project is refused by skill_binding_phase_needs_project; were \
+             one read, it is global"
+        );
+    }
+
+    /// Plan D40: `not_placed` first, then `missing_version`, then the activation.
+    #[test]
+    fn select_applies_its_rules_in_order() {
+        let with = |name: &str, activation: Activation, version: Option<i32>| BoundSkill {
+            activation,
+            version,
+            ..bound(SkillId::new(), name, 1, 0, SkillLevel::Project)
+        };
+        let candidates = vec![
+            with("a", Activation::Always, Some(1)),
+            with("b", Activation::Off, Some(1)),
+            with("c", Activation::Glob, Some(1)),
+            with("d", Activation::Always, None),
+        ];
+
+        let (active, choices) = select(candidates.clone(), true);
+        assert_eq!(
+            choices.iter().map(|c| c.reason).collect::<Vec<_>>(),
+            vec![
+                ChoiceReason::Always,
+                ChoiceReason::Off,
+                ChoiceReason::NoPath,
+                ChoiceReason::MissingVersion,
+            ]
+        );
+        assert_eq!(
+            choices.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c", "d"],
+            "one choice per candidate, in input order"
+        );
+        assert_eq!(
+            choices.iter().map(|c| c.active).collect::<Vec<_>>(),
+            vec![true, false, false, false]
+        );
+        assert_eq!(active, vec![candidates[0].clone()], "only `always` renders");
+
+        let (active, choices) = select(candidates, false);
+        assert!(active.is_empty(), "nothing renders where nothing is placed");
+        assert!(
+            choices
+                .iter()
+                .all(|c| c.reason == ChoiceReason::NotPlaced && !c.active),
+            "every candidate is not_placed: {choices:?}"
+        );
+    }
+
+    /// Plan D55: the record's keys, and the snake_case spellings of the two plain enums.
+    #[test]
+    fn choices_serialize_their_documented_keys() {
+        let choice = SkillChoice {
+            skill: SkillId::new(),
+            name: "house".to_owned(),
+            version: None,
+            level: SkillLevel::Phase,
+            activation: Activation::Glob,
+            active: false,
+            reason: ChoiceReason::MissingVersion,
+        };
+        let value = serde_json::to_value(&choice).expect("a choice serialises");
+        let keys: std::collections::BTreeSet<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "skill",
+                "name",
+                "version",
+                "level",
+                "activation",
+                "active",
+                "reason"
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(value["reason"], serde_json::json!("missing_version"));
+        assert_eq!(value["level"], serde_json::json!("phase"));
+        assert_eq!(value["activation"], serde_json::json!("glob"));
+        assert_eq!(value["version"], serde_json::Value::Null);
+        for reason in [
+            ChoiceReason::Always,
+            ChoiceReason::Off,
+            ChoiceReason::NoPath,
+            ChoiceReason::MissingVersion,
+            ChoiceReason::NotPlaced,
+        ] {
+            assert_eq!(
+                serde_json::to_value(reason).expect("a reason serialises"),
+                serde_json::json!(reason.as_str()),
+                "as_str is the serde spelling"
+            );
+        }
+        for level in [SkillLevel::Global, SkillLevel::Project, SkillLevel::Phase] {
+            assert_eq!(
+                serde_json::to_value(level).expect("a level serialises"),
+                serde_json::json!(level.as_str()),
+                "as_str is the serde spelling"
+            );
+        }
+        assert!(
+            SkillLevel::Global < SkillLevel::Project && SkillLevel::Project < SkillLevel::Phase
         );
     }
 }

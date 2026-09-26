@@ -157,7 +157,14 @@ async fn the_judge_editor_lists_its_placeholders_and_its_wire() {
     select(&mut harness, "judge");
     harness.key("e");
     let frame = harness.render();
-    for token in ["{{item_key}}", "{{phase}}", "{{task}}", "{{candidates}}"] {
+    // MOD-9 D48: the judge's closed set gained `{{skills}}`, so its help lists five.
+    for token in [
+        "{{item_key}}",
+        "{{phase}}",
+        "{{skills}}",
+        "{{task}}",
+        "{{candidates}}",
+    ] {
         assert!(
             frame.contains(token),
             "`{token}` is a judge placeholder: {frame}"

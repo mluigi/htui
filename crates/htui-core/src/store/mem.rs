@@ -115,7 +115,7 @@ struct State {
     skills: HashMap<SkillId, Skill>,
     /// `skill_version`, resolved through [`SkillBinding::version_in_force`].
     skill_versions: Vec<SkillVersion>,
-    /// `skill_binding`, collapsed through [`BoundSkill::collapse`].
+    /// `skill_binding`, resolved through `model::skill::resolve`.
     skill_bindings: Vec<SkillBinding>,
     /// `box_tool`, projected by the inherent [`MemStore::box_profile`].
     box_tools: Vec<BoxTool>,
@@ -406,18 +406,14 @@ impl MemStore {
         }))
     }
 
-    /// The skills in force for a project, or for one phase of it: `R-SKL-2`'s collapse
-    /// (`docs/ANA-5.md` §4.2), already resolved to a version and a body.
+    /// The skill candidates of one step (ANA-22 §6 items 2-3): the global attachments, the
+    /// project's, and — with `phase` — that phase's, resolved most-specific-wins by
+    /// [`resolve`](crate::model::skill::resolve), exactly as `PgStore`'s two `SELECT`s are, so the
+    /// rule has one definition rather than one per backend.
     ///
-    /// `phase: None` asks for the project-level bindings alone. With a phase, the phase's bindings
-    /// override the project's per `skill_id` and
-    /// [`BoundSkill::collapse`](crate::model::BoundSkill::collapse) is what says so — this method
-    /// resolves rows and calls that, exactly as `PgStore`'s two `SELECT`s do, so the rule has one
-    /// definition rather than one per backend.
-    ///
-    /// A binding whose version cannot be resolved is dropped rather than rendered bodiless: see
-    /// [`SkillBinding::version_in_force`](crate::model::SkillBinding::version_in_force) for why a
-    /// pin that names no row resolves to nothing.
+    /// Inactive winners are included — an `off` or `glob` attachment, and a winning pin that
+    /// names no version (`version: None`, plan D39); the assembler's `select` decides and records
+    /// them. A binding whose `skill` row is missing is dropped.
     ///
     /// # Errors
     ///
@@ -428,18 +424,26 @@ impl MemStore {
         phase: Option<PhaseId>,
     ) -> Result<Vec<BoundSkill>> {
         Ok(self.read(|state| {
-            let level = |want: Option<PhaseId>| -> Vec<BoundSkill> {
-                state
-                    .skill_bindings
-                    .iter()
-                    .filter(|binding| binding.project_id == project && binding.phase_id == want)
-                    .filter_map(|binding| state.bind(binding))
-                    .collect()
-            };
-            BoundSkill::collapse(
-                level(None),
-                phase.map(|id| level(Some(id))).unwrap_or_default(),
-            )
+            let rows = state
+                .skill_bindings
+                .iter()
+                .filter(|binding| match binding.project_id {
+                    None => true,
+                    // `phase: None` with a phase row: `phase_id == phase` is false, so the row
+                    // is excluded, as `PgStore`'s `b.phase_id = NULL` is.
+                    Some(owner) => {
+                        owner == project
+                            && (binding.phase_id.is_none() || binding.phase_id == phase)
+                    }
+                })
+                .filter_map(|binding| {
+                    state
+                        .skills
+                        .get(&binding.skill_id)
+                        .map(|skill| (binding.clone(), skill.name.clone()))
+                })
+                .collect();
+            crate::model::skill::resolve(rows, &state.skill_versions)
         }))
     }
 
@@ -1092,22 +1096,6 @@ impl State {
             .iter()
             .filter_map(|kind| self.latest_document(item, kind).cloned())
             .collect()
-    }
-
-    /// One binding resolved to the skill, the version in force and the body (`R-SKL-2`).
-    ///
-    /// `None` when the skill row or the version in force is missing, which is
-    /// [`SkillBinding::version_in_force`]'s "a pin that cannot be honoured renders nothing".
-    fn bind(&self, binding: &SkillBinding) -> Option<BoundSkill> {
-        let skill = self.skills.get(&binding.skill_id)?;
-        let version = binding.version_in_force(&self.skill_versions)?;
-        Some(BoundSkill {
-            skill_id: skill.id,
-            name: skill.name.clone(),
-            version: version.version,
-            position: binding.position,
-            body: version.body.clone(),
-        })
     }
 
     /// The item's documents without their bodies, grouped by kind and ascending by version.
@@ -3088,7 +3076,7 @@ impl State {
             skill_bindings: rows(
                 self.skill_bindings
                     .iter()
-                    .filter(|row| row.project_id == id)
+                    .filter(|row| row.project_id == Some(id))
                     .count(),
             ),
             runs: rows(runs.len()),
@@ -3266,7 +3254,7 @@ impl State {
         self.items.retain(|id, _| !gone.items.contains(id));
         self.item_key_counter
             .retain(|(project, _), _| *project != id);
-        self.skill_bindings.retain(|row| row.project_id != id);
+        self.skill_bindings.retain(|row| row.project_id != Some(id));
         self.kinds.retain(|_, row| row.project_id != id);
         self.phases.retain(|row| !gone.phases.contains(&row.id));
         self.graphs.retain(|id, _| !gone.graphs.contains(id));
@@ -5976,7 +5964,7 @@ mod tests {
                 .iter()
                 .map(|skill| (skill.name.as_str(), skill.version, skill.position))
                 .collect::<Vec<_>>(),
-            vec![("tests", 1, 0), ("rust-style", 2, 1)],
+            vec![("tests", Some(1), 0), ("rust-style", Some(2), 1)],
             "with no phase, the project bindings alone, each at its latest version"
         );
 
@@ -5989,7 +5977,7 @@ mod tests {
                 .iter()
                 .map(|skill| (skill.name.as_str(), skill.version, skill.position))
                 .collect::<Vec<_>>(),
-            vec![("tests", 1, 0), ("rust-style", 1, 2)],
+            vec![("tests", Some(1), 0), ("rust-style", Some(1), 2)],
             "the phase binding overrides the project one: once, pinned to v1, at position 2"
         );
         assert_eq!(
@@ -6004,6 +5992,108 @@ mod tests {
                 .expect("bound_skills must not fail")
                 .is_empty(),
             "a project with no bindings has no skills, not every skill"
+        );
+    }
+
+    /// The demo data plus one global attachment (ANA-22 §6 item 2): skill `house`, v1 body
+    /// `"House rules."`, attached with `project_id` and `phase_id` both `None`, at position 5.
+    fn demo_with_a_global_skill() -> (MemStore, crate::model::SkillId) {
+        let mut data = crate::fixtures::demo_data();
+        let house = crate::model::SkillId::new();
+        let now = Utc::now();
+        data.skills.push(crate::model::Skill {
+            id: house,
+            name: "house".to_owned(),
+            description: "House rules for every project.".to_owned(),
+            created_by: ids::USER,
+            created_at: now,
+            updated_at: now,
+        });
+        data.skill_versions.push(crate::model::SkillVersion {
+            skill_id: house,
+            version: 1,
+            body: "House rules.".to_owned(),
+            source: json!({}),
+            created_by: ids::USER,
+            created_at: now,
+        });
+        data.skill_bindings.push(crate::model::SkillBinding {
+            id: crate::model::SkillBindingId::new(),
+            skill_id: house,
+            project_id: None,
+            phase_id: None,
+            pinned_version: None,
+            position: 5,
+            activation: crate::model::Activation::Always,
+            globs: Vec::new(),
+            languages: Vec::new(),
+            updated_at: now,
+        });
+        (MemStore::from_demo(data), house)
+    }
+
+    /// ANA-22 §6 item 2: a global attachment is a candidate of every project's steps, and sorts
+    /// with the project's and the phase's by `(position, name bytes)`.
+    #[tokio::test]
+    async fn a_global_attachment_reaches_every_project() {
+        use crate::model::SkillLevel;
+        let (store, house) = demo_with_a_global_skill();
+
+        let agy = store
+            .bound_skills(ids::PROJECT_AGY, None)
+            .await
+            .expect("bound_skills must not fail");
+        assert_eq!(
+            agy.iter()
+                .map(|s| (s.skill_id, s.level, s.version, s.position))
+                .collect::<Vec<_>>(),
+            vec![(house, SkillLevel::Global, Some(1), 5)],
+            "a project with no attachment of its own still gets the global one"
+        );
+        assert_eq!(agy[0].body, "House rules.");
+
+        let implement = store
+            .bound_skills(ids::PROJECT_HTUI, Some(ids::PHASE_HTUI_IMPLEMENT))
+            .await
+            .expect("bound_skills must not fail");
+        assert_eq!(
+            implement
+                .iter()
+                .map(|s| (s.name.as_str(), s.level, s.version, s.position))
+                .collect::<Vec<_>>(),
+            vec![
+                ("tests", SkillLevel::Project, Some(1), 0),
+                ("rust-style", SkillLevel::Phase, Some(1), 2),
+                ("house", SkillLevel::Global, Some(1), 5),
+            ],
+            "the global attachment joins the project's and the phase's, in (position, name) order"
+        );
+    }
+
+    /// ANA-22 §7.1: `project_id` keeps `ON DELETE CASCADE`, which never fires for a NULL key, so
+    /// a global attachment survives a project delete and the reach counts the project's own rows.
+    #[tokio::test]
+    async fn delete_project_keeps_global_attachments() {
+        let (store, house) = demo_with_a_global_skill();
+
+        let reach = store
+            .delete_project(ids::PROJECT_HTUI)
+            .await
+            .expect("the delete lands");
+        assert_eq!(
+            reach.skill_bindings, 3,
+            "the reach counts the project's own three attachments, not the global one"
+        );
+        assert_eq!(
+            store
+                .bound_skills(ids::PROJECT_AGY, None)
+                .await
+                .expect("bound_skills must not fail")
+                .iter()
+                .map(|s| s.skill_id)
+                .collect::<Vec<_>>(),
+            vec![house],
+            "the global attachment is still every remaining project's"
         );
     }
 
@@ -6834,7 +6924,7 @@ mod tests {
                 state
                     .skill_bindings
                     .iter()
-                    .all(|row| row.project_id != gone),
+                    .all(|row| row.project_id != Some(gone)),
                 "skill_binding"
             );
             assert!(

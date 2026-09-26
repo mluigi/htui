@@ -182,7 +182,8 @@ impl Placeholder {
         Self::ALL.iter().copied().find(|p| p.token() == token)
     }
 
-    /// Whether the role's closed set contains this placeholder (ANA-5 §4.1 `:319-341`).
+    /// Whether the role's closed set contains this placeholder (ANA-5 §4.1 `:319-341`, with
+    /// `skills` added to the judge by MOD-9 D48).
     #[must_use]
     pub const fn allowed_in(self, role: TemplateRole) -> bool {
         match role {
@@ -475,8 +476,8 @@ mod tests {
         );
         assert_eq!(
             tokens_for(TemplateRole::Judge),
-            vec!["item_key", "phase", "task", "candidates"],
-            "ANA-5 §4.1 `:339`"
+            vec!["item_key", "phase", "skills", "task", "candidates"],
+            "ANA-5 §4.1 `:339`, plus skills (MOD-9 D48)"
         );
         assert_eq!(
             tokens_for(TemplateRole::Handoff),
@@ -605,6 +606,28 @@ mod tests {
                 at: 15,
             }),
             "the closed set is checked before the role, and the role before the required set"
+        );
+    }
+
+    /// MOD-9 D48: a judge weighs candidates against the skills they were written under, so its
+    /// closed set admits `{{skills}}` (optional: `JUDGE_REQUIRED` is untouched).
+    #[test]
+    fn skills_is_allowed_in_a_judge_body() {
+        let parsed = parse(TemplateRole::Judge, "{{task}}\n{{skills}}\n{{candidates}}")
+            .expect("MOD-9 D48: skills is a judge placeholder");
+        assert!(parsed.used.contains(&Placeholder::Skills));
+    }
+
+    /// MOD-9 D44: a handoff carries no skills, and its closed set still says so.
+    #[test]
+    fn skills_is_still_refused_in_a_handoff_body() {
+        assert_eq!(
+            parse(TemplateRole::Handoff, "{{skills}}"),
+            Err(TemplateError::WrongRole {
+                token: "skills".to_string(),
+                role: TemplateRole::Handoff,
+                at: 0,
+            })
         );
     }
 

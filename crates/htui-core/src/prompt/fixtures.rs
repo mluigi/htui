@@ -16,7 +16,7 @@ use crate::model::box_::BoxProfile;
 use crate::model::ids::{ItemId, SkillId, StepId};
 use crate::model::item::Status;
 use crate::model::link::UpstreamEntry;
-use crate::model::skill::BoundSkill;
+use crate::model::skill::{Activation, BoundSkill, SkillLevel};
 use crate::model::{EventKind, EventRole, OsFamily, SessionEvent};
 use crate::prompt::excerpt::{
     Excerpt, ExcerptAudit, ExcerptCaps, ExcerptReason, ExcerptSet, FileRecord, RepoRoot,
@@ -221,9 +221,12 @@ pub fn phase_implement_attempt2() -> PromptSpec {
         skills: vec![BoundSkill {
             skill_id: SkillId::from_uuid(Uuid::from_u128(0x5111)),
             name: "rust-style".to_owned(),
-            version: 2,
+            version: Some(2),
             position: 0,
             body: "Prefer `expect` with a reason over `unwrap`.\nNo `unsafe`.\n".to_owned(),
+            level: SkillLevel::Project,
+            activation: Activation::Always,
+            globs: Vec::new(),
         }],
         excerpts: ExcerptSet {
             files: excerpts,
@@ -678,9 +681,12 @@ pub fn phase_protected_too_big() -> PromptSpec {
     spec.skills = vec![BoundSkill {
         skill_id: SkillId::from_uuid(Uuid::from_u128(0x5111)),
         name: "rust-style".to_owned(),
-        version: 2,
+        version: Some(2),
         position: 0,
         body: prose_block("rust-style", 60),
+        level: SkillLevel::Project,
+        activation: Activation::Always,
+        globs: Vec::new(),
     }];
     spec
 }
@@ -698,16 +704,22 @@ pub fn phase_skills_over_cap() -> PromptSpec {
         BoundSkill {
             skill_id: SkillId::from_uuid(Uuid::from_u128(0x5111)),
             name: "rust-style".to_owned(),
-            version: 2,
+            version: Some(2),
             position: 0,
             body: prose_block("rust-style", 30),
+            level: SkillLevel::Project,
+            activation: Activation::Always,
+            globs: Vec::new(),
         },
         BoundSkill {
             skill_id: SkillId::from_uuid(Uuid::from_u128(0x5222)),
             name: "command-queue".to_owned(),
-            version: 1,
+            version: Some(1),
             position: 1,
             body: prose_block("command-queue", 30),
+            level: SkillLevel::Project,
+            activation: Activation::Always,
+            globs: Vec::new(),
         },
     ];
     spec

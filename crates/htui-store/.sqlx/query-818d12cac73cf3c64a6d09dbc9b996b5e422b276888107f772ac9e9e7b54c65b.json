@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT b.id         AS \"id: htui_core::model::SkillBindingId\",\n                   b.skill_id   AS \"skill_id: SkillId\",\n                   b.project_id AS \"project_id: ProjectId\",\n                   b.phase_id   AS \"phase_id: PhaseId\",\n                   b.pinned_version,\n                   b.position,\n                   b.updated_at,\n                   s.name\n              FROM skill_binding b JOIN skill s ON s.id = b.skill_id\n             WHERE b.project_id = $1 AND b.phase_id IS NULL\n            ",
+  "query": "\n            SELECT b.id         AS \"id: htui_core::model::SkillBindingId\",\n                   b.skill_id   AS \"skill_id: SkillId\",\n                   b.project_id AS \"project_id?: ProjectId\",\n                   b.phase_id   AS \"phase_id: PhaseId\",\n                   b.pinned_version,\n                   b.position,\n                   b.activation AS \"activation: Activation\",\n                   b.globs,\n                   b.languages,\n                   b.updated_at,\n                   s.name\n              FROM skill_binding b JOIN skill s ON s.id = b.skill_id\n             WHERE b.project_id IS NULL\n                OR (b.project_id = $1 AND (b.phase_id IS NULL OR b.phase_id = $2))\n            ",
   "describe": {
     "columns": [
       {
@@ -27,7 +27,7 @@
       },
       {
         "ordinal": 2,
-        "name": "project_id: ProjectId",
+        "name": "project_id?: ProjectId",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -71,6 +71,39 @@
       },
       {
         "ordinal": 6,
+        "name": "activation: Activation",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "activation"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "globs",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "globs"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "languages",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "languages"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -81,7 +114,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 10,
         "name": "name",
         "type_info": "Text",
         "origin": {
@@ -94,19 +127,23 @@
     ],
     "parameters": {
       "Left": [
+        "Uuid",
         "Uuid"
       ]
     },
     "nullable": [
       false,
       false,
+      true,
+      true,
+      true,
       false,
-      true,
-      true,
+      false,
+      false,
       false,
       false,
       false
     ]
   },
-  "hash": "a1d3a8d1f3bd940984910ae7f3dd239c4106e21270746f8f6aa878720aed27f9"
+  "hash": "818d12cac73cf3c64a6d09dbc9b996b5e422b276888107f772ac9e9e7b54c65b"
 }

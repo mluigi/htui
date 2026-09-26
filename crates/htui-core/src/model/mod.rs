@@ -140,7 +140,10 @@ pub use run::{
     prompt_summary,
 };
 pub use scope::{PromptScope, Scope};
-pub use skill::{BoundSkill, Skill, SkillBinding, SkillVersion};
+pub use skill::{
+    Activation, BoundSkill, ChoiceReason, Skill, SkillBinding, SkillChoice, SkillLevel,
+    SkillVersion,
+};
 pub use usage::UsageTotals;
 pub use user::{AppUser, CapabilityTag};
 
@@ -189,6 +192,12 @@ mod tests {
                 "duplicate",
             ],
         );
+    }
+
+    /// `0007_skill_attachments.sql`'s `CHECK (activation IN ('always', 'glob', 'off'))`.
+    #[test]
+    fn activation_matches_check_list() {
+        check_enum(Activation::ALL, &["always", "glob", "off"]);
     }
 
     #[test]

@@ -78,11 +78,11 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2, 3, 4, 5, 6],
+        vec![1, 2, 3, 4, 5, 6, 7],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
-         MOD-7 milestone 1's 0005_box_identity.sql and MOD-38's 0006_requirements.sql, in \
-         ordinal order"
+         MOD-7 milestone 1's 0005_box_identity.sql, MOD-38's 0006_requirements.sql and MOD-9 \
+         milestone 2's 0007_skill_attachments.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -170,8 +170,9 @@ async fn agent_box_gains_a_jsonb_probe_column() {
 ///
 /// `agent.name` is ANA-4 §9 as amended by plan D43 (its `COMMENT ... IS NULL` would have cleared a
 /// comment `0001_init.sql` never wrote); the next five are ANA-5 §9 copied from
-/// `docs/ANA-5.md:2153-2181`; the last nineteen are ANA-2 §9 (`docs/ANA-2.md:1862-1999`). They
-/// live here as literals on purpose: this test is the guard against a paraphrase drifting into a
+/// `docs/ANA-5.md:2153-2181`; the last nineteen are ANA-2 §9 (`docs/ANA-2.md:1862-1999`).
+/// `run_step.trim_record` is the text `0007_skill_attachments.sql` restates (MOD-9 D42), which
+/// replaces `0002`'s. They live here as literals on purpose: this test is the guard against a paraphrase drifting into a
 /// forward-only migration that cannot be edited afterwards.
 const ANA_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     (
@@ -206,10 +207,13 @@ const ANA_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     (
         "run_step",
         "trim_record",
-        "ANA-5 5.1: {v, template, budget, budget_source, reserve, target, estimator, \
-         estimated_before, estimated_after, sections[], excerpts, notes}. Canonical; the prompt \
-         payload sections[] array is its abridged projection. Written at stage 3 by \
-         set_step_prompt, before the session starts.",
+        "ANA-5 5.1 as amended by MOD-9 D42: {v, template, budget, budget_source, reserve, target, \
+         estimator, estimated_before, estimated_after, sections[], skill_choices[], excerpts, \
+         notes}, v 2. skill_choices[] is every candidate skill, ordered by position then name, \
+         each {skill, name, version, level, activation, active, reason} with reason always, off, \
+         no_path, missing_version or not_placed (ANA-22 6 item 8). A v 1 record, written before \
+         0007, has no skill_choices. Canonical; the prompt payload sections[] array is its \
+         abridged projection. Written at stage 3 by set_step_prompt, before the session starts.",
     ),
     (
         "step_graph_phase",
@@ -368,6 +372,38 @@ const MOD7_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The five `COMMENT ON COLUMN` texts of `0007_skill_attachments.sql` (ANA-22 §7.1, MOD-9 plan
+/// D38), verbatim, for [`ANA_COLUMN_COMMENTS`]'s reason.
+const MOD9_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "skill_version",
+        "source",
+        "import provenance and raw frontmatter; prefills an attachment, never read by the prompt \
+         builder",
+    ),
+    (
+        "skill_binding",
+        "project_id",
+        "NULL = global attachment (every project)",
+    ),
+    (
+        "skill_binding",
+        "activation",
+        "always | glob | off; the most specific attachment of a skill wins (ANA-22)",
+    ),
+    (
+        "skill_binding",
+        "globs",
+        "effective globs: typed plus languages expanded at save; <repo>:<glob> only on project or \
+         phase rows",
+    ),
+    (
+        "skill_binding",
+        "languages",
+        "languages as authored; display only",
+    ),
+];
+
 /// The one `COMMENT ON TABLE` of `0003_orchestration.sql` (ANA-2 §9), verbatim. Kept beside
 /// [`ANA_COLUMN_COMMENTS`] rather than in it: `col_description` cannot read it, because a table
 /// comment is `objsubid = 0`.
@@ -383,7 +419,11 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         return;
     };
 
-    for (table, column, expected) in ANA_COLUMN_COMMENTS.iter().chain(MOD7_COLUMN_COMMENTS) {
+    for (table, column, expected) in ANA_COLUMN_COMMENTS
+        .iter()
+        .chain(MOD7_COLUMN_COMMENTS)
+        .chain(MOD9_COLUMN_COMMENTS)
+    {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.col_description(c.oid, a.attnum) \
              FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -399,7 +439,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         assert_eq!(
             actual.as_deref(),
             Some(*expected),
-            "{table}.{column}'s comment is the ANA (or MOD-7) text byte for byte"
+            "{table}.{column}'s comment is the ANA (or MOD-7, or MOD-9) text byte for byte"
         );
     }
 
@@ -421,7 +461,8 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
     );
 
     // And nothing else in those tables carries one, so a reader of `\d+` sees exactly the
-    // twenty-nine contracts the three ANAs and MOD-7 wrote and no half-finished thirtieth.
+    // thirty-four contracts the three ANAs, MOD-7 and ANA-22 wrote and no half-finished
+    // thirty-fifth.
     let commented: Vec<(String, String)> = sqlx::query_as(
         "SELECT c.relname::text, a.attname::text FROM pg_class c \
          JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -434,6 +475,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         ANA_COLUMN_COMMENTS
             .iter()
             .chain(MOD7_COLUMN_COMMENTS)
+            .chain(MOD9_COLUMN_COMMENTS)
             .map(|(table, _, _)| (*table).to_owned())
             .collect::<BTreeSet<String>>()
             .into_iter()
@@ -446,12 +488,13 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
     let mut expected: Vec<(String, String)> = ANA_COLUMN_COMMENTS
         .iter()
         .chain(MOD7_COLUMN_COMMENTS)
+        .chain(MOD9_COLUMN_COMMENTS)
         .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
         .collect();
     expected.sort();
     assert_eq!(
         commented, expected,
-        "exactly the twenty-nine commented columns, and no others"
+        "exactly the thirty-four commented columns, and no others"
     );
 
     db.drop_db().await;
@@ -733,7 +776,8 @@ async fn item_resolution_iff_closed_rejects_both_halves() {
 /// MOD-38 (plan D8): every item closed before 0006 closed through the old `-> closed` edges, which
 /// only a finished item took, so 0006 backfills `done` before it adds the iff constraint, with
 /// `trg_item_updated_at` off so no row's `updated_at` moves. Staged like the 0004 case:
-/// `run_to(5)`, plant a closed row, then the plain `run` applies 0006.
+/// `run_to(5)`, plant a closed row, then `run_to(6)` applies 0006 (MOD-9 D69: the plain `run`
+/// would apply 0007 too).
 #[tokio::test]
 async fn closed_rows_backfill_to_done() {
     const PLANTED_AT: &str = "2020-01-02T03:04:05Z";
@@ -772,7 +816,7 @@ async fn closed_rows_backfill_to_done() {
         planted.push((id, status));
     }
 
-    MIGRATOR.run(&db.pool).await.expect("apply 0006");
+    MIGRATOR.run_to(6, &db.pool).await.expect("apply 0006");
 
     for (id, status) in planted {
         let (resolution, kept): (Option<String>, bool) = sqlx::query_as(
@@ -830,8 +874,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(6),
-        "six embedded migrations, none applied"
+        MigrationState::Pending(7),
+        "seven embedded migrations, none applied"
     );
 
     db.drop_db().await;
