@@ -5990,12 +5990,12 @@ mod tests {
     use htui_agent::event::StopReason;
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        Gate, GateOutcome, GraphSnapshot, ItemPatch, NewRepo, NewRunStep, NewStepGraph, PhaseId,
-        PhasePatch, RepoId, Resolution, RunMode, RunStatus, SnapshotCandidate, SnapshotPhase,
-        Status, StepGraphId, StepGraphPhase, StepId, StepStatus,
+        BoxEdit, Gate, GateOutcome, GraphSnapshot, ItemPatch, NewRepo, NewRunStep, NewStepGraph,
+        PhaseId, PhasePatch, RepoId, Resolution, RunMode, RunStatus, SnapshotCandidate,
+        SnapshotPhase, Status, StepGraphId, StepGraphPhase, StepId, StepStatus,
     };
     use htui_core::store::mem::MemFault;
-    use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+    use htui_core::store::{CasOutcome, MemStore, ReadStore as _, WriteStore as _};
 
     use super::{
         AgentSelector, FirstCandidate, JudgePrompts, NoSink, Resume, SessionKey, required_inputs,
@@ -11534,6 +11534,93 @@ mod tests {
             notes_before,
             "no note for an item some other run already owns"
         );
+    }
+
+    /// `R-ORCH-10` at claim (MOD-7 milestone 3, D85; blueprint H-3): a tag withdrawn between
+    /// `enqueue` and `claim` makes `claim_run` answer `Claim::MissingTags`, which the engine maps
+    /// to [`EngineError::MissingTags`], never to `ClaimRefused`. The run is failed by name, the
+    /// item blocked, and the engine writes the one note. That the worker does not re-queue it is
+    /// `htui`'s half (MOD-7 milestone 3 T3, the Postgres claim-time case): the re-queue arms live
+    /// in `crates/htui/src/run_worker.rs`, which this crate cannot see.
+    #[tokio::test]
+    async fn a_missing_tags_claim_is_not_a_claim_refused() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        // Both on the fixture box: `rust` probed, `gpu` declared, so the enqueue passes.
+        require_tags(&harness, ids::HTUI_FEAT_3, &["gpu", "rust"]).await;
+        harness_engine!(harness.orch, engine);
+
+        let run = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .await
+            .expect("the box has both tags at enqueue");
+        let notes_before = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+
+        // The re-probe between the two: the box withdraws its declared `gpu`.
+        let outcome = harness
+            .orch
+            .store
+            .edit_box(
+                ids::BOX,
+                0,
+                BoxEdit {
+                    declared_tags: Some(Vec::new()),
+                    quirks: None,
+                },
+            )
+            .await
+            .expect("the demo box accepts the edit");
+        assert!(
+            matches!(outcome, CasOutcome::Applied(_)),
+            "the token is current: {outcome:?}"
+        );
+
+        let refused = engine
+            .claim(run)
+            .await
+            .expect_err("the box no longer has `gpu`");
+        assert!(
+            matches!(
+                &refused,
+                EngineError::MissingTags { item, run: Some(failed), missing }
+                    if *item == ids::HTUI_FEAT_3 && *failed == run && missing == &["gpu"]
+            ),
+            "the tags, with the run claim_run failed: {refused:?}"
+        );
+        assert!(
+            !matches!(refused, EngineError::ClaimRefused { .. }),
+            "a permanent refusal is not the worker's re-queued `ClaimRefused`"
+        );
+        assert_eq!(
+            refused.to_string(),
+            format!("item {}: missing tags: gpu", ids::HTUI_FEAT_3)
+        );
+
+        let failed = harness.orch.run(run).await;
+        assert_eq!(failed.status, RunStatus::Failed);
+        assert_eq!(failed.failure.as_deref(), Some("missing tags: gpu"));
+        assert_eq!(failed.started_at, None, "the run never started");
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Blocked
+        );
+        let notes = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        let added: Vec<&str> = notes[notes_before..]
+            .iter()
+            .map(|note| note.body.as_str())
+            .collect();
+        assert_eq!(added, vec!["missing tags: gpu"], "the engine's one note");
     }
 
     /// MOD-4 plan D158 (R-12): a walk task of this process that died leaves its run `running`
