@@ -1999,6 +1999,29 @@ impl WriteStore for PgStore {
         Ok(())
     }
 
+    /// One row per `(repo_id, box_id)`, inserted only where none exists (MOD-7 milestone 4, D104).
+    /// The conflict clause decides it atomically, so a concurrent manual upsert either lands first
+    /// (this answers `false`) or replaces what this wrote.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] when either id names no row (`23503`). A row that already holds
+    /// the pair implies both ids exist, so a conflict never hides a foreign-key refusal.
+    async fn infer_repo_box_path(&self, path: &RepoBoxPath) -> Result<bool> {
+        let done = sqlx::query!(
+            "INSERT INTO repo_box_path (repo_id, box_id, local_path) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (repo_id, box_id) DO NOTHING",
+            path.repo_id.as_uuid(),
+            path.box_id.as_uuid(),
+            path.local_path,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(done.rows_affected() == 1)
+    }
+
     /// Every box's checkout path for a repo, ordered by `box_id` bytes.
     ///
     /// # Errors

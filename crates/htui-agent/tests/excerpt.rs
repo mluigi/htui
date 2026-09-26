@@ -10,13 +10,21 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use htui_agent::excerpt::{FsRepoReader, SkipRule, run_providers};
-use htui_core::prompt::TokenEstimator;
+use htui_agent::excerpt::{
+    FsRepoReader, PassInput, SkipRule, excerpt_pass, excerpt_roots, excerpts_for, run_providers,
+    touched_prefixes,
+};
+use htui_core::model::{
+    BoxId, Isolation, ProjectId, Repo, RepoBoxPath, RepoId, RunStepTree, StepId,
+};
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, BuiltinRanker, ExcerptCandidate, ExcerptCaps, ExcerptProvider, ExcerptReason,
     ExcerptRequest, OwnedExcerptRequest, PathPrefix, ProviderError, RepoPath, RepoReader, RepoRoot,
-    RootSource, select,
+    RootRecord, RootSource, select,
 };
+use htui_core::prompt::settings::resolve_excerpt_caps;
+use htui_core::prompt::{PromptSpec, TokenEstimator, body_of, fixtures};
+use htui_core::scrub::MinimalScrubber;
 
 // ---------------------------------------------------------------------------------------------
 // Doubles
@@ -895,7 +903,7 @@ fn the_reader_and_the_pass_run_under_one_max_file_bytes() {
         "excerpt_max_file_bytes".to_owned(),
         serde_json::json!(1_024),
     )]);
-    let (caps, scan_cap, _deadline) = htui_core::prompt::settings::resolve_excerpt_caps(&app);
+    let (caps, scan_cap, _deadline) = resolve_excerpt_caps(&app);
     assert_eq!(caps.max_file_bytes, 1_024, "the row this case turns on");
 
     let reader = FsRepoReader::new(caps);
@@ -968,6 +976,357 @@ fn a_reader_limit_below_the_configured_cap_is_the_one_the_audit_names() {
             note.contains("max_file_bytes") && note.contains("1024") && note.contains("1000000")
         }),
         "and the mismatch is named rather than hidden: {:?}",
+        set.notes
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-7 milestone 4: the shared pass (D107, D109, D118, D119, D126-D128)
+// ---------------------------------------------------------------------------------------------
+
+/// A `repo` row in the shape `excerpt_roots` and `touched_prefixes` read: an id and a name.
+fn repo_row(name: &str, is_primary: bool) -> Repo {
+    Repo {
+        id: RepoId::new(),
+        project_id: ProjectId::new(),
+        name: name.to_owned(),
+        remote_url: None,
+        default_branch: "main".to_owned(),
+        is_primary,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+/// A `run_step_tree` row for `repo` at `path`.
+fn tree_row(repo: RepoId, path: &str) -> RunStepTree {
+    RunStepTree {
+        run_step_id: StepId::new(),
+        repo_id: repo,
+        mode: Isolation::Worktree,
+        path: path.to_owned(),
+        base_ref: "main".to_owned(),
+        dirty: false,
+    }
+}
+
+/// A `repo_box_path` row for `repo` on `box_id` at `path`.
+fn box_path_row(repo: RepoId, box_id: BoxId, path: &str) -> RepoBoxPath {
+    RepoBoxPath {
+        repo_id: repo,
+        box_id,
+        local_path: path.to_owned(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+/// A phase spec whose `prd` body places `{{excerpts}}`, and no stand-in notes of its own.
+fn phase_spec() -> PromptSpec {
+    let mut spec = fixtures::phase_all_empty();
+    spec.notes = Vec::new();
+    spec
+}
+
+/// A readable `htui` root at `dir`, rung `run_step_tree`, touching `src/lib.rs`.
+fn readable_input(dir: &std::path::Path) -> PassInput {
+    PassInput {
+        roots: vec![fs_root(dir)],
+        touched_prefixes: vec![PathPrefix::parse("src/lib.rs", "htui")],
+        notes: vec!["excerpt: a caller's own note".to_owned()],
+    }
+}
+
+#[test]
+fn excerpt_pass_selects_a_touched_file_from_a_real_tree() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
+
+    let set = excerpt_pass(
+        &base_request(&["src/lib.rs"], vec![fs_root(dir.path())]),
+        TokenEstimator::DEFAULT,
+    );
+
+    assert!(
+        set.files
+            .iter()
+            .any(|file| file.path == "src/lib.rs" && file.reason == ExcerptReason::TouchedPath),
+        "{:?}",
+        set.files
+    );
+    assert_eq!(set.audit.provider_set[0], BUILTIN_ID);
+    assert_eq!(
+        set.audit.roots,
+        vec![RootRecord {
+            repo: "htui".to_owned(),
+            source: RootSource::RunStepTree,
+            scan_truncated: false,
+        }]
+    );
+}
+
+#[test]
+fn excerpt_pass_records_a_no_path_root_and_scans_nothing() {
+    let root = RepoRoot {
+        repo: "htui".to_owned(),
+        root: std::path::PathBuf::new(),
+        source: RootSource::NoPath,
+    };
+    let set = excerpt_pass(
+        &base_request(&["src/lib.rs"], vec![root]),
+        TokenEstimator::DEFAULT,
+    );
+
+    assert!(set.files.is_empty());
+    assert_eq!(set.audit.considered, 0);
+    assert_eq!(set.audit.roots[0].source, RootSource::NoPath);
+    assert!(
+        set.notes
+            .iter()
+            .any(|note| note.contains("no readable root for repo `htui`")),
+        "{:?}",
+        set.notes
+    );
+}
+
+#[test]
+fn excerpt_roots_takes_the_tree_then_the_box_path_then_no_path() {
+    let (a, b, c) = (RepoId::new(), RepoId::new(), RepoId::new());
+    let this_box = BoxId::new();
+    let scope = vec![
+        (a, "a".to_owned()),
+        (b, "b".to_owned()),
+        (c, "c".to_owned()),
+    ];
+    let trees = vec![tree_row(a, "/trees/run/step/a")];
+    let paths = vec![
+        box_path_row(a, this_box, "/checkouts/a"),
+        box_path_row(b, this_box, "/checkouts/b"),
+    ];
+
+    let roots = excerpt_roots(&scope, &trees, &paths, this_box);
+
+    assert_eq!(
+        roots,
+        vec![
+            RepoRoot {
+                repo: "a".to_owned(),
+                root: std::path::PathBuf::from("/trees/run/step/a"),
+                source: RootSource::RunStepTree,
+            },
+            RepoRoot {
+                repo: "b".to_owned(),
+                root: std::path::PathBuf::from("/checkouts/b"),
+                source: RootSource::RepoBoxPath,
+            },
+            RepoRoot {
+                repo: "c".to_owned(),
+                root: std::path::PathBuf::new(),
+                source: RootSource::NoPath,
+            },
+        ]
+    );
+}
+
+#[test]
+fn excerpt_roots_ignores_another_boxs_path() {
+    let b = RepoId::new();
+    let paths = vec![box_path_row(b, BoxId::new(), "/elsewhere/b")];
+
+    let roots = excerpt_roots(&[(b, "b".to_owned())], &[], &paths, BoxId::new());
+
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].source, RootSource::NoPath);
+    assert_eq!(roots[0].root, std::path::PathBuf::new());
+}
+
+#[test]
+fn touched_prefixes_follow_the_overlap_primary_rule() {
+    let repos = vec![repo_row("htui", true), repo_row("docs", false)];
+    let touched = vec!["src/**".to_owned(), "docs:guide/**".to_owned()];
+    assert_eq!(
+        touched_prefixes(&touched, &repos),
+        vec![
+            PathPrefix {
+                repo: "htui".to_owned(),
+                prefix: "src/".to_owned(),
+            },
+            PathPrefix {
+                repo: "docs".to_owned(),
+                prefix: "guide/".to_owned(),
+            },
+        ]
+    );
+
+    let no_primary = vec![repo_row("htui", false)];
+    assert_eq!(
+        touched_prefixes(&["src/lib.rs".to_owned()], &no_primary),
+        vec![PathPrefix {
+            repo: String::new(),
+            prefix: "src/lib.rs".to_owned(),
+        }],
+        "a bare glob with no primary belongs to the empty slug, which no repo carries"
+    );
+}
+
+#[tokio::test]
+async fn excerpts_for_reads_a_tree_it_can_render() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
+    let input = readable_input(dir.path());
+    let caller_notes = input.notes.clone();
+
+    let set = excerpts_for(
+        &phase_spec(),
+        input,
+        &BTreeMap::new(),
+        &MinimalScrubber::new([]),
+    )
+    .await;
+
+    assert!(
+        set.files
+            .iter()
+            .any(|file| file.path == "src/lib.rs" && file.reason == ExcerptReason::TouchedPath),
+        "{:?}",
+        set.files
+    );
+    assert!(
+        set.notes.starts_with(&caller_notes),
+        "the caller's notes go first: {:?}",
+        set.notes
+    );
+}
+
+#[tokio::test]
+async fn excerpts_for_skips_a_template_without_the_placeholder() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
+    let mut spec = phase_spec();
+    spec.template.name = "verdict".to_owned();
+    spec.body = body_of("verdict")
+        .expect("`verdict` is a default body")
+        .to_owned();
+
+    let set = excerpts_for(
+        &spec,
+        readable_input(dir.path()),
+        &BTreeMap::new(),
+        &MinimalScrubber::new([]),
+    )
+    .await;
+
+    assert!(set.files.is_empty());
+    assert_eq!(set.audit.considered, 0);
+    assert_eq!(
+        set.audit.roots,
+        vec![RootRecord {
+            repo: "htui".to_owned(),
+            source: RootSource::RunStepTree,
+            scan_truncated: false,
+        }]
+    );
+    assert!(
+        set.notes.contains(
+            &"excerpt: template `verdict` places no {{excerpts}}; nothing was read".to_owned()
+        ),
+        "{:?}",
+        set.notes
+    );
+}
+
+#[tokio::test]
+async fn excerpts_for_with_no_roots_is_the_empty_audit() {
+    let app = BTreeMap::new();
+    let set = excerpts_for(
+        &phase_spec(),
+        PassInput::default(),
+        &app,
+        &MinimalScrubber::new([]),
+    )
+    .await;
+
+    assert_eq!(set.audit.provider_set, vec![BUILTIN_ID.to_owned()]);
+    assert!(set.audit.roots.is_empty());
+    assert_eq!((set.audit.considered, set.audit.selected), (0, 0));
+    assert_eq!(set.audit.caps, resolve_excerpt_caps(&app).0);
+    assert!(set.audit.files.is_empty());
+    assert!(set.files.is_empty());
+    assert!(set.notes.is_empty(), "{:?}", set.notes);
+}
+
+#[tokio::test]
+async fn excerpts_for_drops_a_file_the_scrubber_refuses() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(
+        dir.path(),
+        "src/lib.rs",
+        b"// -----BEGIN RSA PRIVATE KEY-----\npub fn marker() {}\n",
+    );
+    let mut input = readable_input(dir.path());
+    input.notes = Vec::new();
+
+    let set = excerpts_for(
+        &phase_spec(),
+        input,
+        &BTreeMap::new(),
+        &MinimalScrubber::new([]),
+    )
+    .await;
+
+    assert!(set.files.is_empty(), "{:?}", set.files);
+    assert_eq!(set.audit.selected, 1, "the ranker chose it and paid for it");
+    assert!(
+        set.notes.contains(
+            &"excerpt: `htui:src/lib.rs` dropped; the scrubber refused it (rule `private_key_pem`)"
+                .to_owned()
+        ),
+        "{:?}",
+        set.notes
+    );
+}
+
+#[tokio::test]
+async fn excerpts_for_never_persists_a_note_naming_a_masked_path() {
+    // Review finding M-1. `select`'s own notes name `repo:path` as the reader listed it, and
+    // `trim_record.notes` is persisted unscrubbed. A file under a directory named after a known
+    // secret that the reader lists but cannot read — here, bytes that are not UTF-8 — would put
+    // the secret in the stored record. (An oversize file cannot reach this note through
+    // `FsRepoReader`: the walk's skip rule 5 never lists it, so it names nothing.)
+    let secret = "hunter2hunter2";
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(
+        dir.path(),
+        &format!("{secret}/bad.rs"),
+        b"fn x() {}\n// \xff\xfe\n",
+    );
+    let input = PassInput {
+        roots: vec![fs_root(dir.path())],
+        touched_prefixes: vec![PathPrefix::parse(&format!("{secret}/bad.rs"), "htui")],
+        notes: Vec::new(),
+    };
+
+    let set = excerpts_for(
+        &phase_spec(),
+        input,
+        &BTreeMap::new(),
+        &MinimalScrubber::new([secret.to_owned()]),
+    )
+    .await;
+
+    assert!(set.files.is_empty(), "{:?}", set.files);
+    assert!(!set.notes.is_empty(), "the unreadable file is still noted");
+    for note in &set.notes {
+        assert!(
+            !note.contains(secret),
+            "a note names a masked string: {note}"
+        );
+    }
+    assert!(
+        set.notes.contains(
+            &"excerpt: a note was withheld; it named a string the scrubber masks or refuses"
+                .to_owned()
+        ),
+        "{:?}",
         set.notes
     );
 }

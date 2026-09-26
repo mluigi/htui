@@ -118,6 +118,7 @@ pub const CASES: &[&str] = &[
     "prompt_template_refuses_what_parse_refuses",
     "claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks",
     "claim_run_checks_tags_after_claimability_and_before_the_slot",
+    "infer_repo_box_path_inserts_only_where_absent",
     "skill_create_reads_back_with_version_one",
     "skill_update_is_a_compare_and_set_and_refuses_a_taken_name",
     "skill_version_append_is_a_compare_and_set_on_the_head",
@@ -266,6 +267,9 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "claim_run_checks_tags_after_claimability_and_before_the_slot" => {
             claim_run_checks_tags_after_claimability_and_before_the_slot(store).await;
+        }
+        "infer_repo_box_path_inserts_only_where_absent" => {
+            infer_repo_box_path_inserts_only_where_absent(store).await;
         }
         "skill_create_reads_back_with_version_one" => {
             skill_create_reads_back_with_version_one(store).await;
@@ -2916,6 +2920,123 @@ async fn repo_round_trip_and_primary_flag<S: WriteStore>(store: &S) {
             .collect::<Vec<_>>(),
         vec![(ids::BOX, "/src/two".to_owned())],
         "{CASE}: the per-box checkout path is replaced in place (R-BOX-4)"
+    );
+}
+
+/// MOD-7 milestone 4 (plan D104, D105): `infer_repo_box_path`, the insert-if-absent writer path
+/// inference uses. An empty pair is written and answers `true`; a second call answers `false` and
+/// changes nothing; a row `upsert_repo_box_path` wrote is never replaced, and the manual writer
+/// still replaces an inferred row; an unknown repo or box is `Constraint` and writes nothing.
+async fn infer_repo_box_path_inserts_only_where_absent<S: WriteStore>(store: &S) {
+    const CASE: &str = "infer_repo_box_path_inserts_only_where_absent";
+    let core = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE);
+    let docs = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "docs", false))
+        .await
+        .expect(CASE);
+    let row = |repo: RepoId, local: &str| RepoBoxPath {
+        repo_id: repo,
+        box_id: ids::BOX,
+        local_path: local.to_owned(),
+        updated_at: Utc::now(),
+    };
+    let paths = |repo: RepoId| async move {
+        store
+            .repo_box_paths(repo)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|held| (held.box_id, held.local_path))
+            .collect::<Vec<_>>()
+    };
+
+    // 1. An empty pair is written.
+    assert!(
+        store
+            .infer_repo_box_path(&row(core.id, "/src/inferred"))
+            .await
+            .expect(CASE),
+        "{CASE}: an empty pair is written and answers true"
+    );
+    assert_eq!(
+        paths(core.id).await,
+        vec![(ids::BOX, "/src/inferred".to_owned())],
+        "{CASE}: the inferred row is the only row for the repo"
+    );
+
+    // 2. A second inference changes nothing.
+    assert!(
+        !store
+            .infer_repo_box_path(&row(core.id, "/src/other"))
+            .await
+            .expect(CASE),
+        "{CASE}: a held pair answers false"
+    );
+    assert_eq!(
+        paths(core.id).await,
+        vec![(ids::BOX, "/src/inferred".to_owned())],
+        "{CASE}: a second inference never replaces a row"
+    );
+
+    // 3. A manual row stands.
+    store
+        .upsert_repo_box_path(&row(docs.id, "/src/manual"))
+        .await
+        .expect(CASE);
+    assert!(
+        !store
+            .infer_repo_box_path(&row(docs.id, "/src/guess"))
+            .await
+            .expect(CASE),
+        "{CASE}: a manual row answers false"
+    );
+    assert_eq!(
+        paths(docs.id).await,
+        vec![(ids::BOX, "/src/manual".to_owned())],
+        "{CASE}: the manual row stands (PRD: a manual row is never replaced by inference)"
+    );
+
+    // 4. The manual writer still replaces an inferred row.
+    store
+        .upsert_repo_box_path(&row(core.id, "/src/by-hand"))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        paths(core.id).await,
+        vec![(ids::BOX, "/src/by-hand".to_owned())],
+        "{CASE}: the manual writer replaces an inferred row"
+    );
+
+    // 5. An unknown repo is refused.
+    let no_repo = store
+        .infer_repo_box_path(&RepoBoxPath {
+            repo_id: RepoId::new(),
+            ..row(core.id, "/src/nowhere")
+        })
+        .await;
+    assert!(
+        matches!(no_repo, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown repo is Constraint, got {no_repo:?}"
+    );
+
+    // 6. An unknown box is refused and writes nothing.
+    let no_box = store
+        .infer_repo_box_path(&RepoBoxPath {
+            box_id: BoxId::new(),
+            ..row(docs.id, "/src/nowhere")
+        })
+        .await;
+    assert!(
+        matches!(no_box, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown box is Constraint, got {no_box:?}"
+    );
+    assert_eq!(
+        paths(docs.id).await,
+        vec![(ids::BOX, "/src/manual".to_owned())],
+        "{CASE}: a refused inference writes nothing"
     );
 }
 

@@ -579,6 +579,9 @@ impl WriteStore for SpyStore {
     async fn upsert_repo_box_path(&self, path: &RepoBoxPath) -> StoreResult<()> {
         self.inner.upsert_repo_box_path(path).await
     }
+    async fn infer_repo_box_path(&self, path: &RepoBoxPath) -> StoreResult<bool> {
+        self.inner.infer_repo_box_path(path).await
+    }
     async fn repo_box_paths(&self, repo: RepoId) -> StoreResult<Vec<RepoBoxPath>> {
         self.inner.repo_box_paths(repo).await
     }
