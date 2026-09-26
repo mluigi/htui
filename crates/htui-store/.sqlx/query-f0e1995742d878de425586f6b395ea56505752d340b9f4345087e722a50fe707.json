@@ -1,0 +1,138 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id             AS \"id: SkillBindingId\",\n                   skill_id       AS \"skill_id: SkillId\",\n                   project_id     AS \"project_id?: ProjectId\",\n                   phase_id       AS \"phase_id: PhaseId\",\n                   pinned_version,\n                   position,\n                   activation     AS \"activation: Activation\",\n                   globs,\n                   languages,\n                   updated_at\n              FROM skill_binding\n             WHERE skill_id = $1\n               AND project_id IS NOT DISTINCT FROM $2\n               AND phase_id IS NOT DISTINCT FROM $3\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: SkillBindingId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "skill_id: SkillId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "skill_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "project_id?: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "phase_id: PhaseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "phase_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "pinned_version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "pinned_version"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "activation: Activation",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "activation"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "globs",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "globs"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "languages",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "languages"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f0e1995742d878de425586f6b395ea56505752d340b9f4345087e722a50fe707"
+}

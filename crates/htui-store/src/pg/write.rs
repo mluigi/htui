@@ -20,8 +20,8 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow,
-    BoxSettings, BoxTool, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId,
+    Activation, Agent, AgentBox, AgentId, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord,
+    BoxRow, BoxSettings, BoxTool, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId,
     CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, GateOutcome, Isolation, Item, ItemId,
     ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, NewCommandRun,
     NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo,
@@ -31,24 +31,26 @@ use htui_core::model::{
     Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
     RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
     RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Skill,
-    SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UserId,
-    VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    canonical_declared_tags, overlaps, scope_of,
+    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
+    UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject, canonical_declared_tags, overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::seed;
 use htui_core::store::{
-    CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung, StoreError,
-    StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, chat_step_status, citation_key,
-    close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
-    finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project, illegal_move,
-    invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
-    legal_move, not_a_fanout_candidate, not_a_terminal_status, prompt_template_key,
-    prompt_template_refusal, references_no_row, requirement_withdrawn, reserved_phase_name,
-    resolution_not_closable, row_names_another_step, run_is_terminal, step_is_not_promotable,
-    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
+    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung,
+    StoreError, StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, already_exists,
+    chat_step_status, check_attachment, citation_key, close_out_needs_a_summary, expected_on_row,
+    failure_disagrees_with_status, finish_run_item_mirror, finish_run_needs_a_terminal_status,
+    graph_not_in_project, illegal_move, invalid_area_code, invalid_prefix, item_has_a_live_run,
+    item_kind_is_held, item_not_in_project, legal_move, new_skill_refusal, not_a_fanout_candidate,
+    not_a_terminal_status, prompt_template_key, prompt_template_refusal, references_no_row,
+    requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_step,
+    run_is_terminal, skill_body_refusal, skill_patch_refusal, skill_version_key,
+    step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
+    withdrawn_requirement_cited,
 };
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -583,6 +585,62 @@ async fn revise_requirement(
 
     tx.commit().await.map_err(map_sqlx)?;
     Ok(RequirementUpdate::Updated(updated))
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-9 milestone 3 helpers (plan D75-D79, blueprint D89, D92).
+// ------------------------------------------------------------------------------------------------
+
+/// D92 (F-P): `skill_name_key`'s `23505` in the sentence `MemStore` gives a taken name; anything
+/// else through [`map_sqlx`].
+fn skill_name_taken(err: sqlx::Error, name: &str) -> StoreError {
+    match &err {
+        sqlx::Error::Database(db) if db.constraint() == Some("skill_name_key") => {
+            StoreError::Constraint(already_exists("skill", name))
+        }
+        _ => map_sqlx(err),
+    }
+}
+
+/// D89's classification of an append that wrote nothing, or of bad input before any write
+/// (`refusal`), from two reads: a head other than `expected` is `Stale(head)`; then an unknown
+/// skill is `NotFound`; then no version at all under a token other than `0` is `NotFound` on the
+/// version; then the refusal, if any, is `Constraint`.
+///
+/// With none of those, the append lost to nothing: a concurrent append leaves a head above
+/// `expected`, and `skill_version` rows are only ever removed with their skill, so this arm is
+/// answered as a [`StoreError::Backend`] naming what was seen rather than guessed at.
+async fn skill_version_miss(
+    store: &PgStore,
+    skill: SkillId,
+    expected: i32,
+    refusal: Option<String>,
+) -> Result<CasOutcome<SkillVersion>> {
+    let head = store.skill_version_rows(skill).await?.pop();
+    if let Some(head) = head.as_ref()
+        && head.version != expected
+    {
+        return Ok(CasOutcome::Stale(head.clone()));
+    }
+    if store.skill_row(skill).await?.is_none() {
+        return Err(StoreError::NotFound {
+            entity: "skill",
+            id: skill.to_string(),
+        });
+    }
+    if head.is_none() && expected != 0 {
+        return Err(StoreError::NotFound {
+            entity: "skill_version",
+            id: skill_version_key(skill, expected),
+        });
+    }
+    match refusal {
+        Some(refusal) => Err(StoreError::Constraint(refusal)),
+        None => Err(StoreError::Backend(format!(
+            "skill {skill}: the append at head {expected} wrote nothing, and the head is still \
+             {expected}"
+        ))),
+    }
 }
 
 impl WriteStore for PgStore {
@@ -2479,49 +2537,356 @@ impl WriteStore for PgStore {
         )
     }
 
-    // skill, skill_version, skill_binding (MOD-9 milestone 3)
+    // skill, skill_version, skill_binding (MOD-9 milestone 3, plan D75-D79, blueprint D92)
 
+    /// Every skill, ordered by `name` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
     async fn skills(&self) -> Result<Vec<Skill>> {
-        todo!("MOD-9 T2: PgStore::skills")
+        self.skill_rows().await
     }
 
+    /// One skill's versions, ascending.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
     async fn skill_versions(&self, skill: SkillId) -> Result<Vec<SkillVersion>> {
-        todo!("MOD-9 T2: PgStore::skill_versions")
+        self.skill_version_rows(skill).await
     }
 
+    /// The global rows, or one project's project and phase rows.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
     async fn skill_bindings(&self, project: Option<ProjectId>) -> Result<Vec<SkillBinding>> {
-        todo!("MOD-9 T2: PgStore::skill_bindings")
+        self.skill_binding_rows(project).await
     }
 
+    /// D92: one explicit transaction of two `INSERT`s, so no skill exists without its version 1.
+    /// The input rules first ([`new_skill_refusal`]); a taken name is `skill_name_key`'s `23505`,
+    /// which [`skill_name_taken`] words as `MemStore` does; a taken id and an unknown `created_by`
+    /// are [`map_sqlx`]'s `Constraint`. A failed statement drops the transaction, which rolls back.
     async fn create_skill(&self, new: NewSkill) -> Result<(Skill, SkillVersion)> {
-        todo!("MOD-9 T2: PgStore::create_skill")
+        if let Some(refusal) = new_skill_refusal(&new.name, &new.description, &new.body) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let skill = sqlx::query_as!(
+            Skill,
+            r#"
+            INSERT INTO skill (id, name, description, created_by)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id         AS "id: SkillId",
+                      name,
+                      description,
+                      created_by AS "created_by: UserId",
+                      created_at,
+                      updated_at
+            "#,
+            new.id.as_uuid(),
+            new.name,
+            new.description,
+            new.created_by.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|err| skill_name_taken(err, &new.name))?;
+        let version = sqlx::query_as!(
+            SkillVersion,
+            r#"
+            INSERT INTO skill_version (skill_id, version, body, source, created_by)
+            VALUES ($1, 1, $2, $3, $4)
+            RETURNING skill_id   AS "skill_id: SkillId",
+                      version,
+                      body,
+                      source,
+                      created_by AS "created_by: UserId",
+                      created_at
+            "#,
+            new.id.as_uuid(),
+            new.body,
+            new.source,
+            new.created_by.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok((skill, version))
     }
 
+    /// D76: the compare-and-set of `update_workspace` with `COALESCE` patch semantics. Bad input
+    /// pays one read so the order is `MemStore`'s (`NotFound`, then `Stale`, then `Constraint`); a
+    /// spent token matches no row and never reaches the unique index, so a stale rename into a
+    /// taken name is `Stale`.
     async fn update_skill(
         &self,
         id: SkillId,
         expected: DateTime<Utc>,
         patch: SkillPatch,
     ) -> Result<CasOutcome<Skill>> {
-        todo!("MOD-9 T2: PgStore::update_skill")
+        if let Some(refusal) = skill_patch_refusal(&patch) {
+            return match self.skill_row(id).await? {
+                None => Err(StoreError::NotFound {
+                    entity: "skill",
+                    id: id.to_string(),
+                }),
+                Some(row) if row.updated_at != expected => Ok(CasOutcome::Stale(row)),
+                Some(_) => Err(StoreError::Constraint(refusal)),
+            };
+        }
+        let updated = sqlx::query_as!(
+            Skill,
+            r#"
+            UPDATE skill SET
+                name        = COALESCE($3, name),
+                description = COALESCE($4, description)
+             WHERE id = $1 AND updated_at = $2
+            RETURNING id         AS "id: SkillId",
+                      name,
+                      description,
+                      created_by AS "created_by: UserId",
+                      created_at,
+                      updated_at
+            "#,
+            id.as_uuid(),
+            expected,
+            patch.name.as_deref(),
+            patch.description.as_deref(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| match &patch.name {
+            Some(name) => skill_name_taken(err, name),
+            None => map_sqlx(err),
+        })?;
+        match updated {
+            Some(row) => Ok(CasOutcome::Applied(row)),
+            None => cas_miss(self.skill_row(id).await?, "skill", id),
+        }
     }
 
+    /// D77, D89: one `INSERT … SELECT … WHERE the head is $expected ON CONFLICT DO NOTHING`, the
+    /// `append_prompt_template` shape. Two appends at one head: the second blocks on the primary
+    /// key, then inserts nothing (probed, blueprint §0.3). Zero rows, and bad input before any
+    /// write, are classified by [`skill_version_miss`]'s reads in D89's order. An unknown
+    /// `created_by` is the FK's `23503`, which [`map_sqlx`] turns into `Constraint`.
     async fn add_skill_version(
         &self,
         skill: SkillId,
         expected: i32,
         new: NewSkillVersion,
     ) -> Result<CasOutcome<SkillVersion>> {
-        todo!("MOD-9 T2: PgStore::add_skill_version")
+        if let Some(refusal) = skill_body_refusal(&new.body) {
+            return skill_version_miss(self, skill, expected, Some(refusal)).await;
+        }
+        let inserted = sqlx::query_as!(
+            SkillVersion,
+            r#"
+            INSERT INTO skill_version (skill_id, version, body, source, created_by)
+            SELECT $1, $2::int + 1, $3, $4, $5
+             WHERE EXISTS (SELECT 1 FROM skill WHERE id = $1)
+               AND (SELECT COALESCE(max(version), 0) FROM skill_version WHERE skill_id = $1)
+                   = $2::int
+            ON CONFLICT (skill_id, version) DO NOTHING
+            RETURNING skill_id   AS "skill_id: SkillId",
+                      version,
+                      body,
+                      source,
+                      created_by AS "created_by: UserId",
+                      created_at
+            "#,
+            skill.as_uuid(),
+            expected,
+            new.body,
+            new.source,
+            new.created_by.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        match inserted {
+            Some(row) => Ok(CasOutcome::Applied(row)),
+            None => skill_version_miss(self, skill, expected, None).await,
+        }
     }
 
+    /// D90, D92: the row at `key` and the facts [`check_attachment`] needs are read first, then
+    /// one statement writes: an attach under `None` is `INSERT … ON CONFLICT (skill_id,
+    /// project_id, phase_id) DO NOTHING` (it infers the `NULLS NOT DISTINCT` key, probed), a change
+    /// is `UPDATE … WHERE id AND updated_at`, a detach `DELETE … WHERE id AND updated_at`. The
+    /// reads are advisory: the write's own `WHERE` or `ON CONFLICT` decides, and zero rows re-read
+    /// the key for `Stale`, as `update_workspace`. A project or phase deleted between the reads
+    /// and the write is the FK's `23503`, a `Constraint`.
     async fn set_skill_binding(
         &self,
         key: SkillBindingKey,
         expected: Option<DateTime<Utc>>,
         change: BindingChange,
     ) -> Result<CasOutcome<Option<SkillBinding>>> {
-        todo!("MOD-9 T2: PgStore::set_skill_binding")
+        let current = self.skill_binding_row(key).await?;
+        if current.as_ref().map(|row| row.updated_at) != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        let skill = self
+            .skill_row(key.skill)
+            .await?
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "skill",
+                id: key.skill.to_string(),
+            })?;
+        let project_slug = match key.project {
+            Some(id) => {
+                self.project(id)
+                    .await?
+                    .ok_or_else(|| StoreError::NotFound {
+                        entity: "project",
+                        id: id.to_string(),
+                    })?
+                    .slug
+            }
+            None => String::new(),
+        };
+        let phase_project = match key.phase {
+            Some(id) => {
+                let phase = self
+                    .phase_row(id)
+                    .await?
+                    .ok_or_else(|| StoreError::NotFound {
+                        entity: "step_graph_phase",
+                        id: id.to_string(),
+                    })?;
+                self.step_graph_row(phase.graph_id)
+                    .await?
+                    .map(|graph| graph.project_id)
+            }
+            None => None,
+        };
+
+        let attachment = match change {
+            BindingChange::Detach => {
+                let Some(row) = current else {
+                    return Ok(CasOutcome::Applied(None));
+                };
+                let deleted = sqlx::query!(
+                    "DELETE FROM skill_binding WHERE id = $1 AND updated_at = $2",
+                    row.id.as_uuid(),
+                    row.updated_at,
+                )
+                .execute(&self.pool)
+                .await
+                .map_err(map_sqlx)?
+                .rows_affected();
+                return if deleted == 0 {
+                    Ok(CasOutcome::Stale(self.skill_binding_row(key).await?))
+                } else {
+                    Ok(CasOutcome::Applied(None))
+                };
+            }
+            BindingChange::Attach(attachment) => attachment,
+        };
+        let versions: Vec<i32> = self
+            .skill_version_rows(key.skill)
+            .await?
+            .iter()
+            .map(|row| row.version)
+            .collect();
+        let repos: Vec<String> = match key.project {
+            Some(id) => self
+                .repo_rows(id)
+                .await?
+                .into_iter()
+                .map(|repo| repo.name)
+                .collect(),
+            None => Vec::new(),
+        };
+        let stored = check_attachment(
+            &BindingFacts {
+                key,
+                phase_project,
+                skill_name: &skill.name,
+                versions: &versions,
+                repos: &repos,
+                project_slug: &project_slug,
+            },
+            &attachment,
+        )
+        .map_err(StoreError::Constraint)?;
+
+        let written = match &current {
+            None => sqlx::query_as!(
+                SkillBinding,
+                r#"
+                INSERT INTO skill_binding
+                       (id, skill_id, project_id, phase_id, pinned_version, position, activation,
+                        globs, languages)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (skill_id, project_id, phase_id) DO NOTHING
+                RETURNING id             AS "id: SkillBindingId",
+                          skill_id       AS "skill_id: SkillId",
+                          project_id     AS "project_id?: ProjectId",
+                          phase_id       AS "phase_id: PhaseId",
+                          pinned_version,
+                          position,
+                          activation     AS "activation: Activation",
+                          globs,
+                          languages,
+                          updated_at
+                "#,
+                SkillBindingId::new().as_uuid(),
+                key.skill.as_uuid(),
+                key.project.map(ProjectId::as_uuid),
+                key.phase.map(PhaseId::as_uuid),
+                attachment.pinned_version,
+                attachment.position,
+                attachment.activation.as_str(),
+                &stored.globs[..],
+                &stored.languages[..],
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?,
+            Some(row) => sqlx::query_as!(
+                SkillBinding,
+                r#"
+                UPDATE skill_binding SET
+                    pinned_version = $3,
+                    position       = $4,
+                    activation     = $5,
+                    globs          = $6,
+                    languages      = $7
+                 WHERE id = $1 AND updated_at = $2
+                RETURNING id             AS "id: SkillBindingId",
+                          skill_id       AS "skill_id: SkillId",
+                          project_id     AS "project_id?: ProjectId",
+                          phase_id       AS "phase_id: PhaseId",
+                          pinned_version,
+                          position,
+                          activation     AS "activation: Activation",
+                          globs,
+                          languages,
+                          updated_at
+                "#,
+                row.id.as_uuid(),
+                row.updated_at,
+                attachment.pinned_version,
+                attachment.position,
+                attachment.activation.as_str(),
+                &stored.globs[..],
+                &stored.languages[..],
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?,
+        };
+        match written {
+            Some(row) => Ok(CasOutcome::Applied(Some(row))),
+            None => Ok(CasOutcome::Stale(self.skill_binding_row(key).await?)),
+        }
     }
 
     // settings (D7, D8)
