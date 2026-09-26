@@ -918,7 +918,8 @@ pub fn excerpt_pass(req: &OwnedExcerptRequest, est: TokenEstimator) -> ExcerptSe
 /// 4. Otherwise the budget is `excerpt_residual(spec, scrubber)`. An `Err` records the roots
 ///    unscanned, because `assemble` will refuse the same way. Then [`excerpt_pass`] runs under
 ///    `tokio::task::spawn_blocking`; a `JoinError` records the roots unscanned with
-///    `excerpt: the pass panicked; no excerpts` (§4.5 fail-open).
+///    `excerpt: the pass panicked; no excerpts`, or `excerpt: the pass was cancelled; no excerpts`
+///    when the task never ran (§4.5 fail-open).
 /// 5. `withhold_unmaskable_notes(&mut set.notes, scrubber)`: a pass note names `repo:path` as the
 ///    reader returned it, and `trim_record.notes` is persisted unscrubbed, so a note the scrubber
 ///    would mask or refuse is replaced by a fixed line that names nothing (P-2).
@@ -986,9 +987,17 @@ pub async fn excerpts_for(
         let roots = request.roots.clone();
         match tokio::task::spawn_blocking(move || excerpt_pass(&request, est)).await {
             Ok(set) => set,
-            Err(_) => {
+            Err(error) => {
                 let mut notes = notes;
-                notes.push("excerpt: the pass panicked; no excerpts".to_owned());
+                notes.push(
+                    if error.is_panic() {
+                        "excerpt: the pass panicked; no excerpts"
+                    } else {
+                        // The runtime shut down before the blocking task ran.
+                        "excerpt: the pass was cancelled; no excerpts"
+                    }
+                    .to_owned(),
+                );
                 return unscanned(&roots, caps, notes);
             }
         }
