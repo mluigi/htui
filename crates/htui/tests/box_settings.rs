@@ -4,8 +4,9 @@
 //! `tests/prompt_settings.rs` does: one request in, one reply out, no channels and no shell. The
 //! section half is milestone 2's task 4 and follows it below.
 //!
-//! Every case here runs over `MemStore`: the Postgres halves of `edit_box` are pinned by the store's
-//! own `box_identity` suite, and the end-to-end path by `tests/box_probe_pg.rs`.
+//! Every case here runs over `MemStore`, or over an offline `CacheStore` for the refusal case: the
+//! Postgres halves of `edit_box` are pinned by the store's own `box_identity` suite, and the
+//! end-to-end path by `tests/box_probe_pg.rs`.
 #![cfg(feature = "testkit")]
 
 use chrono::Utc;
