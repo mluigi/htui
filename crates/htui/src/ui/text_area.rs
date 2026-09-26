@@ -1,6 +1,8 @@
 //! One small multi-line text area (MOD-7 milestone 2, PRD D3): the quirks editor's widget, the
 //! multi-line sibling of [`TextField`](crate::ui::TextField). Hard lines only (no soft wrap),
-//! counted in `char`s. `ctrl-s` submits, because `Enter` breaks the line and no terminal mode
+//! counted in `char`s, not display columns, as `TextField` counts them: a wide char (CJK, most
+//! emoji) takes two cells but counts as one, so a line of them can overrun its column, and the
+//! cursor steps by code point, not by grapheme. `ctrl-s` submits, because `Enter` breaks the line and no terminal mode
 //! that reports `Ctrl+Enter` is enabled (plan OQ-16). No history, selection, undo, mask,
 //! bracketed paste or `Zeroizing`: what it holds is not secret.
 
@@ -189,8 +191,9 @@ impl TextArea {
         (self.row, self.col)
     }
 
-    /// At most `height` lines, each at most `width` cells, for the caller to place (and pad) in
-    /// its own `Rect`.
+    /// At most `height` lines, each at most `width` chars, for the caller to place (and pad) in
+    /// its own `Rect`. One char is taken as one cell, as `TextField` does: wide chars are not
+    /// measured, so a CJK or emoji line can overrun `width` cells.
     ///
     /// Nothing when either is 0. The window ends at the cursor row (D61). The cursor row is drawn
     /// as [`TextField::line`](crate::ui::TextField::line) draws an unmasked field: a window of
@@ -567,6 +570,22 @@ mod tests {
         assert_eq!(cursor_cell.content, " ");
         assert_eq!(cursor_cell.style, theme.selected);
         assert_eq!(drawn[0], TextField::with_text(text).line(10, true, &theme));
+    }
+
+    #[test]
+    fn a_wide_char_line_is_windowed_by_chars_not_cells() {
+        // The known limitation shared with `TextField`: the window counts chars, so twelve CJK
+        // chars in a 10-wide window draw 10 chars (about 19 cells), not 10 cells.
+        let theme = Theme::default();
+        let text = "\u{4e00}".repeat(12);
+        let area = TextArea::with_text(&format!("{text}\n{text}"));
+        let drawn = area.lines(10, 2, true, &theme);
+        let other = plain(&drawn[0]);
+        assert_eq!(other.chars().count(), 10, "{other:?}");
+        assert!(other.ends_with('…'), "{other:?}");
+        let cursor_row = plain(&drawn[1]);
+        assert_eq!(cursor_row.chars().count(), 10, "{cursor_row:?}");
+        assert!(cursor_row.starts_with('…'), "{cursor_row:?}");
     }
 
     #[test]
