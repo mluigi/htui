@@ -529,8 +529,12 @@ pub fn assemble(
 /// Whatever [`assemble`] refuses the excerpt-less spec with, unchanged: the caller skips the pass,
 /// because the real assembly will refuse the same way.
 pub fn excerpt_residual(spec: &PromptSpec, scrubber: &dyn Scrubber) -> Result<i64, AssembleError> {
-    let _ = (spec, scrubber);
-    todo!("MOD-7 milestone 4 T2: the residual")
+    let bare = PromptSpec {
+        excerpts: ExcerptSet::default(),
+        ..spec.clone()
+    };
+    let assembled = assemble(&bare, scrubber)?;
+    Ok((assembled.trim.target - assembled.trim.estimated_after).max(0))
 }
 
 /// §4.7 step 7: walk the frame's spans once, in source order, and put each one's bytes in.
@@ -897,8 +901,41 @@ struct ScrubbedInputs {
 /// `audit.files` from the survivors (`ExcerptAudit`'s documented asymmetry). Survivors keep their
 /// ranks, so "the highest rank number is the worst file" still holds.
 pub fn drop_unmaskable_excerpts(set: &mut ExcerptSet, scrubber: &dyn Scrubber) {
-    let _ = (set, scrubber);
-    todo!("MOD-7 milestone 4 T2: the scrub filter")
+    let mut kept = Vec::with_capacity(set.files.len());
+    for file in core::mem::take(&mut set.files) {
+        let note = if let Some(rule) = refused_rule(scrubber, &file.repo) {
+            format!("excerpt: a file dropped; the scrubber refused its repo slug (rule `{rule}`)")
+        } else if let Some(rule) = refused_rule(scrubber, &file.path) {
+            format!(
+                "excerpt: a file in repo `{}` dropped; the scrubber refused its path (rule \
+                 `{rule}`)",
+                file.repo
+            )
+        } else if let Some(rule) = refused_rule(scrubber, &file.content).or_else(|| {
+            file.provider
+                .as_deref()
+                .and_then(|provider| refused_rule(scrubber, provider))
+        }) {
+            format!(
+                "excerpt: `{}:{}` dropped; the scrubber refused it (rule `{rule}`)",
+                file.repo, file.path
+            )
+        } else {
+            kept.push(file);
+            continue;
+        };
+        set.notes.push(note);
+    }
+    set.files = kept;
+}
+
+/// The rule [`scrub_text`] refuses `value` under, as [`assemble`] would probe it for the excerpt
+/// section; `None` when it masks cleanly.
+fn refused_rule(scrubber: &dyn Scrubber, value: &str) -> Option<&'static str> {
+    match scrub_text(scrubber, value, &SectionName::Excerpts.render()) {
+        Err(AssembleError::Unmasked { rule, .. }) => Some(rule),
+        Ok(_) | Err(_) => None,
+    }
 }
 
 /// Masks one string in place under `section`'s name.
