@@ -12,7 +12,7 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │  FEAT-1   in_progress        TUI scaffold                                                                  ││budget    120000 (project) · reserve 0.10 · target 108000                               │
 │  FEAT-2   blocked            Agent driver and chat tab                                                     ││tokens    1067 → 1067 · chars-v2                                                        │
 │  FEAT-3   queued             Postgres store and cache                                                      ││excerpts  builtin@1 · considered 0 · selected 0                                         │
-│  FIX-1    closed             Terminal left raw after panic                                                 ││roots     none · no_path (no run_step_tree, no repo_box_path)                           │
+│  FIX-1    closed             Terminal left raw after panic                                                 ││roots     none · this project has no repo                                               │
 │  TOOL-1   awaiting_approval  CI matrix for the three OSes                                                  ││                                                                                        │
 │▾ agy (3)                                                                                                   ││section                   before   after  strategy                                      │
 │  ANA-1    done               Prompt assembly survey                                                        ││template                     149     149  none                                          │
@@ -33,7 +33,7 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │                                                                                                            ││          preview: output_kind defaults to the template name; the phase row's value arri│
 │                                                                                                            ││          preview: command_queue exposure is a phase setting (R-MCP-4); absent until MOD│
 │                                                                                                            ││          preview: attempt 1, so verify_failure and previous_diff are absent; the real a│
-│                                                                                                            ││          preview: no run_step_tree row and no repo_box_path row, so no root resolves; t│
+│                                                                                                            ││          preview: no run exists, so no run_step_tree row; roots come from this box's re│
 │                                                                                                            ││────────────────────────────────────────                                                │
 │                                                                                                            ││You are running the `prd` phase for htui:FEAT-1 (feature).                              │
 │                                                                                                            ││                                                                                        │

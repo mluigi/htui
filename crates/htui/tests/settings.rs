@@ -791,7 +791,8 @@ async fn the_idle_hint_says_r_cannot_refresh_quota() {
     );
 }
 
-/// A second section, so the strip has something to cycle between before MOD-7 and MOD-15 land.
+/// A second section, so the strip has something to cycle between whichever product sections are
+/// registered.
 #[derive(Debug, Default)]
 struct ProbeSection;
 
