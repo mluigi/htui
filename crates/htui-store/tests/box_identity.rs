@@ -711,6 +711,26 @@ async fn another_users_box_is_not_found_by_edit_box() {
         matches!(answer, Err(StoreError::NotFound { entity: "box", .. })),
         "another user's box is NotFound even with its right token, got {answer:?}"
     );
+    // The refused-tag path re-reads through its own user filter: a refused list must not turn
+    // another user's box into `Constraint` or `Stale(their row)`, whatever the token.
+    for token in [0, 7] {
+        let refused = db
+            .store
+            .edit_box(
+                foreign,
+                token,
+                BoxEdit {
+                    declared_tags: Some(vec!["BAD".to_owned()]),
+                    quirks: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::NotFound { entity: "box", .. })),
+            "NotFound wins over a refused tag on another user's box (token {token}), \
+             got {refused:?}"
+        );
+    }
     assert_eq!(
         whole_row(&db.pool, foreign).await,
         before,
