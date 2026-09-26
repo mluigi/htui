@@ -1,8 +1,9 @@
 //! Skills, their versions and their bindings (`docs/ANA-9.md` §5.6), plus the `R-SKL-2`
 //! resolution the prompt's skills section renders (`docs/ANA-5.md` §4.2).
 //!
-//! Read-only still: the writers are MOD-9 milestone 3's. Since MOD-9 milestone 2 (ANA-22 §6-§7) a
-//! skill attaches globally, to a project or to one phase; [`resolve`] picks the most specific
+//! The writers are MOD-9 milestone 3's (`WriteStore::create_skill` and three others); a `glob`
+//! attachment fires from PRD milestone 5 (D86). Since MOD-9 milestone 2 (ANA-22 §6-§7) a skill
+//! attaches globally, to a project or to one phase; [`resolve`] picks the most specific
 //! attachment per skill, and [`select`] decides, per step, which winners render and records why.
 
 use chrono::{DateTime, Utc};
@@ -17,8 +18,8 @@ str_enum!(
         /// Always rendered. The column default, so every binding written before `0007` is
         /// unchanged.
         Always => "always",
-        /// Rendered when the step's file set matches `globs` (MOD-9 milestone 3). Until the matcher
-        /// lands, a `glob` winner is inactive and records `no_path` (plan D40, OQ-12).
+        /// Rendered when the step's file set matches `globs` (PRD milestone 5, D86). Until the
+        /// matcher fires, a `glob` winner is inactive and records `no_path` (plan D40, OQ-12).
         Glob => "glob",
         /// Attached more broadly but not here: a narrower `off` hides a broader attachment.
         Off => "off",
@@ -112,7 +113,7 @@ pub struct SkillBinding {
     /// `skill_binding.activation`.
     pub activation: Activation,
     /// `skill_binding.globs`: the effective globs, non-empty when `activation` is `Glob`
-    /// (`skill_binding_glob_needs_globs`). Nothing matches them before MOD-9 milestone 3.
+    /// (`skill_binding_glob_needs_globs`). Nothing matches them before PRD milestone 5 (D86).
     pub globs: Vec<String>,
     /// `skill_binding.languages`: as authored, display only; the matcher reads `globs`.
     pub languages: Vec<String>,
@@ -151,6 +152,117 @@ impl SkillBinding {
     }
 }
 
+/// D71: a skill name is 1-64 bytes of `[a-z0-9-]` with no leading, trailing or doubled hyphen
+/// (ANA-22 §6 item 12, the Agent Skills rule). `true` when `name` may be stored.
+///
+/// Checked by the writers and the Skills view, not by a constraint, so a hand-written row still
+/// loads; `store::invalid_skill_name` phrases the refusal.
+#[must_use]
+pub fn validate_name(name: &str) -> bool {
+    let _ = name;
+    todo!()
+}
+
+/// Arguments of `WriteStore::create_skill` (D75, D77): the `skill` row **and** its version 1,
+/// written together so no skill exists without a body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewSkill {
+    /// `skill.id`, minted client-side as a UUIDv7.
+    pub id: SkillId,
+    /// `skill.name`; must pass [`validate_name`].
+    pub name: String,
+    /// `skill.description`, the picker's one-liner; may be empty.
+    pub description: String,
+    /// Version 1's `skill_version.body`; refused when blank (D77, OQ-20).
+    pub body: String,
+    /// Version 1's `skill_version.source`: `{}` from the Skills view; milestone 4's import fills it.
+    pub source: serde_json::Value,
+    /// `skill.created_by` and version 1's `created_by`.
+    pub created_by: UserId,
+}
+
+/// Edit passed to `WriteStore::update_skill` (D76); `None` leaves the column.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillPatch {
+    /// `skill.name`; must pass [`validate_name`] and be free (OQ-17: a rename is allowed).
+    pub name: Option<String>,
+    /// `skill.description`.
+    pub description: Option<String>,
+}
+
+/// Arguments of `WriteStore::add_skill_version` (D75, D77); the version number is the store's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewSkillVersion {
+    /// `skill_version.body`; refused when blank.
+    pub body: String,
+    /// `skill_version.source`, `{}` from the Skills view.
+    pub source: serde_json::Value,
+    /// `skill_version.created_by`.
+    pub created_by: UserId,
+}
+
+/// The natural key of one attachment (D78): `UNIQUE NULLS NOT DISTINCT (skill_id, project_id,
+/// phase_id)`. `project: None` is global; `phase: Some` needs `project: Some`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SkillBindingKey {
+    /// `skill_binding.skill_id`.
+    pub skill: SkillId,
+    /// `skill_binding.project_id`.
+    pub project: Option<ProjectId>,
+    /// `skill_binding.phase_id`.
+    pub phase: Option<PhaseId>,
+}
+
+impl SkillBindingKey {
+    /// The key a stored row sits under.
+    #[must_use]
+    pub fn of(binding: &SkillBinding) -> Self {
+        let _ = binding;
+        todo!()
+    }
+
+    /// The level this key names, by [`SkillBinding::level`]'s rule.
+    #[must_use]
+    pub fn level(self) -> SkillLevel {
+        todo!()
+    }
+}
+
+/// What an attachment says (D75, D78): the editable columns, `globs` **as typed** — the writer
+/// stores `canonical_globs(globs, languages)` and the normalised languages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    /// `skill_binding.pinned_version`; `None` follows the latest.
+    pub pinned_version: Option<i32>,
+    /// `skill_binding.position`, `>= 0`.
+    pub position: i32,
+    /// `skill_binding.activation`.
+    pub activation: Activation,
+    /// Typed globs: `<glob>` or `<repo>:<glob>` (D74).
+    pub globs: Vec<String>,
+    /// Typed language names (D73).
+    pub languages: Vec<String>,
+}
+
+impl Attachment {
+    /// A stored row's attachment, as D80's clone copies it: the stored `globs` passed as typed with
+    /// the stored `languages`, which `canonical_globs` leaves unchanged (it is idempotent).
+    #[must_use]
+    pub fn of(binding: &SkillBinding) -> Self {
+        let _ = binding;
+        todo!()
+    }
+}
+
+/// What `WriteStore::set_skill_binding` does to the row at its key (D75).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BindingChange {
+    /// Insert (`expected: None`) or replace (`expected: Some(updated_at)`) the row.
+    Attach(Attachment),
+    /// Delete the row.
+    Detach,
+}
+
 /// One step's candidate skill: the winning attachment of one skill, resolved to a version and a
 /// body. Not a table.
 ///
@@ -175,7 +287,7 @@ pub struct BoundSkill {
     pub level: SkillLevel,
     /// The winning attachment's activation, which [`select`] reads.
     pub activation: Activation,
-    /// The winning attachment's globs, for MOD-9 milestone 3's matcher. Recorded nowhere yet.
+    /// The winning attachment's globs, for PRD milestone 5's matcher (D86). Recorded nowhere yet.
     pub globs: Vec<String>,
 }
 
@@ -251,7 +363,7 @@ pub fn resolve(rows: Vec<(SkillBinding, String)>, versions: &[SkillVersion]) -> 
 }
 
 /// Why a candidate did or did not render (plan D40, ANA-22 §6 item 8). Serialised snake_case into
-/// `trim_record.skill_choices[].reason`. MOD-9 milestone 3 adds `matched` (with the path) and
+/// `trim_record.skill_choices[].reason`. PRD milestone 5 (D86) adds `matched` (with the path) and
 /// `no_match`; no variant here is renamed then.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -260,7 +372,8 @@ pub enum ChoiceReason {
     Always,
     /// `activation = off` on the winning attachment.
     Off,
-    /// `activation = glob` and no repo root resolves for the step (every step, until milestone 3).
+    /// `activation = glob` and no repo root resolves for the step (every step, until PRD milestone
+    /// 5, D86).
     NoPath,
     /// The winning attachment's pin names no version, or the skill has none.
     MissingVersion,
@@ -307,9 +420,9 @@ pub struct SkillChoice {
 ///
 /// The rules, first match wins: a body that does not place `{{skills}}` (`placed == false`) makes
 /// every candidate `not_placed`; `version: None` is `missing_version`; `Off` is `off`; `Glob` is
-/// `no_path` (no step resolves a root before milestone 3, OQ-12); `Always` is `always` and the only
-/// active outcome. Returns the active candidates in input order — which is collapse order, the
-/// render order — and one [`SkillChoice`] per candidate in the same order.
+/// `no_path` (no step resolves a root before PRD milestone 5, D86; OQ-12); `Always` is `always`
+/// and the only active outcome. Returns the active candidates in input order — which is collapse
+/// order, the render order — and one [`SkillChoice`] per candidate in the same order.
 #[must_use]
 pub fn select(candidates: Vec<BoundSkill>, placed: bool) -> (Vec<BoundSkill>, Vec<SkillChoice>) {
     let mut active = Vec::with_capacity(candidates.len());
@@ -811,6 +924,80 @@ mod tests {
         }
         assert!(
             SkillLevel::Global < SkillLevel::Project && SkillLevel::Project < SkillLevel::Phase
+        );
+    }
+
+    /// D71: the Agent Skills rule, byte for byte; the demo names pass.
+    #[test]
+    fn skill_names_follow_the_agent_skills_rule() {
+        for name in ["rust-style", "tests", "a", "a1-b2", &"a".repeat(64)] {
+            assert!(validate_name(name), "`{name}` may be stored");
+        }
+        for name in [
+            "",
+            &"a".repeat(65),
+            "Rust",
+            "-a",
+            "a-",
+            "a--b",
+            "a_b",
+            "a b",
+            "ä",
+        ] {
+            assert!(!validate_name(name), "`{name}` is refused");
+        }
+    }
+
+    /// D80's copy reads a stored row back as a key and an attachment; nothing is lost.
+    #[test]
+    fn a_key_and_an_attachment_copy_a_row() {
+        let project = ProjectId::new();
+        let phase = PhaseId::new();
+        let row = SkillBinding {
+            project_id: Some(project),
+            phase_id: Some(phase),
+            pinned_version: Some(2),
+            position: 3,
+            activation: Activation::Glob,
+            globs: vec!["htui:src/**".to_owned(), "**/*.rs".to_owned()],
+            languages: vec!["rust".to_owned()],
+            ..binding(SkillId::new(), None)
+        };
+
+        let key = SkillBindingKey::of(&row);
+        assert_eq!(
+            key,
+            SkillBindingKey {
+                skill: row.skill_id,
+                project: Some(project),
+                phase: Some(phase),
+            }
+        );
+        assert_eq!(key.level(), SkillLevel::Phase);
+        assert_eq!(key.level(), row.level(), "one rule for both");
+        assert_eq!(
+            SkillBindingKey { phase: None, ..key }.level(),
+            SkillLevel::Project
+        );
+        assert_eq!(
+            SkillBindingKey {
+                project: None,
+                phase: None,
+                ..key
+            }
+            .level(),
+            SkillLevel::Global
+        );
+
+        assert_eq!(
+            Attachment::of(&row),
+            Attachment {
+                pinned_version: Some(2),
+                position: 3,
+                activation: Activation::Glob,
+                globs: row.globs.clone(),
+                languages: row.languages.clone(),
+            }
         );
     }
 }

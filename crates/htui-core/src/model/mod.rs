@@ -93,6 +93,8 @@ pub mod requirement;
 pub mod run;
 pub mod scope;
 pub mod skill;
+pub mod skill_glob;
+pub mod skill_language;
 pub mod usage;
 pub mod user;
 
@@ -142,9 +144,11 @@ pub use run::{
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{
-    Activation, BoundSkill, ChoiceReason, Skill, SkillBinding, SkillChoice, SkillLevel,
-    SkillVersion,
+    Activation, Attachment, BindingChange, BoundSkill, ChoiceReason, NewSkill, NewSkillVersion,
+    Skill, SkillBinding, SkillBindingKey, SkillChoice, SkillLevel, SkillPatch, SkillVersion,
 };
+pub use skill_glob::{GlobError, SkillGlob, SkillGlobs};
+pub use skill_language::UnknownLanguage;
 pub use usage::UsageTotals;
 pub use user::{AppUser, CapabilityTag};
 
