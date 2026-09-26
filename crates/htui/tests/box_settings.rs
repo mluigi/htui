@@ -822,12 +822,24 @@ async fn two_boxes_with_one_hostname_carry_their_id_suffix() {
         "DESKTOP-HTUI \u{2026}{}",
         &ids::BOX.to_string().replace('-', "")[24..]
     );
-    assert!(frame.contains(other_suffix), "{frame}");
-    assert!(frame.contains(&this_suffix), "{frame}");
+    // The list pane only: the detail pane's `host` row also says `(this box)`.
+    let list: Vec<String> = frame
+        .lines()
+        .map(|line| line.chars().take(28).collect())
+        .collect();
+    let rows_with = |needle: &str| list.iter().filter(|row| row.contains(needle)).count();
+    assert_eq!(rows_with(other_suffix), 1, "{frame}");
     assert_eq!(
-        frame.matches("(this box)").count(),
+        rows_with(&this_suffix[this_suffix.len() - 8..]),
         1,
-        "one box is this one: {frame}"
+        "{frame}"
+    );
+    assert_eq!(rows_with("(this box)"), 1, "one box is this one: {frame}");
+    assert!(
+        list.iter()
+            .any(|row| row.contains(&this_suffix[this_suffix.len() - 8..])
+                && row.contains("(this box)")),
+        "the marker sits on this box's row: {frame}"
     );
 
     insta::with_settings!({ filters => vec![DIGEST_FILTER] }, {

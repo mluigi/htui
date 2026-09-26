@@ -543,7 +543,7 @@ impl BoxesSection {
                 } else {
                     theme.base
                 };
-                Line::styled(clip(&list_label(record, snapshot), room), style)
+                Line::styled(list_label(record, snapshot, room), style)
             })
             .collect();
         let at = self
@@ -703,10 +703,13 @@ impl BoxesSection {
 }
 
 /// A list row: the hostname, the last eight hex digits of the id only when another listed box has
-/// the same hostname (PRD `:262`), and ` (this box)` on this box.
-fn list_label(record: &BoxRecord, snapshot: &BoxesSnapshot) -> String {
+/// the same hostname (PRD `:262`), and ` (this box)` on this box, in `room` chars.
+///
+/// Only the hostname is clipped: the suffix and the marker are what tell two same-named boxes
+/// apart, so they survive a long hostname.
+fn list_label(record: &BoxRecord, snapshot: &BoxesSnapshot, room: usize) -> String {
     let row = &record.row;
-    let mut label = row.hostname.clone();
+    let mut tail = String::new();
     let shared = snapshot
         .boxes
         .iter()
@@ -714,12 +717,15 @@ fn list_label(record: &BoxRecord, snapshot: &BoxesSnapshot) -> String {
     if shared {
         let simple = row.id.as_uuid().simple().to_string();
         let suffix = &simple[simple.len().saturating_sub(ID_SUFFIX)..];
-        label.push_str(&format!(" \u{2026}{suffix}"));
+        tail.push_str(&format!(" \u{2026}{suffix}"));
     }
     if snapshot.this_box == Some(row.id) {
-        label.push_str(" (this box)");
+        tail.push_str(" (this box)");
     }
-    label
+    let host_room = room.saturating_sub(tail.chars().count()).max(1);
+    let mut label = clip(&row.hostname, host_room);
+    label.push_str(&tail);
+    clip(&label, room)
 }
 
 /// `text` cut to `width` chars, the last one a `…` when anything was cut.

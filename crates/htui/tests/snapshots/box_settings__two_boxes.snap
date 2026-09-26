@@ -3,7 +3,7 @@ source: crates/htui/tests/box_settings.rs
 expression: frame
 ---
 DESKTOP-HTUI …00000001      host          DESKTOP-HTUI (this box)
-DESKTOP-HTUI …00000200 (th… os            windows 10.0.26200 · x86_64
+DESKT… …00000200 (this box) os            windows 10.0.26200 · x86_64
                             cpu           AMD Ryzen 9 7950X
                             ram           65536 MB
                             gpu           nvidia
