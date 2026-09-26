@@ -17,11 +17,11 @@
 //! every instant.
 
 use htui_core::model::{
-    ProjectId, Scope, Skill, SkillBinding, SkillBindingKey, SkillId, SkillVersion, StepGraph,
-    StepGraphPhase,
+    NewSkill, NewSkillVersion, ProjectId, Scope, Skill, SkillBinding, SkillBindingKey, SkillId,
+    SkillVersion, StepGraph, StepGraphPhase,
 };
-use htui_core::store::Result;
-use htui_store::{Backend, Writer};
+use htui_core::store::{CasOutcome, Result, StoreError, WriteStore as _};
+use htui_store::{Backend, DATABASE_UNREACHABLE, PROMPT_ON_SERVER_ONLY, Writer};
 
 use crate::store_worker::{StoreReply, StoreRequest};
 
@@ -142,8 +142,41 @@ pub enum StaleWhat {
 /// # Errors
 /// Whatever the store reports.
 pub async fn snapshot(writer: &Writer, scope: &Scope) -> Result<SkillsSnapshot> {
-    let _ = (writer, scope);
-    todo!("MOD-9 T4: the Skills snapshot")
+    let global = writer.skill_bindings(None).await?;
+    let mut projects = Vec::with_capacity(scope.project_ids.len());
+    for project in &scope.project_ids {
+        let bindings = writer.skill_bindings(Some(*project)).await?;
+        let mut graphs = Vec::new();
+        for graph in writer.step_graphs(*project).await? {
+            if graph.is_override {
+                continue;
+            }
+            let phases = writer.phases(graph.id).await?;
+            graphs.push((graph, phases));
+        }
+        let repos = writer
+            .repos(*project)
+            .await?
+            .into_iter()
+            .map(|repo| repo.name)
+            .collect();
+        projects.push(ProjectSkills {
+            project: *project,
+            bindings,
+            graphs,
+            repos,
+        });
+    }
+    let mut skills = Vec::new();
+    for skill in writer.skills().await? {
+        let versions = writer.skill_versions(skill.id).await?;
+        skills.push(SkillEntry { skill, versions });
+    }
+    Ok(SkillsSnapshot {
+        skills,
+        global,
+        projects,
+    })
 }
 
 /// The five request names, in [`StoreRequest`] order.
@@ -178,8 +211,132 @@ pub const READ_NAME: &str = REQUEST_NAMES[0];
 /// `DATABASE_UNREACHABLE` for the four writes; [`StoreError::Backend`] for a request that is not
 /// one of this module's five.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
-    let _ = (backend, request);
-    todo!("MOD-9 T4: serve the five skill requests")
+    match request {
+        StoreRequest::Skills(scope) => {
+            let writer = backend
+                .writer()
+                .ok_or_else(|| StoreError::Unreachable(PROMPT_ON_SERVER_ONLY.to_owned()))?;
+            Ok(StoreReply::Skills(Box::new(
+                snapshot(&writer, scope).await?,
+            )))
+        }
+        StoreRequest::CreateSkill {
+            scope,
+            name,
+            description,
+            body,
+        } => {
+            let writer = write_access(backend)?;
+            let created_by = backend.this_user().await?;
+            // A refusal (a bad name, a blank body, a taken name) stays an error: there is no token
+            // to have spent, so it is `Failed` with the store's sentence, never `SkillsStale`.
+            writer
+                .create_skill(NewSkill {
+                    id: SkillId::new(),
+                    name: name.clone(),
+                    description: description.clone(),
+                    body: body.as_str().to_owned(),
+                    source: empty_source(),
+                    created_by,
+                })
+                .await?;
+            answer(&writer, scope, None).await
+        }
+        StoreRequest::EditSkill {
+            scope,
+            skill,
+            expected,
+            patch,
+        } => {
+            let writer = write_access(backend)?;
+            let stale = match writer.update_skill(*skill, *expected, patch.clone()).await {
+                Ok(CasOutcome::Applied(_)) => None,
+                Ok(CasOutcome::Stale(_))
+                | Err(StoreError::NotFound {
+                    entity: "skill", ..
+                }) => Some(StaleWhat::Skill(*skill)),
+                Err(other) => return Err(other),
+            };
+            answer(&writer, scope, stale).await
+        }
+        StoreRequest::SaveSkillVersion {
+            scope,
+            skill,
+            expected,
+            body,
+        } => {
+            let writer = write_access(backend)?;
+            let created_by = backend.this_user().await?;
+            let new = NewSkillVersion {
+                body: body.as_str().to_owned(),
+                source: empty_source(),
+                created_by,
+            };
+            let stale = match writer.add_skill_version(*skill, *expected, new).await {
+                Ok(CasOutcome::Applied(_)) => None,
+                Ok(CasOutcome::Stale(_))
+                | Err(StoreError::NotFound {
+                    entity: "skill" | "skill_version",
+                    ..
+                }) => Some(StaleWhat::Version(*skill)),
+                Err(other) => return Err(other),
+            };
+            answer(&writer, scope, stale).await
+        }
+        StoreRequest::SetSkillBinding {
+            scope,
+            key,
+            expected,
+            change,
+        } => {
+            let writer = write_access(backend)?;
+            let stale = match writer
+                .set_skill_binding(*key, *expected, change.clone())
+                .await
+            {
+                Ok(CasOutcome::Applied(_)) => None,
+                Ok(CasOutcome::Stale(_))
+                | Err(StoreError::NotFound {
+                    entity: "skill" | "project" | "step_graph_phase",
+                    ..
+                }) => Some(StaleWhat::Binding(*key)),
+                Err(other) => return Err(other),
+            };
+            answer(&writer, scope, stale).await
+        }
+        // `try_serve` routes exactly this module's five variants here, so the last arm is
+        // unreachable from the shell; a caller that reached it anyway is better told which request
+        // it sent than killed.
+        other => Err(StoreError::Backend(format!(
+            "not a skills request: {}",
+            other.name()
+        ))),
+    }
+}
+
+/// The writer, or the refusal every skill write answers offline.
+fn write_access(backend: &Backend) -> Result<Writer> {
+    backend
+        .writer()
+        .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))
+}
+
+/// `skill_version.source` for a version written from the view: `{}` (D77, D87).
+fn empty_source() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+/// The re-read every write answers with: `Skills` when `stale` is `None`, otherwise `SkillsStale`
+/// naming the write.
+async fn answer(writer: &Writer, scope: &Scope, stale: Option<StaleWhat>) -> Result<StoreReply> {
+    let fresh = Box::new(snapshot(writer, scope).await?);
+    Ok(match stale {
+        None => StoreReply::Skills(fresh),
+        Some(what) => StoreReply::SkillsStale {
+            snapshot: fresh,
+            what,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -508,7 +665,7 @@ mod tests {
             .binding(key)
             .expect("the global attachment is in the fresh snapshot")
             .clone();
-        assert_eq!(attached.global, [row.clone()]);
+        assert_eq!(attached.global, std::slice::from_ref(&row));
 
         let detached = applied(
             &backend,
