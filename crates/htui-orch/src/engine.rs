@@ -12388,6 +12388,115 @@ mod tests {
         );
     }
 
+    /// MOD-9 D75/D78 end to end: a global `always` attachment and an `off` one on `implement`,
+    /// both written through `set_skill_binding`. `implement`'s step records the skill `off` and
+    /// renders nothing of it; `prd`, which has no phase-level row, records it `always` and active.
+    #[tokio::test]
+    async fn a_phase_off_attachment_turns_a_global_skill_off_for_that_phase_only() {
+        use htui_core::model::{
+            Activation, Attachment, BindingChange, ChoiceReason, NewSkill, SkillBindingKey, SkillId,
+        };
+        use htui_core::store::CasOutcome;
+
+        let harness = Harness::new().await;
+        let (row, snapshot, prd) = skills_prologue(&harness).await;
+        let store = &harness.orch.store;
+        let (skill, _) = store
+            .create_skill(NewSkill {
+                id: SkillId::new(),
+                name: "docs-style".to_owned(),
+                description: String::new(),
+                body: "Write in the active voice.".to_owned(),
+                source: serde_json::json!({}),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("a new skill");
+        let attach = |activation| {
+            BindingChange::Attach(Attachment {
+                pinned_version: None,
+                position: 0,
+                activation,
+                globs: Vec::new(),
+                languages: Vec::new(),
+            })
+        };
+        let global = store
+            .set_skill_binding(
+                SkillBindingKey {
+                    skill: skill.id,
+                    project: None,
+                    phase: None,
+                },
+                None,
+                attach(Activation::Always),
+            )
+            .await
+            .expect("the global attach is legal");
+        assert!(matches!(global, CasOutcome::Applied(Some(_))), "{global:?}");
+        let off = store
+            .set_skill_binding(
+                SkillBindingKey {
+                    skill: skill.id,
+                    project: Some(ids::PROJECT_HTUI),
+                    phase: Some(ids::PHASE_HTUI_IMPLEMENT),
+                },
+                None,
+                attach(Activation::Off),
+            )
+            .await
+            .expect("the phase attach is legal");
+        assert!(matches!(off, CasOutcome::Applied(Some(_))), "{off:?}");
+
+        let docs = |choices: &[htui_core::model::SkillChoice]| {
+            choice_rows(choices)
+                .into_iter()
+                .find(|(name, ..)| name == "docs-style")
+                .expect("`docs-style` is a recorded candidate")
+        };
+
+        let (_, implement) = implement_prompt(&harness, &row, &snapshot, &prd).await;
+        assert_eq!(
+            docs(&implement.trim.skill_choices),
+            ("docs-style".to_owned(), Some(1), false, ChoiceReason::Off),
+            "the phase's `off` wins over the global `always`"
+        );
+        assert!(
+            !implement.text.contains("<skill name=\"docs-style\""),
+            "an `off` skill does not render: {}",
+            implement.text
+        );
+
+        harness_engine!(harness.orch, engine);
+        assert_eq!(snapshot.phases[0].name, "prd");
+        let spec = engine
+            .phase_spec(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                true,
+            )
+            .await
+            .expect("the spec is built")
+            .expect("`prd` requires nothing");
+        let other = htui_core::prompt::assemble(&spec, &htui_core::scrub::MinimalScrubber::new([]))
+            .expect("the demo `prd` assembles");
+        assert_eq!(
+            docs(&other.trim.skill_choices),
+            ("docs-style".to_owned(), Some(1), true, ChoiceReason::Always),
+            "another phase takes the global `always`"
+        );
+        assert!(
+            other
+                .text
+                .contains("<skill name=\"docs-style\" version=\"1\">"),
+            "and renders it: {}",
+            other.text
+        );
+    }
+
     /// Plan R-15: a phase renamed after the snapshot is not found by `(graph id, name)`, so its
     /// phase-level attachments cannot be applied — and the record says so, rather than losing them
     /// silently.
