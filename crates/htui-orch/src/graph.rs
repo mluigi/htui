@@ -17,11 +17,12 @@ use htui_core::model::{
     Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, GraphSnapshot,
     Isolation, Item, ItemId, ItemPatch, NewStepGraph, PhaseAgent, PhaseId, Project, ProjectId,
     ProjectSettings, PromptTemplate, RepoId, ResolvedGraph, RunMode, SkillBinding, SkillBindingKey,
-    SkillGlob, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPhase, SnapshotSettings,
+    SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPhase, SnapshotSettings,
     SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
 };
 use htui_core::store::{
-    CasOutcome, ReadStore, Result, StoreError, UpdateOutcome, WriteStore, glob_names_unknown_repo,
+    BindingFacts, CasOutcome, ReadStore, Result, StoreError, UpdateOutcome, WriteStore,
+    check_attachment,
 };
 use serde_json::Value;
 
@@ -388,10 +389,11 @@ pub async fn resolve<S: ReadStore + WriteStore, G: GraphSource>(
 /// global attachments are not copied: they apply to the clone already, and a copy would be a
 /// second row at the same level.
 ///
-/// A source attachment whose qualified glob names a repo the project no longer has would be
-/// refused by that writer (D79). The clone checks every such glob **before** it writes anything
-/// (D96), so a stale `<repo>:` glob refuses the clone whole and leaves no orphan graph; the user
-/// fixes the attachment and clones again.
+/// A source attachment that writer would refuse (D78's chain: a qualified glob naming a repo the
+/// project no longer has (D79), a negative position, a pin naming no version, ...) is caught
+/// **before** anything is written (D96): every copy is run through [`check_attachment`] first, so
+/// such a row refuses the clone whole and leaves no orphan graph; the user fixes the attachment
+/// and clones again.
 ///
 /// **One half of ANA-2's clone is owed to a writer that does not exist yet** (blueprint R-6):
 /// `WriteStore` has no `phase_agent` writer at all, so no `phase_agent` row is copied. The clone
@@ -404,8 +406,10 @@ pub async fn resolve<S: ReadStore + WriteStore, G: GraphSource>(
 /// # Errors
 /// [`ResolveError::NoGraph`] when the item resolves to no graph; [`ResolveError::Store`] for the
 /// store's own refusals, including a `Constraint` when the item's `version` has moved under the
-/// caller, and a `Constraint` carrying [`glob_names_unknown_repo`]'s sentence, before any write,
-/// when a source phase attachment names a repo the project no longer has.
+/// caller, and, before any write, a `Constraint` carrying [`check_attachment`]'s sentence when a
+/// source phase attachment would be refused by `set_skill_binding` (for a stale `<repo>:` glob,
+/// [`glob_names_unknown_repo`](htui_core::store::glob_names_unknown_repo)'s), or a `NotFound` for
+/// an attachment whose skill is gone.
 pub async fn override_graph<S: WriteStore, G: GraphSource>(
     store: &S,
     source: &G,
@@ -416,8 +420,10 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
         .await?
         .ok_or(ResolveError::NoGraph(item.id))?;
 
-    // D96 (F-H): every source phase attachment must survive `set_skill_binding`'s repo check
-    // (D79) before the clone writes anything, so a stale `<repo>:` glob refuses the clone whole.
+    // D96 (F-H): every source phase attachment must pass `set_skill_binding`'s whole rule chain
+    // (D78's `check_attachment`) before the clone writes anything, so a row the writer would refuse
+    // (a stale `<repo>:` glob, a negative position, a pin naming no version) refuses the clone
+    // whole and leaves no orphan graph.
     let sources: Vec<PhaseId> = resolved.phases.iter().map(|row| row.phase.id).collect();
     let copies: Vec<SkillBinding> = store
         .skill_bindings(Some(item.project_id))
@@ -429,28 +435,54 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
                 .is_some_and(|phase| sources.contains(&phase))
         })
         .collect();
-    if copies.iter().any(|binding| !binding.globs.is_empty()) {
-        let repos = store.repos(item.project_id).await?;
+    if !copies.is_empty() {
+        let repos: Vec<String> = store
+            .repos(item.project_id)
+            .await?
+            .into_iter()
+            .map(|repo| repo.name)
+            .collect();
+        let project_slug = store
+            .project(item.project_id)
+            .await?
+            .map_or_else(|| item.project_id.to_string(), |project| project.slug);
+        let skills = store.skills().await?;
         for binding in &copies {
-            for glob in &binding.globs {
-                // A bare glob names no repo. A stored glob that no longer parses is the writer's
-                // own refusal below, which a row the writer stored cannot earn.
-                let Ok(SkillGlob {
-                    repo: Some(repo), ..
-                }) = SkillGlob::parse(glob)
-                else {
-                    continue;
-                };
-                if !repos.iter().any(|known| known.name == repo) {
-                    let slug = store
-                        .project(item.project_id)
-                        .await?
-                        .map_or_else(|| item.project_id.to_string(), |project| project.slug);
-                    return Err(ResolveError::Store(StoreError::Constraint(
-                        glob_names_unknown_repo(glob, &repo, &slug),
-                    )));
-                }
-            }
+            let skill_name = skills
+                .iter()
+                .find(|skill| skill.id == binding.skill_id)
+                .map(|skill| skill.name.as_str())
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "skill",
+                    id: binding.skill_id.to_string(),
+                })?;
+            let versions: Vec<i32> = store
+                .skill_versions(binding.skill_id)
+                .await?
+                .into_iter()
+                .map(|version| version.version)
+                .collect();
+            // The copy's key names the cloned phase, which is minted only once the clone is
+            // written. The key here names the source phase instead, and `phase_project` is the
+            // project the writer will find for the cloned phase: the clone is a graph of
+            // `item.project_id`. The phase id only feeds rule 2's sentence, which that fact keeps
+            // from firing, exactly as it cannot fire for the copy.
+            check_attachment(
+                &BindingFacts {
+                    key: SkillBindingKey {
+                        skill: binding.skill_id,
+                        project: Some(item.project_id),
+                        phase: binding.phase_id,
+                    },
+                    phase_project: Some(item.project_id),
+                    skill_name,
+                    versions: &versions,
+                    repos: &repos,
+                    project_slug: &project_slug,
+                },
+                &Attachment::of(binding),
+            )
+            .map_err(|sentence| ResolveError::Store(StoreError::Constraint(sentence)))?;
         }
     }
 
