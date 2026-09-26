@@ -1,6 +1,6 @@
 # Plan: MOD-9 milestone 3 — skills are editable and attachable
 
-**Status: CONFIRMED by the maintainer 2026-09-26, OQ-16..OQ-20 at their defaults.** Two questions were answered before drafting
+**Status: CONFIRMED by the maintainer 2026-09-26, OQ-16..OQ-20 at their defaults; IMPLEMENTED `df91c82`..`e5db119` (2026-09-26), final review `rust-reviewer` APPROVE WITH FIXES, findings 1, 2, 4, 5, 7 and the acceptance gap applied, 3 opened as MOD-59, 6 carried to milestone 4, 8 accepted.** Two questions were answered before drafting
 (2026-09-26): milestone 3 is **split** (OQ-14) and the glob matcher is the **`globset` crate**
 (OQ-15).
 

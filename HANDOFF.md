@@ -436,12 +436,29 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   uses the chosen template and the Prompt sub-tab lists the choices. `R-SKL-2` amended. Plan
   `.claude/plans/mod-9-skills-reach-the-run.plan.md`, blueprint
   `.claude/plans/mod-9-skills-reach-the-run.blueprint.md` (final review `rust-reviewer` APPROVE
-  WITH FIXES, findings applied). **Milestone 3 is next** (writers, Skills view and attachments
-  matrix with a global row, language map, glob matcher over ANA-22 F2, the `graph.rs` clone gap);
-  its plan continues at D70 and R-25. Carry into it: `override_graph` creates its clone without
-  `is_override` (`NewStepGraph` has no such field), so the engine's clone-gap note cannot fire
-  until the clone sets it (review finding 2); and reading bindings before versions is now the
-  race-safe order for the writers (review finding 5).
+  WITH FIXES, findings applied).
+  **Phase 3 landed (`df91c82`..`e5db119`, 2026-09-26):** milestone 3, skills editable and
+  attachable, **split by the maintainer** (glob *firing* is the PRD's new row 5, "Glob attachments
+  fire": the F2 file set, roots for fan-out groups, changed paths, `matched`/`no_match`; better after
+  MOD-7 milestone 4). Shipped: skill names checked by the Agent Skills rule; `globset` (new
+  dependency) behind `model::skill_glob` (`<repo>:` qualifiers, brace-aware lists,
+  `canonical_globs`) and a seed language map (`model::skill_language`, fourteen languages); seven
+  `WriteStore` methods on every store (`skills`, `skill_versions`, `skill_bindings`, `create_skill`
+  with v1 in one transaction, `update_skill`, `add_skill_version`, `set_skill_binding`), each writer
+  a compare-and-set with one refusal chain (`check_attachment`), `CASES` 82; the clone gap closed
+  (`NewStepGraph.is_override` written, `override_graph` checks every copy before any write and
+  carries the source phases' attachments; the engine's clone-gap note is gone); `crate::skills` on
+  the store worker; the Skills view (library, versions, diff, `TextArea` and `$EDITOR`, token
+  estimate, rename; attachments pane with a global row, winner stars, a form showing the effective
+  globs and a repo picker). No migration; `.sqlx` 280. Plan
+  `.claude/plans/mod-9-skills-editable.plan.md`, blueprint
+  `.claude/plans/mod-9-skills-editable.blueprint.md` (F-H decided: an override clone is checked
+  first, then refused). Review `rust-reviewer` APPROVE WITH FIXES: findings 1, 2, 4, 5, 7 and the
+  acceptance gap (a phase `off` over a global `always`, end to end) applied (`22822ca`..`e5db119`);
+  finding 3 opened as MOD-59; finding 8 accepted (documented residue in `crates/htui/src/skills.rs`).
+  **Milestone 4 (import of skill files) is next.** Carry into it: the Skills view cannot open an editor
+  on a skill with no version (review finding 6, `library.rs` `on_skill_key`), which import is the
+  first writer able to produce; and a `glob` attachment still records `no_path` until row 5.
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
   pattern masks, fail-closed persistence gate, Settings tab secret provider section. **No longer
