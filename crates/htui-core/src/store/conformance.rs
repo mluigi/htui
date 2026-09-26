@@ -5908,7 +5908,7 @@ async fn skill_binding_attach_change_detach_are_compare_and_set<S: WriteStore>(s
     );
     assert_eq!(
         store.skill_bindings(None).await.expect(CASE),
-        [row.clone()],
+        std::slice::from_ref(&row),
         "{CASE}: the global rows"
     );
 

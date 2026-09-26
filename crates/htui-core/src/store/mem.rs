@@ -33,11 +33,11 @@ use crate::model::{
     RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
     Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
     RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
-    SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
-    UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject, WorkspaceSummary, canonical_declared_tags, overlaps, prompt_summary,
-    scope_of,
+    SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch,
+    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, WorkspaceSummary, canonical_declared_tags, overlaps,
+    prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -45,15 +45,17 @@ use crate::prompt::template::TemplateRole;
 use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
-    CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StoredSetting, UpdateOutcome,
-    WriteStore, already_exists, chat_step_status, citation_key, close_out_needs_a_summary,
-    expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
-    finish_run_needs_a_terminal_status, graph_not_in_project, invalid_area_code, invalid_prefix,
-    item_has_a_live_run, item_kind_is_held, item_not_in_project, legal_move,
-    not_a_fanout_candidate, not_a_terminal_status, prompt_template_key, prompt_template_refusal,
-    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
-    row_names_another_step, run_is_terminal, step_is_not_promotable, step_slot_is_taken,
-    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
+    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StoredSetting,
+    UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment, citation_key,
+    close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
+    finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project,
+    invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
+    legal_move, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
+    prompt_template_key, prompt_template_refusal, references_no_row, requirement_withdrawn,
+    reserved_phase_name, resolution_not_closable, row_names_another_step, run_is_terminal,
+    skill_body_refusal, skill_patch_refusal, skill_version_key, step_is_not_promotable,
+    step_slot_is_taken, summary_names_another_item, winner_is_not_settled,
+    withdrawn_requirement_cited,
 };
 use uuid::Uuid;
 
@@ -2759,25 +2761,76 @@ impl State {
 
     /// D91: name byte order.
     fn skill_rows(&self) -> Vec<Skill> {
-        todo!("MOD-9 T2")
+        let mut rows: Vec<Skill> = self.skills.values().cloned().collect();
+        rows.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+        rows
     }
 
     /// D91: one skill's versions by `version`.
     fn skill_version_rows(&self, skill: SkillId) -> Vec<SkillVersion> {
-        todo!("MOD-9 T2: {skill}")
+        let mut rows: Vec<SkillVersion> = self
+            .skill_versions
+            .iter()
+            .filter(|row| row.skill_id == skill)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| row.version);
+        rows
     }
 
     /// D91: `project_id == project`, sorted by `(skill_id, phase_id)` (`None < Some`, as `NULLS
     /// FIRST`; `Uuid`'s `Ord` is byte order, as Postgres's `uuid` comparison).
     fn skill_binding_rows(&self, project: Option<ProjectId>) -> Vec<SkillBinding> {
-        todo!("MOD-9 T2: {project:?}")
+        let mut rows: Vec<SkillBinding> = self
+            .skill_bindings
+            .iter()
+            .filter(|row| row.project_id == project)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| (row.skill_id.as_uuid(), row.phase_id.map(PhaseId::as_uuid)));
+        rows
+    }
+
+    /// The row at a natural key, `UNIQUE NULLS NOT DISTINCT (skill_id, project_id, phase_id)`.
+    fn skill_binding_at(&self, key: SkillBindingKey) -> Option<&SkillBinding> {
+        self.skill_bindings
+            .iter()
+            .find(|row| SkillBindingKey::of(row) == key)
     }
 
     /// Order: `new_skill_refusal`; `require_user(created_by, "skill.created_by")`; a taken id →
     /// `already_exists("skill", id)`; a taken name → `already_exists("skill", name)`. Writes the
     /// row and its version 1, both stamped `now`.
     fn create_skill(&mut self, new: NewSkill, now: DateTime<Utc>) -> Result<(Skill, SkillVersion)> {
-        todo!("MOD-9 T2: {new:?} {now}")
+        if let Some(refusal) = new_skill_refusal(&new.name, &new.description, &new.body) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        self.require_user(new.created_by, "skill.created_by")?;
+        if self.skills.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists("skill", new.id)));
+        }
+        if self.skills.values().any(|row| row.name == new.name) {
+            return Err(StoreError::Constraint(already_exists("skill", &new.name)));
+        }
+        let skill = Skill {
+            id: new.id,
+            name: new.name,
+            description: new.description,
+            created_by: new.created_by,
+            created_at: now,
+            updated_at: now,
+        };
+        let version = SkillVersion {
+            skill_id: new.id,
+            version: 1,
+            body: new.body,
+            source: new.source,
+            created_by: new.created_by,
+            created_at: now,
+        };
+        self.skills.insert(skill.id, skill.clone());
+        self.skill_versions.push(version.clone());
+        Ok((skill, version))
     }
 
     /// `update_workspace`'s shape: `NotFound("skill")` → `Stale(current)` →
@@ -2790,7 +2843,40 @@ impl State {
         patch: SkillPatch,
         now: DateTime<Utc>,
     ) -> Result<CasOutcome<Skill>> {
-        todo!("MOD-9 T2: {id} {expected} {patch:?} {now}")
+        let current = self
+            .skills
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "skill",
+                id: id.to_string(),
+            })?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        if let Some(refusal) = skill_patch_refusal(&patch) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if let Some(name) = &patch.name
+            && self
+                .skills
+                .values()
+                .any(|row| row.id != id && row.name == *name)
+        {
+            return Err(StoreError::Constraint(already_exists("skill", name)));
+        }
+        let row = self
+            .skills
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock");
+        if let Some(name) = patch.name {
+            row.name = name;
+        }
+        if let Some(description) = patch.description {
+            row.description = description;
+        }
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
     }
 
     /// D89's order; pushes version `expected + 1` stamped `now`.
@@ -2801,7 +2887,43 @@ impl State {
         new: NewSkillVersion,
         now: DateTime<Utc>,
     ) -> Result<CasOutcome<SkillVersion>> {
-        todo!("MOD-9 T2: {skill} {expected} {new:?} {now}")
+        let head = self
+            .skill_versions
+            .iter()
+            .filter(|row| row.skill_id == skill)
+            .max_by_key(|row| row.version)
+            .cloned();
+        if let Some(head) = &head
+            && head.version != expected
+        {
+            return Ok(CasOutcome::Stale(head.clone()));
+        }
+        if !self.skills.contains_key(&skill) {
+            return Err(StoreError::NotFound {
+                entity: "skill",
+                id: skill.to_string(),
+            });
+        }
+        if head.is_none() && expected != 0 {
+            return Err(StoreError::NotFound {
+                entity: "skill_version",
+                id: skill_version_key(skill, expected),
+            });
+        }
+        if let Some(refusal) = skill_body_refusal(&new.body) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        self.require_user(new.created_by, "skill_version.created_by")?;
+        let row = SkillVersion {
+            skill_id: skill,
+            version: expected + 1,
+            body: new.body,
+            source: new.source,
+            created_by: new.created_by,
+            created_at: now,
+        };
+        self.skill_versions.push(row.clone());
+        Ok(CasOutcome::Applied(row))
     }
 
     /// D90's order. An attach with no row pushes a fresh id; with a row it replaces the five
@@ -2813,7 +2935,97 @@ impl State {
         change: BindingChange,
         now: DateTime<Utc>,
     ) -> Result<CasOutcome<Option<SkillBinding>>> {
-        todo!("MOD-9 T2: {key:?} {expected:?} {change:?} {now}")
+        let current = self.skill_binding_at(key).cloned();
+        if current.as_ref().map(|row| row.updated_at) != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        let skill_name = self
+            .skills
+            .get(&key.skill)
+            .map(|row| row.name.clone())
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "skill",
+                id: key.skill.to_string(),
+            })?;
+        let project_slug = match key.project {
+            Some(id) => self
+                .projects
+                .get(&id)
+                .map(|row| row.slug.clone())
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "project",
+                    id: id.to_string(),
+                })?,
+            None => String::new(),
+        };
+        let phase_project = match key.phase {
+            Some(id) => {
+                let phase = self.phase(id).ok_or_else(|| StoreError::NotFound {
+                    entity: "step_graph_phase",
+                    id: id.to_string(),
+                })?;
+                self.graphs
+                    .get(&phase.graph_id)
+                    .map(|graph| graph.project_id)
+            }
+            None => None,
+        };
+
+        let attachment = match change {
+            BindingChange::Detach => {
+                if let Some(row) = current {
+                    self.skill_bindings.retain(|other| other.id != row.id);
+                }
+                return Ok(CasOutcome::Applied(None));
+            }
+            BindingChange::Attach(attachment) => attachment,
+        };
+        let versions: Vec<i32> = self
+            .skill_version_rows(key.skill)
+            .iter()
+            .map(|row| row.version)
+            .collect();
+        let repos: Vec<String> = key
+            .project
+            .map(|id| self.repo_rows(id))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|repo| repo.name)
+            .collect();
+        let stored = check_attachment(
+            &BindingFacts {
+                key,
+                phase_project,
+                skill_name: &skill_name,
+                versions: &versions,
+                repos: &repos,
+                project_slug: &project_slug,
+            },
+            &attachment,
+        )
+        .map_err(StoreError::Constraint)?;
+
+        let row = SkillBinding {
+            id: current.map_or_else(SkillBindingId::new, |row| row.id),
+            skill_id: key.skill,
+            project_id: key.project,
+            phase_id: key.phase,
+            pinned_version: attachment.pinned_version,
+            position: attachment.position,
+            activation: attachment.activation,
+            globs: stored.globs,
+            languages: stored.languages,
+            updated_at: now,
+        };
+        match self
+            .skill_bindings
+            .iter_mut()
+            .find(|other| other.id == row.id)
+        {
+            Some(slot) => *slot = row.clone(),
+            None => self.skill_bindings.push(row.clone()),
+        }
+        Ok(CasOutcome::Applied(Some(row)))
     }
 
     /// The value one rung currently holds for a key, for [`validate`]'s `not_above` peer.
