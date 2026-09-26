@@ -5,9 +5,17 @@
 //! bracketed paste or `Zeroizing`: what it holds is not secret.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::ui::{FieldOutcome, Theme};
+
+/// Every modifier that makes a key a chord; `SHIFT` is how a terminal reports a capital.
+const CHORD: KeyModifiers = KeyModifiers::CONTROL
+    .union(KeyModifiers::ALT)
+    .union(KeyModifiers::SUPER)
+    .union(KeyModifiers::META)
+    .union(KeyModifiers::HYPER);
 
 /// A multi-line buffer with a `(row, col)` cursor, counted in `char`s.
 #[derive(Clone)]
@@ -23,14 +31,21 @@ pub struct TextArea {
 impl Default for TextArea {
     /// One empty line, cursor at `(0, 0)`.
     fn default() -> Self {
-        todo!()
+        Self {
+            lines: vec![String::new()],
+            row: 0,
+            col: 0,
+        }
     }
 }
 
 /// Never the text: sections derive `Debug`. Prints `line_count` and `len` only.
 impl core::fmt::Debug for TextArea {
-    fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TextArea")
+            .field("line_count", &self.line_count())
+            .field("len", &self.len())
+            .finish()
     }
 }
 
@@ -38,62 +53,249 @@ impl TextArea {
     /// An empty area: one empty line, cursor at `(0, 0)`.
     #[must_use]
     pub fn new() -> Self {
-        todo!()
+        Self::default()
     }
 
     /// `text` split into lines on `\n`, after `\r\n` and a lone `\r` become `\n` (D59); cursor at
     /// the end of the last line.
     #[must_use]
-    pub fn with_text(_text: &str) -> Self {
-        todo!()
+    pub fn with_text(text: &str) -> Self {
+        let normalised = text.replace("\r\n", "\n").replace('\r', "\n");
+        let lines: Vec<String> = normalised.split('\n').map(str::to_owned).collect();
+        let row = lines.len() - 1;
+        let col = lines[row].chars().count();
+        Self { lines, row, col }
     }
 
     /// Feeds one key.
-    pub fn on_key(&mut self, _key: KeyEvent) -> FieldOutcome {
-        todo!()
+    ///
+    /// Any chord (`CONTROL`, `ALT`, `SUPER`, `META`, `HYPER`) passes, except `ctrl-s`, which
+    /// submits; so `ctrl-c` reaches the caller. `Char` inserts unless it is a control char (which
+    /// is swallowed); `Enter` splits the line at the cursor; `Backspace` and `Delete` join lines
+    /// at a line's edge; the arrows, `Home` and `End` move; `Esc` cancels; everything else passes.
+    pub fn on_key(&mut self, key: KeyEvent) -> FieldOutcome {
+        let chord = key.modifiers.intersection(CHORD);
+        if !chord.is_empty() {
+            return if chord == KeyModifiers::CONTROL && matches!(key.code, KeyCode::Char('s' | 'S'))
+            {
+                FieldOutcome::Submit
+            } else {
+                FieldOutcome::Pass
+            };
+        }
+        match key.code {
+            KeyCode::Char(c) => {
+                if !c.is_control() {
+                    let byte = self.byte_of(self.col);
+                    self.lines[self.row].insert(byte, c);
+                    self.col += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let byte = self.byte_of(self.col);
+                let tail = self.lines[self.row].split_off(byte);
+                self.lines.insert(self.row + 1, tail);
+                self.row += 1;
+                self.col = 0;
+            }
+            KeyCode::Backspace => {
+                if self.col > 0 {
+                    let byte = self.byte_of(self.col - 1);
+                    self.lines[self.row].remove(byte);
+                    self.col -= 1;
+                } else if self.row > 0 {
+                    let line = self.lines.remove(self.row);
+                    self.row -= 1;
+                    self.col = self.row_len(self.row);
+                    self.lines[self.row].push_str(&line);
+                }
+            }
+            KeyCode::Delete => {
+                if self.col < self.row_len(self.row) {
+                    let byte = self.byte_of(self.col);
+                    self.lines[self.row].remove(byte);
+                } else if self.row + 1 < self.lines.len() {
+                    let next = self.lines.remove(self.row + 1);
+                    self.lines[self.row].push_str(&next);
+                }
+            }
+            KeyCode::Left => {
+                if self.col > 0 {
+                    self.col -= 1;
+                } else if self.row > 0 {
+                    self.row -= 1;
+                    self.col = self.row_len(self.row);
+                }
+            }
+            KeyCode::Right => {
+                if self.col < self.row_len(self.row) {
+                    self.col += 1;
+                } else if self.row + 1 < self.lines.len() {
+                    self.row += 1;
+                    self.col = 0;
+                }
+            }
+            KeyCode::Up => {
+                if self.row > 0 {
+                    self.row -= 1;
+                    self.col = self.col.min(self.row_len(self.row));
+                }
+            }
+            KeyCode::Down => {
+                if self.row + 1 < self.lines.len() {
+                    self.row += 1;
+                    self.col = self.col.min(self.row_len(self.row));
+                }
+            }
+            KeyCode::Home => self.col = 0,
+            KeyCode::End => self.col = self.row_len(self.row),
+            KeyCode::Esc => return FieldOutcome::Cancel,
+            _ => return FieldOutcome::Pass,
+        }
+        FieldOutcome::Consumed
     }
 
     /// The lines joined by `\n`.
     #[must_use]
     pub fn text(&self) -> String {
-        todo!()
+        self.lines.join("\n")
     }
 
     /// Whether the area is one empty line.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        todo!()
+        self.lines.len() == 1 && self.lines[0].is_empty()
     }
 
     /// How many chars, the `\n` between lines included (so `len() == text().chars().count()`).
     #[must_use]
     pub fn len(&self) -> usize {
-        todo!()
+        self.lines
+            .iter()
+            .map(|line| line.chars().count())
+            .sum::<usize>()
+            + (self.lines.len() - 1)
     }
 
     /// How many lines (at least 1).
     #[must_use]
     pub fn line_count(&self) -> usize {
-        todo!()
+        self.lines.len()
     }
 
     /// The cursor as `(row, col)`.
     #[must_use]
     pub const fn cursor(&self) -> (usize, usize) {
-        todo!()
+        (self.row, self.col)
     }
 
-    /// At most `height` lines, each at most `width` cells.
+    /// At most `height` lines, each at most `width` cells, for the caller to place (and pad) in
+    /// its own `Rect`.
+    ///
+    /// Nothing when either is 0. The window ends at the cursor row (D61). The cursor row is drawn
+    /// as [`TextField::line`](crate::ui::TextField::line) draws an unmasked field: a window of
+    /// chars ending at the cursor, a leading dim `…` when its start is clipped, the cursor cell in
+    /// `theme.selected` while `focused`. Every other row is drawn from column 0 and, when it has
+    /// more than `width` chars, cut to its first `width - 1` and a trailing dim `…`. Computed on
+    /// every call, so a resize needs no event.
     #[must_use]
     pub fn lines(
         &self,
-        _width: u16,
-        _height: u16,
-        _focused: bool,
-        _theme: &Theme,
+        width: u16,
+        height: u16,
+        focused: bool,
+        theme: &Theme,
     ) -> Vec<Line<'static>> {
-        todo!()
+        if width == 0 || height == 0 {
+            return Vec::new();
+        }
+        let width = usize::from(width);
+        let height = usize::from(height);
+        let top = self.row.saturating_sub(height - 1);
+        let bottom = (top + height).min(self.lines.len());
+        (top..bottom)
+            .map(|row| {
+                if row == self.row {
+                    self.cursor_line(width, focused, theme)
+                } else {
+                    clipped_line(&self.lines[row], width, theme)
+                }
+            })
+            .collect()
     }
+
+    /// The cursor row, `TextField::line`'s algorithm (`text_field.rs`) without the mask (D44:
+    /// copied, not extracted).
+    fn cursor_line(&self, budget: usize, focused: bool, theme: &Theme) -> Line<'static> {
+        let glyphs: Vec<char> = self.lines[self.row].chars().collect();
+        let cursor = self.col;
+
+        // `budget` cells hold `['…'] + before + cursor cell + after`, so the cursor is always on
+        // screen; below two cells there is room for the cursor and nothing else.
+        let (start, ellipsis) = if budget < 2 {
+            (cursor, false)
+        } else if cursor < budget {
+            (0, false)
+        } else {
+            (cursor + 2 - budget, true)
+        };
+        let before: String = glyphs[start.min(glyphs.len())..cursor.min(glyphs.len())]
+            .iter()
+            .collect();
+        let at = glyphs.get(cursor).copied().unwrap_or(' ');
+        let room = budget
+            .saturating_sub(usize::from(ellipsis))
+            .saturating_sub(before.chars().count())
+            .saturating_sub(1);
+        let after: String = glyphs
+            .iter()
+            .skip(cursor.saturating_add(1))
+            .take(room)
+            .collect();
+
+        let cursor_style: Style = if focused { theme.selected } else { theme.base };
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
+        if ellipsis {
+            spans.push(Span::styled("…", theme.dim));
+        }
+        if !before.is_empty() {
+            spans.push(Span::styled(before, theme.base));
+        }
+        spans.push(Span::styled(at.to_string(), cursor_style));
+        if !after.is_empty() {
+            spans.push(Span::styled(after, theme.base));
+        }
+        Line::from(spans)
+    }
+
+    /// How many chars `lines[row]` holds.
+    fn row_len(&self, row: usize) -> usize {
+        self.lines[row].chars().count()
+    }
+
+    /// Byte offset of char `index` in the cursor's line, or the line's length past the end.
+    fn byte_of(&self, index: usize) -> usize {
+        let line = &self.lines[self.row];
+        line.char_indices()
+            .nth(index)
+            .map_or(line.len(), |(byte, _)| byte)
+    }
+}
+
+/// A row other than the cursor's: from column 0, cut to `width - 1` chars and a dim `…` when it
+/// is longer than `width`.
+fn clipped_line(line: &str, width: usize, theme: &Theme) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(2);
+    if line.chars().count() > width {
+        let head: String = line.chars().take(width - 1).collect();
+        if !head.is_empty() {
+            spans.push(Span::styled(head, theme.base));
+        }
+        spans.push(Span::styled("…", theme.dim));
+    } else if !line.is_empty() {
+        spans.push(Span::styled(line.to_owned(), theme.base));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]
