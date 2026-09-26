@@ -1437,31 +1437,6 @@ impl PgStore {
         // `None` binds SQL NULL, so `b.phase_id = $2` is NULL and only the project's
         // `phase_id IS NULL` rows (and the global ones) apply.
         let phase = phase.map(PhaseId::as_uuid);
-        // Every version of every candidate skill, once: `version_in_force` ignores another
-        // skill's rows, so one statement answers every attachment of every level.
-        let versions = sqlx::query_as!(
-            SkillVersion,
-            r#"
-            SELECT v.skill_id   AS "skill_id: SkillId",
-                   v.version,
-                   v.body,
-                   v.source,
-                   v.created_by AS "created_by: htui_core::model::UserId",
-                   v.created_at
-              FROM skill_version v
-             WHERE v.skill_id IN (
-                   SELECT b.skill_id
-                     FROM skill_binding b
-                    WHERE b.project_id IS NULL
-                       OR (b.project_id = $1 AND (b.phase_id IS NULL OR b.phase_id = $2)))
-            "#,
-            project.as_uuid(),
-            phase,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
-
         let rows = sqlx::query_as!(
             SkillBindingRow,
             r#"
@@ -1482,6 +1457,30 @@ impl PgStore {
             "#,
             project.as_uuid(),
             phase,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        // The versions of exactly the skills those rows name, read after them (review finding 5):
+        // `skill_version` is append-only, so every version an attachment read above can name is
+        // already here, and a binding or re-pin committed between the two statements cannot
+        // resolve to a spurious `missing_version`. `version_in_force` ignores another skill's
+        // rows, so one statement answers every attachment of every level.
+        let skill_ids: Vec<Uuid> = rows.iter().map(|row| row.skill_id.as_uuid()).collect();
+        let versions = sqlx::query_as!(
+            SkillVersion,
+            r#"
+            SELECT v.skill_id   AS "skill_id: SkillId",
+                   v.version,
+                   v.body,
+                   v.source,
+                   v.created_by AS "created_by: htui_core::model::UserId",
+                   v.created_at
+              FROM skill_version v
+             WHERE v.skill_id = ANY($1)
+            "#,
+            &skill_ids,
         )
         .fetch_all(&self.pool)
         .await

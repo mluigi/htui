@@ -84,10 +84,6 @@ const HANDOFF_TEMPLATE: &str = "handoff";
 
 /// MOD-9 D44: an override graph's phase ids are minted by the clone, which copies no
 /// `skill_binding` (`graph.rs:350-355`), so its steps see global and project attachments only.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "T3 red: the green commit pushes it")
-)]
 const OVERRIDE_SKILLS_NOTE: &str =
     "skills: an override graph's phases carry no phase-level attachments until MOD-9 milestone 3";
 
@@ -4858,6 +4854,11 @@ where
     ///
     /// `Err(kind)` is a required input that resolved to no document, when `strict`. A promoted
     /// step's handoff (plan D163) is not strict: its chat opens with the gap noted instead.
+    ///
+    /// The skill candidates are resolved here for every caller, the handoff included, although
+    /// `promote::handoff_spec` then empties them (MOD-9 D44): a handoff is rare, the two reads go
+    /// to the store every other input of this spec already needs, and one spec builder keeps the
+    /// phase and handoff inputs from drifting (MOD-9 review finding 4, accepted).
     async fn phase_spec(
         &self,
         run: &Run,

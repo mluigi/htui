@@ -172,8 +172,8 @@ async fn agent_box_gains_a_jsonb_probe_column() {
 /// comment `0001_init.sql` never wrote); the next five are ANA-5 §9 copied from
 /// `docs/ANA-5.md:2153-2181`; the last nineteen are ANA-2 §9 (`docs/ANA-2.md:1862-1999`).
 /// `run_step.trim_record` is the text `0007_skill_attachments.sql` restates (MOD-9 D42), which
-/// replaces `0002`'s. They live here as literals on purpose: this test is the guard against a paraphrase drifting into a
-/// forward-only migration that cannot be edited afterwards.
+/// replaces `0002`'s. They live here as literals on purpose: this test is the guard against a
+/// paraphrase drifting into a forward-only migration that cannot be edited afterwards.
 const ANA_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     (
         "agent",
