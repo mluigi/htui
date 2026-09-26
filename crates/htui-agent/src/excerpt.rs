@@ -53,7 +53,7 @@ pub const BINARY_PROBE_BYTES: usize = 8_192;
 ///
 /// Re-exported from `htui-core` rather than spelled again here. The ceiling is a property of
 /// [`ExcerptCandidate`], which that crate owns, and
-/// [`select`](htui_core::prompt::excerpt::select) clamps to it as well — two independent `100`s
+/// [`select`] clamps to it as well — two independent `100`s
 /// were how finding F-100 arrived, with the invariant enforced only by the impure crate.
 pub use htui_core::prompt::excerpt::MAX_PROVIDER_WEIGHT;
 
@@ -694,7 +694,7 @@ fn propose_caught(provider: &dyn ExcerptProvider, req: &ExcerptRequest<'_>) -> O
 /// Returns the merged candidate list and `provider_set` in blueprint P-11's grammar:
 /// `name@version` when the provider answered, `name@version:error`, `:panic` or `:timeout` when it
 /// did not. Registration order is preserved, so a caller that puts
-/// [`BuiltinRanker`](htui_core::prompt::excerpt::BuiltinRanker) first gets `builtin@1` first —
+/// [`BuiltinRanker`] first gets `builtin@1` first —
 /// and the built-in is never dropped because its `propose` is infallible and returns at once.
 ///
 /// **Hazard H-20, stated rather than hidden**: a provider past the deadline is *dropped*, not
