@@ -29,6 +29,6 @@ Graphics · DESKTOP-HTUI · memory · 0 runs
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
-│j/k · N workspace · n project/repo · e edit · p primary · b path · d delete · r reload            │
+│j/k · N workspace · n project/repo · e edit · p primary · b path · i infer · d delete · r reload  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help

@@ -26,8 +26,8 @@ use htui_core::store::{DeleteReach, DeleteTarget};
 
 use crate::app::{Action, Ctx, Handled};
 use crate::hierarchy::{
-    HierarchySnapshot, MirrorAfterDelete, ProjectEntry, REQUEST_NAMES, RepoEntry, reach_parts,
-    reach_totals,
+    HierarchySnapshot, InferOutcome, InferReport, MirrorAfterDelete, ProjectEntry, REQUEST_NAMES,
+    RepoEntry, reach_parts, reach_totals,
 };
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::settings::{SectionId, SettingsSection, message, wrapped};
@@ -43,7 +43,7 @@ const NO_WORKSPACE: &str = "no workspace — `N` creates one";
 const UNAVAILABLE: &str = "hierarchy needs Postgres";
 
 /// Browse's keys.
-const HINT_BROWSE: &str = "j/k \u{b7} N workspace \u{b7} n project/repo \u{b7} e edit \u{b7} p primary \u{b7} b path \u{b7} d delete \u{b7} r reload";
+const HINT_BROWSE: &str = "j/k \u{b7} N workspace \u{b7} n project/repo \u{b7} e edit \u{b7} p primary \u{b7} b path \u{b7} i infer \u{b7} d delete \u{b7} r reload";
 
 /// Browse's keys with nothing read: only the two that do not need a tree.
 const HINT_NO_WORKSPACE: &str = "N workspace · r reload";
@@ -84,6 +84,9 @@ const NOT_UNDONE: &str = "Nothing here can be undone. `y` to continue, `n` or `E
 
 /// What a second confirmation that did not match says. The stage stays where it was.
 const WRONG_SLUG: &str = "that is not the slug; nothing was deleted";
+
+/// How many repo names one list of an inference notice shows before `+N more` (blueprint D137).
+const NAMES_SHOWN: usize = 3;
 
 /// One row of the flat list the section draws and the cursor indexes.
 ///
@@ -223,6 +226,10 @@ pub struct HierarchySection {
     busy: Option<&'static str>,
     /// The last outcome, one line on the hint row.
     notice: Option<String>,
+    /// What an inference in flight puts in front of its report: the `stored as …` notice of the
+    /// write it follows, or `None` for `i`. Held apart from `notice`, which a key refused during
+    /// the walk overwrites with "still in flight" (R-57).
+    carried: Option<String>,
 }
 
 impl HierarchySection {
@@ -928,6 +935,18 @@ impl HierarchySection {
     fn on_tree(&mut self, snapshot: &HierarchySnapshot, ctx: &Ctx<'_>) {
         let write = self.busy.take();
         self.unavailable = None;
+        // MOD-7 milestone 4 (D114, D136): an editor write that can change what inference reads —
+        // the root, or a repo's name or remote — is followed by one inference. Captured here,
+        // before the editor is closed below; `p` has no editor, so it is never followed.
+        let follow = write.is_some_and(|name| {
+            matches!(name, "set_workspace_root" | "create_repo" | "update_repo")
+        }) && matches!(
+            &self.mode,
+            Mode::Editing(editor) if matches!(
+                editor.kind,
+                EditorKind::WorkspaceRoot(_) | EditorKind::NewRepo(_) | EditorKind::EditRepo { .. }
+            )
+        );
         if let Some(name) = write {
             self.notice = self.written(name, snapshot);
             // An **editor** only. A reply carries no correlation, so a read that lands while a
@@ -953,6 +972,14 @@ impl HierarchySection {
             ctx.emit(Action::SetScope {
                 workspace: snapshot.summary(),
             });
+        }
+
+        // Only with a root on this box: without one the answer could only be "no root". The
+        // `stored as …` notice set above stays on screen until the inference answers, and is
+        // carried in front of its report.
+        if follow && snapshot.root_path.is_some() {
+            self.carried = self.notice.clone();
+            self.send(StoreRequest::InferRepoPaths(snapshot.workspace.id), ctx);
         }
     }
 
@@ -1030,6 +1057,7 @@ impl SettingsSection for HierarchySection {
         self.snapshot = None;
         self.mode = Mode::Browse;
         self.busy = None;
+        self.carried = None;
         self.cursor = 0;
     }
 
@@ -1044,7 +1072,7 @@ impl SettingsSection for HierarchySection {
         if matches!(self.mode, Mode::Deleting { .. }) {
             return self.on_deleting_key(key, ctx);
         }
-        // Browse. `j`, `k`, `N`, `n`, `e`, `p`, `b`, `d` and `r` are free: the global table binds
+        // Browse. `j`, `k`, `N`, `n`, `e`, `p`, `b`, `i`, `d` and `r` are free: the global table binds
         // `q`, `?`, the digits, `ctrl-c` and `-`, and the tab consumes `h`/`l`/`[`/`]`/arrows
         // before a section is offered the key.
         match key.code {
@@ -1102,6 +1130,19 @@ impl SettingsSection for HierarchySection {
                 }
                 Handled::Consumed
             }
+            // MOD-7 milestone 4 (D114): infer this box's repo paths under the workspace root. A
+            // write, so it is refused while another is in flight, as the other write keys are.
+            KeyCode::Char('i') => {
+                if !self.refuse('i')
+                    && let Some(snapshot) = &self.snapshot
+                {
+                    let request = StoreRequest::InferRepoPaths(snapshot.workspace.id);
+                    self.notice = None;
+                    self.carried = None;
+                    self.send(request, ctx);
+                }
+                Handled::Consumed
+            }
             KeyCode::Char('d') => {
                 if !self.refuse('d')
                     && let Some(row) = self.selected()
@@ -1139,6 +1180,18 @@ impl SettingsSection for HierarchySection {
                 self.clamp_cursor();
             }
             StoreReply::HierarchyStale(snapshot) => self.on_stale(snapshot),
+            // MOD-7 milestone 4 (D117): a tree like any other, then what the pass did. A notice a
+            // write left (`stored as …`, a follow-up's cause) is kept in front of the report; a
+            // refusal shown during the walk is not, since the walk it waited for is over.
+            StoreReply::RepoPathsInferred { tree, report } => {
+                let before = self.carried.take();
+                self.on_tree(tree, ctx);
+                let report = inferred_notice(report);
+                self.notice = Some(match before {
+                    Some(before) => format!("{before} \u{b7} {report}"),
+                    None => report,
+                });
+            }
             StoreReply::DeleteReach(Some(reach)) => {
                 self.busy = None;
                 if let Mode::Deleting { stage, .. } = &mut self.mode
@@ -1201,6 +1254,9 @@ impl SettingsSection for HierarchySection {
             // can start from — with the editor left open over its text.
             StoreReply::Failed { request, .. } if REQUEST_NAMES.contains(request) => {
                 self.busy = None;
+                if *request == "infer_repo_paths" {
+                    self.carried = None;
+                }
                 // A delete that was refused must not leave `deleting…` or `counting rows…` on
                 // screen: neither stage has anything left to wait for. `InFlight` goes back to the
                 // counts the user already saw, where `y` retries and `Esc` stops; `Counting` has no
@@ -1343,6 +1399,81 @@ fn reload(snapshot: &HierarchySnapshot, kind: EditorKind) -> Reload {
             .flat_map(|entry| entry.repos.iter())
             .find(|entry| entry.repo.id == id)
             .map_or(Reload::Gone, |entry| Reload::Token(entry.repo.updated_at)),
+    }
+}
+
+/// The notice an inference leaves (MOD-7 milestone 4, plan D117, blueprint D137).
+///
+/// Three sentences for the answers that inferred nothing by construction — no root here, a
+/// truncated scan, a workspace without a repo — and otherwise `inferred {n} of {m}`, where `m`
+/// counts every repo that had no row before the pass, followed by what was not inferred. A refused
+/// repo is named, not explained: its sentence may name a path, and the notice is one line.
+pub(crate) fn inferred_notice(report: &InferReport) -> String {
+    if report.root.is_none() {
+        return "no root on this box for this workspace \u{2014} b on the workspace row sets it"
+            .to_owned();
+    }
+    if report.truncated {
+        return format!(
+            "the scan stopped at {} directories; nothing inferred",
+            htui_orch::infer::MAX_DIRS
+        );
+    }
+    if report.repos.is_empty() {
+        return "no repo in this workspace to infer".to_owned();
+    }
+
+    let mut inferred = 0_usize;
+    let mut already = 0_usize;
+    let mut unmatched = Vec::new();
+    let mut ambiguous = Vec::new();
+    let mut refused = Vec::new();
+    for line in &report.repos {
+        match &line.outcome {
+            InferOutcome::Inferred { .. } => inferred += 1,
+            InferOutcome::AlreadySet => already += 1,
+            InferOutcome::NoMatch => unmatched.push(line.name.clone()),
+            InferOutcome::Ambiguous { candidates } => {
+                ambiguous.push(format!("{} ({candidates})", line.name));
+            }
+            InferOutcome::Refused(_) => refused.push(line.name.clone()),
+            // Only in a truncated report, which answered above.
+            InferOutcome::ScanTruncated => {}
+        }
+    }
+
+    let total = report.repos.len() - already;
+    let mut parts = vec![format!("inferred {inferred} of {total}")];
+    if already > 0 {
+        parts.push(format!("{already} already set"));
+    }
+    for (label, names) in [
+        ("no checkout", &unmatched),
+        ("ambiguous", &ambiguous),
+        ("refused", &refused),
+    ] {
+        if !names.is_empty() {
+            parts.push(format!("{label}: {}", capped(names)));
+        }
+    }
+    let mut notice = parts.join(" \u{b7} ");
+    if !(unmatched.is_empty() && ambiguous.is_empty() && refused.is_empty()) {
+        notice.push_str(" \u{2014} b on a repo sets it by hand");
+    }
+    notice
+}
+
+/// At most [`NAMES_SHOWN`] names, comma-separated, then `+{rest} more`.
+fn capped(names: &[String]) -> String {
+    let shown = names
+        .iter()
+        .take(NAMES_SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match names.len().saturating_sub(NAMES_SHOWN) {
+        0 => shown,
+        rest => format!("{shown} +{rest} more"),
     }
 }
 

@@ -1,12 +1,13 @@
-//! The hierarchy the Settings tab edits: one worker-assembled snapshot per read, twelve served
-//! writes, identity filled here and never on the render side (MOD-15 milestone 3, D5/D6/D10).
+//! The hierarchy the Settings tab edits: one worker-assembled snapshot per read, thirteen served
+//! requests, identity filled here and never on the render side (MOD-15 milestone 3, D5/D6/D10).
 //!
 //! A section names a read and is handed rows (`R-NF-3`): nothing below this module is reachable
 //! from `ui/`, and the two identity columns a write needs — `workspace.created_by` and the box a
 //! path belongs to — are resolved from [`Backend`] here, so no view ever holds a `UserId` or a
 //! `BoxId`.
 
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use htui_core::model::{
@@ -17,6 +18,7 @@ use htui_core::root_path::canonical_root;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, Result, StoreError, WriteStore,
 };
+use htui_orch::infer::{Checkout, Choice, MatchedBy};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 
 use crate::store_worker::{StoreReply, StoreRequest};
@@ -76,6 +78,56 @@ pub enum MirrorAfterDelete {
     NotNeeded,
     /// The rebuild failed; the delete still happened.
     Failed(String),
+}
+
+/// What one `InferRepoPaths` did (MOD-7 milestone 4, plan D116). Carries no URL and no id of a
+/// box or a user: repo names, canonical paths and outcomes only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferReport {
+    /// This box's workspace root, canonical; `None` when the workspace has no root here, in which
+    /// case nothing was walked and `repos` is empty.
+    pub root: Option<String>,
+    /// The walk hit `htui_orch::infer::MAX_DIRS`; every repo without a row is `ScanTruncated`.
+    pub truncated: bool,
+    /// One per repo of the workspace, in the tree's order (projects by position, repos by name).
+    pub repos: Vec<RepoInference>,
+}
+
+/// One repo's line of an [`InferReport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoInference {
+    /// The repo.
+    pub repo: RepoId,
+    /// `repo.name`, what the notice prints.
+    pub name: String,
+    /// What happened.
+    pub outcome: InferOutcome,
+}
+
+/// Why a repo did or did not get a row (plan D116).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InferOutcome {
+    /// A row existed before the pass, or a manual write landed first (the insert answered `false`).
+    AlreadySet,
+    /// A row was written.
+    Inferred {
+        /// The canonical path stored.
+        path: String,
+        /// Which rung chose it.
+        by: MatchedBy,
+    },
+    /// No checkout matched.
+    NoMatch,
+    /// Several did; nothing was written.
+    Ambiguous {
+        /// How many.
+        candidates: usize,
+    },
+    /// The chosen path was refused by `canonical_root`, or the store refused the row. The
+    /// sentence names the path as found, never a link's target.
+    Refused(String),
+    /// The scan was cut short, so nothing was inferred.
+    ScanTruncated,
 }
 
 impl HierarchySnapshot {
@@ -164,8 +216,8 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
 /// [`StoreError::Constraint`] carrying a [`RootRefusal`](htui_core::root_path::RootRefusal).
 ///
 /// The last arm answers [`StoreError::Backend`] rather than panicking: `try_serve` routes exactly
-/// the twelve variants below here, so it is unreachable from the shell, and a caller that reached
-/// it anyway is better told which request it sent than killed.
+/// the hierarchy variants below here, so it is unreachable from the shell, and a caller that
+/// reached it anyway is better told which request it sent than killed.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
     let writer = backend
         .writer()
@@ -348,6 +400,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 mirror,
             })
         }
+        StoreRequest::InferRepoPaths(ws) => infer(backend, &writer, *ws, this_box).await,
         other => Err(StoreError::Backend(format!(
             "not a hierarchy request: {}",
             other.name()
@@ -448,12 +501,167 @@ async fn workspace_of(backend: &Backend, project: ProjectId) -> Result<Workspace
         })
 }
 
-/// The twelve request names, in [`StoreRequest`] order.
+/// `InferRepoPaths` (MOD-7 milestone 4, PRD D5, plan D114, D116, D124): this box's filesystem,
+/// this box's rows, this workspace only.
+///
+/// The box first, then the tree, then this box's root, canonicalised (a legacy link row walks its
+/// target). With no root, the answer is `root: None` and nothing is walked. With every repo
+/// already set, nothing is walked either. Otherwise one `find_checkouts` under `spawn_blocking`,
+/// then per repo without a row, in tree order: `choose` against the paths already held on this
+/// box, `canonical` of the chosen path, and `infer_repo_box_path`. A path this pass writes is held
+/// for every later repo. A truncated scan infers nothing. The reply is the re-read tree and the
+/// report.
+async fn infer(
+    backend: &Backend,
+    writer: &Writer,
+    ws: WorkspaceId,
+    this_box: Option<BoxId>,
+) -> Result<StoreReply> {
+    let box_id = box_id(this_box)?;
+    let tree = snapshot(writer, ws, this_box)
+        .await?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "workspace",
+            id: ws.to_string(),
+        })?;
+    let Some(root_row) = &tree.root_path else {
+        return Ok(StoreReply::RepoPathsInferred {
+            tree: Box::new(tree),
+            report: InferReport {
+                root: None,
+                truncated: false,
+                repos: Vec::new(),
+            },
+        });
+    };
+    // A root that no longer resolves is a `Constraint`, which the status line reads as
+    // `infer_repo_paths: constraint violated: …`.
+    let root = canonical(&root_row.root_path).await?;
+
+    let entries: Vec<&RepoEntry> = tree
+        .projects
+        .iter()
+        .flat_map(|entry| entry.repos.iter())
+        .collect();
+    // Walk only when some repo has no row here: a workspace whose repos are all set answers
+    // without touching the disk.
+    let mut walk = if entries.iter().all(|entry| entry.local_path.is_some()) {
+        None
+    } else {
+        // Every repo's row on this box, not only this workspace's: a checkout another repo already
+        // owns is never a candidate.
+        let held: BTreeSet<PathBuf> = backend
+            .repo_paths(box_id)
+            .await?
+            .into_iter()
+            .map(|row| PathBuf::from(row.local_path))
+            .collect();
+        let scan = tokio::task::spawn_blocking({
+            let root = PathBuf::from(&root);
+            move || htui_orch::infer::find_checkouts(&root)
+        })
+        .await
+        .map_err(|err| StoreError::Backend(err.to_string()))?;
+        Some((scan, held))
+    };
+
+    let truncated = walk.as_ref().is_some_and(|(scan, _)| scan.truncated);
+    let mut repos = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let outcome = match &mut walk {
+            // D134: sequentially, in tree order, so a path written for one repo is held for the
+            // next. A truncated scan writes nothing.
+            Some((scan, held)) if entry.local_path.is_none() => {
+                if scan.truncated {
+                    InferOutcome::ScanTruncated
+                } else {
+                    infer_one(writer, &entry.repo, box_id, &scan.checkouts, held).await?
+                }
+            }
+            // A row on this box before the pass; with no walk at all, every repo had one.
+            _ => InferOutcome::AlreadySet,
+        };
+        repos.push(RepoInference {
+            repo: entry.repo.id,
+            name: entry.repo.name.clone(),
+            outcome,
+        });
+    }
+
+    let fresh = snapshot(writer, ws, this_box)
+        .await?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "workspace",
+            id: ws.to_string(),
+        })?;
+    Ok(StoreReply::RepoPathsInferred {
+        tree: Box::new(fresh),
+        report: InferReport {
+            root: Some(root),
+            truncated,
+            repos,
+        },
+    })
+}
+
+/// One repo without a row on this box: `choose`, `canonical` of the chosen path, then the
+/// insert-if-absent write (plan D116). A refusal, by the guard or by the store's constraints, is
+/// the repo's outcome rather than the request's; any other error fails the request.
+async fn infer_one(
+    writer: &Writer,
+    repo: &Repo,
+    box_id: BoxId,
+    checkouts: &[Checkout],
+    held: &mut BTreeSet<PathBuf>,
+) -> Result<InferOutcome> {
+    let (path, by) = match htui_orch::infer::choose(repo, checkouts, held) {
+        Choice::NoMatch => return Ok(InferOutcome::NoMatch),
+        Choice::Ambiguous { candidates } => return Ok(InferOutcome::Ambiguous { candidates }),
+        Choice::Inferred { path, by } => (path, by),
+    };
+    let Some(found) = path.to_str() else {
+        return Ok(InferOutcome::Refused(
+            "the checkout's path is not valid UTF-8".to_owned(),
+        ));
+    };
+    // The same guard `SetRepoPath` runs (F-102): the walk never follows a link, so this is the
+    // path as found, and a refusal names it and never a target.
+    let local_path = match canonical(found).await {
+        Ok(local_path) => local_path,
+        Err(StoreError::Constraint(message)) => return Ok(InferOutcome::Refused(message)),
+        Err(err) => return Err(err),
+    };
+    let written = writer
+        .infer_repo_box_path(&RepoBoxPath {
+            repo_id: repo.id,
+            box_id,
+            local_path: local_path.clone(),
+            // The store's trigger stamps the column, as for every other path write.
+            updated_at: Utc::now(),
+        })
+        .await;
+    match written {
+        Ok(true) => {
+            held.insert(path);
+            held.insert(PathBuf::from(&local_path));
+            Ok(InferOutcome::Inferred {
+                path: local_path,
+                by,
+            })
+        }
+        // A row landed between the tree read and this insert, a manual write most likely: it wins.
+        Ok(false) => Ok(InferOutcome::AlreadySet),
+        Err(StoreError::Constraint(message)) => Ok(InferOutcome::Refused(message)),
+        Err(err) => Err(err),
+    }
+}
+
+/// The thirteen request names, in [`StoreRequest`] order.
 ///
 /// [`StoreRequest::name`]'s arms and the section's
 /// `Failed` match both read from here, so a
-/// thirteenth request cannot be named in one place and matched in the other.
-pub const REQUEST_NAMES: [&str; 12] = [
+/// fourteenth request cannot be named in one place and matched in the other.
+pub const REQUEST_NAMES: [&str; 13] = [
     "hierarchy",
     "create_workspace",
     "update_workspace",
@@ -466,6 +674,7 @@ pub const REQUEST_NAMES: [&str; 12] = [
     "delete_reach",
     "delete_workspace",
     "delete_project",
+    "infer_repo_paths",
 ];
 
 /// Every count of a [`DeleteReach`] with the word the warning pane uses, in the struct's **field
