@@ -25,6 +25,7 @@ use futures::future::Either;
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposure};
 use htui_agent::event::{DoneEvent, StopReason};
+use htui_agent::excerpt::{PassInput, excerpt_roots, excerpts_for, touched_prefixes};
 use htui_agent::record::{Recorder, RunCap, pump};
 use htui_core::model::{
     BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus, Document, DocumentId,
@@ -4399,6 +4400,8 @@ where
             box_profile: self.parts.box_profile.clone(),
             // MOD-9 D44, D48: the judged phase's candidates, the same list for both orders.
             skills: skills.clone(),
+            // No pass for a judge (plan D109): its placeholder set cannot place `{{excerpts}}`
+            // (`template.rs:188-215`), so a file read here could only reach the audit.
             excerpts: no_excerpts(caps),
             command_queue: false,
             verify_failure: None,
@@ -4887,7 +4890,8 @@ where
         self.cleanup_run(run.id).await
     }
 
-    /// Stage 3: the phase's spec ([`Self::phase_spec`]) and `assemble`.
+    /// Stage 3: the phase's spec ([`Self::phase_spec`]) and `assemble`. The excerpt pass runs
+    /// between the two ([`Self::with_excerpts`]).
     ///
     /// The inner `Err` is the run's own outcome rather than an engine fault (blueprint D195):
     /// [`StageThree::MissingInput`] is a required input that resolved to no document, which the
@@ -4903,14 +4907,76 @@ where
         phase: &SnapshotPhase,
         item: ItemId,
     ) -> Result<Result<AssembledPrompt, StageThree>, EngineError> {
-        let spec = match self
+        let mut spec = match self
             .phase_spec(run, snapshot, step, phase, item, true)
             .await?
         {
             Ok(spec) => spec,
             Err(missing) => return Ok(Err(StageThree::MissingInput(missing))),
         };
+        // MOD-7 milestone 4 (D125): here and not in `phase_spec`, which is also the handoff's
+        // builder; a handoff reads no file.
+        self.with_excerpts(run, step, item, &mut spec).await?;
         Ok(assemble(&spec, self.parts.scrubber).map_err(StageThree::Refused))
+    }
+
+    /// ANA-5 §4.5 for a phase prompt (MOD-7 milestone 4, plan D107–D109, D125): the roots, then
+    /// the shared pass, into `spec.excerpts`.
+    ///
+    /// The scope is `run.repo_scope` joined to the names of `repos(run.project_id)`. An id with no
+    /// row there is left out with a note. The roots are this step's `run_step_tree` rows, else
+    /// this box's `repo_box_path` rows, else `no_path` (`excerpt_roots`). A step with no tree rows
+    /// at all, which is a fan-out group before its candidates are prepared (`drive_group`, OQ-32),
+    /// that read a root from `repo_box_path` says so (D108). The item is re-read for
+    /// `touched_paths`, with the same read `phase_spec` uses. Everything else, the placeholder
+    /// test, the residual, the blocking read and the scrub filter, is `excerpts_for`'s.
+    ///
+    /// # Errors
+    /// A store read's failure. Nothing about the excerpts themselves is an error: §4.5 fails open.
+    async fn with_excerpts(
+        &self,
+        run: &Run,
+        step: &RunStep,
+        item: ItemId,
+        spec: &mut PromptSpec,
+    ) -> Result<(), EngineError> {
+        let row = self.item(item).await?;
+        let repos = self.parts.store.repos(run.project_id).await?;
+        let mut notes = Vec::new();
+        let mut scope = Vec::with_capacity(run.repo_scope.len());
+        for id in &run.repo_scope {
+            match repos.iter().find(|repo| repo.id == *id) {
+                Some(repo) => scope.push((*id, repo.name.clone())),
+                None => notes.push(format!(
+                    "excerpt: repo `{id}` in the run's scope has no row in its project; left out"
+                )),
+            }
+        }
+        let trees = self.parts.store.step_trees(step.id).await?;
+        let mut paths = Vec::new();
+        for (id, _) in &scope {
+            paths.extend(self.parts.store.repo_box_paths(*id).await?);
+        }
+        let roots = excerpt_roots(&scope, &trees, &paths, self.parts.box_id);
+        // D108: a fan-out group assembles before any candidate tree exists.
+        if trees.is_empty()
+            && roots
+                .iter()
+                .any(|root| root.source == RootSource::RepoBoxPath)
+        {
+            notes.push(
+                "excerpt: no run_step_tree row yet for this step; roots read from repo_box_path"
+                    .to_owned(),
+            );
+        }
+        let input = PassInput {
+            roots,
+            touched_prefixes: touched_prefixes(&row.touched_paths, &repos),
+            notes,
+        };
+        let excerpts = excerpts_for(spec, input, &self.parts.app, self.parts.scrubber).await;
+        spec.excerpts = excerpts;
+        Ok(())
     }
 
     /// The phase's [`PromptSpec`] for `step`: its resolved inputs, its pinned template, its
@@ -5025,9 +5091,10 @@ where
             // winning (`model::skill::resolve`); the assembler's `select` decides which render and
             // records every candidate in `trim_record.skill_choices`.
             skills,
-            // §4.5's ranker needs a resolved repo root and `repo_box_path` has no writer the walk
-            // can reach, so the audit records the caps a pass *would* have run under and nothing
-            // else — the shape `crates/htui/src/preview.rs:274-295` already ships.
+            // The pass runs in `assemble_prompt` (`Self::with_excerpts`, MOD-7 milestone 4 D125),
+            // not here: this builder is also the promote/handoff path's, and a handoff never reads
+            // a file. So the caps are recorded and nothing else, and `with_excerpts` replaces this
+            // for a phase prompt.
             excerpts: no_excerpts(caps),
             command_queue: phase.command_queue != htui_core::model::CommandQueue::Off,
             // Plan D67: what the previous attempt's winner left — its failed verify and its diff —
@@ -5747,11 +5814,11 @@ fn chat_dirs(trees: &[RunStepTree], repos: &[Repo]) -> Option<(PathBuf, Vec<Path
     Some((cwd, extra_dirs))
 }
 
-/// An excerpt set with no files whose audit records the caps a pass *would* have run under.
+/// An excerpt set with no files, whose audit records the caps a pass *would* have run under.
 ///
-/// §4.5's ranker needs a resolved repo root and `repo_box_path` has no writer the walk can reach,
-/// so this is the shape `crates/htui/src/preview.rs:274-295` already ships — for a phase step and,
-/// with nothing to rank at all, for the judge (plan D53).
+/// Used where no pass runs: `phase_spec`, which the handoff path shares (D125), and the judge,
+/// whose placeholder set cannot place `{{excerpts}}` (D109). A phase prompt's set is
+/// `Self::with_excerpts`'.
 fn no_excerpts(caps: htui_core::prompt::excerpt::ExcerptCaps) -> ExcerptSet {
     ExcerptSet {
         files: Vec::new(),
@@ -12171,6 +12238,404 @@ mod tests {
             "the seeded `RUN_2` and this one; one row per step, each committed to the primary; a \
              `done` item closes as `done` (MOD-38 plan D6)"
         );
+    }
+
+    // -- MOD-7 milestone 4: excerpts reach a phase prompt (D107-D109, D125, D133) ---------------
+
+    /// `FEAT-3`'s `touched_paths`, set through the real writer.
+    async fn touch_feat_3(harness: &Harness, paths: &[&str]) {
+        let row = harness.orch.item(ids::HTUI_FEAT_3).await;
+        harness
+            .orch
+            .store
+            .update_item(
+                row.id,
+                row.version,
+                ItemPatch {
+                    touched_paths: Some(paths.iter().map(|path| (*path).to_owned()).collect()),
+                    author_id: row.created_by,
+                    reason: "a test's touched paths".to_owned(),
+                    ..ItemPatch::default()
+                },
+            )
+            .await
+            .expect("the item's version is current");
+    }
+
+    /// Writes `dir/<repo>/<file>` and every directory above it.
+    fn write_tree(dir: &std::path::Path, repo: RepoId, file: &str, body: &str) {
+        let path = dir.join(repo.to_string()).join(file);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(path, body).expect("write");
+    }
+
+    /// The prologue every excerpt case shares: the primary repo `htui` holding `src/lib.rs` with
+    /// `body` in a real tree under `dir`, the fake isolator rooted there, `FEAT-3` touching that
+    /// file, and `FEAT-3` parked at `prd` (`skills_prologue`).
+    async fn excerpt_prologue(
+        harness: &Harness,
+        dir: &std::path::Path,
+        body: &str,
+    ) -> (
+        RepoId,
+        htui_core::model::Run,
+        GraphSnapshot,
+        htui_core::model::RunStep,
+    ) {
+        let repo = harness.add_primary_repo().await;
+        write_tree(dir, repo, "src/lib.rs", body);
+        harness.orch.isolator.root_trees_at(dir);
+        touch_feat_3(harness, &["src/lib.rs"]).await;
+        let (row, snapshot, prd) = skills_prologue(harness).await;
+        (repo, row, snapshot, prd)
+    }
+
+    /// The `htui` / `run_step_tree` root record, unscanned-truncation false.
+    fn step_tree_root() -> htui_core::prompt::excerpt::RootRecord {
+        htui_core::prompt::excerpt::RootRecord {
+            repo: "htui".to_owned(),
+            source: htui_core::prompt::excerpt::RootSource::RunStepTree,
+            scan_truncated: false,
+        }
+    }
+
+    /// MOD-7 milestone 4 (plan D107, D125): stage 3 reads the step's own tree, and the touched
+    /// file reaches the prompt and its audit.
+    #[tokio::test]
+    async fn a_phase_prompt_reads_excerpts_from_the_step_tree() {
+        use htui_core::prompt::excerpt::ExcerptReason;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        harness_engine!(harness.orch, engine);
+
+        let prompt = engine
+            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .await
+            .expect("no store fault")
+            .expect("the `prd` prompt assembles");
+
+        assert!(
+            prompt.text.contains("<file path=\"htui:src/lib.rs\""),
+            "{}",
+            prompt.text
+        );
+        assert_eq!(prompt.trim.excerpts.roots, vec![step_tree_root()]);
+        assert!(
+            prompt
+                .trim
+                .excerpts
+                .files
+                .iter()
+                .any(|file| file.path == "src/lib.rs" && file.reason == ExcerptReason::TouchedPath),
+            "{:?}",
+            prompt.trim.excerpts.files
+        );
+    }
+
+    /// Plan D109: a template that does not place `{{excerpts}}` reads nothing, and says so.
+    #[tokio::test]
+    async fn a_template_without_excerpts_runs_no_pass() {
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        harness_engine!(harness.orch, engine);
+        let mut spec = engine
+            .phase_spec(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                true,
+            )
+            .await
+            .expect("the spec is built")
+            .expect("`prd` requires nothing");
+        spec.body = htui_core::prompt::body_of("verdict")
+            .expect("`verdict` is a default body")
+            .to_owned();
+
+        engine
+            .with_excerpts(&row, &prd, ids::HTUI_FEAT_3, &mut spec)
+            .await
+            .expect("no store fault");
+
+        assert!(spec.excerpts.files.is_empty());
+        assert_eq!(spec.excerpts.audit.considered, 0);
+        assert_eq!(spec.excerpts.audit.roots, vec![step_tree_root()]);
+        assert!(
+            spec.excerpts
+                .notes
+                .iter()
+                .any(|note| note.contains("places no {{excerpts}}; nothing was read")),
+            "{:?}",
+            spec.excerpts.notes
+        );
+    }
+
+    /// Plan OQ-30, D119: a file the scrubber refuses is dropped with a note, and the prompt is
+    /// still sent rather than refused.
+    #[tokio::test]
+    async fn a_scrubber_refused_excerpt_is_dropped_with_a_note() {
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_, row, snapshot, prd) = excerpt_prologue(
+            &harness,
+            dir.path(),
+            "// -----BEGIN RSA PRIVATE KEY-----\npub fn marker() {}\n",
+        )
+        .await;
+        harness_engine!(harness.orch, engine);
+
+        let prompt = engine
+            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .await
+            .expect("no store fault")
+            .expect("a refused excerpt is dropped, not the prompt");
+
+        assert!(!prompt.text.contains("<file path="), "{}", prompt.text);
+        assert!(
+            prompt.trim.notes.contains(
+                &"excerpt: `htui:src/lib.rs` dropped; the scrubber refused it (rule \
+                  `private_key_pem`)"
+                    .to_owned()
+            ),
+            "{:?}",
+            prompt.trim.notes
+        );
+        assert_eq!(prompt.trim.excerpts.selected, 1);
+        assert!(prompt.trim.excerpts.files.is_empty());
+    }
+
+    /// Plan D119 and the overlap rule (blueprint P-3, D133): with no primary repo a bare glob
+    /// names no repo, so nothing is selected **as touched**. Tier 5 may still pick the file.
+    #[tokio::test]
+    async fn a_bare_glob_without_a_primary_matches_no_repo() {
+        use htui_core::prompt::excerpt::{ExcerptReason, RootSource};
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let repo = RepoId::new();
+        harness
+            .orch
+            .store
+            .create_repo(NewRepo {
+                id: repo,
+                project_id: ids::PROJECT_HTUI,
+                name: "htui".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: false,
+            })
+            .await
+            .expect("the demo project has no repo yet");
+        write_tree(dir.path(), repo, "src/lib.rs", "pub fn marker() {}\n");
+        harness.orch.isolator.root_trees_at(dir.path());
+        touch_feat_3(&harness, &["src/lib.rs"]).await;
+        harness.free_feat_3().await;
+        let CommandOutcome::Started { run, .. } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: Some(vec![repo]),
+            })
+            .await
+            .expect("an explicit scope of the project's repo")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        let row = harness.orch.run(run).await;
+        let snapshot = snapshot_of(&harness, run).await;
+        let prd = harness.orch.steps(run).await.remove(0);
+        harness_engine!(harness.orch, engine);
+
+        let prompt = engine
+            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .await
+            .expect("no store fault")
+            .expect("the `prd` prompt assembles");
+
+        assert!(
+            !prompt
+                .trim
+                .excerpts
+                .files
+                .iter()
+                .any(|file| file.reason == ExcerptReason::TouchedPath),
+            "{:?}",
+            prompt.trim.excerpts.files
+        );
+        assert_eq!(
+            prompt.trim.excerpts.roots[0].source,
+            RootSource::RunStepTree
+        );
+        assert_eq!(
+            prompt.trim.excerpts.considered, 1,
+            "the tree was listed: {:?}",
+            prompt.trim.notes
+        );
+        assert!(
+            !prompt
+                .trim
+                .notes
+                .iter()
+                .any(|note| note.contains("could not be listed")),
+            "{:?}",
+            prompt.trim.notes
+        );
+    }
+
+    /// Plan D108 (blueprint P-4): a step with no `run_step_tree` row, which is a fan-out group
+    /// before its candidates exist, reads this box's `repo_box_path` checkout and says so.
+    #[tokio::test]
+    async fn a_step_without_trees_reads_repo_box_path_with_a_note() {
+        use htui_core::prompt::excerpt::RootSource;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let repo = harness.add_primary_repo().await;
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir_all(checkout.join("src")).expect("mkdir");
+        std::fs::write(checkout.join("src/lib.rs"), "pub fn marker() {}\n").expect("write");
+        harness
+            .orch
+            .store
+            .upsert_repo_box_path(&htui_core::model::RepoBoxPath {
+                repo_id: repo,
+                box_id: harness.orch.box_id(),
+                local_path: checkout.to_string_lossy().into_owned(),
+                updated_at: harness.orch.clock.now(),
+            })
+            .await
+            .expect("the repo and the box both have rows");
+        touch_feat_3(&harness, &["src/lib.rs"]).await;
+        let (row, snapshot, prd) = skills_prologue(&harness).await;
+        let group = htui_core::model::RunStep {
+            id: StepId::new(),
+            ..prd.clone()
+        };
+        assert!(
+            harness
+                .orch
+                .store
+                .step_trees(group.id)
+                .await
+                .expect("MemStore never fails a read")
+                .is_empty(),
+            "an unknown step has no tree rows"
+        );
+        harness_engine!(harness.orch, engine);
+        let mut spec = engine
+            .phase_spec(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                true,
+            )
+            .await
+            .expect("the spec is built")
+            .expect("`prd` requires nothing");
+
+        engine
+            .with_excerpts(&row, &group, ids::HTUI_FEAT_3, &mut spec)
+            .await
+            .expect("no store fault");
+
+        assert_eq!(spec.excerpts.audit.roots[0].source, RootSource::RepoBoxPath);
+        assert!(
+            spec.excerpts
+                .files
+                .iter()
+                .any(|file| file.repo == "htui" && file.path == "src/lib.rs"),
+            "{:?}",
+            spec.excerpts.files
+        );
+        assert!(
+            spec.excerpts.notes.contains(
+                &"excerpt: no run_step_tree row yet for this step; roots read from repo_box_path"
+                    .to_owned()
+            ),
+            "{:?}",
+            spec.excerpts.notes
+        );
+    }
+
+    /// Plan D125 (blueprint H-8): `phase_spec` is also the handoff's builder, so it keeps
+    /// `no_excerpts`; the handoff opening reads no file, while the phase prompt of the same
+    /// fixture does.
+    #[tokio::test]
+    async fn a_handoff_spec_carries_no_excerpts_and_runs_no_pass() {
+        use crate::command::OpeningPath;
+        use crate::graph::GraphSource as _;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        harness_engine!(harness.orch, engine);
+        let empty = super::no_excerpts(super::settings::resolve_excerpt_caps(&engine.parts.app).0);
+
+        // (1) The handoff's spec builder records the caps and nothing else.
+        let spec = engine
+            .phase_spec(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                false,
+            )
+            .await
+            .expect("the spec is built")
+            .expect("not strict: no input is refused");
+        assert_eq!(spec.excerpts, empty);
+
+        // (2) `handoff_spec` keeps it through `..phase`.
+        let template = harness
+            .orch
+            .graphs()
+            .prompt_template(ids::PROJECT_HTUI, "handoff", None)
+            .await
+            .expect("the fake graph source never fails")
+            .expect("the demo project has a `handoff` template");
+        let handoff =
+            crate::promote::handoff_spec(spec, &template, &[], &[], None, "why".to_owned());
+        assert_eq!(handoff.excerpts, empty);
+
+        // (4) The phase prompt of the same fixture does read the file.
+        let prompt = engine
+            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .await
+            .expect("no store fault")
+            .expect("the `prd` prompt assembles");
+        assert!(
+            prompt.text.contains("<file path=\"htui:src/lib.rs\""),
+            "{}",
+            prompt.text
+        );
+
+        // (3) The opening a promotion builds carries no file.
+        let CommandOutcome::Promoted { opening, .. } = harness
+            .dispatch(Command::PromoteStep {
+                run: row.id,
+                step: prd.id,
+                chat_open: false,
+            })
+            .await
+            .expect("a parked step")
+        else {
+            panic!("`PromoteStep` answers `Promoted`");
+        };
+        let OpeningPath::Handoff { text, .. } = &opening.path else {
+            panic!("the fake agent row does not resume: {:?}", opening.path);
+        };
+        assert!(!text.contains("<file path="), "{text}");
     }
 
     // -- MOD-9 D44: skills reach the run -------------------------------------------------------
