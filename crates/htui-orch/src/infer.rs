@@ -74,7 +74,10 @@ impl MatchedBy {
     /// `remote` or `name`, the word the Hierarchy section's notice uses.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
-        todo!()
+        match self {
+            Self::Remote => "remote",
+            Self::Name => "name",
+        }
     }
 }
 
@@ -106,8 +109,100 @@ pub enum Choice {
 /// strips it itself.
 #[must_use]
 pub fn normalise_remote(url: &str) -> Option<String> {
-    let _ = url;
-    todo!()
+    let trimmed = url.trim().trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let s = trimmed.trim_end_matches('/');
+    if s.is_empty() {
+        return None;
+    }
+
+    if let Some((scheme, rest)) = s.split_once("://") {
+        return match scheme.to_ascii_lowercase().as_str() {
+            "https" | "http" | "ssh" | "git" | "git+ssh" | "ssh+git" => network_key(rest),
+            "file" => file_key(rest),
+            _ => None,
+        };
+    }
+    if s.starts_with('/') {
+        return file_key(s);
+    }
+    if has_drive(s) {
+        return file_key(&s.replace('\\', "/"));
+    }
+    scp_key(s)
+}
+
+/// `host/path` from a scheme URL's text after `://`: userinfo and a numeric port dropped, the host
+/// lowercased, the path's repeated `/` collapsed and its leading `/` removed.
+fn network_key(rest: &str) -> Option<String> {
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    // Userinfo ends at the last `@`: everything up to it, credentials included, is dropped here.
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = match host_port.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => host,
+        _ => host_port,
+    };
+    host_path(host, path)
+}
+
+/// `host/path` from an scp-like `[user@]host:path`, or `None` when the text is not one: a `:` must
+/// come before any `/`.
+fn scp_key(s: &str) -> Option<String> {
+    let (before, path) = s.split_once(':')?;
+    if before.contains('/') {
+        return None;
+    }
+    let host = before.rsplit_once('@').map_or(before, |(_, host)| host);
+    host_path(host, path)
+}
+
+/// `host/path`, the host lowercased and the path collapsed without its leading `/`; `None` when
+/// either is empty.
+fn host_path(host: &str, path: &str) -> Option<String> {
+    let path = collapse_slashes(path);
+    let path = path.trim_start_matches('/');
+    if host.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some(format!("{}/{path}", host.to_ascii_lowercase()))
+}
+
+/// `file:` and the collapsed path. A `/` in front of a drive (`file:///C:/…`) is dropped so the
+/// URL and the bare drive path share a key.
+fn file_key(path: &str) -> Option<String> {
+    let path = collapse_slashes(path);
+    let path = match path.strip_prefix('/') {
+        Some(rest) if has_drive(rest) => rest,
+        _ => path.as_str(),
+    };
+    if path.is_empty() || path == "/" {
+        return None;
+    }
+    Some(format!("file:{path}"))
+}
+
+/// `^[A-Za-z]:[\\/]`: a Windows drive path.
+fn has_drive(s: &str) -> bool {
+    matches!(
+        s.as_bytes(),
+        [letter, b':', b'\\' | b'/', ..] if letter.is_ascii_alphabetic()
+    )
+}
+
+/// `s` with every run of `/` folded to one.
+fn collapse_slashes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut previous_slash = false;
+    for ch in s.chars() {
+        let slash = ch == '/';
+        if !(slash && previous_slash) {
+            out.push(ch);
+        }
+        previous_slash = slash;
+    }
+    out
 }
 
 /// `find_checkouts_with(root, Limits::DEFAULT)`. Synchronous `std::fs` plus one `gix::open` per
@@ -144,8 +239,46 @@ pub fn find_checkouts_with(root: &Path, limits: Limits) -> Scan {
 /// none `NoMatch`. A `remote_url` that does not normalise counts as none.
 #[must_use]
 pub fn choose(repo: &Repo, checkouts: &[Checkout], held: &BTreeSet<PathBuf>) -> Choice {
-    let _ = (repo, checkouts, held);
-    todo!()
+    let free: Vec<&Checkout> = checkouts
+        .iter()
+        .filter(|checkout| !held.contains(&checkout.path))
+        .collect();
+    let key = repo.remote_url.as_deref().and_then(normalise_remote);
+
+    if let Some(key) = &key {
+        let by_remote: Vec<&Checkout> = free
+            .iter()
+            .copied()
+            .filter(|checkout| checkout.remote_keys.iter().any(|theirs| theirs == key))
+            .collect();
+        if let Some(choice) = decide(&by_remote, MatchedBy::Remote) {
+            return choice;
+        }
+    }
+
+    // OQ-31: when the repo has a key, a same-named checkout with any remote is one whose remotes
+    // all normalise elsewhere (rung 1 found none equal), so it is a fork or another project.
+    let by_name: Vec<&Checkout> = free
+        .iter()
+        .copied()
+        .filter(|checkout| checkout.name == repo.name)
+        .filter(|checkout| key.is_none() || checkout.remote_keys.is_empty())
+        .collect();
+    decide(&by_name, MatchedBy::Name).unwrap_or(Choice::NoMatch)
+}
+
+/// One rung's verdict: `None` when it had no candidate, so the next rung decides.
+fn decide(candidates: &[&Checkout], by: MatchedBy) -> Option<Choice> {
+    match candidates {
+        [] => None,
+        [only] => Some(Choice::Inferred {
+            path: only.path.clone(),
+            by,
+        }),
+        several => Some(Choice::Ambiguous {
+            candidates: several.len(),
+        }),
+    }
 }
 
 #[cfg(test)]
