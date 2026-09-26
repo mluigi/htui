@@ -686,9 +686,9 @@ where
         let now = self.now();
         let lease = now + self.lease_times().ttl;
         // Anything but `Admitted` is a refusal. `MissingTags` is `R-ORCH-10`'s: `claim_run`
-        // already failed the run and blocked its item, and the engine adds the note (D78). Every
-        // other verdict is ANA-2 §4.7's admission, box full or overlap (plan D83), which wrote
-        // nothing and left the run `queued`.
+        // already failed the run and blocked its item, and the engine adds the note (D78). The
+        // three verdicts named in the last arm are ANA-2 §4.7's admission, not claimable, box full
+        // or overlap (plan D83), which wrote nothing and left the run as it was.
         let claim = self
             .parts
             .store
@@ -696,7 +696,7 @@ where
             .await?;
         match claim {
             Claim::Admitted => {}
-            // Matched before the catch-all, so it can never reach the worker as `ClaimRefused`
+            // Its own arm, never `ClaimRefused`, so it can never reach the worker as a refusal
             // and be re-queued (`htui/src/run_worker.rs`'s two re-queue arms, blueprint H-3).
             Claim::MissingTags { missing } => {
                 let item = Self::item_of(&self.run(run).await?)?;
@@ -713,7 +713,11 @@ where
                     missing,
                 });
             }
-            claim => return Err(EngineError::ClaimRefused { run, claim }),
+            // Named, not a catch-all: a new `Claim` verdict is a compile error here until it is
+            // sorted into a refusal or not (blueprint R-43).
+            claim @ (Claim::NotClaimable | Claim::SlotFull { .. } | Claim::Overlaps { .. }) => {
+                return Err(EngineError::ClaimRefused { run, claim });
+            }
         }
 
         let rest = self.walk_leased(run, lease, self.run_to_rest(run)).await?;
