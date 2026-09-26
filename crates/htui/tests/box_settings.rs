@@ -686,6 +686,37 @@ async fn a_second_save_while_saving_sends_nothing() {
     assert!(frame.contains("edit_box in flight"), "{frame}");
 }
 
+/// §6.4: a refused save keeps the editor over its text, says why, and frees the next save; an
+/// offline refusal is never followed by a `Boxes` that would clear `busy` instead.
+#[tokio::test]
+async fn a_refused_save_keeps_the_editor_and_frees_the_next_save() {
+    let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+
+    bench.key(&mut section, "t");
+    type_at(&bench, &mut section, ", vulkan");
+    bench.key(&mut section, "enter");
+    only_edit(&requests(&bench));
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "edit_box",
+            message: "store unreachable".to_owned(),
+        },
+    );
+
+    assert!(section.captures_input(), "the editor stays open");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("store unreachable"), "{frame}");
+    assert!(!frame.contains("saving\u{2026}"), "{frame}");
+    assert!(frame.contains("gpu, vulkan"), "{frame}");
+
+    bench.key(&mut section, "enter");
+    let (_, expected, _) = only_edit(&requests(&bench));
+    assert_eq!(expected, 0);
+    let frame = bench.render_section(&section, 100);
+    assert!(!frame.contains("edit_box in flight"), "{frame}");
+}
+
 /// D56 (the kinds section's `blocked`): no editor opens while a save is in flight, because that
 /// save's reply closes whatever editor is open and would take the new one's text with it.
 #[tokio::test]
