@@ -42,6 +42,7 @@ use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, MirrorAfterDelete};
 use crate::prompt_settings::{self, SettingsSnapshot};
 use crate::run_worker::{LiveChats, RunRuntime, RunServed};
+use crate::templates::{self, TemplateBody, TemplatesSnapshot};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
 
@@ -524,6 +525,23 @@ pub enum StoreRequest {
         /// The rung row's `updated_at` the editor opened on.
         expected: DateTime<Utc>,
     },
+    /// Every scope project's prompt templates, every version (MOD-9 D5).
+    Templates(Scope),
+    /// Append version `expected + 1` of `(project, name)` iff `expected` is its head (`None`: a new
+    /// name). The worker fills `created_by` (`this_user`); the view never holds a `UserId`.
+    SaveTemplate {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The project the template belongs to.
+        project: ProjectId,
+        /// The template's name; its role is `TemplateRole::of_name(name)`.
+        name: String,
+        /// The whole new body, which the store refuses if `parse` does. Its `Debug` is its
+        /// length.
+        body: TemplateBody,
+        /// The head version the editor opened on: the CAS token, `None` for a name with no row.
+        expected: Option<i32>,
+    },
     /// The connection as the Settings > Connection section shows it (MOD-15 M6, D4): backend
     /// label, whether a DSN is stored (never the DSN), the mirror's `cache_meta`, the last dial.
     ConnectionInfo,
@@ -624,6 +642,9 @@ impl StoreRequest {
             Self::PromptSettings(..) => "prompt_settings",
             Self::SetSetting { .. } => "set_setting",
             Self::ClearSetting { .. } => "clear_setting",
+            // The two of `templates::REQUEST_NAMES`, in that order (MOD-9 D5).
+            Self::Templates(..) => "templates",
+            Self::SaveTemplate { .. } => "save_template",
             // The four of `connection::REQUEST_NAMES`, in that order (MOD-15 M6 D4).
             Self::ConnectionInfo => "connection_info",
             Self::SetDsn(_) => "set_dsn",
@@ -785,6 +806,12 @@ pub enum StoreReply {
     /// A settings write missed its CAS token (M5 D14, PRD D8): the rungs as they are now, for the
     /// editor to reload against. The editor keeps its typed text and retries only on `Enter`.
     PromptSettingsStale(Box<SettingsSnapshot>),
+    /// The scope's prompt templates, freshly read: the answer to [`StoreRequest::Templates`] and to
+    /// a [`StoreRequest::SaveTemplate`] that applied (MOD-9 D5).
+    Templates(Box<TemplatesSnapshot>),
+    /// A template save missed its CAS token (PRD D5): the templates as they are now, for the editor
+    /// to reload against. The editor keeps its typed text and retries only by hand.
+    TemplatesStale(Box<TemplatesSnapshot>),
     /// `ConnectionInfo`, and every connection writer's success (D4): the section re-renders from
     /// it and never patches a field of its own into what it already had.
     Connection(ConnectionSnapshot),
@@ -1078,6 +1105,11 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::PromptSettings(..)
         | StoreRequest::SetSetting { .. }
         | StoreRequest::ClearSetting { .. } => prompt_settings::serve(backend, request).await?,
+        // The two template requests, or-ed for the reason the arms above are: a guard does not count
+        // towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12).
+        StoreRequest::Templates(..) | StoreRequest::SaveTemplate { .. } => {
+            templates::serve(backend, request).await?
+        }
         // The four connection requests, or-ed for the same reason the twenty-four above are: a
         // guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would
         // be an E0004 here (MOD-15 M3 plan F-12, M6 plan D9). Only the read is answered: the three

@@ -10,11 +10,11 @@ use htui_agent::event::{
     DriverEnvelope, DriverEvent, PermissionOption, PlanEntry, StopReason, TerminalReason, ToolKind,
 };
 use htui_core::model::SessionEvent;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::app::Handled;
 use crate::ui::Theme;
+use crate::ui::diff::diff_style;
 use crossterm::event::{KeyCode, KeyEvent};
 
 /// Where a tool call stands.
@@ -621,19 +621,6 @@ impl Transcript {
                 vec![Line::styled(format!("· {update}"), theme.dim)]
             }
         }
-    }
-}
-
-/// `+` accents, `-` errors, everything else is plain — the two gutters a reader looks for.
-fn diff_style(line: &str, theme: &Theme) -> Style {
-    if line.starts_with("+++") || line.starts_with("---") {
-        theme.dim
-    } else if line.starts_with('+') {
-        theme.accent
-    } else if line.starts_with('-') {
-        theme.error
-    } else {
-        theme.dim
     }
 }
 

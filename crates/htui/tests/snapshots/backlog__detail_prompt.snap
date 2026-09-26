@@ -23,12 +23,12 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │                                                     ││box                           80      80  n│
 │                                                     ││skills                        88      88  n│
 │                                                     ││                                           │
+│                                                     ││skills    tests v1 · project · always → act│
+│                                                     ││          rust-style v2 · project · always │
+│                                                     ││                                           │
 │                                                     ││notes     preview: the template is chosen b│
 │                                                     ││          preview: documents are latest-per│
 │                                                     ││          preview: the `summary` kind is ex│
-│                                                     ││          preview: project-level skill bind│
-│                                                     ││          preview: output_kind defaults to │
-│                                                     ││          preview: command_queue exposure i│
-│                                                     ││          preview: attempt 1, so verify_fai│
+│                                                     ││          preview: phase-level skills come │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help

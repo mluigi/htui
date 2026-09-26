@@ -14,9 +14,9 @@
 use std::collections::BTreeMap;
 
 use htui_core::model::{
-    Agent, AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
-    BoxTool, CitationKind, CommandQueue, CoverageRow, Document, DocumentHead, DocumentId, Gate,
-    GateOutcome, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
+    Activation, Agent, AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile,
+    BoxRow, BoxTool, CitationKind, CommandQueue, CoverageRow, Document, DocumentHead, DocumentId,
+    Gate, GateOutcome, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
     ItemSummary, LinkEdge, LinkGraph, LinkKind, Note, PhaseAgent, PhaseId, Priority, Project,
     ProjectId, ProjectRef, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, Requirement,
     RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementRevision,
@@ -1415,17 +1415,16 @@ impl PgStore {
         .map_err(map_sqlx)
     }
 
-    /// The skills in force for a project, or for one phase of it: `R-SKL-2`'s collapse
-    /// (`docs/ANA-5.md` §4.2), already resolved to a version and a body.
+    /// The skill candidates of one step (ANA-22 §6 items 2-3): the global attachments, the
+    /// project's, and — with `phase` — that phase's, resolved most-specific-wins.
     ///
-    /// Two `SELECT`s — the project level (`phase_id IS NULL`) and the phase level — and then
-    /// [`BoundSkill::collapse`] in Rust, exactly as `MemStore` does. The override rule and the
-    /// render order therefore have **one** definition rather than one per backend; expressing
-    /// `R-SKL-2` a second time in SQL would be a copy to keep in step.
-    /// [`SkillBinding::version_in_force`](htui_core::model::SkillBinding::version_in_force)
-    /// resolves `pinned_version` against the same rows for the
-    /// same reason, and a pin that names no `skill_version` drops the binding rather than
-    /// rendering it bodiless.
+    /// Two `SELECT`s — every version of every candidate skill, and the candidate attachments
+    /// (global rows, the project's, and the phase's) — then `htui_core::model::skill::resolve` in
+    /// Rust, exactly as `MemStore` does. The level rule and the render order therefore have
+    /// **one** definition rather than one per backend; expressing `R-SKL-2` a second time in SQL
+    /// would be a copy to keep in step. Inactive winners are included — the assembler's `select`
+    /// decides and records them — and a winning pin that names no version is a candidate with
+    /// `version: None` (plan D39).
     ///
     /// # Errors
     ///
@@ -1435,75 +1434,64 @@ impl PgStore {
         project: ProjectId,
         phase: Option<PhaseId>,
     ) -> Result<Vec<BoundSkill>> {
-        // Every version of every skill this project binds, once: `version_in_force` ignores
-        // another skill's rows, so one statement answers every binding of both levels.
-        let versions = sqlx::query_as!(
-            SkillVersion,
-            r#"
-            SELECT v.skill_id  AS "skill_id: SkillId",
-                   v.version,
-                   v.body,
-                   v.created_by AS "created_by: htui_core::model::UserId",
-                   v.created_at
-              FROM skill_version v
-             WHERE v.skill_id IN (SELECT skill_id FROM skill_binding WHERE project_id = $1)
-            "#,
-            project.as_uuid(),
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
-
-        let project_level = sqlx::query_as!(
+        // `None` binds SQL NULL, so `b.phase_id = $2` is NULL and only the project's
+        // `phase_id IS NULL` rows (and the global ones) apply.
+        let phase = phase.map(PhaseId::as_uuid);
+        let rows = sqlx::query_as!(
             SkillBindingRow,
             r#"
             SELECT b.id         AS "id: htui_core::model::SkillBindingId",
                    b.skill_id   AS "skill_id: SkillId",
-                   b.project_id AS "project_id: ProjectId",
+                   b.project_id AS "project_id?: ProjectId",
                    b.phase_id   AS "phase_id: PhaseId",
                    b.pinned_version,
                    b.position,
+                   b.activation AS "activation: Activation",
+                   b.globs,
+                   b.languages,
                    b.updated_at,
                    s.name
               FROM skill_binding b JOIN skill s ON s.id = b.skill_id
-             WHERE b.project_id = $1 AND b.phase_id IS NULL
+             WHERE b.project_id IS NULL
+                OR (b.project_id = $1 AND (b.phase_id IS NULL OR b.phase_id = $2))
             "#,
             project.as_uuid(),
+            phase,
         )
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
 
-        let phase_level = match phase {
-            None => Vec::new(),
-            Some(phase) => sqlx::query_as!(
-                SkillBindingRow,
-                r#"
-                SELECT b.id         AS "id: htui_core::model::SkillBindingId",
-                       b.skill_id   AS "skill_id: SkillId",
-                       b.project_id AS "project_id: ProjectId",
-                       b.phase_id   AS "phase_id: PhaseId",
-                       b.pinned_version,
-                       b.position,
-                       b.updated_at,
-                       s.name
-                  FROM skill_binding b JOIN skill s ON s.id = b.skill_id
-                 WHERE b.project_id = $1 AND b.phase_id = $2
-                "#,
-                project.as_uuid(),
-                phase.as_uuid(),
-            )
-            .fetch_all(&self.pool)
-            .await
-            .map_err(map_sqlx)?,
-        };
+        // The versions of exactly the skills those rows name, read after them (review finding 5):
+        // `skill_version` is append-only, so every version an attachment read above can name is
+        // already here, and a binding or re-pin committed between the two statements cannot
+        // resolve to a spurious `missing_version`. `version_in_force` ignores another skill's
+        // rows, so one statement answers every attachment of every level.
+        let skill_ids: Vec<Uuid> = rows.iter().map(|row| row.skill_id.as_uuid()).collect();
+        let versions = sqlx::query_as!(
+            SkillVersion,
+            r#"
+            SELECT v.skill_id   AS "skill_id: SkillId",
+                   v.version,
+                   v.body,
+                   v.source,
+                   v.created_by AS "created_by: htui_core::model::UserId",
+                   v.created_at
+              FROM skill_version v
+             WHERE v.skill_id = ANY($1)
+            "#,
+            &skill_ids,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
 
-        let bind = |rows: Vec<SkillBindingRow>| -> Vec<BoundSkill> {
+        Ok(htui_core::model::skill::resolve(
             rows.into_iter()
-                .filter_map(|row| row.bind(&versions))
-                .collect()
-        };
-        Ok(BoundSkill::collapse(bind(project_level), bind(phase_level)))
+                .map(SkillBindingRow::into_binding)
+                .collect(),
+            &versions,
+        ))
     }
 
     /// One box projected for the prompt's `box` section, or `None` when no row has that id.

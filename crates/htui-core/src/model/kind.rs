@@ -334,9 +334,36 @@ pub struct PromptTemplate {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A `prompt_template` row to append (MOD-9 plan D1): everything but `version` and the two
+/// instants, which the store assigns. `version` is the head's plus one, or 1 for a new name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewPromptTemplate {
+    /// `prompt_template.id`, minted client-side as a UUIDv7.
+    pub id: PromptTemplateId,
+    /// `prompt_template.project_id`.
+    pub project_id: ProjectId,
+    /// `prompt_template.name`; its role is `TemplateRole::of_name(name)`.
+    pub name: String,
+    /// `prompt_template.body`; the store refuses what `parse` refuses (plan D4).
+    pub body: String,
+    /// `prompt_template.created_by`.
+    pub created_by: UserId,
+}
+
+impl PromptTemplate {
+    /// Whether `name` may name a template (plan D4): non-empty, no leading or trailing whitespace,
+    /// no `\n` or `\r`, and no U+0000, which Postgres `text` cannot hold. Here rather than in
+    /// either store for `ItemKind::prefix_is_valid`'s reason: both stores refuse the same strings
+    /// with the same sentence.
+    #[must_use]
+    pub fn name_is_valid(name: &str) -> bool {
+        !name.is_empty() && name.trim() == name && !name.contains(['\n', '\r', '\0'])
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ItemKind;
+    use super::{ItemKind, PromptTemplate};
 
     /// The CHECK, byte for byte: `^[A-Z][A-Z0-9]{1,15}$` (`0001_init.sql:282-290`).
     ///
@@ -362,6 +389,24 @@ mod tests {
             "A_B",
         ] {
             assert!(!ItemKind::prefix_is_valid(bad), "`{bad}` is not a prefix");
+        }
+    }
+
+    /// MOD-9 plan D4: the rule both stores apply before `parse`.
+    #[test]
+    fn template_names_are_trimmed_single_line_and_non_empty() {
+        for good in ["implement", "judge", "a b", "é-1"] {
+            assert!(
+                PromptTemplate::name_is_valid(good),
+                "`{good}` names a template"
+            );
+        }
+        for bad in ["", " plan", "plan ", "a\nb", "a\rb", "\t", "a\0b"] {
+            assert!(
+                !PromptTemplate::name_is_valid(bad),
+                "`{}` does not name a template",
+                bad.escape_debug()
+            );
         }
     }
 }

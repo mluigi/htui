@@ -117,9 +117,9 @@ pub use item::{
     Item, ItemFilter, ItemPatch, ItemRevision, ItemSummary, NewItem, Resolution, Status,
 };
 pub use kind::{
-    CommandQueue, Gate, Isolation, ItemKind, ItemKindPatch, NewItemKind, NewStepGraph, PhaseAgent,
-    PhasePatch, ProjectSettings, PromptTemplate, ResolvedGraph, ResolvedPhase, StepGraph,
-    StepGraphPatch, StepGraphPhase,
+    CommandQueue, Gate, Isolation, ItemKind, ItemKindPatch, NewItemKind, NewPromptTemplate,
+    NewStepGraph, PhaseAgent, PhasePatch, ProjectSettings, PromptTemplate, ResolvedGraph,
+    ResolvedPhase, StepGraph, StepGraphPatch, StepGraphPhase,
 };
 pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode, UpstreamEntry};
 pub use note::{NewNote, Note};
@@ -141,7 +141,10 @@ pub use run::{
     prompt_summary,
 };
 pub use scope::{PromptScope, Scope};
-pub use skill::{BoundSkill, Skill, SkillBinding, SkillVersion};
+pub use skill::{
+    Activation, BoundSkill, ChoiceReason, Skill, SkillBinding, SkillChoice, SkillLevel,
+    SkillVersion,
+};
 pub use usage::UsageTotals;
 pub use user::{AppUser, CapabilityTag};
 
@@ -190,6 +193,12 @@ mod tests {
                 "duplicate",
             ],
         );
+    }
+
+    /// `0007_skill_attachments.sql`'s `CHECK (activation IN ('always', 'glob', 'off'))`.
+    #[test]
+    fn activation_matches_check_list() {
+        check_enum(Activation::ALL, &["always", "glob", "off"]);
     }
 
     #[test]

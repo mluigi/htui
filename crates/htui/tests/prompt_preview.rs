@@ -5,7 +5,7 @@
 //! (blueprint E-1, finding F-50).
 //!
 //! Everything here runs the **whole** path the binary runs: the Backlog tab issues the request,
-//! the agent runtime spawns the deferred task on an owned `Backend` clone, the task does the eight
+//! the agent runtime spawns the deferred task on an owned `Backend` clone, the task does the nine
 //! store reads and calls the same `assemble()` MOD-4 will call, and the reply is rendered by the
 //! sub-tab. That is the point of the preview and the reason ANA-5 §12 criterion 12 is asserted from
 //! here rather than only over a fake reader.
@@ -20,7 +20,10 @@ use htui::store_worker::{Origin, RequestEnvelope, StoreReply, StoreRequest};
 use htui::testkit::Harness;
 use htui::ui::tabs::backlog::BacklogTab;
 use htui_agent::registry::DriverFactory;
-use htui_core::model::{ItemId, Scope, WorkspaceSummary};
+use htui_core::fixtures::ids;
+use htui_core::model::{
+    Activation, ChoiceReason, ItemId, Scope, SkillChoice, SkillLevel, WorkspaceSummary,
+};
 use htui_core::store::{MemStore, ReadStore as _};
 use htui_store::Backend;
 
@@ -178,7 +181,8 @@ async fn the_preview_declares_its_stand_ins() {
     // be a deliberate edit in two files rather than a silent one in one.
     for stand_in in [
         "preview: documents are latest-per-kind; ANA-2 input_kinds resolution arrives with MOD-4",
-        "preview: project-level skill bindings only; a phase binding needs a phase id (MOD-4)",
+        "preview: phase-level skills come from the first phase of the item's graph that uses \
+         this template; a glob attachment records no_path because no root resolves",
         "preview: output_kind defaults to the template name; the phase row's value arrives with \
          MOD-4",
         "preview: command_queue exposure is a phase setting (R-MCP-4); absent until MOD-4",
@@ -188,6 +192,100 @@ async fn the_preview_declares_its_stand_ins() {
             "blueprint D.4's verbatim note is missing: `{stand_in}`"
         );
     }
+}
+
+/// MOD-9 D45's skills stand-in, verbatim.
+const SKILLS_NOTE: &str = "preview: phase-level skills come from the first phase of the item's \
+                           graph that uses this template; a glob attachment records no_path \
+                           because no root resolves";
+
+/// The start of MOD-9 D45's second note, the one a preview adds when no phase uses its template.
+const NO_PHASE: &str = "preview: no phase of this item's graph uses template";
+
+/// An `Always` choice that rendered, as the record spells it.
+fn active(
+    skill: htui_core::model::SkillId,
+    name: &str,
+    version: i32,
+    level: SkillLevel,
+) -> SkillChoice {
+    SkillChoice {
+        skill,
+        name: name.to_owned(),
+        version: Some(version),
+        level,
+        activation: Activation::Always,
+        active: true,
+        reason: ChoiceReason::Always,
+    }
+}
+
+#[tokio::test]
+async fn the_preview_carries_the_phase_skills_of_the_matching_phase() {
+    // MOD-9 D45: FEAT-1 runs the `feature` graph, whose `implement` phase uses the `implement`
+    // template and carries the demo's one phase-level binding (`rust-style` pinned to v1). The
+    // preview under that template resolves the phase and shows what the step would get.
+    let backend = Backend::memory(MemStore::demo());
+    let scope = platform_scope().await;
+    let preview = preview::build(&backend, item_id("FEAT-1").await, Some("implement"), &scope)
+        .await
+        .expect("the demo store answers every prompt read");
+    let assembled = preview.outcome.as_ref().expect("the demo item assembles");
+
+    let tests = assembled
+        .text
+        .find("<skill name=\"tests\" version=\"1\">")
+        .expect("the project's `tests` skill renders");
+    let rust_style = assembled
+        .text
+        .find("<skill name=\"rust-style\" version=\"1\">")
+        .expect("the phase pin holds `rust-style` at v1, not the project's v2");
+    assert!(tests < rust_style, "collapse order: position 0, then 2");
+    assert_eq!(
+        assembled.trim.skill_choices,
+        vec![
+            active(ids::SKILL_TESTS, "tests", 1, SkillLevel::Project),
+            active(ids::SKILL_RUST_STYLE, "rust-style", 1, SkillLevel::Phase),
+        ],
+        "D45: the phase-level binding wins over the project one"
+    );
+    let notes = &assembled.trim.notes;
+    assert!(
+        notes.iter().any(|note| note == SKILLS_NOTE),
+        "the skills stand-in is recorded: {notes:#?}"
+    );
+    assert!(
+        !notes.iter().any(|note| note.starts_with(NO_PHASE)),
+        "a phase uses `implement`, so there is no no-phase note: {notes:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_template_no_phase_uses_is_noted_and_shows_project_skills() {
+    // MOD-9 D45's second note: the `feature` graph has no `research` phase, so only global and
+    // project attachments apply and the record says why.
+    let backend = Backend::memory(MemStore::demo());
+    let scope = platform_scope().await;
+    let preview = preview::build(&backend, item_id("FEAT-1").await, Some("research"), &scope)
+        .await
+        .expect("the demo store answers every prompt read");
+    let assembled = preview.outcome.as_ref().expect("the demo item assembles");
+
+    let notes = &assembled.trim.notes;
+    assert!(
+        notes.iter().any(|note| note
+            == "preview: no phase of this item's graph uses template `research`; global and \
+                project skills only"),
+        "D45's second note, verbatim: {notes:#?}"
+    );
+    assert_eq!(
+        assembled.trim.skill_choices,
+        vec![
+            active(ids::SKILL_TESTS, "tests", 1, SkillLevel::Project),
+            active(ids::SKILL_RUST_STYLE, "rust-style", 2, SkillLevel::Project),
+        ],
+        "no phase, so the project binding (unpinned, v2) is the one in force"
+    );
 }
 
 #[tokio::test]

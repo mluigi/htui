@@ -35,16 +35,18 @@ use crate::model::{
     CitationKind, Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId, GateOutcome,
     Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
     ItemRequirement, ItemRevision, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
-    NewItemKind, NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun,
-    NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, PromptScope, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
-    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunId, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch,
+    Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId,
+    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
+    ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
+use crate::prompt::template::{TemplateRole, parse};
 use crate::store::error::Result;
 
 /// The hop ceiling of [`ReadStore::upstream_summaries`], the amended §7.3 upstream walk
@@ -701,6 +703,29 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// The backend's own failures only.
     async fn phases(&self, graph: StepGraphId) -> Result<Vec<StepGraphPhase>>;
+
+    // prompt_template (MOD-9 milestone 1, plan D1-D4)
+
+    /// Appends version `head + 1` of `(new.project_id, new.name)` iff the head version is
+    /// `expected` (`None`: the name has no row yet), as one compare-and-set. Rows are never
+    /// updated or deleted (PRD D5): `step_graph_phase.template_version`, a run snapshot and
+    /// `trim_record.template` refer to versions by number. The reads stay inherent
+    /// (`MemStore::prompt_templates`), because `prompt_template` is not mirrored.
+    ///
+    /// Order, the same on every store (plan D4, blueprint D18): the token first, so a spent token
+    /// answers `Stale` even for bad input; then the name and the body (`parse` in the role
+    /// `TemplateRole::of_name(name)`); then the project and `created_by`.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "prompt_template" }`
+    /// when `expected` is `Some` and the name has no row;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for an invalid name, a body
+    /// `parse` refuses, or a project or `created_by` that names no row. Nothing is written.
+    async fn append_prompt_template(
+        &self,
+        new: NewPromptTemplate,
+        expected: Option<i32>,
+    ) -> Result<CasOutcome<PromptTemplate>>;
 
     // settings (D7, D8)
 
@@ -1409,6 +1434,39 @@ pub fn item_not_in_project(item: ItemId, project: ProjectId) -> String {
 #[must_use]
 pub fn reserved_phase_name(name: &str) -> String {
     format!("`{name}` is a reserved template name, not a phase name")
+}
+
+/// MOD-9 D4: a template name [`PromptTemplate::name_is_valid`] refuses, in the sentence both
+/// stores give it.
+#[must_use]
+pub fn invalid_template_name(name: &str) -> String {
+    format!(
+        "prompt_template.name `{}` must be non-empty, single-line, trimmed and free of NUL",
+        name.escape_debug()
+    )
+}
+
+/// MOD-9 D17: the `NotFound` id of a `(project, name)` pair, so both stores spell it alike.
+#[must_use]
+pub fn prompt_template_key(project: ProjectId, name: &str) -> String {
+    format!("{project}/{name}")
+}
+
+/// MOD-9 D4, D17: why a template may not be saved, or `None` when it may. The name rule first,
+/// then a body with U+0000 (which `parse` accepts and Postgres `text` cannot hold), then [`parse`]
+/// in the name's role; that last sentence is [`TemplateError`](crate::prompt::TemplateError)'s
+/// `Display`.
+#[must_use]
+pub fn prompt_template_refusal(name: &str, body: &str) -> Option<String> {
+    if !PromptTemplate::name_is_valid(name) {
+        return Some(invalid_template_name(name));
+    }
+    if body.contains('\0') {
+        return Some("prompt_template.body must not contain a NUL character".to_owned());
+    }
+    parse(TemplateRole::of_name(name), body)
+        .err()
+        .map(|err| err.to_string())
 }
 
 /// D6: the holder count, in the sentence the refusal carries.

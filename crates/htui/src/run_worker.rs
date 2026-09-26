@@ -32,9 +32,10 @@ use htui_agent::error::DriverError;
 use htui_agent::event::DoneEvent;
 use htui_agent::registry::DriverFactory;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, AgentSummary, BoxId, BoxProfile, DocumentHead, DocumentId, Item,
-    ItemId, NewDocument, PhaseAgent, PhaseId, ProjectId, PromptTemplate, RepoId, ResolvedGraph,
-    Run, RunId, RunStatus, RunStep, SnapshotCandidate, SnapshotPhase, StepId, UserId,
+    Agent, AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxProfile, DocumentHead,
+    DocumentId, Item, ItemId, NewDocument, PhaseAgent, PhaseId, ProjectId, PromptTemplate, RepoId,
+    ResolvedGraph, Run, RunId, RunStatus, RunStep, SnapshotCandidate, SnapshotPhase, StepId,
+    UserId,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{ReadStore as _, Result as StoreResult, StoreError, WriteStore as _};
@@ -2392,6 +2393,14 @@ impl GraphSource for BackendGraphs {
 
     async fn agent_boxes(&self, box_id: BoxId) -> StoreResult<Vec<AgentBox>> {
         self.0.agent_boxes(box_id).await
+    }
+
+    async fn bound_skills(
+        &self,
+        project: ProjectId,
+        phase: Option<PhaseId>,
+    ) -> StoreResult<Vec<BoundSkill>> {
+        self.0.bound_skills(project, phase).await
     }
 }
 

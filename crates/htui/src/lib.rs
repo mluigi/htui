@@ -16,6 +16,7 @@ pub mod catalogue;
 pub mod cli;
 pub mod concepts;
 pub mod connection;
+pub mod editor;
 pub mod event_loop;
 pub mod hierarchy;
 pub mod keymap;
@@ -25,6 +26,7 @@ pub mod prompt_settings;
 pub mod qdrant_settings_info;
 pub mod run_worker;
 pub mod store_worker;
+pub mod templates;
 pub mod terminal;
 pub mod ui;
 

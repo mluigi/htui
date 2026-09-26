@@ -354,8 +354,10 @@ impl Backend {
         }
     }
 
-    /// The skills in force for a project, or for one phase of it: `R-SKL-2`'s collapse
-    /// (`docs/ANA-5.md` §4.2).
+    /// A step's skill candidates for a project, or for one phase of it: the global, project and
+    /// phase attachments resolved most-specific-wins by `htui_core::model::skill::resolve`
+    /// (`R-SKL-2` as amended, MOD-9 D39). Inactive winners are included and a winning pin that
+    /// names no version is a candidate with `version: None`; the assembler's `select` decides.
     ///
     /// # Errors
     ///

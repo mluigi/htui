@@ -24,15 +24,16 @@ use htui_core::model::{
     ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus,
     DEFAULT_MAX_CONCURRENT_ITEMS, Document, GateOutcome, Isolation, Item, ItemId, ItemKind,
     ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, NewCommandRun,
-    NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch,
-    Priority, Project, ProjectId, ProjectPatch, PromptTemplateId, Repo, RepoBoxPath, RepoId,
-    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
-    RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
-    UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject, canonical_declared_tags, overlaps, scope_of,
+    NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo,
+    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note,
+    PhaseId, PhasePatch, Priority, Project, ProjectId, ProjectPatch, PromptTemplate,
+    PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
+    RequirementState, RequirementUpdate, Resolution, Run, RunId, RunKind, RunMode, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    canonical_declared_tags, overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -43,10 +44,10 @@ use htui_core::store::{
     close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
     finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project, illegal_move,
     invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
-    legal_move, not_a_fanout_candidate, not_a_terminal_status, references_no_row,
-    requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_step,
-    run_is_terminal, step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
-    withdrawn_requirement_cited,
+    legal_move, not_a_fanout_candidate, not_a_terminal_status, prompt_template_key,
+    prompt_template_refusal, references_no_row, requirement_withdrawn, reserved_phase_name,
+    resolution_not_closable, row_names_another_step, run_is_terminal, step_is_not_promotable,
+    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -2405,6 +2406,76 @@ impl WriteStore for PgStore {
     /// Whatever the driver reports, through [`map_sqlx`].
     async fn phases(&self, graph: StepGraphId) -> Result<Vec<StepGraphPhase>> {
         self.phase_rows(graph).await
+    }
+
+    // prompt_template (MOD-9 milestone 1)
+
+    /// D3 amended by blueprint D16: one `INSERT … SELECT … WHERE head IS NOT DISTINCT FROM $6 ON
+    /// CONFLICT DO NOTHING`. Two saves at one head: the second blocks on the unique index and then
+    /// inserts nothing (probed on 16.13). Zero rows is split by one head read, `cas_miss`'s
+    /// shape. Bad input pays the head read first so a spent token still answers `Stale` (D18,
+    /// review M2). A project or `created_by` that names no row is the FK's `23503`, which
+    /// [`map_sqlx`] turns into [`StoreError::Constraint`].
+    async fn append_prompt_template(
+        &self,
+        new: NewPromptTemplate,
+        expected: Option<i32>,
+    ) -> Result<CasOutcome<PromptTemplate>> {
+        let key = prompt_template_key(new.project_id, &new.name);
+        if let Some(refusal) = prompt_template_refusal(&new.name, &new.body) {
+            // No row can be named with a NUL, and binding one is `22021`, not an empty read.
+            let head = if new.name.contains('\0') {
+                None
+            } else {
+                self.prompt_template(new.project_id, &new.name, None)
+                    .await?
+            };
+            return match (head, expected) {
+                (Some(head), _) if Some(head.version) != expected => Ok(CasOutcome::Stale(head)),
+                (None, Some(_)) => Err(StoreError::NotFound {
+                    entity: "prompt_template",
+                    id: key,
+                }),
+                _ => Err(StoreError::Constraint(refusal)),
+            };
+        }
+
+        let inserted = sqlx::query_as!(
+            PromptTemplate,
+            r#"
+            INSERT INTO prompt_template (id, project_id, name, version, body, created_by)
+            SELECT $1, $2, $3, COALESCE($6::int, 0) + 1, $4, $5
+             WHERE (SELECT max(version) FROM prompt_template
+                     WHERE project_id = $2 AND name = $3) IS NOT DISTINCT FROM $6::int
+            ON CONFLICT (project_id, name, version) DO NOTHING
+            RETURNING id         AS "id: PromptTemplateId",
+                      project_id AS "project_id: ProjectId",
+                      name,
+                      version,
+                      body,
+                      created_by AS "created_by: UserId",
+                      created_at,
+                      updated_at
+            "#,
+            new.id.as_uuid(),
+            new.project_id.as_uuid(),
+            new.name,
+            new.body,
+            new.created_by.as_uuid(),
+            expected,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(row) = inserted {
+            return Ok(CasOutcome::Applied(row));
+        }
+        cas_miss(
+            self.prompt_template(new.project_id, &new.name, None)
+                .await?,
+            "prompt_template",
+            key,
+        )
     }
 
     // settings (D7, D8)

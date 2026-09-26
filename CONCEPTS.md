@@ -35,8 +35,9 @@ a local-first, developer-guided harness [R-ID-2].
 
 ## Hierarchy
 
-`workspace` groups projects for cross-repo work; `project` owns item keys, kinds, step graphs,
-skill bindings and secrets; `repo` is a git checkout in exactly one project [R-ENT-1..4]. Workspaces
+`workspace` groups projects for cross-repo work; `project` owns item keys, kinds, step graphs and
+secrets; skills attach globally or to a project or one of its phases [R-SKL-2]; `repo` is a git
+checkout in exactly one project [R-ENT-1..4]. Workspaces
 are explicit; a single project runs with none [R-ENT-2]. Logical identity never depends on a
 filesystem path: every box maps repos and workspace roots to its own paths [R-BOX-4].
 

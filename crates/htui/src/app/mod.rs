@@ -5,7 +5,7 @@ pub mod state;
 pub mod update;
 
 pub use action::{Action, Handled, OverlayAction, TabAction};
-pub use state::{App, Ctx, Emit, TopBarState};
+pub use state::{App, Ctx, EDITOR_NEEDS_A_TAB, Emit, TopBarState};
 
 use crossterm::event::{KeyCode, KeyModifiers};
 

@@ -34,15 +34,15 @@ use htui_core::model::{
     CitationKind, Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId, EventKind,
     EventRole, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
     ItemKindPatch, ItemPatch, ItemRequirement, ItemSummary, LinkGraph, NewCommandRun, NewDocument,
-    NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun,
-    NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, PromptScope, Quota, QuotaSource, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
-    ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, normalize,
+    NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch,
+    Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, Quota, QuotaSource, Repo,
+    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
+    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
+    RequirementUpdate, Resolution, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, normalize,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::scrub::MinimalScrubber;
@@ -624,6 +624,13 @@ impl WriteStore for SpyStore {
     }
     async fn phases(&self, graph: StepGraphId) -> StoreResult<Vec<StepGraphPhase>> {
         self.inner.phases(graph).await
+    }
+    async fn append_prompt_template(
+        &self,
+        new: NewPromptTemplate,
+        expected: Option<i32>,
+    ) -> StoreResult<CasOutcome<PromptTemplate>> {
+        self.inner.append_prompt_template(new, expected).await
     }
     async fn set_setting(
         &self,

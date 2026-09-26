@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/templates.rs
+expression: frame
+---
+Graphics · DESKTOP-HTUI · memory · 0 runs
+ 1 Backlog  2 Skills  3 Settings  4 Chat
+ Skills │ Templates
+┌ implement · editing from v1, saves v3 ─────────────────────┐┌ phase placeholders ────────────────┐
+│DRAFT You are running the `implement` phase for {{item_key}}││{{item_key}} scalar                 │
+│                                                            ││{{item_title}} scalar               │
+│{{item}}                                                    ││{{item_kind}} scalar                │
+│{{documents}}                                               ││{{phase}} scalar                    │
+│{{verify_failure}}                                          ││{{output_kind}} scalar              │
+│{{previous_diff}}                                           ││{{attempt}} scalar                  │
+│{{upstream}}                                                ││{{item}} section                    │
+│{{box}}                                                     ││{{documents}} section               │
+│{{skills}}                                                  ││{{upstream}} section                │
+│{{excerpts}}                                                ││{{box}} section                     │
+│{{command_queue}}                                           ││{{skills}} section                  │
+│                                                            ││{{excerpts}} section                │
+│Make the change the plan describes, in this working tree. Ke││{{verify_failure}} section          │
+│When a prior attempt is shown above, read its diff and its v││{{previous_diff}} section           │
+│cause rather than the symptom. Write a `{{output_kind}}` doc││{{command_queue}} section           │
+│you verified it, one section per file group.                ││                                    │
+│                                                            ││                                    │
+│                                                            ││                                    │
+│                                                            ││                                    │
+│                                                            ││                                    │
+│                                                            ││                                    │
+└────────────────────────────────────────────────────────────┘└────────────────────────────────────┘
+ saved elsewhere since you opened it — v2 is now the latest; your draft is kept and Ctrl+S saves it
+ as v3
+ Ctrl+S save  Ctrl+E $EDITOR  Esc cancel  L1:C7
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces

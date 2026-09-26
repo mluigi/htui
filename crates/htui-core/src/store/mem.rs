@@ -25,17 +25,17 @@ use crate::model::{
     DocumentId, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
     ItemKindPatch, ItemLink, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkEdge,
     LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
-    NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewStepGraph,
-    NewWorkspace, Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
-    ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId,
-    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
-    Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
-    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
-    SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
-    canonical_declared_tags, overlaps, prompt_summary, scope_of,
+    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
+    NewStepGraph, NewWorkspace, Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath,
+    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementState,
+    RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId,
+    RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
+    Scope, SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
+    UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceSummary, canonical_declared_tags, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -48,10 +48,10 @@ use crate::store::traits::{
     expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
     finish_run_needs_a_terminal_status, graph_not_in_project, invalid_area_code, invalid_prefix,
     item_has_a_live_run, item_kind_is_held, item_not_in_project, legal_move,
-    not_a_fanout_candidate, not_a_terminal_status, references_no_row, requirement_withdrawn,
-    reserved_phase_name, resolution_not_closable, row_names_another_step, run_is_terminal,
-    step_is_not_promotable, step_slot_is_taken, summary_names_another_item, winner_is_not_settled,
-    withdrawn_requirement_cited,
+    not_a_fanout_candidate, not_a_terminal_status, prompt_template_key, prompt_template_refusal,
+    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
+    row_names_another_step, run_is_terminal, step_is_not_promotable, step_slot_is_taken,
+    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
 use uuid::Uuid;
 
@@ -108,13 +108,14 @@ struct State {
     graphs: HashMap<StepGraphId, StepGraph>,
     /// `step_graph_phase`, read by [`WriteStore::phases`] since MOD-15 (plan D1).
     phases: Vec<StepGraphPhase>,
-    /// `prompt_template`, read by the inherent [`MemStore::prompt_templates`] (MOD-2 plan D102).
+    /// `prompt_template`, read by the inherent [`MemStore::prompt_templates`] (MOD-2 plan D102) and
+    /// appended to only by [`WriteStore::append_prompt_template`] and the project seed (MOD-9 D1).
     templates: Vec<PromptTemplate>,
     /// `skill`, read by the inherent [`MemStore::bound_skills`] (MOD-2 plan D105).
     skills: HashMap<SkillId, Skill>,
     /// `skill_version`, resolved through [`SkillBinding::version_in_force`].
     skill_versions: Vec<SkillVersion>,
-    /// `skill_binding`, collapsed through [`BoundSkill::collapse`].
+    /// `skill_binding`, resolved through `model::skill::resolve`.
     skill_bindings: Vec<SkillBinding>,
     /// `box_tool`, projected by the inherent [`MemStore::box_profile`].
     box_tools: Vec<BoxTool>,
@@ -405,18 +406,14 @@ impl MemStore {
         }))
     }
 
-    /// The skills in force for a project, or for one phase of it: `R-SKL-2`'s collapse
-    /// (`docs/ANA-5.md` §4.2), already resolved to a version and a body.
+    /// The skill candidates of one step (ANA-22 §6 items 2-3): the global attachments, the
+    /// project's, and — with `phase` — that phase's, resolved most-specific-wins by
+    /// [`resolve`](crate::model::skill::resolve), exactly as `PgStore`'s two `SELECT`s are, so the
+    /// rule has one definition rather than one per backend.
     ///
-    /// `phase: None` asks for the project-level bindings alone. With a phase, the phase's bindings
-    /// override the project's per `skill_id` and
-    /// [`BoundSkill::collapse`](crate::model::BoundSkill::collapse) is what says so — this method
-    /// resolves rows and calls that, exactly as `PgStore`'s two `SELECT`s do, so the rule has one
-    /// definition rather than one per backend.
-    ///
-    /// A binding whose version cannot be resolved is dropped rather than rendered bodiless: see
-    /// [`SkillBinding::version_in_force`](crate::model::SkillBinding::version_in_force) for why a
-    /// pin that names no row resolves to nothing.
+    /// Inactive winners are included — an `off` or `glob` attachment, and a winning pin that
+    /// names no version (`version: None`, plan D39); the assembler's `select` decides and records
+    /// them. A binding whose `skill` row is missing is dropped.
     ///
     /// # Errors
     ///
@@ -427,18 +424,26 @@ impl MemStore {
         phase: Option<PhaseId>,
     ) -> Result<Vec<BoundSkill>> {
         Ok(self.read(|state| {
-            let level = |want: Option<PhaseId>| -> Vec<BoundSkill> {
-                state
-                    .skill_bindings
-                    .iter()
-                    .filter(|binding| binding.project_id == project && binding.phase_id == want)
-                    .filter_map(|binding| state.bind(binding))
-                    .collect()
-            };
-            BoundSkill::collapse(
-                level(None),
-                phase.map(|id| level(Some(id))).unwrap_or_default(),
-            )
+            let rows = state
+                .skill_bindings
+                .iter()
+                .filter(|binding| match binding.project_id {
+                    None => true,
+                    // `phase: None` with a phase row: `phase_id == phase` is false, so the row
+                    // is excluded, as `PgStore`'s `b.phase_id = NULL` is.
+                    Some(owner) => {
+                        owner == project
+                            && (binding.phase_id.is_none() || binding.phase_id == phase)
+                    }
+                })
+                .filter_map(|binding| {
+                    state
+                        .skills
+                        .get(&binding.skill_id)
+                        .map(|skill| (binding.clone(), skill.name.clone()))
+                })
+                .collect();
+            crate::model::skill::resolve(rows, &state.skill_versions)
         }))
     }
 
@@ -1091,22 +1096,6 @@ impl State {
             .iter()
             .filter_map(|kind| self.latest_document(item, kind).cloned())
             .collect()
-    }
-
-    /// One binding resolved to the skill, the version in force and the body (`R-SKL-2`).
-    ///
-    /// `None` when the skill row or the version in force is missing, which is
-    /// [`SkillBinding::version_in_force`]'s "a pin that cannot be honoured renders nothing".
-    fn bind(&self, binding: &SkillBinding) -> Option<BoundSkill> {
-        let skill = self.skills.get(&binding.skill_id)?;
-        let version = binding.version_in_force(&self.skill_versions)?;
-        Some(BoundSkill {
-            skill_id: skill.id,
-            name: skill.name.clone(),
-            version: version.version,
-            position: binding.position,
-            body: version.body.clone(),
-        })
     }
 
     /// The item's documents without their bodies, grouped by kind and ascending by version.
@@ -2703,6 +2692,62 @@ impl State {
         rows
     }
 
+    /// MOD-9 D1/D4/D18: the head of `(project, name)` is the token; token, then input, then keys.
+    fn append_prompt_template(
+        &mut self,
+        new: NewPromptTemplate,
+        expected: Option<i32>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<PromptTemplate>> {
+        let head = self
+            .templates
+            .iter()
+            .filter(|row| row.project_id == new.project_id && row.name == new.name)
+            .max_by_key(|row| row.version)
+            .cloned();
+        match (head, expected) {
+            (Some(head), _) if Some(head.version) != expected => {
+                return Ok(CasOutcome::Stale(head));
+            }
+            (None, Some(_)) => {
+                return Err(StoreError::NotFound {
+                    entity: "prompt_template",
+                    id: prompt_template_key(new.project_id, &new.name),
+                });
+            }
+            _ => {}
+        }
+        if let Some(refusal) = prompt_template_refusal(&new.name, &new.body) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        self.require_user(new.created_by, "prompt_template.created_by")?;
+        if !self.projects.contains_key(&new.project_id) {
+            return Err(StoreError::Constraint(references_no_row(
+                "prompt_template.project_id",
+                new.project_id,
+                "project",
+            )));
+        }
+        if self.templates.iter().any(|row| row.id == new.id) {
+            return Err(StoreError::Constraint(already_exists(
+                "prompt_template",
+                new.id,
+            )));
+        }
+        let row = PromptTemplate {
+            id: new.id,
+            project_id: new.project_id,
+            name: new.name,
+            version: expected.unwrap_or(0) + 1,
+            body: new.body,
+            created_by: new.created_by,
+            created_at: now,
+            updated_at: now,
+        };
+        self.templates.push(row.clone());
+        Ok(CasOutcome::Applied(row))
+    }
+
     /// The value one rung currently holds for a key, for [`validate`]'s `not_above` peer.
     fn setting_value(&self, rung: SettingRung, key: SettingKey) -> Option<Value> {
         self.stored_setting(rung, key).and_then(|row| row.value)
@@ -3072,7 +3117,7 @@ impl State {
             skill_bindings: rows(
                 self.skill_bindings
                     .iter()
-                    .filter(|row| row.project_id == id)
+                    .filter(|row| row.project_id == Some(id))
                     .count(),
             ),
             runs: rows(runs.len()),
@@ -3250,7 +3295,7 @@ impl State {
         self.items.retain(|id, _| !gone.items.contains(id));
         self.item_key_counter
             .retain(|(project, _), _| *project != id);
-        self.skill_bindings.retain(|row| row.project_id != id);
+        self.skill_bindings.retain(|row| row.project_id != Some(id));
         self.kinds.retain(|_, row| row.project_id != id);
         self.phases.retain(|row| !gone.phases.contains(&row.id));
         self.graphs.retain(|id, _| !gone.graphs.contains(id));
@@ -5420,6 +5465,15 @@ impl WriteStore for MemStore {
         Ok(self.read(|state| state.phase_rows(graph)))
     }
 
+    async fn append_prompt_template(
+        &self,
+        new: NewPromptTemplate,
+        expected: Option<i32>,
+    ) -> Result<CasOutcome<PromptTemplate>> {
+        let now = Utc::now();
+        self.write(|state| state.append_prompt_template(new, expected, now))
+    }
+
     async fn set_setting(
         &self,
         rung: SettingRung,
@@ -5963,7 +6017,7 @@ mod tests {
                 .iter()
                 .map(|skill| (skill.name.as_str(), skill.version, skill.position))
                 .collect::<Vec<_>>(),
-            vec![("tests", 1, 0), ("rust-style", 2, 1)],
+            vec![("tests", Some(1), 0), ("rust-style", Some(2), 1)],
             "with no phase, the project bindings alone, each at its latest version"
         );
 
@@ -5976,7 +6030,7 @@ mod tests {
                 .iter()
                 .map(|skill| (skill.name.as_str(), skill.version, skill.position))
                 .collect::<Vec<_>>(),
-            vec![("tests", 1, 0), ("rust-style", 1, 2)],
+            vec![("tests", Some(1), 0), ("rust-style", Some(1), 2)],
             "the phase binding overrides the project one: once, pinned to v1, at position 2"
         );
         assert_eq!(
@@ -5991,6 +6045,108 @@ mod tests {
                 .expect("bound_skills must not fail")
                 .is_empty(),
             "a project with no bindings has no skills, not every skill"
+        );
+    }
+
+    /// The demo data plus one global attachment (ANA-22 §6 item 2): skill `house`, v1 body
+    /// `"House rules."`, attached with `project_id` and `phase_id` both `None`, at position 5.
+    fn demo_with_a_global_skill() -> (MemStore, crate::model::SkillId) {
+        let mut data = crate::fixtures::demo_data();
+        let house = crate::model::SkillId::new();
+        let now = Utc::now();
+        data.skills.push(crate::model::Skill {
+            id: house,
+            name: "house".to_owned(),
+            description: "House rules for every project.".to_owned(),
+            created_by: ids::USER,
+            created_at: now,
+            updated_at: now,
+        });
+        data.skill_versions.push(crate::model::SkillVersion {
+            skill_id: house,
+            version: 1,
+            body: "House rules.".to_owned(),
+            source: json!({}),
+            created_by: ids::USER,
+            created_at: now,
+        });
+        data.skill_bindings.push(crate::model::SkillBinding {
+            id: crate::model::SkillBindingId::new(),
+            skill_id: house,
+            project_id: None,
+            phase_id: None,
+            pinned_version: None,
+            position: 5,
+            activation: crate::model::Activation::Always,
+            globs: Vec::new(),
+            languages: Vec::new(),
+            updated_at: now,
+        });
+        (MemStore::from_demo(data), house)
+    }
+
+    /// ANA-22 §6 item 2: a global attachment is a candidate of every project's steps, and sorts
+    /// with the project's and the phase's by `(position, name bytes)`.
+    #[tokio::test]
+    async fn a_global_attachment_reaches_every_project() {
+        use crate::model::SkillLevel;
+        let (store, house) = demo_with_a_global_skill();
+
+        let agy = store
+            .bound_skills(ids::PROJECT_AGY, None)
+            .await
+            .expect("bound_skills must not fail");
+        assert_eq!(
+            agy.iter()
+                .map(|s| (s.skill_id, s.level, s.version, s.position))
+                .collect::<Vec<_>>(),
+            vec![(house, SkillLevel::Global, Some(1), 5)],
+            "a project with no attachment of its own still gets the global one"
+        );
+        assert_eq!(agy[0].body, "House rules.");
+
+        let implement = store
+            .bound_skills(ids::PROJECT_HTUI, Some(ids::PHASE_HTUI_IMPLEMENT))
+            .await
+            .expect("bound_skills must not fail");
+        assert_eq!(
+            implement
+                .iter()
+                .map(|s| (s.name.as_str(), s.level, s.version, s.position))
+                .collect::<Vec<_>>(),
+            vec![
+                ("tests", SkillLevel::Project, Some(1), 0),
+                ("rust-style", SkillLevel::Phase, Some(1), 2),
+                ("house", SkillLevel::Global, Some(1), 5),
+            ],
+            "the global attachment joins the project's and the phase's, in (position, name) order"
+        );
+    }
+
+    /// ANA-22 §7.1: `project_id` keeps `ON DELETE CASCADE`, which never fires for a NULL key, so
+    /// a global attachment survives a project delete and the reach counts the project's own rows.
+    #[tokio::test]
+    async fn delete_project_keeps_global_attachments() {
+        let (store, house) = demo_with_a_global_skill();
+
+        let reach = store
+            .delete_project(ids::PROJECT_HTUI)
+            .await
+            .expect("the delete lands");
+        assert_eq!(
+            reach.skill_bindings, 3,
+            "the reach counts the project's own three attachments, not the global one"
+        );
+        assert_eq!(
+            store
+                .bound_skills(ids::PROJECT_AGY, None)
+                .await
+                .expect("bound_skills must not fail")
+                .iter()
+                .map(|s| s.skill_id)
+                .collect::<Vec<_>>(),
+            vec![house],
+            "the global attachment is still every remaining project's"
         );
     }
 
@@ -6880,7 +7036,7 @@ mod tests {
                 state
                     .skill_bindings
                     .iter()
-                    .all(|row| row.project_id != gone),
+                    .all(|row| row.project_id != Some(gone)),
                 "skill_binding"
             );
             assert!(

@@ -290,11 +290,13 @@ impl BoxesSection {
             return;
         };
         let row = &record.row;
-        let input = TextArea::with_text(&row.quirks);
+        // Cursor at the end of the note, where a new quirk is appended.
+        let mut input = TextArea::with_text(&row.quirks);
+        input.set_cursor(usize::MAX);
         let editor = Editor {
             box_id: row.id,
             expected: row.edit_version,
-            opened_on: input.text(),
+            opened_on: input.text().to_owned(),
             input,
         };
         self.mode = Mode::Quirks(editor);
@@ -339,7 +341,8 @@ impl BoxesSection {
         let outcome = match &mut self.mode {
             Mode::Browse => return Handled::Pass,
             Mode::Tags(editor) => editor.input.on_key(key),
-            Mode::Quirks(editor) => editor.input.on_key(key),
+            // `PageUp`/`PageDown` move by the editor's drawn height.
+            Mode::Quirks(editor) => editor.input.on_key(key, QUIRKS_HEIGHT),
         };
         match outcome {
             FieldOutcome::Consumed => Handled::Consumed,
@@ -394,7 +397,7 @@ impl BoxesSection {
                     expected: editor.expected,
                     edit: BoxEdit {
                         declared_tags: None,
-                        quirks: Some(text),
+                        quirks: Some(text.to_owned()),
                     },
                 })
             }

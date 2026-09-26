@@ -27,10 +27,10 @@ use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposur
 use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::record::{Recorder, RunCap, pump};
 use htui_core::model::{
-    BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, DocumentId, EventKind, Gate,
-    GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun,
-    NewRunStep, NoteId, Project, ProjectSettings, PromptScope, Repo, RepoId, Resolution, Run,
-    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, SnapshotCandidate,
+    BoundSkill, BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, DocumentId, EventKind,
+    Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun,
+    NewRunStep, NoteId, Project, ProjectId, ProjectSettings, PromptScope, Repo, RepoId, Resolution,
+    Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, SnapshotCandidate,
     SnapshotPhase, SnapshotTemplate, Status, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS,
     UserId, VerifyOutcome,
 };
@@ -81,6 +81,11 @@ const JUDGE_TEMPLATE: &str = "judge";
 /// The `prompt_template.name` of the handoff role, which a promoted step's fresh chat opens with
 /// (MOD-4 plan D163, `crates/htui-core/src/prompt/defaults.rs`).
 const HANDOFF_TEMPLATE: &str = "handoff";
+
+/// MOD-9 D44: an override graph's phase ids are minted by the clone, which copies no
+/// `skill_binding` (`graph.rs:350-355`), so its steps see global and project attachments only.
+const OVERRIDE_SKILLS_NOTE: &str =
+    "skills: an override graph's phases carry no phase-level attachments until MOD-9 milestone 3";
 
 /// A handoff's `failure_reason` when neither the run nor the step recorded one: the maintainer
 /// promoted a step that was waiting at its gate (blueprint §7.5).
@@ -4050,7 +4055,9 @@ where
         survivors.sort_by_key(|step| step.fanout_index);
 
         // -- 1. inputs and both orderings, before any row (H-8) --------------------------------
-        let prompts = self.judge_prompts(run, phase, attempt, &survivors).await?;
+        let prompts = self
+            .judge_prompts(run, snapshot, phase, attempt, &survivors)
+            .await?;
         if let Ok(JudgePrompts { forward, .. }) = &prompts
             && let Some(index) = dropped_candidate(forward)
         {
@@ -4188,6 +4195,9 @@ where
     /// the diff is advisory, D55) and its last `command_run` output. The template is the snapshot's
     /// pinned one, else the latest `judge` row (D53); the budget is the judged phase's; every other
     /// section is empty, and `phase` renders as the **judged** phase's name (blueprint F-G).
+    /// Skills are the judged phase's candidates, resolved as the phase step resolves them (MOD-9
+    /// D44, D48); a judge body without `{{skills}}` — the default one among them — records them
+    /// `not_placed`.
     ///
     /// The inner `Err` is a [`JudgeFailure`] the caller lands on a judge row: a candidate with no
     /// recorded prompt or an assembly refusal is `judge_session_failed`, and no template at all is
@@ -4195,6 +4205,7 @@ where
     async fn judge_prompts(
         &self,
         run: &Run,
+        snapshot: &GraphSnapshot,
         phase: &SnapshotPhase,
         attempt: i32,
         survivors: &[&RunStep],
@@ -4299,6 +4310,9 @@ where
         };
 
         let kind = self.item_kind_name(&row).await?;
+        let skills = self
+            .phase_skills(project.id, snapshot, phase, &mut notes)
+            .await?;
         let (caps, _scan, _deadline) = settings::resolve_excerpt_caps(&self.parts.app);
         let spec = |reverse: bool| PromptSpec {
             role: TemplateRole::of_name(&template.name),
@@ -4319,7 +4333,8 @@ where
             documents: Vec::new(),
             upstream: Vec::new(),
             box_profile: self.parts.box_profile.clone(),
-            skills: Vec::new(),
+            // MOD-9 D44, D48: the judged phase's candidates, the same list for both orders.
+            skills: skills.clone(),
             excerpts: no_excerpts(caps),
             command_queue: false,
             verify_failure: None,
@@ -4839,6 +4854,11 @@ where
     ///
     /// `Err(kind)` is a required input that resolved to no document, when `strict`. A promoted
     /// step's handoff (plan D163) is not strict: its chat opens with the gap noted instead.
+    ///
+    /// The skill candidates are resolved here for every caller, the handoff included, although
+    /// `promote::handoff_spec` then empties them (MOD-9 D44): a handoff is rare, the two reads go
+    /// to the store every other input of this spec already needs, and one spec builder keeps the
+    /// phase and handoff inputs from drifting (MOD-9 review finding 4, accepted).
     async fn phase_spec(
         &self,
         run: &Run,
@@ -4908,6 +4928,9 @@ where
             )
             .await?;
         let (caps, _scan, _deadline) = settings::resolve_excerpt_caps(&self.parts.app);
+        let skills = self
+            .phase_skills(project.id, snapshot, phase, &mut notes)
+            .await?;
 
         let role = TemplateRole::of_name(&template.name);
         let (verify_failure, previous_diff) =
@@ -4934,9 +4957,10 @@ where
             documents,
             upstream,
             box_profile: self.parts.box_profile.clone(),
-            // `R-SKL-2`'s resolution is inherent on both stores (blueprint H-11) and the Runs tab
-            // wires it at milestone 6; an empty list renders no section.
-            skills: Vec::new(),
+            // MOD-9 D44: the global, project and phase attachments of this phase, most specific
+            // winning (`model::skill::resolve`); the assembler's `select` decides which render and
+            // records every candidate in `trim_record.skill_choices`.
+            skills,
             // §4.5's ranker needs a resolved repo root and `repo_box_path` has no writer the walk
             // can reach, so the audit records the caps a pass *would* have run under and nothing
             // else — the shape `crates/htui/src/preview.rs:274-295` already ships.
@@ -4958,6 +4982,43 @@ where
             notes,
         };
         Ok(Ok(spec))
+    }
+
+    /// MOD-9 D44: the skill candidates of `phase` in `snapshot`'s graph, for a phase step and for
+    /// the judge of that phase alike.
+    ///
+    /// `SnapshotPhase` carries no `PhaseId` (`model/run.rs:488-527`) and resolution re-densifies
+    /// positions (`graph.rs:286-300`), so the live row is found by `(graph id, name)`, which
+    /// `UNIQUE (graph_id, name)` makes exact (`0001_init.sql:247`). A phase renamed or deleted
+    /// since the snapshot, and every phase of an override graph, get a note rather than a silent
+    /// loss of their phase-level attachments (plan R-15).
+    async fn phase_skills(
+        &self,
+        project: ProjectId,
+        snapshot: &GraphSnapshot,
+        phase: &SnapshotPhase,
+        notes: &mut Vec<String>,
+    ) -> Result<Vec<BoundSkill>, EngineError> {
+        let phase_id = self
+            .parts
+            .store
+            .phases(snapshot.graph.id)
+            .await?
+            .into_iter()
+            .find(|row| row.name == phase.name)
+            .map(|row| row.id);
+        if phase_id.is_none() {
+            notes.push(format!(
+                "skills: phase `{}` is no longer in graph `{}`; phase-level attachments were not \
+                 applied",
+                phase.name, snapshot.graph.name
+            ));
+        }
+        if snapshot.graph.is_override {
+            notes.push(OVERRIDE_SKILLS_NOTE.to_owned());
+        }
+        let skills = self.parts.graphs.bound_skills(project, phase_id).await?;
+        Ok(skills)
     }
 
     /// Plan D67 (M3 D32's forward): the loop's two sections for a phase step at `attempt > 1`,
@@ -5404,7 +5465,7 @@ where
     }
 
     /// One project row.
-    async fn project(&self, id: htui_core::model::ProjectId) -> Result<Project, EngineError> {
+    async fn project(&self, id: ProjectId) -> Result<Project, EngineError> {
         self.parts
             .store
             .project(id)
@@ -5892,7 +5953,9 @@ mod tests {
     use htui_core::store::mem::MemFault;
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 
-    use super::{AgentSelector, FirstCandidate, NoSink, Resume, SessionKey, required_inputs};
+    use super::{
+        AgentSelector, FirstCandidate, JudgePrompts, NoSink, Resume, SessionKey, required_inputs,
+    };
     use crate::command::{Command, CommandOutcome, EngineError, GateAnswer};
     use crate::fake::{FakeOrchestrator, ScriptedStep};
     use crate::isolate::{Clock as _, IsolateError};
@@ -11712,6 +11775,455 @@ mod tests {
             "the seeded `RUN_2` and this one; one row per step, each committed to the primary; a \
              `done` item closes as `done` (MOD-38 plan D6)"
         );
+    }
+
+    // -- MOD-9 D44: skills reach the run -------------------------------------------------------
+
+    /// The prologue every skills case shares (blueprint §4.6, D67): `FEAT-3` parked at `prd`, its
+    /// run row, its decoded snapshot and the parked `prd` step, which recorded a seq-0 prompt.
+    async fn skills_prologue(
+        harness: &Harness,
+    ) -> (
+        htui_core::model::Run,
+        GraphSnapshot,
+        htui_core::model::RunStep,
+    ) {
+        let (run, prd) = started(harness).await;
+        let row = harness.orch.run(run).await;
+        let snapshot = snapshot_of(harness, run).await;
+        let step = harness
+            .orch
+            .steps(run)
+            .await
+            .into_iter()
+            .find(|step| step.id == prd)
+            .expect("the parked `prd` step");
+        (row, snapshot, step)
+    }
+
+    /// The `(name, level, version, position, activation)` of each candidate, in order.
+    fn skill_rows(
+        skills: &[htui_core::model::BoundSkill],
+    ) -> Vec<(
+        String,
+        htui_core::model::SkillLevel,
+        Option<i32>,
+        i32,
+        htui_core::model::Activation,
+    )> {
+        skills
+            .iter()
+            .map(|skill| {
+                (
+                    skill.name.clone(),
+                    skill.level,
+                    skill.version,
+                    skill.position,
+                    skill.activation,
+                )
+            })
+            .collect()
+    }
+
+    /// Every `<section name="skills">` block of an assembled text, closing tag included, in order.
+    /// A judge's text can hold two: the replayed candidate prompt inside `{{task}}` carries the
+    /// candidate phase's own, and a judge body that places `{{skills}}` renders the judged phase's.
+    fn skills_sections(text: &str) -> Vec<&str> {
+        const OPEN: &str = "<section name=\"skills\">";
+        const CLOSE: &str = "</section>";
+        let mut found = Vec::new();
+        let mut rest = text;
+        while let Some(start) = rest.find(OPEN) {
+            let tail = &rest[start..];
+            let end = tail.find(CLOSE).expect("a skills section closes") + CLOSE.len();
+            found.push(&tail[..end]);
+            rest = &tail[end..];
+        }
+        found
+    }
+
+    /// The `(name, version, active, reason)` of each recorded choice, in order.
+    fn choice_rows(
+        choices: &[htui_core::model::SkillChoice],
+    ) -> Vec<(String, Option<i32>, bool, htui_core::model::ChoiceReason)> {
+        choices
+            .iter()
+            .map(|choice| {
+                (
+                    choice.name.clone(),
+                    choice.version,
+                    choice.active,
+                    choice.reason,
+                )
+            })
+            .collect()
+    }
+
+    /// `implement`'s assembled prompt through `phase_spec`, the path stage 3 takes.
+    async fn implement_prompt(
+        harness: &Harness,
+        row: &htui_core::model::Run,
+        snapshot: &GraphSnapshot,
+        prd: &htui_core::model::RunStep,
+    ) -> (
+        htui_core::prompt::PromptSpec,
+        htui_core::prompt::AssembledPrompt,
+    ) {
+        harness_engine!(harness.orch, engine);
+        let implement = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == "implement")
+            .expect("the feature graph has an implement phase");
+        let spec = engine
+            .phase_spec(
+                row,
+                snapshot,
+                prd,
+                implement,
+                row.item_id.expect("an item's run"),
+                false,
+            )
+            .await
+            .expect("the spec is built")
+            .expect("not strict: no input is refused");
+        let assembled =
+            htui_core::prompt::assemble(&spec, &htui_core::scrub::MinimalScrubber::new([]))
+                .expect("the demo `implement` assembles");
+        (spec, assembled)
+    }
+
+    /// MOD-9 D44: a phase step reads its global, project and phase attachments, most specific
+    /// winning: `implement`'s phase-level `rust-style` pinned to v1 beats the project's unpinned
+    /// one (v2), and `tests` comes from the project (`pg_criteria.rs`' phase answer).
+    #[tokio::test]
+    async fn a_phase_step_renders_its_phase_and_project_skills() {
+        use htui_core::model::{Activation, ChoiceReason, SkillLevel};
+
+        let harness = Harness::new().await;
+        let (row, snapshot, prd) = skills_prologue(&harness).await;
+        let (spec, assembled) = implement_prompt(&harness, &row, &snapshot, &prd).await;
+
+        assert_eq!(
+            skill_rows(&spec.skills),
+            vec![
+                (
+                    "tests".to_owned(),
+                    SkillLevel::Project,
+                    Some(1),
+                    0,
+                    Activation::Always
+                ),
+                (
+                    "rust-style".to_owned(),
+                    SkillLevel::Phase,
+                    Some(1),
+                    2,
+                    Activation::Always
+                ),
+            ],
+            "the phase's pin wins over the project's attachment of the same skill"
+        );
+        assert!(
+            assembled
+                .text
+                .contains("<skill name=\"rust-style\" version=\"1\">"),
+            "the phase-pinned version renders: {}",
+            assembled.text
+        );
+        assert!(
+            !assembled
+                .text
+                .contains("<skill name=\"rust-style\" version=\"2\">"),
+            "and the project's latest does not"
+        );
+        assert_eq!(
+            choice_rows(&assembled.trim.skill_choices),
+            vec![
+                ("tests".to_owned(), Some(1), true, ChoiceReason::Always),
+                ("rust-style".to_owned(), Some(1), true, ChoiceReason::Always),
+            ]
+        );
+        assert!(
+            !spec.notes.iter().any(|note| note.starts_with("skills:")),
+            "a live phase of a live graph needs no note: {:?}",
+            spec.notes
+        );
+    }
+
+    /// MOD-9 D44: a phase with no phase-level attachment sees the project's, with no note.
+    #[tokio::test]
+    async fn a_non_implement_phase_renders_project_skills_only() {
+        use htui_core::model::{Activation, SkillLevel};
+
+        let harness = Harness::new().await;
+        let (row, snapshot, prd) = skills_prologue(&harness).await;
+        harness_engine!(harness.orch, engine);
+        assert_eq!(snapshot.phases[0].name, "prd");
+        let spec = engine
+            .phase_spec(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                true,
+            )
+            .await
+            .expect("the spec is built")
+            .expect("`prd` requires nothing");
+        assert_eq!(
+            skill_rows(&spec.skills),
+            vec![
+                (
+                    "tests".to_owned(),
+                    SkillLevel::Project,
+                    Some(1),
+                    0,
+                    Activation::Always
+                ),
+                (
+                    "rust-style".to_owned(),
+                    SkillLevel::Project,
+                    Some(2),
+                    1,
+                    Activation::Always
+                ),
+            ],
+            "the project's two attachments, `rust-style` unpinned at its latest"
+        );
+        assert!(
+            !spec.notes.iter().any(|note| note.starts_with("skills:")),
+            "{:?}",
+            spec.notes
+        );
+    }
+
+    /// Plan R-15: a phase renamed after the snapshot is not found by `(graph id, name)`, so its
+    /// phase-level attachments cannot be applied — and the record says so, rather than losing them
+    /// silently.
+    #[tokio::test]
+    async fn a_renamed_phase_falls_back_to_project_skills_with_a_note() {
+        use htui_core::model::SkillLevel;
+        use htui_core::store::CasOutcome;
+
+        let harness = Harness::new().await;
+        let (row, snapshot, prd) = skills_prologue(&harness).await;
+        let live = harness
+            .orch
+            .store
+            .phases(snapshot.graph.id)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|phase| phase.id == ids::PHASE_HTUI_IMPLEMENT)
+            .expect("the snapshot's graph is the live `feature` graph");
+        let renamed = harness
+            .orch
+            .store
+            .update_phase(
+                ids::PHASE_HTUI_IMPLEMENT,
+                live.updated_at,
+                PhasePatch {
+                    name: Some("build".to_owned()),
+                    ..PhasePatch::default()
+                },
+            )
+            .await
+            .expect("the rename is legal");
+        assert!(matches!(renamed, CasOutcome::Applied(_)), "{renamed:?}");
+
+        let (spec, _) = implement_prompt(&harness, &row, &snapshot, &prd).await;
+        let rust_style = spec
+            .skills
+            .iter()
+            .find(|skill| skill.name == "rust-style")
+            .expect("the project still attaches `rust-style`");
+        assert_eq!(
+            (rust_style.level, rust_style.version),
+            (SkillLevel::Project, Some(2)),
+            "the project's attachment, since the phase's cannot be found"
+        );
+        let expected = format!(
+            "skills: phase `implement` is no longer in graph `{}`; phase-level attachments were \
+             not applied",
+            snapshot.graph.name
+        );
+        assert!(
+            spec.notes.contains(&expected),
+            "{expected:?} in {:?}",
+            spec.notes
+        );
+    }
+
+    /// Plan R-15, the clone gap: an override graph's phases carry no attachment of their own
+    /// until MOD-9 milestone 3, and the record says so. No writer can set `is_override` on a
+    /// snapshot, so the case edits the decoded one (blueprint D67).
+    #[tokio::test]
+    async fn an_override_graph_notes_the_clone_gap() {
+        let harness = Harness::new().await;
+        let (row, mut snapshot, prd) = skills_prologue(&harness).await;
+        snapshot.graph.is_override = true;
+        let (spec, _) = implement_prompt(&harness, &row, &snapshot, &prd).await;
+        assert!(
+            spec.notes
+                .iter()
+                .any(|note| note == super::OVERRIDE_SKILLS_NOTE),
+            "{:?}",
+            spec.notes
+        );
+    }
+
+    /// MOD-9 D48 with D49 withdrawn (blueprint amendment): a judge body that places `{{skills}}`
+    /// renders the **judged** phase's skills, the same block in both orders, recorded `always`.
+    /// The project appends such a body as `judge` v2, which the judge reads as the latest.
+    #[tokio::test]
+    async fn a_judge_renders_the_judged_phases_skills_in_both_orders() {
+        use htui_core::model::{ChoiceReason, NewPromptTemplate, PromptTemplateId};
+        use htui_core::store::CasOutcome;
+
+        let harness = Harness::new().await;
+        let default = htui_core::prompt::body_of("judge").expect("`judge` has a default body");
+        assert!(
+            !default.contains("{{skills}}"),
+            "D49 is withdrawn: the default judge body places no `{{{{skills}}}}`"
+        );
+        let body = default.replacen("{{task}}\n", "{{task}}\n{{skills}}\n", 1);
+        assert_ne!(
+            body, default,
+            "the default places `{{{{task}}}}` on its own line"
+        );
+        let appended = harness
+            .orch
+            .store
+            .append_prompt_template(
+                NewPromptTemplate {
+                    id: PromptTemplateId::new(),
+                    project_id: ids::PROJECT_HTUI,
+                    name: "judge".to_owned(),
+                    body,
+                    created_by: harness.orch.user(),
+                },
+                Some(1),
+            )
+            .await
+            .expect("a judge body may place `{{skills}}` (D48)");
+        assert!(matches!(appended, CasOutcome::Applied(_)), "{appended:?}");
+
+        let (row, snapshot, prd) = skills_prologue(&harness).await;
+        let implement = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == "implement")
+            .expect("the feature graph has an implement phase");
+        assert_eq!(
+            implement.judge, None,
+            "the demo project names no judge agent, so nothing is pinned and the judge reads the \
+             latest `judge` body (plan D53)"
+        );
+        let (_, phase) = implement_prompt(&harness, &row, &snapshot, &prd).await;
+        let phase_block = *skills_sections(&phase.text)
+            .first()
+            .expect("the phase step renders a skills section");
+
+        harness_engine!(harness.orch, engine);
+        let JudgePrompts {
+            forward,
+            reversed,
+            template,
+        } = engine
+            .judge_prompts(&row, &snapshot, implement, 1, &[&prd])
+            .await
+            .expect("the judge's inputs are read")
+            .expect("the judge assembles");
+        assert_eq!(
+            (template.name.as_str(), template.version),
+            ("judge", 2),
+            "the body that places `{{{{skills}}}}`"
+        );
+        assert!(
+            skills_sections(&forward.text).contains(&phase_block),
+            "the judge renders the judged phase's skills block verbatim: {}",
+            forward.text
+        );
+        assert_eq!(
+            skills_sections(&forward.text),
+            skills_sections(&reversed.text),
+            "the same skills in both orders"
+        );
+        assert_eq!(
+            choice_rows(&forward.trim.skill_choices),
+            vec![
+                ("tests".to_owned(), Some(1), true, ChoiceReason::Always),
+                ("rust-style".to_owned(), Some(1), true, ChoiceReason::Always),
+            ]
+        );
+        assert_eq!(forward.trim.skill_choices, reversed.trim.skill_choices);
+    }
+
+    /// MOD-9 D40 with D49 withdrawn: the default judge body places no `{{skills}}`, so the judged
+    /// phase's candidates are resolved and recorded `not_placed`, and the judge renders no skills
+    /// section of its own (the replayed task keeps the candidate's).
+    #[tokio::test]
+    async fn the_default_judge_records_the_judged_phases_skills_not_placed() {
+        use htui_core::model::ChoiceReason;
+
+        let harness = Harness::new().await;
+        let (row, snapshot, prd) = skills_prologue(&harness).await;
+        let implement = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == "implement")
+            .expect("the feature graph has an implement phase");
+        let (_, phase) = implement_prompt(&harness, &row, &snapshot, &prd).await;
+        let phase_block = *skills_sections(&phase.text)
+            .first()
+            .expect("the phase step renders a skills section");
+
+        harness_engine!(harness.orch, engine);
+        let JudgePrompts {
+            forward,
+            reversed,
+            template,
+        } = engine
+            .judge_prompts(&row, &snapshot, implement, 1, &[&prd])
+            .await
+            .expect("the judge's inputs are read")
+            .expect("the judge assembles");
+        assert_eq!(
+            (template.name.as_str(), template.version),
+            ("judge", 1),
+            "the seeded default body"
+        );
+        for prompt in [&forward, &reversed] {
+            assert!(
+                !skills_sections(&prompt.text).contains(&phase_block),
+                "the default judge renders no skills section of its own: {}",
+                prompt.text
+            );
+            assert!(
+                prompt
+                    .trim
+                    .sections
+                    .iter()
+                    .all(|section| section.name != htui_core::prompt::SectionName::Skills),
+                "{:?}",
+                prompt.trim.sections
+            );
+            assert_eq!(
+                choice_rows(&prompt.trim.skill_choices),
+                vec![
+                    ("tests".to_owned(), Some(1), false, ChoiceReason::NotPlaced),
+                    (
+                        "rust-style".to_owned(),
+                        Some(1),
+                        false,
+                        ChoiceReason::NotPlaced
+                    ),
+                ],
+                "every candidate is recorded, none placed"
+            );
+        }
     }
 
     async fn phase_of(orch: &FakeOrchestrator) -> SnapshotPhase {

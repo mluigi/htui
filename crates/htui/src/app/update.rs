@@ -7,7 +7,7 @@ use htui_core::model::{RunId, Scope, StepId, WorkspaceId, WorkspaceSummary};
 use htui_orch::Command;
 
 use crate::app::action::{Action, OverlayAction, TabAction};
-use crate::app::state::{App, Ctx};
+use crate::app::state::{App, Ctx, EDITOR_NEEDS_A_TAB};
 use crate::connection::DsnState;
 use crate::run_worker::OrchRequest;
 use crate::store_worker::{Origin, ReplyEnvelope, StoreReply, StoreRequest};
@@ -29,6 +29,9 @@ impl App {
             Action::SetScope { workspace } => self.set_scope(workspace),
             Action::Replay { step_id } => self.replay(step_id),
             Action::Promote { run, step } => self.promote(run, step),
+            // The unstamped path (`Origin::App`, or a keymap binding): only a tab can open the
+            // editor, because only a tab can be handed the outcome (MOD-9 D10).
+            Action::EditExternally(_) => self.status = Some(EDITOR_NEEDS_A_TAB.to_owned()),
             Action::ToggleHelp => self.help_visible = !self.help_visible,
             Action::Error(message) => self.status = Some(message),
             Action::Tick => {
@@ -350,9 +353,11 @@ impl App {
 mod tests {
     use super::*;
     use crate::app::Handled;
+    use crate::app::state::EDITOR_NEEDS_A_TAB;
+    use crate::editor::{ExternalEdit, ExternalEditOutcome};
     use crate::keymap::Keymap;
     use crate::store_worker::RequestEnvelope;
-    use crate::ui::overlay::MigrationPrompt;
+    use crate::ui::overlay::{MigrationPrompt, Overlay, OverlayId};
     use crate::ui::tabs::{Tab, TabId};
     use crossterm::event::{KeyCode, KeyEvent};
     use htui_core::fixtures::ids;
@@ -704,6 +709,155 @@ mod tests {
             reply: StoreReply::MigrationsApplied { applied: 2 },
         }));
         assert_eq!(app.status.as_deref(), Some("applied 2 migration(s)"));
+    }
+
+    /// What an [`Asker`] was handed back by the editor.
+    type Heard = Rc<RefCell<Vec<ExternalEditOutcome>>>;
+
+    /// A tab that asks for `$EDITOR` on `e` and remembers every outcome it is handed back
+    /// (MOD-9 D10, blueprint D26).
+    struct Asker {
+        id: TabId,
+        heard: Heard,
+    }
+
+    impl Asker {
+        fn new(id: &'static str) -> (Self, Heard) {
+            let heard = Heard::default();
+            let asker = Self {
+                id: TabId(id),
+                heard: Rc::clone(&heard),
+            };
+            (asker, heard)
+        }
+    }
+
+    /// The edit every [`Asker`] and [`Popup`] asks for.
+    fn asked() -> ExternalEdit {
+        ExternalEdit {
+            text: "body\n".to_owned(),
+            stem: "implement".to_owned(),
+        }
+    }
+
+    impl Tab for Asker {
+        fn id(&self) -> TabId {
+            self.id
+        }
+        fn title(&self) -> &str {
+            self.id.0
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_scope_change(&mut self, _scope: &Scope) {}
+        fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+            if key.code == KeyCode::Char('e') {
+                ctx.emit(Action::EditExternally(asked()));
+                return Handled::Consumed;
+            }
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+        fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
+            self.heard.borrow_mut().push(outcome);
+            // Emitted from the callback, so the test sees that `finish_external_edit` drains.
+            ctx.emit(Action::Error(format!("{} heard back", self.id)));
+        }
+    }
+
+    /// An overlay that asks for `$EDITOR` on `e`: only a tab may (D10).
+    struct Popup;
+
+    impl Popup {
+        const ID: OverlayId = OverlayId("popup");
+    }
+
+    impl Overlay for Popup {
+        fn id(&self) -> OverlayId {
+            Self::ID
+        }
+        fn title(&self) -> &str {
+            "Popup"
+        }
+        fn is_modal(&self) -> bool {
+            true
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_key(&mut self, _key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+            ctx.emit(Action::EditExternally(asked()));
+            Handled::Consumed
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+    }
+
+    #[test]
+    fn an_external_edit_from_a_tab_is_held_for_the_loop() {
+        let (mut app, _rx, _seen) = shell();
+        let (asker, heard) = Asker::new("asker");
+        app.register_tab(Box::new(asker));
+        app.update(Action::Tab(TabAction::Focus(TabId("asker"))));
+        app.dirty = false;
+
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+        assert!(app.dirty);
+        assert_eq!(app.status, None);
+        assert_eq!(
+            app.take_external_edit(),
+            Some((TabId("asker"), asked())),
+            "stamped with the emitting tab"
+        );
+        assert_eq!(app.take_external_edit(), None, "taken once");
+        assert!(heard.borrow().is_empty(), "nothing ran yet");
+    }
+
+    #[test]
+    fn an_external_edit_from_an_overlay_is_refused_on_the_status_line() {
+        let (mut app, _rx, _seen) = shell();
+        app.push_overlay(Box::new(Popup));
+
+        app.on_key(KeyEvent::from(KeyCode::Char('e')));
+        assert_eq!(app.status.as_deref(), Some(EDITOR_NEEDS_A_TAB));
+        assert_eq!(app.take_external_edit(), None);
+
+        // The unstamped path: a keymap binding or the shell itself (`Origin::App`).
+        app.status = None;
+        app.update(Action::EditExternally(asked()));
+        assert_eq!(app.status.as_deref(), Some(EDITOR_NEEDS_A_TAB));
+        assert_eq!(app.take_external_edit(), None);
+    }
+
+    #[test]
+    fn finish_external_edit_reaches_only_the_asking_tab() {
+        let (mut app, _rx, _seen) = shell();
+        let (first, first_heard) = Asker::new("first");
+        let (second, second_heard) = Asker::new("second");
+        app.register_tab(Box::new(first));
+        app.register_tab(Box::new(second));
+        app.dirty = false;
+
+        let outcome = ExternalEditOutcome::Edited("new body\n".to_owned());
+        app.finish_external_edit(TabId("second"), outcome.clone());
+        assert_eq!(*second_heard.borrow(), vec![outcome]);
+        assert!(first_heard.borrow().is_empty());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("second heard back"),
+            "what the tab emitted was drained"
+        );
+        assert!(app.dirty);
+
+        // A tab that is no longer registered: the outcome is dropped, nobody else hears it.
+        app.finish_external_edit(
+            TabId("gone"),
+            ExternalEditOutcome::Unchanged { quick: false },
+        );
+        assert_eq!(first_heard.borrow().len(), 0);
+        assert_eq!(second_heard.borrow().len(), 1);
     }
 
     /// MOD-7 D13, blueprint D25: the registration probe answers at `UNSOLICITED`, which the

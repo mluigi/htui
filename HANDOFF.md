@@ -14,7 +14,11 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-25):** **MOD-38 was done** (`docs/decisions/mod/mod-38.md`): migration
+**Current status (2026-09-26):** **ANA-22 was concluded** (`docs/decisions/ana/ana-22.md`): a skill
+is pure library content attached at global, project or phase level, and the attachment carries the
+activation (`always`, `glob`, `off`; language compiled to globs); it unblocks MOD-9 milestones 3 and 4. MOD-9's
+PRD is up (`.claude/prds/mod-9-skill-library-templates.prd.md`); agent help while editing is MOD-55.
+Before it, **MOD-38 was done** (`docs/decisions/mod/mod-38.md`): migration
 `0006_requirements` adds `item.resolution` and the requirement tables behind new store methods on
 MemStore, PgStore and the cache; `closed` is now reachable only through `close_out`, which takes a
 resolution (amends ANA-2 §4.3). MOD-39 (Requirements tab) is unblocked. MOD-7 milestone 1 (box
@@ -25,12 +29,16 @@ BM25 sparse, RRF-fused, scoped by project, filterable to decisions) through `htu
 `htui --search-items`; the agent tool waits on MOD-11, automatic sync on MOD-41, requirements and
 the resolution payload on MOD-50.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
-`0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1) and `0006_requirements`
-(MOD-38; cache: `0001`..`0004`), so **the next migration is `0007`** (cache: `0005`).
+`0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
+(MOD-38) and `0007_skill_attachments` (MOD-9 milestone 2; cache: `0001`..`0004`), so **the next
+migration is `0008`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
 milestone 2 and MOD-38: store conformance `CASES` 71, `READ_CASES` 14, `htui-orch` `CASES` 70,
 `StoreRequest` 66, `StoreReply` 37, 264 `.sqlx` files, 81 `crates/htui/tests/snapshots`,
-`MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns);
+`MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns). Pins moved by MOD-9
+milestones 1 and 2 on top: store `CASES` 74, `StoreRequest` 68, `StoreReply` 39, 264 `.sqlx` files
+(+1 template writer, −3 +2 skill reads), 87 `crates/htui/tests/snapshots`, 34 pinned commented columns
+(`tests/migrations.rs`), and `run_step.trim_record` at `v: 2` with `skill_choices`;
 `cargo doc --workspace --no-deps --keep-going` shows exactly five baseline errors (`htui-core`
 `MIRRORED_TABLES`; `htui-store` `step_exists`, and three private links MOD-38 added in
 `pg/write.rs`: `set_requirement_spec` to `cas_miss`, `amend_requirement` and
@@ -353,7 +361,39 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   item owns only the writers `upsert_skill`, `add_skill_version` and `set_skill_binding`, plus the
   editor. `htui_core::prompt::defaults::DEFAULT_TEMPLATES` is the ten bodies to seed *from*; seeding
   them into a project's `prompt_template` rows **landed with MOD-15** (ANA-5 §4.6,
-  `docs/decisions/mod/mod-15.md`): `htui_core::seed` writes all ten at version 1 on create.
+  `docs/decisions/mod/mod-15.md`): `htui_core::seed` writes all ten at version 1 on create. **PRD:**
+  `.claude/prds/mod-9-skill-library-templates.prd.md` (2026-09-25) — everything in the Skills tab
+  (templates and skills views, no Settings section), in-app `TextArea` plus `$EDITOR`, bound skills
+  wired into engine and preview. Milestones 1 (templates editable) and 2 (skills reach the run) are
+  open; milestones 3 (skill writers, bindings) and 4 (SKILL.md import) follow ANA-22's verdict
+  (`docs/decisions/ana/ana-22.md`, concluded 2026-09-25: skills attached at global, project or phase
+  level with the activation on the attachment, §7 schema and import mapping, §8 phasing).
+  Agent help while editing is MOD-55.
+  **Phase 1 landed (`e971418`..`caacc96`, 2026-09-25):** milestone 1, templates editable — the
+  `append_prompt_template` compare-and-set writer on every store (append-only, head version as the
+  token), `ui::TextArea`, the `$EDITOR` handoff with the terminal suspended and SIGINT/SIGQUIT held
+  off htui, `Templates`/`SaveTemplate` on the store worker, and the Skills tab's `Templates` view
+  (parse-gated save with the cursor on the error, wrapped and scrollable diff between any two
+  versions or against the built-in default); plan `.claude/plans/mod-9-templates-editable.plan.md`,
+  blueprint `.claude/plans/mod-9-templates-editable.blueprint.md`.
+  **Phase 2 landed (`7be0794`..`fd5161e`, 2026-09-26):** milestone 2, skills reach the run, widened
+  by the maintainer to ANA-22's storage and activation read side. Migration `0007_skill_attachments`
+  (ANA-22 §7.1: global level, `activation`/`globs`/`languages`, `skill_version.source`); one pure
+  `model::skill::resolve` (most specific attachment wins, a missing winning pin never falls back)
+  shared by both stores; `select` in the assembler (`always` active; `off`, `glob`→`no_path`,
+  `missing_version`, `not_placed` inactive) with every choice in `trim_record.skill_choices`
+  (record `v: 2`); `GraphSource::bound_skills`, so phase steps and judges get the phase's
+  candidates (a judge body may place `{{skills}}`, D48, though the default judge does not: its
+  replayed `{{task}}` already carries them) and handoffs none; the preview resolves the phase that
+  uses the chosen template and the Prompt sub-tab lists the choices. `R-SKL-2` amended. Plan
+  `.claude/plans/mod-9-skills-reach-the-run.plan.md`, blueprint
+  `.claude/plans/mod-9-skills-reach-the-run.blueprint.md` (final review `rust-reviewer` APPROVE
+  WITH FIXES, findings applied). **Milestone 3 is next** (writers, Skills view and attachments
+  matrix with a global row, language map, glob matcher over ANA-22 F2, the `graph.rs` clone gap);
+  its plan continues at D70 and R-25. Carry into it: `override_graph` creates its clone without
+  `is_override` (`NewStepGraph` has no such field), so the engine's clone-gap note cannot fire
+  until the clone sets it (review finding 2); and reading bindings before versions is now the
+  race-safe order for the writers (review finding 5).
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
   pattern masks, fail-closed persistence gate, Settings tab secret provider section. **No longer
@@ -518,8 +558,8 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   registered section**: MOD-15 added `hierarchy`, `kinds`, `prompt` and `connection` after it, so
   MOD-34 added `qdrant` and MOD-7 milestone 2 `boxes`, so the strip is seven titles wide (61 of
   the pinned 100 columns, `tests/settings.rs`) and
-  `SettingsSection::captures_input` now exists for a section that takes typed input. MOD-9's skills
-  add their own. MOD-2 built it read-only (`r` probe, `i` install, `a` authenticate, `o` open, `x` cancel)
+  `SettingsSection::captures_input` now exists for a section that takes typed input. MOD-9 adds
+  none (its editors live in the Skills tab, PRD D1). MOD-2 built it read-only (`r` probe, `i` install, `a` authenticate, `o` open, `x` cancel)
   and MOD-20/MOD-21 added the install and login actions, so what is missing is the **write** half
   that `R-AGT-4`'s field list and `R-AGT-6`'s "manual entries allowed" still owe. MOD-2 milestone 5
   **D45** already added `probe.source` (`probe` | `manual`) so that "a manual entry is never
@@ -644,6 +684,38 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   (`R-AGT-9` unchanged). **Open question for the maintainer:** `R-SEC-2` amendment only if the server,
   not the worker, resolves project secrets. Blocked on MOD-47, MOD-10.
 
+- [ ] **MOD-55 - Ask an agent for help while editing a template or skill** (from MOD-9, PRD gate
+  2026-09-25). `R-SKL-3`, `R-PRM-4`. MOD-9's editor (Skills tab, `TextArea` and `$EDITOR`,
+  `.claude/prds/mod-9-skill-library-templates.prd.md` D2) gains an action that sends the body being
+  edited, the role's placeholder table and the maintainer's request to a configured agent and offers
+  the reply as a proposed edit, shown as a diff and saved only through the same `parse` gate. Open:
+  which agent and model answer (the chat driver or a one-shot CLI call), whether the exchange is
+  recorded, and how secrets in a body are scrubbed before they leave. Blocked on MOD-9 milestone 1.
+
+- [ ] **MOD-56 - htui's panic hook is wrapped by ratatui's, so a contained panic still restores the
+  terminal** (from MOD-9, milestone-1 blueprint finding F-U; maintainer-decided 2026-09-26).
+  `R-ID-1`, `R-TUI-1`. `terminal::init` (`crates/htui/src/terminal.rs:26-43`) installs htui's
+  **conditional** hook and then calls `ratatui::init()`, whose `try_init` wraps whatever hook is
+  current in ratatui's **unconditional** `restore()` (`ratatui-0.30.2/src/init.rs:397-403`,
+  `:566-572`). So a panic that `htui_agent::excerpt::run_providers` contains (MOD-2 review M1,
+  H-20) still drops the terminal out of raw mode and the alternate screen mid-session, and
+  `restores_the_terminal()` is never consulted first; `tests/panic_hook.rs` tests only the
+  predicate. Fix shape: initialise without ratatui's hook (build the terminal the way `enter`
+  already does, `terminal.rs:88`) or install htui's hook after `ratatui::init` with `take_hook`
+  dropping ratatui's, plus a test that runs the real hook chain. Not blocked.
+
+- [ ] **MOD-57 - Run the external editor inside the TUI pane** (from MOD-9, merge of MOD-7
+  milestone 2, maintainer-decided 2026-09-26). `R-TUI-1`, `R-TUI-7`, `R-NF-1`. Today `E`/`Ctrl+E`
+  in the Templates editor (and any later user of the shared `ui::TextArea`) suspends the whole TUI
+  and runs `$VISUAL`/`$EDITOR` full-screen (`crates/htui/src/editor.rs`). Offer a toggle that runs
+  the editor inside the editing pane instead, with the rest of the TUI still drawn: a pseudo-terminal
+  (`portable-pty`, ConPTY on Windows) feeding a VT parser (`vt100`) drawn by a ratatui widget
+  (`tui-term`), keys forwarded to the child with one reserved chord to leave, resize forwarded,
+  and the file read back through the same `parse` gate on exit. Works for any editor, nvim
+  included. The alternative, nvim's `--embed` RPC UI (`nvim-rs`), is nvim-only and was not
+  preferred. The three crates are not in `Cargo.lock`, so the plan owns that dependency decision.
+  Not blocked; pairs with MOD-54 (display width) for the in-app widget.
+
 ### Deferred backlog
 
 - [ ] **CLEAN-4 - `LoopStop::NoProgressReview` is unreachable** (from MOD-4, risk R-9). `R-ORCH-3`.
@@ -694,6 +766,6 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-21 per-model weights)                                                                  |
-| MOD-N   | 38 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 41 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

@@ -53,7 +53,7 @@ use serde_json::Value;
 
 use crate::model::box_::BoxProfile;
 use crate::model::link::UpstreamEntry;
-use crate::model::skill::BoundSkill;
+use crate::model::skill::{BoundSkill, SkillChoice, select};
 use crate::prompt::render::Rendered;
 use crate::prompt::trim::{Inputs, Trimmer};
 use crate::scrub::Scrubber;
@@ -94,7 +94,9 @@ pub struct PromptSpec {
     pub upstream: Vec<UpstreamEntry>,
     /// The §4.2 box projection. Carries no path, by type (`BoxProfile` drops `box_tool.path`).
     pub box_profile: BoxProfile,
-    /// The `R-SKL-2` resolution, already collapsed and ordered; `assemble()` re-sorts anyway.
+    /// The step's skill candidates, resolved by `model::skill::resolve`: global, project and phase
+    /// attachments, most specific winning, inactive ones included. The assembler collapses and
+    /// selects (MOD-9 D43).
     pub skills: Vec<BoundSkill>,
     /// §4.5's read and windowed excerpts, with the audit half the ranker filled.
     pub excerpts: ExcerptSet,
@@ -504,6 +506,7 @@ pub fn assemble(
         &spec.template,
         template_tokens,
         sections,
+        masked.skill_choices.clone(),
         surviving_audit(spec, &kept_excerpts, scrubber)?,
         notes(spec),
     );
@@ -832,12 +835,16 @@ fn scrubbed_inputs(
 
     let mut upstream = spec.upstream.clone();
     UpstreamEntry::sort_canonical(&mut upstream);
-    let skills = BoundSkill::collapse(spec.skills.clone(), Vec::new());
+    // MOD-9 D43: collapse the candidates, then decide them. Only the active ones render, are
+    // estimated and meet the cap; every candidate is recorded.
+    let placed = parsed.used.contains(&Placeholder::Skills);
+    let (skills, skill_choices) = select(BoundSkill::collapse(spec.skills.clone()), placed);
     let candidates = judge_candidates(&spec);
     Ok(ScrubbedInputs {
         spec,
         upstream,
         skills,
+        skill_choices,
         candidates,
         literals,
     })
@@ -849,8 +856,11 @@ struct ScrubbedInputs {
     spec: PromptSpec,
     /// `spec.upstream` in §4.7 rule 2's canonical order.
     upstream: Vec<UpstreamEntry>,
-    /// `spec.skills` collapsed into `R-SKL-2`'s resolution.
+    /// The **active** candidates: `spec.skills` collapsed into `R-SKL-2`'s resolution and
+    /// selected (MOD-9 D43). Only these render, are estimated and meet `max_skill_tokens`.
     skills: Vec<BoundSkill>,
+    /// Every candidate's choice, in collapse order, for `trim_record.skill_choices`.
+    skill_choices: Vec<SkillChoice>,
     /// The judge's candidates in the order **this** call renders them (§4.7 rule 6).
     candidates: Vec<JudgeCandidate>,
     /// The frame's literal spans, LF-normalised and masked, in span order.

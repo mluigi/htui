@@ -304,7 +304,7 @@ impl PgStore {
                  position, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 SkillBindingId::as_uuid(row.id),
                 SkillId::as_uuid(row.skill_id),
-                ProjectId::as_uuid(row.project_id),
+                row.project_id.map(ProjectId::as_uuid),
                 row.phase_id.map(PhaseId::as_uuid),
                 row.pinned_version,
                 row.position,

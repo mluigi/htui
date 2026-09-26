@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, GraphSnapshot, Isolation, Item, ItemId, ItemPatch,
+    Agent, AgentBox, AgentId, BoundSkill, BoxId, GraphSnapshot, Isolation, Item, ItemId, ItemPatch,
     NewStepGraph, PhaseAgent, PhaseId, Project, ProjectId, ProjectSettings, PromptTemplate, RepoId,
     ResolvedGraph, RunMode, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPhase,
     SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
@@ -100,6 +100,22 @@ pub trait GraphSource: Sync {
     /// # Errors
     /// The backend's own failures.
     async fn agent_boxes(&self, box_id: BoxId) -> Result<Vec<AgentBox>>;
+
+    /// One step's skill candidates (MOD-9 D44): the global attachments, `project`'s, and — with
+    /// `phase` — that phase's, resolved most-specific-wins by `htui_core::model::skill::resolve`
+    /// and ordered `(position, name bytes)`. Inactive winners (`off`, `glob`, a pin with no
+    /// version) are **included**: the assembler's `select` decides and records them.
+    ///
+    /// Inherent on both stores and on `Backend` (`pg/read.rs:1433`, `mem.rs:425`,
+    /// `backend.rs:364`) for `prompt_template`'s reason: `skill*` is not mirrored.
+    ///
+    /// # Errors
+    /// The backend's own failures; `Backend` offline refuses with `PROMPT_ON_SERVER_ONLY`.
+    async fn bound_skills(
+        &self,
+        project: ProjectId,
+        phase: Option<PhaseId>,
+    ) -> Result<Vec<BoundSkill>>;
 }
 
 /// What [`resolve`] answers: the snapshot and the scope, ready for
@@ -725,8 +741,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Agent, AgentBox, AgentId, BTreeMap, BoxId, GraphSource, Isolation, Item, ItemId,
-        PhaseAgent, PhaseId, ProjectId, PromptTemplate, ReadStore, ResolveError, Resolved,
+        Agent, AgentBox, AgentId, BTreeMap, BoundSkill, BoxId, GraphSource, Isolation, Item,
+        ItemId, PhaseAgent, PhaseId, ProjectId, PromptTemplate, ReadStore, ResolveError, Resolved,
         ResolvedGraph, Result, RunMode, SnapshotTemplate, StepGraphId, StepGraphPhase, Value,
         WriteStore, override_graph, resolve,
     };
@@ -818,6 +834,14 @@ question and not a test fix. Decide the version bump first, then paste the new d
 
         async fn agent_boxes(&self, box_id: BoxId) -> Result<Vec<AgentBox>> {
             self.store.agent_boxes(box_id).await
+        }
+
+        async fn bound_skills(
+            &self,
+            project: ProjectId,
+            phase: Option<PhaseId>,
+        ) -> Result<Vec<BoundSkill>> {
+            self.store.bound_skills(project, phase).await
         }
     }
 

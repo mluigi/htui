@@ -1846,7 +1846,7 @@ async fn inherent_prompt_reads_answer_the_fixture() {
             .iter()
             .map(|skill| (skill.name.as_str(), skill.version, skill.position))
             .collect::<Vec<_>>(),
-        vec![("tests", 1, 0), ("rust-style", 2, 1)],
+        vec![("tests", Some(1), 0), ("rust-style", Some(2), 1)],
         "with no phase the project bindings stand, ordered by (position, name bytes), and an \
          unpinned binding follows the latest version"
     );
@@ -1861,7 +1861,7 @@ async fn inherent_prompt_reads_answer_the_fixture() {
             .iter()
             .map(|skill| (skill.name.as_str(), skill.version, skill.position))
             .collect::<Vec<_>>(),
-        vec![("tests", 1, 0), ("rust-style", 1, 2)],
+        vec![("tests", Some(1), 0), ("rust-style", Some(1), 2)],
         "the `implement` phase pins rust-style at v1 and the collapse renders it once, at the \
          phase binding's position"
     );

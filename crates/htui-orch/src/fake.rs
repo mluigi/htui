@@ -25,9 +25,10 @@ use htui_agent::event::{DoneEvent, DriverEvent, ErrorEvent, StopReason, UsageEve
 use htui_agent::fake::{FAKE_AGENT_NAME, FakeDriver};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, Document, DocumentId, Isolation, Item, ItemId, NewDocument,
-    PhaseAgent, PhaseId, ProjectId, PromptTemplate, RepoId, ResolvedGraph, Run, RunId, RunStep,
-    RunStepCommit, RunStepTree, SnapshotPhase, StepId, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
+    Agent, AgentBox, AgentId, BoundSkill, BoxId, Document, DocumentId, Isolation, Item, ItemId,
+    NewDocument, PhaseAgent, PhaseId, ProjectId, PromptTemplate, RepoId, ResolvedGraph, Run, RunId,
+    RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, TIMESTAMPTZ_DIGITS, UserId,
+    VerifyOutcome,
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::store::{MemStore, ReadStore, Result, WriteStore};
@@ -826,7 +827,7 @@ impl Clock for TestClock {
 /// would refuse every phase.
 const STAND_IN_MODEL: &str = "sonnet";
 
-/// The five inherent orchestration reads of `MemStore`, as the trait `graph.rs` defines
+/// The six inherent orchestration reads of `MemStore`, as the trait `graph.rs` defines
 /// (blueprint F-N).
 ///
 /// Implemented on `MemStore` itself rather than on `&MemStore`: a trait impl on the reference would
@@ -839,7 +840,7 @@ const STAND_IN_MODEL: &str = "sonnet";
 ///
 /// Each body calls the *inherent* method of the same name. Method resolution prefers inherent
 /// candidates over trait ones, so this is delegation and not recursion — and
-/// [`the trait's own unit test`](self) calls all five through the trait to prove it.
+/// [`the trait's own unit test`](self) calls all six through the trait to prove it.
 impl GraphSource for MemStore {
     async fn resolve_graph(&self, item: ItemId) -> Result<Option<ResolvedGraph>> {
         self.resolve_graph(item).await
@@ -869,6 +870,14 @@ impl GraphSource for MemStore {
 
     async fn agent_boxes(&self, box_id: BoxId) -> Result<Vec<AgentBox>> {
         self.agent_boxes(box_id).await
+    }
+
+    async fn bound_skills(
+        &self,
+        project: ProjectId,
+        phase: Option<PhaseId>,
+    ) -> Result<Vec<BoundSkill>> {
+        self.bound_skills(project, phase).await
     }
 }
 
@@ -1001,6 +1010,14 @@ impl GraphSource for FakeGraphSource<'_> {
 
     async fn agent_boxes(&self, box_id: BoxId) -> Result<Vec<AgentBox>> {
         GraphSource::agent_boxes(self.store, box_id).await
+    }
+
+    async fn bound_skills(
+        &self,
+        project: ProjectId,
+        phase: Option<PhaseId>,
+    ) -> Result<Vec<BoundSkill>> {
+        GraphSource::bound_skills(self.store, project, phase).await
     }
 }
 
@@ -2097,7 +2114,7 @@ mod tests {
         assert_eq!(isolator.releases(), 2, "every call is counted");
     }
 
-    /// `impl GraphSource for MemStore` delegates to the five inherent reads of the same names.
+    /// `impl GraphSource for MemStore` delegates to the six inherent reads of the same names.
     ///
     /// Method resolution prefers an inherent candidate over a trait one, so the bodies are
     /// delegation — but "prefers" is the kind of rule that is worth a test rather than a comment,
@@ -2140,6 +2157,24 @@ mod tests {
                 .expect("MemStore never fails a read")
                 .is_empty(),
             "the demo fixture seeds no `agent_box` row, so rung 3 finds nothing on it (plan D62)"
+        );
+        // MOD-9 D44, D66: the sixth read.
+        let skills =
+            GraphSource::bound_skills(&store, ids::PROJECT_HTUI, Some(ids::PHASE_HTUI_IMPLEMENT))
+                .await
+                .expect("MemStore never fails a read");
+        assert_eq!(
+            skills,
+            store
+                .bound_skills(ids::PROJECT_HTUI, Some(ids::PHASE_HTUI_IMPLEMENT))
+                .await
+                .expect("MemStore never fails a read"),
+            "the trait answers what the inherent read answers"
+        );
+        assert_eq!(
+            skills.len(),
+            2,
+            "`tests` from the project and `rust-style` from the phase, each once"
         );
     }
 

@@ -18,14 +18,14 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::model::{
-    Agent, AppUser, BoxRow, BoxTool, CitationKind, Document, EventKind, EventRole, GateOutcome,
-    GraphSnapshot, Isolation, Item, ItemKind, ItemKindId, ItemLink, ItemRequirement, ItemRevision,
-    LinkKind, Note, NoteId, OsFamily, PhaseId, Priority, Project, ProjectId, PromptTemplate,
-    PromptTemplateId, Requirement, RequirementArea, RequirementAreaId, RequirementId,
-    RequirementRevision, RequirementSpec, RequirementState, Resolution, Run, RunKind, RunMode,
-    RunStatus, RunStep, SessionEvent, Skill, SkillBinding, SkillVersion, SnapshotCandidate,
-    SnapshotGraph, SnapshotPhase, SnapshotSettings, SnapshotTemplate, Status, StepGraph,
-    StepGraphId, StepGraphPhase, StepId, StepStatus, Workspace, WorkspaceProject,
+    Activation, Agent, AppUser, BoxRow, BoxTool, CitationKind, Document, EventKind, EventRole,
+    GateOutcome, GraphSnapshot, Isolation, Item, ItemKind, ItemKindId, ItemLink, ItemRequirement,
+    ItemRevision, LinkKind, Note, NoteId, OsFamily, PhaseId, Priority, Project, ProjectId,
+    PromptTemplate, PromptTemplateId, Requirement, RequirementArea, RequirementAreaId,
+    RequirementId, RequirementRevision, RequirementSpec, RequirementState, Resolution, Run,
+    RunKind, RunMode, RunStatus, RunStep, SessionEvent, Skill, SkillBinding, SkillVersion,
+    SnapshotCandidate, SnapshotGraph, SnapshotPhase, SnapshotSettings, SnapshotTemplate, Status,
+    StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus, Workspace, WorkspaceProject,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::seed;
@@ -558,6 +558,7 @@ fn skill_versions() -> Vec<SkillVersion> {
         skill_id,
         version,
         body: body.to_owned(),
+        source: json!({}),
         created_by: ids::USER,
         created_at: epoch(),
     })
@@ -593,10 +594,13 @@ fn skill_bindings() -> Vec<SkillBinding> {
         |(id, skill_id, phase_id, pinned_version, position)| SkillBinding {
             id,
             skill_id,
-            project_id: ids::PROJECT_HTUI,
+            project_id: Some(ids::PROJECT_HTUI),
             phase_id,
             pinned_version,
             position,
+            activation: Activation::Always,
+            globs: Vec::new(),
+            languages: Vec::new(),
             updated_at: epoch(),
         },
     )
@@ -1630,7 +1634,7 @@ const PROMPT_DIGEST: &str = "9f2c1b7e4a08d3556c9e1af0b74d28e63c05a91f7d4b8e2016a
 /// half of what the pane renders: this one drops four sections and head-tails a fifth, so both
 /// indicators have something to say.
 const IMPL_TRIM_RECORD: &str = r#"{
-  "v": 1,
+  "v": 2,
   "template": { "name": "implement", "version": 3, "role": "phase" },
   "budget": 40000,
   "budget_source": "project",
@@ -1654,6 +1658,10 @@ const IMPL_TRIM_RECORD: &str = r#"{
     { "name": "excerpts",         "tokens_before": 11855, "tokens_after": 0,     "strategy": "dropped",   "trimmed": true,
       "dropped": 2 },
     { "name": "command_queue",    "tokens_before": 99,    "tokens_after": 99,    "strategy": "none",      "trimmed": false }
+  ],
+  "skill_choices": [
+    { "skill": "00000000-0000-0000-0000-000000005111", "name": "rust-style", "version": 2,
+      "level": "project", "activation": "always", "active": true, "reason": "always" }
   ],
   "excerpts": {
     "provider_set": ["builtin@1"],
@@ -2006,6 +2014,33 @@ mod tests {
             "01a06490-d343-7000-8000-000000000803"
         );
         assert_eq!(demo_uuid(4, 2).get_version_num(), 7, "v7 shaped");
+    }
+
+    /// MOD-9 D59 (plan R-23): the demo loader (`htui-store`'s `pg/demo.rs`) writes none of the
+    /// four `0007_skill_attachments.sql` columns, so Postgres reads their defaults. A fixture row
+    /// that differed would make `inherent_prompt_reads_answer_the_fixture` compare two different
+    /// stores.
+    #[test]
+    fn demo_skill_rows_use_the_column_defaults() {
+        let data = demo_data();
+        for binding in &data.skill_bindings {
+            assert_eq!(
+                (
+                    binding.activation,
+                    binding.globs.is_empty(),
+                    binding.languages.is_empty()
+                ),
+                (crate::model::Activation::Always, true, true),
+                "the demo loader writes no activation, globs or languages: {binding:?}"
+            );
+        }
+        for version in &data.skill_versions {
+            assert_eq!(
+                version.source,
+                serde_json::json!({}),
+                "the demo loader writes no source: {version:?}"
+            );
+        }
     }
 
     #[test]

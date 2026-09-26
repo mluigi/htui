@@ -11,7 +11,7 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │  CLEAN-1  failed             Drop the legacy markdo…││graph  awaiting  DESKTOP-HTUI 09-24 09:00  │
 │  FEAT-1   in_progress        TUI scaffold           ││manual                        —            │
 │  FEAT-2   blocked            Agent driver and chat …││▸ 0.1   awaiting   research         —    0s│
-│  FEAT-3   queued             Postgres store and cac…││        —          ~371 scripted/sonnet    │
+│  FEAT-3   queued             Postgres store and cac…││        —          ~459 scripted/sonnet    │
 │  FIX-1    closed             Terminal left raw afte…││                                           │
 │  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
 │▾ agy (3)                                            ││                                           │

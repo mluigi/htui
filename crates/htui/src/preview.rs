@@ -1,4 +1,4 @@
-//! The prompt preview: eight store reads, one `assemble()`, and no write at all (plan D102, D103).
+//! The prompt preview: nine store reads, one `assemble()`, and no write at all (plan D102, D103).
 //!
 //! This is the milestone's reason to exist. MOD-4's stage 3 will build a [`PromptSpec`] from a
 //! `run_step` and hand it to [`assemble`]; the preview builds **the same type** and hands it to
@@ -79,9 +79,19 @@ const DOCUMENTS_NOTE: &str = "preview: documents are latest-per-kind; ANA-2 inpu
 /// Blueprint H-21: `documents_of_kinds(item, &[])` would otherwise return `summary` too.
 const SUMMARY_NOTE: &str = "preview: the `summary` kind is excluded from documents; §4.3 renders \
                             it as upstream context instead";
-/// Blueprint D.4's second verbatim note.
-const SKILLS_NOTE: &str =
-    "preview: project-level skill bindings only; a phase binding needs a phase id (MOD-4)";
+/// MOD-9 D45: which phase's attachments the preview shows, and why a glob one never renders here.
+const SKILLS_NOTE: &str = "preview: phase-level skills come from the first phase of the item's \
+                           graph that uses this template; a glob attachment records no_path \
+                           because no root resolves";
+
+/// MOD-9 D45's second note: no phase of the item's graph uses the chosen template, or the item
+/// resolves to no graph, so only global and project attachments apply.
+fn no_phase_note(template: &str) -> String {
+    format!(
+        "preview: no phase of this item's graph uses template `{template}`; global and project \
+         skills only"
+    )
+}
 /// Blueprint D.4's third verbatim note.
 const OUTPUT_KIND_NOTE: &str = "preview: output_kind defaults to the template name; the phase \
                                 row's value arrives with MOD-4";
@@ -125,9 +135,9 @@ pub fn offline_refusal() -> &'static str {
 /// Plan D103's spec builder and the `assemble()` that follows it. **Never writes.**
 ///
 /// Blueprint D.4's table, read top to bottom: the item, its project, its kind, the project's
-/// templates, `app_setting`, the documents, the upstream walk, the box and the skills. Eight reads,
-/// every one of them the same read MOD-4 will make, and three fields filled by [`STAND_INS`]
-/// instead of by a `run_step`.
+/// templates, the item's graph (for the phase id), `app_setting`, the documents, the upstream
+/// walk, the box and the skills. Nine reads, every one of them the same read MOD-4 will make, and
+/// three fields filled by [`STAND_INS`] instead of by a `run_step`.
 ///
 /// Returns a whole [`PromptPreview`] rather than a bare [`PromptSpec`] because both halves of the
 /// answer are things the pane renders: a project with no template row is not an error, and neither
@@ -180,12 +190,29 @@ pub async fn build(
         name: chosen.name.clone(),
         version: chosen.version,
     };
+    // MOD-9 D45: the phase whose attachments this template's step would get — the first phase, in
+    // position order, of the item's graph whose `template_name` is the chosen one. Read after the
+    // templates (D64, F-L), so an offline arm refuses with the prompt sentence first.
+    let phase = backend
+        .resolve_graph(item)
+        .await?
+        .and_then(|graph| {
+            graph
+                .phases
+                .into_iter()
+                .filter(|row| row.phase.template_name == chosen.name)
+                .min_by_key(|row| row.phase.position)
+        })
+        .map(|row| row.phase.id);
 
     // The settings chain, once, so `budget_source` is decided inside `resolve_budget` and nowhere
     // else — an offline preview would then *say* `app_setting_default` rather than look identical
     // to a project-configured one (plan D101).
     let app = backend.app_settings().await?;
     let mut notes: Vec<String> = STAND_INS.iter().map(|note| (*note).to_owned()).collect();
+    if phase.is_none() {
+        notes.push(no_phase_note(&chosen.name));
+    }
     let budget = settings::resolve_budget(None, Some(&project.settings), &app);
     let hops = settings::resolve_hops(Some(&project.settings), &app, &mut notes);
     let max_skill_tokens = settings::resolve_max_skill_tokens(&app);
@@ -224,7 +251,7 @@ pub async fn build(
             });
         }
     };
-    let skills = backend.bound_skills(row.project_id, None).await?;
+    let skills = backend.bound_skills(row.project_id, phase).await?;
 
     let spec = PromptSpec {
         role: TemplateRole::of_name(&chosen.name),

@@ -73,7 +73,9 @@ pub fn opening_kind(
 
 /// §4.6(c)'s handoff spec built from the phase's own spec: role `Handoff`, the pinned `handoff`
 /// template's body and ref, `handoff: Some(HandoffInputs { StepSummary::from_events(events,
-/// roots), diff_so_far, failure_reason })`, and `verify_failure`/`previous_diff`/`judge` cleared.
+/// roots), diff_so_far, failure_reason })`, `verify_failure`/`previous_diff`/`judge` cleared, and
+/// `skills` emptied (MOD-9 D44: a handoff body cannot place `{{skills}}`, so a candidate would only
+/// be scrubbed — failing the handoff on a skill body it never shows — and recorded `not_placed`).
 /// Every other field is the phase's.
 #[must_use]
 pub fn handoff_spec(
@@ -94,6 +96,7 @@ pub fn handoff_spec(
         verify_failure: None,
         previous_diff: None,
         judge: None,
+        skills: Vec::new(),
         handoff: Some(HandoffInputs {
             step_summary: StepSummary::from_events(events, roots),
             diff_so_far,
@@ -421,11 +424,40 @@ mod tests {
             previous_diff: None,
             judge: None,
             handoff: spec.handoff.clone(),
+            // Blueprint F-C, D63: the fixture phase carries one skill, and a handoff carries none.
+            skills: Vec::new(),
             ..phase.clone()
         };
-        assert_eq!(spec, expected, "every other field is the phase's");
+        assert_eq!(
+            spec, expected,
+            "every other field is the phase's; D44: a handoff carries no skills"
+        );
         assert_eq!(spec.item_key, phase.item_key);
         assert_eq!(spec.budget, phase.budget);
         assert_eq!(spec.attempt, phase.attempt);
+    }
+
+    /// MOD-9 D44 (blueprint F-D, D63): the handoff body cannot place `{{skills}}`, so a phase's
+    /// candidates would only be scrubbed and recorded `not_placed`. The spec drops them, and the
+    /// assembled record has no choice to show. Tested here because the engine's only handoff path
+    /// (`open_chat`) keeps the text and digest and stores no record.
+    #[test]
+    fn the_handoff_carries_no_skills() {
+        let phase = phase_implement_attempt2();
+        assert!(
+            !phase.skills.is_empty(),
+            "the fixture phase carries a skill, which is what makes this test able to fail"
+        );
+        let spec = handoff_spec(
+            phase,
+            &handoff_template(),
+            &handoff_events(),
+            &[root()],
+            None,
+            "x".to_owned(),
+        );
+        assert!(spec.skills.is_empty(), "{:?}", spec.skills);
+        let assembled = assemble(&spec, &MinimalScrubber::new([])).expect("the handoff assembles");
+        assert_eq!(assembled.trim.skill_choices, Vec::new());
     }
 }
