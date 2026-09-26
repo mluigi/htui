@@ -123,14 +123,24 @@ pub fn scope_of(snapshot: &Value, repo_scope: &[RepoId]) -> RunScope {
     scope
 }
 
-/// Plan D83: `WriteStore::claim_run`'s verdict.
-#[must_use = "a refused claim wrote nothing; the caller must act on why"]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Plan D83: `WriteStore::claim_run`'s verdict. MOD-7 milestone 3 (D80) adds `MissingTags`, the
+/// one verdict that writes, and its `Vec` payload is why the type is no longer `Copy`.
+#[must_use = "a refused claim must be acted on; only `MissingTags` wrote anything"]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
     /// The run is now `running` on the box.
     Admitted,
     /// Not `queued`, or `target_box_id != box`.
     NotClaimable,
+    /// `R-ORCH-10` at claim (MOD-7 milestone 3, D80, D81): the run's item requires tags the box
+    /// has neither probed nor declared. **The one refusal that writes**: inside the admission
+    /// transaction the run moved `queued -> failed` with [`missing_tags_failure`] as its
+    /// `failure`, and its item `queued -> blocked`. Decided after `NotClaimable` and before the
+    /// slot and the overlap, so a permanent refusal wins over a transient one.
+    MissingTags {
+        /// The missing tags: byte order, deduplicated, never empty.
+        missing: Vec<String>,
+    },
     /// The box already runs `limit` runs.
     SlotFull {
         /// Runs counted against the box's slot.
@@ -160,12 +170,25 @@ impl fmt::Display for Claim {
         match self {
             Self::Admitted => f.write_str("admitted"),
             Self::NotClaimable => f.write_str("not claimable"),
+            Self::MissingTags { missing } => f.write_str(&missing_tags_failure(missing)),
             Self::SlotFull { running, limit } => {
                 write!(f, "box full ({running} of {limit} running)")
             }
             Self::Overlaps { with, rule } => write!(f, "overlaps run {with} ({rule})"),
         }
     }
+}
+
+/// `R-ORCH-10`'s one sentence (MOD-7 milestone 3, D77): `missing tags: a, b`, the tags joined by
+/// `", "` **in the order given**. Callers pass what both stores' reads answer (byte order,
+/// deduplicated, non-empty). Both stores' `claim_run` write it into `run.failure`, and it is the
+/// body of the engine's note at enqueue and at claim (ANA-2 §4.10, §12 criterion 14). It lives
+/// here, not in `htui-orch`, because the stores cannot see the engine (the reason the finish-run
+/// sentences live in `store::traits`).
+#[must_use]
+pub fn missing_tags_failure(missing: &[String]) -> String {
+    let _ = missing;
+    todo!("MOD-7 milestone 3 T0 commit (b)")
 }
 
 #[cfg(test)]
@@ -379,5 +402,30 @@ mod tests {
             }
             .is_admitted()
         );
+    }
+
+    #[test]
+    fn missing_tags_failure_joins_in_the_given_order() {
+        assert_eq!(
+            missing_tags_failure(&["a".into(), "b".into()]),
+            "missing tags: a, b"
+        );
+        assert_eq!(missing_tags_failure(&["a".into()]), "missing tags: a");
+        // It does not sort: the stores do.
+        assert_eq!(
+            missing_tags_failure(&["vulkan".into(), "docker".into()]),
+            "missing tags: vulkan, docker"
+        );
+    }
+
+    #[test]
+    fn a_missing_tags_claim_displays_the_sentence() {
+        let missing: Vec<String> = vec!["docker".into(), "vulkan".into()];
+        let claim = Claim::MissingTags {
+            missing: missing.clone(),
+        };
+        assert_eq!(claim.to_string(), "missing tags: docker, vulkan");
+        assert_eq!(claim.to_string(), missing_tags_failure(&missing));
+        assert!(!claim.is_admitted());
     }
 }
