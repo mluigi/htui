@@ -2991,6 +2991,12 @@ impl WriteStore for PgStore {
     /// D80). The run row and the box row are both locked `FOR UPDATE` before the tag read, so a
     /// concurrent `record_box_probe` or `edit_box` waits for the decision and the check cannot
     /// race a re-probe.
+    ///
+    /// The item row is **not** locked. A concurrent `update_item` of `required_tags` is ordered
+    /// after the claim: the claim decides on the tags it read, the same end state `MemStore`
+    /// reaches when the edit lands just after it. No lock, because `create_run` locks the item
+    /// and then the box (through `run.target_box_id`'s foreign key); an item lock taken here after
+    /// the box lock would take the two in the opposite order and could deadlock.
     async fn claim_run(
         &self,
         run: RunId,
