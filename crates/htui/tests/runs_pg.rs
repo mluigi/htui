@@ -1120,7 +1120,9 @@ async fn a_capability_refusal_blocks_and_unblock_reopens_on_postgres() {
         .await;
     assert_eq!(
         stack.take_status(),
-        Some(format!("start_run: item {item}: missing tags: docker, vulkan")),
+        Some(format!(
+            "start_run: item {item}: missing tags: docker, vulkan"
+        )),
         "the refusal names exactly the missing tags, in byte order"
     );
     assert_eq!(
@@ -1152,6 +1154,108 @@ async fn a_capability_refusal_blocks_and_unblock_reopens_on_postgres() {
         stack.run(run).await.status,
         RunStatus::AwaitingApproval,
         "on a box with those tags the run walks to its first gate"
+    );
+
+    stack.finish().await;
+}
+
+/// ANA-2 §4.10's claim-time half through the worker on Postgres (MOD-7 milestone 3, plan D89,
+/// blueprint D91, D99): a run refused for an overlap waits in the worker's queue while its tag is
+/// still declared; the tag is withdrawn (the re-probe the PRD's risk names); when the holder's
+/// task ends, the worker's claim retry meets `PgStore::claim_run`'s check, which fails the run by
+/// name and blocks the item. The retry answers nobody, so the status line stays empty: the proof
+/// that the engine answered `EngineError::MissingTags`, the variant neither of the worker's
+/// re-queue arms matches, and not `ClaimRefused`, is the note only that answer writes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs T2"]
+async fn a_claim_time_refusal_is_not_requeued_on_postgres() {
+    let Some(mut stack) = Stack::new(None).await else {
+        return;
+    };
+    let item = ids::HTUI_FEAT_3;
+    free_feat_3(&stack.db.store).await;
+    require_tags(&stack.db.store, item, &["rust", "gpu"]).await;
+
+    // `seed`'s primary repo is the scope both undeclared items resolve to, so the parked holder
+    // overlaps the second start.
+    let holder = stack.start(ids::HTUI_ANA_2).await;
+    assert_eq!(stack.run(holder).await.status, RunStatus::AwaitingApproval);
+
+    let before = stack.run_ids(item).await;
+    stack
+        .command(Command::StartRun {
+            item,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        })
+        .await;
+    let refused_status = stack.take_status().expect("the claim was refused");
+    assert!(
+        refused_status.starts_with(&format!(
+            "start_run: claim refused: overlaps run {holder} ("
+        )),
+        "the enqueue passed (`gpu` is declared) and the claim met the holder: {refused_status}"
+    );
+    let created: Vec<RunId> = stack
+        .run_ids(item)
+        .await
+        .into_iter()
+        .filter(|run| !before.contains(run))
+        .collect();
+    assert_eq!(created.len(), 1, "one run created: {created:?}");
+    let refused = created[0];
+    assert_eq!(stack.run(refused).await.status, RunStatus::Queued);
+    assert_eq!(stack.item(item).await.status, Status::Queued);
+
+    // The re-probe: the box no longer declares `gpu`.
+    declare_tags(&stack.db.store, 0, &[]).await;
+
+    // Ending the holder's task runs `retry_claims`, then `claim_queued`, then `reclaim(refused)`.
+    stack.command(Command::CancelRun { run: holder }).await;
+    assert_eq!(stack.take_status(), None, "the cancel was accepted");
+    stack
+        .drive_until("the retried claim's note", |store| async move {
+            store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .is_ok_and(|notes| notes.iter().any(|note| note.body == "missing tags: gpu"))
+        })
+        .await;
+
+    let failed = stack.run(refused).await;
+    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(failed.failure.as_deref(), Some("missing tags: gpu"));
+    assert_eq!(
+        failed.executing_box_id, None,
+        "the refused run took no slot"
+    );
+    assert_eq!(failed.started_at, None);
+    assert_eq!(stack.item(item).await.status, Status::Blocked);
+    assert_eq!(
+        note_box(&stack.db.pool, item, "missing tags: gpu").await,
+        vec![Some(ids::BOX.as_uuid())],
+        "one note, written on this box by `Engine::claim`'s `MissingTags` arm"
+    );
+    assert_eq!(
+        stack.take_status(),
+        None,
+        "a claim retry answers nobody: the note is the refusal a human reads"
+    );
+
+    stack.command(Command::Unblock { item }).await;
+    assert_eq!(stack.take_status(), None, "the unblock was accepted");
+    assert_eq!(stack.item(item).await.status, Status::Open);
+    declare_tags(&stack.db.store, 1, &["gpu"]).await;
+    let run = stack.start(item).await;
+    assert_eq!(
+        stack.run(run).await.status,
+        RunStatus::AwaitingApproval,
+        "no holder overlaps now, and the box declares `gpu` again"
+    );
+    assert_eq!(
+        stack.run(refused).await.status,
+        RunStatus::Failed,
+        "nothing re-queued the failed run"
     );
 
     stack.finish().await;
