@@ -1284,3 +1284,49 @@ async fn excerpts_for_drops_a_file_the_scrubber_refuses() {
         set.notes
     );
 }
+
+#[tokio::test]
+async fn excerpts_for_never_persists_a_note_naming_a_masked_path() {
+    // Review finding M-1. `select`'s own notes name `repo:path` as the reader listed it, and
+    // `trim_record.notes` is persisted unscrubbed. A file under a directory named after a known
+    // secret that the reader lists but cannot read — here, bytes that are not UTF-8 — would put
+    // the secret in the stored record. (An oversize file cannot reach this note through
+    // `FsRepoReader`: the walk's skip rule 5 never lists it, so it names nothing.)
+    let secret = "hunter2hunter2";
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(
+        dir.path(),
+        &format!("{secret}/bad.rs"),
+        b"fn x() {}\n// \xff\xfe\n",
+    );
+    let input = PassInput {
+        roots: vec![fs_root(dir.path())],
+        touched_prefixes: vec![PathPrefix::parse(&format!("{secret}/bad.rs"), "htui")],
+        notes: Vec::new(),
+    };
+
+    let set = excerpts_for(
+        &phase_spec(),
+        input,
+        &BTreeMap::new(),
+        &MinimalScrubber::new([secret.to_owned()]),
+    )
+    .await;
+
+    assert!(set.files.is_empty(), "{:?}", set.files);
+    assert!(!set.notes.is_empty(), "the unreadable file is still noted");
+    for note in &set.notes {
+        assert!(
+            !note.contains(secret),
+            "a note names a masked string: {note}"
+        );
+    }
+    assert!(
+        set.notes.contains(
+            &"excerpt: a note was withheld; it named a string the scrubber masks or refuses"
+                .to_owned()
+        ),
+        "{:?}",
+        set.notes
+    );
+}

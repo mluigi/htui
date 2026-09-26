@@ -42,6 +42,7 @@ use htui_core::prompt::excerpt::{
 use htui_core::prompt::settings::resolve_excerpt_caps;
 use htui_core::prompt::{
     Placeholder, PromptSpec, TokenEstimator, drop_unmaskable_excerpts, excerpt_residual, parse,
+    withhold_unmaskable_notes,
 };
 use htui_core::scrub::Scrubber;
 
@@ -918,8 +919,11 @@ pub fn excerpt_pass(req: &OwnedExcerptRequest, est: TokenEstimator) -> ExcerptSe
 ///    unscanned, because `assemble` will refuse the same way. Then [`excerpt_pass`] runs under
 ///    `tokio::task::spawn_blocking`; a `JoinError` records the roots unscanned with
 ///    `excerpt: the pass panicked; no excerpts` (§4.5 fail-open).
-/// 5. `drop_unmaskable_excerpts(&mut set, scrubber)`.
-/// 6. `set.notes` = `input.notes`, then the pass's notes, then the drop notes.
+/// 5. `withhold_unmaskable_notes(&mut set.notes, scrubber)`: a pass note names `repo:path` as the
+///    reader returned it, and `trim_record.notes` is persisted unscrubbed, so a note the scrubber
+///    would mask or refuse is replaced by a fixed line that names nothing (P-2).
+/// 6. `drop_unmaskable_excerpts(&mut set, scrubber)`, whose notes are built safe.
+/// 7. `set.notes` = `input.notes`, then the pass's notes, then the drop notes.
 ///
 /// The request is `item_key`, `item_body`, `phase` and the input documents' bodies from `spec`,
 /// `input.touched_prefixes`, no `changed_paths` (D122), `input.roots`, the budget, and the caps,
@@ -993,6 +997,9 @@ pub async fn excerpts_for(
         // on this thread, so there is no I/O to move off the runtime (H-9).
         excerpt_pass(&request, est)
     };
+    // The pass's own notes name `repo:path` as the reader returned it, so they are checked
+    // before `drop_unmaskable_excerpts` appends its own, which are built safe (P-2).
+    withhold_unmaskable_notes(&mut set.notes, scrubber);
     drop_unmaskable_excerpts(&mut set, scrubber);
     let mut all = notes;
     all.append(&mut set.notes);

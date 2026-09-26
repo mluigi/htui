@@ -21,8 +21,8 @@
 //! itself, [`trim`]'s five-step order and its record, and [`settings`]'s budget chain. T66 lands
 //! [`excerpt`]'s five-tier ranker, its [`ExcerptProvider`](excerpt::ExcerptProvider) seam and
 //! [`excerpt::select`], whose filesystem half is `htui_agent::excerpt`. MOD-7 milestone 4 adds
-//! [`excerpt_residual`] (D118) and [`drop_unmaskable_excerpts`] (D129), which
-//! `htui_agent::excerpt::excerpts_for` uses. It is the one pass both the engine's phase prompt and
+//! [`excerpt_residual`] (D118), [`drop_unmaskable_excerpts`] (D129) and
+//! [`withhold_unmaskable_notes`] (P-2), which `htui_agent::excerpt::excerpts_for` uses. It is the one pass both the engine's phase prompt and
 //! the Backlog preview run, and a caller with no readable root gets the empty audit from it.
 
 pub mod defaults;
@@ -955,6 +955,30 @@ pub fn drop_unmaskable_excerpts(set: &mut ExcerptSet, scrubber: &dyn Scrubber) {
     set.files = kept;
 }
 
+/// What [`withhold_unmaskable_notes`] puts in place of a note it withholds.
+const WITHHELD_NOTE: &str =
+    "excerpt: a note was withheld; it named a string the scrubber masks or refuses";
+
+/// Replaces every note the scrubber would change — refuse or mask — with one fixed line, so a
+/// `repo:path` a pass's note names straight from the filesystem never reaches `trim_record.notes`
+/// in plain text (MOD-7 milestone 4, P-2, D129).
+///
+/// `trim_record.notes` is persisted unscrubbed and the preview shows it, and
+/// [`excerpt::select`]'s own notes name a listed or read path as the reader returned it: one over
+/// `max_file_bytes`, one that could not be read, one declared but excluded, one not repo-relative.
+/// A path under a directory named after a known secret would otherwise be stored as it is. A note
+/// is kept only when the scrubber returns it unchanged, the same test
+/// [`drop_unmaskable_excerpts`] applies before naming a repo or path; the replacement keeps the
+/// note's place and names nothing. A caller runs this on the pass's notes **before**
+/// [`drop_unmaskable_excerpts`] appends its own, which are already built to be safe.
+pub fn withhold_unmaskable_notes(notes: &mut [String], scrubber: &dyn Scrubber) {
+    for note in notes {
+        if !scrubs_unchanged(scrubber, note) {
+            WITHHELD_NOTE.clone_into(note);
+        }
+    }
+}
+
 /// The rule [`scrub_text`] refuses `value` under, as [`assemble`] would probe it for the excerpt
 /// section; `None` when it masks cleanly.
 fn refused_rule(scrubber: &dyn Scrubber, value: &str) -> Option<&'static str> {
@@ -1345,6 +1369,34 @@ mod residual_tests {
                 !note.contains("hunter2hunter2"),
                 "a note names a masked string: {note}"
             );
+        }
+    }
+    #[test]
+    fn withhold_unmaskable_notes_replaces_every_note_naming_a_masked_or_refused_string() {
+        let clean = "excerpt: repo `htui` hit the scan cap of 10 files; the listing is partial";
+        let mut notes = vec![
+            "excerpt: `htui:deploy/hunter2hunter2/big.rs` is 999 bytes, over max_file_bytes (10); \
+             skipped"
+                .to_owned(),
+            clean.to_owned(),
+            "excerpt: `htui:src/sk-live0123456789abcdef.rs` could not be read: gone".to_owned(),
+        ];
+        withhold_unmaskable_notes(
+            &mut notes,
+            &MinimalScrubber::new(["hunter2hunter2".to_owned()]),
+        );
+        assert_eq!(
+            notes,
+            vec![
+                WITHHELD_NOTE.to_owned(),
+                clean.to_owned(),
+                WITHHELD_NOTE.to_owned(),
+            ],
+            "a note the scrubber changes is withheld, one it leaves alone is kept in place"
+        );
+        for note in &notes {
+            assert!(!note.contains("hunter2hunter2"), "{note}");
+            assert!(!note.contains("sk-"), "{note}");
         }
     }
 }
