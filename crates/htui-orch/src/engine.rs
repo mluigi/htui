@@ -25,6 +25,7 @@ use futures::future::Either;
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposure};
 use htui_agent::event::{DoneEvent, StopReason};
+use htui_agent::excerpt::{PassInput, excerpt_roots, excerpts_for, touched_prefixes};
 use htui_agent::record::{Recorder, RunCap, pump};
 use htui_core::model::{
     BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus, Document, DocumentId,
@@ -4399,6 +4400,8 @@ where
             box_profile: self.parts.box_profile.clone(),
             // MOD-9 D44, D48: the judged phase's candidates, the same list for both orders.
             skills: skills.clone(),
+            // No pass for a judge (plan D109): its placeholder set cannot place `{{excerpts}}`
+            // (`template.rs:188-215`), so a file read here could only reach the audit.
             excerpts: no_excerpts(caps),
             command_queue: false,
             verify_failure: None,
@@ -4887,7 +4890,8 @@ where
         self.cleanup_run(run.id).await
     }
 
-    /// Stage 3: the phase's spec ([`Self::phase_spec`]) and `assemble`.
+    /// Stage 3: the phase's spec ([`Self::phase_spec`]) and `assemble`. The excerpt pass runs
+    /// between the two ([`Self::with_excerpts`]).
     ///
     /// The inner `Err` is the run's own outcome rather than an engine fault (blueprint D195):
     /// [`StageThree::MissingInput`] is a required input that resolved to no document, which the
@@ -4903,13 +4907,16 @@ where
         phase: &SnapshotPhase,
         item: ItemId,
     ) -> Result<Result<AssembledPrompt, StageThree>, EngineError> {
-        let spec = match self
+        let mut spec = match self
             .phase_spec(run, snapshot, step, phase, item, true)
             .await?
         {
             Ok(spec) => spec,
             Err(missing) => return Ok(Err(StageThree::MissingInput(missing))),
         };
+        // MOD-7 milestone 4 (D125): here and not in `phase_spec`, which is also the handoff's
+        // builder; a handoff reads no file.
+        self.with_excerpts(run, step, item, &mut spec).await?;
         Ok(assemble(&spec, self.parts.scrubber).map_err(StageThree::Refused))
     }
 
@@ -4926,8 +4933,6 @@ where
     ///
     /// # Errors
     /// A store read's failure. Nothing about the excerpts themselves is an error: §4.5 fails open.
-    // MOD-7 milestone 4 (H-6): defined red and uncalled; the green commit wires it in.
-    #[allow(dead_code)]
     async fn with_excerpts(
         &self,
         run: &Run,
@@ -4935,8 +4940,43 @@ where
         item: ItemId,
         spec: &mut PromptSpec,
     ) -> Result<(), EngineError> {
-        let _ = (run, step, item, spec);
-        todo!("MOD-7 milestone 4 T2: with_excerpts")
+        let row = self.item(item).await?;
+        let repos = self.parts.store.repos(run.project_id).await?;
+        let mut notes = Vec::new();
+        let mut scope = Vec::with_capacity(run.repo_scope.len());
+        for id in &run.repo_scope {
+            match repos.iter().find(|repo| repo.id == *id) {
+                Some(repo) => scope.push((*id, repo.name.clone())),
+                None => notes.push(format!(
+                    "excerpt: repo `{id}` in the run's scope has no row in its project; left out"
+                )),
+            }
+        }
+        let trees = self.parts.store.step_trees(step.id).await?;
+        let mut paths = Vec::new();
+        for (id, _) in &scope {
+            paths.extend(self.parts.store.repo_box_paths(*id).await?);
+        }
+        let roots = excerpt_roots(&scope, &trees, &paths, self.parts.box_id);
+        // D108: a fan-out group assembles before any candidate tree exists.
+        if trees.is_empty()
+            && roots
+                .iter()
+                .any(|root| root.source == RootSource::RepoBoxPath)
+        {
+            notes.push(
+                "excerpt: no run_step_tree row yet for this step; roots read from repo_box_path"
+                    .to_owned(),
+            );
+        }
+        let input = PassInput {
+            roots,
+            touched_prefixes: touched_prefixes(&row.touched_paths, &repos),
+            notes,
+        };
+        let excerpts = excerpts_for(spec, input, &self.parts.app, self.parts.scrubber).await;
+        spec.excerpts = excerpts;
+        Ok(())
     }
 
     /// The phase's [`PromptSpec`] for `step`: its resolved inputs, its pinned template, its
@@ -5051,9 +5091,10 @@ where
             // winning (`model::skill::resolve`); the assembler's `select` decides which render and
             // records every candidate in `trim_record.skill_choices`.
             skills,
-            // §4.5's ranker needs a resolved repo root and `repo_box_path` has no writer the walk
-            // can reach, so the audit records the caps a pass *would* have run under and nothing
-            // else — the shape `crates/htui/src/preview.rs:274-295` already ships.
+            // The pass runs in `assemble_prompt` (`Self::with_excerpts`, MOD-7 milestone 4 D125),
+            // not here: this builder is also the promote/handoff path's, and a handoff never reads
+            // a file. So the caps are recorded and nothing else, and `with_excerpts` replaces this
+            // for a phase prompt.
             excerpts: no_excerpts(caps),
             command_queue: phase.command_queue != htui_core::model::CommandQueue::Off,
             // Plan D67: what the previous attempt's winner left — its failed verify and its diff —
@@ -5773,11 +5814,11 @@ fn chat_dirs(trees: &[RunStepTree], repos: &[Repo]) -> Option<(PathBuf, Vec<Path
     Some((cwd, extra_dirs))
 }
 
-/// An excerpt set with no files whose audit records the caps a pass *would* have run under.
+/// An excerpt set with no files, whose audit records the caps a pass *would* have run under.
 ///
-/// §4.5's ranker needs a resolved repo root and `repo_box_path` has no writer the walk can reach,
-/// so this is the shape `crates/htui/src/preview.rs:274-295` already ships — for a phase step and,
-/// with nothing to rank at all, for the judge (plan D53).
+/// Used where no pass runs: `phase_spec`, which the handoff path shares (D125), and the judge,
+/// whose placeholder set cannot place `{{excerpts}}` (D109). A phase prompt's set is
+/// `Self::with_excerpts`'.
 fn no_excerpts(caps: htui_core::prompt::excerpt::ExcerptCaps) -> ExcerptSet {
     ExcerptSet {
         files: Vec::new(),
