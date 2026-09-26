@@ -1,6 +1,8 @@
 # Plan: MOD-7 milestone 3 — a mismatch is refused by name
 
-> **Status: confirmed** (2026-09-26; maintainer adopted every recommended answer, OQ-20..OQ-25), fact-checked 2026-09-26. Every tree fact this plan relies on is
+> **Status: complete** (`a9d2908`..`d73d120`, 2026-09-26). T0–T3 implemented; review fixes
+> `49d809c`..`d73d120`; deferred test gaps opened as MOD-58. Confirmed 2026-09-26 (maintainer adopted
+> every recommended answer, OQ-20..OQ-25), fact-checked 2026-09-26. Every tree fact this plan relies on is
 > listed under "Claims to verify"; "Verified claims" holds the verdicts, and amendments are marked
 > inline with "(amended at fact-check)".
 >

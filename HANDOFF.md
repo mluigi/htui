@@ -39,10 +39,12 @@ milestone 2 and MOD-38: store conformance `CASES` 71, `READ_CASES` 14, `htui-orc
 milestones 1 and 2 on top: store `CASES` 74, `StoreRequest` 68, `StoreReply` 39, 264 `.sqlx` files
 (+1 template writer, −3 +2 skill reads), 87 `crates/htui/tests/snapshots`, 34 pinned commented columns
 (`tests/migrations.rs`), and `run_step.trim_record` at `v: 2` with `skill_choices`;
-`cargo doc --workspace --no-deps --keep-going` shows exactly five baseline errors (`htui-core`
-`MIRRORED_TABLES`; `htui-store` `step_exists`, and three private links MOD-38 added in
-`pg/write.rs`: `set_requirement_spec` to `cas_miss`, `amend_requirement` and
-`withdraw_requirement` to `revise_requirement`). `git` ≥ 2.33.0 is a runtime dependency
+Pins moved by MOD-7 milestone 3: store `CASES` 76, `htui-orch` `CASES` 72, 267 `.sqlx` files.
+`cargo doc --workspace --no-deps --keep-going` shows exactly six baseline errors (`htui-core`
+`MIRRORED_TABLES`; `htui-store` `step_exists`, `HashEmbedder` in `embed.rs`, and three private
+links MOD-38 added in `pg/write.rs`: `set_requirement_spec` to `cas_miss`, `amend_requirement` and
+`withdraw_requirement` to `revise_requirement`; the count read five before 2026-09-26, but
+`HashEmbedder` already failed at `98e6d2f`). `git` ≥ 2.33.0 is a runtime dependency
 of the `worktree` isolation mode and of reconciliation. **Production `approve` and `accept` are
 greyed and every production judge fails until MOD-11**, because no agent can write its phase's
 `output_kind` document yet, so production fan-outs go to the human (`s` in the Runs pane).
@@ -307,6 +309,24 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   `box_probe_pg` cases cover the reconnect, registration probe and concurrent edit instead.
   Review: 3 low findings; two applied (`e2c6072`, `00c2d48`), two deferrals opened as MOD-53 and
   MOD-54.
+  **Milestone 3 landed (`a9d2908`..`d73d120`, 2026-09-26), "a mismatch is refused by name"**
+  (`.claude/plans/mod-7-capability-refusal.plan.md`,
+  `.claude/plans/mod-7-capability-refusal.blueprint.md`): `R-ORCH-10` at enqueue and at claim, no
+  migration. The engine reaches box tags through a seventh `GraphSource` method, `missing_tags(item,
+  box)`, over the store's existing read. `Engine::enqueue` refuses an `open`/`failed` item whose
+  `required_tags` the box lacks before resolving the graph, like MOD-4's rung-4 refusal: no `run`
+  row, the item `blocked` (a `failed` item stays `failed`) with the note `missing tags: a, b`,
+  `EngineError::MissingTags`, and `Unblock` reopens it - ANA-2 criterion 14's capability half, its
+  own conformance case. At claim, `claim_run` answers the new `Claim::MissingTags` (after
+  `NotClaimable`, before `SlotFull` and `Overlaps`) inside the admission transaction, failing the run
+  with `run.failure = "missing tags: a, b"` and blocking the item on MemStore and PgStore alike;
+  `Claim` lost `Copy`. The engine maps it to `EngineError::MissingTags`, never `ClaimRefused`, so the
+  worker does not re-queue it; the note is written after the transaction and `run.failure` is the
+  lasting record. Known gaps: a claim refused on the worker's retry path (`reclaim`) reaches the
+  note but not the status line (unaddressed task); PgStore reads `item.required_tags` unlocked by
+  design (a lock after the box's would deadlock with `create_run`). Review: 1 medium, 6 low; five
+  applied (`49d809c`..`d73d120`), two rejected, two test gaps deferred as MOD-58. Remaining:
+  milestone 4 (repo path inference and excerpts).
 - [ ] **MOD-53 - Runtime tasks always send a terminal reply** (from MOD-7 milestone 2 review).
   `R-NF-3`, `R-TUI-8`. A panic inside a spawned runtime task (`run_box_probe`, `run_probe`, the
   install and login tasks in `crates/htui/src/agent_worker.rs`) is dropped by `sweep_finished`
@@ -322,6 +342,13 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   `Left`/`Backspace` can split a combining sequence. Measure by display width (`unicode-width`) and
   step by grapheme (`unicode-segmentation`) in both widgets together; declaring those crates is a
   dependency decision. Found 2026-09-26.
+- [ ] **MOD-58 - Two claim-time test gaps** (from MOD-7 milestone 3 review). `R-ORCH-10`. Neither
+  store pins (a) a run with missing tags that is `NotClaimable` because its `target_box_id` is
+  another box (only the cancelled-run half of plan D81's `NotClaimable` rule is pinned), nor (b)
+  plan D94, a run with no item (or whose item row is gone) is never refused for tags. The shared
+  store conformance has no trait method to make a second box, so (a) wants a `pg_criteria` case
+  that inserts a second `box` row plus a MemStore unit test in `mem.rs`; (b) fits either. Found
+  2026-09-26.
 - [ ] **MOD-49 - Interactive path picker for repo and workspace roots** (from MOD-7). `R-BOX-4`,
   `R-TUI-8`. MOD-7 D5 infers each repo's path on a box and falls back to a typed path in a text box
   when inference fails. Replace the typed fallback with a popup window that browses the box's
@@ -766,6 +793,6 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-21 per-model weights)                                                                  |
-| MOD-N   | 41 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 42 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
