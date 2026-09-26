@@ -258,15 +258,18 @@ impl AttachPane {
         self.mode = AttachMode::Browse;
     }
 
+    /// Whether the form is open (not the picker over it): what `Esc` would close.
+    pub(super) fn in_form(&self) -> bool {
+        matches!(self.mode, AttachMode::Form(_))
+    }
+
     /// The write the form sent missed its token: the form keeps its text and takes the row's
-    /// token as it is now, so the next `Ctrl+S` is a deliberate overwrite. `false` when no form is
-    /// open (a detach went stale, or the form was closed meanwhile).
-    pub(super) fn on_stale(&mut self, snapshot: &SkillsSnapshot) -> bool {
-        let (AttachMode::Form(form) | AttachMode::Picker { form, .. }) = &mut self.mode else {
-            return false;
-        };
-        form.token = snapshot.binding(form.key).map(|row| row.updated_at);
-        true
+    /// token as it is now, so the next `Ctrl+S` is a deliberate overwrite. With no form open (a
+    /// detach went stale) there is nothing to keep.
+    pub(super) fn on_stale(&mut self, snapshot: &SkillsSnapshot) {
+        if let AttachMode::Form(form) | AttachMode::Picker { form, .. } = &mut self.mode {
+            form.token = snapshot.binding(form.key).map(|row| row.updated_at);
+        }
     }
 
     /// Keeps the cursor on a row after the snapshot changed.

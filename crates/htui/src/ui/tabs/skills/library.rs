@@ -91,7 +91,8 @@ const BINDING_CHANGED_ELSEWHERE: &str = "this attachment changed elsewhere \u{20
 
 /// A detach over a row that changed or went since the question was asked: nothing was detached,
 /// and the pane shows the row as it is now.
-const BINDING_GONE_ELSEWHERE: &str = "this attachment changed elsewhere \u{2014} nothing was detached; the row shows it as it is now";
+const DETACH_CHANGED_ELSEWHERE: &str = "this attachment changed elsewhere \u{2014} nothing was \
+                                        detached; its row shows it as it is now";
 
 /// The hint row in Browse (96 chars: `j/k` carries no word so the row fits 100 columns).
 const BROWSE_HINT: &str = "j/k  ,/. version  b base  d diff  e edit  E $EDITOR  n new  i info  \
@@ -467,8 +468,14 @@ impl LibraryView {
                 self.snapshot = Some((**snapshot).clone());
                 self.unavailable = None;
                 if self.busy.take().is_some() {
-                    self.sent = None;
-                    self.stale(*what);
+                    let detach = matches!(
+                        self.sent.take(),
+                        Some(Sent::Binding {
+                            change: BindingChange::Detach,
+                            ..
+                        })
+                    );
+                    self.stale(*what, detach);
                 }
                 self.clamp();
             }
@@ -954,6 +961,15 @@ impl LibraryView {
             self.attach = None;
             return Handled::Pass;
         };
+        // The form's save is in flight: its reply closes the form or keeps it, so `Esc` waits for
+        // it, as the editor's does.
+        if let Some(busy) = self.busy
+            && pane.in_form()
+            && key.code == KeyCode::Esc
+        {
+            self.notice = Some(Notice::Error(in_flight(busy)));
+            return Handled::Consumed;
+        }
         match pane.on_key(key, snapshot, ctx) {
             AttachOutcome::Consumed => {}
             AttachOutcome::Pass => return Handled::Pass,
@@ -1107,7 +1123,7 @@ impl LibraryView {
 
     /// A write missed its token, or its row is gone (§6.4's second table): the draft keeps its
     /// text and takes the token as it is now, so the next `Ctrl+S` is a deliberate overwrite.
-    fn stale(&mut self, what: StaleWhat) {
+    fn stale(&mut self, what: StaleWhat, detach: bool) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -1129,14 +1145,13 @@ impl LibraryView {
                 (None, _) => self.gone(),
             },
             StaleWhat::Binding(_) => {
-                let kept = self
-                    .attach
-                    .as_mut()
-                    .is_some_and(|pane| pane.on_stale(snapshot));
-                let sentence = if kept {
-                    BINDING_CHANGED_ELSEWHERE
+                if let Some(pane) = &mut self.attach {
+                    pane.on_stale(snapshot);
+                }
+                let sentence = if detach {
+                    DETACH_CHANGED_ELSEWHERE
                 } else {
-                    BINDING_GONE_ELSEWHERE
+                    BINDING_CHANGED_ELSEWHERE
                 };
                 self.notice = Some(Notice::Error(sentence.to_owned()));
             }
@@ -1581,11 +1596,16 @@ mod tests {
         let [save] = requests.as_slice() else {
             panic!("exactly the attach was sent: {requests:?}");
         };
-        let StoreRequest::SetSkillBinding { key, expected, .. } = save else {
+        let StoreRequest::SetSkillBinding {
+            key: written,
+            expected,
+            ..
+        } = save
+        else {
             panic!("not an attach: {save:?}");
         };
         assert_eq!(
-            (*key, *expected),
+            (*written, *expected),
             (
                 SkillBindingKey {
                     skill: ids::SKILL_RUST_STYLE,
@@ -1594,6 +1614,15 @@ mod tests {
                 },
                 None
             )
+        );
+
+        view.on_key(key(KeyCode::Esc), &mut ctx);
+        assert!(view.captures_input(), "`Esc` waits for the save in flight");
+        assert_eq!(
+            view.notice,
+            Some(Notice::Error(
+                "`set_skill_binding` is still in flight".to_owned()
+            ))
         );
 
         view.on_reply(&untouched, &mut ctx);

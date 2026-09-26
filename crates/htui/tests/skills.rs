@@ -768,6 +768,63 @@ async fn a_glob_naming_no_repo_is_shown_before_save_and_refused_by_the_store() {
 }
 
 #[tokio::test]
+async fn an_attachment_changed_elsewhere_keeps_the_form_and_saves_over_it() {
+    let store = MemStore::demo();
+    let mut harness = open_platform_over(store.clone()).await;
+    select(&mut harness, "tests");
+    harness.key("a");
+    harness.key("j");
+    harness.key("enter");
+    for _ in 0..2 {
+        harness.key("tab");
+    }
+    harness.key("backspace");
+    type_text(&mut harness, "7");
+    let row = htui_row(&store, ids::SKILL_TESTS)
+        .await
+        .expect("the demo `tests` row");
+    set_binding(
+        &store,
+        SkillBindingKey::of(&row),
+        Some(row.updated_at),
+        BindingChange::Attach(Attachment {
+            position: 5,
+            ..always()
+        }),
+    )
+    .await;
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("this attachment changed elsewhere"),
+        "the stale notice: {frame}"
+    );
+    assert!(frame.contains("position    7"), "the form is kept: {frame}");
+    assert_eq!(
+        htui_row(&store, ids::SKILL_TESTS)
+            .await
+            .map(|row| row.position),
+        Some(5),
+        "the stale save wrote nothing"
+    );
+    harness.key("ctrl-s");
+    harness.settle().await;
+    assert_eq!(
+        htui_row(&store, ids::SKILL_TESTS)
+            .await
+            .map(|row| row.position),
+        Some(7),
+        "the second save carries the row's new token"
+    );
+    assert!(
+        notice(&harness.render()).contains("attached to htui"),
+        "{}",
+        harness.render()
+    );
+}
+
+#[tokio::test]
 async fn a_global_attachment_refuses_ctrl_r() {
     let mut harness = open_platform_over(MemStore::demo()).await;
     select(&mut harness, "tests");
