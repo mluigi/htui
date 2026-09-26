@@ -85,7 +85,7 @@ const SUMMARY_NOTE: &str = "preview: the `summary` kind is excluded from documen
 /// MOD-9 D45: which phase's attachments the preview shows, and why a glob one never renders here.
 const SKILLS_NOTE: &str = "preview: phase-level skills come from the first phase of the item's \
                            graph that uses this template; a glob attachment records no_path \
-                           because no root resolves";
+                           until glob activation lands (MOD-9 OQ-12)";
 
 /// MOD-9 D45's second note: no phase of the item's graph uses the chosen template, or the item
 /// resolves to no graph, so only global and project attachments apply.

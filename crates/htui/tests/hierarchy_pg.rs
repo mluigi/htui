@@ -2,8 +2,9 @@
 //! `htui::store_worker::serve` over a `Backend::Online`.
 //!
 //! `tests/hierarchy.rs` proves the inference over a `MemStore`. What only this file can prove is
-//! what Postgres does with the rows: the insert-if-absent statement's conflict clause leaves a
-//! manual `upsert_repo_box_path` row exactly as it was, and the canonical path the worker computed
+//! what Postgres does with the rows: a manual `upsert_repo_box_path` row is reported `AlreadySet`
+//! and left exactly as it was (the insert-if-absent statement's conflict clause itself is pinned by
+//! the store conformance case over `PgStore`), and the canonical path the worker computed
 //! round-trips through the `TEXT` column byte for byte. The row's box is compared with what
 //! `backend.box_info()` answers rather than with a constant (blueprint D144): the demo database
 //! repoints `this_box` at the fixture, and this file does not rely on which id that is.

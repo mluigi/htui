@@ -327,7 +327,7 @@ async fn the_preview_declares_its_stand_ins() {
     for stand_in in [
         "preview: documents are latest-per-kind; ANA-2 input_kinds resolution arrives with MOD-4",
         "preview: phase-level skills come from the first phase of the item's graph that uses \
-         this template; a glob attachment records no_path because no root resolves",
+         this template; a glob attachment records no_path until glob activation lands (MOD-9 OQ-12)",
         "preview: output_kind defaults to the template name; the phase row's value arrives with \
          MOD-4",
         "preview: command_queue exposure is a phase setting (R-MCP-4); absent until MOD-4",
@@ -342,7 +342,7 @@ async fn the_preview_declares_its_stand_ins() {
 /// MOD-9 D45's skills stand-in, verbatim.
 const SKILLS_NOTE: &str = "preview: phase-level skills come from the first phase of the item's \
                            graph that uses this template; a glob attachment records no_path \
-                           because no root resolves";
+                           until glob activation lands (MOD-9 OQ-12)";
 
 /// The start of MOD-9 D45's second note, the one a preview adds when no phase uses its template.
 const NO_PHASE: &str = "preview: no phase of this item's graph uses template";
