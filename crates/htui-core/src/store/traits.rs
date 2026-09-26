@@ -824,7 +824,8 @@ pub trait WriteStore: ReadStore {
     /// run is not `queued` or its `target_box_id` is not `box_id`; [`Claim::MissingTags`] when the
     /// run's item requires a tag in neither the box's `probed_tags` nor its `declared_tags`
     /// (`R-ORCH-10`, MOD-7 milestone 3 D80, D81: exact bytes, the missing tags in byte order and
-    /// deduplicated; a run with no item has none); [`Claim::SlotFull`] when the box already runs its limit of **`running`** runs
+    /// deduplicated; a run with no item has none); [`Claim::SlotFull`] when the box already runs
+    /// its limit of **`running`** runs
     /// ([`BoxSettings::max_concurrent_items`](crate::model::BoxSettings::max_concurrent_items),
     /// else `app_setting`, else
     /// [`DEFAULT_MAX_CONCURRENT_ITEMS`](crate::model::DEFAULT_MAX_CONCURRENT_ITEMS)); then
