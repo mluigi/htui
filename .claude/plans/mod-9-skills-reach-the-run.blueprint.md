@@ -1,11 +1,20 @@
 # Blueprint: MOD-9 milestone 2, "skills reach the run"
 
-**Status**: proposed (2026-09-26). Findings F-A to F-Q (§0) and decisions D50–D69 (§11) are
-proposed here. A finding marked **Blocker** means the plan, read literally, does not compile, fails
+**Status**: CONFIRMED by the maintainer 2026-09-26, with the amendment below (D49 withdrawn).
+Findings F-A to F-Q (§0) and decisions D50–D69 (§11) are proposed here. A finding marked **Blocker** means the plan, read literally, does not compile, fails
 its own named test or the workspace gate, or cannot be validated. **Major** means a named test or a
 named pin is wrong, or a design consequence the maintainer has not seen. **Minor** is a citation, a
 wording or a placement. The Fix column is what the implementer builds; a Fix that amends one of
 D37–D49 is flagged **(amends Dnn)** and goes to the maintainer through the main thread.
+
+> **Amendment 2026-09-26 (maintainer, on F-G):** judges see the judged phase's skills already, inside
+> their `{{task}}` (the candidate's replayed prompt, `engine.rs:4212-4231`). The maintainer chose
+> "allow, not in the default": **D48 stands** (the judge role admits `{{skills}}`, and the engine
+> resolves the judged phase's attachments for the judge, D44/D62), **D49 is withdrawn** — the
+> default `judge` body is unchanged, `0007` carries no judge upgrade, and there is no
+> `JUDGE_SEED_V1`. D56, D57, D58, F-B, F-O and R-20 are moot. A judge on the default body records
+> every candidate `not_placed` (D40), which is the honest record. Where this file still names D49's
+> artefacts, this note wins.
 
 **Plan**: `.claude/plans/mod-9-skills-reach-the-run.plan.md`, confirmed 2026-09-26 (OQ-8
 overturned; OQ-9..OQ-13 defaults). Its D37–D49, T1–T4, file sets and Verified-claims table are
@@ -112,7 +121,7 @@ export CARGO_TARGET_DIR=/home/user/htui/target                          # shared
 `crates/htui-core/src/fixtures.rs` (demo literals + one test); `crates/htui-core/src/store/mem.rs`;
 `crates/htui-core/src/prompt/mod.rs` (the `collapse` call and the `skills` doc only);
 `crates/htui-core/src/prompt/fixtures.rs`; `crates/htui-core/src/prompt/render.rs`;
-`crates/htui-core/src/prompt/defaults.rs`; `crates/htui-core/src/prompt/template.rs`;
+`crates/htui-core/src/prompt/template.rs`;
 `crates/htui-store/src/pg/read.rs`; `crates/htui-store/src/pg/rows.rs`;
 **`crates/htui-store/src/pg/demo.rs`**; `crates/htui-store/.sqlx/` (−3, +2);
 `crates/htui-store/tests/migrations.rs`; `crates/htui-store/tests/pg_criteria.rs`;
@@ -124,24 +133,12 @@ export CARGO_TARGET_DIR=/home/user/htui/target                          # shared
 
 ### 2.1 `crates/htui-store/migrations/0007_skill_attachments.sql` (new), complete
 
-Probed (2026-09-26, Postgres 16.13): applied after `0001`..`0006` with four planted projects, it
-wrote `INSERT 0 2`, and the heads came out as the table below; the `trim_record` comment read back
-equal to the Rust literal of §2.8.
-
-| Planted project | `judge` rows before | After `0007` |
-|---|---|---|
-| `a` | v1 = seed | v1 = seed, **v2 = new**, `created_by` = v1's |
-| `b` | v1 = seed, v2 = edited | unchanged (head edited) |
-| `c` | v1 = edited, v2 = seed | **v3 = new** (head is the seed) |
-| `d` | none (`prd` only) | unchanged |
-
-The two dollar-quoted bodies are exactly today's `JUDGE` (`defaults.rs:177-197`) and D56's new
-body. `$old$` and `$new$` each appear **exactly twice** in the file (the header never spells them),
-which is what D58's extractor relies on. The file (a four-backtick fence, because the body holds a
-```` ```json ```` fence):
+Probed (2026-09-26, Postgres 16.13): applied after `0001`..`0006`; the `trim_record` comment read
+back equal to the Rust literal of §2.8. **Amended 2026-09-26 (D49 withdrawn):** the judge-upgrade
+section that the first draft carried is gone; the file is sections 1 and 2 only.
 
 ````sql
--- 0007_skill_attachments.sql - MOD-9 milestone 2 (docs/ANA-22.md 7.1; plan D38, D42, D48, D49).
+-- 0007_skill_attachments.sql - MOD-9 milestone 2 (docs/ANA-22.md 7.1; plan D38, D42).
 -- Forward-only (R-STO-5).
 --
 -- 1. ANA-22 7.1 verbatim. skill_version keeps its import provenance, and skill_binding becomes the
@@ -151,12 +148,6 @@ which is what D58's extractor relies on. The file (a four-backtick fence, becaus
 --    ON DELETE CASCADE, which never fires for a NULL key. Existing rows read activation 'always',
 --    globs '{}' and languages '{}': every binding keeps today's behaviour.
 -- 2. run_step.trim_record's contract is restated for record v 2 (plan D42): skill_choices[].
--- 3. The default judge body places {{skills}} (plan D48, D49). Append-only (PRD D5): every project
---    whose head judge row is byte for byte the body htui seeded before this migration gets the new
---    body as head + 1, under the head's created_by. An edited head, or a project with no judge row,
---    is left alone, as 0004 moved only the exact seeded value. A run whose snapshot already pinned
---    a judge version keeps it. The two bodies are dollar-quoted verbatim, and migrations.rs pins
---    both against htui_core::prompt::defaults (JUDGE_SEED_V1, body_of("judge")) byte for byte.
 
 -- --------------------------------------------------------------------------------------------
 -- 1. ANA-22 7.1: skill attachments
@@ -198,66 +189,10 @@ COMMENT ON COLUMN run_step.trim_record IS
   'skill_choices. Canonical; the prompt payload sections[] array is its abridged projection. '
   'Written at stage 3 by set_step_prompt, before the session starts.';
 
--- --------------------------------------------------------------------------------------------
--- 3. MOD-9 D49: the default judge body gains {{skills}}
--- --------------------------------------------------------------------------------------------
-
-INSERT INTO prompt_template (project_id, name, version, body, created_by)
-SELECT head.project_id, 'judge', head.version + 1, $new$You are judging {{phase}} candidates for {{item_key}}. You did not write any of them.
-
-{{task}}
-{{skills}}
-
-{{candidates}}
-
-Pick the candidate that best satisfies the task above. Weigh, in order: correctness against the
-task, evidence from verification, the smallest change that does the job, and fit with the
-surrounding code. Ignore candidate order, prose confidence and length; a longer answer is not a
-better one.
-
-Write one paragraph per candidate saying why it wins or loses, then end the document with exactly
-one fenced json block, and nothing after it:
-
-```json
-{ "winner": 0, "reasons": { "0": "one line", "1": "one line" } }
-```
-
-`winner` must be one of the `fanout_index` values shown above, and `reasons` must have one entry
-per candidate shown, keyed by its index as a string.
-$new$, head.created_by
-  FROM (SELECT DISTINCT ON (project_id) project_id, version, body, created_by
-          FROM prompt_template
-         WHERE name = 'judge'
-         ORDER BY project_id, version DESC) AS head
- WHERE head.body = $old$You are judging {{phase}} candidates for {{item_key}}. You did not write any of them.
-
-{{task}}
-
-{{candidates}}
-
-Pick the candidate that best satisfies the task above. Weigh, in order: correctness against the
-task, evidence from verification, the smallest change that does the job, and fit with the
-surrounding code. Ignore candidate order, prose confidence and length; a longer answer is not a
-better one.
-
-Write one paragraph per candidate saying why it wins or loses, then end the document with exactly
-one fenced json block, and nothing after it:
-
-```json
-{ "winner": 0, "reasons": { "0": "one line", "1": "one line" } }
-```
-
-`winner` must be one of the `fanout_index` values shown above, and `reasons` must have one entry
-per candidate shown, keyed by its index as a string.
-$old$;
 ````
 
-Notes for the implementer: the file must be LF-only (the dollar-quoted bodies are compared byte for
-byte; `DEFAULT_TEMPLATES` is LF-only, `defaults.rs:298-301`). `id` takes the column default
-`gen_random_uuid()` (`0001_init.sql:267`), `created_at`/`updated_at` default `now()`. "Head per
-project" is `DISTINCT ON (project_id) … ORDER BY project_id, version DESC`: one row per project,
-the highest version, which `UNIQUE (project_id, name, version)` (`0001_init.sql:275`) makes unique.
-The prompt-template table is not mirrored (`cache/mod.rs:44`), so there is no cache migration.
+Notes for the implementer: the file is LF-only. The skill tables are not mirrored
+(`cache/mod.rs:44`), so there is no cache migration.
 
 ### 2.2 `crates/htui-core/src/model/skill.rs`
 
@@ -794,40 +729,9 @@ pub fn skills(skills: &[BoundSkill]) -> Option<Rendered> {
   line). `:97` doc of `PromptSpec.skills`: "The step's skill candidates, resolved by
   `model::skill::resolve`: global, project and phase attachments, most specific winning, inactive
   ones included. The assembler collapses and selects (MOD-9 D43)."
-- `defaults.rs` (D49, D56, D57): rename today's `const JUDGE` (`:174-197`) to
-
-```rust
-/// The `judge` body `create_project` seeded before MOD-9 milestone 2 (ANA-5 §5.4 `:1771-1794`).
-///
-/// Kept because `0007_skill_attachments.sql` upgrades a project's `judge` head that is still byte
-/// for byte this text (plan D49); `tests/migrations.rs` pins the migration's literal to it. Never
-/// seeded again: [`DEFAULT_TEMPLATES`] carries the milestone-2 body.
-pub const JUDGE_SEED_V1: &str = r#"…today's JUDGE text, unchanged…"#;
-```
-
-  and add the new `const JUDGE` (doc: "ANA-5 §5.4's `judge` body with `{{skills}}` on its own line
-  after `{{task}}` (MOD-9 D48, D49). The fenced `json` block is byte-identical to `:1788-1790` and
-  MOD-4 parses it. With no skill, the skills slot and its line collapse (§4.7 step 5) and the
-  prompt is the pre-milestone-2 bytes."):
-
-```text
-You are judging {{phase}} candidates for {{item_key}}. You did not write any of them.
-
-{{task}}
-{{skills}}
-
-{{candidates}}
-
-Pick the candidate … (every following byte identical to JUDGE_SEED_V1)
-```
-
-  `DEFAULT_TEMPLATES[8]` keeps `("judge", TemplateRole::Judge, JUDGE)`. New unit test
-  `the_judge_body_places_skills_and_keeps_its_verdict_block`: `parse(Judge, JUDGE).used ==
-  [Phase, ItemKey, Task, Skills, Candidates]`; `JUDGE == JUDGE_SEED_V1.replacen("{{task}}\n",
-  "{{task}}\n{{skills}}\n", 1)`; `JUDGE_SEED_V1` parses in `Judge` and does not use `Skills`; the
-  suffix from ```` ```json ```` is equal in both. `every_phase_body_is_wrong_role_for_…` (`:326-379`)
-  is unchanged: the judge row `[Some("task"), None, Some("task")]` still holds (`task` precedes
-  `skills`), and no phase body's first judge-illegal token is `skills` (D48 verified:
+- `defaults.rs`: **unchanged** (D49 withdrawn 2026-09-26). The default `judge` body does not place
+  `{{skills}}`; a maintainer adds it per project in the Templates view. `every_phase_body_is_wrong_role_for_…`
+  (`:326-379`) still holds: no phase body's first judge-illegal token is `skills` (D48 verified:
   `item_kind`/`attempt`/`item` all precede it).
 - `template.rs:196-201` `allowed_in`: `Self::ItemKey | Self::Phase | Self::Skills | Self::Task |
   Self::Candidates`. Doc (`:185`): "… (ANA-5 §4.1 `:319-341`, with `skills` added to the judge by
@@ -910,28 +814,7 @@ const MOD9_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
 ];
 ```
 
-New tests (D58):
-
-```rust
-/// `0007_skill_attachments.sql`, read at compile time: the D49 literals are pinned without a server,
-/// like `prompt/settings.rs`'s `MIGRATION_0002`.
-const MIGRATION_0007: &str = include_str!("../migrations/0007_skill_attachments.sql");
-
-/// The text between the two occurrences of `$tag$`. Panics unless the tag occurs exactly twice.
-fn dollar_quoted<'a>(sql: &'a str, tag: &str) -> &'a str { /* split on tag; assert 3 parts */ }
-```
-
-- `the_migration_bodies_equal_the_rust_constants` — plain `#[test]`, never skips:
-  `dollar_quoted(MIGRATION_0007, "$old$") == htui_core::prompt::defaults::JUDGE_SEED_V1`;
-  `dollar_quoted(MIGRATION_0007, "$new$") == htui_core::prompt::body_of("judge").unwrap()`;
-  `!MIGRATION_0007.contains('\r')`.
-- `an_untouched_judge_seed_gets_the_skills_body_and_an_edited_one_does_not` — `bare_db`,
-  `run_to(6)`, insert one `app_user`, four projects (`plant_project(pool, user, slug)`, a new
-  helper beside `plant_item_kind`, `:652`) and the `judge` rows of §2.1's table (bodies from
-  `JUDGE_SEED_V1` and `"edited {{task}} {{candidates}}\n"`), then `run_to(7)`. Assert per project
-  the `(version, body, created_by)` list: `a` gains v2 = `body_of("judge")` under the planted user;
-  `b` unchanged; `c` gains v3 = the new body; `d` has no `judge` row. And `SELECT count(*) FROM
-  prompt_template WHERE name = 'judge'` rose by exactly 2.
+No D49 tests (D58 withdrawn with D49).
 
 ### 2.9 `crates/htui-store/tests/skill_attachments.rs` (new)
 
