@@ -144,11 +144,7 @@ impl SkillBinding {
     /// same answer `PgStore`'s `WHERE b.project_id IS NULL` gives it.
     #[must_use]
     pub fn level(&self) -> SkillLevel {
-        match (self.project_id, self.phase_id) {
-            (None, _) => SkillLevel::Global,
-            (Some(_), None) => SkillLevel::Project,
-            (Some(_), Some(_)) => SkillLevel::Phase,
-        }
+        SkillBindingKey::of(self).level()
     }
 }
 
@@ -159,8 +155,13 @@ impl SkillBinding {
 /// loads; `store::invalid_skill_name` phrases the refusal.
 #[must_use]
 pub fn validate_name(name: &str) -> bool {
-    let _ = name;
-    todo!()
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
 }
 
 /// Arguments of `WriteStore::create_skill` (D75, D77): the `skill` row **and** its version 1,
@@ -217,14 +218,21 @@ impl SkillBindingKey {
     /// The key a stored row sits under.
     #[must_use]
     pub fn of(binding: &SkillBinding) -> Self {
-        let _ = binding;
-        todo!()
+        Self {
+            skill: binding.skill_id,
+            project: binding.project_id,
+            phase: binding.phase_id,
+        }
     }
 
     /// The level this key names, by [`SkillBinding::level`]'s rule.
     #[must_use]
     pub fn level(self) -> SkillLevel {
-        todo!()
+        match (self.project, self.phase) {
+            (None, _) => SkillLevel::Global,
+            (Some(_), None) => SkillLevel::Project,
+            (Some(_), Some(_)) => SkillLevel::Phase,
+        }
     }
 }
 
@@ -249,8 +257,13 @@ impl Attachment {
     /// the stored `languages`, which `canonical_globs` leaves unchanged (it is idempotent).
     #[must_use]
     pub fn of(binding: &SkillBinding) -> Self {
-        let _ = binding;
-        todo!()
+        Self {
+            pinned_version: binding.pinned_version,
+            position: binding.position,
+            activation: binding.activation,
+            globs: binding.globs.clone(),
+            languages: binding.languages.clone(),
+        }
     }
 }
 

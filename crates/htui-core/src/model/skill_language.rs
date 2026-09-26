@@ -23,8 +23,14 @@ pub struct UnknownLanguage {
 // sql, toml, typescript, yaml)".
 impl core::fmt::Display for UnknownLanguage {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let _ = f;
-        todo!()
+        write!(f, "unknown language `{}` (known: ", self.name)?;
+        for (at, name) in known().enumerate() {
+            if at > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(name)?;
+        }
+        f.write_str(")")
     }
 }
 
@@ -32,8 +38,6 @@ impl std::error::Error for UnknownLanguage {}
 
 /// Every language name, in byte order.
 pub fn known() -> impl Iterator<Item = &'static str> {
-    todo!();
-    #[allow(unreachable_code)]
     MAP.keys().map(String::as_str)
 }
 
@@ -41,8 +45,14 @@ pub fn known() -> impl Iterator<Item = &'static str> {
 /// dropped keeping the first. Does not check the names.
 #[must_use]
 pub fn normalise(languages: &[String]) -> Vec<String> {
-    let _ = languages;
-    todo!()
+    let mut names: Vec<String> = Vec::with_capacity(languages.len());
+    for name in languages {
+        let name = name.trim().to_ascii_lowercase();
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 /// The globs of `languages` (normalised first), concatenated in input order, duplicates dropped
@@ -51,8 +61,18 @@ pub fn normalise(languages: &[String]) -> Vec<String> {
 /// # Errors
 /// [`UnknownLanguage`] for the first name the map does not hold.
 pub fn expand(languages: &[String]) -> Result<Vec<String>, UnknownLanguage> {
-    let _ = languages;
-    todo!()
+    let mut globs: Vec<String> = Vec::new();
+    for name in normalise(languages) {
+        let Some(own) = MAP.get(&name) else {
+            return Err(UnknownLanguage { name });
+        };
+        for glob in own {
+            if !globs.contains(glob) {
+                globs.push(glob.clone());
+            }
+        }
+    }
+    Ok(globs)
 }
 
 #[cfg(test)]

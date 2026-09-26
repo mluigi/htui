@@ -4,7 +4,7 @@
 //! repo-relative with `/`. A bare glob matches in **any** repo of the step's scope (§6 item 6),
 //! unlike `touched_paths`' primary-repo rule (R-30).
 
-use crate::model::skill_language::UnknownLanguage;
+use crate::model::skill_language::{self, UnknownLanguage};
 
 /// Characters that end the qualifier search: a `:` after any of these is part of the glob.
 const META: [char; 7] = ['*', '?', '[', ']', '{', '}', '\\'];
@@ -20,22 +20,60 @@ pub struct SkillGlob {
 
 impl SkillGlob {
     /// Parses one **trimmed** entry. The qualifier is the text before the first `:` when it is
-    /// non-empty and holds no `/` and no [`META`] char (so `src/a:b.rs` and `:foo` are bare).
+    /// non-empty and holds no `/` and no glob metacharacter (`*?[]{}\`), so `src/a:b.rs` and
+    /// `:foo` are bare.
     ///
     /// # Errors
     /// [`GlobError::Invalid`]: a NUL anywhere ("contains a NUL character"); nothing after the
     /// qualifier ("has no glob after `<repo>:`"); `globset` refusing the glob (its `kind()`).
     pub fn parse(text: &str) -> Result<Self, GlobError> {
-        let _ = (text, META);
-        todo!()
+        Self::compiled(text).map(|(glob, _)| glob)
+    }
+
+    /// [`SkillGlob::parse`], keeping the matcher it compiled.
+    fn compiled(text: &str) -> Result<(Self, globset::GlobMatcher), GlobError> {
+        let invalid = |message: String| GlobError::Invalid {
+            glob: text.to_owned(),
+            message,
+        };
+        if text.contains('\0') {
+            return Err(invalid("contains a NUL character".to_owned()));
+        }
+        let (repo, glob) = match text.split_once(':') {
+            Some((repo, glob))
+                if !repo.is_empty() && !repo.contains('/') && !repo.contains(META) =>
+            {
+                (Some(repo), glob)
+            }
+            _ => (None, text),
+        };
+        if let Some(repo) = repo
+            && glob.is_empty()
+        {
+            return Err(invalid(format!("has no glob after `{repo}:`")));
+        }
+        // `matcher` names the glob proper; the refusal names the entry, qualifier included.
+        let compiled = matcher(glob).map_err(|err| match err {
+            GlobError::Invalid { message, .. } => invalid(message),
+            other @ GlobError::UnknownLanguage(_) => other,
+        })?;
+        Ok((
+            Self {
+                repo: repo.map(str::to_owned),
+                glob: glob.to_owned(),
+            },
+            compiled,
+        ))
     }
 }
 
 /// `<repo>:<glob>` or `<glob>`: the canonical stored text.
 impl core::fmt::Display for SkillGlob {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let _ = f;
-        todo!()
+        match &self.repo {
+            Some(repo) => write!(f, "{repo}:{}", self.glob),
+            None => f.write_str(&self.glob),
+        }
     }
 }
 
@@ -62,16 +100,75 @@ pub enum GlobError {
 /// # Errors
 /// The first [`GlobError`], languages before globs (D78's order).
 pub fn canonical_globs(typed: &[String], languages: &[String]) -> Result<Vec<String>, GlobError> {
-    let _ = (typed, languages);
-    todo!()
+    let expanded = skill_language::expand(languages)?;
+    let mut globs: Vec<String> = Vec::with_capacity(typed.len() + expanded.len());
+    for entry in typed {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let glob = SkillGlob::parse(entry)?.to_string();
+        if !globs.contains(&glob) {
+            globs.push(glob);
+        }
+    }
+    for glob in expanded {
+        if !globs.contains(&glob) {
+            globs.push(glob);
+        }
+    }
+    Ok(globs)
 }
 
 /// D93: a comma list as the Skills form takes it. Splits on `,` only outside `{…}` (depth 0) and
 /// `[…]`, with `\x` taken literally; trims each part; drops empties.
 #[must_use]
 pub fn split_list(text: &str) -> Vec<String> {
-    let _ = text;
-    todo!()
+    let mut parts: Vec<String> = Vec::new();
+    let mut part = String::new();
+    // `{` nesting outside a class, and whether a `[...]` class is open. Inside a class `globset`
+    // takes every char literally except the closing `]`, and a `]` first in it (after an optional
+    // `!` or `^`) is a member; the splitter follows the same rule so it never cuts a class.
+    let mut depth = 0_usize;
+    let mut class = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        part.push(c);
+        if class {
+            if c == ']' {
+                class = false;
+            }
+            continue;
+        }
+        match c {
+            '\\' => part.extend(chars.next()),
+            '[' => {
+                class = true;
+                if let Some(&negate @ ('!' | '^')) = chars.peek() {
+                    part.push(negate);
+                    chars.next();
+                }
+                if let Some(&']') = chars.peek() {
+                    part.push(']');
+                    chars.next();
+                }
+            }
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                part.pop();
+                parts.push(core::mem::take(&mut part));
+            }
+            _ => {}
+        }
+    }
+    parts.push(part);
+    parts
+        .iter()
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// A compiled attachment, for PRD milestone 5's `select` (D86). Tested now, called there.
@@ -87,8 +184,11 @@ impl SkillGlobs {
     /// # Errors
     /// The first entry [`SkillGlob::parse`] refuses.
     pub fn compile(globs: &[String]) -> Result<Self, GlobError> {
-        let _ = globs;
-        todo!()
+        let globs = globs
+            .iter()
+            .map(|text| SkillGlob::compiled(text).map(|(glob, compiled)| (glob.repo, compiled)))
+            .collect::<Result<_, _>>()?;
+        Ok(Self { globs })
     }
 
     /// The first path, in `paths` order, that any glob matches in `repo` — a bare glob in any
@@ -99,16 +199,30 @@ impl SkillGlobs {
         repo: &str,
         paths: impl IntoIterator<Item = &'a str>,
     ) -> Option<&'a str> {
-        let _ = (repo, paths, &self.globs);
-        todo!()
+        paths.into_iter().find(|path| {
+            let candidate = globset::Candidate::from_bytes(path.as_bytes());
+            self.globs.iter().any(|(qualifier, compiled)| {
+                qualifier.as_deref().is_none_or(|own| own == repo)
+                    && compiled.is_match_candidate(&candidate)
+            })
+        })
     }
 }
 
 /// The one builder (D72): `literal_separator(true)`, `backslash_escape(true)`,
 /// `empty_alternates(false)`.
 fn matcher(glob: &str) -> Result<globset::GlobMatcher, GlobError> {
-    let _ = glob;
-    todo!()
+    globset::GlobBuilder::new(glob)
+        .literal_separator(true)
+        .backslash_escape(true)
+        .empty_alternates(false)
+        .build()
+        .map(|built| built.compile_matcher())
+        .map_err(|err| GlobError::Invalid {
+            glob: glob.to_owned(),
+            // `err`'s own `Display` already reads "error parsing glob '<g>': …" (F-F).
+            message: err.kind().to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -275,6 +389,11 @@ mod tests {
             split_list(" rust, Toml ,"),
             strings(&["rust", "Toml"]),
             "the languages field splits the same way"
+        );
+        assert_eq!(
+            split_list("[],x].md,[!],y].md, [\\,]"),
+            strings(&["[],x].md", "[!],y].md", "[\\,]"]),
+            "a `]` first in a class is a member, and a `\\` in a class escapes nothing"
         );
         assert!(split_list(" , ").is_empty(), "nothing typed is no entry");
     }
