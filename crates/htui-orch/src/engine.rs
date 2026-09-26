@@ -27,10 +27,10 @@ use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposur
 use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::record::{Recorder, RunCap, pump};
 use htui_core::model::{
-    BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, DocumentId, EventKind, Gate,
-    GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun,
-    NewRunStep, NoteId, Project, ProjectSettings, PromptScope, Repo, RepoId, Resolution, Run,
-    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, SnapshotCandidate,
+    BoundSkill, BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, DocumentId, EventKind,
+    Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun,
+    NewRunStep, NoteId, Project, ProjectId, ProjectSettings, PromptScope, Repo, RepoId, Resolution,
+    Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, SnapshotCandidate,
     SnapshotPhase, SnapshotTemplate, Status, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS,
     UserId, VerifyOutcome,
 };
@@ -4199,6 +4199,9 @@ where
     /// the diff is advisory, D55) and its last `command_run` output. The template is the snapshot's
     /// pinned one, else the latest `judge` row (D53); the budget is the judged phase's; every other
     /// section is empty, and `phase` renders as the **judged** phase's name (blueprint F-G).
+    /// Skills are the judged phase's candidates, resolved as the phase step resolves them (MOD-9
+    /// D44, D48); a judge body without `{{skills}}` — the default one among them — records them
+    /// `not_placed`.
     ///
     /// The inner `Err` is a [`JudgeFailure`] the caller lands on a judge row: a candidate with no
     /// recorded prompt or an assembly refusal is `judge_session_failed`, and no template at all is
@@ -4206,7 +4209,7 @@ where
     async fn judge_prompts(
         &self,
         run: &Run,
-        _snapshot: &GraphSnapshot,
+        snapshot: &GraphSnapshot,
         phase: &SnapshotPhase,
         attempt: i32,
         survivors: &[&RunStep],
@@ -4311,6 +4314,9 @@ where
         };
 
         let kind = self.item_kind_name(&row).await?;
+        let skills = self
+            .phase_skills(project.id, snapshot, phase, &mut notes)
+            .await?;
         let (caps, _scan, _deadline) = settings::resolve_excerpt_caps(&self.parts.app);
         let spec = |reverse: bool| PromptSpec {
             role: TemplateRole::of_name(&template.name),
@@ -4331,7 +4337,8 @@ where
             documents: Vec::new(),
             upstream: Vec::new(),
             box_profile: self.parts.box_profile.clone(),
-            skills: Vec::new(),
+            // MOD-9 D44, D48: the judged phase's candidates, the same list for both orders.
+            skills: skills.clone(),
             excerpts: no_excerpts(caps),
             command_queue: false,
             verify_failure: None,
@@ -4920,6 +4927,9 @@ where
             )
             .await?;
         let (caps, _scan, _deadline) = settings::resolve_excerpt_caps(&self.parts.app);
+        let skills = self
+            .phase_skills(project.id, snapshot, phase, &mut notes)
+            .await?;
 
         let role = TemplateRole::of_name(&template.name);
         let (verify_failure, previous_diff) =
@@ -4946,9 +4956,10 @@ where
             documents,
             upstream,
             box_profile: self.parts.box_profile.clone(),
-            // `R-SKL-2`'s resolution is inherent on both stores (blueprint H-11) and the Runs tab
-            // wires it at milestone 6; an empty list renders no section.
-            skills: Vec::new(),
+            // MOD-9 D44: the global, project and phase attachments of this phase, most specific
+            // winning (`model::skill::resolve`); the assembler's `select` decides which render and
+            // records every candidate in `trim_record.skill_choices`.
+            skills,
             // §4.5's ranker needs a resolved repo root and `repo_box_path` has no writer the walk
             // can reach, so the audit records the caps a pass *would* have run under and nothing
             // else — the shape `crates/htui/src/preview.rs:274-295` already ships.
@@ -4970,6 +4981,43 @@ where
             notes,
         };
         Ok(Ok(spec))
+    }
+
+    /// MOD-9 D44: the skill candidates of `phase` in `snapshot`'s graph, for a phase step and for
+    /// the judge of that phase alike.
+    ///
+    /// `SnapshotPhase` carries no `PhaseId` (`model/run.rs:488-527`) and resolution re-densifies
+    /// positions (`graph.rs:286-300`), so the live row is found by `(graph id, name)`, which
+    /// `UNIQUE (graph_id, name)` makes exact (`0001_init.sql:247`). A phase renamed or deleted
+    /// since the snapshot, and every phase of an override graph, get a note rather than a silent
+    /// loss of their phase-level attachments (plan R-15).
+    async fn phase_skills(
+        &self,
+        project: ProjectId,
+        snapshot: &GraphSnapshot,
+        phase: &SnapshotPhase,
+        notes: &mut Vec<String>,
+    ) -> Result<Vec<BoundSkill>, EngineError> {
+        let phase_id = self
+            .parts
+            .store
+            .phases(snapshot.graph.id)
+            .await?
+            .into_iter()
+            .find(|row| row.name == phase.name)
+            .map(|row| row.id);
+        if phase_id.is_none() {
+            notes.push(format!(
+                "skills: phase `{}` is no longer in graph `{}`; phase-level attachments were not \
+                 applied",
+                phase.name, snapshot.graph.name
+            ));
+        }
+        if snapshot.graph.is_override {
+            notes.push(OVERRIDE_SKILLS_NOTE.to_owned());
+        }
+        let skills = self.parts.graphs.bound_skills(project, phase_id).await?;
+        Ok(skills)
     }
 
     /// Plan D67 (M3 D32's forward): the loop's two sections for a phase step at `attempt > 1`,
@@ -5416,7 +5464,7 @@ where
     }
 
     /// One project row.
-    async fn project(&self, id: htui_core::model::ProjectId) -> Result<Project, EngineError> {
+    async fn project(&self, id: ProjectId) -> Result<Project, EngineError> {
         self.parts
             .store
             .project(id)

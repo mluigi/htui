@@ -73,7 +73,9 @@ pub fn opening_kind(
 
 /// §4.6(c)'s handoff spec built from the phase's own spec: role `Handoff`, the pinned `handoff`
 /// template's body and ref, `handoff: Some(HandoffInputs { StepSummary::from_events(events,
-/// roots), diff_so_far, failure_reason })`, and `verify_failure`/`previous_diff`/`judge` cleared.
+/// roots), diff_so_far, failure_reason })`, `verify_failure`/`previous_diff`/`judge` cleared, and
+/// `skills` emptied (MOD-9 D44: a handoff body cannot place `{{skills}}`, so a candidate would only
+/// be scrubbed — failing the handoff on a skill body it never shows — and recorded `not_placed`).
 /// Every other field is the phase's.
 #[must_use]
 pub fn handoff_spec(
@@ -94,6 +96,7 @@ pub fn handoff_spec(
         verify_failure: None,
         previous_diff: None,
         judge: None,
+        skills: Vec::new(),
         handoff: Some(HandoffInputs {
             step_summary: StepSummary::from_events(events, roots),
             diff_so_far,
