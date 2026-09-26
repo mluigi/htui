@@ -12,7 +12,8 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use crate::keymap::{Binding, KeyChord, KeyScope};
 use crate::ui::overlay::{MigrationPrompt, WorkspaceSwitcher};
 use crate::ui::tabs::settings::{
-    AgentsSection, ConnectionSection, HierarchySection, KindsSection, PromptSection, QdrantSection,
+    AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection, PromptSection,
+    QdrantSection,
 };
 use crate::ui::tabs::{BacklogTab, ChatTab, SettingsTab, SkillsTab};
 
@@ -55,6 +56,8 @@ pub fn register_all(app: &mut App) {
         // existing section's line.
         Box::new(ConnectionSection::new()),
         Box::new(QdrantSection::new()),
+        // Last (MOD-7 milestone 2, D47): appending moves no existing section's line.
+        Box::new(BoxesSection::new()),
     ])));
     app.register_tab(Box::new(ChatTab::new()));
 

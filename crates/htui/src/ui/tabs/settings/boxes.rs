@@ -17,17 +17,60 @@
 
 use htui_core::model::{BoxId, BoxRecord, Scope, canonical_declared_tags, declared_tags_from_text};
 
+use std::collections::BTreeSet;
+
 use crate::app::{Ctx, Handled};
-use crate::box_settings::{BoxesSnapshot, READ_NAME, REQUEST_NAMES};
+use crate::box_settings::{BoxesSnapshot, READ_NAME, REQUEST_NAMES, SpecView};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
+    is_error, message, wrapped,
 };
-use crate::ui::{FieldOutcome, TextArea, TextField};
+use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use htui_core::model::BoxEdit;
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Wrap};
+
+/// What the body says before any boxes have arrived.
+const NOT_READ: &str = "boxes not read yet";
+
+/// The opening of the one line a refused read leaves (the prompt section's `UNAVAILABLE` style).
+const UNAVAILABLE: &str = "boxes unavailable";
+
+/// What the body says over a list with no box in it.
+const NO_BOXES: &str = "no box is registered for this user yet";
+
+/// The Browse keys.
+const HINT_BROWSE: &str =
+    "j/k move \u{b7} t tags \u{b7} e quirks \u{b7} p probe this box \u{b7} r reload";
+
+/// The Browse keys with no list to act on.
+const HINT_NO_LIST: &str = "r reload";
+
+/// The tag editor's keys.
+const HINT_TAGS: &str = "Enter saves \u{b7} Esc cancels \u{b7} comma-separated";
+
+/// The quirks editor's keys (OQ-16: `Enter` is a line break, so `ctrl-s` saves).
+const HINT_QUIRKS: &str = "ctrl-s saves \u{b7} Esc cancels \u{b7} Enter breaks the line";
+
+/// The list pane's width, the one-column gutter to the detail pane included.
+const LIST_WIDTH: u16 = 28;
+
+/// The detail pane's label column.
+const LABEL_WIDTH: usize = 14;
+
+/// How many lines the quirks editor shows at most.
+const QUIRKS_HEIGHT: u16 = 6;
+
+/// How many hex digits of the spec digest the spec line shows (D51).
+const DIGEST_SHOWN: usize = 12;
+
+/// How many hex digits of a box id tell two same-named boxes apart (PRD `:262`).
+const ID_SUFFIX: usize = 8;
 
 /// A second save while the first is in flight (D56).
 const IN_FLIGHT: &str = "edit_box in flight";
@@ -420,5 +463,364 @@ impl SettingsSection for BoxesSection {
         }
     }
 
-    fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+    fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+        let theme = ctx.theme;
+        let notice = self
+            .notice
+            .as_deref()
+            .map(|text| wrapped(text, usize::from(area.width).max(1)))
+            .unwrap_or_default();
+        let [body, hint, notice_area] = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(u16::try_from(notice.len()).unwrap_or(u16::MAX)),
+        ])
+        .areas(area);
+
+        match (&self.unavailable, &self.snapshot) {
+            // The refusal wins the body even with a list behind it: what is on screen would
+            // otherwise be boxes nothing has confirmed since the outage started (the kinds rule).
+            (Some(why), _) => frame.render_widget(
+                Paragraph::new(Line::styled(format!("{UNAVAILABLE}: {why}"), theme.error))
+                    .wrap(Wrap { trim: true }),
+                body,
+            ),
+            (None, None) => message(frame, body, NOT_READ, theme),
+            (None, Some(snapshot)) if snapshot.boxes.is_empty() => {
+                message(frame, body, NO_BOXES, theme);
+            }
+            (None, Some(snapshot)) => {
+                let [list, detail] =
+                    Layout::horizontal([Constraint::Length(LIST_WIDTH), Constraint::Min(0)])
+                        .areas(body);
+                self.render_list(frame, list, snapshot, theme);
+                if let Some(record) = self.selected_record() {
+                    frame.render_widget(
+                        Paragraph::new(self.detail(record, snapshot, detail.width, theme)),
+                        detail,
+                    );
+                }
+            }
+        }
+
+        frame.render_widget(
+            Paragraph::new(Line::styled(self.hint_text(), theme.dim)),
+            hint,
+        );
+        if let Some(text) = &self.notice {
+            let style = if is_error(text) {
+                theme.error
+            } else {
+                theme.dim
+            };
+            let lines: Vec<Line<'static>> = notice
+                .into_iter()
+                .map(|line| Line::styled(line, style))
+                .collect();
+            frame.render_widget(Paragraph::new(lines), notice_area);
+        }
+    }
+}
+
+impl BoxesSection {
+    /// The list pane: one row per box, the selected one in `theme.selected`, scrolled so the
+    /// selection stays on screen.
+    fn render_list(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        snapshot: &BoxesSnapshot,
+        theme: &Theme,
+    ) {
+        // One column is the gutter between the two panes.
+        let room = usize::from(area.width.saturating_sub(1));
+        let lines: Vec<Line<'static>> = snapshot
+            .boxes
+            .iter()
+            .map(|record| {
+                let style = if Some(record.row.id) == self.selected {
+                    theme.selected
+                } else {
+                    theme.base
+                };
+                Line::styled(clip(&list_label(record, snapshot), room), style)
+            })
+            .collect();
+        let at = self
+            .selected
+            .and_then(|id| snapshot.boxes.iter().position(|record| record.row.id == id))
+            .unwrap_or(0);
+        let offset = at.saturating_sub(usize::from(area.height).saturating_sub(1));
+        frame.render_widget(
+            Paragraph::new(lines).scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
+            area,
+        );
+    }
+
+    /// The detail pane for one box: a 14-wide label column, then the value; an open editor draws
+    /// in its row whichever box is selected, so a reload that moved the selection never leaves
+    /// someone typing into a field they cannot see.
+    fn detail(
+        &self,
+        record: &BoxRecord,
+        snapshot: &BoxesSnapshot,
+        width: u16,
+        theme: &Theme,
+    ) -> Vec<Line<'static>> {
+        let row = &record.row;
+        let room = usize::from(width).saturating_sub(LABEL_WIDTH).max(1);
+        let value_width = u16::try_from(room).unwrap_or(u16::MAX);
+        let this_box = snapshot.this_box == Some(row.id);
+        let mut lines = vec![
+            labelled(
+                "host",
+                format!(
+                    "{}{}",
+                    row.hostname,
+                    if this_box { " (this box)" } else { "" }
+                ),
+                theme,
+            ),
+            labelled(
+                "os",
+                format!("{} {} \u{b7} {}", row.os_family, row.os_version, row.arch),
+                theme,
+            ),
+            labelled("cpu", row.cpu.clone(), theme),
+            labelled(
+                "ram",
+                row.ram_mb
+                    .map_or_else(|| "unknown".to_owned(), |mb| format!("{mb} MB")),
+                theme,
+            ),
+            labelled(
+                "gpu",
+                gpu(row.gpu_present, row.gpu_vendor.as_deref()),
+                theme,
+            ),
+            labelled("htui", row.htui_version.clone(), theme),
+            labelled(
+                "last probe",
+                row.last_probed_at.map_or_else(
+                    || "never probed".to_owned(),
+                    |at| at.format("%Y-%m-%d %H:%M UTC").to_string(),
+                ),
+                theme,
+            ),
+            labelled(
+                "spec",
+                format!(
+                    "probed under the current spec: {}",
+                    if record.probe_spec_digest.as_deref() == Some(snapshot.spec.digest.as_str()) {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                ),
+                theme,
+            ),
+            labelled("probed tags", tag_list(&row.probed_tags), theme),
+        ];
+
+        match &self.mode {
+            Mode::Tags(editor) => {
+                let mut spans = vec![label("declared tags", theme)];
+                spans.extend(editor.input.line(value_width, true, theme).spans);
+                lines.push(Line::from(spans));
+                lines.push(indented(
+                    Span::styled(format!("seen: {}", seen(snapshot)), theme.dim),
+                    theme,
+                ));
+            }
+            _ => lines.push(labelled(
+                "declared tags",
+                tag_list(&row.declared_tags),
+                theme,
+            )),
+        }
+
+        match &self.mode {
+            Mode::Quirks(editor) => {
+                let area = editor.input.lines(value_width, QUIRKS_HEIGHT, true, theme);
+                lines.extend(under_label("quirks", area, theme));
+            }
+            _ if row.quirks.is_empty() => {
+                lines.push(labelled("quirks", "(none)".to_owned(), theme))
+            }
+            _ => {
+                let note = row
+                    .quirks
+                    .lines()
+                    .map(|line| Line::styled(line.to_owned(), theme.base))
+                    .collect();
+                lines.extend(under_label("quirks", note, theme));
+            }
+        }
+
+        let tools: Vec<String> = record
+            .tools
+            .iter()
+            .map(|tool| {
+                if tool.version.is_empty() {
+                    tool.name.clone()
+                } else {
+                    format!("{} {}", tool.name, tool.version)
+                }
+            })
+            .collect();
+        if tools.is_empty() {
+            lines.push(labelled("tools", "(none)".to_owned(), theme));
+        } else {
+            let wrapped_tools = wrapped(&tools.join(", "), room)
+                .into_iter()
+                .map(|line| Line::styled(line, theme.base))
+                .collect();
+            lines.extend(under_label("tools", wrapped_tools, theme));
+        }
+
+        lines.push(Line::default());
+        lines.extend(spec_lines(&snapshot.spec, usize::from(width).max(1), theme));
+        lines
+    }
+
+    /// The keys this mode binds, plus what is in flight.
+    fn hint_text(&self) -> String {
+        let listed = self.unavailable.is_none() && !self.boxes().is_empty();
+        let mut hint = match self.mode {
+            Mode::Browse if listed => HINT_BROWSE.to_owned(),
+            Mode::Browse => HINT_NO_LIST.to_owned(),
+            Mode::Tags(_) => HINT_TAGS.to_owned(),
+            Mode::Quirks(_) => HINT_QUIRKS.to_owned(),
+        };
+        if self.probing {
+            hint.push_str(" \u{b7} probing\u{2026}");
+        }
+        if self.busy.is_some() {
+            hint.push_str(" \u{b7} saving\u{2026}");
+        }
+        hint
+    }
+}
+
+/// A list row: the hostname, the last eight hex digits of the id only when another listed box has
+/// the same hostname (PRD `:262`), and ` (this box)` on this box.
+fn list_label(record: &BoxRecord, snapshot: &BoxesSnapshot) -> String {
+    let row = &record.row;
+    let mut label = row.hostname.clone();
+    let shared = snapshot
+        .boxes
+        .iter()
+        .any(|other| other.row.id != row.id && other.row.hostname == row.hostname);
+    if shared {
+        let simple = row.id.as_uuid().simple().to_string();
+        let suffix = &simple[simple.len().saturating_sub(ID_SUFFIX)..];
+        label.push_str(&format!(" \u{2026}{suffix}"));
+    }
+    if snapshot.this_box == Some(row.id) {
+        label.push_str(" (this box)");
+    }
+    label
+}
+
+/// `text` cut to `width` chars, the last one a `…` when anything was cut.
+fn clip(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let mut clipped: String = text.chars().take(width.saturating_sub(1)).collect();
+    if width > 0 {
+        clipped.push('\u{2026}');
+    }
+    clipped
+}
+
+/// The label column's span.
+fn label(name: &str, theme: &Theme) -> Span<'static> {
+    Span::styled(format!("{name:<LABEL_WIDTH$}"), theme.dim)
+}
+
+/// One detail row: the label, then the value.
+fn labelled(name: &str, value: String, theme: &Theme) -> Line<'static> {
+    Line::from(vec![label(name, theme), Span::styled(value, theme.base)])
+}
+
+/// A continuation row: the value column, with nothing in the label column.
+fn indented(value: Span<'static>, theme: &Theme) -> Line<'static> {
+    Line::from(vec![label("", theme), value])
+}
+
+/// Several value lines: the first on the label's row, the rest indented to the value column.
+fn under_label(name: &str, values: Vec<Line<'static>>, theme: &Theme) -> Vec<Line<'static>> {
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let head = if index == 0 {
+                label(name, theme)
+            } else {
+                label("", theme)
+            };
+            let mut spans = vec![head];
+            spans.extend(value.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// The `gpu` row: the vendor when there is one, `present` without, `none` without a GPU.
+fn gpu(present: bool, vendor: Option<&str>) -> String {
+    match (present, vendor) {
+        (true, Some(vendor)) => vendor.to_owned(),
+        (true, None) => "present".to_owned(),
+        (false, _) => "none".to_owned(),
+    }
+}
+
+/// A stored tag list in stored order, or `(none)`.
+fn tag_list(tags: &[String]) -> String {
+    if tags.is_empty() {
+        "(none)".to_owned()
+    } else {
+        tags.join(", ")
+    }
+}
+
+/// D50: every probed and declared tag on a listed box, sorted and deduplicated.
+fn seen(snapshot: &BoxesSnapshot) -> String {
+    let tags: BTreeSet<&str> = snapshot
+        .boxes
+        .iter()
+        .flat_map(|record| {
+            record
+                .row
+                .probed_tags
+                .iter()
+                .chain(&record.row.declared_tags)
+        })
+        .map(String::as_str)
+        .collect();
+    tags.into_iter().collect::<Vec<_>>().join(", ")
+}
+
+/// D51: the spec the next probe runs under, and why a stored overlay was ignored when it was.
+fn spec_lines(spec: &SpecView, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let source = if spec.overlay {
+        "seed + stored overlay"
+    } else {
+        "seed"
+    };
+    let digest: String = spec.digest.chars().take(DIGEST_SHOWN).collect();
+    let mut lines = vec![Line::styled(
+        format!("probe spec: {source} \u{b7} {digest}"),
+        theme.dim,
+    )];
+    if let Some(error) = &spec.error {
+        let style: Style = theme.error;
+        lines.extend(
+            wrapped(error, width)
+                .into_iter()
+                .map(|line| Line::styled(line, style)),
+        );
+    }
+    lines
 }

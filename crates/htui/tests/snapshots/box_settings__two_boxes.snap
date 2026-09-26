@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/box_settings.rs
+expression: frame
+---
+DESKTOP-HTUI …00000001      host          DESKTOP-HTUI (this box)
+DESKTOP-HTUI …00000200 (th… os            windows 10.0.26200 · x86_64
+                            cpu           AMD Ryzen 9 7950X
+                            ram           65536 MB
+                            gpu           nvidia
+                            htui          0.1.0
+                            last probe    2026-09-01 00:00 UTC
+                            spec          probed under the current spec: no
+                            probed tags   rust, msvc, cmake
+                            declared tags gpu
+                            quirks        (none)
+                            tools         cargo 1.98.0, cmake, git 2.51.0, rustc 1.98.0
+
+                            probe spec: seed · <digest>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+j/k move · t tags · e quirks · p probe this box · r reload

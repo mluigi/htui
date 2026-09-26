@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/box_settings.rs
+expression: frame
+---
+no workspace · no box · offline · 0s · 0 runs
+ 1 Settings
+┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
+│ Boxes                                                                                            │
+│boxes unavailable: store unreachable: this box browses its read-only cache and starts no run      │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│r reload                                                                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+boxes: store unreachable: this box browses its read-only cache and starts no run
