@@ -5439,6 +5439,11 @@ impl WriteStore for MemStore {
         self.write(|state| state.upsert_repo_box_path(path, now))
     }
 
+    async fn infer_repo_box_path(&self, path: &RepoBoxPath) -> Result<bool> {
+        let _ = path;
+        todo!("MOD-7 milestone 4 (D104): MemStore's insert-if-absent writer")
+    }
+
     async fn repo_box_paths(&self, repo: RepoId) -> Result<Vec<RepoBoxPath>> {
         Ok(self.read(|state| state.repo_box_path_rows(repo)))
     }

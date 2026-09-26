@@ -1920,6 +1920,12 @@ impl WriteStore for PgStore {
         Ok(())
     }
 
+    /// One row per `(repo_id, box_id)`, inserted only where none exists (MOD-7 milestone 4, D104).
+    async fn infer_repo_box_path(&self, path: &RepoBoxPath) -> Result<bool> {
+        let _ = path;
+        todo!("MOD-7 milestone 4 (D104): PgStore's insert-if-absent writer")
+    }
+
     /// Every box's checkout path for a repo, ordered by `box_id` bytes.
     ///
     /// # Errors

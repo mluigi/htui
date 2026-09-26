@@ -603,6 +603,21 @@ pub trait WriteStore: ReadStore {
     /// row.
     async fn upsert_repo_box_path(&self, path: &RepoBoxPath) -> Result<()>;
 
+    /// Inserts this box's checkout path for a repo **only where none exists** (MOD-7 milestone 4,
+    /// D104): `Ok(true)` when the row was written, `Ok(false)` when a row for
+    /// `(repo_id, box_id)` already existed, which is then left exactly as it was.
+    ///
+    /// The compare-and-set path inference needs, keyed on the row's **absence**, which no
+    /// reconnect changes (the PRD's box-writer constraint). A manual
+    /// [`upsert_repo_box_path`](Self::upsert_repo_box_path) racing it either lands first, so this
+    /// answers `false`, or overwrites the inferred row, so the manual path wins. `updated_at` is the
+    /// store's: the value passed in is ignored on both backends.
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when either id names no
+    /// row, and nothing is written.
+    async fn infer_repo_box_path(&self, path: &RepoBoxPath) -> Result<bool>;
+
     /// Every box's checkout path for a repo, ordered by `box_id` bytes.
     ///
     /// # Errors
