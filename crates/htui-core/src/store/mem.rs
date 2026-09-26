@@ -2288,8 +2288,9 @@ impl State {
         rows
     }
 
-    /// Inserts or replaces this box's checkout path (`R-BOX-4`).
-    fn upsert_repo_box_path(&mut self, path: &RepoBoxPath, now: DateTime<Utc>) -> Result<()> {
+    /// The two foreign keys of `repo_box_path`, repo first, then box: the checks both writers
+    /// share, so their sentences cannot drift.
+    fn check_repo_box_path_ids(&self, path: &RepoBoxPath) -> Result<()> {
         if !self.repos.contains_key(&path.repo_id) {
             return Err(StoreError::Constraint(format!(
                 "repo_box_path.repo_id `{}` references no repo",
@@ -2302,6 +2303,12 @@ impl State {
                 path.box_id
             )));
         }
+        Ok(())
+    }
+
+    /// Inserts or replaces this box's checkout path (`R-BOX-4`).
+    fn upsert_repo_box_path(&mut self, path: &RepoBoxPath, now: DateTime<Utc>) -> Result<()> {
+        self.check_repo_box_path_ids(path)?;
         let mut row = path.clone();
         row.updated_at = now;
         match self
@@ -2313,6 +2320,24 @@ impl State {
             None => self.repo_box_paths.push(row),
         }
         Ok(())
+    }
+
+    /// `WriteStore::infer_repo_box_path`'s twin (MOD-7 milestone 4, D104): the same two existence
+    /// checks as `upsert_repo_box_path`, in the same order and with the same sentences, then a push
+    /// only when no row holds `(repo_id, box_id)`. Answers whether it pushed.
+    fn infer_repo_box_path(&mut self, path: &RepoBoxPath, now: DateTime<Utc>) -> Result<bool> {
+        self.check_repo_box_path_ids(path)?;
+        if self
+            .repo_box_paths
+            .iter()
+            .any(|held| held.repo_id == path.repo_id && held.box_id == path.box_id)
+        {
+            return Ok(false);
+        }
+        let mut row = path.clone();
+        row.updated_at = now;
+        self.repo_box_paths.push(row);
+        Ok(true)
     }
 
     /// Every box's checkout path for a repo, ordered by `box_id` bytes.
@@ -5437,6 +5462,11 @@ impl WriteStore for MemStore {
     async fn upsert_repo_box_path(&self, path: &RepoBoxPath) -> Result<()> {
         let now = Utc::now();
         self.write(|state| state.upsert_repo_box_path(path, now))
+    }
+
+    async fn infer_repo_box_path(&self, path: &RepoBoxPath) -> Result<bool> {
+        let now = Utc::now();
+        self.write(|state| state.infer_repo_box_path(path, now))
     }
 
     async fn repo_box_paths(&self, repo: RepoId) -> Result<Vec<RepoBoxPath>> {
