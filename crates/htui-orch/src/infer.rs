@@ -251,16 +251,17 @@ fn visit(
         return true;
     }
 
-    if is_checkout(dir) {
-        if let Some(name) = name {
-            scan.checkouts.push(Checkout {
-                path: dir.to_path_buf(),
-                name: name.to_owned(),
-                remote_keys: remote_keys(dir),
-            });
-            return false;
-        }
-        // An unnameable root cannot match by name; it is still walked (blueprint §3.4).
+    // An unnameable root cannot match by name, so it is walked like a plain directory instead
+    // (blueprint §3.4).
+    if is_checkout(dir)
+        && let Some(name) = name
+    {
+        scan.checkouts.push(Checkout {
+            path: dir.to_path_buf(),
+            name: name.to_owned(),
+            remote_keys: remote_keys(dir),
+        });
+        return false;
     }
     if depth >= limits.max_depth {
         return false;
