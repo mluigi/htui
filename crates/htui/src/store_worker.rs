@@ -39,7 +39,7 @@ use crate::agent_worker::{AgentRuntime, Served};
 use crate::box_settings::{self, BoxesSnapshot};
 use crate::catalogue::{self, CatalogueSnapshot};
 use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
-use crate::hierarchy::{self, HierarchySnapshot, MirrorAfterDelete};
+use crate::hierarchy::{self, HierarchySnapshot, InferReport, MirrorAfterDelete};
 use crate::prompt_settings::{self, SettingsSnapshot};
 use crate::run_worker::{LiveChats, RunRuntime, RunServed};
 use crate::templates::{self, TemplateBody, TemplatesSnapshot};
@@ -294,10 +294,10 @@ pub enum StoreRequest {
     /// Apply the pending migrations (`R-STO-5`), after the user answered `y`.
     ApplyMigrations,
 
-    // The twelve hierarchy requests of `Settings > Hierarchy` (MOD-15 milestone 3, D5/D6). Each
+    // The thirteen hierarchy requests of `Settings > Hierarchy` (MOD-15 milestone 3, D5/D6). Each
     // carries **only what the user typed**: `created_by` and the box a path belongs to are filled
     // in by [`crate::hierarchy::serve`] from `Backend` identity, so no view holds a `UserId` or a
-    // `BoxId`. All twelve are served through one or-ed arm of [`try_serve`].
+    // `BoxId`. All thirteen are served through one or-ed arm of [`try_serve`].
     /// The whole tree of one workspace for `Settings > Hierarchy` (D5).
     Hierarchy(WorkspaceId),
     /// `created_by` is the worker's (`Backend::this_user`); the section never holds a `UserId`.
@@ -387,6 +387,11 @@ pub enum StoreRequest {
     DeleteWorkspace(WorkspaceId),
     /// Removes a project and its whole history, then rebuilds the mirror from the worker (D10).
     DeleteProject(ProjectId),
+    /// Infer this box's checkout paths for every repo of a workspace that has none here (MOD-7
+    /// milestone 4, PRD D5, plan D114): the workspace root on this box is walked, and each repo
+    /// with exactly one matching checkout gets a canonical row, inserted only where none exists,
+    /// so a manual path is never replaced. Answers [`StoreReply::RepoPathsInferred`].
+    InferRepoPaths(WorkspaceId),
 
     // MOD-15 milestone 4 (D5): the nine catalogue requests, served by [`crate::catalogue`]. Every
     // write carries the `Scope` because the tree the reply re-reads *is* the scope (M4 D7), and all
@@ -614,7 +619,7 @@ impl StoreRequest {
             Self::AuthCancel => "auth_cancel",
             Self::StoreState => "store_state",
             Self::ApplyMigrations => "apply_migrations",
-            // The twelve of `hierarchy::REQUEST_NAMES`, in that order. String literals, because
+            // The thirteen of `hierarchy::REQUEST_NAMES`, in that order. String literals, because
             // this stays a `const fn`.
             Self::Hierarchy(..) => "hierarchy",
             Self::CreateWorkspace { .. } => "create_workspace",
@@ -628,6 +633,7 @@ impl StoreRequest {
             Self::DeleteReach(..) => "delete_reach",
             Self::DeleteWorkspace(..) => "delete_workspace",
             Self::DeleteProject(..) => "delete_project",
+            Self::InferRepoPaths(..) => "infer_repo_paths",
             // The nine of `catalogue::REQUEST_NAMES`, in that order (MOD-15 M4 D5).
             Self::Catalogue(..) => "catalogue",
             Self::CreateKind { .. } => "create_kind",
@@ -783,6 +789,15 @@ pub enum StoreReply {
         reach: Box<DeleteReach>,
         /// What the worker did to the mirror afterwards.
         mirror: MirrorAfterDelete,
+    },
+    /// Answer to [`StoreRequest::InferRepoPaths`]: the tree as it is now and what the pass did,
+    /// per repo (plan D116). One reply carries both, so the section never patches a row locally.
+    /// No URL travels here: the report names repos and canonical paths only.
+    RepoPathsInferred {
+        /// The workspace re-read after the writes.
+        tree: Box<HierarchySnapshot>,
+        /// Per repo, what happened and why.
+        report: InferReport,
     },
     /// The scope's catalogue, freshly read: the answer to [`StoreRequest::Catalogue`] and to every
     /// catalogue write that applied (M4 D2/D7).
@@ -1070,7 +1085,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             request: request.name(),
             message: "no agent runtime in this build".to_owned(),
         },
-        // The twelve hierarchy requests, or-ed rather than guarded: this `match` has no wildcard,
+        // The thirteen hierarchy requests, or-ed rather than guarded: this `match` has no wildcard,
         // and an arm with a guard does not count towards exhaustivity, so `_ if …` would be an
         // E0004 here (MOD-15 M3 plan F-12). The `?` is what keeps `spawn`'s `go_offline` working:
         // an `Unreachable` from `hierarchy::serve` still drops an `Online` backend onto the mirror
@@ -1086,8 +1101,9 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::SetRepoPath { .. }
         | StoreRequest::DeleteReach(..)
         | StoreRequest::DeleteWorkspace(..)
-        | StoreRequest::DeleteProject(..) => hierarchy::serve(backend, request).await?,
-        // The nine catalogue requests, or-ed for the same reason the twelve above are: a guard
+        | StoreRequest::DeleteProject(..)
+        | StoreRequest::InferRepoPaths(..) => hierarchy::serve(backend, request).await?,
+        // The nine catalogue requests, or-ed for the same reason the thirteen above are: a guard
         // does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would be an
         // E0004 here (MOD-15 M3 plan F-12, M4 plan F-2).
         StoreRequest::Catalogue(..)
@@ -1099,7 +1115,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::CreatePhase { .. }
         | StoreRequest::UpdatePhase { .. }
         | StoreRequest::SetPhaseBudget { .. } => catalogue::serve(backend, request).await?,
-        // The three prompt settings requests, or-ed for the same reason the twenty-one above are:
+        // The three prompt settings requests, or-ed for the same reason the twenty-two above are:
         // a guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …`
         // would be an E0004 here (MOD-15 M3 plan F-12, M5 plan F-13).
         StoreRequest::PromptSettings(..)
@@ -1110,7 +1126,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::Templates(..) | StoreRequest::SaveTemplate { .. } => {
             templates::serve(backend, request).await?
         }
-        // The four connection requests, or-ed for the same reason the twenty-four above are: a
+        // The four connection requests, or-ed for the same reason the twenty-five above are: a
         // guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would
         // be an E0004 here (MOD-15 M3 plan F-12, M6 plan D9). Only the read is answered: the three
         // writers need `reconnect`, `refresher` and the connect context, none of which a function
@@ -1119,7 +1135,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::SetDsn(_)
         | StoreRequest::ClearDsn
         | StoreRequest::RebuildCache => connection::serve(backend, request).await?,
-        // The two box requests, or-ed for the same reason the twenty-eight above are: a guard
+        // The two box requests, or-ed for the same reason the twenty-nine above are: a guard
         // does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would be an
         // E0004 here (MOD-15 M3 plan F-12, MOD-7 milestone 2 D46).
         StoreRequest::Boxes | StoreRequest::EditBox { .. } => {

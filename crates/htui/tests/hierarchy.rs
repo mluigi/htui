@@ -5,18 +5,27 @@
 //! channels and no shell. The section half lives below the divider and goes through `Harness`.
 #![cfg(feature = "testkit")]
 
+use std::fs;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
 use chrono::Utc;
 use htui::app::Action;
-use htui::hierarchy::{HierarchySnapshot, MirrorAfterDelete, REQUEST_NAMES};
+use htui::hierarchy::{
+    HierarchySnapshot, InferOutcome, InferReport, MirrorAfterDelete, REQUEST_NAMES, RepoInference,
+};
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{AgentsSection, HierarchySection, SettingsSection, SettingsTab};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    NewProject, ProjectId, ProjectPatch, RepoId, RepoPatch, WorkspaceId, WorkspacePatch,
+    NewProject, ProjectId, ProjectPatch, RepoBoxPath, RepoId, RepoPatch, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch,
 };
 use htui_core::store::{DeleteReach, DeleteTarget, MemStore, ReadStore, WriteStore};
+use htui_orch::infer::{MAX_DIRS, MatchedBy};
+use htui_orch::isolate::git::testkit::repo_with_one_commit;
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -85,7 +94,7 @@ async fn a_hierarchy_read_of_nil_is_none() {
     );
 }
 
-/// `StoreRequest::name` and `hierarchy::REQUEST_NAMES` are the same twelve strings in the same
+/// `StoreRequest::name` and `hierarchy::REQUEST_NAMES` are the same thirteen strings in the same
 /// order: the section matches a `Failed` reply by name, and the two lists drifting apart would
 /// make a refusal land on no one.
 #[test]
@@ -138,6 +147,7 @@ fn hierarchy_names_are_stable() {
         StoreRequest::DeleteReach(DeleteTarget::Workspace(WorkspaceId::default())),
         StoreRequest::DeleteWorkspace(WorkspaceId::default()),
         StoreRequest::DeleteProject(ProjectId::default()),
+        StoreRequest::InferRepoPaths(WorkspaceId::default()),
     ];
 
     assert_eq!(requests.len(), REQUEST_NAMES.len());
@@ -410,7 +420,7 @@ async fn a_canonical_path_that_is_not_utf8_is_refused() {
 
     let dir = tempfile::tempdir().expect("a throwaway directory");
     let target = dir.path().join(OsStr::from_bytes(b"not\xffutf8"));
-    std::fs::create_dir(&target).expect("a directory whose name is not UTF-8");
+    fs::create_dir(&target).expect("a directory whose name is not UTF-8");
     let link = dir.path().join("checkout");
     std::os::unix::fs::symlink(&target, &link).expect("the link is created");
 
@@ -661,7 +671,7 @@ async fn delete_workspace_keeps_its_projects() {
     );
 }
 
-/// Offline, every one of the twelve is refused by its own name with the one sentence MOD-25
+/// Offline, every one of the thirteen is refused by its own name with the one sentence MOD-25
 /// coined: `Backend::writer()` is `None`, so `serve` never reaches the seam.
 #[tokio::test]
 async fn offline_refuses_every_hierarchy_request_by_name() {
@@ -684,7 +694,7 @@ async fn offline_refuses_every_hierarchy_request_by_name() {
     }
 }
 
-/// One of each of the twelve, in `REQUEST_NAMES` order. The ids are nil where the request never
+/// One of each of the thirteen, in `REQUEST_NAMES` order. The ids are nil where the request never
 /// reaches a store.
 fn hierarchy_requests() -> Vec<StoreRequest> {
     vec![
@@ -735,7 +745,335 @@ fn hierarchy_requests() -> Vec<StoreRequest> {
         StoreRequest::DeleteReach(DeleteTarget::Workspace(WorkspaceId::default())),
         StoreRequest::DeleteWorkspace(WorkspaceId::default()),
         StoreRequest::DeleteProject(ProjectId::default()),
+        StoreRequest::InferRepoPaths(WorkspaceId::default()),
     ]
+}
+
+// ---- inference (MOD-7 milestone 4, T4; plan D114, D116, D124) ----
+//
+// Every checkout is a real repository built by `repo_with_one_commit` with `gix` alone, and its
+// remote is a `[remote "origin"]` section appended to `.git/config` by hand (D131): no `git` binary.
+
+/// The remote every `core` in this file is registered with.
+const CORE_REMOTE: &str = "https://example.com/o/core.git";
+
+/// The same repository as [`CORE_REMOTE`], spelled the way a clone over SSH records it.
+const CORE_CLONE_REMOTE: &str = "git@example.com:o/core";
+
+/// A repo named `name` in `vulkan-tutorials`, created through the worker; its id.
+async fn create_repo(backend: &Backend, name: &str, remote: Option<&str>) -> RepoId {
+    let created = tree(
+        serve(
+            backend,
+            &StoreRequest::CreateRepo {
+                project: ids::PROJECT_VULKAN,
+                name: name.to_owned(),
+                remote_url: remote.map(str::to_owned),
+                default_branch: "main".to_owned(),
+                is_primary: false,
+            },
+        )
+        .await,
+    );
+    created.projects[0]
+        .repos
+        .iter()
+        .find(|entry| entry.repo.name == name)
+        .expect("the new repo is in the tree")
+        .repo
+        .id
+}
+
+/// A real repository at `root/rel`, with `remote` as its `origin` when given.
+fn checkout(root: &Path, rel: &str, remote: Option<&str>) -> PathBuf {
+    let dir = root.join(rel);
+    fs::create_dir_all(&dir).expect("the checkout's directory is created");
+    repo_with_one_commit(&dir);
+    if let Some(url) = remote {
+        let mut config = fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(".git").join("config"))
+            .expect("the repository's config opens");
+        write!(
+            config,
+            "[remote \"origin\"]\n\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+        )
+        .expect("the remote is written");
+    }
+    dir
+}
+
+/// `Graphics`' root on this box, through the worker (and so through its guard).
+async fn set_root(backend: &Backend, dir: &Path) -> HierarchySnapshot {
+    tree(
+        serve(
+            backend,
+            &StoreRequest::SetWorkspaceRoot {
+                id: ids::WORKSPACE_GRAPHICS,
+                path: dir.display().to_string(),
+            },
+        )
+        .await,
+    )
+}
+
+/// The tree and the report an inference answers, or a panic naming what came back instead.
+#[track_caller]
+fn inferred(reply: StoreReply) -> (HierarchySnapshot, InferReport) {
+    match reply {
+        StoreReply::RepoPathsInferred { tree, report } => (*tree, report),
+        other => panic!("expected an inference: {other:?}"),
+    }
+}
+
+/// One `InferRepoPaths` over `Graphics`.
+async fn infer(backend: &Backend) -> (HierarchySnapshot, InferReport) {
+    inferred(
+        serve(
+            backend,
+            &StoreRequest::InferRepoPaths(ids::WORKSPACE_GRAPHICS),
+        )
+        .await,
+    )
+}
+
+/// What the report says about the repo named `name`.
+#[track_caller]
+fn outcome<'a>(report: &'a InferReport, name: &str) -> &'a InferOutcome {
+    &report
+        .repos
+        .iter()
+        .find(|line| line.name == name)
+        .unwrap_or_else(|| panic!("`{name}` is in the report: {report:?}"))
+        .outcome
+}
+
+/// This box's row for the repo named `name`, as the tree shows it.
+#[track_caller]
+fn local_path(tree: &HierarchySnapshot, name: &str) -> Option<RepoBoxPath> {
+    tree.projects
+        .iter()
+        .flat_map(|entry| entry.repos.iter())
+        .find(|entry| entry.repo.name == name)
+        .unwrap_or_else(|| panic!("`{name}` is in the tree"))
+        .local_path
+        .clone()
+}
+
+/// `path`, canonical, as the worker stores it.
+fn canonical(path: &Path) -> String {
+    path.canonicalize()
+        .expect("the path resolves")
+        .into_os_string()
+        .into_string()
+        .expect("a tempdir path is UTF-8")
+}
+
+/// The first failing test of T4: a remote match under the root is stored canonical, under this
+/// box, and the report names the root it walked.
+#[tokio::test]
+async fn inference_writes_one_canonical_row_by_remote() {
+    let backend = demo();
+    let root = tempfile::tempdir().expect("a throwaway workspace root");
+    let core = checkout(root.path(), "src/core", Some(CORE_CLONE_REMOTE));
+    create_repo(&backend, "core", Some(CORE_REMOTE)).await;
+    set_root(&backend, root.path()).await;
+
+    let (tree, report) = infer(&backend).await;
+
+    assert_eq!(report.root, Some(canonical(root.path())));
+    assert!(!report.truncated);
+    assert_eq!(
+        outcome(&report, "core"),
+        &InferOutcome::Inferred {
+            path: canonical(&core),
+            by: MatchedBy::Remote,
+        }
+    );
+    let row = local_path(&tree, "core").expect("the reply's tree carries the new row");
+    assert_eq!(row.local_path, canonical(&core));
+    assert_eq!(row.box_id, ids::BOX, "the worker fills in the box");
+}
+
+/// A manual row is never replaced (PRD D5): the repo is `AlreadySet`, and the tree still shows the
+/// path that was typed, not the checkout the walk would have found.
+#[tokio::test]
+async fn inference_leaves_a_manual_row_and_reports_it_already_set() {
+    let backend = demo();
+    let root = tempfile::tempdir().expect("a throwaway workspace root");
+    checkout(root.path(), "docs", None);
+    let elsewhere = root.path().join("elsewhere");
+    fs::create_dir(&elsewhere).expect("the manual path exists");
+    let docs = create_repo(&backend, "docs", None).await;
+    set_root(&backend, root.path()).await;
+    let _ = tree(
+        serve(
+            &backend,
+            &StoreRequest::SetRepoPath {
+                project: ids::PROJECT_VULKAN,
+                repo: docs,
+                path: elsewhere.display().to_string(),
+            },
+        )
+        .await,
+    );
+
+    let (tree, report) = infer(&backend).await;
+
+    assert_eq!(outcome(&report, "docs"), &InferOutcome::AlreadySet);
+    assert_eq!(
+        local_path(&tree, "docs").map(|row| row.local_path),
+        Some(canonical(&elsewhere)),
+        "the manual row is untouched"
+    );
+}
+
+/// Two clones of one remote are two candidates, and ambiguity writes nothing (PRD D5).
+#[tokio::test]
+async fn two_clones_are_ambiguous_and_write_nothing() {
+    let backend = demo();
+    let root = tempfile::tempdir().expect("a throwaway workspace root");
+    checkout(root.path(), "one/core", Some(CORE_CLONE_REMOTE));
+    checkout(root.path(), "two/core", Some(CORE_REMOTE));
+    create_repo(&backend, "core", Some(CORE_REMOTE)).await;
+    set_root(&backend, root.path()).await;
+
+    let (tree, report) = infer(&backend).await;
+
+    assert_eq!(
+        outcome(&report, "core"),
+        &InferOutcome::Ambiguous { candidates: 2 }
+    );
+    assert_eq!(local_path(&tree, "core"), None, "nothing was written");
+}
+
+/// A root with nothing under it matches nothing.
+#[tokio::test]
+async fn no_checkout_reports_no_match() {
+    let backend = demo();
+    let root = tempfile::tempdir().expect("a throwaway workspace root");
+    create_repo(&backend, "web", Some("https://example.com/o/web.git")).await;
+    set_root(&backend, root.path()).await;
+
+    let (tree, report) = infer(&backend).await;
+
+    assert_eq!(outcome(&report, "web"), &InferOutcome::NoMatch);
+    assert_eq!(local_path(&tree, "web"), None);
+}
+
+/// A repo with no remote is matched on its name, the second rung (plan D112).
+#[tokio::test]
+async fn a_name_match_is_inferred_for_a_repo_without_a_remote() {
+    let backend = demo();
+    let root = tempfile::tempdir().expect("a throwaway workspace root");
+    let tools = checkout(root.path(), "tools", None);
+    create_repo(&backend, "tools", None).await;
+    set_root(&backend, root.path()).await;
+
+    let (tree, report) = infer(&backend).await;
+
+    assert_eq!(
+        outcome(&report, "tools"),
+        &InferOutcome::Inferred {
+            path: canonical(&tools),
+            by: MatchedBy::Name,
+        }
+    );
+    assert_eq!(
+        local_path(&tree, "tools").map(|row| row.local_path),
+        Some(canonical(&tools))
+    );
+}
+
+/// A root set through a link is stored as its target (F-102), and every path the walk finds is
+/// under that target: a link's name never reaches a row.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlinked_root_yields_paths_under_its_target() {
+    let backend = demo();
+    let dir = tempfile::tempdir().expect("a throwaway directory");
+    let real = dir.path().join("real");
+    fs::create_dir(&real).expect("the real root");
+    checkout(&real, "core", Some(CORE_CLONE_REMOTE));
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("the link is created");
+    create_repo(&backend, "core", Some(CORE_REMOTE)).await;
+
+    let stored = set_root(&backend, &link).await;
+    assert_eq!(
+        stored.root_path.map(|row| row.root_path),
+        Some(canonical(&real)),
+        "the root is stored as the link's target"
+    );
+
+    let (_, report) = infer(&backend).await;
+    let InferOutcome::Inferred { path, .. } = outcome(&report, "core") else {
+        panic!("the checkout under the target is found: {report:?}");
+    };
+    assert!(
+        path.starts_with(&canonical(&real)),
+        "the path is under the target: {path}"
+    );
+    assert!(
+        !Path::new(path)
+            .components()
+            .any(|part| part.as_os_str() == "link"),
+        "the path never walks the link: {path}"
+    );
+}
+
+/// No root on this box: nothing is walked and nothing is reported.
+#[tokio::test]
+async fn no_root_reports_none_and_walks_nothing() {
+    let backend = demo();
+    create_repo(&backend, "core", Some(CORE_REMOTE)).await;
+
+    let (_, report) = infer(&backend).await;
+
+    assert_eq!(
+        report,
+        InferReport {
+            root: None,
+            truncated: false,
+            repos: vec![],
+        }
+    );
+}
+
+/// Inference is idempotent: the second pass finds the row the first wrote and changes nothing.
+#[tokio::test]
+async fn a_second_pass_changes_nothing() {
+    let backend = demo();
+    let root = tempfile::tempdir().expect("a throwaway workspace root");
+    checkout(root.path(), "src/core", Some(CORE_CLONE_REMOTE));
+    create_repo(&backend, "core", Some(CORE_REMOTE)).await;
+    set_root(&backend, root.path()).await;
+
+    let (first, _) = infer(&backend).await;
+    let (second, report) = infer(&backend).await;
+
+    assert_eq!(outcome(&report, "core"), &InferOutcome::AlreadySet);
+    assert_eq!(second, first, "the tree is the one the first pass answered");
+}
+
+/// A scan cut short at `MAX_DIRS` infers nothing, not even the match it did see: an unseen second
+/// clone would turn it into a wrong single match (plan D113).
+#[tokio::test]
+async fn a_scan_that_hits_the_cap_infers_nothing() {
+    let backend = demo();
+    let root = tempfile::tempdir().expect("a throwaway workspace root");
+    checkout(root.path(), "core", Some(CORE_CLONE_REMOTE));
+    for n in 0..MAX_DIRS {
+        fs::create_dir(root.path().join(format!("d{n:05}"))).expect("an empty sibling");
+    }
+    create_repo(&backend, "core", Some(CORE_REMOTE)).await;
+    set_root(&backend, root.path()).await;
+
+    let (tree, report) = infer(&backend).await;
+
+    assert!(report.truncated, "the walk stopped at the cap");
+    assert_eq!(outcome(&report, "core"), &InferOutcome::ScanTruncated);
+    assert_eq!(local_path(&tree, "core"), None, "nothing was written");
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1375,4 +1713,368 @@ async fn a_wrong_slug_deletes_nothing() {
         frame.contains("vulkan-tutorials  Vulkan Tutorials"),
         "and the tree is still there: {frame}"
     );
+}
+
+// ---- section: inference (MOD-7 milestone 4, T4; plan D114, D117; blueprint D136-D138) ----
+
+/// `tree` with a root on this box at `path`: a synthetic row, since the section never stats one.
+fn with_root(mut tree: HierarchySnapshot, path: &str) -> HierarchySnapshot {
+    tree.root_path = Some(WorkspaceBoxPath {
+        workspace_id: tree.workspace.id,
+        box_id: ids::BOX,
+        root_path: path.to_owned(),
+        updated_at: tree.workspace.updated_at,
+    });
+    tree
+}
+
+/// The `InferRepoPaths` requests among `actions`, by workspace.
+fn inferences(actions: &[Action]) -> Vec<WorkspaceId> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Store(StoreRequest::InferRepoPaths(ws)) => Some(*ws),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `vulkan-tutorials` with `alpha` (primary) and `beta`, as `p_moves_the_primary` builds it.
+async fn tree_with_two_repos(backend: &Backend) -> HierarchySnapshot {
+    for (name, is_primary) in [("alpha", true), ("beta", false)] {
+        let reply = serve(
+            backend,
+            &StoreRequest::CreateRepo {
+                project: ids::PROJECT_VULKAN,
+                name: name.to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary,
+            },
+        )
+        .await;
+        let _ = tree(reply);
+    }
+    demo_tree(backend, ids::WORKSPACE_GRAPHICS).await
+}
+
+/// `i` asks the worker to infer the scope's workspace, once (D114).
+#[tokio::test]
+async fn i_sends_infer_repo_paths_for_the_scope() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    let backend = demo();
+    let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
+    let _ = bench.drained();
+
+    bench.key(&mut section, "i");
+
+    let emitted = bench.drained();
+    assert!(
+        matches!(
+            emitted.as_slice(),
+            [Action::Store(StoreRequest::InferRepoPaths(ws))] if *ws == ids::WORKSPACE_GRAPHICS
+        ),
+        "`i` is one request for the scope's workspace: {emitted:?}"
+    );
+}
+
+/// `i` is a write, so it is refused while another write is in flight, as the other write keys are.
+#[tokio::test]
+async fn i_is_refused_while_a_write_is_in_flight() {
+    let backend = demo();
+    let with_repos = tree_with_two_repos(&backend).await;
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(with_repos))),
+    );
+    let _ = bench.drained();
+
+    for _ in 0..3 {
+        bench.key(&mut section, "j");
+    }
+    bench.key(&mut section, "p");
+    let _ = bench.drained();
+    bench.key(&mut section, "i");
+
+    assert!(
+        bench.drained().is_empty(),
+        "no second request while `p` is in flight"
+    );
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("`update_repo` is still in flight"),
+        "and the refusal names the write it is waiting for: {frame}"
+    );
+}
+
+/// A root written through the editor, with a root in the fresh tree, is followed by exactly one
+/// inference (D136).
+#[tokio::test]
+async fn a_root_write_that_applied_is_followed_by_one_inference() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    let backend = demo();
+    let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(opened.clone()))),
+    );
+    let _ = bench.drained();
+
+    bench.key(&mut section, "b");
+    type_at(&bench, &mut section, "/srv/htui");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(with_root(opened, "/srv/htui")))),
+    );
+
+    let emitted = bench.drained();
+    assert!(
+        matches!(
+            emitted.as_slice(),
+            [Action::Store(StoreRequest::InferRepoPaths(ws))] if *ws == ids::WORKSPACE_GRAPHICS
+        ),
+        "the applied root write is followed by one inference: {emitted:?}"
+    );
+}
+
+/// A new repo on a workspace with no root here has nothing to walk, so it is not followed (D136).
+#[tokio::test]
+async fn a_new_repo_on_a_workspace_without_a_root_is_not_followed() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    let backend = demo();
+    let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(opened.clone()))),
+    );
+    let _ = bench.drained();
+
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "n");
+    type_at(&bench, &mut section, "core");
+    bench.key(&mut section, "enter");
+    let emitted = bench.drained();
+    assert!(
+        matches!(
+            emitted.as_slice(),
+            [Action::Store(StoreRequest::CreateRepo { .. })]
+        ),
+        "`Enter` creates the repo: {emitted:?}"
+    );
+
+    bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
+
+    let emitted = bench.drained();
+    assert!(
+        inferences(&emitted).is_empty(),
+        "no root on this box, no inference: {emitted:?}"
+    );
+}
+
+/// `p` changes no column inference reads, so it is never followed, root or not (P-8, D136).
+#[tokio::test]
+async fn p_is_not_followed_by_an_inference() {
+    let backend = demo();
+    let with_repos = with_root(tree_with_two_repos(&backend).await, "/srv/htui");
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(with_repos.clone()))),
+    );
+    let _ = bench.drained();
+
+    for _ in 0..3 {
+        bench.key(&mut section, "j");
+    }
+    bench.key(&mut section, "p");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(with_repos))),
+    );
+
+    let emitted = bench.drained();
+    assert!(
+        inferences(&emitted).is_empty(),
+        "`p` is not followed by an inference: {emitted:?}"
+    );
+}
+
+/// An inference reply is a tree plus a notice built from its report (D117). Rendered from a
+/// synthetic reply with fixed paths, so the frame does not move with a tempdir (H-10, D138).
+#[tokio::test]
+async fn an_inference_reply_renders_the_tree_and_the_report() {
+    let backend = demo();
+    let core = create_repo(&backend, "core", Some(CORE_REMOTE)).await;
+    let docs = create_repo(&backend, "docs", None).await;
+    let mut tree = with_root(
+        demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await,
+        "/srv/graphics",
+    );
+    for entry in &mut tree.projects[0].repos {
+        if entry.repo.id == core {
+            entry.local_path = Some(RepoBoxPath {
+                repo_id: core,
+                box_id: ids::BOX,
+                local_path: "/srv/graphics/core".to_owned(),
+                updated_at: entry.repo.updated_at,
+            });
+        }
+    }
+    let report = InferReport {
+        root: Some("/srv/graphics".to_owned()),
+        truncated: false,
+        repos: vec![
+            RepoInference {
+                repo: core,
+                name: "core".to_owned(),
+                outcome: InferOutcome::Inferred {
+                    path: "/srv/graphics/core".to_owned(),
+                    by: MatchedBy::Remote,
+                },
+            },
+            RepoInference {
+                repo: docs,
+                name: "docs".to_owned(),
+                outcome: InferOutcome::NoMatch,
+            },
+        ],
+    };
+
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::RepoPathsInferred {
+            tree: Box::new(tree),
+            report,
+        },
+    );
+
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains(
+            "inferred 1 of 2 \u{b7} no checkout: docs \u{2014} b on a repo sets it by hand"
+        ),
+        "the notice reports what was and was not inferred: {frame}"
+    );
+    insta::assert_snapshot!("inferred", frame);
+}
+
+/// One report line for the notice cases.
+fn line(name: &str, outcome: InferOutcome) -> RepoInference {
+    RepoInference {
+        repo: RepoId::new(),
+        name: name.to_owned(),
+        outcome,
+    }
+}
+
+/// The notice grammar of D137, byte-exact, for every row of blueprint §6.5: no root, a truncated
+/// scan, an empty workspace, and the counted sentence with each name list capped at three.
+#[tokio::test]
+async fn the_report_notice_names_what_was_not_inferred() {
+    let inferred = || InferOutcome::Inferred {
+        path: "/srv/graphics/core".to_owned(),
+        by: MatchedBy::Remote,
+    };
+    let cases = [
+        (
+            InferReport {
+                root: None,
+                truncated: false,
+                repos: vec![],
+            },
+            "no root on this box for this workspace \u{2014} b on the workspace row sets it"
+                .to_owned(),
+        ),
+        (
+            InferReport {
+                root: Some("/srv/graphics".to_owned()),
+                truncated: true,
+                repos: vec![line("core", InferOutcome::ScanTruncated)],
+            },
+            format!("the scan stopped at {MAX_DIRS} directories; nothing inferred"),
+        ),
+        (
+            InferReport {
+                root: Some("/srv/graphics".to_owned()),
+                truncated: false,
+                repos: vec![],
+            },
+            "no repo in this workspace to infer".to_owned(),
+        ),
+        (
+            InferReport {
+                root: Some("/srv/graphics".to_owned()),
+                truncated: false,
+                repos: vec![
+                    line("core", inferred()),
+                    line("api", InferOutcome::AlreadySet),
+                    line("docs", InferOutcome::NoMatch),
+                    line("web", InferOutcome::Ambiguous { candidates: 2 }),
+                ],
+            },
+            "inferred 1 of 3 \u{b7} 1 already set \u{b7} no checkout: docs \u{b7} ambiguous: web (2) \u{2014} b on a repo sets it by hand"
+                .to_owned(),
+        ),
+        (
+            InferReport {
+                root: Some("/srv/graphics".to_owned()),
+                truncated: false,
+                repos: vec![
+                    line("core", inferred()),
+                    line("a1", InferOutcome::NoMatch),
+                    line("a2", InferOutcome::NoMatch),
+                    line("a3", InferOutcome::NoMatch),
+                    line("a4", InferOutcome::NoMatch),
+                    line("a5", InferOutcome::NoMatch),
+                    line("gfx", InferOutcome::Refused("refused".to_owned())),
+                ],
+            },
+            "inferred 1 of 7 \u{b7} no checkout: a1, a2, a3 +2 more \u{b7} refused: gfx \u{2014} b on a repo sets it by hand"
+                .to_owned(),
+        ),
+        (
+            InferReport {
+                root: Some("/srv/graphics".to_owned()),
+                truncated: false,
+                repos: vec![line("core", inferred()), line("docs", inferred())],
+            },
+            "inferred 2 of 2".to_owned(),
+        ),
+    ];
+
+    let backend = demo();
+    let tree = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    for (report, expected) in cases {
+        let bench = SectionBench::new().await;
+        let mut section = HierarchySection::new();
+        bench.reply(
+            &mut section,
+            &StoreReply::RepoPathsInferred {
+                tree: Box::new(tree.clone()),
+                report: report.clone(),
+            },
+        );
+        let frame = bench.render_section(&section, 250);
+        let hint = frame
+            .lines()
+            .find(|row| row.contains("j/k"))
+            .unwrap_or_else(|| panic!("the hint row is drawn: {frame}"));
+        assert!(
+            hint.trim_end().ends_with(&format!("\u{b7} {expected}")),
+            "{report:?} reads `{expected}`: {hint}"
+        );
+    }
 }
