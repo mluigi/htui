@@ -4840,6 +4840,26 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
         "{CASE}: and the overlapping item is blocked"
     );
 
+    // Control: an untagged run on the same repo meets the overlap, so ANA-2's run really held it.
+    // Taken before CLEAN-1's claim, while ANA-2's run holds one of two slots.
+    let overlap_control_item = mint_tagged(CASE, store, "Overlap control", &[]).await;
+    let overlap_control = store
+        .create_run(new_run(ids::PROJECT_HTUI, overlap_control_item, vec![repo]))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(overlap_control, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        Claim::Overlaps {
+            with: ana,
+            rule: OverlapRule::NotIsolated
+        },
+        "{CASE}: an untagged run is refused for the overlap: ANA-2's run really held the repo"
+    );
+
     // Before the slot: fill the box, then a tagged run is still refused for its tags.
     let clean = store
         .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_CLEAN_1, Vec::new()))
