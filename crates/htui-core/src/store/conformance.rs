@@ -29,7 +29,7 @@ use crate::model::{
     SkillBindingKey, SkillId, SkillPatch, SkillVersion, SnapshotGraph, SnapshotSettings, Status,
     StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
     TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject, canonical_declared_tags,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -116,6 +116,8 @@ pub const CASES: &[&str] = &[
     "prompt_template_append_is_a_cas_on_the_head",
     "prompt_template_new_name_starts_at_one",
     "prompt_template_refuses_what_parse_refuses",
+    "claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks",
+    "claim_run_checks_tags_after_claimability_and_before_the_slot",
     "skill_create_reads_back_with_version_one",
     "skill_update_is_a_compare_and_set_and_refuses_a_taken_name",
     "skill_version_append_is_a_compare_and_set_on_the_head",
@@ -258,6 +260,12 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "prompt_template_refuses_what_parse_refuses" => {
             prompt_template_refuses_what_parse_refuses(store).await;
+        }
+        "claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks" => {
+            claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks(store).await;
+        }
+        "claim_run_checks_tags_after_claimability_and_before_the_slot" => {
+            claim_run_checks_tags_after_claimability_and_before_the_slot(store).await;
         }
         "skill_create_reads_back_with_version_one" => {
             skill_create_reads_back_with_version_one(store).await;
@@ -4597,6 +4605,356 @@ async fn claim_run_applies_the_isolation_and_path_rules<S: WriteStore>(store: &S
         run_row(CASE, store, j).await.status,
         RunStatus::Queued,
         "{CASE}: and J stays queued"
+    );
+}
+
+/// A tag list from string literals, in the order given (the store cases pass tags out of byte
+/// order on purpose).
+fn tags(list: &[&str]) -> Vec<String> {
+    list.iter().map(|tag| (*tag).to_owned()).collect()
+}
+
+/// Mints a FEAT item of the `htui` project that requires `required` (MOD-7 milestone 3, D93: the
+/// tags ride on the mint, not on a later edit).
+async fn mint_tagged<S: WriteStore>(
+    case: &str,
+    store: &S,
+    title: &str,
+    required: &[&str],
+) -> ItemId {
+    store
+        .mint_item(NewItem {
+            required_tags: tags(required),
+            ..new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, title)
+        })
+        .await
+        .expect(case)
+        .id
+}
+
+/// `R-ORCH-10` at claim (ANA-2 §4.10, MOD-7 milestone 3 D80): a run whose item requires a tag the
+/// box has neither probed nor declared is refused by name, and that refusal is the one that
+/// writes. Inside the admission transaction the run moves `queued -> failed` with
+/// [`missing_tags_failure`]'s sentence and its item `queued -> blocked`; no slot is taken, the
+/// verdict is not repeated, and once the box declares the tags the reopened item runs. The
+/// engine's half (the note, and the refusal that is not re-queued) is the `htui-orch` claim-time
+/// case.
+async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStore>(store: &S) {
+    const CASE: &str = "claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let until = at + TimeDelta::minutes(5);
+
+    let ana = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(ana, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: ANA-2's untagged run is admitted, one of the box's two slots"
+    );
+
+    // `rust` is probed on the fixture box; `vulkan` is doubled to pin the dedup, and the list is
+    // given out of byte order to pin the sort.
+    let item = mint_tagged(
+        CASE,
+        store,
+        "Tagged",
+        &["rust", "vulkan", "docker", "vulkan"],
+    )
+    .await;
+    let run = store
+        .create_run(new_run(ids::PROJECT_HTUI, item, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        item_row(CASE, store, item).await.status,
+        Status::Queued,
+        "{CASE}: create_run queued the tagged item"
+    );
+
+    let missing = tags(&["docker", "vulkan"]);
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        Claim::MissingTags {
+            missing: missing.clone()
+        },
+        "{CASE}: the missing tags, in byte order and deduplicated"
+    );
+    let failed = run_row(CASE, store, run).await;
+    assert_eq!(
+        failed.status,
+        RunStatus::Failed,
+        "{CASE}: the refusal failed the run"
+    );
+    assert_eq!(
+        failed.failure,
+        Some(missing_tags_failure(&missing)),
+        "{CASE}: run.failure is the one sentence"
+    );
+    assert_eq!(
+        failed.failure.as_deref(),
+        Some("missing tags: docker, vulkan"),
+        "{CASE}: byte for byte (ANA-2 §4.10)"
+    );
+    assert_eq!(
+        failed.finished_at,
+        Some(at),
+        "{CASE}: finished at the caller's clock"
+    );
+    assert_eq!(
+        failed.executing_box_id, None,
+        "{CASE}: the refused run never executed"
+    );
+    assert_eq!(failed.started_at, None, "{CASE}: nor started");
+    assert_eq!(failed.lease_box_id, None, "{CASE}: and holds no lease");
+    assert_eq!(
+        failed.lease_expires_at, None,
+        "{CASE}: no lease expiry either"
+    );
+    assert_eq!(
+        item_row(CASE, store, item).await.status,
+        Status::Blocked,
+        "{CASE}: the item moved queued -> blocked in the same transaction"
+    );
+
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        Claim::NotClaimable,
+        "{CASE}: a failed run is not claimable again"
+    );
+    assert_eq!(
+        run_row(CASE, store, run).await,
+        failed,
+        "{CASE}: and the second claim wrote nothing"
+    );
+
+    let clean = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_CLEAN_1, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(clean, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: the second running run on a box of two: the failed run took no slot"
+    );
+
+    assert!(
+        store
+            .transition_run(clean, RunStatus::Running, RunStatus::AwaitingApproval, at)
+            .await
+            .expect(CASE),
+        "{CASE}: CLEAN-1's run parks, freeing its slot"
+    );
+    assert!(
+        store
+            .transition(item, Status::Blocked, Status::Open)
+            .await
+            .expect(CASE),
+        "{CASE}: the blocked item reopens"
+    );
+    let edited = store
+        .edit_box(
+            ids::BOX,
+            0,
+            BoxEdit {
+                declared_tags: Some(tags(&["docker", "gpu", "vulkan"])),
+                quirks: None,
+            },
+        )
+        .await
+        .expect(CASE);
+    assert!(
+        matches!(edited, CasOutcome::Applied(_)),
+        "{CASE}: the box declares the missing tags"
+    );
+    let rerun = store
+        .create_run(new_run(ids::PROJECT_HTUI, item, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(rerun, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: with the tags declared the item's fresh run is admitted"
+    );
+    assert_eq!(
+        item_row(CASE, store, item).await.status,
+        Status::InProgress,
+        "{CASE}: and its item is in progress"
+    );
+}
+
+/// `R-ORCH-10`'s place in the claim order (MOD-7 milestone 3, D81): `NotFound`, `NotClaimable`,
+/// **`MissingTags`**, `SlotFull`, `Overlaps`. A run that is not claimable is answered so and
+/// nothing is written, even when its item lacks tags; a tagged run is refused by name before the
+/// overlap and before the full box, because a permanent refusal wins over a transient one.
+async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteStore>(store: &S) {
+    const CASE: &str = "claim_run_checks_tags_after_claimability_and_before_the_slot";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let until = at + TimeDelta::minutes(5);
+
+    // Claimability first: a cancelled run is not claimable, and nothing is written.
+    let cancelled_item = mint_tagged(CASE, store, "Cancelled", &["vulkan"]).await;
+    let cancelled = store
+        .create_run(new_run(ids::PROJECT_HTUI, cancelled_item, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    store
+        .finish_run(cancelled, RunStatus::Cancelled, None, at)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store
+            .claim_run(cancelled, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        Claim::NotClaimable,
+        "{CASE}: claimability is decided before the tags"
+    );
+    let row = run_row(CASE, store, cancelled).await;
+    assert_eq!(
+        row.status,
+        RunStatus::Cancelled,
+        "{CASE}: the cancelled run stays cancelled"
+    );
+    assert_eq!(row.failure, None, "{CASE}: and carries no failure");
+    assert_eq!(
+        item_row(CASE, store, cancelled_item).await.status,
+        Status::Open,
+        "{CASE}: its item is not blocked: nothing was written"
+    );
+
+    // Before the overlap: a tagged run that also overlaps is refused for its tags.
+    let repo = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE)
+        .id;
+    let ana = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, vec![repo]))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(ana, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: ANA-2's run holds the repo"
+    );
+    let overlapping_item = mint_tagged(CASE, store, "Overlapping", &["vulkan"]).await;
+    let overlapping = store
+        .create_run(new_run(ids::PROJECT_HTUI, overlapping_item, vec![repo]))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(overlapping, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        Claim::MissingTags {
+            missing: tags(&["vulkan"])
+        },
+        "{CASE}: the tags are decided before the overlap with ANA-2's run"
+    );
+    assert_eq!(
+        item_row(CASE, store, overlapping_item).await.status,
+        Status::Blocked,
+        "{CASE}: and the overlapping item is blocked"
+    );
+
+    // Control: an untagged run on the same repo meets the overlap, so ANA-2's run really held it.
+    // Taken before CLEAN-1's claim, while ANA-2's run holds one of two slots.
+    let overlap_control_item = mint_tagged(CASE, store, "Overlap control", &[]).await;
+    let overlap_control = store
+        .create_run(new_run(ids::PROJECT_HTUI, overlap_control_item, vec![repo]))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(overlap_control, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        Claim::Overlaps {
+            with: ana,
+            rule: OverlapRule::NotIsolated
+        },
+        "{CASE}: an untagged run is refused for the overlap: ANA-2's run really held the repo"
+    );
+
+    // Before the slot: fill the box, then a tagged run is still refused for its tags.
+    let clean = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_CLEAN_1, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(clean, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: CLEAN-1's run takes the second of two slots"
+    );
+    let full_item = mint_tagged(CASE, store, "Full box", &["docker"]).await;
+    let full = store
+        .create_run(new_run(ids::PROJECT_HTUI, full_item, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(full, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        Claim::MissingTags {
+            missing: tags(&["docker"])
+        },
+        "{CASE}: the tags are decided before the full box"
+    );
+
+    // Control: an untagged run meets the full box, so the box really was full.
+    let control_item = mint_tagged(CASE, store, "Control", &[]).await;
+    let control = store
+        .create_run(new_run(ids::PROJECT_HTUI, control_item, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(control, ids::BOX, owner, at, until)
+            .await
+            .expect(CASE),
+        Claim::SlotFull {
+            running: 2,
+            limit: 2
+        },
+        "{CASE}: an untagged run is refused for the full box"
     );
 }
 

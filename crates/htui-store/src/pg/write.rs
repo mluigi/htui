@@ -34,7 +34,7 @@ use htui_core::model::{
     SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
     StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
     UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject, canonical_declared_tags, overlaps, scope_of,
+    WorkspaceProject, canonical_declared_tags, missing_tags_failure, overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -3398,7 +3398,17 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::NotFound`] `{ entity: "run" }` or `{ entity: "box" }`, the run looked up
     /// first. Every refusal that is not an error is an `Ok` [`Claim`] other than
-    /// [`Claim::Admitted`], with nothing written.
+    /// [`Claim::Admitted`], with nothing written, except [`Claim::MissingTags`]: the run is failed
+    /// and its item blocked in this same transaction, which is then committed (MOD-7 milestone 3,
+    /// D80). The run row and the box row are both locked `FOR UPDATE` before the tag read, so a
+    /// concurrent `record_box_probe` or `edit_box` waits for the decision and the check cannot
+    /// race a re-probe.
+    ///
+    /// The item row is **not** locked. A concurrent `update_item` of `required_tags` is ordered
+    /// after the claim: the claim decides on the tags it read, the same end state `MemStore`
+    /// reaches when the edit lands just after it. No lock, because `create_run` locks the item
+    /// and then the box (through `run.target_box_id`'s foreign key); an item lock taken here after
+    /// the box lock would take the two in the opposite order and could deadlock.
     async fn claim_run(
         &self,
         run: RunId,
@@ -3441,6 +3451,54 @@ impl WriteStore for PgStore {
 
         if claimed.status != RunStatus::Queued || claimed.target_box_id != box_id {
             return Ok(Claim::NotClaimable);
+        }
+
+        // R-ORCH-10 at claim (MOD-7 milestone 3, D80, D81): inside the admission transaction,
+        // after claimability and before the slot and the overlap. The shipped read's form
+        // (`pg/read.rs`'s `missing_tags`), joined through the run; a chat run joins no item and is
+        // never refused.
+        let missing = sqlx::query_scalar!(
+            r#"
+            SELECT DISTINCT t COLLATE "C" AS "tag!"
+              FROM run r
+              JOIN item i ON i.id = r.item_id
+             CROSS JOIN box b, UNNEST(i.required_tags) t
+             WHERE r.id = $1 AND b.id = $2
+               AND t <> ALL (b.probed_tags || b.declared_tags)
+             ORDER BY 1
+            "#,
+            run.as_uuid(),
+            box_id.as_uuid(),
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if !missing.is_empty() {
+            sqlx::query!(
+                "UPDATE run \
+                    SET status      = 'failed', \
+                        failure     = $2, \
+                        finished_at = COALESCE(finished_at, $3) \
+                  WHERE id = $1 AND status = 'queued'",
+                run.as_uuid(),
+                missing_tags_failure(&missing),
+                at,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            // A stale item status is not a refusal: zero rows here means someone else already
+            // moved the item on (the admitted branch's rule).
+            sqlx::query!(
+                "UPDATE item SET status = 'blocked' \
+                  WHERE id = (SELECT item_id FROM run WHERE id = $1) AND status = 'queued'",
+                run.as_uuid(),
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            tx.commit().await.map_err(map_sqlx)?;
+            return Ok(Claim::MissingTags { missing });
         }
 
         let limit = match serde_json::from_value::<BoxSettings>(settings)

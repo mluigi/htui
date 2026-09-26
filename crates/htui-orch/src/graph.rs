@@ -47,10 +47,11 @@ const DEFAULT_MAX_AGENTS_PER_RUN: u32 = 8;
 /// `htui-core` so invariant 10 holds in both directions: the engine never names a concrete store,
 /// and `htui-store` never learns that an engine exists. `fake.rs` implements it for `MemStore`
 /// (T3). `htui` cannot implement it for `Backend` (both are foreign there, E0117), so
-/// `run_worker::BackendGraphs` wraps a `Backend` and implements it (MOD-4 plan D155).
+/// `run_worker::BackendGraphs` wraps a `Backend` and implements it (MOD-4 plan D155). MOD-9
+/// added `bound_skills` and MOD-7 milestone 3 `missing_tags`, for the same reason.
 ///
-/// `app_setting` is deliberately **not** a fifth method (blueprint A-2): those reads are inherent
-/// too, so [`resolve`] takes the resolved map as a parameter, the shape
+/// `app_setting` is deliberately **not** a method of this trait (blueprint A-2): those reads are
+/// inherent too, so [`resolve`] takes the resolved map as a parameter, the shape
 /// `htui_core::prompt::settings::resolve_budget` already uses.
 ///
 /// Plain `async fn` with the targeted allow, mirroring `htui-core`'s own store seam
@@ -120,6 +121,18 @@ pub trait GraphSource: Sync {
         project: ProjectId,
         phase: Option<PhaseId>,
     ) -> Result<Vec<BoundSkill>>;
+
+    /// `R-ORCH-10`'s read (MOD-7 milestone 3, D75): the entries of `item.required_tags` that
+    /// `box_id` has neither probed nor declared (`box.probed_tags ∪ box.declared_tags`), compared
+    /// as exact bytes, sorted by bytes and deduplicated. Empty when the box can run the item, and
+    /// for an item that requires nothing. Inherent on both stores and on `Backend` (`mem.rs:678`,
+    /// `pg/read.rs:1919`, `backend.rs:561`) for `prompt_template`'s reason: `box` is mirrored,
+    /// but the mirror runs no orchestration reads.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] for an unknown item or box, the item first; the backend's own
+    /// failures; `Backend` offline refuses with its orchestration sentence.
+    async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>>;
 }
 
 /// What [`resolve`] answers: the snapshot and the scope, ready for
@@ -921,6 +934,10 @@ question and not a test fix. Decide the version bump first, then paste the new d
             phase: Option<PhaseId>,
         ) -> Result<Vec<BoundSkill>> {
             self.store.bound_skills(project, phase).await
+        }
+
+        async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
+            self.store.missing_tags(item, box_id).await
         }
     }
 

@@ -907,8 +907,11 @@ pub trait WriteStore: ReadStore {
     /// ANA-2 §4.7's admission, one transaction, answered as a [`Claim`] (plan D83).
     ///
     /// The decision order: `NotFound` for the run, then the box; [`Claim::NotClaimable`] when the
-    /// run is not `queued` or its `target_box_id` is not `box_id`; [`Claim::SlotFull`] when the
-    /// box already runs its limit of **`running`** runs
+    /// run is not `queued` or its `target_box_id` is not `box_id`; [`Claim::MissingTags`] when the
+    /// run's item requires a tag in neither the box's `probed_tags` nor its `declared_tags`
+    /// (`R-ORCH-10`, MOD-7 milestone 3 D80, D81: exact bytes, the missing tags in byte order and
+    /// deduplicated; a run with no item has none); [`Claim::SlotFull`] when the box already runs
+    /// its limit of **`running`** runs
     /// ([`BoxSettings::max_concurrent_items`](crate::model::BoxSettings::max_concurrent_items),
     /// else `app_setting`, else
     /// [`DEFAULT_MAX_CONCURRENT_ITEMS`](crate::model::DEFAULT_MAX_CONCURRENT_ITEMS)); then
@@ -924,8 +927,12 @@ pub trait WriteStore: ReadStore {
     ///
     /// On [`Claim::Admitted`] the run moves `queued -> running` with `executing_box_id = box_id`,
     /// `started_at = at`, `lease_box_id = box_id`, `lease_owner = owner`,
-    /// `lease_expires_at = lease_until`, and the item `queued -> in_progress`. Every other answer
-    /// writes nothing.
+    /// `lease_expires_at = lease_until`, and the item `queued -> in_progress`. On
+    /// [`Claim::MissingTags`] the run moves `queued -> failed` with `failure` =
+    /// [`missing_tags_failure`](crate::model::missing_tags_failure) of the list and
+    /// `finished_at = at`, and its item `queued -> blocked`, in the same transaction;
+    /// `executing_box_id`, `started_at` and the lease stay unset, so no slot is taken. Every other
+    /// answer writes nothing.
     ///
     /// The two predicates range over two different sets, and `awaiting_approval` is where they
     /// part: a parked run consumes no compute and so holds no slot, but it still owns its trees

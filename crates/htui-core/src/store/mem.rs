@@ -36,8 +36,8 @@ use crate::model::{
     SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch,
     SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
     StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, WorkspaceSummary, canonical_declared_tags, overlaps,
-    prompt_summary, scope_of,
+    WorkspacePatch, WorkspaceProject, WorkspaceSummary, canonical_declared_tags,
+    missing_tags_failure, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -693,14 +693,7 @@ impl MemStore {
                     id: box_id.to_string(),
                 });
             }
-            let capabilities = state.box_capabilities(box_id);
-            let mut missing: Vec<String> = required
-                .into_iter()
-                .filter(|tag| !capabilities.contains(tag))
-                .collect();
-            missing.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-            missing.dedup();
-            Ok(missing)
+            Ok(state.missing_for(&required, box_id))
         })
     }
 
@@ -3636,6 +3629,21 @@ impl State {
             .unwrap_or_default()
     }
 
+    /// `R-ORCH-10`'s set (MOD-7 D76): the entries of `required` in neither `probed_tags` nor
+    /// `declared_tags` of `box_id`, sorted by bytes and deduplicated. One helper, so
+    /// `MemStore::missing_tags` and `claim_run` cannot order or dedup differently.
+    fn missing_for(&self, required: &[String], box_id: BoxId) -> Vec<String> {
+        let capabilities = self.box_capabilities(box_id);
+        let mut missing: Vec<String> = required
+            .iter()
+            .filter(|tag| !capabilities.contains(*tag))
+            .cloned()
+            .collect();
+        missing.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        missing.dedup();
+        missing
+    }
+
     /// `R-ORCH-9`'s three rungs: the box's own setting, else `app_setting`, else
     /// [`DEFAULT_MAX_CONCURRENT_ITEMS`]. A box whose `settings` blob does not decode falls through
     /// exactly as one that names no key does — the column is free-form JSON and a reader that
@@ -3826,7 +3834,9 @@ impl State {
         Ok(row)
     }
 
-    /// ANA-2 §4.7's admission, decided before the first write so a refusal writes nothing.
+    /// ANA-2 §4.7's admission and `R-ORCH-10`'s claim-time check (MOD-7 milestone 3, D80), decided
+    /// before any write: a refusal writes nothing, except `MissingTags`, which fails the run and
+    /// blocks its item.
     fn claim_run(
         &mut self,
         run: RunId,
@@ -3845,6 +3855,34 @@ impl State {
         }
         if claimed.status != RunStatus::Queued || claimed.target_box_id != box_id {
             return Ok(Claim::NotClaimable);
+        }
+
+        // R-ORCH-10 at claim (MOD-7 milestone 3, D80, D81): after claimability, before the slot
+        // and the overlap, so a permanent refusal wins over a transient one. A run with no item
+        // (a chat run), or whose item row is gone, has no tags to check, as the Postgres join
+        // finds none (D94).
+        let missing = claimed
+            .item_id
+            .and_then(|item| self.items.get(&item))
+            .map(|row| self.missing_for(&row.required_tags, box_id))
+            .unwrap_or_default();
+        if !missing.is_empty() {
+            if let Some(row) = self.runs.get_mut(&run) {
+                row.status = RunStatus::Failed;
+                row.failure = Some(missing_tags_failure(&missing));
+                row.finished_at = row.finished_at.or(Some(at));
+                row.updated_at = now;
+            }
+            if let Some(item) = claimed.item_id
+                && self
+                    .items
+                    .get(&item)
+                    .is_some_and(|row| row.status == Status::Queued)
+            {
+                // A stale item status is not a refusal, as in the admitted branch below.
+                self.transition(item, Status::Queued, Status::Blocked, now)?;
+            }
+            return Ok(Claim::MissingTags { missing });
         }
 
         // Two predicates over two sets, which §4.7 draws apart on purpose. The slot count is
