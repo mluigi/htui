@@ -434,25 +434,28 @@ pub fn box_profile(profile: &BoxProfile) -> Rendered {
 /// `None` when no candidate has a version: §4.2's vocabulary has no empty `skills` section.
 #[must_use]
 pub fn skills(skills: &[BoundSkill]) -> Option<Rendered> {
-    if skills.is_empty() {
-        return None;
-    }
     let blocks: Vec<String> = skills
         .iter()
-        .map(|skill| {
+        .filter_map(|skill| {
+            // MOD-9 D53: a candidate with no version in force renders nothing. The assembler never
+            // passes one — `select` records it `missing_version` — so this is the pure function's
+            // own guard, not a path.
+            let version = skill.version?;
             let body = content_of(&skill.body);
             let open = format!(
-                "<skill name=\"{}\" version=\"{}\">",
-                attr(&skill.name),
-                skill.version.unwrap_or_default(),
+                "<skill name=\"{}\" version=\"{version}\">",
+                attr(&skill.name)
             );
-            if body.is_empty() {
+            Some(if body.is_empty() {
                 format!("{open}\n</skill>")
             } else {
                 format!("{open}\n{body}\n</skill>")
-            }
+            })
         })
         .collect();
+    if blocks.is_empty() {
+        return None;
+    }
     Some(Rendered {
         name: SectionName::Skills,
         attrs: Vec::new(),

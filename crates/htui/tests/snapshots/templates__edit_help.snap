@@ -8,12 +8,12 @@ Graphics · DESKTOP-HTUI · memory · 0 runs
 ┌ judge · editing from v1, saves v2 ─────────────────────────┐┌ judge placeholders ────────────────┐
 │You are judging {{phase}} candidates for {{item_key}}. You d││{{item_key}} scalar                 │
 │                                                            ││{{phase}} scalar                    │
-│{{task}}                                                    ││{{task}} section                    │
-│                                                            ││{{candidates}} section required     │
-│{{candidates}}                                              ││                                    │
-│                                                            ││wire: end with one ```json block    │
-│Pick the candidate that best satisfies the task above. Weigh││{winner, reasons}                   │
-│task, evidence from verification, the smallest change that d││                                    │
+│{{task}}                                                    ││{{skills}} section                  │
+│                                                            ││{{task}} section                    │
+│{{candidates}}                                              ││{{candidates}} section required     │
+│                                                            ││                                    │
+│Pick the candidate that best satisfies the task above. Weigh││wire: end with one ```json block    │
+│task, evidence from verification, the smallest change that d││{winner, reasons}                   │
 │surrounding code. Ignore candidate order, prose confidence a││                                    │
 │better one.                                                 ││                                    │
 │                                                            ││                                    │

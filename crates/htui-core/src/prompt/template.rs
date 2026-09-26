@@ -198,7 +198,7 @@ impl Placeholder {
             TemplateRole::Judge => {
                 matches!(
                     self,
-                    Self::ItemKey | Self::Phase | Self::Task | Self::Candidates
+                    Self::ItemKey | Self::Phase | Self::Skills | Self::Task | Self::Candidates
                 )
             }
             TemplateRole::Handoff => matches!(

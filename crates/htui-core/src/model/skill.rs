@@ -143,7 +143,11 @@ impl SkillBinding {
     /// same answer `PgStore`'s `WHERE b.project_id IS NULL` gives it.
     #[must_use]
     pub fn level(&self) -> SkillLevel {
-        todo!("MOD-9 T1 green")
+        match (self.project_id, self.phase_id) {
+            (None, _) => SkillLevel::Global,
+            (Some(_), None) => SkillLevel::Project,
+            (Some(_), Some(_)) => SkillLevel::Phase,
+        }
     }
 }
 
@@ -195,8 +199,8 @@ impl BoundSkill {
     /// order wins.
     #[must_use]
     pub fn collapse(mut skills: Vec<Self>) -> Vec<Self> {
-        // Most specific first. `sort_by` is stable, so equal levels keep their input order.
-        skills.sort_by(|a, b| b.level.cmp(&a.level));
+        // Most specific first. `sort_by_key` is stable, so equal levels keep their input order.
+        skills.sort_by_key(|skill| core::cmp::Reverse(skill.level));
         let mut resolved: Vec<Self> = Vec::with_capacity(skills.len());
         for skill in skills {
             if !resolved.iter().any(|kept| kept.skill_id == skill.skill_id) {
@@ -225,8 +229,25 @@ impl BoundSkill {
 /// stores call this, so "which attachment wins" has one definition.
 #[must_use]
 pub fn resolve(rows: Vec<(SkillBinding, String)>, versions: &[SkillVersion]) -> Vec<BoundSkill> {
-    let _ = (rows, versions);
-    todo!("MOD-9 T1 green")
+    let candidates = rows
+        .into_iter()
+        .map(|(binding, name)| {
+            let in_force = binding.version_in_force(versions);
+            BoundSkill {
+                skill_id: binding.skill_id,
+                name,
+                version: in_force.map(|version| version.version),
+                position: binding.position,
+                body: in_force
+                    .map(|version| version.body.clone())
+                    .unwrap_or_default(),
+                level: binding.level(),
+                activation: binding.activation,
+                globs: binding.globs,
+            }
+        })
+        .collect();
+    BoundSkill::collapse(candidates)
 }
 
 /// Why a candidate did or did not render (plan D40, ANA-22 §6 item 8). Serialised snake_case into
@@ -291,8 +312,35 @@ pub struct SkillChoice {
 /// render order — and one [`SkillChoice`] per candidate in the same order.
 #[must_use]
 pub fn select(candidates: Vec<BoundSkill>, placed: bool) -> (Vec<BoundSkill>, Vec<SkillChoice>) {
-    let _ = (candidates, placed);
-    todo!("MOD-9 T1 green")
+    let mut active = Vec::with_capacity(candidates.len());
+    let mut choices = Vec::with_capacity(candidates.len());
+    for skill in candidates {
+        let reason = if !placed {
+            ChoiceReason::NotPlaced
+        } else if skill.version.is_none() {
+            ChoiceReason::MissingVersion
+        } else {
+            match skill.activation {
+                Activation::Off => ChoiceReason::Off,
+                Activation::Glob => ChoiceReason::NoPath,
+                Activation::Always => ChoiceReason::Always,
+            }
+        };
+        let is_active = reason == ChoiceReason::Always;
+        choices.push(SkillChoice {
+            skill: skill.skill_id,
+            name: skill.name.clone(),
+            version: skill.version,
+            level: skill.level,
+            activation: skill.activation,
+            active: is_active,
+            reason,
+        });
+        if is_active {
+            active.push(skill);
+        }
+    }
+    (active, choices)
 }
 
 #[cfg(test)]
