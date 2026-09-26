@@ -84,6 +84,17 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 ### Analyses
 
 
+- [ ] **ANA-23 - Pure-Rust local embedder to replace `ort`/`fastembed`** (maintainer-requested
+  2026-09-26, during MOD-9 milestone 3). `htui-store`'s `local-embed` feature
+  (`embed::FastEmbedder`, BGE-small-en-v1.5, MOD-34, `docs/decisions/mod/mod-34.md`) pulls `ort`,
+  whose `ort-sys` build script downloads ONNX Runtime from `parcel.pyke.io` or needs
+  `ORT_LIB_LOCATION` pointing at a native `libonnxruntime`; sandboxes that block the host can only
+  build `htui-store` and `htui` with a hand-fetched library. The maintainer wants no native runtime
+  fetched at build time. Compare **`candle`** (with `tokenizers` on its `fancy-regex` feature, no
+  `onig`) and **`tract-onnx`** (runs the same ONNX file): offline build, binary size, embedding
+  speed on the demo corpus, how and when model weights are fetched at run time, and whether the
+  vectors equal the ones already stored in qdrant within a tolerance or force a re-embed. Deliver a
+  verdict and the `MOD-N` that implements it.
 - [ ] **ANA-21 - Per-model weights for agent assignment, derived from public sources** (from MOD-4
   milestone 4, OQ-7; maintainer-requested 2026-09-23; MOD-4 is done, `docs/decisions/mod/mod-4.md`).
   `R-AGT-8`, `R-ORCH-7`. Blocks MOD-36.
@@ -765,7 +776,7 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 1 (ANA-21 per-model weights)                                                                  |
+| ANA-N   | 2 (ANA-21 per-model weights, ANA-23 pure-Rust embedder)                                                                  |
 | MOD-N   | 41 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
