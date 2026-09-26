@@ -2568,7 +2568,7 @@ impl WriteStore for PgStore {
 
     /// D92: one explicit transaction of two `INSERT`s, so no skill exists without its version 1.
     /// The input rules first ([`new_skill_refusal`]); a taken name is `skill_name_key`'s `23505`,
-    /// which [`skill_name_taken`] words as `MemStore` does; a taken id and an unknown `created_by`
+    /// which `skill_name_taken` words as `MemStore` does; a taken id and an unknown `created_by`
     /// are [`map_sqlx`]'s `Constraint`. A failed statement drops the transaction, which rolls back.
     async fn create_skill(&self, new: NewSkill) -> Result<(Skill, SkillVersion)> {
         if let Some(refusal) = new_skill_refusal(&new.name, &new.description, &new.body) {
@@ -2673,7 +2673,7 @@ impl WriteStore for PgStore {
     /// D77, D89: one `INSERT … SELECT … WHERE the head is $expected ON CONFLICT DO NOTHING`, the
     /// `append_prompt_template` shape. Two appends at one head: the second blocks on the primary
     /// key, then inserts nothing (probed, blueprint §0.3). Zero rows, and bad input before any
-    /// write, are classified by [`skill_version_miss`]'s reads in D89's order. An unknown
+    /// write, are classified by `skill_version_miss`'s reads in D89's order. An unknown
     /// `created_by` is the FK's `23503`, which [`map_sqlx`] turns into `Constraint`.
     async fn add_skill_version(
         &self,
