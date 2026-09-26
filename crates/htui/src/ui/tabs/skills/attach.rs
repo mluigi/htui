@@ -253,9 +253,30 @@ impl AttachPane {
         !matches!(self.mode, AttachMode::Browse)
     }
 
-    /// The write the form sent landed: back to the rows.
-    pub(super) fn on_landed(&mut self) {
+    /// The write the form sent landed. Keys typed on the form while it was in flight still
+    /// edited it: when the form no longer builds what was sent, it stays open on those edits with
+    /// the landed row's token, so the next `Ctrl+S` writes them over the row just saved (the
+    /// library editor's "later edits kept" rule), and this answers `true`. Otherwise (a detach,
+    /// or nothing typed since) the pane goes back to its rows.
+    pub(super) fn on_landed(
+        &mut self,
+        key: SkillBindingKey,
+        change: &BindingChange,
+        snapshot: &SkillsSnapshot,
+    ) -> bool {
+        if let (
+            AttachMode::Form(form) | AttachMode::Picker { form, .. },
+            BindingChange::Attach(sent),
+        ) = (&mut self.mode, change)
+            && form.key == key
+            && build(form).as_ref() != Ok(sent)
+            && let Some(row) = snapshot.binding(key)
+        {
+            form.token = Some(row.updated_at);
+            return true;
+        }
         self.mode = AttachMode::Browse;
+        false
     }
 
     /// Whether the form is open (not the picker over it): what `Esc` would close.

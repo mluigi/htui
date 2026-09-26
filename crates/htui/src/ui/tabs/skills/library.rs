@@ -1065,11 +1065,20 @@ impl LibraryView {
                 self.mode = Mode::Browse;
                 self.notice = Some(Notice::Info(format!("saved `{name}`")));
             }
-            Sent::Binding { change, target, .. } => {
-                if let Some(pane) = &mut self.attach {
-                    pane.on_landed();
-                }
+            Sent::Binding {
+                key,
+                change,
+                target,
+                ..
+            } => {
+                let kept = match (&mut self.attach, &self.snapshot) {
+                    (Some(pane), Some(snapshot)) => pane.on_landed(key, &change, snapshot),
+                    _ => false,
+                };
                 self.notice = Some(Notice::Info(match change {
+                    BindingChange::Attach(_) if kept => {
+                        format!("attached to {target} \u{2014} later edits kept, Ctrl+S saves them")
+                    }
                     BindingChange::Attach(_) => format!("attached to {target}"),
                     BindingChange::Detach => format!("detached from {target}"),
                 }));
