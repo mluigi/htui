@@ -348,6 +348,40 @@ async fn ctrl_r_picks_a_repo_of_the_project() {
     );
 }
 
+/// The picker separates the qualifier from a glob already typed before the cursor, and adds no
+/// second separator after one the user typed.
+#[tokio::test]
+async fn ctrl_r_separates_the_qualifier_from_a_typed_glob() {
+    let store = MemStore::demo();
+    add_repo(&store, "core", true).await;
+    add_repo(&store, "web", false).await;
+    let mut harness = open_platform_over(store).await;
+    select(&mut harness, "tests");
+    harness.key("a");
+    harness.key("j");
+    harness.key("enter");
+    for _ in 0..4 {
+        harness.key("tab");
+    }
+    type_text(&mut harness, "src/**");
+    harness.key("ctrl-r");
+    harness.key("enter");
+    let frame = harness.render();
+    assert!(
+        frame.contains("globs       src/**, core:"),
+        "`, ` went in before the qualifier: {frame}"
+    );
+    type_text(&mut harness, "docs/**, ");
+    harness.key("ctrl-r");
+    harness.key("j");
+    harness.key("enter");
+    let frame = harness.render();
+    assert!(
+        frame.contains("globs       src/**, core:docs/**, web:"),
+        "after a typed `, ` nothing more: {frame}"
+    );
+}
+
 #[tokio::test]
 async fn a_save_over_a_moved_head_keeps_the_draft() {
     let store = MemStore::demo();
