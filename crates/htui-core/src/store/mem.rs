@@ -35,7 +35,7 @@ use crate::model::{
     SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
     StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId,
     Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
-    overlaps, prompt_summary, scope_of,
+    canonical_declared_tags, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -1706,6 +1706,47 @@ impl State {
                 }
             })
             .collect()
+    }
+
+    /// `edit_version` compare-and-set on one box of `user` (MOD-7 D41): `NotFound` for an unknown
+    /// id or another user's box, then `Stale` for a spent token, then `Constraint` for a tag, and
+    /// only then the write. `now` stands in for Postgres's `set_updated_at` trigger.
+    fn edit_box(
+        &mut self,
+        user: Option<UserId>,
+        id: BoxId,
+        expected: i32,
+        edit: BoxEdit,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<BoxRow>> {
+        let Some(row) = self.boxes.get(&id).filter(|row| Some(row.user_id) == user) else {
+            return Err(StoreError::NotFound {
+                entity: "box",
+                id: id.to_string(),
+            });
+        };
+        if row.edit_version != expected {
+            return Ok(CasOutcome::Stale(row.clone()));
+        }
+        let tags = edit
+            .declared_tags
+            .as_deref()
+            .map(canonical_declared_tags)
+            .transpose()
+            .map_err(StoreError::Constraint)?;
+        let row = self
+            .boxes
+            .get_mut(&id)
+            .expect("the box was looked up above, under the same lock");
+        if let Some(tags) = tags {
+            row.declared_tags = tags;
+        }
+        if let Some(quirks) = edit.quirks {
+            row.quirks = quirks;
+        }
+        row.edit_version += 1;
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
     }
 
     /// The `run` / `run_step` pair of a free-standing chat, both a no-op when the id is already
@@ -5197,11 +5238,14 @@ impl WriteStore for MemStore {
 
     async fn edit_box(
         &self,
-        _id: BoxId,
-        _expected: i32,
-        _edit: BoxEdit,
+        id: BoxId,
+        expected: i32,
+        edit: BoxEdit,
     ) -> Result<CasOutcome<BoxRow>> {
-        todo!("MOD-7 milestone 2 T1: MemStore::edit_box")
+        // Both before the write lock: `this_user` takes the read lock (blueprint F-K).
+        let user = self.this_user();
+        let now = Utc::now();
+        self.write(|state| state.edit_box(user, id, expected, edit, now))
     }
 
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> Result<()> {
