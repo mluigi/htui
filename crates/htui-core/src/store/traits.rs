@@ -31,19 +31,19 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{
-    Agent, AgentBox, AgentId, BoxId, BoxProbe, BoxRecord, ChatRunSpec, CitationKind, Claim,
-    CommandRun, CoverageRow, Document, DocumentHead, DocumentId, GateOutcome, Item, ItemCitation,
-    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement,
-    ItemRevision, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind,
-    NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
-    NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
-    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunId,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
-    UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject,
+    Agent, AgentBox, AgentId, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, ChatRunSpec,
+    CitationKind, Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId, GateOutcome,
+    Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
+    ItemRequirement, ItemRevision, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
+    NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch,
+    Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId,
+    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
+    ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::prompt::template::{TemplateRole, parse};
@@ -391,6 +391,26 @@ pub trait WriteStore: ReadStore {
     ///
     /// Whatever the backend's read fails with.
     async fn boxes(&self) -> Result<Vec<BoxRecord>>;
+
+    /// The declared-tags and quirks editors' compare-and-set (MOD-7 milestone 2, D41): writes the
+    /// columns `edit` names, and `edit_version + 1`, where the row is this user's and its
+    /// `edit_version` is `expected`, in one statement. A narrow human writer (MOD-2 D74): never
+    /// `hostname`, the probe columns, `htui_version`, `settings`, `machine_fingerprint`,
+    /// `probe_spec_digest`, `last_seen_at` or `box_tool`. Registration and the probe never write
+    /// `edit_version`, so neither can stale an open editor.
+    ///
+    /// Answers [`CasOutcome::Applied`] with the row as written, or [`CasOutcome::Stale`] with the
+    /// row as it is now when `expected` is spent (nothing is written).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) with `entity: "box"` for an
+    /// unknown id **or a box of another `app_user`** (the reach of [`boxes`](WriteStore::boxes));
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) carrying
+    /// [`canonical_declared_tags`](crate::model::canonical_declared_tags)'s sentence for a tag it
+    /// refuses. Precedence: `NotFound`, then `Stale`, then `Constraint`.
+    async fn edit_box(&self, id: BoxId, expected: i32, edit: BoxEdit)
+    -> Result<CasOutcome<BoxRow>>;
 
     /// Mints the `run` / `run_step` pair of a free-standing chat, both `ON CONFLICT (id) DO
     /// NOTHING` (MOD-2 plan D4).

@@ -26,7 +26,7 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot};
 use crate::ui::tabs::backlog::detail::Scroll;
 use crate::ui::tabs::settings::wrapped;
-use crate::ui::{AreaOutcome, FieldOutcome, TextArea, TextField, Theme, diff};
+use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// The save's `StoreRequest::name`, what `busy` holds while it is in flight.
@@ -223,7 +223,7 @@ struct Editor {
 }
 
 impl Editor {
-    /// An editor over `text`, cursor at byte 0.
+    /// An editor over `text` (line ends normalised by `TextArea::with_text`), cursor at byte 0.
     fn new(
         project: ProjectId,
         name: String,
@@ -231,13 +231,14 @@ impl Editor {
         from: Option<i32>,
         text: &str,
     ) -> Self {
+        let area = TextArea::with_text(text);
         Self {
             project,
             name,
             token,
             from,
-            area: TextArea::with_text(text),
-            original: text.to_owned(),
+            original: area.text().to_owned(),
+            area,
             confirm_item: false,
             esc_armed: false,
             sent: None,
@@ -382,8 +383,11 @@ impl TemplatesView {
         };
         match outcome {
             ExternalEditOutcome::Edited(text) => {
-                // The `Ctrl+S` gate minus the send: the cursor goes to the error, else to 0.
+                // The `Ctrl+S` gate minus the send: the cursor goes to the error, else to 0. The
+                // gate parses the draft as the area holds it (line ends normalised), so the
+                // error's byte is a byte of that text.
                 editor.area = TextArea::with_text(&text);
+                let text = editor.area.text().to_owned();
                 editor.confirm_item = false;
                 editor.esc_armed = false;
                 self.notice = Some(match parse(TemplateRole::of_name(&editor.name), &text) {
@@ -631,20 +635,14 @@ impl TemplatesView {
         self.mode = Mode::Editing(Editor::new(project, name, None, None, body));
     }
 
-    /// The editor (plan D11, D13): `Ctrl+S`, `Ctrl+E` and `Esc` are the view's, `Tab` and
-    /// `Shift+Tab` pass so the shell switches tabs with the draft kept, everything else is text.
+    /// The editor (plan D11, D13): `Ctrl+S` (the area's `Submit`), `Ctrl+E` and `Esc` are the
+    /// view's, `Tab` and `Shift+Tab` pass so the shell switches tabs with the draft kept,
+    /// everything else is text.
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let chord = key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL;
-        match key.code {
-            KeyCode::Char('s' | 'S') if chord => {
-                self.save(ctx);
-                return Handled::Consumed;
-            }
-            KeyCode::Char('e' | 'E') if chord => {
-                self.hand_off(ctx);
-                return Handled::Consumed;
-            }
-            _ => {}
+        if chord && matches!(key.code, KeyCode::Char('e' | 'E')) {
+            self.hand_off(ctx);
+            return Handled::Consumed;
         }
         let busy = self.busy;
         let page = self.page.get();
@@ -653,7 +651,7 @@ impl TemplatesView {
         };
         let before = editor.area.text().len();
         match editor.area.on_key(key, page) {
-            AreaOutcome::Consumed => {
+            FieldOutcome::Consumed => {
                 if editor.area.text().len() != before {
                     editor.confirm_item = false;
                     editor.esc_armed = false;
@@ -661,7 +659,11 @@ impl TemplatesView {
                 }
                 Handled::Consumed
             }
-            AreaOutcome::Cancel => {
+            FieldOutcome::Submit => {
+                self.save(ctx);
+                Handled::Consumed
+            }
+            FieldOutcome::Cancel => {
                 if let Some(busy) = busy {
                     // The save's reply closes the editor or keeps it; leaving now would leave the
                     // reply with no editor to land on and `busy` with nothing to clear it.
@@ -675,7 +677,7 @@ impl TemplatesView {
                 }
                 Handled::Consumed
             }
-            AreaOutcome::Pass => Handled::Pass,
+            FieldOutcome::Pass => Handled::Pass,
         }
     }
 

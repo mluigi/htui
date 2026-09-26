@@ -4,7 +4,7 @@
 > recommended for the implement phase; the maintainer accepted. The contract is `R-SKL-1..4`,
 > `R-PRM-4` and `R-TUI-7`, with the template half already designed in `docs/ANA-5.md` §4.1, §4.6,
 > §5.4 and §6.2 and the read-only skill model shipped by MOD-2 (D105). The PRD gate opened two new
-> items: **ANA-22** (how a skill is stored and when it activates) and **MOD-51** (asking an agent for
+> items: **ANA-22** (how a skill is stored and when it activates) and **MOD-55** (asking an agent for
 > help while editing). Milestones 3 and 4 wait on ANA-22.
 
 ## Problem
@@ -72,7 +72,7 @@ Facts gathered from the tree on 2026-09-25 while routing; each is re-checked by 
   consistently off and the fix is in the prompt, and when a convention (a coding standard, a review
   checklist) should reach every run of a project or phase without being pasted into item bodies.
 - **Also served**: MOD-12 (auto mode runs whatever templates and skills are bound), MOD-26 (personas
-  will be built on the same editor), MOD-51 (agent help plugs into this editor).
+  will be built on the same editor), MOD-55 (agent help plugs into this editor).
 - **Not for**: editing skills as files on disk — the database is the only source of truth; import is
   a one-shot copy (D3). Agents never receive skills as files; the prompt builder injects them.
 
@@ -132,7 +132,7 @@ Concretely in scope:
 
 **Out of scope**
 
-- **Agent help while editing** — **MOD-51**, opened at this PRD gate.
+- **Agent help while editing** — **MOD-55**, opened at this PRD gate.
 - **How a skill is stored and activated** (frontmatter fields, language/glob/trigger conditions,
   automatic selection by the prompt builder) — **ANA-22**, opened at this PRD gate.
 - **Exporting skills to files, materialising them for agents** — declined (D3): the database is the
@@ -148,7 +148,7 @@ Answered by the maintainer on 2026-09-25, before planning.
 - **D1 — Everything lives in the Skills tab.** Two views, Skills and Templates. No Settings section;
   MOD-23's text saying otherwise is corrected.
 - **D2 — Both editors.** An in-app `TextArea` and an `$EDITOR` handoff. Asking an agent for help is a
-  separate item, **MOD-51**.
+  separate item, **MOD-55**.
 - **D3 — The database is the source of truth.** Skills live in Postgres; import is a one-shot copy;
   nothing is exported or materialised as files — the prompt builder injects the necessary skills.
   **How a skill is saved** — which frontmatter fields become columns (e.g. when it activates, for
@@ -191,7 +191,7 @@ writers.
 ## Open Questions
 
 - [x] Where templates are edited — Skills tab (D1).
-- [x] Editor — both `TextArea` and `$EDITOR`; agent help is MOD-51 (D2).
+- [x] Editor — both `TextArea` and `$EDITOR`; agent help is MOD-55 (D2).
 - [x] Skills as files — no; database only (D3).
 - [x] Engine wiring — in scope (D4).
 - [x] How a skill is stored and when it activates — ANA-22 concluded (`docs/decisions/ana/ana-22.md`): a skill is library content attached at global, project or phase level; the attachment carries activation (`always`, `glob`, `off`); §7 schema and import mapping.

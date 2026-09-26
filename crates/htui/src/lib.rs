@@ -11,6 +11,7 @@
 
 pub mod agent_worker;
 pub mod app;
+pub mod box_settings;
 pub mod catalogue;
 pub mod cli;
 pub mod concepts;

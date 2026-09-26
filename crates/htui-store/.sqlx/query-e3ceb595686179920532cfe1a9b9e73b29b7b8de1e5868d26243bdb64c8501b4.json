@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id             AS \"id: BoxId\",\n                   user_id        AS \"user_id: htui_core::model::UserId\",\n                   hostname,\n                   os_family      AS \"os_family: htui_core::model::OsFamily\",\n                   os_version,\n                   arch,\n                   cpu,\n                   ram_mb,\n                   gpu_present,\n                   gpu_vendor,\n                   htui_version,\n                   probed_tags,\n                   declared_tags,\n                   quirks,\n                   settings,\n                   registered_at,\n                   last_seen_at,\n                   last_probed_at,\n                   updated_at\n              FROM box WHERE id = $1\n            ",
+  "query": "\n            SELECT id AS \"id: BoxId\", user_id AS \"user_id: htui_core::model::UserId\", hostname,\n                   os_family AS \"os_family: htui_core::model::OsFamily\", os_version, arch, cpu,\n                   ram_mb, gpu_present, gpu_vendor, htui_version, probed_tags, declared_tags,\n                   quirks, settings, registered_at, last_seen_at, last_probed_at, updated_at,\n                   edit_version, probe_spec_digest\n              FROM box WHERE user_id = $1 ORDER BY id\n            ",
   "describe": {
     "columns": [
       {
@@ -211,6 +211,28 @@
             "name": "updated_at"
           }
         }
+      },
+      {
+        "ordinal": 19,
+        "name": "edit_version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "box",
+            "name": "edit_version"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "probe_spec_digest",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "box",
+            "name": "probe_spec_digest"
+          }
+        }
       }
     ],
     "parameters": {
@@ -237,8 +259,10 @@
       false,
       false,
       true,
-      false
+      false,
+      false,
+      true
     ]
   },
-  "hash": "955f76e87375557fbf16f9bdfd0703151313ae1480b4a9ecd8ade67f85e0460d"
+  "hash": "e3ceb595686179920532cfe1a9b9e73b29b7b8de1e5868d26243bdb64c8501b4"
 }

@@ -1,41 +1,47 @@
-//! A small multi-line editor (MOD-9 D7; PRD D2): insert, delete, newline, arrows, Home/End,
-//! PgUp/PgDn and a byte-offset cursor, so a `parse` error lands on its byte. No wrap, undo,
-//! selection or paste (PRD risk row 5). Width in `char`s, as `TextField` (no `unicode-width`),
-//! except that a `\t` draws as spaces to the next tab stop (every four columns) and any other
-//! control char as a one-column stand-in: `ratatui` drops control chars when it draws, and a body
-//! from `$EDITOR` can hold them.
+//! One small multi-line editor, shared by the Skills tab's Templates editor (MOD-9 D7; PRD D2)
+//! and the Settings → Boxes quirks editor (MOD-7 milestone 2, D44; PRD D3): the multi-line
+//! sibling of [`TextField`](crate::ui::TextField).
 //!
-//! The viewport (`top`, `left`) lives in `Cell`s (D19): [`TextArea::lines`] scrolls it to keep the
-//! cursor in view and remembers where it left it, and it does so through `&self`, because a tab
-//! draws from `Tab::render(&self, ..)`.
+//! Insert, delete, newline, arrows, Home/End, PgUp/PgDn and a byte-offset cursor, so a `parse`
+//! error lands on its byte. Hard lines only: no soft wrap, undo, selection, history, mask,
+//! bracketed paste or `Zeroizing` (MOD-9 PRD risk row 5; what it holds is not secret, though its
+//! `Debug` still prints lengths only). `ctrl-s` submits, because `Enter` breaks the line and no
+//! terminal mode that reports `Ctrl+Enter` is enabled (MOD-7 plan OQ-16); every other chord
+//! passes to the caller. [`TextArea::with_text`] turns `\r\n` and a lone `\r` into `\n` (MOD-7
+//! D59), so the text it hands back is what an editor opened on compares against.
+//!
+//! Width is counted in `char`s, as `TextField` counts it (no `unicode-width`): a wide char (CJK,
+//! most emoji) takes two cells but counts as one, so a line of them can overrun its column, and
+//! the cursor steps by code point, not by grapheme. The exceptions: a `\t` draws as spaces to the
+//! next tab stop (every four columns) and any other control char as a one-column stand-in, because
+//! `ratatui` drops control chars when it draws, and a body from `$EDITOR` can hold them.
+//!
+//! The viewport (`top`, `left`) lives in `Cell`s (MOD-9 D19): [`TextArea::lines`] scrolls it to
+//! keep the cursor in view and remembers where it left it, and it does so through `&self`, because
+//! a tab draws from `Tab::render(&self, ..)`.
 
 use core::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::{Line, Span};
 
-use crate::ui::Theme;
+use crate::ui::{FieldOutcome, Theme};
 
 /// Columns between tab stops, for a `\t` that came back from `$EDITOR` (typing one is out of scope,
-/// PRD risk row 5).
+/// MOD-9 PRD risk row 5).
 const TAB_STOP: usize = 4;
 
-/// What one key did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AreaOutcome {
-    /// Edited or moved: nothing for the caller to do.
-    Consumed,
-    /// `Esc`: the caller decides what cancelling means.
-    Cancel,
-    /// Not an editing key (a `CONTROL`/`ALT`/`SUPER`/`META`/`HYPER` chord, `Tab`, `BackTab`,
-    /// `F(n)`, …): the caller keeps its own bindings.
-    Pass,
-}
+/// Every modifier that makes a key a chord; `SHIFT` is how a terminal reports a capital.
+const CHORD: KeyModifiers = KeyModifiers::CONTROL
+    .union(KeyModifiers::ALT)
+    .union(KeyModifiers::SUPER)
+    .union(KeyModifiers::META)
+    .union(KeyModifiers::HYPER);
 
 /// A multi-line buffer with a byte-offset cursor. Never `Debug`s its text.
 #[derive(Clone, Default)]
 pub struct TextArea {
-    /// What was typed. Never printed by [`Debug`](core::fmt::Debug).
+    /// What was typed; lines are split on `\n`. Never printed by [`Debug`](core::fmt::Debug).
     text: String,
     /// Byte offset into `text`, always on a char boundary.
     cursor: usize,
@@ -45,39 +51,46 @@ pub struct TextArea {
     /// remembered between frames so the view does not jump. `Cell` because `Tab::render` is
     /// `&self`.
     top: Cell<usize>,
-    /// First visible char column, as `top`.
+    /// First visible drawn column, as `top`.
     left: Cell<usize>,
 }
 
-/// Lengths and the cursor, never the text: a template body is user text, and every request that
-/// might carry a view derives `Debug` (`TextField`'s rule).
+/// Lengths and the cursor, never the text: a template body and a box's quirks are user text, and
+/// every request or section that might carry a view derives `Debug` (`TextField`'s rule).
 impl core::fmt::Debug for TextArea {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("TextArea")
-            .field("len", &self.text.len())
-            .field("lines", &self.line_count())
+            .field("len", &self.len())
+            .field("line_count", &self.line_count())
             .field("cursor", &self.cursor)
             .finish()
     }
 }
 
 impl TextArea {
-    /// An empty buffer.
+    /// An empty buffer: one empty line, cursor at byte 0.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// A buffer holding `text`, cursor at byte 0 and the viewport at the top left.
+    /// A buffer holding `text` with `\r\n` and a lone `\r` turned into `\n` (MOD-7 D59), cursor at
+    /// byte 0 and the viewport at the top left. [`set_cursor`](TextArea::set_cursor)`(usize::MAX)`
+    /// puts the cursor at the end instead.
     #[must_use]
     pub fn with_text(text: &str) -> Self {
+        let text = if text.contains('\r') {
+            text.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            text.to_owned()
+        };
         Self {
-            text: text.to_owned(),
+            text,
             ..Self::default()
         }
     }
 
-    /// The whole buffer.
+    /// The whole buffer, lines joined by `\n`.
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
@@ -87,6 +100,24 @@ impl TextArea {
     #[must_use]
     pub fn into_text(self) -> String {
         self.text
+    }
+
+    /// Whether the buffer is one empty line.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// How many chars, the `\n` between lines included (so `len() == text().chars().count()`).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    /// How many lines the buffer holds (at least 1): one more than its `\n`s.
+    #[must_use]
+    pub fn line_count(&self) -> usize {
+        self.text.bytes().filter(|&b| b == b'\n').count() + 1
     }
 
     /// The cursor, as a byte offset into [`text`](TextArea::text).
@@ -117,20 +148,21 @@ impl TextArea {
 
     /// Feeds one key; `page` is how many lines `PageUp`/`PageDown` move (at least one).
     ///
-    /// Every modifier but `SHIFT` passes (`SHIFT` is how a terminal reports a capital). `Char`
-    /// inserts unless it is a control char, which is swallowed; `Enter` inserts `\n`;
-    /// `Backspace`/`Delete` join lines at their ends; `Left`/`Right` cross them; `Up`/`Down` and
-    /// `PageUp`/`PageDown` keep the goal column; `Home`/`End` stay on the line; `Esc` cancels and
-    /// everything else passes. Edits happen in place: no key builds a new `String`.
-    pub fn on_key(&mut self, key: KeyEvent, page: u16) -> AreaOutcome {
-        if key.modifiers.intersects(
-            KeyModifiers::CONTROL
-                | KeyModifiers::ALT
-                | KeyModifiers::SUPER
-                | KeyModifiers::META
-                | KeyModifiers::HYPER,
-        ) {
-            return AreaOutcome::Pass;
+    /// Any chord (`CONTROL`, `ALT`, `SUPER`, `META`, `HYPER`) passes, except `ctrl-s`, which
+    /// submits; so `ctrl-c` and `ctrl-e` reach the caller. `SHIFT` alone is a capital, not a
+    /// chord. `Char` inserts unless it is a control char, which is swallowed; `Enter` inserts
+    /// `\n`; `Backspace`/`Delete` join lines at their ends; `Left`/`Right` cross them; `Up`/`Down`
+    /// and `PageUp`/`PageDown` keep the goal column; `Home`/`End` stay on the line; `Esc` cancels
+    /// and everything else passes. Edits happen in place: no key builds a new `String`.
+    pub fn on_key(&mut self, key: KeyEvent, page: u16) -> FieldOutcome {
+        let chord = key.modifiers.intersection(CHORD);
+        if !chord.is_empty() {
+            return if chord == KeyModifiers::CONTROL && matches!(key.code, KeyCode::Char('s' | 'S'))
+            {
+                FieldOutcome::Submit
+            } else {
+                FieldOutcome::Pass
+            };
         }
         let page = usize::from(page.max(1));
         match key.code {
@@ -173,20 +205,22 @@ impl TextArea {
             KeyCode::Down => self.move_lines(true, 1),
             KeyCode::PageUp => self.move_lines(false, page),
             KeyCode::PageDown => self.move_lines(true, page),
-            KeyCode::Esc => return AreaOutcome::Cancel,
-            _ => return AreaOutcome::Pass,
+            KeyCode::Esc => return FieldOutcome::Cancel,
+            _ => return FieldOutcome::Pass,
         }
-        AreaOutcome::Consumed
+        FieldOutcome::Consumed
     }
 
     /// At most `height` lines, each the `width`-column window of its line that keeps the cursor in
     /// view, for the caller to place in its own `Rect`. A line is drawn with its tabs as spaces and
-    /// its other control chars as one-column stand-ins.
+    /// its other control chars as one-column stand-ins; one char is otherwise one cell, as
+    /// `TextField` takes it, so a CJK or emoji line can overrun `width` cells.
     ///
     /// The viewport moves only as far as it must to show the cursor, and is remembered (D19), so a
-    /// cursor moving inside the window does not scroll it. Every line is `theme.base`; while
-    /// `focused`, the cursor cell (a space past the end of its line) is `theme.selected`. No room,
-    /// no lines.
+    /// cursor moving inside the window does not scroll it; every line shares its horizontal
+    /// offset, and a line longer than the window is cut at its edge. Every line is `theme.base`;
+    /// while `focused`, the cursor cell (a space past the end of its line) is `theme.selected`.
+    /// No room, no lines.
     #[must_use]
     pub fn lines(
         &self,
@@ -233,11 +267,6 @@ impl TextArea {
                 Line::from(spans)
             })
             .collect()
-    }
-
-    /// How many lines the buffer holds: one more than its `\n`s.
-    fn line_count(&self) -> usize {
-        self.text.bytes().filter(|&b| b == b'\n').count() + 1
     }
 
     /// Inserts one char at the cursor and steps over it.
@@ -343,7 +372,11 @@ mod tests {
         KeyEvent::from(code)
     }
 
-    fn press(area: &mut TextArea, code: KeyCode) -> AreaOutcome {
+    fn chord(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    fn press(area: &mut TextArea, code: KeyCode) -> FieldOutcome {
         area.on_key(key(code), 10)
     }
 
@@ -354,8 +387,26 @@ mod tests {
             } else {
                 KeyCode::Char(c)
             };
-            assert_eq!(press(area, code), AreaOutcome::Consumed);
+            assert_eq!(press(area, code), FieldOutcome::Consumed);
         }
+    }
+
+    /// An area holding `text` with the cursor at the end, as the Boxes quirks editor opens it.
+    fn at_end(text: &str) -> TextArea {
+        let mut area = TextArea::with_text(text);
+        area.set_cursor(usize::MAX);
+        area
+    }
+
+    /// An area holding `text` with the cursor put on line `row`, char column `col`.
+    fn at(text: &str, row: usize, col: usize) -> TextArea {
+        let mut area = TextArea::with_text(text);
+        let start: usize = text.split('\n').take(row).map(|line| line.len() + 1).sum();
+        let line = text.split('\n').nth(row).expect("the row exists");
+        let byte = line.char_indices().nth(col).map_or(line.len(), |(b, _)| b);
+        area.set_cursor(start + byte);
+        assert_eq!(area.cursor_line_col(), (row, col));
+        area
     }
 
     /// One drawn line's text, spans joined.
@@ -396,15 +447,15 @@ mod tests {
 
         // `SHIFT` is a capital, not a chord.
         assert_eq!(
-            wide.on_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT), 10),
-            AreaOutcome::Consumed
+            wide.on_key(chord(KeyCode::Char('N'), KeyModifiers::SHIFT), 10),
+            FieldOutcome::Consumed
         );
         assert_eq!(wide.text(), "aézN");
 
         // A control char is swallowed, not inserted and not passed.
         assert_eq!(
             press(&mut wide, KeyCode::Char('\u{7}')),
-            AreaOutcome::Consumed
+            FieldOutcome::Consumed
         );
         assert_eq!(wide.into_text(), "aézN");
     }
@@ -413,20 +464,57 @@ mod tests {
     fn enter_splits_the_line_and_backspace_joins_it_again() {
         let mut area = TextArea::with_text("headtail");
         area.set_cursor(4);
-        assert_eq!(press(&mut area, KeyCode::Enter), AreaOutcome::Consumed);
+        assert_eq!(press(&mut area, KeyCode::Enter), FieldOutcome::Consumed);
         assert_eq!(area.text(), "head\ntail");
         assert_eq!(area.cursor_line_col(), (1, 0));
 
-        assert_eq!(press(&mut area, KeyCode::Backspace), AreaOutcome::Consumed);
+        assert_eq!(press(&mut area, KeyCode::Backspace), FieldOutcome::Consumed);
         assert_eq!(area.text(), "headtail");
         assert_eq!(area.cursor(), 4);
         assert_eq!(area.cursor_line_col(), (0, 4));
 
         // At the very start there is nothing to remove.
         area.set_cursor(0);
-        assert_eq!(press(&mut area, KeyCode::Backspace), AreaOutcome::Consumed);
+        assert_eq!(press(&mut area, KeyCode::Backspace), FieldOutcome::Consumed);
         assert_eq!(area.text(), "headtail");
         assert_eq!(area.cursor(), 0);
+    }
+
+    #[test]
+    fn enter_splits_the_line_at_the_cursor() {
+        let mut area = at_end("abcd");
+        assert_eq!(press(&mut area, KeyCode::Left), FieldOutcome::Consumed);
+        assert_eq!(press(&mut area, KeyCode::Left), FieldOutcome::Consumed);
+        assert_eq!(press(&mut area, KeyCode::Enter), FieldOutcome::Consumed);
+        assert_eq!(area.text(), "ab\ncd");
+        assert_eq!(area.cursor_line_col(), (1, 0));
+        assert_eq!(area.line_count(), 2);
+
+        // `SHIFT` is how a terminal reports a capital; it does not turn `Enter` into anything else.
+        let mut shifted = at_end("xy");
+        assert_eq!(
+            shifted.on_key(chord(KeyCode::Enter, KeyModifiers::SHIFT), 10),
+            FieldOutcome::Consumed
+        );
+        assert_eq!(shifted.text(), "xy\n");
+        assert_eq!(shifted.cursor_line_col(), (1, 0));
+    }
+
+    #[test]
+    fn backspace_at_column_zero_joins_the_previous_line() {
+        let mut area = at("ab\ncd", 1, 0);
+        assert_eq!(press(&mut area, KeyCode::Backspace), FieldOutcome::Consumed);
+        assert_eq!(area.text(), "abcd");
+        assert_eq!(area.cursor_line_col(), (0, 2));
+
+        // At `(0, 0)` there is nothing before the cursor.
+        let mut start = at("ab\ncd", 0, 0);
+        assert_eq!(
+            press(&mut start, KeyCode::Backspace),
+            FieldOutcome::Consumed
+        );
+        assert_eq!(start.text(), "ab\ncd");
+        assert_eq!(start.cursor_line_col(), (0, 0));
     }
 
     #[test]
@@ -434,7 +522,7 @@ mod tests {
         let mut area = TextArea::with_text("ab\ncd");
         press(&mut area, KeyCode::End);
         assert_eq!(area.cursor(), 2);
-        assert_eq!(press(&mut area, KeyCode::Delete), AreaOutcome::Consumed);
+        assert_eq!(press(&mut area, KeyCode::Delete), FieldOutcome::Consumed);
         assert_eq!(area.text(), "abcd");
         assert_eq!(area.cursor(), 2, "the cursor stays put");
 
@@ -451,18 +539,38 @@ mod tests {
     }
 
     #[test]
+    fn delete_at_the_end_joins_the_next_line() {
+        let mut area = at("ab\ncd", 0, 2);
+        assert_eq!(press(&mut area, KeyCode::Delete), FieldOutcome::Consumed);
+        assert_eq!(area.text(), "abcd");
+        assert_eq!(area.cursor_line_col(), (0, 2));
+
+        // At the end of the last line there is nothing after the cursor.
+        let mut end = at_end("ab\ncd");
+        assert_eq!(press(&mut end, KeyCode::Delete), FieldOutcome::Consumed);
+        assert_eq!(end.text(), "ab\ncd");
+        assert_eq!(end.cursor_line_col(), (1, 2));
+
+        // Before the end of a line it removes the char at the cursor.
+        let mut middle = at("ab\ncd", 1, 0);
+        press(&mut middle, KeyCode::Delete);
+        assert_eq!(middle.text(), "ab\nd");
+        assert_eq!(middle.cursor_line_col(), (1, 0));
+    }
+
+    #[test]
     fn left_and_right_cross_line_boundaries() {
         let mut area = TextArea::with_text("ab\ncd");
         area.set_cursor(3);
         assert_eq!(area.cursor_line_col(), (1, 0));
 
-        assert_eq!(press(&mut area, KeyCode::Left), AreaOutcome::Consumed);
+        assert_eq!(press(&mut area, KeyCode::Left), FieldOutcome::Consumed);
         assert_eq!(
             area.cursor_line_col(),
             (0, 2),
             "to the end of the line above"
         );
-        assert_eq!(press(&mut area, KeyCode::Right), AreaOutcome::Consumed);
+        assert_eq!(press(&mut area, KeyCode::Right), FieldOutcome::Consumed);
         assert_eq!(
             area.cursor_line_col(),
             (1, 0),
@@ -476,6 +584,39 @@ mod tests {
         area.set_cursor(5);
         press(&mut area, KeyCode::Right);
         assert_eq!(area.cursor(), 5);
+    }
+
+    #[test]
+    fn left_and_right_cross_line_ends() {
+        let mut area = at("abc\nde", 1, 0);
+        assert_eq!(press(&mut area, KeyCode::Left), FieldOutcome::Consumed);
+        assert_eq!(
+            area.cursor_line_col(),
+            (0, 3),
+            "to the end of the previous line"
+        );
+        assert_eq!(press(&mut area, KeyCode::Right), FieldOutcome::Consumed);
+        assert_eq!(
+            area.cursor_line_col(),
+            (1, 0),
+            "to column 0 of the next line"
+        );
+
+        let mut start = at("abc\nde", 0, 0);
+        assert_eq!(press(&mut start, KeyCode::Left), FieldOutcome::Consumed);
+        assert_eq!(start.cursor_line_col(), (0, 0));
+
+        let mut end = at_end("abc\nde");
+        assert_eq!(end.cursor_line_col(), (1, 2));
+        assert_eq!(press(&mut end, KeyCode::Right), FieldOutcome::Consumed);
+        assert_eq!(end.cursor_line_col(), (1, 2));
+
+        // `Home` and `End` stay on the current line.
+        let mut line = at("abc\nde", 1, 1);
+        assert_eq!(press(&mut line, KeyCode::Home), FieldOutcome::Consumed);
+        assert_eq!(line.cursor_line_col(), (1, 0));
+        assert_eq!(press(&mut line, KeyCode::End), FieldOutcome::Consumed);
+        assert_eq!(line.cursor_line_col(), (1, 2));
     }
 
     #[test]
@@ -523,13 +664,41 @@ mod tests {
     }
 
     #[test]
+    fn up_and_down_keep_the_column_clamped() {
+        let mut area = at("abcdef\nxy\nlonger", 0, 5);
+        assert_eq!(press(&mut area, KeyCode::Down), FieldOutcome::Consumed);
+        assert_eq!(area.cursor_line_col(), (1, 2), "clamped to `xy`");
+        assert_eq!(press(&mut area, KeyCode::Down), FieldOutcome::Consumed);
+        assert_eq!(
+            area.cursor_line_col(),
+            (2, 5),
+            "the goal column comes back past the short line"
+        );
+        assert_eq!(press(&mut area, KeyCode::Down), FieldOutcome::Consumed);
+        assert_eq!(
+            area.cursor_line_col(),
+            (2, 5),
+            "`Down` on the last line moves nothing"
+        );
+
+        let mut top = at("abcdef\nxy\nlonger", 0, 5);
+        assert_eq!(press(&mut top, KeyCode::Up), FieldOutcome::Consumed);
+        assert_eq!(
+            top.cursor_line_col(),
+            (0, 5),
+            "`Up` on the first line moves nothing"
+        );
+        assert_eq!(top.text(), "abcdef\nxy\nlonger");
+    }
+
+    #[test]
     fn home_and_end_stay_on_the_line() {
         let mut area = TextArea::with_text("ab\ncde\nf");
         area.set_cursor(4);
-        assert_eq!(press(&mut area, KeyCode::Home), AreaOutcome::Consumed);
+        assert_eq!(press(&mut area, KeyCode::Home), FieldOutcome::Consumed);
         assert_eq!(area.cursor(), 3);
         assert_eq!(area.cursor_line_col(), (1, 0));
-        assert_eq!(press(&mut area, KeyCode::End), AreaOutcome::Consumed);
+        assert_eq!(press(&mut area, KeyCode::End), FieldOutcome::Consumed);
         assert_eq!(area.cursor(), 6);
         assert_eq!(area.cursor_line_col(), (1, 3));
 
@@ -549,7 +718,7 @@ mod tests {
 
         assert_eq!(
             area.on_key(key(KeyCode::PageDown), 3),
-            AreaOutcome::Consumed
+            FieldOutcome::Consumed
         );
         assert_eq!(
             area.cursor_line_col(),
@@ -614,13 +783,13 @@ mod tests {
             KeyModifiers::HYPER,
         ] {
             assert_eq!(
-                area.on_key(KeyEvent::new(KeyCode::Char('s'), modifier), 10),
-                AreaOutcome::Pass,
+                area.on_key(chord(KeyCode::Char('e'), modifier), 10),
+                FieldOutcome::Pass,
                 "`{modifier:?}` is a chord, not a character"
             );
             assert_eq!(
-                area.on_key(KeyEvent::new(KeyCode::Enter, modifier), 10),
-                AreaOutcome::Pass
+                area.on_key(chord(KeyCode::Enter, modifier), 10),
+                FieldOutcome::Pass
             );
         }
         for code in [
@@ -629,17 +798,98 @@ mod tests {
             KeyCode::F(2),
             KeyCode::Insert,
         ] {
-            assert_eq!(press(&mut area, code), AreaOutcome::Pass, "{code:?}");
+            assert_eq!(press(&mut area, code), FieldOutcome::Pass, "{code:?}");
         }
         assert_eq!(area.text(), "ab", "none of those typed anything");
         assert_eq!(area.cursor(), 0);
     }
 
     #[test]
+    fn ctrl_s_submits_and_esc_cancels() {
+        let mut area = at_end("a\nb");
+        assert_eq!(
+            area.on_key(chord(KeyCode::Char('s'), KeyModifiers::CONTROL), 10),
+            FieldOutcome::Submit
+        );
+        assert_eq!(
+            area.on_key(
+                chord(
+                    KeyCode::Char('S'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                ),
+                10
+            ),
+            FieldOutcome::Submit,
+            "`SHIFT` on top of `CONTROL` still submits"
+        );
+        assert_eq!(press(&mut area, KeyCode::Esc), FieldOutcome::Cancel);
+        assert_eq!(area.text(), "a\nb");
+        assert_eq!(area.cursor_line_col(), (1, 1));
+    }
+
+    #[test]
     fn esc_cancels() {
         let mut area = TextArea::with_text("ab");
-        assert_eq!(press(&mut area, KeyCode::Esc), AreaOutcome::Cancel);
+        assert_eq!(press(&mut area, KeyCode::Esc), FieldOutcome::Cancel);
         assert_eq!(area.text(), "ab");
+    }
+
+    #[test]
+    fn other_chords_tab_and_function_keys_pass() {
+        let mut area = at_end("ab");
+        for event in [
+            chord(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            chord(KeyCode::Char('x'), KeyModifiers::ALT),
+            chord(
+                KeyCode::Char('s'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            chord(KeyCode::Char('s'), KeyModifiers::SUPER),
+            key(KeyCode::Tab),
+            key(KeyCode::BackTab),
+            key(KeyCode::F(5)),
+        ] {
+            assert_eq!(area.on_key(event, 10), FieldOutcome::Pass, "{event:?}");
+        }
+        assert_eq!(area.text(), "ab");
+        assert_eq!(area.cursor_line_col(), (0, 2));
+
+        // `SHIFT` alone is a capital, not a chord.
+        assert_eq!(
+            area.on_key(chord(KeyCode::Char('C'), KeyModifiers::SHIFT), 10),
+            FieldOutcome::Consumed
+        );
+        assert_eq!(area.text(), "abC");
+    }
+
+    #[test]
+    fn a_control_char_is_swallowed_not_inserted() {
+        let mut area = at_end("ab");
+        assert_eq!(
+            press(&mut area, KeyCode::Char('\u{7}')),
+            FieldOutcome::Consumed
+        );
+        assert_eq!(area.text(), "ab");
+        assert_eq!(area.cursor_line_col(), (0, 2));
+    }
+
+    #[test]
+    fn text_joins_lines_with_newline_and_with_text_round_trips() {
+        let area = TextArea::with_text("a\n\nb");
+        assert_eq!(area.text(), "a\n\nb");
+        assert_eq!(area.line_count(), 3);
+        assert_eq!(area.len(), area.text().chars().count());
+        assert_eq!(area.cursor_line_col(), (0, 0), "cursor at the start");
+        assert_eq!(at_end("a\n\nb").cursor_line_col(), (2, 1));
+
+        assert_eq!(TextArea::with_text("a\r\nb\rc").text(), "a\nb\nc");
+        assert!(TextArea::with_text("").is_empty());
+        assert!(!TextArea::with_text("\n").is_empty());
+        assert_eq!(TextArea::new().line_count(), 1);
+        assert!(TextArea::new().is_empty());
+        assert_eq!(TextArea::new().len(), 0);
+        assert_eq!(TextArea::default().cursor(), 0);
+        assert_eq!(TextArea::default().cursor_line_col(), (0, 0));
     }
 
     #[test]
@@ -650,8 +900,17 @@ mod tests {
         assert!(!rendered.contains("secret"), "{rendered}");
         assert!(!rendered.contains("body"), "{rendered}");
         assert!(rendered.contains("len: 11"), "{rendered}");
-        assert!(rendered.contains("lines: 2"), "{rendered}");
+        assert!(rendered.contains("line_count: 2"), "{rendered}");
         assert!(rendered.contains("cursor: 3"), "{rendered}");
+    }
+
+    #[test]
+    fn debug_never_prints_the_text() {
+        let printed = format!("{:?}", TextArea::with_text("secret-ish\nnote"));
+        assert!(printed.contains("line_count"), "{printed}");
+        assert!(printed.contains("len"), "{printed}");
+        assert!(!printed.contains("secret-ish"), "{printed}");
+        assert!(!printed.contains("note"), "{printed}");
     }
 
     #[test]
@@ -700,6 +959,82 @@ mod tests {
         // No room, no lines.
         assert!(area.lines(0, 3, true, &theme).is_empty());
         assert!(area.lines(3, 0, true, &theme).is_empty());
+    }
+
+    #[test]
+    fn the_window_keeps_the_cursor_row_visible() {
+        let text = (0..10)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let area = at_end(&text);
+        assert_eq!(area.cursor_line_col().0, 9);
+        let drawn: Vec<String> = area
+            .lines(20, 3, false, &Theme::default())
+            .iter()
+            .map(|line| plain(line).trim_end().to_owned())
+            .collect();
+        assert_eq!(drawn, ["line7", "line8", "line9"]);
+
+        // A window taller than the text draws every line and no more (a fresh area: this one
+        // remembers its viewport at `line7`, D19).
+        assert_eq!(
+            at_end(&text).lines(20, 30, false, &Theme::default()).len(),
+            10
+        );
+        // A zero-sized window draws nothing.
+        assert!(area.lines(0, 3, false, &Theme::default()).is_empty());
+        assert!(area.lines(20, 0, false, &Theme::default()).is_empty());
+    }
+
+    #[test]
+    fn a_long_other_row_is_cut_at_the_window_edge() {
+        let theme = Theme::default();
+        let area = at_end("abcdefghijklmnop\nx");
+        let drawn = area.lines(10, 2, false, &theme);
+        assert_eq!(plain(&drawn[0]), "abcdefghij", "cut, with no `…`");
+        assert!(drawn[0].spans.iter().all(|span| span.style == theme.base));
+    }
+
+    #[test]
+    fn a_long_cursor_line_scrolls_to_show_the_cursor() {
+        let theme = Theme::default();
+        let text = "abcdefghijklmnopqrstuvwxyz0123";
+        assert_eq!(text.chars().count(), 30);
+        let area = at_end(text);
+        let drawn = area.lines(10, 1, true, &theme);
+        assert_eq!(drawn.len(), 1);
+        let rendered = plain(&drawn[0]);
+        assert_eq!(rendered, "vwxyz0123 ", "the tail and the cursor cell");
+        let cursor_cell = drawn[0].spans.last().expect("a span");
+        assert_eq!(cursor_cell.content, " ");
+        assert_eq!(cursor_cell.style, theme.selected);
+    }
+
+    #[test]
+    fn a_wide_char_line_is_windowed_by_chars_not_cells() {
+        // The known limitation shared with `TextField`: the window counts chars, so a 10-wide
+        // window over twelve CJK chars draws up to 10 chars (about 19 cells), not 10 cells. Every
+        // line shares the cursor line's horizontal offset.
+        let theme = Theme::default();
+        let text = "\u{4e00}".repeat(12);
+        let area = at_end(&format!("{text}\n{text}"));
+        let drawn = area.lines(10, 2, true, &theme);
+        let other = plain(&drawn[0]);
+        assert_eq!(other, "\u{4e00}".repeat(9), "{other:?}");
+        let cursor_row = plain(&drawn[1]);
+        assert_eq!(cursor_row.chars().count(), 10, "{cursor_row:?}");
+        assert_eq!(cursor_row, format!("{} ", "\u{4e00}".repeat(9)));
+    }
+
+    #[test]
+    fn a_multi_byte_char_counts_as_one() {
+        let mut area = at_end("aé");
+        assert_eq!(area.len(), 2);
+        assert_eq!(area.cursor_line_col(), (0, 2));
+        assert_eq!(press(&mut area, KeyCode::Backspace), FieldOutcome::Consumed);
+        assert_eq!(area.text(), "a");
+        assert_eq!(area.cursor_line_col(), (0, 1));
     }
 
     /// A `\t` from `$EDITOR` draws as spaces to the next tab stop; `ratatui` would drop it and
@@ -760,8 +1095,7 @@ mod tests {
         fn render(area: &TextArea) -> Vec<Line<'static>> {
             area.lines(4, 2, true, &Theme::default())
         }
-        let mut area = TextArea::with_text("a\nb\nc\nd");
-        area.set_cursor(area.text().len());
+        let area = at_end("a\nb\nc\nd");
         let drawn: Vec<String> = render(&area).iter().map(plain).collect();
         assert_eq!(drawn, ["c", "d "]);
     }

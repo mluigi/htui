@@ -7,7 +7,8 @@
 
 use htui_store::testkit as common;
 
-use htui_core::model::{BoxId, UserId};
+use htui_core::model::{BoxEdit, BoxId, UserId};
+use htui_core::store::{CasOutcome, StoreError, WriteStore as _};
 use htui_store::identity::Identity;
 use htui_store::{Fingerprint, Registration};
 use sqlx::PgPool;
@@ -500,8 +501,6 @@ async fn a_reconnect_leaves_htui_version_and_the_probe_columns_alone() {
 /// and its tool never appear.
 #[tokio::test]
 async fn boxes_lists_only_this_user_s_boxes_in_id_order() {
-    use htui_core::store::WriteStore as _;
-
     let Some(db) = common::fresh_db().await else {
         return;
     };
@@ -576,6 +575,167 @@ async fn boxes_lists_only_this_user_s_boxes_in_id_order() {
         .map(|tool| tool.name.as_str())
         .collect();
     assert_eq!(own, ["git"], "the registered box keeps only its own tool");
+
+    db.drop_db().await;
+}
+
+/// `updated_at` of one row, as Postgres prints it.
+async fn updated_at(pool: &PgPool, id: BoxId) -> String {
+    sqlx::query_scalar("SELECT updated_at::text FROM box WHERE id = $1")
+        .bind(id.as_uuid())
+        .fetch_one(pool)
+        .await
+        .expect("read box.updated_at")
+}
+
+/// MOD-7 milestone 2 (D39, D41): registration never writes `edit_version`, `declared_tags` or
+/// `quirks`, so a reconnect (here a rename, which does write the row) cannot stale an open editor
+/// or undo its edit; the `set_updated_at` trigger still moves `updated_at`. The in-trait half is
+/// the conformance case `edit_box_survives_a_probe_between_read_and_write`.
+#[tokio::test]
+async fn a_reconnect_leaves_edit_version_and_the_edited_fields_alone() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+
+    let me = db.store.this_box();
+    let edited = db
+        .store
+        .edit_box(
+            me,
+            0,
+            BoxEdit {
+                declared_tags: Some(vec!["gpu".to_owned()]),
+                quirks: Some("a\nb".to_owned()),
+            },
+        )
+        .await
+        .expect("edit this box");
+    let CasOutcome::Applied(edited) = edited else {
+        panic!("a fresh box's token is 0, got {edited:?}");
+    };
+    assert_eq!(edited.edit_version, 1, "the edit moves the token");
+    let stamped = updated_at(&db.pool, me).await;
+
+    let answer = db
+        .store
+        .register_box(&identity(me, &unique_hostname("RENAMED")), None)
+        .await
+        .expect("reconnect under a new hostname");
+    assert!(
+        matches!(
+            answer,
+            Registration::Known {
+                renamed_from: Some(_)
+            }
+        ),
+        "a renamed reconnect is the same box, got {answer:?}"
+    );
+
+    let (version, tags, quirks): (i32, Vec<String>, String) =
+        sqlx::query_as("SELECT edit_version, declared_tags, quirks FROM box WHERE id = $1")
+            .bind(me.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the edited columns");
+    assert_eq!(version, 1, "registration never writes edit_version");
+    assert_eq!(tags, ["gpu"], "registration never writes declared_tags");
+    assert_eq!(quirks, "a\nb", "registration never writes quirks");
+    assert_ne!(
+        updated_at(&db.pool, me).await,
+        stamped,
+        "the rename wrote the row, so the trigger moved updated_at"
+    );
+
+    let again = db
+        .store
+        .edit_box(
+            me,
+            1,
+            BoxEdit {
+                declared_tags: None,
+                quirks: Some("c".to_owned()),
+            },
+        )
+        .await
+        .expect("edit again on the token the reconnect left");
+    let CasOutcome::Applied(again) = again else {
+        panic!("the reconnect did not spend the token, got {again:?}");
+    };
+    assert_eq!(again.edit_version, 2, "the token moves again");
+
+    db.drop_db().await;
+}
+
+/// MOD-7 milestone 2 (D41, fact-check): `edit_box` reaches only this user's boxes, as `boxes()`
+/// does, so another user's box is `NotFound` even with its right token, and nothing in its row is
+/// written. The `MemStore` half is `edit_box_refuses_another_user_s_box_as_not_found` in
+/// `htui-core`'s `store::mem`.
+#[tokio::test]
+async fn another_users_box_is_not_found_by_edit_box() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+
+    let stranger = UserId::new();
+    sqlx::query("INSERT INTO app_user (id, name) VALUES ($1, $2)")
+        .bind(stranger.as_uuid())
+        .bind(format!("stranger-{}", uuid::Uuid::now_v7().simple()))
+        .execute(&db.pool)
+        .await
+        .expect("plant another user");
+    let foreign = BoxId::new();
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version) \
+         VALUES ($1, $2, 'elsewhere', 'linux', '', 'x86_64', '0.0.0')",
+    )
+    .bind(foreign.as_uuid())
+    .bind(stranger.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("plant a box under the other user");
+    let before = whole_row(&db.pool, foreign).await;
+
+    let answer = db
+        .store
+        .edit_box(
+            foreign,
+            0,
+            BoxEdit {
+                declared_tags: Some(vec!["gpu".to_owned()]),
+                quirks: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(answer, Err(StoreError::NotFound { entity: "box", .. })),
+        "another user's box is NotFound even with its right token, got {answer:?}"
+    );
+    // The refused-tag path re-reads through its own user filter: a refused list must not turn
+    // another user's box into `Constraint` or `Stale(their row)`, whatever the token.
+    for token in [0, 7] {
+        let refused = db
+            .store
+            .edit_box(
+                foreign,
+                token,
+                BoxEdit {
+                    declared_tags: Some(vec!["BAD".to_owned()]),
+                    quirks: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::NotFound { entity: "box", .. })),
+            "NotFound wins over a refused tag on another user's box (token {token}), \
+             got {refused:?}"
+        );
+    }
+    assert_eq!(
+        whole_row(&db.pool, foreign).await,
+        before,
+        "the stranger's row is untouched"
+    );
 
     db.drop_db().await;
 }

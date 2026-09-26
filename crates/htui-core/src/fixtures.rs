@@ -476,6 +476,7 @@ fn boxes() -> Vec<BoxRow> {
         last_seen_at: demo_at(2, 8),
         last_probed_at: Some(epoch()),
         updated_at: demo_at(2, 8),
+        edit_version: 0,
     }]
 }
 

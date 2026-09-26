@@ -17,7 +17,7 @@
 **Current status (2026-09-26):** **ANA-22 was concluded** (`docs/decisions/ana/ana-22.md`): a skill
 is pure library content attached at global, project or phase level, and the attachment carries the
 activation (`always`, `glob`, `off`; language compiled to globs); it unblocks MOD-9 milestones 3 and 4. MOD-9's
-PRD is up (`.claude/prds/mod-9-skill-library-templates.prd.md`); agent help while editing is MOD-51.
+PRD is up (`.claude/prds/mod-9-skill-library-templates.prd.md`); agent help while editing is MOD-55.
 Before it, **MOD-38 was done** (`docs/decisions/mod/mod-38.md`): migration
 `0006_requirements` adds `item.resolution` and the requirement tables behind new store methods on
 MemStore, PgStore and the cache; `closed` is now reachable only through `close_out`, which takes a
@@ -33,12 +33,16 @@ the resolution payload on MOD-50.
 (MOD-38) and `0007_skill_attachments` (MOD-9 milestone 2; cache: `0001`..`0004`), so **the next
 migration is `0008`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
-milestone 1 and MOD-38: store conformance `CASES` 68, `READ_CASES` 14, `htui-orch` `CASES` 70,
-`StoreRequest` 64, `StoreReply` 35, 263 `.sqlx` files, `MIRRORED_TABLES` 21. Pins moved by MOD-9
-milestone 1 on top: store `CASES` 71, `StoreRequest` 66, `StoreReply` 37, 264 `.sqlx` files; and by
-MOD-9 milestone 2: 263 `.sqlx` files, 34 pinned commented columns (`tests/migrations.rs`), and
-`run_step.trim_record` at `v: 2` with `skill_choices` (the other pins unchanged); `cargo doc --workspace --no-deps` shows exactly two baseline errors
-(`htui-core` `MIRRORED_TABLES`, `htui-store` `step_exists`). `git` ≥ 2.33.0 is a runtime dependency
+milestone 2 and MOD-38: store conformance `CASES` 71, `READ_CASES` 14, `htui-orch` `CASES` 70,
+`StoreRequest` 66, `StoreReply` 37, 264 `.sqlx` files, 81 `crates/htui/tests/snapshots`,
+`MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns). Pins moved by MOD-9
+milestones 1 and 2 on top: store `CASES` 74, `StoreRequest` 68, `StoreReply` 39, 264 `.sqlx` files
+(+1 template writer, −3 +2 skill reads), 87 `crates/htui/tests/snapshots`, 34 pinned commented columns
+(`tests/migrations.rs`), and `run_step.trim_record` at `v: 2` with `skill_choices`;
+`cargo doc --workspace --no-deps --keep-going` shows exactly five baseline errors (`htui-core`
+`MIRRORED_TABLES`; `htui-store` `step_exists`, and three private links MOD-38 added in
+`pg/write.rs`: `set_requirement_spec` to `cas_miss`, `amend_requirement` and
+`withdraw_requirement` to `revise_requirement`). `git` ≥ 2.33.0 is a runtime dependency
 of the `worktree` isolation mode and of reconciliation. **Production `approve` and `accept` are
 greyed and every production judge fails until MOD-11**, because no agent can write its phase's
 `output_kind` document yet, so production fan-outs go to the human (`s` in the Runs pane).
@@ -288,6 +292,36 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   `boxes`. **Open at milestone 1's close:** R-18, macOS `xcode-select` stubs (`/usr/bin/git` and
   others) open an install dialog when probed on a Mac without the Command Line Tools — deferred until
   someone verifies macOS, guard sketched in the blueprint §11; the Windows facts moved to MOD-16.
+  **Milestone 2 landed (`63f5673`..`00c2d48`, merged 2026-09-26), "the maintainer sees and edits
+  it"** (`.claude/plans/mod-7-box-settings-section.plan.md`,
+  `.claude/plans/mod-7-box-settings-section.blueprint.md`): `BoxRow` carries
+  `edit_version`; `WriteStore::edit_box` is a compare-and-set on it over every store (`NotFound`,
+  then `Stale`, then `Constraint`; another user's box is `NotFound`), and no reconnect, probe or
+  `register_box` bumps it; declared tags go through `canonical_declared_tags` (`[a-z0-9_-]{1,64}`,
+  sorted, deduplicated, invalid refused). `crate::box_settings` serves `StoreRequest::{Boxes,
+  EditBox}` on the store worker and shows the effective probe spec read-only. Settings > **Boxes**
+  (seventh section) lists every box of the user: `t` tags, `e` quirks in the new multi-line
+  `htui::ui::TextArea` (`ctrl-s` saves), `p` probes this box only and refuses locally while a
+  probe is in flight (deviation from blueprint D63, `16079aa`), `r` reloads. Probe spec editor
+  deferred to MOD-51. The manual live check was skipped by the maintainer; the Postgres
+  `box_probe_pg` cases cover the reconnect, registration probe and concurrent edit instead.
+  Review: 3 low findings; two applied (`e2c6072`, `00c2d48`), two deferrals opened as MOD-53 and
+  MOD-54.
+- [ ] **MOD-53 - Runtime tasks always send a terminal reply** (from MOD-7 milestone 2 review).
+  `R-NF-3`, `R-TUI-8`. A panic inside a spawned runtime task (`run_box_probe`, `run_probe`, the
+  install and login tasks in `crates/htui/src/agent_worker.rs`) is dropped by `sweep_finished`
+  without a reply, so the UI flag that waits for it (`probing` in the Settings agents and boxes
+  sections, and the like) stays set for the rest of the session. Clearing such a flag from the UI
+  side reintroduces the superseded-seq bug `16079aa` fixed, so the fix belongs in the runtime:
+  catch the panic (or notice a panicked `JoinHandle` in `sweep_finished`) and send the task's
+  terminal reply with a failure. Found 2026-09-26.
+- [ ] **MOD-54 - Wide characters and graphemes in the text widgets** (from MOD-7 milestone 2
+  review). `R-TUI-1`, `R-NF-1`. `TextField` and `TextArea` (`crates/htui/src/ui/`) count width in
+  `char`s and move the cursor by code point (plan D44 of MOD-7 milestone 2, `TextField`'s module
+  doc), so a CJK or emoji line overruns its column and the cursor cell can fall off-screen, and
+  `Left`/`Backspace` can split a combining sequence. Measure by display width (`unicode-width`) and
+  step by grapheme (`unicode-segmentation`) in both widgets together; declaring those crates is a
+  dependency decision. Found 2026-09-26.
 - [ ] **MOD-49 - Interactive path picker for repo and workspace roots** (from MOD-7). `R-BOX-4`,
   `R-TUI-8`. MOD-7 D5 infers each repo's path on a box and falls back to a typed path in a text box
   when inference fails. Replace the typed fallback with a popup window that browses the box's
@@ -296,6 +330,21 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   same canonicalisation as the text box (`htui_core::root_path::canonical_root`, F-102). Listing runs
   off the UI task (`R-NF-3`). Blocked on MOD-7 milestone 4. Raised by the maintainer at MOD-7's PRD
   gate, 2026-09-25.
+- [ ] **MOD-51 - `box_probe_spec` editor in the Settings box section** (from MOD-7 milestone 2,
+  OQ-18). `R-BOX-2`, `R-TUI-8`. MOD-7 milestone 1's plan (OQ-9, D15, as amended at maintainer
+  review) promised milestone 2 a validated writer of the `app_setting.box_probe_spec` overlay; the
+  PRD's milestone 2 row does not carry it, and the maintainer deferred it here at milestone 2's
+  CONFIRM gate (2026-09-26). Milestone 2 ships only the read-only view of the effective spec. The
+  writer validates through `htui_agent::box_probe` spec parsing before it stores, is a
+  compare-and-set, and runs off the UI task (`R-NF-3`); the planned shape is task T6 of
+  `.claude/plans/mod-7-box-settings-section.plan.md`. Unblocked: MOD-7 milestone 2 landed
+  (the Boxes section, `crates/htui/src/ui/tabs/settings/boxes.rs`, and `crate::box_settings`).
+- [ ] **MOD-52 - `ctrl-c` does not quit `htui`** (from MOD-7 milestone 2 plan fact-check). `R-TUI-1`.
+  Crossterm's raw mode clears `ISIG`, so `ctrl-c` raises no `SIGINT`, and no `ctrl-` chord is bound:
+  `Keymap::default_global` (`crates/htui/src/keymap.rs:198-238`) binds `q`, `Tab`, `BackTab`,
+  `1`-`9`, `?` and the overlay `Esc`. Sections nevertheless pass `CONTROL` chords through "so `ctrl-c`
+  still quits", and several comments say it quits. Decide whether `ctrl-c` should quit (bind it
+  globally, respecting text-input capture) or not (correct the comments). Found 2026-09-26.
 - [ ] **MOD-9 - Skill library and templates.** `R-SKL-1..4`, `R-PRM-4`, `R-TUI-7`. Versioned skills,
   project and phase bindings, template rows, Skills tab editor with version diff, import of
   existing skill markdown files. Per ANA-5 (`docs/ANA-5.md` §4.1, §5.4): template save validation
@@ -319,7 +368,7 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   open; milestones 3 (skill writers, bindings) and 4 (SKILL.md import) follow ANA-22's verdict
   (`docs/decisions/ana/ana-22.md`, concluded 2026-09-25: skills attached at global, project or phase
   level with the activation on the attachment, §7 schema and import mapping, §8 phasing).
-  Agent help while editing is MOD-51.
+  Agent help while editing is MOD-55.
   **Phase 1 landed (`e971418`..`caacc96`, 2026-09-25):** milestone 1, templates editable — the
   `append_prompt_template` compare-and-set writer on every store (append-only, head version as the
   token), `ui::TextArea`, the `$EDITOR` handoff with the terminal suspended and SIGINT/SIGQUIT held
@@ -507,9 +556,10 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   Settings tab, not a tab of its own** — `SettingsSection`/`SectionId("agents")` in the section
   strip (`crates/htui/src/ui/tabs/settings/{mod.rs,agents.rs}`). It is **no longer the only
   registered section**: MOD-15 added `hierarchy`, `kinds`, `prompt` and `connection` after it, so
-  the strip is five titles wide (46 of the pinned 100 columns, `tests/settings.rs`) and
-  `SettingsSection::captures_input` now exists for a section that takes typed input. MOD-7's box
-  profile adds its own; MOD-9 adds none (its editors live in the Skills tab, PRD D1). MOD-2 built it read-only (`r` probe, `i` install, `a` authenticate, `o` open, `x` cancel)
+  MOD-34 added `qdrant` and MOD-7 milestone 2 `boxes`, so the strip is seven titles wide (61 of
+  the pinned 100 columns, `tests/settings.rs`) and
+  `SettingsSection::captures_input` now exists for a section that takes typed input. MOD-9 adds
+  none (its editors live in the Skills tab, PRD D1). MOD-2 built it read-only (`r` probe, `i` install, `a` authenticate, `o` open, `x` cancel)
   and MOD-20/MOD-21 added the install and login actions, so what is missing is the **write** half
   that `R-AGT-4`'s field list and `R-AGT-6`'s "manual entries allowed" still owe. MOD-2 milestone 5
   **D45** already added `probe.source` (`probe` | `manual`) so that "a manual entry is never
@@ -634,7 +684,7 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   (`R-AGT-9` unchanged). **Open question for the maintainer:** `R-SEC-2` amendment only if the server,
   not the worker, resolves project secrets. Blocked on MOD-47, MOD-10.
 
-- [ ] **MOD-51 - Ask an agent for help while editing a template or skill** (from MOD-9, PRD gate
+- [ ] **MOD-55 - Ask an agent for help while editing a template or skill** (from MOD-9, PRD gate
   2026-09-25). `R-SKL-3`, `R-PRM-4`. MOD-9's editor (Skills tab, `TextArea` and `$EDITOR`,
   `.claude/prds/mod-9-skill-library-templates.prd.md` D2) gains an action that sends the body being
   edited, the role's placeholder table and the maintainer's request to a configured agent and offers
@@ -642,7 +692,7 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   which agent and model answer (the chat driver or a one-shot CLI call), whether the exchange is
   recorded, and how secrets in a body are scrubbed before they leave. Blocked on MOD-9 milestone 1.
 
-- [ ] **MOD-52 - htui's panic hook is wrapped by ratatui's, so a contained panic still restores the
+- [ ] **MOD-56 - htui's panic hook is wrapped by ratatui's, so a contained panic still restores the
   terminal** (from MOD-9, milestone-1 blueprint finding F-U; maintainer-decided 2026-09-26).
   `R-ID-1`, `R-TUI-1`. `terminal::init` (`crates/htui/src/terminal.rs:26-43`) installs htui's
   **conditional** hook and then calls `ratatui::init()`, whose `try_init` wraps whatever hook is
@@ -653,6 +703,18 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   predicate. Fix shape: initialise without ratatui's hook (build the terminal the way `enter`
   already does, `terminal.rs:88`) or install htui's hook after `ratatui::init` with `take_hook`
   dropping ratatui's, plus a test that runs the real hook chain. Not blocked.
+
+- [ ] **MOD-57 - Run the external editor inside the TUI pane** (from MOD-9, merge of MOD-7
+  milestone 2, maintainer-decided 2026-09-26). `R-TUI-1`, `R-TUI-7`, `R-NF-1`. Today `E`/`Ctrl+E`
+  in the Templates editor (and any later user of the shared `ui::TextArea`) suspends the whole TUI
+  and runs `$VISUAL`/`$EDITOR` full-screen (`crates/htui/src/editor.rs`). Offer a toggle that runs
+  the editor inside the editing pane instead, with the rest of the TUI still drawn: a pseudo-terminal
+  (`portable-pty`, ConPTY on Windows) feeding a VT parser (`vt100`) drawn by a ratatui widget
+  (`tui-term`), keys forwarded to the child with one reserved chord to leave, resize forwarded,
+  and the file read back through the same `parse` gate on exit. Works for any editor, nvim
+  included. The alternative, nvim's `--embed` RPC UI (`nvim-rs`), is nvim-only and was not
+  preferred. The three crates are not in `Cargo.lock`, so the plan owns that dependency decision.
+  Not blocked; pairs with MOD-54 (display width) for the in-app widget.
 
 ### Deferred backlog
 
@@ -704,6 +766,6 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-21 per-model weights)                                                                  |
-| MOD-N   | 36 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 agent help in the editor, MOD-52 panic hook order; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 41 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

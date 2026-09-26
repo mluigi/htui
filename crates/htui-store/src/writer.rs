@@ -33,13 +33,13 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, BoxProbe, BoxRecord, ChatRunSpec, CitationKind, Claim,
-    CommandRun, CoverageRow, Document, DocumentHead, DocumentId, GateOutcome, Item, ItemCitation,
-    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement,
-    ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject,
-    NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-    NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
-    PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    Agent, AgentBox, AgentId, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, ChatRunSpec,
+    CitationKind, Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId, GateOutcome,
+    Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
+    ItemRequirement, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind,
+    NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
+    NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
     RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
     RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunId,
     RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status,
@@ -438,6 +438,18 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.boxes().await,
             Self::Online(pg) => pg.boxes().await,
+        }
+    }
+
+    async fn edit_box(
+        &self,
+        id: BoxId,
+        expected: i32,
+        edit: BoxEdit,
+    ) -> Result<CasOutcome<BoxRow>> {
+        match self {
+            Self::Memory(store) => store.edit_box(id, expected, edit).await,
+            Self::Online(pg) => pg.edit_box(id, expected, edit).await,
         }
     }
 

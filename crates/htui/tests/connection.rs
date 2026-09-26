@@ -1168,7 +1168,8 @@ fn requested(bench: &SectionBench) -> Vec<StoreRequest> {
         .collect()
 }
 
-/// The five sections in the product's own registration order (D19).
+/// The first five of the product's seven sections, in its own registration order (D19); Qdrant
+/// and Boxes follow them in `register_all` and are not needed here.
 fn sections() -> Vec<Box<dyn SettingsSection>> {
     vec![
         Box::new(AgentsSection::new()),
@@ -2057,7 +2058,7 @@ async fn the_product_registers_connection_after_prompt() {
     let frame = harness.render();
     assert!(
         frame.contains("Agents") && frame.contains("Prompt") && frame.contains("Connection"),
-        "five sections in the strip: {frame}"
+        "the sections are in the strip: {frame}"
     );
 
     for _ in 0..4 {

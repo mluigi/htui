@@ -63,6 +63,10 @@ pub struct BoxRow {
     pub last_probed_at: Option<DateTime<Utc>>,
     /// `box.updated_at`.
     pub updated_at: DateTime<Utc>,
+    /// `box.edit_version`: the compare-and-set token of the declared-tags and quirks editors
+    /// (MOD-7 milestone 2, D39). Bumped by `WriteStore::edit_box` and by nothing else:
+    /// registration and the box probe never write it, so a reconnect cannot stale an open editor.
+    pub edit_version: i32,
 }
 
 /// A row of `box_tool` (§5.2): one compiler, build tool, shell or container runtime found by the
@@ -139,6 +143,77 @@ impl BoxRecord {
             || self.row.htui_version != running
             || self.probe_spec_digest.as_deref() != Some(spec_digest)
     }
+}
+
+/// The longest declared tag, in chars (MOD-7 D42).
+pub const DECLARED_TAG_MAX: usize = 64;
+
+/// One human edit of a box row (MOD-7 milestone 2, D41): `Some` writes that column, `None` leaves
+/// it alone. An edit with both `None` is legal and still bumps `edit_version`.
+///
+/// `Debug` is derived on purpose: quirks are not secret (they go into every prompt's box
+/// section), and `htui`'s `StoreRequest` carries this type and derives `Debug`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoxEdit {
+    /// `box.declared_tags`, whole; the store validates, sorts and deduplicates it.
+    pub declared_tags: Option<Vec<String>>,
+    /// `box.quirks`, whole, lines separated by `\n`; stored as given (D43).
+    pub quirks: Option<String>,
+}
+
+/// Whether `tag` is a declared tag (MOD-7 D42): 1 to [`DECLARED_TAG_MAX`] chars of
+/// `[a-z0-9_-]`, the first one a letter or a digit. Every tag the seed derives already is.
+#[must_use]
+pub fn is_declared_tag(tag: &str) -> bool {
+    let allowed = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-';
+    let mut chars = tag.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(allowed)
+        && tag.chars().count() <= DECLARED_TAG_MAX
+}
+
+/// The stored form of a declared-tag list (MOD-7 D42, D55): each element validated **as given**
+/// (no trim, no split, no case change), then sorted by bytes and deduplicated. Both stores call
+/// this before they write, so a refusal carries one sentence on `MemStore` and on Postgres.
+///
+/// # Errors
+///
+/// The refusal sentence of the first element [`is_declared_tag`] rejects, in input order.
+pub fn canonical_declared_tags(tags: &[String]) -> Result<Vec<String>, String> {
+    if let Some(bad) = tags.iter().find(|tag| !is_declared_tag(tag)) {
+        return Err(declared_tag_refusal(bad));
+    }
+    let mut canonical = tags.to_vec();
+    // `str`'s `Ord` is byte order, which is what "sorted by bytes" means.
+    canonical.sort_unstable();
+    canonical.dedup();
+    Ok(canonical)
+}
+
+/// A declared-tag list as the user types it (MOD-7 D42, D50): split on `,`, each piece trimmed,
+/// empty pieces dropped, then [`canonical_declared_tags`]. Empty text is no tags.
+///
+/// # Errors
+///
+/// [`canonical_declared_tags`]'s sentence.
+pub fn declared_tags_from_text(text: &str) -> Result<Vec<String>, String> {
+    let pieces: Vec<String> = text
+        .split(',')
+        .map(str::trim)
+        .filter(|piece| !piece.is_empty())
+        .map(str::to_owned)
+        .collect();
+    canonical_declared_tags(&pieces)
+}
+
+/// The one refusal sentence (private).
+fn declared_tag_refusal(tag: &str) -> String {
+    format!(
+        "declared tag `{tag}` is not 1-{DECLARED_TAG_MAX} characters of a-z, 0-9, `_` and `-` \
+         starting with a letter or a digit"
+    )
 }
 
 /// Top-bar projection of the current box (`R-TUI-1`). Not a table.
@@ -290,6 +365,7 @@ mod tests {
             last_seen_at: at(),
             last_probed_at: Some(at()),
             updated_at: at(),
+            edit_version: 0,
         }
     }
 
@@ -478,6 +554,95 @@ mod tests {
                 ("git".to_owned(), "2.47.0".to_owned()),
             ],
             "name and version, and nothing else"
+        );
+    }
+
+    fn owned(tags: &[&str]) -> Vec<String> {
+        tags.iter().map(|&tag| tag.to_owned()).collect()
+    }
+
+    /// MOD-7 D42: `[a-z0-9_-]`, 1 to 64 chars, the first a letter or a digit.
+    #[test]
+    fn a_declared_tag_is_lowercase_digits_underscore_and_dash() {
+        for tag in ["gpu", "heavy_build", "x86-64", "9p", "a"] {
+            assert!(is_declared_tag(tag), "`{tag}` is a declared tag");
+        }
+        for tag in ["", "_x", "-x", "GPU", "gpu tag", "gpü", "a,b"] {
+            assert!(!is_declared_tag(tag), "`{tag}` is not a declared tag");
+        }
+    }
+
+    /// MOD-7 D42, D50: the text the user types is split on `,`, trimmed, sorted and deduplicated.
+    #[test]
+    fn a_declared_tag_list_is_split_on_commas_trimmed_sorted_and_deduplicated() {
+        assert_eq!(
+            declared_tags_from_text(" vulkan, gpu ,,gpu, heavy_build "),
+            Ok(owned(&["gpu", "heavy_build", "vulkan"]))
+        );
+    }
+
+    /// MOD-7 D42: empty text, blanks and bare commas are no tags, not a refusal.
+    #[test]
+    fn an_empty_tag_list_is_no_tags() {
+        for text in ["", "  ", " , , "] {
+            assert_eq!(declared_tags_from_text(text), Ok(Vec::new()), "{text:?}");
+        }
+    }
+
+    /// MOD-7 D42: nothing is lower-cased on the user's behalf; the refusal names the tag.
+    #[test]
+    fn an_uppercase_or_spaced_tag_is_refused_by_name() {
+        let upper = declared_tags_from_text("gpu, Vulkan").expect_err("`Vulkan` is refused");
+        assert!(upper.contains("`Vulkan`"), "{upper}");
+        assert_eq!(upper, declared_tag_refusal("Vulkan"));
+
+        let spaced =
+            declared_tags_from_text("gpu, heavy build").expect_err("`heavy build` is refused");
+        assert!(spaced.contains("`heavy build`"), "{spaced}");
+    }
+
+    /// MOD-7 D42: the ten seeded tags (`R-BOX-3`, `pg/mod.rs`) and the five milestone 1 derives
+    /// (OQ-12) all pass the rule, so no stored list starts out invalid.
+    #[test]
+    fn every_seeded_and_derived_tag_is_a_valid_declared_tag() {
+        let seeded = [
+            "gpu",
+            "vulkan",
+            "msvc",
+            "mingw",
+            "clang",
+            "cmake",
+            "vcpkg",
+            "docker",
+            "rust",
+            "heavy_build",
+        ];
+        let derived = ["go", "node", "python", "java", "dotnet"];
+        for tag in seeded.into_iter().chain(derived) {
+            assert!(is_declared_tag(tag), "`{tag}` is a valid declared tag");
+        }
+    }
+
+    /// MOD-7 D42: the cap is [`DECLARED_TAG_MAX`] chars.
+    #[test]
+    fn a_sixty_five_char_tag_is_refused() {
+        assert!(is_declared_tag(&"a".repeat(DECLARED_TAG_MAX)));
+        assert!(!is_declared_tag(&"a".repeat(DECLARED_TAG_MAX + 1)));
+    }
+
+    /// MOD-7 D55: the store-side rule takes each element as given, so a stray space or comma is
+    /// a refusal rather than a silent rewrite.
+    #[test]
+    fn the_store_list_is_validated_strictly_not_trimmed_or_split() {
+        for tags in [owned(&[" gpu"]), owned(&["a,b"]), owned(&[""])] {
+            assert!(
+                canonical_declared_tags(&tags).is_err(),
+                "{tags:?} is refused"
+            );
+        }
+        assert_eq!(
+            canonical_declared_tags(&owned(&["vulkan", "gpu", "gpu"])),
+            Ok(owned(&["gpu", "vulkan"]))
         );
     }
 }
