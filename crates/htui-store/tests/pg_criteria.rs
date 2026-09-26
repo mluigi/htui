@@ -691,10 +691,10 @@ async fn admission_is_serialised_by_the_box_row_lock() {
         1,
         "exactly one claim may take the last slot, got ({one}, {two})"
     );
-    let refusal = if one.is_admitted() { two } else { one };
+    let refusal = if one.is_admitted() { &two } else { &one };
     assert_eq!(
         refusal,
-        Claim::SlotFull {
+        &Claim::SlotFull {
             running: 1,
             limit: 1
         },
