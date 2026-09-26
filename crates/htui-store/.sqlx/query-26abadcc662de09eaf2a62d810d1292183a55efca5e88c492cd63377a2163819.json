@@ -1,0 +1,114 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE item_requirement ir\n               SET requirement_version = r.version\n              FROM requirement r\n             WHERE r.id = ir.requirement_id\n               AND ir.item_id = $1 AND ir.requirement_id = $2 AND ir.kind = $3\n               AND ir.deleted_at IS NULL\n            RETURNING ir.item_id             AS \"item_id!: ItemId\",\n                      ir.requirement_id      AS \"requirement_id!: RequirementId\",\n                      ir.kind                AS \"kind!: CitationKind\",\n                      ir.requirement_version AS \"requirement_version!\",\n                      ir.proposed_by_step_id AS \"proposed_by_step_id?: StepId\",\n                      ir.created_at          AS \"created_at!\",\n                      ir.updated_at          AS \"updated_at!\",\n                      ir.deleted_at          AS \"deleted_at?\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id!: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "item_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "requirement_id!: RequirementId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "requirement_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind!: CitationKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "requirement_version!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "requirement_version"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "proposed_by_step_id?: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "proposed_by_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "updated_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "deleted_at?",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_requirement",
+            "name": "deleted_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "26abadcc662de09eaf2a62d810d1292183a55efca5e88c492cd63377a2163819"
+}

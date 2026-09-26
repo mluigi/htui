@@ -149,7 +149,7 @@ query over `requirement_revision` joined to the item named in `amended_by_item_i
 
 ---
 
-## 5. Schema (migration `0005_requirements.sql`, forward-only)
+## 5. Schema (migration `0006_requirements.sql`, forward-only)
 
 ```sql
 -- One spec header per project: preamble, out-of-scope, superseded-material prose (§4.4).
@@ -281,7 +281,7 @@ Decisions get **no new entity**: a decision is a closed item with a `resolution`
 import sources (MOD-8) and nothing more for any `htui`-managed project.
 
 1. **MOD-38 - Requirements schema, seam and close-out resolution** (from ANA-11).
-   - Migration `0005_requirements.sql` per §5, and cache migration per §5.2.
+   - Migration `0006_requirements.sql` per §5, and cache migration per §5.2.
    - Trait methods of §5.1 on `MemStore`, `PgStore` and the cache read path.
    - `close_out` takes a resolution and gains the `open` → `closed` guard; ANA-2 §4.3 is amended by
      this item's write-up.

@@ -1,0 +1,148 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT requirement_id     AS \"requirement_id: RequirementId\",\n                   version,\n                   body,\n                   rationale,\n                   priority           AS \"priority: Priority\",\n                   state              AS \"state: RequirementState\",\n                   author_id          AS \"author_id: UserId\",\n                   box_id             AS \"box_id: BoxId\",\n                   reason,\n                   amended_by_item_id AS \"amended_by_item_id: ItemId\",\n                   created_at\n              FROM requirement_revision\n             WHERE requirement_id = $1\n             ORDER BY version\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "requirement_id: RequirementId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement_revision",
+            "name": "requirement_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "requirement_revision",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "body",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement_revision",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "rationale",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement_revision",
+            "name": "rationale"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "priority: Priority",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement_revision",
+            "name": "priority"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "state: RequirementState",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement_revision",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "author_id: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement_revision",
+            "name": "author_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "box_id: BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement_revision",
+            "name": "box_id"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "requirement_revision",
+            "name": "reason"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "amended_by_item_id: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "requirement_revision",
+            "name": "amended_by_item_id"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "requirement_revision",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "dd78dfc4d153d00fe43ebcce8771f124739e66e21473f7b94e4b4b71fd98b958"
+}

@@ -20,19 +20,22 @@ use serde_json::Value;
 
 use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AppUser, BoundSkill, BoxId, BoxInfo, BoxProbe,
-    BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec, Claim, CommandRun,
-    CommandRunId, DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, GateOutcome,
-    Item, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch,
-    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument,
-    NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRun, NewRunStep,
+    BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec, CitationKind, Claim,
+    CommandRun, CommandRunId, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead,
+    DocumentId, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
+    ItemKindPatch, ItemLink, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkEdge,
+    LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
+    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
     NewStepGraph, NewWorkspace, Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
     ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath,
-    RepoId, RepoPatch, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
-    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
-    SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
-    overlaps, prompt_summary, scope_of,
+    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementState,
+    RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId,
+    RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
+    Scope, SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
+    UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceSummary, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -41,13 +44,14 @@ use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StoredSetting, UpdateOutcome,
-    WriteStore, already_exists, chat_step_status, close_out_needs_a_summary, expected_on_row,
-    failure_disagrees_with_status, finish_run_item_mirror, finish_run_needs_a_terminal_status,
-    graph_not_in_project, invalid_prefix, item_has_a_live_run, item_kind_is_held,
-    item_not_in_project, legal_move, not_a_fanout_candidate, not_a_terminal_status,
-    prompt_template_key, prompt_template_refusal, references_no_row, reserved_phase_name,
+    WriteStore, already_exists, chat_step_status, citation_key, close_out_needs_a_summary,
+    expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
+    finish_run_needs_a_terminal_status, graph_not_in_project, invalid_area_code, invalid_prefix,
+    item_has_a_live_run, item_kind_is_held, item_not_in_project, legal_move,
+    not_a_fanout_candidate, not_a_terminal_status, prompt_template_key, prompt_template_refusal,
+    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
     row_names_another_step, run_is_terminal, step_is_not_promotable, step_slot_is_taken,
-    summary_names_another_item, winner_is_not_settled,
+    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
 use uuid::Uuid;
 
@@ -168,6 +172,18 @@ struct State {
     lease_owners: HashMap<RunId, Uuid>,
     /// `session_event`.
     events: Vec<SessionEvent>,
+    /// `requirement_spec` (ANA-11 §4.4), keyed by its primary key, the project (MOD-38).
+    requirement_specs: HashMap<ProjectId, RequirementSpec>,
+    /// `requirement_area`.
+    requirement_areas: HashMap<RequirementAreaId, RequirementArea>,
+    /// `requirement_key_counter`: the highest number minted per area (MOD-38 plan D8).
+    requirement_key_counter: HashMap<RequirementAreaId, i32>,
+    /// `requirement`.
+    requirements: HashMap<RequirementId, Requirement>,
+    /// `requirement_revision`, append-only.
+    requirement_revisions: Vec<RequirementRevision>,
+    /// `item_requirement`; tombstones are kept, as [`State::links`] keeps them (plan D10).
+    item_requirements: Vec<ItemRequirement>,
 }
 
 impl MemStore {
@@ -253,6 +269,24 @@ impl MemStore {
             command_runs: BTreeMap::new(),
             lease_owners: HashMap::new(),
             events: data.events,
+            requirement_specs: data
+                .requirement_specs
+                .into_iter()
+                .map(|row| (row.project_id, row))
+                .collect(),
+            requirement_areas: data
+                .requirement_areas
+                .into_iter()
+                .map(|row| (row.id, row))
+                .collect(),
+            requirement_key_counter: data.requirement_key_counter,
+            requirements: data
+                .requirements
+                .into_iter()
+                .map(|row| (row.id, row))
+                .collect(),
+            requirement_revisions: data.requirement_revisions,
+            item_requirements: data.item_requirements,
         };
         Self {
             state: Arc::new(RwLock::new(state)),
@@ -1247,6 +1281,7 @@ impl State {
             created_at: now,
             updated_at: now,
             closed_at: None,
+            resolution: None,
         };
 
         self.revisions.insert(
@@ -1381,6 +1416,8 @@ impl State {
         }
         item.status = to;
         item.updated_at = now;
+        // `legal_move` refuses every move to `closed` (MOD-38 PRD D1), so of the two terminal
+        // statuses only `done` gets here; the Postgres twin's `CASE` names just that one.
         item.closed_at = to.is_terminal().then_some(now);
         Ok(true)
     }
@@ -2955,6 +2992,7 @@ impl State {
     /// and `workspace_box_paths` because a project is not a workspace; `run_step_commits` and
     /// `run_step_trees` were `0` for the same reason until MOD-4 milestone 1 gave this store the
     /// two maps (plan D12), and `command_runs` until milestone 3 gave it the third (plan D31).
+    /// MOD-38's six requirement counts come from the same pass (blueprint F1, §4.4).
     fn project_reach(&self, id: ProjectId) -> Option<(DeleteReach, ProjectReach)> {
         if !self.projects.contains_key(&id) {
             return None;
@@ -2993,6 +3031,18 @@ impl State {
             .collect();
         let repos: HashSet<RepoId> = self
             .repos
+            .values()
+            .filter(|row| row.project_id == id)
+            .map(|row| row.id)
+            .collect();
+        let requirement_areas: HashSet<RequirementAreaId> = self
+            .requirement_areas
+            .values()
+            .filter(|row| row.project_id == id)
+            .map(|row| row.id)
+            .collect();
+        let requirements: HashSet<RequirementId> = self
+            .requirements
             .values()
             .filter(|row| row.project_id == id)
             .map(|row| row.id)
@@ -3093,6 +3143,30 @@ impl State {
                     .filter(|row| items.contains(&row.item_id))
                     .count(),
             ),
+            requirement_specs: rows(usize::from(self.requirement_specs.contains_key(&id))),
+            requirement_areas: rows(requirement_areas.len()),
+            requirement_key_counters: rows(
+                self.requirement_key_counter
+                    .keys()
+                    .filter(|area| requirement_areas.contains(area))
+                    .count(),
+            ),
+            requirements: rows(requirements.len()),
+            requirement_revisions: rows(
+                self.requirement_revisions
+                    .iter()
+                    .filter(|row| requirements.contains(&row.requirement_id))
+                    .count(),
+            ),
+            // Either end, tombstones included, as `links` above (blueprint §4.4).
+            item_requirements: rows(
+                self.item_requirements
+                    .iter()
+                    .filter(|row| {
+                        items.contains(&row.item_id) || requirements.contains(&row.requirement_id)
+                    })
+                    .count(),
+            ),
         };
         Some((
             reach,
@@ -3103,6 +3177,8 @@ impl State {
                 graphs,
                 phases,
                 repos,
+                requirement_areas,
+                requirements,
             },
         ))
     }
@@ -3129,7 +3205,7 @@ impl State {
     /// `item_link` goes when **either** end is the project's, tombstones included: that is what
     /// takes the fixture's cross-project edge from `agy:FEAT-1` to `htui:FEAT-2`, which no
     /// per-project predicate would have reached.
-    fn delete_project(&mut self, id: ProjectId) -> Result<DeleteReach> {
+    fn delete_project(&mut self, id: ProjectId, now: DateTime<Utc>) -> Result<DeleteReach> {
         let (reach, gone) = self.project_reach(id).ok_or_else(|| StoreError::NotFound {
             entity: "project",
             id: id.to_string(),
@@ -3153,6 +3229,40 @@ impl State {
         self.links.retain(|row| {
             !gone.items.contains(&row.from_item_id) && !gone.items.contains(&row.to_item_id)
         });
+        // MOD-38 blueprint §4.4: a citation goes with either end, as a link does, and one that
+        // survives loses a proposing step that did not (`proposed_by_step_id ... ON DELETE SET
+        // NULL`, whose UPDATE fires `trg_item_requirement_updated_at`); a revision goes with its
+        // requirement, and one that survives in another project loses a deciding item that did
+        // not (`amended_by_item_id ... ON DELETE SET NULL`).
+        self.item_requirements.retain(|row| {
+            !gone.items.contains(&row.item_id) && !gone.requirements.contains(&row.requirement_id)
+        });
+        for row in &mut self.item_requirements {
+            if row
+                .proposed_by_step_id
+                .is_some_and(|step| gone.steps.contains(&step))
+            {
+                row.proposed_by_step_id = None;
+                row.updated_at = now;
+            }
+        }
+        self.requirement_revisions
+            .retain(|row| !gone.requirements.contains(&row.requirement_id));
+        for row in &mut self.requirement_revisions {
+            if row
+                .amended_by_item_id
+                .is_some_and(|item| gone.items.contains(&item))
+            {
+                row.amended_by_item_id = None;
+            }
+        }
+        self.requirements
+            .retain(|id, _| !gone.requirements.contains(id));
+        self.requirement_key_counter
+            .retain(|area, _| !gone.requirement_areas.contains(area));
+        self.requirement_areas
+            .retain(|id, _| !gone.requirement_areas.contains(id));
+        self.requirement_specs.remove(&id);
         self.items.retain(|id, _| !gone.items.contains(id));
         self.item_key_counter
             .retain(|(project, _), _| *project != id);
@@ -4221,6 +4331,7 @@ impl State {
     fn close_out(
         &mut self,
         item: ItemId,
+        resolution: Resolution,
         summary: NewDocument,
         commits: &[RunStepCommit],
         now: DateTime<Utc>,
@@ -4249,7 +4360,13 @@ impl State {
                 summary.item_id,
             )));
         }
-        legal_move(status, Status::Closed)?;
+        // ANA-11 §4.2's law, not §4.3's table: close-out is the only way into `closed` (MOD-38
+        // PRD D1), so `legal_move` would refuse every status.
+        if !resolution.closes_from(status) {
+            return Err(StoreError::Constraint(resolution_not_closable(
+                item, status, resolution,
+            )));
+        }
         for row in commits {
             self.check_step_batch(
                 "run_step_commit",
@@ -4263,7 +4380,15 @@ impl State {
             self.step_commits
                 .insert((row.run_step_id, row.repo_id), row.clone());
         }
-        self.transition(item, status, Status::Closed, now)?;
+        // Plan D5: the direct write `transition` no longer makes, under the same `now`.
+        let row = self
+            .items
+            .get_mut(&item)
+            .expect("require_item found it above");
+        row.status = Status::Closed;
+        row.resolution = Some(resolution);
+        row.updated_at = now;
+        row.closed_at = Some(now);
         Ok(document)
     }
 
@@ -4338,6 +4463,549 @@ impl State {
                 .collect(),
         })
     }
+
+    // ---- MOD-38: ANA-11 §5.1 requirements and citations --------------------------------------
+    //
+    // The MOD-15 discipline again: every refusal is decided before the first write, so a writer's
+    // single `write` closure is its transaction. Every ordering compares text by bytes, which is
+    // what `String`'s `Ord` does and what `PgStore`'s `COLLATE "C"` does (blueprint §4.1). Suspect
+    // is derived on every read and stored nowhere (plan D11).
+
+    /// A project's areas in `(position, code)` order.
+    fn requirement_area_rows(&self, project: ProjectId) -> Vec<RequirementArea> {
+        let mut rows: Vec<RequirementArea> = self
+            .requirement_areas
+            .values()
+            .filter(|row| row.project_id == project)
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| {
+            left.position
+                .cmp(&right.position)
+                .then_with(|| left.code.cmp(&right.code))
+        });
+        rows
+    }
+
+    /// Whether a requirement passes every conjunct of the filter (plan D14).
+    fn requirement_matches(row: &Requirement, filter: &RequirementFilter) -> bool {
+        if filter
+            .area_codes
+            .as_ref()
+            .is_some_and(|codes| !codes.contains(&row.area_code))
+        {
+            return false;
+        }
+        if filter
+            .states
+            .as_ref()
+            .is_some_and(|states| !states.contains(&row.state))
+        {
+            return false;
+        }
+        if filter
+            .priorities
+            .as_ref()
+            .is_some_and(|priorities| !priorities.contains(&row.priority))
+        {
+            return false;
+        }
+        if let Some(text) = &filter.text {
+            let needle = text.to_lowercase();
+            if !row.key.to_lowercase().contains(&needle)
+                && !row.body.to_lowercase().contains(&needle)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// A project's matching requirements in `(area_code, number)` order.
+    fn requirement_rows(&self, project: ProjectId, filter: &RequirementFilter) -> Vec<Requirement> {
+        let mut rows: Vec<Requirement> = self
+            .requirements
+            .values()
+            .filter(|row| row.project_id == project && Self::requirement_matches(row, filter))
+            .cloned()
+            .collect();
+        rows.sort_by(|left, right| {
+            left.area_code
+                .cmp(&right.area_code)
+                .then_with(|| left.number.cmp(&right.number))
+        });
+        rows
+    }
+
+    /// A requirement's revisions in `version` order; empty for an unknown id.
+    fn requirement_revision_rows(&self, id: RequirementId) -> Vec<RequirementRevision> {
+        let mut rows: Vec<RequirementRevision> = self
+            .requirement_revisions
+            .iter()
+            .filter(|row| row.requirement_id == id)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| row.version);
+        rows
+    }
+
+    /// An item's live citations, each joined to its requirement as it is now, in
+    /// `(area_code, number, kind)` order.
+    fn item_citations(&self, item: ItemId) -> Vec<ItemCitation> {
+        let mut rows: Vec<ItemCitation> = self
+            .item_requirements
+            .iter()
+            .filter(|row| row.item_id == item && row.deleted_at.is_none())
+            .filter_map(|row| {
+                let requirement = self.requirements.get(&row.requirement_id)?;
+                Some(ItemCitation {
+                    requirement: requirement.clone(),
+                    kind: row.kind,
+                    requirement_version: row.requirement_version,
+                    proposed_by_step_id: row.proposed_by_step_id,
+                    suspect: requirement.makes_suspect(row.requirement_version),
+                })
+            })
+            .collect();
+        rows.sort_by(|left, right| {
+            left.requirement
+                .area_code
+                .cmp(&right.requirement.area_code)
+                .then_with(|| left.requirement.number.cmp(&right.requirement.number))
+                .then_with(|| left.kind.as_str().cmp(right.kind.as_str()))
+        });
+        rows
+    }
+
+    /// A requirement's live citations, each with its item's status and resolution, in
+    /// `(key_prefix, key_number, item id, kind)` order.
+    fn coverage_rows(&self, requirement: RequirementId) -> Vec<CoverageRow> {
+        let Some(head) = self.requirements.get(&requirement) else {
+            return Vec::new();
+        };
+        let mut rows: Vec<(&Item, CoverageRow)> = self
+            .item_requirements
+            .iter()
+            .filter(|row| row.requirement_id == requirement && row.deleted_at.is_none())
+            .filter_map(|row| {
+                let item = self.items.get(&row.item_id)?;
+                Some((
+                    item,
+                    CoverageRow {
+                        item: item.summary(),
+                        kind: row.kind,
+                        resolution: item.resolution,
+                        requirement_version: row.requirement_version,
+                        suspect: head.makes_suspect(row.requirement_version),
+                    },
+                ))
+            })
+            .collect();
+        rows.sort_by(|(left_item, left), (right_item, right)| {
+            left_item
+                .key_prefix
+                .cmp(&right_item.key_prefix)
+                .then_with(|| left_item.key_number.cmp(&right_item.key_number))
+                .then_with(|| left_item.id.cmp(&right_item.id))
+                .then_with(|| left.kind.as_str().cmp(right.kind.as_str()))
+        });
+        rows.into_iter().map(|(_, row)| row).collect()
+    }
+
+    /// `requirement_revision.box_id` / `NewRequirement::box_id` must name a `box` row, if any.
+    fn require_revision_box(&self, box_id: Option<BoxId>) -> Result<()> {
+        match box_id {
+            Some(box_id) if !self.boxes.contains_key(&box_id) => Err(StoreError::Constraint(
+                references_no_row("requirement_revision.box_id", box_id, "box"),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Compare-and-set on `requirement_spec.version` (plan D9). `None` creates the header only
+    /// where there is none; a token that matches no stored row is `Stale` with the row as it is.
+    fn set_requirement_spec(
+        &mut self,
+        project: ProjectId,
+        expected_version: Option<i32>,
+        owner_id: UserId,
+        preamble: String,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<RequirementSpec>> {
+        match (self.requirement_specs.get(&project), expected_version) {
+            (Some(row), Some(version)) if row.version == version => {}
+            (Some(row), _) => return Ok(CasOutcome::Stale(row.clone())),
+            (None, Some(_)) => {
+                return Err(StoreError::NotFound {
+                    entity: "requirement_spec",
+                    id: project.to_string(),
+                });
+            }
+            (None, None) => {
+                if !self.projects.contains_key(&project) {
+                    return Err(StoreError::Constraint(references_no_row(
+                        "requirement_spec.project_id",
+                        project,
+                        "project",
+                    )));
+                }
+            }
+        }
+        self.require_user(owner_id, "requirement_spec.owner_id")?;
+
+        let row = self
+            .requirement_specs
+            .entry(project)
+            .and_modify(|row| row.version += 1)
+            .or_insert_with(|| RequirementSpec {
+                project_id: project,
+                owner_id,
+                preamble: String::new(),
+                version: 1,
+                updated_at: now,
+            });
+        row.owner_id = owner_id;
+        row.preamble = preamble;
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// One `requirement_area`; the code CHECK is decided first, in [`invalid_area_code`]'s words.
+    fn create_requirement_area(
+        &mut self,
+        new: NewRequirementArea,
+        now: DateTime<Utc>,
+    ) -> Result<RequirementArea> {
+        if !RequirementArea::code_is_valid(&new.code) {
+            return Err(StoreError::Constraint(invalid_area_code(&new.code)));
+        }
+        if !self.projects.contains_key(&new.project_id) {
+            return Err(StoreError::Constraint(references_no_row(
+                "requirement_area.project_id",
+                new.project_id,
+                "project",
+            )));
+        }
+        if self.requirement_areas.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists(
+                "requirement_area",
+                new.id,
+            )));
+        }
+        if self
+            .requirement_areas
+            .values()
+            .any(|row| row.project_id == new.project_id && row.code == new.code)
+        {
+            return Err(StoreError::Constraint(already_exists(
+                "requirement_area.code",
+                &new.code,
+            )));
+        }
+        let row = RequirementArea {
+            id: new.id,
+            project_id: new.project_id,
+            code: new.code,
+            title: new.title,
+            description: new.description,
+            position: new.position,
+            updated_at: now,
+        };
+        self.requirement_areas.insert(row.id, row.clone());
+        Ok(row)
+    }
+
+    /// Mints a requirement: counter upsert, key assembly and revision 1 in one lock (plan D8), as
+    /// [`State::mint`] does for an item. Every refusal runs before the counter moves.
+    fn mint_requirement(
+        &mut self,
+        area: RequirementAreaId,
+        new: NewRequirement,
+        now: DateTime<Utc>,
+    ) -> Result<Requirement> {
+        let area_row = self
+            .requirement_areas
+            .get(&area)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "requirement_area",
+                id: area.to_string(),
+            })?;
+        if self.requirements.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists(
+                "requirement",
+                new.id,
+            )));
+        }
+        self.require_user(new.created_by, "requirement.created_by")?;
+        self.require_revision_box(new.box_id)?;
+
+        let project_id = area_row.project_id;
+        let area_code = area_row.code.clone();
+        let counter = self.requirement_key_counter.entry(area).or_insert(0);
+        *counter += 1;
+        let number = *counter;
+
+        let row = Requirement {
+            id: new.id,
+            project_id,
+            area_id: area,
+            key: format!("R-{area_code}-{number}"),
+            area_code,
+            number,
+            body: new.body,
+            rationale: new.rationale,
+            priority: new.priority,
+            state: RequirementState::Active,
+            version: 1,
+            created_by: new.created_by,
+            created_at: now,
+            updated_at: now,
+        };
+        self.requirement_revisions.push(RequirementRevision {
+            requirement_id: row.id,
+            version: 1,
+            body: row.body.clone(),
+            rationale: row.rationale.clone(),
+            priority: row.priority,
+            state: row.state,
+            author_id: new.created_by,
+            box_id: new.box_id,
+            reason: "created".to_owned(),
+            amended_by_item_id: None,
+            created_at: now,
+        });
+        self.requirements.insert(row.id, row.clone());
+        Ok(row)
+    }
+
+    /// The amend and the withdraw, which differ only in the citation the deciding item gets: a
+    /// `withdraws` one also moves the row to `withdrawn` (PRD D3, plan D10).
+    ///
+    /// Checked NotFound, divergence, Constraint, and only then written: the row at `version + 1`,
+    /// its revision naming the deciding item, and that item's citation at the new version.
+    fn revise_requirement(
+        &mut self,
+        id: RequirementId,
+        expected_version: i32,
+        patch: RequirementPatch,
+        decided_by: (ItemId, CitationKind),
+        now: DateTime<Utc>,
+    ) -> Result<RequirementUpdate> {
+        let (item, kind) = decided_by;
+        let head = self
+            .requirements
+            .get(&id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "requirement",
+                id: id.to_string(),
+            })?;
+        if head.version != expected_version {
+            let ancestor = self
+                .requirement_revisions
+                .iter()
+                .find(|row| row.requirement_id == id && row.version == expected_version)
+                .cloned()
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "requirement_revision",
+                    id: format!("{id}@{expected_version}"),
+                })?;
+            return Ok(RequirementUpdate::Diverged {
+                head: head.clone(),
+                ancestor,
+            });
+        }
+        if head.state == RequirementState::Withdrawn {
+            return Err(StoreError::Constraint(requirement_withdrawn(&head.key)));
+        }
+        if !self.items.contains_key(&item) {
+            return Err(StoreError::Constraint(references_no_row(
+                "requirement_revision.amended_by_item_id",
+                item,
+                "item",
+            )));
+        }
+        self.require_user(patch.author_id, "requirement_revision.author_id")?;
+        self.require_revision_box(patch.box_id)?;
+
+        let row = self
+            .requirements
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock");
+        if let Some(body) = patch.body {
+            row.body = body;
+        }
+        if let Some(rationale) = patch.rationale {
+            row.rationale = rationale;
+        }
+        if let Some(priority) = patch.priority {
+            row.priority = priority;
+        }
+        if kind == CitationKind::Withdraws {
+            row.state = RequirementState::Withdrawn;
+        }
+        row.version += 1;
+        row.updated_at = now;
+        let head = row.clone();
+
+        self.requirement_revisions.push(RequirementRevision {
+            requirement_id: id,
+            version: head.version,
+            body: head.body.clone(),
+            rationale: head.rationale.clone(),
+            priority: head.priority,
+            state: head.state,
+            author_id: patch.author_id,
+            box_id: patch.box_id,
+            reason: patch.reason,
+            amended_by_item_id: Some(item),
+            created_at: now,
+        });
+        self.upsert_citation(item, id, kind, head.version, now);
+        Ok(RequirementUpdate::Updated(head))
+    }
+
+    /// `INSERT ... ON CONFLICT (item_id, requirement_id, kind) DO UPDATE`: the row stamped at
+    /// `stamp` and live, a tombstone revived. A new row has no proposing step; an existing one
+    /// keeps its own, which [`State::cite`] alone overwrites.
+    fn upsert_citation(
+        &mut self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+        stamp: i32,
+        now: DateTime<Utc>,
+    ) -> &mut ItemRequirement {
+        let at = match self.item_requirements.iter().position(|row| {
+            row.item_id == item && row.requirement_id == requirement && row.kind == kind
+        }) {
+            Some(at) => at,
+            None => {
+                self.item_requirements.push(ItemRequirement {
+                    item_id: item,
+                    requirement_id: requirement,
+                    kind,
+                    requirement_version: stamp,
+                    proposed_by_step_id: None,
+                    created_at: now,
+                    updated_at: now,
+                    deleted_at: None,
+                });
+                self.item_requirements.len() - 1
+            }
+        };
+        let row = &mut self.item_requirements[at];
+        row.requirement_version = stamp;
+        row.deleted_at = None;
+        row.updated_at = now;
+        row
+    }
+
+    /// The live citation of a triple, or the `NotFound` naming it that `uncite` and `reconfirm`
+    /// answer (plan D10).
+    fn live_citation_mut(
+        &mut self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+    ) -> Result<&mut ItemRequirement> {
+        self.item_requirements
+            .iter_mut()
+            .find(|row| {
+                row.item_id == item
+                    && row.requirement_id == requirement
+                    && row.kind == kind
+                    && row.deleted_at.is_none()
+            })
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "item_requirement",
+                id: citation_key(item, requirement, kind),
+            })
+    }
+
+    /// Plan D10's upsert, stamped at the requirement's current version. Refusals run item,
+    /// requirement, withdrawn, step.
+    fn cite(
+        &mut self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+        proposed_by: Option<StepId>,
+        now: DateTime<Utc>,
+    ) -> Result<ItemRequirement> {
+        self.require_item(item)?;
+        let head = self
+            .requirements
+            .get(&requirement)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "requirement",
+                id: requirement.to_string(),
+            })?;
+        if head.state == RequirementState::Withdrawn
+            && matches!(kind, CitationKind::Addresses | CitationKind::Reserves)
+        {
+            return Err(StoreError::Constraint(withdrawn_requirement_cited(
+                &head.key, kind,
+            )));
+        }
+        if let Some(step) = proposed_by
+            && !self.steps.contains_key(&step)
+        {
+            return Err(StoreError::Constraint(references_no_row(
+                "item_requirement.proposed_by_step_id",
+                step,
+                "run_step",
+            )));
+        }
+        let stamp = head.version;
+        let row = self.upsert_citation(item, requirement, kind, stamp, now);
+        row.proposed_by_step_id = proposed_by;
+        Ok(row.clone())
+    }
+
+    /// Tombstones a live citation.
+    fn uncite(
+        &mut self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let row = self.live_citation_mut(item, requirement, kind)?;
+        row.deleted_at = Some(now);
+        row.updated_at = now;
+        Ok(())
+    }
+
+    /// Re-stamps a live citation at the requirement's current version, clearing suspect.
+    /// Refusals run citation, then withdrawn: an `addresses` / `reserves` citation of a withdrawn
+    /// requirement is not re-stamped, as `cite` would not stamp it (plan D10).
+    fn reconfirm(
+        &mut self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+        now: DateTime<Utc>,
+    ) -> Result<ItemRequirement> {
+        self.live_citation_mut(item, requirement, kind)?;
+        // A live citation's requirement exists (`ON DELETE CASCADE`), so a missing one can only
+        // mean a missing citation, which the lookup above reports.
+        let head = self.requirements.get(&requirement);
+        if let Some(head) = head
+            && head.state == RequirementState::Withdrawn
+            && matches!(kind, CitationKind::Addresses | CitationKind::Reserves)
+        {
+            return Err(StoreError::Constraint(withdrawn_requirement_cited(
+                &head.key, kind,
+            )));
+        }
+        let stamp = head.map(|row| row.version);
+        let row = self.live_citation_mut(item, requirement, kind)?;
+        if let Some(stamp) = stamp {
+            row.requirement_version = stamp;
+        }
+        row.updated_at = now;
+        Ok(row.clone())
+    }
 }
 
 /// The rows a project delete takes, identified once by [`State::project_reach`] so the report and
@@ -4356,6 +5024,10 @@ struct ProjectReach {
     phases: HashSet<PhaseId>,
     /// `repo` ids of the project.
     repos: HashSet<RepoId>,
+    /// `requirement_area` ids of the project (MOD-38).
+    requirement_areas: HashSet<RequirementAreaId>,
+    /// `requirement` ids of the project.
+    requirements: HashSet<RequirementId>,
 }
 
 /// A row count as the `u64` [`DeleteReach`] holds, saturating rather than casting: `usize` is
@@ -4472,6 +5144,43 @@ impl ReadStore for MemStore {
         kinds: &[String],
     ) -> Result<Vec<ResolvedInput>> {
         Ok(self.read(|state| state.resolve_inputs(item, run, kinds)))
+    }
+
+    // ---- ANA-11 §5.1 (MOD-38): requirements. Total, as the run reads above are ----
+
+    async fn requirement_spec(&self, project: ProjectId) -> Result<Option<RequirementSpec>> {
+        Ok(self.read(|state| state.requirement_specs.get(&project).cloned()))
+    }
+
+    async fn requirement_areas(&self, project: ProjectId) -> Result<Vec<RequirementArea>> {
+        Ok(self.read(|state| state.requirement_area_rows(project)))
+    }
+
+    async fn requirements(
+        &self,
+        project: ProjectId,
+        filter: &RequirementFilter,
+    ) -> Result<Vec<Requirement>> {
+        Ok(self.read(|state| state.requirement_rows(project, filter)))
+    }
+
+    async fn requirement(&self, id: RequirementId) -> Result<Option<Requirement>> {
+        Ok(self.read(|state| state.requirements.get(&id).cloned()))
+    }
+
+    async fn requirement_revisions(
+        &self,
+        id: RequirementId,
+    ) -> Result<Option<Vec<RequirementRevision>>> {
+        Ok(Some(self.read(|state| state.requirement_revision_rows(id))))
+    }
+
+    async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {
+        Ok(self.read(|state| state.item_citations(item)))
+    }
+
+    async fn requirement_coverage(&self, requirement: RequirementId) -> Result<Vec<CoverageRow>> {
+        Ok(self.read(|state| state.coverage_rows(requirement)))
     }
 }
 
@@ -4764,7 +5473,8 @@ impl WriteStore for MemStore {
     }
 
     async fn delete_project(&self, id: ProjectId) -> Result<DeleteReach> {
-        self.write(|state| state.delete_project(id))
+        let now = Utc::now();
+        self.write(|state| state.delete_project(id, now))
     }
 
     // MOD-4 milestones 1 and 2, in ANA-2 §8's order. `create_run`, `claim_run`, `select_fanout`,
@@ -4936,15 +5646,121 @@ impl WriteStore for MemStore {
     async fn close_out(
         &self,
         item: ItemId,
+        resolution: Resolution,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document> {
         let now = Utc::now();
-        self.write(|state| state.close_out(item, summary, commits, now))
+        self.write(|state| state.close_out(item, resolution, summary, commits, now))
     }
 
     async fn add_note(&self, note: NewNote) -> Result<Note> {
         self.write(|state| state.add_note(note))
+    }
+
+    // ---- ANA-11 §5.1 (MOD-38): requirements and citations, one `write` closure each ----
+
+    async fn set_requirement_spec(
+        &self,
+        project: ProjectId,
+        expected_version: Option<i32>,
+        owner_id: UserId,
+        preamble: String,
+    ) -> Result<CasOutcome<RequirementSpec>> {
+        let now = Utc::now();
+        self.write(|state| {
+            state.set_requirement_spec(project, expected_version, owner_id, preamble, now)
+        })
+    }
+
+    async fn create_requirement_area(&self, new: NewRequirementArea) -> Result<RequirementArea> {
+        let now = Utc::now();
+        self.write(|state| state.create_requirement_area(new, now))
+    }
+
+    async fn mint_requirement(
+        &self,
+        area: RequirementAreaId,
+        new: NewRequirement,
+    ) -> Result<Requirement> {
+        let now = Utc::now();
+        self.write(|state| state.mint_requirement(area, new, now))
+    }
+
+    async fn amend_requirement(
+        &self,
+        id: RequirementId,
+        expected_version: i32,
+        patch: RequirementPatch,
+        amended_by: ItemId,
+    ) -> Result<RequirementUpdate> {
+        let now = Utc::now();
+        self.write(|state| {
+            state.revise_requirement(
+                id,
+                expected_version,
+                patch,
+                (amended_by, CitationKind::Amends),
+                now,
+            )
+        })
+    }
+
+    async fn withdraw_requirement(
+        &self,
+        id: RequirementId,
+        expected_version: i32,
+        withdrawn_by: ItemId,
+        author_id: UserId,
+        box_id: Option<BoxId>,
+    ) -> Result<RequirementUpdate> {
+        let now = Utc::now();
+        let patch = RequirementPatch {
+            author_id,
+            box_id,
+            reason: "withdrawn".to_owned(),
+            ..RequirementPatch::default()
+        };
+        self.write(|state| {
+            state.revise_requirement(
+                id,
+                expected_version,
+                patch,
+                (withdrawn_by, CitationKind::Withdraws),
+                now,
+            )
+        })
+    }
+
+    async fn cite(
+        &self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+        proposed_by: Option<StepId>,
+    ) -> Result<ItemRequirement> {
+        let now = Utc::now();
+        self.write(|state| state.cite(item, requirement, kind, proposed_by, now))
+    }
+
+    async fn uncite(
+        &self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+    ) -> Result<()> {
+        let now = Utc::now();
+        self.write(|state| state.uncite(item, requirement, kind, now))
+    }
+
+    async fn reconfirm(
+        &self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+    ) -> Result<ItemRequirement> {
+        let now = Utc::now();
+        self.write(|state| state.reconfirm(item, requirement, kind, now))
     }
 }
 
@@ -4953,11 +5769,13 @@ mod tests {
     use super::MemStore;
     use crate::fixtures::ids;
     use crate::model::{
-        AgentBox, AgentId, BoxId, BoxProbe, ChatRunSpec, Claim, DocumentId, GateOutcome,
-        GraphSnapshot, Isolation, ItemId, ItemKindPatch, NewDocument, NewItem, NewNote, NewProject,
-        NewRepo, NewRun, NewRunStep, NoteId, OverlapRule, ProbedTool, ProjectId, RepoId, RunId,
-        RunKind, RunMode, RunStatus, RunStepCommit, RunStepTree, Scope, SnapshotGraph,
-        SnapshotSettings, Status, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
+        AgentBox, AgentId, BoxId, BoxProbe, ChatRunSpec, CitationKind, Claim, DocumentId,
+        GateOutcome, GraphSnapshot, Isolation, ItemId, ItemKindPatch, NewDocument, NewItem,
+        NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
+        NoteId, OverlapRule, Priority, ProbedTool, ProjectId, RepoId, RequirementAreaId,
+        RequirementId, RequirementPatch, RequirementUpdate, Resolution, RunId, RunKind, RunMode,
+        RunStatus, RunStepCommit, RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status,
+        StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -6113,6 +6931,40 @@ mod tests {
                     .all(|row| state.repos.contains_key(&row.repo_id)),
                 "every surviving repo path has a surviving repo"
             );
+            // MOD-38 blueprint §4.4: the six requirement tables go with the project too.
+            assert!(
+                !state.requirement_specs.contains_key(&gone)
+                    && state
+                        .requirement_areas
+                        .values()
+                        .all(|row| row.project_id != gone)
+                    && state
+                        .requirements
+                        .values()
+                        .all(|row| row.project_id != gone),
+                "requirement_spec, requirement_area and requirement"
+            );
+            assert!(
+                state
+                    .requirement_key_counter
+                    .keys()
+                    .all(|area| state.requirement_areas.contains_key(area)),
+                "every surviving requirement counter has a surviving area"
+            );
+            assert!(
+                state
+                    .requirement_revisions
+                    .iter()
+                    .all(|row| state.requirements.contains_key(&row.requirement_id)),
+                "every surviving requirement revision has a surviving requirement"
+            );
+            assert!(
+                state.item_requirements.iter().all(|row| {
+                    state.items.contains_key(&row.item_id)
+                        && state.requirements.contains_key(&row.requirement_id)
+                }),
+                "every surviving citation has both ends, tombstones included"
+            );
 
             // …and what a project delete is not: the workspace, its sibling projects, and every
             // table `0001_init.sql` does not cascade from `project`.
@@ -6135,6 +6987,164 @@ mod tests {
                 "skill, skill_version, app_user, box, box_tool and agent are not below a project"
             );
         });
+    }
+
+    /// MOD-38 blueprint §4.4: a revision in a surviving project that names a deleted item as its
+    /// deciding item keeps the row and loses the reference, as `ON DELETE SET NULL` does on
+    /// `requirement_revision.amended_by_item_id`; the deciding item's own citation goes with it.
+    #[tokio::test]
+    async fn delete_project_nulls_a_surviving_revisions_deciding_item() {
+        let store = MemStore::demo();
+        let area = store
+            .create_requirement_area(NewRequirementArea {
+                id: RequirementAreaId::new(),
+                project_id: ids::PROJECT_AGY,
+                code: "API".to_owned(),
+                title: "API".to_owned(),
+                description: String::new(),
+                position: 0,
+            })
+            .await
+            .expect("agy takes an area");
+        let minted = store
+            .mint_requirement(
+                area.id,
+                NewRequirement {
+                    id: RequirementId::new(),
+                    body: "Decided in another project.".to_owned(),
+                    rationale: String::new(),
+                    priority: Priority::Must,
+                    created_by: ids::USER,
+                    box_id: None,
+                },
+            )
+            .await
+            .expect("the mint lands");
+        let amended = store
+            .amend_requirement(
+                minted.id,
+                1,
+                RequirementPatch {
+                    body: Some("Amended by htui:FEAT-3.".to_owned()),
+                    author_id: ids::USER,
+                    reason: "amended".to_owned(),
+                    ..RequirementPatch::default()
+                },
+                ids::HTUI_FEAT_3,
+            )
+            .await
+            .expect("the amend lands");
+        assert!(
+            matches!(amended, RequirementUpdate::Updated(ref row) if row.version == 2),
+            "precondition: {amended:?}"
+        );
+
+        let report = store
+            .delete_project(ids::PROJECT_HTUI)
+            .await
+            .expect("the delete lands");
+        assert_eq!(
+            report.item_requirements, 6,
+            "the fixture's five citations plus FEAT-3's `amends` of the agy requirement"
+        );
+
+        let revisions = store
+            .requirement_revisions(minted.id)
+            .await
+            .expect("a read")
+            .expect("MemStore keeps revisions");
+        assert_eq!(
+            revisions
+                .iter()
+                .map(|row| (row.version, row.amended_by_item_id))
+                .collect::<Vec<_>>(),
+            vec![(1, None), (2, None)],
+            "revision 2 survives, and no longer names the deleted item"
+        );
+        assert_eq!(
+            store
+                .requirement(minted.id)
+                .await
+                .expect("a read")
+                .map(|row| row.version),
+            Some(2),
+            "the agy requirement itself is untouched"
+        );
+        assert_eq!(
+            store.requirement_coverage(minted.id).await.expect("a read"),
+            Vec::new(),
+            "the deleted item's citation went with it"
+        );
+    }
+
+    /// MOD-38: a citation between two surviving rows keeps itself and loses a proposing step of
+    /// the deleted project, as `ON DELETE SET NULL` does on
+    /// `item_requirement.proposed_by_step_id`, whose UPDATE also moves `updated_at`.
+    #[tokio::test]
+    async fn delete_project_nulls_a_surviving_citations_proposing_step() {
+        let store = MemStore::demo();
+        let area = store
+            .create_requirement_area(NewRequirementArea {
+                id: RequirementAreaId::new(),
+                project_id: ids::PROJECT_AGY,
+                code: "API".to_owned(),
+                title: "API".to_owned(),
+                description: String::new(),
+                position: 0,
+            })
+            .await
+            .expect("agy takes an area");
+        let minted = store
+            .mint_requirement(
+                area.id,
+                NewRequirement {
+                    id: RequirementId::new(),
+                    body: "Proposed by an htui step.".to_owned(),
+                    rationale: String::new(),
+                    priority: Priority::Must,
+                    created_by: ids::USER,
+                    box_id: None,
+                },
+            )
+            .await
+            .expect("the mint lands");
+        let cited = store
+            .cite(
+                ids::AGY_FEAT_1,
+                minted.id,
+                CitationKind::Addresses,
+                Some(ids::STEP_IMPL),
+            )
+            .await
+            .expect("the cite lands");
+        assert_eq!(
+            cited.proposed_by_step_id,
+            Some(ids::STEP_IMPL),
+            "precondition"
+        );
+
+        store
+            .delete_project(ids::PROJECT_HTUI)
+            .await
+            .expect("the delete lands");
+
+        let row = store
+            .write(|state| {
+                state
+                    .item_requirements
+                    .iter()
+                    .find(|row| row.item_id == ids::AGY_FEAT_1 && row.requirement_id == minted.id)
+                    .cloned()
+            })
+            .expect("the agy citation survives");
+        assert_eq!(
+            row.proposed_by_step_id, None,
+            "the citation no longer names the deleted step"
+        );
+        assert!(
+            row.updated_at > cited.updated_at,
+            "the SET NULL moved updated_at, as the Postgres trigger does"
+        );
     }
 
     /// A fresh project, authored by the fixture user, with the slug the test names.
@@ -7480,7 +8490,12 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .close_out(ids::HTUI_FEAT_3, summary(ids::HTUI_FEAT_3, "summary"), &[])
+                    .close_out(
+                        ids::HTUI_FEAT_3,
+                        Resolution::Withdrawn,
+                        summary(ids::HTUI_FEAT_3, "summary"),
+                        &[]
+                    )
                     .await,
                 Err(StoreError::Constraint(_))
             ),
@@ -7489,7 +8504,12 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .close_out(ids::HTUI_FEAT_1, summary(ids::HTUI_FEAT_1, "plan"), &[])
+                    .close_out(
+                        ids::HTUI_FEAT_1,
+                        Resolution::Done,
+                        summary(ids::HTUI_FEAT_1, "plan"),
+                        &[]
+                    )
                     .await,
                 Err(StoreError::Constraint(_))
             ),
@@ -7498,7 +8518,12 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .close_out(ids::HTUI_FEAT_1, summary(ids::HTUI_ANA_2, "summary"), &[])
+                    .close_out(
+                        ids::HTUI_FEAT_1,
+                        Resolution::Done,
+                        summary(ids::HTUI_ANA_2, "summary"),
+                        &[]
+                    )
                     .await,
                 Err(StoreError::Constraint(_))
             ),
@@ -7507,15 +8532,25 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .close_out(ids::HTUI_ANA_2, summary(ids::HTUI_ANA_2, "summary"), &[])
+                    .close_out(
+                        ids::HTUI_ANA_2,
+                        Resolution::Done,
+                        summary(ids::HTUI_ANA_2, "summary"),
+                        &[]
+                    )
                     .await,
                 Err(StoreError::Constraint(_))
             ),
-            "open does not reach closed (ANA-2 §4.3)"
+            "open does not close as done (ANA-11 §4.2)"
         );
         assert!(matches!(
             store
-                .close_out(ItemId::new(), summary(ItemId::new(), "summary"), &[])
+                .close_out(
+                    ItemId::new(),
+                    Resolution::Withdrawn,
+                    summary(ItemId::new(), "summary"),
+                    &[]
+                )
                 .await,
             Err(StoreError::NotFound { entity: "item", .. })
         ));
@@ -7536,6 +8571,7 @@ mod tests {
         let written = store
             .close_out(
                 ids::HTUI_FEAT_1,
+                Resolution::Done,
                 summary(ids::HTUI_FEAT_1, "summary"),
                 &commits,
             )
@@ -7548,6 +8584,7 @@ mod tests {
             .expect("the item reads back")
             .expect("it exists");
         assert_eq!(item.status, Status::Closed);
+        assert_eq!(item.resolution, Some(Resolution::Done), "and says why");
         assert!(item.closed_at.is_some(), "closed_at tracks the status");
         assert_eq!(
             store

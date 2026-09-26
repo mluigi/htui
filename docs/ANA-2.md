@@ -519,6 +519,11 @@ session that ended without one.
 
 ### 4.3 Status transitions: item, run, run_step (`R-ENT-8`, `R-ORCH-11`)
 
+> **Amended by MOD-38 (2026-09-25, `docs/decisions/mod/mod-38.md`).** `closed` is no longer a
+> `transition` target: it is reached only through close-out, which takes a resolution. `done` and
+> `concluded` close from `done`; `rejected`, `withdrawn`, `superseded` and `duplicate` also close
+> from `open`, `blocked` or `failed`. The item table below predates this.
+
 **The constraint.** `R-ENT-8` (`docs/REQUIREMENTS.md:91-93`), verbatim:
 
 > "Item status is one of `open`, `queued`, `in_progress`, `awaiting_approval`, `blocked`, `done`,

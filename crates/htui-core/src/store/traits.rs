@@ -31,15 +31,19 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{
-    Agent, AgentBox, AgentId, BoxId, BoxProbe, BoxRecord, ChatRunSpec, Claim, CommandRun, Document,
-    DocumentHead, DocumentId, GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId,
-    ItemKindPatch, ItemPatch, ItemRevision, ItemSummary, LinkGraph, NewCommandRun, NewDocument,
-    NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRun, NewRunStep,
-    NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
-    PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, RepoPatch, ResolvedInput, Run, RunId,
+    Agent, AgentBox, AgentId, BoxId, BoxProbe, BoxRecord, ChatRunSpec, CitationKind, Claim,
+    CommandRun, CoverageRow, Document, DocumentHead, DocumentId, GateOutcome, Item, ItemCitation,
+    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement,
+    ItemRevision, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind,
+    NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
+    NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunId,
     RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status,
     StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
-    UpstreamEntry, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::prompt::template::{TemplateRole, parse};
@@ -181,6 +185,65 @@ pub trait ReadStore: Send + Sync {
         run: RunId,
         kinds: &[String],
     ) -> Result<Vec<ResolvedInput>>;
+
+    // ---- ANA-11 §5.1: requirements (MOD-38) --------------------------------------------------
+
+    /// The project's spec header, or `None` when it has none (mirrored, plan D12).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn requirement_spec(&self, project: ProjectId) -> Result<Option<RequirementSpec>>;
+
+    /// The project's areas in `(position, code)` order, code by bytes; empty for an unknown
+    /// project.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn requirement_areas(&self, project: ProjectId) -> Result<Vec<RequirementArea>>;
+
+    /// The project's requirements matching `filter` (plan D14), in `(area_code, number)` order,
+    /// area_code by bytes. The text filter is a literal substring of `key` or `body`, case-folded
+    /// per backend as [`items`](Self::items)' is ([`RequirementFilter::text`]).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn requirements(
+        &self,
+        project: ProjectId,
+        filter: &RequirementFilter,
+    ) -> Result<Vec<Requirement>>;
+
+    /// One requirement, or `None`.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn requirement(&self, id: RequirementId) -> Result<Option<Requirement>>;
+
+    /// The requirement's revisions in `version` order; `Some(vec![])` for an unknown id on
+    /// `MemStore`/`PgStore`, and `None` = not cached (the mirror holds no revisions, plan D12).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn requirement_revisions(
+        &self,
+        id: RequirementId,
+    ) -> Result<Option<Vec<RequirementRevision>>>;
+
+    /// The item's live citations with `suspect` derived (plan D11), in
+    /// `(requirement.area_code, requirement.number, kind)` order, all by bytes; empty for an
+    /// unknown item.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>>;
+
+    /// The requirement's live citations with each citing item's status and resolution, in
+    /// `(item.key_prefix, item.key_number, item.id, kind)` order, text by bytes; empty for an
+    /// unknown id.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn requirement_coverage(&self, requirement: RequirementId) -> Result<Vec<CoverageRow>>;
 }
 
 /// Everything a write path needs.
@@ -208,7 +271,8 @@ pub trait WriteStore: ReadStore {
     /// An illegal `(from, to)` is [`StoreError::Constraint`](crate::store::StoreError::Constraint)
     /// without an update ([`legal_move`], ANA-2 §4.3); a missing row is
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) first (plan D14). A stale
-    /// `from` on a legal pair is still `Ok(false)`.
+    /// `from` on a legal pair is still `Ok(false)`. `to = closed` is refused from every status
+    /// (MOD-38 PRD D1); use [`close_out`](WriteStore::close_out).
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool>;
 
     /// Appends session events, skipping any `(run_step_id, seq)` already stored, and answers how
@@ -1073,8 +1137,12 @@ pub trait WriteStore: ReadStore {
     ) -> Result<()>;
 
     /// `R-TUI-9`'s three effects, one transaction (plan D6): the summary document at its next
-    /// version, the commits upserted, the item moved to `closed` under the law with `closed_at`
-    /// set. Refused while any run of the item is active.
+    /// version, the commits upserted, and the item set to `closed` with `resolution` and
+    /// `closed_at`. Close-out is the **only** way into `closed` (MOD-38 PRD D1; it amends ANA-2
+    /// §4.3); its law is [`Resolution::closes_from`], not [`legal_move`], so an `open` item closes
+    /// as one of the four non-success resolutions (ANA-11 §4.2). Refused while any run of the item
+    /// is active. Guard order: NotFound, live run, summary kind, summary item, `closes_from`,
+    /// commit steps.
     ///
     /// # Errors
     /// Its own refusals, plus - because it performs their work - every refusal of
@@ -1084,13 +1152,14 @@ pub trait WriteStore: ReadStore {
     /// `{ entity: "run_step" }` for a commit row naming a step that does not exist;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when a run of the item is
     /// `queued | running | awaiting_approval`, when `summary.kind != "summary"`, when
-    /// `summary.item_id != item`, when the item's status cannot move to `closed` (only `blocked`,
-    /// `failed` and `done` can), when a commit row names an unknown repo, or when the summary
+    /// `summary.item_id != item`, when `!resolution.closes_from(status)`
+    /// ([`resolution_not_closable`]), when a commit row names an unknown repo, or when the summary
     /// duplicates a document id or names an unknown `created_by` / `produced_by_step_id`. Any
     /// refusal writes nothing: every one of these is decided before the first write.
     async fn close_out(
         &self,
         item: ItemId,
+        resolution: Resolution,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document>;
@@ -1101,6 +1170,124 @@ pub trait WriteStore: ReadStore {
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) on an unknown item,
     /// author, box or step (foreign keys) or a duplicate id.
     async fn add_note(&self, note: NewNote) -> Result<Note>;
+
+    // ---- ANA-11 §5.1: requirements and citations (MOD-38) ------------------------------------
+
+    /// Compare-and-set write of the spec header (plan D9): `expected_version: None` inserts
+    /// version 1 when the project has no header, `Some(v)` updates the header at `v` to `v + 1`.
+    /// A token that does not match the stored row (including `None` when a row exists) is
+    /// `Ok(Stale(row as it is))`.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound)
+    /// `{ entity: "requirement_spec" }` for `Some(_)` with no header;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for an unknown project or
+    /// owner.
+    async fn set_requirement_spec(
+        &self,
+        project: ProjectId,
+        expected_version: Option<i32>,
+        owner_id: UserId,
+        preamble: String,
+    ) -> Result<CasOutcome<RequirementSpec>>;
+
+    /// Inserts one `requirement_area`.
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a code outside
+    /// `^[A-Z][A-Z0-9]{1,15}$` ([`invalid_area_code`]), a code the project already has, a
+    /// duplicate id or an unknown project.
+    async fn create_requirement_area(&self, new: NewRequirementArea) -> Result<RequirementArea>;
+
+    /// Mints the area's next number, the requirement and its revision 1 (`reason = "created"`)
+    /// in one statement; a refused mint consumes no number (plan D8).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound)
+    /// `{ entity: "requirement_area" }` for an unknown area;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a duplicate id or a
+    /// `created_by` / `box_id` that names no row.
+    async fn mint_requirement(
+        &self,
+        area: RequirementAreaId,
+        new: NewRequirement,
+    ) -> Result<Requirement>;
+
+    /// Compare-and-set amend, one transaction (PRD D3): the row at `version + 1`, its revision
+    /// with `amended_by_item_id = amended_by`, and `amended_by`'s `amends` citation upserted at the
+    /// new version (a tombstone revived). Checked in the order NotFound, divergence, Constraint.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "requirement" }`;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a withdrawn
+    /// requirement ([`requirement_withdrawn`]) or an `amended_by` / author / box that names no
+    /// row.
+    async fn amend_requirement(
+        &self,
+        id: RequirementId,
+        expected_version: i32,
+        patch: RequirementPatch,
+        amended_by: ItemId,
+    ) -> Result<RequirementUpdate>;
+
+    /// [`amend_requirement`](WriteStore::amend_requirement) for `state = withdrawn`: revision
+    /// `reason = "withdrawn"`, and `withdrawn_by`'s `withdraws` citation at the new version.
+    ///
+    /// # Errors
+    /// As [`amend_requirement`](WriteStore::amend_requirement), an already-withdrawn requirement
+    /// included.
+    async fn withdraw_requirement(
+        &self,
+        id: RequirementId,
+        expected_version: i32,
+        withdrawn_by: ItemId,
+        author_id: UserId,
+        box_id: Option<BoxId>,
+    ) -> Result<RequirementUpdate>;
+
+    /// Upserts a live citation stamped at the requirement's current version, reviving a tombstone
+    /// and overwriting `proposed_by_step_id` (plan D10).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `"item"` then
+    /// `"requirement"`; [`StoreError::Constraint`](crate::store::StoreError::Constraint) for
+    /// `addresses`/`reserves` of a withdrawn requirement ([`withdrawn_requirement_cited`]) or an
+    /// unknown step.
+    async fn cite(
+        &self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+        proposed_by: Option<StepId>,
+    ) -> Result<ItemRequirement>;
+
+    /// Tombstones a live citation (`deleted_at = now`).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound)
+    /// `{ entity: "item_requirement", id: citation_key(..) }` ([`citation_key`]) when no live row
+    /// matches.
+    async fn uncite(
+        &self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+    ) -> Result<()>;
+
+    /// Re-stamps a live citation at the requirement's current version, clearing `suspect`.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound)
+    /// `{ entity: "item_requirement", id: citation_key(..) }` ([`citation_key`]) when no live row
+    /// matches; then [`StoreError::Constraint`](crate::store::StoreError::Constraint) for
+    /// `addresses`/`reserves` of a withdrawn requirement ([`withdrawn_requirement_cited`]), as
+    /// [`cite`](Self::cite) refuses it (plan D10).
+    async fn reconfirm(
+        &self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+    ) -> Result<ItemRequirement>;
 }
 
 /// The `run_step.status` a terminal [`RunStatus`] closes a chat step with, or `None` when the
@@ -1315,6 +1502,38 @@ pub fn summary_names_another_item(item: ItemId, named: ItemId) -> String {
     format!("the summary of {item} cannot name item {named}")
 }
 
+// ---- MOD-38: ANA-11's refusals ----
+
+/// ANA-11 §4.2: the close-out law refuses this pair (T3).
+#[must_use]
+pub fn resolution_not_closable(item: ItemId, status: Status, resolution: Resolution) -> String {
+    format!("item {item} is `{status}`; it cannot close as `{resolution}` (ANA-11 §4.2)")
+}
+
+/// Plan D10: a withdrawn requirement is not amended or withdrawn again (T6).
+#[must_use]
+pub fn requirement_withdrawn(key: &str) -> String {
+    format!("requirement {key} is withdrawn")
+}
+
+/// Plan D10: a withdrawn requirement takes no new `addresses` / `reserves` citation (T6).
+#[must_use]
+pub fn withdrawn_requirement_cited(key: &str, kind: CitationKind) -> String {
+    format!("requirement {key} is withdrawn; it takes no new `{kind}` citation")
+}
+
+/// The `requirement_area.code` CHECK, in words; both stores check it before the insert (T6).
+#[must_use]
+pub fn invalid_area_code(code: &str) -> String {
+    format!("requirement_area.code `{code}` is not `^[A-Z][A-Z0-9]{{1,15}}$`")
+}
+
+/// The `id` of an `item_requirement` `NotFound`: its primary key, `item/requirement/kind` (T6).
+#[must_use]
+pub fn citation_key(item: ItemId, requirement: RequirementId, kind: CitationKind) -> String {
+    format!("{item}/{requirement}/{kind}")
+}
+
 /// §4.5: `select_fanout` takes a winner from the candidates of one `(run, position, attempt)`.
 #[must_use]
 pub fn not_a_fanout_candidate(winner: StepId, run: RunId, position: i32, attempt: i32) -> String {
@@ -1467,7 +1686,8 @@ pub enum DeleteTarget {
 /// callers of the counting code cannot disagree about it. A workspace delete fills
 /// `workspace_links` and `workspace_box_paths` only. `phase_agents` is `0` on `MemStore`, which
 /// holds no such table, and `0` on the demo database, which seeds none; `run_step_commits`,
-/// `run_step_trees` and `command_runs` are counted on both since MOD-4.
+/// `run_step_trees` and `command_runs` are counted on both since MOD-4. MOD-38's six
+/// requirement fields are counted on both stores.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeleteReach {
     /// `workspace_project` rows.
@@ -1519,6 +1739,19 @@ pub struct DeleteReach {
     pub links: u64,
     /// `document` rows.
     pub documents: u64,
+    /// `requirement_spec` rows (0 or 1), MOD-38.
+    pub requirement_specs: u64,
+    /// `requirement_area` rows.
+    pub requirement_areas: u64,
+    /// `requirement_key_counter` rows, which cascade from `requirement_area`.
+    pub requirement_key_counters: u64,
+    /// `requirement` rows.
+    pub requirements: u64,
+    /// `requirement_revision` rows of the project's requirements.
+    pub requirement_revisions: u64,
+    /// `item_requirement` rows whose item **or** requirement is in the project, tombstones
+    /// included: a cross-project citation goes with either end, as `links` does.
+    pub item_requirements: u64,
 }
 
 /// Where a setting lives (D8): an `app_setting` row, one key of `project.settings`, or

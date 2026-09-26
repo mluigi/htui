@@ -20,9 +20,9 @@ use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, BoxId, Claim, CommandRunId, CommandRunStatus, GraphSnapshot,
     Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, NewCommandRun, NewItem,
-    NewProject, NewRepo, NewRun, NewWorkspace, ProjectId, RepoId, RunId, RunMode, RunStatus,
-    RunStepTree, SnapshotGraph, SnapshotSettings, Status, StepId, TIMESTAMPTZ_DIGITS, Transport,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    NewProject, NewRepo, NewRequirement, NewRun, NewWorkspace, Priority, ProjectId, RepoId,
+    RequirementId, RunId, RunMode, RunStatus, RunStepTree, SnapshotGraph, SnapshotSettings, Status,
+    StepId, TIMESTAMPTZ_DIGITS, Transport, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -195,6 +195,65 @@ async fn concurrent_mints_produce_consecutive_numbers() {
         Some(100),
         "the counter ends at the highest number minted"
     );
+
+    db.drop_db().await;
+}
+
+/// §11.2's first clause for `requirement_key_counter` (MOD-38 plan D8, blueprint F9): two
+/// independent pools minting in one area produce consecutive numbers.
+///
+/// The fixture has minted `R-ENT-1` and `R-ENT-2`, so the counter row exists and every mint here
+/// takes the `DO UPDATE` branch of `mint_requirement`'s CTE; its row lock is the only thing
+/// serialising them, exactly as it is for [`concurrent_mints_produce_consecutive_numbers`].
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_requirement_mints_produce_consecutive_numbers() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+
+    let left = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("second pool")
+        .store;
+    let right = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("third pool")
+        .store;
+
+    let mints = join_all((0..100).map(|n| {
+        let store = if n % 2 == 0 { &left } else { &right };
+        let new = NewRequirement {
+            id: RequirementId::new(),
+            body: format!("race {n}"),
+            rationale: String::new(),
+            priority: Priority::Must,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        };
+        async move { store.mint_requirement(ids::AREA_ENT, new).await }
+    }))
+    .await;
+
+    let mut numbers: Vec<i32> = mints
+        .into_iter()
+        .map(|minted| minted.expect("every mint lands").number)
+        .collect();
+    numbers.sort_unstable();
+    assert_eq!(
+        numbers,
+        (3..103).collect::<Vec<i32>>(),
+        "a hundred concurrent mints after the fixture's two are exactly 3..=102: no duplicate, \
+         no gap"
+    );
+    // Runtime-checked, as `rows_of` is: a test's `query!` would need its own `.sqlx` entry.
+    let last = sqlx::query_scalar::<_, i32>(
+        "SELECT last_value FROM requirement_key_counter WHERE area_id = $1",
+    )
+    .bind(ids::AREA_ENT.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read requirement_key_counter");
+    assert_eq!(last, 102, "the counter ends at the highest number minted");
 
     db.drop_db().await;
 }
@@ -550,7 +609,7 @@ async fn status_cas_never_bumps_version() {
 
     assert!(
         !db.store
-            .transition(before.id, Status::Done, Status::Closed)
+            .transition(before.id, Status::Done, Status::Open)
             .await
             .expect("transition must not fail"),
         "a stale `from` is refused rather than applied"
@@ -2466,14 +2525,15 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
 
     /// Every table of PRD D13's chain, paired with the [`DeleteReach`] field that claims it.
     ///
-    /// Twenty-two entries for twenty-two fields: a field added without an entry leaves the struct
-    /// literal below incomplete and the crate does not compile.
+    /// Twenty-eight entries for twenty-eight fields: a field added without an entry leaves the
+    /// struct literal below incomplete and the crate does not compile. MOD-38's six requirement
+    /// tables close the list, in `DeleteReach` field order.
     ///
     /// `TABLES` and `claimed` are zipped **positionally**, so a new name goes where its field sits
     /// in `DeleteReach` and never simply at the end: `run_step_trees` is struct index 16, between
     /// `run_step_commits` and `command_runs`, and appending it to both arrays would compile while
     /// comparing every later field against the wrong table (T1 audit A-3).
-    const TABLES: [&str; 22] = [
+    const TABLES: [&str; 28] = [
         "workspace_project",
         "workspace_box_path",
         "item",
@@ -2496,6 +2556,12 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         "item_revision",
         "item_link",
         "document",
+        "requirement_spec",
+        "requirement_area",
+        "requirement_key_counter",
+        "requirement",
+        "requirement_revision",
+        "item_requirement",
     ];
 
     let mut before = Vec::with_capacity(TABLES.len());
@@ -2535,8 +2601,14 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         revisions,
         links,
         documents,
+        requirement_specs,
+        requirement_areas,
+        requirement_key_counters,
+        requirements,
+        requirement_revisions,
+        item_requirements,
     } = report;
-    let claimed: [u64; 22] = [
+    let claimed: [u64; 28] = [
         workspace_links,
         workspace_box_paths,
         items,
@@ -2559,6 +2631,12 @@ async fn every_cascade_table_loses_exactly_what_the_report_names() {
         revisions,
         links,
         documents,
+        requirement_specs,
+        requirement_areas,
+        requirement_key_counters,
+        requirements,
+        requirement_revisions,
+        item_requirements,
     ];
 
     for ((table, was), says) in TABLES.into_iter().zip(before).zip(claimed) {

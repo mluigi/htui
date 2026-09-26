@@ -33,15 +33,19 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, BoxProbe, BoxRecord, ChatRunSpec, Claim, CommandRun, Document,
-    DocumentHead, DocumentId, GateOutcome, Item, ItemFilter, ItemId, ItemKind, ItemKindId,
-    ItemKindPatch, ItemPatch, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
-    NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRun, NewRunStep, NewStepGraph,
-    NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope,
-    PromptTemplate, Repo, RepoBoxPath, RepoId, RepoPatch, ResolvedInput, Run, RunId, RunStatus,
-    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    Agent, AgentBox, AgentId, BoxId, BoxProbe, BoxRecord, ChatRunSpec, CitationKind, Claim,
+    CommandRun, CoverageRow, Document, DocumentHead, DocumentId, GateOutcome, Item, ItemCitation,
+    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement,
+    ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject,
+    NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
+    NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunId,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
+    UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
@@ -281,6 +285,64 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.resolve_inputs(item, run, kinds).await,
             Self::Online(pg) => pg.resolve_inputs(item, run, kinds).await,
+        }
+    }
+
+    // ---- ANA-11 §5.1: requirements (MOD-38) ----
+
+    async fn requirement_spec(&self, project: ProjectId) -> Result<Option<RequirementSpec>> {
+        match self {
+            Self::Memory(store) => store.requirement_spec(project).await,
+            Self::Online(pg) => pg.requirement_spec(project).await,
+        }
+    }
+
+    async fn requirement_areas(&self, project: ProjectId) -> Result<Vec<RequirementArea>> {
+        match self {
+            Self::Memory(store) => store.requirement_areas(project).await,
+            Self::Online(pg) => pg.requirement_areas(project).await,
+        }
+    }
+
+    async fn requirements(
+        &self,
+        project: ProjectId,
+        filter: &RequirementFilter,
+    ) -> Result<Vec<Requirement>> {
+        match self {
+            Self::Memory(store) => store.requirements(project, filter).await,
+            Self::Online(pg) => pg.requirements(project, filter).await,
+        }
+    }
+
+    async fn requirement(&self, id: RequirementId) -> Result<Option<Requirement>> {
+        match self {
+            Self::Memory(store) => store.requirement(id).await,
+            Self::Online(pg) => pg.requirement(id).await,
+        }
+    }
+
+    async fn requirement_revisions(
+        &self,
+        id: RequirementId,
+    ) -> Result<Option<Vec<RequirementRevision>>> {
+        match self {
+            Self::Memory(store) => store.requirement_revisions(id).await,
+            Self::Online(pg) => pg.requirement_revisions(id).await,
+        }
+    }
+
+    async fn item_requirements(&self, item: ItemId) -> Result<Vec<ItemCitation>> {
+        match self {
+            Self::Memory(store) => store.item_requirements(item).await,
+            Self::Online(pg) => pg.item_requirements(item).await,
+        }
+    }
+
+    async fn requirement_coverage(&self, requirement: RequirementId) -> Result<Vec<CoverageRow>> {
+        match self {
+            Self::Memory(store) => store.requirement_coverage(requirement).await,
+            Self::Online(pg) => pg.requirement_coverage(requirement).await,
         }
     }
 }
@@ -904,12 +966,13 @@ impl WriteStore for Writer {
     async fn close_out(
         &self,
         item: ItemId,
+        resolution: Resolution,
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document> {
         match self {
-            Self::Memory(store) => store.close_out(item, summary, commits).await,
-            Self::Online(pg) => pg.close_out(item, summary, commits).await,
+            Self::Memory(store) => store.close_out(item, resolution, summary, commits).await,
+            Self::Online(pg) => pg.close_out(item, resolution, summary, commits).await,
         }
     }
 
@@ -917,6 +980,124 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.add_note(note).await,
             Self::Online(pg) => pg.add_note(note).await,
+        }
+    }
+
+    // ---- ANA-11 §5.1: requirements and citations (MOD-38) ----
+
+    async fn set_requirement_spec(
+        &self,
+        project: ProjectId,
+        expected_version: Option<i32>,
+        owner_id: UserId,
+        preamble: String,
+    ) -> Result<CasOutcome<RequirementSpec>> {
+        match self {
+            Self::Memory(store) => {
+                store
+                    .set_requirement_spec(project, expected_version, owner_id, preamble)
+                    .await
+            }
+            Self::Online(pg) => {
+                pg.set_requirement_spec(project, expected_version, owner_id, preamble)
+                    .await
+            }
+        }
+    }
+
+    async fn create_requirement_area(&self, new: NewRequirementArea) -> Result<RequirementArea> {
+        match self {
+            Self::Memory(store) => store.create_requirement_area(new).await,
+            Self::Online(pg) => pg.create_requirement_area(new).await,
+        }
+    }
+
+    async fn mint_requirement(
+        &self,
+        area: RequirementAreaId,
+        new: NewRequirement,
+    ) -> Result<Requirement> {
+        match self {
+            Self::Memory(store) => store.mint_requirement(area, new).await,
+            Self::Online(pg) => pg.mint_requirement(area, new).await,
+        }
+    }
+
+    async fn amend_requirement(
+        &self,
+        id: RequirementId,
+        expected_version: i32,
+        patch: RequirementPatch,
+        amended_by: ItemId,
+    ) -> Result<RequirementUpdate> {
+        match self {
+            Self::Memory(store) => {
+                store
+                    .amend_requirement(id, expected_version, patch, amended_by)
+                    .await
+            }
+            Self::Online(pg) => {
+                pg.amend_requirement(id, expected_version, patch, amended_by)
+                    .await
+            }
+        }
+    }
+
+    async fn withdraw_requirement(
+        &self,
+        id: RequirementId,
+        expected_version: i32,
+        withdrawn_by: ItemId,
+        author_id: UserId,
+        box_id: Option<BoxId>,
+    ) -> Result<RequirementUpdate> {
+        match self {
+            Self::Memory(store) => {
+                store
+                    .withdraw_requirement(id, expected_version, withdrawn_by, author_id, box_id)
+                    .await
+            }
+            Self::Online(pg) => {
+                pg.withdraw_requirement(id, expected_version, withdrawn_by, author_id, box_id)
+                    .await
+            }
+        }
+    }
+
+    async fn cite(
+        &self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+        proposed_by: Option<StepId>,
+    ) -> Result<ItemRequirement> {
+        match self {
+            Self::Memory(store) => store.cite(item, requirement, kind, proposed_by).await,
+            Self::Online(pg) => pg.cite(item, requirement, kind, proposed_by).await,
+        }
+    }
+
+    async fn uncite(
+        &self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+    ) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.uncite(item, requirement, kind).await,
+            Self::Online(pg) => pg.uncite(item, requirement, kind).await,
+        }
+    }
+
+    async fn reconfirm(
+        &self,
+        item: ItemId,
+        requirement: RequirementId,
+        kind: CitationKind,
+    ) -> Result<ItemRequirement> {
+        match self {
+            Self::Memory(store) => store.reconfirm(item, requirement, kind).await,
+            Self::Online(pg) => pg.reconfirm(item, requirement, kind).await,
         }
     }
 }

@@ -111,4 +111,8 @@ id_newtype!(
     SkillBindingId,
     /// `command_run.id` (§5.8).
     CommandRunId,
+    /// `requirement_area.id` (ANA-11 §5).
+    RequirementAreaId,
+    /// `requirement.id` (ANA-11 §5).
+    RequirementId,
 );

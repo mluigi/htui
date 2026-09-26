@@ -89,6 +89,7 @@ pub mod link;
 pub mod note;
 pub mod overlap;
 pub mod quota;
+pub mod requirement;
 pub mod run;
 pub mod scope;
 pub mod skill;
@@ -108,10 +109,12 @@ pub use hierarchy::{
 };
 pub use ids::{
     AgentId, BoxId, CommandRunId, DocumentId, ItemId, ItemKindId, NoteId, PhaseId, ProjectId,
-    PromptTemplateId, RepoId, RunId, SkillBindingId, SkillId, StepGraphId, StepId, UserId,
-    WorkspaceId,
+    PromptTemplateId, RepoId, RequirementAreaId, RequirementId, RunId, SkillBindingId, SkillId,
+    StepGraphId, StepId, UserId, WorkspaceId,
 };
-pub use item::{Item, ItemFilter, ItemPatch, ItemRevision, ItemSummary, NewItem, Status};
+pub use item::{
+    Item, ItemFilter, ItemPatch, ItemRevision, ItemSummary, NewItem, Resolution, Status,
+};
 pub use kind::{
     CommandQueue, Gate, Isolation, ItemKind, ItemKindPatch, NewItemKind, NewPromptTemplate,
     NewStepGraph, PhaseAgent, PhasePatch, ProjectSettings, PromptTemplate, ResolvedGraph,
@@ -123,6 +126,11 @@ pub use overlap::{Claim, OverlapRule, RepoScope, RunScope, overlaps, scope_of};
 pub use quota::{
     Availability, CapError, PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN, ProjectCaps, Quota,
     QuotaSource, QuotaWindow, SkipReason, Spend, available, normalize,
+};
+pub use requirement::{
+    CitationKind, CoverageRow, ItemCitation, ItemRequirement, NewRequirement, NewRequirementArea,
+    Priority, Requirement, RequirementArea, RequirementFilter, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
 };
 pub use run::{
     ChatRunSpec, CommandRun, CommandRunStatus, GateOutcome, GraphSnapshot, NewCommandRun, NewRun,
@@ -166,6 +174,39 @@ mod tests {
             let back: T = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(&back, variant, "serde round-trip");
         }
+    }
+
+    #[test]
+    fn resolution_matches_check_list() {
+        check_enum(
+            Resolution::ALL,
+            &[
+                "done",
+                "concluded",
+                "rejected",
+                "withdrawn",
+                "superseded",
+                "duplicate",
+            ],
+        );
+    }
+
+    #[test]
+    fn priority_matches_check_list() {
+        check_enum(Priority::ALL, &["must", "later"]);
+    }
+
+    #[test]
+    fn requirement_state_matches_check_list() {
+        check_enum(RequirementState::ALL, &["active", "withdrawn"]);
+    }
+
+    #[test]
+    fn citation_kind_matches_check_list() {
+        check_enum(
+            CitationKind::ALL,
+            &["addresses", "amends", "withdraws", "reserves"],
+        );
     }
 
     #[test]
@@ -348,6 +389,8 @@ mod tests {
         check_id(SkillId::from_uuid(u), u);
         check_id(SkillBindingId::from_uuid(u), u);
         check_id(CommandRunId::from_uuid(u), u);
+        check_id(RequirementAreaId::from_uuid(u), u);
+        check_id(RequirementId::from_uuid(u), u);
     }
 
     #[test]

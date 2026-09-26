@@ -23,7 +23,7 @@ use crate::error::{map_migrate, map_sqlx};
 /// The mirror file inside [`CacheStore::dir`].
 pub const CACHE_FILE: &str = "cache.sqlite";
 
-/// The seventeen mirrored tables of §4.4, in foreign-key order.
+/// The twenty-one mirrored tables of §4.4, in foreign-key order.
 ///
 /// The order is the one [`refresh::run_pass`] fills them in and the one [`CacheStore::rebuild`]
 /// empties them in; `cache_meta` and `cache_cursor` are local and deliberately absent.
@@ -37,7 +37,11 @@ pub const CACHE_FILE: &str = "cache.sqlite";
 /// `run_step_tree` joined in MOD-4 milestone 1 (plan D7, D9): ANA-2 §4.6's isolation trees are
 /// what an offline reader needs to say where a step's work went, and like `run_step_commit` the
 /// table has no `updated_at` of its own and rides its parent step's.
-pub const MIRRORED_TABLES: [&str; 17] = [
+///
+/// `requirement_spec`, `requirement_area`, `requirement` and `item_requirement` joined in MOD-38
+/// (plan D12, `docs/ANA-11.md` §5.2): an offline reader answers the §5.1 requirement reads off
+/// them. `requirement_revision` and `requirement_key_counter` are not mirrored.
+pub const MIRRORED_TABLES: [&str; 21] = [
     "app_user",
     "agent",
     "box",
@@ -55,6 +59,10 @@ pub const MIRRORED_TABLES: [&str; 17] = [
     "run_step_commit",
     "run_step_tree",
     "session_event",
+    "requirement_spec",
+    "requirement_area",
+    "requirement",
+    "item_requirement",
 ];
 
 /// A [`CacheMeta::last_full_refresh_at`] older than this clears every cursor on the next

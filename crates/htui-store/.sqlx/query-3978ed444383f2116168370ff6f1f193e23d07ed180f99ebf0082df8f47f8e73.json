@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE item SET status = 'closed', resolution = $3, closed_at = clock_timestamp() WHERE id = $1 AND status = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3978ed444383f2116168370ff6f1f193e23d07ed180f99ebf0082df8f47f8e73"
+}

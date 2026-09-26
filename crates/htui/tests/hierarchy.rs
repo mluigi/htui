@@ -948,10 +948,10 @@ async fn deleting_the_last_workspace_leaves_the_pane_empty() {
     let _ = bench.drained();
     bench.reply(
         &mut section,
-        &StoreReply::DeleteReach(Some(DeleteReach {
+        &StoreReply::DeleteReach(Some(Box::new(DeleteReach {
             workspace_links: 1,
             ..DeleteReach::default()
-        })),
+        }))),
     );
     bench.key(&mut section, "y");
     type_at(&bench, &mut section, "graphics");
@@ -962,10 +962,10 @@ async fn deleting_the_last_workspace_leaves_the_pane_empty() {
         &mut section,
         &StoreReply::Deleted {
             target: DeleteTarget::Workspace(ids::WORKSPACE_GRAPHICS),
-            reach: DeleteReach {
+            reach: Box::new(DeleteReach {
                 workspace_links: 1,
                 ..DeleteReach::default()
-            },
+            }),
             mirror: MirrorAfterDelete::NotNeeded,
         },
     );
@@ -1063,10 +1063,10 @@ async fn a_tree_that_lands_mid_delete_keeps_the_confirmation() {
 
     bench.reply(
         &mut section,
-        &StoreReply::DeleteReach(Some(DeleteReach {
+        &StoreReply::DeleteReach(Some(Box::new(DeleteReach {
             workspace_links: 1,
             ..DeleteReach::default()
-        })),
+        }))),
     );
     let frame = bench.render_section(&section, 100);
     assert!(

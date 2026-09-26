@@ -14,24 +14,28 @@ use uuid::Uuid;
 
 use crate::fixtures::ids;
 use crate::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, BoxProbe, BoxRow, ChatRunSpec, Claim, CommandQueue,
-    CommandRun, CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId,
-    EventKind, EventRole, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemFilter, ItemId,
-    ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument,
-    NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRun, NewRunStep,
-    NewStepGraph, NewWorkspace, NoteId, OverlapRule, PhaseId, PhasePatch, ProbedTool, ProjectId,
-    ProjectPatch, PromptScope, PromptTemplate, PromptTemplateId, RepoBoxPath, RepoId, RepoPatch,
-    RepoScope, Run, RunId, RunKind, RunMode, RunScope, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, Scope, SessionEvent, SnapshotGraph, SnapshotSettings, Status, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
-    UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject,
+    Agent, AgentBox, AgentId, Billing, BoxId, BoxProbe, BoxRow, ChatRunSpec, CitationKind, Claim,
+    CommandQueue, CommandRun, CommandRunId, CommandRunStatus, CoverageRow,
+    DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EventKind, EventRole, Gate, GateOutcome,
+    GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKindId, ItemKindPatch,
+    ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
+    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
+    NewStepGraph, NewWorkspace, NoteId, OverlapRule, PhaseId, PhasePatch, Priority, ProbedTool,
+    ProjectId, ProjectPatch, PromptScope, PromptTemplate, PromptTemplateId, RepoBoxPath, RepoId,
+    RepoPatch, RepoScope, Requirement, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementState, RequirementUpdate, Resolution, Run,
+    RunId, RunKind, RunMode, RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope,
+    SessionEvent, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry,
+    UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::store::error::StoreError;
 use crate::store::traits::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, UpdateOutcome, WriteStore,
+    citation_key, illegal_move, invalid_area_code, requirement_withdrawn, resolution_not_closable,
+    withdrawn_requirement_cited,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -92,6 +96,18 @@ pub const CASES: &[&str] = &[
     "record_box_probe_replaces_profile_and_tools",
     "record_box_probe_refuses_an_unknown_box",
     "boxes_lists_every_box_with_its_tools",
+    "close_out_resolution_law",
+    "transition_never_reaches_closed",
+    "requirement_mint_is_per_area_and_never_reused",
+    "requirement_area_create_checks_the_code",
+    "requirement_amend_is_cas_and_names_the_item",
+    "requirement_withdraw_refuses_new_addresses",
+    "amend_records_the_deciding_citation",
+    "a_newer_version_makes_a_citation_suspect_until_reconfirmed",
+    "uncite_tombstones_and_cite_revives",
+    "coverage_lists_citing_items_with_resolution",
+    "spec_is_cas",
+    "project_delete_counts_requirements",
     "prompt_template_append_is_a_cas_on_the_head",
     "prompt_template_new_name_starts_at_one",
     "prompt_template_refuses_what_parse_refuses",
@@ -194,6 +210,30 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
             record_box_probe_refuses_an_unknown_box(store).await;
         }
         "boxes_lists_every_box_with_its_tools" => boxes_lists_every_box_with_its_tools(store).await,
+        "close_out_resolution_law" => close_out_resolution_law(store).await,
+        "transition_never_reaches_closed" => transition_never_reaches_closed(store).await,
+        "requirement_mint_is_per_area_and_never_reused" => {
+            requirement_mint_is_per_area_and_never_reused(store).await;
+        }
+        "requirement_area_create_checks_the_code" => {
+            requirement_area_create_checks_the_code(store).await;
+        }
+        "requirement_amend_is_cas_and_names_the_item" => {
+            requirement_amend_is_cas_and_names_the_item(store).await;
+        }
+        "requirement_withdraw_refuses_new_addresses" => {
+            requirement_withdraw_refuses_new_addresses(store).await;
+        }
+        "amend_records_the_deciding_citation" => amend_records_the_deciding_citation(store).await,
+        "a_newer_version_makes_a_citation_suspect_until_reconfirmed" => {
+            a_newer_version_makes_a_citation_suspect_until_reconfirmed(store).await;
+        }
+        "uncite_tombstones_and_cite_revives" => uncite_tombstones_and_cite_revives(store).await,
+        "coverage_lists_citing_items_with_resolution" => {
+            coverage_lists_citing_items_with_resolution(store).await;
+        }
+        "spec_is_cas" => spec_is_cas(store).await,
+        "project_delete_counts_requirements" => project_delete_counts_requirements(store).await,
         "prompt_template_append_is_a_cas_on_the_head" => {
             prompt_template_append_is_a_cas_on_the_head(store).await;
         }
@@ -249,6 +289,11 @@ pub const READ_CASES: &[&str] = &[
     "run_and_steps_round_trip",
     "trees_and_commits_read_back",
     "resolve_inputs_prefers_this_run_and_skips_losers",
+    "requirement_spec_and_areas_read_back",
+    "requirements_filter_by_area_state_priority_and_text",
+    "item_citations_derive_suspect",
+    "coverage_carries_status_and_resolution",
+    "requirement_revisions_or_not_cached",
 ];
 
 /// Runs one [`READ_CASES`] case by name against an already-loaded store.
@@ -271,6 +316,15 @@ pub async fn run_read_case<S: ReadStore>(name: &str, store: &S) {
         "resolve_inputs_prefers_this_run_and_skips_losers" => {
             resolve_inputs_prefers_this_run_and_skips_losers(store).await;
         }
+        "requirement_spec_and_areas_read_back" => requirement_spec_and_areas_read_back(store).await,
+        "requirements_filter_by_area_state_priority_and_text" => {
+            requirements_filter_by_area_state_priority_and_text(store).await;
+        }
+        "item_citations_derive_suspect" => item_citations_derive_suspect(store).await,
+        "coverage_carries_status_and_resolution" => {
+            coverage_carries_status_and_resolution(store).await;
+        }
+        "requirement_revisions_or_not_cached" => requirement_revisions_or_not_cached(store).await,
         other => panic!("unknown read case `{other}`; READ_CASES and run_read_case disagree"),
     }
 }
@@ -736,18 +790,17 @@ async fn status_cas_keeps_version<S: WriteStore>(store: &S) {
 
 /// Items are never deleted; closing is a status (§4.1).
 async fn no_delete_path<S: WriteStore>(store: &S) {
-    // `open` does not reach `closed` in ANA-2 §4.3's item table: only `blocked`, `failed` and
-    // `done` do, so the close-out path takes two sanctioned moves (plan D4).
-    let blocked = store
-        .transition(ids::HTUI_ANA_2, Status::Open, Status::Blocked)
+    // Close-out is the only way into `closed` (MOD-38 PRD D1), and an `open` item closes as one
+    // of the four non-success resolutions (ANA-11 §4.2), so the item closes straight from `open`.
+    store
+        .close_out(
+            ids::HTUI_ANA_2,
+            Resolution::Withdrawn,
+            new_document(ids::HTUI_ANA_2, "summary", None),
+            &[],
+        )
         .await
-        .expect("no_delete_path: transition must not fail");
-    assert!(blocked, "no_delete_path: open -> blocked matches");
-    let closed = store
-        .transition(ids::HTUI_ANA_2, Status::Blocked, Status::Closed)
-        .await
-        .expect("no_delete_path: transition must not fail");
-    assert!(closed, "no_delete_path: blocked -> closed matches");
+        .expect("no_delete_path: open closes out as withdrawn");
 
     let still_there = store
         .item(ids::HTUI_ANA_2)
@@ -6854,6 +6907,7 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
     let live = store
         .close_out(
             ids::HTUI_FEAT_3,
+            Resolution::Withdrawn,
             new_document(ids::HTUI_FEAT_3, "summary", None),
             &[],
         )
@@ -6881,24 +6935,55 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
         "{CASE}: nor moved the item"
     );
 
-    for (item, summary, why) in [
+    // MOD-38's open -> closed edge: `queued -> open` leaves RUN_2 queued, and the law alone
+    // would close the now-`open` item as `withdrawn`; the live run still refuses it.
+    assert!(
+        store
+            .transition(ids::HTUI_FEAT_3, Status::Queued, Status::Open)
+            .await
+            .expect(CASE),
+        "{CASE}: FEAT-3 is un-queued, RUN_2 still live"
+    );
+    let reopened = store
+        .close_out(
+            ids::HTUI_FEAT_3,
+            Resolution::Withdrawn,
+            new_document(ids::HTUI_FEAT_3, "summary", None),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(&reopened, Err(StoreError::Constraint(sentence))
+            if sentence.contains(&ids::RUN_2.to_string())),
+        "{CASE}: an `open` item with a live run is not closed out either, got {reopened:?}"
+    );
+    assert_eq!(
+        item_row(CASE, store, ids::HTUI_FEAT_3).await.status,
+        Status::Open,
+        "{CASE}: and stays open"
+    );
+
+    for (item, resolution, summary, why) in [
         (
             ids::HTUI_ANA_2,
+            Resolution::Done,
             new_document(ids::HTUI_ANA_2, "summary", None),
-            "open does not reach closed (ANA-2 §4.3)",
+            "open does not close as done (ANA-11 §4.2)",
         ),
         (
             ids::HTUI_FEAT_1,
+            Resolution::Done,
             new_document(ids::HTUI_FEAT_1, "plan", None),
             "the document must be a summary",
         ),
         (
             ids::HTUI_FEAT_1,
+            Resolution::Done,
             new_document(ids::HTUI_ANA_2, "summary", None),
             "the summary must name the item being closed",
         ),
     ] {
-        let refused = store.close_out(item, summary, &[]).await;
+        let refused = store.close_out(item, resolution, summary, &[]).await;
         assert!(
             matches!(refused, Err(StoreError::Constraint(_))),
             "{CASE}: {why}, got {refused:?}"
@@ -6907,6 +6992,7 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
     let unknown = store
         .close_out(
             ItemId::new(),
+            Resolution::Withdrawn,
             new_document(ItemId::new(), "summary", None),
             &[],
         )
@@ -6931,6 +7017,7 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
     let written = store
         .close_out(
             ids::HTUI_FEAT_1,
+            Resolution::Done,
             new_document(ids::HTUI_FEAT_1, "summary", None),
             &commits,
         )
@@ -6939,6 +7026,11 @@ async fn close_out_refuses_a_live_run<S: WriteStore>(store: &S) {
     assert_eq!(written.version, 1, "{CASE}: the first summary of the item");
     let closed = item_row(CASE, store, ids::HTUI_FEAT_1).await;
     assert_eq!(closed.status, Status::Closed, "{CASE}: the item is closed");
+    assert_eq!(
+        closed.resolution,
+        Some(Resolution::Done),
+        "{CASE}: as the resolution it was handed"
+    );
     assert!(
         closed.closed_at.is_some(),
         "{CASE}: closed_at tracks the current status"
@@ -6968,9 +7060,9 @@ async fn illegal_transitions_are_constraint<S: WriteStore>(store: &S) {
         (Status::Queued, Status::InProgress),
         (Status::InProgress, Status::Done),
         // The fourth pair is what makes `done` a `from` rather than only the row the loop stops
-        // on: `done` reaches `closed` and `open` and nothing else, so six of its eight targets are
-        // refusals this leg would otherwise never ask for.
-        (Status::Done, Status::Closed),
+        // on: `done` reaches `open` and nothing else, so seven of its eight targets are refusals
+        // this leg would otherwise never ask for (`closed` among them since MOD-38 PRD D1).
+        (Status::Done, Status::Open),
     ] {
         let before = item_row(CASE, store, ids::HTUI_ANA_2).await;
         assert_eq!(before.status, from, "{CASE}: the item is driven to {from}");
@@ -7118,6 +7210,1323 @@ async fn illegal_transitions_are_constraint<S: WriteStore>(store: &S) {
     assert!(
         matches!(missing, Err(StoreError::NotFound { entity: "run", .. })),
         "{CASE}: an unknown run is NotFound, got {missing:?}"
+    );
+}
+
+/// The HTUI project's fixture items, which between them hold every [`Status`] once (a test in
+/// `fixtures.rs` pins that): the two MOD-38 cases sweep the laws over them rather than over a
+/// list of their own.
+fn htui_fixture_items() -> Vec<ItemId> {
+    crate::fixtures::demo_data()
+        .items
+        .into_iter()
+        .filter(|item| item.project_id == ids::PROJECT_HTUI)
+        .map(|item| item.id)
+        .collect()
+}
+
+/// MOD-38 plan D4: close-out's law is ANA-11 §4.2's [`Resolution::closes_from`], not ANA-2
+/// §4.3's transition table. Every pair the law refuses is exactly [`resolution_not_closable`]'s
+/// sentence with nothing written; an `open` item closes as a non-success resolution and reads it
+/// back; a `closed` item closes as nothing.
+async fn close_out_resolution_law<S: WriteStore>(store: &S) {
+    const CASE: &str = "close_out_resolution_law";
+
+    let mut swept = Vec::new();
+    for item in htui_fixture_items() {
+        // A live run is refused before the law is asked (the guard order of `close_out`'s doc),
+        // which is `close_out_refuses_a_live_run`'s ground, not this case's.
+        if store
+            .runs(item)
+            .await
+            .expect(CASE)
+            .iter()
+            .any(|run| run.status.is_active())
+        {
+            continue;
+        }
+        let before = item_row(CASE, store, item).await;
+        let documents = store.documents(item).await.expect(CASE);
+        for resolution in Resolution::ALL.iter().copied() {
+            if resolution.closes_from(before.status) {
+                continue;
+            }
+            let refused = store
+                .close_out(item, resolution, new_document(item, "summary", None), &[])
+                .await;
+            let StoreError::Constraint(sentence) = refused.expect_err(&format!(
+                "{CASE}: `{}` does not close as `{resolution}`",
+                before.status
+            )) else {
+                panic!("{CASE}: a refused pair is Constraint, not NotFound")
+            };
+            assert_eq!(
+                sentence,
+                resolution_not_closable(item, before.status, resolution),
+                "{CASE}: the refusal is the close-out law's sentence"
+            );
+        }
+        assert_eq!(
+            item_row(CASE, store, item).await,
+            before,
+            "{CASE}: every refused pair left the `{}` row byte-identical",
+            before.status
+        );
+        assert_eq!(
+            store.documents(item).await.expect(CASE),
+            documents,
+            "{CASE}: and wrote no summary"
+        );
+        swept.push(before.status);
+    }
+    for status in [
+        Status::Open,
+        Status::Blocked,
+        Status::Failed,
+        Status::Done,
+        Status::Closed,
+    ] {
+        assert!(
+            swept.contains(&status),
+            "{CASE}: the sweep reached a `{status}` item (fixture precondition)"
+        );
+    }
+
+    let open = item_row(CASE, store, ids::HTUI_ANA_2).await;
+    assert_eq!(open.status, Status::Open, "{CASE}: fixture precondition");
+    let refused = store
+        .close_out(
+            ids::HTUI_ANA_2,
+            Resolution::Done,
+            new_document(ids::HTUI_ANA_2, "summary", None),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(StoreError::Constraint(sentence))
+            if *sentence == resolution_not_closable(ids::HTUI_ANA_2, Status::Open, Resolution::Done)),
+        "{CASE}: an open item does not close as done, got {refused:?}"
+    );
+    let written = store
+        .close_out(
+            ids::HTUI_ANA_2,
+            Resolution::Withdrawn,
+            new_document(ids::HTUI_ANA_2, "summary", None),
+            &[],
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(written.version, 1, "{CASE}: the first summary of the item");
+    let closed = item_row(CASE, store, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        (closed.status, closed.resolution),
+        (Status::Closed, Some(Resolution::Withdrawn)),
+        "{CASE}: an open item closes as withdrawn, and says so"
+    );
+    assert!(
+        closed.closed_at.is_some(),
+        "{CASE}: closed_at tracks the current status"
+    );
+
+    for item in [ids::HTUI_FIX_1, ids::HTUI_ANA_2] {
+        let before = item_row(CASE, store, item).await;
+        for resolution in Resolution::ALL.iter().copied() {
+            let refused = store
+                .close_out(item, resolution, new_document(item, "summary", None), &[])
+                .await;
+            assert!(
+                matches!(&refused, Err(StoreError::Constraint(sentence))
+                    if *sentence == resolution_not_closable(item, Status::Closed, resolution)),
+                "{CASE}: a closed item does not close again as `{resolution}`, got {refused:?}"
+            );
+        }
+        assert_eq!(
+            item_row(CASE, store, item).await,
+            before,
+            "{CASE}: a second close-out keeps the first resolution"
+        );
+    }
+}
+
+/// MOD-38 PRD D1: `transition` never reaches `closed`, from any status; close-out is the only way
+/// in. The refusal is [`illegal_move`]'s sentence with the row untouched, and plan D14's
+/// precedence still holds: an unknown id is `NotFound` first.
+async fn transition_never_reaches_closed<S: WriteStore>(store: &S) {
+    const CASE: &str = "transition_never_reaches_closed";
+
+    for item in htui_fixture_items() {
+        let before = item_row(CASE, store, item).await;
+        let refused = store.transition(item, before.status, Status::Closed).await;
+        let StoreError::Constraint(sentence) = refused.expect_err(&format!(
+            "{CASE}: `{}` does not transition into `closed`",
+            before.status
+        )) else {
+            panic!("{CASE}: an illegal move is Constraint, not NotFound")
+        };
+        assert_eq!(
+            sentence,
+            illegal_move("item", before.status, Status::Closed),
+            "{CASE}: the refusal is `illegal_move`'s sentence"
+        );
+        assert_eq!(
+            item_row(CASE, store, item).await,
+            before,
+            "{CASE}: the refused `{}` row is byte-identical",
+            before.status
+        );
+    }
+
+    let unknown = store
+        .transition(ItemId::new(), Status::Done, Status::Closed)
+        .await;
+    assert!(
+        matches!(unknown, Err(StoreError::NotFound { entity: "item", .. })),
+        "{CASE}: plan D14 — an unknown item is NotFound even though the pair is illegal, got \
+         {unknown:?}"
+    );
+}
+
+// ---- MOD-38 (plan D8-D14): requirements and citations --------------------------------------
+//
+// Every case below reads and writes through the ANA-11 §5.1 methods alone and asserts against
+// the fixture's requirement set (blueprint §8): `htui` holds `R-ENT-1` (v2, amended by `ANA-2`),
+// `R-ENT-2` and `R-STO-1`; `ANA-1`'s citation of `R-ENT-1` is stamped at v1 and so is suspect.
+
+/// A requirement request with a fresh id, by the fixture user on the fixture box.
+fn new_requirement(body: &str) -> NewRequirement {
+    NewRequirement {
+        id: RequirementId::new(),
+        body: body.to_owned(),
+        rationale: String::new(),
+        priority: Priority::Must,
+        created_by: ids::USER,
+        box_id: Some(ids::BOX),
+    }
+}
+
+/// An amend of the body alone, by the fixture user on the fixture box, with the ordinary reason.
+fn body_patch(body: &str) -> RequirementPatch {
+    RequirementPatch {
+        body: Some(body.to_owned()),
+        rationale: None,
+        priority: None,
+        author_id: ids::USER,
+        box_id: Some(ids::BOX),
+        reason: "amended".to_owned(),
+    }
+}
+
+/// An area request with a fresh id and an empty description.
+fn new_area(project: ProjectId, code: &str, position: i32) -> NewRequirementArea {
+    NewRequirementArea {
+        id: RequirementAreaId::new(),
+        project_id: project,
+        code: code.to_owned(),
+        title: format!("{code} area"),
+        description: String::new(),
+        position,
+    }
+}
+
+/// The head an amend or withdraw landed, or a panic naming the case.
+fn requirement_updated(case: &str, outcome: RequirementUpdate) -> Requirement {
+    match outcome {
+        RequirementUpdate::Updated(row) => row,
+        RequirementUpdate::Diverged { head, ancestor } => {
+            panic!(
+                "{case}: expected Updated, got Diverged {{ head: {head:?}, ancestor: {ancestor:?} }}"
+            )
+        }
+    }
+}
+
+/// One requirement row as the store holds it now.
+async fn requirement_row<S: ReadStore>(case: &str, store: &S, id: RequirementId) -> Requirement {
+    store
+        .requirement(id)
+        .await
+        .expect(case)
+        .unwrap_or_else(|| panic!("{case}: requirement {id} exists"))
+}
+
+/// A requirement's revisions on a store that keeps them (`MemStore`, `PgStore`).
+async fn revisions_of<S: ReadStore>(
+    case: &str,
+    store: &S,
+    id: RequirementId,
+) -> Vec<RequirementRevision> {
+    store
+        .requirement_revisions(id)
+        .await
+        .expect(case)
+        .unwrap_or_else(|| panic!("{case}: a writable store keeps the revisions of {id}"))
+}
+
+/// A citation as [`ReadStore::item_requirements`] should answer it, with the requirement as it is
+/// now and `suspect` derived from the two versions (plan D11).
+async fn citation<S: ReadStore>(
+    case: &str,
+    store: &S,
+    requirement: RequirementId,
+    kind: CitationKind,
+    stamp: i32,
+) -> ItemCitation {
+    let requirement = requirement_row(case, store, requirement).await;
+    let suspect = requirement.makes_suspect(stamp);
+    ItemCitation {
+        requirement,
+        kind,
+        requirement_version: stamp,
+        proposed_by_step_id: None,
+        suspect,
+    }
+}
+
+/// `(item, kind, stamp, suspect)` of every coverage row, in the order the store answered.
+fn coverage_view(rows: &[CoverageRow]) -> Vec<(ItemId, CitationKind, i32, bool)> {
+    rows.iter()
+        .map(|row| (row.item.id, row.kind, row.requirement_version, row.suspect))
+        .collect()
+}
+
+/// `NotFound { entity: "item_requirement" }` naming exactly this triple (plan D10).
+fn is_missing_citation<T>(
+    outcome: &Result<T, StoreError>,
+    item: ItemId,
+    requirement: RequirementId,
+    kind: CitationKind,
+) -> bool {
+    matches!(outcome, Err(StoreError::NotFound { entity: "item_requirement", id })
+        if *id == citation_key(item, requirement, kind))
+}
+
+/// Plan D8: the number comes from the area's counter, one per area, and a refused mint burns
+/// none. The generated key, the copied `area_code` and revision 1 come with the row.
+async fn requirement_mint_is_per_area_and_never_reused<S: WriteStore>(store: &S) {
+    const CASE: &str = "requirement_mint_is_per_area_and_never_reused";
+
+    let request = new_requirement("Every area mints its own numbers.");
+    let ent = store
+        .mint_requirement(ids::AREA_ENT, request.clone())
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            ent.id,
+            ent.project_id,
+            ent.area_id,
+            ent.area_code.as_str(),
+            ent.number,
+            ent.key.as_str(),
+        ),
+        (
+            request.id,
+            ids::PROJECT_HTUI,
+            ids::AREA_ENT,
+            "ENT",
+            3,
+            "R-ENT-3"
+        ),
+        "{CASE}: the fixture minted R-ENT-1 and R-ENT-2, so the next ENT number is 3"
+    );
+    assert_eq!(
+        (
+            ent.body.as_str(),
+            ent.rationale.as_str(),
+            ent.priority,
+            ent.state,
+            ent.version,
+            ent.created_by,
+        ),
+        (
+            request.body.as_str(),
+            "",
+            Priority::Must,
+            RequirementState::Active,
+            1,
+            ids::USER
+        ),
+        "{CASE}: the row carries the request, active at v1"
+    );
+    assert_eq!(
+        store.requirement(ent.id).await.expect(CASE),
+        Some(ent.clone()),
+        "{CASE}: the mint reads back as it was returned"
+    );
+
+    let sto = store
+        .mint_requirement(
+            ids::AREA_STO,
+            new_requirement("A second area, a second counter."),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (sto.key.as_str(), sto.number),
+        ("R-STO-2", 2),
+        "{CASE}: STO counts on its own"
+    );
+
+    let nil_author = store
+        .mint_requirement(
+            ids::AREA_ENT,
+            NewRequirement {
+                created_by: UserId::default(),
+                ..new_requirement("By nobody.")
+            },
+        )
+        .await;
+    assert!(
+        matches!(nil_author, Err(StoreError::Constraint(_))),
+        "{CASE}: a created_by that names no row is Constraint, got {nil_author:?}"
+    );
+    let duplicate = store.mint_requirement(ids::AREA_ENT, request.clone()).await;
+    assert!(
+        matches!(duplicate, Err(StoreError::Constraint(_))),
+        "{CASE}: a duplicate id is Constraint, got {duplicate:?}"
+    );
+    let next = store
+        .mint_requirement(ids::AREA_ENT, new_requirement("After two refusals."))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        next.key, "R-ENT-4",
+        "{CASE}: neither refused mint consumed a number (plan D8)"
+    );
+
+    let unknown = store
+        .mint_requirement(RequirementAreaId::new(), new_requirement("Nowhere."))
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "requirement_area",
+                ..
+            })
+        ),
+        "{CASE}: an unknown area is NotFound, got {unknown:?}"
+    );
+
+    let revisions = revisions_of(CASE, store, ent.id).await;
+    assert_eq!(
+        revisions
+            .iter()
+            .map(|row| (
+                row.requirement_id,
+                row.version,
+                row.body.as_str(),
+                row.rationale.as_str(),
+                row.priority,
+                row.state,
+                row.author_id,
+                row.box_id,
+                row.reason.as_str(),
+                row.amended_by_item_id,
+            ))
+            .collect::<Vec<_>>(),
+        vec![(
+            ent.id,
+            1,
+            request.body.as_str(),
+            "",
+            Priority::Must,
+            RequirementState::Active,
+            ids::USER,
+            Some(ids::BOX),
+            "created",
+            None,
+        )],
+        "{CASE}: the mint wrote revision 1, reason `created`"
+    );
+}
+
+/// The `requirement_area.code` CHECK is decided before the insert with
+/// [`invalid_area_code`]'s sentence; the other refusals are `Constraint`, and a code is unique per
+/// project only. Areas read back in `(position, code)` order.
+async fn requirement_area_create_checks_the_code<S: WriteStore>(store: &S) {
+    const CASE: &str = "requirement_area_create_checks_the_code";
+
+    let too_long = format!("E{}", "N".repeat(16));
+    for code in ["ent", "E", "E-1", too_long.as_str()] {
+        let refused = store
+            .create_requirement_area(new_area(ids::PROJECT_HTUI, code, 2))
+            .await;
+        assert!(
+            matches!(&refused, Err(StoreError::Constraint(sentence))
+                if *sentence == invalid_area_code(code)),
+            "{CASE}: `{code}` is outside the CHECK, got {refused:?}"
+        );
+    }
+    let taken = store
+        .create_requirement_area(new_area(ids::PROJECT_HTUI, "ENT", 2))
+        .await;
+    assert!(
+        matches!(taken, Err(StoreError::Constraint(_))),
+        "{CASE}: htui already has ENT, got {taken:?}"
+    );
+    let duplicate = store
+        .create_requirement_area(NewRequirementArea {
+            id: ids::AREA_ENT,
+            ..new_area(ids::PROJECT_HTUI, "DUP", 2)
+        })
+        .await;
+    assert!(
+        matches!(duplicate, Err(StoreError::Constraint(_))),
+        "{CASE}: a duplicate id is Constraint, got {duplicate:?}"
+    );
+    let orphan = store
+        .create_requirement_area(new_area(ProjectId::new(), "ENT", 0))
+        .await;
+    assert!(
+        matches!(orphan, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown project is Constraint, got {orphan:?}"
+    );
+    assert_eq!(
+        store
+            .requirement_areas(ids::PROJECT_HTUI)
+            .await
+            .expect(CASE)
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        vec![ids::AREA_ENT, ids::AREA_STO],
+        "{CASE}: no refusal wrote a row"
+    );
+
+    let request = new_area(ids::PROJECT_AGY, "ENT", 1);
+    let ent = store
+        .create_requirement_area(request.clone())
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            ent.id,
+            ent.project_id,
+            ent.code.as_str(),
+            ent.title.as_str(),
+            ent.description.as_str(),
+            ent.position,
+        ),
+        (
+            request.id,
+            ids::PROJECT_AGY,
+            "ENT",
+            request.title.as_str(),
+            "",
+            1
+        ),
+        "{CASE}: ENT is free in agy: a code is unique per project"
+    );
+    let api = store
+        .create_requirement_area(new_area(ids::PROJECT_AGY, "API", 1))
+        .await
+        .expect(CASE);
+    let first = store
+        .create_requirement_area(new_area(ids::PROJECT_AGY, "ZZ", 0))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store.requirement_areas(ids::PROJECT_AGY).await.expect(CASE),
+        vec![first, api, ent],
+        "{CASE}: position first, then code by bytes"
+    );
+}
+
+/// ANA-9 §4.2's compare-and-set on `requirement.version` (plan D9): the edit lands at `v + 1`
+/// with a revision naming the deciding item, and a spent token answers the head and the revision
+/// it was taken from. The checks run NotFound, divergence, Constraint.
+async fn requirement_amend_is_cas_and_names_the_item<S: WriteStore>(store: &S) {
+    const CASE: &str = "requirement_amend_is_cas_and_names_the_item";
+
+    let before = requirement_row(CASE, store, ids::REQ_STO_1).await;
+    assert_eq!(before.version, 1, "{CASE}: fixture precondition");
+    let patch = body_patch("Postgres is the only source of truth.");
+    let head = requirement_updated(
+        CASE,
+        store
+            .amend_requirement(ids::REQ_STO_1, 1, patch.clone(), ids::HTUI_FEAT_3)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (
+            head.version,
+            head.body.as_str(),
+            head.rationale.as_str(),
+            head.priority,
+            head.state,
+            head.key.as_str(),
+        ),
+        (
+            2,
+            "Postgres is the only source of truth.",
+            before.rationale.as_str(),
+            before.priority,
+            RequirementState::Active,
+            "R-STO-1"
+        ),
+        "{CASE}: the patched column moved, the others did not, and the version went up by one"
+    );
+    assert_eq!(
+        requirement_row(CASE, store, ids::REQ_STO_1).await,
+        head,
+        "{CASE}: the head reads back as it was returned"
+    );
+    let revisions = revisions_of(CASE, store, ids::REQ_STO_1).await;
+    assert_eq!(
+        revisions
+            .iter()
+            .map(|row| (
+                row.version,
+                row.body.as_str(),
+                row.reason.as_str(),
+                row.amended_by_item_id,
+                row.author_id,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, before.body.as_str(), "created", None, ids::USER),
+            (
+                2,
+                head.body.as_str(),
+                patch.reason.as_str(),
+                Some(ids::HTUI_FEAT_3),
+                ids::USER
+            ),
+        ],
+        "{CASE}: revision 2 names the deciding item and carries the patch's reason"
+    );
+
+    let spent = store
+        .amend_requirement(ids::REQ_STO_1, 1, body_patch("Too late."), ids::HTUI_FEAT_3)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        spent,
+        RequirementUpdate::Diverged {
+            head: head.clone(),
+            ancestor: revisions[0].clone(),
+        },
+        "{CASE}: a spent token answers the head and the revision it was taken from"
+    );
+
+    let unknown = store
+        .amend_requirement(RequirementId::new(), 1, body_patch("x"), ids::HTUI_FEAT_3)
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "requirement",
+                ..
+            })
+        ),
+        "{CASE}: an unknown requirement is NotFound, got {unknown:?}"
+    );
+    let orphan = store
+        .amend_requirement(ids::REQ_STO_1, 2, body_patch("By nothing."), ItemId::new())
+        .await;
+    assert!(
+        matches!(orphan, Err(StoreError::Constraint(_))),
+        "{CASE}: an amended_by that names no item is Constraint, got {orphan:?}"
+    );
+    assert_eq!(
+        requirement_row(CASE, store, ids::REQ_STO_1).await,
+        head,
+        "{CASE}: the refused amend left the head at v2"
+    );
+    assert_eq!(
+        revisions_of(CASE, store, ids::REQ_STO_1).await.len(),
+        2,
+        "{CASE}: and wrote no revision"
+    );
+}
+
+/// Plan D10: a withdraw is an amend to `state = withdrawn`, recorded with the deciding item's
+/// `withdraws` citation; afterwards the requirement takes no new `addresses` / `reserves`
+/// citation, has none re-stamped by `reconfirm`, and is neither amended nor withdrawn again.
+async fn requirement_withdraw_refuses_new_addresses<S: WriteStore>(store: &S) {
+    const CASE: &str = "requirement_withdraw_refuses_new_addresses";
+
+    store
+        .cite(
+            ids::HTUI_FIX_1,
+            ids::REQ_ENT_2,
+            CitationKind::Addresses,
+            None,
+        )
+        .await
+        .expect(CASE);
+    let head = requirement_updated(
+        CASE,
+        store
+            .withdraw_requirement(
+                ids::REQ_ENT_2,
+                1,
+                ids::HTUI_FEAT_3,
+                ids::USER,
+                Some(ids::BOX),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (head.state, head.version),
+        (RequirementState::Withdrawn, 2),
+        "{CASE}: the withdraw lands at v2"
+    );
+    let last = revisions_of(CASE, store, ids::REQ_ENT_2)
+        .await
+        .pop()
+        .unwrap_or_else(|| panic!("{CASE}: the withdraw wrote a revision"));
+    assert_eq!(
+        (
+            last.version,
+            last.state,
+            last.reason.as_str(),
+            last.amended_by_item_id,
+        ),
+        (
+            2,
+            RequirementState::Withdrawn,
+            "withdrawn",
+            Some(ids::HTUI_FEAT_3)
+        ),
+        "{CASE}: revision 2 is the withdraw, naming the deciding item"
+    );
+    assert_eq!(
+        store.item_requirements(ids::HTUI_FEAT_3).await.expect(CASE),
+        vec![citation(CASE, store, ids::REQ_ENT_2, CitationKind::Withdraws, 2).await],
+        "{CASE}: the deciding item cites the requirement as `withdraws`, at the new version"
+    );
+
+    let addresses = store
+        .cite(
+            ids::AGY_FEAT_1,
+            ids::REQ_ENT_2,
+            CitationKind::Addresses,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(&addresses, Err(StoreError::Constraint(sentence))
+            if *sentence == withdrawn_requirement_cited("R-ENT-2", CitationKind::Addresses)),
+        "{CASE}: a withdrawn requirement takes no new `addresses`, got {addresses:?}"
+    );
+    let revived = store
+        .cite(
+            ids::HTUI_FEAT_2,
+            ids::REQ_ENT_2,
+            CitationKind::Reserves,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(&revived, Err(StoreError::Constraint(sentence))
+            if *sentence == withdrawn_requirement_cited("R-ENT-2", CitationKind::Reserves)),
+        "{CASE}: nor does a tombstoned `reserves` come back, got {revived:?}"
+    );
+    assert_eq!(
+        store.item_requirements(ids::HTUI_FEAT_2).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: the refused revival left the tombstone alone"
+    );
+
+    let reconfirmed = store
+        .reconfirm(ids::HTUI_FIX_1, ids::REQ_ENT_2, CitationKind::Addresses)
+        .await;
+    assert!(
+        matches!(&reconfirmed, Err(StoreError::Constraint(sentence))
+            if *sentence == withdrawn_requirement_cited("R-ENT-2", CitationKind::Addresses)),
+        "{CASE}: nor has a live `addresses` from before the withdraw re-stamped, \
+         got {reconfirmed:?}"
+    );
+    assert_eq!(
+        store
+            .item_requirements(ids::HTUI_FIX_1)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .filter(|row| row.requirement.id == ids::REQ_ENT_2)
+            .collect::<Vec<_>>(),
+        vec![citation(CASE, store, ids::REQ_ENT_2, CitationKind::Addresses, 1).await],
+        "{CASE}: the refused reconfirm left the citation at v1, suspect"
+    );
+    store
+        .reconfirm(ids::HTUI_FEAT_3, ids::REQ_ENT_2, CitationKind::Withdraws)
+        .await
+        .unwrap_or_else(|error| {
+            panic!("{CASE}: the deciding `withdraws` still reconfirms, got {error:?}")
+        });
+
+    let again = store
+        .withdraw_requirement(
+            ids::REQ_ENT_2,
+            2,
+            ids::HTUI_FEAT_3,
+            ids::USER,
+            Some(ids::BOX),
+        )
+        .await;
+    assert!(
+        matches!(&again, Err(StoreError::Constraint(sentence))
+            if *sentence == requirement_withdrawn("R-ENT-2")),
+        "{CASE}: a withdrawn requirement is not withdrawn again, got {again:?}"
+    );
+    let amended = store
+        .amend_requirement(ids::REQ_ENT_2, 2, body_patch("Revived?"), ids::HTUI_FEAT_3)
+        .await;
+    assert!(
+        matches!(&amended, Err(StoreError::Constraint(sentence))
+            if *sentence == requirement_withdrawn("R-ENT-2")),
+        "{CASE}: nor amended, got {amended:?}"
+    );
+    assert_eq!(
+        requirement_row(CASE, store, ids::REQ_ENT_2).await,
+        head,
+        "{CASE}: both refusals left the head at v2"
+    );
+}
+
+/// PRD D3: an amend records the deciding item's `amends` citation at the new version in the same
+/// transaction, and a later amend by the same item revives and re-stamps that one row.
+async fn amend_records_the_deciding_citation<S: WriteStore>(store: &S) {
+    const CASE: &str = "amend_records_the_deciding_citation";
+
+    assert_eq!(
+        store.item_requirements(ids::HTUI_FEAT_3).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: fixture precondition, FEAT-3 cites nothing"
+    );
+    requirement_updated(
+        CASE,
+        store
+            .amend_requirement(ids::REQ_STO_1, 1, body_patch("v2"), ids::HTUI_FEAT_3)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        store.item_requirements(ids::HTUI_FEAT_3).await.expect(CASE),
+        vec![citation(CASE, store, ids::REQ_STO_1, CitationKind::Amends, 2).await],
+        "{CASE}: the amend wrote FEAT-3's `amends` citation at v2, not suspect"
+    );
+
+    store
+        .uncite(ids::HTUI_FEAT_3, ids::REQ_STO_1, CitationKind::Amends)
+        .await
+        .expect(CASE);
+    requirement_updated(
+        CASE,
+        store
+            .amend_requirement(ids::REQ_STO_1, 2, body_patch("v3"), ids::HTUI_FEAT_3)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        store.item_requirements(ids::HTUI_FEAT_3).await.expect(CASE),
+        vec![citation(CASE, store, ids::REQ_STO_1, CitationKind::Amends, 3).await],
+        "{CASE}: the second amend revived the tombstone at v3: one row, not two"
+    );
+}
+
+/// Plan D11: a citation is suspect while the requirement is newer than its stamp, on both reads,
+/// and `reconfirm` re-stamps it at the current version. A triple with no live row is `NotFound`
+/// naming [`citation_key`].
+async fn a_newer_version_makes_a_citation_suspect_until_reconfirmed<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_newer_version_makes_a_citation_suspect_until_reconfirmed";
+
+    assert_eq!(
+        store.item_requirements(ids::HTUI_FEAT_1).await.expect(CASE),
+        vec![citation(CASE, store, ids::REQ_STO_1, CitationKind::Addresses, 1).await],
+        "{CASE}: fixture precondition, FEAT-1 addresses R-STO-1 at its current v1"
+    );
+    requirement_updated(
+        CASE,
+        store
+            .amend_requirement(ids::REQ_STO_1, 1, body_patch("v2"), ids::HTUI_FEAT_3)
+            .await
+            .expect(CASE),
+    );
+    let suspect = citation(CASE, store, ids::REQ_STO_1, CitationKind::Addresses, 1).await;
+    assert!(suspect.suspect, "{CASE}: v2 > stamp 1");
+    assert_eq!(
+        store.item_requirements(ids::HTUI_FEAT_1).await.expect(CASE),
+        vec![suspect],
+        "{CASE}: the amend made FEAT-1's citation suspect"
+    );
+    assert_eq!(
+        coverage_view(
+            &store
+                .requirement_coverage(ids::REQ_STO_1)
+                .await
+                .expect(CASE)
+        ),
+        vec![
+            (ids::HTUI_FEAT_1, CitationKind::Addresses, 1, true),
+            (ids::HTUI_FEAT_3, CitationKind::Amends, 2, false),
+            (ids::HTUI_FIX_1, CitationKind::Addresses, 1, true),
+        ],
+        "{CASE}: coverage derives the same flag, in item key order"
+    );
+
+    let restamped = store
+        .reconfirm(ids::HTUI_FEAT_1, ids::REQ_STO_1, CitationKind::Addresses)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            restamped.item_id,
+            restamped.requirement_id,
+            restamped.kind,
+            restamped.requirement_version,
+            restamped.deleted_at,
+        ),
+        (
+            ids::HTUI_FEAT_1,
+            ids::REQ_STO_1,
+            CitationKind::Addresses,
+            2,
+            None
+        ),
+        "{CASE}: reconfirm re-stamps the live row at the current version"
+    );
+    assert_eq!(
+        store.item_requirements(ids::HTUI_FEAT_1).await.expect(CASE),
+        vec![citation(CASE, store, ids::REQ_STO_1, CitationKind::Addresses, 2).await],
+        "{CASE}: and the flag clears"
+    );
+
+    let absent = store
+        .reconfirm(ids::HTUI_FEAT_1, ids::REQ_STO_1, CitationKind::Reserves)
+        .await;
+    assert!(
+        is_missing_citation(
+            &absent,
+            ids::HTUI_FEAT_1,
+            ids::REQ_STO_1,
+            CitationKind::Reserves
+        ),
+        "{CASE}: a triple with no row is NotFound naming it, got {absent:?}"
+    );
+}
+
+/// Plan D10: `uncite` tombstones, so the citation leaves both reads and a second `uncite` or a
+/// `reconfirm` finds nothing live; `cite` upserts, reviving a tombstone at the current version
+/// and overwriting `proposed_by_step_id`. `cite`'s refusals run item, requirement, step.
+async fn uncite_tombstones_and_cite_revives<S: WriteStore>(store: &S) {
+    const CASE: &str = "uncite_tombstones_and_cite_revives";
+
+    store
+        .uncite(ids::HTUI_FIX_1, ids::REQ_STO_1, CitationKind::Addresses)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store.item_requirements(ids::HTUI_FIX_1).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: the tombstone leaves the item's citations"
+    );
+    assert_eq!(
+        coverage_view(
+            &store
+                .requirement_coverage(ids::REQ_STO_1)
+                .await
+                .expect(CASE)
+        ),
+        vec![(ids::HTUI_FEAT_1, CitationKind::Addresses, 1, false)],
+        "{CASE}: and the requirement's coverage"
+    );
+    let twice = store
+        .uncite(ids::HTUI_FIX_1, ids::REQ_STO_1, CitationKind::Addresses)
+        .await;
+    assert!(
+        is_missing_citation(
+            &twice,
+            ids::HTUI_FIX_1,
+            ids::REQ_STO_1,
+            CitationKind::Addresses
+        ),
+        "{CASE}: a tombstone is not uncited again, got {twice:?}"
+    );
+    let reconfirmed = store
+        .reconfirm(ids::HTUI_FIX_1, ids::REQ_STO_1, CitationKind::Addresses)
+        .await;
+    assert!(
+        is_missing_citation(
+            &reconfirmed,
+            ids::HTUI_FIX_1,
+            ids::REQ_STO_1,
+            CitationKind::Addresses
+        ),
+        "{CASE}: nor reconfirmed, got {reconfirmed:?}"
+    );
+
+    // Moved on first, so the revival's stamp is visibly the current version and not the old one.
+    requirement_updated(
+        CASE,
+        store
+            .amend_requirement(ids::REQ_STO_1, 1, body_patch("v2"), ids::HTUI_FEAT_3)
+            .await
+            .expect(CASE),
+    );
+    let revived = store
+        .cite(
+            ids::HTUI_FIX_1,
+            ids::REQ_STO_1,
+            CitationKind::Addresses,
+            None,
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            revived.requirement_version,
+            revived.proposed_by_step_id,
+            revived.deleted_at
+        ),
+        (2, None, None),
+        "{CASE}: cite revives the tombstone at the current version"
+    );
+    assert_eq!(
+        store.item_requirements(ids::HTUI_FIX_1).await.expect(CASE),
+        vec![citation(CASE, store, ids::REQ_STO_1, CitationKind::Addresses, 2).await],
+        "{CASE}: and it is live again, not suspect"
+    );
+    let restepped = store
+        .cite(
+            ids::HTUI_FIX_1,
+            ids::REQ_STO_1,
+            CitationKind::Addresses,
+            Some(ids::STEP_PRD),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        restepped.proposed_by_step_id,
+        Some(ids::STEP_PRD),
+        "{CASE}: a cite of a live row overwrites the proposing step"
+    );
+    assert_eq!(
+        store
+            .item_requirements(ids::HTUI_FIX_1)
+            .await
+            .expect(CASE)
+            .iter()
+            .map(|row| (row.kind, row.proposed_by_step_id))
+            .collect::<Vec<_>>(),
+        vec![(CitationKind::Addresses, Some(ids::STEP_PRD))],
+        "{CASE}: still one row"
+    );
+
+    store
+        .cite(
+            ids::HTUI_FEAT_2,
+            ids::REQ_ENT_2,
+            CitationKind::Reserves,
+            None,
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        store.item_requirements(ids::HTUI_FEAT_2).await.expect(CASE),
+        vec![citation(CASE, store, ids::REQ_ENT_2, CitationKind::Reserves, 1).await],
+        "{CASE}: the fixture's tombstone revives too"
+    );
+
+    let both_unknown = store
+        .cite(
+            ItemId::new(),
+            RequirementId::new(),
+            CitationKind::Addresses,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(
+            both_unknown,
+            Err(StoreError::NotFound { entity: "item", .. })
+        ),
+        "{CASE}: an unknown item is NotFound first, got {both_unknown:?}"
+    );
+    let no_requirement = store
+        .cite(
+            ids::HTUI_FEAT_1,
+            RequirementId::new(),
+            CitationKind::Addresses,
+            None,
+        )
+        .await;
+    assert!(
+        matches!(
+            no_requirement,
+            Err(StoreError::NotFound {
+                entity: "requirement",
+                ..
+            })
+        ),
+        "{CASE}: an unknown requirement is NotFound, got {no_requirement:?}"
+    );
+    let no_step = store
+        .cite(
+            ids::HTUI_FEAT_1,
+            ids::REQ_ENT_1,
+            CitationKind::Addresses,
+            Some(StepId::new()),
+        )
+        .await;
+    assert!(
+        matches!(no_step, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown step is Constraint, got {no_step:?}"
+    );
+}
+
+/// ANA-11 §4.3: a requirement's coverage names each citing item with its status and, once it is
+/// closed, its resolution, in item key order.
+async fn coverage_lists_citing_items_with_resolution<S: WriteStore>(store: &S) {
+    const CASE: &str = "coverage_lists_citing_items_with_resolution";
+
+    store
+        .cite(
+            ids::HTUI_ANA_2,
+            ids::REQ_STO_1,
+            CitationKind::Addresses,
+            None,
+        )
+        .await
+        .expect(CASE);
+    store
+        .close_out(
+            ids::HTUI_ANA_2,
+            Resolution::Withdrawn,
+            new_document(ids::HTUI_ANA_2, "summary", None),
+            &[],
+        )
+        .await
+        .expect(CASE);
+
+    let coverage = store
+        .requirement_coverage(ids::REQ_STO_1)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        coverage
+            .iter()
+            .map(|row| (
+                row.item.id,
+                row.item.key.as_str(),
+                row.item.status,
+                row.resolution,
+                row.kind,
+                row.requirement_version,
+                row.suspect,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                ids::HTUI_ANA_2,
+                "ANA-2",
+                Status::Closed,
+                Some(Resolution::Withdrawn),
+                CitationKind::Addresses,
+                1,
+                false
+            ),
+            (
+                ids::HTUI_FEAT_1,
+                "FEAT-1",
+                Status::InProgress,
+                None,
+                CitationKind::Addresses,
+                1,
+                false
+            ),
+            (
+                ids::HTUI_FIX_1,
+                "FIX-1",
+                Status::Closed,
+                Some(Resolution::Done),
+                CitationKind::Addresses,
+                1,
+                false
+            ),
+        ],
+        "{CASE}: every citing item, with the resolution close-out wrote"
+    );
+}
+
+/// Plan D9: the spec header is a compare-and-set on its own `version`. `None` creates it, a spent
+/// token answers the row as it is, and `Some(_)` with no header is `NotFound`.
+async fn spec_is_cas<S: WriteStore>(store: &S) {
+    const CASE: &str = "spec_is_cas";
+
+    assert_eq!(
+        store.requirement_spec(ids::PROJECT_AGY).await.expect(CASE),
+        None,
+        "{CASE}: fixture precondition, agy has no header"
+    );
+    let early = store
+        .set_requirement_spec(ids::PROJECT_AGY, Some(1), ids::USER, "p".to_owned())
+        .await;
+    assert!(
+        matches!(
+            early,
+            Err(StoreError::NotFound {
+                entity: "requirement_spec",
+                ..
+            })
+        ),
+        "{CASE}: a token with no header to compare against is NotFound, got {early:?}"
+    );
+
+    let v1 = applied(
+        CASE,
+        store
+            .set_requirement_spec(ids::PROJECT_AGY, None, ids::USER, "p".to_owned())
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (v1.project_id, v1.owner_id, v1.preamble.as_str(), v1.version),
+        (ids::PROJECT_AGY, ids::USER, "p", 1),
+        "{CASE}: `None` creates the header at v1"
+    );
+    assert_eq!(
+        stale(
+            CASE,
+            store
+                .set_requirement_spec(ids::PROJECT_AGY, None, ids::USER, "again".to_owned())
+                .await
+                .expect(CASE),
+        ),
+        v1,
+        "{CASE}: `None` against an existing header is Stale with the row as it is"
+    );
+    let v2 = applied(
+        CASE,
+        store
+            .set_requirement_spec(ids::PROJECT_AGY, Some(1), ids::USER, "q".to_owned())
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (v2.preamble.as_str(), v2.version),
+        ("q", 2),
+        "{CASE}: the token matched, so the header moved to v2"
+    );
+    assert_eq!(
+        stale(
+            CASE,
+            store
+                .set_requirement_spec(ids::PROJECT_AGY, Some(1), ids::USER, "r".to_owned())
+                .await
+                .expect(CASE),
+        ),
+        v2,
+        "{CASE}: the spent token answers v2 as it is"
+    );
+    assert_eq!(
+        store.requirement_spec(ids::PROJECT_AGY).await.expect(CASE),
+        Some(v2),
+        "{CASE}: the header reads back at v2"
+    );
+
+    let fixture = crate::fixtures::demo_data().requirement_specs;
+    assert_eq!(
+        stale(
+            CASE,
+            store
+                .set_requirement_spec(ids::PROJECT_HTUI, None, ids::USER, "x".to_owned())
+                .await
+                .expect(CASE),
+        ),
+        fixture[0],
+        "{CASE}: htui's fixture header answers a `None` token as it is"
+    );
+
+    let orphan = store
+        .set_requirement_spec(ProjectId::new(), None, ids::USER, "x".to_owned())
+        .await;
+    assert!(
+        matches!(orphan, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown project is Constraint, got {orphan:?}"
+    );
+    let no_owner = store
+        .set_requirement_spec(ids::PROJECT_VULKAN, None, UserId::new(), "x".to_owned())
+        .await;
+    assert!(
+        matches!(no_owner, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown owner is Constraint, got {no_owner:?}"
+    );
+    assert_eq!(
+        store
+            .requirement_spec(ids::PROJECT_VULKAN)
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: and wrote nothing"
+    );
+}
+
+/// Blueprint F1: a project delete takes six requirement tables, and [`DeleteReach`] counts every
+/// one of them - a citation from another project's item included, which goes with the
+/// requirement it cites, as a cross-project link goes with either end.
+async fn project_delete_counts_requirements<S: WriteStore>(store: &S) {
+    const CASE: &str = "project_delete_counts_requirements";
+
+    store
+        .cite(
+            ids::AGY_FEAT_1,
+            ids::REQ_STO_1,
+            CitationKind::Addresses,
+            None,
+        )
+        .await
+        .expect(CASE);
+    let reach = store
+        .delete_reach(DeleteTarget::Project(ids::PROJECT_HTUI))
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the fixture project has a reach"));
+    let report = store.delete_project(ids::PROJECT_HTUI).await.expect(CASE);
+    assert_eq!(
+        report, reach,
+        "{CASE}: the counts shown before the act are the counts the act took (PRD D13)"
+    );
+    assert_eq!(
+        (
+            report.requirement_specs,
+            report.requirement_areas,
+            report.requirement_key_counters,
+            report.requirements,
+            report.requirement_revisions,
+            report.item_requirements,
+        ),
+        (1, 2, 2, 3, 4, 6),
+        "{CASE}: the fixture's requirement set, plus agy's citation of R-STO-1"
+    );
+
+    assert_eq!(
+        store.item_requirements(ids::AGY_FEAT_1).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: agy's citation went with the requirement it cited"
+    );
+    assert_eq!(
+        store.requirement(ids::REQ_STO_1).await.expect(CASE),
+        None,
+        "{CASE}: the requirement is gone"
+    );
+    assert_eq!(
+        store
+            .requirement_areas(ids::PROJECT_HTUI)
+            .await
+            .expect(CASE),
+        Vec::new(),
+        "{CASE}: and its areas"
+    );
+    assert_eq!(
+        store.requirement_spec(ids::PROJECT_HTUI).await.expect(CASE),
+        None,
+        "{CASE}: and its header"
     );
 }
 
@@ -8017,6 +9426,343 @@ async fn resolve_inputs_prefers_this_run_and_skips_losers<S: ReadStore>(store: &
     assert!(
         unknown.first().is_some_and(|row| row.document.is_none()),
         "{CASE}: and resolves it to None rather than refusing"
+    );
+}
+
+// ---- MOD-38 (plan D12): the requirement reads, over the fixture ------------------------------
+
+/// The fixture's requirement row `id`, as [`crate::fixtures::demo_data`] builds it.
+fn fixture_requirement(id: RequirementId) -> Requirement {
+    crate::fixtures::demo_data()
+        .requirements
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap_or_else(|| panic!("requirement {id} is a fixture row"))
+}
+
+/// A fixture citation as [`ReadStore::item_requirements`] answers it, `suspect` derived.
+fn fixture_citation(requirement: RequirementId, kind: CitationKind, stamp: i32) -> ItemCitation {
+    let requirement = fixture_requirement(requirement);
+    let suspect = requirement.makes_suspect(stamp);
+    ItemCitation {
+        requirement,
+        kind,
+        requirement_version: stamp,
+        proposed_by_step_id: None,
+        suspect,
+    }
+}
+
+/// The spec header and the areas read back as the fixture wrote them; a project with none
+/// answers `None` and an empty list rather than an error.
+async fn requirement_spec_and_areas_read_back<S: ReadStore>(store: &S) {
+    const CASE: &str = "requirement_spec_and_areas_read_back";
+    let data = crate::fixtures::demo_data();
+
+    assert_eq!(
+        store.requirement_spec(ids::PROJECT_HTUI).await.expect(CASE),
+        data.requirement_specs.first().cloned(),
+        "{CASE}: htui's header, v1, owned by the fixture user"
+    );
+    assert_eq!(
+        store.requirement_spec(ids::PROJECT_AGY).await.expect(CASE),
+        None,
+        "{CASE}: agy has no header"
+    );
+    let areas = store
+        .requirement_areas(ids::PROJECT_HTUI)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        areas
+            .iter()
+            .map(|row| (row.code.as_str(), row.position))
+            .collect::<Vec<_>>(),
+        vec![("ENT", 0), ("STO", 1)],
+        "{CASE}: htui's two areas in position order"
+    );
+    assert_eq!(
+        areas, data.requirement_areas,
+        "{CASE}: each area reads back whole"
+    );
+    assert_eq!(
+        store.requirement_areas(ids::PROJECT_AGY).await.expect(CASE),
+        Vec::new(),
+        "{CASE}: agy has no areas"
+    );
+}
+
+/// Plan D14: every [`RequirementFilter`] field is a conjunct, `None` does not filter, and the
+/// text filter is a case-insensitive literal substring of the key or the body. Rows come in
+/// `(area_code, number)` order.
+async fn requirements_filter_by_area_state_priority_and_text<S: ReadStore>(store: &S) {
+    const CASE: &str = "requirements_filter_by_area_state_priority_and_text";
+    let keys = |rows: &[Requirement]| rows.iter().map(|row| row.key.clone()).collect::<Vec<_>>();
+
+    let all = store
+        .requirements(ids::PROJECT_HTUI, &RequirementFilter::default())
+        .await
+        .expect(CASE);
+    assert_eq!(
+        all,
+        [ids::REQ_ENT_1, ids::REQ_ENT_2, ids::REQ_STO_1]
+            .into_iter()
+            .map(fixture_requirement)
+            .collect::<Vec<_>>(),
+        "{CASE}: the default filter is every requirement, whole, in key order"
+    );
+    for (filter, expected, why) in [
+        (
+            RequirementFilter {
+                area_codes: Some(vec!["STO".to_owned()]),
+                ..RequirementFilter::default()
+            },
+            vec!["R-STO-1"],
+            "one area",
+        ),
+        (
+            RequirementFilter {
+                priorities: Some(vec![Priority::Later]),
+                ..RequirementFilter::default()
+            },
+            vec!["R-ENT-2"],
+            "one priority",
+        ),
+        (
+            RequirementFilter {
+                states: Some(vec![RequirementState::Withdrawn]),
+                ..RequirementFilter::default()
+            },
+            Vec::new(),
+            "no withdrawn requirement in the fixture",
+        ),
+        (
+            RequirementFilter {
+                text: Some("r-ent".to_owned()),
+                ..RequirementFilter::default()
+            },
+            vec!["R-ENT-1", "R-ENT-2"],
+            "a key match, case-insensitive",
+        ),
+        (
+            RequirementFilter {
+                text: Some("MIRROR".to_owned()),
+                ..RequirementFilter::default()
+            },
+            vec!["R-STO-1"],
+            "a body match, case-insensitive",
+        ),
+        (
+            RequirementFilter {
+                area_codes: Some(vec!["ENT".to_owned()]),
+                priorities: Some(vec![Priority::Must]),
+                ..RequirementFilter::default()
+            },
+            vec!["R-ENT-1"],
+            "two fields are a conjunction",
+        ),
+    ] {
+        assert_eq!(
+            keys(
+                &store
+                    .requirements(ids::PROJECT_HTUI, &filter)
+                    .await
+                    .expect(CASE)
+            ),
+            expected,
+            "{CASE}: {why}"
+        );
+    }
+    assert_eq!(
+        store
+            .requirements(ids::PROJECT_AGY, &RequirementFilter::default())
+            .await
+            .expect(CASE),
+        Vec::new(),
+        "{CASE}: agy has none"
+    );
+
+    for row in &all {
+        assert_eq!(
+            store.requirement(row.id).await.expect(CASE).as_ref(),
+            Some(row),
+            "{CASE}: {} reads the same alone as in the list",
+            row.key
+        );
+    }
+    assert_eq!(
+        store.requirement(RequirementId::new()).await.expect(CASE),
+        None,
+        "{CASE}: an unknown id is None"
+    );
+}
+
+/// Plan D11 on the fixture: `ANA-1` cites `R-ENT-1` at v1 while it stands at v2, so that one
+/// citation is suspect; `ANA-2`'s `amends` is at v2 and is not; a tombstone is not a citation.
+async fn item_citations_derive_suspect<S: ReadStore>(store: &S) {
+    const CASE: &str = "item_citations_derive_suspect";
+
+    for (item, expected, why) in [
+        (
+            ids::HTUI_ANA_1,
+            vec![fixture_citation(ids::REQ_ENT_1, CitationKind::Addresses, 1)],
+            "stamped at v1 against v2: suspect",
+        ),
+        (
+            ids::HTUI_ANA_2,
+            vec![fixture_citation(ids::REQ_ENT_1, CitationKind::Amends, 2)],
+            "the deciding item's citation is at the current version",
+        ),
+        (
+            ids::HTUI_FEAT_1,
+            vec![fixture_citation(ids::REQ_STO_1, CitationKind::Addresses, 1)],
+            "current",
+        ),
+        (ids::HTUI_FEAT_2, Vec::new(), "a tombstone is not listed"),
+        (ids::AGY_FEAT_1, Vec::new(), "an item that cites nothing"),
+        (
+            ItemId::new(),
+            Vec::new(),
+            "an unknown item is empty, not an error",
+        ),
+    ] {
+        assert_eq!(
+            store.item_requirements(item).await.expect(CASE),
+            expected,
+            "{CASE}: {why}"
+        );
+    }
+    assert!(
+        fixture_citation(ids::REQ_ENT_1, CitationKind::Addresses, 1).suspect,
+        "{CASE}: the fixture's one suspect citation (precondition)"
+    );
+}
+
+/// ANA-11 §4.3's coverage on the fixture: each citing item's status and resolution, suspect
+/// derived, in item key order; the tombstone is absent.
+async fn coverage_carries_status_and_resolution<S: ReadStore>(store: &S) {
+    const CASE: &str = "coverage_carries_status_and_resolution";
+    let view = |rows: Vec<CoverageRow>| {
+        rows.into_iter()
+            .map(|row| {
+                (
+                    row.item.id,
+                    row.item.status,
+                    row.resolution,
+                    row.kind,
+                    row.requirement_version,
+                    row.suspect,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        view(
+            store
+                .requirement_coverage(ids::REQ_ENT_1)
+                .await
+                .expect(CASE)
+        ),
+        vec![
+            (
+                ids::HTUI_ANA_1,
+                Status::Done,
+                None,
+                CitationKind::Addresses,
+                1,
+                true
+            ),
+            (
+                ids::HTUI_ANA_2,
+                Status::Open,
+                None,
+                CitationKind::Amends,
+                2,
+                false
+            ),
+        ],
+        "{CASE}: R-ENT-1 is addressed by ANA-1 (suspect) and was amended by ANA-2"
+    );
+    assert_eq!(
+        view(
+            store
+                .requirement_coverage(ids::REQ_STO_1)
+                .await
+                .expect(CASE)
+        ),
+        vec![
+            (
+                ids::HTUI_FEAT_1,
+                Status::InProgress,
+                None,
+                CitationKind::Addresses,
+                1,
+                false
+            ),
+            (
+                ids::HTUI_FIX_1,
+                Status::Closed,
+                Some(Resolution::Done),
+                CitationKind::Addresses,
+                1,
+                false
+            ),
+        ],
+        "{CASE}: R-STO-1 is addressed by the open FEAT-1 and the closed FIX-1"
+    );
+    assert_eq!(
+        store
+            .requirement_coverage(ids::REQ_ENT_2)
+            .await
+            .expect(CASE),
+        Vec::new(),
+        "{CASE}: R-ENT-2's only citation is a tombstone"
+    );
+    assert_eq!(
+        store
+            .item(ids::HTUI_FIX_1)
+            .await
+            .expect(CASE)
+            .and_then(|row| row.resolution),
+        Some(Resolution::Done),
+        "{CASE}: the item row carries the same resolution"
+    );
+}
+
+/// Plan D12: a store that keeps revisions answers them in version order; the mirror keeps none
+/// and says so with `None` rather than an empty history.
+async fn requirement_revisions_or_not_cached<S: ReadStore>(store: &S) {
+    const CASE: &str = "requirement_revisions_or_not_cached";
+    let expected: Vec<RequirementRevision> = crate::fixtures::demo_data()
+        .requirement_revisions
+        .into_iter()
+        .filter(|row| row.requirement_id == ids::REQ_ENT_1)
+        .collect();
+    assert_eq!(
+        expected
+            .iter()
+            .map(|row| (row.version, row.reason.as_str(), row.amended_by_item_id))
+            .collect::<Vec<_>>(),
+        vec![(1, "created", None), (2, "amended", Some(ids::HTUI_ANA_2))],
+        "{CASE}: fixture precondition"
+    );
+
+    match store
+        .requirement_revisions(ids::REQ_ENT_1)
+        .await
+        .expect(CASE)
+    {
+        None => {}
+        Some(rows) => assert_eq!(rows, expected, "{CASE}: R-ENT-1's two revisions, whole"),
+    }
+    let unknown = store
+        .requirement_revisions(RequirementId::new())
+        .await
+        .expect(CASE);
+    assert!(
+        unknown.is_none_or(|rows| rows.is_empty()),
+        "{CASE}: an unknown id has no history"
     );
 }
 

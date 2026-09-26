@@ -25,8 +25,8 @@ use std::path::PathBuf;
 
 use htui_agent::driver::AgentSessionRef;
 use htui_core::model::{
-    AgentId, Claim, DocumentId, GraphSnapshot, Item, ItemId, RepoId, Run, RunId, RunMode,
-    RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus,
+    AgentId, Claim, DocumentId, GraphSnapshot, Item, ItemId, RepoId, Resolution, Run, RunId,
+    RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus,
 };
 use htui_core::prompt::AssembleError;
 use htui_core::store::StoreError;
@@ -125,11 +125,14 @@ pub enum Command {
         /// The item to unblock.
         item: ItemId,
     },
-    /// `R-TUI-9`'s close-out (plan D167): one `summary` document and the item `closed`. The engine
-    /// builds the summary; the caller names the item.
+    /// `R-TUI-9`'s close-out (plan D167): one `summary` document and the item `closed` as
+    /// `resolution` (MOD-38 PRD D2). The engine builds the summary; the caller names the item
+    /// and the resolution — until MOD-39, the one [`close_out_enabled`] answers.
     CloseOut {
         /// The item to close.
         item: ItemId,
+        /// Why it closes (ANA-11 §4.2).
+        resolution: Resolution,
     },
 }
 
@@ -1158,11 +1161,16 @@ pub fn unblock_enabled(item: &Item, runs: &[(Run, Cursor)]) -> Result<UnblockCas
 
 /// `R-TUI-9`'s close-out (MOD-4 plan D167, ANA-2 §4.10): no run of the item is active, and the
 /// item is `done`, `failed` or `blocked` — the refusals `WriteStore::close_out` re-checks inside
-/// its own transaction, stated here so the Runs tab greys the key by them.
+/// its own transaction, stated here so the Runs tab greys the key by them — and the resolution
+/// the Runs pane closes with ([`Resolution::default_for`], MOD-38 plan D6).
+///
+/// The store also closes an `open` item as one of the four non-success resolutions; until
+/// MOD-39's picker the Runs pane does not offer that, so `default_for`'s `None` is refused here.
 ///
 /// # Errors
-/// [`EngineError::RunStatus`] naming the first live run, then [`EngineError::NotClosable`].
-pub fn close_out_enabled(item: &Item, runs: &[Run]) -> Result<(), EngineError> {
+/// [`EngineError::RunStatus`] naming the first live run, then [`EngineError::NotClosable`] when
+/// `default_for(item.status)` is `None`.
+pub fn close_out_enabled(item: &Item, runs: &[Run]) -> Result<Resolution, EngineError> {
     if let Some(live) = runs.iter().find(|run| run.status.is_active()) {
         return Err(EngineError::RunStatus {
             run: live.id,
@@ -1170,13 +1178,10 @@ pub fn close_out_enabled(item: &Item, runs: &[Run]) -> Result<(), EngineError> {
             expected: "done | failed | cancelled",
         });
     }
-    if !matches!(item.status, Status::Done | Status::Failed | Status::Blocked) {
-        return Err(EngineError::NotClosable {
-            item: item.id,
-            status: item.status,
-        });
-    }
-    Ok(())
+    Resolution::default_for(item.status).ok_or(EngineError::NotClosable {
+        item: item.id,
+        status: item.status,
+    })
 }
 
 /// MOD-4 plan D177 (R-25): a manual cleanup retry is for a run that has finished.
@@ -1210,8 +1215,8 @@ pub fn start_enabled(item: &Item) -> Result<(), EngineError> {
 mod tests {
     use htui_core::fixtures::{demo_data, ids};
     use htui_core::model::{
-        Claim, GraphSnapshot, Item, OverlapRule, Run, RunStatus, RunStep, SnapshotPhase, Status,
-        StepStatus,
+        Claim, GraphSnapshot, Item, OverlapRule, Resolution, Run, RunStatus, RunStep,
+        SnapshotPhase, Status, StepStatus,
     };
     use htui_core::store::StoreError;
 
@@ -2123,17 +2128,24 @@ mod tests {
     }
 
     /// MOD-4 plan D167: close-out is refused while a run of the item is active, then for an item
-    /// §4.10 does not close.
+    /// §4.10 does not close; an item it closes answers the resolution the Runs pane closes it as
+    /// (MOD-38 plan D6: `done` -> `done`, `failed` and `blocked` -> `withdrawn`).
     #[test]
     fn close_out_needs_no_live_run_and_a_closable_item() {
         let parked = parked_run();
         let mut finished = parked.clone();
         finished.status = RunStatus::Done;
-        for status in [Status::Done, Status::Failed, Status::Blocked] {
-            assert!(
-                close_out_enabled(&item_at(status), std::slice::from_ref(&finished)).is_ok(),
-                "`{status}` closes"
+        for (status, resolution) in [
+            (Status::Done, Resolution::Done),
+            (Status::Failed, Resolution::Withdrawn),
+            (Status::Blocked, Resolution::Withdrawn),
+        ] {
+            assert_eq!(
+                close_out_enabled(&item_at(status), std::slice::from_ref(&finished)).ok(),
+                Some(resolution),
+                "`{status}` closes as `{resolution}`"
             );
+            assert_eq!(Resolution::default_for(status), Some(resolution));
         }
         let refused =
             close_out_enabled(&item_at(Status::Open), &[finished.clone(), parked.clone()])

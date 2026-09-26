@@ -43,8 +43,8 @@ use htui_agent::registry::{DriverFactory, TransportBuilder};
 use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, DocumentHead, DocumentId, EventKind, EventRole, Item,
-    ItemId, NewDocument, NewRepo, RepoId, Run, RunId, RunMode, RunStatus, RunStep, RunStepCommit,
-    SessionEvent, SnapshotPhase, Status, StepId, StepStatus, Transport, UsageTotals,
+    ItemId, NewDocument, NewRepo, RepoId, Resolution, Run, RunId, RunMode, RunStatus, RunStep,
+    RunStepCommit, SessionEvent, SnapshotPhase, Status, StepId, StepStatus, Transport, UsageTotals,
 };
 use htui_core::store::{ReadStore as _, StoreError, WriteStore as _};
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
@@ -756,7 +756,12 @@ async fn close_out_is_one_transaction_on_postgres() {
     assert_eq!(stack.run(run).await.status, RunStatus::AwaitingApproval);
 
     let documents_before = stack.documents(item).await;
-    stack.command(Command::CloseOut { item }).await;
+    stack
+        .command(Command::CloseOut {
+            item,
+            resolution: Resolution::Done,
+        })
+        .await;
     let refused = stack.take_status().expect("the close-out was refused");
     assert!(
         refused.starts_with("close_out: ") && refused.contains(&run.to_string()),
@@ -776,7 +781,7 @@ async fn close_out_is_one_transaction_on_postgres() {
     let direct = stack
         .db
         .store
-        .close_out(item, direct_summary(item), &[])
+        .close_out(item, Resolution::Done, direct_summary(item), &[])
         .await;
     assert!(
         matches!(&direct, Err(StoreError::Constraint(text)) if text.contains(&run.to_string())),
@@ -811,6 +816,7 @@ async fn close_out_is_one_transaction_on_postgres() {
         .store
         .close_out(
             item,
+            Resolution::Done,
             direct_summary(item),
             &[RunStepCommit {
                 run_step_id: first.id,
@@ -837,7 +843,12 @@ async fn close_out_is_one_transaction_on_postgres() {
     );
 
     let documents_before = documents_before.len();
-    stack.command(Command::CloseOut { item }).await;
+    stack
+        .command(Command::CloseOut {
+            item,
+            resolution: Resolution::Done,
+        })
+        .await;
     assert_eq!(stack.take_status(), None, "the close-out was accepted");
     let summaries = stack.summaries(item).await;
     assert_eq!(summaries.len(), 1, "exactly one summary: {summaries:?}");
@@ -904,6 +915,11 @@ async fn close_out_is_one_transaction_on_postgres() {
     }
     let closed = stack.item(item).await;
     assert_eq!(closed.status, Status::Closed);
+    assert_eq!(
+        closed.resolution,
+        Some(Resolution::Done),
+        "a `done` item closes as done (MOD-38 PRD D2)"
+    );
     assert!(closed.closed_at.is_some(), "`closed_at` is set");
     assert_ne!(
         closed.closed_at, done.closed_at,
