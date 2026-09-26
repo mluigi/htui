@@ -27,12 +27,12 @@ use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposur
 use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::record::{Recorder, RunCap, pump};
 use htui_core::model::{
-    BoundSkill, BoxId, BoxProfile, CommandRunId, CommandRunStatus, Document, DocumentId, EventKind,
-    Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun,
-    NewRunStep, NoteId, Project, ProjectId, ProjectSettings, PromptScope, Repo, RepoId, Resolution,
-    Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, SnapshotCandidate,
-    SnapshotPhase, SnapshotTemplate, Status, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS,
-    UserId, VerifyOutcome,
+    BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus, Document, DocumentId,
+    EventKind, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote,
+    NewRun, NewRunStep, NoteId, Project, ProjectId, ProjectSettings, PromptScope, Repo, RepoId,
+    Resolution, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary,
+    SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepId, StepOutcome, StepStatus,
+    TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
 };
 use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoRoot, RootSource};
 use htui_core::prompt::{
@@ -676,22 +676,44 @@ where
     /// a Tokio runtime with the time driver enabled (blueprint H-3).
     ///
     /// # Errors
-    /// [`EngineError::ClaimRefused`] naming the rule when `claim_run` does not admit the run,
-    /// which then stays `queued` with nothing written; [`EngineError::LeaseLost`] when another
-    /// orchestrator takes the lease mid-walk; every other [`EngineError`] the walk raises.
+    /// [`EngineError::ClaimRefused`] naming the rule when the box is full or the scope overlaps,
+    /// the run then left `queued` with nothing written; [`EngineError::MissingTags`] when the
+    /// run's item needs tags this box lacks, after `claim_run` failed the run and blocked its item
+    /// in its transaction and this engine noted it (`R-ORCH-10`, MOD-7 milestone 3 D85);
+    /// [`EngineError::LeaseLost`] when another orchestrator takes the lease mid-walk; every other
+    /// [`EngineError`] the walk raises.
     pub async fn claim(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
         let now = self.now();
         let lease = now + self.lease_times().ttl;
-        // Anything but `Admitted` is ANA-2 §4.7's admission refusing: the box is at
-        // `max_concurrent_items` or the scope overlaps a live run (plan D83). Nothing is written
-        // and the run stays `queued`.
+        // Anything but `Admitted` is a refusal. `MissingTags` is `R-ORCH-10`'s: `claim_run`
+        // already failed the run and blocked its item, and the engine adds the note (D78). Every
+        // other verdict is ANA-2 §4.7's admission, box full or overlap (plan D83), which wrote
+        // nothing and left the run `queued`.
         let claim = self
             .parts
             .store
             .claim_run(run, self.parts.box_id, self.parts.owner, now, lease)
             .await?;
-        if !claim.is_admitted() {
-            return Err(EngineError::ClaimRefused { run, claim });
+        match claim {
+            Claim::Admitted => {}
+            // Matched before the catch-all, so it can never reach the worker as `ClaimRefused`
+            // and be re-queued (`htui/src/run_worker.rs`'s two re-queue arms, blueprint H-3).
+            Claim::MissingTags { missing } => {
+                let item = Self::item_of(&self.run(run).await?)?;
+                self.note(
+                    item,
+                    RunFailure::MissingTags(missing.clone()).to_string(),
+                    None,
+                    now,
+                )
+                .await?;
+                return Err(EngineError::MissingTags {
+                    item,
+                    run: Some(run),
+                    missing,
+                });
+            }
+            claim => return Err(EngineError::ClaimRefused { run, claim }),
         }
 
         let rest = self.walk_leased(run, lease, self.run_to_rest(run)).await?;
