@@ -46,9 +46,38 @@ pub struct PromptTab {
     failed: Option<String>,
     /// First visible line.
     scroll: Scroll,
-    /// The rendered lines, rebuilt on every reply. Held rather than recomputed per frame: the
+    /// The rendered rows, rebuilt on every reply. Held rather than recomputed per frame: the
     /// prompt text is up to the whole token budget, and a render runs on the UI task.
-    lines: Vec<String>,
+    lines: Vec<Row>,
+}
+
+/// One rendered row of the pane: its text, and whether it is drawn in `Theme::dim` (MOD-9 D46).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Row {
+    text: String,
+    dim: bool,
+}
+
+impl Row {
+    /// A row in the normal style.
+    fn plain(text: String) -> Self {
+        Self { text, dim: false }
+    }
+
+    /// This row as the rows it renders to: one per `\n`-separated piece, a trailing `\r` dropped,
+    /// each keeping the style. For every row `render_lines` builds this equals the old
+    /// `rows.join("\n").lines()` (review finding M5): only the last row could differ, and it is a
+    /// line of `assembled.text.lines()` or an `AssembleError` sentence, neither of which ends in
+    /// `\n`.
+    fn split(self) -> impl Iterator<Item = Self> {
+        let dim = self.dim;
+        self.text
+            .split('\n')
+            .map(|piece| piece.strip_suffix('\r').unwrap_or(piece).to_owned())
+            .map(move |text| Self { text, dim })
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
 }
 
 impl PromptTab {
@@ -96,22 +125,22 @@ impl PromptTab {
             Some(preview) => render_lines(preview),
             None => Vec::new(),
         };
-        self.lines = rows.join("\n").lines().map(str::to_owned).collect();
+        self.lines = rows.into_iter().flat_map(Row::split).collect();
     }
 }
 
 /// Every line the pane shows, top to bottom (blueprint B.16).
-fn render_lines(preview: &PromptPreview) -> Vec<String> {
+fn render_lines(preview: &PromptPreview) -> Vec<Row> {
     let mut lines = Vec::new();
     let template = match preview.template.as_ref() {
         Some(row) => format!("{} v{}", row.name, row.version),
         None => "none".to_owned(),
     };
-    lines.push(labelled("template", &template));
-    lines.push(labelled(
+    lines.push(Row::plain(labelled("template", &template)));
+    lines.push(Row::plain(labelled(
         "picker",
         &format!("n / p \u{b7} {} template(s)", preview.available.len()),
-    ));
+    )));
 
     // Bound once, and used again at the bottom for the text. The second `match` that used to read
     // `preview.outcome` there needed an `unreachable!` arm to say what this binding says by
@@ -119,20 +148,20 @@ fn render_lines(preview: &PromptPreview) -> Vec<String> {
     // reasoning behind it ever stops holding (finding L5).
     let assembled = match &preview.outcome {
         Ok(assembled) => {
-            lines.push(labelled("digest", &assembled.digest));
+            lines.push(Row::plain(labelled("digest", &assembled.digest)));
             assembled
         }
         Err(message) => {
             // A refusal is a preview: it is what the run would have said, in the words it would
             // have used, and it is the one thing this pane can tell a maintainer who has just
             // mistyped a `token_budget`.
-            lines.push(labelled("refused", message));
+            lines.push(Row::plain(labelled("refused", message)));
             return lines;
         }
     };
     let record = &assembled.trim;
 
-    lines.push(labelled(
+    lines.push(Row::plain(labelled(
         "budget",
         &format!(
             "{} ({}) \u{b7} reserve {:.2} \u{b7} target {}",
@@ -141,24 +170,29 @@ fn render_lines(preview: &PromptPreview) -> Vec<String> {
             record.reserve,
             record.target
         ),
-    ));
-    lines.push(labelled(
+    )));
+    lines.push(Row::plain(labelled(
         "tokens",
         &format!(
             "{} \u{2192} {} \u{b7} {}",
             record.estimated_before, record.estimated_after, record.estimator
         ),
-    ));
-    lines.extend(excerpt_lines(record));
-    lines.push(String::new());
-    lines.extend(section_lines(&record.sections));
-    lines.push(String::new());
+    )));
+    lines.extend(excerpt_lines(record).into_iter().map(Row::plain));
+    lines.push(Row::default());
+    lines.extend(section_lines(&record.sections).into_iter().map(Row::plain));
+    lines.push(Row::default());
     for (index, note) in record.notes.iter().enumerate() {
         let label = if index == 0 { "notes" } else { "" };
-        lines.push(labelled(label, note));
+        lines.push(Row::plain(labelled(label, note)));
     }
-    lines.push(RULE.to_owned());
-    lines.extend(assembled.text.lines().map(str::to_owned));
+    lines.push(Row::plain(RULE.to_owned()));
+    lines.extend(
+        assembled
+            .text
+            .lines()
+            .map(|line| Row::plain(line.to_owned())),
+    );
     lines
 }
 
@@ -330,7 +364,13 @@ impl DetailTab for PromptTab {
             .iter()
             .skip(self.scroll.skip())
             .take(usize::from(area.height))
-            .map(|row| Line::raw(row.as_str()))
+            .map(|row| {
+                if row.dim {
+                    Line::styled(row.text.as_str(), ctx.theme.dim)
+                } else {
+                    Line::raw(row.text.as_str())
+                }
+            })
             .collect();
         frame.render_widget(Paragraph::new(Text::from(window)), area);
     }
@@ -339,6 +379,7 @@ impl DetailTab for PromptTab {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use htui_core::model::{Activation, ChoiceReason, SkillChoice, SkillLevel};
     use ratatui::buffer::Buffer;
     use ratatui::widgets::Widget as _;
 
@@ -378,16 +419,87 @@ mod tests {
         // a note carrying a newline still contributes two rows and a blank separator still
         // contributes one. Without the `join`/`lines()` round trip this is where they would part.
         let rows = [
-            "template  prd v1".to_owned(),
-            String::new(),
-            "notes     first\nsecond".to_owned(),
-            "last".to_owned(),
+            Row::plain("template  prd v1".to_owned()),
+            Row::default(),
+            Row::plain("notes     first\nsecond".to_owned()),
+            Row::plain("last".to_owned()),
         ];
-        let split: Vec<String> = rows.join("\n").lines().map(str::to_owned).collect();
+        let split: Vec<String> = rows
+            .into_iter()
+            .flat_map(Row::split)
+            .map(|row| row.text)
+            .collect();
         assert_eq!(
             split,
             ["template  prd v1", "", "notes     first", "second", "last",],
             "the blank line survives and the embedded newline becomes its own row"
         );
+    }
+
+    #[test]
+    fn an_inactive_choice_is_a_dim_row() {
+        // MOD-9 D46 / D65: one row per skill choice between the section table and the notes, the
+        // `skills` label on the first; an active choice in the normal style, an inactive one dim.
+        let mut assembled = htui_core::prompt::assemble(
+            &htui_core::prompt::fixtures::phase_implement_attempt2(),
+            &htui_core::scrub::MinimalScrubber::new([]),
+        )
+        .expect("the fixture assembles");
+        assembled.trim.skill_choices.push(SkillChoice {
+            skill: htui_core::fixtures::ids::SKILL_TESTS,
+            name: "legacy\nstyle".to_owned(),
+            version: None,
+            level: SkillLevel::Global,
+            activation: Activation::Off,
+            active: false,
+            reason: ChoiceReason::Off,
+        });
+        let preview = PromptPreview {
+            item: htui_core::fixtures::ids::HTUI_FEAT_1,
+            available: vec!["implement".to_owned()],
+            template: Some(htui_core::prompt::TemplateRef {
+                name: "implement".to_owned(),
+                version: 1,
+            }),
+            outcome: Ok(assembled),
+        };
+
+        let rows = render_lines(&preview);
+        let first = labelled(
+            "skills",
+            "rust-style v2 \u{b7} project \u{b7} always \u{2192} active",
+        );
+        let second = labelled("", "legacy style v? \u{b7} global \u{b7} off \u{2192} off");
+        let at = rows
+            .iter()
+            .position(|row| row.text == first)
+            .unwrap_or_else(|| panic!("the active choice is a row: {rows:#?}"));
+        assert!(
+            !rows[at].dim,
+            "an active choice is drawn in the normal style"
+        );
+        assert_eq!(
+            rows.get(at + 1),
+            Some(&Row {
+                text: second,
+                dim: true
+            }),
+            "the inactive choice follows, dim, its name on one row"
+        );
+        assert_eq!(
+            rows.get(at + 2),
+            Some(&Row::default()),
+            "a blank row closes the block"
+        );
+        assert!(
+            rows.get(at + 3)
+                .is_some_and(|row| row.text.starts_with("notes")),
+            "the notes follow the block"
+        );
+        let table = rows
+            .iter()
+            .position(|row| row.text.starts_with("section "))
+            .expect("the section table is rendered");
+        assert!(table < at, "the block sits below the section table");
     }
 }
