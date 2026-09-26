@@ -19,6 +19,13 @@
 //! rewritten to a launch whose one tool cannot exist before any probe, so tier 1 answers `missing`
 //! and nothing real is spawned.
 //!
+//! **Milestone 2 (blueprint §7, T5).** Four more cases prove the declared-tags and quirks
+//! compare-and-set on Postgres, driven through `htui::store_worker::serve` with `Boxes` and
+//! `EditBox` over the same `Stack`: an editor opened before a reconnect and a registration probe
+//! still saves (neither touches `edit_version`); a second editor on a spent token is answered
+//! `BoxesStale` and never overwrites the first; another box of this user is listed and editable;
+//! and another user's box is neither listed nor editable.
+//!
 //! Each case prints `testkit::SKIP` and returns with `HTUI_TEST_DATABASE_URL` unset, and panics
 //! instead when `CI` is set, like every other Postgres-backed suite. The cases write `sh` scripts,
 //! so they are unix-only, as the `agent_worker` registration cases are.
@@ -31,11 +38,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use htui::agent_worker::{AgentRuntime, BoxProbeReport};
-use htui::store_worker::{Origin, ReplyEnvelope, StoreReply, UNSOLICITED};
+use htui::box_settings::BoxesSnapshot;
+use htui::store_worker::{Origin, ReplyEnvelope, StoreReply, StoreRequest, UNSOLICITED, serve};
 use htui_agent::box_probe::hardware::{FixedHardware, Hardware};
 use htui_agent::box_probe::spec::{SETTING_KEY, digest, seed};
 use htui_agent::probe::{ProbeEnv, ProbeSnapshot, ProbeStatus, platform_key};
-use htui_core::model::BoxId;
+use htui_core::model::{BoxEdit, BoxId, BoxRow, UserId};
 use htui_core::store::WriteStore as _;
 use htui_store::identity::Identity;
 use htui_store::{Backend, CacheStore, HTUI_VERSION, PgStore, Registration, testkit};
@@ -249,6 +257,66 @@ impl Stack {
             .expect("count this user's boxes")
     }
 
+    /// One request through the production store worker's `serve`, over this stack's backend.
+    async fn serve(&self, request: StoreRequest) -> StoreReply {
+        serve(&self.backend, &request).await
+    }
+
+    /// `box.edit_version` of `id`, by SQL.
+    async fn edit_version(&self, id: BoxId) -> i32 {
+        sqlx::query_scalar("SELECT edit_version FROM box WHERE id = $1")
+            .bind(id.as_uuid())
+            .fetch_one(self.pool())
+            .await
+            .expect("read edit_version")
+    }
+
+    /// `box.declared_tags` and `box.quirks` of `id`, by SQL.
+    async fn declared(&self, id: BoxId) -> (Vec<String>, String) {
+        sqlx::query_as("SELECT declared_tags, quirks FROM box WHERE id = $1")
+            .bind(id.as_uuid())
+            .fetch_one(self.pool())
+            .await
+            .expect("read declared_tags and quirks")
+    }
+
+    /// `box.updated_at` of this box, as Postgres prints it.
+    async fn updated_at(&self) -> String {
+        sqlx::query_scalar("SELECT updated_at::text FROM box WHERE id = $1")
+            .bind(self.box_id().as_uuid())
+            .fetch_one(self.pool())
+            .await
+            .expect("read updated_at")
+    }
+
+    /// A `box` row of `owner` named `hostname`, planted by SQL, never probed.
+    async fn plant_box(&self, owner: UserId, hostname: &str) -> BoxId {
+        let id = BoxId::new();
+        sqlx::query(
+            "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version) \
+             VALUES ($1, $2, $3, 'linux', '', 'x86_64', '0.0.0')",
+        )
+        .bind(id.as_uuid())
+        .bind(owner.as_uuid())
+        .bind(hostname)
+        .execute(self.pool())
+        .await
+        .expect("plant a box");
+        id
+    }
+
+    /// Another `app_user`, planted by SQL.
+    async fn plant_user(&self) -> UserId {
+        let user = UserId::new();
+        sqlx::query("INSERT INTO app_user (id, name) VALUES ($1, $2)")
+            .bind(user.as_uuid())
+            .bind("stranger")
+            .execute(self.pool())
+            .await
+            .expect("plant another user");
+        user
+    }
+
     async fn drop_db(self) {
         self.db.drop_db().await;
     }
@@ -265,6 +333,40 @@ fn the_report(replies: &[ReplyEnvelope]) -> BoxProbeReport {
     assert_eq!(report.box_failed, None, "the box half wrote: {report:?}");
     assert_eq!(report.agents_failed, None, "the agent half ran: {report:?}");
     report.clone()
+}
+
+/// The snapshot of a `Boxes` reply: a read, or an `EditBox` that applied.
+fn applied(reply: StoreReply) -> BoxesSnapshot {
+    let StoreReply::Boxes(snapshot) = reply else {
+        panic!("the worker answers Boxes: {reply:?}")
+    };
+    *snapshot
+}
+
+/// The snapshot of a `BoxesStale` reply: an `EditBox` on a spent token or a box not found.
+fn stale(reply: StoreReply) -> BoxesSnapshot {
+    let StoreReply::BoxesStale(snapshot) = reply else {
+        panic!("the worker answers BoxesStale: {reply:?}")
+    };
+    *snapshot
+}
+
+/// The row of `id` in `snapshot`, which must list it.
+fn row_of(snapshot: &BoxesSnapshot, id: BoxId) -> &BoxRow {
+    &snapshot
+        .boxes
+        .iter()
+        .find(|record| record.row.id == id)
+        .unwrap_or_else(|| panic!("the snapshot lists {id:?}: {snapshot:?}"))
+        .row
+}
+
+/// An edit of the declared tags only.
+fn tags(tags: &[&str]) -> BoxEdit {
+    BoxEdit {
+        declared_tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
+        quirks: None,
+    }
 }
 
 /// The pair of seeded tools every probe finds (`terraform` needs a stored spec).
@@ -467,6 +569,224 @@ async fn a_stored_spec_change_reprobes() {
             .contains(&("terraform".to_owned(), "1.9.0".to_owned())),
         "the stored spec's tool is recorded"
     );
+
+    stack.drop_db().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Milestone 2: the declared tags and quirks CAS (blueprint §7.2)
+// ---------------------------------------------------------------------------------------------
+
+/// PRD metric "Declared tags and quirks CAS", plan D39: an editor opened before a reconnect, a
+/// rename and a registration probe still saves on its token, because neither writes
+/// `edit_version`.
+#[tokio::test]
+async fn an_open_editor_survives_a_reconnect_and_a_registration_probe() {
+    let Some(mut stack) = Stack::new().await else {
+        return;
+    };
+    the_report(&stack.swap().await);
+    let this_box = stack.box_id();
+    let opened = applied(stack.serve(StoreRequest::Boxes).await);
+    assert_eq!(opened.this_box, Some(this_box));
+    let token = row_of(&opened, this_box).edit_version;
+    assert_eq!(token, 0, "a registered box starts at 0");
+    let first_updated = stack.updated_at().await;
+    let first = stack.columns().await;
+
+    stack
+        .db
+        .store
+        .register_box(
+            &Identity {
+                box_id: this_box,
+                hostname: "reconnected".to_owned(),
+            },
+            None,
+        )
+        .await
+        .expect("the reconnect registers");
+    sqlx::query("INSERT INTO app_setting (key, value) VALUES ($1, $2)")
+        .bind(SETTING_KEY)
+        .bind(terraform_spec())
+        .execute(stack.pool())
+        .await
+        .expect("store a spec");
+    the_report(&stack.swap().await);
+
+    let second = stack.columns().await;
+    assert_ne!(
+        stack.updated_at().await,
+        first_updated,
+        "the row was written"
+    );
+    assert_ne!(
+        second.probe_spec_digest, first.probe_spec_digest,
+        "the registration probe re-probed"
+    );
+    assert_eq!(
+        stack.edit_version(this_box).await,
+        token,
+        "neither registration nor the probe writes edit_version"
+    );
+
+    let saved = applied(
+        stack
+            .serve(StoreRequest::EditBox {
+                box_id: this_box,
+                expected: token,
+                edit: tags(&["gpu", "heavy_build"]),
+            })
+            .await,
+    );
+
+    let row = row_of(&saved, this_box);
+    assert_eq!(row.declared_tags, ["gpu", "heavy_build"]);
+    assert_eq!(row.edit_version, token + 1);
+    assert_eq!(row.hostname, "reconnected");
+    assert_eq!(
+        stack.columns().await,
+        second,
+        "the probe columns are the second probe's"
+    );
+    assert_eq!(
+        stack.declared(this_box).await,
+        (
+            vec!["gpu".to_owned(), "heavy_build".to_owned()],
+            String::new()
+        )
+    );
+
+    stack.drop_db().await;
+}
+
+/// PRD metric "Declared tags and quirks CAS": the second of two editors on one token is told, and
+/// the first one's tags stay.
+#[tokio::test]
+async fn a_concurrent_edit_is_reported_and_never_overwritten() {
+    let Some(stack) = Stack::new().await else {
+        return;
+    };
+    let this_box = stack.box_id();
+    let first_editor = applied(stack.serve(StoreRequest::Boxes).await);
+    let second_editor = applied(stack.serve(StoreRequest::Boxes).await);
+    let token = row_of(&first_editor, this_box).edit_version;
+    assert_eq!(token, 0);
+    assert_eq!(row_of(&second_editor, this_box).edit_version, token);
+
+    let saved = applied(
+        stack
+            .serve(StoreRequest::EditBox {
+                box_id: this_box,
+                expected: token,
+                edit: tags(&["gpu"]),
+            })
+            .await,
+    );
+    assert_eq!(row_of(&saved, this_box).declared_tags, ["gpu"]);
+
+    let refused = stale(
+        stack
+            .serve(StoreRequest::EditBox {
+                box_id: this_box,
+                expected: token,
+                edit: tags(&["vulkan"]),
+            })
+            .await,
+    );
+
+    let row = row_of(&refused, this_box);
+    assert_eq!(row.declared_tags, ["gpu"], "the row as it is now");
+    assert_eq!(row.edit_version, 1);
+    assert_eq!(
+        stack.declared(this_box).await.0,
+        ["gpu"],
+        "the second editor wrote nothing"
+    );
+    assert_eq!(stack.edit_version(this_box).await, 1);
+
+    stack.drop_db().await;
+}
+
+/// PRD D47: every box of this user is listed, and one that is not this process's box is edited on
+/// its own token without touching this one.
+#[tokio::test]
+async fn another_box_of_this_user_is_editable() {
+    let Some(stack) = Stack::new().await else {
+        return;
+    };
+    let this_box = stack.box_id();
+    let second = stack.plant_box(stack.db.store.this_user(), "SECOND").await;
+    let listed = applied(stack.serve(StoreRequest::Boxes).await);
+    assert_eq!(listed.boxes.len(), 2, "this user's two boxes: {listed:?}");
+    let token = row_of(&listed, second).edit_version;
+    assert_eq!(token, 0);
+    let this_before = stack.declared(this_box).await;
+    let this_version = stack.edit_version(this_box).await;
+
+    let saved = applied(
+        stack
+            .serve(StoreRequest::EditBox {
+                box_id: second,
+                expected: token,
+                edit: BoxEdit {
+                    declared_tags: None,
+                    quirks: Some("x".to_owned()),
+                },
+            })
+            .await,
+    );
+
+    assert_eq!(row_of(&saved, second).quirks, "x");
+    assert_eq!(stack.declared(second).await, (Vec::new(), "x".to_owned()));
+    assert_eq!(stack.edit_version(second).await, 1);
+    assert_eq!(
+        stack.declared(this_box).await,
+        this_before,
+        "this box is untouched"
+    );
+    assert_eq!(stack.edit_version(this_box).await, this_version);
+
+    stack.drop_db().await;
+}
+
+/// PRD D47, T1's `NotFound { entity: "box" }`: another user's box is never listed, and an edit of
+/// it is answered `BoxesStale` and writes nothing.
+#[tokio::test]
+async fn another_users_box_is_not_listed_and_not_editable() {
+    let Some(stack) = Stack::new().await else {
+        return;
+    };
+    let stranger = stack.plant_user().await;
+    let foreign = stack.plant_box(stranger, "ELSEWHERE").await;
+    let before = stack.declared(foreign).await;
+    let version = stack.edit_version(foreign).await;
+
+    let listed = applied(stack.serve(StoreRequest::Boxes).await);
+    assert!(
+        listed.boxes.iter().all(|record| record.row.id != foreign),
+        "another user's box is not listed: {listed:?}"
+    );
+
+    let refused = stale(
+        stack
+            .serve(StoreRequest::EditBox {
+                box_id: foreign,
+                expected: version,
+                edit: BoxEdit {
+                    declared_tags: Some(vec!["gpu".to_owned()]),
+                    quirks: Some("x".to_owned()),
+                },
+            })
+            .await,
+    );
+
+    assert!(
+        refused.boxes.iter().all(|record| record.row.id != foreign),
+        "the stale snapshot does not list it either: {refused:?}"
+    );
+    assert_eq!(stack.declared(foreign).await, before, "nothing was written");
+    assert_eq!(stack.edit_version(foreign).await, version);
 
     stack.drop_db().await;
 }
