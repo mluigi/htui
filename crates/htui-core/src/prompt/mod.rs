@@ -518,6 +518,21 @@ pub fn assemble(
     })
 }
 
+/// ANA-5 §4.4 step 6's residual (MOD-7 milestone 4, D118): the tokens left under the target once
+/// everything but the excerpts is assembled. `spec` is assembled with an empty [`ExcerptSet`] and
+/// the answer is `(trim.target - trim.estimated_after).max(0)`, the budget §4.5's selection may
+/// spend. The excerpt section's framing is not in it; an overshoot is §4.4's to trim, and excerpt
+/// files are what it drops first.
+///
+/// # Errors
+///
+/// Whatever [`assemble`] refuses the excerpt-less spec with, unchanged: the caller skips the pass,
+/// because the real assembly will refuse the same way.
+pub fn excerpt_residual(spec: &PromptSpec, scrubber: &dyn Scrubber) -> Result<i64, AssembleError> {
+    let _ = (spec, scrubber);
+    todo!("MOD-7 milestone 4 T2: the residual")
+}
+
 /// §4.7 step 7: walk the frame's spans once, in source order, and put each one's bytes in.
 ///
 /// `literals` is the frame's literal spans, already LF-normalised and masked, in the same order the
@@ -867,6 +882,25 @@ struct ScrubbedInputs {
     literals: Vec<String>,
 }
 
+/// Drops every excerpt the scrubber cannot mask (MOD-7 milestone 4, plan OQ-30 default, D119),
+/// with a note per file, so one secret-shaped file never refuses the whole prompt.
+///
+/// It checks the four strings [`assemble`] masks for an excerpt (`repo`, `path`, `content`, and
+/// `provider` when there is one), in that order, so every file kept here is one `assemble` will not
+/// refuse over. The note names the rule and never the content. It names `repo:path` only when both
+/// scrubbed clean, because `trim_record.notes` is persisted unscrubbed:
+/// - ``excerpt: `repo:path` dropped; the scrubber refused it (rule `…`)`` (content or provider);
+/// - ``excerpt: a file in repo `repo` dropped; the scrubber refused its path (rule `…`)``;
+/// - ``excerpt: a file dropped; the scrubber refused its repo slug (rule `…`)``.
+///
+/// `audit` is left as it is: `selected` still counts a dropped file, and `assemble` rebuilds
+/// `audit.files` from the survivors (`ExcerptAudit`'s documented asymmetry). Survivors keep their
+/// ranks, so "the highest rank number is the worst file" still holds.
+pub fn drop_unmaskable_excerpts(set: &mut ExcerptSet, scrubber: &dyn Scrubber) {
+    let _ = (set, scrubber);
+    todo!("MOD-7 milestone 4 T2: the scrub filter")
+}
+
 /// Masks one string in place under `section`'s name.
 fn mask(scrubber: &dyn Scrubber, value: &mut String, section: &str) -> Result<(), AssembleError> {
     *value = scrub_text(scrubber, value, section)?;
@@ -1034,5 +1068,181 @@ mod tests {
         }
         assert!(SectionName::FailureReason.is_protected(TemplateRole::Handoff));
         assert!(!SectionName::FailureReason.is_protected(TemplateRole::Phase));
+    }
+}
+
+/// [`excerpt_residual`] and [`drop_unmaskable_excerpts`] (MOD-7 milestone 4, D118, D129), over the
+/// `test-support` fixtures.
+#[cfg(all(test, feature = "test-support"))]
+mod residual_tests {
+    use super::*;
+    use crate::prompt::excerpt::{Excerpt, ExcerptAudit, ExcerptReason};
+    use crate::prompt::fixtures;
+    use crate::scrub::MinimalScrubber;
+
+    /// One excerpt file with the given repo, path and content, and nothing else interesting.
+    fn file(repo: &str, path: &str, content: &str, rank: u32) -> Excerpt {
+        Excerpt {
+            repo: repo.to_owned(),
+            path: path.to_owned(),
+            first_line: 1,
+            last_line: 1,
+            truncated: false,
+            elided_lines: 0,
+            elided_bytes: 0,
+            rank,
+            weight: 100,
+            reason: ExcerptReason::TouchedPath,
+            provider: None,
+            content: content.to_owned(),
+        }
+    }
+
+    /// `target - estimated_after` of `spec` assembled with no excerpts, the number the residual is
+    /// defined as.
+    fn room_without_excerpts(spec: &PromptSpec) -> i64 {
+        let bare = PromptSpec {
+            excerpts: ExcerptSet::default(),
+            ..spec.clone()
+        };
+        let assembled = assemble(&bare, &MinimalScrubber::new([])).expect("the fixture assembles");
+        assembled.trim.target - assembled.trim.estimated_after
+    }
+
+    #[test]
+    fn excerpt_residual_is_the_room_left_under_the_target() {
+        let spec = fixtures::phase_all_empty();
+        let residual =
+            excerpt_residual(&spec, &MinimalScrubber::new([])).expect("the fixture assembles");
+        assert_eq!(residual, room_without_excerpts(&spec));
+        assert!(residual > 0, "an all-empty phase leaves room: {residual}");
+    }
+
+    #[test]
+    fn excerpt_residual_ignores_the_specs_own_excerpts() {
+        let bare = fixtures::phase_all_empty();
+        let mut spec = bare.clone();
+        spec.excerpts.files = vec![
+            file("htui", "src/lib.rs", "pub fn marker() {}\n", 1),
+            file("htui", "src/main.rs", "fn main() {}\n", 2),
+        ];
+        let scrubber = MinimalScrubber::new([]);
+        assert_eq!(
+            excerpt_residual(&spec, &scrubber).expect("the fixture assembles"),
+            excerpt_residual(&bare, &scrubber).expect("the fixture assembles"),
+        );
+    }
+
+    #[test]
+    fn excerpt_residual_is_never_negative() {
+        let spec = fixtures::phase_oversize();
+        let residual =
+            excerpt_residual(&spec, &MinimalScrubber::new([])).expect("the fixture assembles");
+        assert!(residual >= 0, "{residual}");
+        assert_eq!(residual, room_without_excerpts(&spec).max(0));
+    }
+
+    #[test]
+    fn excerpt_residual_passes_an_assemble_error_through() {
+        let mut spec = fixtures::phase_all_empty();
+        spec.body = "{{no_such_placeholder}}".to_owned();
+        let refused = excerpt_residual(&spec, &MinimalScrubber::new([]));
+        assert!(
+            matches!(refused, Err(AssembleError::UnknownPlaceholder { .. })),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn drop_unmaskable_excerpts_drops_and_names_the_file() {
+        let audit = ExcerptAudit {
+            considered: 7,
+            selected: 2,
+            ..ExcerptAudit::default()
+        };
+        let mut set = ExcerptSet {
+            files: vec![
+                file("htui", "src/lib.rs", "pub fn marker() {}\n", 1),
+                file(
+                    "htui",
+                    "src/key.rs",
+                    "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n",
+                    2,
+                ),
+            ],
+            audit: audit.clone(),
+            notes: vec!["a note from the pass".to_owned()],
+        };
+        drop_unmaskable_excerpts(&mut set, &MinimalScrubber::new([]));
+        assert_eq!(set.files.len(), 1);
+        assert_eq!(set.files[0].path, "src/lib.rs");
+        assert_eq!(set.files[0].rank, 1, "a survivor keeps its rank");
+        assert_eq!(
+            set.notes,
+            vec![
+                "a note from the pass".to_owned(),
+                "excerpt: `htui:src/key.rs` dropped; the scrubber refused it (rule \
+                 `private_key_pem`)"
+                    .to_owned(),
+            ]
+        );
+        assert_eq!(set.audit, audit, "the audit is left as it is");
+    }
+
+    #[test]
+    fn drop_unmaskable_excerpts_never_names_a_refused_path() {
+        let mut set = ExcerptSet {
+            files: vec![
+                file(
+                    "htui",
+                    "src/sk-live0123456789abcdef.rs",
+                    "fn quiet() {}\n",
+                    1,
+                ),
+                file("sk-repo0123456789", "src/lib.rs", "fn quiet() {}\n", 2),
+            ],
+            ..ExcerptSet::default()
+        };
+        drop_unmaskable_excerpts(&mut set, &MinimalScrubber::new([]));
+        assert!(set.files.is_empty());
+        assert_eq!(set.notes.len(), 2, "{:?}", set.notes);
+        assert!(
+            set.notes[0].starts_with("excerpt: a file in repo `htui` dropped"),
+            "{}",
+            set.notes[0]
+        );
+        assert!(
+            set.notes[1].starts_with("excerpt: a file dropped; the scrubber refused its repo slug"),
+            "{}",
+            set.notes[1]
+        );
+        for note in &set.notes {
+            assert!(
+                !note.contains("sk-"),
+                "a note names a refused string: {note}"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_unmaskable_excerpts_keeps_a_file_whose_secret_masks() {
+        let mut set = ExcerptSet {
+            files: vec![file(
+                "htui",
+                "src/config.rs",
+                "const PASSWORD: &str = \"hunter2hunter2\";\n",
+                1,
+            )],
+            ..ExcerptSet::default()
+        };
+        let before = set.clone();
+        drop_unmaskable_excerpts(
+            &mut set,
+            &MinimalScrubber::new(["hunter2hunter2".to_owned()]),
+        );
+        assert_eq!(
+            set, before,
+            "a secret the scrubber masks is assemble's to mask"
+        );
     }
 }
