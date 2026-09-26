@@ -134,14 +134,14 @@ touching the store.
 - C8: the recorder flushes re-offered rows as a replay call separate from fresh rows; a short
   fresh insert is a non-retried error. Stale "offline buffer" docs corrected.
 - C2: lease methods take durations; Postgres stamps with `clock_timestamp()`; the stamped expiry
-  comes back to the caller; MemStore gets an injectable clock (per D2).
+  comes back to the caller; MemStore gets an injectable clock (D2).
 - C3: `quota_at` ordering guard on both stores, a lost ordering race told apart from `NotFound`.
 - C6: `upsert_agent` split into create and an `updated_at` CAS update returning `CasOutcome`.
 - C7: a pin and a trait-doc invariant ("every `box.settings` writer is a CAS").
 - C4 heartbeat: a `touch_box` store method (`last_seen_at = clock_timestamp()`) called on a timer
   from the store worker while online.
 - C5: a headless connect mode that never migrates and refuses pending/newer/dirty schema and an
-  `htui` below the target version; the target version kept in `app_setting` (per D3);
+  `htui` below the target version; the target version kept in `app_setting` (D3);
   `concepts.rs` moved onto it.
 - `R-STO-5` amendment (done, maintainer's typed ok 2026-09-26).
 - Conformance cases for every metric above on MemStore and PgStore.
@@ -184,21 +184,20 @@ Milestone 1 is what MOD-41 most needs and touches the recorder and engine. Miles
 store-only plus one timer. Milestone 4 has the widest test churn (every lease conformance case),
 so it goes last and can be split off without stranding the others.
 
-## Open Questions (maintainer, before planning)
+## Decisions taken at the PRD gate
 
-- **D1 — How is a step write fenced?** Recommended: a `StepFence` argument, `Lease(owner)` for the
-  engine and `Unleased` for chats; the predicate is `run.lease_owner = $owner` or
-  `run.lease_owner IS NULL` respectively, and a miss is a new `StoreError::Fenced`. Alternative: a
-  status-only fence (`run_step.finished_at IS NULL` / run not terminal), which needs no plumbing but
-  does not stop a stale holder writing while the adopter drives the same step.
-- **D2 — C2 now or with MOD-42?** Recommended: now, as milestone 4. Lease methods take durations,
-  Postgres stamps, MemStore takes a clock (the `Clock` trait moves from `htui-orch` to `htui-core`
-  so tests share one `TestClock`). Alternative: defer to MOD-42, since ANA-16 calls C2 harmless
-  while every lease check is same-box, which stays true until a relay answers from another box.
-- **D3 — What happens below the target version?** Recommended: the TUI that applies migrations
-  raises `app_setting` `htui.target_version` to its own version (never lowers it); a headless
-  process below the target refuses; a TUI below it runs with a warning. Alternative: the TUI
-  refuses too.
+Answered by the maintainer on 2026-09-26 ("all recomm"), before planning. They are decisions, not
+proposals: the plan implements them.
+
+- **D1 — Step writes carry an owner fence.** A `StepFence` argument on `append_events`,
+  `set_step_usage` and `finish_step`: `Lease(owner)` for the engine, `Unleased` for chats. The
+  predicate is `run.lease_owner = $owner` or `run.lease_owner IS NULL`, joined through `run` in the
+  same statement; a miss writes nothing and is a new `StoreError::Fenced`.
+- **D2 — C2 lands now, as milestone 4.** Lease methods take durations, Postgres stamps with
+  `clock_timestamp()` and returns what it wrote, and MemStore takes a clock; the `Clock` trait moves
+  from `htui-orch` to `htui-core` so tests share one `TestClock`.
+- **D3 — Below the target version, a TUI warns and a headless process refuses.** A TUI that applies
+  migrations raises `app_setting` `htui.target_version` to its own version and never lowers it.
 
 ## Risks
 
