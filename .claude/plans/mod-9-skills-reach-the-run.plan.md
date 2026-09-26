@@ -1,6 +1,6 @@
 # Plan: MOD-9 milestone 2 — bound skills reach the run
 
-**Status: CONFIRMED by the maintainer 2026-09-26** with OQ-9..OQ-13 defaults as written and **OQ-8 overturned**: judge prompts carry skills (D44, D48, D49), and untouched seeded `judge` templates are migrated to the new default (D49). **Amended 2026-09-26 at the blueprint gate (F-G):** a judge's `{{task}}` already replays the candidate's prompt, skills included, so the maintainer chose "allow, not in the default": D48 stands, **D49 is withdrawn** (the default `judge` body is unchanged, `0007` has no judge upgrade, R-20 is moot).
+**Status: CONFIRMED by the maintainer 2026-09-26; IMPLEMENTED `7be0794`..`fd5161e` (2026-09-26), final review `rust-reviewer` APPROVE WITH FIXES, findings 1, 3, 5, 6 applied, 4 accepted and documented, 2 carried to milestone 3.** with OQ-9..OQ-13 defaults as written and **OQ-8 overturned**: judge prompts carry skills (D44, D48, D49), and untouched seeded `judge` templates are migrated to the new default (D49). **Amended 2026-09-26 at the blueprint gate (F-G):** a judge's `{{task}}` already replays the candidate's prompt, skills included, so the maintainer chose "allow, not in the default": D48 stands, **D49 is withdrawn** (the default `judge` body is unchanged, `0007` has no judge upgrade, R-20 is moot).
 
 **Source**: `.claude/prds/mod-9-skill-library-templates.prd.md`, milestone 2 (Delivery Milestones
 table, row 2): "Engine phase and judge steps and the preview resolve `bound_skills(project,

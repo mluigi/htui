@@ -1,6 +1,6 @@
 # Blueprint: MOD-9 milestone 2, "skills reach the run"
 
-**Status**: CONFIRMED by the maintainer 2026-09-26, with the amendment below (D49 withdrawn).
+**Status**: CONFIRMED by the maintainer 2026-09-26, with the amendment below (D49 withdrawn). **Implemented** `7be0794`..`fd5161e` (2026-09-26).
 Findings F-A to F-Q (§0) and decisions D50–D69 (§11) are proposed here. A finding marked **Blocker** means the plan, read literally, does not compile, fails
 its own named test or the workspace gate, or cannot be validated. **Major** means a named test or a
 named pin is wrong, or a design consequence the maintainer has not seen. **Minor** is a citation, a

@@ -29,12 +29,15 @@ BM25 sparse, RRF-fused, scoped by project, filterable to decisions) through `htu
 `htui --search-items`; the agent tool waits on MOD-11, automatic sync on MOD-41, requirements and
 the resolution payload on MOD-50.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
-`0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1) and `0006_requirements`
-(MOD-38; cache: `0001`..`0004`), so **the next migration is `0007`** (cache: `0005`).
+`0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
+(MOD-38) and `0007_skill_attachments` (MOD-9 milestone 2; cache: `0001`..`0004`), so **the next
+migration is `0008`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
 milestone 1 and MOD-38: store conformance `CASES` 68, `READ_CASES` 14, `htui-orch` `CASES` 70,
 `StoreRequest` 64, `StoreReply` 35, 263 `.sqlx` files, `MIRRORED_TABLES` 21. Pins moved by MOD-9
-milestone 1 on top: store `CASES` 71, `StoreRequest` 66, `StoreReply` 37, 264 `.sqlx` files; `cargo doc --workspace --no-deps` shows exactly two baseline errors
+milestone 1 on top: store `CASES` 71, `StoreRequest` 66, `StoreReply` 37, 264 `.sqlx` files; and by
+MOD-9 milestone 2: 263 `.sqlx` files, 34 pinned commented columns (`tests/migrations.rs`), and
+`run_step.trim_record` at `v: 2` with `skill_choices` (the other pins unchanged); `cargo doc --workspace --no-deps` shows exactly two baseline errors
 (`htui-core` `MIRRORED_TABLES`, `htui-store` `step_exists`). `git` ≥ 2.33.0 is a runtime dependency
 of the `worktree` isolation mode and of reconciliation. **Production `approve` and `accept` are
 greyed and every production judge fails until MOD-11**, because no agent can write its phase's
@@ -323,8 +326,25 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   off htui, `Templates`/`SaveTemplate` on the store worker, and the Skills tab's `Templates` view
   (parse-gated save with the cursor on the error, wrapped and scrollable diff between any two
   versions or against the built-in default); plan `.claude/plans/mod-9-templates-editable.plan.md`,
-  blueprint `.claude/plans/mod-9-templates-editable.blueprint.md`. Milestone 2 (skills reach the run)
-  is next; its plan continues at D37 and R-14.
+  blueprint `.claude/plans/mod-9-templates-editable.blueprint.md`.
+  **Phase 2 landed (`7be0794`..`fd5161e`, 2026-09-26):** milestone 2, skills reach the run, widened
+  by the maintainer to ANA-22's storage and activation read side. Migration `0007_skill_attachments`
+  (ANA-22 §7.1: global level, `activation`/`globs`/`languages`, `skill_version.source`); one pure
+  `model::skill::resolve` (most specific attachment wins, a missing winning pin never falls back)
+  shared by both stores; `select` in the assembler (`always` active; `off`, `glob`→`no_path`,
+  `missing_version`, `not_placed` inactive) with every choice in `trim_record.skill_choices`
+  (record `v: 2`); `GraphSource::bound_skills`, so phase steps and judges get the phase's
+  candidates (a judge body may place `{{skills}}`, D48, though the default judge does not: its
+  replayed `{{task}}` already carries them) and handoffs none; the preview resolves the phase that
+  uses the chosen template and the Prompt sub-tab lists the choices. `R-SKL-2` amended. Plan
+  `.claude/plans/mod-9-skills-reach-the-run.plan.md`, blueprint
+  `.claude/plans/mod-9-skills-reach-the-run.blueprint.md` (final review `rust-reviewer` APPROVE
+  WITH FIXES, findings applied). **Milestone 3 is next** (writers, Skills view and attachments
+  matrix with a global row, language map, glob matcher over ANA-22 F2, the `graph.rs` clone gap);
+  its plan continues at D70 and R-25. Carry into it: `override_graph` creates its clone without
+  `is_override` (`NewStepGraph` has no such field), so the engine's clone-gap note cannot fire
+  until the clone sets it (review finding 2); and reading bindings before versions is now the
+  race-safe order for the writers (review finding 5).
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
   pattern masks, fail-closed persistence gate, Settings tab secret provider section. **No longer

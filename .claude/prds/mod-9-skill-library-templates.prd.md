@@ -181,8 +181,8 @@ Answered by the maintainer on 2026-09-25, before planning.
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | Templates are editable | Skills tab `Templates` view: list, body, diff between versions; `TextArea` and `$EDITOR` editing; save runs `parse`, puts the cursor on the error, warns on a missing `{{item}}`, and appends a version as a compare-and-set. | complete (`e971418`..`caacc96`, 2026-09-25) | [plan](../plans/mod-9-templates-editable.plan.md), [blueprint](../plans/mod-9-templates-editable.blueprint.md) |
-| 2 | Bound skills reach the run | Engine phase and judge steps and the preview resolve `bound_skills(project, Some(phase))`. | pending | — |
-| 3 | Skills are editable and bindable | Skill writers, `Skills` view with library, editor, diff, bindings matrix by project and phase, token estimate — in the shape ANA-22 decides. | pending (ANA-22 concluded) | — |
+| 2 | Bound skills reach the run | Engine phase and judge steps and the preview resolve `bound_skills(project, Some(phase))`. Widened 2026-09-26 by the maintainer to ANA-22's storage and activation read side (migration `0007`, global level, `always`/`off` selection recorded per step). | complete (`7be0794`..`fd5161e`, 2026-09-26) | [plan](../plans/mod-9-skills-reach-the-run.plan.md), [blueprint](../plans/mod-9-skills-reach-the-run.blueprint.md) |
+| 3 | Skills are editable and bindable | Skill writers, `Skills` view with library, editor, diff, bindings matrix by project and phase, token estimate — in the shape ANA-22 decides; plus the language map, glob matcher and clone gap (storage moved to milestone 2). | pending (ANA-22 concluded) | — |
 | 4 | Existing skills come in | `SKILL.md` import from a file or directory, frontmatter mapped per ANA-22. | pending (ANA-22 concluded) | — |
 
 Milestones 1 and 2 are independent of each other and of ANA-22. Milestone 4 needs milestone 3's

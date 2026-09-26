@@ -357,3 +357,10 @@ seed (at least `rust`, `c`, `cpp`, `python`, `typescript`, `javascript`, `go`, `
   one. A workspace level was considered and rejected because `workspace_project` is many-to-many
   (maintainer's choice: global, project, phase). §5.2's comparison is kept as it was argued; its
   conclusion is superseded by §6 items 1-4.
+- 2026-09-26 — **phasing amended by the maintainer** (MOD-9 milestone 2 plan,
+  `.claude/plans/mod-9-skills-reach-the-run.plan.md`): §7.1's migration (as `0007`, `0006` having
+  gone to MOD-38), §7.2's model, the three-level resolution and `select` for `always`/`off` with the
+  recorded choice moved from milestone 3 to milestone 2; a `glob` attachment records `no_path` until
+  milestone 3's matcher. `collapse` takes one list carrying `level` rather than three (plan D39).
+  The choice rides a new top-level `skill_choices` in the trim record (§9's open point). The verdict
+  is unchanged.
