@@ -52,8 +52,9 @@ const DOCUMENT_FLOOR_PERCENT: usize = 25;
 const VERIFY_FLOOR_LINES: usize = 200;
 /// §4.6c's floor for a handoff `step_summary`.
 const STEP_SUMMARY_FLOOR_LINES: usize = 20;
-/// `trim_record.v`: version 1, first, so a later reader can branch (§5.1).
-const RECORD_VERSION: u8 = 1;
+/// `trim_record.v`: version 2 since MOD-9 D42 added `skill_choices`; first, so a reader can branch
+/// (§5.1).
+const RECORD_VERSION: u8 = 2;
 
 /// How a section lost content. Closed vocabulary (§5.1 `:1545`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -169,7 +170,7 @@ pub struct TemplateRecord {
     pub role: TemplateRole,
 }
 
-/// `run_step.trim_record`, version 1 (ANA-5 §5.1).
+/// `run_step.trim_record`, version 2 (ANA-5 §5.1 as amended by MOD-9 D42).
 ///
 /// Byte-stable, but **not** by the route §5.1 assumed. §5.1 says "`serde_json::Map` is a `BTreeMap`
 /// in this workspace, so object keys serialise sorted"; that is false in a workspace build
