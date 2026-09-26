@@ -508,7 +508,7 @@ async fn workspace_of(backend: &Backend, project: ProjectId) -> Result<Workspace
 /// target). With no root, the answer is `root: None` and nothing is walked. With every repo
 /// already set, nothing is walked either. Otherwise one `find_checkouts` under `spawn_blocking`,
 /// then per repo without a row, in tree order: `choose` against the paths already held on this
-/// box, `canonical` of the chosen path, and `infer_repo_box_path`. A path this pass writes is held
+/// box (each row as stored and as it resolves), `canonical` of the chosen path, and `infer_repo_box_path`. A path this pass writes is held
 /// for every later repo. A truncated scan infers nothing. The reply is the re-read tree and the
 /// report.
 async fn infer(
@@ -550,15 +550,22 @@ async fn infer(
     } else {
         // Every repo's row on this box, not only this workspace's: a checkout another repo already
         // owns is never a candidate.
-        let held: BTreeSet<PathBuf> = backend
-            .repo_paths(box_id)
-            .await?
-            .into_iter()
-            .map(|row| PathBuf::from(row.local_path))
-            .collect();
-        let scan = tokio::task::spawn_blocking({
+        let rows = backend.repo_paths(box_id).await?;
+        let (scan, held) = tokio::task::spawn_blocking({
             let root = PathBuf::from(&root);
-            move || htui_orch::infer::find_checkouts(&root)
+            move || {
+                // Each row as stored and as it resolves: a legacy row stored as a link (before
+                // F-102) names a checkout the walk yields by its target, and must hold it too.
+                let mut held = BTreeSet::new();
+                for row in rows {
+                    let raw = PathBuf::from(row.local_path);
+                    if let Ok(resolved) = canonical_root(&raw) {
+                        held.insert(resolved);
+                    }
+                    held.insert(raw);
+                }
+                (htui_orch::infer::find_checkouts(&root), held)
+            }
         })
         .await
         .map_err(|err| StoreError::Backend(err.to_string()))?;

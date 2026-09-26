@@ -1022,6 +1022,46 @@ async fn a_symlinked_root_yields_paths_under_its_target() {
     );
 }
 
+/// A legacy row stored as a link (before `SetRepoPath` canonicalised, F-102) still holds the
+/// checkout it points at: the walk yields the target, so the held set has to know the row by its
+/// target too, or a second repo with the same remote is inferred onto a checkout already owned.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_legacy_link_row_holds_the_checkout_it_points_at() {
+    let backend = demo();
+    let dir = tempfile::tempdir().expect("a throwaway directory");
+    let root = dir.path().join("root");
+    fs::create_dir(&root).expect("the root");
+    let core = checkout(&root, "core", Some(CORE_CLONE_REMOTE));
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&core, &link).expect("the link is created");
+    let owner = create_repo(&backend, "core", Some(CORE_REMOTE)).await;
+    create_repo(&backend, "fork", Some(CORE_REMOTE)).await;
+    set_root(&backend, &root).await;
+    // Straight to the store, past the worker's guard: the row as an older build stored it.
+    backend
+        .writer()
+        .expect("a memory backend writes")
+        .upsert_repo_box_path(&RepoBoxPath {
+            repo_id: owner,
+            box_id: ids::BOX,
+            local_path: link.display().to_string(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("the legacy row is written");
+
+    let (tree, report) = infer(&backend).await;
+
+    assert_eq!(outcome(&report, "core"), &InferOutcome::AlreadySet);
+    assert_eq!(
+        outcome(&report, "fork"),
+        &InferOutcome::NoMatch,
+        "the only checkout is held by `core`'s row"
+    );
+    assert_eq!(local_path(&tree, "fork"), None, "nothing was written");
+}
+
 /// No root on this box: nothing is walked and nothing is reported.
 #[tokio::test]
 async fn no_root_reports_none_and_walks_nothing() {
