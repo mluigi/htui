@@ -1644,6 +1644,110 @@ mod tests {
         );
     }
 
+    /// The editor's "later edits kept" rule for the attachment form: a key typed while the save
+    /// was in flight keeps the form open on the landed row's token, so the next `Ctrl+S` writes
+    /// the edit over the row just saved; a save with nothing typed after it closes the form.
+    #[tokio::test]
+    async fn the_attach_form_keeps_edits_typed_during_its_save() {
+        let backend = Backend::memory(MemStore::demo());
+        let scope = vulkan();
+        let (top_bar, keymap, theme, emit) = (
+            TopBarState::default(),
+            Keymap::default_global(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let mut ctx = Ctx::new(
+            &scope,
+            &[],
+            &top_bar,
+            &keymap,
+            &theme,
+            Origin::Tab(SkillsTab::ID),
+            &emit,
+        );
+        let mut view = LibraryView::default();
+        let untouched = serve(&backend, &StoreRequest::Skills(scope.clone())).await;
+        view.on_reply(&untouched, &mut ctx);
+        let written = SkillBindingKey {
+            skill: ids::SKILL_RUST_STYLE,
+            project: Some(ids::PROJECT_VULKAN),
+            phase: None,
+        };
+
+        // `a` on `rust-style`; `j` to `vulkan-tutorials`; `Enter` opens a new form (`always`).
+        view.on_key(key(KeyCode::Char('a')), &mut ctx);
+        view.on_key(key(KeyCode::Char('j')), &mut ctx);
+        view.on_key(key(KeyCode::Enter), &mut ctx);
+        view.on_key(ctrl('s'), &mut ctx);
+        let requests = sent(&emit);
+        let [save] = requests.as_slice() else {
+            panic!("exactly the attach was sent: {requests:?}");
+        };
+
+        // `Space` twice on the activation while the save is in flight: `always` becomes `off`.
+        view.on_key(key(KeyCode::Char(' ')), &mut ctx);
+        view.on_key(key(KeyCode::Char(' ')), &mut ctx);
+        let saved = serve(&backend, save).await;
+        view.on_reply(&saved, &mut ctx);
+        assert_eq!(view.busy, None, "the save landed");
+        assert!(view.captures_input(), "the later edit keeps the form open");
+        assert!(
+            matches!(
+                &view.notice,
+                Some(Notice::Info(text))
+                    if text.starts_with("attached to ") && text.contains("later edits kept")
+            ),
+            "{:?}",
+            view.notice
+        );
+        let StoreReply::Skills(landed) = &saved else {
+            panic!("the attach answers with the library: {saved:?}");
+        };
+        let token = landed
+            .binding(written)
+            .expect("the attach landed")
+            .updated_at;
+
+        // The next save writes the edit over the landed row, and nothing typed after it closes
+        // the form.
+        view.on_key(ctrl('s'), &mut ctx);
+        let requests = sent(&emit);
+        let [again] = requests.as_slice() else {
+            panic!("exactly the second attach was sent: {requests:?}");
+        };
+        let StoreRequest::SetSkillBinding {
+            key: rewritten,
+            expected,
+            change: BindingChange::Attach(attachment),
+            ..
+        } = again
+        else {
+            panic!("not an attach: {again:?}");
+        };
+        assert_eq!(
+            (*rewritten, *expected, attachment.activation),
+            (written, Some(token), Activation::Off),
+            "the kept edit is saved under the landed row's token"
+        );
+        let saved = serve(&backend, again).await;
+        view.on_reply(&saved, &mut ctx);
+        assert_eq!(view.busy, None, "the second save landed");
+        assert!(
+            !view.captures_input(),
+            "nothing typed since: the form closed"
+        );
+        assert!(
+            matches!(
+                &view.notice,
+                Some(Notice::Info(text))
+                    if text.starts_with("attached to ") && !text.contains("later edits kept")
+            ),
+            "{:?}",
+            view.notice
+        );
+    }
+
     /// D77: a blank body is refused by the view, and the refusal sends nothing.
     #[tokio::test]
     async fn a_blank_body_dispatches_no_request() {
