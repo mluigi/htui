@@ -20,9 +20,10 @@
 //! per-section renderers, and [`digest`], the canonical form and its hash. T65 landed [`assemble`]
 //! itself, [`trim`]'s five-step order and its record, and [`settings`]'s budget chain. T66 lands
 //! [`excerpt`]'s five-tier ranker, its [`ExcerptProvider`](excerpt::ExcerptProvider) seam and
-//! [`excerpt::select`], whose filesystem half is `htui_agent::excerpt`. A caller that resolved no
-//! readable root still supplies an empty [`ExcerptSet`], which is what the preview does by design
-//! (plan D103).
+//! [`excerpt::select`], whose filesystem half is `htui_agent::excerpt`. MOD-7 milestone 4 adds
+//! [`excerpt_residual`] (D118) and [`drop_unmaskable_excerpts`] (D129), which
+//! `htui_agent::excerpt::excerpts_for` uses. It is the one pass both the engine's phase prompt and
+//! the Backlog preview run, and a caller with no readable root gets the empty audit from it.
 
 pub mod defaults;
 pub mod digest;
@@ -891,10 +892,18 @@ struct ScrubbedInputs {
 ///
 /// It checks the four strings [`assemble`] masks for an excerpt (`repo`, `path`, `content`, and
 /// `provider` when there is one), in that order, so every file kept here is one `assemble` will not
-/// refuse over. The note names the rule and never the content. It names `repo:path` only when both
-/// scrubbed clean, because `trim_record.notes` is persisted unscrubbed:
-/// - ``excerpt: `repo:path` dropped; the scrubber refused it (rule `…`)`` (content or provider);
-/// - ``excerpt: a file in repo `repo` dropped; the scrubber refused its path (rule `…`)``;
+/// refuse over. The note names the rule and never the content. Because `trim_record.notes` is
+/// persisted unscrubbed, a note names a repo or path only when the scrubber returns it unchanged —
+/// neither refused nor masked (a known secret inside a file name is masked, and naming it would
+/// leak it). `repo:path` is named only when both are unchanged, the repo alone when only it is:
+/// - ``excerpt: `repo:path` dropped; the scrubber refused it (rule `…`)`` (content or provider,
+///   repo and path unchanged);
+/// - ``excerpt: a file in repo `repo` dropped; the scrubber refused it (rule `…`)`` (content or
+///   provider, repo unchanged, path masked);
+/// - ``excerpt: a file in repo `repo` dropped; the scrubber refused its path (rule `…`)`` (path
+///   refused, repo unchanged);
+/// - ``excerpt: a file dropped; the scrubber refused it (rule `…`)`` or ``… refused its path
+///   (rule `…`)`` (the repo masked);
 /// - ``excerpt: a file dropped; the scrubber refused its repo slug (rule `…`)``.
 ///
 /// `audit` is left as it is: `selected` still counts a dropped file, and `assemble` rebuilds
@@ -906,20 +915,37 @@ pub fn drop_unmaskable_excerpts(set: &mut ExcerptSet, scrubber: &dyn Scrubber) {
         let note = if let Some(rule) = refused_rule(scrubber, &file.repo) {
             format!("excerpt: a file dropped; the scrubber refused its repo slug (rule `{rule}`)")
         } else if let Some(rule) = refused_rule(scrubber, &file.path) {
-            format!(
-                "excerpt: a file in repo `{}` dropped; the scrubber refused its path (rule \
-                 `{rule}`)",
-                file.repo
-            )
+            if scrubs_unchanged(scrubber, &file.repo) {
+                format!(
+                    "excerpt: a file in repo `{}` dropped; the scrubber refused its path (rule \
+                     `{rule}`)",
+                    file.repo
+                )
+            } else {
+                format!("excerpt: a file dropped; the scrubber refused its path (rule `{rule}`)")
+            }
         } else if let Some(rule) = refused_rule(scrubber, &file.content).or_else(|| {
             file.provider
                 .as_deref()
                 .and_then(|provider| refused_rule(scrubber, provider))
         }) {
-            format!(
-                "excerpt: `{}:{}` dropped; the scrubber refused it (rule `{rule}`)",
-                file.repo, file.path
-            )
+            match (
+                scrubs_unchanged(scrubber, &file.repo),
+                scrubs_unchanged(scrubber, &file.path),
+            ) {
+                (true, true) => format!(
+                    "excerpt: `{}:{}` dropped; the scrubber refused it (rule `{rule}`)",
+                    file.repo, file.path
+                ),
+                (true, false) => format!(
+                    "excerpt: a file in repo `{}` dropped; the scrubber refused it (rule \
+                     `{rule}`)",
+                    file.repo
+                ),
+                (false, _) => {
+                    format!("excerpt: a file dropped; the scrubber refused it (rule `{rule}`)")
+                }
+            }
         } else {
             kept.push(file);
             continue;
@@ -936,6 +962,15 @@ fn refused_rule(scrubber: &dyn Scrubber, value: &str) -> Option<&'static str> {
         Err(AssembleError::Unmasked { rule, .. }) => Some(rule),
         Ok(_) | Err(_) => None,
     }
+}
+
+/// Whether [`scrub_text`] returns `value` unchanged under the excerpt section's name — neither
+/// refused nor masked — so a persisted note may name it.
+fn scrubs_unchanged(scrubber: &dyn Scrubber, value: &str) -> bool {
+    matches!(
+        scrub_text(scrubber, value, &SectionName::Excerpts.render()),
+        Ok(masked) if masked == value
+    )
 }
 
 /// Masks one string in place under `section`'s name.
@@ -1281,5 +1316,35 @@ mod residual_tests {
             set, before,
             "a secret the scrubber masks is assemble's to mask"
         );
+    }
+
+    #[test]
+    fn drop_unmaskable_excerpts_never_names_a_masked_path() {
+        let mut set = ExcerptSet {
+            files: vec![file(
+                "htui",
+                "deploy/hunter2hunter2.pem",
+                "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n",
+                1,
+            )],
+            ..ExcerptSet::default()
+        };
+        drop_unmaskable_excerpts(
+            &mut set,
+            &MinimalScrubber::new(["hunter2hunter2".to_owned()]),
+        );
+        assert!(set.files.is_empty(), "the unmaskable file is dropped");
+        assert_eq!(set.notes.len(), 1, "{:?}", set.notes);
+        assert!(
+            set.notes[0].starts_with("excerpt: a file in repo `htui` dropped"),
+            "{}",
+            set.notes[0]
+        );
+        for note in &set.notes {
+            assert!(
+                !note.contains("hunter2hunter2"),
+                "a note names a masked string: {note}"
+            );
+        }
     }
 }

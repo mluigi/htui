@@ -12473,6 +12473,20 @@ mod tests {
             prompt.trim.excerpts.roots[0].source,
             RootSource::RunStepTree
         );
+        assert_eq!(
+            prompt.trim.excerpts.considered, 1,
+            "the tree was listed: {:?}",
+            prompt.trim.notes
+        );
+        assert!(
+            !prompt
+                .trim
+                .notes
+                .iter()
+                .any(|note| note.contains("could not be listed")),
+            "{:?}",
+            prompt.trim.notes
+        );
     }
 
     /// Plan D108 (blueprint P-4): a step with no `run_step_tree` row, which is a fan-out group
