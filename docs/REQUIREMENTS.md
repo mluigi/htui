@@ -13,7 +13,10 @@ and previous 11 ANA-10 amendments reverted to online-only requirements;
 amended 2026-09-14 by maintainer decision — R-MCP-2 added spawn_subagent, R-AGT-4 added claude-cli;
 amended 2026-09-25 by maintainer decision on ANA-11 (`docs/ANA-11.md` §7,
 `docs/decisions/ana/ana-11.md`) — R-ENT-14 and R-ENT-15 added; R-ENT-8, R-NF-4, R-STO-3 and
-R-TUI-1 amended in place; the optional R-MCP-2 `requirement_cite` amendment deferred to MOD-11.
+R-TUI-1 amended in place; the optional R-MCP-2 `requirement_cite` amendment deferred to MOD-11;
+amended 2026-09-26 by maintainer decision on ANA-22 (`docs/ANA-22.md` §6,
+`docs/decisions/ana/ana-22.md`) during MOD-9 milestone 2 — R-SKL-2 amended in place (global level,
+most-specific-wins, activation on the attachment).
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -259,8 +262,9 @@ conflict. Their verdicts survive only where restated here.
 - **R-PRM-4 (must).** Prompt templates per phase are versioned rows in Postgres,
   with a documented placeholder contract, editable in the TUI.
 - **R-SKL-1 (must).** Skill library in Postgres: name, description, versioned markdown body.
-- **R-SKL-2 (must).** Bindings at project level and at phase level; a phase binding overrides a
-  project binding of the same skill. A binding pins a version or follows latest.
+- **R-SKL-2 (must).** Skills attach at global, project or phase level; the most specific attachment
+  of a skill wins (phase over project over global). An attachment pins a version or follows latest,
+  and carries the activation (`always`, `glob`, `off`).
 - **R-SKL-3 (must).** TUI supports create, edit, view version diff, bind and unbind.
 - **R-SKL-4 (must).** Import from existing `SKILL.md` files as a convenience.
 
