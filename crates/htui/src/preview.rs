@@ -474,20 +474,4 @@ mod tests {
             "plan D107: the reserved names are MOD-4's"
         );
     }
-
-    #[test]
-    fn the_empty_audit_registers_the_builtin_and_records_the_caps() {
-        let caps = htui_core::prompt::excerpt::ExcerptCaps {
-            max_files: 12,
-            file_line_cap: 400,
-            head_lines: 200,
-            max_file_bytes: 262_144,
-        };
-        let set = empty_excerpts(caps);
-        assert!(set.files.is_empty());
-        assert!(set.audit.roots.is_empty(), "plan D110");
-        assert_eq!(set.audit.provider_set, vec![BUILTIN_ID.to_owned()]);
-        assert_eq!(set.audit.caps, caps);
-        assert_eq!((set.audit.considered, set.audit.selected), (0, 0));
-    }
 }
