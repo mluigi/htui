@@ -33,19 +33,20 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, ChatRunSpec,
-    CitationKind, Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId, GateOutcome,
-    Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
-    ItemRequirement, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind,
-    NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
-    NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
-    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunId,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
-    UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject,
+    Agent, AgentBox, AgentId, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow,
+    ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId,
+    GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch,
+    ItemPatch, ItemRequirement, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
+    NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
+    Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, Repo,
+    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
+    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
+    RequirementUpdate, Resolution, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId,
+    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
+    StepId, StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
@@ -710,6 +711,70 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.append_prompt_template(new, expected).await,
             Self::Online(pg) => pg.append_prompt_template(new, expected).await,
+        }
+    }
+
+    async fn skills(&self) -> Result<Vec<Skill>> {
+        match self {
+            Self::Memory(store) => store.skills().await,
+            Self::Online(pg) => pg.skills().await,
+        }
+    }
+
+    async fn skill_versions(&self, skill: SkillId) -> Result<Vec<SkillVersion>> {
+        match self {
+            Self::Memory(store) => store.skill_versions(skill).await,
+            Self::Online(pg) => pg.skill_versions(skill).await,
+        }
+    }
+
+    async fn skill_bindings(&self, project: Option<ProjectId>) -> Result<Vec<SkillBinding>> {
+        match self {
+            Self::Memory(store) => store.skill_bindings(project).await,
+            Self::Online(pg) => pg.skill_bindings(project).await,
+        }
+    }
+
+    async fn create_skill(&self, new: NewSkill) -> Result<(Skill, SkillVersion)> {
+        match self {
+            Self::Memory(store) => store.create_skill(new).await,
+            Self::Online(pg) => pg.create_skill(new).await,
+        }
+    }
+
+    async fn update_skill(
+        &self,
+        id: SkillId,
+        expected: DateTime<Utc>,
+        patch: SkillPatch,
+    ) -> Result<CasOutcome<Skill>> {
+        match self {
+            Self::Memory(store) => store.update_skill(id, expected, patch).await,
+            Self::Online(pg) => pg.update_skill(id, expected, patch).await,
+        }
+    }
+
+    async fn add_skill_version(
+        &self,
+        skill: SkillId,
+        expected: i32,
+        new: NewSkillVersion,
+    ) -> Result<CasOutcome<SkillVersion>> {
+        match self {
+            Self::Memory(store) => store.add_skill_version(skill, expected, new).await,
+            Self::Online(pg) => pg.add_skill_version(skill, expected, new).await,
+        }
+    }
+
+    async fn set_skill_binding(
+        &self,
+        key: SkillBindingKey,
+        expected: Option<DateTime<Utc>>,
+        change: BindingChange,
+    ) -> Result<CasOutcome<Option<SkillBinding>>> {
+        match self {
+            Self::Memory(store) => store.set_skill_binding(key, expected, change).await,
+            Self::Online(pg) => pg.set_skill_binding(key, expected, change).await,
         }
     }
 

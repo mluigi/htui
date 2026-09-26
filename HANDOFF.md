@@ -88,6 +88,17 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 ### Analyses
 
 
+- [ ] **ANA-23 - Pure-Rust local embedder to replace `ort`/`fastembed`** (maintainer-requested
+  2026-09-26, during MOD-9 milestone 3). `htui-store`'s `local-embed` feature
+  (`embed::FastEmbedder`, BGE-small-en-v1.5, MOD-34, `docs/decisions/mod/mod-34.md`) pulls `ort`,
+  whose `ort-sys` build script downloads ONNX Runtime from `parcel.pyke.io` or needs
+  `ORT_LIB_LOCATION` pointing at a native `libonnxruntime`; sandboxes that block the host can only
+  build `htui-store` and `htui` with a hand-fetched library. The maintainer wants no native runtime
+  fetched at build time. Compare **`candle`** (with `tokenizers` on its `fancy-regex` feature, no
+  `onig`) and **`tract-onnx`** (runs the same ONNX file): offline build, binary size, embedding
+  speed on the demo corpus, how and when model weights are fetched at run time, and whether the
+  vectors equal the ones already stored in qdrant within a tolerance or force a re-embed. Deliver a
+  verdict and the `MOD-N` that implements it.
 - [ ] **ANA-21 - Per-model weights for agent assignment, derived from public sources** (from MOD-4
   milestone 4, OQ-7; maintainer-requested 2026-09-23; MOD-4 is done, `docs/decisions/mod/mod-4.md`).
   `R-AGT-8`, `R-ORCH-7`. Blocks MOD-36.
@@ -273,6 +284,16 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   store conformance has no trait method to make a second box, so (a) wants a `pg_criteria` case
   that inserts a second `box` row plus a MemStore unit test in `mem.rs`; (b) fits either. Found
   2026-09-26.
+- [ ] **MOD-59 - A write's reply names itself, so a form never stays "in flight"** (from MOD-9
+  milestone 3 review, finding 3). `R-TUI-7`, `R-NF-3`. The Skills and Templates views decide that a
+  save landed by finding what they sent in the re-read snapshot (`ui/tabs/skills/library.rs` `land`,
+  milestone 1's D27 in `templates.rs`). If another session changes the same skill, binding or
+  template between the write and the worker's re-read, or `MemStore` stamps two writes with the same
+  instant, the predicate never holds: `busy` stays set and the editor, rename form or attachment
+  form refuses `Esc` and `Ctrl+S` until the workspace changes. Make a write's reply identify itself
+  (e.g. `StoreReply::SkillsWritten { snapshot, what }` and a templates twin) so landing no longer
+  depends on content, or release the form on any reply to the write's request name. Found
+  2026-09-26.
 - [ ] **MOD-49 - Interactive path picker for repo and workspace roots** (from MOD-7). `R-BOX-4`,
   `R-TUI-8`. MOD-7 D5 infers each repo's path on a box and falls back to a typed path in a text box
   when inference fails; as built, the typed fallback is Settings > Hierarchy's `b` (MOD-7 milestone
@@ -343,12 +364,29 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   uses the chosen template and the Prompt sub-tab lists the choices. `R-SKL-2` amended. Plan
   `.claude/plans/mod-9-skills-reach-the-run.plan.md`, blueprint
   `.claude/plans/mod-9-skills-reach-the-run.blueprint.md` (final review `rust-reviewer` APPROVE
-  WITH FIXES, findings applied). **Milestone 3 is next** (writers, Skills view and attachments
-  matrix with a global row, language map, glob matcher over ANA-22 F2, the `graph.rs` clone gap);
-  its plan continues at D70 and R-25. Carry into it: `override_graph` creates its clone without
-  `is_override` (`NewStepGraph` has no such field), so the engine's clone-gap note cannot fire
-  until the clone sets it (review finding 2); and reading bindings before versions is now the
-  race-safe order for the writers (review finding 5).
+  WITH FIXES, findings applied).
+  **Phase 3 landed (`df91c82`..`e5db119`, 2026-09-26):** milestone 3, skills editable and
+  attachable, **split by the maintainer** (glob *firing* is the PRD's new row 5, "Glob attachments
+  fire": the F2 file set, roots for fan-out groups, changed paths, `matched`/`no_match`; unblocked
+  now that MOD-7 milestone 4 runs the excerpt pass over `repo_box_path` roots). Shipped: skill names checked by the Agent Skills rule; `globset` (new
+  dependency) behind `model::skill_glob` (`<repo>:` qualifiers, brace-aware lists,
+  `canonical_globs`) and a seed language map (`model::skill_language`, fourteen languages); seven
+  `WriteStore` methods on every store (`skills`, `skill_versions`, `skill_bindings`, `create_skill`
+  with v1 in one transaction, `update_skill`, `add_skill_version`, `set_skill_binding`), each writer
+  a compare-and-set with one refusal chain (`check_attachment`), `CASES` 82; the clone gap closed
+  (`NewStepGraph.is_override` written, `override_graph` checks every copy before any write and
+  carries the source phases' attachments; the engine's clone-gap note is gone); `crate::skills` on
+  the store worker; the Skills view (library, versions, diff, `TextArea` and `$EDITOR`, token
+  estimate, rename; attachments pane with a global row, winner stars, a form showing the effective
+  globs and a repo picker). No migration; `.sqlx` 280. Plan
+  `.claude/plans/mod-9-skills-editable.plan.md`, blueprint
+  `.claude/plans/mod-9-skills-editable.blueprint.md` (F-H decided: an override clone is checked
+  first, then refused). Review `rust-reviewer` APPROVE WITH FIXES: findings 1, 2, 4, 5, 7 and the
+  acceptance gap (a phase `off` over a global `always`, end to end) applied (`22822ca`..`e5db119`);
+  finding 3 opened as MOD-59; finding 8 accepted (documented residue in `crates/htui/src/skills.rs`).
+  **Milestone 4 (import of skill files) is next.** Carry into it: the Skills view cannot open an editor
+  on a skill with no version (review finding 6, `library.rs` `on_skill_key`), which import is the
+  first writer able to produce; and a `glob` attachment still records `no_path` until row 5.
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
   pattern masks, fail-closed persistence gate, Settings tab secret provider section. **No longer
@@ -744,7 +782,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 1 (ANA-21 per-model weights)                                                                  |
-| MOD-N   | 41 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 2 (ANA-21 per-model weights, ANA-23 pure-Rust embedder)                                                                  |
+| MOD-N   | 42 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-59 write replies name themselves, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-5 merge-hook test flake)                |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

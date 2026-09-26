@@ -30,19 +30,21 @@ use htui_agent::record::{
 };
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, ChatRunSpec,
-    CitationKind, Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId, EventKind,
-    EventRole, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
-    ItemKindPatch, ItemPatch, ItemRequirement, ItemSummary, LinkGraph, NewCommandRun, NewDocument,
-    NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch,
-    Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, Quota, QuotaSource, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
-    RequirementUpdate, Resolution, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, normalize,
+    Agent, AgentBox, AgentId, Billing, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow,
+    ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId,
+    EventKind, EventRole, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
+    ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemSummary, LinkGraph, NewCommandRun,
+    NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo,
+    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    PromptScope, PromptTemplate, Quota, QuotaSource, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
+    ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
+    UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject, normalize,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::scrub::MinimalScrubber;
@@ -634,6 +636,42 @@ impl WriteStore for SpyStore {
         expected: Option<i32>,
     ) -> StoreResult<CasOutcome<PromptTemplate>> {
         self.inner.append_prompt_template(new, expected).await
+    }
+    async fn skills(&self) -> StoreResult<Vec<Skill>> {
+        self.inner.skills().await
+    }
+    async fn skill_versions(&self, skill: SkillId) -> StoreResult<Vec<SkillVersion>> {
+        self.inner.skill_versions(skill).await
+    }
+    async fn skill_bindings(&self, project: Option<ProjectId>) -> StoreResult<Vec<SkillBinding>> {
+        self.inner.skill_bindings(project).await
+    }
+    async fn create_skill(&self, new: NewSkill) -> StoreResult<(Skill, SkillVersion)> {
+        self.inner.create_skill(new).await
+    }
+    async fn update_skill(
+        &self,
+        id: SkillId,
+        expected: DateTime<Utc>,
+        patch: SkillPatch,
+    ) -> StoreResult<CasOutcome<Skill>> {
+        self.inner.update_skill(id, expected, patch).await
+    }
+    async fn add_skill_version(
+        &self,
+        skill: SkillId,
+        expected: i32,
+        new: NewSkillVersion,
+    ) -> StoreResult<CasOutcome<SkillVersion>> {
+        self.inner.add_skill_version(skill, expected, new).await
+    }
+    async fn set_skill_binding(
+        &self,
+        key: SkillBindingKey,
+        expected: Option<DateTime<Utc>>,
+        change: BindingChange,
+    ) -> StoreResult<CasOutcome<Option<SkillBinding>>> {
+        self.inner.set_skill_binding(key, expected, change).await
     }
     async fn set_setting(
         &self,

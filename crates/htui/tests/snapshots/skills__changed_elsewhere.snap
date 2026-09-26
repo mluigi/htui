@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/skills.rs
+expression: frame
+---
+Graphics · DESKTOP-HTUI · memory · 0 runs
+ 1 Backlog  2 Skills  3 Settings  4 Chat
+ Skills │ Templates
+┌ rust-style · editing from v2, saves v4 · ~42 tokens ─────────────────────────────────────────────┐
+│XPrefer `expect` with a reason. One error enum per crate.                                         │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ saved elsewhere since you opened it — v3 is now the latest; your draft is kept and Ctrl+S saves it
+ as v4
+ Ctrl+S save  Ctrl+E $EDITOR  Esc cancel  L1:C2
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces

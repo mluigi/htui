@@ -19,24 +19,25 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::model::{
-    Agent, AgentBox, AgentId, AgentSummary, AppUser, BoundSkill, BoxEdit, BoxId, BoxInfo, BoxProbe,
-    BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec, CitationKind, Claim,
-    CommandRun, CommandRunId, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead,
-    DocumentId, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
-    ItemKindPatch, ItemLink, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkEdge,
-    LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
-    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-    NewStepGraph, NewWorkspace, Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath,
-    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
-    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementState,
-    RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId,
-    RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
-    Scope, SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
-    UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    WorkspaceSummary, canonical_declared_tags, missing_tags_failure, overlaps, prompt_summary,
-    scope_of,
+    Agent, AgentBox, AgentId, AgentSummary, AppUser, BindingChange, BoundSkill, BoxEdit, BoxId,
+    BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec,
+    CitationKind, Claim, CommandRun, CommandRunId, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS,
+    Document, DocumentHead, DocumentId, GateOutcome, Item, ItemCitation, ItemFilter, ItemId,
+    ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement, ItemRevision,
+    ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem,
+    NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
+    Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
+    PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
+    Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
+    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
+    SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch,
+    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, WorkspaceSummary, canonical_declared_tags,
+    missing_tags_failure, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -44,15 +45,17 @@ use crate::prompt::template::TemplateRole;
 use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
-    CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StoredSetting, UpdateOutcome,
-    WriteStore, already_exists, chat_step_status, citation_key, close_out_needs_a_summary,
-    expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
-    finish_run_needs_a_terminal_status, graph_not_in_project, invalid_area_code, invalid_prefix,
-    item_has_a_live_run, item_kind_is_held, item_not_in_project, legal_move,
-    not_a_fanout_candidate, not_a_terminal_status, prompt_template_key, prompt_template_refusal,
-    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
-    row_names_another_step, run_is_terminal, step_is_not_promotable, step_slot_is_taken,
-    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
+    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StoredSetting,
+    UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment, citation_key,
+    close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
+    finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project,
+    invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
+    legal_move, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
+    prompt_template_key, prompt_template_refusal, references_no_row, requirement_withdrawn,
+    reserved_phase_name, resolution_not_closable, row_names_another_step, run_is_terminal,
+    skill_body_refusal, skill_patch_refusal, skill_version_key, step_is_not_promotable,
+    step_slot_is_taken, summary_names_another_item, winner_is_not_settled,
+    withdrawn_requirement_cited,
 };
 use uuid::Uuid;
 
@@ -112,11 +115,16 @@ struct State {
     /// `prompt_template`, read by the inherent [`MemStore::prompt_templates`] (MOD-2 plan D102) and
     /// appended to only by [`WriteStore::append_prompt_template`] and the project seed (MOD-9 D1).
     templates: Vec<PromptTemplate>,
-    /// `skill`, read by the inherent [`MemStore::bound_skills`] (MOD-2 plan D105).
+    /// `skill`, read by the inherent [`MemStore::bound_skills`] (MOD-2 plan D105) and
+    /// [`WriteStore::skills`], written by [`WriteStore::create_skill`] and
+    /// [`WriteStore::update_skill`] (MOD-9 milestone 3).
     skills: HashMap<SkillId, Skill>,
-    /// `skill_version`, resolved through [`SkillBinding::version_in_force`].
+    /// `skill_version`, resolved through [`SkillBinding::version_in_force`], read by
+    /// [`WriteStore::skill_versions`] and appended to by [`WriteStore::create_skill`] and
+    /// [`WriteStore::add_skill_version`].
     skill_versions: Vec<SkillVersion>,
-    /// `skill_binding`, resolved through `model::skill::resolve`.
+    /// `skill_binding`, resolved through `model::skill::resolve`, read by
+    /// [`WriteStore::skill_bindings`] and written by [`WriteStore::set_skill_binding`].
     skill_bindings: Vec<SkillBinding>,
     /// `box_tool`, projected by the inherent [`MemStore::box_profile`].
     box_tools: Vec<BoxTool>,
@@ -2536,7 +2544,7 @@ impl State {
             project_id: new.project_id,
             name: new.name,
             description: new.description,
-            is_override: false,
+            is_override: new.is_override,
             created_at: now,
             updated_at: now,
         };
@@ -2765,6 +2773,277 @@ impl State {
         };
         self.templates.push(row.clone());
         Ok(CasOutcome::Applied(row))
+    }
+
+    // ---- MOD-9 milestone 3: the skill writers (plan D75-D79, blueprint §3.3) ----------------
+
+    /// D91: name byte order.
+    fn skill_rows(&self) -> Vec<Skill> {
+        let mut rows: Vec<Skill> = self.skills.values().cloned().collect();
+        rows.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+        rows
+    }
+
+    /// D91: one skill's versions by `version`.
+    fn skill_version_rows(&self, skill: SkillId) -> Vec<SkillVersion> {
+        let mut rows: Vec<SkillVersion> = self
+            .skill_versions
+            .iter()
+            .filter(|row| row.skill_id == skill)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| row.version);
+        rows
+    }
+
+    /// D91: `project_id == project`, sorted by `(skill_id, phase_id)` (`None < Some`, as `NULLS
+    /// FIRST`; `Uuid`'s `Ord` is byte order, as Postgres's `uuid` comparison).
+    fn skill_binding_rows(&self, project: Option<ProjectId>) -> Vec<SkillBinding> {
+        let mut rows: Vec<SkillBinding> = self
+            .skill_bindings
+            .iter()
+            .filter(|row| row.project_id == project)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| (row.skill_id.as_uuid(), row.phase_id.map(PhaseId::as_uuid)));
+        rows
+    }
+
+    /// The row at a natural key, `UNIQUE NULLS NOT DISTINCT (skill_id, project_id, phase_id)`.
+    fn skill_binding_at(&self, key: SkillBindingKey) -> Option<&SkillBinding> {
+        self.skill_bindings
+            .iter()
+            .find(|row| SkillBindingKey::of(row) == key)
+    }
+
+    /// Order: `new_skill_refusal`; `require_user(created_by, "skill.created_by")`; a taken id →
+    /// `already_exists("skill", id)`; a taken name → `already_exists("skill", name)`. Writes the
+    /// row and its version 1, both stamped `now`.
+    fn create_skill(&mut self, new: NewSkill, now: DateTime<Utc>) -> Result<(Skill, SkillVersion)> {
+        if let Some(refusal) = new_skill_refusal(&new.name, &new.description, &new.body) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        self.require_user(new.created_by, "skill.created_by")?;
+        if self.skills.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists("skill", new.id)));
+        }
+        if self.skills.values().any(|row| row.name == new.name) {
+            return Err(StoreError::Constraint(already_exists("skill", &new.name)));
+        }
+        let skill = Skill {
+            id: new.id,
+            name: new.name,
+            description: new.description,
+            created_by: new.created_by,
+            created_at: now,
+            updated_at: now,
+        };
+        let version = SkillVersion {
+            skill_id: new.id,
+            version: 1,
+            body: new.body,
+            source: new.source,
+            created_by: new.created_by,
+            created_at: now,
+        };
+        self.skills.insert(skill.id, skill.clone());
+        self.skill_versions.push(version.clone());
+        Ok((skill, version))
+    }
+
+    /// `update_workspace`'s shape: `NotFound("skill")` → `Stale(current)` →
+    /// `skill_patch_refusal` → a name another row holds → apply both `Some` fields and stamp
+    /// `now` (an all-`None` patch still stamps, as the Postgres trigger does).
+    fn update_skill(
+        &mut self,
+        id: SkillId,
+        expected: DateTime<Utc>,
+        patch: SkillPatch,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Skill>> {
+        let current = self
+            .skills
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "skill",
+                id: id.to_string(),
+            })?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        if let Some(refusal) = skill_patch_refusal(&patch) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if let Some(name) = &patch.name
+            && self
+                .skills
+                .values()
+                .any(|row| row.id != id && row.name == *name)
+        {
+            return Err(StoreError::Constraint(already_exists("skill", name)));
+        }
+        let row = self
+            .skills
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock");
+        if let Some(name) = patch.name {
+            row.name = name;
+        }
+        if let Some(description) = patch.description {
+            row.description = description;
+        }
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// D89's order; pushes version `expected + 1` stamped `now`.
+    fn add_skill_version(
+        &mut self,
+        skill: SkillId,
+        expected: i32,
+        new: NewSkillVersion,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<SkillVersion>> {
+        let head = self
+            .skill_versions
+            .iter()
+            .filter(|row| row.skill_id == skill)
+            .max_by_key(|row| row.version)
+            .cloned();
+        if let Some(head) = &head
+            && head.version != expected
+        {
+            return Ok(CasOutcome::Stale(head.clone()));
+        }
+        if !self.skills.contains_key(&skill) {
+            return Err(StoreError::NotFound {
+                entity: "skill",
+                id: skill.to_string(),
+            });
+        }
+        if head.is_none() && expected != 0 {
+            return Err(StoreError::NotFound {
+                entity: "skill_version",
+                id: skill_version_key(skill, expected),
+            });
+        }
+        if let Some(refusal) = skill_body_refusal(&new.body) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        self.require_user(new.created_by, "skill_version.created_by")?;
+        let row = SkillVersion {
+            skill_id: skill,
+            version: expected + 1,
+            body: new.body,
+            source: new.source,
+            created_by: new.created_by,
+            created_at: now,
+        };
+        self.skill_versions.push(row.clone());
+        Ok(CasOutcome::Applied(row))
+    }
+
+    /// D90's order. An attach with no row pushes a fresh id; with a row it replaces the five
+    /// editable columns in place and stamps `now` (the id is kept); a detach removes the row.
+    fn set_skill_binding(
+        &mut self,
+        key: SkillBindingKey,
+        expected: Option<DateTime<Utc>>,
+        change: BindingChange,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Option<SkillBinding>>> {
+        let current = self.skill_binding_at(key).cloned();
+        if current.as_ref().map(|row| row.updated_at) != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        let skill_name = self
+            .skills
+            .get(&key.skill)
+            .map(|row| row.name.clone())
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "skill",
+                id: key.skill.to_string(),
+            })?;
+        let project_slug = match key.project {
+            Some(id) => self
+                .projects
+                .get(&id)
+                .map(|row| row.slug.clone())
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "project",
+                    id: id.to_string(),
+                })?,
+            None => String::new(),
+        };
+        let phase_project = match key.phase {
+            Some(id) => {
+                let phase = self.phase(id).ok_or_else(|| StoreError::NotFound {
+                    entity: "step_graph_phase",
+                    id: id.to_string(),
+                })?;
+                self.graphs
+                    .get(&phase.graph_id)
+                    .map(|graph| graph.project_id)
+            }
+            None => None,
+        };
+
+        let attachment = match change {
+            BindingChange::Detach => {
+                if let Some(row) = current {
+                    self.skill_bindings.retain(|other| other.id != row.id);
+                }
+                return Ok(CasOutcome::Applied(None));
+            }
+            BindingChange::Attach(attachment) => attachment,
+        };
+        let versions: Vec<i32> = self
+            .skill_version_rows(key.skill)
+            .iter()
+            .map(|row| row.version)
+            .collect();
+        let repos: Vec<String> = key
+            .project
+            .map(|id| self.repo_rows(id))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|repo| repo.name)
+            .collect();
+        let stored = check_attachment(
+            &BindingFacts {
+                key,
+                phase_project,
+                skill_name: &skill_name,
+                versions: &versions,
+                repos: &repos,
+                project_slug: &project_slug,
+            },
+            &attachment,
+        )
+        .map_err(StoreError::Constraint)?;
+
+        let row = SkillBinding {
+            id: current.map_or_else(SkillBindingId::new, |row| row.id),
+            skill_id: key.skill,
+            project_id: key.project,
+            phase_id: key.phase,
+            pinned_version: attachment.pinned_version,
+            position: attachment.position,
+            activation: attachment.activation,
+            globs: stored.globs,
+            languages: stored.languages,
+            updated_at: now,
+        };
+        match self
+            .skill_bindings
+            .iter_mut()
+            .find(|other| other.id == row.id)
+        {
+            Some(slot) => *slot = row.clone(),
+            None => self.skill_bindings.push(row.clone()),
+        }
+        Ok(CasOutcome::Applied(Some(row)))
     }
 
     /// The value one rung currently holds for a key, for [`validate`]'s `not_above` peer.
@@ -5541,6 +5820,53 @@ impl WriteStore for MemStore {
     ) -> Result<CasOutcome<PromptTemplate>> {
         let now = Utc::now();
         self.write(|state| state.append_prompt_template(new, expected, now))
+    }
+
+    async fn skills(&self) -> Result<Vec<Skill>> {
+        Ok(self.read(State::skill_rows))
+    }
+
+    async fn skill_versions(&self, skill: SkillId) -> Result<Vec<SkillVersion>> {
+        Ok(self.read(|state| state.skill_version_rows(skill)))
+    }
+
+    async fn skill_bindings(&self, project: Option<ProjectId>) -> Result<Vec<SkillBinding>> {
+        Ok(self.read(|state| state.skill_binding_rows(project)))
+    }
+
+    async fn create_skill(&self, new: NewSkill) -> Result<(Skill, SkillVersion)> {
+        let now = Utc::now();
+        self.write(|state| state.create_skill(new, now))
+    }
+
+    async fn update_skill(
+        &self,
+        id: SkillId,
+        expected: DateTime<Utc>,
+        patch: SkillPatch,
+    ) -> Result<CasOutcome<Skill>> {
+        let now = Utc::now();
+        self.write(|state| state.update_skill(id, expected, patch, now))
+    }
+
+    async fn add_skill_version(
+        &self,
+        skill: SkillId,
+        expected: i32,
+        new: NewSkillVersion,
+    ) -> Result<CasOutcome<SkillVersion>> {
+        let now = Utc::now();
+        self.write(|state| state.add_skill_version(skill, expected, new, now))
+    }
+
+    async fn set_skill_binding(
+        &self,
+        key: SkillBindingKey,
+        expected: Option<DateTime<Utc>>,
+        change: BindingChange,
+    ) -> Result<CasOutcome<Option<SkillBinding>>> {
+        let now = Utc::now();
+        self.write(|state| state.set_skill_binding(key, expected, change, now))
     }
 
     async fn set_setting(
@@ -9105,6 +9431,52 @@ mod tests {
                 .expect("the read is total")
                 .is_empty(),
             "an empty scope overlaps nothing (hazard H-10)"
+        );
+    }
+
+    /// MOD-9 D89: a skill with no version (a hand-written or imported row; `create_skill` always
+    /// writes v1, so no writer can make one) takes version 1 at the token `0`, and any other token
+    /// is `NotFound` on the missing version, keyed `"<skill>/v<n>"`.
+    #[tokio::test]
+    async fn a_skill_with_no_version_takes_version_one_at_zero() {
+        let mut data = crate::fixtures::demo_data();
+        let id = crate::model::SkillId::new();
+        let at = Utc::now();
+        data.skills.push(crate::model::Skill {
+            id,
+            name: "bare".to_owned(),
+            description: String::new(),
+            created_by: ids::USER,
+            created_at: at,
+            updated_at: at,
+        });
+        let store = MemStore::from_demo(data);
+        let version = |body: &str| crate::model::NewSkillVersion {
+            body: body.to_owned(),
+            source: json!({}),
+            created_by: ids::USER,
+        };
+
+        let missing = store.add_skill_version(id, 1, version("one")).await;
+        match missing {
+            Err(StoreError::NotFound {
+                entity: "skill_version",
+                id: key,
+            }) => assert_eq!(key, format!("{id}/v1"), "the missing version is named"),
+            other => panic!("a token on a skill with no version is NotFound, got {other:?}"),
+        }
+
+        let CasOutcome::Applied(v1) = store
+            .add_skill_version(id, 0, version("one"))
+            .await
+            .expect("append at 0")
+        else {
+            panic!("the token 0 on a skill with no version applies");
+        };
+        assert_eq!(
+            (v1.skill_id, v1.version, v1.body.as_str()),
+            (id, 1, "one"),
+            "the first version of a bare skill is v1"
         );
     }
 }

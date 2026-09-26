@@ -25,25 +25,32 @@
 //! audit row. The prompt inputs that are **not** mirrored — `prompt_template`, `skill`,
 //! `skill_version`, `skill_binding`, `box_tool` — stay inherent on `MemStore` / `PgStore` for the
 //! same reason `agents()` does.
+//!
+//! **MOD-9 milestone 3** adds the skill readers to `WriteStore` beside their writers (plan D75),
+//! as MOD-15 did; the bound-skill read the prompt uses stays inherent.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::model::skill::validate_name;
+use crate::model::skill_glob::{SkillGlob, canonical_globs};
+use crate::model::skill_language;
 use crate::model::{
-    Agent, AgentBox, AgentId, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, ChatRunSpec,
-    CitationKind, Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId, GateOutcome,
-    Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
-    ItemRequirement, ItemRevision, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
-    NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch,
-    Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId,
-    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
-    ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject,
+    Activation, Agent, AgentBox, AgentId, Attachment, BindingChange, BoxEdit, BoxId, BoxProbe,
+    BoxRecord, BoxRow, ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow, Document,
+    DocumentHead, DocumentId, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
+    ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkGraph,
+    NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate,
+    NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunId,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
+    SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
+    UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::prompt::template::{TemplateRole, parse};
@@ -741,6 +748,85 @@ pub trait WriteStore: ReadStore {
         new: NewPromptTemplate,
         expected: Option<i32>,
     ) -> Result<CasOutcome<PromptTemplate>>;
+
+    // skill, skill_version, skill_binding (MOD-9 milestone 3, plan D75-D79)
+    //
+    // Readers sit beside the writers, as MOD-15's do, so the conformance suite can read back what
+    // it wrote on both stores; the not-mirrored rule of this file's header is about `ReadStore`
+    // and the mirror, which these do not touch. Every writer is a compare-and-set, and the
+    // precedence is `append_prompt_template`'s: the token first, then `NotFound`, then
+    // `Constraint` (D75). The refusal sentences are the pure helpers below (D88).
+
+    /// Every skill, ordered by `name` bytes (`COLLATE "C"`).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn skills(&self) -> Result<Vec<Skill>>;
+
+    /// One skill's versions, ascending; empty for an unknown skill.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn skill_versions(&self, skill: SkillId) -> Result<Vec<SkillVersion>>;
+
+    /// `None`: the global attachments; `Some(p)`: `p`'s project and phase attachments. Ordered by
+    /// `(skill_id, phase_id)` bytes, `NULL` phase first (D91).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn skill_bindings(&self, project: Option<ProjectId>) -> Result<Vec<SkillBinding>>;
+
+    /// Inserts the skill and its version 1 together (D75, D77, OQ-16).
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for
+    /// [`new_skill_refusal`]'s sentences, a taken name (`already_exists("skill", name)`), a taken
+    /// id, or a `created_by` that names no user. Nothing is written.
+    async fn create_skill(&self, new: NewSkill) -> Result<(Skill, SkillVersion)>;
+
+    /// Renames and/or re-describes under CAS on `skill.updated_at` (D76, OQ-17). Order: `NotFound`
+    /// (unknown id), then `Stale` (spent token, even for bad input), then `Constraint`.
+    ///
+    /// # Errors
+    /// `NotFound { entity: "skill" }`; `Constraint` for [`skill_patch_refusal`]'s sentences or a
+    /// taken name (`already_exists("skill", name)`).
+    async fn update_skill(
+        &self,
+        id: SkillId,
+        expected: DateTime<Utc>,
+        patch: SkillPatch,
+    ) -> Result<CasOutcome<Skill>>;
+
+    /// Appends version `expected + 1` iff the head is `expected` (`0`: "the skill has no version",
+    /// a hand-written or imported row). Order (D89): a head other than `expected` is `Stale(head)`;
+    /// then `NotFound { entity: "skill" }`; then, with no version at all and `expected != 0`,
+    /// `NotFound { entity: "skill_version", id: skill_version_key(skill, expected) }`; then
+    /// `Constraint`. `skill.updated_at` is not touched.
+    ///
+    /// # Errors
+    /// As above; `Constraint` for [`skill_body_refusal`]'s sentences or an unknown `created_by`.
+    async fn add_skill_version(
+        &self,
+        skill: SkillId,
+        expected: i32,
+        new: NewSkillVersion,
+    ) -> Result<CasOutcome<SkillVersion>>;
+
+    /// Attaches, changes or detaches the one row at `key` (D78). `expected: None` is "I expect no
+    /// row"; `Some(t)` is that row's `updated_at`. Order (D90): the row at `key` is read and a
+    /// token that does not match it answers `Stale(row or None)`; then `NotFound` for the skill,
+    /// the project, the phase (`entity`: `"skill"`, `"project"`, `"step_graph_phase"`); then
+    /// `Detach` deletes (no row: `Applied(None)`); then [`check_attachment`]'s `Constraint`s; then
+    /// the write. `Applied` carries the row as stored (`None` after a detach).
+    ///
+    /// # Errors
+    /// As above.
+    async fn set_skill_binding(
+        &self,
+        key: SkillBindingKey,
+        expected: Option<DateTime<Utc>>,
+        change: BindingChange,
+    ) -> Result<CasOutcome<Option<SkillBinding>>>;
 
     // settings (D7, D8)
 
@@ -1489,6 +1575,196 @@ pub fn prompt_template_refusal(name: &str, body: &str) -> Option<String> {
     parse(TemplateRole::of_name(name), body)
         .err()
         .map(|err| err.to_string())
+}
+
+// ---- MOD-9 milestone 3: the skill writers' refusals (plan D71-D79, blueprint D88) -------------
+//
+// Every rule and sentence of the four skill writers lives here, so `MemStore` and `PgStore` only
+// look facts up and refuse the same input with the same sentence (R-32).
+
+/// MOD-9 D71: a name [`validate_name`] refuses.
+#[must_use]
+pub fn invalid_skill_name(name: &str) -> String {
+    format!(
+        "skill.name `{}` must be 1-64 of a-z, 0-9 and single inner hyphens",
+        name.escape_debug()
+    )
+}
+
+/// MOD-9 D77 (OQ-20): a blank body renders an empty `<skill>` block that costs tokens and says
+/// nothing.
+pub const BLANK_SKILL_BODY: &str = "a skill needs text";
+
+/// A `text` column Postgres cannot hold (`22021`), refused by rule on both stores.
+#[must_use]
+pub fn has_nul(column: &str) -> String {
+    format!("{column} must not contain a NUL character")
+}
+
+/// D77: why a body may not be stored — blank first, then a NUL (`skill_version.body`).
+#[must_use]
+pub fn skill_body_refusal(body: &str) -> Option<String> {
+    if body.trim().is_empty() {
+        return Some(BLANK_SKILL_BODY.to_owned());
+    }
+    body.contains('\0').then(|| has_nul("skill_version.body"))
+}
+
+/// D71, D77: `create_skill`'s input, in order: name, description NUL (`skill.description`), body.
+#[must_use]
+pub fn new_skill_refusal(name: &str, description: &str, body: &str) -> Option<String> {
+    if !validate_name(name) {
+        return Some(invalid_skill_name(name));
+    }
+    if description.contains('\0') {
+        return Some(has_nul("skill.description"));
+    }
+    skill_body_refusal(body)
+}
+
+/// D76: `update_skill`'s input: the name (if any), then the description's NUL (if any).
+#[must_use]
+pub fn skill_patch_refusal(patch: &SkillPatch) -> Option<String> {
+    if let Some(name) = &patch.name
+        && !validate_name(name)
+    {
+        return Some(invalid_skill_name(name));
+    }
+    patch
+        .description
+        .as_deref()
+        .is_some_and(|description| description.contains('\0'))
+        .then(|| has_nul("skill.description"))
+}
+
+/// The `NotFound` id of a missing version: `"{skill}/v{version}"`.
+#[must_use]
+pub fn skill_version_key(skill: SkillId, version: i32) -> String {
+    format!("{skill}/v{version}")
+}
+
+/// D78: a phase key with no project.
+#[must_use]
+pub fn phase_attachment_needs_a_project(phase: PhaseId) -> String {
+    format!("a phase attachment needs its project: step_graph_phase {phase} was given none")
+}
+
+/// D78: the phase's graph belongs to another project ([`graph_not_in_project`]'s shape).
+#[must_use]
+pub fn phase_not_in_project(phase: PhaseId, project: ProjectId) -> String {
+    format!("step_graph_phase {phase} is not in project {project}")
+}
+
+/// D78: a pin to a version the skill does not have.
+#[must_use]
+pub fn pin_names_no_version(skill: &str, version: i32) -> String {
+    format!("skill_binding.pinned_version `{version}` names no version of skill `{skill}`")
+}
+
+/// D78: `position < 0`.
+#[must_use]
+pub fn negative_position(position: i32) -> String {
+    format!("skill_binding.position `{position}` must be 0 or more")
+}
+
+/// D78: a qualified glob on a global row.
+#[must_use]
+pub fn global_glob_names_a_repo(glob: &str, repo: &str) -> String {
+    format!("glob `{glob}` names repo `{repo}`, but a global attachment belongs to no project")
+}
+
+/// D79 (OQ-18), verbatim.
+#[must_use]
+pub fn glob_names_unknown_repo(glob: &str, repo: &str, project_slug: &str) -> String {
+    format!("glob `{glob}` names repo `{repo}`, which project `{project_slug}` does not have")
+}
+
+/// D78: `activation = glob` with no effective glob (the DB's glob-needs-globs check backs it).
+pub const GLOB_NEEDS_GLOBS: &str =
+    "an attachment with activation `glob` needs at least one glob or language";
+
+/// What a store looked up before [`check_attachment`] (D88): the facts the rule needs, so the
+/// rule itself is pure and has one definition.
+#[derive(Debug, Clone, Copy)]
+pub struct BindingFacts<'a> {
+    /// The key being written.
+    pub key: SkillBindingKey,
+    /// The project owning `key.phase`'s graph (`None` when `key.phase` is `None`).
+    pub phase_project: Option<ProjectId>,
+    /// `skill.name`, for the pin sentence.
+    pub skill_name: &'a str,
+    /// Every version number the skill has.
+    pub versions: &'a [i32],
+    /// `key.project`'s repo names (empty for a global key).
+    pub repos: &'a [String],
+    /// `key.project`'s slug (empty for a global key), for D79's sentence.
+    pub project_slug: &'a str,
+}
+
+/// The columns [`check_attachment`] derives: what is stored beside the attachment's own three.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAttachment {
+    /// `canonical_globs(attachment.globs, attachment.languages)`.
+    pub globs: Vec<String>,
+    /// `skill_language::normalise(attachment.languages)`.
+    pub languages: Vec<String>,
+}
+
+/// D78's `Constraint` chain, in order, first refusal wins:
+/// 1. `key.phase` without `key.project` → [`phase_attachment_needs_a_project`];
+/// 2. `phase_project != key.project` → [`phase_not_in_project`];
+/// 3. `pinned_version: Some(n)` not in `versions` → [`pin_names_no_version`];
+/// 4. `position < 0` → [`negative_position`];
+/// 5. [`canonical_globs`] → the
+///    [`GlobError`](crate::model::GlobError)'s `Display` (languages, then globs);
+/// 6. per canonical glob with a qualifier: global key → [`global_glob_names_a_repo`]; repo not in
+///    `repos` → [`glob_names_unknown_repo`];
+/// 7. `Glob` with no canonical glob → [`GLOB_NEEDS_GLOBS`].
+///
+/// # Errors
+/// The sentence.
+pub fn check_attachment(
+    facts: &BindingFacts<'_>,
+    attachment: &Attachment,
+) -> core::result::Result<StoredAttachment, String> {
+    let key = facts.key;
+    if let Some(phase) = key.phase {
+        let Some(project) = key.project else {
+            return Err(phase_attachment_needs_a_project(phase));
+        };
+        if facts.phase_project != Some(project) {
+            return Err(phase_not_in_project(phase, project));
+        }
+    }
+    if let Some(pin) = attachment.pinned_version
+        && !facts.versions.contains(&pin)
+    {
+        return Err(pin_names_no_version(facts.skill_name, pin));
+    }
+    if attachment.position < 0 {
+        return Err(negative_position(attachment.position));
+    }
+    let globs =
+        canonical_globs(&attachment.globs, &attachment.languages).map_err(|err| err.to_string())?;
+    for glob in &globs {
+        let parsed = SkillGlob::parse(glob).map_err(|err| err.to_string())?;
+        let Some(repo) = parsed.repo else {
+            continue;
+        };
+        if key.project.is_none() {
+            return Err(global_glob_names_a_repo(glob, &repo));
+        }
+        if !facts.repos.contains(&repo) {
+            return Err(glob_names_unknown_repo(glob, &repo, facts.project_slug));
+        }
+    }
+    if attachment.activation == Activation::Glob && globs.is_empty() {
+        return Err(GLOB_NEEDS_GLOBS.to_owned());
+    }
+    Ok(StoredAttachment {
+        globs,
+        languages: skill_language::normalise(&attachment.languages),
+    })
 }
 
 /// D6: the holder count, in the sentence the refusal carries.

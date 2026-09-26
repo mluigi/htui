@@ -20,10 +20,11 @@ use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, Permissi
 use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
-    AgentId, AgentSummary, BoxEdit, BoxId, BoxInfo, Document, DocumentHead, DocumentId, Item,
-    ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemSummary, LinkGraph, Note, PhaseId,
-    PhasePatch, ProjectId, ProjectPatch, RepoId, RepoPatch, RunSummary, Scope, SessionEvent,
-    StepGraphId, StepGraphPatch, StepId, WorkspaceId, WorkspacePatch, WorkspaceSummary,
+    AgentId, AgentSummary, BindingChange, BoxEdit, BoxId, BoxInfo, Document, DocumentHead,
+    DocumentId, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemSummary, LinkGraph, Note,
+    PhaseId, PhasePatch, ProjectId, ProjectPatch, RepoId, RepoPatch, RunSummary, Scope,
+    SessionEvent, SkillBindingKey, SkillId, SkillPatch, StepGraphId, StepGraphPatch, StepId,
+    WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::store::{
@@ -42,6 +43,7 @@ use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, InferReport, MirrorAfterDelete};
 use crate::prompt_settings::{self, SettingsSnapshot};
 use crate::run_worker::{LiveChats, RunRuntime, RunServed};
+use crate::skills::{self, SkillsSnapshot, StaleWhat};
 use crate::templates::{self, TemplateBody, TemplatesSnapshot};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
@@ -547,6 +549,61 @@ pub enum StoreRequest {
         /// The head version the editor opened on: the CAS token, `None` for a name with no row.
         expected: Option<i32>,
     },
+    /// The Skills view's library, global attachments, and each scope project's attachments,
+    /// graphs and repo names (MOD-9 D81). Answered with [`StoreReply::Skills`].
+    Skills(Scope),
+    /// `create_skill`: the row and its version 1 together (D75, D77). The worker mints the id and
+    /// fills `created_by`; the view never holds a `UserId`. A refusal (name, blank body, taken
+    /// name) is [`StoreReply::Failed`].
+    CreateSkill {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// `skill.name`.
+        name: String,
+        /// `skill.description`.
+        description: String,
+        /// Version 1's body. Its `Debug` is its length.
+        body: TemplateBody,
+    },
+    /// `update_skill` under CAS on `skill.updated_at` (D76): answered with [`StoreReply::Skills`]
+    /// when it applied and [`StoreReply::SkillsStale`] when the token was spent or the skill is
+    /// gone.
+    EditSkill {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// Which skill.
+        skill: SkillId,
+        /// `skill.updated_at` the form opened on: the CAS token.
+        expected: DateTime<Utc>,
+        /// What changed.
+        patch: SkillPatch,
+    },
+    /// `add_skill_version`: append version `expected + 1` iff `expected` is the head (D75, D89).
+    /// The worker fills `created_by`. [`StoreReply::SkillsStale`] when the head moved or the skill
+    /// is gone.
+    SaveSkillVersion {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// Which skill.
+        skill: SkillId,
+        /// The head version the editor opened on: the CAS token (`0`: the skill has none).
+        expected: i32,
+        /// The new body. Its `Debug` is its length.
+        body: TemplateBody,
+    },
+    /// `set_skill_binding`: attach, change or detach the one row at `key` (D78, D90).
+    /// [`StoreReply::SkillsStale`] when the row at the key is not the one the form opened on, or
+    /// its skill, project or phase is gone.
+    SetSkillBinding {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The attachment's key.
+        key: SkillBindingKey,
+        /// The row's `updated_at` the form opened on; `None` for "no row at the key".
+        expected: Option<DateTime<Utc>>,
+        /// Attach or detach.
+        change: BindingChange,
+    },
     /// The connection as the Settings > Connection section shows it (MOD-15 M6, D4): backend
     /// label, whether a DSN is stored (never the DSN), the mirror's `cache_meta`, the last dial.
     ConnectionInfo,
@@ -651,6 +708,12 @@ impl StoreRequest {
             // The two of `templates::REQUEST_NAMES`, in that order (MOD-9 D5).
             Self::Templates(..) => "templates",
             Self::SaveTemplate { .. } => "save_template",
+            // The five of `skills::REQUEST_NAMES`, in that order (MOD-9 D81).
+            Self::Skills(..) => "skills",
+            Self::CreateSkill { .. } => "create_skill",
+            Self::EditSkill { .. } => "edit_skill",
+            Self::SaveSkillVersion { .. } => "save_skill_version",
+            Self::SetSkillBinding { .. } => "set_skill_binding",
             // The four of `connection::REQUEST_NAMES`, in that order (MOD-15 M6 D4).
             Self::ConnectionInfo => "connection_info",
             Self::SetDsn(_) => "set_dsn",
@@ -827,6 +890,18 @@ pub enum StoreReply {
     /// A template save missed its CAS token (PRD D5): the templates as they are now, for the editor
     /// to reload against. The editor keeps its typed text and retries only by hand.
     TemplatesStale(Box<TemplatesSnapshot>),
+    /// The Skills view's snapshot, freshly read: the answer to [`StoreRequest::Skills`] and to
+    /// every skill write that applied (MOD-9 D81).
+    Skills(Box<SkillsSnapshot>),
+    /// A skill write missed its token, or its skill, project or phase is gone (D81, D97): the
+    /// snapshot as it is now and which write it answers. The draft keeps its text and retries only
+    /// by hand.
+    SkillsStale {
+        /// The snapshot as it is now.
+        snapshot: Box<SkillsSnapshot>,
+        /// Which write went stale.
+        what: StaleWhat,
+    },
     /// `ConnectionInfo`, and every connection writer's success (D4): the section re-renders from
     /// it and never patches a field of its own into what it already had.
     Connection(ConnectionSnapshot),
@@ -1126,6 +1201,13 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::Templates(..) | StoreRequest::SaveTemplate { .. } => {
             templates::serve(backend, request).await?
         }
+        // The five skill requests, or-ed for the reason the arms above are: a guard does not count
+        // towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-9 D81).
+        StoreRequest::Skills(..)
+        | StoreRequest::CreateSkill { .. }
+        | StoreRequest::EditSkill { .. }
+        | StoreRequest::SaveSkillVersion { .. }
+        | StoreRequest::SetSkillBinding { .. } => skills::serve(backend, request).await?,
         // The four connection requests, or-ed for the same reason the twenty-five above are: a
         // guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would
         // be an E0004 here (MOD-15 M3 plan F-12, M6 plan D9). Only the read is answered: the three
