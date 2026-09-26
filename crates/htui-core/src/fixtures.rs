@@ -1633,7 +1633,7 @@ const PROMPT_DIGEST: &str = "9f2c1b7e4a08d3556c9e1af0b74d28e63c05a91f7d4b8e2016a
 /// half of what the pane renders: this one drops four sections and head-tails a fifth, so both
 /// indicators have something to say.
 const IMPL_TRIM_RECORD: &str = r#"{
-  "v": 1,
+  "v": 2,
   "template": { "name": "implement", "version": 3, "role": "phase" },
   "budget": 40000,
   "budget_source": "project",
@@ -1657,6 +1657,10 @@ const IMPL_TRIM_RECORD: &str = r#"{
     { "name": "excerpts",         "tokens_before": 11855, "tokens_after": 0,     "strategy": "dropped",   "trimmed": true,
       "dropped": 2 },
     { "name": "command_queue",    "tokens_before": 99,    "tokens_after": 99,    "strategy": "none",      "trimmed": false }
+  ],
+  "skill_choices": [
+    { "skill": "00000000-0000-0000-0000-000000005111", "name": "rust-style", "version": 2,
+      "level": "project", "activation": "always", "active": true, "reason": "always" }
   ],
   "excerpts": {
     "provider_set": ["builtin@1"],

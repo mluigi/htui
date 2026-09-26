@@ -987,12 +987,24 @@ fn to_value_is_byte_stable_and_carries_the_documented_keys() {
             "estimated_before",
             "estimated_after",
             "sections",
+            "skill_choices",
             "excerpts",
             "notes",
         ]),
-        "§5.1's twelve keys, no more and no fewer"
+        "§5.1's twelve keys and MOD-9 D42's skill_choices: thirteen, no more and no fewer"
     );
-    assert_eq!(first["v"], serde_json::json!(1));
+    assert_eq!(
+        first["v"],
+        serde_json::json!(2),
+        "MOD-9 D42 bumped the record"
+    );
+    // `phase_implement_attempt2` carries one `Always` skill, placed by the implement body.
+    let choices = first["skill_choices"]
+        .as_array()
+        .expect("MOD-9 D55: `skill_choices` is always an array");
+    assert_eq!(choices.len(), 1, "one candidate, one choice");
+    assert_eq!(choices[0]["reason"], serde_json::json!("always"));
+    assert_eq!(choices[0]["active"], serde_json::json!(true));
     assert_eq!(first["template"]["role"], serde_json::json!("phase"));
     assert_eq!(first["template"]["version"], serde_json::json!(3));
     assert_eq!(first["estimator"], serde_json::json!("chars-v2"));

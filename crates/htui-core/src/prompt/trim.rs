@@ -33,6 +33,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::model::link::UpstreamEntry;
+use crate::model::skill::SkillChoice;
 use crate::prompt::estimate::TokenEstimator;
 use crate::prompt::excerpt::{Excerpt, ExcerptAudit};
 use crate::prompt::render::{self, Rendered, UpstreamState};
@@ -199,6 +200,9 @@ pub struct TrimRecord {
     pub estimated_after: i64,
     /// One row per section that had data, in render order, `template` first.
     pub sections: Vec<Section>,
+    /// Every skill candidate and whether it rendered, in collapse order (MOD-9 D42, ANA-22 §6
+    /// item 8). Always present; `[]` when the step had no candidate.
+    pub skill_choices: Vec<SkillChoice>,
     /// §4.5's audit, verbatim.
     pub excerpts: ExcerptAudit,
     /// Conditions that are not errors: a clamped `hops`, a skipped repo, a declared stand-in.
@@ -1018,6 +1022,7 @@ pub(crate) fn record(
     template: &TemplateRef,
     template_tokens: i64,
     sections: Vec<Section>,
+    skill_choices: Vec<SkillChoice>,
     excerpts: ExcerptAudit,
     notes: Vec<String>,
 ) -> TrimRecord {
@@ -1039,6 +1044,7 @@ pub(crate) fn record(
         estimated_before: rows.iter().map(|row| row.tokens_before).sum(),
         estimated_after: rows.iter().map(|row| row.tokens_after).sum(),
         sections: rows,
+        skill_choices,
         excerpts,
         notes,
     }

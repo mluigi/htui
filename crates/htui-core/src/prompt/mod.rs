@@ -506,6 +506,8 @@ pub fn assemble(
         &spec.template,
         template_tokens,
         sections,
+        // T2 red: the choices arrive with `select` (MOD-9 D43).
+        Vec::new(),
         surviving_audit(spec, &kept_excerpts, scrubber)?,
         notes(spec),
     );
