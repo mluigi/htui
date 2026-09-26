@@ -644,6 +644,16 @@ async fn an_open_editor_survives_a_reconnect_and_a_registration_probe() {
     assert_eq!(row.declared_tags, ["gpu", "heavy_build"]);
     assert_eq!(row.edit_version, token + 1);
     assert_eq!(row.hostname, "reconnected");
+    let record = saved
+        .boxes
+        .iter()
+        .find(|record| record.row.id == this_box)
+        .expect("this box is listed");
+    assert_eq!(
+        record.probe_spec_digest, second.probe_spec_digest,
+        "the reply was re-read after the second probe"
+    );
+    assert_eq!(row.probed_tags, second.probed_tags);
     assert_eq!(
         stack.columns().await,
         second,
@@ -767,6 +777,8 @@ async fn another_users_box_is_not_listed_and_not_editable() {
         listed.boxes.iter().all(|record| record.row.id != foreign),
         "another user's box is not listed: {listed:?}"
     );
+    assert_eq!(listed.boxes.len(), 1, "only this user's box: {listed:?}");
+    row_of(&listed, stack.box_id());
 
     let refused = stale(
         stack
@@ -785,6 +797,12 @@ async fn another_users_box_is_not_listed_and_not_editable() {
         refused.boxes.iter().all(|record| record.row.id != foreign),
         "the stale snapshot does not list it either: {refused:?}"
     );
+    assert_eq!(
+        refused.boxes.len(),
+        1,
+        "the stale snapshot lists this user's box: {refused:?}"
+    );
+    row_of(&refused, stack.box_id());
     assert_eq!(stack.declared(foreign).await, before, "nothing was written");
     assert_eq!(stack.edit_version(foreign).await, version);
 
