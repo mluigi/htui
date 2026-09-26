@@ -481,7 +481,8 @@ impl AttachPane {
     }
 
     /// The picker. `Enter` types `<repo>:` into the globs field at its cursor, one char key at a
-    /// time (D101: `TextField` has no insert API, and a key is what inserts at the cursor).
+    /// time (D101: `TextField` has no insert API, and a key is what inserts at the cursor), after
+    /// `, ` when the text before the cursor ends in anything but `,` or whitespace.
     fn on_picker_key(
         &mut self,
         mut form: Form,
@@ -505,7 +506,15 @@ impl AttachPane {
             KeyCode::Char('k') | KeyCode::Up => cursor = cursor.saturating_sub(1),
             KeyCode::Enter => {
                 if let Some(repo) = repos.get(cursor) {
-                    for c in format!("{repo}:").chars() {
+                    // A glob typed right before the cursor is a list entry of its own: `, ` keeps
+                    // the qualifier off it.
+                    let separator = form
+                        .globs
+                        .before_cursor()
+                        .and_then(|before| before.chars().last())
+                        .is_some_and(|last| last != ',' && !last.is_whitespace());
+                    let inserted = format!("{}{repo}:", if separator { ", " } else { "" });
+                    for c in inserted.chars() {
                         form.globs.on_key(KeyEvent::from(KeyCode::Char(c)));
                     }
                     form.focus = FormField::Globs;
