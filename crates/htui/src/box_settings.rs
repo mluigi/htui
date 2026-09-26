@@ -12,7 +12,7 @@
 
 use htui_agent::box_probe::spec;
 use htui_core::model::{BoxId, BoxRecord};
-use htui_core::store::Result;
+use htui_core::store::{CasOutcome, Result, StoreError, WriteStore};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 use serde_json::Value;
 
@@ -47,8 +47,12 @@ pub struct SpecView {
 /// The view of `spec::effective(spec::seed(), stored)`. Pure.
 #[must_use]
 pub fn spec_view(stored: Option<&Value>) -> SpecView {
-    let _ = (stored, spec::seed());
-    todo!("MOD-7 milestone 2 T3: spec_view")
+    let effective = spec::effective(spec::seed(), stored);
+    SpecView {
+        overlay: stored.is_some() && effective.error.is_none(),
+        digest: effective.digest,
+        error: effective.error,
+    }
 }
 
 /// One read (D45): `backend.box_info()` for this box, `writer.boxes()`, and
@@ -57,8 +61,14 @@ pub fn spec_view(stored: Option<&Value>) -> SpecView {
 /// # Errors
 /// Whatever the store reports.
 pub async fn snapshot(backend: &Backend, writer: &Writer) -> Result<BoxesSnapshot> {
-    let _ = (backend, writer);
-    todo!("MOD-7 milestone 2 T3: snapshot")
+    let this_box = backend.box_info().await?.map(|info| info.box_id);
+    let boxes = writer.boxes().await?;
+    let settings = backend.app_settings().await?;
+    Ok(BoxesSnapshot {
+        this_box,
+        boxes,
+        spec: spec_view(settings.get(spec::SETTING_KEY)),
+    })
 }
 
 /// Serves `Boxes` and `EditBox` (D45, D46). `Err(Unreachable(DATABASE_UNREACHABLE))` offline
@@ -70,8 +80,44 @@ pub async fn snapshot(backend: &Backend, writer: &Writer) -> Result<BoxesSnapsho
 /// Whatever the seam reports (a `Constraint` becomes `Failed` with the tag sentence), plus
 /// `Unreachable` offline and `Backend` for a request that is not one of the two.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
-    let _ = (backend, request, DATABASE_UNREACHABLE);
-    todo!("MOD-7 milestone 2 T3: serve")
+    let writer = backend
+        .writer()
+        .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
+
+    match request {
+        StoreRequest::Boxes => Ok(StoreReply::Boxes(Box::new(
+            snapshot(backend, &writer).await?,
+        ))),
+        StoreRequest::EditBox {
+            box_id,
+            expected,
+            edit,
+        } => {
+            // The worker re-reads rather than handing the section the single row `Stale` carries:
+            // the section renders the whole list, and a row patched in locally would be a second
+            // source of truth. A box gone under the editor is a miss like a spent token (D48's
+            // `DELETED_ELSEWHERE`); a refused tag list stays an error, so `Failed` carries the
+            // store's sentence.
+            let applied = match writer.edit_box(*box_id, *expected, edit.clone()).await {
+                Ok(CasOutcome::Applied(_)) => true,
+                Ok(CasOutcome::Stale(_)) | Err(StoreError::NotFound { entity: "box", .. }) => false,
+                Err(other) => return Err(other),
+            };
+            let fresh = Box::new(snapshot(backend, &writer).await?);
+            Ok(if applied {
+                StoreReply::Boxes(fresh)
+            } else {
+                StoreReply::BoxesStale(fresh)
+            })
+        }
+        // `try_serve` routes exactly this module's two variants here, so the last arm is
+        // unreachable from the shell; a caller that reached it anyway is better told which request
+        // it sent than killed.
+        other => Err(StoreError::Backend(format!(
+            "not a box settings request: {}",
+            other.name()
+        ))),
+    }
 }
 
 /// The two request names, in [`StoreRequest`] order.
