@@ -1538,7 +1538,8 @@ impl PgStore {
                    registered_at,
                    last_seen_at,
                    last_probed_at,
-                   updated_at
+                   updated_at,
+                   edit_version
               FROM box WHERE id = $1
             "#,
             id.as_uuid(),
@@ -1815,7 +1816,8 @@ impl PgStore {
                    registered_at,
                    last_seen_at,
                    last_probed_at,
-                   updated_at
+                   updated_at,
+                   edit_version
               FROM box WHERE id = $1
             "#,
             id.as_uuid(),

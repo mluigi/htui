@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id AS \"id: BoxId\", user_id AS \"user_id: htui_core::model::UserId\", hostname,\n                   os_family AS \"os_family: htui_core::model::OsFamily\", os_version, arch, cpu,\n                   ram_mb, gpu_present, gpu_vendor, htui_version, probed_tags, declared_tags,\n                   quirks, settings, registered_at, last_seen_at, last_probed_at, updated_at,\n                   probe_spec_digest\n              FROM box WHERE user_id = $1 ORDER BY id\n            ",
+  "query": "\n            SELECT id             AS \"id: BoxId\",\n                   user_id        AS \"user_id: htui_core::model::UserId\",\n                   hostname,\n                   os_family      AS \"os_family: htui_core::model::OsFamily\",\n                   os_version,\n                   arch,\n                   cpu,\n                   ram_mb,\n                   gpu_present,\n                   gpu_vendor,\n                   htui_version,\n                   probed_tags,\n                   declared_tags,\n                   quirks,\n                   settings,\n                   registered_at,\n                   last_seen_at,\n                   last_probed_at,\n                   updated_at,\n                   edit_version\n              FROM box WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -214,12 +214,12 @@
       },
       {
         "ordinal": 19,
-        "name": "probe_spec_digest",
-        "type_info": "Text",
+        "name": "edit_version",
+        "type_info": "Int4",
         "origin": {
           "Table": {
             "table": "box",
-            "name": "probe_spec_digest"
+            "name": "edit_version"
           }
         }
       }
@@ -249,8 +249,8 @@
       false,
       true,
       false,
-      true
+      false
     ]
   },
-  "hash": "a778245ef7475e7abf75d6c25e2283f5a6f7fc87fa9e3c50f57f8626838d82ea"
+  "hash": "5875c0fce5de0b4204e3c057988c7b3aae2b8f153be7b6f1b12aa96787325edb"
 }

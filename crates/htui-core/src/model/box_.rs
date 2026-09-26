@@ -63,6 +63,10 @@ pub struct BoxRow {
     pub last_probed_at: Option<DateTime<Utc>>,
     /// `box.updated_at`.
     pub updated_at: DateTime<Utc>,
+    /// `box.edit_version`: the compare-and-set token of the declared-tags and quirks editors
+    /// (MOD-7 milestone 2, D39). Bumped by `WriteStore::edit_box` and by nothing else:
+    /// registration and the box probe never write it, so a reconnect cannot stale an open editor.
+    pub edit_version: i32,
 }
 
 /// A row of `box_tool` (§5.2): one compiler, build tool, shell or container runtime found by the
@@ -361,6 +365,7 @@ mod tests {
             last_seen_at: at(),
             last_probed_at: Some(at()),
             updated_at: at(),
+            edit_version: 0,
         }
     }
 

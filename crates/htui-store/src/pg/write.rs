@@ -1156,7 +1156,7 @@ impl WriteStore for PgStore {
                    os_family AS "os_family: htui_core::model::OsFamily", os_version, arch, cpu,
                    ram_mb, gpu_present, gpu_vendor, htui_version, probed_tags, declared_tags,
                    quirks, settings, registered_at, last_seen_at, last_probed_at, updated_at,
-                   probe_spec_digest
+                   edit_version, probe_spec_digest
               FROM box WHERE user_id = $1 ORDER BY id
             "#,
             self.this_user().as_uuid(),
@@ -1217,6 +1217,7 @@ impl WriteStore for PgStore {
                         last_seen_at: row.last_seen_at,
                         last_probed_at: row.last_probed_at,
                         updated_at: row.updated_at,
+                        edit_version: row.edit_version,
                     },
                     tools: own,
                     probe_spec_digest: row.probe_spec_digest,
