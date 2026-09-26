@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/hierarchy.rs
+expression: frame
+---
+Graphics (graphics) — root on this box: /srv/graphics
+  vulkan-tutorials  Vulkan Tutorials
+     core  main  https://example.com/o/core.git  /srv/graphics/core
+     docs  main  —  unset
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+inferred 1 of 2 · no checkout: docs — b on a repo sets it by hand

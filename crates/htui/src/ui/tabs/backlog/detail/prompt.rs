@@ -240,9 +240,9 @@ fn excerpt_lines(record: &TrimRecord) -> Vec<String> {
         audit.provider_set.join(", ")
     };
     let roots = if audit.roots.is_empty() {
-        // Plan D110: no `repo` row is read in this milestone, so there is no repo to say `no_path`
-        // about. The declared stand-in note below says the same thing in full.
-        "none \u{b7} no_path (no run_step_tree, no repo_box_path)".to_owned()
+        // The preview's scope is the project's repos (MOD-7 milestone 4, D120), so an empty list
+        // means the project has none; a repo with no path records `no_path` like any other root.
+        "none \u{b7} this project has no repo".to_owned()
     } else {
         audit
             .roots

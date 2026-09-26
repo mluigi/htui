@@ -22,9 +22,11 @@ use htui::ui::tabs::backlog::BacklogTab;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Activation, ChoiceReason, ItemId, Scope, SkillChoice, SkillLevel, WorkspaceSummary,
+    Activation, ChoiceReason, ItemId, ItemPatch, NewRepo, RepoBoxPath, RepoId, Scope, SkillChoice,
+    SkillLevel, WorkspaceSummary,
 };
-use htui_core::store::{MemStore, ReadStore as _};
+use htui_core::prompt::excerpt::RootSource;
+use htui_core::store::{MemStore, ReadStore as _, UpdateOutcome, WriteStore as _};
 use htui_store::Backend;
 
 /// How far right the Prompt sub-tab sits: Body, Runs, Graph, Documents, Notes, **Prompt**.
@@ -117,8 +119,8 @@ async fn the_prompt_sub_tab_previews_feat_1() {
         "the section list is rendered"
     );
     assert!(
-        frame.contains("no_path"),
-        "ANA-5 §12 criterion 12: the excerpt section is absent and the audit says why\n{frame}"
+        frame.contains("this project has no repo"),
+        "ANA-5 §12 criterion 12: the demo project has no repo, and the roots line says so\n{frame}"
     );
     insta::assert_snapshot!("preview_feat_1", frame);
 }
@@ -141,7 +143,7 @@ async fn the_preview_assembles_from_real_store_reads() {
     );
     assert!(
         assembled.trim.excerpts.roots.is_empty(),
-        "plan D110: no `repo` row is read in this milestone, so `roots` is empty"
+        "the demo project seeds no repo, so there is no root to record"
     );
     assert_eq!(assembled.trim.excerpts.considered, 0);
     assert_eq!(assembled.trim.excerpts.selected, 0);
@@ -154,6 +156,149 @@ async fn the_preview_assembles_from_real_store_reads() {
         assembled.trim.excerpts.caps.max_files > 0,
         "`resolve_excerpt_caps` answered, so the audit records the caps the pass would have run \
          under"
+    );
+}
+
+/// Adds the repo `name` to the demo `htui` project, the primary one when `primary`.
+async fn add_repo(store: &MemStore, name: &str, primary: bool) -> RepoId {
+    store
+        .create_repo(NewRepo {
+            id: RepoId::new(),
+            project_id: ids::PROJECT_HTUI,
+            name: name.to_owned(),
+            remote_url: None,
+            default_branch: "main".to_owned(),
+            is_primary: primary,
+        })
+        .await
+        .expect("the memory store never fails")
+        .id
+}
+
+/// The demo store with one primary repo `htui`, checked out on this box at a throwaway directory
+/// holding `src/lib.rs`, and FEAT-1 declaring `src/lib.rs` as its touched path (MOD-7 D120).
+///
+/// The directory is returned so it outlives the preview that reads it.
+async fn a_project_with_a_checkout() -> (MemStore, tempfile::TempDir) {
+    let store = MemStore::demo();
+    let repo = add_repo(&store, "htui", true).await;
+    let dir = tempfile::tempdir().expect("a throwaway checkout");
+    std::fs::create_dir_all(dir.path().join("src")).expect("the checkout's src directory");
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "//! The crate root.\npub fn scaffold() {}\n",
+    )
+    .expect("the checkout's one file");
+    store
+        .upsert_repo_box_path(&RepoBoxPath {
+            repo_id: repo,
+            box_id: ids::BOX,
+            local_path: dir.path().to_string_lossy().into_owned(),
+            updated_at: chrono::Utc::now(),
+        })
+        .await
+        .expect("the memory store never fails");
+
+    let item = item_id("FEAT-1").await;
+    let version = store
+        .item(item)
+        .await
+        .expect("the memory store never fails")
+        .expect("the demo item exists")
+        .version;
+    let outcome = store
+        .update_item(
+            item,
+            version,
+            ItemPatch {
+                touched_paths: Some(vec!["src/lib.rs".to_owned()]),
+                author_id: ids::USER,
+                box_id: Some(ids::BOX),
+                reason: "edited".to_owned(),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .expect("the memory store never fails");
+    assert!(
+        matches!(outcome, UpdateOutcome::Updated(_)),
+        "the edit is against the head version: {outcome:?}"
+    );
+    (store, dir)
+}
+
+#[tokio::test]
+async fn a_repo_path_row_puts_its_files_in_the_preview() {
+    // MOD-7 D120: a preview has no run and so no `run_step_tree` row, and the root it reads is
+    // this box's `repo_box_path` row, the rung a run reads before its trees exist.
+    let (store, _dir) = a_project_with_a_checkout().await;
+    let scope = platform_scope().await;
+    let item = item_id("FEAT-1").await;
+    let preview = preview::build(&Backend::memory(store), item, None, &scope)
+        .await
+        .expect("the demo store answers every prompt read");
+    let assembled = preview.outcome.as_ref().expect("the demo item assembles");
+
+    assert!(
+        assembled.text.contains("<file path=\"htui:src/lib.rs\""),
+        "the touched file is excerpted under its repo-qualified path:\n{}",
+        assembled.text
+    );
+    let roots: Vec<(&str, RootSource)> = assembled
+        .trim
+        .excerpts
+        .roots
+        .iter()
+        .map(|root| (root.repo.as_str(), root.source))
+        .collect();
+    assert_eq!(roots, vec![("htui", RootSource::RepoBoxPath)]);
+
+    let bare = preview::build(&Backend::memory(MemStore::demo()), item, None, &scope)
+        .await
+        .expect("the demo store answers every prompt read");
+    assert_ne!(
+        assembled.digest,
+        bare.outcome
+            .as_ref()
+            .expect("the demo item assembles")
+            .digest,
+        "the excerpt is part of the bytes, so it is part of the digest"
+    );
+}
+
+#[tokio::test]
+async fn a_repo_without_a_path_row_records_no_path() {
+    // ANA-5 §4.5 step 1: every repo of the project is a root, and one with no row on this box is
+    // recorded `no_path` rather than dropped, with `select`'s own note saying nothing was scanned.
+    let (store, _dir) = a_project_with_a_checkout().await;
+    add_repo(&store, "docs", false).await;
+    let scope = platform_scope().await;
+    let preview = preview::build(
+        &Backend::memory(store),
+        item_id("FEAT-1").await,
+        None,
+        &scope,
+    )
+    .await
+    .expect("the demo store answers every prompt read");
+    let assembled = preview.outcome.as_ref().expect("the demo item assembles");
+
+    assert!(
+        assembled
+            .trim
+            .excerpts
+            .roots
+            .iter()
+            .any(|root| root.repo == "docs" && root.source == RootSource::NoPath),
+        "the pathless repo is a `no_path` root: {:?}",
+        assembled.trim.excerpts.roots
+    );
+    let notes = &assembled.trim.notes;
+    assert!(
+        notes
+            .iter()
+            .any(|note| note == "excerpt: no readable root for repo `docs`; nothing was scanned"),
+        "the audit says why `docs` contributed nothing: {notes:#?}"
     );
 }
 
@@ -182,7 +327,7 @@ async fn the_preview_declares_its_stand_ins() {
     for stand_in in [
         "preview: documents are latest-per-kind; ANA-2 input_kinds resolution arrives with MOD-4",
         "preview: phase-level skills come from the first phase of the item's graph that uses \
-         this template; a glob attachment records no_path because no root resolves",
+         this template; a glob attachment records no_path until glob activation lands (MOD-9 OQ-12)",
         "preview: output_kind defaults to the template name; the phase row's value arrives with \
          MOD-4",
         "preview: command_queue exposure is a phase setting (R-MCP-4); absent until MOD-4",
@@ -197,7 +342,7 @@ async fn the_preview_declares_its_stand_ins() {
 /// MOD-9 D45's skills stand-in, verbatim.
 const SKILLS_NOTE: &str = "preview: phase-level skills come from the first phase of the item's \
                            graph that uses this template; a glob attachment records no_path \
-                           because no root resolves";
+                           until glob activation lands (MOD-9 OQ-12)";
 
 /// The start of MOD-9 D45's second note, the one a preview adds when no phase uses its template.
 const NO_PHASE: &str = "preview: no phase of this item's graph uses template";
@@ -478,7 +623,10 @@ async fn an_item_with_nothing_attached_still_previews() {
         !frame.contains("upstream"),
         "no upstream link, so no `upstream` row:\n{frame}"
     );
-    assert!(frame.contains("no_path"), "criterion 12 again, at 100x30");
+    assert!(
+        frame.contains("this project has no repo"),
+        "criterion 12 again, at 100x30"
+    );
     insta::assert_snapshot!("preview_ana_2", frame);
 }
 

@@ -603,6 +603,13 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn infer_repo_box_path(&self, path: &RepoBoxPath) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.infer_repo_box_path(path).await,
+            Self::Online(pg) => pg.infer_repo_box_path(path).await,
+        }
+    }
+
     async fn repo_box_paths(&self, repo: RepoId) -> Result<Vec<RepoBoxPath>> {
         match self {
             Self::Memory(store) => store.repo_box_paths(repo).await,

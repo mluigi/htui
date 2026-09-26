@@ -12,7 +12,7 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │  FEAT-1   in_progress        TUI scaffold           ││budget    120000 (project) · reserve 0.10 ·│
 │  FEAT-2   blocked            Agent driver and chat …││tokens    354 → 354 · chars-v2             │
 │  FEAT-3   queued             Postgres store and cac…││excerpts  builtin@1 · considered 0 · select│
-│  FIX-1    closed             Terminal left raw afte…││roots     none · no_path (no run_step_tree,│
+│  FIX-1    closed             Terminal left raw afte…││roots     none · this project has no repo  │
 │  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
 │▾ agy (3)                                            ││section                   before   after  s│
 │  ANA-1    done               Prompt assembly survey ││template                     149     149  n│

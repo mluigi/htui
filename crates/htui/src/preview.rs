@@ -7,7 +7,9 @@
 //! is declared in `trim_record.notes` rather than silently defaulted — see [`STAND_INS`]. Inventing
 //! an `input_kinds` order or pointing the excerpt walk at the process's working directory would
 //! make the preview's bytes a thing no real run would ever produce, which defeats the only purpose
-//! it has.
+//! it has. Since MOD-7 milestone 4 the excerpt section is real: the roots are this box's
+//! `repo_box_path` rows, the rung a run reads before its trees exist, and the pass is
+//! `htui_agent::excerpt::excerpts_for`, the engine's own.
 //!
 //! **It writes nothing.** No `set_step_prompt`, no `prompt` event, no run. That is correctness
 //! rather than caution: `set_step_prompt` writes *a step's* audit row and a preview has no step.
@@ -24,14 +26,15 @@
 //! `skill*` and `box_tool` are not mirrored, so an offline preview is not one missing setting but
 //! four missing tables; `htui` is an online-only program and says so in one sentence.
 
-use htui_core::model::{ItemId, PromptScope, Scope};
-use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet};
+use htui_agent::excerpt::{PassInput, excerpt_roots, excerpts_for, touched_prefixes};
+use htui_core::model::{ItemId, PromptScope, RepoId, Scope};
+use htui_core::prompt::excerpt::ExcerptSet;
 use htui_core::prompt::{
     AssembledPrompt, DEFAULT_TEMPLATES, InputDocument, PromptSpec, TemplateRef, TemplateRole,
     TokenEstimator, assemble, settings,
 };
 use htui_core::scrub::MinimalScrubber;
-use htui_core::store::{ReadStore as _, Result as StoreResult, StoreError};
+use htui_core::store::{ReadStore as _, Result as StoreResult, StoreError, WriteStore as _};
 use htui_store::Backend;
 use tokio::sync::mpsc;
 
@@ -82,7 +85,7 @@ const SUMMARY_NOTE: &str = "preview: the `summary` kind is excluded from documen
 /// MOD-9 D45: which phase's attachments the preview shows, and why a glob one never renders here.
 const SKILLS_NOTE: &str = "preview: phase-level skills come from the first phase of the item's \
                            graph that uses this template; a glob attachment records no_path \
-                           because no root resolves";
+                           until glob activation lands (MOD-9 OQ-12)";
 
 /// MOD-9 D45's second note: no phase of the item's graph uses the chosen template, or the item
 /// resolves to no graph, so only global and project attachments apply.
@@ -101,10 +104,9 @@ const COMMAND_QUEUE_NOTE: &str =
 /// Attempt 1, so `verify_failure` and `previous_diff` are absent by the normal empty-section rule.
 const ATTEMPT_NOTE: &str = "preview: attempt 1, so verify_failure and previous_diff are absent; \
                             the real attempt comes from run_step (MOD-4)";
-/// ANA-5 §12 criterion 12, as the preview meets it (plan D103, D110).
-const EXCERPTS_NOTE: &str = "preview: no run_step_tree row and no repo_box_path row, so no root \
-                             resolves; the excerpt section is absent and roots records no_path per \
-                             repo (plan D110: no repo row is read in this milestone)";
+/// ANA-5 §12 criterion 12, as the preview meets it (plan D103; MOD-7 milestone 4 D120).
+const EXCERPTS_NOTE: &str = "preview: no run exists, so no run_step_tree row; roots come from this \
+                             box's repo_box_path rows, else no_path";
 
 /// What the Prompt sub-tab receives: one reply per request, the assembler's verdict either way.
 ///
@@ -137,7 +139,9 @@ pub fn offline_refusal() -> &'static str {
 /// Blueprint D.4's table, read top to bottom: the item, its project, its kind, the project's
 /// templates, the item's graph (for the phase id), `app_setting`, the documents, the upstream
 /// walk, the box and the skills. Nine reads, every one of them the same read MOD-4 will make, and
-/// three fields filled by [`STAND_INS`] instead of by a `run_step`.
+/// three fields filled by [`STAND_INS`] instead of by a `run_step`. Two more since MOD-7 milestone
+/// 4: the project's repos and this box's `repo_box_path` rows, the roots the excerpt pass reads
+/// (plan D120).
 ///
 /// Returns a whole [`PromptPreview`] rather than a bare [`PromptSpec`] because both halves of the
 /// answer are things the pane renders: a project with no template row is not an error, and neither
@@ -216,9 +220,6 @@ pub async fn build(
     let budget = settings::resolve_budget(None, Some(&project.settings), &app);
     let hops = settings::resolve_hops(Some(&project.settings), &app, &mut notes);
     let max_skill_tokens = settings::resolve_max_skill_tokens(&app);
-    // The caps are recorded verbatim in the audit even though no pass ran: "the caps the selection
-    // would have run under" is what makes `selected: 0` legible rather than ambiguous.
-    let (caps, _scan, _deadline) = settings::resolve_excerpt_caps(&app);
 
     let documents = backend
         .documents_of_kinds(item, &[])
@@ -234,26 +235,45 @@ pub async fn build(
     let upstream = backend
         .upstream_summaries(item, hops, &PromptScope::from_scope(scope, row.project_id))
         .await?;
-    let box_profile = match backend.box_info().await? {
-        Some(info) => {
-            backend
-                .box_profile(info.box_id)
-                .await?
-                .ok_or_else(|| StoreError::NotFound {
+    let (box_id, box_profile) =
+        match backend.box_info().await? {
+            Some(info) => {
+                let profile = backend.box_profile(info.box_id).await?.ok_or_else(|| {
+                    StoreError::NotFound {
+                        entity: "box",
+                        id: info.box_id.to_string(),
+                    }
+                })?;
+                (info.box_id, profile)
+            }
+            None => {
+                return Err(StoreError::NotFound {
                     entity: "box",
-                    id: info.box_id.to_string(),
-                })?
-        }
-        None => {
-            return Err(StoreError::NotFound {
-                entity: "box",
-                id: "this box is not registered".to_owned(),
-            });
-        }
-    };
+                    id: "this box is not registered".to_owned(),
+                });
+            }
+        };
     let skills = backend.bound_skills(row.project_id, phase).await?;
+    // MOD-7 milestone 4 (plan D120): ANA-5 §4.5 step 1's "otherwise the project's repos". A
+    // preview has no run, so no `run_step_tree` row: each root is this box's `repo_box_path` row,
+    // else `no_path`. Read after every other read, so an offline arm still refuses with the prompt
+    // sentence first (D64, F-L).
+    let writer = backend
+        .writer()
+        .ok_or_else(|| StoreError::Unreachable(offline_refusal().to_owned()))?;
+    let repos = writer.repos(row.project_id).await?;
+    let paths = backend.repo_paths(box_id).await?;
+    let repo_scope: Vec<(RepoId, String)> = repos
+        .iter()
+        .map(|repo| (repo.id, repo.name.clone()))
+        .collect();
+    let input = PassInput {
+        roots: excerpt_roots(&repo_scope, &[], &paths, box_id),
+        touched_prefixes: touched_prefixes(&row.touched_paths, &repos),
+        notes: Vec::new(),
+    };
 
-    let spec = PromptSpec {
+    let mut spec = PromptSpec {
         role: TemplateRole::of_name(&chosen.name),
         template: pinned.clone(),
         body: chosen.body.clone(),
@@ -268,7 +288,7 @@ pub async fn build(
         upstream,
         box_profile,
         skills,
-        excerpts: empty_excerpts(caps),
+        excerpts: ExcerptSet::default(),
         command_queue: false,
         verify_failure: None,
         previous_diff: None,
@@ -280,37 +300,19 @@ pub async fn build(
         notes,
     };
 
+    // No session secrets to mask, and still fail-closed on the prefix rules (`R-SEC-3`): the
+    // preview shows the screen exactly what a run would send, never less masked. One scrubber for
+    // both, so the pass drops exactly what `assemble` would refuse to send.
+    let scrubber = MinimalScrubber::new([]);
+    // The engine's own pass, one call (MOD-7 P-1): the preview's bytes and a run's cannot drift.
+    spec.excerpts = excerpts_for(&spec, input, &app, &scrubber).await;
+
     Ok(PromptPreview {
         item,
         available,
         template: Some(pinned),
-        // No session secrets to mask, and still fail-closed on the prefix rules (`R-SEC-3`): the
-        // preview shows the screen exactly what a run would send, never less masked.
-        outcome: assemble(&spec, &MinimalScrubber::new([])).map_err(|error| error.to_string()),
+        outcome: assemble(&spec, &scrubber).map_err(|error| error.to_string()),
     })
-}
-
-/// §4.5's audit for a pass that never ran (plan D103, D110; blueprint D.5).
-///
-/// **`select` is deliberately not called.** The preview resolves no root — `run_step_tree` does not
-/// exist yet and `repo_box_path` has no writer — and with no root there is no reader work to do, so
-/// calling the ranker would only be a longer way of writing this. `roots` is empty rather than one
-/// `RootRecord { source: NoPath }` per repo because plan D110 reads no `repo` row in this
-/// milestone; [`EXCERPTS_NOTE`] is where that is said, and `excerpt::tests::
-/// no_roots_means_no_section_and_a_no_path_root_per_repo` is where the per-repo half is proved.
-fn empty_excerpts(caps: htui_core::prompt::excerpt::ExcerptCaps) -> ExcerptSet {
-    ExcerptSet {
-        files: Vec::new(),
-        audit: ExcerptAudit {
-            provider_set: vec![BUILTIN_ID.to_owned()],
-            roots: Vec::new(),
-            considered: 0,
-            selected: 0,
-            caps,
-            files: Vec::new(),
-        },
-        notes: Vec::new(),
-    }
 }
 
 /// The picker's list: every distinct template name the project has, minus the two reserved ones,
@@ -473,21 +475,5 @@ mod tests {
             chosen.name, "judge",
             "plan D107: the reserved names are MOD-4's"
         );
-    }
-
-    #[test]
-    fn the_empty_audit_registers_the_builtin_and_records_the_caps() {
-        let caps = htui_core::prompt::excerpt::ExcerptCaps {
-            max_files: 12,
-            file_line_cap: 400,
-            head_lines: 200,
-            max_file_bytes: 262_144,
-        };
-        let set = empty_excerpts(caps);
-        assert!(set.files.is_empty());
-        assert!(set.audit.roots.is_empty(), "plan D110");
-        assert_eq!(set.audit.provider_set, vec![BUILTIN_ID.to_owned()]);
-        assert_eq!(set.audit.caps, caps);
-        assert_eq!((set.audit.considered, set.audit.selected), (0, 0));
     }
 }
