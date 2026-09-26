@@ -32,7 +32,7 @@ use htui_core::model::{
     NewRun, NewRunStep, NoteId, Project, ProjectId, ProjectSettings, PromptScope, Repo, RepoId,
     Resolution, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary,
     SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepId, StepOutcome, StepStatus,
-    TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
+    TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoRoot, RootSource};
 use htui_core::prompt::{
@@ -700,13 +700,8 @@ where
             // and be re-queued (`htui/src/run_worker.rs`'s two re-queue arms, blueprint H-3).
             Claim::MissingTags { missing } => {
                 let item = Self::item_of(&self.run(run).await?)?;
-                self.note(
-                    item,
-                    RunFailure::MissingTags(missing.clone()).to_string(),
-                    None,
-                    now,
-                )
-                .await?;
+                self.note(item, missing_tags_failure(&missing), None, now)
+                    .await?;
                 return Err(EngineError::MissingTags {
                     item,
                     run: Some(run),
@@ -761,13 +756,8 @@ where
             .store
             .transition(item.id, Status::Open, Status::Blocked)
             .await?;
-        self.note(
-            item.id,
-            RunFailure::MissingTags(missing.clone()).to_string(),
-            None,
-            self.now(),
-        )
-        .await?;
+        self.note(item.id, missing_tags_failure(&missing), None, self.now())
+            .await?;
         Ok(EngineError::MissingTags {
             item: item.id,
             run: None,
