@@ -19,9 +19,9 @@ pub struct SkillGlob {
 }
 
 impl SkillGlob {
-    /// Parses one **trimmed** entry. The qualifier is the text before the first `:` when it is
-    /// non-empty and holds no `/` and no glob metacharacter (`*?[]{}\`), so `src/a:b.rs` and
-    /// `:foo` are bare.
+    /// Parses one **trimmed** entry. The qualifier is the text before the first `:` when, trimmed,
+    /// it is non-empty and holds no `/` and no glob metacharacter (`*?[]{}\`), so `src/a:b.rs` and
+    /// `:foo` are bare. Whitespace around a qualifier's `:` is dropped: `htui: src` is `htui:src`.
     ///
     /// # Errors
     /// [`GlobError::Invalid`]: a NUL anywhere ("contains a NUL character"); nothing after the
@@ -39,7 +39,10 @@ impl SkillGlob {
         if text.contains('\0') {
             return Err(invalid("contains a NUL character".to_owned()));
         }
-        let (repo, glob) = match text.split_once(':') {
+        let (repo, glob) = match text
+            .split_once(':')
+            .map(|(repo, glob)| (repo.trim(), glob.trim()))
+        {
             Some((repo, glob))
                 if !repo.is_empty() && !repo.contains('/') && !repo.contains(META) =>
             {
