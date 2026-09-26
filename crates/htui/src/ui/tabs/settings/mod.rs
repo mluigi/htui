@@ -1,14 +1,15 @@
 //! The Settings tab: a strip of sections, one per area of configuration.
 //!
 //! A registry for the same reason the tabs and the detail sub-tabs are one (MOD-1 plan D5):
-//! MOD-2's agent registry, MOD-7's box profile, MOD-9's skills and MOD-15's hierarchy each want a
-//! section of this tab, and each should be a file plus one `register` line rather than a `match`
-//! arm growing in here. [`SettingsSection`] mirrors
-//! [`DetailTab`](crate::ui::tabs::backlog::detail::DetailTab) one level across, with
+//! MOD-2's agent registry, MOD-7's `Boxes` section (every box of the user, this box marked),
+//! MOD-9's skills and MOD-15's hierarchy each want a section of this tab, and each should be a
+//! file plus one `register` line rather than a `match` arm growing in here. [`SettingsSection`]
+//! mirrors [`DetailTab`](crate::ui::tabs::backlog::detail::DetailTab) one level across, with
 //! [`on_scope_change`](SettingsSection::on_scope_change) where the detail pane has
 //! `on_item_change`: a section is scoped to a workspace, not to an item.
 
 pub mod agents;
+pub mod boxes;
 pub mod connection;
 pub mod hierarchy;
 pub mod kinds;
@@ -30,6 +31,7 @@ use crate::ui::tabs::registry::{Tab, TabId};
 use crossterm::event::{KeyCode, KeyEvent};
 
 pub use agents::AgentsSection;
+pub use boxes::BoxesSection;
 pub use connection::ConnectionSection;
 pub use hierarchy::HierarchySection;
 pub use kinds::KindsSection;
@@ -59,9 +61,9 @@ pub(crate) fn yes_or_no(text: &str) -> Option<bool> {
 /// Whether a notice is one the user has to act on rather than read, and so belongs in
 /// `theme.error`.
 ///
-/// The kinds section, the hierarchy section and the prompt section coin their compare-and-set
-/// sentences from the same two openings — the row moved under an open editor, or it is gone — and
-/// all of them draw them the same way (M4 D14).
+/// The kinds section, the hierarchy section, the prompt section and the boxes section coin their
+/// compare-and-set sentences from the same two openings — the row moved under an open editor, or it
+/// is gone — and all of them draw them the same way (M4 D14).
 pub(crate) fn is_error(notice: &str) -> bool {
     notice.starts_with("changed elsewhere") || notice.starts_with("deleted elsewhere")
 }
