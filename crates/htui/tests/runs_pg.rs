@@ -1167,7 +1167,6 @@ async fn a_capability_refusal_blocks_and_unblock_reopens_on_postgres() {
 /// that the engine answered `EngineError::MissingTags`, the variant neither of the worker's
 /// re-queue arms matches, and not `ClaimRefused`, is the note only that answer writes.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs T2"]
 async fn a_claim_time_refusal_is_not_requeued_on_postgres() {
     let Some(mut stack) = Stack::new(None).await else {
         return;
