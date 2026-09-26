@@ -226,6 +226,10 @@ pub struct HierarchySection {
     busy: Option<&'static str>,
     /// The last outcome, one line on the hint row.
     notice: Option<String>,
+    /// What an inference in flight puts in front of its report: the `stored as …` notice of the
+    /// write it follows, or `None` for `i`. Held apart from `notice`, which a key refused during
+    /// the walk overwrites with "still in flight" (R-57).
+    carried: Option<String>,
 }
 
 impl HierarchySection {
@@ -971,8 +975,10 @@ impl HierarchySection {
         }
 
         // Only with a root on this box: without one the answer could only be "no root". The
-        // `stored as …` notice set above stays on screen until the inference answers.
+        // `stored as …` notice set above stays on screen until the inference answers, and is
+        // carried in front of its report.
         if follow && snapshot.root_path.is_some() {
+            self.carried = self.notice.clone();
             self.send(StoreRequest::InferRepoPaths(snapshot.workspace.id), ctx);
         }
     }
@@ -1051,6 +1057,7 @@ impl SettingsSection for HierarchySection {
         self.snapshot = None;
         self.mode = Mode::Browse;
         self.busy = None;
+        self.carried = None;
         self.cursor = 0;
     }
 
@@ -1131,6 +1138,7 @@ impl SettingsSection for HierarchySection {
                 {
                     let request = StoreRequest::InferRepoPaths(snapshot.workspace.id);
                     self.notice = None;
+                    self.carried = None;
                     self.send(request, ctx);
                 }
                 Handled::Consumed
@@ -1173,9 +1181,10 @@ impl SettingsSection for HierarchySection {
             }
             StoreReply::HierarchyStale(snapshot) => self.on_stale(snapshot),
             // MOD-7 milestone 4 (D117): a tree like any other, then what the pass did. A notice a
-            // write left (`stored as …`, a follow-up's cause) is kept in front of the report.
+            // write left (`stored as …`, a follow-up's cause) is kept in front of the report; a
+            // refusal shown during the walk is not, since the walk it waited for is over.
             StoreReply::RepoPathsInferred { tree, report } => {
-                let before = self.notice.take();
+                let before = self.carried.take();
                 self.on_tree(tree, ctx);
                 let report = inferred_notice(report);
                 self.notice = Some(match before {
@@ -1245,6 +1254,9 @@ impl SettingsSection for HierarchySection {
             // can start from — with the editor left open over its text.
             StoreReply::Failed { request, .. } if REQUEST_NAMES.contains(request) => {
                 self.busy = None;
+                if *request == "infer_repo_paths" {
+                    self.carried = None;
+                }
                 // A delete that was refused must not leave `deleting…` or `counting rows…` on
                 // screen: neither stage has anything left to wait for. `InFlight` goes back to the
                 // counts the user already saw, where `y` retries and `Esc` stops; `Counting` has no

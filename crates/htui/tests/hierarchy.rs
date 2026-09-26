@@ -2146,6 +2146,74 @@ async fn an_inference_reply_renders_the_tree_and_the_report() {
     insta::assert_snapshot!("inferred", frame);
 }
 
+/// The report is prefixed by the follow-up's cause, the `stored as …` of the root write, and never
+/// by a refusal shown while the walk ran (R-57): once the reply lands nothing is in flight.
+#[tokio::test]
+async fn an_inference_report_keeps_its_cause_and_drops_a_refusal_shown_during_the_walk() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    let backend = demo();
+    let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    let rooted = with_root(opened.clone(), "/srv/htui");
+    let report = || InferReport {
+        root: Some("/srv/htui".to_owned()),
+        truncated: false,
+        repos: vec![],
+    };
+    bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
+    let _ = bench.drained();
+
+    // The follow-up: typed with a trailing slash, so the stored root reads differently.
+    bench.key(&mut section, "b");
+    type_at(&bench, &mut section, "/srv/htui/");
+    bench.key(&mut section, "enter");
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(rooted.clone()))),
+    );
+    assert_eq!(inferences(&bench.drained()), vec![ids::WORKSPACE_GRAPHICS]);
+    bench.key(&mut section, "e");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("`infer_repo_paths` is still in flight"),
+        "`e` is refused during the walk: {frame}"
+    );
+    bench.reply(
+        &mut section,
+        &StoreReply::RepoPathsInferred {
+            tree: Box::new(rooted.clone()),
+            report: report(),
+        },
+    );
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("stored as `/srv/htui` \u{b7} no repo in this workspace to infer"),
+        "the follow-up's cause stays in front of the report: {frame}"
+    );
+    assert!(!frame.contains("in flight"), "nothing is in flight: {frame}");
+
+    // `i` carries no cause, and the refusal it provoked is not one.
+    bench.key(&mut section, "i");
+    let _ = bench.drained();
+    bench.key(&mut section, "b");
+    bench.reply(
+        &mut section,
+        &StoreReply::RepoPathsInferred {
+            tree: Box::new(rooted),
+            report: report(),
+        },
+    );
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("no repo in this workspace to infer"),
+        "the report is shown: {frame}"
+    );
+    assert!(
+        !frame.contains("in flight") && !frame.contains("stored as"),
+        "and nothing in front of it: {frame}"
+    );
+}
+
 /// One report line for the notice cases.
 fn line(name: &str, outcome: InferOutcome) -> RepoInference {
     RepoInference {
