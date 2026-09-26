@@ -1228,7 +1228,7 @@ impl WriteStore for PgStore {
 
     /// The editors' compare-and-set (MOD-7 D41, D58): one `UPDATE` with the user filter and the
     /// token in its `WHERE`, `COALESCE` so a `None` field keeps its column. A miss re-reads the row
-    /// through [`PgStore::box_row`], kept only when it is this user's, and [`cas_miss`] decides
+    /// through [`PgStore::box_row`], kept only when it is this user's, and `cas_miss` decides
     /// `Stale` or `NotFound`. An invalid tag list takes the same read first, so `NotFound` and
     /// `Stale` win over `Constraint` (the order `update_item_kind` keeps).
     ///
