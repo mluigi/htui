@@ -175,10 +175,10 @@ touching the store.
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Step fence | C1 and C8: a stale lease holder writes nothing to its old step, chats still write, and a short fresh insert is loud. | pending | - |
-| 2 | Ordered writes | C3 quota ordering, C6 agent CAS, C7 pinned. | pending | - |
-| 3 | Box and schema | C4 heartbeat and C5 headless connect with the target version. | pending | - |
-| 4 | Database time | C2: lease times stamped by Postgres, heartbeat fence on the returned expiry, MemStore clock. | pending | - |
+| 1 | Step fence | C1 and C8: a stale lease holder writes nothing to its old step, chats still write, and a short fresh insert is loud. | in-progress | [plan](../plans/mod-40-multi-writer-hardening.plan.md) |
+| 2 | Ordered writes | C3 quota ordering, C6 agent CAS, C7 pinned. | pending | [plan](../plans/mod-40-multi-writer-hardening.plan.md) |
+| 3 | Box and schema | C4 heartbeat and C5 headless connect with the target version. | pending | [plan](../plans/mod-40-multi-writer-hardening.plan.md) |
+| 4 | Database time | C2: lease times stamped by Postgres, heartbeat fence on the returned expiry, MemStore clock. | pending | [plan](../plans/mod-40-multi-writer-hardening.plan.md) |
 
 Milestone 1 is what MOD-41 most needs and touches the recorder and engine. Milestones 2 and 3 are
 store-only plus one timer. Milestone 4 has the widest test churn (every lease conformance case),
