@@ -25,10 +25,10 @@ use htui_core::model::{
     StepId, StepStatus, VerifyOutcome,
 };
 use htui_core::model::{
-    Claim, NewItem, OverlapRule, Quota, QuotaSource, RunKind, Scope, Spend, WorkspaceId,
+    BoxEdit, Claim, NewItem, OverlapRule, Quota, QuotaSource, RunKind, Scope, Spend, WorkspaceId,
 };
 use htui_core::prompt::DiffBlock;
-use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+use htui_core::store::{CasOutcome, MemStore, ReadStore as _, WriteStore as _};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -285,11 +285,11 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Seventy, and the count is pinned in two places on purpose — here by
-/// `cases_are_unique_and_seventy` and out of crate by `tests/fake_conformance.rs` —
-/// because a binding that silently ran sixty-nine of them would still be green.
+/// Seventy-two, and the count is pinned in two places on purpose — here by
+/// `cases_are_unique_and_counted` and out of crate by `tests/fake_conformance.rs` —
+/// because a binding that silently ran one fewer of them would still be green.
 ///
-/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18.
+/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18 + 2.
 ///
 /// **Eighteen before milestone 4.** Six are `docs/ANA-2.md` §12's validation criteria (1, 2, 3,
 /// 5, 6 and 7); four are contract lines §12 does not number but §4.2 states outright; one is the
@@ -329,8 +329,13 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// mismatch; a cancel that meets a live lease; four promotions (criterion 17's first half, a
 /// failed step of a parked run, a finished run refused, a dropped running step parked); five
 /// accepts (criterion 17's second half, the promotion and the document it needs, a failed
-/// verify, a verify on a deadline measured from the accept, an `unavailable` verify noted); `Unblock`'s three cases (criterion 14's reopen, R-4's escalated run, R-7's refused
-/// reconcile); and criterion 20's close-out and its refusal while a run is live.
+/// verify, a verify on a deadline measured from the accept, an `unavailable` verify noted);
+/// `Unblock`'s three cases (rung 4's reopen, R-4's escalated run, R-7's refused reconcile); and
+/// criterion 20's close-out and its refusal while a run is live.
+///
+/// **Two for MOD-7 milestone 3** (plan D86, D87): criterion 14's capability half, a refusal at
+/// `StartRun` that writes no run and that `Unblock` reopens, and ANA-2 §4.10's claim-time half, a
+/// run failed by name when its tag was withdrawn after enqueue.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -382,6 +387,13 @@ pub const CASES: &[&str] = &[
     "a_skipped_candidate_falls_through_to_the_next",
     // Plan D62, rung 4 at `StartRun`: no run row, the item `blocked`, a note naming the phase.
     "no_candidate_agent_blocks_the_item",
+    // ANA-2 §12 criterion 14 (`:2121-2122`, MOD-7 milestone 3 D86): a capability refusal writes
+    // no run, blocks the item with a note naming exactly the missing tags, and `Unblock` reopens
+    // it.
+    "a_capability_refusal_writes_no_run_and_unblock_reopens",
+    // ANA-2 §4.10's claim-time half (MOD-7 milestone 3 D87): a tag withdrawn between enqueue and
+    // claim fails the run by name, before the overlap.
+    "a_capability_refusal_at_claim_fails_the_run_by_name",
     // Plan D62, stage 1: a walk that skips every candidate fails the run `no_candidate_agent`.
     "every_candidate_skipped_refuses_the_run",
     // Plan D67: a second attempt's prompt carries `verify_failure` and `previous_diff`.
@@ -478,7 +490,8 @@ pub const CASES: &[&str] = &[
     "accept_artifact_verifies_on_a_deadline_from_the_accept",
     // MOD-4 plan D211: an `unavailable` verify is recorded and noted, not refused.
     "accept_artifact_notes_an_unavailable_verify",
-    // Criterion 14's `Unblock` half (`:2121-2122`, plan D161): rung 4's blocked item reopens.
+    // Rung 4's `Unblock` round trip (plan D161): its blocked item reopens. Criterion 14 itself is
+    // MOD-7 milestone 3's case above.
     "unblock_opens_a_blocked_item_with_no_run",
     // R-4 (plan D161 case 2): an escalated item follows its parked run, which is then promoted
     // and approved.
@@ -504,9 +517,9 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
 ///
 /// A plain function rather than a `match` inside [`run_case`]'s own body, and that is about the
 /// stack, not style: an unoptimised build gives every arm's case future its own stack slot, so a
-/// seventy-arm `match` in an `async fn` puts all seventy in the one frame every case is then
-/// polled beneath, and the recovery cases' walks overflowed a test thread's 2 MiB. Here the slots
-/// are gone before the first poll.
+/// seventy-two-arm `match` in an `async fn` puts all seventy-two in the one frame every case is
+/// then polled beneath, and the recovery cases' walks overflowed a test thread's 2 MiB. Here the
+/// slots are gone before the first poll.
 ///
 /// # Panics
 /// On a name [`CASES`] holds and this `match` does not.
@@ -554,6 +567,12 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         }
         "no_candidate_agent_blocks_the_item" => {
             Box::pin(no_candidate_agent_blocks_the_item(harness))
+        }
+        "a_capability_refusal_writes_no_run_and_unblock_reopens" => Box::pin(
+            a_capability_refusal_writes_no_run_and_unblock_reopens(harness),
+        ),
+        "a_capability_refusal_at_claim_fails_the_run_by_name" => {
+            Box::pin(a_capability_refusal_at_claim_fails_the_run_by_name(harness))
         }
         "every_candidate_skipped_refuses_the_run" => {
             Box::pin(every_candidate_skipped_refuses_the_run(harness))
@@ -2619,6 +2638,169 @@ async fn no_candidate_agent_blocks_the_item<H: CaseHarness>(harness: &H) {
     );
 }
 
+/// ANA-2 §12 criterion 14 (`docs/ANA-2.md:2121-2122`), its capability half (MOD-7 milestone 3,
+/// D86): an item requiring tags the box has neither probed nor declared is refused at `StartRun`
+/// with no `run` row, the item `blocked` and one note whose body is exactly the missing tags,
+/// written on this box; `Unblock` reopens it, and once the box declares the tags `StartRun` walks.
+async fn a_capability_refusal_writes_no_run_and_unblock_reopens<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    require_tags(&orch, ids::HTUI_FEAT_3, &["rust", "vulkan", "docker"]).await;
+    let runs_before = orch
+        .store()
+        .runs(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read")
+        .len();
+    let notes_before = orch
+        .store()
+        .notes(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read")
+        .len();
+
+    let refused = orch
+        .dispatch(Command::StartRun {
+            item: ids::HTUI_FEAT_3,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        })
+        .await
+        .expect_err("the demo box has neither `docker` nor `vulkan`");
+    assert!(
+        matches!(
+            &refused,
+            EngineError::MissingTags { item, run: None, missing }
+                if *item == ids::HTUI_FEAT_3 && missing == &["docker", "vulkan"]
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        refused.to_string(),
+        format!("item {}: missing tags: docker, vulkan", ids::HTUI_FEAT_3)
+    );
+    assert_eq!(
+        orch.store()
+            .runs(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len(),
+        runs_before,
+        "a queue-time refusal writes no run row (ANA-2 §4.10)"
+    );
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::Blocked
+    );
+    let notes = orch
+        .store()
+        .notes(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read");
+    let added = &notes[notes_before..];
+    assert_eq!(added.len(), 1, "exactly one note: {added:?}");
+    assert_eq!(added[0].body, "missing tags: docker, vulkan");
+    assert_eq!(added[0].box_id, Some(ids::BOX), "the note names the box");
+    assert_eq!(added[0].via_step_id, None, "no step exists");
+
+    let (case, rest) = unblock(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!((case, rest), (UnblockCase::Reopen, None));
+    assert_eq!(item_of(&orch, ids::HTUI_FEAT_3).await.status, Status::Open);
+
+    declare_tags(&orch, &["docker", "gpu", "vulkan"]).await;
+    let (_, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        rest.run,
+        RunStatus::AwaitingApproval,
+        "a box with those tags runs the reopened item"
+    );
+}
+
+/// ANA-2 §4.10's claim-time half (MOD-7 milestone 3, D87; the PRD's "tag check at claim races a
+/// re-probe" risk): a run queued behind an overlap while its tag was declared, whose tag is then
+/// withdrawn, is failed at its next claim with `missing tags: gpu`, and the check comes before
+/// the overlap that still stands. The item is `blocked` with the note, and `Unblock` reopens it.
+async fn a_capability_refusal_at_claim_fails_the_run_by_name<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    // Blueprint P-5: without a primary repo the resolved scope is empty and never overlaps.
+    primary_repo(&orch).await;
+    let first = mint_feat(&orch, "Holder", &["src/**"]).await;
+    let second = mint_feat(&orch, "Needs a GPU", &["src/**"]).await;
+    // `gpu` is declared on the fixture box, so the enqueue passes.
+    require_tags(&orch, second, &["gpu"]).await;
+
+    let (holder, rest) = start(&orch, first).await;
+    assert_eq!(
+        rest.run,
+        RunStatus::AwaitingApproval,
+        "the holder parks, and a parked run still holds its scope"
+    );
+    let (run, claim) = start_refused(&orch, second).await;
+    assert_eq!(
+        claim,
+        Claim::Overlaps {
+            with: holder,
+            rule: OverlapRule::Paths,
+        }
+    );
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::Queued);
+    let notes_before = orch
+        .store()
+        .notes(second)
+        .await
+        .expect("MemStore never fails a read")
+        .len();
+
+    // The re-probe: the box withdraws its declared `gpu` while the run waits in the queue.
+    declare_tags(&orch, &[]).await;
+    let refused = orch
+        .claim(run)
+        .await
+        .expect_err("the box no longer has `gpu`");
+    assert!(
+        matches!(
+            &refused,
+            EngineError::MissingTags { item, run: Some(failed), missing }
+                if *item == second && *failed == run && missing == &["gpu"]
+        ),
+        "the tags, before the overlap that still stands (D81): {refused:?}"
+    );
+
+    let failed = run_of(&orch, run).await;
+    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(failed.failure.as_deref(), Some("missing tags: gpu"));
+    assert_eq!(failed.executing_box_id, None, "no box executed it");
+    assert_eq!(failed.started_at, None, "the run never started");
+    assert_eq!(failed.lease_expires_at, None, "no lease was taken");
+    assert!(failed.finished_at.is_some(), "a failed run is finished");
+    assert!(
+        steps_of(&orch, run).await.is_empty(),
+        "nothing walked the failed run"
+    );
+    assert_eq!(item_of(&orch, second).await.status, Status::Blocked);
+    let notes = orch
+        .store()
+        .notes(second)
+        .await
+        .expect("MemStore never fails a read");
+    let added = &notes[notes_before..];
+    assert_eq!(added.len(), 1, "exactly one note: {added:?}");
+    assert_eq!(added[0].body, "missing tags: gpu");
+    assert_eq!(added[0].box_id, Some(ids::BOX), "the note names the box");
+    assert_eq!(
+        run_of(&orch, holder).await.status,
+        RunStatus::AwaitingApproval,
+        "the holder is untouched"
+    );
+
+    let (case, rest) = unblock(&orch, second).await;
+    assert_eq!(
+        (case, rest),
+        (UnblockCase::Reopen, None),
+        "the failed run is not active, so the item reopens"
+    );
+}
+
 /// Plan D62, stage 1: the walk skips every candidate for a reason other than the inline-approval
 /// interlock, so the run fails `no_candidate_agent` with each skip named, in blueprint H-16's
 /// order — the item is `blocked` before the run is failed — and no step row exists.
@@ -3500,6 +3682,62 @@ async fn touch<O: Orchestrate>(orch: &O, item: ItemId, paths: &[&str]) {
         )
         .await
         .expect("the item's version is current");
+}
+
+/// Sets `item.required_tags` through the patch writer, so the next `StartRun` checks them (MOD-7
+/// milestone 3, D97).
+///
+/// # Panics
+/// When the item's version moved under the case.
+async fn require_tags<O: Orchestrate>(orch: &O, item: ItemId, tags: &[&str]) {
+    let row = item_of(orch, item).await;
+    orch.store()
+        .update_item(
+            item,
+            row.version,
+            ItemPatch {
+                required_tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
+                author_id: row.created_by,
+                reason: "a conformance case's required tags".to_owned(),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .expect("the item's version is current");
+}
+
+/// Replaces the demo box's `declared_tags` through `edit_box`, at its current token (MOD-7
+/// milestone 3, D86): the same box after a declaration is "a box with those tags".
+///
+/// # Panics
+/// When the box is gone or the edit is stale or refused, which means the fixture moved.
+async fn declare_tags<O: Orchestrate>(orch: &O, tags: &[&str]) {
+    let token = orch
+        .store()
+        .boxes()
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .find(|record| record.row.id == ids::BOX)
+        .expect("the fixture holds the demo box")
+        .row
+        .edit_version;
+    let outcome = orch
+        .store()
+        .edit_box(
+            ids::BOX,
+            token,
+            BoxEdit {
+                declared_tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
+                quirks: None,
+            },
+        )
+        .await
+        .expect("the demo box accepts the tags");
+    assert!(
+        matches!(outcome, CasOutcome::Applied(_)),
+        "the token is current: {outcome:?}"
+    );
 }
 
 /// A fresh `open` FEAT item on the HTUI project declaring `paths`: criterion 16 needs five
@@ -5194,9 +5432,10 @@ async fn unblock<O: Orchestrate>(orch: &O, item: ItemId) -> (UnblockCase, Option
     (case, rest)
 }
 
-/// ANA-2 §12 criterion 14's `Unblock` half (`docs/ANA-2.md:2121-2122`, MOD-4 plan D161 case 1):
-/// rung 4 at `StartRun` leaves the item `blocked` with no run; `Unblock` reopens it, and once the
-/// phase has a candidate again `StartRun` walks it.
+/// Rung 4's `Unblock` round trip (MOD-4 plan D161 case 1): rung 4 at `StartRun` leaves the item
+/// `blocked` with no run; `Unblock` reopens it, and once the phase has a candidate again
+/// `StartRun` walks it. Criterion 14 itself is
+/// `a_capability_refusal_writes_no_run_and_unblock_reopens` (MOD-7 milestone 3, D86).
 async fn unblock_opens_a_blocked_item_with_no_run<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     free_feat_3(&orch).await;
@@ -5507,15 +5746,15 @@ mod tests {
 
     /// The list is the suite's API, and its length is a claim a binding is allowed to check.
     #[test]
-    fn cases_are_unique_and_seventy() {
+    fn cases_are_unique_and_counted() {
         let mut sorted: Vec<&&str> = CASES.iter().collect();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            70,
-            "18 + 5 + 13 + 6 + 10 + 18: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            72,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -5534,7 +5773,8 @@ mod tests {
              eighteen (ANA-5 criterion 3's refused prompt at `walk_step` and at `drive_group`, \
              criterion 3's running run parked on a topology mismatch, a cancel meeting a live \
              lease, four promotions, five accepts, `Unblock`'s three cases, and criterion \
-             20's close-out and its refusal)"
+             20's close-out and its refusal), and MOD-7 milestone 3's two (criterion 14's \
+             capability half and §4.10's claim-time half)"
         );
     }
 

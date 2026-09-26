@@ -123,7 +123,9 @@ pub use kind::{
 };
 pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode, UpstreamEntry};
 pub use note::{NewNote, Note};
-pub use overlap::{Claim, OverlapRule, RepoScope, RunScope, overlaps, scope_of};
+pub use overlap::{
+    Claim, OverlapRule, RepoScope, RunScope, missing_tags_failure, overlaps, scope_of,
+};
 pub use quota::{
     Availability, CapError, PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN, ProjectCaps, Quota,
     QuotaSource, QuotaWindow, SkipReason, Spend, available, normalize,
