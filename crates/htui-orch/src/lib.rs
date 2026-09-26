@@ -16,7 +16,9 @@
 //! heartbeat and the sweep's pure half (plan D85, D86, D90, D91, D97). Milestone 6 adds
 //! [`closeout`] and [`promote`], the pure halves of close-out and promotion, and the four verbs
 //! the maintainer drives a run with — promote, accept, unblock and close-out — with one admission
-//! function per verb in [`command`] (MOD-4 plan D184). `queue.rs`, also named
+//! function per verb in [`command`] (MOD-4 plan D184). MOD-7 milestone 4 adds [`infer`],
+//! repo-path inference's pure half: remote-URL normalisation, a bounded checkout walk and the
+//! remote-first, name-second choice (plan D111–D113). `queue.rs`, also named
 //! by ANA-2 §8, remains MOD-12's and is deliberately not created, not even empty (plan D1).
 #![warn(missing_docs)]
 
@@ -30,6 +32,7 @@ pub mod fake;
 pub mod fanout;
 pub mod gate;
 pub mod graph;
+pub mod infer;
 pub mod isolate;
 pub mod overlap;
 pub mod promote;
