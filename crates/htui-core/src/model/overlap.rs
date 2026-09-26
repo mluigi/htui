@@ -187,8 +187,7 @@ impl fmt::Display for Claim {
 /// sentences live in `store::traits`).
 #[must_use]
 pub fn missing_tags_failure(missing: &[String]) -> String {
-    let _ = missing;
-    todo!("MOD-7 milestone 3 T0 commit (b)")
+    format!("missing tags: {}", missing.join(", "))
 }
 
 #[cfg(test)]
