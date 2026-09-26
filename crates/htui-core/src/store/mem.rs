@@ -19,23 +19,25 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::model::{
-    Agent, AgentBox, AgentId, AgentSummary, AppUser, BoundSkill, BoxEdit, BoxId, BoxInfo, BoxProbe,
-    BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec, CitationKind, Claim,
-    CommandRun, CommandRunId, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead,
-    DocumentId, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
-    ItemKindPatch, ItemLink, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkEdge,
-    LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
-    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-    NewStepGraph, NewWorkspace, Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath,
-    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
-    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementState,
-    RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId,
-    RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
-    Scope, SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
-    UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    WorkspaceSummary, canonical_declared_tags, overlaps, prompt_summary, scope_of,
+    Agent, AgentBox, AgentId, AgentSummary, AppUser, BindingChange, BoundSkill, BoxEdit, BoxId,
+    BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec,
+    CitationKind, Claim, CommandRun, CommandRunId, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS,
+    Document, DocumentHead, DocumentId, GateOutcome, Item, ItemCitation, ItemFilter, ItemId,
+    ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement, ItemRevision,
+    ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem,
+    NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
+    Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
+    PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
+    Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
+    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
+    SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
+    UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject, WorkspaceSummary, canonical_declared_tags, overlaps, prompt_summary,
+    scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -111,11 +113,16 @@ struct State {
     /// `prompt_template`, read by the inherent [`MemStore::prompt_templates`] (MOD-2 plan D102) and
     /// appended to only by [`WriteStore::append_prompt_template`] and the project seed (MOD-9 D1).
     templates: Vec<PromptTemplate>,
-    /// `skill`, read by the inherent [`MemStore::bound_skills`] (MOD-2 plan D105).
+    /// `skill`, read by the inherent [`MemStore::bound_skills`] (MOD-2 plan D105) and
+    /// [`WriteStore::skills`], written by [`WriteStore::create_skill`] and
+    /// [`WriteStore::update_skill`] (MOD-9 milestone 3).
     skills: HashMap<SkillId, Skill>,
-    /// `skill_version`, resolved through [`SkillBinding::version_in_force`].
+    /// `skill_version`, resolved through [`SkillBinding::version_in_force`], read by
+    /// [`WriteStore::skill_versions`] and appended to by [`WriteStore::create_skill`] and
+    /// [`WriteStore::add_skill_version`].
     skill_versions: Vec<SkillVersion>,
-    /// `skill_binding`, resolved through `model::skill::resolve`.
+    /// `skill_binding`, resolved through `model::skill::resolve`, read by
+    /// [`WriteStore::skill_bindings`] and written by [`WriteStore::set_skill_binding`].
     skill_bindings: Vec<SkillBinding>,
     /// `box_tool`, projected by the inherent [`MemStore::box_profile`].
     box_tools: Vec<BoxTool>,
@@ -2746,6 +2753,67 @@ impl State {
         };
         self.templates.push(row.clone());
         Ok(CasOutcome::Applied(row))
+    }
+
+    // ---- MOD-9 milestone 3: the skill writers (plan D75-D79, blueprint §3.3) ----------------
+
+    /// D91: name byte order.
+    fn skill_rows(&self) -> Vec<Skill> {
+        todo!("MOD-9 T2")
+    }
+
+    /// D91: one skill's versions by `version`.
+    fn skill_version_rows(&self, skill: SkillId) -> Vec<SkillVersion> {
+        todo!("MOD-9 T2: {skill}")
+    }
+
+    /// D91: `project_id == project`, sorted by `(skill_id, phase_id)` (`None < Some`, as `NULLS
+    /// FIRST`; `Uuid`'s `Ord` is byte order, as Postgres's `uuid` comparison).
+    fn skill_binding_rows(&self, project: Option<ProjectId>) -> Vec<SkillBinding> {
+        todo!("MOD-9 T2: {project:?}")
+    }
+
+    /// Order: `new_skill_refusal`; `require_user(created_by, "skill.created_by")`; a taken id →
+    /// `already_exists("skill", id)`; a taken name → `already_exists("skill", name)`. Writes the
+    /// row and its version 1, both stamped `now`.
+    fn create_skill(&mut self, new: NewSkill, now: DateTime<Utc>) -> Result<(Skill, SkillVersion)> {
+        todo!("MOD-9 T2: {new:?} {now}")
+    }
+
+    /// `update_workspace`'s shape: `NotFound("skill")` → `Stale(current)` →
+    /// `skill_patch_refusal` → a name another row holds → apply both `Some` fields and stamp
+    /// `now` (an all-`None` patch still stamps, as the Postgres trigger does).
+    fn update_skill(
+        &mut self,
+        id: SkillId,
+        expected: DateTime<Utc>,
+        patch: SkillPatch,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Skill>> {
+        todo!("MOD-9 T2: {id} {expected} {patch:?} {now}")
+    }
+
+    /// D89's order; pushes version `expected + 1` stamped `now`.
+    fn add_skill_version(
+        &mut self,
+        skill: SkillId,
+        expected: i32,
+        new: NewSkillVersion,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<SkillVersion>> {
+        todo!("MOD-9 T2: {skill} {expected} {new:?} {now}")
+    }
+
+    /// D90's order. An attach with no row pushes a fresh id; with a row it replaces the five
+    /// editable columns in place and stamps `now` (the id is kept); a detach removes the row.
+    fn set_skill_binding(
+        &mut self,
+        key: SkillBindingKey,
+        expected: Option<DateTime<Utc>>,
+        change: BindingChange,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Option<SkillBinding>>> {
+        todo!("MOD-9 T2: {key:?} {expected:?} {change:?} {now}")
     }
 
     /// The value one rung currently holds for a key, for [`validate`]'s `not_above` peer.
@@ -5472,6 +5540,53 @@ impl WriteStore for MemStore {
     ) -> Result<CasOutcome<PromptTemplate>> {
         let now = Utc::now();
         self.write(|state| state.append_prompt_template(new, expected, now))
+    }
+
+    async fn skills(&self) -> Result<Vec<Skill>> {
+        Ok(self.read(State::skill_rows))
+    }
+
+    async fn skill_versions(&self, skill: SkillId) -> Result<Vec<SkillVersion>> {
+        Ok(self.read(|state| state.skill_version_rows(skill)))
+    }
+
+    async fn skill_bindings(&self, project: Option<ProjectId>) -> Result<Vec<SkillBinding>> {
+        Ok(self.read(|state| state.skill_binding_rows(project)))
+    }
+
+    async fn create_skill(&self, new: NewSkill) -> Result<(Skill, SkillVersion)> {
+        let now = Utc::now();
+        self.write(|state| state.create_skill(new, now))
+    }
+
+    async fn update_skill(
+        &self,
+        id: SkillId,
+        expected: DateTime<Utc>,
+        patch: SkillPatch,
+    ) -> Result<CasOutcome<Skill>> {
+        let now = Utc::now();
+        self.write(|state| state.update_skill(id, expected, patch, now))
+    }
+
+    async fn add_skill_version(
+        &self,
+        skill: SkillId,
+        expected: i32,
+        new: NewSkillVersion,
+    ) -> Result<CasOutcome<SkillVersion>> {
+        let now = Utc::now();
+        self.write(|state| state.add_skill_version(skill, expected, new, now))
+    }
+
+    async fn set_skill_binding(
+        &self,
+        key: SkillBindingKey,
+        expected: Option<DateTime<Utc>>,
+        change: BindingChange,
+    ) -> Result<CasOutcome<Option<SkillBinding>>> {
+        let now = Utc::now();
+        self.write(|state| state.set_skill_binding(key, expected, change, now))
     }
 
     async fn set_setting(
@@ -9036,6 +9151,52 @@ mod tests {
                 .expect("the read is total")
                 .is_empty(),
             "an empty scope overlaps nothing (hazard H-10)"
+        );
+    }
+
+    /// MOD-9 D89: a skill with no version (a hand-written or imported row; `create_skill` always
+    /// writes v1, so no writer can make one) takes version 1 at the token `0`, and any other token
+    /// is `NotFound` on the missing version, keyed `"<skill>/v<n>"`.
+    #[tokio::test]
+    async fn a_skill_with_no_version_takes_version_one_at_zero() {
+        let mut data = crate::fixtures::demo_data();
+        let id = crate::model::SkillId::new();
+        let at = Utc::now();
+        data.skills.push(crate::model::Skill {
+            id,
+            name: "bare".to_owned(),
+            description: String::new(),
+            created_by: ids::USER,
+            created_at: at,
+            updated_at: at,
+        });
+        let store = MemStore::from_demo(data);
+        let version = |body: &str| crate::model::NewSkillVersion {
+            body: body.to_owned(),
+            source: json!({}),
+            created_by: ids::USER,
+        };
+
+        let missing = store.add_skill_version(id, 1, version("one")).await;
+        match missing {
+            Err(StoreError::NotFound {
+                entity: "skill_version",
+                id: key,
+            }) => assert_eq!(key, format!("{id}/v1"), "the missing version is named"),
+            other => panic!("a token on a skill with no version is NotFound, got {other:?}"),
+        }
+
+        let CasOutcome::Applied(v1) = store
+            .add_skill_version(id, 0, version("one"))
+            .await
+            .expect("append at 0")
+        else {
+            panic!("the token 0 on a skill with no version applies");
+        };
+        assert_eq!(
+            (v1.skill_id, v1.version, v1.body.as_str()),
+            (id, 1, "one"),
+            "the first version of a bare skill is v1"
         );
     }
 }

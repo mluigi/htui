@@ -20,19 +20,20 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool,
-    ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus,
-    DEFAULT_MAX_CONCURRENT_ITEMS, Document, GateOutcome, Isolation, Item, ItemId, ItemKind,
-    ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, NewCommandRun,
+    Agent, AgentBox, AgentId, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow,
+    BoxSettings, BoxTool, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId,
+    CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, GateOutcome, Isolation, Item, ItemId,
+    ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, NewCommandRun,
     NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note,
-    PhaseId, PhasePatch, Priority, Project, ProjectId, ProjectPatch, PromptTemplate,
-    PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
-    RequirementAreaId, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
-    RequirementState, RequirementUpdate, Resolution, Run, RunId, RunKind, RunMode, RunStatus,
-    RunStep, RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Priority, Project, ProjectId,
+    ProjectPatch, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
+    RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Skill,
+    SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UserId,
+    VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
     canonical_declared_tags, overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -2476,6 +2477,51 @@ impl WriteStore for PgStore {
             "prompt_template",
             key,
         )
+    }
+
+    // skill, skill_version, skill_binding (MOD-9 milestone 3)
+
+    async fn skills(&self) -> Result<Vec<Skill>> {
+        todo!("MOD-9 T2: PgStore::skills")
+    }
+
+    async fn skill_versions(&self, skill: SkillId) -> Result<Vec<SkillVersion>> {
+        todo!("MOD-9 T2: PgStore::skill_versions")
+    }
+
+    async fn skill_bindings(&self, project: Option<ProjectId>) -> Result<Vec<SkillBinding>> {
+        todo!("MOD-9 T2: PgStore::skill_bindings")
+    }
+
+    async fn create_skill(&self, new: NewSkill) -> Result<(Skill, SkillVersion)> {
+        todo!("MOD-9 T2: PgStore::create_skill")
+    }
+
+    async fn update_skill(
+        &self,
+        id: SkillId,
+        expected: DateTime<Utc>,
+        patch: SkillPatch,
+    ) -> Result<CasOutcome<Skill>> {
+        todo!("MOD-9 T2: PgStore::update_skill")
+    }
+
+    async fn add_skill_version(
+        &self,
+        skill: SkillId,
+        expected: i32,
+        new: NewSkillVersion,
+    ) -> Result<CasOutcome<SkillVersion>> {
+        todo!("MOD-9 T2: PgStore::add_skill_version")
+    }
+
+    async fn set_skill_binding(
+        &self,
+        key: SkillBindingKey,
+        expected: Option<DateTime<Utc>>,
+        change: BindingChange,
+    ) -> Result<CasOutcome<Option<SkillBinding>>> {
+        todo!("MOD-9 T2: PgStore::set_skill_binding")
     }
 
     // settings (D7, D8)

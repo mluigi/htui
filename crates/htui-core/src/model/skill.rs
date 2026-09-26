@@ -152,7 +152,7 @@ impl SkillBinding {
 /// (ANA-22 §6 item 12, the Agent Skills rule). `true` when `name` may be stored.
 ///
 /// Checked by the writers and the Skills view, not by a constraint, so a hand-written row still
-/// loads; `store::invalid_skill_name` phrases the refusal.
+/// loads; [`invalid_skill_name`](crate::store::invalid_skill_name) phrases the refusal.
 #[must_use]
 pub fn validate_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
