@@ -19,7 +19,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::model::{
-    Agent, AgentBox, AgentId, AgentSummary, AppUser, BoundSkill, BoxId, BoxInfo, BoxProbe,
+    Agent, AgentBox, AgentId, AgentSummary, AppUser, BoundSkill, BoxEdit, BoxId, BoxInfo, BoxProbe,
     BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec, CitationKind, Claim,
     CommandRun, CommandRunId, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead,
     DocumentId, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
@@ -5195,6 +5195,15 @@ impl WriteStore for MemStore {
         Ok(self.read(|state| state.box_records(user)))
     }
 
+    async fn edit_box(
+        &self,
+        _id: BoxId,
+        _expected: i32,
+        _edit: BoxEdit,
+    ) -> Result<CasOutcome<BoxRow>> {
+        todo!("MOD-7 milestone 2 T1: MemStore::edit_box")
+    }
+
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> Result<()> {
         self.write(|state| state.start_chat_run(chat))
     }
@@ -6448,6 +6457,65 @@ mod tests {
             fixture_tools,
             ["cargo", "cmake", "git", "rustc"],
             "the fixture box keeps its own tools, sorted"
+        );
+    }
+
+    /// MOD-7 milestone 2 (D41, fact-check): `edit_box` reaches only this user's boxes, as `boxes()`
+    /// does. Another user's box is `NotFound`, even with its right token, and writes nothing; its
+    /// `NotFound` also wins over a spent token and a refused tag (precedence). The Postgres half is
+    /// `box_identity.rs::another_users_box_is_not_found_by_edit_box`.
+    #[tokio::test]
+    async fn edit_box_refuses_another_user_s_box_as_not_found() {
+        use crate::model::{AppUser, BoxEdit};
+
+        let mut data = crate::fixtures::demo_data();
+        let mut theirs = data
+            .boxes
+            .iter()
+            .find(|row| row.id == ids::BOX)
+            .expect("the fixture box")
+            .clone();
+        let foreign = BoxId::from_uuid(Uuid::from_u128(2));
+        let stranger = UserId::new();
+        let now = Utc::now();
+        data.users.push(AppUser {
+            id: stranger,
+            name: "stranger".to_owned(),
+            email: None,
+            created_at: now,
+            updated_at: now,
+        });
+        theirs.id = foreign;
+        theirs.user_id = stranger;
+        theirs.hostname = "ELSEWHERE".to_owned();
+        data.boxes.push(theirs);
+        let store = MemStore::from_demo(data);
+        assert_ne!(
+            store.this_user(),
+            Some(stranger),
+            "the fixture user stays this user: the stranger was created later"
+        );
+        let before = store.box_row(foreign).await.expect("box_row never fails");
+        assert!(before.is_some(), "the stranger's box is stored");
+
+        let tags = |tags: &[&str]| BoxEdit {
+            declared_tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
+            quirks: None,
+        };
+        let right_token = store.edit_box(foreign, 0, tags(&["gpu"])).await;
+        assert!(
+            matches!(right_token, Err(StoreError::NotFound { entity: "box", .. })),
+            "another user's box is NotFound even with its right token, got {right_token:?}"
+        );
+        let precedence = store.edit_box(foreign, 7, tags(&["BAD"])).await;
+        assert!(
+            matches!(precedence, Err(StoreError::NotFound { entity: "box", .. })),
+            "NotFound wins over a spent token and a refused tag, got {precedence:?}"
+        );
+        assert_eq!(
+            store.box_row(foreign).await.expect("box_row never fails"),
+            before,
+            "the stranger's row is untouched"
         );
     }
 

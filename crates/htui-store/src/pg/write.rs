@@ -20,7 +20,7 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool,
+    Agent, AgentBox, AgentId, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool,
     ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus,
     DEFAULT_MAX_CONCURRENT_ITEMS, Document, GateOutcome, Isolation, Item, ItemId, ItemKind,
     ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, NewCommandRun,
@@ -1224,6 +1224,15 @@ impl WriteStore for PgStore {
                 }
             })
             .collect())
+    }
+
+    async fn edit_box(
+        &self,
+        _id: BoxId,
+        _expected: i32,
+        _edit: BoxEdit,
+    ) -> Result<CasOutcome<BoxRow>> {
+        todo!("MOD-7 milestone 2 T1: PgStore::edit_box")
     }
 
     /// The `run` / `run_step` pair of a free-standing chat, in one transaction, both

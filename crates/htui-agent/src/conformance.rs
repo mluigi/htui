@@ -30,11 +30,11 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, BoxProbe, BoxRecord, ChatRunSpec, CitationKind,
-    Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId, EventKind, EventRole,
-    GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch,
-    ItemPatch, ItemRequirement, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
-    NewItemKind, NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun,
+    Agent, AgentBox, AgentId, Billing, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, ChatRunSpec,
+    CitationKind, Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId, EventKind,
+    EventRole, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
+    ItemKindPatch, ItemPatch, ItemRequirement, ItemSummary, LinkGraph, NewCommandRun, NewDocument,
+    NewItem, NewItemKind, NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun,
     NewRunStep, NewStepGraph, NewWorkspace, Note, PER_TOKEN_CAP_RUN, PhaseId, PhasePatch, Project,
     ProjectId, ProjectPatch, PromptScope, Quota, QuotaSource, Repo, RepoBoxPath, RepoId, RepoPatch,
     Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
@@ -755,6 +755,14 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     }
     async fn boxes(&self) -> StoreResult<Vec<BoxRecord>> {
         self.inner.boxes().await
+    }
+    async fn edit_box(
+        &self,
+        id: BoxId,
+        expected: i32,
+        edit: BoxEdit,
+    ) -> StoreResult<CasOutcome<BoxRow>> {
+        self.inner.edit_box(id, expected, edit).await
     }
     async fn set_agent_box_quota(
         &self,

@@ -34,7 +34,7 @@ async fn demo_store_loads_the_fixture() {
     );
     assert_eq!(
         conformance::CASES.len(),
-        68,
+        71,
         "B.9's fifteen cases, MOD-2's five store-seam cases (plan D3), milestone 7's two quota \
          cases (plans D67 and D74), milestone 9's `set_step_prompt`, MOD-15 milestone 1's \
          twelve, one per entity group (plan D12), milestone 2's seed case (plan D7), MOD-4 \
@@ -43,7 +43,8 @@ async fn demo_store_loads_the_fixture() {
          MOD-4 milestone 5's four: the isolation and path rules (plan D83), `take_lease` \
          (plan D87), `interrupt_step` (plan D89) and `release_lease` (plan D139), MOD-7 \
          milestone 1's three for the box probe writer (plan D10), MOD-38's two close-out cases \
-         (plan D4) and ten requirement cases (plan D9-D14)"
+         (plan D4) and ten requirement cases (plan D9-D14), and MOD-7 milestone 2's three for the \
+         box editors' compare-and-set (plan D41)"
     );
     assert_eq!(
         conformance::READ_CASES.len(),

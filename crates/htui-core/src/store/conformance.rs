@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::fixtures::ids;
 use crate::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, BoxProbe, BoxRow, ChatRunSpec, CitationKind, Claim,
-    CommandQueue, CommandRun, CommandRunId, CommandRunStatus, CoverageRow,
+    Agent, AgentBox, AgentId, Billing, BoxEdit, BoxId, BoxProbe, BoxRow, ChatRunSpec, CitationKind,
+    Claim, CommandQueue, CommandRun, CommandRunId, CommandRunStatus, CoverageRow,
     DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EventKind, EventRole, Gate, GateOutcome,
     GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKindId, ItemKindPatch,
     ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
@@ -27,7 +27,7 @@ use crate::model::{
     RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SnapshotGraph,
     SnapshotSettings, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome,
     StepStatus, TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry, UserId, VerifyOutcome,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, canonical_declared_tags,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -108,6 +108,9 @@ pub const CASES: &[&str] = &[
     "coverage_lists_citing_items_with_resolution",
     "spec_is_cas",
     "project_delete_counts_requirements",
+    "edit_box_is_cas_on_edit_version",
+    "edit_box_survives_a_probe_between_read_and_write",
+    "edit_box_refuses_an_invalid_tag",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -231,6 +234,11 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "spec_is_cas" => spec_is_cas(store).await,
         "project_delete_counts_requirements" => project_delete_counts_requirements(store).await,
+        "edit_box_is_cas_on_edit_version" => edit_box_is_cas_on_edit_version(store).await,
+        "edit_box_survives_a_probe_between_read_and_write" => {
+            edit_box_survives_a_probe_between_read_and_write(store).await;
+        }
+        "edit_box_refuses_an_invalid_tag" => edit_box_refuses_an_invalid_tag(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -5205,6 +5213,285 @@ async fn boxes_lists_every_box_with_its_tools<S: WriteStore>(store: &S) {
     );
 }
 
+/// A [`BoxEdit`] that writes `declared_tags` and leaves `quirks` alone.
+fn tags_edit(tags: &[&str]) -> BoxEdit {
+    BoxEdit {
+        declared_tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
+        quirks: None,
+    }
+}
+
+/// `row` with the four columns `edit_box` writes set to `like`'s, so that comparing the result
+/// with `like` checks every column the editors never own.
+fn masked_edit(row: &BoxRow, like: &BoxRow) -> BoxRow {
+    BoxRow {
+        declared_tags: like.declared_tags.clone(),
+        quirks: like.quirks.clone(),
+        edit_version: like.edit_version,
+        updated_at: like.updated_at,
+        ..row.clone()
+    }
+}
+
+/// MOD-7 milestone 2 (D41): `edit_box` is a compare-and-set on `box.edit_version`. An edit on the
+/// current token writes the columns it names, sorted and deduplicated for the tags, stored as given
+/// for the quirks, and moves the token by one and `updated_at`; an edit naming neither column
+/// still moves the token. A spent token is `Stale` with the row as it is now and writes nothing;
+/// an unknown box is `NotFound`. No column a probe, registration or the settings writer owns
+/// moves, and neither do the box's tools or recorded spec digest.
+///
+/// What the generic suite cannot show is delegated by name. A reconnect (registration is not a
+/// trait method) leaves the token and the edited columns alone:
+/// `box_identity.rs::a_reconnect_leaves_edit_version_and_the_edited_fields_alone`. Another
+/// user's box is `NotFound`, which the demo fixture has no second user to show:
+/// `box_identity.rs::another_users_box_is_not_found_by_edit_box` on Postgres and
+/// `edit_box_refuses_another_user_s_box_as_not_found` on `MemStore`.
+async fn edit_box_is_cas_on_edit_version<S: WriteStore>(store: &S) {
+    const CASE: &str = "edit_box_is_cas_on_edit_version";
+    let fixture = fixture_box();
+    let before = store.boxes().await.expect(CASE);
+    assert_eq!(before.len(), 1, "{CASE}: the fixture user has one box");
+    assert_eq!(
+        before[0].row.edit_version, 0,
+        "{CASE}: the fixture box has never been edited"
+    );
+
+    let first = store
+        .edit_box(ids::BOX, 0, tags_edit(&["heavy_build", "gpu", "gpu"]))
+        .await
+        .expect(CASE);
+    let CasOutcome::Applied(first) = first else {
+        panic!("{CASE}: the current token applies, got {first:?}");
+    };
+    assert_eq!(first.edit_version, 1, "{CASE}: the token moves by one");
+    assert_eq!(
+        first.declared_tags,
+        ["gpu", "heavy_build"],
+        "{CASE}: the tags are stored sorted and deduplicated"
+    );
+    assert_eq!(first.quirks, "", "{CASE}: a `None` quirks keeps the column");
+    assert!(
+        first.updated_at > fixture.updated_at,
+        "{CASE}: updated_at moves, as the BEFORE UPDATE trigger moves it"
+    );
+    assert_eq!(
+        masked_edit(&first, &fixture),
+        fixture,
+        "{CASE}: no column but the edited ones, the token and updated_at moves (MOD-2 D74)"
+    );
+    let after = store.boxes().await.expect(CASE);
+    assert_eq!(after.len(), 1, "{CASE}: still one box");
+    assert_eq!(
+        after[0].row, first,
+        "{CASE}: boxes() reads the row as written"
+    );
+    assert_eq!(
+        after[0].tools, before[0].tools,
+        "{CASE}: the box's tools are not the editor's"
+    );
+    assert_eq!(
+        after[0].probe_spec_digest, before[0].probe_spec_digest,
+        "{CASE}: the recorded spec digest is not the editor's"
+    );
+
+    let quirks = "line one\nline two";
+    let second = store
+        .edit_box(
+            ids::BOX,
+            1,
+            BoxEdit {
+                declared_tags: None,
+                quirks: Some(quirks.to_owned()),
+            },
+        )
+        .await
+        .expect(CASE);
+    let CasOutcome::Applied(second) = second else {
+        panic!("{CASE}: the moved token applies, got {second:?}");
+    };
+    assert_eq!(second.edit_version, 2, "{CASE}: the token moves again");
+    assert_eq!(
+        second.quirks, quirks,
+        "{CASE}: the quirks are stored byte for byte, newline included"
+    );
+    assert_eq!(
+        second.declared_tags, first.declared_tags,
+        "{CASE}: a `None` tag list keeps the column"
+    );
+
+    let third = store
+        .edit_box(ids::BOX, 2, BoxEdit::default())
+        .await
+        .expect(CASE);
+    let CasOutcome::Applied(third) = third else {
+        panic!("{CASE}: an empty edit on the current token applies, got {third:?}");
+    };
+    assert_eq!(
+        third.edit_version, 3,
+        "{CASE}: an edit naming no column still moves the token"
+    );
+    assert_eq!(
+        BoxRow {
+            updated_at: second.updated_at,
+            edit_version: second.edit_version,
+            ..third.clone()
+        },
+        second,
+        "{CASE}: an empty edit moves nothing but the token and updated_at"
+    );
+
+    let settled = store.boxes().await.expect(CASE);
+    let spent = store
+        .edit_box(ids::BOX, 1, tags_edit(&["x"]))
+        .await
+        .expect(CASE);
+    let CasOutcome::Stale(current) = spent else {
+        panic!("{CASE}: a spent token is Stale, got {spent:?}");
+    };
+    assert_eq!(
+        current.edit_version, 3,
+        "{CASE}: Stale carries the current token"
+    );
+    assert_eq!(
+        current, settled[0].row,
+        "{CASE}: Stale carries the row as it is now"
+    );
+    assert_eq!(
+        store.boxes().await.expect(CASE),
+        settled,
+        "{CASE}: a spent token writes nothing"
+    );
+
+    let unknown = store.edit_box(BoxId::new(), 0, tags_edit(&["x"])).await;
+    assert!(
+        matches!(unknown, Err(StoreError::NotFound { entity: "box", .. })),
+        "{CASE}: an unknown box is NotFound, got {unknown:?}"
+    );
+}
+
+/// MOD-7 milestone 2 (D39, D41): a box probe between an editor's read and its write does not
+/// stale the editor, because the probe never writes `edit_version`; and the edit then leaves the
+/// probe's columns, tools and spec digest as the probe wrote them. This is the in-trait half of
+/// "a reconnect cannot stale an open editor"; registration is not a trait method, so its half is
+/// the Postgres test the doc of the case above names.
+async fn edit_box_survives_a_probe_between_read_and_write<S: WriteStore>(store: &S) {
+    const CASE: &str = "edit_box_survives_a_probe_between_read_and_write";
+    let token = store.boxes().await.expect(CASE)[0].row.edit_version;
+    assert_eq!(token, 0, "{CASE}: the fixture box has never been edited");
+
+    let probe = box_probe(
+        ids::BOX,
+        probe_clock(0),
+        vec![probed_tool("cargo", "1.0")],
+        "between",
+    );
+    store.record_box_probe(&probe).await.expect(CASE);
+
+    let edited = store
+        .edit_box(ids::BOX, token, tags_edit(&["gpu", "heavy_build"]))
+        .await
+        .expect(CASE);
+    let CasOutcome::Applied(row) = edited else {
+        panic!("{CASE}: a probe does not spend the token, got {edited:?}");
+    };
+    assert_eq!(
+        row.edit_version,
+        token + 1,
+        "{CASE}: the token moves by one"
+    );
+    assert_eq!(
+        row.declared_tags,
+        ["gpu", "heavy_build"],
+        "{CASE}: the edit is written"
+    );
+    assert_eq!(
+        row.os_version, "os between",
+        "{CASE}: the probe's os_version stays"
+    );
+    assert_eq!(
+        row.probed_tags, probe.probed_tags,
+        "{CASE}: the probe's probed_tags stay"
+    );
+    assert_eq!(
+        row.htui_version, probe.htui_version,
+        "{CASE}: the probe's htui_version stays"
+    );
+    assert_eq!(
+        row.last_probed_at,
+        Some(probe_clock(0)),
+        "{CASE}: the probe's instant stays"
+    );
+
+    let records = store.boxes().await.expect(CASE);
+    assert_eq!(records.len(), 1, "{CASE}: the fixture user has one box");
+    assert_eq!(
+        records[0]
+            .tools
+            .iter()
+            .map(|tool| (tool.name.as_str(), tool.version.as_str()))
+            .collect::<Vec<_>>(),
+        [("cargo", "1.0")],
+        "{CASE}: the probe's tool set stays"
+    );
+    assert_eq!(
+        records[0].probe_spec_digest.as_deref(),
+        Some(crate::prompt::digest::sha256_hex("between").as_str()),
+        "{CASE}: the probe's spec digest stays"
+    );
+}
+
+/// MOD-7 milestone 2 (D41, D42, D55): a tag the declared-tag rule refuses is a `Constraint`
+/// carrying the rule's own sentence, and writes nothing, not even the token. The refusal comes
+/// last: a spent token with a refused tag is `Stale`, and an unknown box with one is `NotFound`.
+async fn edit_box_refuses_an_invalid_tag<S: WriteStore>(store: &S) {
+    const CASE: &str = "edit_box_refuses_an_invalid_tag";
+    let before = store.boxes().await.expect(CASE);
+    assert_eq!(
+        before[0].row.edit_version, 0,
+        "{CASE}: the fixture box has never been edited"
+    );
+
+    let refused = store.edit_box(ids::BOX, 0, tags_edit(&["GPU"])).await;
+    let sentence = canonical_declared_tags(&["GPU".to_owned()])
+        .expect_err("the rule refuses an upper-case tag");
+    match refused {
+        Err(StoreError::Constraint(said)) => assert_eq!(
+            said, sentence,
+            "{CASE}: the refusal is the declared-tag rule's own sentence"
+        ),
+        other => panic!("{CASE}: an upper-case tag is a Constraint, got {other:?}"),
+    }
+    assert_eq!(
+        store.boxes().await.expect(CASE),
+        before,
+        "{CASE}: the refused edit wrote nothing, the token included"
+    );
+
+    let valid = store
+        .edit_box(ids::BOX, 0, tags_edit(&["gpu"]))
+        .await
+        .expect(CASE);
+    let CasOutcome::Applied(valid) = valid else {
+        panic!("{CASE}: a valid edit on the current token applies, got {valid:?}");
+    };
+    assert_eq!(
+        valid.edit_version, 1,
+        "{CASE}: the valid edit moves the token"
+    );
+
+    let spent = store.edit_box(ids::BOX, 0, tags_edit(&["bad tag"])).await;
+    assert!(
+        matches!(&spent, Ok(CasOutcome::Stale(row)) if row.edit_version == 1),
+        "{CASE}: a spent token wins over a refused tag, got {spent:?}"
+    );
+
+    let unknown = store.edit_box(BoxId::new(), 0, tags_edit(&["BAD"])).await;
+    assert!(
+        matches!(unknown, Err(StoreError::NotFound { entity: "box", .. })),
+        "{CASE}: an unknown box wins over a refused tag, got {unknown:?}"
+    );
+}
+
 /// Plan D89: `interrupt_step` is a compare-and-set on `running`. It writes `failed`, the note and
 /// the first `finished_at`, and leaves `gate_outcome` `NULL`, because a crash is not a gate
 /// answer. On any other status it writes nothing at all.
@@ -9515,7 +9802,9 @@ mod tests {
     /// written. Two shapes of reference are checked, both taken from inline-code spans: a bare
     /// snake_case name of four or more underscores (a test in this crate) and `<file>.rs::<name>`
     /// (a test in the named file). A file the table below does not know is a failure, not a skip:
-    /// an unchecked reference is exactly the hole this test exists to close. Spans that are not
+    /// an unchecked reference is exactly the hole this test exists to close. Besides this module
+    /// and `mem.rs`, the table reads two `htui-store` integration tests at run time: `pg_criteria.rs`
+    /// and, for MOD-7 milestone 2's box editor, `box_identity.rs`. Spans that are not
     /// plain snake_case are skipped, which is what keeps this test's own message templates -
     /// compiled into the source it scans - from being read as references.
     ///
@@ -9552,6 +9841,12 @@ mod tests {
                 .join("../htui-store/tests/pg_criteria.rs"),
         )
         .expect("read crates/htui-store/tests/pg_criteria.rs");
+        // The same, for MOD-7 milestone 2's Postgres-only box editor tests (D54).
+        let box_identity = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../htui-store/tests/box_identity.rs"),
+        )
+        .expect("read crates/htui-store/tests/box_identity.rs");
 
         // `(` for a plain fn, `<` for a generic one: every case in this module is `fn name<S: ..>`.
         let defines = |source: &str, name: &str| {
@@ -9580,6 +9875,7 @@ mod tests {
                     "conformance" => SELF,
                     "mem" => MEM,
                     "pg_criteria" => pg_criteria.as_str(),
+                    "box_identity" => box_identity.as_str(),
                     other => panic!(
                         "`{other}.rs::{name}` points at a file this test cannot read: add it to \
                          the table in `every_cross_referenced_test_name_exists`"
