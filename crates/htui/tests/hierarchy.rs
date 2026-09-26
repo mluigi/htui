@@ -2190,7 +2190,10 @@ async fn an_inference_report_keeps_its_cause_and_drops_a_refusal_shown_during_th
         frame.contains("stored as `/srv/htui` \u{b7} no repo in this workspace to infer"),
         "the follow-up's cause stays in front of the report: {frame}"
     );
-    assert!(!frame.contains("in flight"), "nothing is in flight: {frame}");
+    assert!(
+        !frame.contains("in flight"),
+        "nothing is in flight: {frame}"
+    );
 
     // `i` carries no cause, and the refusal it provoked is not one.
     bench.key(&mut section, "i");
