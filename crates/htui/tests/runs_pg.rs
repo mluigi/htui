@@ -51,7 +51,7 @@ use htui_core::model::{
     RunStatus, RunStep, RunStepCommit, SessionEvent, SnapshotPhase, Status, StepId, StepStatus,
     Transport, UsageTotals,
 };
-use htui_core::store::{CasOutcome, ReadStore as _, StoreError, WriteStore as _};
+use htui_core::store::{CasOutcome, ReadStore as _, StepFence, StoreError, WriteStore as _};
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
 use htui_orch::{Command, GateAnswer};
 use htui_store::{Backend, CacheStore, PgStore, testkit};
@@ -644,7 +644,7 @@ async fn a_promoted_step_continues_its_own_log_on_postgres() {
         stack
             .db
             .store
-            .append_events(&second_turn)
+            .append_events(StepFence::Unleased, &second_turn)
             .await
             .expect("the second turn lands"),
         2

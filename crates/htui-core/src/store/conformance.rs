@@ -35,9 +35,9 @@ use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::store::error::StoreError;
 use crate::store::traits::{
-    CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, UpdateOutcome, WriteStore,
-    already_exists, citation_key, illegal_move, invalid_area_code, requirement_withdrawn,
-    resolution_not_closable, withdrawn_requirement_cited,
+    CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StepFence, UpdateOutcome,
+    WriteStore, already_exists, citation_key, illegal_move, invalid_area_code,
+    requirement_withdrawn, resolution_not_closable, withdrawn_requirement_cited,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -125,6 +125,12 @@ pub const CASES: &[&str] = &[
     "skill_binding_attach_change_detach_are_compare_and_set",
     "skill_binding_refuses_by_rule",
     "skill_binding_stores_expanded_globs_and_languages_as_typed",
+    "a_stale_owner_writes_nothing_to_the_step",
+    "the_new_owner_writes_the_step",
+    "an_unleased_fence_writes_a_chat_step",
+    "an_unleased_fence_is_refused_on_a_leased_run",
+    "a_replayed_batch_under_the_right_fence_is_ok_zero",
+    "a_missing_step_keeps_its_old_error_not_fenced",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -286,6 +292,20 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "skill_binding_refuses_by_rule" => skill_binding_refuses_by_rule(store).await,
         "skill_binding_stores_expanded_globs_and_languages_as_typed" => {
             skill_binding_stores_expanded_globs_and_languages_as_typed(store).await;
+        }
+        "a_stale_owner_writes_nothing_to_the_step" => {
+            a_stale_owner_writes_nothing_to_the_step(store).await
+        }
+        "the_new_owner_writes_the_step" => the_new_owner_writes_the_step(store).await,
+        "an_unleased_fence_writes_a_chat_step" => an_unleased_fence_writes_a_chat_step(store).await,
+        "an_unleased_fence_is_refused_on_a_leased_run" => {
+            an_unleased_fence_is_refused_on_a_leased_run(store).await
+        }
+        "a_replayed_batch_under_the_right_fence_is_ok_zero" => {
+            a_replayed_batch_under_the_right_fence_is_ok_zero(store).await
+        }
+        "a_missing_step_keeps_its_old_error_not_fenced" => {
+            a_missing_step_keeps_its_old_error_not_fenced(store).await
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -1316,7 +1336,7 @@ async fn append_events_idempotent_and_ordered<S: WriteStore>(store: &S) {
     let first: Vec<SessionEvent> = (0..5).map(|seq| chat_event(step, seq)).collect();
     assert_eq!(
         store
-            .append_events(&first)
+            .append_events(StepFence::Unleased, &first)
             .await
             .expect("append_events_idempotent_and_ordered: the first append must land"),
         5,
@@ -1329,7 +1349,7 @@ async fn append_events_idempotent_and_ordered<S: WriteStore>(store: &S) {
     again.push(chat_event(step, 6));
     assert_eq!(
         store
-            .append_events(&again)
+            .append_events(StepFence::Unleased, &again)
             .await
             .expect("append_events_idempotent_and_ordered: the replay must not fail"),
         2,
@@ -1356,7 +1376,7 @@ async fn append_events_idempotent_and_ordered<S: WriteStore>(store: &S) {
     // statement is one `INSERT`, so a bad row cannot leave the good ones behind (§5.8 FK).
     let orphan = StepId::new();
     let mixed = vec![chat_event(step, 7), chat_event(orphan, 0)];
-    let refused = store.append_events(&mixed).await;
+    let refused = store.append_events(StepFence::Unleased, &mixed).await;
     assert!(
         matches!(refused, Err(StoreError::Constraint(_))),
         "append_events_idempotent_and_ordered: an unknown run_step_id is refused, got {refused:?}"
@@ -1374,7 +1394,7 @@ async fn append_events_idempotent_and_ordered<S: WriteStore>(store: &S) {
 
     assert_eq!(
         store
-            .append_events(&[])
+            .append_events(StepFence::Unleased, &[])
             .await
             .expect("append_events_idempotent_and_ordered: an empty batch must not fail"),
         0,
@@ -1394,6 +1414,7 @@ async fn set_step_usage_writes_usage_and_digest<S: WriteStore>(store: &S) {
     let step = ids::STEP_IMPL;
     store
         .set_step_usage(
+            StepFence::Unleased,
             step,
             json!({ "input_tokens": 10, "output_tokens": 20 }),
             Some("9f8e7d".to_owned()),
@@ -1401,11 +1422,18 @@ async fn set_step_usage_writes_usage_and_digest<S: WriteStore>(store: &S) {
         .await
         .expect("set_step_usage_writes_usage_and_digest: the first write must land");
     store
-        .set_step_usage(step, json!({ "input_tokens": 30 }), None)
+        .set_step_usage(
+            StepFence::Unleased,
+            step,
+            json!({ "input_tokens": 30 }),
+            None,
+        )
         .await
         .expect("set_step_usage_writes_usage_and_digest: a digest-free write must land");
 
-    let unknown = store.set_step_usage(StepId::new(), json!({}), None).await;
+    let unknown = store
+        .set_step_usage(StepFence::Unleased, StepId::new(), json!({}), None)
+        .await;
     assert!(
         matches!(
             unknown,
@@ -1440,7 +1468,9 @@ async fn start_chat_run_mints_chat_rows<S: WriteStore>(store: &S) {
     );
 
     // Nothing to record into yet: the step row is what the event FK points at.
-    let early = store.append_events(&[chat_event(chat.step_id, 0)]).await;
+    let early = store
+        .append_events(StepFence::Unleased, &[chat_event(chat.step_id, 0)])
+        .await;
     assert!(
         matches!(early, Err(StoreError::Constraint(_))),
         "start_chat_run_mints_chat_rows: no step exists before the mint, got {early:?}"
@@ -1453,7 +1483,7 @@ async fn start_chat_run_mints_chat_rows<S: WriteStore>(store: &S) {
     let rows: Vec<SessionEvent> = (0..3).map(|seq| chat_event(chat.step_id, seq)).collect();
     assert_eq!(
         store
-            .append_events(&rows)
+            .append_events(StepFence::Unleased, &rows)
             .await
             .expect("start_chat_run_mints_chat_rows: the chat's events must land"),
         3,
@@ -5462,6 +5492,468 @@ async fn release_lease_frees_the_run_for_its_own_sweep<S: WriteStore>(store: &S)
     );
 }
 
+// ------------------------------------------------------------------------------------------
+// MOD-40 milestone 1 (plan D1, blueprint B1-B7): the step fence. `append_events`,
+// `set_step_usage` and `finish_step` write only while the step's run carries the fence's lease;
+// a writer whose run another process took is answered `Fenced` and writes nothing.
+// ------------------------------------------------------------------------------------------
+
+/// MOD-40 D1: a fresh run claimed by `a` until `at + 5 min`, with one step. The fence cases start
+/// here; the run is `HTUI_ANA_2`'s, as the lease cases' are.
+async fn leased_step<S: WriteStore>(
+    case: &str,
+    store: &S,
+    a: Uuid,
+    at: DateTime<Utc>,
+) -> (RunId, StepId) {
+    let run = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(case)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, a, at, at + TimeDelta::minutes(5))
+            .await
+            .expect(case),
+        Claim::Admitted,
+        "{case}: A claims the run until at + 5 min"
+    );
+    let step = store
+        .create_step(new_run_step(run, 0, 1, 0))
+        .await
+        .expect(case)
+        .id;
+    (run, step)
+}
+
+/// B takes the run's lapsed lease, as a sweep's `adopt_runs` does to a suspended holder.
+async fn taken_by<S: WriteStore>(case: &str, store: &S, run: RunId, b: Uuid, at: DateTime<Utc>) {
+    assert!(
+        store
+            .take_lease(
+                run,
+                ids::BOX,
+                b,
+                at + TimeDelta::minutes(6),
+                at + TimeDelta::minutes(20)
+            )
+            .await
+            .expect(case),
+        "{case}: B takes A's lapsed lease"
+    );
+}
+
+/// The step's log, empty when nothing is cached (`step_events` answers `None` then).
+async fn log_of<S: ReadStore>(case: &str, store: &S, step: StepId) -> Vec<SessionEvent> {
+    store
+        .step_events(step)
+        .await
+        .expect(case)
+        .unwrap_or_default()
+}
+
+/// The three fenced writes under `fence` each answer `Fenced { step }`: an append at `seq`, a
+/// usage write, a settle at `at`.
+async fn assert_fenced<S: WriteStore>(
+    case: &str,
+    store: &S,
+    fence: StepFence,
+    step: StepId,
+    seq: i32,
+    at: DateTime<Utc>,
+) {
+    let append = store.append_events(fence, &[chat_event(step, seq)]).await;
+    assert!(
+        matches!(append, Err(StoreError::Fenced { step: s }) if s == step),
+        "{case}: an append under {fence:?} is fenced, got {append:?}"
+    );
+    let usage = store
+        .set_step_usage(
+            fence,
+            step,
+            json!({ "input_tokens": 99 }),
+            Some("stale".to_owned()),
+        )
+        .await;
+    assert!(
+        matches!(usage, Err(StoreError::Fenced { step: s }) if s == step),
+        "{case}: a usage write under {fence:?} is fenced, got {usage:?}"
+    );
+    let settle = store
+        .finish_step(
+            fence,
+            step,
+            StepOutcome {
+                exit_code: Some(1),
+                finished_at: at,
+                ..StepOutcome::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(settle, Err(StoreError::Fenced { step: s }) if s == step),
+        "{case}: a settle under {fence:?} is fenced, got {settle:?}"
+    );
+}
+
+/// MOD-40 plan D1 (ANA-16 C1): once B has taken A's lapsed lease, every step write A makes under
+/// its old lease is `Fenced` and writes nothing, a replay of rows already stored included
+/// (blueprint B7).
+async fn a_stale_owner_writes_nothing_to_the_step<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_stale_owner_writes_nothing_to_the_step";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let (run, step) = leased_step(CASE, store, a, at).await;
+    let rows: Vec<SessionEvent> = (0..2).map(|seq| chat_event(step, seq)).collect();
+    assert_eq!(
+        store
+            .append_events(StepFence::Lease(a), &rows)
+            .await
+            .expect(CASE),
+        2,
+        "{CASE}: A writes its step while it holds the lease"
+    );
+    store
+        .set_step_usage(
+            StepFence::Lease(a),
+            step,
+            json!({ "input_tokens": 1 }),
+            Some("d0".to_owned()),
+        )
+        .await
+        .expect(CASE);
+    taken_by(CASE, store, run, b, at).await;
+    let row = step_row(CASE, store, run, step).await;
+    let log = log_of(CASE, store, step).await;
+
+    assert_fenced(
+        CASE,
+        store,
+        StepFence::Lease(a),
+        step,
+        2,
+        at + TimeDelta::minutes(7),
+    )
+    .await;
+    let replay = store.append_events(StepFence::Lease(a), &rows).await;
+    assert!(
+        matches!(replay, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: A's replay of stored rows is fenced too, never Ok(0) (blueprint B7), got {replay:?}"
+    );
+    assert_eq!(
+        step_row(CASE, store, run, step).await,
+        row,
+        "{CASE}: the refused writes left the settle and usage columns alone"
+    );
+    assert_eq!(
+        log_of(CASE, store, step).await,
+        log,
+        "{CASE}: the refused writes appended nothing"
+    );
+    assert_eq!(log.len(), 2, "{CASE}: A's two rows stand");
+}
+
+/// MOD-40 plan D1: the process that took the lease writes the step under its own.
+async fn the_new_owner_writes_the_step<S: WriteStore>(store: &S) {
+    const CASE: &str = "the_new_owner_writes_the_step";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let (run, step) = leased_step(CASE, store, a, at).await;
+    let rows: Vec<SessionEvent> = (0..2).map(|seq| chat_event(step, seq)).collect();
+    assert_eq!(
+        store
+            .append_events(StepFence::Lease(a), &rows)
+            .await
+            .expect(CASE),
+        2,
+        "{CASE}: A writes its step while it holds the lease"
+    );
+    taken_by(CASE, store, run, b, at).await;
+
+    let more: Vec<SessionEvent> = (2..4).map(|seq| chat_event(step, seq)).collect();
+    assert_eq!(
+        store
+            .append_events(StepFence::Lease(b), &more)
+            .await
+            .expect(CASE),
+        2,
+        "{CASE}: B appends under its lease"
+    );
+    store
+        .set_step_usage(
+            StepFence::Lease(b),
+            step,
+            json!({ "input_tokens": 5 }),
+            None,
+        )
+        .await
+        .expect(CASE);
+    store
+        .finish_step(
+            StepFence::Lease(b),
+            step,
+            StepOutcome {
+                exit_code: Some(0),
+                finished_at: at + TimeDelta::minutes(7),
+                ..StepOutcome::default()
+            },
+        )
+        .await
+        .expect(CASE);
+
+    let row = step_row(CASE, store, run, step).await;
+    assert_eq!(
+        (row.exit_code, row.finished_at, row.usage),
+        (
+            Some(0),
+            Some(at + TimeDelta::minutes(7)),
+            Some(json!({ "input_tokens": 5 }))
+        ),
+        "{CASE}: B's usage and settle landed"
+    );
+    assert_eq!(
+        log_of(CASE, store, step)
+            .await
+            .iter()
+            .map(|event| event.seq)
+            .collect::<Vec<i32>>(),
+        (0..4).collect::<Vec<i32>>(),
+        "{CASE}: A's rows and B's, in order"
+    );
+}
+
+/// MOD-40 plan D1: a chat run holds no lease, so `Unleased` writes its step, and a fence naming
+/// any owner is refused there.
+async fn an_unleased_fence_writes_a_chat_step<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_unleased_fence_writes_a_chat_step";
+    let at = seam_clock();
+    let chat = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        ids::BOX,
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        Some("sonnet".to_owned()),
+    );
+    store.start_chat_run(&chat).await.expect(CASE);
+    let rows: Vec<SessionEvent> = (0..3).map(|seq| chat_event(chat.step_id, seq)).collect();
+    assert_eq!(
+        store
+            .append_events(StepFence::Unleased, &rows)
+            .await
+            .expect(CASE),
+        3,
+        "{CASE}: a chat's rows land unleased"
+    );
+    store
+        .set_step_usage(
+            StepFence::Unleased,
+            chat.step_id,
+            json!({ "input_tokens": 3 }),
+            Some("c0".to_owned()),
+        )
+        .await
+        .expect(CASE);
+    store
+        .finish_step(
+            StepFence::Unleased,
+            chat.step_id,
+            StepOutcome {
+                exit_code: Some(0),
+                finished_at: at,
+                ..StepOutcome::default()
+            },
+        )
+        .await
+        .expect(CASE);
+    let row = step_row(CASE, store, chat.run_id, chat.step_id).await;
+    let log = log_of(CASE, store, chat.step_id).await;
+
+    assert_fenced(
+        CASE,
+        store,
+        StepFence::Lease(Uuid::now_v7()),
+        chat.step_id,
+        3,
+        at + TimeDelta::minutes(1),
+    )
+    .await;
+    assert_eq!(
+        step_row(CASE, store, chat.run_id, chat.step_id).await,
+        row,
+        "{CASE}: the refused writes left the chat step alone"
+    );
+    assert_eq!(
+        log_of(CASE, store, chat.step_id).await,
+        log,
+        "{CASE}: the refused append wrote nothing"
+    );
+}
+
+/// MOD-40 plan D1, plan R-1: `Unleased` is refused on a run whose lease names an owner; once the
+/// owner gives the lease back (a park, plan D139) the step is a chat's to continue, and the old
+/// owner's fence is refused instead.
+async fn an_unleased_fence_is_refused_on_a_leased_run<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_unleased_fence_is_refused_on_a_leased_run";
+    let a = Uuid::now_v7();
+    let at = seam_clock();
+    let (run, step) = leased_step(CASE, store, a, at).await;
+
+    assert_fenced(
+        CASE,
+        store,
+        StepFence::Unleased,
+        step,
+        0,
+        at + TimeDelta::minutes(1),
+    )
+    .await;
+    assert!(
+        log_of(CASE, store, step).await.is_empty(),
+        "{CASE}: the refused append wrote nothing"
+    );
+    assert_eq!(
+        step_row(CASE, store, run, step).await.finished_at,
+        None,
+        "{CASE}: the refused settle wrote nothing"
+    );
+
+    assert!(
+        store
+            .release_lease(run, a, at + TimeDelta::minutes(1))
+            .await
+            .expect(CASE),
+        "{CASE}: A gives its lease back, as a park does"
+    );
+    assert_eq!(
+        store
+            .append_events(StepFence::Unleased, &[chat_event(step, 0)])
+            .await
+            .expect(CASE),
+        1,
+        "{CASE}: a released run's step takes an unleased row"
+    );
+    assert_fenced(
+        CASE,
+        store,
+        StepFence::Lease(a),
+        step,
+        1,
+        at + TimeDelta::minutes(2),
+    )
+    .await;
+}
+
+/// MOD-40 plan D1, D3: under the right fence a replay is `Ok(0)` and a partial replay counts only
+/// its new rows; the same replay under the wrong fence is `Fenced` (blueprint B7).
+async fn a_replayed_batch_under_the_right_fence_is_ok_zero<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_replayed_batch_under_the_right_fence_is_ok_zero";
+    let a = Uuid::now_v7();
+    let at = seam_clock();
+    let (_, step) = leased_step(CASE, store, a, at).await;
+    let rows: Vec<SessionEvent> = (0..3).map(|seq| chat_event(step, seq)).collect();
+
+    assert_eq!(
+        store
+            .append_events(StepFence::Lease(a), &rows)
+            .await
+            .expect(CASE),
+        3,
+        "{CASE}: three new rows"
+    );
+    assert_eq!(
+        store
+            .append_events(StepFence::Lease(a), &rows)
+            .await
+            .expect(CASE),
+        0,
+        "{CASE}: a whole replay under the right fence lands nothing and is not an error"
+    );
+    let wider: Vec<SessionEvent> = (0..4).map(|seq| chat_event(step, seq)).collect();
+    assert_eq!(
+        store
+            .append_events(StepFence::Lease(a), &wider)
+            .await
+            .expect(CASE),
+        1,
+        "{CASE}: a replay with one new row counts the one"
+    );
+    assert_eq!(
+        log_of(CASE, store, step)
+            .await
+            .iter()
+            .map(|event| event.seq)
+            .collect::<Vec<i32>>(),
+        (0..4).collect::<Vec<i32>>(),
+        "{CASE}: seq 0..4, no duplicate"
+    );
+
+    let wrong = store.append_events(StepFence::Unleased, &rows).await;
+    assert!(
+        matches!(wrong, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: the same replay under the wrong fence is fenced (blueprint B7), got {wrong:?}"
+    );
+}
+
+/// MOD-40 blueprint B6: a step that does not exist keeps today's answer under any fence —
+/// `Constraint` for the append, `NotFound` for the two updates — and a batch naming one refuses
+/// whole with `Constraint`, ahead of the fence, even when its other step is fenced.
+async fn a_missing_step_keeps_its_old_error_not_fenced<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_missing_step_keeps_its_old_error_not_fenced";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let orphan = StepId::new();
+    let (run, step) = leased_step(CASE, store, a, at).await;
+    taken_by(CASE, store, run, b, at).await;
+
+    for fence in [StepFence::Unleased, StepFence::Lease(Uuid::now_v7())] {
+        let append = store.append_events(fence, &[chat_event(orphan, 0)]).await;
+        assert!(
+            matches!(append, Err(StoreError::Constraint(_))),
+            "{CASE}: an append on a missing step under {fence:?} is Constraint, got {append:?}"
+        );
+        let usage = store.set_step_usage(fence, orphan, json!({}), None).await;
+        assert!(
+            matches!(
+                usage,
+                Err(StoreError::NotFound {
+                    entity: "run_step",
+                    ..
+                })
+            ),
+            "{CASE}: a usage write on a missing step under {fence:?} is NotFound, got {usage:?}"
+        );
+        let settle = store
+            .finish_step(fence, orphan, StepOutcome::default())
+            .await;
+        assert!(
+            matches!(
+                settle,
+                Err(StoreError::NotFound {
+                    entity: "run_step",
+                    ..
+                })
+            ),
+            "{CASE}: a settle on a missing step under {fence:?} is NotFound, got {settle:?}"
+        );
+    }
+
+    let mixed = store
+        .append_events(
+            StepFence::Lease(a),
+            &[chat_event(step, 0), chat_event(orphan, 0)],
+        )
+        .await;
+    assert!(
+        matches!(mixed, Err(StoreError::Constraint(_))),
+        "{CASE}: a batch naming a missing step and a fenced one is Constraint (B6), got {mixed:?}"
+    );
+    assert!(
+        log_of(CASE, store, step).await.is_empty(),
+        "{CASE}: the refused batch wrote none of its rows"
+    );
+}
+
 /// The fixture's one `box` row, as `load_demo` and `MemStore::from_demo` both load it.
 fn fixture_box() -> BoxRow {
     crate::fixtures::demo_data()
@@ -7202,6 +7694,7 @@ async fn interrupt_step_is_a_cas_on_running<S: WriteStore>(store: &S) {
     let settled = running(1).await;
     store
         .finish_step(
+            StepFence::Unleased,
             settled,
             StepOutcome {
                 exit_code: Some(0),
@@ -7470,6 +7963,7 @@ async fn finish_step_records_the_settle<S: WriteStore>(store: &S) {
     let finished = seam_clock();
     store
         .finish_step(
+            StepFence::Unleased,
             ids::STEP_R2_PRD,
             StepOutcome {
                 exit_code: Some(0),
@@ -7507,6 +8001,7 @@ async fn finish_step_records_the_settle<S: WriteStore>(store: &S) {
 
     store
         .finish_step(
+            StepFence::Unleased,
             ids::STEP_R2_PRD,
             StepOutcome {
                 exit_code: Some(1),
@@ -7534,7 +8029,7 @@ async fn finish_step_records_the_settle<S: WriteStore>(store: &S) {
     );
 
     let unknown = store
-        .finish_step(StepId::new(), StepOutcome::default())
+        .finish_step(StepFence::Unleased, StepId::new(), StepOutcome::default())
         .await;
     assert!(
         matches!(

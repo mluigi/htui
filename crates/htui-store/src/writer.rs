@@ -50,8 +50,8 @@ use htui_core::model::{
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
-    CasOutcome, DeleteReach, DeleteTarget, MemStore, ReadStore, Result, SettingRung, StoredSetting,
-    UpdateOutcome, WriteStore,
+    CasOutcome, DeleteReach, DeleteTarget, MemStore, ReadStore, Result, SettingRung, StepFence,
+    StoredSetting, UpdateOutcome, WriteStore,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -375,22 +375,27 @@ impl WriteStore for Writer {
         }
     }
 
-    async fn append_events(&self, events: &[SessionEvent]) -> Result<usize> {
+    async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> Result<usize> {
         match self {
-            Self::Memory(store) => store.append_events(events).await,
-            Self::Online(pg) => pg.append_events(events).await,
+            Self::Memory(store) => store.append_events(fence, events).await,
+            Self::Online(pg) => pg.append_events(fence, events).await,
         }
     }
 
     async fn set_step_usage(
         &self,
+        fence: StepFence,
         step: StepId,
         usage: Value,
         prompt_digest: Option<String>,
     ) -> Result<()> {
         match self {
-            Self::Memory(store) => store.set_step_usage(step, usage, prompt_digest).await,
-            Self::Online(pg) => pg.set_step_usage(step, usage, prompt_digest).await,
+            Self::Memory(store) => {
+                store
+                    .set_step_usage(fence, step, usage, prompt_digest)
+                    .await
+            }
+            Self::Online(pg) => pg.set_step_usage(fence, step, usage, prompt_digest).await,
         }
     }
 
@@ -930,10 +935,15 @@ impl WriteStore for Writer {
         }
     }
 
-    async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> Result<()> {
+    async fn finish_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        outcome: StepOutcome,
+    ) -> Result<()> {
         match self {
-            Self::Memory(store) => store.finish_step(step, outcome).await,
-            Self::Online(pg) => pg.finish_step(step, outcome).await,
+            Self::Memory(store) => store.finish_step(fence, step, outcome).await,
+            Self::Online(pg) => pg.finish_step(fence, step, outcome).await,
         }
     }
 

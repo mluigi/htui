@@ -18,16 +18,17 @@ use chrono::{DateTime, SubsecRound as _, TimeDelta, Utc};
 use futures::future::join_all;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, Claim, CommandRunId, CommandRunStatus, GraphSnapshot,
-    Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, NewCommandRun, NewItem,
-    NewProject, NewRepo, NewRequirement, NewRun, NewWorkspace, Priority, ProjectId, RepoId,
-    RequirementId, RunId, RunMode, RunStatus, RunStepTree, SnapshotGraph, SnapshotSettings, Status,
-    StepId, TIMESTAMPTZ_DIGITS, Transport, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    Agent, AgentBox, AgentId, Billing, BoxId, Claim, CommandRunId, CommandRunStatus, EventKind,
+    EventRole, GraphSnapshot, Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch,
+    NewCommandRun, NewItem, NewProject, NewRepo, NewRequirement, NewRun, NewWorkspace, Priority,
+    ProjectId, RepoId, RequirementId, RunId, RunMode, RunStatus, RunStepTree, SessionEvent,
+    SnapshotGraph, SnapshotSettings, Status, StepId, TIMESTAMPTZ_DIGITS, Transport,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
 use htui_core::store::{
-    CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, SettingRung, UpdateOutcome,
+    CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, SettingRung, StepFence, UpdateOutcome,
     WriteStore as _,
 };
 use htui_store::PgStore;
@@ -1013,6 +1014,7 @@ async fn set_step_usage_keeps_the_digest_a_none_call_does_not_supply() {
 
     db.store
         .set_step_usage(
+            StepFence::Unleased,
             step,
             serde_json::json!({ "input_tokens": 11 }),
             Some("d1ge57".to_owned()),
@@ -1030,6 +1032,7 @@ async fn set_step_usage_keeps_the_digest_a_none_call_does_not_supply() {
 
     db.store
         .set_step_usage(
+            StepFence::Unleased,
             step,
             serde_json::json!({ "input_tokens": 30, "output_tokens": 40 }),
             None,
@@ -1047,7 +1050,12 @@ async fn set_step_usage_keeps_the_digest_a_none_call_does_not_supply() {
     );
 
     db.store
-        .set_step_usage(step, serde_json::json!({}), Some("f00d".to_owned()))
+        .set_step_usage(
+            StepFence::Unleased,
+            step,
+            serde_json::json!({}),
+            Some("f00d".to_owned()),
+        )
         .await
         .expect("a second digest write must land");
     assert_eq!(
@@ -1094,7 +1102,12 @@ async fn set_step_prompt_writes_only_the_digest_and_the_record() {
 
     // Something in every column the write must not disturb, so "unchanged" is a real claim.
     db.store
-        .set_step_usage(step, serde_json::json!({ "input_tokens": 7 }), None)
+        .set_step_usage(
+            StepFence::Unleased,
+            step,
+            serde_json::json!({ "input_tokens": 7 }),
+            None,
+        )
         .await
         .expect("the usage write lands");
     db.store
@@ -3929,6 +3942,76 @@ async fn upsert_step_tree_writes_the_primary_isolation_path() {
         column().await.0.as_deref(),
         Some("/srv/trees/prd/docs"),
         "an empty batch names no tree, so it leaves the column alone"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-40 blueprint B2: a step write racing an uncommitted lease take waits for it, then answers
+/// `Fenced`, and writes nothing.
+///
+/// Under `READ COMMITTED` a join reads `run` and does not lock it, so without the `FOR SHARE` in
+/// the append's `lease` CTE the write would see the pre-take row and commit after the take. Here
+/// the take is a raw `UPDATE run SET lease_owner` inside an open transaction, standing in for a
+/// `take_lease` or `adopt_runs` whose commit has not landed yet: the write must still be waiting
+/// on its row lock when checked, and must re-read the committed owner once the take commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_take_committed_mid_write_fences_it() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (a, b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let now = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    assert_eq!(
+        db.store
+            .claim_run(ids::RUN_2, ids::BOX, a, now, now + TimeDelta::minutes(5))
+            .await
+            .expect("the claim must not fail"),
+        Claim::Admitted,
+        "A claims the queued fixture run"
+    );
+
+    let mut tx = db.pool.begin().await.expect("begin");
+    sqlx::query("UPDATE run SET lease_owner = $1 WHERE id = $2")
+        .bind(b)
+        .bind(ids::RUN_2.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("B's take, uncommitted");
+
+    let store = db.store.clone();
+    let row = SessionEvent {
+        run_step_id: ids::STEP_R2_PRD,
+        seq: 0,
+        turn: 0,
+        kind: EventKind::AssistantText,
+        role: EventRole::Agent,
+        tool_call_id: None,
+        payload: serde_json::json!({ "text": "A, asleep through its lease" }),
+        raw: None,
+        at: now,
+    };
+    let handle =
+        tokio::spawn(async move { store.append_events(StepFence::Lease(a), &[row]).await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !handle.is_finished(),
+        "the write waits on the take's row lock (`FOR SHARE OF r`)"
+    );
+
+    tx.commit().await.expect("B's take commits");
+    let answer = handle.await.expect("the write task must not panic");
+    assert!(
+        matches!(answer, Err(htui_core::store::StoreError::Fenced { step }) if step == ids::STEP_R2_PRD),
+        "the write re-reads the committed owner and is fenced, got {answer:?}"
+    );
+    assert!(
+        db.store
+            .step_events(ids::STEP_R2_PRD)
+            .await
+            .expect("read must not fail")
+            .is_none(),
+        "the fenced write left no row"
     );
 
     db.drop_db().await;

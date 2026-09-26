@@ -50,7 +50,7 @@ use htui_core::prompt::settings::SettingKey;
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, Result as StoreResult, SettingRung,
-    StoredSetting, UpdateOutcome, WriteStore,
+    StepFence, StoredSetting, UpdateOutcome, WriteStore,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -723,11 +723,12 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> StoreResult<bool> {
         self.inner.transition(id, from, to).await
     }
-    async fn append_events(&self, events: &[SessionEvent]) -> StoreResult<usize> {
-        self.inner.append_events(events).await
+    async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> StoreResult<usize> {
+        self.inner.append_events(fence, events).await
     }
     async fn set_step_usage(
         &self,
+        fence: StepFence,
         step: StepId,
         usage: Value,
         prompt_digest: Option<String>,
@@ -735,7 +736,7 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
         // The write first, the log after: the guard is taken and dropped with no `.await` inside
         // its scope.
         self.inner
-            .set_step_usage(step, usage.clone(), prompt_digest.clone())
+            .set_step_usage(fence, step, usage.clone(), prompt_digest.clone())
             .await?;
         self.calls
             .lock()
@@ -1090,8 +1091,13 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     ) -> StoreResult<bool> {
         self.inner.transition_step(step, from, to, at).await
     }
-    async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> StoreResult<()> {
-        self.inner.finish_step(step, outcome).await
+    async fn finish_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        outcome: StepOutcome,
+    ) -> StoreResult<()> {
+        self.inner.finish_step(fence, step, outcome).await
     }
     async fn interrupt_step(
         &self,

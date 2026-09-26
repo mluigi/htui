@@ -103,7 +103,7 @@ use htui_core::model::{
     StepId, UsageTotals, quota::normalize,
 };
 use htui_core::scrub::{Scrubber, Unmasked};
-use htui_core::store::{StoreError, WriteStore};
+use htui_core::store::{StepFence, StoreError, WriteStore};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -416,6 +416,9 @@ pub struct Recorder<'a, S: WriteStore> {
     last_quota_raw: Option<Value>,
     /// Plan D70: the per-run cap this session is bounded by, or `None` for an unbounded run.
     run_cap: Option<RunCap>,
+    /// MOD-40 plan D2: the lease every row, usage and digest write of this session is made
+    /// under. [`StepFence::Unleased`] unless [`Recorder::with_fence`] says otherwise.
+    fence: StepFence,
     /// Set by the first breach and never cleared: a later `usage` row reports no second verdict,
     /// because the session it would cancel is already being closed.
     cap_breached: Option<CapBreach>,
@@ -444,6 +447,7 @@ impl<S: WriteStore> core::fmt::Debug for Recorder<'_, S> {
             // not what a recorder log is about either.
             .field("quota_latch", &self.quota_latch.is_some())
             .field("run_cap", &self.run_cap)
+            .field("fence", &self.fence)
             .field("cap_breached", &self.cap_breached)
             .finish()
     }
@@ -483,6 +487,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             quota_latch: None,
             last_quota_raw: None,
             run_cap: None,
+            fence: StepFence::Unleased,
             cap_breached: None,
             residue: None,
             dropped: 0,
@@ -555,6 +560,19 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     #[must_use]
     pub fn with_run_cap(mut self, cap: RunCap) -> Self {
         self.run_cap = Some(cap);
+        self
+    }
+
+    /// Writes every row, the usage and the digest under `fence` (MOD-40 plan D2).
+    ///
+    /// A builder for [`Recorder::with_quota_latch`]'s reason: most recorders are a chat's, whose
+    /// run holds no lease, and [`StepFence::Unleased`] is the default. The engine passes the lease
+    /// its walk holds. A recorder that forgets it on a leased run is refused with
+    /// [`StoreError::Fenced`] at its first write, loudly; one whose lease another process took
+    /// writes nothing more.
+    #[must_use]
+    pub fn with_fence(mut self, fence: StepFence) -> Self {
+        self.fence = fence;
         self
     }
 
@@ -1039,7 +1057,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             let turn = self.turn;
             rows.push(self.event_row(row, seq, turn));
         }
-        match self.store.append_events(&rows).await {
+        match self.store.append_events(self.fence, &rows).await {
             Ok(written) => {
                 self.rows += written;
                 Ok(())
@@ -1111,7 +1129,9 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         }
         let usage = self.usage.to_value();
         let digest = self.digest_pending.take();
-        self.store.set_step_usage(self.step, usage, digest).await?;
+        self.store
+            .set_step_usage(self.fence, self.step, usage, digest)
+            .await?;
         self.usage_dirty = false;
         Ok(())
     }
@@ -1810,7 +1830,7 @@ mod tests {
         ChatRunSpec, EventKind, EventRole, RunStep, SessionEvent, StepId, UsageTotals,
     };
     use htui_core::scrub::MinimalScrubber;
-    use htui_core::store::{MemStore, ReadStore, WriteStore};
+    use htui_core::store::{MemStore, ReadStore, StepFence, WriteStore};
     use serde_json::{Value, json};
 
     use super::{Recorder, RecorderSummary};
@@ -1942,7 +1962,7 @@ mod tests {
     /// `ReadStore::step_events`.
     async fn seed(store: &MemStore, step: StepId, rows: &[SessionEvent]) -> Vec<SessionEvent> {
         store
-            .append_events(rows)
+            .append_events(StepFence::Unleased, rows)
             .await
             .expect("the earlier log must land");
         log(store, step).await
@@ -2126,7 +2146,12 @@ mod tests {
         let tail = seed(&store, chat.step_id, &earlier).await;
         // The pre-promotion recorder left the column at the earlier spend.
         store
-            .set_step_usage(chat.step_id, UsageTotals::from_rows(&tail).to_value(), None)
+            .set_step_usage(
+                StepFence::Unleased,
+                chat.step_id,
+                UsageTotals::from_rows(&tail).to_value(),
+                None,
+            )
             .await
             .expect("the earlier spend must land");
 

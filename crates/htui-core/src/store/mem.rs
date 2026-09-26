@@ -45,9 +45,9 @@ use crate::prompt::template::TemplateRole;
 use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
-    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StoredSetting,
-    UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment, citation_key,
-    close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
+    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StepFence,
+    StoredSetting, UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment,
+    citation_key, close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
     finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project,
     invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
     legal_move, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
@@ -1432,7 +1432,7 @@ impl State {
     ///
     /// Every event is validated **before** the first insert, because Postgres does the whole batch
     /// in one statement: a batch naming a step that does not exist must write none of its rows.
-    fn append_events(&mut self, events: &[SessionEvent]) -> Result<usize> {
+    fn append_events(&mut self, _fence: StepFence, events: &[SessionEvent]) -> Result<usize> {
         for event in events {
             if !self.steps.contains_key(&event.run_step_id) {
                 return Err(StoreError::Constraint(format!(
@@ -1461,6 +1461,7 @@ impl State {
     /// `run_step.usage`, plus `prompt_digest` when one is supplied (`docs/ANA-4.md` §4.1).
     fn set_step_usage(
         &mut self,
+        _fence: StepFence,
         step: StepId,
         usage: Value,
         prompt_digest: Option<String>,
@@ -4216,6 +4217,7 @@ impl State {
     /// The settle columns of [`StepOutcome`] and never `status`.
     fn finish_step(
         &mut self,
+        _fence: StepFence,
         step: StepId,
         outcome: StepOutcome,
         now: DateTime<Utc>,
@@ -5579,18 +5581,19 @@ impl WriteStore for MemStore {
         self.write(|state| state.transition(id, from, to, now))
     }
 
-    async fn append_events(&self, events: &[SessionEvent]) -> Result<usize> {
-        self.write(|state| state.append_events(events))
+    async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> Result<usize> {
+        self.write(|state| state.append_events(fence, events))
     }
 
     async fn set_step_usage(
         &self,
+        fence: StepFence,
         step: StepId,
         usage: Value,
         prompt_digest: Option<String>,
     ) -> Result<()> {
         let now = Utc::now();
-        self.write(|state| state.set_step_usage(step, usage, prompt_digest, now))
+        self.write(|state| state.set_step_usage(fence, step, usage, prompt_digest, now))
     }
 
     async fn upsert_agent(&self, agent: &Agent) -> Result<()> {
@@ -5999,9 +6002,14 @@ impl WriteStore for MemStore {
         self.write(|state| state.transition_step(step, from, to, at, now))
     }
 
-    async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> Result<()> {
+    async fn finish_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        outcome: StepOutcome,
+    ) -> Result<()> {
         let now = Utc::now();
-        self.write(|state| state.finish_step(step, outcome, now))
+        self.write(|state| state.finish_step(fence, step, outcome, now))
     }
 
     async fn interrupt_step(&self, step: StepId, note: &str, at: DateTime<Utc>) -> Result<bool> {
@@ -6216,7 +6224,9 @@ mod tests {
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
     use crate::store::error::StoreError;
-    use crate::store::{CasOutcome, DeleteTarget, ReadStore as _, SettingRung, WriteStore as _};
+    use crate::store::{
+        CasOutcome, DeleteTarget, ReadStore as _, SettingRung, StepFence, WriteStore as _,
+    };
     use chrono::{TimeDelta, Utc};
     use serde_json::{Value, json};
     use uuid::Uuid;
@@ -6299,6 +6309,7 @@ mod tests {
         let store = MemStore::demo();
         store
             .set_step_usage(
+                StepFence::Unleased,
                 ids::STEP_IMPL,
                 json!({ "input_tokens": 7 }),
                 Some("abc".to_owned()),
@@ -6306,7 +6317,12 @@ mod tests {
             .await
             .expect("the first write lands");
         store
-            .set_step_usage(ids::STEP_IMPL, json!({ "input_tokens": 9 }), None)
+            .set_step_usage(
+                StepFence::Unleased,
+                ids::STEP_IMPL,
+                json!({ "input_tokens": 9 }),
+                None,
+            )
             .await
             .expect("the second write lands");
 
@@ -6341,7 +6357,12 @@ mod tests {
     async fn set_step_prompt_writes_both_columns() {
         let store = MemStore::demo();
         store
-            .set_step_usage(ids::STEP_IMPL, json!({ "input_tokens": 7 }), None)
+            .set_step_usage(
+                StepFence::Unleased,
+                ids::STEP_IMPL,
+                json!({ "input_tokens": 7 }),
+                None,
+            )
             .await
             .expect("the usage write lands");
         store
@@ -8554,6 +8575,7 @@ mod tests {
         let finished = Utc::now();
         store
             .finish_step(
+                StepFence::Unleased,
                 ids::STEP_R2_PRD,
                 StepOutcome {
                     exit_code: Some(0),
@@ -8568,6 +8590,7 @@ mod tests {
             .expect("the settle lands");
         store
             .finish_step(
+                StepFence::Unleased,
                 ids::STEP_R2_PRD,
                 StepOutcome {
                     exit_code: Some(1),
@@ -8607,7 +8630,7 @@ mod tests {
         );
         assert!(matches!(
             store
-                .finish_step(StepId::new(), StepOutcome::default())
+                .finish_step(StepFence::Unleased, StepId::new(), StepOutcome::default())
                 .await,
             Err(StoreError::NotFound {
                 entity: "run_step",

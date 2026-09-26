@@ -41,7 +41,7 @@ use htui_core::prompt::{
     TemplateRef, TemplateRole, TokenEstimator, TrimStrategy, VerifyFailure, assemble, settings,
 };
 use htui_core::scrub::Scrubber;
-use htui_core::store::{StoreError, WriteStore};
+use htui_core::store::{StepFence, StoreError, WriteStore};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -1401,6 +1401,7 @@ where
             self.parts
                 .store
                 .finish_step(
+                    StepFence::Lease(self.parts.owner),
                     row.id,
                     StepOutcome {
                         exit_code: None,
@@ -2280,6 +2281,7 @@ where
         self.parts
             .store
             .finish_step(
+                StepFence::Lease(self.parts.owner),
                 step.id,
                 StepOutcome {
                     exit_code: None,
@@ -3187,6 +3189,7 @@ where
         self.parts
             .store
             .finish_step(
+                StepFence::Lease(self.parts.owner),
                 step.id,
                 StepOutcome {
                     exit_code: None,
@@ -3788,6 +3791,7 @@ where
         self.parts
             .store
             .finish_step(
+                StepFence::Lease(self.parts.owner),
                 step.id,
                 StepOutcome {
                     exit_code: None,
@@ -4229,6 +4233,7 @@ where
         self.parts
             .store
             .finish_step(
+                StepFence::Lease(self.parts.owner),
                 judge.id,
                 StepOutcome {
                     exit_code: None,
@@ -5277,7 +5282,10 @@ where
             step.id,
             settings.keep_raw_events,
             None,
-        );
+        )
+        // MOD-40 plan D2: the walk's lease rides every row, usage and digest write, so a walk
+        // that sleeps through its lease writes nothing once another process has adopted it.
+        .with_fence(StepFence::Lease(self.parts.owner));
         if let Some(micros) = settings.per_token_cap_run {
             recorder = recorder.with_run_cap(RunCap {
                 micros,

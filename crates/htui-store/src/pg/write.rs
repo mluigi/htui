@@ -41,7 +41,7 @@ use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::seed;
 use htui_core::store::{
     BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung,
-    StoreError, StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, already_exists,
+    StepFence, StoreError, StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, already_exists,
     chat_step_status, check_attachment, citation_key, close_out_needs_a_summary, expected_on_row,
     failure_disagrees_with_status, finish_run_item_mirror, finish_run_needs_a_terminal_status,
     graph_not_in_project, illegal_move, invalid_area_code, invalid_prefix, item_has_a_live_run,
@@ -943,7 +943,7 @@ impl WriteStore for PgStore {
     /// [`StoreError::Constraint`] when an event names a `run_step` that does not exist (`23503`)
     /// or a `kind` / `role` outside the §4.3 `CHECK` lists (`23514`). One statement, so a refused
     /// batch writes none of its rows.
-    async fn append_events(&self, events: &[SessionEvent]) -> Result<usize> {
+    async fn append_events(&self, _fence: StepFence, events: &[SessionEvent]) -> Result<usize> {
         if events.is_empty() {
             return Ok(0);
         }
@@ -984,6 +984,7 @@ impl WriteStore for PgStore {
     /// this statement can mean.
     async fn set_step_usage(
         &self,
+        _fence: StepFence,
         step: StepId,
         usage: Value,
         prompt_digest: Option<String>,
@@ -4069,7 +4070,12 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::NotFound`] `{ entity: "run_step" }` - zero rows updated is the only thing this
     /// statement can mean.
-    async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> Result<()> {
+    async fn finish_step(
+        &self,
+        _fence: StepFence,
+        step: StepId,
+        outcome: StepOutcome,
+    ) -> Result<()> {
         let updated = sqlx::query!(
             "UPDATE run_step \
                 SET exit_code        = $2, \

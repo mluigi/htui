@@ -255,13 +255,10 @@ pub trait ReadStore: Send + Sync {
 
 /// Everything a write path needs.
 ///
-/// It used to be implemented only by a store that can reach Postgres. Since MOD-2 milestone 4
-/// (plan D34) `htui-store`'s offline sink implements it too, writing the `session_event` rows to
-/// a JSON-lines buffer and answering
-/// [`StoreError::Unreachable`](crate::store::StoreError::Unreachable) for everything the buffer
-/// cannot hold — so "an offline write is a compile error" is now narrower and still true where it
-/// counts: nothing reaches **Postgres** except through a store that has a connection, and the
-/// read-only mirror still does not implement this trait at all.
+/// Implemented by the stores that write where they read — `PgStore`, which needs a connection,
+/// and `MemStore` — and by `htui-store`'s `Writer`, which holds one of the two. The read-only
+/// mirror does not implement it, so an offline write is a compile error. (Between MOD-2 milestone
+/// 4 and MOD-25 an offline sink implemented it too; MOD-25 removed it.)
 #[allow(async_fn_in_trait)] // D2 / plan V3, as above.
 pub trait WriteStore: ReadStore {
     /// Mints an item: counter upsert, key assembly and revision 1 in one transaction (§7.1, §4.1).
@@ -282,18 +279,26 @@ pub trait WriteStore: ReadStore {
     /// (MOD-38 PRD D1); use [`close_out`](WriteStore::close_out).
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool>;
 
-    /// Appends session events, skipping any `(run_step_id, seq)` already stored, and answers how
-    /// many rows were actually inserted (`docs/ANA-4.md` §4.1, `docs/ANA-9.md` §4.3).
+    /// Appends session events under `fence`, skipping any `(run_step_id, seq)` already stored, and
+    /// answers how many rows were actually inserted (`docs/ANA-4.md` §4.1, `docs/ANA-9.md` §4.3,
+    /// MOD-40 plan D1).
     ///
-    /// One statement: either every new row lands or none does, so a batch holding an event for a
-    /// step that does not exist writes nothing at all. Idempotence is the primary key's, which is
-    /// what makes replaying an offline buffer safe.
+    /// One statement: either every new row lands or none does, so a batch naming a step that does
+    /// not exist, or a step whose run does not carry `fence`'s lease, writes nothing at all.
+    /// Idempotence is the primary key's: a row already stored is skipped and not counted. That is
+    /// what makes the recorder's re-offer of a batch whose answer it never got safe, and why such a
+    /// replay may answer less than it offered; a **fresh** batch that answers less has met a second
+    /// writer, which the recorder reports (MOD-40 plan D3).
     ///
     /// # Errors
     ///
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when an event names a
-    /// `run_step` that does not exist or a `kind` / `role` outside the §4.3 `CHECK` lists.
-    async fn append_events(&self, events: &[SessionEvent]) -> Result<usize>;
+    /// In this order: [`StoreError::Constraint`](crate::store::StoreError::Constraint) when an
+    /// event names a `run_step` that does not exist;
+    /// [`StoreError::Fenced`](crate::store::StoreError::Fenced) when a named step's run has a
+    /// `lease_owner` other than `fence`'s, even if every row is already stored;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a `kind` / `role`
+    /// outside the §4.3 `CHECK` lists.
+    async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> Result<usize>;
 
     /// Writes `run_step.usage`, and `run_step.prompt_digest` when `prompt_digest` is `Some`
     /// (`docs/ANA-4.md` §4.1; the digest parameter survives to milestone 9, plan D15(b)).
@@ -301,11 +306,16 @@ pub trait WriteStore: ReadStore {
     /// `None` leaves the stored digest as it is rather than clearing it: the recorder computes the
     /// digest once, at the prompt, and every later usage write for the same step passes `None`.
     ///
+    /// Written only while the step's run carries `fence`'s lease (MOD-40 plan D1).
+    ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) when the step does not exist.
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) when the step does not exist;
+    /// [`StoreError::Fenced`](crate::store::StoreError::Fenced) when it does and its run's
+    /// `lease_owner` is not `fence`'s.
     async fn set_step_usage(
         &self,
+        fence: StepFence,
         step: StepId,
         usage: Value,
         prompt_digest: Option<String>,
@@ -1075,11 +1085,15 @@ pub trait WriteStore: ReadStore {
         at: DateTime<Utc>,
     ) -> Result<bool>;
 
-    /// Writes the settle columns of [`StepOutcome`]; never `status`.
+    /// Writes the settle columns of [`StepOutcome`]; never `status`. Only while the step's run
+    /// carries `fence`'s lease (MOD-40 plan D1).
     ///
     /// # Errors
-    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`.
-    async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> Result<()>;
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
+    /// [`StoreError::Fenced`](crate::store::StoreError::Fenced) when the step exists and its run's
+    /// `lease_owner` is not `fence`'s.
+    async fn finish_step(&self, fence: StepFence, step: StepId, outcome: StepOutcome)
+    -> Result<()>;
 
     /// Plan D89, ANA-2 §4.9's interrupted step: a compare-and-set `running -> failed` with
     /// `gate_note = note` and `finished_at = COALESCE(finished_at, at)`, `gate_outcome` left
@@ -1984,6 +1998,37 @@ impl<T> CasOutcome<T> {
     pub fn into_inner(self) -> T {
         match self {
             Self::Applied(row) | Self::Stale(row) => row,
+        }
+    }
+}
+
+/// Which lease a step write is made under (MOD-40 plan D1, PRD D1).
+///
+/// [`WriteStore::append_events`], [`WriteStore::set_step_usage`] and [`WriteStore::finish_step`]
+/// take one and write only while the step's run carries exactly that lease:
+/// `run.lease_owner IS NOT DISTINCT FROM` [`StepFence::owner`]. A process whose run another process
+/// adopted ([`WriteStore::adopt_runs`], [`WriteStore::take_lease`]) still holds its old `Lease`,
+/// and the store answers it with [`StoreError::Fenced`](crate::store::StoreError::Fenced) and
+/// writes nothing.
+///
+/// No `Default`: every caller says which one it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepFence {
+    /// The walk's own lease: the `owner` it passed to `claim_run`, `take_lease` or `adopt_runs`
+    /// (the engine's `parts.owner`). Writes only while `run.lease_owner = owner`.
+    Lease(Uuid),
+    /// No lease: a chat run, whose `lease_owner` is `NULL`, or a promoted step continued by a chat
+    /// after its park released the lease. Refused on a run whose lease names an owner.
+    Unleased,
+}
+
+impl StepFence {
+    /// The `run.lease_owner` this fence writes under: the owner, or `None` for `NULL`.
+    #[must_use]
+    pub const fn owner(self) -> Option<Uuid> {
+        match self {
+            Self::Lease(owner) => Some(owner),
+            Self::Unleased => None,
         }
     }
 }

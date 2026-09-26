@@ -14,9 +14,9 @@ pub use error::{Result, StoreError};
 pub use mem::MemStore;
 pub use traits::{
     BLANK_SKILL_BODY, BindingFacts, CasOutcome, DeleteReach, DeleteTarget, GLOB_NEEDS_GLOBS,
-    MAX_UPSTREAM_HOPS, ReadStore, SettingRung, StoredAttachment, StoredSetting, TransitionLaw,
-    UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment, citation_key,
-    close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
+    MAX_UPSTREAM_HOPS, ReadStore, SettingRung, StepFence, StoredAttachment, StoredSetting,
+    TransitionLaw, UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment,
+    citation_key, close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
     finish_run_item_mirror, finish_run_needs_a_terminal_status, glob_names_unknown_repo,
     global_glob_names_a_repo, graph_not_in_project, has_nul, illegal_move, invalid_area_code,
     invalid_prefix, invalid_skill_name, invalid_template_name, item_has_a_live_run,

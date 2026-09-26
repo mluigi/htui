@@ -38,7 +38,7 @@ use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, DocumentId, EventKind, ItemId, NewDocument, NewRepo, RepoId,
     RunId, RunMode, RunStatus, RunStep, SessionEvent, SnapshotPhase, StepId, StepStatus, Transport,
 };
-use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+use htui_core::store::{MemStore, ReadStore as _, StepFence, WriteStore as _};
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
 use htui_orch::{Command, GateAnswer};
 use serde_json::json;
@@ -753,16 +753,19 @@ async fn an_unanswered_permission_replays_parked_but_answers_nothing() {
             .expect("epoch is a time"),
     };
     store
-        .append_events(&[
-            row(0, EventKind::Prompt, json!({ "text": "clean the build" })),
-            row(
-                1,
-                EventKind::PermissionRequest,
-                json!({ "request_id": "req-1", "tool_call_id": "call-1",
+        .append_events(
+            StepFence::Unleased,
+            &[
+                row(0, EventKind::Prompt, json!({ "text": "clean the build" })),
+                row(
+                    1,
+                    EventKind::PermissionRequest,
+                    json!({ "request_id": "req-1", "tool_call_id": "call-1",
                         "options": [{ "id": "allow", "label": "Allow once",
                                       "kind": "allow_once" }] }),
-            ),
-        ])
+                ),
+            ],
+        )
         .await
         .expect("the rows land on the fixture's step");
 
