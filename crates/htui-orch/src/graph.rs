@@ -402,6 +402,7 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
                 "Per-item override of `{}` for {}",
                 resolved.graph.name, item.key
             ),
+            is_override: true,
         })
         .await?;
 
@@ -736,8 +737,11 @@ async fn agent_name<G: GraphSource>(
 #[cfg(test)]
 mod tests {
     use htui_core::fixtures::{DemoData, demo_data, ids};
-    use htui_core::model::{Gate, NewRepo, PromptTemplateId, RepoId, RepoScope, RunScope};
-    use htui_core::store::MemStore;
+    use htui_core::model::{
+        Activation, Gate, NewRepo, PromptTemplateId, RepoId, RepoScope, RunScope, SkillBinding,
+        SkillBindingId,
+    };
+    use htui_core::store::{MemStore, StoreError, glob_names_unknown_repo};
     use serde_json::json;
 
     use super::{
@@ -1435,15 +1439,23 @@ question and not a test fix. Decide the version bump first, then paste the new d
         );
     }
 
-    /// ANA-2 §4.1: the clone is deep over `step_graph_phase` and **never** over `skill_binding`,
-    /// because a phase binding keyed `UNIQUE NULLS NOT DISTINCT (skill_id, project_id, phase_id)`
-    /// would double every project binding the item's phases inherit.
+    /// ANA-2 §4.1 with MOD-9 D80: the clone is deep over `step_graph_phase` **and** over the
+    /// source phases' own attachments, each copied onto its cloned phase, and it is marked
+    /// `is_override`. Project and global attachments are not copied: they already apply to the
+    /// clone, and a copy would be a second row at the same level.
+    ///
+    /// This replaces `override_clone_leaves_bindings_alone`, whose "a cloned phase inherits the
+    /// project's bindings and none of the original phase's" pinned the clone gap D80 closes.
     #[tokio::test]
-    async fn override_clone_leaves_bindings_alone() {
+    async fn override_clone_carries_phase_attachments_and_marks_itself() {
         let store = MemStore::demo();
         let item = feat_1(&store).await;
         let source = TestSource::claude(&store);
 
+        let source_rows = store
+            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .await
+            .expect("MemStore never fails a read");
         let project_level = store
             .bound_skills(ids::PROJECT_HTUI, None)
             .await
@@ -1461,6 +1473,16 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .await
             .expect("the item takes an override");
         assert_eq!(clone.name, format!("{}-override", item.key));
+        assert!(clone.is_override, "the clone is written as an override");
+        assert!(
+            store
+                .step_graphs(ids::PROJECT_HTUI)
+                .await
+                .expect("MemStore never fails a read")
+                .iter()
+                .any(|graph| graph.id == clone.id && graph.is_override),
+            "and reads back as one"
+        );
 
         let original: Vec<StepGraphPhase> = store
             .phases(ids::GRAPH_HTUI_FEAT)
@@ -1484,13 +1506,50 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .iter()
             .find(|phase| phase.name == "implement")
             .expect("the feature graph has an implement phase");
+        let after = store
+            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .await
+            .expect("MemStore never fails a read");
+        let copies: Vec<&SkillBinding> = after
+            .iter()
+            .filter(|row| {
+                row.phase_id
+                    .is_some_and(|phase| cloned.iter().any(|clone| clone.id == phase))
+            })
+            .collect();
+        assert_eq!(
+            copies.len(),
+            1,
+            "the source's one phase-level row is copied, onto implement only: {copies:?}"
+        );
+        let copy = copies[0];
+        assert_eq!(
+            (copy.skill_id, copy.project_id, copy.phase_id),
+            (
+                ids::SKILL_RUST_STYLE,
+                Some(ids::PROJECT_HTUI),
+                Some(implement.id)
+            ),
+            "the copy sits on the cloned implement phase"
+        );
+        assert_eq!(
+            (
+                copy.pinned_version,
+                copy.position,
+                copy.activation,
+                copy.globs.as_slice(),
+                copy.languages.as_slice()
+            ),
+            (Some(1), 2, Activation::Always, &[][..], &[][..]),
+            "and says what the source row says"
+        );
         assert_eq!(
             store
                 .bound_skills(ids::PROJECT_HTUI, Some(implement.id))
                 .await
                 .expect("MemStore never fails a read"),
-            project_level,
-            "a cloned phase inherits the project's bindings and none of the original phase's"
+            bound_before,
+            "the cloned implement phase binds what the original one does"
         );
         assert_eq!(
             store
@@ -1499,6 +1558,15 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 .expect("MemStore never fails a read"),
             bound_before,
             "and the original phase's bindings are untouched"
+        );
+        let untouched: Vec<SkillBinding> = after
+            .iter()
+            .filter(|row| row.id != copy.id)
+            .cloned()
+            .collect();
+        assert_eq!(
+            untouched, source_rows,
+            "the source rows are untouched, ids and updated_at included"
         );
 
         let repointed = store
@@ -1523,6 +1591,100 @@ question and not a test fix. Decide the version bump first, then paste the new d
         .expect("the override resolves");
         assert_eq!(resolved.snapshot.graph.id, clone.id);
         assert_eq!(resolved.snapshot.topology, FEATURE_TOPOLOGY);
+    }
+
+    /// MOD-9 D96 (the maintainer's "check first, then refuse"): a source phase attachment whose
+    /// qualified glob names a repo the project no longer has would be refused by
+    /// `set_skill_binding` (D79), so the clone refuses before it writes anything — no
+    /// `-override` graph, no copied row, the item still on its graph. A qualified glob naming a
+    /// repo the project has passes the same check, so the refusal names the stale one.
+    #[tokio::test]
+    async fn override_clone_refuses_a_stale_repo_glob_before_writing() {
+        // Planted in the fixture rather than written: the writer refuses exactly this row.
+        let store = store_with(|data| {
+            let phase_row = data
+                .skill_bindings
+                .iter()
+                .find(|row| row.phase_id == Some(ids::PHASE_HTUI_IMPLEMENT))
+                .expect("the fixture's one phase-level binding")
+                .clone();
+            data.skill_bindings.push(SkillBinding {
+                id: SkillBindingId::new(),
+                skill_id: ids::SKILL_TESTS,
+                pinned_version: None,
+                activation: Activation::Glob,
+                globs: vec!["core:src/**".to_owned(), "gone:**/*.rs".to_owned()],
+                ..phase_row
+            });
+        });
+        store
+            .create_repo(NewRepo {
+                id: RepoId::new(),
+                project_id: ids::PROJECT_HTUI,
+                name: "core".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: true,
+            })
+            .await
+            .expect("the fixture project takes a repo");
+        let item = feat_1(&store).await;
+        let slug = store
+            .project(ids::PROJECT_HTUI)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the fixture holds htui")
+            .slug;
+        let graphs_before = store
+            .step_graphs(ids::PROJECT_HTUI)
+            .await
+            .expect("MemStore never fails a read");
+        let rows_before = store
+            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .await
+            .expect("MemStore never fails a read");
+
+        let error = override_graph(&store, &TestSource::claude(&store), &item)
+            .await
+            .expect_err("`gone` is no repo of the project");
+        assert_eq!(
+            error,
+            ResolveError::Store(StoreError::Constraint(glob_names_unknown_repo(
+                "gone:**/*.rs",
+                "gone",
+                &slug
+            )))
+        );
+
+        let graphs_after = store
+            .step_graphs(ids::PROJECT_HTUI)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            !graphs_after
+                .iter()
+                .any(|graph| graph.name == format!("{}-override", item.key)),
+            "no override graph is written: {graphs_after:?}"
+        );
+        assert_eq!(graphs_after, graphs_before, "nor any other graph");
+        assert_eq!(
+            store
+                .skill_bindings(Some(ids::PROJECT_HTUI))
+                .await
+                .expect("MemStore never fails a read"),
+            rows_before,
+            "nor any attachment"
+        );
+        assert_eq!(
+            store
+                .item(item.id)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the item is still there")
+                .step_graph_id,
+            item.step_graph_id,
+            "and the item is not repointed"
+        );
     }
 
     /// An item whose kind names no graph and which names none itself cannot be run.

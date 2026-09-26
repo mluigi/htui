@@ -807,6 +807,7 @@ async fn repoint<O: Orchestrate>(orch: &O, item: ItemId, mutate: impl Fn(&mut St
             project_id: row.project_id,
             name: format!("{}-edited", row.key),
             description: "a conformance case's edit of the live graph".to_owned(),
+            is_override: false,
         })
         .await
         .expect("the name is fresh");
@@ -867,6 +868,7 @@ async fn insert_verify_phase<O: Orchestrate>(orch: &O, item: ItemId) {
             project_id: row.project_id,
             name: format!("{}-with-verify", row.key),
             description: "an intermediate position between implement and review".to_owned(),
+            is_override: false,
         })
         .await
         .expect("the name is fresh");

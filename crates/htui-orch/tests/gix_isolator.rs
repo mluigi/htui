@@ -340,6 +340,7 @@ async fn repoint(store: &MemStore, item: ItemId, mutate: impl Fn(&mut StepGraphP
             project_id: row.project_id,
             name: format!("{}-isolated-{id}", row.key),
             description: "a gix_isolator case's edit of the live graph".to_owned(),
+            is_override: false,
         })
         .await
         .expect("the name is fresh");

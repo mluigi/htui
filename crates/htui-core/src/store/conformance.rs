@@ -3150,6 +3150,7 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
             project_id: ids::PROJECT_HTUI,
             name: "release".to_owned(),
             description: "Cut a release".to_owned(),
+            is_override: false,
         })
         .await
         .expect(CASE);
@@ -3160,6 +3161,7 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
             project_id: ids::PROJECT_HTUI,
             name: "analysis".to_owned(),
             description: String::new(),
+            is_override: false,
         })
         .await;
     assert!(
@@ -3386,6 +3388,28 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
             })
         ),
         "{CASE}: an unknown id is NotFound, got {unknown:?}"
+    );
+
+    // MOD-9 D80, D95: `is_override` is written at create and read back; last, so the name list
+    // above is the graphs a non-override create leaves.
+    let marked = store
+        .create_step_graph(NewStepGraph {
+            id: StepGraphId::new(),
+            project_id: ids::PROJECT_HTUI,
+            name: "release-override".to_owned(),
+            description: String::new(),
+            is_override: true,
+        })
+        .await
+        .expect(CASE);
+    assert!(marked.is_override, "{CASE}: create writes is_override");
+    assert!(!graph.is_override, "{CASE}: and false stays false");
+    let listed = store.step_graphs(ids::PROJECT_HTUI).await.expect(CASE);
+    assert!(
+        listed
+            .iter()
+            .any(|row| row.id == marked.id && row.is_override),
+        "{CASE}: is_override reads back"
     );
 }
 
