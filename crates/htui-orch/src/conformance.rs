@@ -329,8 +329,9 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// mismatch; a cancel that meets a live lease; four promotions (criterion 17's first half, a
 /// failed step of a parked run, a finished run refused, a dropped running step parked); five
 /// accepts (criterion 17's second half, the promotion and the document it needs, a failed
-/// verify, a verify on a deadline measured from the accept, an `unavailable` verify noted); `Unblock`'s three cases (criterion 14's reopen, R-4's escalated run, R-7's refused
-/// reconcile); and criterion 20's close-out and its refusal while a run is live.
+/// verify, a verify on a deadline measured from the accept, an `unavailable` verify noted);
+/// `Unblock`'s three cases (rung 4's reopen, R-4's escalated run, R-7's refused reconcile); and
+/// criterion 20's close-out and its refusal while a run is live.
 ///
 /// **One for MOD-7 milestone 3** (plan D86): criterion 14's capability half, a refusal at
 /// `StartRun` that writes no run and that `Unblock` reopens.
@@ -485,7 +486,8 @@ pub const CASES: &[&str] = &[
     "accept_artifact_verifies_on_a_deadline_from_the_accept",
     // MOD-4 plan D211: an `unavailable` verify is recorded and noted, not refused.
     "accept_artifact_notes_an_unavailable_verify",
-    // Criterion 14's `Unblock` half (`:2121-2122`, plan D161): rung 4's blocked item reopens.
+    // Rung 4's `Unblock` round trip (plan D161): its blocked item reopens. Criterion 14 itself is
+    // MOD-7 milestone 3's case above.
     "unblock_opens_a_blocked_item_with_no_run",
     // R-4 (plan D161 case 2): an escalated item follows its parked run, which is then promoted
     // and approved.
@@ -5338,9 +5340,10 @@ async fn unblock<O: Orchestrate>(orch: &O, item: ItemId) -> (UnblockCase, Option
     (case, rest)
 }
 
-/// ANA-2 §12 criterion 14's `Unblock` half (`docs/ANA-2.md:2121-2122`, MOD-4 plan D161 case 1):
-/// rung 4 at `StartRun` leaves the item `blocked` with no run; `Unblock` reopens it, and once the
-/// phase has a candidate again `StartRun` walks it.
+/// Rung 4's `Unblock` round trip (MOD-4 plan D161 case 1): rung 4 at `StartRun` leaves the item
+/// `blocked` with no run; `Unblock` reopens it, and once the phase has a candidate again
+/// `StartRun` walks it. Criterion 14 itself is
+/// `a_capability_refusal_writes_no_run_and_unblock_reopens` (MOD-7 milestone 3, D86).
 async fn unblock_opens_a_blocked_item_with_no_run<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     free_feat_3(&orch).await;

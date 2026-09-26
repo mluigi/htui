@@ -583,16 +583,18 @@ where
         }
     }
 
-    /// §6.2's `run`/`queue` up to the claim (MOD-4 plan D186, blueprint F-I): resolve the item's
-    /// graph, refuse rung 4 onto the item, and create the run `queued`. `create_run` moves the
-    /// item `open | failed -> queued` in its own transaction, so it admits one run per item and
-    /// no item lock is needed.
+    /// §6.2's `run`/`queue` up to the claim (MOD-4 plan D186, blueprint F-I): refuse missing tags,
+    /// then resolve the item's graph and refuse rung 4, onto the item, and create the run
+    /// `queued`. `create_run` moves the item `open | failed -> queued` in its own transaction, so
+    /// it admits one run per item and no item lock is needed.
     ///
     /// `pub` so milestone 6's `run_worker` can take the run's lock between this and
     /// [`Self::claim`]: `StartRun` is exactly the two, in that order.
     ///
     /// # Errors
-    /// [`EngineError::Resolve`] (rung 4, after its note on the item), and the store's refusals.
+    /// [`EngineError::Resolve`] (rung 4, after its note on the item),
+    /// [`EngineError::MissingTags`] (`R-ORCH-10`, after its note on the item, before resolution),
+    /// and the store's refusals.
     pub async fn enqueue(
         &self,
         item: ItemId,
@@ -600,6 +602,20 @@ where
         repo_scope: Option<Vec<RepoId>>,
     ) -> Result<RunId, EngineError> {
         let item = self.item(item).await?;
+        // R-ORCH-10 at queue time (MOD-7 milestone 3, D79): before resolution, so an item that
+        // lacks tags *and* has no candidate is refused for the tags, the cheaper box-level fact.
+        // Only an item `create_run` would accept (`open | failed`) is checked; any other status
+        // falls through to that refusal and writes no note (D98).
+        if matches!(item.status, Status::Open | Status::Failed) {
+            let missing = self
+                .parts
+                .graphs
+                .missing_tags(item.id, self.parts.box_id)
+                .await?;
+            if !missing.is_empty() {
+                return Err(self.refuse_missing_tags(&item, missing).await?);
+            }
+        }
         let resolved = match graph::resolve(
             self.parts.store,
             self.parts.graphs,
@@ -703,6 +719,34 @@ where
         self.note(item.id, failure.to_string(), None, self.now())
             .await?;
         Ok(ResolveError::NoCandidate { phase })
+    }
+
+    /// `R-ORCH-10` at `StartRun` (MOD-7 milestone 3, D79, D82): no run row exists, so the refusal
+    /// is written to the item, `open -> blocked` and then `missing tags: a, b` as a note on this
+    /// box, and handed back. A `failed` item has no `blocked` edge and the compare-and-set answers
+    /// `Ok(false)`, which leaves it `failed` with the note still written (rung 4's rule; invariant
+    /// 7).
+    async fn refuse_missing_tags(
+        &self,
+        item: &Item,
+        missing: Vec<String>,
+    ) -> Result<EngineError, EngineError> {
+        self.parts
+            .store
+            .transition(item.id, Status::Open, Status::Blocked)
+            .await?;
+        self.note(
+            item.id,
+            RunFailure::MissingTags(missing.clone()).to_string(),
+            None,
+            self.now(),
+        )
+        .await?;
+        Ok(EngineError::MissingTags {
+            item: item.id,
+            run: None,
+            missing,
+        })
     }
 
     /// §6.2's `approve` / `reject with note` / `accept artifact`.
