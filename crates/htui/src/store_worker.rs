@@ -20,10 +20,10 @@ use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, Permissi
 use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
-    AgentId, AgentSummary, BoxInfo, Document, DocumentHead, DocumentId, Item, ItemFilter, ItemId,
-    ItemKindId, ItemKindPatch, ItemSummary, LinkGraph, Note, PhaseId, PhasePatch, ProjectId,
-    ProjectPatch, RepoId, RepoPatch, RunSummary, Scope, SessionEvent, StepGraphId, StepGraphPatch,
-    StepId, WorkspaceId, WorkspacePatch, WorkspaceSummary,
+    AgentId, AgentSummary, BoxEdit, BoxId, BoxInfo, Document, DocumentHead, DocumentId, Item,
+    ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemSummary, LinkGraph, Note, PhaseId,
+    PhasePatch, ProjectId, ProjectPatch, RepoId, RepoPatch, RunSummary, Scope, SessionEvent,
+    StepGraphId, StepGraphPatch, StepId, WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::store::{
@@ -36,6 +36,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 
 use crate::agent_worker::{AgentRuntime, Served};
+use crate::box_settings::{self, BoxesSnapshot};
 use crate::catalogue::{self, CatalogueSnapshot};
 use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, MirrorAfterDelete};
@@ -205,8 +206,23 @@ pub enum StoreRequest {
     /// Probe this box, then its agents, now (MOD-7 D11): the registration probe's path without the
     /// "needs a probe" decision. Served by the agent runtime's own task; answered once with
     /// [`StoreReply::BoxProbed`], or refused with [`StoreReply::Failed`] before anything spawns
-    /// (offline: `REGISTRY_ON_SERVER_ONLY`; a claim held). Milestone 1 binds it to no key (plan D15).
+    /// (offline: `REGISTRY_ON_SERVER_ONLY`; a claim held). The `Settings > Boxes` section binds it
+    /// to `p`, on this box only (MOD-7 milestone 2, D49).
     ProbeBox,
+    /// Every box of this user, this box marked, and the effective probe spec (MOD-7 milestone 2,
+    /// D45): answered with [`StoreReply::Boxes`]. Served in the loop, like the catalogue reads.
+    Boxes,
+    /// A declared-tags or quirks edit, compare-and-set on `box.edit_version` (MOD-7 D41, D46).
+    /// Answered with [`StoreReply::Boxes`] when it applied and [`StoreReply::BoxesStale`] when the
+    /// token was spent or the box is gone; a refused tag list is [`StoreReply::Failed`].
+    EditBox {
+        /// The box, as a snapshot listed it.
+        box_id: BoxId,
+        /// The `edit_version` the editor opened on.
+        expected: i32,
+        /// Only the edited field is `Some`.
+        edit: BoxEdit,
+    },
     /// Pre-flight an adapter install for one registry row (MOD-20 D13, D18).
     ///
     /// One registry read, one `HEAD`, **no archive byte**: what this box would fetch and how it
@@ -568,6 +584,9 @@ impl StoreRequest {
             Self::ChatFollow { .. } => "chat_follow",
             Self::ProbeAgents => "probe_agents",
             Self::ProbeBox => "probe_box",
+            // The two of `box_settings::REQUEST_NAMES`, in that order (MOD-7 milestone 2, D46).
+            Self::Boxes => "boxes",
+            Self::EditBox { .. } => "edit_box",
             Self::InstallPlan { .. } => "install_plan",
             Self::InstallConfirm { .. } => "install_confirm",
             Self::InstallCancel => "install_cancel",
@@ -782,6 +801,12 @@ pub enum StoreReply {
     /// What one box probe did (MOD-7 D13): one per box probe, at the requester's address or
     /// [`UNSOLICITED`].
     BoxProbed(crate::agent_worker::BoxProbeReport),
+    /// This user's boxes, freshly read: the answer to [`StoreRequest::Boxes`] and to every box
+    /// edit that applied (MOD-7 milestone 2, D46).
+    Boxes(Box<BoxesSnapshot>),
+    /// A box edit missed its token, or its box is gone (D46, D48): the boxes as they are now, for
+    /// the editor to reload against. The editor keeps its typed text and retries only on save.
+    BoxesStale(Box<BoxesSnapshot>),
     /// The store failed. `request` is [`StoreRequest::name`].
     Failed {
         /// Which request failed.
@@ -1062,6 +1087,12 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::SetDsn(_)
         | StoreRequest::ClearDsn
         | StoreRequest::RebuildCache => connection::serve(backend, request).await?,
+        // The two box requests, or-ed for the same reason the twenty-eight above are: a guard
+        // does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would be an
+        // E0004 here (MOD-15 M3 plan F-12, MOD-7 milestone 2 D46).
+        StoreRequest::Boxes | StoreRequest::EditBox { .. } => {
+            box_settings::serve(backend, request).await?
+        }
         StoreRequest::StoreState => StoreReply::StoreState {
             label: backend.label(),
             migrations_pending: None,
@@ -2746,6 +2777,24 @@ mod tests {
             }
             .name(),
             "chat_follow"
+        );
+    }
+
+    /// The two box requests are named exactly as `box_settings::REQUEST_NAMES` lists them, so the
+    /// section's `Failed` match and the worker cannot drift apart (MOD-7 milestone 2, D46).
+    #[test]
+    fn box_requests_are_named_as_box_settings_lists_them() {
+        assert_eq!(
+            [
+                StoreRequest::Boxes.name(),
+                StoreRequest::EditBox {
+                    box_id: BoxId::new(),
+                    expected: 0,
+                    edit: BoxEdit::default(),
+                }
+                .name(),
+            ],
+            box_settings::REQUEST_NAMES
         );
     }
 
