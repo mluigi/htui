@@ -26,7 +26,7 @@
 //! cannot drift (MOD-2 D103).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -35,11 +35,14 @@ use tracing::warn;
 
 use htui_core::model::{BoxId, Repo, RepoBoxPath, RepoId, RunStepTree};
 use htui_core::prompt::excerpt::{
-    ExcerptCandidate, ExcerptCaps, ExcerptProvider, ExcerptRequest, ExcerptSet,
-    OwnedExcerptRequest, PathPrefix, ProviderError, RepoReader, RepoRoot, skip_by_path,
+    BUILTIN_ID, BuiltinRanker, ExcerptAudit, ExcerptCandidate, ExcerptCaps, ExcerptProvider,
+    ExcerptRequest, ExcerptSet, OwnedExcerptRequest, PathPrefix, ProviderError, RepoReader,
+    RepoRoot, RootRecord, RootSource, select, skip_by_path,
 };
 use htui_core::prompt::settings::resolve_excerpt_caps;
-use htui_core::prompt::{PromptSpec, TokenEstimator};
+use htui_core::prompt::{
+    Placeholder, PromptSpec, TokenEstimator, drop_unmaskable_excerpts, excerpt_residual, parse,
+};
 use htui_core::scrub::Scrubber;
 
 /// How many bytes of a file the binary test reads (§4.5 `:1073`).
@@ -403,7 +406,7 @@ impl FsRepoReader {
 /// The **root itself** is deliberately not checked. It is a maintainer-configured path rather than
 /// repository content, `list` reads through it the same way, and `/tmp` is a symlink on more than
 /// one box — refusing it would refuse a legitimate checkout without closing anything.
-fn descend(root: &Path, path: &str) -> Result<std::path::PathBuf, ProviderError> {
+fn descend(root: &Path, path: &str) -> Result<PathBuf, ProviderError> {
     let bytes = path.as_bytes();
     let rooted = bytes.first().is_some_and(|c| *c == b'/' || *c == b'\\');
     let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
@@ -836,8 +839,26 @@ pub fn excerpt_roots(
     paths: &[RepoBoxPath],
     box_id: BoxId,
 ) -> Vec<RepoRoot> {
-    let _ = (scope, trees, paths, box_id);
-    todo!("MOD-7 milestone 4 T2: excerpt_roots")
+    scope
+        .iter()
+        .map(|(id, name)| {
+            let (root, source) = if let Some(tree) = trees.iter().find(|tree| tree.repo_id == *id) {
+                (PathBuf::from(&tree.path), RootSource::RunStepTree)
+            } else if let Some(path) = paths
+                .iter()
+                .find(|path| path.repo_id == *id && path.box_id == box_id)
+            {
+                (PathBuf::from(&path.local_path), RootSource::RepoBoxPath)
+            } else {
+                (PathBuf::new(), RootSource::NoPath)
+            };
+            RepoRoot {
+                repo: name.clone(),
+                root,
+                source,
+            }
+        })
+        .collect()
 }
 
 /// `item.touched_paths` as §4.5's tier-1 prefixes, under `overlap::resolve`'s primary rule
@@ -845,8 +866,14 @@ pub fn excerpt_roots(
 /// `is_primary` repo, and to the empty slug when there is none, which matches no repo.
 #[must_use]
 pub fn touched_prefixes(touched: &[String], repos: &[Repo]) -> Vec<PathPrefix> {
-    let _ = (touched, repos);
-    todo!("MOD-7 milestone 4 T2: touched_prefixes")
+    let primary = repos
+        .iter()
+        .find(|repo| repo.is_primary)
+        .map_or("", |repo| repo.name.as_str());
+    touched
+        .iter()
+        .map(|glob| PathPrefix::parse(glob, primary))
+        .collect()
 }
 
 /// What the shared pass needs beside the spec.
@@ -866,8 +893,16 @@ pub struct PassInput {
 /// under `spawn_blocking` whenever a root is readable.
 #[must_use]
 pub fn excerpt_pass(req: &OwnedExcerptRequest, est: TokenEstimator) -> ExcerptSet {
-    let _ = (req, est);
-    todo!("MOD-7 milestone 4 T2: excerpt_pass")
+    let providers: Vec<Arc<dyn ExcerptProvider>> = vec![Arc::new(BuiltinRanker)];
+    let request = req.as_request();
+    let (merged, provider_set) = run_providers(&providers, &request);
+    select(
+        &FsRepoReader::new(req.caps),
+        &request,
+        merged,
+        provider_set,
+        est,
+    )
 }
 
 /// The excerpt set for `spec` (plan D109, D118, D119; MOD-7 milestone 4 D126, D128).
@@ -895,8 +930,100 @@ pub async fn excerpts_for(
     app: &BTreeMap<String, serde_json::Value>,
     scrubber: &dyn Scrubber,
 ) -> ExcerptSet {
-    let _ = (spec, input, app, scrubber);
-    todo!("MOD-7 milestone 4 T2: excerpts_for")
+    let (caps, scan_cap, deadline) = resolve_excerpt_caps(app);
+    let PassInput {
+        roots,
+        touched_prefixes,
+        notes,
+    } = input;
+
+    let places = parse(spec.role, &spec.body)
+        .is_ok_and(|parsed| parsed.used.contains(&Placeholder::Excerpts));
+    if !places {
+        let mut notes = notes;
+        notes.push(format!(
+            "excerpt: template `{}` places no {{{{excerpts}}}}; nothing was read",
+            spec.template.name
+        ));
+        return unscanned(&roots, caps, notes);
+    }
+
+    let readable = roots.iter().any(|root| root.source != RootSource::NoPath);
+    let budget_tokens = if readable {
+        match excerpt_residual(spec, scrubber) {
+            Ok(budget) => budget,
+            // `assemble` refuses this spec the same way, so nothing read here could be sent.
+            Err(_) => return unscanned(&roots, caps, notes),
+        }
+    } else {
+        0
+    };
+    let request = OwnedExcerptRequest {
+        item_key: spec.item_key.clone(),
+        item_body: spec.item_body.clone(),
+        phase: spec.phase.clone(),
+        document_bodies: spec
+            .documents
+            .iter()
+            .map(|document| document.body.clone())
+            .collect(),
+        touched_prefixes,
+        // D122: the previous attempt's diff carries no repo-qualified path list.
+        changed_paths: Vec::new(),
+        roots,
+        budget_tokens,
+        caps,
+        scan_cap,
+        deadline,
+    };
+    let est = spec.estimator;
+
+    let mut set = if readable {
+        let roots = request.roots.clone();
+        match tokio::task::spawn_blocking(move || excerpt_pass(&request, est)).await {
+            Ok(set) => set,
+            Err(_) => {
+                let mut notes = notes;
+                notes.push("excerpt: the pass panicked; no excerpts".to_owned());
+                return unscanned(&roots, caps, notes);
+            }
+        }
+    } else {
+        // No readable root: `select` lists nothing and reads nothing, and the one provider runs
+        // on this thread, so there is no I/O to move off the runtime (H-9).
+        excerpt_pass(&request, est)
+    };
+    drop_unmaskable_excerpts(&mut set, scrubber);
+    let mut all = notes;
+    all.append(&mut set.notes);
+    set.notes = all;
+    set
+}
+
+/// The set a pass that read nothing records: the built-in registered, every root as given and
+/// unscanned (sorted by repo bytes, as `select` sorts them), the caps, and `notes`.
+fn unscanned(roots: &[RepoRoot], caps: ExcerptCaps, notes: Vec<String>) -> ExcerptSet {
+    let mut records: Vec<RootRecord> = roots
+        .iter()
+        .map(|root| RootRecord {
+            repo: root.repo.clone(),
+            source: root.source,
+            scan_truncated: false,
+        })
+        .collect();
+    records.sort_by(|a, b| a.repo.as_bytes().cmp(b.repo.as_bytes()));
+    ExcerptSet {
+        files: Vec::new(),
+        audit: ExcerptAudit {
+            provider_set: vec![BUILTIN_ID.to_owned()],
+            roots: records,
+            considered: 0,
+            selected: 0,
+            caps,
+            files: Vec::new(),
+        },
+        notes,
+    }
 }
 
 #[cfg(test)]
@@ -938,8 +1065,8 @@ mod tests {
         let reader = FsRepoReader::default();
         let root = RepoRoot {
             repo: "htui".to_owned(),
-            root: std::path::PathBuf::from("/tmp"),
-            source: htui_core::prompt::excerpt::RootSource::RunStepTree,
+            root: PathBuf::from("/tmp"),
+            source: RootSource::RunStepTree,
         };
         for path in ["../etc/passwd", "a/../../etc/passwd", "/etc/passwd"] {
             let error = reader.read(&root, path).expect_err("refused");
