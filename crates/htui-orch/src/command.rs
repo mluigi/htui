@@ -382,6 +382,21 @@ pub enum EngineError {
         /// What `claim_run` answered; never [`Claim::Admitted`].
         claim: Claim,
     },
+    /// `R-ORCH-10` (MOD-7 milestone 3, D84): the item requires tags this box has neither probed
+    /// nor declared. At `StartRun`'s enqueue (`run: None`) no run row was written and the item is
+    /// `blocked` with a note; at the claim (`run: Some`) `claim_run` failed the run inside the
+    /// admission transaction and the engine noted it. Permanent until the box gains the tags or
+    /// the item drops them, so it is **not** [`EngineError::ClaimRefused`] and nothing re-queues
+    /// it.
+    #[error("item {item}: missing tags: {}", .missing.join(", "))]
+    MissingTags {
+        /// The item refused.
+        item: ItemId,
+        /// The run `claim_run` failed; `None` at enqueue, where no run exists.
+        run: Option<RunId>,
+        /// The missing tags: byte order, deduplicated, never empty.
+        missing: Vec<String>,
+    },
     /// Plan D86: a heartbeat's refresh touched zero rows, so another orchestrator took the lease
     /// and the walk was dropped where it stood, writing nothing further (ANA-2 `:1280-1282`).
     ///
@@ -1643,6 +1658,26 @@ mod tests {
             }
             .to_string(),
             format!("claim refused: overlaps run {} (paths)", ids::RUN_1)
+        );
+        assert_eq!(
+            EngineError::MissingTags {
+                item: ids::HTUI_FEAT_3,
+                run: None,
+                missing: vec!["docker".into(), "vulkan".into()],
+            }
+            .to_string(),
+            format!("item {}: missing tags: docker, vulkan", ids::HTUI_FEAT_3),
+            "MOD-7 milestone 3 D84: the enqueue refusal"
+        );
+        assert_eq!(
+            EngineError::MissingTags {
+                item: ids::HTUI_FEAT_3,
+                run: Some(ids::RUN_2),
+                missing: vec!["docker".into(), "vulkan".into()],
+            }
+            .to_string(),
+            format!("item {}: missing tags: docker, vulkan", ids::HTUI_FEAT_3),
+            "the claim-time refusal reads the same: the run is not in the sentence"
         );
         assert_eq!(
             EngineError::LeaseLost { run: ids::RUN_2 }.to_string(),

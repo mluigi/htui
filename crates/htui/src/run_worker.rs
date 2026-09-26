@@ -2402,6 +2402,10 @@ impl GraphSource for BackendGraphs {
     ) -> StoreResult<Vec<BoundSkill>> {
         self.0.bound_skills(project, phase).await
     }
+
+    async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> StoreResult<Vec<String>> {
+        self.0.missing_tags(item, box_id).await
+    }
 }
 
 /// The walk fixture is shared with `store_worker`'s promotion case (blueprint §8.10).

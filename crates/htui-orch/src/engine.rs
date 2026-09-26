@@ -11351,6 +11351,147 @@ mod tests {
         );
     }
 
+    /// Sets `item`'s `required_tags` through `update_item`, at its current version.
+    async fn require_tags(harness: &Harness, item: htui_core::model::ItemId, tags: &[&str]) {
+        let row = harness
+            .orch
+            .store
+            .item(item)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the fixture holds the item");
+        let outcome = harness
+            .orch
+            .store
+            .update_item(
+                item,
+                row.version,
+                ItemPatch {
+                    required_tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
+                    author_id: row.created_by,
+                    reason: "a test's required tags".to_owned(),
+                    ..ItemPatch::default()
+                },
+            )
+            .await
+            .expect("the patch is valid");
+        assert!(
+            matches!(outcome, htui_core::store::UpdateOutcome::Updated(_)),
+            "the item's version is current"
+        );
+    }
+
+    /// `R-ORCH-10` at queue time (MOD-7 milestone 3, D79): the tag check runs **before**
+    /// resolution, so an item that lacks tags and whose phase has no candidate is refused for the
+    /// tags. No run row is written; the item is `blocked` with exactly the tag note.
+    #[tokio::test]
+    async fn enqueue_refuses_missing_tags_before_resolving() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness.orch.without_candidates("prd");
+        require_tags(&harness, ids::HTUI_FEAT_3, &["vulkan", "rust"]).await;
+        let runs_before = harness
+            .orch
+            .store
+            .runs(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+        let notes_before = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .await
+            .expect_err("the demo box has not got `vulkan`");
+        assert!(
+            matches!(
+                &refused,
+                EngineError::MissingTags { item, run: None, missing }
+                    if *item == ids::HTUI_FEAT_3 && missing == &["vulkan"]
+            ),
+            "the tags, not rung 4: {refused:?}"
+        );
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .runs(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len(),
+            runs_before,
+            "a queue-time refusal writes no run row (ANA-2 §4.10)"
+        );
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Blocked
+        );
+        let notes = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        let added: Vec<&str> = notes[notes_before..]
+            .iter()
+            .map(|note| note.body.as_str())
+            .collect();
+        assert_eq!(added, vec!["missing tags: vulkan"]);
+        assert!(
+            !notes
+                .iter()
+                .any(|note| note.body.contains("no_candidate_agent: phase `prd`")),
+            "resolution never ran"
+        );
+    }
+
+    /// MOD-7 milestone 3 D98 (blueprint H-7): only an item `create_run` would accept is checked.
+    /// `FEAT-3` seeded `queued` under `RUN_2` meets `create_run`'s own refusal, with no note.
+    #[tokio::test]
+    async fn enqueue_checks_tags_only_where_create_run_would() {
+        let harness = Harness::new().await;
+        require_tags(&harness, ids::HTUI_FEAT_3, &["vulkan"]).await;
+        let notes_before = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .await
+            .expect_err("a queued item admits no second run");
+        assert!(
+            matches!(refused, EngineError::Store(_)),
+            "`create_run`'s refusal, not the tags: {refused:?}"
+        );
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Queued
+        );
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len(),
+            notes_before,
+            "no note for an item some other run already owns"
+        );
+    }
+
     /// MOD-4 plan D158 (R-12): a walk task of this process that died leaves its run `running`
     /// under a live lease naming this process, which plan D88 keeps the sweep off. `mark` puts
     /// it in the dead-walk set, so the next sweep gives the lease back and adopts it.
