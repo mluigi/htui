@@ -1251,11 +1251,23 @@ async fn a_claim_time_refusal_is_not_requeued_on_postgres() {
         RunStatus::AwaitingApproval,
         "no holder overlaps now, and the box declares `gpu` again"
     );
+    // What the rows can show after the retry and the fresh start: the refused run's row is the
+    // one `claim_run` wrote, untouched, and no run of the item sits at `queued`. (Whether the
+    // worker's in-memory queue still holds the id is not visible here; the note above is what
+    // proves the engine answered `MissingTags`.)
+    let still = stack.run(refused).await;
     assert_eq!(
-        stack.run(refused).await.status,
-        RunStatus::Failed,
-        "nothing re-queued the failed run"
+        (still.status, still.failure.as_deref(), still.started_at),
+        (RunStatus::Failed, Some("missing tags: gpu"), None),
+        "the refused run is still `failed` with its sentence and never started"
     );
+    for id in stack.run_ids(item).await {
+        assert_ne!(
+            stack.run(id).await.status,
+            RunStatus::Queued,
+            "no run of the item is back at `queued`: {id}"
+        );
+    }
 
     stack.finish().await;
 }
