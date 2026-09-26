@@ -827,7 +827,7 @@ impl Clock for TestClock {
 /// would refuse every phase.
 const STAND_IN_MODEL: &str = "sonnet";
 
-/// The six inherent orchestration reads of `MemStore`, as the trait `graph.rs` defines
+/// The seven inherent orchestration reads of `MemStore`, as the trait `graph.rs` defines
 /// (blueprint F-N).
 ///
 /// Implemented on `MemStore` itself rather than on `&MemStore`: a trait impl on the reference would
@@ -840,7 +840,7 @@ const STAND_IN_MODEL: &str = "sonnet";
 ///
 /// Each body calls the *inherent* method of the same name. Method resolution prefers inherent
 /// candidates over trait ones, so this is delegation and not recursion — and
-/// [`the trait's own unit test`](self) calls all six through the trait to prove it.
+/// [`the trait's own unit test`](self) calls all seven through the trait to prove it.
 impl GraphSource for MemStore {
     async fn resolve_graph(&self, item: ItemId) -> Result<Option<ResolvedGraph>> {
         self.resolve_graph(item).await
@@ -878,6 +878,10 @@ impl GraphSource for MemStore {
         phase: Option<PhaseId>,
     ) -> Result<Vec<BoundSkill>> {
         self.bound_skills(project, phase).await
+    }
+
+    async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
+        self.missing_tags(item, box_id).await
     }
 }
 
@@ -1018,6 +1022,10 @@ impl GraphSource for FakeGraphSource<'_> {
         phase: Option<PhaseId>,
     ) -> Result<Vec<BoundSkill>> {
         GraphSource::bound_skills(self.store, project, phase).await
+    }
+
+    async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
+        GraphSource::missing_tags(self.store, item, box_id).await
     }
 }
 
@@ -2114,11 +2122,12 @@ mod tests {
         assert_eq!(isolator.releases(), 2, "every call is counted");
     }
 
-    /// `impl GraphSource for MemStore` delegates to the six inherent reads of the same names.
+    /// `impl GraphSource for MemStore` delegates to the seven inherent reads of the same names.
     ///
     /// Method resolution prefers an inherent candidate over a trait one, so the bodies are
     /// delegation — but "prefers" is the kind of rule that is worth a test rather than a comment,
-    /// because getting it wrong is an infinite recursion and not a compile error.
+    /// because getting it wrong is an infinite recursion and not a compile error. MOD-7 milestone
+    /// 3 D75: the seventh read.
     #[tokio::test]
     async fn the_store_answers_the_source_without_recursing() {
         let store = MemStore::demo();
@@ -2175,6 +2184,46 @@ mod tests {
             skills.len(),
             2,
             "`tests` from the project and `rust-style` from the phase, each once"
+        );
+
+        // MOD-7 milestone 3 D75: the seventh read.
+        use htui_core::model::{ItemId, NewItem};
+        use htui_core::store::WriteStore as _;
+        let needs_cuda = store
+            .mint_item(NewItem {
+                id: ItemId::new(),
+                project_id: ids::PROJECT_HTUI,
+                kind_id: ids::KIND_HTUI_FEAT,
+                title: "needs a GPU toolchain".to_owned(),
+                body: String::new(),
+                required_tags: vec!["cuda".to_owned()],
+                touched_paths: Vec::new(),
+                priority: 0,
+                step_graph_id: None,
+                created_by: ids::USER,
+                box_id: Some(ids::BOX),
+            })
+            .await
+            .expect("the mint lands")
+            .id;
+        let missing = GraphSource::missing_tags(&store, needs_cuda, ids::BOX)
+            .await
+            .expect("MemStore never fails a read of a known item and box");
+        assert_eq!(missing, vec!["cuda".to_owned()]);
+        assert_eq!(
+            missing,
+            store
+                .missing_tags(needs_cuda, ids::BOX)
+                .await
+                .expect("MemStore never fails a read of a known item and box"),
+            "the trait answers what the inherent read answers"
+        );
+        assert!(
+            GraphSource::missing_tags(&store, ids::HTUI_FEAT_3, ids::BOX)
+                .await
+                .expect("MemStore never fails a read of a known item and box")
+                .is_empty(),
+            "FEAT-3 requires `rust`, which the demo box probed"
         );
     }
 

@@ -97,6 +97,11 @@ pub enum RunFailure {
         /// The assembler's own sentence (`htui_core::prompt::AssembleError`'s `Display`).
         reason: String,
     },
+    /// `R-ORCH-10` (MOD-7 milestone 3, D83): the item requires tags this box has neither probed
+    /// nor declared. Carries them in byte order, deduplicated, as `GraphSource::missing_tags` and
+    /// `Claim::MissingTags` answer. The note at enqueue and at claim, and `run.failure` at claim,
+    /// read the same bytes (D78).
+    MissingTags(Vec<String>),
 }
 
 impl fmt::Display for RunFailure {
@@ -131,6 +136,7 @@ impl fmt::Display for RunFailure {
             Self::PromptRefused { phase, reason } => {
                 write!(f, "prompt refused at `{phase}`: {reason}")
             }
+            Self::MissingTags(missing) => write!(f, "missing tags: {}", missing.join(", ")),
         }
     }
 }
@@ -403,6 +409,16 @@ mod tests {
     /// module was written against.
     #[test]
     fn run_failure_display_is_ana2s_bytes() {
+        assert_eq!(
+            RunFailure::MissingTags(vec!["a".into(), "b".into()]).to_string(),
+            "missing tags: a, b",
+            "MOD-7 milestone 3 D77: the tags joined with `, `, in the order given"
+        );
+        assert_eq!(
+            RunFailure::MissingTags(vec!["docker".into(), "vulkan".into()]).to_string(),
+            "missing tags: docker, vulkan",
+            "criterion 14's note body, byte for byte"
+        );
         assert_eq!(
             RunFailure::MissingInput("plan".to_owned()).to_string(),
             "missing input document: plan",
