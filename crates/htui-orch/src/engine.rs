@@ -11516,6 +11516,110 @@ mod tests {
         );
     }
 
+    /// `R-ORCH-10` at queue time on a `failed` item (MOD-7 milestone 3, D82): `failed` has no
+    /// `blocked` edge, so the compare-and-set answers `false` and the item stays `failed`, while
+    /// the note is still written (rung 4's rule; invariant 7). No run row; the error is the tags.
+    #[tokio::test]
+    async fn enqueue_refuses_missing_tags_on_a_failed_item_and_leaves_it_failed() {
+        let harness = Harness::new().await;
+        // `FEAT-3` is seeded `queued` under `RUN_2`; move it `in_progress` as a claim would, then
+        // failing `RUN_2` mirrors it `in_progress -> failed` (plan D7).
+        assert!(
+            harness
+                .orch
+                .store
+                .transition(ids::HTUI_FEAT_3, Status::Queued, Status::InProgress)
+                .await
+                .expect("MemStore never fails a compare-and-set"),
+            "the seeded item is `queued`"
+        );
+        harness
+            .orch
+            .store
+            .finish_run(
+                ids::RUN_2,
+                RunStatus::Failed,
+                Some("a test's failure"),
+                harness.orch.clock.now(),
+            )
+            .await
+            .expect("the seeded run is queued and can be failed");
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Failed,
+            "the precondition: the item is `failed`"
+        );
+        require_tags(&harness, ids::HTUI_FEAT_3, &["vulkan"]).await;
+        let runs_before = harness
+            .orch
+            .store
+            .runs(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+        let notes_before = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .len();
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .await
+            .expect_err("the demo box has not got `vulkan`");
+        assert!(
+            matches!(
+                &refused,
+                EngineError::MissingTags { item, run: None, missing }
+                    if *item == ids::HTUI_FEAT_3 && missing == &["vulkan"]
+            ),
+            "the tags: {refused:?}"
+        );
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Failed,
+            "`transition(Open, Blocked)` answered false: the item stays `failed`"
+        );
+        assert!(
+            !harness
+                .orch
+                .store
+                .transition(ids::HTUI_FEAT_3, Status::Open, Status::Blocked)
+                .await
+                .expect("MemStore never fails a compare-and-set"),
+            "a `failed` item has no `open -> blocked` to take"
+        );
+        assert_eq!(
+            harness
+                .orch
+                .store
+                .runs(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .len(),
+            runs_before,
+            "a queue-time refusal writes no run row (ANA-2 §4.10)"
+        );
+        let notes = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        let added: Vec<&str> = notes[notes_before..]
+            .iter()
+            .map(|note| note.body.as_str())
+            .collect();
+        assert_eq!(
+            added,
+            vec!["missing tags: vulkan"],
+            "the note is written even though the item could not be blocked"
+        );
+    }
+
     /// MOD-7 milestone 3 D98 (blueprint H-7): only an item `create_run` would accept is checked.
     /// `FEAT-3` seeded `queued` under `RUN_2` meets `create_run`'s own refusal, with no note.
     #[tokio::test]
