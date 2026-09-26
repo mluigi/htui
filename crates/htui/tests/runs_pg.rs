@@ -13,6 +13,10 @@
 //! server, not from a mirror window (H-9): the step's second turn is written straight to the
 //! server, so the chat's turns follow a tail the shell never wrote itself.
 //!
+//! MOD-7 milestone 3 adds criterion 14's capability half and ANA-2 §4.10's claim-time half, driven
+//! through the same `RunRuntime`: the enqueue refusal reads tags through
+//! `run_worker::BackendGraphs`, and the claim's through `PgStore::claim_run`.
+//!
 //! Every case builds the same stack: a throwaway database with the demo world
 //! (`testkit::demo_db`), a throwaway mirror (`CacheStore`), `Backend::Online` over the two, and a
 //! [`Harness`] over that backend with a `RunRuntime` whose isolator and verifier are the fakes and
@@ -42,11 +46,12 @@ use htui_agent::fake::{FakeAdapter, FakeDriver};
 use htui_agent::registry::{DriverFactory, TransportBuilder};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, DocumentHead, DocumentId, EventKind, EventRole, Item,
-    ItemId, NewDocument, NewRepo, RepoId, Resolution, Run, RunId, RunMode, RunStatus, RunStep,
-    RunStepCommit, SessionEvent, SnapshotPhase, Status, StepId, StepStatus, Transport, UsageTotals,
+    Agent, AgentBox, AgentId, Billing, BoxEdit, DocumentHead, DocumentId, EventKind, EventRole,
+    Item, ItemId, ItemPatch, NewDocument, NewRepo, RepoId, Resolution, Run, RunId, RunMode,
+    RunStatus, RunStep, RunStepCommit, SessionEvent, SnapshotPhase, Status, StepId, StepStatus,
+    Transport, UsageTotals,
 };
-use htui_core::store::{ReadStore as _, StoreError, WriteStore as _};
+use htui_core::store::{CasOutcome, ReadStore as _, StoreError, WriteStore as _};
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
 use htui_orch::{Command, GateAnswer};
 use htui_store::{Backend, CacheStore, PgStore, testkit};
@@ -506,6 +511,63 @@ async fn free_feat_3(store: &PgStore) {
         .finish_run(ids::RUN_2, RunStatus::Cancelled, None, Utc::now())
         .await
         .expect("the seeded run is queued and cancellable");
+}
+
+/// Replaces `item.required_tags` through `update_item` at the row's current version (MOD-7
+/// milestone 3): the cases patch tags at run time, so no fixture moves.
+async fn require_tags(store: &PgStore, item: ItemId, tags: &[&str]) {
+    let row = store
+        .item(item)
+        .await
+        .expect("the read answers")
+        .expect("the item exists");
+    store
+        .update_item(
+            item,
+            row.version,
+            ItemPatch {
+                required_tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
+                author_id: row.created_by,
+                reason: "a Postgres case's required tags".to_owned(),
+                ..ItemPatch::default()
+            },
+        )
+        .await
+        .expect("the item's version is current");
+}
+
+/// Replaces the demo box's `declared_tags` through `edit_box` at token `expected` (MOD-7
+/// milestone 3). The demo box starts at `edit_version` 0 on Postgres, and each applied edit bumps
+/// it by one.
+async fn declare_tags(store: &PgStore, expected: i32, tags: &[&str]) {
+    let outcome = store
+        .edit_box(
+            ids::BOX,
+            expected,
+            BoxEdit {
+                declared_tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
+                quirks: None,
+            },
+        )
+        .await
+        .expect("the demo box accepts the tags");
+    assert!(
+        matches!(outcome, CasOutcome::Applied(_)),
+        "the token {expected} is current: {outcome:?}"
+    );
+}
+
+/// The `item_note.box_id` of every note on `item` whose body is exactly `body`, oldest first:
+/// which box wrote the refusal, a column `Stack::notes` does not show.
+async fn note_box(pool: &PgPool, item: ItemId, body: &str) -> Vec<Option<uuid::Uuid>> {
+    sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+        "SELECT box_id FROM item_note WHERE item_id = $1 AND body = $2 ORDER BY created_at",
+    )
+    .bind(item.as_uuid())
+    .bind(body)
+    .fetch_all(pool)
+    .await
+    .expect("read item_note")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1021,6 +1083,75 @@ async fn unblock_follows_an_escalated_run_on_postgres() {
     assert!(
         promoted.promoted_at.is_some(),
         "the escalated review was promoted"
+    );
+
+    stack.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Criterion 14 and ANA-2 §4.10 (MOD-7 milestone 3)
+// ---------------------------------------------------------------------------------------------
+
+/// ANA-2 §12 criterion 14 in full on Postgres (MOD-7 milestone 3, plan D89): an item requiring
+/// tags the box has neither probed nor declared is refused at `StartRun` through the worker, read
+/// through `run_worker::BackendGraphs`. No `run` row is written, the item is `blocked`, and one
+/// note on this box carries exactly the missing tags; `Unblock` reopens the item, and once the box
+/// declares the tags `StartRun` walks.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capability_refusal_blocks_and_unblock_reopens_on_postgres() {
+    let Some(mut stack) = Stack::new(None).await else {
+        return;
+    };
+    let item = ids::HTUI_FEAT_3;
+    free_feat_3(&stack.db.store).await;
+    require_tags(&stack.db.store, item, &["rust", "vulkan", "docker"]).await;
+    assert_eq!(
+        stack.run_ids(item).await,
+        vec![ids::RUN_2],
+        "only the seeded run `free_feat_3` cancelled"
+    );
+
+    stack
+        .command(Command::StartRun {
+            item,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        })
+        .await;
+    assert_eq!(
+        stack.take_status(),
+        Some(format!("start_run: item {item}: missing tags: docker, vulkan")),
+        "the refusal names exactly the missing tags, in byte order"
+    );
+    assert_eq!(
+        stack.run_ids(item).await,
+        vec![ids::RUN_2],
+        "a queue-time refusal writes no `run` row"
+    );
+    assert_eq!(stack.item(item).await.status, Status::Blocked);
+    assert_eq!(
+        note_box(&stack.db.pool, item, "missing tags: docker, vulkan").await,
+        vec![Some(ids::BOX.as_uuid())],
+        "one note, exactly the missing tags, written on this box"
+    );
+
+    stack.command(Command::Unblock { item }).await;
+    assert_eq!(stack.take_status(), None, "the unblock was accepted");
+    assert_eq!(stack.item(item).await.status, Status::Open);
+    assert!(
+        stack
+            .notes(item)
+            .await
+            .contains(&"unblocked: back to `open`".to_owned()),
+        "a human reads what was done"
+    );
+
+    declare_tags(&stack.db.store, 0, &["docker", "gpu", "vulkan"]).await;
+    let run = stack.start(item).await;
+    assert_eq!(
+        stack.run(run).await.status,
+        RunStatus::AwaitingApproval,
+        "on a box with those tags the run walks to its first gate"
     );
 
     stack.finish().await;
