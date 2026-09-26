@@ -231,7 +231,7 @@ Answered by the maintainer on 2026-09-25, before planning.
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | A box knows itself | Registration keys on the id and survives a rename, a copied `box.toml` mints a new box, and the probe fills hardware, `box_tool` and `probed_tags` at registration, on `htui` version change and on demand; agents are probed on registration and missing ones offered for install. No UI yet beyond what exists. | complete (`27c4318`..`670c108`, 2026-09-25) | [plan](../plans/mod-7-box-identity-probe.plan.md), [blueprint](../plans/mod-7-box-identity-probe.blueprint.md) |
-| 2 | The maintainer sees and edits it | The Settings `box` section lists boxes with profile, tools and tags; re-probe on this box; declared tags and multi-line quirks edited as a compare-and-set a reconnect cannot stale. | pending | — |
+| 2 | The maintainer sees and edits it | The Settings `box` section lists boxes with profile, tools and tags; re-probe on this box; declared tags and multi-line quirks edited as a compare-and-set a reconnect cannot stale. | complete (`63f5673`..`00c2d48`, 2026-09-26) | [plan](../plans/mod-7-box-settings-section.plan.md), [blueprint](../plans/mod-7-box-settings-section.blueprint.md) |
 | 3 | A mismatch is refused by name | `R-ORCH-10` at enqueue and at claim, the engine's box-tag seam, criterion 14's capability half as its own conformance case. | pending | — |
 | 4 | Paths and excerpts are real | Repo paths inferred per project under the workspace root with a manual text box on failure, and phase, judge and preview prompts carry excerpts read from those roots. | pending | — |
 

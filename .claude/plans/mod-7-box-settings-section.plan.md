@@ -1,5 +1,9 @@
 # Plan: MOD-7 milestone 2 — the maintainer sees and edits it
 
+> **Status: complete** (`63f5673`..`00c2d48`, 2026-09-26). T0–T5 implemented; T6 deferred to MOD-51.
+> The manual live check (§Validation) was skipped by the maintainer in favour of the Postgres
+> `box_probe_pg` cases. Review deferrals: MOD-53, MOD-54.
+
 **Source**: `.claude/prds/mod-7-box-registry.prd.md`, milestone 2 (Delivery Milestones table, row 2,
 `:234`): "The Settings `box` section lists boxes with profile, tools and tags; re-probe on this box;
 declared tags and multi-line quirks edited as a compare-and-set a reconnect cannot stale." Scope
