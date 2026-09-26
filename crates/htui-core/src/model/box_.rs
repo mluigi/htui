@@ -161,8 +161,13 @@ pub struct BoxEdit {
 /// `[a-z0-9_-]`, the first one a letter or a digit. Every tag the seed derives already is.
 #[must_use]
 pub fn is_declared_tag(tag: &str) -> bool {
-    let _ = tag;
-    todo!("MOD-7 T0 green")
+    let allowed = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-';
+    let mut chars = tag.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(allowed)
+        && tag.chars().count() <= DECLARED_TAG_MAX
 }
 
 /// The stored form of a declared-tag list (MOD-7 D42, D55): each element validated **as given**
@@ -173,8 +178,14 @@ pub fn is_declared_tag(tag: &str) -> bool {
 ///
 /// The refusal sentence of the first element [`is_declared_tag`] rejects, in input order.
 pub fn canonical_declared_tags(tags: &[String]) -> Result<Vec<String>, String> {
-    let _ = (tags, declared_tag_refusal);
-    todo!("MOD-7 T0 green")
+    if let Some(bad) = tags.iter().find(|tag| !is_declared_tag(tag)) {
+        return Err(declared_tag_refusal(bad));
+    }
+    let mut canonical = tags.to_vec();
+    // `str`'s `Ord` is byte order, which is what "sorted by bytes" means.
+    canonical.sort_unstable();
+    canonical.dedup();
+    Ok(canonical)
 }
 
 /// A declared-tag list as the user types it (MOD-7 D42, D50): split on `,`, each piece trimmed,
@@ -184,8 +195,13 @@ pub fn canonical_declared_tags(tags: &[String]) -> Result<Vec<String>, String> {
 ///
 /// [`canonical_declared_tags`]'s sentence.
 pub fn declared_tags_from_text(text: &str) -> Result<Vec<String>, String> {
-    let _ = text;
-    todo!("MOD-7 T0 green")
+    let pieces: Vec<String> = text
+        .split(',')
+        .map(str::trim)
+        .filter(|piece| !piece.is_empty())
+        .map(str::to_owned)
+        .collect();
+    canonical_declared_tags(&pieces)
 }
 
 /// The one refusal sentence (private).
