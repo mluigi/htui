@@ -112,6 +112,9 @@ pub struct FakeIsolator {
     /// the signal it raises first; with a resume signal (plan D145), the call that waits for it
     /// instead. One-shot.
     reconcile_stall: Mutex<Option<ReconcileStall>>,
+    /// Where `prepare` roots its trees, when a case points it at a real directory (MOD-7
+    /// milestone 4); `None` keeps `FAKE_TREE_ROOT/<run>/<step>`.
+    tree_root: Mutex<Option<PathBuf>>,
 }
 
 /// One [`diff`](Isolator::diff) call as [`FakeIsolator`] saw it: the `run_step_id` of every tree
@@ -183,6 +186,17 @@ impl FakeIsolator {
             .lock()
             .expect("no panic holds the fake isolator's lock")
             .push_back(err);
+    }
+
+    /// Root every tree [`prepare`](Isolator::prepare) reports at `dir`: `cwd` becomes `dir` and
+    /// each repo's tree `dir/<repo id>`, for every step (MOD-7 milestone 4). The fake still creates
+    /// nothing; a case that wants files under a tree writes them there itself, which is how the
+    /// excerpt pass gets a readable root without a real isolator.
+    pub fn root_trees_at(&self, dir: impl Into<PathBuf>) {
+        *self
+            .tree_root
+            .lock()
+            .expect("no panic holds the fake isolator's lock") = Some(dir.into());
     }
 
     /// Make every [`prepare`](Isolator::prepare) report `dirs` as its `extra_dirs`.
@@ -428,7 +442,17 @@ impl Isolator for FakeIsolator {
                     .expect("no panic holds the fake isolator's lock")
                     .insert((run, step), guard);
             }
-            let cwd = format!("{FAKE_TREE_ROOT}/{run}/{step}");
+            let root = self
+                .tree_root
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .clone();
+            // Unset, the bytes are the ones every existing case was written against.
+            let synthetic = format!("{FAKE_TREE_ROOT}/{run}/{step}");
+            let tree_path = |repo: &RepoId| match &root {
+                Some(dir) => dir.join(repo.to_string()).to_string_lossy().into_owned(),
+                None => format!("{synthetic}/{repo}"),
+            };
             let trees = scope
                 .iter()
                 .map(|repo| {
@@ -442,7 +466,7 @@ impl Isolator for FakeIsolator {
                             run_step_id: step,
                             repo_id: *repo,
                             mode: isolation,
-                            path: format!("{cwd}/{repo}"),
+                            path: tree_path(repo),
                             base_ref: base.clone(),
                             dirty: false,
                         },
@@ -452,7 +476,7 @@ impl Isolator for FakeIsolator {
                 .collect();
             Ok(Prepared {
                 trees,
-                cwd: PathBuf::from(cwd),
+                cwd: root.clone().unwrap_or_else(|| PathBuf::from(&synthetic)),
                 // The fake puts every tree under one `cwd`, which is the `worktree`/`copy` shape
                 // (plan D28), so this is empty unless a case scripted it with
                 // [`script_extra_dirs`](FakeIsolator::script_extra_dirs).
