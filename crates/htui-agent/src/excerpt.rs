@@ -20,8 +20,12 @@
 //! No new dependency (§4.5 `:1007`): the walk is `std::fs` plus a hand matcher, in the shape
 //! [`crate::probe`]'s glob walker already established, and the `.gitignore` matcher is a declared
 //! **subset** rather than a glob crate.
+//!
+//! MOD-7 milestone 4 wires the pass. [`excerpts_for`] is the one function both the engine's phase
+//! prompt and the Backlog preview call, so the bytes a maintainer previews and the bytes a run sends
+//! cannot drift (MOD-2 D103).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -29,11 +33,14 @@ use std::time::Instant;
 
 use tracing::warn;
 
+use htui_core::model::{BoxId, Repo, RepoBoxPath, RepoId, RunStepTree};
 use htui_core::prompt::excerpt::{
-    ExcerptCandidate, ExcerptCaps, ExcerptProvider, ExcerptRequest, OwnedExcerptRequest,
-    ProviderError, RepoReader, RepoRoot, skip_by_path,
+    ExcerptCandidate, ExcerptCaps, ExcerptProvider, ExcerptRequest, ExcerptSet,
+    OwnedExcerptRequest, PathPrefix, ProviderError, RepoReader, RepoRoot, skip_by_path,
 };
 use htui_core::prompt::settings::resolve_excerpt_caps;
+use htui_core::prompt::{PromptSpec, TokenEstimator};
+use htui_core::scrub::Scrubber;
 
 /// How many bytes of a file the binary test reads (§4.5 `:1073`).
 pub const BINARY_PROBE_BYTES: usize = 8_192;
@@ -206,7 +213,7 @@ impl Default for FsRepoReader {
     ///
     /// [`DEFAULTS`]: htui_core::prompt::settings::DEFAULTS
     fn default() -> Self {
-        Self::new(resolve_excerpt_caps(&std::collections::BTreeMap::new()).0)
+        Self::new(resolve_excerpt_caps(&BTreeMap::new()).0)
     }
 }
 
@@ -813,6 +820,83 @@ pub fn run_providers(
         }
     }
     (merged, provider_set)
+}
+
+/// ANA-5 §4.5 step 1 (plan D107): one root per scope repo, by **row presence**.
+///
+/// The step's `run_step_tree` row for the repo (`RootSource::RunStepTree`), else this box's
+/// `repo_box_path` row (`RootSource::RepoBoxPath`; rows of other boxes are ignored), else
+/// `RootSource::NoPath` with an empty root. `repo` is the repo's name, the slug a rendered
+/// `path="repo:…"` and `PathPrefix` use. No `stat`: an unreadable root is `select`'s "could not
+/// be listed" note, which keeps this pure. In `scope` order.
+#[must_use]
+pub fn excerpt_roots(
+    scope: &[(RepoId, String)],
+    trees: &[RunStepTree],
+    paths: &[RepoBoxPath],
+    box_id: BoxId,
+) -> Vec<RepoRoot> {
+    let _ = (scope, trees, paths, box_id);
+    todo!("MOD-7 milestone 4 T2: excerpt_roots")
+}
+
+/// `item.touched_paths` as §4.5's tier-1 prefixes, under `overlap::resolve`'s primary rule
+/// (`crates/htui-orch/src/overlap.rs:43-54`, plan D119): a bare glob belongs to the project's
+/// `is_primary` repo, and to the empty slug when there is none, which matches no repo.
+#[must_use]
+pub fn touched_prefixes(touched: &[String], repos: &[Repo]) -> Vec<PathPrefix> {
+    let _ = (touched, repos);
+    todo!("MOD-7 milestone 4 T2: touched_prefixes")
+}
+
+/// What the shared pass needs beside the spec.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PassInput {
+    /// `excerpt_roots`' answer.
+    pub roots: Vec<RepoRoot>,
+    /// `touched_prefixes`' answer.
+    pub touched_prefixes: Vec<PathPrefix>,
+    /// The caller's own notes about the roots, which go first: a scope repo with no row, or
+    /// D108's "no `run_step_tree` row yet".
+    pub notes: Vec<String>,
+}
+
+/// §4.5 over the filesystem (plan D119): the built-in provider, then `select` over an
+/// `FsRepoReader` built from the request's own caps (F-101). **Blocking**: `excerpts_for` calls it
+/// under `spawn_blocking` whenever a root is readable.
+#[must_use]
+pub fn excerpt_pass(req: &OwnedExcerptRequest, est: TokenEstimator) -> ExcerptSet {
+    let _ = (req, est);
+    todo!("MOD-7 milestone 4 T2: excerpt_pass")
+}
+
+/// The excerpt set for `spec` (plan D109, D118, D119; MOD-7 milestone 4 D126, D128).
+///
+/// 1. `resolve_excerpt_caps(app)`.
+/// 2. `spec.body` parsed in `spec.role` does not place `{{excerpts}}` (or does not parse): no
+///    pass. The roots are recorded unscanned, with the note
+///    ``excerpt: template `name` places no {{excerpts}}; nothing was read``.
+/// 3. No readable root (none, or all `NoPath`): [`excerpt_pass`] **inline**, with a zero budget.
+///    It reads nothing and spawns nothing (H-9), and records each `NoPath` with `select`'s own "no
+///    readable root" note.
+/// 4. Otherwise the budget is `excerpt_residual(spec, scrubber)`. An `Err` records the roots
+///    unscanned, because `assemble` will refuse the same way. Then [`excerpt_pass`] runs under
+///    `tokio::task::spawn_blocking`; a `JoinError` records the roots unscanned with
+///    `excerpt: the pass panicked; no excerpts` (§4.5 fail-open).
+/// 5. `drop_unmaskable_excerpts(&mut set, scrubber)`.
+/// 6. `set.notes` = `input.notes`, then the pass's notes, then the drop notes.
+///
+/// The request is `item_key`, `item_body`, `phase` and the input documents' bodies from `spec`,
+/// `input.touched_prefixes`, no `changed_paths` (D122), `input.roots`, the budget, and the caps,
+/// `scan_cap` and `deadline` of step 1. `est` is `spec.estimator`.
+pub async fn excerpts_for(
+    spec: &PromptSpec,
+    input: PassInput,
+    app: &BTreeMap<String, serde_json::Value>,
+    scrubber: &dyn Scrubber,
+) -> ExcerptSet {
+    let _ = (spec, input, app, scrubber);
+    todo!("MOD-7 milestone 4 T2: excerpts_for")
 }
 
 #[cfg(test)]
