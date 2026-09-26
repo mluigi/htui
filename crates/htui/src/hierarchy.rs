@@ -778,9 +778,17 @@ pub fn reach_totals(reach: &DeleteReach) -> (u64, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{box_id, reach_parts, reach_totals};
-    use htui_core::model::BoxId;
-    use htui_core::store::{DeleteReach, StoreError};
+    use std::collections::BTreeSet;
+
+    use chrono::Utc;
+    use htui_core::fixtures::ids;
+    use htui_core::model::{BoxId, RepoBoxPath};
+    use htui_core::store::{DeleteReach, MemStore, StoreError, WriteStore};
+    use htui_orch::infer::Checkout;
+    use htui_store::Backend;
+
+    use super::{InferOutcome, box_id, infer_one, reach_parts, reach_totals};
+    use crate::store_worker::{StoreRequest, serve};
 
     /// A path write on a box with no row is refused by name rather than stored under a nil id.
     /// There is no backend this is reachable from in a test — a `MemStore` either has a
@@ -799,6 +807,73 @@ mod tests {
         assert_eq!(
             box_id(None).unwrap_err().to_string(),
             "box `(this box)` not found"
+        );
+    }
+
+    /// A row that lands between the tree read and `infer_one`'s insert — a manual write, most
+    /// likely — wins: the insert-if-absent answers `Ok(false)`, the repo is `AlreadySet`, the row
+    /// keeps the typed path, and nothing is held for a later repo (plan D116). Reached only by a
+    /// race through `InferRepoPaths`, so it is pinned here by calling `infer_one` after the row.
+    #[tokio::test]
+    async fn a_row_that_lands_before_the_insert_is_already_set_and_kept() {
+        let backend = Backend::memory(MemStore::demo());
+        let writer = backend.writer().expect("a memory backend writes");
+        let _ = serve(
+            &backend,
+            &StoreRequest::CreateRepo {
+                project: ids::PROJECT_VULKAN,
+                name: "core".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: false,
+            },
+        )
+        .await;
+        let repo = writer
+            .repos(ids::PROJECT_VULKAN)
+            .await
+            .expect("the repos read")
+            .into_iter()
+            .find(|repo| repo.name == "core")
+            .expect("`core` was created");
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let found = dir.path().join("core");
+        let typed = dir.path().join("typed");
+        std::fs::create_dir(&found).expect("the checkout's directory");
+        std::fs::create_dir(&typed).expect("the typed directory");
+        let typed = typed.display().to_string();
+        writer
+            .upsert_repo_box_path(&RepoBoxPath {
+                repo_id: repo.id,
+                box_id: ids::BOX,
+                local_path: typed.clone(),
+                updated_at: Utc::now(),
+            })
+            .await
+            .expect("the manual row is written");
+        let checkouts = [Checkout {
+            path: found,
+            name: "core".to_owned(),
+            remote_keys: Vec::new(),
+        }];
+        let mut held = BTreeSet::new();
+
+        let outcome = infer_one(&writer, &repo, ids::BOX, &checkouts, &mut held)
+            .await
+            .expect("a lost race is an outcome, not an error");
+
+        assert_eq!(outcome, InferOutcome::AlreadySet);
+        assert!(
+            held.is_empty(),
+            "a path this pass did not write holds nothing: {held:?}"
+        );
+        let rows = writer.repo_box_paths(repo.id).await.expect("the rows read");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.local_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![typed.as_str()],
+            "the manual row is untouched"
         );
     }
 
