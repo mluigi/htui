@@ -223,8 +223,108 @@ pub fn find_checkouts(root: &Path) -> Scan {
 /// `truncated`.
 #[must_use]
 pub fn find_checkouts_with(root: &Path, limits: Limits) -> Scan {
-    let _ = (root, limits);
-    todo!()
+    let mut scan = Scan::default();
+    // The root is canonical, so it is no link either; a root that is not a directory holds nothing.
+    let is_dir = std::fs::symlink_metadata(root).is_ok_and(|meta| meta.is_dir());
+    if is_dir {
+        let name = root.file_name().and_then(|name| name.to_str());
+        let mut examined = 0;
+        visit(root, name, 0, limits, &mut examined, &mut scan);
+    }
+    scan
+}
+
+/// Examines `dir` at `depth`: lists it when it is a checkout, descends into it otherwise. `name` is
+/// `None` only for a root whose file name is not UTF-8 (or `/`), which is walked but never listed.
+/// Answers `true` when the scan must stop, the cap having been passed.
+fn visit(
+    dir: &Path,
+    name: Option<&str>,
+    depth: usize,
+    limits: Limits,
+    examined: &mut usize,
+    scan: &mut Scan,
+) -> bool {
+    *examined += 1;
+    if *examined > limits.max_dirs {
+        scan.truncated = true;
+        return true;
+    }
+
+    if is_checkout(dir) {
+        if let Some(name) = name {
+            scan.checkouts.push(Checkout {
+                path: dir.to_path_buf(),
+                name: name.to_owned(),
+                remote_keys: remote_keys(dir),
+            });
+            return false;
+        }
+        // An unnameable root cannot match by name; it is still walked (blueprint §3.4).
+    }
+    if depth >= limits.max_depth {
+        return false;
+    }
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false; // an unreadable directory contributes nothing
+    };
+    let mut children: Vec<(String, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            // `DirEntry::file_type` does not follow a link, so a link is never a directory here.
+            let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+            (is_dir && !name.starts_with('.')).then(|| (name, entry.path()))
+        })
+        .collect();
+    children.sort_unstable_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+
+    children
+        .iter()
+        .any(|(name, path)| visit(path, Some(name), depth + 1, limits, examined, scan))
+}
+
+/// `dir/.git` is a directory, or a file beginning `gitdir:`; a link named `.git` is neither.
+fn is_checkout(dir: &Path) -> bool {
+    use std::io::Read as _;
+
+    let dot_git = dir.join(".git");
+    let Ok(meta) = std::fs::symlink_metadata(&dot_git) else {
+        return false;
+    };
+    if meta.is_dir() {
+        return true;
+    }
+    if !meta.is_file() {
+        return false;
+    }
+    let mut head = [0_u8; 7];
+    std::fs::File::open(&dot_git)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .is_ok_and(|()| &head == b"gitdir:")
+}
+
+/// Every configured remote's fetch URL in `dir`, normalised, sorted and deduplicated. The raw URL
+/// never leaves this function: `gix` keeps `user:tok@` in it (plan claim 19c).
+fn remote_keys(dir: &Path) -> Vec<String> {
+    let Ok(repo) = gix::open(dir) else {
+        return Vec::new(); // an unopenable checkout has no remotes (plan D113)
+    };
+    let mut keys: Vec<String> = repo
+        .remote_names()
+        .iter()
+        .filter_map(|name| {
+            // Without the annotation `find_remote` is E0283 (plan claim 19a).
+            let name: &gix::bstr::BStr = name.as_ref();
+            let remote = repo.find_remote(name).ok()?;
+            let url = remote.url(gix::remote::Direction::Fetch)?;
+            normalise_remote(&url.to_bstring().to_string())
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 /// Remote first, name second, ambiguity is failure (PRD D5, plan D112), for one repo with no row on
