@@ -5236,8 +5236,9 @@ fn masked_edit(row: &BoxRow, like: &BoxRow) -> BoxRow {
 /// MOD-7 milestone 2 (D41): `edit_box` is a compare-and-set on `box.edit_version`. An edit on the
 /// current token writes the columns it names, sorted and deduplicated for the tags, stored as given
 /// for the quirks, and moves the token by one and `updated_at`; an edit naming neither column
-/// still moves the token. A spent token is `Stale` with the row as it is now and writes nothing;
-/// an unknown box is `NotFound`. No column a probe, registration or the settings writer owns
+/// still moves the token. `Some` of an empty list or text clears the column; only `None` leaves
+/// it. A spent token is `Stale` with the row as it is now and writes nothing; an unknown box is
+/// `NotFound`. No column a probe, registration or the settings writer owns
 /// moves, and neither do the box's tools or recorded spec digest.
 ///
 /// What the generic suite cannot show is delegated by name. A reconnect (registration is not a
@@ -5366,6 +5367,36 @@ async fn edit_box_is_cas_on_edit_version<S: WriteStore>(store: &S) {
     assert!(
         matches!(unknown, Err(StoreError::NotFound { entity: "box", .. })),
         "{CASE}: an unknown box is NotFound, got {unknown:?}"
+    );
+
+    // What the section sends when a user deletes every tag and empties the quirks.
+    let cleared = store
+        .edit_box(
+            ids::BOX,
+            3,
+            BoxEdit {
+                declared_tags: Some(Vec::new()),
+                quirks: Some(String::new()),
+            },
+        )
+        .await
+        .expect(CASE);
+    let CasOutcome::Applied(cleared) = cleared else {
+        panic!("{CASE}: clearing on the current token applies, got {cleared:?}");
+    };
+    assert_eq!(cleared.edit_version, 4, "{CASE}: a clear moves the token");
+    assert!(
+        cleared.declared_tags.is_empty(),
+        "{CASE}: `Some(empty)` clears the tags; only `None` leaves them"
+    );
+    assert_eq!(
+        cleared.quirks, "",
+        "{CASE}: `Some(\"\")` clears the quirks; only `None` leaves them"
+    );
+    assert_eq!(
+        store.boxes().await.expect(CASE)[0].row,
+        cleared,
+        "{CASE}: boxes() reads the cleared row as written"
     );
 }
 
