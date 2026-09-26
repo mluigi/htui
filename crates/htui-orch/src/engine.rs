@@ -82,11 +82,6 @@ const JUDGE_TEMPLATE: &str = "judge";
 /// (MOD-4 plan D163, `crates/htui-core/src/prompt/defaults.rs`).
 const HANDOFF_TEMPLATE: &str = "handoff";
 
-/// MOD-9 D44: an override graph's phase ids are minted by the clone, which copies no
-/// `skill_binding` (`graph.rs:350-355`), so its steps see global and project attachments only.
-const OVERRIDE_SKILLS_NOTE: &str =
-    "skills: an override graph's phases carry no phase-level attachments until MOD-9 milestone 3";
-
 /// A handoff's `failure_reason` when neither the run nor the step recorded one: the maintainer
 /// promoted a step that was waiting at its gate (blueprint §7.5).
 const PROMOTED_AT_A_GATE: &str = "promoted by the maintainer at a gate";
@@ -4990,8 +4985,8 @@ where
     /// `SnapshotPhase` carries no `PhaseId` (`model/run.rs:488-527`) and resolution re-densifies
     /// positions (`graph.rs:286-300`), so the live row is found by `(graph id, name)`, which
     /// `UNIQUE (graph_id, name)` makes exact (`0001_init.sql:247`). A phase renamed or deleted
-    /// since the snapshot, and every phase of an override graph, get a note rather than a silent
-    /// loss of their phase-level attachments (plan R-15).
+    /// since the snapshot gets a note rather than a silent loss of its phase-level attachments
+    /// (plan R-15). An override graph's phases carry their own copies (MOD-9 D80).
     async fn phase_skills(
         &self,
         project: ProjectId,
@@ -5013,9 +5008,6 @@ where
                  applied",
                 phase.name, snapshot.graph.name
             ));
-        }
-        if snapshot.graph.is_override {
-            notes.push(OVERRIDE_SKILLS_NOTE.to_owned());
         }
         let skills = self.parts.graphs.bound_skills(project, phase_id).await?;
         Ok(skills)
@@ -12053,24 +12045,6 @@ mod tests {
         assert!(
             spec.notes.contains(&expected),
             "{expected:?} in {:?}",
-            spec.notes
-        );
-    }
-
-    /// Plan R-15, the clone gap: an override graph's phases carry no attachment of their own
-    /// until MOD-9 milestone 3, and the record says so. No writer can set `is_override` on a
-    /// snapshot, so the case edits the decoded one (blueprint D67).
-    #[tokio::test]
-    async fn an_override_graph_notes_the_clone_gap() {
-        let harness = Harness::new().await;
-        let (row, mut snapshot, prd) = skills_prologue(&harness).await;
-        snapshot.graph.is_override = true;
-        let (spec, _) = implement_prompt(&harness, &row, &snapshot, &prd).await;
-        assert!(
-            spec.notes
-                .iter()
-                .any(|note| note == super::OVERRIDE_SKILLS_NOTE),
-            "{:?}",
             spec.notes
         );
     }

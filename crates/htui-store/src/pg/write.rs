@@ -2240,8 +2240,8 @@ impl WriteStore for PgStore {
         sqlx::query_as!(
             StepGraph,
             r#"
-            INSERT INTO step_graph (id, project_id, name, description)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO step_graph (id, project_id, name, description, is_override)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id         AS "id: StepGraphId",
                       project_id AS "project_id: ProjectId",
                       name,
@@ -2255,6 +2255,7 @@ impl WriteStore for PgStore {
             new.project_id.as_uuid(),
             new.name,
             new.description,
+            new.is_override,
         )
         .fetch_one(&self.pool)
         .await

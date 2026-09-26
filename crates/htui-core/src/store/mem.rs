@@ -2526,7 +2526,7 @@ impl State {
             project_id: new.project_id,
             name: new.name,
             description: new.description,
-            is_override: false,
+            is_override: new.is_override,
             created_at: now,
             updated_at: now,
         };

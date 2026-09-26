@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO step_graph (id, project_id, name, description)\n            VALUES ($1, $2, $3, $4)\n            RETURNING id         AS \"id: StepGraphId\",\n                      project_id AS \"project_id: ProjectId\",\n                      name,\n                      description,\n                      -- Inserted, not appended: see `step_graph_row` in `pg/read.rs`.\n                      is_override,\n                      created_at,\n                      updated_at\n            ",
+  "query": "\n            INSERT INTO step_graph (id, project_id, name, description, is_override)\n            VALUES ($1, $2, $3, $4, $5)\n            RETURNING id         AS \"id: StepGraphId\",\n                      project_id AS \"project_id: ProjectId\",\n                      name,\n                      description,\n                      -- Inserted, not appended: see `step_graph_row` in `pg/read.rs`.\n                      is_override,\n                      created_at,\n                      updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -86,7 +86,8 @@
         "Uuid",
         "Uuid",
         "Text",
-        "Text"
+        "Text",
+        "Bool"
       ]
     },
     "nullable": [
@@ -99,5 +100,5 @@
       false
     ]
   },
-  "hash": "dc01b3461798639f3c363c858a2f09dbd9824e38315716320958c28e34bc3e8e"
+  "hash": "beeca2403d09cbe9bf897e6cf9600ce8ccf437b1fd95f1e78dad0af1d477afbe"
 }
