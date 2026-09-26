@@ -9,7 +9,7 @@
 //! the body is the canonical text verbatim, so a `</section>` inside a document body is inert
 //! (blueprint H-28).
 
-use htui_core::model::ItemId;
+use htui_core::model::{ItemId, SkillChoice};
 use htui_core::prompt::{Section, TrimRecord};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -182,6 +182,18 @@ fn render_lines(preview: &PromptPreview) -> Vec<Row> {
     lines.push(Row::default());
     lines.extend(section_lines(&record.sections).into_iter().map(Row::plain));
     lines.push(Row::default());
+    // MOD-9 D46: every candidate the assembler decided, the inactive ones dim, so a skill that did
+    // not render says why here rather than only in the record.
+    for (index, choice) in record.skill_choices.iter().enumerate() {
+        let label = if index == 0 { "skills" } else { "" };
+        lines.push(Row {
+            text: labelled(label, &choice_line(choice)),
+            dim: !choice.active,
+        });
+    }
+    if !record.skill_choices.is_empty() {
+        lines.push(Row::default());
+    }
     for (index, note) in record.notes.iter().enumerate() {
         let label = if index == 0 { "notes" } else { "" };
         lines.push(Row::plain(labelled(label, note)));
@@ -194,6 +206,26 @@ fn render_lines(preview: &PromptPreview) -> Vec<Row> {
             .map(|line| Row::plain(line.to_owned())),
     );
     lines
+}
+
+/// One skill choice as the pane lists it: `<name> v<N|?> · <level> · <activation> → <outcome>`,
+/// where the outcome is `active` or the reason. CR and LF in a name become spaces, so one choice
+/// is one row.
+fn choice_line(choice: &SkillChoice) -> String {
+    let version = choice
+        .version
+        .map_or_else(|| "?".to_owned(), |version| version.to_string());
+    let outcome = if choice.active {
+        "active"
+    } else {
+        choice.reason.as_str()
+    };
+    format!(
+        "{} v{version} \u{b7} {} \u{b7} {} \u{2192} {outcome}",
+        choice.name.replace(['\n', '\r'], " "),
+        choice.level.as_str(),
+        choice.activation.as_str(),
+    )
 }
 
 /// The `excerpts` and `roots` lines of §4.5's audit.
@@ -379,7 +411,7 @@ impl DetailTab for PromptTab {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use htui_core::model::{Activation, ChoiceReason, SkillChoice, SkillLevel};
+    use htui_core::model::{Activation, ChoiceReason, SkillLevel};
     use ratatui::buffer::Buffer;
     use ratatui::widgets::Widget as _;
 
@@ -454,6 +486,8 @@ mod tests {
             active: false,
             reason: ChoiceReason::Off,
         });
+        // The fixture records no note, and the block's place is "before the notes".
+        assembled.trim.notes.push("a note".to_owned());
         let preview = PromptPreview {
             item: htui_core::fixtures::ids::HTUI_FEAT_1,
             available: vec!["implement".to_owned()],
@@ -493,7 +527,7 @@ mod tests {
         );
         assert!(
             rows.get(at + 3)
-                .is_some_and(|row| row.text.starts_with("notes")),
+                .is_some_and(|row| row.text == labelled("notes", "a note")),
             "the notes follow the block"
         );
         let table = rows

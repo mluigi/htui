@@ -5,7 +5,7 @@
 //! (blueprint E-1, finding F-50).
 //!
 //! Everything here runs the **whole** path the binary runs: the Backlog tab issues the request,
-//! the agent runtime spawns the deferred task on an owned `Backend` clone, the task does the eight
+//! the agent runtime spawns the deferred task on an owned `Backend` clone, the task does the nine
 //! store reads and calls the same `assemble()` MOD-4 will call, and the reply is rendered by the
 //! sub-tab. That is the point of the preview and the reason ANA-5 §12 criterion 12 is asserted from
 //! here rather than only over a fake reader.

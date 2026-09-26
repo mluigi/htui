@@ -23,10 +23,13 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │                                                                                                            ││box                           80      80  none                                          │
 │                                                                                                            ││skills                        88      88  none                                          │
 │                                                                                                            ││                                                                                        │
+│                                                                                                            ││skills    tests v1 · project · always → active                                          │
+│                                                                                                            ││          rust-style v2 · project · always → active                                     │
+│                                                                                                            ││                                                                                        │
 │                                                                                                            ││notes     preview: the template is chosen by name at its latest version and stands in fo│
 │                                                                                                            ││          preview: documents are latest-per-kind; ANA-2 input_kinds resolution arrives w│
 │                                                                                                            ││          preview: the `summary` kind is excluded from documents; §4.3 renders it as ups│
-│                                                                                                            ││          preview: project-level skill bindings only; a phase binding needs a phase id (│
+│                                                                                                            ││          preview: phase-level skills come from the first phase of the item's graph that│
 │                                                                                                            ││          preview: output_kind defaults to the template name; the phase row's value arri│
 │                                                                                                            ││          preview: command_queue exposure is a phase setting (R-MCP-4); absent until MOD│
 │                                                                                                            ││          preview: attempt 1, so verify_failure and previous_diff are absent; the real a│
@@ -57,8 +60,5 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │                                                                                                            ││- Driving an agent; the chat tab is MOD-2.                                              │
 │                                                                                                            ││- Any real database. MOD-1 runs against the in-memory store and its demo fixture.       │
 │                                                                                                            ││                                                                                        │
-│                                                                                                            ││Done when                                                                               │
-│                                                                                                            ││- `cargo run -- --demo` opens on the backlog of the Platform workspace.                 │
-│                                                                                                            ││- The snapshot tests render at 100x30 and every sub-tab has an empty state.             │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────────────────┘
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help
