@@ -829,7 +829,7 @@ mod tests {
         Activation, Gate, NewRepo, PromptTemplateId, RepoId, RepoScope, RunScope, SkillBinding,
         SkillBindingId,
     };
-    use htui_core::store::{MemStore, StoreError, glob_names_unknown_repo};
+    use htui_core::store::{MemStore, StoreError, glob_names_unknown_repo, negative_position};
     use serde_json::json;
 
     use super::{
@@ -1746,6 +1746,68 @@ question and not a test fix. Decide the version bump first, then paste the new d
                 "gone",
                 &slug
             )))
+        );
+
+        let graphs_after = store
+            .step_graphs(ids::PROJECT_HTUI)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            !graphs_after
+                .iter()
+                .any(|graph| graph.name == format!("{}-override", item.key)),
+            "no override graph is written: {graphs_after:?}"
+        );
+        assert_eq!(graphs_after, graphs_before, "nor any other graph");
+        assert_eq!(
+            store
+                .skill_bindings(Some(ids::PROJECT_HTUI))
+                .await
+                .expect("MemStore never fails a read"),
+            rows_before,
+            "nor any attachment"
+        );
+        assert_eq!(
+            store
+                .item(item.id)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the item is still there")
+                .step_graph_id,
+            item.step_graph_id,
+            "and the item is not repointed"
+        );
+    }
+
+    /// MOD-9 D96: the pre-check is `set_skill_binding`'s whole rule chain (D78), not its repo
+    /// rule alone. A source phase attachment at `position` -1 (a row the writer refuses, so
+    /// planted) refuses the clone with the writer's own sentence before anything is written.
+    #[tokio::test]
+    async fn override_clone_refuses_a_negative_position_before_writing() {
+        let store = store_with(|data| {
+            let phase_row = data
+                .skill_bindings
+                .iter_mut()
+                .find(|row| row.phase_id == Some(ids::PHASE_HTUI_IMPLEMENT))
+                .expect("the fixture's one phase-level binding");
+            phase_row.position = -1;
+        });
+        let item = feat_1(&store).await;
+        let graphs_before = store
+            .step_graphs(ids::PROJECT_HTUI)
+            .await
+            .expect("MemStore never fails a read");
+        let rows_before = store
+            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .await
+            .expect("MemStore never fails a read");
+
+        let error = override_graph(&store, &TestSource::claude(&store), &item)
+            .await
+            .expect_err("the writer refuses a negative position");
+        assert_eq!(
+            error,
+            ResolveError::Store(StoreError::Constraint(negative_position(-1)))
         );
 
         let graphs_after = store
