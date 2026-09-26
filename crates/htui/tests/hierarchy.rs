@@ -1076,6 +1076,102 @@ async fn a_scan_that_hits_the_cap_infers_nothing() {
     assert_eq!(local_path(&tree, "core"), None, "nothing was written");
 }
 
+/// D134, R-55: the pass is sequential and its held set grows with each write, so of two
+/// same-named repos without a remote only the first in tree order takes the one checkout.
+#[tokio::test]
+async fn a_path_this_pass_writes_is_held_for_the_next_repo() {
+    let backend = demo();
+    let root = tempfile::tempdir().expect("a throwaway workspace root");
+    let tools = checkout(root.path(), "tools", None);
+    let first = create_repo(&backend, "tools", None).await;
+    let created = tree(
+        serve(
+            &backend,
+            &StoreRequest::CreateProject {
+                workspace: ids::WORKSPACE_GRAPHICS,
+                slug: "renderer".to_owned(),
+                name: "Renderer".to_owned(),
+                description: String::new(),
+            },
+        )
+        .await,
+    );
+    let renderer = created.projects[1].project.id;
+    let _ = tree(
+        serve(
+            &backend,
+            &StoreRequest::CreateRepo {
+                project: renderer,
+                name: "tools".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: false,
+            },
+        )
+        .await,
+    );
+    set_root(&backend, root.path()).await;
+
+    let (tree, report) = infer(&backend).await;
+
+    let outcomes: Vec<(RepoId, &InferOutcome)> = report
+        .repos
+        .iter()
+        .map(|line| (line.repo, &line.outcome))
+        .collect();
+    assert_eq!(outcomes.len(), 2, "both repos are reported: {report:?}");
+    assert_eq!(outcomes[0].0, first, "the report is in tree order");
+    assert_eq!(
+        outcomes[0].1,
+        &InferOutcome::Inferred {
+            path: canonical(&tools),
+            by: MatchedBy::Name,
+        }
+    );
+    assert_eq!(
+        outcomes[1].1,
+        &InferOutcome::NoMatch,
+        "the checkout the first repo took is held"
+    );
+    let rows: Vec<String> = tree
+        .projects
+        .iter()
+        .flat_map(|entry| entry.repos.iter())
+        .filter_map(|entry| entry.local_path.as_ref())
+        .map(|row| row.local_path.clone())
+        .collect();
+    assert_eq!(rows, vec![canonical(&tools)], "exactly one row carries it");
+}
+
+/// D134: a checkout another repo already owns on this box is never a candidate, even for a repo
+/// whose name matches it.
+#[tokio::test]
+async fn a_checkout_held_by_another_repo_is_not_a_candidate() {
+    let backend = demo();
+    let root = tempfile::tempdir().expect("a throwaway workspace root");
+    let tools = checkout(root.path(), "tools", None);
+    let owner = create_repo(&backend, "tools2", None).await;
+    let _ = tree(
+        serve(
+            &backend,
+            &StoreRequest::SetRepoPath {
+                project: ids::PROJECT_VULKAN,
+                repo: owner,
+                path: canonical(&tools),
+            },
+        )
+        .await,
+    );
+    create_repo(&backend, "tools", None).await;
+    set_root(&backend, root.path()).await;
+
+    let (tree, report) = infer(&backend).await;
+
+    assert_eq!(outcome(&report, "tools2"), &InferOutcome::AlreadySet);
+    assert_eq!(outcome(&report, "tools"), &InferOutcome::NoMatch);
+    assert_eq!(local_path(&tree, "tools"), None, "no row for `tools`");
+}
+
 // -------------------------------------------------------------------------------------------
 // ---- section (T3) ----
 //
@@ -1877,6 +1973,85 @@ async fn a_new_repo_on_a_workspace_without_a_root_is_not_followed() {
     assert!(
         inferences(&emitted).is_empty(),
         "no root on this box, no inference: {emitted:?}"
+    );
+}
+
+/// A new repo on a workspace with a root here is followed by exactly one inference (D136).
+#[tokio::test]
+async fn a_new_repo_on_a_workspace_with_a_root_is_followed_by_one_inference() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    let backend = demo();
+    let opened = with_root(
+        demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await,
+        "/srv/htui",
+    );
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(opened.clone()))),
+    );
+    let _ = bench.drained();
+
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "n");
+    type_at(&bench, &mut section, "core");
+    bench.key(&mut section, "enter");
+    let emitted = bench.drained();
+    assert!(
+        matches!(
+            emitted.as_slice(),
+            [Action::Store(StoreRequest::CreateRepo { .. })]
+        ),
+        "`Enter` creates the repo: {emitted:?}"
+    );
+
+    bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
+
+    let emitted = bench.drained();
+    assert_eq!(
+        inferences(&emitted),
+        vec![ids::WORKSPACE_GRAPHICS],
+        "the applied `create_repo` is followed by one inference: {emitted:?}"
+    );
+}
+
+/// A repo edited through `e`, with a root here, is followed by exactly one inference (D136).
+#[tokio::test]
+async fn an_edited_repo_on_a_workspace_with_a_root_is_followed_by_one_inference() {
+    let backend = demo();
+    let with_repos = with_root(tree_with_two_repos(&backend).await, "/srv/htui");
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(with_repos.clone()))),
+    );
+    let _ = bench.drained();
+
+    for _ in 0..3 {
+        bench.key(&mut section, "j");
+    }
+    bench.key(&mut section, "e");
+    bench.key(&mut section, "enter");
+    let emitted = bench.drained();
+    assert!(
+        matches!(
+            emitted.as_slice(),
+            [Action::Store(StoreRequest::UpdateRepo { .. })]
+        ),
+        "`Enter` updates the repo: {emitted:?}"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(with_repos))),
+    );
+
+    let emitted = bench.drained();
+    assert_eq!(
+        inferences(&emitted),
+        vec![ids::WORKSPACE_GRAPHICS],
+        "the applied `update_repo` is followed by one inference: {emitted:?}"
     );
 }
 
