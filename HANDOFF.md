@@ -360,6 +360,16 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
   store conformance has no trait method to make a second box, so (a) wants a `pg_criteria` case
   that inserts a second `box` row plus a MemStore unit test in `mem.rs`; (b) fits either. Found
   2026-09-26.
+- [ ] **MOD-59 - A write's reply names itself, so a form never stays "in flight"** (from MOD-9
+  milestone 3 review, finding 3). `R-TUI-7`, `R-NF-3`. The Skills and Templates views decide that a
+  save landed by finding what they sent in the re-read snapshot (`ui/tabs/skills/library.rs` `land`,
+  milestone 1's D27 in `templates.rs`). If another session changes the same skill, binding or
+  template between the write and the worker's re-read, or `MemStore` stamps two writes with the same
+  instant, the predicate never holds: `busy` stays set and the editor, rename form or attachment
+  form refuses `Esc` and `Ctrl+S` until the workspace changes. Make a write's reply identify itself
+  (e.g. `StoreReply::SkillsWritten { snapshot, what }` and a templates twin) so landing no longer
+  depends on content, or release the form on any reply to the write's request name. Found
+  2026-09-26.
 - [ ] **MOD-49 - Interactive path picker for repo and workspace roots** (from MOD-7). `R-BOX-4`,
   `R-TUI-8`. MOD-7 D5 infers each repo's path on a box and falls back to a typed path in a text box
   when inference fails. Replace the typed fallback with a popup window that browses the box's
@@ -804,6 +814,6 @@ and MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`).
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-21 per-model weights, ANA-23 pure-Rust embedder)                                                                  |
-| MOD-N   | 42 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 43 (MOD-7 box, MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-59 write replies name themselves, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
