@@ -36,8 +36,8 @@ use crate::prompt::settings::SettingKey;
 use crate::store::error::StoreError;
 use crate::store::traits::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, UpdateOutcome, WriteStore,
-    citation_key, illegal_move, invalid_area_code, requirement_withdrawn, resolution_not_closable,
-    withdrawn_requirement_cited,
+    already_exists, citation_key, illegal_move, invalid_area_code, requirement_withdrawn,
+    resolution_not_closable, withdrawn_requirement_cited,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -6074,6 +6074,24 @@ async fn skill_create_reads_back_with_version_one<S: WriteStore>(store: &S) {
     assert!(
         matches!(unknown, Err(StoreError::Constraint(_))),
         "{CASE}: a created_by that names no app_user is Constraint, got {unknown:?}"
+    );
+    // The author is looked at before the name: a stranger taking a taken name is refused for the
+    // author, on both stores.
+    let mut stranger = new_skill("tests", BODY);
+    stranger.created_by = UserId::new();
+    constraint_with(
+        CASE,
+        store.create_skill(stranger).await,
+        "references no app_user",
+        "an unknown author with a taken name",
+    );
+    let mut twin = new_skill("docs-twin", BODY);
+    twin.id = skill.id;
+    constraint_with(
+        CASE,
+        store.create_skill(twin).await,
+        &already_exists("skill", skill.id),
+        "a taken id",
     );
     assert_eq!(
         store.skills().await.expect(CASE).len(),
