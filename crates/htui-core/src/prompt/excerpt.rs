@@ -1169,9 +1169,17 @@ pub fn select(
 
     // MOD-9 D72: the enumerated file set, taken from the walk's own listing after the two filters
     // above — not a second walk (the research's option (a)), which would double the filesystem
-    // cost of every step for no new data. Captured here because `fill_lexical_heads` takes the
-    // listing by `&mut` and would otherwise let a head-bearing entry in (H-17), and because
-    // tiers 1–4 are pure over the path, so nothing below can change the answer.
+    // cost of every step for no new data.
+    //
+    // Captured here, next to `let considered`, because that is the point where `listing` is what
+    // the filters left and nothing else has touched it. `vetted`, `fill_lexical_heads` and `rank`
+    // are all pure over the path, so no tier below can change the answer — and keeping the copy
+    // at the point of truth is what stops a later change to *what feeds* `listing` from silently
+    // changing what `listed` means. (H-17 originally gave a stronger reason — that
+    // `fill_lexical_heads` takes `&mut listing` and would let a head-bearing entry in — and it is
+    // not one: that function takes `&mut [Listed]`, writes only `listing[*index].head`, and this
+    // copies `repo` and `path`. It can neither add nor remove an entry. The placement is locality
+    // and legibility, not correctness, and no test pins it.)
     let listed: Vec<RepoPath> = listing
         .iter()
         .map(|entry| RepoPath {
@@ -1486,8 +1494,18 @@ pub struct ExcerptSet {
     /// MOD-9 D72: the walk's **enumerated** file set — every path the walk listed, after
     /// `skip_by_path` and `is_repo_relative`, whether or not it was selected. This is the set
     /// `skill_binding.globs` is matched against (D87), and it is deliberately a **superset** of
-    /// `files`: a skill can activate on a file that was too big to excerpt, and on one the budget
-    /// did not reach.
+    /// `files`: the residual budget and `max_files` can decline a file the walk enumerated, and a
+    /// `glob` fires on it anyway. The prompt would not have shown the model that file, which is
+    /// the point — the matcher sees the repository, not the excerpt section.
+    ///
+    /// The superset stops where the **walk** stopped. A `.git` path, a secret-denylisted path, a
+    /// lockfile, a binary and a file over `max_file_bytes` are all refused by the reader or by
+    /// `skip_by_path` before the listing exists, so none of them is enumerated. The size cap
+    /// prunes **in the walk**: `FsRepoReader::skip` answers `SkipRule::TooLarge` from the open
+    /// descriptor's own `len`, so an over-cap file never reaches `select` at all and is absent
+    /// here rather than merely absent from `files`. MOD-9's plan reads the other way — "a file too
+    /// large to excerpt does [appear]" — and the tree settles it: the reader refuses the file
+    /// before it is listed. The plan sentence is superseded, and the code is right.
     ///
     /// Empty wherever no pass ran — `no_excerpts`, `unscanned`, and every fixture — which is
     /// exactly the `None` `select` is given (D97).
@@ -2367,8 +2385,8 @@ mod tests {
     }
 
     /// MOD-9 D72: `listed` is the walk's own enumeration, captured from the listing local after
-    /// `skip_by_path` and `is_repo_relative` and before `fill_lexical_heads` takes it by `&mut`
-    /// (H-17) — not a second walk, and not the selected excerpts.
+    /// `skip_by_path` and `is_repo_relative` and before any tier runs — not a second walk, and
+    /// not the selected excerpts.
     #[test]
     fn the_listed_set_is_the_walk_after_the_skip_rules() {
         let mut owned = request("a body naming nothing\n", &[], &[]);
