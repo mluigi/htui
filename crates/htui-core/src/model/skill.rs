@@ -992,6 +992,10 @@ mod tests {
                 .all(|c| c.reason == ChoiceReason::NotPlaced && !c.active),
             "every candidate is not_placed: {choices:?}"
         );
+        assert_eq!(
+            choices[2].matched, None,
+            "D74: the file set names this candidate, and `not_placed` still records no path"
+        );
     }
 
     /// D74: a `glob` winner whose skill the file set named is active and carries the
@@ -1079,16 +1083,26 @@ mod tests {
     /// D74: `matched` is the only reason that puts a path in the record, and it puts it in every
     /// other key's `null`. The whole `Option<String>` is one column wide, so a reader that reads
     /// it does not have to know which reason it is looking at first.
+    ///
+    /// All seven reasons are driven, and the two that are decided before `activation` is read at
+    /// all — `not_placed` and `missing_version` — are driven with a file set that *names* this
+    /// candidate. That is the whole point of the two rows: a record claiming a glob fired while its
+    /// reason says the template never placed `{{skills}}` is a shape no reader can audit, and
+    /// nothing else in the suite caught it.
     #[test]
     fn a_matched_choice_carries_the_path_into_the_record() {
         let skill = SkillId::new();
-        let choice = |activation: Activation, matches: Option<&BTreeMap<SkillId, String>>| {
+        let choice = |activation: Activation,
+                      version: Option<i32>,
+                      placed: bool,
+                      matches: Option<&BTreeMap<SkillId, String>>| {
             let candidate = BoundSkill {
                 activation,
+                version,
                 globs: vec!["**/*.rs".to_owned()],
                 ..bound(skill, "house", 1, 0, SkillLevel::Project)
             };
-            let (active, mut choices) = select(vec![candidate], true, matches);
+            let (active, mut choices) = select(vec![candidate], placed, matches);
             assert_eq!(
                 active.is_empty(),
                 !choices[0].active,
@@ -1098,23 +1112,63 @@ mod tests {
         };
         let matched: BTreeMap<SkillId, String> =
             [(skill, "htui:x.rs".to_owned())].into_iter().collect();
+        let recorded = |choice: &SkillChoice| {
+            serde_json::to_value(choice).expect("a choice serialises")["matched"].clone()
+        };
 
         assert_eq!(
-            serde_json::to_value(choice(Activation::Glob, Some(&matched)))
-                .expect("a choice serialises")["matched"],
+            recorded(&choice(Activation::Glob, Some(1), true, Some(&matched))),
             serde_json::json!("htui:x.rs"),
             "D74: a matched choice records the `<repo>:<path>` that fired"
         );
-        for (activation, matches) in [
-            (Activation::Always, None),
-            (Activation::Off, None),
-            (Activation::Glob, None),
-            (Activation::Glob, Some(&BTreeMap::new())),
+        for (reason, activation, version, placed, matches) in [
+            (
+                ChoiceReason::Always,
+                Activation::Always,
+                Some(1),
+                true,
+                Some(&matched),
+            ),
+            (
+                ChoiceReason::Off,
+                Activation::Off,
+                Some(1),
+                true,
+                Some(&matched),
+            ),
+            (ChoiceReason::NoPath, Activation::Glob, Some(1), true, None),
+            (
+                ChoiceReason::NoMatch,
+                Activation::Glob,
+                Some(1),
+                true,
+                Some(&BTreeMap::new()),
+            ),
+            (
+                ChoiceReason::MissingVersion,
+                Activation::Glob,
+                None,
+                true,
+                Some(&matched),
+            ),
+            (
+                ChoiceReason::NotPlaced,
+                Activation::Glob,
+                Some(1),
+                false,
+                Some(&matched),
+            ),
         ] {
+            let choice = choice(activation, version, placed, matches);
             assert_eq!(
-                serde_json::to_value(choice(activation, matches)).expect("a choice serialises")["matched"],
+                choice.reason, reason,
+                "the row drives the reason it claims, or the null below proves nothing"
+            );
+            assert_eq!(
+                recorded(&choice),
                 serde_json::Value::Null,
-                "every other reason records `matched: null`"
+                "D74: `{}` records `matched: null`, whatever the file set named",
+                reason.as_str()
             );
         }
     }
