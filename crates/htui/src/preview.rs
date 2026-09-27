@@ -84,13 +84,13 @@ const SUMMARY_NOTE: &str = "preview: the `summary` kind is excluded from documen
                             it as upstream context instead";
 /// MOD-9 D45/D73: which phase's attachments the preview shows, and what its file set is.
 ///
-/// **This is not the blueprint's §3.7 text, and the difference is `skill_matches`.** That text
-/// says a glob attachment "is matched against this box's excerpt walk, as it is in a run", which
-/// would be false here: this unit gives the engine a real file set (D89) and nothing fills
-/// `spec.skill_matches` yet, so `select` still records `no_path` in the preview and in a run
-/// alike. The unit that fills that field re-words this sentence again; what is true today, and
-/// what the sentence therefore says, is the part that does not depend on it — the walk runs, and
-/// with no previous attempt its listing is the whole set.
+/// The sentence names the walk, not the recorded reason, and that is deliberate. The blueprint's
+/// §3.7 text says a glob attachment "is matched against this box's excerpt walk, as it is in a
+/// run", which is not yet true of the *record*: `spec.skill_files` is filled (D89) and
+/// `spec.skill_matches` — the map `select` reads — is not, so a `glob` candidate still records
+/// `no_path` here and in a run alike. When that field is filled this sentence is re-worded to say
+/// `matched`; until then it says the half that does not depend on it, which is that the walk runs
+/// and, with no previous attempt, its listing is the whole set.
 const SKILLS_NOTE: &str = "preview: phase-level skills come from the first phase of the item's \
                            graph that uses this template; a glob attachment is matched against \
                            this box's excerpt walk, and with no previous attempt that walk's \
