@@ -1386,7 +1386,11 @@ fn the_listed_set_is_what_the_walk_offered_and_not_what_it_refused() {
     let dir = tempfile::tempdir().expect("a throwaway root");
     write(dir.path(), "src/keep.rs", b"fn keep() {}\n");
     write(dir.path(), ".git/config", b"[core]\n");
-    write(dir.path(), "secret.pem", b"-----BEGIN RSA PRIVATE KEY-----\n");
+    write(
+        dir.path(),
+        "secret.pem",
+        b"-----BEGIN RSA PRIVATE KEY-----\n",
+    );
     write(dir.path(), "Cargo.lock", b"[[package]]\n");
     write(dir.path(), "src/image.dat", b"PNG\x00\x01\x02binary\n");
     write(dir.path(), "src/big.rs", &vec![b'x'; 4_096]);

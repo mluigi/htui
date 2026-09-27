@@ -12403,12 +12403,15 @@ mod tests {
              walk's byte order"
         );
         assert_eq!(
-            spec.skill_files,
-            spec.excerpts.listed,
+            spec.skill_files, spec.excerpts.listed,
             "and it is the listing by value, not a copy of it that can drift"
         );
         assert_eq!(
-            spec.excerpts.files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            spec.excerpts
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
             vec!["src/lib.rs"],
             "the prompt paid for the touched file only. The two sets therefore differ — \
              `docs/legacy.md` is in the listing and in no excerpt — so a fill taken from `files` \
@@ -12439,7 +12442,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("a throwaway root");
         let (repo, row, snapshot, prd) =
             excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
-        write_tree(dir.path(), repo, "docs/notes.md", "Not on the touched list.\n");
+        write_tree(
+            dir.path(),
+            repo,
+            "docs/notes.md",
+            "Not on the touched list.\n",
+        );
         harness_engine!(harness.orch, engine);
 
         // (0) The literal itself, which is the only thing a direct read of it can say.
@@ -12487,7 +12495,10 @@ mod tests {
             handoff.skill_files.is_empty() && handoff.skill_matches.is_none(),
             "and the handoff that `..phase` derives still resolves none"
         );
-        assert_eq!(handoff.excerpts, set, "its excerpt set is the empty one too");
+        assert_eq!(
+            handoff.excerpts, set,
+            "its excerpt set is the empty one too"
+        );
 
         // (3) The same builder, once the walk has run, resolves the walk's listing. The contrast is
         // the point: an empty file set on (1) means "no pass ran", not "the pass found nothing".
