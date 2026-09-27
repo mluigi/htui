@@ -311,6 +311,10 @@ fn choices_follow_the_collapse_order_and_carry_masked_names() {
     assert!(!serialised.contains("s3cr3t"), "{serialised}");
 }
 
+/// The digest is over the rendered bytes, so it moves with the active set and with nothing else.
+/// MOD-9 D74's glob half is the sharp case: a `glob` skill is a rendered section, so toggling the
+/// globs of one that matched moves the digest and toggling the globs of one that never matched
+/// does not — the second half being what keeps a matched path out of the bytes.
 #[test]
 fn the_digest_moves_only_when_the_active_set_moves() {
     let mut off = base();
@@ -328,10 +332,21 @@ fn the_digest_moves_only_when_the_active_set_moves() {
     let mut always = off.clone();
     always.skills[1].activation = Activation::Always;
 
+    // The two walks the glob half needs. The first names the `.rs` file `**/*.rs` matches; the
+    // second names a file none of the three patterns below matches, so the skill behind the second
+    // half never matched under any of them. One walk would have made the halves one scenario.
+    let matching_walk = || glob_spec(&[("htui", "crates/htui-core/src/lib.rs")]);
+    let unmatching_walk = || glob_spec(&[("htui", "Cargo.toml")]);
+
     let off = ok(&off);
     let off_edited = ok(&off_edited);
     let glob = ok(&glob);
     let always = ok(&always);
+    let fired = ok(&matching_walk());
+    let stops_matching = ok(&with_globs(matching_walk(), "**/*.md"));
+    let never = with_globs(unmatching_walk(), "**/*.md");
+    let never_matched = ok(&never);
+    let still_misses = ok(&with_globs(never, "**/*.txt"));
 
     assert_eq!(
         off.digest, off_edited.digest,
@@ -343,7 +358,7 @@ fn the_digest_moves_only_when_the_active_set_moves() {
     );
     assert_eq!(
         off.digest, glob.digest,
-        "`off` and a `glob` the file set did not name both render nothing, so the bytes agree"
+        "`off` and a `glob` with no file set resolved both render nothing, so the bytes agree"
     );
     assert_ne!(
         glob.trim.skill_choices, off.trim.skill_choices,
@@ -353,32 +368,11 @@ fn the_digest_moves_only_when_the_active_set_moves() {
         off.digest, always.digest,
         "switching a skill on changes what renders, so the digest moves"
     );
-}
-
-/// MOD-9 D74, the glob half of the digest rule: a `glob` skill is a rendered section, so whether
-/// it fires is a change to the active set and therefore to the digest. Toggling a skill's globs
-/// so it stops matching moves it; toggling one that never matched does not — the second half is
-/// what keeps a matched path out of the bytes.
-#[test]
-fn a_glob_skill_digest_moves_when_it_stops_matching_and_not_when_it_never_matched() {
-    let fired = ok(&glob_spec(&[("htui", "crates/htui-core/src/lib.rs")]));
-    let stops_matching = ok(&with_globs(
-        glob_spec(&[("htui", "crates/htui-core/src/lib.rs")]),
-        "**/*.md",
-    ));
-    // The same walk, and two globs that both miss it: the second half of the rule, which is what
-    // keeps a `glob` attachment from churning a digest no reader can audit.
-    let never = with_globs(
-        glob_spec(&[("htui", "crates/htui-core/src/lib.rs")]),
-        "**/*.md",
-    );
-    let never_matched = ok(&never);
-    let still_misses = ok(&with_globs(never, "**/*.txt"));
 
     assert_eq!(
         fired.trim.skill_choices[1].reason,
         ChoiceReason::Matched,
-        "the file set named the glob, so it renders"
+        "the walk named the glob, so it renders"
     );
     assert_ne!(
         fired.digest, stops_matching.digest,
