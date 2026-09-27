@@ -144,8 +144,8 @@ pub use run::{
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{
-    Activation, BoundSkill, ChoiceReason, Skill, SkillBinding, SkillChoice, SkillLevel,
-    SkillVersion,
+    Activation, BoundSkill, ChoiceReason, NewSkill, NewSkillBinding, NewSkillVersion, Skill,
+    SkillBinding, SkillChoice, SkillLevel, SkillVersion,
 };
 pub use usage::UsageTotals;
 pub use user::{AppUser, CapabilityTag};

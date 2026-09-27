@@ -1,9 +1,12 @@
 //! Skills, their versions and their bindings (`docs/ANA-9.md` §5.6), plus the `R-SKL-2`
 //! resolution the prompt's skills section renders (`docs/ANA-5.md` §4.2).
 //!
-//! Read-only still: the writers are MOD-9 milestone 3's. Since MOD-9 milestone 2 (ANA-22 §6-§7) a
-//! skill attaches globally, to a project or to one phase; [`resolve`] picks the most specific
-//! attachment per skill, and [`select`] decides, per step, which winners render and records why.
+//! Since MOD-9 milestone 2 (ANA-22 §6-§7) a skill attaches globally, to a project or to one
+//! phase; [`resolve`] picks the most specific attachment per skill, and [`select`] decides, per
+//! step, which winners render and records why. MOD-9 milestone 3 adds the write side's arguments —
+//! [`NewSkill`], [`NewSkillVersion`], [`NewSkillBinding`] — and the name rule
+//! [`Skill::name_is_valid`] the writers check, which is why they live beside the rows they
+//! construct rather than in `model/kind.rs`.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -69,6 +72,28 @@ pub struct Skill {
     pub created_at: DateTime<Utc>,
     /// `skill.updated_at`.
     pub updated_at: DateTime<Utc>,
+}
+
+impl Skill {
+    /// Whether `name` may name a skill (plan D77, OQ-20): the Agent Skills rule ANA-22 §6 item 12
+    /// adopts — one to 64 characters of `[a-z0-9-]`, with no leading, trailing or doubled hyphen.
+    ///
+    /// Here, and not in either store, for `ItemKind::prefix_is_valid`'s reason: both stores refuse
+    /// the same strings with the same sentence, so this is what says they agree with the rule
+    /// rather than a check constraint they would refuse in two different ways. The rule is narrow
+    /// on purpose — a skill name is a library key that ends up in a `<skill name="…">` attribute
+    /// and in a directory-shaped file path, so it carries no case, no space and no punctuation.
+    #[must_use]
+    pub fn name_is_valid(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !name.starts_with('-')
+            && !name.ends_with('-')
+            && !name.contains("--")
+    }
 }
 
 /// A row of `skill_version` (§5.6): one immutable body of a skill. The primary key is
@@ -341,6 +366,67 @@ pub fn select(candidates: Vec<BoundSkill>, placed: bool) -> (Vec<BoundSkill>, Ve
         }
     }
     (active, choices)
+}
+
+/// Arguments of a skill save (plan D90, D91, OQ-18): everything but the two instants, which the
+/// store's clock assigns. The id is minted client-side, like [`NewItemKind`](crate::model::NewItemKind)
+/// and `NewPromptTemplate`, so the caller can name a row it has not read yet.
+///
+/// `name` is the library key and never moves: a save edits `description` and leaves the name alone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewSkill {
+    /// `skill.id`, a UUIDv7.
+    pub id: SkillId,
+    /// `skill.name`; the Agent Skills rule is checked by the writer (D77, OQ-20).
+    pub name: String,
+    /// `skill.description`; not rendered into a prompt, it is the picker's one-liner.
+    pub description: String,
+    /// `skill.created_by`; the worker fills it from `this_user` (`R-NF-3`).
+    pub created_by: UserId,
+}
+
+/// Arguments of a version append (plan D90, D91). `skill_version` is append-only and carries no
+/// `updated_at` (`0001_init.sql`), so the store assigns the version number — the head's plus one,
+/// or 1 — and the instant, and the caller supplies only the content.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewSkillVersion {
+    /// `skill_version.skill_id`.
+    pub skill_id: SkillId,
+    /// `skill_version.body`: the markdown inlined into the prompt's skills section verbatim.
+    pub body: String,
+    /// `skill_version.source`: import provenance. `{}` for a body typed in the TUI.
+    pub source: serde_json::Value,
+    /// `skill_version.created_by`.
+    pub created_by: UserId,
+}
+
+/// Arguments of an attachment (plan D90, D91). The key is `(skill_id, project_id, phase_id)` under
+/// `UNIQUE NULLS NOT DISTINCT`, so a global attachment is `(skill, None, None)` and the upsert
+/// replaces its own row rather than adding a second one.
+///
+/// The id is minted client-side for the same reason [`NewSkill`]'s is: `ON CONFLICT … DO UPDATE`
+/// needs a row id for the insert case and keeps it for the update case.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewSkillBinding {
+    /// `skill_binding.id`.
+    pub id: SkillBindingId,
+    /// `skill_binding.skill_id`.
+    pub skill_id: SkillId,
+    /// `skill_binding.project_id`; `None` is the global level (ANA-22 §6 item 2).
+    pub project_id: Option<ProjectId>,
+    /// `skill_binding.phase_id`; `Some` requires a project.
+    pub phase_id: Option<PhaseId>,
+    /// `skill_binding.pinned_version`; `None` follows the latest version.
+    pub pinned_version: Option<i32>,
+    /// `skill_binding.position`: ascending render order, `skill.name` bytes breaking the tie.
+    pub position: i32,
+    /// `skill_binding.activation`.
+    pub activation: Activation,
+    /// `skill_binding.globs`: typed globs unioned with every named language's expansion (D83), and
+    /// what [`crate::prompt::glob`] matches. A store refuses a glob that does not compile (D78).
+    pub globs: Vec<String>,
+    /// `skill_binding.languages`, as authored; display only.
+    pub languages: Vec<String>,
 }
 
 #[cfg(test)]
@@ -821,7 +907,14 @@ mod tests {
     #[test]
     fn a_skill_name_follows_the_agent_skills_rule() {
         let sixty_four = "a".repeat(64);
-        for good in ["a", "0", "rust-style", "a1-b2", "house-rules", sixty_four.as_str()] {
+        for good in [
+            "a",
+            "0",
+            "rust-style",
+            "a1-b2",
+            "house-rules",
+            sixty_four.as_str(),
+        ] {
             assert!(Skill::name_is_valid(good), "`{good}` names a skill");
         }
         let sixty_five = "a".repeat(65);
