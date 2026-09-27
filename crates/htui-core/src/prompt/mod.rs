@@ -24,11 +24,14 @@
 //! [`excerpt_residual`] (D118), [`drop_unmaskable_excerpts`] (D129) and
 //! [`withhold_unmaskable_notes`] (P-2), which `htui_agent::excerpt::excerpts_for` uses. It is the one pass both the engine's phase prompt and
 //! the Backlog preview run, and a caller with no readable root gets the empty audit from it.
+//! MOD-9 milestone 3 adds [`glob`], the hand-written path matcher behind `activation = glob`
+//! (plan D70, D71).
 
 pub mod defaults;
 pub mod digest;
 pub mod estimate;
 pub mod excerpt;
+pub mod glob;
 pub mod render;
 pub mod settings;
 pub mod template;
