@@ -14,18 +14,19 @@ use uuid::Uuid;
 
 use crate::fixtures::ids;
 use crate::model::{
-    Agent, AgentBox, AgentId, Billing, BoxEdit, BoxId, BoxProbe, BoxRow, ChatRunSpec, CitationKind,
-    Claim, CommandQueue, CommandRun, CommandRunId, CommandRunStatus, CoverageRow,
+    Activation, Agent, AgentBox, AgentId, Billing, BoxEdit, BoxId, BoxProbe, BoxRow, ChatRunSpec,
+    CitationKind, Claim, CommandQueue, CommandRun, CommandRunId, CommandRunStatus, CoverageRow,
     DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EventKind, EventRole, Gate, GateOutcome,
     GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKindId, ItemKindPatch,
     ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
     NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-    NewStepGraph, NewWorkspace, NoteId, OverlapRule, PhaseId, PhasePatch, Priority, ProbedTool,
-    ProjectId, ProjectPatch, PromptScope, PromptTemplate, PromptTemplateId, RepoBoxPath, RepoId,
-    RepoPatch, RepoScope, Requirement, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementState, RequirementUpdate, Resolution, Run,
-    RunId, RunKind, RunMode, RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope,
-    SessionEvent, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch,
+    NewSkill, NewSkillBinding, NewSkillVersion, NewStepGraph, NewWorkspace, NoteId, OverlapRule,
+    PhaseId, PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate,
+    PromptTemplateId, RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement, RequirementAreaId,
+    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementState,
+    RequirementUpdate, Resolution, Run, RunId, RunKind, RunMode, RunScope, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, Scope, SessionEvent, SkillBinding, SkillBindingId, SkillId,
+    SkillLevel, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch,
     StepGraphPhase, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry,
     UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
     canonical_declared_tags, missing_tags_failure,
@@ -115,6 +116,10 @@ pub const CASES: &[&str] = &[
     "prompt_template_append_is_a_cas_on_the_head",
     "prompt_template_new_name_starts_at_one",
     "prompt_template_refuses_what_parse_refuses",
+    "skill_upsert_creates_then_edits_under_the_updated_at_token",
+    "skill_version_append_is_a_cas_on_the_head",
+    "skill_binding_upsert_replaces_its_own_row_and_a_spent_token_is_stale",
+    "skill_binding_refuses_what_its_checks_refuse",
     "claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks",
     "claim_run_checks_tags_after_claimability_and_before_the_slot",
     "infer_repo_box_path_inserts_only_where_absent",
@@ -254,6 +259,18 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "prompt_template_refuses_what_parse_refuses" => {
             prompt_template_refuses_what_parse_refuses(store).await;
+        }
+        "skill_upsert_creates_then_edits_under_the_updated_at_token" => {
+            skill_upsert_creates_then_edits_under_the_updated_at_token(store).await;
+        }
+        "skill_version_append_is_a_cas_on_the_head" => {
+            skill_version_append_is_a_cas_on_the_head(store).await;
+        }
+        "skill_binding_upsert_replaces_its_own_row_and_a_spent_token_is_stale" => {
+            skill_binding_upsert_replaces_its_own_row_and_a_spent_token_is_stale(store).await;
+        }
+        "skill_binding_refuses_what_its_checks_refuse" => {
+            skill_binding_refuses_what_its_checks_refuse(store).await;
         }
         "claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks" => {
             claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks(store).await;
@@ -5724,6 +5741,106 @@ fn new_template(project: ProjectId, name: &str, body: &str) -> NewPromptTemplate
     }
 }
 
+/// A skill to save, with the id the case chooses, authored by the fixture user (plan D77).
+///
+/// The name must be one no fixture row holds: `skill.name` is `UNIQUE` across the table, so a
+/// case that moved `tests` or `rust-style` would move the row the preview-style reads and
+/// `pg_criteria` depend on (blueprint H-2). The cases below all use `house`, which nothing seeds.
+fn new_skill(id: SkillId, name: &str, description: &str) -> NewSkill {
+    NewSkill {
+        id,
+        name: name.to_owned(),
+        description: description.to_owned(),
+        created_by: ids::USER,
+    }
+}
+
+/// One version to append, with a fresh body and no import provenance.
+fn new_version(skill: SkillId, body: &str) -> NewSkillVersion {
+    NewSkillVersion {
+        skill_id: skill,
+        body: body.to_owned(),
+        source: json!({}),
+        created_by: ids::USER,
+    }
+}
+
+/// One attachment to write, at a level, with a fresh id.
+fn new_binding(
+    id: SkillBindingId,
+    skill: SkillId,
+    project: Option<ProjectId>,
+    phase: Option<PhaseId>,
+) -> NewSkillBinding {
+    NewSkillBinding {
+        id,
+        skill_id: skill,
+        project_id: project,
+        phase_id: phase,
+        pinned_version: None,
+        position: 0,
+        activation: Activation::Always,
+        globs: Vec::new(),
+        languages: Vec::new(),
+    }
+}
+
+/// `new_binding` with a position, so a replace is observable without a second field.
+fn new_binding_at(
+    id: SkillBindingId,
+    skill: SkillId,
+    project: Option<ProjectId>,
+    phase: Option<PhaseId>,
+    position: i32,
+) -> NewSkillBinding {
+    NewSkillBinding {
+        position,
+        ..new_binding(id, skill, project, phase)
+    }
+}
+
+/// A `Constraint` whose message names the column, whichever store said it.
+///
+/// `MemStore` speaks [`references_no_row`]'s prose and `PgStore` names the foreign key
+/// (`H-9`), so a case about *which* column was refused accepts either; a case about a rule both
+/// stores refuse in Rust passes the one sentence they share.
+fn constraint_naming(
+    case: &str,
+    outcome: Result<CasOutcome<SkillBinding>, StoreError>,
+    needles: &[&str],
+    what: &str,
+) -> String {
+    match outcome {
+        Err(StoreError::Constraint(message)) => {
+            assert!(
+                needles.iter().any(|needle| message.contains(needle)),
+                "{case}: {what}: the refusal names one of {needles:?}, got {message:?}"
+            );
+            message
+        }
+        other => panic!("{case}: {what} is Constraint, got {other:?}"),
+    }
+}
+
+/// The same, for the two writers that answer with a [`Skill`] or a [`SkillVersion`].
+fn constraint_naming_row<T: core::fmt::Debug>(
+    case: &str,
+    outcome: Result<CasOutcome<T>, StoreError>,
+    needles: &[&str],
+    what: &str,
+) -> String {
+    match outcome {
+        Err(StoreError::Constraint(message)) => {
+            assert!(
+                needles.iter().any(|needle| message.contains(needle)),
+                "{case}: {what}: the refusal names one of {needles:?}, got {message:?}"
+            );
+            message
+        }
+        other => panic!("{case}: {what} is Constraint, got {other:?}"),
+    }
+}
+
 /// MOD-9 plan D1, D3, blueprint D16: the head version is the token. A save at the head appends
 /// `head + 1` with the caller's body and author; a second save from the same token finds the new
 /// head; a token on a name with no row is `NotFound`, `Some(0)` included (F-B's regression: the
@@ -5975,6 +6092,709 @@ async fn prompt_template_refuses_what_parse_refuses<S: WriteStore>(store: &S) {
             .expect(CASE),
     );
     assert_eq!(head.version, 2, "{CASE}: the unknown author wrote nothing");
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-9 milestone 3: the four skill writers (plan D76-D80, blueprint D92, D104, D105)
+// ------------------------------------------------------------------------------------------------
+//
+// The order every case below reads is D18's and D78's, and it is the invariant of the task: the
+// token first (so a spent token is `Stale` before bad input is judged), then the input the writer
+// refuses in Rust, then the keys it can only check against rows. Both stores answer in that order,
+// and the tail of each case proves it: a good write at the same token lands, so nothing the case
+// refused ever wrote.
+
+/// A token for a row the fixture does not have: the shape every `NotFound` here is checked under.
+fn token() -> DateTime<Utc> {
+    DateTime::from_timestamp(1_788_393_600, 0).expect("a valid timestamp")
+}
+
+/// MOD-9 plan D76, D78: `skill.name` is the key and `skill.updated_at` the token. A save under
+/// `None` creates, a save under the row's `updated_at` moves the description and the token, and a
+/// third save under the first token is `Stale` carrying the second row — the name never moves and
+/// a second editor cannot spend the first one's edit.
+async fn skill_upsert_creates_then_edits_under_the_updated_at_token<S: WriteStore>(store: &S) {
+    const CASE: &str = "skill_upsert_creates_then_edits_under_the_updated_at_token";
+    const FIRST: &str = "House rules.";
+    const SECOND: &str = "House rules, revised.";
+
+    let id = SkillId::new();
+    let created = applied(
+        CASE,
+        store
+            .upsert_skill(new_skill(id, "house", FIRST), None)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (created.id, created.name.as_str(), created.description.as_str()),
+        (id, "house", FIRST),
+        "{CASE}: a save under None creates the row the caller named"
+    );
+    assert_eq!(created.created_by, ids::USER, "{CASE}: authored by the caller");
+    assert_eq!(
+        created.updated_at, created.created_at,
+        "{CASE}: the `updated_at` trigger is BEFORE UPDATE only, so an insert's two instants are \
+         the one statement's now()"
+    );
+
+    let edited = applied(
+        CASE,
+        store
+            .upsert_skill(
+                new_skill(SkillId::new(), "house", SECOND),
+                Some(created.updated_at),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (edited.id, edited.name.as_str(), edited.description.as_str()),
+        (id, "house", SECOND),
+        "{CASE}: an edit keeps the row's id and its name, and moves the description"
+    );
+    assert!(
+        edited.updated_at > created.updated_at,
+        "{CASE}: an edit moves the token ({} -> {})",
+        created.updated_at,
+        edited.updated_at
+    );
+
+    let spent = stale(
+        CASE,
+        store
+            .upsert_skill(
+                new_skill(SkillId::new(), "house", "written over"),
+                Some(created.updated_at),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (spent.id, spent.description.as_str()),
+        (id, SECOND),
+        "{CASE}: a spent token finds the second editor's row, not its own"
+    );
+
+    let missing = store
+        .upsert_skill(new_skill(SkillId::new(), "no-such", ""), Some(token()))
+        .await;
+    match missing {
+        Err(StoreError::NotFound { entity, id }) => {
+            assert_eq!(entity, "skill", "{CASE}: the entity is `skill`");
+            assert_eq!(id, "no-such", "{CASE}: and a skill is named by its name");
+        }
+        other => panic!("{CASE}: a token on a name with no row is NotFound, got {other:?}"),
+    }
+
+    // The Agent Skills rule is the writer's, not a constraint (plan D77, OQ-20).
+    constraint_naming_row(
+        CASE,
+        store
+            .upsert_skill(new_skill(SkillId::new(), "House", ""), None)
+            .await,
+        &["skill.name"],
+        "a name with a capital and a space",
+    );
+    constraint_naming_row(
+        CASE,
+        store.upsert_skill(new_skill(SkillId::new(), "-lead", ""), None).await,
+        &["skill.name"],
+        "a name with a leading hyphen",
+    );
+    // Postgres `text` cannot hold U+0000 (`22021`), so both stores refuse it by rule.
+    constraint_naming_row(
+        CASE,
+        store
+            .upsert_skill(new_skill(SkillId::new(), "ok\0", ""), None)
+            .await,
+        &["skill.name"],
+        "a name with a NUL",
+    );
+    constraint_naming_row(
+        CASE,
+        store
+            .upsert_skill(new_skill(SkillId::new(), "other", "a\0b"), None)
+            .await,
+        &["skill.description"],
+        "a description with a NUL",
+    );
+    // The fixture's own `tests` id under a name nothing holds: the id is taken, so the row cannot
+    // be created. `MemStore` says it in prose and `PgStore` names the primary key (H-9), so the
+    // assertion is the `Constraint` itself.
+    let taken = store
+        .upsert_skill(new_skill(ids::SKILL_TESTS, "other", ""), None)
+        .await;
+    assert!(
+        matches!(taken, Err(StoreError::Constraint(_))),
+        "{CASE}: an id that is taken is Constraint, got {taken:?}"
+    );
+
+    let tail = applied(
+        CASE,
+        store
+            .upsert_skill(
+                new_skill(SkillId::new(), "house", "House rules, again."),
+                Some(edited.updated_at),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (tail.id, tail.description.as_str()),
+        (id, "House rules, again."),
+        "{CASE}: a good save at the current token lands, so none of the refusals wrote"
+    );
+}
+
+/// MOD-9 plan D76: the head version is the token, the shape of
+/// `prompt_template_append_is_a_cas_on_the_head` with `(skill_id, version)` in place of
+/// `(project_id, name, version)`. A skill with no version yet starts at 1 under `None`, and
+/// `Some(0)` on one is `NotFound` — F-B's regression, the first SQL shape inserted v1 there.
+async fn skill_version_append_is_a_cas_on_the_head<S: WriteStore>(store: &S) {
+    const CASE: &str = "skill_version_append_is_a_cas_on_the_head";
+    const A: &str = "One error enum per crate.";
+    const B: &str = "One error enum per crate, one test per rule.";
+    const C: &str = "One error enum per crate, one test per rule, one name per case.";
+    const D: &str = "One error enum per crate, one test per rule, one name per case, in order.";
+
+    let skill = SkillId::new();
+    applied(
+        CASE,
+        store
+            .upsert_skill(new_skill(skill, "house", "House rules."), None)
+            .await
+            .expect(CASE),
+    );
+
+    let v1 = applied(
+        CASE,
+        store.add_skill_version(new_version(skill, A), None).await.expect(CASE),
+    );
+    assert_eq!(
+        (v1.skill_id, v1.version, v1.body.as_str()),
+        (skill, 1, A),
+        "{CASE}: a skill with no version starts at v1 under None"
+    );
+    assert_eq!(v1.created_by, ids::USER, "{CASE}: authored by the caller");
+
+    let v2 = applied(
+        CASE,
+        store
+            .add_skill_version(new_version(skill, B), Some(1))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (v2.version, v2.body.as_str()),
+        (2, B),
+        "{CASE}: a save at head v1 appends v2 with the caller's body"
+    );
+
+    let head = stale(
+        CASE,
+        store
+            .add_skill_version(new_version(skill, C), Some(1))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (head.version, head.body.as_str()),
+        (2, B),
+        "{CASE}: a spent token finds v2 with the first body"
+    );
+
+    let v3 = applied(
+        CASE,
+        store
+            .add_skill_version(new_version(skill, C), Some(2))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (v3.version, v3.body.as_str()),
+        (3, C),
+        "{CASE}: a save at head v2 appends v3"
+    );
+
+    constraint_naming_row(
+        CASE,
+        store
+            .add_skill_version(new_version(skill, "a\0b"), Some(3))
+            .await,
+        &["skill_version.body"],
+        "a body with a NUL",
+    );
+
+    // At the current head, so only the author can refuse it: `app_user`'s FK on Postgres,
+    // `require_user` on `MemStore`.
+    let mut stranger = new_version(skill, D);
+    stranger.created_by = UserId::new();
+    let unknown = store.add_skill_version(stranger, Some(3)).await;
+    assert!(
+        matches!(unknown, Err(StoreError::Constraint(_))),
+        "{CASE}: a created_by that names no app_user is Constraint, got {unknown:?}"
+    );
+
+    let v4 = applied(
+        CASE,
+        store
+            .add_skill_version(new_version(skill, D), Some(3))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (v4.version, v4.body.as_str()),
+        (4, D),
+        "{CASE}: the refusals wrote nothing, so the head was still v3 and a good save lands at v4"
+    );
+
+    let empty = SkillId::new();
+    applied(
+        CASE,
+        store
+            .upsert_skill(new_skill(empty, "empty", ""), None)
+            .await
+            .expect(CASE),
+    );
+    for token in [0, 7] {
+        let missing = store
+            .add_skill_version(new_version(empty, A), Some(token))
+            .await;
+        match missing {
+            Err(StoreError::NotFound { entity, id }) => {
+                assert_eq!(entity, "skill_version", "{CASE}: the entity names the table");
+                assert_eq!(
+                    id,
+                    format!("{empty}/v{token}"),
+                    "{CASE}: and the pair is the id, so a version and not a row is what is missing"
+                );
+            }
+            other => panic!(
+                "{CASE}: Some({token}) on a skill with no version is NotFound, got {other:?}"
+            ),
+        }
+    }
+    let first = applied(
+        CASE,
+        store
+            .add_skill_version(new_version(empty, A), None)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        first.version, 1,
+        "{CASE}: the refusals above left the skill with no version, so None starts at 1"
+    );
+}
+
+/// MOD-9 plan D76, D78: `UNIQUE NULLS NOT DISTINCT (skill_id, project_id, phase_id)` is the whole
+/// test — the same `(skill, None, None)` twice is **one** row carrying the **first** id, and the
+/// global, project and phase keys of one skill are three rows that coexist.
+async fn skill_binding_upsert_replaces_its_own_row_and_a_spent_token_is_stale<S: WriteStore>(
+    store: &S,
+) {
+    const CASE: &str = "skill_binding_upsert_replaces_its_own_row_and_a_spent_token_is_stale";
+
+    let skill = SkillId::new();
+    applied(
+        CASE,
+        store
+            .upsert_skill(new_skill(skill, "house", "House rules."), None)
+            .await
+            .expect(CASE),
+    );
+
+    let global_id = SkillBindingId::new();
+    let global = applied(
+        CASE,
+        store
+            .set_skill_binding(new_binding(global_id, skill, None, None), None)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (global.id, global.level()),
+        (global_id, SkillLevel::Global),
+        "{CASE}: (None, None) is the global level and the row carries the caller's id"
+    );
+    assert_eq!(global.activation, Activation::Always, "{CASE}: and its activation");
+
+    let replaced = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                new_binding_at(SkillBindingId::new(), skill, None, None, 4),
+                Some(global.updated_at),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (replaced.id, replaced.position),
+        (global_id, 4),
+        "{CASE}: one attachment per skill per level, so the replace keeps the first id and takes \
+         the new position"
+    );
+
+    let spent = stale(
+        CASE,
+        store
+            .set_skill_binding(
+                new_binding_at(SkillBindingId::new(), skill, None, None, 9),
+                Some(global.updated_at),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (spent.id, spent.position),
+        (global_id, 4),
+        "{CASE}: a spent token finds the replaced row, not the one the caller meant to write"
+    );
+
+    let project = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                new_binding(SkillBindingId::new(), skill, Some(ids::PROJECT_HTUI), None),
+                None,
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        project.level(),
+        SkillLevel::Project,
+        "{CASE}: the project's own attachment is a second row of the same skill"
+    );
+    let phase = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                new_binding(
+                    SkillBindingId::new(),
+                    skill,
+                    Some(ids::PROJECT_HTUI),
+                    Some(ids::PHASE_HTUI_IMPLEMENT),
+                ),
+                None,
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        phase.level(),
+        SkillLevel::Phase,
+        "{CASE}: and the phase's is the third, so three attachments of one skill coexist"
+    );
+
+    let removed = applied(
+        CASE,
+        store
+            .remove_skill_binding(project.id, project.updated_at)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (removed.id, removed.level()),
+        (project.id, SkillLevel::Project),
+        "{CASE}: the unbind answers the row it detached"
+    );
+
+    let again = store
+        .remove_skill_binding(project.id, project.updated_at)
+        .await;
+    assert!(
+        matches!(
+            again,
+            Err(StoreError::NotFound {
+                entity: "skill_binding",
+                ..
+            })
+        ),
+        "{CASE}: a second unbind under the same token finds no row, got {again:?}"
+    );
+    let recreated = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                new_binding(SkillBindingId::new(), skill, Some(ids::PROJECT_HTUI), None),
+                None,
+            )
+            .await
+            .expect(CASE),
+    );
+    assert!(
+        recreated.updated_at >= project.updated_at,
+        "{CASE}: the key was free again, so None created rather than replaced"
+    );
+
+    let tail = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                new_binding_at(
+                    SkillBindingId::new(),
+                    skill,
+                    Some(ids::PROJECT_HTUI),
+                    Some(ids::PHASE_HTUI_IMPLEMENT),
+                    7,
+                ),
+                Some(phase.updated_at),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (tail.id, tail.position),
+        (phase.id, 7),
+        "{CASE}: the phase row was still there, so the replace landed and the other two were \
+         untouched"
+    );
+    let global_untouched = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                new_binding(SkillBindingId::new(), skill, None, None),
+                Some(spent.updated_at),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (global_untouched.id, global_untouched.position),
+        (global_id, 4),
+        "{CASE}: and the global row still carries the replace's token, so the unbind took only \
+         the project's own"
+    );
+}
+
+/// MOD-9 plan D78, blueprint D100: the five rules `set_skill_binding` refuses in Rust, in the
+/// order it refuses them, each as a `Constraint` whose message is asserted with `contains`; a
+/// spent token is `Stale` before any of them; and a good save at the same token lands at the end,
+/// which is what proves none of the refusals wrote.
+async fn skill_binding_refuses_what_its_checks_refuse<S: WriteStore>(store: &S) {
+    const CASE: &str = "skill_binding_refuses_what_its_checks_refuse";
+
+    let skill = SkillId::new();
+    applied(
+        CASE,
+        store
+            .upsert_skill(new_skill(skill, "house", "House rules."), None)
+            .await
+            .expect(CASE),
+    );
+    applied(
+        CASE,
+        store
+            .add_skill_version(new_version(skill, "One error enum per crate."), None)
+            .await
+            .expect(CASE),
+    );
+    let row = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                new_binding(SkillBindingId::new(), skill, Some(ids::PROJECT_HTUI), None),
+                None,
+            )
+            .await
+            .expect(CASE),
+    );
+
+    constraint_naming(
+        CASE,
+        store
+            .set_skill_binding(
+                new_binding(
+                    SkillBindingId::new(),
+                    skill,
+                    None,
+                    Some(ids::PHASE_HTUI_IMPLEMENT),
+                ),
+                None,
+            )
+            .await,
+        &["skill_binding.phase_id", "needs a project_id"],
+        "a phase attachment without its project",
+    );
+    constraint_naming(
+        CASE,
+        store
+            .set_skill_binding(
+                NewSkillBinding {
+                    activation: Activation::Glob,
+                    ..new_binding(
+                        SkillBindingId::new(),
+                        skill,
+                        Some(ids::PROJECT_HTUI),
+                        None,
+                    )
+                },
+                None,
+            )
+            .await,
+        &["skill_binding.globs", "skill_binding_glob_needs_globs"],
+        "a glob attachment with no glob",
+    );
+    constraint_naming(
+        CASE,
+        store
+            .set_skill_binding(
+                NewSkillBinding {
+                    activation: Activation::Glob,
+                    globs: vec!["htui:**/*.rs".to_owned()],
+                    ..new_binding(SkillBindingId::new(), skill, None, None)
+                },
+                None,
+            )
+            .await,
+        &["names a repo"],
+        "a repo-qualified glob on a global row",
+    );
+    for (glob, needle, at) in [
+        ("src/**x/*.rs", "**` is only a whole component", "at byte 4"),
+        (
+            "a/{b,{c,d}}/x.rs",
+            "nested `{…}` is not supported",
+            "at byte 8",
+        ),
+        ("x{,.txt}", "an alternative must not be empty", "at byte 2"),
+        ("pre{a,b}fix.rs", "`{…}` is only a whole component", "at byte 3"),
+    ] {
+        constraint_naming(
+            CASE,
+            store
+                .set_skill_binding(
+                    NewSkillBinding {
+                        activation: Activation::Glob,
+                        globs: vec![glob.to_owned()],
+                        ..new_binding(
+                            SkillBindingId::new(),
+                            skill,
+                            Some(ids::PROJECT_HTUI),
+                            None,
+                        )
+                    },
+                    None,
+                )
+                .await,
+            &[needle, at],
+            "a glob the matcher refuses",
+        );
+    }
+    constraint_naming(
+        CASE,
+        store
+            .set_skill_binding(
+                NewSkillBinding {
+                    pinned_version: Some(9),
+                    ..new_binding(
+                        SkillBindingId::new(),
+                        skill,
+                        Some(ids::PROJECT_HTUI),
+                        None,
+                    )
+                },
+                None,
+            )
+            .await,
+        &["skill_binding.pinned_version 9 names no version"],
+        "a pin the skill has no version for",
+    );
+    constraint_naming(
+        CASE,
+        store
+            .set_skill_binding(
+                new_binding(
+                    SkillBindingId::new(),
+                    SkillId::new(),
+                    Some(ids::PROJECT_HTUI),
+                    None,
+                ),
+                None,
+            )
+            .await,
+        &["skill_binding.skill_id", "skill_id_fkey"],
+        "a skill that names no row",
+    );
+    constraint_naming(
+        CASE,
+        store
+            .set_skill_binding(
+                new_binding(SkillBindingId::new(), skill, Some(ProjectId::new()), None),
+                None,
+            )
+            .await,
+        &["skill_binding.project_id", "project_id_fkey"],
+        "a project that names no row",
+    );
+    constraint_naming(
+        CASE,
+        store
+            .set_skill_binding(
+                new_binding(
+                    SkillBindingId::new(),
+                    skill,
+                    Some(ids::PROJECT_HTUI),
+                    Some(PhaseId::new()),
+                ),
+                None,
+            )
+            .await,
+        &["skill_binding.phase_id", "phase_id_fkey"],
+        "a phase that names no row",
+    );
+
+    // The token is read before any of that (D18), so a refused input under a spent token is the
+    // row the token is spent against, not the refusal.
+    let spent = stale(
+        CASE,
+        store
+            .set_skill_binding(
+                NewSkillBinding {
+                    activation: Activation::Glob,
+                    ..new_binding(
+                        SkillBindingId::new(),
+                        skill,
+                        None,
+                        Some(ids::PHASE_HTUI_IMPLEMENT),
+                    )
+                },
+                Some(row.updated_at + TimeDelta::seconds(1)),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (spent.id, spent.position),
+        (row.id, 0),
+        "{CASE}: a spent token is Stale before the refusals, and carries the row it is spent \
+         against"
+    );
+
+    let tail = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                new_binding_at(
+                    SkillBindingId::new(),
+                    skill,
+                    Some(ids::PROJECT_HTUI),
+                    None,
+                    3,
+                ),
+                Some(row.updated_at),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (tail.id, tail.position),
+        (row.id, 3),
+        "{CASE}: a good save at the current token lands, so none of the refusals wrote"
+    );
 }
 
 /// A [`BoxEdit`] that writes `declared_tags` and leaves `quirks` alone.

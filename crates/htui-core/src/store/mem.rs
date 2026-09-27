@@ -5879,13 +5879,14 @@ mod tests {
     use super::MemStore;
     use crate::fixtures::ids;
     use crate::model::{
-        AgentBox, AgentId, BoxId, BoxProbe, ChatRunSpec, CitationKind, Claim, DocumentId,
-        GateOutcome, GraphSnapshot, Isolation, ItemId, ItemKindPatch, NewDocument, NewItem,
-        NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-        NoteId, OverlapRule, Priority, ProbedTool, ProjectId, RepoId, RequirementAreaId,
-        RequirementId, RequirementPatch, RequirementUpdate, Resolution, RunId, RunKind, RunMode,
-        RunStatus, RunStepCommit, RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status,
-        StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
+        Activation, AgentBox, AgentId, BoxId, BoxProbe, ChatRunSpec, CitationKind, Claim,
+        DocumentId, GateOutcome, GraphSnapshot, Isolation, ItemId, ItemKindPatch, NewDocument,
+        NewItem, NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun,
+        NewRunStep, NewSkill, NewSkillBinding, NewSkillVersion, NoteId, OverlapRule, Priority,
+        ProbedTool, ProjectId, RepoId, RequirementAreaId, RequirementId, RequirementPatch,
+        RequirementUpdate, Resolution, RunId, RunKind, RunMode, RunStatus, RunStepCommit,
+        RunStepTree, Scope, SkillBindingId, SkillId, SkillLevel, SnapshotGraph, SnapshotSettings,
+        Status, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -9105,6 +9106,283 @@ mod tests {
                 .expect("the read is total")
                 .is_empty(),
             "an empty scope overlaps nothing (hazard H-10)"
+        );
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // MOD-9 milestone 3: the skill writers (plan D76-D80, blueprint D79)
+    // --------------------------------------------------------------------------------------------
+
+    /// A skill to save under the fixture user, as the writers take it.
+    fn skill_row(id: SkillId, name: &str, description: &str) -> NewSkill {
+        NewSkill {
+            id,
+            name: name.to_owned(),
+            description: description.to_owned(),
+            created_by: ids::USER,
+        }
+    }
+
+    /// One version to append, with a fresh body and no import provenance.
+    fn version_row(skill: SkillId, body: &str) -> NewSkillVersion {
+        NewSkillVersion {
+            skill_id: skill,
+            body: body.to_owned(),
+            source: json!({}),
+            created_by: ids::USER,
+        }
+    }
+
+    /// One attachment to write, at a level, always on and unpinned.
+    fn binding_row(
+        id: SkillBindingId,
+        skill: SkillId,
+        project: Option<ProjectId>,
+        phase: Option<PhaseId>,
+    ) -> NewSkillBinding {
+        NewSkillBinding {
+            id,
+            skill_id: skill,
+            project_id: project,
+            phase_id: phase,
+            pinned_version: None,
+            position: 0,
+            activation: Activation::Always,
+            globs: Vec::new(),
+            languages: Vec::new(),
+        }
+    }
+
+    /// D79: the three collections keep their shapes — `skills` is a `HashMap` keyed by
+    /// `SkillId`, the other two are `Vec`s with composite or nullable keys, so one row is found
+    /// by filtering and there is no index to keep in step.
+    #[tokio::test]
+    async fn the_three_skill_collections_keep_their_shapes() {
+        let store = MemStore::demo();
+        let house = SkillId::new();
+        let tests = SkillId::new();
+        store
+            .upsert_skill(skill_row(house, "house", "House rules."), None)
+            .await
+            .expect("the save lands");
+        store
+            .upsert_skill(skill_row(tests, "tests-too", "A second skill."), None)
+            .await
+            .expect("the second save lands");
+        store
+            .add_skill_version(version_row(house, "House rules."), None)
+            .await
+            .expect("the append lands");
+        store
+            .add_skill_version(version_row(tests, "Named after the rule."), None)
+            .await
+            .expect("the second append lands");
+        let row = store
+            .set_skill_binding(
+                binding_row(SkillBindingId::new(), house, None, None),
+                None,
+            )
+            .await
+            .expect("the attachment lands");
+
+        assert_eq!(
+            store.read(|state| (state.skills.len(), state.skills.contains_key(&house))),
+            (4, true),
+            "the fixture's two skills plus the two written, keyed by SkillId"
+        );
+        assert_eq!(
+            store.read(|state| {
+                state
+                    .skill_versions
+                    .iter()
+                    .filter(|version| version.skill_id == house)
+                    .count()
+            }),
+            1,
+            "skill_version is a Vec, so a skill's versions are found by filtering"
+        );
+        assert_eq!(
+            store.read(|state| {
+                state
+                    .skill_bindings
+                    .iter()
+                    .filter(|binding| binding.id == row.id)
+                    .count()
+            }),
+            1,
+            "and so is skill_binding, by the row the writer returned"
+        );
+        assert_eq!(
+            store.read(|state| state.skill_bindings.len()),
+            4,
+            "the fixture's three attachments plus the one written"
+        );
+    }
+
+    /// D76: the two `State` transitions the conformance case cannot see from outside — an insert
+    /// takes one instant for both columns, an edit takes a strictly later one, and a token on a
+    /// name with no row is `NotFound` rather than a create.
+    #[tokio::test]
+    async fn upsert_skill_creates_then_edits_and_answers_stale() {
+        let store = MemStore::demo();
+        let id = SkillId::new();
+        let created = store
+            .upsert_skill(skill_row(id, "house", "House rules."), None)
+            .await
+            .expect("the save lands");
+        assert_eq!(
+            created.created_at, created.updated_at,
+            "one `now` is threaded through the whole create, so the two columns agree"
+        );
+
+        let edited = store
+            .upsert_skill(
+                skill_row(SkillId::new(), "house", "Revised."),
+                Some(created.updated_at),
+            )
+            .await
+            .expect("the edit lands");
+        assert_eq!(
+            (edited.id, edited.description.as_str()),
+            (id, "Revised."),
+            "the name is the key and never moves, so the row is edited in place"
+        );
+        assert!(
+            edited.updated_at > created.updated_at,
+            "a later call takes a later instant ({} -> {})",
+            created.updated_at,
+            edited.updated_at
+        );
+
+        let missing = store
+            .upsert_skill(
+                skill_row(SkillId::new(), "no-such", ""),
+                Some(edited.updated_at),
+            )
+            .await;
+        assert!(
+            matches!(
+                missing,
+                Err(StoreError::NotFound {
+                    entity: "skill",
+                    ..
+                })
+            ),
+            "a token on a name with no row is NotFound, got {missing:?}"
+        );
+    }
+
+    /// D78: each of the five rules the writer refuses in Rust leaves `skill_bindings` exactly as
+    /// it found it — a refusal is a refusal, not a partial write.
+    #[tokio::test]
+    async fn a_refused_binding_wrote_nothing() {
+        let store = MemStore::demo();
+        let skill = SkillId::new();
+        store
+            .upsert_skill(skill_row(skill, "house", "House rules."), None)
+            .await
+            .expect("the save lands");
+        store
+            .add_skill_version(version_row(skill, "House rules."), None)
+            .await
+            .expect("the append lands");
+        let before = store.read(|state| state.skill_bindings.len());
+
+        let refused = [
+            NewSkillBinding {
+                ..binding_row(
+                    SkillBindingId::new(),
+                    skill,
+                    None,
+                    Some(ids::PHASE_HTUI_IMPLEMENT),
+                )
+            },
+            NewSkillBinding {
+                activation: Activation::Glob,
+                ..binding_row(SkillBindingId::new(), skill, Some(ids::PROJECT_HTUI), None)
+            },
+            NewSkillBinding {
+                activation: Activation::Glob,
+                globs: vec!["htui:**/*.rs".to_owned()],
+                ..binding_row(SkillBindingId::new(), skill, None, None)
+            },
+            NewSkillBinding {
+                activation: Activation::Glob,
+                globs: vec!["src/**x/*.rs".to_owned()],
+                ..binding_row(SkillBindingId::new(), skill, Some(ids::PROJECT_HTUI), None)
+            },
+            NewSkillBinding {
+                pinned_version: Some(9),
+                ..binding_row(SkillBindingId::new(), skill, Some(ids::PROJECT_HTUI), None)
+            },
+        ];
+        for (index, new) in refused.into_iter().enumerate() {
+            let outcome = store.set_skill_binding(new, None).await;
+            assert!(
+                matches!(outcome, Err(StoreError::Constraint(_))),
+                "refusal {index} is Constraint, got {outcome:?}"
+            );
+            assert_eq!(
+                store.read(|state| state.skill_bindings.len()),
+                before,
+                "refusal {index} wrote nothing"
+            );
+        }
+
+        let landed = store
+            .set_skill_binding(
+                binding_row(SkillBindingId::new(), skill, Some(ids::PROJECT_HTUI), None),
+                None,
+            )
+            .await
+            .expect("a good write still lands after the refusals");
+        assert_eq!(
+            landed.level(),
+            SkillLevel::Project,
+            "and the collection grew by exactly the one row"
+        );
+    }
+
+    /// D79 / H-31: a global attachment is not `project_id`, so `delete_project`'s `retain` keeps
+    /// it — and the reach still counts only the project's own three.
+    #[tokio::test]
+    async fn a_global_attachment_survives_project_delete() {
+        let store = MemStore::demo();
+        let house = SkillId::new();
+        store
+            .upsert_skill(skill_row(house, "house", "House rules."), None)
+            .await
+            .expect("the save lands");
+        store
+            .add_skill_version(version_row(house, "House rules."), None)
+            .await
+            .expect("the append lands");
+        store
+            .set_skill_binding(
+                binding_row(SkillBindingId::new(), house, None, None),
+                None,
+            )
+            .await
+            .expect("the attachment lands");
+
+        let reach = store
+            .delete_project(ids::PROJECT_HTUI)
+            .await
+            .expect("the delete lands");
+        assert_eq!(
+            reach.skill_bindings, 3,
+            "the reach counts the project's own attachments, not the global one"
+        );
+        assert_eq!(
+            store
+                .bound_skills(ids::PROJECT_AGY, None)
+                .await
+                .expect("the read is total")
+                .iter()
+                .map(|skill| skill.skill_id)
+                .collect::<Vec<_>>(),
+            vec![house],
+            "and the global row still reaches the project that is left"
         );
     }
 }

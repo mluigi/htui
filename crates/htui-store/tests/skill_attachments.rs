@@ -18,10 +18,10 @@ use chrono::Utc;
 use htui_core::fixtures::{DemoData, demo_data, ids};
 use htui_core::model::skill::select;
 use htui_core::model::{
-    Activation, ChoiceReason, PhaseId, ProjectId, Skill, SkillBinding, SkillBindingId, SkillId,
-    SkillLevel, SkillVersion,
+    Activation, ChoiceReason, NewSkillBinding, PhaseId, ProjectId, Skill, SkillBinding,
+    SkillBindingId, SkillId, SkillLevel, SkillVersion,
 };
-use htui_core::store::{MemStore, WriteStore as _};
+use htui_core::store::{MemStore, StoreError, WriteStore as _};
 use sqlx::postgres::PgPool;
 
 /// One attachment to plant: the skill's name, its two keys, the activation, globs, position.
@@ -442,6 +442,233 @@ async fn the_checks_refuse_a_phase_row_without_a_project_and_glob_without_globs(
         demo,
         vec![("always".to_owned(), Vec::new(), Vec::new()); 3],
         "the demo loader writes none of the new columns, so its three rows read the defaults"
+    );
+
+    db.drop_db().await;
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-9 milestone 3: the writer in front of the checks (plan D76, D78, D100)
+// ------------------------------------------------------------------------------------------------
+//
+// The four writers are `WriteStore` methods, so they reach the same tables from Rust before any
+// statement runs. What these cases add over `prompt_template`-shaped conformance is the half only
+// a server can show: the CHECKs are still there for a row that did not come through the writer,
+// the driver's own `TEXT[]` binding is the one the column ends up holding, and a rule the writer
+// refuses in Rust is refused in **one** sentence by both stores.
+
+/// One attachment to write through the writer, at a level, with a fresh id.
+///
+/// `SKILL_TESTS` throughout: the fixture binds it at the project level only, so `(None, None)` is
+/// a free key and a refusal there is the rule's own rather than a spent token.
+fn written(
+    skill: SkillId,
+    project: Option<ProjectId>,
+    phase: Option<PhaseId>,
+    activation: Activation,
+    globs: &[&str],
+    pinned_version: Option<i32>,
+) -> NewSkillBinding {
+    NewSkillBinding {
+        id: SkillBindingId::new(),
+        skill_id: skill,
+        project_id: project,
+        phase_id: phase,
+        pinned_version,
+        position: 0,
+        activation,
+        globs: globs.iter().map(|glob| (*glob).to_owned()).collect(),
+        languages: Vec::new(),
+    }
+}
+
+/// D78's five rules, in the order the writer applies them, over the fixture's `tests` skill.
+fn the_five_refusals() -> Vec<(&'static str, NewSkillBinding)> {
+    let skill = ids::SKILL_TESTS;
+    vec![
+        (
+            "a phase attachment without its project",
+            written(
+                skill,
+                None,
+                Some(ids::PHASE_HTUI_IMPLEMENT),
+                Activation::Always,
+                &[],
+                None,
+            ),
+        ),
+        (
+            "a glob attachment with no glob",
+            written(skill, None, None, Activation::Glob, &[], None),
+        ),
+        (
+            "a repo-qualified glob on a global row",
+            written(
+                skill,
+                None,
+                None,
+                Activation::Glob,
+                &["htui:**/*.rs"],
+                None,
+            ),
+        ),
+        (
+            "a glob the matcher refuses",
+            written(
+                skill,
+                None,
+                None,
+                Activation::Glob,
+                &["src/**x/*.rs"],
+                None,
+            ),
+        ),
+        (
+            "a pin the skill has no version for",
+            written(skill, None, None, Activation::Always, &[], Some(9)),
+        ),
+    ]
+}
+
+/// D78: the writer refuses a `glob` row with no globs **in Rust**, so the constraint's own name
+/// never appears in a writer-driven refusal — and the CHECK is still there for a row planted
+/// around the writer, which is what makes the Rust refusal a courtesy and not the guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_writer_refuses_a_glob_row_with_no_globs_before_the_check_does() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let outcome = db
+        .store
+        .set_skill_binding(
+            written(ids::SKILL_TESTS, None, None, Activation::Glob, &[], None),
+            None,
+        )
+        .await;
+    let Err(StoreError::Constraint(message)) = outcome else {
+        panic!("a glob attachment with no glob is Constraint, got {outcome:?}");
+    };
+    assert!(
+        message.contains("skill_binding.globs") && message.contains("skill_binding_glob_needs_globs"),
+        "the refusal names the column and the check it mirrors, got {message:?}"
+    );
+    assert!(
+        !message.starts_with("skill_binding_glob_needs_globs:"),
+        "and it is the writer's own sentence, not the driver's `{constraint}: {message}` form, \
+         got {message:?}"
+    );
+
+    let planted: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM skill_binding WHERE skill_id = $1 AND project_id IS NULL")
+            .bind(ids::SKILL_TESTS.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("count the global rows");
+    assert_eq!(planted, 0, "the refusal wrote nothing");
+
+    assert_eq!(
+        constraint(
+            plant_binding(
+                &db.pool,
+                ids::SKILL_TESTS,
+                None,
+                None,
+                "glob",
+                &[],
+                0
+            )
+            .await
+        ),
+        "skill_binding_glob_needs_globs",
+        "and the CHECK still refuses a row that did not come through the writer"
+    );
+
+    db.drop_db().await;
+}
+
+/// D78, D100: the five rules are refused in Rust on both backends, so the two stores answer the
+/// same edit with the same sentence. This is "the two stores agree" operationally: byte-identical
+/// refusals over the same fixture, not two messages that both mention the column.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_writer_and_mem_agree_on_every_refusal() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let mem = MemStore::from_demo(demo_data());
+    for (what, new) in the_five_refusals() {
+        let from_pg = db.store.set_skill_binding(new.clone(), None).await;
+        let from_mem = mem.set_skill_binding(new, None).await;
+        match (from_pg, from_mem) {
+            (Err(StoreError::Constraint(pg)), Err(StoreError::Constraint(ours))) => {
+                assert_eq!(
+                    pg, ours,
+                    "{what}: the two stores spell the refusal alike, byte for byte"
+                );
+            }
+            other => panic!("{what}: both stores answer Constraint, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        db.store
+            .bound_skills(ids::PROJECT_AGY, None)
+            .await
+            .expect("PgStore::bound_skills")
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["rust-style", "tests"],
+        "and none of the five wrote: `tests` still reaches another project from the fixture's \
+         project-level row alone"
+    );
+
+    db.drop_db().await;
+}
+
+/// D78's third rule's positive half: a repo-qualified glob is refused on a global row because the
+/// qualifier needs a project to qualify against, and accepted on a project row — where the same
+/// `TEXT[]` has to reach the column as written, which is the binding `sqlx` cannot check (H-6).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_qualified_glob_is_accepted_on_a_project_row() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let row = db
+        .store
+        .set_skill_binding(
+            written(
+                ids::SKILL_TESTS,
+                Some(ids::PROJECT_HTUI),
+                Some(ids::PHASE_HTUI_IMPLEMENT),
+                Activation::Glob,
+                &["htui:**/*.rs", "**/*.md"],
+                None,
+            ),
+            None,
+        )
+        .await
+        .expect("a qualified glob on a project row is written");
+    assert_eq!(
+        (row.activation, row.globs),
+        (
+            Activation::Glob,
+            vec!["htui:**/*.rs".to_owned(), "**/*.md".to_owned()]
+        ),
+        "the row carries the globs in the order the caller wrote them"
+    );
+
+    let read: (String, Vec<String>) =
+        sqlx::query_as("SELECT activation, globs FROM skill_binding WHERE id = $1")
+            .bind(row.id.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the row back");
+    assert_eq!(
+        read,
+        (
+            "glob".to_owned(),
+            vec!["htui:**/*.rs".to_owned(), "**/*.md".to_owned()]
+        ),
+        "and the column holds them as the row does: the TEXT[] binding is the one that counts"
     );
 
     db.drop_db().await;
