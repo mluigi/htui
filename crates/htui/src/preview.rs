@@ -82,10 +82,19 @@ const DOCUMENTS_NOTE: &str = "preview: documents are latest-per-kind; ANA-2 inpu
 /// Blueprint H-21: `documents_of_kinds(item, &[])` would otherwise return `summary` too.
 const SUMMARY_NOTE: &str = "preview: the `summary` kind is excluded from documents; §4.3 renders \
                             it as upstream context instead";
-/// MOD-9 D45: which phase's attachments the preview shows, and why a glob one never renders here.
+/// MOD-9 D45/D73: which phase's attachments the preview shows, and what its file set is.
+///
+/// **This is not the blueprint's §3.7 text, and the difference is `skill_matches`.** That text
+/// says a glob attachment "is matched against this box's excerpt walk, as it is in a run", which
+/// would be false here: this unit gives the engine a real file set (D89) and nothing fills
+/// `spec.skill_matches` yet, so `select` still records `no_path` in the preview and in a run
+/// alike. The unit that fills that field re-words this sentence again; what is true today, and
+/// what the sentence therefore says, is the part that does not depend on it — the walk runs, and
+/// with no previous attempt its listing is the whole set.
 const SKILLS_NOTE: &str = "preview: phase-level skills come from the first phase of the item's \
-                           graph that uses this template; a glob attachment records no_path \
-                           until glob activation lands (MOD-9 OQ-12)";
+                           graph that uses this template; a glob attachment is matched against \
+                           this box's excerpt walk, and with no previous attempt that walk's \
+                           listing is the whole file set";
 
 /// MOD-9 D45's second note: no phase of the item's graph uses the chosen template, or the item
 /// resolves to no graph, so only global and project attachments apply.
@@ -270,6 +279,9 @@ pub async fn build(
     let input = PassInput {
         roots: excerpt_roots(&repo_scope, &[], &paths, box_id),
         touched_prefixes: touched_prefixes(&row.touched_paths, &repos),
+        // A preview has no previous attempt (plan D102), so tier 2 of the ranker has nothing to
+        // read here. The walk's listing is the whole file set, which is what the note above says.
+        changed_paths: Vec::new(),
         notes: Vec::new(),
     };
 

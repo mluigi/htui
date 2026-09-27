@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use htui_core::model::{BoxId, Isolation, RepoId, RunId, RunStepCommit, RunStepTree, StepId};
 use htui_core::prompt::DiffBlock;
+use htui_core::prompt::excerpt::RepoPath;
 use tokio::sync::OwnedMutexGuard;
 
 use super::copy;
@@ -1272,8 +1273,15 @@ impl GixIsolator {
         blocking(move || git::branch_target(&path, &name)).await
     }
 
-    /// One repository's slice of [`Isolator::diff`]: its name, its range and both texts, or `None`
-    /// when the row committed nothing.
+    /// The repository that holds `after`, and the two revisions to compare, or `None` when the
+    /// row committed nothing or its repo has no checkout on this box (MOD-9 D89).
+    ///
+    /// [`diff_of`](GixIsolator::diff_of) and [`changed_paths`](GixIsolator::changed_paths) both
+    /// answer over this, and nothing else. They are two readings of one range: a name list and a
+    /// patch. If either re-derived the range instead, the two could disagree — a `copy` step's
+    /// range lives in the copy before reconcile and in the checkout after, so the wrong one of the
+    /// two is a *different repository* and answers nothing at all rather than something close
+    /// (blueprint H-20).
     ///
     /// D74 (blueprint A-3) chooses the repository that holds `after`: a `copy` tree's own object
     /// database until reconcile, and the checkout after it, because the merge commit exists only
@@ -1284,12 +1292,11 @@ impl GixIsolator {
     /// itself unless another run's merge moved the primary first (D136). Plan D146: whether
     /// `after` is that merge is always asked of the checkout, where the merge lives, never of a
     /// `copy` tree, and only for a `worktree` or `copy` row: the in-place modes never merge.
-    async fn diff_of(
+    async fn range_of(
         &self,
-        git: &Cli,
         trees: &[RunStepTree],
         commit: &RunStepCommit,
-    ) -> Result<Option<(String, String, String, String)>, IsolateError> {
+    ) -> Result<Option<(String, PathBuf, String, String)>, IsolateError> {
         let before = commit.before_hash.as_str();
         let Some(after) = commit
             .after_hash
@@ -1340,14 +1347,31 @@ impl GixIsolator {
                 blocking(move || git::reconcile_parent(&probe, &base, &hex, step)).await?;
         }
         let before = merged_onto.as_deref().unwrap_or(before);
-        let stat = git.diff(&repo, before, after, true).await?;
-        let patch = git.diff(&repo, before, after, false).await?;
         Ok(Some((
             checkout.name.clone(),
-            format!("{before}..{after}"),
-            stat,
-            patch,
+            repo,
+            before.to_owned(),
+            after.to_owned(),
         )))
+    }
+
+    /// One repository's slice of [`Isolator::diff`]: its name, its range and both texts, or `None`
+    /// when the row committed nothing.
+    ///
+    /// [`range_of`](GixIsolator::range_of)'s answer and two `git diff`s over it, unchanged since
+    /// milestone 4 (blueprint H-20): every `DiffBlock` byte is the same as before the split.
+    async fn diff_of(
+        &self,
+        git: &Cli,
+        trees: &[RunStepTree],
+        commit: &RunStepCommit,
+    ) -> Result<Option<(String, String, String, String)>, IsolateError> {
+        let Some((name, repo, before, after)) = self.range_of(trees, commit).await? else {
+            return Ok(None);
+        };
+        let stat = git.diff(&repo, &before, &after, true).await?;
+        let patch = git.diff(&repo, &before, &after, false).await?;
+        Ok(Some((name, format!("{before}..{after}"), stat, patch)))
     }
 }
 
@@ -1489,6 +1513,47 @@ impl Isolator for GixIsolator {
                     ),
                 }),
             })
+        })
+    }
+
+    /// MOD-9 D89: one `git diff --name-only -z` per committed row, over
+    /// [`range_of`](GixIsolator::range_of)'s revisions, in the order of `commits`.
+    ///
+    /// No usable `git` is `Ok(Vec::new())` — the same degradation [`diff`](GixIsolator::diff)
+    /// makes, in the same sentence as a rule: the file set is a hint and its absence degrades a
+    /// prompt. Splitting on NUL and dropping the empty field is the whole of the decoding, because
+    /// `-z` is why no name arrives quoted.
+    ///
+    /// A name git lists twice (a rename, which it reports as a delete and an add under no
+    /// `--find-renames`) appears twice. The consumer de-duplicates on `(repo, path)`, so this
+    /// verb's own answer is git's rather than a second opinion about it.
+    fn changed_paths<'a>(
+        &'a self,
+        trees: &'a [RunStepTree],
+        commits: &'a [RunStepCommit],
+    ) -> IsolatorFuture<'a, Vec<RepoPath>> {
+        Box::pin(async move {
+            let Ok(git) = self.cli() else {
+                return Ok(Vec::new());
+            };
+            let git = git.clone();
+            let mut paths: Vec<RepoPath> = Vec::new();
+            for commit in commits {
+                let Some((name, repo, before, after)) = self.range_of(trees, commit).await? else {
+                    continue;
+                };
+                let listed = git.changed_paths(&repo, &before, &after).await?;
+                paths.extend(
+                    listed
+                        .split('\0')
+                        .filter(|path| !path.is_empty())
+                        .map(|path| RepoPath {
+                            repo: name.clone(),
+                            path: path.to_owned(),
+                        }),
+                );
+            }
+            Ok(paths)
         })
     }
 
@@ -4057,7 +4122,12 @@ mod tests {
             .await
             .expect("the copy mode prepares");
         let copy = PathBuf::from(&prepared.trees[0].tree.path);
-        commit_file(&copy, "the-step-work.md", "the step commits\n", "the step commits");
+        commit_file(
+            &copy,
+            "the-step-work.md",
+            "the step commits\n",
+            "the step commits",
+        );
         let rows = rows(&prepared);
         let captured = isolator
             .capture(step, &rows)
@@ -4077,12 +4147,16 @@ mod tests {
             "the copy is the repository `range_of` resolved, so the name is the step's own"
         );
         assert_eq!(
-            git.changed_paths(&copy, &head, &captured[0].after_hash.clone().expect("a commit"),)
-                .await
-                .expect("git reads")
-                .split('\0')
-                .filter(|name| !name.is_empty())
-                .collect::<Vec<_>>(),
+            git.changed_paths(
+                &copy,
+                &head,
+                &captured[0].after_hash.clone().expect("a commit"),
+            )
+            .await
+            .expect("git reads")
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>(),
             vec!["the-step-work.md"],
             "and it is git's own answer for that range, not a re-derivation"
         );
@@ -4144,7 +4218,12 @@ mod tests {
         };
         let with = GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
             .expect("the config validates");
-        assert!(with.changed_paths(&rows, &[]).await.expect("reads").is_empty());
+        assert!(
+            with.changed_paths(&rows, &[])
+                .await
+                .expect("reads")
+                .is_empty()
+        );
         assert!(
             with.changed_paths(
                 &rows,

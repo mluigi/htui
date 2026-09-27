@@ -1032,6 +1032,7 @@ fn readable_input(dir: &std::path::Path) -> PassInput {
     PassInput {
         roots: vec![fs_root(dir)],
         touched_prefixes: vec![PathPrefix::parse("src/lib.rs", "htui")],
+        changed_paths: Vec::new(),
         notes: vec!["excerpt: a caller's own note".to_owned()],
     }
 }
@@ -1302,6 +1303,7 @@ async fn excerpts_for_never_persists_a_note_naming_a_masked_path() {
     let input = PassInput {
         roots: vec![fs_root(dir.path())],
         touched_prefixes: vec![PathPrefix::parse(&format!("{secret}/bad.rs"), "htui")],
+        changed_paths: Vec::new(),
         notes: Vec::new(),
     };
 

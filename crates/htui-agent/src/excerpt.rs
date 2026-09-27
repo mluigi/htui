@@ -36,8 +36,8 @@ use tracing::warn;
 use htui_core::model::{BoxId, Repo, RepoBoxPath, RepoId, RunStepTree};
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, BuiltinRanker, ExcerptAudit, ExcerptCandidate, ExcerptCaps, ExcerptProvider,
-    ExcerptRequest, ExcerptSet, OwnedExcerptRequest, PathPrefix, ProviderError, RepoReader,
-    RepoRoot, RootRecord, RootSource, select, skip_by_path,
+    ExcerptRequest, ExcerptSet, OwnedExcerptRequest, PathPrefix, ProviderError, RepoPath,
+    RepoReader, RepoRoot, RootRecord, RootSource, select, skip_by_path,
 };
 use htui_core::prompt::settings::resolve_excerpt_caps;
 use htui_core::prompt::{
@@ -884,6 +884,15 @@ pub struct PassInput {
     pub roots: Vec<RepoRoot>,
     /// `touched_prefixes`' answer.
     pub touched_prefixes: Vec<PathPrefix>,
+    /// The previous attempt's changed paths (MOD-9 D87/D89), already repo-qualified. Empty on
+    /// attempt 1 and wherever the isolator could not answer.
+    ///
+    /// The pass reads it for tier 2's `prev_diff`, a field that existed from the start with **no
+    /// producer in production for its whole life**: the engine's only caller of this function
+    /// hard-coded `Vec::new()` under a D122 comment saying the previous attempt's diff carried no
+    /// repo-qualified path list. It does — the `Isolator` seam answers it, and the engine asks
+    /// once per retried step that has a `glob` candidate (R-35).
+    pub changed_paths: Vec<RepoPath>,
     /// The caller's own notes about the roots, which go first: a scope repo with no row, or
     /// D108's "no `run_step_tree` row yet".
     pub notes: Vec<String>,
@@ -927,7 +936,7 @@ pub fn excerpt_pass(req: &OwnedExcerptRequest, est: TokenEstimator) -> ExcerptSe
 /// 7. `set.notes` = `input.notes`, then the pass's notes, then the drop notes.
 ///
 /// The request is `item_key`, `item_body`, `phase` and the input documents' bodies from `spec`,
-/// `input.touched_prefixes`, no `changed_paths` (D122), `input.roots`, the budget, and the caps,
+/// `input.touched_prefixes`, `input.changed_paths` (D89), `input.roots`, the budget, and the caps,
 /// `scan_cap` and `deadline` of step 1. `est` is `spec.estimator`.
 pub async fn excerpts_for(
     spec: &PromptSpec,
@@ -939,6 +948,7 @@ pub async fn excerpts_for(
     let PassInput {
         roots,
         touched_prefixes,
+        changed_paths,
         notes,
     } = input;
 
@@ -973,8 +983,9 @@ pub async fn excerpts_for(
             .map(|document| document.body.clone())
             .collect(),
         touched_prefixes,
-        // D122: the previous attempt's diff carries no repo-qualified path list.
-        changed_paths: Vec::new(),
+        // MOD-9 D87: the caller owns this now. The preview has no previous attempt and passes an
+        // empty vector, which is the same fact the field carried before it had a producer.
+        changed_paths,
         roots,
         budget_tokens,
         caps,

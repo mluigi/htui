@@ -839,6 +839,49 @@ impl Cli {
         }
         Ok(exited.stdout)
     }
+
+    /// MOD-9 D89: `git diff --no-color --no-ext-diff --no-textconv --name-only -z <before> <after>
+    /// --` in `repo`, under `COLUMNS=80`, with stdout head-capped at [`DIFF_CAP`].
+    ///
+    /// **`-z` is the whole reason this is a separate verb rather than a line of `diff`.** Without
+    /// it git quotes a name that holds a space, a quote or a newline, and quotes any byte outside
+    /// ASCII as an octal escape under the default `core.quotePath`. A caller would then be holding
+    /// a *rendered* path and would need an unescaper to get the real one — a parser, in the one
+    /// place whose own contract is that it asks git rather than guessing (D89). With it, each name
+    /// arrives verbatim and NUL-delimited, and splitting on NUL is the whole of the decoding.
+    ///
+    /// The other flags and the budget are `diff`'s, so this call is bounded exactly as that one
+    /// is; the prefixes are dropped because a name list has no `a/` to print. Not retried: a read
+    /// (M3 D39).
+    ///
+    /// # Errors
+    /// [`IsolateError::Git`] for a spawn or budget failure, or for a non-zero exit (a revision the
+    /// repository does not hold, among them).
+    pub async fn changed_paths(
+        &self,
+        repo: &Path,
+        before: &str,
+        after: &str,
+    ) -> Result<String, IsolateError> {
+        let args = [
+            OsStr::new("diff"),
+            OsStr::new("--no-color"),
+            OsStr::new("--no-ext-diff"),
+            OsStr::new("--no-textconv"),
+            OsStr::new("--name-only"),
+            OsStr::new("-z"),
+            OsStr::new(before),
+            OsStr::new(after),
+            OsStr::new("--"),
+        ];
+        let exited = self
+            .run_capturing("diff", repo, &args, &[DIFF_COLUMNS], Capture::Head)
+            .await?;
+        if !exited.ok() {
+            return Err(exited.failure("diff"));
+        }
+        Ok(exited.stdout)
+    }
 }
 
 /// The sleeps between retries (plan D39): 200, 400 and 800 ms, so four attempts in all.
@@ -3618,7 +3661,10 @@ mod tests {
             .changed_paths(dir.path(), &before, &after)
             .await
             .expect("the names read");
-        assert_eq!(listed, oracle_changed_paths(&git, dir.path(), &before, &after));
+        assert_eq!(
+            listed,
+            oracle_changed_paths(&git, dir.path(), &before, &after)
+        );
         assert_eq!(
             listed.split('\0').collect::<Vec<_>>(),
             vec!["a name with a space.txt", "héllo.txt", ""],
@@ -3628,7 +3674,10 @@ mod tests {
             !listed.contains('"') && !listed.contains('\\'),
             "D89: `-z` means a name never arrives quoted, so there is nothing to unescape: {listed}"
         );
-        assert!(!listed.contains('\n'), "and nothing is newline-delimited: {listed}");
+        assert!(
+            !listed.contains('\n'),
+            "and nothing is newline-delimited: {listed}"
+        );
     }
 
     /// An empty range lists no names, which is an answer and not an error — the shape

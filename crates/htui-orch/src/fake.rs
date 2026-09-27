@@ -31,6 +31,7 @@ use htui_core::model::{
     VerifyOutcome,
 };
 use htui_core::prompt::DiffBlock;
+use htui_core::prompt::excerpt::RepoPath;
 use htui_core::store::{MemStore, ReadStore, Result, WriteStore};
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -91,6 +92,14 @@ pub struct FakeIsolator {
     /// The `run_step_id`s of the tree and commit rows each [`diff`](Isolator::diff) call was
     /// handed, in call order — so a case can tell *whose* rows plan D67 diffed.
     diff_requests: Mutex<Vec<DiffRequest>>,
+    /// Scripted [`changed_paths`](Isolator::changed_paths) answers, FIFO, one consumed per call;
+    /// unscripted is empty (MOD-9 D89); `Err` is a scripted
+    /// [`fail_changed_paths`](Self::fail_changed_paths).
+    changed: Mutex<VecDeque<std::result::Result<Vec<RepoPath>, IsolateError>>>,
+    /// The same rows each [`changed_paths`](Isolator::changed_paths) call was handed, in call
+    /// order. A separate log from `diff_requests` and not merged into it, because R-35's guard
+    /// makes "not called" the answer most cases are checking, and a shared log could not say it.
+    changed_path_requests: Mutex<Vec<DiffRequest>>,
     /// Every [`reconcile`](Isolator::reconcile) call, as `(winner, siblings)`, in call order — so a
     /// case can tell which siblings plan D54(d) handed the isolator.
     reconciles: Mutex<Vec<(StepId, Vec<StepId>)>>,
@@ -228,6 +237,35 @@ impl FakeIsolator {
             .lock()
             .expect("no panic holds the fake isolator's lock")
             .push_back(Err(IsolateError::Git(reason.to_owned())));
+    }
+
+    /// Queue the answer of the next [`changed_paths`](Isolator::changed_paths): the paths a
+    /// previous attempt's commits touched. An unscripted call answers empty, so a case that never
+    /// scripts one sees the shape of a box with no `git`.
+    pub fn script_changed_paths(&self, paths: Vec<RepoPath>) {
+        self.changed
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(Ok(paths));
+    }
+
+    /// Make the next [`changed_paths`](Isolator::changed_paths) fail with a `git` error, the
+    /// shape MOD-9 D89 degrades to a prompt note rather than a failed step — the file set is a
+    /// hint, as the diff is (D55).
+    pub fn fail_changed_paths(&self, reason: &str) {
+        self.changed
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(Err(IsolateError::Git(reason.to_owned())));
+    }
+
+    /// Every [`changed_paths`](Isolator::changed_paths) call so far, as the rows it was handed.
+    #[must_use]
+    pub fn changed_path_requests(&self) -> Vec<DiffRequest> {
+        self.changed_path_requests
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .clone()
     }
 
     /// Every [`diff`](Isolator::diff) call so far, as the rows it was handed.
@@ -591,6 +629,33 @@ impl Isolator for FakeIsolator {
                 .expect("no panic holds the fake isolator's lock")
                 .pop_front()
                 .unwrap_or(Ok(None))
+        })
+    }
+
+    /// MOD-9 D89: the next [`script_changed_paths`](FakeIsolator::script_changed_paths) or
+    /// [`fail_changed_paths`](FakeIsolator::fail_changed_paths) answer, or an empty vector
+    /// unscripted; the rows are recorded for
+    /// [`changed_path_requests`](FakeIsolator::changed_path_requests) either way, so a case can
+    /// assert that the engine asked exactly once and on which step — and, because an unscripted
+    /// answer is the same empty vector, that it did not ask at all.
+    fn changed_paths<'a>(
+        &'a self,
+        trees: &'a [RunStepTree],
+        commits: &'a [RunStepCommit],
+    ) -> IsolatorFuture<'a, Vec<RepoPath>> {
+        Box::pin(async move {
+            self.changed_path_requests
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .push(DiffRequest {
+                    trees: trees.iter().map(|row| row.run_step_id).collect(),
+                    commits: commits.iter().map(|row| row.run_step_id).collect(),
+                });
+            self.changed
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .pop_front()
+                .unwrap_or(Ok(Vec::new()))
         })
     }
 

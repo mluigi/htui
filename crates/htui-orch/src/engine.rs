@@ -35,7 +35,9 @@ use htui_core::model::{
     SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepId, StepOutcome, StepStatus,
     TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome, missing_tags_failure,
 };
-use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoRoot, RootSource};
+use htui_core::prompt::excerpt::{
+    BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
+};
 use htui_core::prompt::{
     AssembledPrompt, DiffBlock, InputDocument, JudgeCandidate, PromptSpec, SectionName,
     TemplateRef, TemplateRole, TokenEstimator, TrimStrategy, VerifyFailure, assemble, settings,
@@ -4973,17 +4975,62 @@ where
                     .to_owned(),
             );
         }
+        // MOD-9 D89 / R-35: the previous attempt's changed paths, asked of the isolator — the only
+        // holder of the checkout the commits were made in. Two guards, both about cost: an attempt
+        // of 1 has no commits to diff, and a step with no `glob` candidate cannot use the answer,
+        // which is the common case. The second guard is also why tier 2 of the ranker stays
+        // **inert** on a step with no glob attachment: `TIER2_PREV_DIFF` is live only where a
+        // `glob` fired (blueprint H-22).
+        let wants_changed = step.attempt > 1
+            && spec
+                .skills
+                .iter()
+                .any(|skill| skill.activation == htui_core::model::Activation::Glob);
+        let mut changed: Vec<RepoPath> = Vec::new();
+        if wants_changed {
+            // The previous step's trees and commits, read again: `forwarded` read them for the
+            // diff, and the two reads are two primary-key lookups beside a walk already reading
+            // the same tree (blueprint H-23). The alternative — a field on `PromptSpec` — would
+            // carry a commit list into a struct the assembler digests.
+            let steps = self.parts.store.run_steps(run.id).await?;
+            let previous = steps
+                .iter()
+                .filter(|row| row.position == step.position && row.attempt < step.attempt)
+                .max_by_key(|row| row.attempt);
+            if let Some(previous) = previous {
+                let trees = self.parts.store.step_trees(previous.id).await?;
+                let commits = self.parts.store.step_commits(previous.id).await?;
+                match self.parts.isolator.changed_paths(&trees, &commits).await {
+                    Ok(paths) => changed = paths,
+                    // Advisory input, so a failure degrades the prompt with a note rather than
+                    // failing the step — `forwarded`'s rule, for the same input.
+                    Err(err) => notes.push(format!("changed_paths unavailable: {err}")),
+                }
+            }
+        }
         let input = PassInput {
             roots,
             touched_prefixes: touched_prefixes(&row.touched_paths, &repos),
+            // MOD-9 D87: the ranker's tier 2 reads this and has never had a producer in
+            // production. Now it does.
+            changed_paths: changed.clone(),
             notes,
         };
         let excerpts = excerpts_for(spec, input, &self.parts.app, self.parts.scrubber).await;
-        // MOD-9 D72/D73: the walk is the file set a `glob` attachment is matched against, and the
-        // enumeration is deliberately a superset of what the budget paid for — a skill may fire on
-        // a file this prompt never showed the model. The previous attempt's changed paths (D89)
-        // join it in a later commit of this milestone, when `Isolator::changed_paths` lands.
-        spec.skill_files = excerpts.listed.clone();
+        // MOD-9 D72/D73/D89: the walk is the file set a `glob` attachment is matched against, and
+        // the enumeration is deliberately a superset of what the budget paid for — a skill may fire
+        // on a file this prompt never showed the model. The previous attempt's changed paths join
+        // it, de-duplicated on `(repo, path)` and **after** the listing, so a path both could name
+        // is the walk's, and the recorded `matched` path is the walk's first.
+        spec.skill_files = {
+            let mut files = excerpts.listed.clone();
+            for path in changed {
+                if !files.contains(&path) {
+                    files.push(path);
+                }
+            }
+            files
+        };
         spec.excerpts = excerpts;
         Ok(())
     }
@@ -6099,8 +6146,8 @@ mod tests {
     use htui_core::fixtures::ids;
     use htui_core::model::{
         BoxEdit, Gate, GateOutcome, GraphSnapshot, ItemPatch, NewRepo, NewRunStep, NewSkillBinding,
-        NewStepGraph, PhaseId, PhasePatch, RepoId, Resolution, RunMode, RunStatus, SnapshotCandidate,
-        SnapshotPhase, Status, StepGraphId, StepGraphPhase, StepId, StepStatus,
+        NewStepGraph, PhaseId, PhasePatch, RepoId, Resolution, RunMode, RunStatus,
+        SnapshotCandidate, SnapshotPhase, Status, StepGraphId, StepGraphPhase, StepId, StepStatus,
     };
     use htui_core::prompt::excerpt::RepoPath;
     use htui_core::store::mem::MemFault;
@@ -6111,7 +6158,7 @@ mod tests {
     };
     use crate::command::{Command, CommandOutcome, EngineError, GateAnswer};
     use crate::fake::{FakeOrchestrator, ScriptedStep};
-    use crate::isolate::{Clock as _, IsolateError};
+    use crate::isolate::{Clock as _, IsolateError, Isolator as _};
     use crate::status::RunFailure;
 
     /// Everything an `Engine` borrows from a `FakeOrchestrator`, held alive for one test.
@@ -12462,7 +12509,10 @@ mod tests {
         let CasOutcome::Applied(row) = applied else {
             panic!("the attachment is flipped to glob, not left where it was: {applied:?}");
         };
-        assert_eq!(row.globs, globs, "and it carries the globs the matcher will read");
+        assert_eq!(
+            row.globs, globs,
+            "and it carries the globs the matcher will read"
+        );
     }
 
     /// The attempt-1 step retried, and the tree and commit rows the retry is forwarded from.
@@ -12538,7 +12588,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("a throwaway root");
         let (repo, row, snapshot, prd) =
             excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
-        write_tree(dir.path(), repo, "docs/notes.md", "Not on the touched list.\n");
+        write_tree(
+            dir.path(),
+            repo,
+            "docs/notes.md",
+            "Not on the touched list.\n",
+        );
         glob_the_tests_skill(&harness, &["**/*.md"]).await;
         let second = retry_with_commits(&harness, row.clone(), &prd, repo).await;
         harness.orch.isolator.script_changed_paths(vec![
@@ -12565,6 +12620,10 @@ mod tests {
             .await
             .expect("the spec is built")
             .expect("`prd` requires nothing");
+        // `RetryStep` ran the new attempt as far as the gate, and that walk assembled its own
+        // prompt — so the isolator has already been asked once by the time this test drives the
+        // pass itself. Counting from here is what makes the assertion about *this* call.
+        let asked = harness.orch.isolator.changed_path_requests().len();
         engine
             .with_excerpts(&row, &second, ids::HTUI_FEAT_3, &mut spec)
             .await
@@ -12575,11 +12634,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.path.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "docs/notes.md",
-                "src/lib.rs",
-                "src/only-the-diff-saw-it.rs",
-            ],
+            vec!["docs/notes.md", "src/lib.rs", "src/only-the-diff-saw-it.rs",],
             "D87/D89: the walk's listing, then the changed paths the walk never saw, each once and \
              in that order"
         );
@@ -12598,10 +12653,19 @@ mod tests {
         );
 
         let requests = harness.orch.isolator.changed_path_requests();
-        assert_eq!(requests.len(), 1, "D89: asked once, not once per repo or per consumer");
-        assert_eq!(requests[0].trees, vec![prd.id], "on the previous attempt's tree rows");
         assert_eq!(
-            requests[0].commits,
+            requests.len(),
+            asked + 1,
+            "D89: this pass asks once — not once per consumer, and not once per commit row"
+        );
+        let last = requests.last().expect("the call is recorded");
+        assert_eq!(
+            last.trees,
+            vec![prd.id],
+            "on the previous attempt's tree rows"
+        );
+        assert_eq!(
+            last.commits,
             vec![prd.id],
             "and its commit rows, which is the row the range is read from"
         );
@@ -12614,7 +12678,7 @@ mod tests {
     async fn an_attempt_of_one_asks_for_no_changed_paths() {
         let harness = Harness::new().await;
         let dir = tempfile::tempdir().expect("a throwaway root");
-        let (repo, row, snapshot, prd) =
+        let (_repo, row, snapshot, prd) =
             excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
         glob_the_tests_skill(&harness, &["**/*.rs"]).await;
         harness.orch.isolator.script_changed_paths(vec![RepoPath {
@@ -12649,32 +12713,21 @@ mod tests {
             "and the file set is the walk's listing alone"
         );
 
-        // The same answer, on the second attempt. If attempt 1 had consumed it, this union would
-        // be the listing alone and the assertion would fail.
-        let second = retry_with_commits(&harness, row.clone(), &prd, repo).await;
-        let mut retried = engine
-            .phase_spec(
-                &row,
-                &snapshot,
-                &second,
-                &snapshot.phases[0],
-                ids::HTUI_FEAT_3,
-                true,
-            )
-            .await
-            .expect("the spec is built")
-            .expect("`prd` requires nothing");
-        engine
-            .with_excerpts(&row, &second, ids::HTUI_FEAT_3, &mut retried)
-            .await
-            .expect("no store fault");
-        assert!(
-            retried
-                .skill_files
-                .iter()
-                .any(|entry| entry.path == "src/attempt-one-never-asks.rs"),
-            "the answer scripted before attempt 1 is still queued, so attempt 1 did not pop it: {:?}",
-            retried.skill_files
+        // "Did not ask" and "asked and was answered nothing" are different facts, and only the
+        // queue tells them apart. An unscripted call answers empty, so draining the queue here is
+        // the only way to show attempt 1 left the scripted answer where it was.
+        assert_eq!(
+            harness
+                .orch
+                .isolator
+                .changed_paths(&[], &[])
+                .await
+                .expect("an unscripted call does not fail"),
+            vec![RepoPath {
+                repo: "htui".to_owned(),
+                path: "src/attempt-one-never-asks.rs".to_owned(),
+            }],
+            "the answer scripted before attempt 1 is still queued, so attempt 1 did not pop it"
         );
     }
 
@@ -12688,7 +12741,10 @@ mod tests {
         let (repo, row, snapshot, prd) =
             excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
         let second = retry_with_commits(&harness, row.clone(), &prd, repo).await;
-        assert_eq!(second.attempt, 2, "so the attempt guard cannot be what skipped the call");
+        assert_eq!(
+            second.attempt, 2,
+            "so the attempt guard cannot be what skipped the call"
+        );
         assert!(
             harness
                 .orch
@@ -12754,13 +12810,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("a throwaway root");
         let (repo, row, snapshot, prd) =
             excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
-        write_tree(dir.path(), repo, "docs/notes.md", "Not on the touched list.\n");
+        write_tree(
+            dir.path(),
+            repo,
+            "docs/notes.md",
+            "Not on the touched list.\n",
+        );
         glob_the_tests_skill(&harness, &["**/*.md"]).await;
         let second = retry_with_commits(&harness, row.clone(), &prd, repo).await;
-        harness
-            .orch
-            .isolator
-            .fail_changed_paths("git diff: no usable budget");
+        harness.orch.isolator.fail_changed_paths("no usable budget");
         harness_engine!(harness.orch, engine);
 
         let mut spec = engine
@@ -12775,6 +12833,9 @@ mod tests {
             .await
             .expect("the spec is built")
             .expect("`prd` requires nothing");
+        // The retry that created `second` ran its own pass and asked once; this assertion is
+        // about the call this test drives.
+        let asked = harness.orch.isolator.changed_path_requests().len();
         engine
             .with_excerpts(&row, &second, ids::HTUI_FEAT_3, &mut spec)
             .await
@@ -12786,7 +12847,7 @@ mod tests {
                 .iter()
                 .filter(|note| note.starts_with("changed_paths unavailable:"))
                 .collect::<Vec<_>>(),
-            vec!["changed_paths unavailable: git diff: no usable budget"],
+            vec!["changed_paths unavailable: git: no usable budget"],
             "the refusal is recorded in the same place and the same shape `forwarded` uses for \
              `previous_diff unavailable:`"
         );
@@ -12796,8 +12857,8 @@ mod tests {
         );
         assert_eq!(
             harness.orch.isolator.changed_path_requests().len(),
-            1,
-            "the call was still made and is still recorded"
+            asked + 1,
+            "the call was still made and is still recorded — a refusal is not a skip"
         );
     }
 

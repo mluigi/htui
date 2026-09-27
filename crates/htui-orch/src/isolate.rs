@@ -24,6 +24,7 @@ use htui_core::model::{
     Isolation, RepoId, RunId, RunStepCommit, RunStepTree, StepId, TIMESTAMPTZ_DIGITS,
 };
 use htui_core::prompt::DiffBlock;
+use htui_core::prompt::excerpt::RepoPath;
 
 pub mod copy;
 pub mod git;
@@ -194,6 +195,26 @@ pub trait Isolator: Send + Sync + fmt::Debug {
         trees: &'a [RunStepTree],
         commits: &'a [RunStepCommit],
     ) -> IsolatorFuture<'a, Option<DiffBlock>>;
+
+    /// MOD-9 D89: the repo-relative paths the previous attempt's commits touched, one entry per
+    /// `(repo, path)`, in `commits` order and then git's own order. Empty when no row committed
+    /// anything, and when `git` is unusable — the file set is a hint, and its absence degrades a
+    /// prompt rather than failing it.
+    ///
+    /// This is the input the excerpt ranker's tier 2 has always read
+    /// ([`ExcerptRequest::changed_paths`](htui_core::prompt::excerpt::ExcerptRequest::changed_paths))
+    /// and, since MOD-9 milestone 3, half of the file set a `glob` attachment is matched against
+    /// (D87). It is a seam method rather than a [`ReadStore`](htui_core::store::ReadStore) one
+    /// because `run_step_commit` stores `before_hash` and `after_hash` and **no paths**
+    /// (`model/run.rs:585-594`): a store reader would have to re-derive them from the rendered
+    /// `DiffBlock`, which that type's own doc (`prompt/mod.rs:157-159`) forbids. Asking git is
+    /// cheaper and more correct — it knows renames and binary files, and a diff-text parser
+    /// guesses.
+    fn changed_paths<'a>(
+        &'a self,
+        trees: &'a [RunStepTree],
+        commits: &'a [RunStepCommit],
+    ) -> IsolatorFuture<'a, Vec<RepoPath>>;
 
     /// §4.6 step 4: the winning candidate's branch merged into the primary tree, one commit row
     /// per repo.

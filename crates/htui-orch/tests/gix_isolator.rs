@@ -28,6 +28,7 @@ use htui_core::model::{
     StepGraphId, StepGraphPhase, StepId, StepStatus, VerifyOutcome,
 };
 use htui_core::prompt::DiffBlock;
+use htui_core::prompt::excerpt::RepoPath;
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{MemStore, ReadStore as _, StoreError, WriteStore as _};
 use htui_orch::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
@@ -2008,6 +2009,14 @@ impl Isolator for StallAfterReconcile<'_> {
         commits: &'a [RunStepCommit],
     ) -> IsolatorFuture<'a, Option<DiffBlock>> {
         self.inner.diff(trees, commits)
+    }
+
+    fn changed_paths<'a>(
+        &'a self,
+        trees: &'a [RunStepTree],
+        commits: &'a [RunStepCommit],
+    ) -> IsolatorFuture<'a, Vec<RepoPath>> {
+        self.inner.changed_paths(trees, commits)
     }
 
     fn reconcile<'a>(
