@@ -9670,12 +9670,11 @@ mod tests {
             "one `now` is threaded through the whole create, so the two columns agree"
         );
 
+        // The row's own id, the shape a caller that read the row and sends it back whole makes and
+        // the shape `PgStore` applies (its `ON CONFLICT (name) DO UPDATE` never writes `id`).
         let edited = applied(
             store
-                .upsert_skill(
-                    skill_row(SkillId::new(), "house", "Revised."),
-                    Some(created.updated_at),
-                )
+                .upsert_skill(skill_row(id, "house", "Revised."), Some(created.updated_at))
                 .await,
         );
         assert_eq!(

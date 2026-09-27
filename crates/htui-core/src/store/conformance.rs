@@ -6133,13 +6133,14 @@ async fn skill_upsert_creates_then_edits_under_the_updated_at_token<S: WriteStor
          the one statement's now()"
     );
 
+    // Blueprint 2.7 step 2 says "the same" — the **row's own** id, which is the shape a caller
+    // that read the row and sent it back whole makes. `PgStore` applies it (`ON CONFLICT (name)
+    // DO UPDATE` never writes `id`), so `MemStore` must too; minting a fresh id here would hide
+    // the two stores disagreeing.
     let edited = applied(
         CASE,
         store
-            .upsert_skill(
-                new_skill(SkillId::new(), "house", SECOND),
-                Some(created.updated_at),
-            )
+            .upsert_skill(new_skill(id, "house", SECOND), Some(created.updated_at))
             .await
             .expect(CASE),
     );
