@@ -2517,7 +2517,7 @@ impl WriteStore for PgStore {
     /// `ON CONFLICT (name)` infers the unique index over `skill.name` whatever its name is. The
     /// create path (`expected = NULL`) inserts and never collides; the edit path inserts a row
     /// that collides and updates it under its own `WHERE`. A spent token reaches neither — the
-    /// guard's `IS NOT DISTINCT FROM $5` is false — and falls through to [`cas_miss`], which is
+    /// guard's `IS NOT DISTINCT FROM $5` is false — and falls through to `cas_miss`, which is
     /// where `Stale` and `NotFound` are told apart.
     ///
     /// # Errors
@@ -2651,7 +2651,7 @@ impl WriteStore for PgStore {
     /// The insert's own guard is the row's `updated_at`, so a create (`None`) and a replace
     /// (`Some(t)`) both insert and both collide, and the `DO UPDATE`'s `WHERE
     /// skill_binding.updated_at = $10` is what decides. A spent token inserts nothing at all and
-    /// falls through to [`cas_miss`], whose re-read spells the key with `IS NOT DISTINCT FROM`
+    /// falls through to `cas_miss`, whose re-read spells the key with `IS NOT DISTINCT FROM`
     /// for the same reason the guard does (H-8).
     ///
     /// # Errors

@@ -1567,9 +1567,10 @@ impl PgStore {
     ///
     /// The pin check's read, and the only one of the five that is a list: the question is "does
     /// this skill have a version `n`", not "does version `n` exist", so another skill's row must
-    /// not answer it — and [`skill_pin_refusal`] scopes the scan to the skill for exactly that
-    /// reason. The bodies come back because `SkillVersion` is the row type the writer's
-    /// `cas_miss` and `bound_skills` already name, and a `Vec` of them costs one statement.
+    /// not answer it — and [`skill_pin_refusal`](htui_core::store::skill_pin_refusal) scopes the
+    /// scan to the skill for exactly that reason. The bodies come back because `SkillVersion` is
+    /// the row type the writer's `cas_miss` and `bound_skills` already name, and a `Vec` of them
+    /// costs one statement.
     ///
     /// # Errors
     ///
@@ -1776,8 +1777,7 @@ impl PgStore {
               LEFT JOIN project p ON p.id = b.project_id
               LEFT JOIN step_graph_phase g ON g.id = b.phase_id
              WHERE b.project_id IS NULL OR b.project_id = ANY($1)
-             ORDER BY b.project_id NULLS FIRST, b.project_id, b.phase_id NULLS FIRST,
-                      b.phase_id, s.name COLLATE "C"
+             ORDER BY b.project_id NULLS FIRST, b.phase_id NULLS FIRST, s.name COLLATE "C"
             "#,
             &owners,
         )

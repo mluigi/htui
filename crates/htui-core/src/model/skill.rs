@@ -447,7 +447,7 @@ pub struct SkillEntry {
 ///
 /// **Raw on purpose.** [`resolve`] would collapse the three levels into one winner per skill,
 /// which is what a prompt wants and exactly what a matrix must not show: the matrix is where the
-/// three rows of one skill are compared. `pg/rows.rs`'s milestone-2 [`SkillBindingRow`] is the
+/// three rows of one skill are compared. `pg/rows.rs`'s milestone-2 `SkillBindingRow` is the
 /// bare row and this is its joined form; both are `pub` and neither is a table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillAttachmentRow {

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT b.id            AS \"id: SkillBindingId\",\n                   b.skill_id      AS \"skill_id: SkillId\",\n                   s.name,\n                   b.project_id    AS \"project_id?: ProjectId\",\n                   p.slug          AS \"project_slug?: String\",\n                   b.phase_id      AS \"phase_id: PhaseId\",\n                   g.name          AS \"phase_name?: String\",\n                   b.pinned_version,\n                   b.position,\n                   b.activation    AS \"activation: Activation\",\n                   b.globs,\n                   b.languages,\n                   b.updated_at\n              FROM skill_binding b\n              JOIN skill s ON s.id = b.skill_id\n              LEFT JOIN project p ON p.id = b.project_id\n              LEFT JOIN step_graph_phase g ON g.id = b.phase_id\n             WHERE b.project_id IS NULL OR b.project_id = ANY($1)\n             ORDER BY b.project_id NULLS FIRST, b.project_id, b.phase_id NULLS FIRST,\n                      b.phase_id, s.name COLLATE \"C\"\n            ",
+  "query": "\n            SELECT b.id            AS \"id: SkillBindingId\",\n                   b.skill_id      AS \"skill_id: SkillId\",\n                   s.name,\n                   b.project_id    AS \"project_id?: ProjectId\",\n                   p.slug          AS \"project_slug?: String\",\n                   b.phase_id      AS \"phase_id: PhaseId\",\n                   g.name          AS \"phase_name?: String\",\n                   b.pinned_version,\n                   b.position,\n                   b.activation    AS \"activation: Activation\",\n                   b.globs,\n                   b.languages,\n                   b.updated_at\n              FROM skill_binding b\n              JOIN skill s ON s.id = b.skill_id\n              LEFT JOIN project p ON p.id = b.project_id\n              LEFT JOIN step_graph_phase g ON g.id = b.phase_id\n             WHERE b.project_id IS NULL OR b.project_id = ANY($1)\n             ORDER BY b.project_id NULLS FIRST, b.phase_id NULLS FIRST, s.name COLLATE \"C\"\n            ",
   "describe": {
     "columns": [
       {
@@ -168,5 +168,5 @@
       false
     ]
   },
-  "hash": "981a7a110a6fd5b21ff3db69b157e288f340e4176fad2b193c41b48c8c1feae7"
+  "hash": "dcfcab2f480368dd39191c7c3b91e234e1563f36f259e5b564d46bb9610370c8"
 }

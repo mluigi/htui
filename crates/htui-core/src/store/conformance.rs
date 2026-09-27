@@ -25,11 +25,11 @@ use crate::model::{
     PromptTemplate, PromptTemplateId, RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement,
     RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
     RequirementState, RequirementUpdate, Resolution, Run, RunId, RunKind, RunMode, RunScope,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SkillBinding,
-    SkillBindingId, SkillId, SkillLevel, SnapshotGraph, SnapshotSettings, Status, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
-    UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject, canonical_declared_tags, missing_tags_failure,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SkillBindingId, SkillId,
+    SkillLevel, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry,
+    UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    canonical_declared_tags, missing_tags_failure,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -5801,29 +5801,16 @@ fn new_binding_at(
 
 /// A `Constraint` whose message names the column, whichever store said it.
 ///
-/// `MemStore` speaks [`references_no_row`]'s prose and `PgStore` names the foreign key
+/// `MemStore` speaks `references_no_row`'s prose and `PgStore` names the foreign key
 /// (`H-9`), so a case about *which* column was refused accepts either; a case about a rule both
 /// stores refuse in Rust passes the one sentence they share.
-fn constraint_naming(
-    case: &str,
-    outcome: Result<CasOutcome<SkillBinding>, StoreError>,
-    needles: &[&str],
-    what: &str,
-) -> String {
-    match outcome {
-        Err(StoreError::Constraint(message)) => {
-            assert!(
-                needles.iter().any(|needle| message.contains(needle)),
-                "{case}: {what}: the refusal names one of {needles:?}, got {message:?}"
-            );
-            message
-        }
-        other => panic!("{case}: {what} is Constraint, got {other:?}"),
-    }
-}
-
-/// The same, for the two writers that answer with a [`Skill`] or a [`SkillVersion`].
-fn constraint_naming_row<T: core::fmt::Debug>(
+/// A `Constraint` whose message names the column, whichever store said it.
+///
+/// `MemStore` speaks [`references_no_row`]'s prose and `PgStore` names the foreign key
+/// (`H-9`), so a case about *which* column was refused passes the needles of both; a case about a
+/// rule the writer refuses in Rust passes the one sentence they share. The row type is a
+/// parameter so the two skill writers and the binding writer share this one helper.
+fn constraint_naming<T: core::fmt::Debug>(
     case: &str,
     outcome: Result<CasOutcome<T>, StoreError>,
     needles: &[&str],
@@ -6196,7 +6183,7 @@ async fn skill_upsert_creates_then_edits_under_the_updated_at_token<S: WriteStor
     }
 
     // The Agent Skills rule is the writer's, not a constraint (plan D77, OQ-20).
-    constraint_naming_row(
+    constraint_naming(
         CASE,
         store
             .upsert_skill(new_skill(SkillId::new(), "House", ""), None)
@@ -6204,7 +6191,7 @@ async fn skill_upsert_creates_then_edits_under_the_updated_at_token<S: WriteStor
         &["skill.name"],
         "a name with a capital and a space",
     );
-    constraint_naming_row(
+    constraint_naming(
         CASE,
         store
             .upsert_skill(new_skill(SkillId::new(), "-lead", ""), None)
@@ -6213,7 +6200,7 @@ async fn skill_upsert_creates_then_edits_under_the_updated_at_token<S: WriteStor
         "a name with a leading hyphen",
     );
     // Postgres `text` cannot hold U+0000 (`22021`), so both stores refuse it by rule.
-    constraint_naming_row(
+    constraint_naming(
         CASE,
         store
             .upsert_skill(new_skill(SkillId::new(), "ok\0", ""), None)
@@ -6221,7 +6208,7 @@ async fn skill_upsert_creates_then_edits_under_the_updated_at_token<S: WriteStor
         &["skill.name"],
         "a name with a NUL",
     );
-    constraint_naming_row(
+    constraint_naming(
         CASE,
         store
             .upsert_skill(new_skill(SkillId::new(), "other", "a\0b"), None)
@@ -6330,7 +6317,7 @@ async fn skill_version_append_is_a_cas_on_the_head<S: WriteStore>(store: &S) {
         "{CASE}: a save at head v2 appends v3"
     );
 
-    constraint_naming_row(
+    constraint_naming(
         CASE,
         store
             .add_skill_version(new_version(skill, "a\0b"), Some(3))
