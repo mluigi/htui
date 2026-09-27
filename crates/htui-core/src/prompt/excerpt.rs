@@ -1167,6 +1167,19 @@ pub fn select(
     }
     let considered = u32::try_from(listing.len()).unwrap_or(u32::MAX);
 
+    // MOD-9 D72: the enumerated file set, taken from the walk's own listing after the two filters
+    // above — not a second walk (the research's option (a)), which would double the filesystem
+    // cost of every step for no new data. Captured here because `fill_lexical_heads` takes the
+    // listing by `&mut` and would otherwise let a head-bearing entry in (H-17), and because
+    // tiers 1–4 are pure over the path, so nothing below can change the answer.
+    let listed: Vec<RepoPath> = listing
+        .iter()
+        .map(|entry| RepoPath {
+            repo: entry.repo.clone(),
+            path: entry.path.clone(),
+        })
+        .collect();
+
     // Every provider candidate is vetted against the listing **here**, while the listing is still
     // the only thing anything holds, and before a single `read` is issued (finding HIGH H1).
     let merged = vetted(merged, &listing, &mut notes);
@@ -1295,9 +1308,7 @@ pub fn select(
         files,
         audit,
         notes,
-        // MOD-9 D72 (red): the enumeration is not wired yet, so `the_listed_set_is_the_walk_after
-        // _the_skip_rules` is what turns this into the walk's own listing.
-        listed: Vec::new(),
+        listed,
     }
 }
 
@@ -2381,11 +2392,7 @@ mod tests {
             crate::prompt::TokenEstimator::DEFAULT,
         );
 
-        let listed: Vec<&str> = set
-            .listed
-            .iter()
-            .map(|entry| entry.path.as_str())
-            .collect();
+        let listed: Vec<&str> = set.listed.iter().map(|entry| entry.path.as_str()).collect();
         assert_eq!(
             listed,
             vec!["src/small.rs"],

@@ -59,10 +59,10 @@ use crate::model::box_::BoxProfile;
 use crate::model::ids::SkillId;
 use crate::model::link::UpstreamEntry;
 use crate::model::skill::{BoundSkill, SkillChoice, select};
-use excerpt::RepoPath;
 use crate::prompt::render::Rendered;
 use crate::prompt::trim::{Inputs, Trimmer};
 use crate::scrub::Scrubber;
+use excerpt::RepoPath;
 
 /// Everything the assembler needs, and nothing it must not have (ANA-5 §8 `:1917-1942`).
 ///

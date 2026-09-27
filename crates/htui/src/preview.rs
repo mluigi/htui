@@ -310,6 +310,9 @@ pub async fn build(
     let scrubber = MinimalScrubber::new([]);
     // The engine's own pass, one call (MOD-7 P-1): the preview's bytes and a run's cannot drift.
     spec.excerpts = excerpts_for(&spec, input, &app, &scrubber).await;
+    // MOD-9 D73: the preview runs the same walk a step does, so it fills the same field. There is
+    // no previous attempt here, so the listing is the whole file set.
+    spec.skill_files = spec.excerpts.listed.clone();
 
     Ok(PromptPreview {
         item,

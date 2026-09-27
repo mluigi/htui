@@ -4979,6 +4979,11 @@ where
             notes,
         };
         let excerpts = excerpts_for(spec, input, &self.parts.app, self.parts.scrubber).await;
+        // MOD-9 D72/D73: the walk is the file set a `glob` attachment is matched against, and the
+        // enumeration is deliberately a superset of what the budget paid for — a skill may fire on
+        // a file this prompt never showed the model. The previous attempt's changed paths (D89)
+        // join it in a later commit of this milestone, when `Isolator::changed_paths` lands.
+        spec.skill_files = excerpts.listed.clone();
         spec.excerpts = excerpts;
         Ok(())
     }
