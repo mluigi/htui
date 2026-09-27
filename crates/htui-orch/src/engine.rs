@@ -12417,25 +12417,97 @@ mod tests {
         );
     }
 
-    /// MOD-9 D72: the judge's and the handoff's set enumerates nothing, because no pass ran — and
-    /// that empty enumeration is what makes `select` record `no_path` rather than `no_match` (D97).
-    #[test]
-    fn no_excerpts_lists_nothing() {
-        let set = crate::engine::no_excerpts(htui_core::prompt::excerpt::ExcerptCaps {
-            max_files: 12,
-            file_line_cap: 400,
-            head_lines: 200,
-            max_file_bytes: 524_288,
-        });
+    /// MOD-9 D72: no pass ran, so nothing was enumerated — and the two emptinesses are different
+    /// facts. `files` is what the prompt showed the model; `listed` is what a `glob` attachment is
+    /// matched against, and only the first can be empty while the second is not.
+    ///
+    /// Asserted through the builders that decide it, not through the `no_excerpts` literal alone.
+    /// The literal is a struct with a hardcoded `Vec::new()`, so reading emptiness back off it
+    /// proves only that a struct field is empty — and the previous version of this test claimed the
+    /// judge and the handoff on that basis while touching neither.
+    ///
+    /// The judge's half is **not** asserted here and cannot be: `judge_prompts` assembles its spec
+    /// internally and returns `JudgePrompts`, so the spec — and its `skill_files` with it — never
+    /// surfaces. Pinning it needs a signature change, which belongs with the unit that gives the
+    /// record its shape. What is assertable is that both of those specs start with no file set and
+    /// no matches, and that a phase prompt's does not.
+    #[tokio::test]
+    async fn a_handoff_and_a_judge_resolve_no_file_set_and_a_phase_prompt_does() {
+        use crate::graph::GraphSource as _;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (repo, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        write_tree(dir.path(), repo, "docs/notes.md", "Not on the touched list.\n");
+        harness_engine!(harness.orch, engine);
+
+        // (0) The literal itself, which is the only thing a direct read of it can say.
+        let set = super::no_excerpts(super::settings::resolve_excerpt_caps(&engine.parts.app).0);
         assert!(set.files.is_empty(), "no pass ran, so no excerpt was taken");
         assert!(
             set.listed.is_empty(),
-            "D72: no pass ran, so nothing was enumerated either. The two differ: `files` is what \
-             the prompt showed the model and `listed` is what a `glob` attachment is matched \
-             against, and only the first can be empty while the second is not. Got {:?}",
+            "D72: and nothing was enumerated either, because enumeration is the walk's output and \
+             there was no walk. Got {:?}",
             set.listed
         );
         assert_eq!(set.audit.considered, 0, "the audit says the same");
+
+        // (1) The builder both no-file-set paths share. A handoff never reads a file, so it
+        // resolves no file set — which is `no_path` rather than `no_match` (D97).
+        let mut spec = engine
+            .phase_spec(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                false,
+            )
+            .await
+            .expect("the spec is built")
+            .expect("not strict: no input is refused");
+        assert!(
+            spec.skill_files.is_empty() && spec.skill_matches.is_none(),
+            "D73/D97: the handoff's builder resolves no file set and no matches, so a `glob` \
+             candidate on this path records `no_path`"
+        );
+
+        // (2) `promote::handoff_spec` keeps both through `..phase`.
+        let template = harness
+            .orch
+            .graphs()
+            .prompt_template(ids::PROJECT_HTUI, "handoff", None)
+            .await
+            .expect("the fake graph source never fails")
+            .expect("the demo project has a `handoff` template");
+        let handoff =
+            crate::promote::handoff_spec(spec.clone(), &template, &[], &[], None, "why".to_owned());
+        assert!(
+            handoff.skill_files.is_empty() && handoff.skill_matches.is_none(),
+            "and the handoff that `..phase` derives still resolves none"
+        );
+        assert_eq!(handoff.excerpts, set, "its excerpt set is the empty one too");
+
+        // (3) The same builder, once the walk has run, resolves the walk's listing. The contrast is
+        // the point: an empty file set on (1) means "no pass ran", not "the pass found nothing".
+        engine
+            .with_excerpts(&row, &prd, ids::HTUI_FEAT_3, &mut spec)
+            .await
+            .expect("no store fault");
+        assert_eq!(
+            spec.skill_files, spec.excerpts.listed,
+            "D73: the same spec that resolved no file set for the handoff resolves the walk's \
+             listing once `with_excerpts` has run"
+        );
+        assert_eq!(
+            spec.skill_files
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["docs/notes.md", "src/lib.rs"],
+            "both walked files, in the walk's byte order"
+        );
     }
 
     /// Plan D109: a template that does not place `{{excerpts}}` reads nothing, and says so.
