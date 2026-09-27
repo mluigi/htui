@@ -288,6 +288,10 @@ pub async fn build(
         upstream,
         box_profile,
         skills,
+        // MOD-9 D73: the walk below fills both, immediately before `assemble`, so the preview
+        // resolves a file set exactly as a step does.
+        skill_files: Vec::new(),
+        skill_matches: None,
         excerpts: ExcerptSet::default(),
         command_queue: false,
         verify_failure: None,

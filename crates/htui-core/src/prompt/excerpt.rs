@@ -1295,6 +1295,9 @@ pub fn select(
         files,
         audit,
         notes,
+        // MOD-9 D72 (red): the enumeration is not wired yet, so `the_listed_set_is_the_walk_after
+        // _the_skip_rules` is what turns this into the walk's own listing.
+        listed: Vec::new(),
     }
 }
 
@@ -1469,6 +1472,15 @@ pub struct ExcerptSet {
     /// Notes the pass produced that are not errors — a skipped repo, a dropped provider. Copied
     /// into `trim_record.notes`.
     pub notes: Vec<String>,
+    /// MOD-9 D72: the walk's **enumerated** file set — every path the walk listed, after
+    /// `skip_by_path` and `is_repo_relative`, whether or not it was selected. This is the set
+    /// `skill_binding.globs` is matched against (D87), and it is deliberately a **superset** of
+    /// `files`: a skill can activate on a file that was too big to excerpt, and on one the budget
+    /// did not reach.
+    ///
+    /// Empty wherever no pass ran — `no_excerpts`, `unscanned`, and every fixture — which is
+    /// exactly the `None` `select` is given (D97).
+    pub listed: Vec<RepoPath>,
 }
 
 #[cfg(test)]
@@ -2341,5 +2353,81 @@ mod tests {
         };
         assert_eq!(audit.selected, 3);
         assert!(audit.files.is_empty());
+    }
+
+    /// MOD-9 D72: `listed` is the walk's own enumeration, captured from the listing local after
+    /// `skip_by_path` and `is_repo_relative` and before `fill_lexical_heads` takes it by `&mut`
+    /// (H-17) — not a second walk, and not the selected excerpts.
+    #[test]
+    fn the_listed_set_is_the_walk_after_the_skip_rules() {
+        let mut owned = request("a body naming nothing\n", &[], &[]);
+        owned.roots = vec![root("htui")];
+        owned.caps.max_file_bytes = 32;
+        let big = "x".repeat(64);
+        let reader = MapReader::with(&[
+            ("htui", ".git/config", "[core]\n"),
+            ("htui", "secret.pem", "-----BEGIN RSA PRIVATE KEY-----\n"),
+            ("htui", "Cargo.lock", "[[package]]\n"),
+            ("htui", "src/big.rs", &big),
+            ("htui", "src/small.rs", "fn small() {}\n"),
+        ])
+        .refusing_over(32);
+
+        let set = select(
+            &reader,
+            &owned.as_request(),
+            Vec::new(),
+            vec![BUILTIN_ID.to_owned()],
+            crate::prompt::TokenEstimator::DEFAULT,
+        );
+
+        let listed: Vec<&str> = set
+            .listed
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["src/small.rs"],
+            "D72: the three path-only rules drop `.git/config`, `secret.pem` and `Cargo.lock` \
+             before the listing is built, and the 64-byte `src/big.rs` never reaches it at all \
+             because the **reader** refuses a file over its own cap before it lists it — which is \
+             earlier than any cap `select` could apply. Only `src/small.rs` is enumerated."
+        );
+    }
+
+    /// D72's reason for the field: `listed` is a **superset** of `files`, and it is empty exactly
+    /// where no pass ran — which is the `None` `select` is given (D97).
+    #[test]
+    fn the_listed_set_is_a_superset_of_the_excerpts_and_is_empty_where_no_pass_ran() {
+        let mut owned = request("a body naming nothing\n", &[], &[]);
+        owned.roots = vec![root("htui")];
+        owned.budget_tokens = 0;
+        let reader = MapReader::with(&[
+            ("htui", "src/a.rs", "fn a() {}\n"),
+            ("htui", "src/b.rs", "fn b() {}\n"),
+        ]);
+
+        let set = select(
+            &reader,
+            &owned.as_request(),
+            Vec::new(),
+            vec![BUILTIN_ID.to_owned()],
+            crate::prompt::TokenEstimator::DEFAULT,
+        );
+
+        assert!(set.files.is_empty(), "a zero residual budget takes nothing");
+        assert_eq!(
+            set.listed.len(),
+            2,
+            "both files are still enumerated, which is the point: a `glob` skill can activate on a \
+             file the prompt never showed the model, so the matcher must see the walk and not the \
+             budget. Got {:?}",
+            set.listed
+        );
+        assert!(
+            ExcerptSet::default().listed.is_empty(),
+            "D72: empty wherever no pass ran, which is what `no_excerpts` and `unscanned` record"
+        );
     }
 }

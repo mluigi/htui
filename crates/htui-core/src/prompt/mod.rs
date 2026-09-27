@@ -56,8 +56,10 @@ use serde::{Serialize, Serializer};
 use serde_json::Value;
 
 use crate::model::box_::BoxProfile;
+use crate::model::ids::SkillId;
 use crate::model::link::UpstreamEntry;
 use crate::model::skill::{BoundSkill, SkillChoice, select};
+use excerpt::RepoPath;
 use crate::prompt::render::Rendered;
 use crate::prompt::trim::{Inputs, Trimmer};
 use crate::scrub::Scrubber;
@@ -102,6 +104,18 @@ pub struct PromptSpec {
     /// attachments, most specific winning, inactive ones included. The assembler collapses and
     /// selects (MOD-9 D43).
     pub skills: Vec<BoundSkill>,
+    /// MOD-9 D73/D89: the step's file set for glob activation — the walk's listing
+    /// ([`ExcerptSet::listed`]) unioned with the previous attempt's changed paths, de-duplicated on
+    /// `(repo, path)` and in that order. Filled by the engine's `with_excerpts` and by the `htui`
+    /// crate's `preview::build`; empty wherever no file set resolved.
+    pub skill_files: Vec<RepoPath>,
+    /// MOD-9 D73/D97: what [`matched_skills`](crate::prompt::glob::matched_skills) fired on, or
+    /// `None` when **no** file set resolved — which is what `select` records as `no_path`, and is
+    /// not the same as "the set ran and matched nothing". `Some({})` is that other answer.
+    ///
+    /// The `Option` is D73's, which gives `select` an `Option<&BTreeMap<…>>`; a bare map on the
+    /// spec would collapse `no_path` and `no_match` into one record (F-5).
+    pub skill_matches: Option<BTreeMap<SkillId, String>>,
     /// §4.5's read and windowed excerpts, with the audit half the ranker filled.
     pub excerpts: ExcerptSet,
     /// Whether `R-MCP-4`'s `command_run` exposure is on for this phase (§4.2 `:484`).
@@ -1271,6 +1285,7 @@ mod residual_tests {
             ],
             audit: audit.clone(),
             notes: vec!["a note from the pass".to_owned()],
+            listed: Vec::new(),
         };
         drop_unmaskable_excerpts(&mut set, &MinimalScrubber::new([]));
         assert_eq!(set.files.len(), 1);

@@ -4400,6 +4400,10 @@ where
             box_profile: self.parts.box_profile.clone(),
             // MOD-9 D44, D48: the judged phase's candidates, the same list for both orders.
             skills: skills.clone(),
+            // MOD-9 D73/D97: a judge reads no file, so it resolves no file set — which is
+            // `no_path`, never `no_match`.
+            skill_files: Vec::new(),
+            skill_matches: None,
             // No pass for a judge (plan D109): its placeholder set cannot place `{{excerpts}}`
             // (`template.rs:188-215`), so a file read here could only reach the audit.
             excerpts: no_excerpts(caps),
@@ -5091,6 +5095,11 @@ where
             // winning (`model::skill::resolve`); the assembler's `select` decides which render and
             // records every candidate in `trim_record.skill_choices`.
             skills,
+            // MOD-9 D73/D97: `with_excerpts` fills both for a phase prompt, after the walk; this
+            // builder is also the promote/handoff path's, and a handoff never reads a file, so it
+            // starts with no file set at all — which is `no_path`, not `no_match`.
+            skill_files: Vec::new(),
+            skill_matches: None,
             // The pass runs in `assemble_prompt` (`Self::with_excerpts`, MOD-7 milestone 4 D125),
             // not here: this builder is also the promote/handoff path's, and a handoff never reads
             // a file. So the caps are recorded and nothing else, and `with_excerpts` replaces this
@@ -5831,6 +5840,9 @@ fn no_excerpts(caps: htui_core::prompt::excerpt::ExcerptCaps) -> ExcerptSet {
             files: Vec::new(),
         },
         notes: Vec::new(),
+        // MOD-9 D72: no pass ran, so nothing was enumerated — which is the `None` a `glob`
+        // candidate records as `no_path` (D97).
+        listed: Vec::new(),
     }
 }
 
@@ -12333,6 +12345,27 @@ mod tests {
             "{:?}",
             prompt.trim.excerpts.files
         );
+    }
+
+    /// MOD-9 D72: the judge's and the handoff's set enumerates nothing, because no pass ran — and
+    /// that empty enumeration is what makes `select` record `no_path` rather than `no_match` (D97).
+    #[test]
+    fn no_excerpts_lists_nothing() {
+        let set = crate::engine::no_excerpts(htui_core::prompt::excerpt::ExcerptCaps {
+            max_files: 12,
+            file_line_cap: 400,
+            head_lines: 200,
+            max_file_bytes: 524_288,
+        });
+        assert!(set.files.is_empty(), "no pass ran, so no excerpt was taken");
+        assert!(
+            set.listed.is_empty(),
+            "D72: no pass ran, so nothing was enumerated either. The two differ: `files` is what \
+             the prompt showed the model and `listed` is what a `glob` attachment is matched \
+             against, and only the first can be empty while the second is not. Got {:?}",
+            set.listed
+        );
+        assert_eq!(set.audit.considered, 0, "the audit says the same");
     }
 
     /// Plan D109: a template that does not place `{{excerpts}}` reads nothing, and says so.

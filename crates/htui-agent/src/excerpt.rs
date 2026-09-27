@@ -1039,6 +1039,10 @@ fn unscanned(roots: &[RepoRoot], caps: ExcerptCaps, notes: Vec<String>) -> Excer
             files: Vec::new(),
         },
         notes,
+        // MOD-9 D72: this pass read nothing, so it enumerated nothing — which is the `None` a
+        // `glob` candidate records as `no_path` (D97), and not the `Some({})` of a walk that ran
+        // and missed.
+        listed: Vec::new(),
     }
 }
 

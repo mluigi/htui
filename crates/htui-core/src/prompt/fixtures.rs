@@ -228,10 +228,16 @@ pub fn phase_implement_attempt2() -> PromptSpec {
             activation: Activation::Always,
             globs: Vec::new(),
         }],
+        // MOD-9 D73/D97: a fixture resolves no file set, so it carries none. That is the `None`
+        // a `glob` candidate records as `no_path` — not the `Some({})` of a walk that matched
+        // nothing, which is a different record and says so.
+        skill_files: Vec::new(),
+        skill_matches: None,
         excerpts: ExcerptSet {
             files: excerpts,
             audit,
             notes: Vec::new(),
+            listed: Vec::new(),
         },
         command_queue: true,
         verify_failure: Some(VerifyFailure {
@@ -288,6 +294,8 @@ pub fn phase_all_empty() -> PromptSpec {
             quirks: String::new(),
         },
         skills: Vec::new(),
+        skill_files: Vec::new(),
+        skill_matches: None,
         excerpts: ExcerptSet::default(),
         command_queue: false,
         verify_failure: None,
@@ -378,6 +386,8 @@ pub fn judge_three_candidates() -> PromptSpec {
         upstream: Vec::new(),
         box_profile: demo_box(),
         skills: Vec::new(),
+        skill_files: Vec::new(),
+        skill_matches: None,
         excerpts: ExcerptSet::default(),
         command_queue: false,
         verify_failure: None,
@@ -520,6 +530,8 @@ pub fn handoff_basic() -> PromptSpec {
         upstream: Vec::new(),
         box_profile: demo_box(),
         skills: Vec::new(),
+        skill_files: Vec::new(),
+        skill_matches: None,
         excerpts: ExcerptSet::default(),
         command_queue: false,
         verify_failure: None,
