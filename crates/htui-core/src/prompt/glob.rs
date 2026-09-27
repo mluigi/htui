@@ -7,6 +7,9 @@
 //! components and is legal only as a whole component, `{a,b}` alternates and is legal only as a
 //! whole component, `[abc]` / `[!abc]` / `[a-z]` are character classes, `\` escapes the next
 //! metacharacter, and a leading `!`, a trailing `/`, an absolute path and a NUL are refused.
+//! A `\` in front of anything else is refused too, which is the half of D70's price that costs the
+//! most: `src/a\.rs` is turned down rather than stored as `src/a.rs`, because `.` is ordinary in
+//! this dialect and a backslash that means nothing is a typo the maintainer should see.
 //! Matching is case-sensitive. One implementation of "compiles" serves both the writer and the
 //! matcher, so a stored glob is always a compiling one (plan D78, D99).
 //!
@@ -334,10 +337,42 @@ fn compile_component(component: &str, base: usize) -> Result<Segment, GlobError>
     if let Some(at) = misplaced_globstar(component) {
         return Err(GlobError::MisplacedGlobstar { at: base + at });
     }
-    match component.find('{') {
+    match find_unescaped(component, '{') {
         Some(open) => compile_alternation(component, open, base),
         None => Ok(Segment::Parts(tokens(component, base)?)),
     }
+}
+
+/// The byte of the first `target` that no `\` stands in front of, or `None`.
+///
+/// A `\` stands in front of exactly one character (D71), so `\{` is a literal brace and never opens
+/// an alternation, and `\}` never closes one. Every scan in this module that looks for a structural
+/// character goes through here; the ones that look for a *token* (`tokens`, `misplaced_globstar`)
+/// walk the escape themselves.
+fn find_unescaped(component: &str, target: char) -> Option<usize> {
+    let mut chars = component.char_indices();
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            c if c == target => return Some(at),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether a `\` may stand in front of `c`: the dialect's metacharacters, and nothing else.
+///
+/// D71 is "`\` escapes the next metacharacter", and blueprint §2.1.1's refusal table's last row
+/// (`src/\x.rs` is a [`GlobError::DanglingEscape`]) is the same rule. `-` is in the set because it
+/// is a metacharacter inside a class — the range operator — even though it is ordinary outside one.
+fn escapable(c: char) -> bool {
+    matches!(
+        c,
+        '*' | '?' | '[' | ']' | '{' | '}' | ',' | '\\' | '!' | ':' | '/' | '-'
+    )
 }
 
 /// The byte of the first `**` that is not the whole component; escaped stars do not count.
@@ -403,10 +438,8 @@ fn compile_alternation(component: &str, open: usize, base: usize) -> Result<Segm
 
 /// The `{a,b}` content split on its unescaped commas, each piece with its byte in the pattern.
 fn split_alternatives(content: &str, base: usize) -> Result<Vec<(&str, usize)>, GlobError> {
-    if content.contains('{') || content.contains('}') {
-        return Err(GlobError::NestedAlternation {
-            at: base + content.find(['{', '}']).expect("just found one"),
-        });
+    if let Some(at) = find_unescaped(content, '{').or_else(|| find_unescaped(content, '}')) {
+        return Err(GlobError::NestedAlternation { at: base + at });
     }
     let mut pieces = Vec::new();
     let mut start = 0;
@@ -435,6 +468,11 @@ fn split_alternatives(content: &str, base: usize) -> Result<Vec<(&str, usize)>, 
 }
 
 /// The tokens of one component: `*`, `?`, `[…]`, `\` and everything else literal.
+///
+/// A `\` with nothing escapable after it is a [`GlobError::DanglingEscape`] at the `\` itself, in
+/// a class as much as outside one: a `\` that means nothing is a maintainer's typo either way, and
+/// D70's price is that it is refused at save time rather than stored as a pattern that quietly
+/// means something else.
 fn tokens(component: &str, base: usize) -> Result<Vec<Tok>, GlobError> {
     let mut toks = Vec::new();
     let mut chars = component.char_indices();
@@ -443,10 +481,14 @@ fn tokens(component: &str, base: usize) -> Result<Vec<Tok>, GlobError> {
             '*' => toks.push(Tok::Star),
             '?' => toks.push(Tok::Any),
             '\\' => match chars.next() {
-                Some((_, escaped)) => toks.push(Tok::Char(escaped)),
-                None => return Err(GlobError::DanglingEscape { at: base + at }),
+                Some((_, escaped)) if escapable(escaped) => toks.push(Tok::Char(escaped)),
+                _ => return Err(GlobError::DanglingEscape { at: base + at }),
             },
-            '[' => toks.push(class(chars.by_ref(), base + at)?),
+            '[' => toks.push(class(chars.by_ref(), base, at)?),
+            // Unreachable from a compiled component: `compile_component` diverts on the first
+            // unescaped `{`, and a `}` never reaches here either — `class` and
+            // `compile_alternation` have consumed or refused both by now. Kept as the belt to
+            // those two scans, which are the ones that make `\{` a literal.
             '{' | '}' => return Err(GlobError::NestedAlternation { at: base + at }),
             c => toks.push(Tok::Char(c)),
         }
@@ -454,31 +496,35 @@ fn tokens(component: &str, base: usize) -> Result<Vec<Tok>, GlobError> {
     Ok(toks)
 }
 
-/// `[abc]`, `[!abc]`, `[a-z]`, with `\` escaping inside. `at` is the `[`, already rebased.
+/// `[abc]`, `[!abc]`, `[a-z]`, with `\` escaping inside. `at` is the `[`'s byte in `component`.
+///
+/// `chars` is the caller's iterator over the whole component, so the offsets it yields are the
+/// component's own and `base` is all this has to add back.
 ///
 /// The body is gathered first and the ranges read out of it, so `]` needs no "unless it is first"
 /// exception: the one-character class `[]` is the empty class this dialect refuses.
-fn class(chars: &mut std::str::CharIndices<'_>, at: usize) -> Result<Tok, GlobError> {
+fn class(chars: &mut std::str::CharIndices<'_>, base: usize, at: usize) -> Result<Tok, GlobError> {
     let mut body = String::new();
     let mut closed = false;
-    while let Some((_, c)) = chars.next() {
+    while let Some((offset, c)) = chars.next() {
         match c {
             ']' => {
                 closed = true;
                 break;
             }
             '\\' => match chars.next() {
-                Some((_, escaped)) => body.push(escaped),
+                Some((_, escaped)) if escapable(escaped) => body.push(escaped),
+                Some(_) => return Err(GlobError::DanglingEscape { at: base + offset }),
                 None => break,
             },
             c => body.push(c),
         }
     }
     if !closed {
-        return Err(GlobError::UnterminatedClass { at });
+        return Err(GlobError::UnterminatedClass { at: base + at });
     }
     let Some((negated, ranges)) = ranges(&body) else {
-        return Err(GlobError::EmptyClass { at });
+        return Err(GlobError::EmptyClass { at: base + at });
     };
     Ok(Tok::Class { negated, ranges })
 }
@@ -739,8 +785,8 @@ mod tests {
             (r"a\{b\}.rs", "a{b}.rs", true),
             ("x[0-9\\]].rs", "x].rs", true),
             // Matching is case-sensitive everywhere.
+            ("*.RS", "X.RS", true),
             ("*.RS", "main.rs", false),
-            ("*.RS", "X.RS", false),
             ("[a-c].rs", "B.rs", false),
             // A component is a whole path component, not a prefix or a suffix of one.
             ("src", "src", true),
@@ -758,6 +804,44 @@ mod tests {
                 compiled.matches(path),
                 expected,
                 "the method agrees with the function"
+            );
+        }
+    }
+
+    /// `\` makes the metacharacter after it literal, and only a metacharacter: a `\` in front of
+    /// anything else is a refusal, in a class as much as outside one (D70's price, D71's rule).
+    #[test]
+    fn escapes_bind_the_next_metacharacter_and_nothing_else() {
+        for (pattern, path) in [
+            (r"a\*b", "a*b"),
+            (r"a\?b", "a?b"),
+            (r"a\[b", "a[b"),
+            (r"a\]b", "a]b"),
+            (r"a\{b", "a{b"),
+            (r"a\}b", "a}b"),
+            (r"a\,b", "a,b"),
+            // `\\` is a literal backslash, which in a path is a character and in a `RepoPath` is
+            // one of the things a Windows checkout puts in a name.
+            (r"a\\b", "a\\b"),
+            (r"a\!b", "a!b"),
+            (r"a\:b", "a:b"),
+            (r"a\-b", "a-b"),
+            ("x[0-9\\]].rs", "x].rs"),
+        ] {
+            let compiled =
+                compile(pattern).unwrap_or_else(|err| panic!("`{pattern}` must compile: {err}"));
+            assert!(matches(&compiled, path), "`{pattern}` matches `{path}`");
+        }
+        for (pattern, at) in [
+            ("src/a\\.rs", 5),
+            ("src/a\\q.rs", 5),
+            ("src/[a\\q]", 6),
+            ("src/\\", 4),
+        ] {
+            assert_eq!(
+                compile(pattern).expect_err("a `\\` in front of an ordinary character is refused"),
+                GlobError::DanglingEscape { at },
+                "`{pattern}` names the `\\` itself, which is what the editor puts a cursor on"
             );
         }
     }
