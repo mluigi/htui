@@ -813,4 +813,105 @@ mod tests {
             SkillLevel::Global < SkillLevel::Project && SkillLevel::Project < SkillLevel::Phase
         );
     }
+
+    /// OQ-20 / plan D77: the Agent Skills rule ANA-22 §6 item 12 adopts, checked by the writer and
+    /// not by a constraint — `[a-z0-9-]`, 1–64 characters, no leading, trailing or doubled
+    /// hyphen. It is here, and not in either store, for `ItemKind::prefix_is_valid`'s reason: both
+    /// stores refuse the same strings with the same sentence.
+    #[test]
+    fn a_skill_name_follows_the_agent_skills_rule() {
+        let sixty_four = "a".repeat(64);
+        for good in ["a", "0", "rust-style", "a1-b2", "house-rules", sixty_four.as_str()] {
+            assert!(Skill::name_is_valid(good), "`{good}` names a skill");
+        }
+        let sixty_five = "a".repeat(65);
+        for bad in [
+            "",
+            "-a",
+            "a-",
+            "a--b",
+            "A",
+            "a_b",
+            "a b",
+            "a.b",
+            "a/b",
+            "é",
+            "a\0b",
+            "a\nb",
+            sixty_five.as_str(),
+        ] {
+            assert!(
+                !Skill::name_is_valid(bad),
+                "`{}` does not name a skill",
+                bad.escape_debug()
+            );
+        }
+    }
+
+    /// D90, D91: the three write arguments live beside the rows they construct, each carrying a
+    /// client-minted id and the columns the store does not assign. The key sets are pinned because
+    /// `StoreRequest` carries these across a channel in a later task.
+    #[test]
+    fn the_new_skill_arguments_serialize_their_documented_keys() {
+        let keys = |value: serde_json::Value| {
+            let mut keys: Vec<String> = value
+                .as_object()
+                .expect("an object")
+                .keys()
+                .map(String::clone)
+                .collect();
+            keys.sort();
+            keys
+        };
+        let skill = NewSkill {
+            id: SkillId::new(),
+            name: "house-rules".to_owned(),
+            description: "the ones we always follow".to_owned(),
+            created_by: UserId::new(),
+        };
+        let version = NewSkillVersion {
+            skill_id: SkillId::new(),
+            body: "# house rules".to_owned(),
+            source: serde_json::json!({}),
+            created_by: UserId::new(),
+        };
+        let binding = NewSkillBinding {
+            id: SkillBindingId::new(),
+            skill_id: SkillId::new(),
+            project_id: None,
+            phase_id: None,
+            pinned_version: Some(2),
+            position: 0,
+            activation: Activation::Glob,
+            globs: vec!["**/*.rs".to_owned()],
+            languages: vec!["rust".to_owned()],
+        };
+
+        assert_eq!(
+            keys(serde_json::to_value(&skill).expect("a new skill serialises")),
+            ["created_by", "description", "id", "name"],
+            "`NewSkill` is `skill`'s row minus the two instants the store assigns"
+        );
+        assert_eq!(
+            keys(serde_json::to_value(&version).expect("a new version serialises")),
+            ["body", "created_by", "skill_id", "source"],
+            "`skill_version` is append-only, so no id and no instant"
+        );
+        assert_eq!(
+            keys(serde_json::to_value(&binding).expect("a new binding serialises")),
+            [
+                "activation",
+                "globs",
+                "id",
+                "languages",
+                "phase_id",
+                "pinned_version",
+                "position",
+                "project_id",
+                "skill_id",
+            ],
+            "`NewSkillBinding` is every `skill_binding` column the store assigns (`created_at` does \
+             not exist; `updated_at` is the CAS token, never written by hand)"
+        );
+    }
 }
