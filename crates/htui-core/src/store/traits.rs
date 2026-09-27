@@ -1541,33 +1541,39 @@ pub fn skill_refusal(name: &str, description: &str) -> Option<String> {
     None
 }
 
-/// MOD-9 D78: why an attachment may not be written, or `None`.
+/// MOD-9 D78: the four rules of `set_skill_binding` that need no read — the fifth, the pin, is
+/// [`skill_pin_refusal`], because it does.
 ///
 /// Every sentence here is one both stores give, and the glob sentence is
 /// [`GlobError`](crate::prompt::glob::GlobError)'s own `Display` verbatim (D99), so the matrix
 /// view's pre-flight and this refusal can never disagree about why a glob was turned down. The
 /// order is the schema's own: the two CHECKs `Postgres` carries (`skill_binding_phase_needs_project`
-/// and `skill_binding_glob_needs_globs`), then the two rules it does not — a repo-qualified glob on
-/// a **global** row (ANA-22 §6 item 6: a global attachment cannot name a repo) and a pin the skill
-/// has no version for.
+/// and `skill_binding_glob_needs_globs`), then the two rules it carries no CHECK for — a
+/// repo-qualified glob on a **global** row (ANA-22 §6 item 6: a global attachment cannot name a
+/// repo) and a glob [`crate::prompt::glob::compile`] refuses, with the byte the editor puts a
+/// cursor on.
 ///
-/// The token is **not** checked here: a spent `updated_at` answers `Stale` from the row read, and
-/// that read comes first in the writer, so bad input against a spent token is `Stale` on both
-/// stores (D78's error order). `versions` is one query's worth of `skill_version` and may hold
-/// another skill's rows, as [`SkillBinding::version_in_force`](crate::model::SkillBinding::version_in_force)
-/// allows; only `new.skill_id`'s count.
+/// The split is not tidiness. `PgStore` pays for the `skill_version` read only when a pin is
+/// actually set — the common case writes no pin and would otherwise read a whole version list to
+/// answer `None` — exactly as `append_prompt_template` pays for its head read only when there is a
+/// refusal to classify.
+///
+/// The token is **not** checked here either: a spent `updated_at` answers `Stale` from the row
+/// read, and that read comes first in the writer, so bad input against a spent token is `Stale` on
+/// both stores (D78's error order).
 #[must_use]
-pub fn skill_binding_refusal(new: &NewSkillBinding, versions: &[SkillVersion]) -> Option<String> {
+pub fn skill_binding_refusal(new: &NewSkillBinding) -> Option<String> {
     if new.phase_id.is_some() && new.project_id.is_none() {
         return Some(
-            "skill_binding.phase_id requires a project_id (`skill_binding_phase_needs_project`)"
+            "skill_binding.phase_id needs a project_id: a phase attachment is the project's \
+             (ANA-22 §6 item 2)"
                 .to_owned(),
         );
     }
     if new.activation == Activation::Glob && new.globs.is_empty() {
         return Some(
-            "skill_binding.activation `glob` needs at least one glob \
-             (`skill_binding_glob_needs_globs`)"
+            "skill_binding.globs must name at least one glob when activation is `glob` \
+             (skill_binding_glob_needs_globs)"
                 .to_owned(),
         );
     }
@@ -1578,23 +1584,32 @@ pub fn skill_binding_refusal(new: &NewSkillBinding, versions: &[SkillVersion]) -
         };
         if pattern.repo.is_some() && new.project_id.is_none() {
             return Some(format!(
-                "a repo-qualified glob `{}` cannot sit on a global attachment, which names no repo \
-                 (ANA-22 §6 item 6)",
+                "skill_binding.globs `{}` names a repo, and a global attachment applies to every \
+                 project (ANA-22 §6 item 6)",
                 glob.escape_debug()
             ));
         }
     }
-    if let Some(pinned) = new.pinned_version
-        && !versions
-            .iter()
-            .any(|v| v.skill_id == new.skill_id && v.version == pinned)
-    {
-        return Some(format!(
-            "skill_binding.pinned_version {pinned} names no skill_version of skill {}",
-            new.skill_id
-        ));
-    }
     None
+}
+
+/// MOD-9 D78: a `pinned_version` the skill has no version for, in one sentence for both stores.
+///
+/// The fifth rule, and the only one that needs a read: `versions` is whatever the caller already
+/// has, one query's worth of `skill_version`, and it may hold another skill's rows as
+/// [`SkillBinding::version_in_force`](crate::model::SkillBinding::version_in_force) allows — so the
+/// check is scoped to `skill`, and another skill's version 1 does not satisfy this skill's pin 1.
+#[must_use]
+pub fn skill_pin_refusal(pinned: i32, skill: SkillId, versions: &[SkillVersion]) -> Option<String> {
+    if versions
+        .iter()
+        .any(|version| version.skill_id == skill && version.version == pinned)
+    {
+        return None;
+    }
+    Some(format!(
+        "skill_binding.pinned_version {pinned} names no version of skill `{skill}`"
+    ))
 }
 
 #[cfg(test)]
@@ -1704,12 +1719,15 @@ mod tests {
 
     /// D78: every rule the writer carries in Rust, in the order the schema's own CHECKs put them,
     /// and a good attachment at the end that none of the refusals affected.
+    ///
+    /// The pin is the one rule that needs a read, so it is a second helper and the second half of
+    /// this test: a writer that carries the version list on the first helper's signature pays for
+    /// the read on every call, which is the thing D78's split exists to avoid.
     #[test]
     fn a_binding_refusal_names_the_rule_it_refused() {
         let id = skill();
         let project = ProjectId::new();
         let phase = PhaseId::new();
-        let versions = [version(id, 1), version(id, 2)];
 
         // A phase without a project: `skill_binding_phase_needs_project`.
         let no_project = NewSkillBinding {
@@ -1717,8 +1735,9 @@ mod tests {
             ..binding(id)
         };
         assert_eq!(
-            skill_binding_refusal(&no_project, &versions).expect("a phase needs a project"),
-            "skill_binding.phase_id requires a project_id (`skill_binding_phase_needs_project`)"
+            skill_binding_refusal(&no_project).expect("a phase needs a project"),
+            "skill_binding.phase_id needs a project_id: a phase attachment is the project's \
+             (ANA-22 §6 item 2)"
         );
 
         // `activation = glob` with nothing to match: `skill_binding_glob_needs_globs`.
@@ -1727,9 +1746,9 @@ mod tests {
             ..binding(id)
         };
         assert_eq!(
-            skill_binding_refusal(&no_globs, &versions).expect("a glob activation needs globs"),
-            "skill_binding.activation `glob` needs at least one glob \
-             (`skill_binding_glob_needs_globs`)"
+            skill_binding_refusal(&no_globs).expect("a glob activation needs globs"),
+            "skill_binding.globs must name at least one glob when activation is `glob` \
+             (skill_binding_glob_needs_globs)"
         );
 
         // A repo-qualified glob on a global row: the rule `Postgres` carries no CHECK for.
@@ -1739,33 +1758,35 @@ mod tests {
             ..binding(id)
         };
         assert_eq!(
-            skill_binding_refusal(&qualified, &versions).expect("a global row names no repo"),
-            "a repo-qualified glob `htui:**/*.rs` cannot sit on a global attachment, which names \
-             no repo (ANA-22 §6 item 6)"
+            skill_binding_refusal(&qualified).expect("a global row names no repo"),
+            "skill_binding.globs `htui:**/*.rs` names a repo, and a global attachment applies to \
+             every project (ANA-22 §6 item 6)"
         );
         assert!(
-            skill_binding_refusal(
-                &NewSkillBinding {
-                    project_id: Some(project),
-                    ..qualified.clone()
-                },
-                &versions
-            )
+            skill_binding_refusal(&NewSkillBinding {
+                project_id: Some(project),
+                ..qualified.clone()
+            })
             .is_none(),
             "the same glob is fine on a project row, which does name repos"
         );
 
         // A glob the matcher refuses (D95, D99): the sentence is `GlobError`'s own `Display`, and
         // the position the editor puts a cursor on rides in that same sentence.
-        for (glob, at) in [("src/**x/*.rs", 4), ("a/{b,{c,d}}/x.rs", 5), ("x{,.rs}", 2)] {
+        for (glob, at) in [
+            ("src/**x/*.rs", 4),
+            ("a/{b,{c,d}}/x.rs", 5),
+            ("x{,.rs}", 2),
+            ("pre{a,b}fix.rs", 3),
+        ] {
             let bad = NewSkillBinding {
                 project_id: Some(project),
                 activation: Activation::Glob,
                 globs: vec![glob.to_owned()],
                 ..binding(id)
             };
-            let sentence = skill_binding_refusal(&bad, &versions)
-                .unwrap_or_else(|| panic!("`{glob}` must be refused"));
+            let sentence =
+                skill_binding_refusal(&bad).unwrap_or_else(|| panic!("`{glob}` must be refused"));
             let expected = crate::prompt::glob::compile(glob).expect_err("the matcher refuses it");
             assert_eq!(
                 sentence,
@@ -1779,50 +1800,46 @@ mod tests {
             );
         }
 
-        // A pin the skill has no version for, and one it does: another skill's rows do not count.
-        let pinned = NewSkillBinding {
-            pinned_version: Some(7),
-            ..binding(id)
-        };
-        assert_eq!(
-            skill_binding_refusal(&pinned, &versions).expect("the pin names no row"),
-            format!("skill_binding.pinned_version 7 names no skill_version of skill {id}")
-        );
-        assert!(
-            skill_binding_refusal(
-                &NewSkillBinding {
-                    pinned_version: Some(1),
-                    ..binding(id)
-                },
-                &versions
-            )
-            .is_none(),
-            "a pin the skill does have is not a refusal"
-        );
-        assert_eq!(
-            skill_binding_refusal(
-                &NewSkillBinding {
-                    pinned_version: Some(1),
-                    ..binding(id)
-                },
-                &[version(skill(), 1)]
-            ),
-            Some(format!(
-                "skill_binding.pinned_version 1 names no skill_version of skill {id}"
-            )),
-            "another skill's version 1 is not this skill's version 1"
-        );
-
-        // The tail: none of the refusals above wrote anything, so this attachment lands.
+        // The tail: none of the four refusals above wrote anything, so this attachment lands.
         let good = NewSkillBinding {
             project_id: Some(project),
             activation: Activation::Glob,
             globs: vec!["**/*.rs".to_owned()],
             languages: vec!["rust".to_owned()],
-            pinned_version: Some(1),
             ..binding(id)
         };
-        assert_eq!(skill_binding_refusal(&good, &versions), None);
+        assert_eq!(skill_binding_refusal(&good), None);
+    }
+
+    /// D78's fifth rule, in its own helper: a `pinned_version` the skill has no version for. A pin
+    /// the skill does have is not a refusal, and another skill's version 1 is not this skill's 1.
+    #[test]
+    fn a_pin_refusal_names_the_version_it_could_not_find() {
+        let id = skill();
+        let versions = [version(id, 1), version(id, 2)];
+        assert_eq!(
+            skill_pin_refusal(7, id, &versions).expect("the pin names no row"),
+            format!("skill_binding.pinned_version 7 names no version of skill `{id}`")
+        );
+        assert_eq!(
+            skill_pin_refusal(2, id, &versions),
+            None,
+            "a pin the skill does have is not a refusal"
+        );
+        assert_eq!(
+            skill_pin_refusal(1, id, &[version(skill(), 1)]),
+            Some(format!(
+                "skill_binding.pinned_version 1 names no version of skill `{id}`"
+            )),
+            "another skill's version 1 is not this skill's version 1"
+        );
+        assert_eq!(
+            skill_pin_refusal(1, id, &[]),
+            Some(format!(
+                "skill_binding.pinned_version 1 names no version of skill `{id}`"
+            )),
+            "a skill with no version at all has no version 1"
+        );
     }
 }
 
