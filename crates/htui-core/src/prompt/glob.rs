@@ -20,7 +20,7 @@ use thiserror::Error;
 
 use super::excerpt::RepoPath;
 use crate::model::ids::SkillId;
-use crate::model::skill::BoundSkill;
+use crate::model::skill::{Activation, BoundSkill};
 
 /// A compiled glob: segments separated by `/`, each one of [`Segment`].
 ///
@@ -268,14 +268,27 @@ pub fn first_match(globs: &[String], files: &[RepoPath]) -> Option<RepoPath> {
 
 /// Each skill's matched path, rendered `<repo>:<path>` (D71).
 ///
-/// One entry per skill whose `globs` matched something; a skill whose globs matched nothing is
-/// absent, which is what `no_match` records and what `no_path` (an absent *file set*) is not. The
-/// map is a `BTreeMap` because it rides on [`PromptSpec`](crate::prompt::PromptSpec), whose
+/// One entry per skill that **fired** — whose `activation` is [`Activation::Glob`] and whose
+/// `globs` matched something. A skill whose globs matched nothing is absent, which is what
+/// `no_match` records and what `no_path` (an absent *file set*) is not.
+///
+/// The activation guard is load-bearing rather than tidy. `globs` and `activation` are separate
+/// columns and nothing in the schema ties them: the writer refuses *empty* globs on a `glob` row
+/// (D78) and does not refuse leftover globs on an `always` or `off` row, so a row like that is one
+/// a maintainer can produce by switching an attachment off and leaving its globs typed. This map is
+/// what `select` reads to decide `matched` against `always` and `off` (D74), so an entry here for
+/// a switched-off attachment would record `matched` with a real path from the walk — the record
+/// would say the attachment fired when the maintainer had turned it off.
+///
+/// The map is a `BTreeMap` because it rides on [`PromptSpec`](crate::prompt::PromptSpec), whose
 /// assembled bytes and digest must not depend on iteration order.
 #[must_use]
 pub fn matched_skills(skills: &[BoundSkill], files: &[RepoPath]) -> BTreeMap<SkillId, String> {
     let mut matched = BTreeMap::new();
     for skill in skills {
+        if skill.activation != Activation::Glob {
+            continue;
+        }
         if let Some(file) = first_match(&skill.globs, files) {
             matched.insert(skill.skill_id, format!("{}:{}", file.repo, file.path));
         }
