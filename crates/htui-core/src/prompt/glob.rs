@@ -117,6 +117,13 @@ pub enum GlobError {
         /// The byte offset the empty alternative would have started at.
         at: usize,
     },
+    /// A `{` that is not a whole component: it sits inside a longer one (`pre{a,b}fix.rs`), it does
+    /// not open one (`src/x{a,b}/c.rs`), or it opens one and never closes it (`{a,b`).
+    #[error("`{{a,b}}` is only a whole component, at byte {at}")]
+    MisplacedBrace {
+        /// The byte offset of the `{`.
+        at: usize,
+    },
     /// A `{` that never reaches its `}` inside its component.
     #[error("`{{` without `}}`, at byte {at}")]
     UnterminatedBrace {
@@ -169,6 +176,7 @@ impl GlobError {
             | Self::MisplacedGlobstar { at }
             | Self::NestedAlternation { at }
             | Self::EmptyAlternative { at }
+            | Self::MisplacedBrace { at }
             | Self::UnterminatedBrace { at }
             | Self::UnterminatedClass { at }
             | Self::EmptyClass { at }
@@ -403,7 +411,7 @@ fn misplaced_globstar(component: &str) -> Option<usize> {
 /// D96: an alternation is a whole component, so it is one level deep. An empty alternative is
 /// complained about before the alternation's span is, because `foo{,.txt}` is a maintainer's typo
 /// in the alternation rather than in its position — and `pre{a,b}fix.rs`, whose alternatives are
-/// all fine, is complained about as a nest.
+/// all fine, is complained about as a misplaced brace, which is what it is.
 fn compile_alternation(component: &str, open: usize, base: usize) -> Result<Segment, GlobError> {
     let mut chars = component[open + 1..].char_indices();
     let mut close = None;
@@ -424,11 +432,14 @@ fn compile_alternation(component: &str, open: usize, base: usize) -> Result<Segm
         }
     }
     let Some(close) = close else {
+        // A `{` with no `}` is a brace that was never closed, wherever it sits: `{a,b` and `a/{b`
+        // are the same mistake, and "unterminated" is the more useful of the two sentences. A
+        // brace is only *misplaced* once there is a `}` to be misplaced along with it.
         return Err(GlobError::UnterminatedBrace { at: base + open });
     };
     let alternatives = split_alternatives(&content, base + open + 1)?;
     if open != 0 || close + 1 != component.len() {
-        return Err(GlobError::NestedAlternation { at: base + open });
+        return Err(GlobError::MisplacedBrace { at: base + open });
     }
     let mut branches = Vec::with_capacity(alternatives.len());
     for (text, at) in alternatives {
@@ -490,7 +501,8 @@ fn tokens(component: &str, base: usize) -> Result<Vec<Tok>, GlobError> {
             // unescaped `{`, and a `}` never reaches here either — `class` and
             // `compile_alternation` have consumed or refused both by now. Kept as the belt to
             // those two scans, which are the ones that make `\{` a literal.
-            '{' | '}' => return Err(GlobError::NestedAlternation { at: base + at }),
+            '{' => return Err(GlobError::MisplacedBrace { at: base + at }),
+            '}' => return Err(GlobError::UnterminatedBrace { at: base + at }),
             c => toks.push(Tok::Char(c)),
         }
     }
@@ -982,7 +994,7 @@ mod tests {
     /// the position is what puts the editor's cursor on the character that is wrong (D103).
     #[test]
     fn every_refusal_names_its_byte() {
-        let refusals: [(&str, GlobError); 14] = [
+        let refusals: [(&str, GlobError); 18] = [
             ("", GlobError::Empty),
             ("!**/*.rs", GlobError::Negation { at: 0 }),
             ("src/", GlobError::TrailingSlash { at: 3 }),
@@ -990,7 +1002,11 @@ mod tests {
             ("a/**b/c.rs", GlobError::MisplacedGlobstar { at: 2 }),
             ("a/{b,{c,d}}/x.rs", GlobError::NestedAlternation { at: 5 }),
             ("x{,.rs}", GlobError::EmptyAlternative { at: 2 }),
+            ("pre{a,b}fix.rs", GlobError::MisplacedBrace { at: 3 }),
+            ("{a,b", GlobError::UnterminatedBrace { at: 0 }),
             ("a/{b,c", GlobError::UnterminatedBrace { at: 2 }),
+            ("a/{b", GlobError::UnterminatedBrace { at: 2 }),
+            ("a/b}", GlobError::UnterminatedBrace { at: 3 }),
             ("**/[", GlobError::UnterminatedClass { at: 3 }),
             ("[].rs", GlobError::EmptyClass { at: 1 }),
             ("src/\\", GlobError::DanglingEscape { at: 4 }),
@@ -1026,21 +1042,45 @@ mod tests {
 
     /// An alternation is a whole component and never nests (D96). An empty alternative is
     /// complained about first, because `foo{,.txt}` is a typo in the list rather than in its
-    /// position; a well-formed list that is not a whole component is a nest.
+    /// position; a well-formed list that is not a whole component is a misplaced brace, and a list
+    /// inside a list is a nest.
     #[test]
     fn an_alternation_is_a_whole_component_and_never_nests() {
         for (pattern, at) in [
-            // The offending brace: the outer one when the list is fine and misplaced, the inner
-            // one when a list sits inside a list.
-            ("pre{a,b}fix.rs", 3),
-            ("src/{a,b}x/c.rs", 4),
-            ("src/x{a,b}/c.rs", 5),
+            // The inner `{`: a list sitting inside a list, which D96 refuses by name.
             ("{a,{b,c}}", 3),
         ] {
             assert_eq!(
                 compile(pattern).expect_err("a nested alternation is refused"),
                 GlobError::NestedAlternation { at },
                 "`{pattern}` names the brace that is in the wrong place"
+            );
+        }
+        for (pattern, at) in [
+            // The `{` of a list that is fine but is not a whole component: inside a longer
+            // component on either side, and opening one that is never closed.
+            ("pre{a,b}fix.rs", 3),
+            ("src/{a,b}x/c.rs", 4),
+            ("src/x{a,b}/c.rs", 5),
+        ] {
+            assert_eq!(
+                compile(pattern).expect_err("a misplaced brace is refused"),
+                GlobError::MisplacedBrace { at },
+                "`{pattern}` names the `{{` that is not a whole component"
+            );
+        }
+        for (pattern, at) in [
+            // A `{` with no `}` is a brace that was never closed, wherever it sits — including
+            // where it does open the whole component, which is the one row where this differs from
+            // blueprint §2.1.1 (see the commit message).
+            ("a/{b", 2),
+            ("a/b}", 3),
+            ("{a,b", 0),
+        ] {
+            assert_eq!(
+                compile(pattern).expect_err("a brace that was never closed is refused"),
+                GlobError::UnterminatedBrace { at },
+                "`{pattern}` names the brace that never closed"
             );
         }
         for (pattern, at) in [("{,}", 1), ("{a,}", 3), ("{}", 1), ("x{,.rs}", 2)] {
