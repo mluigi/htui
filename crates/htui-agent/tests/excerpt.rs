@@ -1330,3 +1330,100 @@ async fn excerpts_for_never_persists_a_note_naming_a_masked_path() {
         set.notes
     );
 }
+
+#[tokio::test]
+async fn an_unscanned_pass_lists_nothing() {
+    // MOD-9 D72 and D97. `unscanned` is the one production `ExcerptSet` literal in this crate,
+    // and the empty `listed` it carries is load-bearing: it is the `None` a `glob` candidate
+    // records as `no_path`. A walk that ran and matched nothing is `Some({})` and records
+    // `no_match` — a different record, and the two collapse into one the moment an empty set is
+    // allowed to mean both.
+    //
+    // Driven down `excerpts_for`'s first `unscanned` return: a template that places no
+    // `{{excerpts}}` reads nothing, so there is no walk and no enumeration. The other two returns
+    // (an `assemble`-refused spec, and a `spawn_blocking` join error) build the same literal.
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
+    let mut spec = phase_spec();
+    spec.template.name = "verdict".to_owned();
+    spec.body = body_of("verdict")
+        .expect("`verdict` is a default body")
+        .to_owned();
+
+    let set = excerpts_for(
+        &spec,
+        readable_input(dir.path()),
+        &BTreeMap::new(),
+        &MinimalScrubber::new([]),
+    )
+    .await;
+
+    assert!(
+        set.notes
+            .iter()
+            .any(|note| note.contains("places no {{excerpts}}; nothing was read")),
+        "the arm taken is the one this claims: {:?}",
+        set.notes
+    );
+    assert!(set.files.is_empty(), "no pass ran, so no excerpt was taken");
+    assert!(
+        set.listed.is_empty(),
+        "D72: and nothing was enumerated either, because enumeration is the walk's output and \
+         there was no walk. This is the `None` behind `no_path`, and it is not the `Some({{}})` \
+         of a walk that ran and matched nothing. Got {:?}",
+        set.listed
+    );
+}
+
+#[test]
+fn the_listed_set_is_what_the_walk_offered_and_not_what_it_refused() {
+    // MOD-9 D72, plan line 291: "a `.git` file, a `.pem`, a lockfile and a **binary** never appear
+    // in `ExcerptSet.listed`". Three of those four are `htui-core`'s `skip_by_path` and any reader
+    // can hold them. The fourth is `FsRepoReader`'s, and no fake can: `MapReader::list` filters
+    // on `body.len() <= max_file_bytes` and nothing else, so a NUL-bearing entry added to the
+    // `htui-core` case would land **in** `listed` rather than be dropped from it. So the binary
+    // case is pinned here, over the reader that actually enforces it.
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/keep.rs", b"fn keep() {}\n");
+    write(dir.path(), ".git/config", b"[core]\n");
+    write(dir.path(), "secret.pem", b"-----BEGIN RSA PRIVATE KEY-----\n");
+    write(dir.path(), "Cargo.lock", b"[[package]]\n");
+    write(dir.path(), "src/image.dat", b"PNG\x00\x01\x02binary\n");
+    write(dir.path(), "src/big.rs", &vec![b'x'; 4_096]);
+
+    let mut owned = base_request(&["src/"], vec![fs_root(dir.path())]);
+    owned.caps.max_file_bytes = 1_024;
+    let set = select(
+        &capped(1_024),
+        &owned.as_request(),
+        Vec::new(),
+        vec![BUILTIN_ID.to_owned()],
+        TokenEstimator::DEFAULT,
+    );
+
+    let listed: Vec<&str> = set.listed.iter().map(|entry| entry.path.as_str()).collect();
+    assert_eq!(
+        listed,
+        vec!["src/keep.rs"],
+        "D72: the reader refused the `.git` path, the `.pem` and the lockfile by rule name, the \
+         NUL-bearing file by its probe and `src/big.rs` by its own cap — all of them **before** the \
+         listing was built, so none is enumerated. A size cap prunes in the walk, not after it, \
+         which is why an over-cap file is absent from `listed` and not merely absent from `files`. \
+         Got {listed:?}"
+    );
+    // The other half of the field's contract, on the same walk: the enumeration is not the
+    // prompt. `src/keep.rs` is under the touched prefix and was paid for; the four refusals are
+    // enumerated nowhere, so a `glob` cannot fire on them either.
+    assert!(
+        set.files.iter().any(|file| file.path == "src/keep.rs"),
+        "the keeper is in the prompt as well as the listing: {:?}",
+        set.files
+    );
+    assert!(
+        set.listed
+            .iter()
+            .all(|entry| !entry.path.ends_with(".dat") && !entry.path.ends_with(".pem")),
+        "nothing the reader refused is offered to a matcher: {:?}",
+        set.listed
+    );
+}

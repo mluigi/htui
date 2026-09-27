@@ -2403,10 +2403,15 @@ mod tests {
         );
     }
 
-    /// D72's reason for the field: `listed` is a **superset** of `files`, and it is empty exactly
-    /// where no pass ran — which is the `None` `select` is given (D97).
+    /// D72's reason for the field: `listed` is a **superset** of `files`, and a matcher must see
+    /// the walk rather than the budget.
+    ///
+    /// The other half — empty exactly where no pass ran, which is the `None` D97 rests on — is
+    /// not asserted here. `ExcerptSet::default()` gives an empty `listed` for free and says
+    /// nothing about any pass. It is pinned where the arm actually is, in
+    /// `crates/htui-agent/tests/excerpt.rs::an_unscanned_pass_lists_nothing`.
     #[test]
-    fn the_listed_set_is_a_superset_of_the_excerpts_and_is_empty_where_no_pass_ran() {
+    fn the_listed_set_is_a_superset_of_the_excerpts() {
         let mut owned = request("a body naming nothing\n", &[], &[]);
         owned.roots = vec![root("htui")];
         owned.budget_tokens = 0;
@@ -2431,10 +2436,6 @@ mod tests {
              file the prompt never showed the model, so the matcher must see the walk and not the \
              budget. Got {:?}",
             set.listed
-        );
-        assert!(
-            ExcerptSet::default().listed.is_empty(),
-            "D72: empty wherever no pass ran, which is what `no_excerpts` and `unscanned` record"
         );
     }
 }
