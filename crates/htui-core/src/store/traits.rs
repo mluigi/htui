@@ -25,6 +25,15 @@
 //! audit row. The prompt inputs that are **not** mirrored — `prompt_template`, `skill`,
 //! `skill_version`, `skill_binding`, `box_tool` — stay inherent on `MemStore` / `PgStore` for the
 //! same reason `agents()` does.
+//!
+//! **MOD-9 milestone 3** adds four [`WriteStore`] methods for the skill tables — `upsert_skill`,
+//! `add_skill_version`, `set_skill_binding`, `remove_skill_binding` — and nothing on
+//! [`ReadStore`]. The four are here because a writer is reached through `Writer`, which is
+//! exhaustive over this trait and nothing else, so a skill the editor saves has to be one of its
+//! arms. Their reads stay inherent on [`MemStore`](crate::store::MemStore) / `PgStore` and are
+//! dispatched by `Backend`, for the reason the paragraph above gives: `skill*` is not mirrored,
+//! so a trait read would promise an offline answer the mirror cannot give (plan D86, blueprint
+//! D92).
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -36,14 +45,15 @@ use crate::model::{
     Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
     ItemRequirement, ItemRevision, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
     NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewSkillBinding, NewStepGraph, NewWorkspace, Note,
-    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
-    RequirementUpdate, Resolution, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillId, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
-    UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillBinding, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunId,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
+    SkillBinding, SkillBindingId, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::prompt::template::{TemplateRole, parse};
@@ -741,6 +751,96 @@ pub trait WriteStore: ReadStore {
         new: NewPromptTemplate,
         expected: Option<i32>,
     ) -> Result<CasOutcome<PromptTemplate>>;
+
+    // skill, skill_version, skill_binding (MOD-9 milestone 3, plan D76, D78)
+
+    /// A `skill` row created or edited, `name` being the key and `updated_at` the token.
+    ///
+    /// `expected` is the `updated_at` the editor opened on. `None` is a **token**, not "don't
+    /// care": it means "I expect no row", so it is `Stale` once the name has one, and a spent
+    /// token is never `NotFound` on a row that exists.
+    ///
+    /// The name never moves — it is the library key the editor, the render order and the unique
+    /// index all name — so an edit writes `description` and nothing else. The order is D18's and
+    /// D78's, the same one [`append_prompt_template`](Self::append_prompt_template) has: the
+    /// token first, so a spent token answers `Stale` before the name is judged; then the name
+    /// rule and the description's NUL ([`skill_refusal`]); then the keys.
+    ///
+    /// The reads stay inherent ([`MemStore::bound_skills`](crate::store::MemStore::bound_skills)),
+    /// because `skill` is not mirrored.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) when `expected` is `Some` and
+    /// the name has no row; [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a
+    /// name [`Skill::name_is_valid`] refuses, a NUL in either field, an `id` that is taken, or a
+    /// `created_by` that names no `app_user`. Nothing is written by any of them.
+    async fn upsert_skill(
+        &self,
+        new: NewSkill,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Skill>>;
+
+    /// Appends version `expected + 1` of `new.skill_id` iff `expected` is that skill's head
+    /// version; `None` is a skill with no version yet and starts at 1.
+    ///
+    /// `skill_version` carries **no** `updated_at` trigger (`0001_init.sql` §5.1 names it as
+    /// deliberately absent), so this never moves `skill.updated_at`: the description a save writes
+    /// and the body it appends are two tables and two independent tokens (blueprint D101, R-37).
+    /// Rows are never updated or deleted, as `prompt_template`'s are not (PRD D5).
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) when `expected` is `Some` and
+    /// the skill has no version at all (`Some(0)` included — the regression the template case
+    /// pins); [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a body with a
+    /// NUL, or a `skill_id` or `created_by` that names no row (Postgres: the FKs' `23503`).
+    /// Nothing is written.
+    async fn add_skill_version(
+        &self,
+        new: NewSkillVersion,
+        expected: Option<i32>,
+    ) -> Result<CasOutcome<SkillVersion>>;
+
+    /// The attachment of `(skill_id, project_id, phase_id)`, inserted or replaced, under the
+    /// `updated_at` token.
+    ///
+    /// The upsert is the key's, not a blind insert: `UNIQUE NULLS NOT DISTINCT (skill_id,
+    /// project_id, phase_id)` is one attachment per skill per level, and replacing it must not
+    /// mint a second row. `expected` is `Some(row.updated_at)` for a replace and `None` for a
+    /// create — a token in both positions, never "don't care".
+    ///
+    /// Refused **in Rust, before the statement**, in this order (D78): a `phase_id` without a
+    /// `project_id`; `activation = glob` with empty `globs`; a repo-qualified glob on a **global**
+    /// row (ANA-22 §6 item 6: a global attachment cannot name a repo); a glob
+    /// [`compile`](crate::prompt::glob::compile) refuses, with the byte; a `pinned_version` the
+    /// skill has no version for. The Postgres CHECKs are `23514` and absent on `MemStore`, so the
+    /// Rust refusal is what makes the two stores agree; the last two have no CHECK at all and are
+    /// purely the writer's (blueprint D100). The token is read before any of them, so a refused
+    /// input under a spent token is `Stale` on both stores.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) when `expected` is `Some` and
+    /// the key has no row; [`StoreError::Constraint`](crate::store::StoreError::Constraint) for
+    /// any of the five refusals, or a `skill_id`, `project_id` or `phase_id` that names no row
+    /// (Postgres: the FKs' `23503`).
+    async fn set_skill_binding(
+        &self,
+        new: NewSkillBinding,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<SkillBinding>>;
+
+    /// Detaches one row, under its own `updated_at` token.
+    ///
+    /// A writer rather than `activation = off` (OQ-19): a spent token is `Stale` and the row
+    /// survives, so a second unbind can never remove the first one's result (R-32), and the row
+    /// really goes rather than reading as an attachment that is neither on nor off.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an `id` no row has.
+    async fn remove_skill_binding(
+        &self,
+        id: SkillBindingId,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<SkillBinding>>;
 
     // settings (D7, D8)
 

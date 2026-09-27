@@ -26,17 +26,17 @@ use crate::model::{
     ItemKindPatch, ItemLink, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkEdge,
     LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
     NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-    NewStepGraph, NewWorkspace, Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath,
-    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
-    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementState,
-    RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId,
-    RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
-    Scope, SessionEvent, Skill, SkillBinding, SkillId, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
-    UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    WorkspaceSummary, canonical_declared_tags, missing_tags_failure, overlaps, prompt_summary,
-    scope_of,
+    NewSkill, NewSkillBinding, NewSkillVersion, NewStepGraph, NewWorkspace, Note, PhaseAgent,
+    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate,
+    PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput,
+    ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
+    RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingId, SkillId,
+    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, WorkspaceSummary, canonical_declared_tags,
+    missing_tags_failure, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -51,8 +51,10 @@ use crate::store::traits::{
     item_has_a_live_run, item_kind_is_held, item_not_in_project, legal_move,
     not_a_fanout_candidate, not_a_terminal_status, prompt_template_key, prompt_template_refusal,
     references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
-    row_names_another_step, run_is_terminal, step_is_not_promotable, step_slot_is_taken,
-    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
+    row_names_another_step, run_is_terminal, skill_binding_key, skill_binding_refusal, skill_key,
+    skill_pin_refusal, skill_refusal, skill_version_key, step_is_not_promotable,
+    step_slot_is_taken, summary_names_another_item, winner_is_not_settled,
+    withdrawn_requirement_cited,
 };
 use uuid::Uuid;
 
@@ -2765,6 +2767,256 @@ impl State {
         };
         self.templates.push(row.clone());
         Ok(CasOutcome::Applied(row))
+    }
+
+    /// MOD-9 D76: `skill.name` is the key and `skill.updated_at` the token; token, then input, then
+    /// keys, the order of [`State::append_prompt_template`] (D18), so a spent token answers
+    /// `Stale` before the name is judged and `None` on a name that now has a row is `Stale` too.
+    fn upsert_skill(
+        &mut self,
+        new: NewSkill,
+        expected: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Skill>> {
+        let current = self
+            .skills
+            .values()
+            .find(|row| row.name == new.name)
+            .cloned();
+        match &current {
+            // `expected != Some(row.updated_at)` covers both a spent token and `None` on a row
+            // that exists: `None` is "I expect no row", not "don't care".
+            Some(row) if expected != Some(row.updated_at) => {
+                return Ok(CasOutcome::Stale(row.clone()));
+            }
+            None if expected.is_some() => {
+                return Err(StoreError::NotFound {
+                    entity: "skill",
+                    id: skill_key(&new.name),
+                });
+            }
+            _ => {}
+        }
+        if let Some(refusal) = skill_refusal(&new.name, &new.description) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        self.require_user(new.created_by, "skill.created_by")?;
+        if self.skills.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists("skill", new.id)));
+        }
+        let row = match current {
+            Some(mut row) => {
+                // The name is the key and never moves; only the description and the token do.
+                row.description = new.description;
+                row.updated_at = now;
+                self.skills.insert(row.id, row.clone());
+                row
+            }
+            None => {
+                let row = Skill {
+                    id: new.id,
+                    name: new.name,
+                    description: new.description,
+                    created_by: new.created_by,
+                    created_at: now,
+                    updated_at: now,
+                };
+                self.skills.insert(row.id, row.clone());
+                row
+            }
+        };
+        Ok(CasOutcome::Applied(row))
+    }
+
+    /// MOD-9 D76: the head version is the token, the shape of
+    /// [`State::append_prompt_template`] with `(skill_id, version)` in place of
+    /// `(project_id, name, version)`. `skill_version` is append-only, so there is no update and no
+    /// delete to refuse.
+    fn add_skill_version(
+        &mut self,
+        new: NewSkillVersion,
+        expected: Option<i32>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<SkillVersion>> {
+        let head = self
+            .skill_versions
+            .iter()
+            .filter(|row| row.skill_id == new.skill_id)
+            .max_by_key(|row| row.version)
+            .cloned();
+        match (&head, expected) {
+            (Some(head), _) if Some(head.version) != expected => {
+                return Ok(CasOutcome::Stale(head.clone()));
+            }
+            (None, Some(token)) => {
+                return Err(StoreError::NotFound {
+                    entity: "skill_version",
+                    id: skill_version_key(new.skill_id, token),
+                });
+            }
+            _ => {}
+        }
+        if new.body.contains('\0') {
+            return Err(StoreError::Constraint(
+                "skill_version.body must not contain a NUL character".to_owned(),
+            ));
+        }
+        if !self.skills.contains_key(&new.skill_id) {
+            return Err(StoreError::Constraint(references_no_row(
+                "skill_version.skill_id",
+                new.skill_id,
+                "skill",
+            )));
+        }
+        self.require_user(new.created_by, "skill_version.created_by")?;
+        let row = SkillVersion {
+            skill_id: new.skill_id,
+            version: expected.unwrap_or(0) + 1,
+            body: new.body,
+            source: new.source,
+            created_by: new.created_by,
+            created_at: now,
+        };
+        self.skill_versions.push(row.clone());
+        Ok(CasOutcome::Applied(row))
+    }
+
+    /// MOD-9 D76, D78: the token, then the five rules, then the references. The token comes first
+    /// so a spent token answers `Stale` and never a refusal (D18).
+    fn set_skill_binding(
+        &mut self,
+        new: NewSkillBinding,
+        expected: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<SkillBinding>> {
+        let current = self
+            .skill_bindings
+            .iter()
+            .find(|row| {
+                row.skill_id == new.skill_id
+                    && row.project_id == new.project_id
+                    && row.phase_id == new.phase_id
+            })
+            .cloned();
+        match &current {
+            Some(row) if expected != Some(row.updated_at) => {
+                return Ok(CasOutcome::Stale(row.clone()));
+            }
+            None if expected.is_some() => {
+                return Err(StoreError::NotFound {
+                    entity: "skill_binding",
+                    id: skill_binding_key(new.skill_id, new.project_id, new.phase_id),
+                });
+            }
+            _ => {}
+        }
+        if !self.skills.contains_key(&new.skill_id) {
+            return Err(StoreError::Constraint(references_no_row(
+                "skill_binding.skill_id",
+                new.skill_id,
+                "skill",
+            )));
+        }
+        if let Some(refusal) = skill_binding_refusal(&new) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if let Some(pinned) = new.pinned_version
+            && let Some(refusal) = skill_pin_refusal(pinned, new.skill_id, &self.skill_versions)
+        {
+            return Err(StoreError::Constraint(refusal));
+        }
+        // The FKs, which `PgStore` answers as `23503`. `phase_id`'s FK is to `step_graph_phase(id)`
+        // alone, so "the phase belongs to this project" is **not** checked on either store: a row
+        // may name another project's phase, and the engine's `(graph id, name)` lookup never reads
+        // it. D78 mirrors the CHECKs; it does not extend them (blueprint H-30).
+        if let Some(project_id) = new.project_id
+            && !self.projects.contains_key(&project_id)
+        {
+            return Err(StoreError::Constraint(references_no_row(
+                "skill_binding.project_id",
+                project_id,
+                "project",
+            )));
+        }
+        if let Some(phase_id) = new.phase_id
+            && !self.phases.iter().any(|row| row.id == phase_id)
+        {
+            return Err(StoreError::Constraint(references_no_row(
+                "skill_binding.phase_id",
+                phase_id,
+                "step_graph_phase",
+            )));
+        }
+        if current.is_none() && self.skill_bindings.iter().any(|row| row.id == new.id) {
+            return Err(StoreError::Constraint(already_exists(
+                "skill_binding",
+                new.id,
+            )));
+        }
+        let row = match current {
+            Some(mut row) => {
+                row.pinned_version = new.pinned_version;
+                row.position = new.position;
+                row.activation = new.activation;
+                row.globs = new.globs;
+                row.languages = new.languages;
+                row.updated_at = now;
+                // `skill_bindings` is a `Vec` (D79), so a replace is written back at the index its
+                // key was read from — read a statement ago under this same lock, so it is there.
+                let index = Self::position_of_binding(&self.skill_bindings, row.id);
+                self.skill_bindings[index] = row.clone();
+                row
+            }
+            None => {
+                let row = SkillBinding {
+                    id: new.id,
+                    skill_id: new.skill_id,
+                    project_id: new.project_id,
+                    phase_id: new.phase_id,
+                    pinned_version: new.pinned_version,
+                    position: new.position,
+                    activation: new.activation,
+                    globs: new.globs,
+                    languages: new.languages,
+                    updated_at: now,
+                };
+                self.skill_bindings.push(row.clone());
+                row
+            }
+        };
+        Ok(CasOutcome::Applied(row))
+    }
+
+    /// The index of `id` in `rows`.
+    ///
+    /// `skill_bindings` is a `Vec`, not a map, because its key is composite and half of it is
+    /// nullable (D79); a replace therefore has to be written back at the index the key was read
+    /// from, and this is that index.
+    fn position_of_binding(rows: &[SkillBinding], id: SkillBindingId) -> usize {
+        rows.iter()
+            .position(|row| row.id == id)
+            .expect("the row was read a statement ago under the same lock")
+    }
+
+    /// MOD-9 D76, R-32: the token, then the removal. A spent token is `Stale` and the row
+    /// survives, which is the whole reason this is a compare-and-set and not a bare delete.
+    fn remove_skill_binding(
+        &mut self,
+        id: SkillBindingId,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<SkillBinding>> {
+        let index = self
+            .skill_bindings
+            .iter()
+            .position(|row| row.id == id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "skill_binding",
+                id: id.to_string(),
+            })?;
+        if self.skill_bindings[index].updated_at != expected {
+            return Ok(CasOutcome::Stale(self.skill_bindings[index].clone()));
+        }
+        Ok(CasOutcome::Applied(self.skill_bindings.remove(index)))
     }
 
     /// The value one rung currently holds for a key, for [`validate`]'s `not_above` peer.
@@ -5543,6 +5795,41 @@ impl WriteStore for MemStore {
         self.write(|state| state.append_prompt_template(new, expected, now))
     }
 
+    async fn upsert_skill(
+        &self,
+        new: NewSkill,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Skill>> {
+        let now = Utc::now();
+        self.write(|state| state.upsert_skill(new, expected, now))
+    }
+
+    async fn add_skill_version(
+        &self,
+        new: NewSkillVersion,
+        expected: Option<i32>,
+    ) -> Result<CasOutcome<SkillVersion>> {
+        let now = Utc::now();
+        self.write(|state| state.add_skill_version(new, expected, now))
+    }
+
+    async fn set_skill_binding(
+        &self,
+        new: NewSkillBinding,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<SkillBinding>> {
+        let now = Utc::now();
+        self.write(|state| state.set_skill_binding(new, expected, now))
+    }
+
+    async fn remove_skill_binding(
+        &self,
+        id: SkillBindingId,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<SkillBinding>> {
+        self.write(|state| state.remove_skill_binding(id, expected))
+    }
+
     async fn set_setting(
         &self,
         rung: SettingRung,
@@ -5882,15 +6169,16 @@ mod tests {
         Activation, AgentBox, AgentId, BoxId, BoxProbe, ChatRunSpec, CitationKind, Claim,
         DocumentId, GateOutcome, GraphSnapshot, Isolation, ItemId, ItemKindPatch, NewDocument,
         NewItem, NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun,
-        NewRunStep, NewSkill, NewSkillBinding, NewSkillVersion, NoteId, OverlapRule, Priority,
-        ProbedTool, ProjectId, RepoId, RequirementAreaId, RequirementId, RequirementPatch,
-        RequirementUpdate, Resolution, RunId, RunKind, RunMode, RunStatus, RunStepCommit,
-        RunStepTree, Scope, SkillBindingId, SkillId, SkillLevel, SnapshotGraph, SnapshotSettings,
-        Status, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
+        NewRunStep, NewSkill, NewSkillBinding, NewSkillVersion, NoteId, OverlapRule, PhaseId,
+        Priority, ProbedTool, ProjectId, RepoId, RequirementAreaId, RequirementId,
+        RequirementPatch, RequirementUpdate, Resolution, RunId, RunKind, RunMode, RunStatus,
+        RunStepCommit, RunStepTree, Scope, Skill, SkillBinding, SkillBindingId, SkillId,
+        SkillLevel, SkillVersion, SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome,
+        StepStatus, UserId, VerifyOutcome,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
-    use crate::store::error::StoreError;
+    use crate::store::error::{Result, StoreError};
     use crate::store::{CasOutcome, DeleteTarget, ReadStore as _, SettingRung, WriteStore as _};
     use chrono::{TimeDelta, Utc};
     use serde_json::{Value, json};
@@ -6120,11 +6408,11 @@ mod tests {
 
     /// The demo data plus one global attachment (ANA-22 §6 item 2): skill `house`, v1 body
     /// `"House rules."`, attached with `project_id` and `phase_id` both `None`, at position 5.
-    fn demo_with_a_global_skill() -> (MemStore, crate::model::SkillId) {
+    fn demo_with_a_global_skill() -> (MemStore, SkillId) {
         let mut data = crate::fixtures::demo_data();
-        let house = crate::model::SkillId::new();
+        let house = SkillId::new();
         let now = Utc::now();
-        data.skills.push(crate::model::Skill {
+        data.skills.push(Skill {
             id: house,
             name: "house".to_owned(),
             description: "House rules for every project.".to_owned(),
@@ -6132,7 +6420,7 @@ mod tests {
             created_at: now,
             updated_at: now,
         });
-        data.skill_versions.push(crate::model::SkillVersion {
+        data.skill_versions.push(SkillVersion {
             skill_id: house,
             version: 1,
             body: "House rules.".to_owned(),
@@ -6140,14 +6428,14 @@ mod tests {
             created_by: ids::USER,
             created_at: now,
         });
-        data.skill_bindings.push(crate::model::SkillBinding {
-            id: crate::model::SkillBindingId::new(),
+        data.skill_bindings.push(SkillBinding {
+            id: SkillBindingId::new(),
             skill_id: house,
             project_id: None,
             phase_id: None,
             pinned_version: None,
             position: 5,
-            activation: crate::model::Activation::Always,
+            activation: Activation::Always,
             globs: Vec::new(),
             languages: Vec::new(),
             updated_at: now,
@@ -6159,7 +6447,6 @@ mod tests {
     /// with the project's and the phase's by `(position, name bytes)`.
     #[tokio::test]
     async fn a_global_attachment_reaches_every_project() {
-        use crate::model::SkillLevel;
         let (store, house) = demo_with_a_global_skill();
 
         let agy = store
@@ -9113,6 +9400,15 @@ mod tests {
     // MOD-9 milestone 3: the skill writers (plan D76-D80, blueprint D79)
     // --------------------------------------------------------------------------------------------
 
+    /// The row a write applied, or a panic. `Stale` is a legitimate answer, so each test says
+    /// which one it means by calling this rather than `.expect`.
+    fn applied<T: core::fmt::Debug>(outcome: Result<CasOutcome<T>>) -> T {
+        match outcome {
+            Ok(CasOutcome::Applied(row)) => row,
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
     /// A skill to save under the fixture user, as the writers take it.
     fn skill_row(id: SkillId, name: &str, description: &str) -> NewSkill {
         NewSkill {
@@ -9160,30 +9456,32 @@ mod tests {
     async fn the_three_skill_collections_keep_their_shapes() {
         let store = MemStore::demo();
         let house = SkillId::new();
-        let tests = SkillId::new();
-        store
-            .upsert_skill(skill_row(house, "house", "House rules."), None)
-            .await
-            .expect("the save lands");
-        store
-            .upsert_skill(skill_row(tests, "tests-too", "A second skill."), None)
-            .await
-            .expect("the second save lands");
-        store
-            .add_skill_version(version_row(house, "House rules."), None)
-            .await
-            .expect("the append lands");
-        store
-            .add_skill_version(version_row(tests, "Named after the rule."), None)
-            .await
-            .expect("the second append lands");
-        let row = store
-            .set_skill_binding(
-                binding_row(SkillBindingId::new(), house, None, None),
-                None,
-            )
-            .await
-            .expect("the attachment lands");
+        let other = SkillId::new();
+        applied(
+            store
+                .upsert_skill(skill_row(house, "house", "House rules."), None)
+                .await,
+        );
+        applied(
+            store
+                .upsert_skill(skill_row(other, "house-too", "Second."), None)
+                .await,
+        );
+        applied(
+            store
+                .add_skill_version(version_row(house, "House rules."), None)
+                .await,
+        );
+        applied(
+            store
+                .add_skill_version(version_row(other, "Second."), None)
+                .await,
+        );
+        let row = applied(
+            store
+                .set_skill_binding(binding_row(SkillBindingId::new(), house, None, None), None)
+                .await,
+        );
 
         assert_eq!(
             store.read(|state| (state.skills.len(), state.skills.contains_key(&house))),
@@ -9226,22 +9524,24 @@ mod tests {
     async fn upsert_skill_creates_then_edits_and_answers_stale() {
         let store = MemStore::demo();
         let id = SkillId::new();
-        let created = store
-            .upsert_skill(skill_row(id, "house", "House rules."), None)
-            .await
-            .expect("the save lands");
+        let created = applied(
+            store
+                .upsert_skill(skill_row(id, "house", "House rules."), None)
+                .await,
+        );
         assert_eq!(
             created.created_at, created.updated_at,
             "one `now` is threaded through the whole create, so the two columns agree"
         );
 
-        let edited = store
-            .upsert_skill(
-                skill_row(SkillId::new(), "house", "Revised."),
-                Some(created.updated_at),
-            )
-            .await
-            .expect("the edit lands");
+        let edited = applied(
+            store
+                .upsert_skill(
+                    skill_row(SkillId::new(), "house", "Revised."),
+                    Some(created.updated_at),
+                )
+                .await,
+        );
         assert_eq!(
             (edited.id, edited.description.as_str()),
             (id, "Revised."),
@@ -9278,28 +9578,28 @@ mod tests {
     async fn a_refused_binding_wrote_nothing() {
         let store = MemStore::demo();
         let skill = SkillId::new();
-        store
-            .upsert_skill(skill_row(skill, "house", "House rules."), None)
-            .await
-            .expect("the save lands");
-        store
-            .add_skill_version(version_row(skill, "House rules."), None)
-            .await
-            .expect("the append lands");
+        applied(
+            store
+                .upsert_skill(skill_row(skill, "house", "House rules."), None)
+                .await,
+        );
+        applied(
+            store
+                .add_skill_version(version_row(skill, "House rules."), None)
+                .await,
+        );
         let before = store.read(|state| state.skill_bindings.len());
 
         let refused = [
-            NewSkillBinding {
-                ..binding_row(
-                    SkillBindingId::new(),
-                    skill,
-                    None,
-                    Some(ids::PHASE_HTUI_IMPLEMENT),
-                )
-            },
+            binding_row(
+                SkillBindingId::new(),
+                skill,
+                None,
+                Some(ids::PHASE_HTUI_IMPLEMENT),
+            ),
             NewSkillBinding {
                 activation: Activation::Glob,
-                ..binding_row(SkillBindingId::new(), skill, Some(ids::PROJECT_HTUI), None)
+                ..binding_row(SkillBindingId::new(), skill, None, None)
             },
             NewSkillBinding {
                 activation: Activation::Glob,
@@ -9309,11 +9609,11 @@ mod tests {
             NewSkillBinding {
                 activation: Activation::Glob,
                 globs: vec!["src/**x/*.rs".to_owned()],
-                ..binding_row(SkillBindingId::new(), skill, Some(ids::PROJECT_HTUI), None)
+                ..binding_row(SkillBindingId::new(), skill, None, None)
             },
             NewSkillBinding {
                 pinned_version: Some(9),
-                ..binding_row(SkillBindingId::new(), skill, Some(ids::PROJECT_HTUI), None)
+                ..binding_row(SkillBindingId::new(), skill, None, None)
             },
         ];
         for (index, new) in refused.into_iter().enumerate() {
@@ -9329,13 +9629,14 @@ mod tests {
             );
         }
 
-        let landed = store
-            .set_skill_binding(
-                binding_row(SkillBindingId::new(), skill, Some(ids::PROJECT_HTUI), None),
-                None,
-            )
-            .await
-            .expect("a good write still lands after the refusals");
+        let landed = applied(
+            store
+                .set_skill_binding(
+                    binding_row(SkillBindingId::new(), skill, Some(ids::PROJECT_HTUI), None),
+                    None,
+                )
+                .await,
+        );
         assert_eq!(
             landed.level(),
             SkillLevel::Project,
@@ -9349,21 +9650,26 @@ mod tests {
     async fn a_global_attachment_survives_project_delete() {
         let store = MemStore::demo();
         let house = SkillId::new();
-        store
-            .upsert_skill(skill_row(house, "house", "House rules."), None)
-            .await
-            .expect("the save lands");
-        store
-            .add_skill_version(version_row(house, "House rules."), None)
-            .await
-            .expect("the append lands");
-        store
-            .set_skill_binding(
-                binding_row(SkillBindingId::new(), house, None, None),
-                None,
-            )
-            .await
-            .expect("the attachment lands");
+        applied(
+            store
+                .upsert_skill(skill_row(house, "house", "House rules."), None)
+                .await,
+        );
+        applied(
+            store
+                .add_skill_version(version_row(house, "House rules."), None)
+                .await,
+        );
+        let row = applied(
+            store
+                .set_skill_binding(binding_row(SkillBindingId::new(), house, None, None), None)
+                .await,
+        );
+        assert_eq!(
+            row.level(),
+            SkillLevel::Global,
+            "the attachment is at the global level to begin with"
+        );
 
         let reach = store
             .delete_project(ids::PROJECT_HTUI)

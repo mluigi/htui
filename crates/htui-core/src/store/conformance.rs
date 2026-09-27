@@ -21,15 +21,15 @@ use crate::model::{
     ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
     NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
     NewSkill, NewSkillBinding, NewSkillVersion, NewStepGraph, NewWorkspace, NoteId, OverlapRule,
-    PhaseId, PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate,
-    PromptTemplateId, RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementState,
-    RequirementUpdate, Resolution, Run, RunId, RunKind, RunMode, RunScope, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, Scope, SessionEvent, SkillBinding, SkillBindingId, SkillId,
-    SkillLevel, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry,
-    UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    canonical_declared_tags, missing_tags_failure,
+    PhaseId, PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope,
+    PromptTemplate, PromptTemplateId, RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementState, RequirementUpdate, Resolution, Run, RunId, RunKind, RunMode, RunScope,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SkillBinding,
+    SkillBindingId, SkillId, SkillLevel, SnapshotGraph, SnapshotSettings, Status, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
+    UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject, canonical_declared_tags, missing_tags_failure,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -6127,11 +6127,19 @@ async fn skill_upsert_creates_then_edits_under_the_updated_at_token<S: WriteStor
             .expect(CASE),
     );
     assert_eq!(
-        (created.id, created.name.as_str(), created.description.as_str()),
+        (
+            created.id,
+            created.name.as_str(),
+            created.description.as_str()
+        ),
         (id, "house", FIRST),
         "{CASE}: a save under None creates the row the caller named"
     );
-    assert_eq!(created.created_by, ids::USER, "{CASE}: authored by the caller");
+    assert_eq!(
+        created.created_by,
+        ids::USER,
+        "{CASE}: authored by the caller"
+    );
     assert_eq!(
         created.updated_at, created.created_at,
         "{CASE}: the `updated_at` trigger is BEFORE UPDATE only, so an insert's two instants are \
@@ -6198,7 +6206,9 @@ async fn skill_upsert_creates_then_edits_under_the_updated_at_token<S: WriteStor
     );
     constraint_naming_row(
         CASE,
-        store.upsert_skill(new_skill(SkillId::new(), "-lead", ""), None).await,
+        store
+            .upsert_skill(new_skill(SkillId::new(), "-lead", ""), None)
+            .await,
         &["skill.name"],
         "a name with a leading hyphen",
     );
@@ -6269,7 +6279,10 @@ async fn skill_version_append_is_a_cas_on_the_head<S: WriteStore>(store: &S) {
 
     let v1 = applied(
         CASE,
-        store.add_skill_version(new_version(skill, A), None).await.expect(CASE),
+        store
+            .add_skill_version(new_version(skill, A), None)
+            .await
+            .expect(CASE),
     );
     assert_eq!(
         (v1.skill_id, v1.version, v1.body.as_str()),
@@ -6363,7 +6376,10 @@ async fn skill_version_append_is_a_cas_on_the_head<S: WriteStore>(store: &S) {
             .await;
         match missing {
             Err(StoreError::NotFound { entity, id }) => {
-                assert_eq!(entity, "skill_version", "{CASE}: the entity names the table");
+                assert_eq!(
+                    entity, "skill_version",
+                    "{CASE}: the entity names the table"
+                );
                 assert_eq!(
                     id,
                     format!("{empty}/v{token}"),
@@ -6418,7 +6434,11 @@ async fn skill_binding_upsert_replaces_its_own_row_and_a_spent_token_is_stale<S:
         (global_id, SkillLevel::Global),
         "{CASE}: (None, None) is the global level and the row carries the caller's id"
     );
-    assert_eq!(global.activation, Activation::Always, "{CASE}: and its activation");
+    assert_eq!(
+        global.activation,
+        Activation::Always,
+        "{CASE}: and its activation"
+    );
 
     let replaced = applied(
         CASE,
@@ -6563,10 +6583,10 @@ async fn skill_binding_upsert_replaces_its_own_row_and_a_spent_token_is_stale<S:
             .expect(CASE),
     );
     assert_eq!(
-        (global_untouched.id, global_untouched.position),
-        (global_id, 4),
-        "{CASE}: and the global row still carries the replace's token, so the unbind took only \
-         the project's own"
+        (global_untouched.id, global_untouched.level()),
+        (global_id, SkillLevel::Global),
+        "{CASE}: the global row answered under the token the replace left, so the unbind took \
+         only the project's own"
     );
 }
 
@@ -6625,12 +6645,7 @@ async fn skill_binding_refuses_what_its_checks_refuse<S: WriteStore>(store: &S) 
             .set_skill_binding(
                 NewSkillBinding {
                     activation: Activation::Glob,
-                    ..new_binding(
-                        SkillBindingId::new(),
-                        skill,
-                        Some(ids::PROJECT_HTUI),
-                        None,
-                    )
+                    ..new_binding(SkillBindingId::new(), skill, None, None)
                 },
                 None,
             )
@@ -6661,7 +6676,11 @@ async fn skill_binding_refuses_what_its_checks_refuse<S: WriteStore>(store: &S) 
             "at byte 8",
         ),
         ("x{,.txt}", "an alternative must not be empty", "at byte 2"),
-        ("pre{a,b}fix.rs", "`{…}` is only a whole component", "at byte 3"),
+        (
+            "pre{a,b}fix.rs",
+            "`{…}` is only a whole component",
+            "at byte 3",
+        ),
     ] {
         constraint_naming(
             CASE,
@@ -6670,12 +6689,7 @@ async fn skill_binding_refuses_what_its_checks_refuse<S: WriteStore>(store: &S) 
                     NewSkillBinding {
                         activation: Activation::Glob,
                         globs: vec![glob.to_owned()],
-                        ..new_binding(
-                            SkillBindingId::new(),
-                            skill,
-                            Some(ids::PROJECT_HTUI),
-                            None,
-                        )
+                        ..new_binding(SkillBindingId::new(), skill, None, None)
                     },
                     None,
                 )
@@ -6690,12 +6704,7 @@ async fn skill_binding_refuses_what_its_checks_refuse<S: WriteStore>(store: &S) 
             .set_skill_binding(
                 NewSkillBinding {
                     pinned_version: Some(9),
-                    ..new_binding(
-                        SkillBindingId::new(),
-                        skill,
-                        Some(ids::PROJECT_HTUI),
-                        None,
-                    )
+                    ..new_binding(SkillBindingId::new(), skill, None, None)
                 },
                 None,
             )
@@ -6755,12 +6764,7 @@ async fn skill_binding_refuses_what_its_checks_refuse<S: WriteStore>(store: &S) 
             .set_skill_binding(
                 NewSkillBinding {
                     activation: Activation::Glob,
-                    ..new_binding(
-                        SkillBindingId::new(),
-                        skill,
-                        None,
-                        Some(ids::PHASE_HTUI_IMPLEMENT),
-                    )
+                    ..new_binding(SkillBindingId::new(), skill, Some(ids::PROJECT_HTUI), None)
                 },
                 Some(row.updated_at + TimeDelta::seconds(1)),
             )
