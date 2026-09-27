@@ -1554,7 +1554,8 @@ pub fn skill_refusal(name: &str, description: &str) -> Option<String> {
 /// The token is **not** checked here: a spent `updated_at` answers `Stale` from the row read, and
 /// that read comes first in the writer, so bad input against a spent token is `Stale` on both
 /// stores (D78's error order). `versions` is one query's worth of `skill_version` and may hold
-/// another skill's rows, as [`SkillBinding::version_in_force`] allows; only `new.skill_id`'s count.
+/// another skill's rows, as [`SkillBinding::version_in_force`](crate::model::SkillBinding::version_in_force)
+/// allows; only `new.skill_id`'s count.
 #[must_use]
 pub fn skill_binding_refusal(new: &NewSkillBinding, versions: &[SkillVersion]) -> Option<String> {
     if new.phase_id.is_some() && new.project_id.is_none() {
