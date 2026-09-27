@@ -1525,9 +1525,10 @@ impl Isolator for GixIsolator {
     /// prompt. Splitting on NUL and dropping the empty field is the whole of the decoding, because
     /// `-z` is why no name arrives quoted.
     ///
-    /// A name git lists twice (a rename, which it reports as a delete and an add under no
-    /// `--find-renames`) appears twice. The consumer de-duplicates on `(repo, path)`, so this
-    /// verb's own answer is git's rather than a second opinion about it.
+    /// The list is git's own, verbatim: what it prints for a rename, a mode change or a binary
+    /// file is what it prints here, because this verb is the alternative to having a second
+    /// opinion about those. Two rows of one repository can therefore carry the same name; the
+    /// consumer de-duplicates on `(repo, path)`, which is the engine's job and not this one's.
     fn changed_paths<'a>(
         &'a self,
         trees: &'a [RunStepTree],
