@@ -226,8 +226,9 @@ impl Pattern {
     /// holding a [`RepoPath`] wants [`Pattern::matches_file`], and that is what [`first_match`] and
     /// [`matched_skills`] call.
     ///
-    /// Backtracking, over a glob and a path a maintainer typed: the cost is bounded by the count of
-    /// `**` and `*` times the length of the path, and both are small.
+    /// The cost is linear in the tokens of a component times the length of the path, and linear in
+    /// the components of the pattern times the components of the path: `*` and `**` backtrack
+    /// through a mark rather than through a recursive retry of every suffix (see [`toks_match`]).
     #[must_use]
     pub fn matches(&self, path: &str) -> bool {
         let parts: Vec<&str> = path.split('/').collect();
@@ -493,55 +494,117 @@ fn ranges(body: &str) -> Option<(bool, Vec<(char, char)>)> {
     (!ranges.is_empty()).then_some((negated, ranges))
 }
 
-/// `segs` against `parts`, with `**` free to take any number of leading components.
+/// `segs` against `parts`, with `**` free to take any number of components.
+///
+/// The two-pointer matcher over components, the same shape as [`toks_match`] and for the same
+/// reason. `**` is the only source of backtracking: it records where it was, and a later mismatch
+/// rewinds to just after it and lets it take one more component. Every rewind advances the
+/// position, so the walk is `O(segments + components)` — where "try zero components, then one, then
+/// two, recursively, for every `**`" is `O(C(segments + components, components))`, which twenty
+/// `**` against twenty components does not finish in a human lifetime. (Blueprint §2.1's descent is
+/// that recursive form; its comment calls it bounded, and the adversarial pass measured otherwise.)
+///
+/// A `**` takes **zero** components first, which is what D71 asks for: `**/*.rs` prefers the
+/// shallowest match, and the recorded path is the walk's first.
 fn segments_match(segs: &[Segment], parts: &[&str]) -> bool {
-    let Some((head, rest)) = segs.split_first() else {
-        return parts.is_empty();
-    };
-    match head {
-        Segment::AnyComponents => {
-            (0..=parts.len()).any(|take| segments_match(rest, &parts[take..]))
+    let (mut s, mut p) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    while p < parts.len() {
+        match segs.get(s) {
+            Some(Segment::AnyComponents) => {
+                star = Some(s);
+                s += 1;
+            }
+            Some(segment) if segment_matches(segment, parts[p]) => {
+                s += 1;
+                p += 1;
+            }
+            _ => {
+                let Some(star_at) = star else {
+                    return false;
+                };
+                s = star_at + 1;
+                p += 1;
+                star = Some(star_at);
+            }
         }
-        Segment::Parts(toks) => match parts.split_first() {
-            Some((part, tail)) if toks_match(toks, part) => segments_match(rest, tail),
-            _ => false,
-        },
-        Segment::Alt(branches) => match parts.split_first() {
-            Some((part, tail)) => branches.iter().any(|branch| {
-                segments_match(branch, std::slice::from_ref(part)) && segments_match(rest, tail)
-            }),
-            None => false,
-        },
+    }
+    segs[s..]
+        .iter()
+        .all(|segment| matches!(segment, Segment::AnyComponents))
+}
+
+/// One component of a path against one [`Segment`], which by construction is a whole component.
+///
+/// An alternation is one component (D96), so each of its branches is the single [`Segment::Parts`]
+/// `compile_alternation` built; a `**` is a segment of the pattern, never a match for a component
+/// of the path on its own.
+fn segment_matches(segment: &Segment, part: &str) -> bool {
+    match segment {
+        Segment::Parts(toks) => toks_match(toks, part),
+        Segment::Alt(branches) => branches.iter().any(
+            |branch| matches!(branch.as_slice(), [Segment::Parts(toks)] if toks_match(toks, part)),
+        ),
+        Segment::AnyComponents => false,
     }
 }
 
-/// One component's tokens against one component, with `*` backtracking.
+/// One component's tokens against one component: the two-pointer matcher, `*` the only token that
+/// consumes more than one character.
+///
+/// The alternative — "on a `*`, try every suffix of what is left, recursively" — costs `O(stars)`
+/// per star, so a component with N stars costs `O(len^N)`. That is a hang, not a slow path, and a
+/// maintainer can type the pattern: `*a*a*...*z` took minutes against a forty-character component
+/// before this form replaced it. Instead one `star` mark remembers where the most recent `*` was and
+/// how much it had eaten, and a mismatch rewinds to it and lets it eat one more; every rewind
+/// advances the position, so the walk is `O(tokens * len)`.
 ///
 /// `*` never crosses a `/` because the caller already split on it: a component holds no separator,
 /// so the `c != '/'` arms below cannot be reached. They are kept as the belt to D71's braces.
 fn toks_match(toks: &[Tok], text: &str) -> bool {
-    let Some((head, rest)) = toks.split_first() else {
-        return text.is_empty();
-    };
-    match head {
-        Tok::Char(c) => text
-            .strip_prefix(*c)
-            .is_some_and(|tail| toks_match(rest, tail)),
-        Tok::Any => match text.chars().next() {
-            Some(c) if c != '/' => toks_match(rest, &text[c.len_utf8()..]),
-            _ => false,
-        },
-        Tok::Star => (0..=text.len())
-            .filter(|i| text.is_char_boundary(*i))
-            .any(|i| toks_match(rest, &text[i..])),
-        Tok::Class { negated, ranges } => match text.chars().next() {
-            Some(c) if c != '/' => {
-                let inside = ranges.iter().any(|(low, high)| c >= *low && c <= *high);
-                inside != *negated && toks_match(rest, &text[c.len_utf8()..])
+    let chars: Vec<char> = text.chars().collect();
+    let (mut t, mut p) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while p < chars.len() {
+        match toks.get(t) {
+            Some(Tok::Star) => {
+                star = Some((t, p));
+                t += 1;
             }
-            _ => false,
-        },
+            Some(Tok::Any) if chars[p] != '/' => {
+                t += 1;
+                p += 1;
+            }
+            Some(Tok::Class { negated, ranges }) if chars[p] != '/' => {
+                let inside = ranges
+                    .iter()
+                    .any(|(low, high)| chars[p] >= *low && chars[p] <= *high);
+                if inside != *negated {
+                    t += 1;
+                    p += 1;
+                } else if let Some((star_at, mark)) = star {
+                    t = star_at + 1;
+                    p = mark + 1;
+                    star = Some((star_at, mark + 1));
+                } else {
+                    return false;
+                }
+            }
+            Some(Tok::Char(want)) if *want == chars[p] => {
+                t += 1;
+                p += 1;
+            }
+            _ => {
+                let Some((star_at, mark)) = star else {
+                    return false;
+                };
+                t = star_at + 1;
+                p = mark + 1;
+                star = Some((star_at, mark + 1));
+            }
+        }
     }
+    toks[t..].iter().all(|tok| *tok == Tok::Star)
 }
 
 #[cfg(test)]
@@ -554,6 +617,47 @@ mod tests {
             repo: repo.to_owned(),
             path: path.to_owned(),
         }
+    }
+
+    /// The matcher walks a pattern in proportion to its own size, not exponentially in it. A `*` that
+    /// retried every suffix recursively, or a `**` that retried every number of components
+    /// recursively, would both be correct and both would hang: the adversarial pass that found this
+    /// measured eleven `*` against a forty-character component at minutes, and the shapes a
+    /// maintainer types reach either form. These two cases are the shapes, and the assertions are
+    /// the answers as well as the cost — a rewrite that made them fast by being wrong would fail.
+    #[test]
+    fn a_pattern_full_of_stars_matches_in_proportion_to_its_own_size() {
+        let stars = "*a".repeat(20);
+        let compiled = compile(&stars).expect("twenty stars is a pattern a maintainer can type");
+
+        // Sixty-four characters holding twenty `a`: each `*` eats the `b` before the next one, and
+        // the last token is a literal `a`, so the component has to end with one.
+        let hit = "b".repeat(25) + &"a" + &"ba".repeat(19);
+        assert_eq!(hit.len(), 64, "the component is sixty-four characters long");
+        assert!(
+            compiled.matches(&hit),
+            "twenty `*` against twenty `a` in sixty-four characters matches"
+        );
+
+        // The same pattern, and no `a` at all: one pass, and no match.
+        let miss = "b".repeat(64);
+        assert!(
+            !compiled.matches(&miss),
+            "the miss is the same walk, not a different one"
+        );
+
+        // The same for `**`, whose exponential form is "every number of components, for every `**`".
+        let globstars = format!("{}x.rs", "**/".repeat(20));
+        let compiled = compile(&globstars).expect("twenty globstars compile as whole components");
+        let path = format!("{}x.rs", "a/".repeat(20));
+        assert!(
+            compiled.matches(&path),
+            "twenty `**` against twenty components matches"
+        );
+        assert!(
+            !compiled.matches(&format!("{}x.py", "a/".repeat(20))),
+            "and the last component still has to match"
+        );
     }
 
     /// Compiles `pattern` and asserts it does (or does not) match `path`. This is plan D71's dialect
