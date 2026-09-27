@@ -1516,8 +1516,9 @@ impl Isolator for GixIsolator {
         })
     }
 
-    /// MOD-9 D89: one `git diff --name-only -z` per committed row, over
-    /// [`range_of`](GixIsolator::range_of)'s revisions, in the order of `commits`.
+    /// MOD-9 D89: one `git diff --name-only -z` per committed row, over `range_of`'s revisions —
+    /// the same checkout and the same two commits [`diff`](GixIsolator::diff) reads — in the order
+    /// of `commits`.
     ///
     /// No usable `git` is `Ok(Vec::new())` — the same degradation [`diff`](GixIsolator::diff)
     /// makes, in the same sentence as a rule: the file set is a hint and its absence degrades a
