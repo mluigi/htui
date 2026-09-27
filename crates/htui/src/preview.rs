@@ -288,8 +288,11 @@ pub async fn build(
         upstream,
         box_profile,
         skills,
-        // MOD-9 D73: the walk below fills both, immediately before `assemble`, so the preview
-        // resolves a file set exactly as a step does.
+        // MOD-9 D73: the walk below fills `skill_files`, immediately before `assemble`, so the
+        // preview resolves a file set exactly as a step does. `skill_matches` is filled where
+        // `glob::matched_skills` runs, which lands with the `select` rewrite; until then it is
+        // `None`, so every `glob` candidate here records `no_path` even though the preview does run
+        // a real walk. `prompt::STAND_INS` says so to the operator in the notes.
         skill_files: Vec::new(),
         skill_matches: None,
         excerpts: ExcerptSet::default(),
