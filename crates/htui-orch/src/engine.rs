@@ -4983,7 +4983,7 @@ where
         // enumeration is deliberately a superset of what the budget paid for — a skill may fire on
         // a file this prompt never showed the model. The previous attempt's changed paths (D89)
         // join it in a later commit of this milestone, when `Isolator::changed_paths` lands.
-        // (red) the fill is restored in the next commit of this pair.
+        spec.skill_files = excerpts.listed.clone();
         spec.excerpts = excerpts;
         Ok(())
     }
