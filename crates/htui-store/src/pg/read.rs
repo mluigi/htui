@@ -22,9 +22,10 @@ use htui_core::model::{
     RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementRevision,
     RequirementSpec, RequirementState, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase,
     Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree,
-    RunSummary, Scope, SessionEvent, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
-    StepGraphPhase, StepId, StepStatus, UpstreamEntry, UserId, VerifyOutcome, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
+    RunSummary, Scope, SessionEvent, Skill, SkillAttachmentRow, SkillBinding, SkillBindingId,
+    SkillEntry, SkillId, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPhase, StepId,
+    StepStatus, UpstreamEntry, UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspaceProject, WorkspaceSummary,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -1492,6 +1493,336 @@ impl PgStore {
                 .collect(),
             &versions,
         ))
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // MOD-9 milestone 3: the writers' re-reads, and the three attachment reads (plan D76, D92,
+    // D104).
+    //
+    // The five re-reads exist for one reason each: a compare-and-set that touched no row has to
+    // tell `Stale` from `NotFound`, and only a read of the row can. They are inherent and private
+    // to the module's callers, never on `ReadStore`, for the reason the block above gives.
+    // -------------------------------------------------------------------------------------------
+
+    /// MOD-9 D76: the `skill` row of one name, or `None` when the library holds no such name.
+    ///
+    /// `upsert_skill`'s `cas_miss` read. By **name**, not by id: the name is the key the editor
+    /// edits under and the token is a column, so a save that reached nothing has to look the row
+    /// up the way the save found it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn skill_by_name(&self, name: &str) -> Result<Option<Skill>> {
+        sqlx::query_as!(
+            Skill,
+            r#"
+            SELECT id         AS "id: SkillId",
+                   name,
+                   description,
+                   created_by AS "created_by: UserId",
+                   created_at,
+                   updated_at
+              FROM skill
+             WHERE name = $1
+            "#,
+            name,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-9 D76: a skill's highest version, or `None` when it has none.
+    ///
+    /// `add_skill_version`'s `cas_miss` read. One row, not a list: the compare-and-set is against
+    /// the head and nothing else, and `SkillBinding::version_in_force` is not what this answers.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn skill_head(&self, skill: SkillId) -> Result<Option<SkillVersion>> {
+        sqlx::query_as!(
+            SkillVersion,
+            r#"
+            SELECT skill_id   AS "skill_id: SkillId",
+                   version,
+                   body,
+                   source,
+                   created_by AS "created_by: UserId",
+                   created_at
+              FROM skill_version
+             WHERE skill_id = $1
+             ORDER BY version DESC
+             LIMIT 1
+            "#,
+            skill.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-9 D78, D104: every version of one skill, ascending.
+    ///
+    /// The pin check's read, and the only one of the five that is a list: the question is "does
+    /// this skill have a version `n`", not "does version `n` exist", so another skill's row must
+    /// not answer it — and [`skill_pin_refusal`] scopes the scan to the skill for exactly that
+    /// reason. The bodies come back because `SkillVersion` is the row type the writer's
+    /// `cas_miss` and `bound_skills` already name, and a `Vec` of them costs one statement.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn skill_versions_of(&self, skill: SkillId) -> Result<Vec<SkillVersion>> {
+        sqlx::query_as!(
+            SkillVersion,
+            r#"
+            SELECT skill_id   AS "skill_id: SkillId",
+                   version,
+                   body,
+                   source,
+                   created_by AS "created_by: UserId",
+                   created_at
+              FROM skill_version
+             WHERE skill_id = $1
+             ORDER BY version
+            "#,
+            skill.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-9 D76: the `skill_binding` row of one id, or `None` when there is none.
+    ///
+    /// `remove_skill_binding`'s `cas_miss` read, and the one that makes a second unbind a
+    /// `NotFound` rather than a `Stale`: the row the first unbind took is gone, and a token that
+    /// names a row nobody holds has nothing to be stale against.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn skill_binding_by_id(&self, id: SkillBindingId) -> Result<Option<SkillBinding>> {
+        sqlx::query_as!(
+            SkillBinding,
+            r#"
+            SELECT id            AS "id: SkillBindingId",
+                   skill_id      AS "skill_id: SkillId",
+                   project_id    AS "project_id?: ProjectId",
+                   phase_id      AS "phase_id: PhaseId",
+                   pinned_version,
+                   position,
+                   activation    AS "activation: Activation",
+                   globs,
+                   languages,
+                   updated_at
+              FROM skill_binding
+             WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-9 D76, D78: the attachment of one `(skill, project, phase)` key, or `None`.
+    ///
+    /// `set_skill_binding`'s `cas_miss` read, and the one place in the tree where the key's
+    /// `NULL` semantics have to be spelled exactly right (blueprint H-8): `project_id = $2` with a
+    /// NULL `project_id` compares to NULL and never matches, so a **global** attachment's spent
+    /// token would answer `NotFound` instead of `Stale`. `IS NOT DISTINCT FROM` is the same
+    /// spelling the writer's own guard uses, and the two must not drift.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn skill_binding_at(
+        &self,
+        skill: SkillId,
+        project: Option<ProjectId>,
+        phase: Option<PhaseId>,
+    ) -> Result<Option<SkillBinding>> {
+        // `None` binds SQL NULL, so each `IS NOT DISTINCT FROM` is the three-valued comparison
+        // the unique key itself is defined with.
+        sqlx::query_as!(
+            SkillBinding,
+            r#"
+            SELECT id            AS "id: SkillBindingId",
+                   skill_id      AS "skill_id: SkillId",
+                   project_id    AS "project_id?: ProjectId",
+                   phase_id      AS "phase_id: PhaseId",
+                   pinned_version,
+                   position,
+                   activation    AS "activation: Activation",
+                   globs,
+                   languages,
+                   updated_at
+              FROM skill_binding
+             WHERE skill_id = $1
+               AND project_id IS NOT DISTINCT FROM $2
+               AND phase_id IS NOT DISTINCT FROM $3
+            "#,
+            skill.as_uuid(),
+            project.map(ProjectId::as_uuid),
+            phase.map(PhaseId::as_uuid),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-9 D93: the whole library with every version, `skill.name` byte order and
+    /// `skill_version.version` ascending.
+    ///
+    /// **Not a scoped read.** `skill` has no `project_id` and the library is global (D92), which
+    /// is why the snapshot that carries it holds a `Scope` for the attachments beside it and
+    /// nothing for this.
+    ///
+    /// `COLLATE "C"` rather than a bare `ORDER BY name`, so the order is the byte order
+    /// `MemStore` sorts by and not the database's collation — the same argument
+    /// [`PgStore::prompt_templates`] makes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn skill_library(&self) -> Result<Vec<SkillEntry>> {
+        let skills: Vec<Skill> = sqlx::query_as!(
+            Skill,
+            r#"
+            SELECT id         AS "id: SkillId",
+                   name,
+                   description,
+                   created_by AS "created_by: UserId",
+                   created_at,
+                   updated_at
+              FROM skill
+             ORDER BY name COLLATE "C"
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let versions = sqlx::query_as!(
+            SkillVersion,
+            r#"
+            SELECT skill_id   AS "skill_id: SkillId",
+                   version,
+                   body,
+                   source,
+                   created_by AS "created_by: UserId",
+                   created_at
+              FROM skill_version
+             ORDER BY skill_id, version
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        // The two statements are read into memory and joined here rather than in SQL: the
+        // library is small, and one projection written once is what keeps `MemStore`'s order and
+        // this one's from drifting.
+        Ok(skills
+            .into_iter()
+            .map(|skill| {
+                let versions = versions
+                    .iter()
+                    .filter(|version| version.skill_id == skill.id)
+                    .cloned()
+                    .collect();
+                SkillEntry { skill, versions }
+            })
+            .collect())
+    }
+
+    /// MOD-9 D92: every attachment that applies to the listed projects — the global rows and
+    /// each project's own — with the skill's name, the project's slug and the phase's name joined.
+    ///
+    /// The matrix's one read, and one request per event rather than one per project: N requests of
+    /// one variant leave all but one undrawn (F-2). The order is the matrix's: `project_id` NULLS
+    /// FIRST, then `project_id`, then `phase_id` NULLS FIRST, then `phase_id`, then
+    /// `skill.name` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn skill_attachments(
+        &self,
+        projects: &[ProjectId],
+    ) -> Result<Vec<SkillAttachmentRow>> {
+        let owners: Vec<Uuid> = projects.iter().map(|id| id.as_uuid()).collect();
+        // `project_id IS NULL OR project_id = ANY($1)`: the global row applies to every project,
+        // which is the one row no list of projects can name.
+        sqlx::query_as!(
+            SkillAttachmentRow,
+            r#"
+            SELECT b.id            AS "id: SkillBindingId",
+                   b.skill_id      AS "skill_id: SkillId",
+                   s.name,
+                   b.project_id    AS "project_id?: ProjectId",
+                   p.slug          AS "project_slug?: String",
+                   b.phase_id      AS "phase_id: PhaseId",
+                   g.name          AS "phase_name?: String",
+                   b.pinned_version,
+                   b.position,
+                   b.activation    AS "activation: Activation",
+                   b.globs,
+                   b.languages,
+                   b.updated_at
+              FROM skill_binding b
+              JOIN skill s ON s.id = b.skill_id
+              LEFT JOIN project p ON p.id = b.project_id
+              LEFT JOIN step_graph_phase g ON g.id = b.phase_id
+             WHERE b.project_id IS NULL OR b.project_id = ANY($1)
+             ORDER BY b.project_id NULLS FIRST, b.project_id, b.phase_id NULLS FIRST,
+                      b.phase_id, s.name COLLATE "C"
+            "#,
+            &owners,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-9 D98: the **raw** `skill_binding` rows of one phase, nothing resolved.
+    ///
+    /// This is the read `override_graph` copies from (D85): a [`BoundSkill`] would have lost
+    /// `languages`, which the copy must carry verbatim, and would have collapsed the levels the
+    /// copy has to keep apart. `position` ascending, which is the order `resolve` renders in.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn phase_attachments(
+        &self,
+        project: ProjectId,
+        phase: PhaseId,
+    ) -> Result<Vec<SkillBinding>> {
+        sqlx::query_as!(
+            SkillBinding,
+            r#"
+            SELECT id            AS "id: SkillBindingId",
+                   skill_id      AS "skill_id: SkillId",
+                   project_id    AS "project_id?: ProjectId",
+                   phase_id      AS "phase_id: PhaseId",
+                   pinned_version,
+                   position,
+                   activation    AS "activation: Activation",
+                   globs,
+                   languages,
+                   updated_at
+              FROM skill_binding
+             WHERE project_id = $1 AND phase_id = $2
+             ORDER BY position
+            "#,
+            project.as_uuid(),
+            phase.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 
     /// One box projected for the prompt's `box` section, or `None` when no row has that id.

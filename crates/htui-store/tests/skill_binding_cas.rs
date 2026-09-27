@@ -74,7 +74,7 @@ async fn wait_on_a_lock(pool: &sqlx::PgPool) {
 
 /// Asserts the loser is still blocked, which is what makes the commit below the thing that
 /// releases it rather than a race the test won by luck.
-fn assert_still_blocked<T>(handle: &mut tokio::task::JoinHandle<T>) {
+async fn assert_still_blocked<T>(handle: &mut tokio::task::JoinHandle<T>) {
     assert!(
         tokio::time::timeout(Duration::from_millis(200), &mut *handle)
             .await
@@ -111,14 +111,11 @@ async fn two_bindings_at_one_key_write_one_row() {
     // The loser: a create (`expected: None`) of the same key, which cannot see the uncommitted
     // row and so believes the key is free.
     let store = db.store.clone();
-    let mut loser = tokio::spawn(async move {
-        store
-            .set_skill_binding(binding(None, 9), None)
-            .await
-    });
+    let mut loser =
+        tokio::spawn(async move { store.set_skill_binding(binding(None, 9), None).await });
 
     wait_on_a_lock(&db.pool).await;
-    assert_still_blocked(&mut loser);
+    assert_still_blocked(&mut loser).await;
 
     winner.commit().await.expect("commit the winner");
     let outcome = tokio::time::timeout(PATIENCE, loser)
@@ -155,11 +152,14 @@ async fn an_unbind_under_a_spent_token_keeps_the_row() {
     let Some(db) = common::demo_db().await else {
         return; // `common` printed the skip line already (plan D13).
     };
-    let row = db
+    let CasOutcome::Applied(row) = db
         .store
         .set_skill_binding(binding(Some(ids::PROJECT_AGY), 0), None)
         .await
-        .expect("the attachment lands");
+        .expect("the attachment lands")
+    else {
+        panic!("a create under None is Applied");
+    };
     let spent = row.updated_at;
 
     // The winner: a move of `position`, which the `updated_at` trigger turns into a new token.
@@ -179,7 +179,7 @@ async fn an_unbind_under_a_spent_token_keeps_the_row() {
     let mut loser = tokio::spawn(async move { store.remove_skill_binding(id, spent).await });
 
     wait_on_a_lock(&db.pool).await;
-    assert_still_blocked(&mut loser);
+    assert_still_blocked(&mut loser).await;
 
     winner.commit().await.expect("commit the winner");
     let outcome = tokio::time::timeout(PATIENCE, loser)
@@ -210,7 +210,7 @@ async fn an_unbind_under_a_spent_token_keeps_the_row() {
 
     // The token the winner left is the one a fresh unbind detaches, so the writer is not stuck
     // on a row no token can name.
-    let (after, position): (DateTime<Utc>, i32) =
+    let (after, _position): (DateTime<Utc>, i32) =
         sqlx::query_as("SELECT updated_at, position FROM skill_binding WHERE id = $1")
             .bind(row.id.as_uuid())
             .fetch_one(&db.pool)
@@ -234,5 +234,8 @@ async fn an_unbind_under_a_spent_token_keeps_the_row() {
         .fetch_one(&db.pool)
         .await
         .expect("count the attachments");
-    assert_eq!(rows, 0, "the row really goes once the token is the current one");
+    assert_eq!(
+        rows, 0,
+        "the row really goes once the token is the current one"
+    );
 }

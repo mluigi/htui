@@ -30,8 +30,9 @@ use htui_core::model::{
     ItemSummary, LinkGraph, Note, PhaseAgent, PhaseId, Project, ProjectId, ProjectRef, PromptScope,
     PromptTemplate, RepoBoxPath, RepoId, Requirement, RequirementArea, RequirementFilter,
     RequirementId, RequirementRevision, RequirementSpec, ResolvedGraph, ResolvedInput, Run, RunId,
-    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, StepGraph, StepGraphId,
-    StepId, UpstreamEntry, UserId, WorkspaceSummary,
+    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SkillAttachmentRow,
+    SkillBinding, SkillEntry, StepGraph, StepGraphId, StepId, UpstreamEntry, UserId,
+    WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -371,6 +372,61 @@ impl Backend {
         match self {
             Self::Memory(store) => store.bound_skills(project, phase).await,
             Self::Online { pg, .. } => pg.bound_skills(project, phase).await,
+            Self::Offline { .. } => Err(prompt_offline()),
+        }
+    }
+
+    /// MOD-9 D93: the whole skill library with every version, `skill.name` byte order.
+    ///
+    /// Global and **not** scoped: `skill` has no `project_id`, which is why the snapshot that
+    /// carries it holds a `Scope` for the attachments beside it and nothing for this.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`PROMPT_ON_SERVER_ONLY`], for the reason the block above gives.
+    pub async fn skill_library(&self) -> Result<Vec<SkillEntry>> {
+        match self {
+            Self::Memory(store) => store.skill_library().await,
+            Self::Online { pg, .. } => pg.skill_library().await,
+            Self::Offline { .. } => Err(prompt_offline()),
+        }
+    }
+
+    /// MOD-9 D92: every attachment that applies to the listed projects — the global rows and
+    /// each project's own — with the skill's name, the project's slug and the phase's name
+    /// joined. One read for the whole matrix (F-2), never one per project.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`PROMPT_ON_SERVER_ONLY`].
+    pub async fn skill_attachments(
+        &self,
+        projects: &[ProjectId],
+    ) -> Result<Vec<SkillAttachmentRow>> {
+        match self {
+            Self::Memory(store) => store.skill_attachments(projects).await,
+            Self::Online { pg, .. } => pg.skill_attachments(projects).await,
+            Self::Offline { .. } => Err(prompt_offline()),
+        }
+    }
+
+    /// MOD-9 D98: the **raw** `skill_binding` rows of one phase, nothing resolved — the read the
+    /// override clone copies from (D85), which is why it is not `bound_skills`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`PROMPT_ON_SERVER_ONLY`].
+    pub async fn phase_attachments(
+        &self,
+        project: ProjectId,
+        phase: PhaseId,
+    ) -> Result<Vec<SkillBinding>> {
+        match self {
+            Self::Memory(store) => store.phase_attachments(project, phase).await,
+            Self::Online { pg, .. } => pg.phase_attachments(project, phase).await,
             Self::Offline { .. } => Err(prompt_offline()),
         }
     }

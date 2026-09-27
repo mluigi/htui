@@ -32,11 +32,11 @@ use crate::model::{
     RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
     RequirementSpec, RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput,
     ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
-    RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingId, SkillId,
-    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, WorkspaceSummary, canonical_declared_tags,
-    missing_tags_failure, overlaps, prompt_summary, scope_of,
+    RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillAttachmentRow, SkillBinding,
+    SkillBindingId, SkillEntry, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
+    canonical_declared_tags, missing_tags_failure, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -447,6 +447,137 @@ impl MemStore {
                 })
                 .collect();
             crate::model::skill::resolve(rows, &state.skill_versions)
+        }))
+    }
+
+    /// MOD-9 D93: the whole library with every version, `skill.name` byte order and
+    /// `skill_version.version` ascending.
+    ///
+    /// **Not a scoped read**: `skill` has no `project_id` and the library is global (D92), which
+    /// is why the snapshot that carries it holds a `Scope` for the attachments beside it and
+    /// nothing for this.
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn skill_library(&self) -> Result<Vec<SkillEntry>> {
+        Ok(self.read(|state| {
+            let mut skills: Vec<Skill> = state.skills.values().cloned().collect();
+            // Byte order, not `String`'s own `Ord`, so this is the order `PgStore`'s
+            // `ORDER BY name COLLATE "C"` gives and not the database's collation.
+            skills.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+            skills
+                .into_iter()
+                .map(|skill| {
+                    let mut versions: Vec<SkillVersion> = state
+                        .skill_versions
+                        .iter()
+                        .filter(|version| version.skill_id == skill.id)
+                        .cloned()
+                        .collect();
+                    versions.sort_by_key(|version| version.version);
+                    SkillEntry { skill, versions }
+                })
+                .collect()
+        }))
+    }
+
+    /// MOD-9 D92: every attachment that applies to the listed projects — the global rows and each
+    /// project's own — with the skill's name, the project's slug and the phase's name joined.
+    ///
+    /// The matrix's one read, and one request per event rather than one per project (F-2). The
+    /// order is the matrix's: `project_id` NULLS FIRST, then `project_id`, then `phase_id` NULLS
+    /// FIRST, then `phase_id`, then `skill.name` bytes — written out, because `Option`'s own
+    /// `Ord` is NULLS LAST and Postgres orders it the other way round.
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s.
+    pub async fn skill_attachments(
+        &self,
+        projects: &[ProjectId],
+    ) -> Result<Vec<SkillAttachmentRow>> {
+        Ok(self.read(|state| {
+            let mut rows: Vec<SkillAttachmentRow> = state
+                .skill_bindings
+                .iter()
+                .filter(|row| match row.project_id {
+                    // The global row applies to every project, which is the one row no list of
+                    // projects can name.
+                    None => true,
+                    Some(owner) => projects.contains(&owner),
+                })
+                .map(|row| SkillAttachmentRow {
+                    id: row.id,
+                    skill_id: row.skill_id,
+                    name: state
+                        .skills
+                        .get(&row.skill_id)
+                        .map_or_else(String::new, |skill| skill.name.clone()),
+                    project_id: row.project_id,
+                    project_slug: row
+                        .project_id
+                        .and_then(|id| state.projects.get(&id))
+                        .map(|project| project.slug.clone()),
+                    phase_id: row.phase_id,
+                    phase_name: row.phase_id.and_then(|id| {
+                        state
+                            .phases
+                            .iter()
+                            .find(|phase| phase.id == id)
+                            .map(|phase| phase.name.clone())
+                    }),
+                    pinned_version: row.pinned_version,
+                    position: row.position,
+                    activation: row.activation,
+                    globs: row.globs.clone(),
+                    languages: row.languages.clone(),
+                    updated_at: row.updated_at,
+                })
+                .collect();
+            rows.sort_by(|left, right| {
+                let project = match (left.project_id, right.project_id) {
+                    (None, Some(_)) => core::cmp::Ordering::Less,
+                    (Some(_), None) => core::cmp::Ordering::Greater,
+                    (mine, theirs) => mine.cmp(&theirs),
+                };
+                let phase = match (left.phase_id, right.phase_id) {
+                    (None, Some(_)) => core::cmp::Ordering::Less,
+                    (Some(_), None) => core::cmp::Ordering::Greater,
+                    (mine, theirs) => mine.cmp(&theirs),
+                };
+                project
+                    .then(phase)
+                    .then_with(|| left.name.as_bytes().cmp(right.name.as_bytes()))
+            });
+            rows
+        }))
+    }
+
+    /// MOD-9 D98: the **raw** `skill_binding` rows of one phase, nothing resolved, in `position`
+    /// order.
+    ///
+    /// This is the read `override_graph` copies from (D85): a [`BoundSkill`] would have lost
+    /// `languages`, which the copy must carry verbatim, and would have collapsed the levels the
+    /// copy keeps apart.
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature matches `PgStore`'s.
+    pub async fn phase_attachments(
+        &self,
+        project: ProjectId,
+        phase: PhaseId,
+    ) -> Result<Vec<SkillBinding>> {
+        Ok(self.read(|state| {
+            let mut rows: Vec<SkillBinding> = state
+                .skill_bindings
+                .iter()
+                .filter(|row| row.project_id == Some(project) && row.phase_id == Some(phase))
+                .cloned()
+                .collect();
+            rows.sort_by_key(|row| row.position);
+            rows
         }))
     }
 

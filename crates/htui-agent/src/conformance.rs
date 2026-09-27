@@ -35,14 +35,15 @@ use htui_core::model::{
     EventRole, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
     ItemKindPatch, ItemPatch, ItemRequirement, ItemSummary, LinkGraph, NewCommandRun, NewDocument,
     NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PER_TOKEN_CAP_RUN,
-    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, Quota,
-    QuotaSource, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
-    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunId, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry, UserId,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, normalize,
+    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillBinding, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, PER_TOKEN_CAP_RUN, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, PromptScope, PromptTemplate, Quota, QuotaSource, Repo, RepoBoxPath, RepoId,
+    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
+    ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, Skill, SkillBinding, SkillBindingId, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
+    UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, normalize,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::scrub::MinimalScrubber;
@@ -939,6 +940,35 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
         expected: Option<i32>,
     ) -> StoreResult<CasOutcome<PromptTemplate>> {
         self.inner.append_prompt_template(new, expected).await
+    }
+
+    async fn upsert_skill(
+        &self,
+        new: NewSkill,
+        expected: Option<DateTime<Utc>>,
+    ) -> StoreResult<CasOutcome<Skill>> {
+        self.inner.upsert_skill(new, expected).await
+    }
+    async fn add_skill_version(
+        &self,
+        new: NewSkillVersion,
+        expected: Option<i32>,
+    ) -> StoreResult<CasOutcome<SkillVersion>> {
+        self.inner.add_skill_version(new, expected).await
+    }
+    async fn set_skill_binding(
+        &self,
+        new: NewSkillBinding,
+        expected: Option<DateTime<Utc>>,
+    ) -> StoreResult<CasOutcome<SkillBinding>> {
+        self.inner.set_skill_binding(new, expected).await
+    }
+    async fn remove_skill_binding(
+        &self,
+        id: SkillBindingId,
+        expected: DateTime<Utc>,
+    ) -> StoreResult<CasOutcome<SkillBinding>> {
+        self.inner.remove_skill_binding(id, expected).await
     }
     async fn set_setting(
         &self,

@@ -1,0 +1,172 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT b.id            AS \"id: SkillBindingId\",\n                   b.skill_id      AS \"skill_id: SkillId\",\n                   s.name,\n                   b.project_id    AS \"project_id?: ProjectId\",\n                   p.slug          AS \"project_slug?: String\",\n                   b.phase_id      AS \"phase_id: PhaseId\",\n                   g.name          AS \"phase_name?: String\",\n                   b.pinned_version,\n                   b.position,\n                   b.activation    AS \"activation: Activation\",\n                   b.globs,\n                   b.languages,\n                   b.updated_at\n              FROM skill_binding b\n              JOIN skill s ON s.id = b.skill_id\n              LEFT JOIN project p ON p.id = b.project_id\n              LEFT JOIN step_graph_phase g ON g.id = b.phase_id\n             WHERE b.project_id IS NULL OR b.project_id = ANY($1)\n             ORDER BY b.project_id NULLS FIRST, b.project_id, b.phase_id NULLS FIRST,\n                      b.phase_id, s.name COLLATE \"C\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: SkillBindingId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "skill_id: SkillId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "skill_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "skill",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "project_id?: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "project_slug?: String",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "slug"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "phase_id: PhaseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "phase_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "phase_name?: String",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "pinned_version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "pinned_version"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "activation: Activation",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "activation"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "globs",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "globs"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "languages",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "languages"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "skill_binding",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "981a7a110a6fd5b21ff3db69b157e288f340e4176fad2b193c41b48c8c1feae7"
+}

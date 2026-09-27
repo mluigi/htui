@@ -1979,6 +1979,109 @@ async fn inherent_prompt_reads_answer_the_fixture() {
     db.drop_db().await;
 }
 
+/// MOD-9 milestone 3's three inherent skill reads (plan D92, D93, D98), against the fixture.
+///
+/// A second test beside `inherent_prompt_reads_answer_the_fixture` rather than three more
+/// assertions inside it: that one pins the five reads milestone 2 added and its name says so.
+/// What these three add is the comparison in the other direction — the library, the attachment
+/// matrix's one read and the clone's raw read are each an order the two backends spell
+/// differently in SQL and in Rust, and nothing else in the suite compares them.
+#[tokio::test(flavor = "multi_thread")]
+async fn inherent_skill_reads_answer_the_fixture() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let mem = htui_core::store::MemStore::demo();
+
+    // The library is global: no `project_id` to scope it by, `skill.name` byte order, versions
+    // ascending under their skill.
+    let library = db
+        .store
+        .skill_library()
+        .await
+        .expect("skill_library must not fail");
+    assert_eq!(
+        library
+            .iter()
+            .map(|entry| (
+                entry.skill.name.as_str(),
+                entry.versions.iter().map(|v| v.version).collect::<Vec<_>>()
+            ))
+            .collect::<Vec<_>>(),
+        vec![("rust-style", vec![1, 2]), ("tests", vec![1])],
+        "the fixture's two skills in name byte order, each with every version ascending"
+    );
+    assert_eq!(
+        library,
+        mem.skill_library().await.expect("MemStore::skill_library"),
+        "Postgres and the reference store answer the same library in the same order"
+    );
+
+    // The matrix's one read: every global row plus the listed projects' own, in the matrix's
+    // order — `project_id` NULLS FIRST, then the phase, then the skill's name.
+    let attachments = db
+        .store
+        .skill_attachments(&[ids::PROJECT_HTUI, ids::PROJECT_AGY])
+        .await
+        .expect("skill_attachments must not fail");
+    assert_eq!(
+        attachments
+            .iter()
+            .map(|row| (
+                row.name.as_str(),
+                row.project_slug.as_deref(),
+                row.phase_name.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("rust-style", Some("htui"), None),
+            ("tests", Some("htui"), None),
+            ("rust-style", Some("htui"), Some("implement")),
+        ],
+        "the fixture's three rows, project level before phase level, `skill.name` breaking the tie"
+    );
+    assert_eq!(
+        attachments,
+        mem.skill_attachments(&[ids::PROJECT_HTUI, ids::PROJECT_AGY])
+            .await
+            .expect("MemStore::skill_attachments"),
+        "and the two backends agree on the joins and on the order"
+    );
+    assert_eq!(
+        db.store
+            .skill_attachments(&[ids::PROJECT_AGY])
+            .await
+            .expect("a project with no attachment of its own is not an error"),
+        Vec::default(),
+        "a list of projects names no global row, because the fixture plants none"
+    );
+
+    // The clone's read: raw rows, nothing resolved, so `languages` survives the trip.
+    let phase = db
+        .store
+        .phase_attachments(ids::PROJECT_HTUI, ids::PHASE_HTUI_IMPLEMENT)
+        .await
+        .expect("phase_attachments must not fail");
+    assert_eq!(
+        phase
+            .iter()
+            .map(|row| (row.skill_id, row.pinned_version, row.position))
+            .collect::<Vec<_>>(),
+        vec![(ids::SKILL_RUST_STYLE, Some(1), 2)],
+        "the one phase-level row the fixture holds, unresolved: the pin and the position are the \
+         row's own"
+    );
+    assert_eq!(
+        phase,
+        mem.phase_attachments(ids::PROJECT_HTUI, ids::PHASE_HTUI_IMPLEMENT)
+            .await
+            .expect("MemStore::phase_attachments"),
+        "and the two backends agree on it"
+    );
+
+    db.drop_db().await;
+}
+
 /// D3's token is the migration's `BEFORE UPDATE` trigger's, and nothing a caller sends can become
 /// one.
 ///

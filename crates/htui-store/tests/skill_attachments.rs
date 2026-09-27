@@ -21,7 +21,7 @@ use htui_core::model::{
     Activation, ChoiceReason, NewSkillBinding, PhaseId, ProjectId, Skill, SkillBinding,
     SkillBindingId, SkillId, SkillLevel, SkillVersion,
 };
-use htui_core::store::{MemStore, StoreError, WriteStore as _};
+use htui_core::store::{CasOutcome, MemStore, StoreError, WriteStore as _};
 use sqlx::postgres::PgPool;
 
 /// One attachment to plant: the skill's name, its two keys, the activation, globs, position.
@@ -503,25 +503,11 @@ fn the_five_refusals() -> Vec<(&'static str, NewSkillBinding)> {
         ),
         (
             "a repo-qualified glob on a global row",
-            written(
-                skill,
-                None,
-                None,
-                Activation::Glob,
-                &["htui:**/*.rs"],
-                None,
-            ),
+            written(skill, None, None, Activation::Glob, &["htui:**/*.rs"], None),
         ),
         (
             "a glob the matcher refuses",
-            written(
-                skill,
-                None,
-                None,
-                Activation::Glob,
-                &["src/**x/*.rs"],
-                None,
-            ),
+            written(skill, None, None, Activation::Glob, &["src/**x/*.rs"], None),
         ),
         (
             "a pin the skill has no version for",
@@ -549,36 +535,27 @@ async fn the_writer_refuses_a_glob_row_with_no_globs_before_the_check_does() {
         panic!("a glob attachment with no glob is Constraint, got {outcome:?}");
     };
     assert!(
-        message.contains("skill_binding.globs") && message.contains("skill_binding_glob_needs_globs"),
+        message.contains("skill_binding.globs")
+            && message.contains("skill_binding_glob_needs_globs"),
         "the refusal names the column and the check it mirrors, got {message:?}"
     );
     assert!(
         !message.starts_with("skill_binding_glob_needs_globs:"),
-        "and it is the writer's own sentence, not the driver's `{constraint}: {message}` form, \
+        "and it is the writer's own sentence, not the driver's `<constraint>: <message>` form, \
          got {message:?}"
     );
 
-    let planted: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM skill_binding WHERE skill_id = $1 AND project_id IS NULL")
-            .bind(ids::SKILL_TESTS.as_uuid())
-            .fetch_one(&db.pool)
-            .await
-            .expect("count the global rows");
+    let planted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM skill_binding WHERE skill_id = $1 AND project_id IS NULL",
+    )
+    .bind(ids::SKILL_TESTS.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("count the global rows");
     assert_eq!(planted, 0, "the refusal wrote nothing");
 
     assert_eq!(
-        constraint(
-            plant_binding(
-                &db.pool,
-                ids::SKILL_TESTS,
-                None,
-                None,
-                "glob",
-                &[],
-                0
-            )
-            .await
-        ),
+        constraint(plant_binding(&db.pool, ids::SKILL_TESTS, None, None, "glob", &[], 0).await),
         "skill_binding_glob_needs_globs",
         "and the CHECK still refuses a row that did not come through the writer"
     );
@@ -616,9 +593,9 @@ async fn the_writer_and_mem_agree_on_every_refusal() {
             .iter()
             .map(|skill| skill.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["rust-style", "tests"],
-        "and none of the five wrote: `tests` still reaches another project from the fixture's \
-         project-level row alone"
+        Vec::<&str>::new(),
+        "and none of the five wrote: the fixture's three attachments are all on `htui`, so a \
+         project with none of its own still sees nothing — a global row would appear here"
     );
 
     db.drop_db().await;
@@ -632,7 +609,7 @@ async fn a_qualified_glob_is_accepted_on_a_project_row() {
     let Some(db) = common::demo_db().await else {
         return;
     };
-    let row = db
+    let CasOutcome::Applied(row) = db
         .store
         .set_skill_binding(
             written(
@@ -646,7 +623,10 @@ async fn a_qualified_glob_is_accepted_on_a_project_row() {
             None,
         )
         .await
-        .expect("a qualified glob on a project row is written");
+        .expect("a qualified glob on a project row is written")
+    else {
+        panic!("a create under None is Applied");
+    };
     assert_eq!(
         (row.activation, row.globs),
         (

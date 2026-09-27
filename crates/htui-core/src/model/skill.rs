@@ -429,6 +429,57 @@ pub struct NewSkillBinding {
     pub languages: Vec<String>,
 }
 
+/// One skill with every version it has (plan D93): the library list's row.
+///
+/// A projection and not a table, because the library view needs both halves in one reply and the
+/// two are read in two statements. `versions` is ascending, so `last()` is the head a pin or an
+/// unpinned attachment resolves to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillEntry {
+    /// The `skill` row.
+    pub skill: Skill,
+    /// Its `skill_version` rows, `version` ascending; empty for a skill nothing has appended to.
+    pub versions: Vec<SkillVersion>,
+}
+
+/// One attachment as the matrix draws it (plan D92, D94): the raw `skill_binding` row with the
+/// two joins the view needs already made, and nothing resolved.
+///
+/// **Raw on purpose.** [`resolve`] would collapse the three levels into one winner per skill,
+/// which is what a prompt wants and exactly what a matrix must not show: the matrix is where the
+/// three rows of one skill are compared. `pg/rows.rs`'s milestone-2 [`SkillBindingRow`] is the
+/// bare row and this is its joined form; both are `pub` and neither is a table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillAttachmentRow {
+    /// `skill_binding.id`: the token an unbind and a replace both name.
+    pub id: SkillBindingId,
+    /// `skill_binding.skill_id`.
+    pub skill_id: SkillId,
+    /// The attached skill's `skill.name`; the matrix's row label and its tie-break.
+    pub name: String,
+    /// `skill_binding.project_id`; `None` is the global row, which the matrix draws above the
+    /// projects.
+    pub project_id: Option<ProjectId>,
+    /// The project's `project.slug`, or `None` at the global level.
+    pub project_slug: Option<String>,
+    /// `skill_binding.phase_id`; `None` is the project (or global) level.
+    pub phase_id: Option<PhaseId>,
+    /// The phase's `step_graph_phase.name`, or `None` when the row is not at the phase level.
+    pub phase_name: Option<String>,
+    /// `skill_binding.pinned_version`; `None` follows the latest version.
+    pub pinned_version: Option<i32>,
+    /// `skill_binding.position`: ascending render order, `skill.name` bytes breaking the tie.
+    pub position: i32,
+    /// `skill_binding.activation`.
+    pub activation: Activation,
+    /// `skill_binding.globs`: the effective globs, what the matcher reads.
+    pub globs: Vec<String>,
+    /// `skill_binding.languages`: as authored, display only.
+    pub languages: Vec<String>,
+    /// `skill_binding.updated_at`: the token every write and the unbind compare against.
+    pub updated_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

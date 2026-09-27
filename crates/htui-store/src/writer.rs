@@ -38,14 +38,15 @@ use htui_core::model::{
     Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
     ItemRequirement, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind,
     NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
-    NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
-    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunId,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
-    UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject,
+    NewRunStep, NewSkill, NewSkillBinding, NewSkillVersion, NewStepGraph, NewWorkspace, Note,
+    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, Repo,
+    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
+    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
+    RequirementUpdate, Resolution, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingId,
+    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
@@ -710,6 +711,50 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.append_prompt_template(new, expected).await,
             Self::Online(pg) => pg.append_prompt_template(new, expected).await,
+        }
+    }
+
+    async fn upsert_skill(
+        &self,
+        new: NewSkill,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Skill>> {
+        match self {
+            Self::Memory(store) => store.upsert_skill(new, expected).await,
+            Self::Online(pg) => pg.upsert_skill(new, expected).await,
+        }
+    }
+
+    async fn add_skill_version(
+        &self,
+        new: NewSkillVersion,
+        expected: Option<i32>,
+    ) -> Result<CasOutcome<SkillVersion>> {
+        match self {
+            Self::Memory(store) => store.add_skill_version(new, expected).await,
+            Self::Online(pg) => pg.add_skill_version(new, expected).await,
+        }
+    }
+
+    async fn set_skill_binding(
+        &self,
+        new: NewSkillBinding,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<SkillBinding>> {
+        match self {
+            Self::Memory(store) => store.set_skill_binding(new, expected).await,
+            Self::Online(pg) => pg.set_skill_binding(new, expected).await,
+        }
+    }
+
+    async fn remove_skill_binding(
+        &self,
+        id: SkillBindingId,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<SkillBinding>> {
+        match self {
+            Self::Memory(store) => store.remove_skill_binding(id, expected).await,
+            Self::Online(pg) => pg.remove_skill_binding(id, expected).await,
         }
     }
 

@@ -20,17 +20,18 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool,
-    ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus,
+    Activation, Agent, AgentBox, AgentId, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings,
+    BoxTool, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus,
     DEFAULT_MAX_CONCURRENT_ITEMS, Document, GateOutcome, Isolation, Item, ItemId, ItemKind,
     ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, NewCommandRun,
     NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note,
-    PhaseId, PhasePatch, Priority, Project, ProjectId, ProjectPatch, PromptTemplate,
-    PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
-    RequirementAreaId, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
-    RequirementState, RequirementUpdate, Resolution, Run, RunId, RunKind, RunMode, RunStatus,
-    RunStep, RunStepCommit, RunStepTree, SessionEvent, Status, StepGraph, StepGraphId,
+    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillBinding,
+    NewSkillVersion, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Priority, Project,
+    ProjectId, ProjectPatch, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId,
+    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
+    RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Skill,
+    SkillBinding, SkillBindingId, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
     StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
     Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
     canonical_declared_tags, missing_tags_failure, overlaps, scope_of,
@@ -46,8 +47,10 @@ use htui_core::store::{
     invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
     legal_move, not_a_fanout_candidate, not_a_terminal_status, prompt_template_key,
     prompt_template_refusal, references_no_row, requirement_withdrawn, reserved_phase_name,
-    resolution_not_closable, row_names_another_step, run_is_terminal, step_is_not_promotable,
-    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
+    resolution_not_closable, row_names_another_step, run_is_terminal, skill_binding_key,
+    skill_binding_refusal, skill_key, skill_pin_refusal, skill_refusal, skill_version_key,
+    step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
+    withdrawn_requirement_cited,
 };
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -2499,6 +2502,287 @@ impl WriteStore for PgStore {
             "prompt_template",
             key,
         )
+    }
+
+    // skill, skill_version, skill_binding (MOD-9 milestone 3, plan D76, D78)
+
+    /// MOD-9 D76: `INSERT … SELECT … WHERE <the row's `updated_at`> IS NOT DISTINCT FROM $5 … ON
+    /// CONFLICT (name) DO UPDATE … WHERE skill.updated_at = $5`.
+    ///
+    /// `created_at` and `updated_at` are both **supplied**, because the `updated_at` trigger is
+    /// `BEFORE UPDATE` only (`0001_init.sql` §5.1) and an insert therefore reads whatever the
+    /// statement wrote — the same reason `pg/demo.rs` binds `updated_at` on its `step_graph`
+    /// insert, and the reason a create's two instants are one `now()`.
+    ///
+    /// `ON CONFLICT (name)` infers the unique index over `skill.name` whatever its name is. The
+    /// create path (`expected = NULL`) inserts and never collides; the edit path inserts a row
+    /// that collides and updates it under its own `WHERE`. A spent token reaches neither — the
+    /// guard's `IS NOT DISTINCT FROM $5` is false — and falls through to [`cas_miss`], which is
+    /// where `Stale` and `NotFound` are told apart.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for `Some` on a name with no row; [`StoreError::Constraint`] as
+    /// the trait's, including the `23505` of an `id` that is taken. Nothing is written by either.
+    async fn upsert_skill(
+        &self,
+        new: NewSkill,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Skill>> {
+        let key = skill_key(&new.name);
+        if let Some(refusal) = skill_refusal(&new.name, &new.description) {
+            // No row can be named with a NUL, and binding one is `22021`, not an empty read.
+            let current = if new.name.contains('\0') {
+                None
+            } else {
+                self.skill_by_name(&new.name).await?
+            };
+            return match (current, expected) {
+                (Some(current), _) if expected != Some(current.updated_at) => {
+                    Ok(CasOutcome::Stale(current))
+                }
+                (None, Some(_)) => Err(StoreError::NotFound {
+                    entity: "skill",
+                    id: key,
+                }),
+                _ => Err(StoreError::Constraint(refusal)),
+            };
+        }
+
+        let inserted = sqlx::query_as!(
+            Skill,
+            r#"
+            INSERT INTO skill (id, name, description, created_by, created_at, updated_at)
+            SELECT $1, $2, $3, $4, now(), now()
+             WHERE (SELECT updated_at FROM skill WHERE name = $2)
+                   IS NOT DISTINCT FROM $5::timestamptz
+            ON CONFLICT (name) DO UPDATE SET description = EXCLUDED.description
+             WHERE skill.updated_at = $5::timestamptz
+            RETURNING id         AS "id: SkillId",
+                      name,
+                      description,
+                      created_by AS "created_by: UserId",
+                      created_at,
+                      updated_at
+            "#,
+            new.id.as_uuid(),
+            new.name,
+            new.description,
+            new.created_by.as_uuid(),
+            expected,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(row) = inserted {
+            return Ok(CasOutcome::Applied(row));
+        }
+        cas_miss(self.skill_by_name(&new.name).await?, "skill", key)
+    }
+
+    /// MOD-9 D76: the `append_prompt_template` statement with `(skill_id, version)` for
+    /// `(project_id, name, version)`. `source` is written as given, so the UI's `{}` reaches the
+    /// column and not its default by accident, and `skill_version` carries no `updated_at`
+    /// trigger — this statement never moves `skill.updated_at` (D101).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for `Some` on a skill with no version; [`StoreError::Constraint`]
+    /// for a NUL body or a `skill_id` / `created_by` that names no row (`23503`).
+    async fn add_skill_version(
+        &self,
+        new: NewSkillVersion,
+        expected: Option<i32>,
+    ) -> Result<CasOutcome<SkillVersion>> {
+        if new.body.contains('\0') {
+            let head = self.skill_head(new.skill_id).await?;
+            return match (head, expected) {
+                (Some(head), _) if Some(head.version) != expected => Ok(CasOutcome::Stale(head)),
+                (None, Some(token)) => Err(StoreError::NotFound {
+                    entity: "skill_version",
+                    id: skill_version_key(new.skill_id, token),
+                }),
+                _ => Err(StoreError::Constraint(
+                    "skill_version.body must not contain a NUL character".to_owned(),
+                )),
+            };
+        }
+
+        let inserted = sqlx::query_as!(
+            SkillVersion,
+            r#"
+            INSERT INTO skill_version (skill_id, version, body, source, created_by)
+            SELECT $1, COALESCE($4::int, 0) + 1, $2, $3, $5
+             WHERE (SELECT max(version) FROM skill_version WHERE skill_id = $1)
+                   IS NOT DISTINCT FROM $4::int
+            ON CONFLICT (skill_id, version) DO NOTHING
+            RETURNING skill_id   AS "skill_id: SkillId",
+                      version,
+                      body,
+                      source,
+                      created_by AS "created_by: UserId",
+                      created_at
+            "#,
+            new.skill_id.as_uuid(),
+            new.body,
+            new.source,
+            expected,
+            new.created_by.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(row) = inserted {
+            return Ok(CasOutcome::Applied(row));
+        }
+        cas_miss(
+            self.skill_head(new.skill_id).await?,
+            "skill_version",
+            skill_version_key(new.skill_id, expected.unwrap_or_default()),
+        )
+    }
+
+    /// MOD-9 D76, D78: the five rules in Rust, then one statement.
+    ///
+    /// `ON CONFLICT (skill_id, project_id, phase_id)` infers the `UNIQUE NULLS NOT DISTINCT`
+    /// table constraint by its column list: the inference is over columns and expressions, and
+    /// this constraint is not partial, so no `index_predicate` is needed (blueprint H-7).
+    ///
+    /// The insert's own guard is the row's `updated_at`, so a create (`None`) and a replace
+    /// (`Some(t)`) both insert and both collide, and the `DO UPDATE`'s `WHERE
+    /// skill_binding.updated_at = $10` is what decides. A spent token inserts nothing at all and
+    /// falls through to [`cas_miss`], whose re-read spells the key with `IS NOT DISTINCT FROM`
+    /// for the same reason the guard does (H-8).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for `Some` on a key with no row; [`StoreError::Constraint`] for
+    /// any of D78's five, or an FK that names no row (`23503`).
+    async fn set_skill_binding(
+        &self,
+        new: NewSkillBinding,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<SkillBinding>> {
+        let key = skill_binding_key(new.skill_id, new.project_id, new.phase_id);
+        // The pin is the only rule that needs a read, so the read is only paid for a pin: the
+        // common case writes none and would otherwise read a whole version list to answer `None`
+        // (D104).
+        let mut refusal = skill_binding_refusal(&new);
+        if refusal.is_none()
+            && let Some(pinned) = new.pinned_version
+        {
+            let versions = self.skill_versions_of(new.skill_id).await?;
+            refusal = skill_pin_refusal(pinned, new.skill_id, &versions);
+        }
+        if let Some(refusal) = refusal {
+            let current = self
+                .skill_binding_at(new.skill_id, new.project_id, new.phase_id)
+                .await?;
+            return match (current, expected) {
+                (Some(current), _) if expected != Some(current.updated_at) => {
+                    Ok(CasOutcome::Stale(current))
+                }
+                (None, Some(_)) => Err(StoreError::NotFound {
+                    entity: "skill_binding",
+                    id: key,
+                }),
+                _ => Err(StoreError::Constraint(refusal)),
+            };
+        }
+
+        let inserted = sqlx::query_as!(
+            SkillBinding,
+            r#"
+            INSERT INTO skill_binding (id, skill_id, project_id, phase_id, pinned_version,
+                                       position, activation, globs, languages)
+            SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
+             WHERE (SELECT updated_at FROM skill_binding
+                     WHERE skill_id = $2 AND project_id IS NOT DISTINCT FROM $3::uuid
+                       AND phase_id IS NOT DISTINCT FROM $4::uuid)
+                   IS NOT DISTINCT FROM $10::timestamptz
+            ON CONFLICT (skill_id, project_id, phase_id) DO UPDATE SET
+                pinned_version = EXCLUDED.pinned_version,
+                position       = EXCLUDED.position,
+                activation     = EXCLUDED.activation,
+                globs          = EXCLUDED.globs,
+                languages      = EXCLUDED.languages
+             WHERE skill_binding.updated_at = $10::timestamptz
+            RETURNING id          AS "id: SkillBindingId",
+                      skill_id    AS "skill_id: SkillId",
+                      project_id  AS "project_id?: ProjectId",
+                      phase_id    AS "phase_id: PhaseId",
+                      pinned_version,
+                      position,
+                      activation  AS "activation: Activation",
+                      globs,
+                      languages,
+                      updated_at
+            "#,
+            new.id.as_uuid(),
+            new.skill_id.as_uuid(),
+            new.project_id.map(ProjectId::as_uuid),
+            new.phase_id.map(PhaseId::as_uuid),
+            new.pinned_version,
+            new.position,
+            new.activation.as_str(),
+            &new.globs[..],
+            &new.languages[..],
+            expected,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(row) = inserted {
+            return Ok(CasOutcome::Applied(row));
+        }
+        cas_miss(
+            self.skill_binding_at(new.skill_id, new.project_id, new.phase_id)
+                .await?,
+            "skill_binding",
+            key,
+        )
+    }
+
+    /// MOD-9 D76, R-32: `DELETE … WHERE id = $1 AND updated_at = $2`.
+    ///
+    /// A spent token deletes nothing and answers `Stale` with the winner's row, so a second
+    /// unbind can never remove the first one's result; the `BEFORE UPDATE` trigger is what makes
+    /// the winner's `updated_at` differ from the token the loser holds.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an `id` no row has.
+    async fn remove_skill_binding(
+        &self,
+        id: SkillBindingId,
+        expected: DateTime<Utc>,
+    ) -> Result<CasOutcome<SkillBinding>> {
+        let deleted = sqlx::query_as!(
+            SkillBinding,
+            r#"
+            DELETE FROM skill_binding
+             WHERE id = $1 AND updated_at = $2
+            RETURNING id          AS "id: SkillBindingId",
+                      skill_id    AS "skill_id: SkillId",
+                      project_id  AS "project_id?: ProjectId",
+                      phase_id    AS "phase_id: PhaseId",
+                      pinned_version,
+                      position,
+                      activation  AS "activation: Activation",
+                      globs,
+                      languages,
+                      updated_at
+            "#,
+            id.as_uuid(),
+            expected,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(row) = deleted {
+            return Ok(CasOutcome::Applied(row));
+        }
+        cas_miss(self.skill_binding_by_id(id).await?, "skill_binding", id)
     }
 
     // settings (D7, D8)

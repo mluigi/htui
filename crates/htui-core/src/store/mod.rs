@@ -21,6 +21,7 @@ pub use traits::{
     item_kind_is_held, item_not_in_project, legal_move, not_a_fanout_candidate,
     not_a_terminal_status, prompt_template_key, prompt_template_refusal, references_no_row,
     requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_step,
-    run_is_terminal, step_is_not_promotable, step_slot_is_taken, summary_names_another_item,
-    winner_is_not_settled, withdrawn_requirement_cited,
+    run_is_terminal, skill_binding_key, skill_binding_refusal, skill_key, skill_pin_refusal,
+    skill_refusal, skill_version_key, step_is_not_promotable, step_slot_is_taken,
+    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
