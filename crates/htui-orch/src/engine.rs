@@ -12674,9 +12674,12 @@ mod tests {
         );
     }
 
-    /// D89/R-35: an attempt of 1 has no previous attempt, so the call is not made — and the
-    /// scripted answer is still there for the attempt that does follow, which is how a case can
-    /// tell "skipped" from "consumed and answered nothing".
+    /// D89/R-35: an attempt of 1 has no previous attempt, so the call is not made, and the
+    /// scripted answer is still queued afterwards.
+    ///
+    /// The second half is the one that carries weight. "Did not ask" and "asked, and was
+    /// answered nothing" produce the same empty file set, because an unscripted answer *is* an
+    /// empty vector; only the queue tells them apart, so the case drains it and reads it back.
     #[tokio::test]
     async fn an_attempt_of_one_asks_for_no_changed_paths() {
         let harness = Harness::new().await;
