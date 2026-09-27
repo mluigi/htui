@@ -3565,6 +3565,108 @@ mod tests {
         }
     }
 
+    /// MOD-9 D89: the oracle for the name list, spawned by the test itself under the same pinned
+    /// `COLUMNS` and the same scrubbed environment [`oracle_diff`] uses.
+    fn oracle_changed_paths(
+        git: &Cli,
+        repo: &std::path::Path,
+        before: &str,
+        after: &str,
+    ) -> String {
+        let mut oracle = std::process::Command::new(git.binary());
+        oracle.current_dir(repo).args([
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--name-only",
+            "-z",
+            before,
+            after,
+            "--",
+        ]);
+        for key in SCRUBBED_ENV {
+            oracle.env_remove(key);
+        }
+        let out = oracle
+            .env("LC_ALL", "C")
+            .env("COLUMNS", "80")
+            .output()
+            .expect("the oracle runs");
+        assert!(out.status.success(), "the oracle failed: {out:?}");
+        String::from_utf8(out.stdout).expect("the oracle's output is text")
+    }
+
+    /// D89: `--name-only -z` is what `core.quotePath` cannot corrupt, so the answer needs no
+    /// unescaping anywhere.
+    ///
+    /// The two names are the whole test. `a name with a space.txt` is quoted only when the output
+    /// is newline-delimited, and `héllo.txt` is quoted as `"h\\303\\251llo.txt"` by `quotePath`
+    /// in every format — so a caller that split on `\n` and stripped quotes would hold a path
+    /// that is not a path, and a caller that split on NUL never sees a quote at all.
+    #[tokio::test]
+    async fn changed_paths_are_the_names_git_lists_nul_delimited_and_unquoted() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let before = repo_with_one_commit(dir.path());
+        commit_file(dir.path(), "a name with a space.txt", "one\n", "one");
+        let after = commit_file(dir.path(), "héllo.txt", "two\n", "two");
+
+        let listed = git
+            .changed_paths(dir.path(), &before, &after)
+            .await
+            .expect("the names read");
+        assert_eq!(listed, oracle_changed_paths(&git, dir.path(), &before, &after));
+        assert_eq!(
+            listed.split('\0').collect::<Vec<_>>(),
+            vec!["a name with a space.txt", "héllo.txt", ""],
+            "git's own order, each name one field, and the empty field the trailing NUL leaves"
+        );
+        assert!(
+            !listed.contains('"') && !listed.contains('\\'),
+            "D89: `-z` means a name never arrives quoted, so there is nothing to unescape: {listed}"
+        );
+        assert!(!listed.contains('\n'), "and nothing is newline-delimited: {listed}");
+    }
+
+    /// An empty range lists no names, which is an answer and not an error — the shape
+    /// `GixIsolator::changed_paths` relies on when a step committed nothing.
+    #[tokio::test]
+    async fn changed_paths_of_an_empty_range_is_empty() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let head = repo_with_one_commit(dir.path());
+        assert_eq!(
+            git.changed_paths(dir.path(), &head, &head)
+                .await
+                .expect("the empty range reads"),
+            ""
+        );
+    }
+
+    /// A revision the repository does not hold is `git`'s own refusal, carried verbatim — the
+    /// `IsolateError::Git` the isolator's caller degrades to a prompt note.
+    #[tokio::test]
+    async fn changed_paths_of_a_range_git_does_not_hold_is_an_error() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let head = repo_with_one_commit(dir.path());
+        let refused = git
+            .changed_paths(dir.path(), &head, &"0".repeat(40))
+            .await
+            .expect_err("git refuses a revision it does not hold");
+        assert!(
+            matches!(&refused, IsolateError::Git(message) if message.starts_with("git diff:")),
+            "the failure names the verb: {refused}"
+        );
+    }
+
     /// D55: a head cap, not a tail one — a long patch keeps its first `diff --git` header and says
     /// it was cut.
     #[tokio::test]

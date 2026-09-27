@@ -1693,7 +1693,9 @@ mod tests {
 
     use super::{
         GixIsolator, IsolatorConfig, RepoCheckout, already_reset, label_conflict, local_moved,
+        no_checkout_for_repo,
     };
+    use crate::isolate::IsolateError;
 
     /// A repository at `<dir>/<name>` with one commit, and the pieces a config map wants.
     fn repo(dir: &Path, name: &str, is_primary: bool) -> (RepoId, RepoCheckout, String) {
@@ -4031,6 +4033,158 @@ mod tests {
         );
     }
 
+    /// D89: the two verbs answer over **one** range, and the copy case is where that is
+    /// observable.
+    ///
+    /// Before reconcile the range lives in the copy and after it lives in the primary, so a
+    /// `changed_paths` that re-derived the range instead of sharing [`GixIsolator::range_of`]
+    /// would ask the wrong repository and answer nothing. The names below are therefore the same
+    /// file the patch above names, read from the same two checkouts.
+    #[tokio::test]
+    async fn changed_paths_reads_the_copy_before_reconcile_and_the_checkout_after() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let isolator =
+            GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+                .expect("the config validates");
+
+        let step = StepId::new();
+        let prepared = isolator
+            .prepare(RunId::new(), step, &[core], Isolation::Copy, None)
+            .await
+            .expect("the copy mode prepares");
+        let copy = PathBuf::from(&prepared.trees[0].tree.path);
+        commit_file(&copy, "the-step-work.md", "the step commits\n", "the step commits");
+        let rows = rows(&prepared);
+        let captured = isolator
+            .capture(step, &rows)
+            .await
+            .expect("the step captures");
+
+        let before_merge = isolator
+            .changed_paths(&rows, &captured)
+            .await
+            .expect("the copy holds the range");
+        assert_eq!(
+            before_merge,
+            vec![htui_core::prompt::excerpt::RepoPath {
+                repo: "core".to_owned(),
+                path: "the-step-work.md".to_owned(),
+            }],
+            "the copy is the repository `range_of` resolved, so the name is the step's own"
+        );
+        assert_eq!(
+            git.changed_paths(&copy, &head, &captured[0].after_hash.clone().expect("a commit"),)
+                .await
+                .expect("git reads")
+                .split('\0')
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>(),
+            vec!["the-step-work.md"],
+            "and it is git's own answer for that range, not a re-derivation"
+        );
+
+        let reconciled = isolator
+            .reconcile(step, &rows, &[])
+            .await
+            .expect("the copy reconciles");
+        assert_eq!(
+            isolator
+                .changed_paths(&rows, &reconciled)
+                .await
+                .expect("the checkout holds the merge"),
+            before_merge,
+            "D89: after reconcile the range moved to the primary and the names are the same, so \
+             the two verbs really are reading one range"
+        );
+    }
+
+    /// D89: no usable `git`, a row that committed nothing and a `HEAD` that did not move are all
+    /// an empty answer. The file set is a hint, and its absence degrades a prompt.
+    #[tokio::test]
+    async fn changed_paths_is_empty_without_git_and_without_a_moved_head() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let (core, core_checkout, head) = repo(dir.path(), "core", true);
+        let step = StepId::new();
+        let rows = vec![RunStepTree {
+            run_step_id: step,
+            repo_id: core,
+            mode: Isolation::Local,
+            path: dir.path().join("nowhere").to_string_lossy().into_owned(),
+            base_ref: head.clone(),
+            dirty: false,
+        }];
+        let moved = commit_file(&core_checkout.local_path, "g", "x\n", "x");
+        let committed = vec![RunStepCommit {
+            run_step_id: step,
+            repo_id: core,
+            before_hash: head.clone(),
+            after_hash: Some(moved),
+        }];
+
+        let without = GixIsolator::with_git(
+            config(&dir.path().join("trees"), &[(core, core_checkout.clone())]),
+            Err("git not on PATH".to_owned()),
+        )
+        .expect("the config validates");
+        assert!(
+            without
+                .changed_paths(&rows, &committed)
+                .await
+                .expect("no git is not an error")
+                .is_empty(),
+            "D89: no usable `git` is `Ok(Vec::new())`, the shape `diff`'s `None` has"
+        );
+
+        let Some(_git) = crate::skip_without_git!() else {
+            return;
+        };
+        let with = GixIsolator::new(config(&dir.path().join("trees"), &[(core, core_checkout)]))
+            .expect("the config validates");
+        assert!(with.changed_paths(&rows, &[]).await.expect("reads").is_empty());
+        assert!(
+            with.changed_paths(
+                &rows,
+                &[RunStepCommit {
+                    after_hash: None,
+                    ..committed[0].clone()
+                }]
+            )
+            .await
+            .expect("reads")
+            .is_empty(),
+            "a step that committed nothing has no changed paths"
+        );
+        assert!(
+            with.changed_paths(
+                &rows,
+                &[RunStepCommit {
+                    after_hash: Some(head),
+                    ..committed[0].clone()
+                }]
+            )
+            .await
+            .expect("reads")
+            .is_empty(),
+            "and neither has a step whose `HEAD` never moved"
+        );
+        // A repo with no checkout on this box is `diff`'s own refusal, carried through.
+        let unknown = vec![RunStepCommit {
+            repo_id: RepoId::new(),
+            ..committed[0].clone()
+        }];
+        assert!(
+            matches!(
+                with.changed_paths(&rows, &unknown).await,
+                Err(IsolateError::Refused(refusal)) if refusal == no_checkout_for_repo()
+            ),
+            "the same sentence `diff` refuses with, so the two verbs cannot disagree about a repo"
+        );
+    }
+
     /// Every M3 path is what `None` reaches: a no-slot `shared_serialized` prepare still records a
     /// dirty checkout at its `HEAD` rather than refusing it, and `local` refuses a slot outright.
     #[tokio::test]
@@ -4109,7 +4263,7 @@ mod tests {
                             Some(slot(index, 24, &base)),
                         )
                         .await?;
-                    Ok::<_, crate::isolate::IsolateError>(prepared.trees[0].before_hash.clone())
+                    Ok::<_, IsolateError>(prepared.trees[0].before_hash.clone())
                 })
             })
             .collect();
