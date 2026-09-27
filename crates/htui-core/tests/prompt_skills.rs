@@ -10,8 +10,9 @@
 #![cfg(feature = "test-support")]
 
 use htui_core::model::{Activation, ChoiceReason, SkillChoice, SkillLevel};
+use htui_core::prompt::excerpt::RepoPath;
 use htui_core::prompt::{
-    AssembleError, AssembledPrompt, PromptSpec, SectionName, assemble, fixtures,
+    AssembleError, AssembledPrompt, PromptSpec, SectionName, assemble, fixtures, glob,
 };
 use htui_core::scrub::MinimalScrubber;
 
@@ -90,27 +91,121 @@ fn an_off_skill_is_not_rendered_and_is_recorded_off() {
             activation: Activation::Off,
             active: false,
             reason: ChoiceReason::Off,
+            matched: None,
         }
     );
     assert!(prompt.trim.skill_choices[0].active);
     assert_eq!(prompt.trim.skill_choices[0].reason, ChoiceReason::Always);
 }
 
-#[test]
-fn a_glob_skill_records_no_path_before_milestone_3() {
+/// MOD-9 D73/D74: a `glob` winner reads the spec's file set, and the record distinguishes the
+/// three answers — matched, missed, and there-was-no-file-set. The matcher runs here so the test
+/// is the wiring and not a hand-written map: `Engine::with_excerpts` and `preview::build` do
+/// exactly these two lines.
+fn glob_spec(files: &[(&str, &str)]) -> PromptSpec {
     let mut spec = base();
     spec.skills[1].activation = Activation::Glob;
     spec.skills[1].globs = vec!["**/*.rs".to_owned()];
+    spec.skill_files = files
+        .iter()
+        .map(|(repo, path)| RepoPath {
+            repo: (*repo).to_owned(),
+            path: (*path).to_owned(),
+        })
+        .collect();
+    spec.skill_matches = Some(glob::matched_skills(&spec.skills, &spec.skill_files));
+    spec
+}
+
+#[test]
+fn a_glob_skill_that_matches_renders_and_records_the_path() {
+    let spec = glob_spec(&[("htui", "crates/htui-core/src/lib.rs")]);
+    let prompt = ok(&spec);
+    assert!(
+        prompt.text.contains("name=\"command-queue\" version=\"1\""),
+        "D74: a `glob` winner the file set named is active, so it renders like an `always` one"
+    );
+    let choice = &prompt.trim.skill_choices[1];
+    assert_eq!(choice.reason, ChoiceReason::Matched);
+    assert_eq!(choice.activation, Activation::Glob);
+    assert!(choice.active);
+    assert_eq!(
+        choice.matched.as_deref(),
+        Some("htui:crates/htui-core/src/lib.rs"),
+        "D74: the record names the `<repo>:<path>` that fired, so the firing is auditable"
+    );
+}
+
+#[test]
+fn a_glob_skill_the_file_set_missed_records_no_match_and_renders_nothing() {
+    let spec = glob_spec(&[("htui", "docs/ANA-5.md")]);
+    let skill = spec.skills[1].skill_id;
     let prompt = ok(&spec);
 
     assert!(
         !prompt.text.contains("name=\"command-queue\""),
-        "OQ-12: no step resolves a root before milestone 3, so a `glob` winner is inactive"
+        "a `glob` nothing matched is inactive"
+    );
+    let choice = &prompt.trim.skill_choices[1];
+    assert_eq!(choice.reason, ChoiceReason::NoMatch);
+    assert!(!choice.active);
+    assert_eq!(choice.matched, None);
+    assert_eq!(
+        spec.skill_matches.as_ref().expect("a file set ran").get(&skill),
+        None,
+        "the walk ran and named nothing, which is the empty map behind `no_match`"
+    );
+}
+
+#[test]
+fn a_glob_skill_with_no_file_set_records_no_path() {
+    let mut spec = glob_spec(&[("htui", "crates/htui-core/src/lib.rs")]);
+    spec.skill_matches = None;
+    let prompt = ok(&spec);
+
+    assert!(
+        !prompt.text.contains("name=\"command-queue\""),
+        "no file set, no render — the judge and the handoff both record this"
     );
     let choice = &prompt.trim.skill_choices[1];
     assert_eq!(choice.reason, ChoiceReason::NoPath);
-    assert_eq!(choice.activation, Activation::Glob);
     assert!(!choice.active);
+    assert_eq!(choice.matched, None);
+}
+
+#[test]
+fn the_matched_key_is_null_for_every_reason_but_the_one_that_fires() {
+    let matched = ok(&glob_spec(&[("htui", "crates/htui-core/src/lib.rs")]));
+    let always = ok(&base());
+    let mut off_spec = base();
+    off_spec.skills[1].activation = Activation::Off;
+    let off = ok(&off_spec);
+    let missed = ok(&glob_spec(&[("htui", "docs/ANA-5.md")]));
+    let mut no_path = glob_spec(&[("htui", "crates/htui-core/src/lib.rs")]);
+    no_path.skill_matches = None;
+    let no_path = ok(&no_path);
+
+    let fired: Vec<serde_json::Value> = [&matched, &always, &off, &missed, &no_path]
+        .iter()
+        .map(|prompt| prompt.trim.to_value()["skill_choices"][1]["matched"].clone())
+        .collect();
+    assert_eq!(
+        fired[0],
+        serde_json::json!("htui:crates/htui-core/src/lib.rs"),
+        "the matched choice carries its path"
+    );
+    for (label, value) in [("no_match", &fired[3]), ("no_path", &fired[4])] {
+        assert_eq!(
+            value,
+            &serde_json::Value::Null,
+            "`{label}` records `matched: null`"
+        );
+    }
+    assert_eq!(
+        fired[2],
+        serde_json::Value::Null,
+        "`off` records `matched: null`"
+    );
 }
 
 #[test]
@@ -245,14 +340,61 @@ fn the_digest_moves_only_when_the_active_set_moves() {
     );
     assert_eq!(
         off.digest, glob.digest,
-        "`off` and `glob` are both inactive before milestone 3"
+        "`off` and a `glob` the file set did not name both render nothing, so the bytes agree"
     );
     assert_ne!(
         glob.trim.skill_choices, off.trim.skill_choices,
-        "the record says why"
+        "the record says why: `off` against `no_path`"
     );
     assert_ne!(
         off.digest, always.digest,
         "switching a skill on changes what renders, so the digest moves"
     );
+}
+
+/// MOD-9 D74, the glob half of the digest rule: a `glob` skill is a rendered section, so whether
+/// it fires is a change to the active set and therefore to the digest. Toggling a skill's globs
+/// so it stops matching moves it; toggling one that never matched does not — the second half is
+/// what keeps a matched path out of the bytes.
+#[test]
+fn a_glob_skill_digest_moves_when_it_stops_matching_and_not_when_it_never_matched() {
+    let fired = glob_spec(&[("htui", "crates/htui-core/src/lib.rs")]);
+    let fired = ok(&fired);
+
+    let mut stops_matching = glob_spec(&[("htui", "crates/htui-core/src/lib.rs")]);
+    still_matching_globs(&mut stops_matching);
+    let stops_matching = ok(&stops_matching);
+
+    let never = glob_spec(&[("htui", "docs/ANA-5.md")]);
+    let never_matched = ok(&never);
+    let mut still_misses = never;
+    still_matching_globs(&mut still_misses);
+    let still_misses = ok(&still_misses);
+
+    assert_eq!(
+        fired.trim.skill_choices[1].reason,
+        ChoiceReason::Matched,
+        "the file set named the glob, so it renders"
+    );
+    assert_ne!(
+        fired.digest, stops_matching.digest,
+        "a matched glob that stops matching leaves the active set, so the digest moves"
+    );
+    assert_eq!(
+        stops_matching.trim.skill_choices[1].reason,
+        ChoiceReason::NoMatch
+    );
+    assert_eq!(
+        never_matched.digest, still_misses.digest,
+        "toggling a glob that never matched changes no rendered byte"
+    );
+    assert_eq!(never_matched.trim, still_misses.trim);
+}
+
+/// Points a spec's `glob` skill at `**/*.md` and re-runs the matcher, which is what a caller does
+/// after an edit. Kept out of the test bodies so the assertions read as the rule, not as the
+/// wiring.
+fn still_matching_globs(spec: &mut PromptSpec) {
+    spec.skills[1].globs = vec!["**/*.md".to_owned()];
+    spec.skill_matches = Some(glob::matched_skills(&spec.skills, &spec.skill_files));
 }

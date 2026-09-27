@@ -9,7 +9,7 @@ use htui_store::testkit as common;
 
 use std::collections::BTreeSet;
 
-use htui_core::model::{BoxId, OsFamily};
+use htui_core::model::{BoxId, ChoiceReason, OsFamily};
 use htui_core::store::StoreError;
 use htui_store::{MIGRATOR, MigrationState, PgStore, Registration, identity};
 use sqlx::Row as _;
@@ -78,11 +78,12 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2, 3, 4, 5, 6, 7],
+        vec![1, 2, 3, 4, 5, 6, 7, 8],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
-         MOD-7 milestone 1's 0005_box_identity.sql, MOD-38's 0006_requirements.sql and MOD-9 \
-         milestone 2's 0007_skill_attachments.sql, in ordinal order"
+         MOD-7 milestone 1's 0005_box_identity.sql, MOD-38's 0006_requirements.sql, MOD-9 \
+         milestone 2's 0007_skill_attachments.sql and MOD-9 milestone 3's \
+         0008_skill_match.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -171,8 +172,8 @@ async fn agent_box_gains_a_jsonb_probe_column() {
 /// `agent.name` is ANA-4 §9 as amended by plan D43 (its `COMMENT ... IS NULL` would have cleared a
 /// comment `0001_init.sql` never wrote); the next five are ANA-5 §9 copied from
 /// `docs/ANA-5.md:2153-2181`; the last nineteen are ANA-2 §9 (`docs/ANA-2.md:1862-1999`).
-/// `run_step.trim_record` is the text `0007_skill_attachments.sql` restates (MOD-9 D42), which
-/// replaces `0002`'s. They live here as literals on purpose: this test is the guard against a
+/// `run_step.trim_record` is the text `0008_skill_match.sql` re-issues (MOD-9 D42, D75), which
+/// replaces `0007`'s. They live here as literals on purpose: this test is the guard against a
 /// paraphrase drifting into a forward-only migration that cannot be edited afterwards.
 const ANA_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     (
@@ -210,8 +211,9 @@ const ANA_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
         "ANA-5 5.1 as amended by MOD-9 D42: {v, template, budget, budget_source, reserve, target, \
          estimator, estimated_before, estimated_after, sections[], skill_choices[], excerpts, \
          notes}, v 2. skill_choices[] is every candidate skill, ordered by position then name, \
-         each {skill, name, version, level, activation, active, reason} with reason always, off, \
-         no_path, missing_version or not_placed (ANA-22 6 item 8). A v 1 record, written before \
+         each {skill, name, version, level, activation, active, reason, matched} with reason \
+         always, matched, no_match, off, no_path, missing_version or not_placed (ANA-22 6 item \
+         8); matched is the repo:path the glob fired on, or null. A v 1 record, written before \
          0007, has no skill_choices. Canonical; the prompt payload sections[] array is its \
          abridged projection. Written at stage 3 by set_step_prompt, before the session starts.",
     ),
@@ -498,6 +500,80 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
     );
 
     db.drop_db().await;
+}
+
+/// MOD-9 D75: the reason vocabulary a `skill_choices[].reason` can carry and the key set a
+/// `skill_choices[]` entry can have are two hand-written lists — [`ChoiceReason::as_str`] in
+/// `htui-core` and the `COMMENT ON COLUMN` `0008_skill_match.sql` writes. Nothing forces them to
+/// agree, so this pins the two against each other: a variant added to the enum and forgotten in
+/// the comment fails here rather than in a record a maintainer reads.
+///
+/// Both sides are literals this repository owns, so unlike the test above this needs no server
+/// and runs on every gate — which is the point, because a vocabulary that drifts is invisible on
+/// a box without Postgres until the next one that has it.
+#[test]
+fn the_migration_names_every_reason_the_record_can_carry() {
+    let sql = include_str!("../migrations/0008_skill_match.sql");
+
+    // The comment is written as adjacent string literals, one per source line, so the file's own
+    // bytes carry a `'` and an indent that Postgres drops when it concatenates them. Joining them
+    // the way Postgres does is what makes this a check of the **text** rather than of how the
+    // migration happens to be wrapped.
+    let value = sql.replace("'\n  '", "");
+
+    for reason in [
+        ChoiceReason::Always,
+        ChoiceReason::Matched,
+        ChoiceReason::NoMatch,
+        ChoiceReason::Off,
+        ChoiceReason::NoPath,
+        ChoiceReason::MissingVersion,
+        ChoiceReason::NotPlaced,
+    ] {
+        assert!(
+            value.contains(reason.as_str()),
+            "0008_skill_match.sql names `{}`, one of the seven reasons a skill choice can carry",
+            reason.as_str()
+        );
+    }
+
+    let (_, after_keys) = value
+        .split_once("each {")
+        .expect("0008's comment lists a skill choice's keys");
+    let (keys, _) = after_keys
+        .split_once('}')
+        .expect("the key list is closed");
+    assert_eq!(
+        keys.split(", ").collect::<Vec<_>>(),
+        [
+            "skill",
+            "name",
+            "version",
+            "level",
+            "activation",
+            "active",
+            "reason",
+            "matched"
+        ],
+        "D74: the comment's eight keys, in the order `SkillChoice` declares them"
+    );
+}
+
+/// `0007`'s comment is history — it is the vocabulary milestone 2 shipped, and `0008` re-issues
+/// the one a database carries today. `schema_state` already refuses a database that applied an
+/// older text of a migration (pg/mod.rs:584-627, `checksum_drift`), so editing `0007` in place
+/// would strand every such database; this says the same thing without a server.
+#[test]
+fn the_older_text_is_still_the_one_0007_wrote() {
+    let sql = include_str!("../migrations/0007_skill_attachments.sql");
+    assert!(
+        !sql.contains("no_match"),
+        "0007 predates `no_match` and must not gain it: a comment cannot be edited in place"
+    );
+    assert!(
+        sql.contains("active, reason} with reason always, off, no_path, "),
+        "0007's own text is byte for byte what it wrote, and it has seven keys rather than eight"
+    );
 }
 
 /// ANA-5 §5.3's ten defaults, folded into `0002` as section 3 (`docs/ANA-5.md:2183-2189`).
@@ -874,8 +950,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(7),
-        "seven embedded migrations, none applied"
+        MigrationState::Pending(8),
+        "eight embedded migrations, none applied"
     );
 
     db.drop_db().await;

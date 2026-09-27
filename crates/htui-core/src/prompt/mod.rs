@@ -880,7 +880,11 @@ fn scrubbed_inputs(
     // MOD-9 D43: collapse the candidates, then decide them. Only the active ones render, are
     // estimated and meet the cap; every candidate is recorded.
     let placed = parsed.used.contains(&Placeholder::Skills);
-    let (skills, skill_choices) = select(BoundSkill::collapse(spec.skills.clone()), placed);
+    let (skills, skill_choices) = select(
+        BoundSkill::collapse(spec.skills.clone()),
+        placed,
+        spec.skill_matches.as_ref(),
+    );
     let candidates = judge_candidates(&spec);
     Ok(ScrubbedInputs {
         spec,

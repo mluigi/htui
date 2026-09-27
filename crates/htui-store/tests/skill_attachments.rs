@@ -297,7 +297,7 @@ async fn an_off_phase_attachment_hides_a_project_skill() {
         "the phase row wins over the project row"
     );
 
-    let (active, choices) = select(candidates, true);
+    let (active, choices) = select(candidates, true, None);
     assert_eq!(
         active.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
         vec!["rust-style"],

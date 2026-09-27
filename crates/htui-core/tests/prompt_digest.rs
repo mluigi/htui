@@ -1005,6 +1005,34 @@ fn to_value_is_byte_stable_and_carries_the_documented_keys() {
     assert_eq!(choices.len(), 1, "one candidate, one choice");
     assert_eq!(choices[0]["reason"], serde_json::json!("always"));
     assert_eq!(choices[0]["active"], serde_json::json!(true));
+    // MOD-9 D74 adds `matched` to a **choice**, which is why the thirteen top-level keys and the
+    // `v` above did not move. Pinned here so a later key added to the record is a deliberate act
+    // rather than a side effect of touching the choice.
+    let choice_keys: BTreeSet<&str> = choices[0]
+        .as_object()
+        .expect("a choice is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        choice_keys,
+        BTreeSet::from([
+            "skill",
+            "name",
+            "version",
+            "level",
+            "activation",
+            "active",
+            "reason",
+            "matched",
+        ]),
+        "D74: §5.1's seven choice keys and D74's matched: eight, no more and no fewer"
+    );
+    assert_eq!(
+        choices[0]["matched"],
+        serde_json::Value::Null,
+        "an `always` choice did not match a glob, so the path is null"
+    );
     assert_eq!(first["template"]["role"], serde_json::json!("phase"));
     assert_eq!(first["template"]["version"], serde_json::json!(3));
     assert_eq!(first["estimator"], serde_json::json!("chars-v2"));
