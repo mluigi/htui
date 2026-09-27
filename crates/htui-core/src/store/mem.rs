@@ -2932,7 +2932,11 @@ impl State {
             return Err(StoreError::Constraint(refusal));
         }
         self.require_user(new.created_by, "skill.created_by")?;
-        if self.skills.contains_key(&new.id) {
+        // Only the create path, the guard `set_skill_binding` already uses: on the edit path the
+        // `id` is the caller's own and is about to be dropped (the name is the key and the row is
+        // written back under its existing id), so only a *different* skill's id is a conflict.
+        // `PgStore` agrees because its `ON CONFLICT (name) DO UPDATE` never writes `id`.
+        if current.is_none() && self.skills.contains_key(&new.id) {
             return Err(StoreError::Constraint(already_exists("skill", new.id)));
         }
         let row = match current {
