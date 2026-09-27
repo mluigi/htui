@@ -675,6 +675,70 @@ mod tests {
         );
     }
 
+    /// D78 / H-10: a bind with no token is the create path — a fresh [`SkillBindingId`] inserted
+    /// on the unique key — and it is the one a user hits the first time they attach a skill. The
+    /// token is what tells the two apart, so this is also what pins the seam passing `None`
+    /// through rather than inventing one.
+    #[tokio::test]
+    async fn a_bind_with_no_token_inserts_the_row_and_answers_skills() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+        let before = read(&backend, &scope).await;
+        assert_eq!(
+            before.attachment(ids::SKILL_TESTS, Some(ids::PROJECT_AGY), None),
+            None,
+            "the demo holds no `tests` row for `agy`, so this is an insert and not a replace"
+        );
+
+        let reply = serve(
+            &backend,
+            &set(
+                &scope,
+                ids::SKILL_TESTS,
+                Some(ids::PROJECT_AGY),
+                None,
+                3,
+                None,
+            ),
+        )
+        .await;
+
+        let Ok(StoreReply::Skills(after)) = reply else {
+            panic!("an applied bind answers `Skills`, got {reply:?}")
+        };
+        let row = after
+            .attachment(ids::SKILL_TESTS, Some(ids::PROJECT_AGY), None)
+            .expect("the new row is in the fresh snapshot the reply re-read");
+        assert_eq!(
+            row.project_slug.as_deref(),
+            Some("agy"),
+            "the joined project"
+        );
+        assert_eq!(row.position, 3, "the columns it was given");
+        assert_eq!(row.phase_name, None, "a project row joins no phase");
+        assert_ne!(
+            row.id,
+            ids::BINDING_HTUI_TESTS,
+            "H-10: the create path mints a fresh id, and the replace path keeps the old one"
+        );
+        assert_eq!(
+            after
+                .attachment(ids::SKILL_TESTS, Some(ids::PROJECT_HTUI), None)
+                .map(|left| left.id),
+            Some(ids::BINDING_HTUI_TESTS),
+            "H-8: the unique key is `IS NOT DISTINCT FROM`, so another project's row is another row"
+        );
+        assert_eq!(
+            after.attachments.len(),
+            before.attachments.len() + 1,
+            "and only that row: the library is untouched"
+        );
+        assert_eq!(
+            after.skills, before.skills,
+            "a bind never touches a version"
+        );
+    }
+
     /// OQ-19: an unbind removes the row rather than writing `activation = off`, and the reply
     /// re-reads the whole scope so the matrix drops it without a second request.
     #[tokio::test]
