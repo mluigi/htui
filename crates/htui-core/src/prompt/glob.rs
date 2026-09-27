@@ -575,6 +575,11 @@ mod tests {
             ("src/**", "src/a.rs", true),
             ("src/**", "src/a/b.rs", true),
             ("src/**", "srcs/a.rs", false),
+            ("src/**", "src2/x.rs", false),
+            ("**/src", "src", true),
+            ("**/src", "a/src", true),
+            ("**/src", "a/b/src", true),
+            ("**/src", "a/src2", false),
             ("**", "a/b/c.rs", true),
             ("a/**/b", "a/b", true),
             ("a/**/b", "a/x/y/b", true),
@@ -584,31 +589,46 @@ mod tests {
             ("?.rs", "ab.rs", false),
             ("a?c", "abc", true),
             ("a?c", "a/c", false),
+            ("src/?.rs", "src/a.rs", true),
+            ("src/?.rs", "src/ab.rs", false),
+            ("src/?.rs", "src/.rs", false),
+            // `*` inside a component is a run of characters, not of components.
+            ("src/a*.rs", "src/a.rs", true),
+            ("src/a*.rs", "src/abc.rs", true),
+            ("src/a*.rs", "src/b.rs", false),
             // `{a,b}` alternates, as a whole component (D96).
             ("{a,b}/x.rs", "a/x.rs", true),
             ("{a,b}/x.rs", "b/x.rs", true),
             ("{a,b}/x.rs", "c/x.rs", false),
             ("src/{a,b}/x.rs", "src/b/x.rs", true),
             // Character classes.
+            ("[abc].rs", "a.rs", true),
             ("[abc].rs", "b.rs", true),
+            ("[abc].rs", "c.rs", true),
             ("[abc].rs", "d.rs", false),
             ("[!abc].rs", "d.rs", true),
+            ("[!abc].rs", "a.rs", false),
             ("[!abc].rs", "b.rs", false),
+            ("[a-c].rs", "a.rs", true),
+            ("[a-c].rs", "b.rs", true),
             ("[a-c].rs", "c.rs", true),
             ("[a-c].rs", "d.rs", false),
             ("x[0-9][0-9].rs", "x42.rs", true),
             ("x[0-9][0-9].rs", "x4.rs", false),
-            // `\` escapes the next metacharacter.
+            // `\` escapes the next metacharacter, so a metacharacter is literal.
             (r"a\*b", "a*b", true),
             (r"a\*b", "axb", false),
             (r"a\?b", "a?b", true),
+            (r"a\{b\}.rs", "a{b}.rs", true),
             ("x[0-9\\]].rs", "x].rs", true),
             // Matching is case-sensitive everywhere.
             ("*.RS", "main.rs", false),
+            ("*.RS", "X.RS", false),
             ("[a-c].rs", "B.rs", false),
             // A component is a whole path component, not a prefix or a suffix of one.
             ("src", "src", true),
             ("src", "src2/x.rs", false),
+            ("crates/ax.rs", "crates/abc.rs", false),
         ] {
             let compiled =
                 compile(pattern).unwrap_or_else(|err| panic!("`{pattern}` must compile: {err}"));
@@ -654,24 +674,28 @@ mod tests {
     #[test]
     fn matched_skills_records_one_rendered_path_per_matching_skill() {
         let files = vec![file("htui", "src/main.rs"), file("htui", "docs/readme.md")];
-        let globbed = |id: SkillId, globs: &[&str]| BoundSkill {
+        let globbed = |id: SkillId, activation: Activation, globs: &[&str]| BoundSkill {
             skill_id: id,
             name: "house".to_owned(),
             version: Some(1),
             position: 0,
             body: String::new(),
             level: SkillLevel::Project,
-            activation: Activation::Glob,
+            activation,
             globs: globs.iter().map(|g| (*g).to_owned()).collect(),
         };
         let rust = SkillId::new();
         let other = SkillId::new();
         let missed = SkillId::new();
+        let switched_off = SkillId::new();
+        let always = SkillId::new();
         let matched = matched_skills(
             &[
-                globbed(rust, &["**/*.rs"]),
-                globbed(other, &["htui:docs/**"]),
-                globbed(missed, &["**/*.py"]),
+                globbed(rust, Activation::Glob, &["**/*.rs"]),
+                globbed(other, Activation::Glob, &["htui:docs/**"]),
+                globbed(missed, Activation::Glob, &["**/*.py"]),
+                globbed(switched_off, Activation::Off, &["**/*.rs"]),
+                globbed(always, Activation::Always, &["**/*.rs"]),
             ],
             &files,
         );
@@ -689,6 +713,44 @@ mod tests {
             !matched.contains_key(&missed),
             "a skill whose globs matched nothing is absent, which is what `no_match` records"
         );
+        for (id, activation) in [
+            (switched_off, Activation::Off),
+            (always, Activation::Always),
+        ] {
+            assert!(
+                !matched.contains_key(&id),
+                "a `{activation:?}` attachment is decided by its activation, not by its globs: the \
+                 map is what `select` reads to record `matched`, and recording a path for an \
+                 attachment that never fired would say it did"
+            );
+        }
+    }
+
+    /// Plan R-25's "compile is total", as a test rather than a claim: over an alphabet of the
+    /// dialect's own metacharacters plus one ordinary letter, every pattern of one, two and three
+    /// bytes compiles to a `Result` and never panics. A panic here would be a `MemStore` or a
+    /// `PgStore` write that aborts the process rather than answering `Constraint` (D78).
+    #[test]
+    fn no_panic_on_any_short_input() {
+        const ALPHABET: [char; 12] = ['*', '?', '[', ']', '{', '}', ',', '\\', '!', '/', ':', 'a'];
+        let mut inputs = Vec::new();
+        for first in ALPHABET {
+            inputs.push(first.to_string());
+            for second in ALPHABET {
+                inputs.push(format!("{first}{second}"));
+                for third in ALPHABET {
+                    inputs.push(format!("{first}{second}{third}"));
+                }
+            }
+        }
+        assert_eq!(
+            inputs.len(),
+            12 + 144 + 1728,
+            "the sweep is the one this test names"
+        );
+        for input in &inputs {
+            let _ = compile(input);
+        }
     }
 
     /// An empty `globs` list matches nothing, and a glob the matcher cannot compile is skipped
@@ -718,7 +780,7 @@ mod tests {
     /// the position is what puts the editor's cursor on the character that is wrong (D103).
     #[test]
     fn every_refusal_names_its_byte() {
-        let refusals: [(&str, GlobError); 13] = [
+        let refusals: [(&str, GlobError); 14] = [
             ("", GlobError::Empty),
             ("!**/*.rs", GlobError::Negation { at: 0 }),
             ("src/", GlobError::TrailingSlash { at: 3 }),
@@ -728,8 +790,9 @@ mod tests {
             ("x{,.rs}", GlobError::EmptyAlternative { at: 2 }),
             ("a/{b,c", GlobError::UnterminatedBrace { at: 2 }),
             ("**/[", GlobError::UnterminatedClass { at: 3 }),
-            ("[].rs", GlobError::EmptyClass { at: 0 }),
+            ("[].rs", GlobError::EmptyClass { at: 1 }),
             ("src/\\", GlobError::DanglingEscape { at: 4 }),
+            ("src/\\x.rs", GlobError::DanglingEscape { at: 4 }),
             ("a\0b", GlobError::Nul { at: 1 }),
             (":/**/*.rs", GlobError::BadQualifier { at: 0 }),
         ];
