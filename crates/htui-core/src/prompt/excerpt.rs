@@ -1503,8 +1503,8 @@ pub struct ExcerptSet {
     /// `skip_by_path` before the listing exists, so none of them is enumerated. The size cap
     /// prunes **in the walk**: `FsRepoReader::skip` answers `SkipRule::TooLarge` from the open
     /// descriptor's own `len`, so an over-cap file never reaches `select` at all and is absent
-    /// here rather than merely absent from `files`. MOD-9's plan reads the other way — "a file too
-    /// large to excerpt does [appear]" — and the tree settles it: the reader refuses the file
+    /// here rather than merely absent from `files`. MOD-9's plan reads the other way — that a file
+    /// too large to excerpt *does* appear — and the tree settles it: the reader refuses the file
     /// before it is listed. The plan sentence is superseded, and the code is right.
     ///
     /// Empty wherever no pass ran — `no_excerpts`, `unscanned`, and every fixture — which is
