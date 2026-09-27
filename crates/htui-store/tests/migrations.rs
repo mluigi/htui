@@ -521,7 +521,17 @@ fn the_migration_names_every_reason_the_record_can_carry() {
     // migration happens to be wrapped.
     let value = sql.replace("'\n  '", "");
 
-    for reason in [
+    // Sliced, not `contains`: `matched` and `no_match` also occur in the migration's own leading
+    // comment and in the key list, so a substring search would be satisfied by either of those and
+    // would pass on a comment that had dropped the word. Comparing the list also pins its order and
+    // its length, so an eighth word or a reshuffle fails here.
+    let (_, after_reason) = value
+        .split_once("with reason ")
+        .expect("0008's comment names the vocabulary the reason key carries");
+    let (words, _) = after_reason
+        .split_once(" (")
+        .expect("the vocabulary is closed before the citation that follows it");
+    let expected = [
         ChoiceReason::Always,
         ChoiceReason::Matched,
         ChoiceReason::NoMatch,
@@ -529,13 +539,17 @@ fn the_migration_names_every_reason_the_record_can_carry() {
         ChoiceReason::NoPath,
         ChoiceReason::MissingVersion,
         ChoiceReason::NotPlaced,
-    ] {
-        assert!(
-            value.contains(reason.as_str()),
-            "0008_skill_match.sql names `{}`, one of the seven reasons a skill choice can carry",
-            reason.as_str()
-        );
-    }
+    ]
+    .map(|reason| reason.as_str());
+    assert_eq!(
+        // The list separates on commas, and on the `or` that joins its last pair.
+        words
+            .split(", ")
+            .flat_map(|word| word.split(" or "))
+            .collect::<Vec<_>>(),
+        expected,
+        "D75: the comment's seven reasons, in `ChoiceReason`'s declaration order"
+    );
 
     let (_, after_keys) = value
         .split_once("each {")
