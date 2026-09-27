@@ -796,6 +796,48 @@ mod tests {
         assert_eq!(names, REQUEST_NAMES);
     }
 
+    /// `try_serve` or-serves this module's four variants into one arm beside every other
+    /// module's, and each of those functions takes the same `&StoreRequest`, so a variant
+    /// or-ed into the wrong one compiles clean and is answered by that module's refusal
+    /// sentence. Only this seam builds [`StoreReply::Skills`], so the reply pins the routing.
+    #[tokio::test]
+    async fn every_one_of_the_four_is_routed_to_this_seam() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+        let row = read(&backend, &scope)
+            .await
+            .attachment(ids::SKILL_TESTS, Some(ids::PROJECT_HTUI), None)
+            .expect("`tests` is attached to `htui`")
+            .clone();
+        let samples = [
+            StoreRequest::Skills(scope.clone()),
+            save(&scope, "house-rules", "d", "b", None, None),
+            set(
+                &scope,
+                ids::SKILL_TESTS,
+                Some(ids::PROJECT_AGY),
+                None,
+                3,
+                None,
+            ),
+            StoreRequest::RemoveSkillBinding {
+                scope,
+                id: row.id,
+                expected: row.updated_at,
+            },
+        ];
+
+        for request in &samples {
+            let reply = store_worker::serve(&backend, request).await;
+            assert!(
+                matches!(reply, StoreReply::Skills(_)),
+                "`try_serve` routes `{}` here; a variant or-ed into another module's arm answers \
+                 that module's `not a … request` sentence instead",
+                request.name()
+            );
+        }
+    }
+
     /// Offline there is no writer, so the save is refused before anything is sent: the worker
     /// answers `Failed` for `save_skill` with the unreachable-database sentence. There is no
     /// server here to check for a row, and none is needed: nothing could have reached one.
