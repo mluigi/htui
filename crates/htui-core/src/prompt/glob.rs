@@ -705,7 +705,7 @@ mod tests {
 
         // Sixty-four characters holding twenty `a`: each `*` eats the `b` before the next one, and
         // the last token is a literal `a`, so the component has to end with one.
-        let hit = "b".repeat(25) + &"a" + &"ba".repeat(19);
+        let hit = "b".repeat(25) + "a" + &"ba".repeat(19);
         assert_eq!(hit.len(), 64, "the component is sixty-four characters long");
         assert!(
             compiled.matches(&hit),
@@ -1116,16 +1116,13 @@ mod tests {
     /// inside a list is a nest.
     #[test]
     fn an_alternation_is_a_whole_component_and_never_nests() {
-        for (pattern, at) in [
-            // The inner `{`: a list sitting inside a list, which D96 refuses by name.
-            ("{a,{b,c}}", 3),
-        ] {
-            assert_eq!(
-                compile(pattern).expect_err("a nested alternation is refused"),
-                GlobError::NestedAlternation { at },
-                "`{pattern}` names the brace that is in the wrong place"
-            );
-        }
+        // The one nest D96 refuses by name, and the only shape of it: a list inside a list, which
+        // names the inner `{` — the outer one is a perfectly good whole component.
+        assert_eq!(
+            compile("{a,{b,c}}").expect_err("a nested alternation is refused"),
+            GlobError::NestedAlternation { at: 3 },
+            "`{{a,{{b,c}}}}` names the inner brace"
+        );
         for (pattern, at) in [
             // The `{` of a list that is fine but is not a whole component: inside a longer
             // component on either side, and opening one that is never closed.
