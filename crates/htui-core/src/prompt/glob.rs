@@ -1020,6 +1020,75 @@ mod tests {
         }
     }
 
+    /// Every [`GlobError`] variant's exact sentence, and the byte it names, pinned together.
+    ///
+    /// These strings are a contract in two places at once (plan D99, blueprint D100): T4's
+    /// activation form pre-flights a typed glob with [`compile`] and shows what this returns, and
+    /// `skill_binding_refusal` carries the identical string as its `Constraint`. A reworded refusal
+    /// is therefore a change to a message a maintainer has already read, and the wording pinned
+    /// here is blueprint §2.1's rather than this module's own — which is what lets T1b assert on
+    /// the substrings §2.7's conformance needles name.
+    #[test]
+    fn the_display_names_the_byte() {
+        let messages: [(&str, Option<usize>, &str); 14] = [
+            ("", None, "a glob must not be empty"),
+            (
+                "!**/*.rs",
+                Some(0),
+                "`!` is not negation in a skill glob, at byte 0",
+            ),
+            ("src/", Some(3), "a glob must not end with `/`, at byte 3"),
+            (
+                "htui:/src/*.rs",
+                Some(5),
+                "a glob must be repo-relative, so it must not start with `/`, at byte 5",
+            ),
+            (
+                "a/**b/c.rs",
+                Some(2),
+                "`**` is only a whole component, at byte 2",
+            ),
+            (
+                "a/{b,{c,d}}/x.rs",
+                Some(5),
+                "nested `{…}` is not supported, at byte 5",
+            ),
+            (
+                "x{,.rs}",
+                Some(2),
+                "an alternative must not be empty, at byte 2",
+            ),
+            (
+                "pre{a,b}fix.rs",
+                Some(3),
+                "`{…}` is only a whole component, at byte 3",
+            ),
+            ("a/{b", Some(2), "unterminated `{` at byte 2"),
+            ("**/[", Some(3), "unterminated `[` at byte 3"),
+            ("[].rs", Some(1), "an empty character class at byte 1"),
+            (
+                "src/\\",
+                Some(4),
+                "`\\` must escape a metacharacter, at byte 4",
+            ),
+            ("a\0b", Some(1), "a glob must not contain NUL, at byte 1"),
+            (
+                ":/x.rs",
+                Some(0),
+                "a repo qualifier must be a non-empty name without `/`, at byte 0",
+            ),
+        ];
+        for (pattern, at, message) in messages {
+            let got = compile(pattern).expect_err(&format!("`{pattern:?}` must be refused"));
+            assert_eq!(got.at(), at, "`{pattern:?}` names the byte");
+            assert_eq!(
+                got.to_string(),
+                message,
+                "`{pattern:?}` says this and no other words"
+            );
+        }
+    }
+
     /// `GlobError::Empty` is the one refusal with no position, because it is about the pattern as a
     /// whole: an empty pattern, a bare `:`, and an empty component (`a//b`) all land there. The
     /// empty component is refused rather than folded, so a stored glob means what was typed.
