@@ -3041,13 +3041,6 @@ impl State {
             }
             _ => {}
         }
-        if !self.skills.contains_key(&new.skill_id) {
-            return Err(StoreError::Constraint(references_no_row(
-                "skill_binding.skill_id",
-                new.skill_id,
-                "skill",
-            )));
-        }
         if let Some(refusal) = skill_binding_refusal(&new) {
             return Err(StoreError::Constraint(refusal));
         }
@@ -3056,10 +3049,22 @@ impl State {
         {
             return Err(StoreError::Constraint(refusal));
         }
-        // The FKs, which `PgStore` answers as `23503`. `phase_id`'s FK is to `step_graph_phase(id)`
-        // alone, so "the phase belongs to this project" is **not** checked on either store: a row
-        // may name another project's phase, and the engine's `(graph id, name)` lookup never reads
-        // it. D78 mirrors the CHECKs; it does not extend them (blueprint H-30).
+        // The references, which `PgStore` answers as `23503` and which come **after** the five
+        // rules on both stores: the rules are decided in Rust and the keys are the database's, so
+        // an attachment that is both unknown and illegal says the same thing on both. The
+        // blueprint's code sample puts the skill check first and its own prose puts it last; the
+        // prose is what makes the two stores agree, so it is the one followed here.
+        if !self.skills.contains_key(&new.skill_id) {
+            return Err(StoreError::Constraint(references_no_row(
+                "skill_binding.skill_id",
+                new.skill_id,
+                "skill",
+            )));
+        }
+        // `phase_id`'s FK is to `step_graph_phase(id)` alone, so "the phase belongs to this
+        // project" is **not** checked on either store: a row may name another project's phase, and
+        // the engine's `(graph id, name)` lookup never reads it. D78 mirrors the CHECKs; it does
+        // not extend them (blueprint H-30).
         if let Some(project_id) = new.project_id
             && !self.projects.contains_key(&project_id)
         {

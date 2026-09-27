@@ -585,6 +585,30 @@ async fn the_writer_and_mem_agree_on_every_refusal() {
             other => panic!("{what}: both stores answer Constraint, got {other:?}"),
         }
     }
+    // An input that is both unknown and illegal says the same thing on both stores: the five
+    // rules are decided in Rust and the keys are the database's, and the rules come first. The
+    // order is what makes this true, so it is the order this case pins.
+    let both = written(
+        SkillId::new(),
+        None,
+        None,
+        Activation::Glob,
+        &["src/**x/*.rs"],
+        None,
+    );
+    match (
+        db.store.set_skill_binding(both.clone(), None).await,
+        mem.set_skill_binding(both, None).await,
+    ) {
+        (Err(StoreError::Constraint(pg)), Err(StoreError::Constraint(ours))) => {
+            assert_eq!(
+                pg, ours,
+                "an unknown skill and a glob the matcher refuses is the glob's refusal on both"
+            );
+        }
+        other => panic!("both stores answer Constraint, got {other:?}"),
+    }
+
     assert_eq!(
         db.store
             .bound_skills(ids::PROJECT_AGY, None)
@@ -594,7 +618,7 @@ async fn the_writer_and_mem_agree_on_every_refusal() {
             .map(|skill| skill.name.as_str())
             .collect::<Vec<_>>(),
         Vec::<&str>::new(),
-        "and none of the five wrote: the fixture's three attachments are all on `htui`, so a \
+        "and none of the six wrote: the fixture's three attachments are all on `htui`, so a \
          project with none of its own still sees nothing — a global row would appear here"
     );
 

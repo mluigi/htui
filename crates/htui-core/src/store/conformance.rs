@@ -6657,10 +6657,13 @@ async fn skill_binding_refuses_what_its_checks_refuse<S: WriteStore>(store: &S) 
     );
     for (glob, needle, at) in [
         ("src/**x/*.rs", "**` is only a whole component", "at byte 4"),
+        // Byte 5 is the inner `{`, which is what `GlobError::NestedAlternation` documents it to
+        // be. Blueprint 2.7's table says 8 for this row; that is a typo in the table, and the
+        // matcher's own doc and its landed test table are the specification (D71, D103).
         (
             "a/{b,{c,d}}/x.rs",
             "nested `{…}` is not supported",
-            "at byte 8",
+            "at byte 5",
         ),
         ("x{,.txt}", "an alternative must not be empty", "at byte 2"),
         (
@@ -6669,7 +6672,7 @@ async fn skill_binding_refuses_what_its_checks_refuse<S: WriteStore>(store: &S) 
             "at byte 3",
         ),
     ] {
-        constraint_naming(
+        let message = constraint_naming(
             CASE,
             store
                 .set_skill_binding(
@@ -6681,8 +6684,13 @@ async fn skill_binding_refuses_what_its_checks_refuse<S: WriteStore>(store: &S) 
                     None,
                 )
                 .await,
-            &[needle, at],
+            &[needle],
             "a glob the matcher refuses",
+        );
+        assert!(
+            message.contains(at),
+            "{CASE}: `{glob}`: the refusal also names the byte to put a cursor on ({at}), got \
+             {message:?}"
         );
     }
     constraint_naming(
