@@ -12863,6 +12863,21 @@ mod tests {
             asked + 1,
             "the call was still made and is still recorded — a refusal is not a skip"
         );
+        // The other half of
+        // `the_previous_attempts_changed_paths_reach_the_rankers_tier_two`: the same file, on a
+        // step with no changed paths, is not tier 2. Without this pair the `prev_diff` assertion
+        // would pass on a ranker that has been calling `docs/notes.md` tier 2 for another reason.
+        let reason = spec
+            .excerpts
+            .files
+            .iter()
+            .find(|file| file.path == "docs/notes.md")
+            .map(|file| file.reason);
+        assert_ne!(
+            reason,
+            Some(htui_core::prompt::excerpt::ExcerptReason::PrevDiff),
+            "with no changed paths there is no tier 2 to reach it, whatever the file is"
+        );
     }
 
     /// MOD-9 D87: `TIER2_PREV_DIFF` is live in production for the first time.
