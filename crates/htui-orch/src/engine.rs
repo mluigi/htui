@@ -5101,11 +5101,12 @@ where
             // records every candidate in `trim_record.skill_choices`.
             skills,
             // MOD-9 D73/D97: `with_excerpts` fills `skill_files` for a phase prompt, after the
-            // walk. `skill_matches` is filled where `glob::matched_skills` runs, which lands with
-            // the `select` rewrite — until then it is `None` here and on the preview, so every
-            // `glob` candidate on both paths records `no_path`. This builder is also the
-            // promote/handoff path's, and a handoff never reads a file, so it starts with no file
-            // set at all, which is `no_path` rather than `no_match` and will stay right.
+            // walk. `skill_matches` is the map `select` reads, and nothing fills it yet — the
+            // matcher is owed the line that follows that walk, here and in `preview::build` — so
+            // every `glob` candidate on both paths records `no_path`, and `matched`/`no_match` are
+            // not yet reachable in a real run. This builder is also the promote/handoff path's, and
+            // a handoff never reads a file, so it starts with no file set at all, which is `no_path`
+            // rather than `no_match` and will stay right.
             skill_files: Vec::new(),
             skill_matches: None,
             // The pass runs in `assemble_prompt` (`Self::with_excerpts`, MOD-7 milestone 4 D125),
