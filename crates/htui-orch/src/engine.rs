@@ -4992,11 +4992,14 @@ where
             // diff, and the two reads are two primary-key lookups beside a walk already reading
             // the same tree (blueprint H-23). The alternative — a field on `PromptSpec` — would
             // carry a commit list into a struct the assembler digests.
+            //
+            // `winner_at` and not a plain "the highest earlier attempt at this position", because
+            // `forwarded` resolves the previous attempt through it and the two must name the same
+            // row: on a `fan_out > 1` group that is the selected candidate, and a second opinion
+            // about which sibling lost would put this step's file set beside a diff from another
+            // one. The `run_steps` read it needs is the one `forwarded` already made (H-24).
             let steps = self.parts.store.run_steps(run.id).await?;
-            let previous = steps
-                .iter()
-                .filter(|row| row.position == step.position && row.attempt < step.attempt)
-                .max_by_key(|row| row.attempt);
+            let previous = winner_at(&steps, step.position, step.attempt - 1);
             if let Some(previous) = previous {
                 let trees = self.parts.store.step_trees(previous.id).await?;
                 let commits = self.parts.store.step_commits(previous.id).await?;
