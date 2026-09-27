@@ -68,9 +68,11 @@ pub enum Tok {
 
 /// One variant per refusal, each carrying the byte it happened at (plan D103).
 ///
-/// The `Display` strings are a contract (plan D99): the matrix view pre-flights a typed glob with
-/// [`compile`] and shows this text, and the writer's `Constraint` carries the identical string, so
-/// the two can never disagree about why a glob was refused.
+/// The `Display` strings are a contract (plan D99, blueprint D100): the matrix view pre-flights a
+/// typed glob with [`compile`] and shows this text, and the writer's `Constraint` carries the
+/// identical string, so the two can never disagree about why a glob was refused. They are
+/// therefore blueprint §2.1's wording verbatim rather than this module's own, and
+/// `the_display_names_the_byte` holds every one of them still.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum GlobError {
     /// The pattern is nothing, or one of its `/`-separated components is (`a//b`).
@@ -80,83 +82,82 @@ pub enum GlobError {
     #[error("a glob must not be empty")]
     Empty,
     /// `!` is not negation in this dialect — negation is `activation = off`, on the attachment.
-    #[error("a leading `!` is not negation in htui globs, at byte {at}")]
+    #[error("`!` is not negation in a skill glob, at byte {at}")]
     Negation {
         /// The byte offset of the `!`.
         at: usize,
     },
     /// A trailing `/` asks for directories, and a file set only ever holds files.
-    #[error("a trailing `/` matches directories, which a file set never holds, at byte {at}")]
+    #[error("a glob must not end with `/`, at byte {at}")]
     TrailingSlash {
         /// The byte offset of the `/`.
         at: usize,
     },
     /// Paths are repo-relative; a leading `/` would name the repo root, not a file in a repo.
-    #[error("a glob must be repo-relative, at byte {at}")]
+    #[error("a glob must be repo-relative, so it must not start with `/`, at byte {at}")]
     Absolute {
         /// The byte offset of the `/`.
         at: usize,
     },
     /// `**` swallows whole components, so it is only meaningful as one. `a/**b` is a typo for
     /// `a/**/b`, and a typo that compiles is a glob that quietly matches nothing (R-25).
-    #[error("`**` is only legal as a whole component, at byte {at}")]
+    #[error("`**` is only a whole component, at byte {at}")]
     MisplacedGlobstar {
         /// The byte offset of the first `*` of the offending `**`.
         at: usize,
     },
-    /// An alternation is a whole component, so it can neither sit inside a longer component
-    /// (`pre{a,b}fix.rs`) nor inside another alternation (`{a,{b,c}}`).
-    #[error("`{{a,{{b,c}}}}` nests, which this dialect does not allow, at byte {at}")]
+    /// A `{` inside an alternative, e.g. `a/{b,{c,d}}` (D96: an alternation is one level deep).
+    #[error("nested `{{…}}` is not supported, at byte {at}")]
     NestedAlternation {
-        /// The byte offset of the offending brace.
+        /// The byte offset of the inner `{`.
         at: usize,
     },
     /// `{,a}`, `{a,}` and `{}` all name an alternative that is not there.
-    #[error("`{{a,}}` has an empty alternative, at byte {at}")]
+    #[error("an alternative must not be empty, at byte {at}")]
     EmptyAlternative {
         /// The byte offset the empty alternative would have started at.
         at: usize,
     },
-    /// A `{` that is not a whole component: it sits inside a longer one (`pre{a,b}fix.rs`), it does
-    /// not open one (`src/x{a,b}/c.rs`), or it opens one and never closes it (`{a,b`).
-    #[error("`{{a,b}}` is only a whole component, at byte {at}")]
+    /// A `{` that is not a whole component: it sits inside a longer one (`pre{a,b}fix.rs`) or it
+    /// does not span one (`src/x{a,b}/c.rs`).
+    #[error("`{{…}}` is only a whole component, at byte {at}")]
     MisplacedBrace {
         /// The byte offset of the `{`.
         at: usize,
     },
-    /// A `{` that never reaches its `}` inside its component.
-    #[error("`{{` without `}}`, at byte {at}")]
+    /// A `{` that never reaches its `}`, whether or not it opened the component.
+    #[error("unterminated `{{` at byte {at}")]
     UnterminatedBrace {
         /// The byte offset of the `{`.
         at: usize,
     },
     /// A `[` that never reaches its `]`, including one that runs into the next `/`.
-    #[error("`[` without `]`, at byte {at}")]
+    #[error("unterminated `[` at byte {at}")]
     UnterminatedClass {
         /// The byte offset of the `[`.
         at: usize,
     },
     /// `[]` and `[!]` hold no character at all.
-    #[error("`[]` matches nothing, at byte {at}")]
+    #[error("an empty character class at byte {at}")]
     EmptyClass {
         /// The byte offset just past the `[`, which is where the character that should have been
         /// inside it would have gone.
         at: usize,
     },
-    /// A `\` with nothing after it.
-    #[error("`\\` at the end of a glob escapes nothing, at byte {at}")]
+    /// A `\` with nothing after it, or a `\` in front of a character that is not a metacharacter.
+    #[error("`\\` must escape a metacharacter, at byte {at}")]
     DanglingEscape {
         /// The byte offset of the `\`.
         at: usize,
     },
     /// Postgres `text` cannot hold `U+0000` (`22021`), so neither can a stored glob.
-    #[error("a glob must not contain a NUL character, at byte {at}")]
+    #[error("a glob must not contain NUL, at byte {at}")]
     Nul {
         /// The byte offset of the NUL.
         at: usize,
     },
     /// `:` opens the `<repo>:` qualifier, so a pattern that starts with one names no repository.
-    #[error("`{{repo}}:` names no repository, at byte {at}")]
+    #[error("a repo qualifier must be a non-empty name without `/`, at byte {at}")]
     BadQualifier {
         /// The byte offset of the `:`.
         at: usize,
