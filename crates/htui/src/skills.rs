@@ -716,6 +716,62 @@ mod tests {
         );
     }
 
+    /// OQ-19 / R-32: an unbind is as safe as every other write. A spent token is `Stale`, the row
+    /// another writer changed survives, and the view is told to reload rather than shown a
+    /// removal that never happened.
+    #[tokio::test]
+    async fn an_unbind_at_a_spent_token_answers_skills_stale_and_the_row_survives() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+        let before = read(&backend, &scope).await;
+        let row = before
+            .attachment(ids::SKILL_TESTS, Some(ids::PROJECT_HTUI), None)
+            .expect("`tests` is attached to `htui`")
+            .clone();
+        let first = serve(
+            &backend,
+            &set(
+                &scope,
+                ids::SKILL_TESTS,
+                Some(ids::PROJECT_HTUI),
+                None,
+                7,
+                Some(row.updated_at),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(first, Ok(StoreReply::Skills(_))),
+            "the write that spends the token applies: {first:?}"
+        );
+        let middle = read(&backend, &scope).await;
+
+        let reply = serve(
+            &backend,
+            &StoreRequest::RemoveSkillBinding {
+                scope: scope.clone(),
+                id: row.id,
+                expected: row.updated_at,
+            },
+        )
+        .await;
+
+        let Ok(StoreReply::SkillsStale(fresh)) = reply else {
+            panic!("a spent token answers `SkillsStale`, got {reply:?}")
+        };
+        assert_eq!(
+            *fresh, middle,
+            "the stale reply is the store as it is, unchanged"
+        );
+        assert_eq!(
+            fresh
+                .attachment(ids::SKILL_TESTS, Some(ids::PROJECT_HTUI), None)
+                .map(|left| left.position),
+            Some(7),
+            "a row another writer changed survives the unbind that lost the race"
+        );
+    }
+
     /// The staleness index keys on [`StoreRequest::name`], so a name spelled one way in
     /// [`REQUEST_NAMES`] and another in the `name` arms would silently supersede a reply the view
     /// was waiting for.
