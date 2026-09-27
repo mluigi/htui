@@ -4983,7 +4983,7 @@ where
         // enumeration is deliberately a superset of what the budget paid for — a skill may fire on
         // a file this prompt never showed the model. The previous attempt's changed paths (D89)
         // join it in a later commit of this milestone, when `Isolator::changed_paths` lands.
-        spec.skill_files = excerpts.listed.clone();
+        // (red) the fill is restored in the next commit of this pair.
         spec.excerpts = excerpts;
         Ok(())
     }
@@ -12349,6 +12349,68 @@ mod tests {
                 .any(|file| file.path == "src/lib.rs" && file.reason == ExcerptReason::TouchedPath),
             "{:?}",
             prompt.trim.excerpts.files
+        );
+    }
+
+    /// MOD-9 D72/D73: the walk's enumeration reaches the spec, and it is the walk's — a strict
+    /// **superset** of what the prompt paid for. `docs/legacy.md` is enumerated and never excerpted,
+    /// which is the whole difference a `glob` attachment rests on: it fires on a file the prompt
+    /// never showed the model, so the matcher must be handed the listing and not `ExcerptSet::files`.
+    #[tokio::test]
+    async fn the_phase_specs_file_set_is_the_walks_listing_and_not_its_excerpts() {
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (repo, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        // Bytes that are not UTF-8 and hold no NUL. The walk's binary probe looks for the NUL and
+        // does not find one, so the file is **listed**; `read` then refuses it, so it is never
+        // excerpted. Listed-but-not-excerpted, with no cap and no budget arithmetic to arrange it.
+        let legacy = dir.path().join(repo.to_string()).join("docs/legacy.md");
+        std::fs::create_dir_all(legacy.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(&legacy, b"a legacy note\n\xff\xfe\n").expect("write");
+        harness_engine!(harness.orch, engine);
+
+        let mut spec = engine
+            .phase_spec(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                true,
+            )
+            .await
+            .expect("the spec is built")
+            .expect("`prd` requires nothing");
+        engine
+            .with_excerpts(&row, &prd, ids::HTUI_FEAT_3, &mut spec)
+            .await
+            .expect("no store fault");
+
+        fn paths(entries: &[htui_core::prompt::excerpt::RepoPath]) -> Vec<(&str, &str)> {
+            entries
+                .iter()
+                .map(|entry| (entry.repo.as_str(), entry.path.as_str()))
+                .collect()
+        }
+        assert_eq!(
+            paths(&spec.skill_files),
+            vec![("htui", "docs/legacy.md"), ("htui", "src/lib.rs")],
+            "D72/D73: `skill_files` is `ExcerptSet::listed` — the walk's own enumeration, in the \
+             walk's byte order"
+        );
+        assert_eq!(
+            spec.skill_files,
+            spec.excerpts.listed,
+            "and it is the listing by value, not a copy of it that can drift"
+        );
+        assert_eq!(
+            spec.excerpts.files.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/lib.rs"],
+            "the prompt paid for the touched file only. The two sets therefore differ — \
+             `docs/legacy.md` is in the listing and in no excerpt — so a fill taken from `files` \
+             instead of `listed` loses it and fails the first assertion. Notes: {:?}",
+            spec.excerpts.notes
         );
     }
 
