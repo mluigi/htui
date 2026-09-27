@@ -20,10 +20,11 @@ use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, Permissi
 use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
-    AgentId, AgentSummary, BoxEdit, BoxId, BoxInfo, Document, DocumentHead, DocumentId, Item,
-    ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemSummary, LinkGraph, Note, PhaseId,
+    Activation, AgentId, AgentSummary, BoxEdit, BoxId, BoxInfo, Document, DocumentHead, DocumentId,
+    Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemSummary, LinkGraph, Note, PhaseId,
     PhasePatch, ProjectId, ProjectPatch, RepoId, RepoPatch, RunSummary, Scope, SessionEvent,
-    StepGraphId, StepGraphPatch, StepId, WorkspaceId, WorkspacePatch, WorkspaceSummary,
+    SkillBindingId, SkillId, StepGraphId, StepGraphPatch, StepId, WorkspaceId, WorkspacePatch,
+    WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::store::{
@@ -42,6 +43,7 @@ use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, InferReport, MirrorAfterDelete};
 use crate::prompt_settings::{self, SettingsSnapshot};
 use crate::run_worker::{LiveChats, RunRuntime, RunServed};
+use crate::skills::{self, SkillBody, SkillsSnapshot};
 use crate::templates::{self, TemplateBody, TemplatesSnapshot};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
@@ -547,6 +549,67 @@ pub enum StoreRequest {
         /// The head version the editor opened on: the CAS token, `None` for a name with no row.
         expected: Option<i32>,
     },
+
+    // MOD-9 milestone 3 (D81): the four skill requests, served by [`crate::skills`]. Every write
+    // carries the `Scope` because the reply re-reads *is* the scope, and all four are served
+    // through one further or-ed arm of `try_serve`.
+    /// The whole library and the scope's attachments.
+    Skills(Scope),
+    /// Creates or edits one skill and appends the body as the next version (D78, OQ-18). The two
+    /// tokens are two surfaces, `skill.updated_at` and the head version, and the seam
+    /// short-circuits on the first `Stale` (D101) so a stale token can never leave a moved
+    /// description behind an unsaved body.
+    SaveSkill {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The library key; a create is a name no row holds. It never moves.
+        name: String,
+        /// `skill.description`, the library's one-liner.
+        description: String,
+        /// The whole new body. A skill body is markdown and is **not** parsed: its `Debug` is its
+        /// length.
+        body: SkillBody,
+        /// The `skill.updated_at` the editor opened on: the `upsert_skill` token, `None` for a
+        /// create. `None` is a token — "I expect no row" — not "don't care" (D101).
+        expected: Option<DateTime<Utc>>,
+        /// The head version the editor opened on: the `add_skill_version` token, `None` for a new
+        /// name. Exactly [`SaveTemplate`](Self::SaveTemplate)'s `expected`.
+        expected_version: Option<i32>,
+    },
+    /// The attachment of one `(skill, project, phase)`, inserted or replaced (D78).
+    SetSkillBinding {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The skill the attachment is for.
+        skill_id: SkillId,
+        /// The level: `None`/`None` is global, `Some(_)`/`None` the project, both `Some` a phase.
+        project_id: Option<ProjectId>,
+        /// The phase, which requires `project_id`.
+        phase_id: Option<PhaseId>,
+        /// Follows the latest version when `None`.
+        pinned_version: Option<i32>,
+        /// `skill_binding.position`.
+        position: i32,
+        /// `skill_binding.activation`.
+        activation: Activation,
+        /// The **effective** globs, typed plus every named language's expansion (D83).
+        globs: Vec<String>,
+        /// The languages as authored; display only.
+        languages: Vec<String>,
+        /// The `updated_at` the form opened on (`None`: no row yet). A spent token answers
+        /// [`StoreReply::SkillsStale`].
+        expected: Option<DateTime<Utc>>,
+    },
+    /// Detaches one row. The token is `updated_at`, so an unbind is as safe as every other write
+    /// and a row another writer changed survives (OQ-19, R-32).
+    RemoveSkillBinding {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The row to detach.
+        id: SkillBindingId,
+        /// The `updated_at` the matrix listed.
+        expected: DateTime<Utc>,
+    },
     /// The connection as the Settings > Connection section shows it (MOD-15 M6, D4): backend
     /// label, whether a DSN is stored (never the DSN), the mirror's `cache_meta`, the last dial.
     ConnectionInfo,
@@ -651,6 +714,11 @@ impl StoreRequest {
             // The two of `templates::REQUEST_NAMES`, in that order (MOD-9 D5).
             Self::Templates(..) => "templates",
             Self::SaveTemplate { .. } => "save_template",
+            // The four of `skills::REQUEST_NAMES`, in that order (MOD-9 D81).
+            Self::Skills(..) => "skills",
+            Self::SaveSkill { .. } => "save_skill",
+            Self::SetSkillBinding { .. } => "set_skill_binding",
+            Self::RemoveSkillBinding { .. } => "remove_skill_binding",
             // The four of `connection::REQUEST_NAMES`, in that order (MOD-15 M6 D4).
             Self::ConnectionInfo => "connection_info",
             Self::SetDsn(_) => "set_dsn",
@@ -827,6 +895,12 @@ pub enum StoreReply {
     /// A template save missed its CAS token (PRD D5): the templates as they are now, for the editor
     /// to reload against. The editor keeps its typed text and retries only by hand.
     TemplatesStale(Box<TemplatesSnapshot>),
+    /// The library and the scope's attachments, freshly read: the answer to
+    /// [`StoreRequest::Skills`] and to every skill write that applied (MOD-9 D81).
+    Skills(Box<SkillsSnapshot>),
+    /// A skill write missed its token (PRD D8, D101): the store as it is now, for the editor to
+    /// reload against. The editor keeps its typed text and its draft.
+    SkillsStale(Box<SkillsSnapshot>),
     /// `ConnectionInfo`, and every connection writer's success (D4): the section re-renders from
     /// it and never patches a field of its own into what it already had.
     Connection(ConnectionSnapshot),
@@ -1126,6 +1200,12 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::Templates(..) | StoreRequest::SaveTemplate { .. } => {
             templates::serve(backend, request).await?
         }
+        // The four skill requests, or-ed for the reason the arms above are: a guard does not count
+        // towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12).
+        StoreRequest::Skills(..)
+        | StoreRequest::SaveSkill { .. }
+        | StoreRequest::SetSkillBinding { .. }
+        | StoreRequest::RemoveSkillBinding { .. } => skills::serve(backend, request).await?,
         // The four connection requests, or-ed for the same reason the twenty-five above are: a
         // guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would
         // be an E0004 here (MOD-15 M3 plan F-12, M6 plan D9). Only the read is answered: the three
