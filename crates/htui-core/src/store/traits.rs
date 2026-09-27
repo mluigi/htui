@@ -1510,6 +1510,17 @@ pub fn skill_key(name: &str) -> String {
     name.to_owned()
 }
 
+/// MOD-9 D77: the `NotFound` id of a `(skill, version)` pair, so both stores spell it alike.
+///
+/// A pair and not a row, because `skill_version` is keyed `(skill_id, version)` and an append
+/// under a spent head token answers `NotFound` for a version rather than for a row. T1b's
+/// `add_skill_version` is the one caller and its conformance case pins the text, so the spelling
+/// is written once, here.
+#[must_use]
+pub fn skill_version_key(skill: SkillId, version: i32) -> String {
+    format!("{skill}/v{version}")
+}
+
 /// MOD-9 D77: the `NotFound` id of a `(skill, project, phase)` attachment, so both stores spell it
 /// alike.
 ///
