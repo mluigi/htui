@@ -6156,6 +6156,48 @@ async fn skill_upsert_creates_then_edits_under_the_updated_at_token<S: WriteStor
         edited.updated_at
     );
 
+    // D18/D78's order, token first: at a **spent** token a description the writer refuses is still
+    // `Stale`, never the `skill.description` `Constraint`. The name cannot carry this — a name the
+    // writer refuses can never hold a row, so it would answer `NotFound` from the token arm — and
+    // the description refusal further down is at `None` on a name with no row, where the token match
+    // falls through. Nothing else pins which of the two comes first.
+    let refused = stale(
+        CASE,
+        store
+            .upsert_skill(
+                new_skill(SkillId::new(), "house", "a\0b"),
+                Some(created.updated_at),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (refused.id, refused.description.as_str()),
+        (id, SECOND),
+        "{CASE}: the token is read before the input is judged, so a refused description under a \
+         spent token is Stale and carries the current row"
+    );
+
+    // `None` is a token, not "don't care": once the name holds a row it is `Stale`, the same
+    // `Some(_) if expected != Some(row.updated_at)` arm as a spent token. Asserted in the trait
+    // doc, the `State` doc and here, because inverting that arm to `expected.is_some() && ...`
+    // replaces the row under `None` and nothing else notices.
+    let uncased = stale(
+        CASE,
+        store
+            .upsert_skill(
+                new_skill(SkillId::new(), "house", "written under None"),
+                None,
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (uncased.id, uncased.description.as_str()),
+        (id, SECOND),
+        "{CASE}: None on a name that now has a row is Stale, carrying that row"
+    );
+
     let spent = stale(
         CASE,
         store
@@ -6303,6 +6345,23 @@ async fn skill_version_append_is_a_cas_on_the_head<S: WriteStore>(store: &S) {
         (head.version, head.body.as_str()),
         (2, B),
         "{CASE}: a spent token finds v2 with the first body"
+    );
+
+    // D18/D78's order, token first, on this writer too: a refused body under a **spent** token is
+    // `Stale`, not the `skill_version.body` `Constraint`. The NUL refusal further down is at the
+    // current head, where the token match falls through, so nothing else pins which comes first.
+    let refused = stale(
+        CASE,
+        store
+            .add_skill_version(new_version(skill, "a\0b"), Some(1))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (refused.version, refused.body.as_str()),
+        (2, B),
+        "{CASE}: the head is read before the body is judged, so a NUL body under a spent token \
+         is Stale and carries the head"
     );
 
     let v3 = applied(
