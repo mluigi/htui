@@ -902,6 +902,29 @@ mod tests {
         }
     }
 
+    /// D81: the last arm is unreachable from the shell — `try_serve` routes exactly this module's
+    /// four variants here — so nothing reaches it but a caller that got the routing wrong, and
+    /// that caller is told which request it sent rather than left to a panic.
+    #[tokio::test]
+    async fn serve_refuses_a_foreign_request_by_name() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+
+        for request in [
+            StoreRequest::Templates(scope.clone()),
+            StoreRequest::PromptSettings(scope),
+        ] {
+            let err = serve(&backend, &request)
+                .await
+                .expect_err("another module's request is refused here");
+            assert_eq!(
+                err,
+                StoreError::Backend(format!("not a skill request: {}", request.name())),
+                "the refusal names the request that got here by mistake"
+            );
+        }
+    }
+
     /// Offline there is no writer, so the save is refused before anything is sent: the worker
     /// answers `Failed` for `save_skill` with the unreachable-database sentence. There is no
     /// server here to check for a row, and none is needed: nothing could have reached one.
