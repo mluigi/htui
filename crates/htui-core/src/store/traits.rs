@@ -31,19 +31,19 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{
-    Agent, AgentBox, AgentId, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, ChatRunSpec,
+    Activation, Agent, AgentBox, AgentId, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, ChatRunSpec,
     CitationKind, Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId, GateOutcome,
     Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
     ItemRequirement, ItemRevision, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
     NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch,
-    Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId,
-    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
-    ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject,
+    NewRequirementArea, NewRun, NewRunStep, NewSkillBinding, NewStepGraph, NewWorkspace, Note,
+    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, Repo,
+    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
+    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
+    RequirementUpdate, Resolution, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillId, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
+    UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::prompt::template::{TemplateRole, parse};
@@ -1489,6 +1489,340 @@ pub fn prompt_template_refusal(name: &str, body: &str) -> Option<String> {
     parse(TemplateRole::of_name(name), body)
         .err()
         .map(|err| err.to_string())
+}
+
+/// MOD-9 D77: a skill name [`Skill::name_is_valid`] refuses, in the sentence both stores give it.
+///
+/// Beside [`invalid_template_name`] because it is the same rule in the same place: a name is the
+/// library key, so it is checked once and both backends answer with this text.
+#[must_use]
+pub fn invalid_skill_name(name: &str) -> String {
+    format!(
+        "skill.name `{}` must be 1-64 characters of `[a-z0-9-]`, with no leading, trailing or \
+         doubled hyphen",
+        name.escape_debug()
+    )
+}
+
+/// MOD-9 D77: the `NotFound` id of a skill by name, so both stores spell it alike.
+#[must_use]
+pub fn skill_key(name: &str) -> String {
+    name.to_owned()
+}
+
+/// MOD-9 D77: the `NotFound` id of a `(skill, project, phase)` attachment, so both stores spell it
+/// alike.
+///
+/// `-` is the SQL `NULL`, and it is unambiguous here: a `ProjectId` and a `PhaseId` are UUIDs.
+#[must_use]
+pub fn skill_binding_key(
+    skill: SkillId,
+    project: Option<ProjectId>,
+    phase: Option<PhaseId>,
+) -> String {
+    let project = project.map_or_else(|| "-".to_owned(), |id| id.to_string());
+    let phase = phase.map_or_else(|| "-".to_owned(), |id| id.to_string());
+    format!("{skill}/{project}/{phase}")
+}
+
+/// MOD-9 D77: why a skill may not be saved, or `None` when it may.
+///
+/// The name rule first, then a NUL in the description (which Postgres `text` cannot hold, `22021`).
+/// The name needs no NUL arm of its own: `Skill::name_is_valid` already refuses it, so a name
+/// holding one is refused by the name sentence first and this order says so.
+#[must_use]
+pub fn skill_refusal(name: &str, description: &str) -> Option<String> {
+    if !Skill::name_is_valid(name) {
+        return Some(invalid_skill_name(name));
+    }
+    if description.contains('\0') {
+        return Some("skill.description must not contain a NUL character".to_owned());
+    }
+    None
+}
+
+/// MOD-9 D78: why an attachment may not be written, or `None`.
+///
+/// Every sentence here is one both stores give, and the glob sentence is
+/// [`GlobError`](crate::prompt::glob::GlobError)'s own `Display` verbatim (D99), so the matrix
+/// view's pre-flight and this refusal can never disagree about why a glob was turned down. The
+/// order is the schema's own: the two CHECKs `Postgres` carries (`skill_binding_phase_needs_project`
+/// and `skill_binding_glob_needs_globs`), then the two rules it does not — a repo-qualified glob on
+/// a **global** row (ANA-22 §6 item 6: a global attachment cannot name a repo) and a pin the skill
+/// has no version for.
+///
+/// The token is **not** checked here: a spent `updated_at` answers `Stale` from the row read, and
+/// that read comes first in the writer, so bad input against a spent token is `Stale` on both
+/// stores (D78's error order). `versions` is one query's worth of `skill_version` and may hold
+/// another skill's rows, as [`SkillBinding::version_in_force`] allows; only `new.skill_id`'s count.
+#[must_use]
+pub fn skill_binding_refusal(new: &NewSkillBinding, versions: &[SkillVersion]) -> Option<String> {
+    if new.phase_id.is_some() && new.project_id.is_none() {
+        return Some(
+            "skill_binding.phase_id requires a project_id (`skill_binding_phase_needs_project`)"
+                .to_owned(),
+        );
+    }
+    if new.activation == Activation::Glob && new.globs.is_empty() {
+        return Some(
+            "skill_binding.activation `glob` needs at least one glob \
+             (`skill_binding_glob_needs_globs`)"
+                .to_owned(),
+        );
+    }
+    for glob in &new.globs {
+        let pattern = match crate::prompt::glob::compile(glob) {
+            Ok(pattern) => pattern,
+            Err(err) => return Some(err.to_string()),
+        };
+        if pattern.repo.is_some() && new.project_id.is_none() {
+            return Some(format!(
+                "a repo-qualified glob `{}` cannot sit on a global attachment, which names no repo \
+                 (ANA-22 §6 item 6)",
+                glob.escape_debug()
+            ));
+        }
+    }
+    if let Some(pinned) = new.pinned_version
+        && !versions
+            .iter()
+            .any(|v| v.skill_id == new.skill_id && v.version == pinned)
+    {
+        return Some(format!(
+            "skill_binding.pinned_version {pinned} names no skill_version of skill {}",
+            new.skill_id
+        ));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ids::SkillBindingId;
+
+    /// One skill, shared by every case in this module: a [`NewSkillBinding`] is only comparable
+    /// against versions of its own skill, and a helper that minted a fresh id per call would make
+    /// the pin cases pass for the wrong reason.
+    fn skill() -> SkillId {
+        SkillId::new()
+    }
+
+    fn binding(skill: SkillId) -> NewSkillBinding {
+        NewSkillBinding {
+            id: SkillBindingId::new(),
+            skill_id: skill,
+            project_id: None,
+            phase_id: None,
+            pinned_version: None,
+            position: 0,
+            activation: Activation::Always,
+            globs: Vec::new(),
+            languages: Vec::new(),
+        }
+    }
+
+    fn version(skill: SkillId, version: i32) -> SkillVersion {
+        SkillVersion {
+            skill_id: skill,
+            version,
+            body: format!("v{version}"),
+            source: serde_json::json!({}),
+            created_by: UserId::new(),
+            created_at: DateTime::from_timestamp(1_788_393_600, 0).expect("a valid timestamp"),
+        }
+    }
+
+    /// D77: the sentences are spelled once, so `MemStore` and `PgStore` answer the same input with
+    /// the same text. The name sentence quotes the rule rather than restating it loosely, and it
+    /// escapes what it quotes.
+    #[test]
+    fn a_skill_name_is_refused_in_the_sentence_both_stores_give() {
+        assert_eq!(
+            invalid_skill_name("House Rules"),
+            "skill.name `House Rules` must be 1-64 characters of `[a-z0-9-]`, with no leading, \
+             trailing or doubled hyphen"
+        );
+        assert!(
+            invalid_skill_name("a\nb").contains("a\\nb"),
+            "a name holding a control character is escaped, not printed raw: {}",
+            invalid_skill_name("a\nb")
+        );
+        assert_eq!(
+            skill_key("rust-style"),
+            "rust-style",
+            "a skill is named by its name: the table is global, so there is no project prefix"
+        );
+
+        let id = skill();
+        let project = ProjectId::new();
+        let phase = PhaseId::new();
+        assert_eq!(
+            skill_binding_key(id, None, None),
+            format!("{id}/-/-"),
+            "a global attachment spells both nullable keys as `-`"
+        );
+        assert_eq!(
+            skill_binding_key(id, Some(project), None),
+            format!("{id}/{project}/-"),
+            "a project attachment spells its phase as `-`"
+        );
+        assert_eq!(
+            skill_binding_key(id, Some(project), Some(phase)),
+            format!("{id}/{project}/{phase}"),
+            "a phase attachment names both keys"
+        );
+    }
+
+    /// D77: the name rule is consulted before anything else, so a name that is wrong for two
+    /// reasons is reported for the one the rule owns. The NUL arm is the description's alone —
+    /// [`Skill::name_is_valid`] already refuses a NUL in the name, so that path is the name
+    /// sentence, and this order is what says so.
+    #[test]
+    fn skill_refusal_prefers_the_name_over_the_nul() {
+        assert_eq!(skill_refusal("house-rules", "the ones we follow"), None);
+        assert_eq!(
+            skill_refusal("House Rules", "fine"),
+            Some(invalid_skill_name("House Rules"))
+        );
+        assert_eq!(
+            skill_refusal("house-rules", "fine\0not fine"),
+            Some("skill.description must not contain a NUL character".to_owned())
+        );
+        assert_eq!(
+            skill_refusal("Bad Name", "fine\0not fine"),
+            Some(invalid_skill_name("Bad Name")),
+            "the name is checked first, and it is the arm that owns a NUL in the name"
+        );
+        assert_eq!(
+            skill_refusal("a\0b", "fine"),
+            Some(invalid_skill_name("a\0b")),
+            "a NUL in the name is a name failure, not a description one"
+        );
+    }
+
+    /// D78: every rule the writer carries in Rust, in the order the schema's own CHECKs put them,
+    /// and a good attachment at the end that none of the refusals affected.
+    #[test]
+    fn a_binding_refusal_names_the_rule_it_refused() {
+        let id = skill();
+        let project = ProjectId::new();
+        let phase = PhaseId::new();
+        let versions = [version(id, 1), version(id, 2)];
+
+        // A phase without a project: `skill_binding_phase_needs_project`.
+        let no_project = NewSkillBinding {
+            phase_id: Some(phase),
+            ..binding(id)
+        };
+        assert_eq!(
+            skill_binding_refusal(&no_project, &versions).expect("a phase needs a project"),
+            "skill_binding.phase_id requires a project_id (`skill_binding_phase_needs_project`)"
+        );
+
+        // `activation = glob` with nothing to match: `skill_binding_glob_needs_globs`.
+        let no_globs = NewSkillBinding {
+            activation: Activation::Glob,
+            ..binding(id)
+        };
+        assert_eq!(
+            skill_binding_refusal(&no_globs, &versions).expect("a glob activation needs globs"),
+            "skill_binding.activation `glob` needs at least one glob \
+             (`skill_binding_glob_needs_globs`)"
+        );
+
+        // A repo-qualified glob on a global row: the rule `Postgres` carries no CHECK for.
+        let qualified = NewSkillBinding {
+            activation: Activation::Glob,
+            globs: vec!["htui:**/*.rs".to_owned()],
+            ..binding(id)
+        };
+        assert_eq!(
+            skill_binding_refusal(&qualified, &versions).expect("a global row names no repo"),
+            "a repo-qualified glob `htui:**/*.rs` cannot sit on a global attachment, which names \
+             no repo (ANA-22 §6 item 6)"
+        );
+        assert!(
+            skill_binding_refusal(
+                &NewSkillBinding {
+                    project_id: Some(project),
+                    ..qualified.clone()
+                },
+                &versions
+            )
+            .is_none(),
+            "the same glob is fine on a project row, which does name repos"
+        );
+
+        // A glob the matcher refuses (D95, D99): the sentence is `GlobError`'s own `Display`, and
+        // the position the editor puts a cursor on rides in that same sentence.
+        for (glob, at) in [("src/**x/*.rs", 4), ("a/{b,{c,d}}/x.rs", 5), ("x{,.rs}", 2)] {
+            let bad = NewSkillBinding {
+                project_id: Some(project),
+                activation: Activation::Glob,
+                globs: vec![glob.to_owned()],
+                ..binding(id)
+            };
+            let sentence = skill_binding_refusal(&bad, &versions)
+                .unwrap_or_else(|| panic!("`{glob}` must be refused"));
+            let expected = crate::prompt::glob::compile(glob).expect_err("the matcher refuses it");
+            assert_eq!(
+                sentence,
+                expected.to_string(),
+                "`{glob}` names the same reason"
+            );
+            assert_eq!(
+                expected.at(),
+                Some(at),
+                "`{glob}` names the byte the editor puts a cursor on"
+            );
+        }
+
+        // A pin the skill has no version for, and one it does: another skill's rows do not count.
+        let pinned = NewSkillBinding {
+            pinned_version: Some(7),
+            ..binding(id)
+        };
+        assert_eq!(
+            skill_binding_refusal(&pinned, &versions).expect("the pin names no row"),
+            format!("skill_binding.pinned_version 7 names no skill_version of skill {id}")
+        );
+        assert!(
+            skill_binding_refusal(
+                &NewSkillBinding {
+                    pinned_version: Some(1),
+                    ..binding(id)
+                },
+                &versions
+            )
+            .is_none(),
+            "a pin the skill does have is not a refusal"
+        );
+        assert_eq!(
+            skill_binding_refusal(
+                &NewSkillBinding {
+                    pinned_version: Some(1),
+                    ..binding(id)
+                },
+                &[version(skill(), 1)]
+            ),
+            Some(format!(
+                "skill_binding.pinned_version 1 names no skill_version of skill {id}"
+            )),
+            "another skill's version 1 is not this skill's version 1"
+        );
+
+        // The tail: none of the refusals above wrote anything, so this attachment lands.
+        let good = NewSkillBinding {
+            project_id: Some(project),
+            activation: Activation::Glob,
+            globs: vec!["**/*.rs".to_owned()],
+            languages: vec!["rust".to_owned()],
+            pinned_version: Some(1),
+            ..binding(id)
+        };
+        assert_eq!(skill_binding_refusal(&good, &versions), None);
+    }
 }
 
 /// D6: the holder count, in the sentence the refusal carries.
