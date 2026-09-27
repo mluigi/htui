@@ -132,7 +132,8 @@ pub enum GlobError {
     /// `[]` and `[!]` hold no character at all.
     #[error("`[]` matches nothing, at byte {at}")]
     EmptyClass {
-        /// The byte offset of the `[`.
+        /// The byte offset just past the `[`, which is where the character that should have been
+        /// inside it would have gone.
         at: usize,
     },
     /// A `\` with nothing after it.
@@ -524,7 +525,7 @@ fn class(chars: &mut std::str::CharIndices<'_>, base: usize, at: usize) -> Resul
         return Err(GlobError::UnterminatedClass { at: base + at });
     }
     let Some((negated, ranges)) = ranges(&body) else {
-        return Err(GlobError::EmptyClass { at: base + at });
+        return Err(GlobError::EmptyClass { at: base + at + 1 });
     };
     Ok(Tok::Class { negated, ranges })
 }
