@@ -122,7 +122,23 @@ impl SkillsSnapshot {
 /// [`htui_store::PROMPT_ON_SERVER_ONLY`] for both reads, because the `skill*` tables are not
 /// mirrored.
 pub async fn snapshot(backend: &Backend, scope: &Scope) -> Result<SkillsSnapshot> {
-    todo!()
+    let skills = backend
+        .skill_library()
+        .await?
+        .into_iter()
+        .map(|entry| SkillSummary {
+            id: entry.skill.id,
+            name: entry.skill.name,
+            description: entry.skill.description,
+            updated_at: entry.skill.updated_at,
+            versions: entry.versions,
+        })
+        .collect();
+    let attachments = backend.skill_attachments(&scope.project_ids).await?;
+    Ok(SkillsSnapshot {
+        skills,
+        attachments,
+    })
 }
 
 /// The four request names, in [`StoreRequest`] order.
@@ -148,13 +164,133 @@ pub const READ_NAME: &str = REQUEST_NAMES[0];
 /// the read and `DATABASE_UNREACHABLE` for the three writers; [`StoreError::Backend`] for a
 /// request that is not one of this module's four.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
-    todo!()
+    match request {
+        // The read goes through `Backend` rather than a `Writer`: the library and the attachments
+        // are inherent on each store and refuse offline with their own sentence, which is the one
+        // the view shows.
+        StoreRequest::Skills(scope) => Ok(StoreReply::Skills(Box::new(
+            snapshot(backend, scope).await?,
+        ))),
+        StoreRequest::SaveSkill {
+            scope,
+            name,
+            description,
+            body,
+            expected,
+            expected_version,
+        } => {
+            let writer = backend
+                .writer()
+                .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
+            let created_by = backend.this_user().await?;
+            // MOD-9 D101: the two tokens are two surfaces — `skill.updated_at` for the description
+            // and the head version for the append — and the write is short-circuited on the first
+            // `Stale`, so a stale token can never leave a moved description behind an unsaved body.
+            let saved = match writer
+                .upsert_skill(
+                    NewSkill {
+                        id: SkillId::new(),
+                        name: name.clone(),
+                        description: description.clone(),
+                        created_by,
+                    },
+                    *expected,
+                )
+                .await?
+            {
+                CasOutcome::Applied(skill) => skill,
+                CasOutcome::Stale(_) => return stale(backend, scope).await,
+            };
+            match writer
+                .add_skill_version(
+                    NewSkillVersion {
+                        skill_id: saved.id,
+                        body: body.as_str().to_owned(),
+                        source: serde_json::json!({}),
+                        created_by,
+                    },
+                    *expected_version,
+                )
+                .await?
+            {
+                CasOutcome::Applied(_) => {}
+                CasOutcome::Stale(_) => return stale(backend, scope).await,
+            }
+            // The worker re-reads rather than handing the view the one row the outcome carries: the
+            // view renders a list, and a row patched in locally would be a second source of truth.
+            Ok(StoreReply::Skills(Box::new(
+                snapshot(backend, scope).await?,
+            )))
+        }
+        StoreRequest::SetSkillBinding {
+            scope,
+            skill_id,
+            project_id,
+            phase_id,
+            pinned_version,
+            position,
+            activation,
+            globs,
+            languages,
+            expected,
+        } => {
+            let writer = backend
+                .writer()
+                .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
+            let outcome = writer
+                .set_skill_binding(
+                    NewSkillBinding {
+                        id: SkillBindingId::new(),
+                        skill_id: *skill_id,
+                        project_id: *project_id,
+                        phase_id: *phase_id,
+                        pinned_version: *pinned_version,
+                        position: *position,
+                        activation: *activation,
+                        globs: globs.clone(),
+                        languages: languages.clone(),
+                    },
+                    *expected,
+                )
+                .await?;
+            match outcome {
+                CasOutcome::Applied(_) => Ok(StoreReply::Skills(Box::new(
+                    snapshot(backend, scope).await?,
+                ))),
+                CasOutcome::Stale(_) => stale(backend, scope).await,
+            }
+        }
+        StoreRequest::RemoveSkillBinding {
+            scope,
+            id,
+            expected,
+        } => {
+            let writer = backend
+                .writer()
+                .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
+            match writer.remove_skill_binding(*id, *expected).await? {
+                CasOutcome::Applied(_) => Ok(StoreReply::Skills(Box::new(
+                    snapshot(backend, scope).await?,
+                ))),
+                CasOutcome::Stale(_) => stale(backend, scope).await,
+            }
+        }
+        // `try_serve` routes exactly this module's four variants here, so the last arm is
+        // unreachable from the shell; a caller that reached it anyway is better told which request
+        // it sent than killed.
+        other => Err(StoreError::Backend(format!(
+            "not a skill request: {}",
+            other.name()
+        ))),
+    }
 }
 
 /// The fresh snapshot a spent token answers with: the store as it is, unchanged, which is what the
 /// editor reloads against (D101).
 async fn stale(backend: &Backend, scope: &Scope) -> Result<StoreReply> {
-    todo!()
+    Ok(StoreReply::SkillsStale(Box::new(
+        snapshot(backend, scope).await?,
+    )))
 }
 
 #[cfg(test)]
