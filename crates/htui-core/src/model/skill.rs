@@ -6,7 +6,9 @@
 //! step, which winners render and records why. MOD-9 milestone 3 adds the write side's arguments —
 //! [`NewSkill`], [`NewSkillVersion`], [`NewSkillBinding`] — and the name rule
 //! [`Skill::name_is_valid`] the writers check, which is why they live beside the rows they
-//! construct rather than in `model/kind.rs`.
+//! construct rather than in `model/kind.rs`. It also hands [`select`] the step's file set, so a
+//! `glob` attachment is `matched`, `no_match` or `no_path` rather than always the last
+//! (D73, D74).
 
 use std::collections::BTreeMap;
 
@@ -22,8 +24,10 @@ str_enum!(
         /// Always rendered. The column default, so every binding written before `0007` is
         /// unchanged.
         Always => "always",
-        /// Rendered when the step's file set matches `globs` (MOD-9 milestone 3). Until the matcher
-        /// lands, a `glob` winner is inactive and records `no_path` (plan D40, OQ-12).
+        /// Rendered when the step's file set matches `globs` (MOD-9 milestone 3, D71, D73). A
+        /// `glob` winner the set named is active and records `matched` with the
+        /// `<repo>:<path>` that fired; one the set missed records `no_match`, and one with no
+        /// file set at all records `no_path` (D74).
         Glob => "glob",
         /// Attached more broadly but not here: a narrower `off` hides a broader attachment.
         Off => "off",
@@ -139,7 +143,8 @@ pub struct SkillBinding {
     /// `skill_binding.activation`.
     pub activation: Activation,
     /// `skill_binding.globs`: the effective globs, non-empty when `activation` is `Glob`
-    /// (`skill_binding_glob_needs_globs`). Nothing matches them before MOD-9 milestone 3.
+    /// (`skill_binding_glob_needs_globs`). What [`crate::prompt::glob`] matches, and what
+    /// [`select`] reads the step's file set against (MOD-9 D73).
     pub globs: Vec<String>,
     /// `skill_binding.languages`: as authored, display only; the matcher reads `globs`.
     pub languages: Vec<String>,
@@ -202,7 +207,9 @@ pub struct BoundSkill {
     pub level: SkillLevel,
     /// The winning attachment's activation, which [`select`] reads.
     pub activation: Activation,
-    /// The winning attachment's globs, for MOD-9 milestone 3's matcher. Recorded nowhere yet.
+    /// The winning attachment's globs, what [`crate::prompt::glob::matched_skills`] matches
+    /// against the step's file set. The assembler itself never reads them: the engine and the
+    /// preview run the matcher and hand `select` its answer (MOD-9 D73).
     pub globs: Vec<String>,
 }
 
@@ -345,11 +352,12 @@ pub struct SkillChoice {
     pub matched: Option<String>,
 }
 
-/// Plan D40: decides every candidate, in order, for one step. Pure.
+/// Plan D40/D51: decides every candidate, in order, for one step. Pure.
 ///
 /// The rules, first match wins: a body that does not place `{{skills}}` (`placed == false`) makes
 /// every candidate `not_placed`; `version: None` is `missing_version`; `Off` is `off`; a `Glob` is
-/// `no_path` until the matcher is wired; `Always` is `always` and the only active outcome. Returns
+/// `matched` with the path when `matches` is `Some` and names the skill, `no_match` when it is
+/// `Some` and does not, and `no_path` when it is `None` (MOD-9 D73); `Always` is `always`. Returns
 /// the active candidates in input order — which is collapse order, the render order — and one
 /// [`SkillChoice`] per candidate in the same order.
 ///
@@ -361,11 +369,12 @@ pub struct SkillChoice {
 pub fn select(
     candidates: Vec<BoundSkill>,
     placed: bool,
-    _matches: Option<&BTreeMap<SkillId, String>>,
+    matches: Option<&BTreeMap<SkillId, String>>,
 ) -> (Vec<BoundSkill>, Vec<SkillChoice>) {
     let mut active = Vec::with_capacity(candidates.len());
     let mut choices = Vec::with_capacity(candidates.len());
     for skill in candidates {
+        let mut matched = None;
         let reason = if !placed {
             ChoiceReason::NotPlaced
         } else if skill.version.is_none() {
@@ -373,11 +382,23 @@ pub fn select(
         } else {
             match skill.activation {
                 Activation::Off => ChoiceReason::Off,
-                Activation::Glob => ChoiceReason::NoPath,
+                Activation::Glob => match matches {
+                    Some(matches) => match matches.get(&skill.skill_id) {
+                        Some(path) => {
+                            matched = Some(path.clone());
+                            ChoiceReason::Matched
+                        }
+                        None => ChoiceReason::NoMatch,
+                    },
+                    // D73: no file set resolved, which is the judge's and the handoff's record.
+                    None => ChoiceReason::NoPath,
+                },
                 Activation::Always => ChoiceReason::Always,
             }
         };
-        let is_active = reason == ChoiceReason::Always;
+        // D74: `matched` and `always` are the two active outcomes; the test widens from
+        // `reason == Always` to `matches!(reason, Always | Matched)`.
+        let is_active = matches!(reason, ChoiceReason::Always | ChoiceReason::Matched);
         choices.push(SkillChoice {
             skill: skill.skill_id,
             name: skill.name.clone(),
@@ -386,7 +407,7 @@ pub fn select(
             activation: skill.activation,
             active: is_active,
             reason,
-            matched: None,
+            matched,
         });
         if is_active {
             active.push(skill);
@@ -886,14 +907,14 @@ mod tests {
             with("a", Activation::Always, Some(1)),
             with("b", Activation::Off, Some(1)),
             BoundSkill {
+                skill_id: glob,
                 globs: vec!["**/*.rs".to_owned()],
                 ..with("c", Activation::Glob, Some(1))
             },
             with("d", Activation::Always, None),
         ];
-        let reasons = |choices: &[SkillChoice]| {
-            choices.iter().map(|c| c.reason).collect::<Vec<_>>()
-        };
+        let reasons =
+            |choices: &[SkillChoice]| choices.iter().map(|c| c.reason).collect::<Vec<_>>();
 
         let (active, choices) = select(candidates.clone(), true, None);
         assert_eq!(
@@ -917,8 +938,9 @@ mod tests {
         );
         assert_eq!(active, vec![candidates[0].clone()], "only `always` renders");
 
-        let matched: BTreeMap<SkillId, String> =
-            [(glob, "htui:src/main.rs".to_owned())].into_iter().collect();
+        let matched: BTreeMap<SkillId, String> = [(glob, "htui:src/main.rs".to_owned())]
+            .into_iter()
+            .collect();
         let (active, choices) = select(candidates.clone(), true, Some(&matched));
         assert_eq!(
             reasons(&choices),
@@ -930,13 +952,20 @@ mod tests {
             ],
             "the file set named the glob candidate, so it is `matched`"
         );
-        assert!(choices[2].active, "a matched glob renders, as `always` does");
+        assert!(
+            choices[2].active,
+            "a matched glob renders, as `always` does"
+        );
         assert_eq!(
             choices[2].matched.as_deref(),
-            None,
-            "the `None` map does not name this candidate, whose id is not the one it was built with"
+            Some("htui:src/main.rs"),
+            "D74: the choice carries the path the file set fired on"
         );
-        assert_eq!(active.len(), 1, "the glob candidate missed its own key");
+        assert_eq!(
+            active,
+            vec![candidates[0].clone(), candidates[2].clone()],
+            "and the candidate is in the rendered set, in input order"
+        );
 
         let (active, choices) = select(candidates.clone(), true, Some(&BTreeMap::new()));
         assert_eq!(
@@ -949,7 +978,10 @@ mod tests {
             ],
             "the file set ran and named nothing, which is `no_match`"
         );
-        assert!(!choices[2].active, "a glob that matched nothing renders nothing");
+        assert!(
+            !choices[2].active,
+            "a glob that matched nothing renders nothing"
+        );
         assert_eq!(active, vec![candidates[0].clone()]);
 
         let (active, choices) = select(candidates, false, Some(&matched));
@@ -983,7 +1015,11 @@ mod tests {
         assert_eq!(active, vec![candidate], "a matched glob renders");
         assert_eq!(choices.len(), 1);
         assert_eq!(
-            (choices[0].active, choices[0].reason, choices[0].matched.as_deref()),
+            (
+                choices[0].active,
+                choices[0].reason,
+                choices[0].matched.as_deref()
+            ),
             (
                 true,
                 ChoiceReason::Matched,
@@ -1008,7 +1044,11 @@ mod tests {
 
         assert!(active.is_empty(), "a glob nothing matched renders nothing");
         assert_eq!(
-            (choices[0].active, choices[0].reason, choices[0].matched.clone()),
+            (
+                choices[0].active,
+                choices[0].reason,
+                choices[0].matched.clone()
+            ),
             (false, ChoiceReason::NoMatch, None),
             "no_match is inactive, says so, and carries no path"
         );
@@ -1072,8 +1112,7 @@ mod tests {
             (Activation::Glob, Some(&BTreeMap::new())),
         ] {
             assert_eq!(
-                serde_json::to_value(choice(activation, matches)).expect("a choice serialises")
-                    ["matched"],
+                serde_json::to_value(choice(activation, matches)).expect("a choice serialises")["matched"],
                 serde_json::Value::Null,
                 "every other reason records `matched: null`"
             );
@@ -1109,15 +1148,22 @@ mod tests {
                 "level",
                 "activation",
                 "active",
-                "reason"
+                "reason",
+                "matched"
             ]
             .into_iter()
             .collect(),
+            "§5.1's seven keys and D74's matched: eight, no more and no fewer"
         );
         assert_eq!(value["reason"], serde_json::json!("missing_version"));
         assert_eq!(value["level"], serde_json::json!("phase"));
         assert_eq!(value["activation"], serde_json::json!("glob"));
         assert_eq!(value["version"], serde_json::Value::Null);
+        assert_eq!(
+            value["matched"],
+            serde_json::Value::Null,
+            "D74: only a `matched` choice carries a path"
+        );
         for reason in [
             ChoiceReason::Always,
             ChoiceReason::Matched,

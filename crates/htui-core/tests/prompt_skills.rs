@@ -151,7 +151,10 @@ fn a_glob_skill_the_file_set_missed_records_no_match_and_renders_nothing() {
     assert!(!choice.active);
     assert_eq!(choice.matched, None);
     assert_eq!(
-        spec.skill_matches.as_ref().expect("a file set ran").get(&skill),
+        spec.skill_matches
+            .as_ref()
+            .expect("a file set ran")
+            .get(&skill),
         None,
         "the walk ran and named nothing, which is the empty map behind `no_match`"
     );
@@ -358,18 +361,19 @@ fn the_digest_moves_only_when_the_active_set_moves() {
 /// what keeps a matched path out of the bytes.
 #[test]
 fn a_glob_skill_digest_moves_when_it_stops_matching_and_not_when_it_never_matched() {
-    let fired = glob_spec(&[("htui", "crates/htui-core/src/lib.rs")]);
-    let fired = ok(&fired);
-
-    let mut stops_matching = glob_spec(&[("htui", "crates/htui-core/src/lib.rs")]);
-    still_matching_globs(&mut stops_matching);
-    let stops_matching = ok(&stops_matching);
-
-    let never = glob_spec(&[("htui", "docs/ANA-5.md")]);
+    let fired = ok(&glob_spec(&[("htui", "crates/htui-core/src/lib.rs")]));
+    let stops_matching = ok(&with_globs(
+        glob_spec(&[("htui", "crates/htui-core/src/lib.rs")]),
+        "**/*.md",
+    ));
+    // The same walk, and two globs that both miss it: the second half of the rule, which is what
+    // keeps a `glob` attachment from churning a digest no reader can audit.
+    let never = with_globs(
+        glob_spec(&[("htui", "crates/htui-core/src/lib.rs")]),
+        "**/*.md",
+    );
     let never_matched = ok(&never);
-    let mut still_misses = never;
-    still_matching_globs(&mut still_misses);
-    let still_misses = ok(&still_misses);
+    let still_misses = ok(&with_globs(never, "**/*.txt"));
 
     assert_eq!(
         fired.trim.skill_choices[1].reason,
@@ -388,13 +392,18 @@ fn a_glob_skill_digest_moves_when_it_stops_matching_and_not_when_it_never_matche
         never_matched.digest, still_misses.digest,
         "toggling a glob that never matched changes no rendered byte"
     );
+    assert_eq!(
+        never_matched.trim.skill_choices[1].reason,
+        ChoiceReason::NoMatch
+    );
     assert_eq!(never_matched.trim, still_misses.trim);
 }
 
-/// Points a spec's `glob` skill at `**/*.md` and re-runs the matcher, which is what a caller does
-/// after an edit. Kept out of the test bodies so the assertions read as the rule, not as the
+/// Repoints a spec's `glob` skill at one pattern and re-runs the matcher, which is what a caller
+/// does after an edit. Kept out of the test bodies so the assertions read as the rule, not as the
 /// wiring.
-fn still_matching_globs(spec: &mut PromptSpec) {
-    spec.skills[1].globs = vec!["**/*.md".to_owned()];
+fn with_globs(mut spec: PromptSpec, pattern: &str) -> PromptSpec {
+    spec.skills[1].globs = vec![pattern.to_owned()];
     spec.skill_matches = Some(glob::matched_skills(&spec.skills, &spec.skill_files));
+    spec
 }

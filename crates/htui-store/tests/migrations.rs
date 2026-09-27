@@ -540,9 +540,7 @@ fn the_migration_names_every_reason_the_record_can_carry() {
     let (_, after_keys) = value
         .split_once("each {")
         .expect("0008's comment lists a skill choice's keys");
-    let (keys, _) = after_keys
-        .split_once('}')
-        .expect("the key list is closed");
+    let (keys, _) = after_keys.split_once('}').expect("the key list is closed");
     assert_eq!(
         keys.split(", ").collect::<Vec<_>>(),
         [

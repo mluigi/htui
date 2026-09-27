@@ -1661,7 +1661,8 @@ const IMPL_TRIM_RECORD: &str = r#"{
   ],
   "skill_choices": [
     { "skill": "00000000-0000-0000-0000-000000005111", "name": "rust-style", "version": 2,
-      "level": "project", "activation": "always", "active": true, "reason": "always" }
+      "level": "project", "activation": "always", "active": true, "reason": "always",
+      "matched": null }
   ],
   "excerpts": {
     "provider_set": ["builtin@1"],
