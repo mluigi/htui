@@ -7,8 +7,11 @@
 //! compare-and-set tokens are the whole gate, and they live in the writer ([`crate::skills`]).
 //!
 //! The token a save carries is the head version when the editor opened, not the version shown:
-//! editing v1 while v3 is head saves v4 (plan D1, OQ-5). `skill.updated_at` is the second token
-//! and guards the description (D101).
+//! editing v1 while v3 is head saves v4. That rule is the **Templates** milestone's D1 and OQ-5
+//! (`mod-9-templates-editable.plan.md`), inherited here unchanged — this milestone's plan numbers
+//! its decisions D70-D89 and its open questions OQ-14..OQ-20, so a bare "D1" resolves to nothing
+//! in the contract this file cites. What D101 adds on top is the **second** token,
+//! `skill.updated_at`, which guards the description.
 
 use core::cell::Cell;
 
