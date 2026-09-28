@@ -602,6 +602,58 @@ fn fs_reader_skips_git_gitignored_binary_large_and_lockfiles_in_order() {
 
 #[cfg(unix)]
 #[test]
+fn fs_reader_ignores_symlinked_gitignore_files() {
+    use std::os::unix::fs::symlink;
+
+    let outside = tempfile::tempdir().expect("an outside directory");
+    write(outside.path(), "rules", b"keep.rs\n");
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    for prefix in ["", "nested/"] {
+        write(dir.path(), &format!("{prefix}keep.rs"), b"fn keep() {}\n");
+        symlink(
+            outside.path().join("rules"),
+            dir.path().join(format!("{prefix}.gitignore")),
+        )
+        .expect("symlink");
+    }
+
+    let (paths, truncated) = FsRepoReader::default()
+        .list(&fs_root(dir.path()), 20_000)
+        .expect("the root is readable");
+    assert!(!truncated);
+    assert_eq!(paths, vec!["keep.rs", "nested/keep.rs"]);
+}
+
+#[test]
+fn fs_reader_bounds_gitignore_files_before_parsing() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    let reader = capped(32);
+    for prefix in ["", "nested/"] {
+        write(dir.path(), &format!("{prefix}keep.rs"), b"fn keep() {}\n");
+    }
+
+    // At the cap the rules still apply; one byte over it rejects the entire file, including
+    // the complete rule at its beginning. Exercise both the root and recursive walk.
+    for size in [32, 33] {
+        let mut rules = b"keep.rs\n#".to_vec();
+        rules.resize(size, b'x');
+        for prefix in ["", "nested/"] {
+            write(dir.path(), &format!("{prefix}.gitignore"), &rules);
+        }
+        let (paths, truncated) = reader
+            .list(&fs_root(dir.path()), 20_000)
+            .expect("the root is readable");
+        assert!(!truncated);
+        if size == 32 {
+            assert_eq!(paths, vec![".gitignore", "nested/.gitignore"]);
+        } else {
+            assert_eq!(paths, vec!["keep.rs", "nested/keep.rs"]);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn fs_reader_never_lists_or_reads_through_a_symlink() {
     // Hazard H-1 in its filesystem form, and review finding HIGH H1. A symlink is the one way a
     // *repo-relative* path can name bytes outside the root, and `read` is reached by `select` with

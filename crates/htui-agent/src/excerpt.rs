@@ -255,8 +255,8 @@ impl FsRepoReader {
         names.sort_by(|a, b| a.as_encoded_bytes().cmp(b.as_encoded_bytes()));
 
         // The directory's own `.gitignore`, read once and scoped to this subtree.
-        let pushed = match std::fs::read_to_string(dir.join(".gitignore")) {
-            Ok(text) => {
+        let pushed = match read_gitignore(&dir.join(".gitignore"), self.caps.max_file_bytes) {
+            Some(text) => {
                 let rules = GitignoreSubset::parse(&text);
                 let empty = rules.is_empty();
                 if !empty {
@@ -264,7 +264,7 @@ impl FsRepoReader {
                 }
                 !empty
             }
-            Err(_) => false,
+            None => false,
         };
 
         let mut truncated = false;
@@ -475,6 +475,23 @@ fn open_regular(path: &Path) -> Option<(std::fs::File, std::fs::Metadata)> {
         return None;
     }
     Some((file, after))
+}
+
+/// Ignore files obey the same regular-file and byte limits as excerpt sources. Unreadable,
+/// invalid UTF-8 and oversized files contribute no rules; never parse a truncated prefix.
+fn read_gitignore(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::Read as _;
+
+    let (file, meta) = open_regular(path)?;
+    if meta.len() > max_bytes {
+        return None;
+    }
+    let mut text = String::new();
+    // Metadata can become stale while a file grows, so bound the read itself as well.
+    file.take(max_bytes.saturating_add(1))
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() as u64 <= max_bytes).then_some(text)
 }
 
 /// Whether two [`std::fs::Metadata`] describe the same file, for [`open_regular`]'s re-check.
