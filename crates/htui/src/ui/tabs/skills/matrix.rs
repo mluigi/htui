@@ -958,7 +958,11 @@ impl MatrixView {
             theme.dim
         };
         let mut spans = vec![Span::styled(
-            format!("  {:<LEVEL_WIDTH$}", level.label),
+            // The label is user data — a `slug`, a `graph.name`, a `phase.name` — and the cells
+            // beside it are packed by width, so it takes the same `cut` the skill name does: a
+            // wider label would push every skill column off the row and leave the selected cell
+            // outside the block.
+            format!("  {:<LEVEL_WIDTH$}", cut(&level.label, LEVEL_WIDTH)),
             label_style,
         )];
         for column in self.visible_columns() {
