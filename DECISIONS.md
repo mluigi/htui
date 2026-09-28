@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-31](docs/decisions/mod/mod-31.md)** - A running prompt preview makes an adapter install refuse (done, 2026-09-28)
 - **[MOD-7](docs/decisions/mod/mod-7.md)** - Box registry + capabilities (done, 2026-09-26)
 - **[ANA-22](docs/decisions/ana/ana-22.md)** - How a skill is stored and when it activates (concluded, 2026-09-25)
 - **[MOD-38](docs/decisions/mod/mod-38.md)** - Requirements schema, seam and close-out resolution (done, 2026-09-25)
