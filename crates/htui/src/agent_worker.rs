@@ -463,7 +463,7 @@ impl core::fmt::Debug for AgentRuntime {
     }
 }
 
-/// One task this runtime owns in [`background`](Self::background), and what it writes (MOD-31 D1).
+/// One task this runtime owns in [`background`](AgentRuntime::background), and what it writes (MOD-31 D1).
 ///
 /// The collection mixes two kinds of work and the guard consults only one of them: a probe and a
 /// chat's staleness re-probe both end by writing `agent_box`, and a prompt preview **reaches no
@@ -490,13 +490,13 @@ struct Background {
 enum Writes {
     /// The task ends by writing `agent_box` for at least one row.
     AgentBox,
-    /// The task reaches no write method: it reads, and answers on the frame channel.
+    /// The task reaches no write method: it reads, and answers on the reply channel.
     Nothing,
 }
 
 impl Background {
     /// A task that **writes `agent_box`** for at least one row, so
-    /// [`claim_is_free`](Self::claim_is_free) must see it.
+    /// [`claim_is_free`](AgentRuntime::claim_is_free) must see it.
     ///
     /// The promise: a task pushed here is one an install's re-probe would race on the same row
     /// (hazard H-10, MOD-21 D19), and the guard is entitled to refuse the install beside it. A task
@@ -532,7 +532,7 @@ impl Background {
     }
 
     /// Whether this task writes `agent_box`, which is the one question
-    /// [`claim_is_free`](Self::claim_is_free) asks of the collection.
+    /// [`claim_is_free`](AgentRuntime::claim_is_free) asks of the collection.
     fn writes_agent_box(&self) -> bool {
         matches!(self.writes, Writes::AgentBox)
     }
