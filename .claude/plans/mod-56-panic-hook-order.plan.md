@@ -52,7 +52,10 @@ hooks") — the order is the contract, and only the app can honour it when it al
   `std::panic::set_hook` is process state and `tests/panic_hook.rs` says so in its own module doc:
   a second case in that binary, running in parallel, would see this one's hook. So the real-chain
   assertions are appended to `a_contained_provider_panic_leaves_the_terminal_alone`, after the
-  predicate assertions it already makes, and the binary keeps exactly one test.
+  predicate assertions it already makes, and the binary keeps exactly one test. (Amended at review:
+  the source guard added by HIGH-1 is a *second* binary, not a second test in this one, and D219
+  does not forbid it — it touches no hook, so the process-state rule that forces D219 never
+  applies to it.)
 - **D220 — the test asserts the *effect*, not the predicate.** The existing test already pins
   `restores_the_terminal()` per panic. What is untested — and what MOD-56 is about — is that the
   decision *reaches* the restore. The new half drives the real chain with a counting restore and
@@ -79,6 +82,7 @@ hooks") — the order is the contract, and only the app can honour it when it al
 |---|---|
 | `crates/htui/src/terminal.rs` | `init` builds the terminal (D217); `install_panic_hook` delegates to a new `install_panic_hook_restoring` (D218); `enter`'s comment (D221) |
 | `crates/htui/tests/panic_hook.rs` | the real-chain half of the existing `#[test]` (D219, D220) |
+| `crates/htui/tests/panic_hook_order.rs` | **new, added at review** — the source guard for D217, i.e. Risk 3's mitigation |
 
 No other file changes. `lib.rs::run` calls `terminal::init()` once and is unaffected.
 
@@ -104,11 +108,14 @@ halves are one commit's worth of work and one reviewer pass covers both.
 
 ## Test plan
 
-- `cargo test -p htui --test panic_hook -- --test-threads=1` — the extended test; the only new case.
+- `cargo test -p htui --test panic_hook --test panic_hook_order -- --test-threads=1` — the extended
+  test and the new source guard.
 - The existing three predicate assertions inside it are unchanged and must still pass — the fix
   changes the chain, not the predicate.
+- The guard is red against the pre-fix `init()`: revert `init` to `ratatui::init()`, and
+  `panic_hook_order` fails while `panic_hook` still passes. That asymmetry is the point.
 - Full workspace gate (below). The `htui` crate's other tests do not touch the terminal, so the
-  blast radius is one binary.
+  blast radius is two binaries.
 
 ## Risks
 
@@ -121,8 +128,17 @@ halves are one commit's worth of work and one reviewer pass covers both.
    If the reviewer objects, the fallback is a `#[cfg(test)]` unit test inside `terminal.rs` and a
    private seam — at the cost of putting a hook-mutating test in the lib's shared test binary,
    which the repo's own convention argues against.
-3. **A future `ratatui::init` call anywhere re-breaks this.** Mitigated by D221's comment, which
-   now names *this* bug as the reason, not just hook stacking.
+3. **A future `ratatui::init` call anywhere re-breaks this.** *Amended at review.* The plan already
+   named this risk, and accepted D221's comment as the entire mitigation — the review raised its
+   severity, from a risk the plan had named to one the plan could not actually catch, because a
+   comment fails no test. Concretely: the test half drives the seam directly and never calls
+   `init()`, so reverting `init()` to `ratatui::init()` left every test in `panic_hook.rs` green
+   (verified, not assumed). The mitigation is now a source guard, `tests/panic_hook_order.rs`,
+   asserting that `terminal.rs`'s code contains none of `ratatui::init`, `ratatui::try_init`,
+   `init_with_options` or `set_panic_hook` — the same move as
+   `prompt_settings.rs::no_key_name_is_spelled_in_the_section`. It reads the file with its comments
+   stripped, because the fix is *about* naming the functions it forbids. D221's comment stays, as
+   the thing that says why the guard is not pedantry.
 4. **The workspace lints `unused_qualifications = "warn"`** and the gate runs `-D warnings`, so
    `std::io::stdout()` and `crossterm::…` must stay fully qualified (the file's existing style). The
    only import line that changes is the `use ratatui::…` one.
@@ -132,7 +148,7 @@ halves are one commit's worth of work and one reviewer pass covers both.
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-features --all-targets -- -D warnings
-cargo test -p htui --test panic_hook -- --test-threads=1
+cargo test -p htui --test panic_hook --test panic_hook_order -- --test-threads=1
 USERNAME=htui-ci HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres \
   cargo test --workspace --all-features -- --test-threads=1
 ```
@@ -150,6 +166,8 @@ screen. Then `Ctrl-C`/kill the process ungracefully and confirm the terminal is 
 
 - [ ] `init()` no longer calls `ratatui::init`/`try_init`/`init_with_options`; htui's hook is the
       outermost one for the whole process lifetime.
+- [ ] That is enforced by a test, not only by a comment: `tests/panic_hook_order.rs` fails if any of
+      those four names reappears in `terminal.rs`'s code.
 - [ ] A contained provider panic (spawned and inline) does not restore the terminal; an
       uncontained panic does. Asserted through the real hook chain, not through the predicate.
 - [ ] `install_panic_hook()` keeps its signature and its behaviour for the production path.

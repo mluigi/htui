@@ -9,8 +9,9 @@
 //! instead of calling `ratatui::init`, which installs a hook of its own that restores the
 //! terminal unconditionally *before* calling the one it wrapped (`ratatui-0.30.2/src/init.rs:398`,
 //! `:566-572`); behind that one, this predicate is an opinion with no way to act on it (MOD-56
-//! D217). Nothing here may take a ratatui init again; `Suspend::enter` says so a second time,
-//! for the case where the one that is tempting is the one that is already running.
+//! D217). Nothing here may take a ratatui init again, and `Suspend::enter` has to say so for
+//! itself: the temptation arrives mid-session, with a terminal already up and no ratatui init
+//! running to defer to.
 
 use ratatui::{DefaultTerminal, Terminal, backend::CrosstermBackend};
 
@@ -25,16 +26,22 @@ pub struct TerminalGuard {
 
 /// Installs the panic hook and takes the terminal over.
 ///
-/// Panics if the terminal cannot be put into raw mode, which is [`ratatui::init()`]'s contract;
-/// there is no usable TUI in that case, and the panic is safe because the hook is installed first
-/// and restores on it (MOD-56 D217).
+/// Panics if the terminal cannot be put into raw mode, cannot be given the alternate screen, or
+/// cannot be measured: the three `expect`s below. That is [`ratatui::init()`]'s contract — it is
+/// `try_init().expect(...)` — now covering the two steps this crate performs itself. There is no
+/// usable TUI in any of the three cases and `lib.rs::run` has no error path for one.
+///
+/// The panic is safe because of the order, which is the whole of MOD-56 (D217): the hook goes in
+/// before the first `expect`, so it is already the outermost one in the process when any of the
+/// three fires, and the restore runs ahead of the unwind reaching the default hook underneath it.
 #[must_use]
 pub fn init() -> TerminalGuard {
     install_panic_hook();
-    // `ratatui::try_init`'s body, minus its `set_panic_hook` (`init.rs:397-402`). Written out
+    // `ratatui::try_init`'s body, minus its `set_panic_hook` (`init.rs:398-402`). Written out
     // because the order is the fix: the hook above is the outermost one from here to the end of
     // the process, and a second one — restoring unconditionally ahead of it — would put this
     // crate back where MOD-56 found it, with the predicate right and the terminal gone anyway.
+    // `tests/panic_hook_order.rs` is what keeps this shape.
     crossterm::terminal::enable_raw_mode().expect("htui cannot put the terminal into raw mode");
     crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)
         .expect("htui cannot enter the alternate screen");
