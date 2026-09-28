@@ -909,7 +909,7 @@ the attachments are inherent on [`MemStore`](crate::store::MemStore) / `PgStore`
     ///
     /// `skill_version` carries **no** `updated_at` trigger (`0001_init.sql` §5.1 names it as
     /// deliberately absent), so this never moves `skill.updated_at` and the two tokens of a
-    /// [`SaveSkill`](https://docs.rs) are independent surfaces (blueprint D101).
+    /// `SaveSkill` are independent surfaces (blueprint D101).
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) when `expected` is `Some` and
@@ -3928,7 +3928,7 @@ pub struct NewStepGraph {
     /// `step_graph.is_override` (ANA-2 §4.1): a per-item clone, hidden from the graph list.
     /// **Not** here in milestone 2 — both stores hard-coded `false` (`mem.rs:2539` and the
     /// Postgres `INSERT`), which is the defect this milestone closes. Only
-    /// [`override_graph`](https://docs.rs) sets it `true`; every other construction site is a
+    /// `htui_orch::graph::override_graph` sets it `true`; every other construction site is a
     /// maintainer- or fixture-created graph and says `false` (plan D85, OQ-16).
     pub is_override: bool,
 }

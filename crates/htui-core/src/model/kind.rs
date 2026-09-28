@@ -162,18 +162,16 @@ pub struct NewStepGraph {
     ///
     /// Here from MOD-9 milestone 3 (plan D85, OQ-16). Both stores hard-coded `false` before it —
     /// which is why `Engine::phase_skills`'s override note could never fire in production — and the
-    /// only writer that sets it `true` is
-    /// [`htui_orch::graph::override_graph`](https://docs.rs); every other construction site is a
-    /// maintainer- or fixture-created graph and says `false`.
+    /// only writer that sets it `true` is `htui_orch::graph::override_graph`; every other
+    /// construction site is a maintainer- or fixture-created graph and says `false`.
     pub is_override: bool,
 }
 
 /// Edit passed to [`crate::store::WriteStore::update_step_graph`]; `None` leaves the column.
 ///
 /// `is_override` is not here: an override is a clone, minted by
-/// [`htui_orch::graph::override_graph`](https://docs.rs) with
-/// [`NewStepGraph::is_override`] set, and a graph does not stop being one. The column arrives with
-/// MOD-4's `0003` (PRD scope), so nothing edits it.
+/// `htui_orch::graph::override_graph` with [`NewStepGraph::is_override`] set, and a graph does not
+/// stop being one. The column arrives with MOD-4's `0003` (PRD scope), so nothing edits it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StepGraphPatch {
     /// `step_graph.name`.
