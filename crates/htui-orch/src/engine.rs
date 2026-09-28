@@ -12806,6 +12806,66 @@ mod tests {
         );
     }
 
+    /// MOD-9 D89: a step whose previous attempt has no row is a miss, and a miss is said out
+    /// loud. `forwarded` records the same absence (`no attempt N at position P to forward from`)
+    /// and returns; this pass returned with nothing, so an operator reading `trim_record` saw a
+    /// short file set and no reason for it.
+    ///
+    /// Attempt 3 is the shape: the rows for attempt 1 exist and attempt 2 never ran, so the
+    /// lookup for `attempt - 1` is empty while the guards above it are both satisfied. Reachable
+    /// in a real run — `group_at` skips a judge-only slot (`fanout_index < 0`), so a step retried
+    /// onto a slot whose previous attempt held no candidate row hits it.
+    #[tokio::test]
+    async fn a_step_with_no_previous_attempt_row_notes_the_miss() {
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_repo, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        glob_the_tests_skill(&harness, &["**/*.md"]).await;
+        harness.orch.isolator.script_changed_paths(vec![RepoPath {
+            repo: "htui".to_owned(),
+            path: "docs/notes.md".to_owned(),
+        }]);
+        harness_engine!(harness.orch, engine);
+
+        let mut spec = engine
+            .phase_spec(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                true,
+            )
+            .await
+            .expect("the spec is built")
+            .expect("`prd` requires nothing");
+        let mut third = prd.clone();
+        third.attempt = 3;
+        engine
+            .with_excerpts(&row, &third, ids::HTUI_FEAT_3, &mut spec)
+            .await
+            .expect("no store fault");
+
+        assert_eq!(
+            spec.excerpts
+                .notes
+                .iter()
+                .filter(|note| note.contains("no attempt 2 at position"))
+                .collect::<Vec<_>>(),
+            vec!["no attempt 2 at position 0 to diff (plan D67)"],
+            "the same shape `forwarded` records for the same absence, worded for this verb"
+        );
+        assert!(
+            harness.orch.isolator.changed_path_requests().is_empty(),
+            "and nothing was asked: there is no row to ask about"
+        );
+        assert_eq!(
+            spec.skill_files, spec.excerpts.listed,
+            "so the file set is the walk's listing alone"
+        );
+    }
+
     /// MOD-9 D89: `FEAT-3`'s project-level `tests` attachment, flipped from `Always` to `Glob`
     /// through the real writer and under the row's own `updated_at` token.
     ///
