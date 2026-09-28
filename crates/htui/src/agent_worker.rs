@@ -720,6 +720,10 @@ impl AgentRuntime {
     /// The predicate is named through a closure rather than as `Background::writes_agent_box`,
     /// because `filter` hands it `&&Background` and a method on `&self` is a `fn(&Background)`:
     /// the same path spelled as a function item is a trait-bound error, not a clippy lint.
+    /// [`claim_is_free`](Self::claim_is_free) asks the same question of the same collection and
+    /// spells it `any(Background::writes_agent_box)` instead, because `any` hands it
+    /// `&Background` and so takes the function item directly — `any` takes `FnMut(Self::Item)`
+    /// where `filter` takes `FnMut(&Self::Item)`. Neither spelling is the other's mistake.
     #[must_use]
     pub fn writing_background_len(&self) -> usize {
         self.background
@@ -5963,7 +5967,7 @@ pub(crate) mod tests {
     /// already running on this box"* while the only thing alive was the preview, and no probe had
     /// been asked for.
     ///
-    /// The three `serve` calls are adjacent on purpose: `serve` sweeps finished tasks as its first
+    /// The two `serve` calls are adjacent on purpose: `serve` sweeps finished tasks as its first
     /// statement, so an `await` of my own between the preview and the install could sweep the very
     /// entry whose presence makes this case mean anything.
     #[tokio::test]
@@ -6162,6 +6166,11 @@ pub(crate) mod tests {
         assert!(
             matches!(previewed, Served::Deferred),
             "the preview is deferred to the runtime's own task (`R-NF-3`): {previewed:?}"
+        );
+        assert_eq!(
+            runtime.background_len(),
+            1,
+            "the preview is in the collection, so the zero below is about which entry it is"
         );
         assert_eq!(
             runtime.writing_background_len(),
