@@ -12585,6 +12585,12 @@ mod tests {
     /// The union is the assertion: `docs/notes.md` is in the walk's listing *and* in the scripted
     /// answer, so it must appear **once** and in the listing's position — the de-duplication and
     /// the order are what make the recorded `matched` path the walk's when both could match.
+    ///
+    /// Two of the four scripted names are ones the walk refuses, and they are in the answer on
+    /// purpose. `Cargo.lock` is on disk and denied by `NOISE_SUFFIX`; `../outside.rs` is not even
+    /// repo-relative. `listed` is post-both-guards and `changed` is verbatim git output, so
+    /// without the union applying the same two the file set would carry names no `glob` should
+    /// fire on — the matcher does not re-filter (H-21), so this is the only place they are dropped.
     #[tokio::test]
     async fn changed_paths_are_the_files_the_previous_attempt_touched() {
         let harness = Harness::new().await;
@@ -12597,7 +12603,8 @@ mod tests {
             "docs/notes.md",
             "Not on the touched list.\n",
         );
-        glob_the_tests_skill(&harness, &["**/*.md"]).await;
+        write_tree(dir.path(), repo, "Cargo.lock", "# lockfile\n");
+        glob_the_tests_skill(&harness, &["**/*.md", "**/*.lock", "**/*.rs"]).await;
         let second = retry_with_commits(&harness, row.clone(), &prd, repo).await;
         harness.orch.isolator.script_changed_paths(vec![
             RepoPath {
@@ -12607,6 +12614,14 @@ mod tests {
             RepoPath {
                 repo: "htui".to_owned(),
                 path: "src/only-the-diff-saw-it.rs".to_owned(),
+            },
+            RepoPath {
+                repo: "htui".to_owned(),
+                path: "Cargo.lock".to_owned(),
+            },
+            RepoPath {
+                repo: "htui".to_owned(),
+                path: "../outside.rs".to_owned(),
             },
         ]);
         harness_engine!(harness.orch, engine);
@@ -12639,7 +12654,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["docs/notes.md", "src/lib.rs", "src/only-the-diff-saw-it.rs",],
             "D87/D89: the walk's listing, then the changed paths the walk never saw, each once and \
-             in that order"
+             in that order — and neither of the two the walk's own guards refuse"
+        );
+        assert_eq!(
+            spec.skill_files
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter(|path| path.ends_with(".lock") || path.contains(".."))
+                .collect::<Vec<_>>(),
+            Vec::<&str>::new(),
+            "H-21: `Pattern::matches` is a pure function of the name and does not re-filter, so the \
+             union is where `Cargo.lock` and `../outside.rs` have to die. A file set carrying them \
+             would match a `**/*.lock` attachment on a file the prompt never showed the model and \
+             that the excerpt pass denied by rule"
+        );
+        assert!(
+            spec.excerpts.notes.iter().any(|note| {
+                note.contains("htui:../outside.rs") && note.contains("not_repo_relative")
+            }),
+            "and the denial is recorded, because the walk's own `declared but denied` note cannot \
+             be the whole of it: that one is written while the listing is built, from the paths the \
+             reader returned, so a name that is in no tree at all — `../outside.rs` — is dropped \
+             without a word. Notes: {:?}",
+            spec.excerpts.notes
         );
         assert_eq!(
             spec.skill_files,
