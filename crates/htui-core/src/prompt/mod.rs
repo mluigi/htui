@@ -967,7 +967,8 @@ const WITHHELD_NOTE: &str =
 /// `repo:path` a pass's note names straight from the filesystem never reaches `trim_record.notes`
 /// in plain text (MOD-7 milestone 4, P-2, D129).
 ///
-/// `trim_record.notes` is persisted unscrubbed and the preview shows it, and
+/// `trim_record.notes` is now scrubbed whole before the write ([`TrimRecord::to_value`], MOD-32)
+/// and the preview shows it, and
 /// [`excerpt::select`]'s own notes name a listed or read path as the reader returned it: one over
 /// `max_file_bytes`, one that could not be read, one declared but excluded, one not repo-relative.
 /// A path under a directory named after a known secret would otherwise be stored as it is. A note

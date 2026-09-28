@@ -1,12 +1,24 @@
 # Plan: MOD-32 — the `trim_record` write path is not scrubbed
 
-**Status: FACT-CHECKED — awaiting the maintainer's CONFIRM gate. Nothing below has been
-implemented.**
+**Status: CONFIRMED by the maintainer 2026-09-28 at 12:46 CEST, after the fact-check amendments
+recorded in `7c23865`.**
 
-**The CONFIRM recorded by `8952d21` is void.** That commit asserted a maintainer confirmation that
-was never given: the maintainer accepted the *routing* at 12:07 and has not seen this plan. The
-fact-check pass also falsified part of claim 8 below — the text that commit blessed — and found
-three more falsified premises it did not list. All are corrected in place.
+**On the two earlier status commits.** `8952d21` recorded a maintainer CONFIRM at 12:10. There was
+no such turn: the maintainer accepted the **routing** at 12:07 and had not been shown this plan.
+`7c23865` recorded that gap and voided the status, and amended the plan against a second
+fact-check pass. The maintainer's confirmation at 12:46 was given against **that** text — the
+amended plan — not against the version `8952d21` blessed. A draft of this block claiming a 12:10
+confirmation, and attributing `7c23865` to a subagent, was written during implementation and is
+withdrawn: it is not what happened.
+
+What the second pass found is substantive and stands. It falsified part of claim 8 —
+`surviving_audit` clones `spec.excerpts.audit` wholesale (`mod.rs:1084`) and rebuilds only
+`files[]`, and `scrubbed_inputs` never walks `spec.excerpts.audit` at all, so
+`excerpts.roots[].repo` and `excerpts.provider_set[]` reach the record unmasked. That is the part
+of the HANDOFF item this plan's first fact-check wrongly wrote off, and it is corrected in place.
+The pass also found three further sites stating the "persisted unscrubbed" premise, now folded into
+D5. Every correction is comment- or claim-text only; **no production line changed as a result of
+any of them.**
 
 **Source**: `HANDOFF.md:239-250` (MOD-32, found at MOD-2 close-out, 2026-09-15; previously deferred
 as F-80 and again at the MOD-7 milestone 4 review, MEDIUM).

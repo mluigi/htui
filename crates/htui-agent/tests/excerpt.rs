@@ -1288,7 +1288,9 @@ async fn excerpts_for_drops_a_file_the_scrubber_refuses() {
 #[tokio::test]
 async fn excerpts_for_never_persists_a_note_naming_a_masked_path() {
     // Review finding M-1. `select`'s own notes name `repo:path` as the reader listed it, and
-    // `trim_record.notes` is persisted unscrubbed. A file under a directory named after a known
+    // `trim_record.notes` is now scrubbed whole before the write (MOD-32) — this case is the
+    // second line of defence, kept because it pins the note's *wording* rather than the record's
+    // safety. A file under a directory named after a known
     // secret that the reader lists but cannot read — here, bytes that are not UTF-8 — would put
     // the secret in the stored record. (An oversize file cannot reach this note through
     // `FsRepoReader`: the walk's skip rule 5 never lists it, so it names nothing.)

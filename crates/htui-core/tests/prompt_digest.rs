@@ -1385,3 +1385,166 @@ fn the_record_vocabularies_spell_themselves_once() {
         assert_eq!(source.as_str(), serialised(&source), "{source:?}");
     }
 }
+
+#[test]
+fn a_known_secret_in_a_caller_note_is_masked_in_the_record() {
+    // MOD-32, T1 case 1. `PromptSpec.notes` is caller free text, copied verbatim into
+    // `trim_record.notes` at `prompt/mod.rs:1110-1114`, and no `mask` call in `scrubbed_inputs`
+    // reaches it — so nothing scrubbed the record's own strings on the way to the store.
+    //
+    // This case pins the **masking** half, not the scanning half, and the distinction is the
+    // point: a known secret is maskable, so a pass that only refused would fail a step over a
+    // value the scrubber can remove. The engine's caller hands in a `MinimalScrubber` holding
+    // exactly these strings (`record.rs:362`).
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.notes = vec![format!("clamped hops to {SECRET} on this box")];
+    let prompt = ok(&spec);
+
+    let value = prompt
+        .trim
+        .to_value(&MinimalScrubber::new([SECRET.to_owned()]))
+        .expect("a maskable secret in a caller note is masked, not refused");
+    assert_eq!(
+        value["notes"][0],
+        serde_json::json!("clamped hops to [REDACTED] on this box"),
+        "the note is masked in the value that is persisted, at the note's own index"
+    );
+    assert!(
+        !value.to_string().contains(SECRET),
+        "no leaf of the persisted record may carry the secret: {value}"
+    );
+}
+
+#[test]
+fn a_credential_shaped_string_in_the_record_refuses_the_serialisation() {
+    // MOD-32, T1 case 2. The fail-closed half, on the persist path: `R-SEC-3` gates what is
+    // written, and a credential-shaped string the scrubber cannot mask must stop the write
+    // rather than reach `run_step.trim_record`.
+    //
+    // Case 1 proves the pass masks; this proves it also *refuses*, and a scan that only looked
+    // would let a case 1 style masking bug through in the other direction. Together they are the
+    // one call: mask, then fail closed on residue (`scrub.rs:228-233`).
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.notes = vec!["the key is AKIAAAAAAAAAAAAAAAAA".to_owned()];
+    let prompt = ok(&spec);
+
+    let error = prompt
+        .trim
+        .to_value(&scrubber())
+        .expect_err("`R-SEC-3` is fail-closed on the persist path too");
+
+    assert_eq!(
+        error.rule, "aws_access_key_id",
+        "the rule names the finding"
+    );
+    assert_eq!(
+        error.path, "/notes/0",
+        "the pointer locates the note, which is the fact a maintainer can act on"
+    );
+    // This error is logged and persisted in an `error` event, so its `Display` and `Debug` are
+    // the security contract (`scrub.rs:60-71`) and neither may repeat the text.
+    for rendered in [&error.to_string(), &format!("{error:?}")] {
+        assert!(!rendered.contains("AKIA"), "leaked: {rendered}");
+        assert!(
+            !rendered.contains("AAAAAAAAAAAAAAAAAA"),
+            "leaked: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn the_template_name_is_reached_by_a_pass_that_enumerates_nothing() {
+    // MOD-32, T1 case 3 — the falsification guard, and the only case here that is about the
+    // *shape* of the fix rather than its behaviour.
+    //
+    // `spec.template.name` is a `prompt_template` row name that no `mask` call in
+    // `scrubbed_inputs` names, and the HANDOFF item did not predict it: the fields it named are
+    // already covered. So the defect was never "these three strings" — it was a guarantee
+    // expressed as an enumeration, which goes stale the day a field is added and nobody extends
+    // it. This case is what a future reversion to a field list fails on, and the mutation in the
+    // task report (mask `self.notes` only) is exactly that reversion.
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.template.name = "sk-ant-api03-DEADBEEF".to_owned();
+    let prompt = ok(&spec);
+
+    let error = prompt
+        .trim
+        .to_value(&scrubber())
+        .expect_err("a field no mask call ever named is still reached by the whole-record pass");
+
+    assert_eq!(error.rule, "anthropic_api_key");
+    assert_eq!(error.path, "/template/name");
+    assert!(!error.to_string().contains("DEADBEEF"), "{}", error);
+}
+
+#[test]
+fn the_audit_root_and_provider_strings_are_reached_by_the_pass() {
+    // MOD-32, T1 case 3b — the pair the plan's **first** fact-check wrongly wrote off.
+    //
+    // `scrubbed_inputs` walks `spec.excerpts.files` and never `spec.excerpts.audit`, and
+    // `surviving_audit` clones the audit wholesale (`prompt/mod.rs:1084`), rebuilding only
+    // `files[]`. So `excerpts.roots[].repo` and `excerpts.provider_set[]` reach the record exactly
+    // as the reader produced them — the root strings are, in the HANDOFF item's own words, the
+    // part that leaks. They are the two fields a future reversion to a field list would most
+    // plausibly miss, because they sit in the same struct as the fields that are covered.
+    let mut roots_spec = fixtures::phase_implement_attempt2();
+    assert!(
+        !roots_spec.excerpts.audit.roots.is_empty(),
+        "the fixture carries a root record, which is what this case mutates"
+    );
+    roots_spec.excerpts.audit.roots[0].repo = "sk-ant-api03-ROOTSLUG".to_owned();
+    let root_error = ok(&roots_spec)
+        .trim
+        .to_value(&scrubber())
+        .expect_err("an audit root slug is a record string like any other");
+    assert_eq!(
+        root_error.rule, "anthropic_api_key",
+        "the rule names the finding"
+    );
+    assert_eq!(
+        root_error.path, "/excerpts/roots/0/repo",
+        "and the pointer locates the root record, not the files array"
+    );
+    assert!(!root_error.to_string().contains("ROOTSLUG"), "{root_error}");
+
+    let mut provider_spec = fixtures::phase_implement_attempt2();
+    assert!(
+        !provider_spec.excerpts.audit.provider_set.is_empty(),
+        "the fixture carries a provider id, which is what this case mutates"
+    );
+    provider_spec.excerpts.audit.provider_set[0] = "AKIAAAAAAAAAAAAAAAAA@2".to_owned();
+    let provider_error = ok(&provider_spec)
+        .trim
+        .to_value(&scrubber())
+        .expect_err("a provider id is a record string like any other");
+    assert_eq!(provider_error.rule, "aws_access_key_id");
+    assert_eq!(provider_error.path, "/excerpts/provider_set/0");
+    assert!(
+        !provider_error.to_string().contains("AKIA"),
+        "{provider_error}"
+    );
+}
+
+#[test]
+fn scrubbing_a_record_twice_changes_nothing() {
+    // MOD-32, T1 case 4. `to_value` masks, so a caller that serialises a record whose strings are
+    // already masked must record the same bytes. Without this, an idempotence bug would make the
+    // second write differ from the first and the column's bytes depend on how many times a
+    // payload passed through.
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.notes = vec![format!("clamped hops to {SECRET}")];
+    let prompt = ok(&spec);
+    let scrubber = MinimalScrubber::new([SECRET.to_owned()]);
+
+    let once = prompt.trim.to_value(&scrubber).expect("maskable");
+    let twice = prompt
+        .trim
+        .to_value(&scrubber)
+        .expect("already masked, still clean");
+    assert_eq!(once, twice, "masking is idempotent (`scrub.rs:52`)");
+    assert_eq!(
+        twice["notes"][0],
+        serde_json::json!("clamped hops to [REDACTED]"),
+        "and the second pass does not mask the marker again"
+    );
+}
