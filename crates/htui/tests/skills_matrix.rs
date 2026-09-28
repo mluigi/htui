@@ -688,12 +688,9 @@ async fn a_spent_token_leaves_the_row_as_it_is_and_says_so() {
     );
 }
 
-/// The picker writes the `<repo>:` qualifier from the **project's own repos**, read from the
-/// hierarchy. The demo fixture holds no `repo` row at all, so the test creates one the way a user
-/// would have.
-#[tokio::test]
-async fn a_repo_picker_writes_the_qualifier_from_the_project_s_repos() {
-    let store = MemStore::demo();
+/// The demo fixture holds no `repo` row at all, so a picker case creates one the way a user
+/// would have — and the **primary** one, so the level list is otherwise the seed's.
+async fn with_tutorials_repo(store: &MemStore) {
     store
         .create_repo(NewRepo {
             id: RepoId::new(),
@@ -705,6 +702,14 @@ async fn a_repo_picker_writes_the_qualifier_from_the_project_s_repos() {
         })
         .await
         .expect("the direct write");
+}
+
+/// The picker writes the `<repo>:` qualifier from the **project's own repos**, read from the
+/// hierarchy.
+#[tokio::test]
+async fn a_repo_picker_writes_the_qualifier_from_the_project_s_repos() {
+    let store = MemStore::demo();
+    with_tutorials_repo(&store).await;
     let mut harness = matrix(open_over(store.clone()).await).await;
     go_to(&mut harness, "vulkan-tutorials");
     harness.key("e");
@@ -736,6 +741,55 @@ async fn a_repo_picker_writes_the_qualifier_from_the_project_s_repos() {
         only(&store).await.expect("the row").globs,
         ["tutorials:**/*.rs"],
         "and the store received it"
+    );
+}
+
+/// D83 / H-33: a repo-qualified attachment reopens on the **bare** globs, so `Ctrl+S` on a
+/// reopened row is a no-op. The stored list already carries the `<repo>:` and the picker prepends
+/// it to every line again, so a field seeded with the stored list would save
+/// `tutorials:tutorials:**/*.rs` — a `GlobError` about a glob the user never typed, which leaves
+/// the row editable only once and the write never landing.
+#[tokio::test]
+async fn a_qualified_attachment_reopens_without_a_second_qualifier() {
+    let store = MemStore::demo();
+    with_tutorials_repo(&store).await;
+    let mut harness = matrix(open_over(store.clone()).await).await;
+    go_to(&mut harness, "vulkan-tutorials");
+
+    harness.key("e");
+    type_text(&mut harness, "**/*.rs");
+    harness.key("R");
+    harness.settle().await;
+    harness.key("j");
+    harness.key("enter");
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let stored = only(&store).await.expect("the row").globs;
+    assert_eq!(stored, ["tutorials:**/*.rs"], "the first save qualified it");
+
+    harness.key("e");
+    let frame = harness.render();
+    assert!(
+        frame.contains("tutorials:**/*.rs"),
+        "the effective globs the form previews are the stored ones, qualifier and all: {frame}"
+    );
+    assert!(
+        !frame.contains("tutorials:tutorials:"),
+        "and the qualifier is not written twice — the form opens on the bare glob, because the \
+         picker re-adds the prefix to every line it saves: {frame}"
+    );
+
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let frame = harness.render();
+    assert_eq!(
+        only(&store).await.expect("the row").globs,
+        stored,
+        "saving a reopened row changes nothing, which is what makes reopen-then-save safe"
+    );
+    assert!(
+        !notice(&frame).contains("only a whole component"),
+        "and the save was not refused with a `GlobError` about a glob the user never typed: {frame}"
     );
 }
 
