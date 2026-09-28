@@ -3815,15 +3815,14 @@ async fn a_run_with_no_item_is_never_refused_for_tags() {
     .await
     .expect("plant a queued run with no item");
 
+    let owner = uuid::Uuid::now_v7();
+    // `timestamptz` is microsecond-resolution, so the lease comes back truncated from the
+    // nanoseconds it was handed. `MemStore` keeps every digit, which is why the same assertion
+    // needs no truncation there; `ChatRunSpec::mint` truncates for the same reason.
+    let until = (at + TimeDelta::minutes(5)).trunc_subsecs(TIMESTAMPTZ_DIGITS);
     assert_eq!(
         db.store
-            .claim_run(
-                id,
-                ids::BOX,
-                uuid::Uuid::now_v7(),
-                at,
-                at + TimeDelta::minutes(5)
-            )
+            .claim_run(id, ids::BOX, owner, at, until)
             .await
             .expect("the claim is answered"),
         Claim::Admitted,
@@ -3838,8 +3837,9 @@ async fn a_run_with_no_item_is_never_refused_for_tags() {
     assert_eq!(claimed.status, RunStatus::Running);
     assert_eq!(claimed.executing_box_id, Some(ids::BOX));
     assert_eq!(
-        claimed.item_id, None,
-        "it is still the run that was claimed"
+        claimed.lease_expires_at,
+        Some(until),
+        "the admitted claim wrote the lease it was handed"
     );
 
     db.drop_db().await;
