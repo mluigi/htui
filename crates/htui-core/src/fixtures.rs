@@ -2044,6 +2044,21 @@ mod tests {
         }
     }
 
+    /// MOD-9 plan D85, blueprint H-39: the same rule one table over. The demo loader's
+    /// `INSERT INTO step_graph` names six columns and never `is_override`, so Postgres reads the
+    /// column default. A fixture graph marked `true` would therefore load as a different graph into
+    /// the two stores, and `inherent_prompt_reads_answer_the_fixture` would compare two of them.
+    #[test]
+    fn demo_graphs_are_not_overrides() {
+        for graph in &demo_data().graphs {
+            assert!(
+                !graph.is_override,
+                "the demo loader writes no `is_override`, so every seeded graph takes the column \
+                 default: {graph:?}"
+            );
+        }
+    }
+
     #[test]
     fn demo_at_is_anchored_at_the_first_of_september() {
         assert_eq!(demo_at(0, 0).to_rfc3339(), "2026-09-01T00:00:00+00:00");
