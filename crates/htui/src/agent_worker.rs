@@ -6027,19 +6027,22 @@ pub(crate) mod tests {
         // either. This case pins the *absence of the refusal*, and absence of a refusal is not
         // presence of a success: `install_plan` gets past the guard, spawns `run_plan`, and the
         // registry is unrouted, so the pre-flight fails for the fixture's own reasons. A success
-        // assertion would be a claim this fixture cannot support.
+        // assertion would be a claim this fixture cannot support, and `Served::Deferred` would pass
+        // on a runtime that refused the plan for some *other* reason — which is the bug's own
+        // failure mode, wrong-reason instead of no-reason.
         //
-        // Two rewrites are worth naming, because both look like improvements. Asserting
-        // `Served::Deferred` would pass on a runtime that refused the plan for some *other*
-        // reason — which is the bug's own failure mode, wrong-reason instead of no-reason. And
-        // asserting `!message.contains("probe is already running")` would pin nothing at all: that
-        // sentence is gone from the tree, so it is vacuously absent on every path, before and
-        // after the fix. The property under test is the guard declining to fire, so the substring
-        // is the guard's own words.
+        // **Two** sentences are checked, and the second is load-bearing. Naming only the new one
+        // makes the assert vacuous: the pre-fix guard refuses with *other words*, so a runtime
+        // that is still broken never produces the string this case looks for. Written that way it
+        // passed against the very code it exists to fail. The old sentence is therefore pinned as
+        // the bug's fingerprint, so "the guard declined to fire" is total rather than partial. No
+        // other refusal carries either substring: the login and install arms name an agent id, and
+        // `BOX_PROBE_RUNNING` says "is running", not "already running".
         if let Served::Reply(StoreReply::Failed { request, message }) = &planned {
             assert_eq!(*request, "install_plan");
             assert!(
-                !message.contains("already writing this box"),
+                !message.contains("already writing this box")
+                    && !message.contains("already running on this box"),
                 "a preview writes no `agent_box` row, so it holds no claim (MOD-31 D5): {message}"
             );
         }
@@ -6165,12 +6168,14 @@ pub(crate) mod tests {
         let probed = runtime
             .serve(&backend, &tx, &envelope(2, StoreRequest::ProbeBox))
             .await;
-        // The same rule as the install case, for the same two reasons: the *refusal* is what is
-        // pinned, not the probe's outcome. See that case's comment for why.
+        // The same rule as the install case, and for the same two reasons: the *refusal* is what is
+        // pinned rather than the probe's outcome, and both of the guard's sentences are checked so
+        // the assert is not vacuous against the pre-fix guard. See that case's comment for why.
         if let Served::Reply(StoreReply::Failed { request, message }) = &probed {
             assert_eq!(*request, "probe_box");
             assert!(
-                !message.contains("already writing this box"),
+                !message.contains("already writing this box")
+                    && !message.contains("already running on this box"),
                 "a preview writes no `agent_box` row, so it holds no claim (MOD-31 D5): {message}"
             );
         }
