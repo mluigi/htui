@@ -75,6 +75,14 @@ every migration and `cache_migrations/` (D2, D5 — no schema change, and `0009`
 lane); `crates/htui-store/.sqlx/` (D2, D5 — untyped queries only); `HANDOFF.md`, `DECISIONS.md`,
 `docs/**`.
 
+**One out-of-plan correction, maintainer-approved 2026-09-28.** The review found that the D94
+comment inside `State::claim_run` (`mem.rs:3606-3609`) repeats the false claim the tests were written
+to disprove — it names a chat run as a run with no item, but `start_chat_run` inserts at `running`,
+so a chat run is `NotClaimable` at the status half and never reaches the tag query. A pin whose own
+production comment contradicts it is the worst place to leave that, so the comment is corrected. It
+is a comment: no production line's behaviour changes, and the "not touched, on purpose" rule above
+holds for everything except this.
+
 ---
 
 ## Tasks

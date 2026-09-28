@@ -3604,9 +3604,10 @@ impl State {
         }
 
         // R-ORCH-10 at claim (MOD-7 milestone 3, D80, D81): after claimability, before the slot
-        // and the overlap, so a permanent refusal wins over a transient one. A run with no item
-        // (a chat run), or whose item row is gone, has no tags to check, as the Postgres join
-        // finds none (D94).
+        // and the overlap, so a permanent refusal wins over a transient one. A run whose item row
+        // is absent has no tags to check, as the Postgres join finds none (D94). A chat run is not
+        // such a run: `start_chat_run` inserts at `running`, so it is `NotClaimable` at the status
+        // half above and never reaches this check (MOD-58).
         let missing = claimed
             .item_id
             .and_then(|item| self.items.get(&item))
