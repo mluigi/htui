@@ -34,8 +34,8 @@ use htui_agent::registry::DriverFactory;
 use htui_core::model::{
     Agent, AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxProfile, DocumentHead,
     DocumentId, Item, ItemId, NewDocument, PhaseAgent, PhaseId, ProjectId, PromptTemplate, RepoId,
-    ResolvedGraph, Run, RunId, RunStatus, RunStep, SnapshotCandidate, SnapshotPhase, StepId,
-    UserId,
+    ResolvedGraph, Run, RunId, RunStatus, RunStep, SkillBinding, SnapshotCandidate, SnapshotPhase,
+    StepId, UserId,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{ReadStore as _, Result as StoreResult, StoreError, WriteStore as _};
@@ -2401,6 +2401,14 @@ impl GraphSource for BackendGraphs {
         phase: Option<PhaseId>,
     ) -> StoreResult<Vec<BoundSkill>> {
         self.0.bound_skills(project, phase).await
+    }
+
+    async fn phase_attachments(
+        &self,
+        project: ProjectId,
+        phase: PhaseId,
+    ) -> StoreResult<Vec<SkillBinding>> {
+        self.0.phase_attachments(project, phase).await
     }
 
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> StoreResult<Vec<String>> {

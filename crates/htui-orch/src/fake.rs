@@ -27,8 +27,8 @@ use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, BoundSkill, BoxId, Document, DocumentId, Isolation, Item, ItemId,
     NewDocument, PhaseAgent, PhaseId, ProjectId, PromptTemplate, RepoId, ResolvedGraph, Run, RunId,
-    RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, TIMESTAMPTZ_DIGITS, UserId,
-    VerifyOutcome,
+    RunStep, RunStepCommit, RunStepTree, SkillBinding, SnapshotPhase, StepId, TIMESTAMPTZ_DIGITS,
+    UserId, VerifyOutcome,
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::prompt::excerpt::RepoPath;
@@ -969,6 +969,14 @@ impl GraphSource for MemStore {
         self.bound_skills(project, phase).await
     }
 
+    async fn phase_attachments(
+        &self,
+        project: ProjectId,
+        phase: PhaseId,
+    ) -> Result<Vec<SkillBinding>> {
+        self.phase_attachments(project, phase).await
+    }
+
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
         self.missing_tags(item, box_id).await
     }
@@ -1111,6 +1119,14 @@ impl GraphSource for FakeGraphSource<'_> {
         phase: Option<PhaseId>,
     ) -> Result<Vec<BoundSkill>> {
         GraphSource::bound_skills(self.store, project, phase).await
+    }
+
+    async fn phase_attachments(
+        &self,
+        project: ProjectId,
+        phase: PhaseId,
+    ) -> Result<Vec<SkillBinding>> {
+        GraphSource::phase_attachments(self.store, project, phase).await
     }
 
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
@@ -2273,6 +2289,27 @@ mod tests {
             skills.len(),
             2,
             "`tests` from the project and `rust-style` from the phase, each once"
+        );
+
+        // MOD-9 D85, D98: the eighth read — the raw rows the override clone copies, which the
+        // resolved half above cannot answer.
+        let attachments =
+            GraphSource::phase_attachments(&store, ids::PROJECT_HTUI, ids::PHASE_HTUI_IMPLEMENT)
+                .await
+                .expect("MemStore never fails a read");
+        assert_eq!(
+            attachments,
+            store
+                .phase_attachments(ids::PROJECT_HTUI, ids::PHASE_HTUI_IMPLEMENT)
+                .await
+                .expect("MemStore never fails a read"),
+            "the trait answers what the inherent read answers"
+        );
+        assert_eq!(
+            attachments.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![ids::BINDING_HTUI_IMPLEMENT_RUST_STYLE],
+            "one row, and it is the seeded phase-level binding — nothing resolved, so the \
+             project rows are absent"
         );
 
         // MOD-7 milestone 3 D75: the seventh read.

@@ -9364,14 +9364,13 @@ mod tests {
             row.is_override,
             "the row the writer answers carries what it was asked for"
         );
-        assert_eq!(
+        assert!(
             store
                 .step_graph(id)
                 .await
                 .expect("MemStore never fails a read")
                 .expect("the graph is there")
                 .is_override,
-            true,
             "and so does the read, so `GraphSnapshot` can carry the marker into the record"
         );
         assert!(

@@ -4,7 +4,8 @@
 //! reserves for this milestone (`crates/htui-core/src/model/run.rs:453`), the call into
 //! [`crate::overlap::resolve`] that writes §4.7's scope into the snapshot (plan D79, D81) and
 //! refuses an empty scope for an item with a primary repo (plan D14), and the override clone
-//! that is deep over `step_graph_phase` and never over `skill_binding` (`docs/ANA-2.md:290-295`).
+//! that is deep over `step_graph_phase` and over each phase's own level-`Phase` attachments
+//! (`docs/ANA-2.md:290-295`, plan D85).
 //!
 //! Resolution is the **only** place that reads `step_graph_phase`. Once a run exists, the walk
 //! reads its own `graph_snapshot` and nothing else (invariant 2, `docs/ANA-2.md:109-113`), which
@@ -14,9 +15,10 @@ use std::collections::BTreeMap;
 
 use htui_core::model::{
     Agent, AgentBox, AgentId, BoundSkill, BoxId, GraphSnapshot, Isolation, Item, ItemId, ItemPatch,
-    NewStepGraph, PhaseAgent, PhaseId, Project, ProjectId, ProjectSettings, PromptTemplate, RepoId,
-    ResolvedGraph, RunMode, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPhase,
-    SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
+    NewSkillBinding, NewStepGraph, PhaseAgent, PhaseId, Project, ProjectId, ProjectSettings,
+    PromptTemplate, RepoId, ResolvedGraph, RunMode, SkillBinding, SkillBindingId,
+    SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPhase, SnapshotSettings,
+    SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
 };
 use htui_core::store::{ReadStore, Result, StoreError, UpdateOutcome, WriteStore};
 use serde_json::Value;
@@ -117,6 +119,24 @@ pub trait GraphSource: Sync {
         project: ProjectId,
         phase: Option<PhaseId>,
     ) -> Result<Vec<BoundSkill>>;
+
+    /// The **raw** `skill_binding` rows of one phase, nothing resolved and nothing collapsed
+    /// (MOD-9 D85).
+    ///
+    /// Distinct from [`bound_skills`](GraphSource::bound_skills) in the reason the override clone
+    /// needs it: a [`BoundSkill`] has resolved away the fields a copy must carry verbatim —
+    /// `languages` above all, and the ids and `updated_at` the two writers take as tokens.
+    ///
+    /// Inherent on both stores and on `Backend` (`mem.rs:567`, `pg/read.rs:1798`,
+    /// `backend.rs:422`, landed in T1) for `prompt_template`'s reason: `skill*` is not mirrored.
+    ///
+    /// # Errors
+    /// The backend's own failures; `Backend` offline refuses with `PROMPT_ON_SERVER_ONLY`.
+    async fn phase_attachments(
+        &self,
+        project: ProjectId,
+        phase: PhaseId,
+    ) -> Result<Vec<SkillBinding>>;
 
     /// `R-ORCH-10`'s read (MOD-7 milestone 3, D75): the entries of `item.required_tags` that
     /// `box_id` has neither probed nor declared (`box.probed_tags ∪ box.declared_tags`), compared
@@ -376,17 +396,20 @@ pub async fn resolve<S: ReadStore + WriteStore, G: GraphSource>(
     })
 }
 
-/// `<item.key>-override`: a clone deep over `step_graph_phase` and **never** over `skill_binding`.
+/// `<item.key>-override`: a clone deep over `step_graph_phase` and over each phase's **own**
+/// level-`Phase` attachments, and never over a project-level or global one.
 ///
-/// A phase binding is keyed `UNIQUE NULLS NOT DISTINCT (skill_id, project_id, phase_id)`, so
-/// copying bindings onto cloned phase ids would silently double every project binding the item's
-/// phases inherit (`docs/ANA-2.md:290-295`, PRD `:399`). An override therefore starts with
-/// project-level bindings only, and a phase binding on an override graph is created explicitly.
+/// A phase binding is the most specific attachment there is, so copying one onto the cloned phase
+/// is the point of an override (`docs/ANA-2.md:290-295`, PRD `:399`, plan D85). A **project** row is
+/// keyed `UNIQUE NULLS NOT DISTINCT (skill_id, project_id, phase_id)` and the clone resolves the
+/// *same* project, so copying one would shadow the project's own row and the item's phases would
+/// stop inheriting it. An override therefore starts from the project's bindings, and a project- or
+/// global-level attachment on an override graph is written deliberately or not at all.
 ///
-/// **Two halves of ANA-2's clone are owed to writers that do not exist yet** (blueprint R-6):
-/// `WriteStore` has no `phase_agent` writer at all, and `step_graph.is_override` is settable by no
-/// writer either — `NewStepGraph` has no field for it and `StepGraphPatch` says so in its own doc
-/// comment. The clone this function performs is complete with respect to the seam it has.
+/// **One half of ANA-2's clone is still owed to a writer that does not exist** (blueprint R-6):
+/// `WriteStore` has no `phase_agent` writer, so the clone's `SnapshotCandidate::candidates` come
+/// from the same four-rung resolution over the source graph's rows rather than from copies. The
+/// clone is complete with respect to the seam it has.
 /// Likewise **re-override** (ANA-2 `:297-300`: delete the existing override's phases and re-clone,
 /// leaving `item.step_graph_id` alone) needs a phase deleter `WriteStore` does not carry; until it
 /// does, a second call earns `create_step_graph`'s own `(project_id, name)` `Constraint`, which is
@@ -421,13 +444,50 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
         .await?;
 
     for row in &resolved.phases {
+        let phase_id = PhaseId::new();
         store
             .create_phase(&StepGraphPhase {
-                id: PhaseId::new(),
+                id: phase_id,
                 graph_id: clone.id,
                 ..row.phase.clone()
             })
             .await?;
+        // MOD-9 D85: the source phase's own level-`Phase` attachments, copied onto the cloned
+        // phase with fresh ids and the writer's `None` token — the cloned phase carries none, so
+        // nothing is replaced and no CAS can fail.
+        //
+        // **Project-level and global rows are deliberately not copied.** They are keyed by
+        // `(skill_id, project_id, phase_id)` and the clone resolves the *same* project, so a copied
+        // project row would shadow the original project's and the item's phases would stop
+        // inheriting it. That is exactly the objection `override_clone_leaves_bindings_alone`
+        // recorded, and the copy keeps its force for the rows it is about: a **phase** row is
+        // always the most specific attachment, so a phase row copied onto the cloned phase is the
+        // point of an override.
+        for binding in source
+            .phase_attachments(item.project_id, row.phase.id)
+            .await?
+        {
+            store
+                .set_skill_binding(
+                    NewSkillBinding {
+                        id: SkillBindingId::new(),
+                        skill_id: binding.skill_id,
+                        project_id: Some(item.project_id),
+                        phase_id: Some(phase_id),
+                        // Verbatim, `languages` included: they are display only, and a saved
+                        // attachment's languages never change (D83).
+                        pinned_version: binding.pinned_version,
+                        position: binding.position,
+                        activation: binding.activation,
+                        globs: binding.globs,
+                        languages: binding.languages,
+                    },
+                    // The cloned phase carries none, so this is a create and the token is "I
+                    // expect no row" (D101's reading of `None`).
+                    None,
+                )
+                .await?;
+        }
     }
 
     // The item is repointed last, so a failure part-way through leaves an orphan graph rather than
@@ -758,8 +818,8 @@ mod tests {
     use super::{
         Agent, AgentBox, AgentId, BTreeMap, BoundSkill, BoxId, GraphSource, Isolation, Item,
         ItemId, PhaseAgent, PhaseId, ProjectId, PromptTemplate, ReadStore, ResolveError, Resolved,
-        ResolvedGraph, Result, RunMode, SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
-        Value, WriteStore, override_graph, resolve,
+        ResolvedGraph, Result, RunMode, SkillBinding, SnapshotTemplate, StepGraph, StepGraphId,
+        StepGraphPhase, Value, WriteStore, override_graph, resolve,
     };
 
     /// The digest of the seeded `feature` graph, resolved against the demo fixture with one
@@ -857,6 +917,14 @@ question and not a test fix. Decide the version bump first, then paste the new d
             phase: Option<PhaseId>,
         ) -> Result<Vec<BoundSkill>> {
             self.store.bound_skills(project, phase).await
+        }
+
+        async fn phase_attachments(
+            &self,
+            project: ProjectId,
+            phase: PhaseId,
+        ) -> Result<Vec<SkillBinding>> {
+            self.store.phase_attachments(project, phase).await
         }
 
         async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
@@ -1553,10 +1621,16 @@ question and not a test fix. Decide the version bump first, then paste the new d
             assert_ne!(left.id, right.id, "a copied binding mints a fresh id");
             assert_eq!(
                 left.phase_id,
+                Some(ids::PHASE_HTUI_IMPLEMENT),
+                "the source row is still keyed on the source phase"
+            );
+            assert_eq!(
+                right.phase_id,
                 Some(implement.id),
-                "and lands on the cloned phase"
+                "and the copy is keyed on the cloned one"
             );
             assert_eq!(left.project_id, Some(ids::PROJECT_HTUI));
+            assert_eq!(right.project_id, Some(ids::PROJECT_HTUI));
             assert_eq!(left.skill_id, right.skill_id);
             assert_eq!(
                 left.pinned_version, right.pinned_version,
@@ -1630,6 +1704,57 @@ question and not a test fix. Decide the version bump first, then paste the new d
         // The name is unchanged by this milestone (blueprint H-41); the marker is an addition to
         // the row, not a replacement for what identified it.
         assert_eq!(marked[0].name, format!("{}-override", item.key));
+    }
+
+    /// MOD-9 D98: the delegation. `phase_attachments` answers the **raw** rows, which is what
+    /// `override_graph`'s copy needs and what `bound_skills` cannot supply — a `BoundSkill` has
+    /// resolved away `languages` and the ids the writers take as tokens.
+    #[tokio::test]
+    async fn phase_attachments_reads_the_raw_rows_of_one_phase() {
+        let store = MemStore::demo();
+        let source = TestSource::claude(&store);
+
+        let rows = source
+            .phase_attachments(ids::PROJECT_HTUI, ids::PHASE_HTUI_IMPLEMENT)
+            .await
+            .expect("MemStore never fails a read");
+        assert_eq!(rows.len(), 1, "the fixture seeds one phase-level binding");
+        let row = &rows[0];
+        assert_eq!(row.id, ids::BINDING_HTUI_IMPLEMENT_RUST_STYLE);
+        assert_eq!(row.skill_id, ids::SKILL_RUST_STYLE);
+        assert_eq!(row.project_id, Some(ids::PROJECT_HTUI));
+        assert_eq!(row.phase_id, Some(ids::PHASE_HTUI_IMPLEMENT));
+        assert_eq!(row.pinned_version, Some(1));
+        assert_eq!(row.position, 2);
+        assert_eq!(row.globs, Vec::<String>::new(), "verbatim, not resolved");
+        assert_eq!(
+            row.languages,
+            Vec::<String>::new(),
+            "verbatim, not resolved"
+        );
+        assert_eq!(
+            store
+                .phase_attachments(ids::PROJECT_HTUI, ids::PHASE_HTUI_IMPLEMENT)
+                .await
+                .expect("MemStore never fails a read"),
+            rows,
+            "the trait answers what the inherent read answers"
+        );
+        let unbound = store
+            .phases(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|row| row.id != ids::PHASE_HTUI_IMPLEMENT)
+            .expect("`feature` has four phases and only one of them is named by an id");
+        assert!(
+            source
+                .phase_attachments(ids::PROJECT_HTUI, unbound.id)
+                .await
+                .expect("MemStore never fails a read")
+                .is_empty(),
+            "a phase with no binding of its own has none, whatever the project binds"
+        );
     }
 
     /// An item whose kind names no graph and which names none itself cannot be run.

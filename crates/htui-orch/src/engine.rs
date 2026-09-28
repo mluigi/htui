@@ -85,10 +85,17 @@ const JUDGE_TEMPLATE: &str = "judge";
 /// (MOD-4 plan D163, `crates/htui-core/src/prompt/defaults.rs`).
 const HANDOFF_TEMPLATE: &str = "handoff";
 
-/// MOD-9 D44: an override graph's phase ids are minted by the clone, which copies no
-/// `skill_binding` (`graph.rs:350-355`), so its steps see global and project attachments only.
-const OVERRIDE_SKILLS_NOTE: &str =
-    "skills: an override graph's phases carry no phase-level attachments until MOD-9 milestone 3";
+/// MOD-9 D85 (OQ-17): an override graph's phases carry a **copy** of the source graph's
+/// phase-level attachments, made when the clone was written; they do not follow a later change to
+/// the source graph, and the two graphs' rows are visible side by side in the Skills tab's matrix.
+///
+/// The **source** graph is named in this override's own `description` — `override_graph` writes
+/// `"Per-item override of `<source>` for <key>"` — and not here: `phase_skills` holds
+/// `snapshot.graph`, and for an override that graph *is* the clone, so no interpolation would have
+/// anything to interpolate. A `String`-returning note would be the only way to change that, and a
+/// constant is not worth one.
+const OVERRIDE_SKILLS_NOTE: &str = "skills: this override's phase attachments were copied from the graph it was made from, and \
+     do not follow later changes there";
 
 /// A handoff's `failure_reason` when neither the run nor the step recorded one: the maintainer
 /// promoted a step that was waiting at its gate (blueprint §7.5).
@@ -5231,8 +5238,9 @@ where
     /// `SnapshotPhase` carries no `PhaseId` (`model/run.rs:488-527`) and resolution re-densifies
     /// positions (`graph.rs:286-300`), so the live row is found by `(graph id, name)`, which
     /// `UNIQUE (graph_id, name)` makes exact (`0001_init.sql:247`). A phase renamed or deleted
-    /// since the snapshot, and every phase of an override graph, get a note rather than a silent
-    /// loss of their phase-level attachments (plan R-15).
+    /// since the snapshot gets a note, and every phase of an override graph carries a **copy** of
+    /// the source phase's attachments (D85), which the note says — because a copy that silently
+    /// stopped following its source would read as a bug (plan R-15).
     async fn phase_skills(
         &self,
         project: ProjectId,
