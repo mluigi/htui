@@ -1514,20 +1514,47 @@ mod tests {
     }
 
     /// The level label column is fixed, because the cells beside it are packed by width: a wider
-    /// level would push every skill column off the frame.
+    /// level would push every skill column off the frame. The demo seed's longest label is
+    /// exactly [`LEVEL_WIDTH`](super::LEVEL_WIDTH) — `feature/implement` — so nothing in the
+    /// fixture exercises the case, and the assertion has to drive [`level_line`] with a label the
+    /// program can actually produce: `graph.name` and `project.slug` are free-form text and
+    /// `StoreRequest::CreateGraph` takes whatever the user typed.
     #[test]
-    fn the_level_label_column_holds_the_labels_the_levels_produce() {
+    fn a_level_label_wider_than_the_column_leaves_both_cell_columns_on_the_row() {
+        let skill = |name: &str| super::SkillSummary {
+            id: htui_core::model::SkillId::new(),
+            name: name.to_owned(),
+            description: String::new(),
+            updated_at: chrono::DateTime::UNIX_EPOCH,
+            versions: Vec::new(),
+        };
+        let mut view = super::MatrixView::default();
+        view.snapshot = Some(crate::skills::SkillsSnapshot {
+            skills: vec![skill("rust-style"), skill("tests")],
+            attachments: Vec::new(),
+        });
+        let level = |label: &str| super::Level {
+            axis: super::Axis::Global,
+            label: label.to_owned(),
+        };
+        let theme = crate::ui::Theme::default();
+
         for label in [
             "global",
             "vulkan-tutorials",
             "feature/implement",
             "analysis/research",
+            // 28 chars, and a name a maintainer really would type.
+            "documentation-and-examples",
         ] {
-            assert!(
-                label.chars().count() <= super::LEVEL_WIDTH,
-                "`{label}` is {} chars and the column is {}",
-                label.chars().count(),
-                super::LEVEL_WIDTH
+            let line = view.level_line(0, &level(label), &theme);
+            assert_eq!(
+                line.width(),
+                super::LIST_WIDTH as usize,
+                "`{label}` is {} chars: the two cell columns must still be on the row, because the \
+                 cells after a label wider than the column are otherwise outside the block and the \
+                 selected one is invisible",
+                label.chars().count()
             );
         }
         assert_eq!(
