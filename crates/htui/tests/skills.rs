@@ -323,6 +323,43 @@ async fn a_save_over_a_moved_head_keeps_the_draft() {
     insta::assert_snapshot!("stale", frame);
 }
 
+/// D101, the other side of the notice above: the stale arm moved **both** tokens, so the promise
+/// the notice makes in its own words — "the draft is kept, and Ctrl+S appends to v4" — is kept.
+/// The head version is the `add_skill_version` token; the `updated_at` it moved beside it is the
+/// `upsert_skill` one, and a save that re-sent the spent one would be stale all over again.
+#[tokio::test]
+async fn a_ctrl_s_after_a_stale_notice_appends_the_draft() {
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+    select(&mut harness, "rust-style");
+    harness.key("E");
+    type_text(&mut harness, "DRAFT ");
+    append(&store, ids::SKILL_RUST_STYLE, "saved elsewhere\n", Some(2)).await;
+    harness.key("ctrl-s");
+    harness.settle().await;
+    assert_eq!(
+        head(&store, "rust-style").await.map(|row| row.version),
+        Some(3),
+        "the save that was stale wrote nothing, so the external append is the head"
+    );
+
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let row = head(&store, "rust-style").await.expect("a head");
+    assert_eq!(row.version, 4, "the token the stale notice named");
+    assert!(
+        row.body.starts_with("DRAFT Prefer `expect`"),
+        "the draft the notice said was kept: {:?}",
+        row.body
+    );
+    let frame = harness.render();
+    assert!(notice(&frame).contains("saved v4"), "{frame}");
+    assert!(
+        !hint(&frame).contains("Ctrl+S save"),
+        "the draft landed, so the editor closed: {frame}"
+    );
+}
+
 // --- asserts -----------------------------------------------------------------------------------
 
 /// D78 / OQ-18: one `Ctrl+S` upserts the row and appends the body as the next version, so the
