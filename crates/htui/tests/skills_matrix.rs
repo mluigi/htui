@@ -108,16 +108,27 @@ fn row_text(label: &str, first: &str, second: &str) -> String {
     row(label, &[first, second])
 }
 
-/// Walks the level cursor down until the label column reads `label`, so a fixture that grows or
+/// The pane title's `" @ {label} "`, which is what says **where the cursor is**: the level list
+/// draws every label at once, so the label column alone cannot say which row is selected — the
+/// same reason the library's own helper matches its pane title.
+fn cursor_title(label: &str) -> String {
+    format!(" @ {label} ")
+}
+
+/// Walks the level cursor down until the pane is titled for `label`, so a fixture that grows or
 /// loses a phase does not silently move this helper's callers onto the wrong row.
 fn go_to(harness: &mut Harness, label: &str) {
+    let wanted = cursor_title(label);
     for _ in 0..40 {
-        if harness.render().contains(&row(label, &NONE)) {
+        if harness.render().contains(&wanted) {
             return;
         }
         harness.key("j");
     }
-    panic!("`{label}` is not a level of this scope:\n{}", harness.render());
+    panic!(
+        "`{label}` is not a level of this scope:\n{}",
+        harness.render()
+    );
 }
 
 /// The attachments of the Graphics scope, as another session would read them.
@@ -135,7 +146,8 @@ async fn only(store: &MemStore) -> Option<SkillAttachmentRow> {
     rows.pop()
 }
 
-/// Writes one attachment straight into the shared store, as another session would.
+/// Writes one attachment straight into the shared store, as another session would, and answers
+/// what the store answered — a test that wants a `Stale` has to be able to see one.
 async fn bind(
     store: &MemStore,
     skill_id: SkillId,
@@ -143,8 +155,8 @@ async fn bind(
     phase: Option<PhaseId>,
     position: i32,
     expected: Option<DateTime<Utc>>,
-) {
-    let outcome = store
+) -> CasOutcome<htui_core::model::SkillBinding> {
+    store
         .set_skill_binding(
             NewSkillBinding {
                 id: SkillBindingId::new(),
@@ -160,7 +172,19 @@ async fn bind(
             expected,
         )
         .await
-        .expect("the direct write");
+        .expect("the direct write")
+}
+
+/// [`bind`], asserted to have applied — the shape every test but the spent-token one wants.
+async fn bound(
+    store: &MemStore,
+    skill_id: SkillId,
+    project: Option<ProjectId>,
+    phase: Option<PhaseId>,
+    position: i32,
+    expected: Option<DateTime<Utc>>,
+) {
+    let outcome = bind(store, skill_id, project, phase, position, expected).await;
     assert!(
         matches!(outcome, CasOutcome::Applied(_)),
         "the direct bind over {expected:?} was not applied"
@@ -191,7 +215,7 @@ async fn the_matrix_shows_a_global_row_above_the_projects_and_the_phases() {
         frame.contains(" 1 Backlog  2 Skills  3 Settings  4 Chat"),
         "and the strip text is the shell's: {frame}"
     );
-    let header = row(LEVEL_HEADER, &["rust-style", "tests"]);
+    let header = row(LEVEL_HEADER, &SKILLS);
     assert!(frame.contains(&header), "the skill columns: {frame}");
     // The whole level list, in the order the rows are drawn: the global row first, then the
     // scope's project, then that project's phases by graph name and phase position. The seed is
@@ -236,7 +260,7 @@ async fn the_matrix_shows_a_global_row_above_the_projects_and_the_phases() {
 #[tokio::test]
 async fn the_language_map_expands_into_the_effective_globs_shown_before_the_save() {
     let store = MemStore::demo();
-    let mut harness = open_matrix().await;
+    let mut harness = matrix(open_over(store.clone()).await).await;
 
     harness.key("e");
     type_text(&mut harness, "docs/**");
@@ -279,6 +303,66 @@ async fn the_language_map_expands_into_the_effective_globs_shown_before_the_save
     );
 }
 
+/// The form opens on what the **store** holds: the activation, the pin, the position, the stored
+/// `globs` (which are already the effective list, the language expansion and the qualifier
+/// included) and the `languages` as they were typed. Saving it again is a no-op, which is what
+/// makes a reopen-then-save safe.
+#[tokio::test]
+async fn the_activation_form_opens_on_the_stored_row() {
+    let store = MemStore::demo();
+    let planted = store
+        .set_skill_binding(
+            NewSkillBinding {
+                id: SkillBindingId::new(),
+                skill_id: ids::SKILL_TESTS,
+                project_id: Some(ids::PROJECT_VULKAN),
+                phase_id: None,
+                pinned_version: Some(1),
+                position: 4,
+                activation: Activation::Glob,
+                globs: vec!["**/*.py".to_owned()],
+                languages: vec!["python".to_owned()],
+            },
+            None,
+        )
+        .await
+        .expect("the direct write");
+    assert!(matches!(planted, CasOutcome::Applied(_)), "the planted row");
+
+    let mut harness = matrix(open_over(store.clone()).await).await;
+    go_to(&mut harness, "vulkan-tutorials");
+    harness.key("right");
+    assert!(
+        harness
+            .render()
+            .contains(&row_text("vulkan-tutorials", "\u{b7}", "v1g")),
+        "the cell is the pinned v1 and the `g` of a `glob` activation: {}",
+        harness.render()
+    );
+    harness.key("e");
+    let frame = harness.render();
+    assert!(
+        frame.contains(" tests @ vulkan-tutorials "),
+        "the pane's title names both ends of the cell: {frame}"
+    );
+    for expected in [
+        " activation: glob",
+        " pin:        v1",
+        " position:   4",
+        " repo:       every repo",
+        " globs (one per line):",
+        " languages (one per line):",
+        " known: c cpp csharp",
+        " effective globs:",
+    ] {
+        assert!(
+            frame.contains(expected),
+            "`{expected}` is in the form: {frame}"
+        );
+    }
+    insta::assert_snapshot!("form", frame);
+}
+
 // --- asserts -----------------------------------------------------------------------------------
 
 /// D78: `a` writes one row at the selected level and the reply re-reads the whole scope, so the
@@ -311,7 +395,8 @@ async fn attaching_at_a_level_writes_one_row_and_the_matrix_re_reads() {
     );
 }
 
-/// `p` cycles `latest → v1 → v2 → latest`, and the cell shows which version is in force.
+/// `p` cycles `latest → v1 → v2 → latest` over the versions the skill has, and the cell shows
+/// which one is in force rather than always the head.
 #[tokio::test]
 async fn a_pin_follows_latest_until_it_is_set_and_cleared() {
     let store = MemStore::demo();
@@ -320,31 +405,36 @@ async fn a_pin_follows_latest_until_it_is_set_and_cleared() {
     harness.key("a");
     harness.settle().await;
     assert_eq!(only(&store).await.expect("the row").pinned_version, None);
-
-    harness.key("p");
     assert!(
-        hint(&harness.render()).contains("Ctrl+S save"),
-        "`p` opens the form over the cell and cycles the pin there, because a cycle applied to the \
-         cell itself would walk straight into the `glob`-needs-a-glob refusal: {}",
-        hint(&harness.render())
-    );
-    harness.key("ctrl-s");
-    harness.settle().await;
-    let row = only(&store).await.expect("the row");
-    assert_eq!(row.pinned_version, Some(1), "the first `p` pins v1");
-    assert!(
-        harness.render().contains(&row_text("vulkan-tutorials", "v1", "\u{b7}")),
-        "and the cell says v1, not the head: {}",
+        harness
+            .render()
+            .contains(&row_text("vulkan-tutorials", "v2", "\u{b7}")),
+        "unpinned, the cell reads the head: {}",
         harness.render()
     );
 
-    harness.key("p");
-    harness.key("ctrl-s");
-    harness.settle().await;
-    assert_eq!(
-        only(&store).await.expect("the row").pinned_version,
-        None,
-        "the second `p` is back to latest"
+    for (press, expected) in [(1, Some(1)), (2, Some(2)), (3, None)] {
+        harness.key("p");
+        assert!(
+            hint(&harness.render()).contains("Ctrl+S save"),
+            "`p` opens the form over the cell and cycles the pin there, because a cycle applied to \
+             the cell itself would walk straight into the `glob`-needs-a-glob refusal: {}",
+            hint(&harness.render())
+        );
+        harness.key("ctrl-s");
+        harness.settle().await;
+        assert_eq!(
+            only(&store).await.expect("the row").pinned_version,
+            expected,
+            "the {press}th `p`"
+        );
+    }
+    assert!(
+        harness
+            .render()
+            .contains(&row_text("vulkan-tutorials", "v2", "\u{b7}")),
+        "and the cell is back to the head: {}",
+        harness.render()
     );
 }
 
@@ -353,7 +443,7 @@ async fn a_pin_follows_latest_until_it_is_set_and_cleared() {
 #[tokio::test]
 async fn activating_glob_without_globs_is_refused_before_it_is_sent() {
     let store = MemStore::demo();
-    let mut harness = open_matrix().await;
+    let mut harness = matrix(open_over(store.clone()).await).await;
     // The `tests` column on the global row: attached nowhere, so the form opens on the defaults.
     harness.key("right");
     harness.key("e");
@@ -389,7 +479,7 @@ async fn activating_glob_without_globs_is_refused_before_it_is_sent() {
 #[tokio::test]
 async fn a_qualified_glob_is_refused_on_a_global_row() {
     let store = MemStore::demo();
-    let mut harness = open_matrix().await;
+    let mut harness = matrix(open_over(store.clone()).await).await;
     harness.key("e");
     type_text(&mut harness, "tutorials:**/*.rs");
     harness.key("ctrl-s");
@@ -403,10 +493,7 @@ async fn a_qualified_glob_is_refused_on_a_global_row() {
         ),
         "the writer's sentence, from the row the user was on: {frame}"
     );
-    assert!(
-        attachments(&store).await.is_empty(),
-        "nothing was sent"
-    );
+    assert!(attachments(&store).await.is_empty(), "nothing was sent");
 }
 
 /// D100: the three patterns the plan names are refused **before** the request, each with
@@ -442,7 +529,7 @@ async fn a_glob_the_matcher_cannot_compile_is_refused_before_it_is_sent() {
 #[tokio::test]
 async fn unbinding_removes_the_row_and_the_matrix_shows_it_gone() {
     let store = MemStore::demo();
-    bind(
+    bound(
         &store,
         ids::SKILL_TESTS,
         Some(ids::PROJECT_VULKAN),
@@ -485,7 +572,7 @@ async fn unbinding_removes_the_row_and_the_matrix_shows_it_gone() {
 #[tokio::test]
 async fn a_spent_token_leaves_the_row_as_it_is_and_says_so() {
     let store = MemStore::demo();
-    bind(
+    bound(
         &store,
         ids::SKILL_TESTS,
         Some(ids::PROJECT_VULKAN),
@@ -495,24 +582,14 @@ async fn a_spent_token_leaves_the_row_as_it_is_and_says_so() {
     )
     .await;
     let token = only(&store).await.expect("the row").updated_at;
-    // Another session moves the row, so the token the form will carry is spent.
-    bind(
-        &store,
-        ids::SKILL_TESTS,
-        Some(ids::PROJECT_VULKAN),
-        None,
-        7,
-        Some(token),
-    )
-    .await;
 
     let mut harness = matrix(open_over(store.clone()).await).await;
     go_to(&mut harness, "vulkan-tutorials");
     harness.key("right");
     harness.key("e");
-    // The form opened on the row the *read* answered, which is the one the other session wrote.
-    // Move it again, so the token this form holds is the one just spent.
-    bind(
+    // Another session moves the row while the form is open, so the token the form holds is spent
+    // and the write the form is about to send loses the race.
+    let moved = bind(
         &store,
         ids::SKILL_TESTS,
         Some(ids::PROJECT_VULKAN),
@@ -521,6 +598,11 @@ async fn a_spent_token_leaves_the_row_as_it_is_and_says_so() {
         Some(token),
     )
     .await;
+    assert!(
+        matches!(moved, CasOutcome::Applied(_)),
+        "the other session's write applies: it is holding the token the form is about to spend"
+    );
+
     harness.key("ctrl-s");
     harness.settle().await;
 
@@ -532,7 +614,7 @@ async fn a_spent_token_leaves_the_row_as_it_is_and_says_so() {
     assert_eq!(
         only(&store).await.expect("the surviving row").position,
         9,
-        "the row is as the writer that won left it"
+        "the row is as the writer that won left it, and the losing write changed nothing"
     );
     assert!(
         !hint(&frame).contains("Ctrl+S save"),
@@ -592,22 +674,27 @@ async fn a_repo_picker_writes_the_qualifier_from_the_project_s_repos() {
 }
 
 /// A global attachment cannot name a repo, so the picker is refused there before it is even asked
-/// for — the same rule the writer enforces on a qualified glob, said the same way.
+/// for — the same rule the writer enforces on a qualified glob, and the reason a global row can
+/// never carry one.
 #[tokio::test]
 async fn the_repo_picker_is_refused_on_a_global_row() {
     let store = MemStore::demo();
-    let mut harness = open_matrix().await;
+    let mut harness = matrix(open_over(store.clone()).await).await;
     harness.key("e");
     harness.key("R");
     harness.settle().await;
     let frame = harness.render();
     assert!(
-        frame.contains("a global attachment cannot name a repo"),
+        notice(&frame).contains("a global attachment cannot name a repo"),
         "the refusal names the rule: {frame}"
     );
     assert!(
-        !frame.contains("every repo"),
-        "and no picker was opened: {frame}"
+        !frame.contains(" pick one of") && !frame.contains(" reading this project's repos"),
+        "and no picker was opened, so the hierarchy was never read: {frame}"
+    );
+    assert!(
+        attachments(&store).await.is_empty(),
+        "and nothing was written"
     );
 }
 

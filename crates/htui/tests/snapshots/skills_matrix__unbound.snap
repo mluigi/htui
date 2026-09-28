@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/skills_matrix.rs
+expression: frame
+---
+Graphics · DESKTOP-HTUI · memory · 0 runs
+ 1 Backlog  2 Skills  3 Settings  4 Chat
+ Skills │ Templates
+┌ Attachments ───────────────────────────────┐┌ tests @ vulkan-tutorials ──────────────────────────┐
+│  level             rust-style   tests      ││ nothing is attached at this level                  │
+│  global            ·            ·          ││ a attaches, e edits, x detaches                    │
+│  vulkan-tutorials  ·            ·          ││                                                    │
+│  analysis/research ·            ·          ││                                                    │
+│  analysis/verdict  ·            ·          ││                                                    │
+│  bug/reproduce     ·            ·          ││                                                    │
+│  bug/fix           ·            ·          ││                                                    │
+│  bug/review        ·            ·          ││                                                    │
+│  feature/prd       ·            ·          ││                                                    │
+│  feature/plan      ·            ·          ││                                                    │
+│  feature/implement ·            ·          ││                                                    │
+│  feature/review    ·            ·          ││                                                    │
+│  refactor/plan     ·            ·          ││                                                    │
+│  refactor/implement·            ·          ││                                                    │
+│  refactor/review   ·            ·          ││                                                    │
+│  tooling/plan      ·            ·          ││                                                    │
+│  tooling/implement ·            ·          ││                                                    │
+│  tooling/review    ·            ·          ││                                                    │
+│                                            ││                                                    │
+│                                            ││                                                    │
+│                                            ││                                                    │
+│                                            ││                                                    │
+└────────────────────────────────────────────┘└────────────────────────────────────────────────────┘
+ detached tests from vulkan-tutorials
+ j/k level  ←/→ skill  g/G ends  a/e/x cell  A/p cell  r reload  m/Esc close
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces

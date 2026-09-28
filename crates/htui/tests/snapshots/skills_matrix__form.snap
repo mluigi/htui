@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/skills_matrix.rs
+expression: frame
+---
+Graphics · DESKTOP-HTUI · memory · 0 runs
+ 1 Backlog  2 Skills  3 Settings  4 Chat
+ Skills │ Templates
+┌ Attachments ───────────────────────────────┐┌ tests @ vulkan-tutorials ──────────────────────────┐
+│  level             rust-style   tests      ││ activation: glob                                   │
+│  global            ·            ·          ││ pin:        v1                                     │
+│  vulkan-tutorials  ·            v1g        ││ position:   4                                      │
+│  analysis/research ·            ·          ││ repo:       every repo                             │
+│  analysis/verdict  ·            ·          ││ globs (one per line):                              │
+│  bug/reproduce     ·            ·          ││**/*.py                                             │
+│  bug/fix           ·            ·          ││ languages (one per line):                          │
+│  bug/review        ·            ·          ││python                                              │
+│  feature/prd       ·            ·          ││ known: c cpp csharp go java javascript markdown    │
+│  feature/plan      ·            ·          ││python rust shell sql toml typescript yaml          │
+│  feature/implement ·            ·          ││ effective globs:                                   │
+│  feature/review    ·            ·          ││  **/*.py                                           │
+│  refactor/plan     ·            ·          ││                                                    │
+│  refactor/implement·            ·          ││                                                    │
+│  refactor/review   ·            ·          ││                                                    │
+│  tooling/plan      ·            ·          ││                                                    │
+│  tooling/implement ·            ·          ││                                                    │
+│  tooling/review    ·            ·          ││                                                    │
+│                                            ││                                                    │
+│                                            ││                                                    │
+│                                            ││                                                    │
+│                                            ││                                                    │
+└────────────────────────────────────────────┘└────────────────────────────────────────────────────┘
+
+ Tab next field  Ctrl+S save  A activation  p pin  R repo  Esc cancel  L1:C1
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces
