@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use htui::app::register_all;
 use htui::testkit::Harness;
 use htui_core::fixtures::ids;
+use htui_core::model::NewSkillVersion;
 use htui_core::model::{
     Activation, NewRepo, NewSkillBinding, PhaseId, ProjectId, RepoId, SkillAttachmentRow,
     SkillBindingId, SkillId,
@@ -903,5 +904,203 @@ async fn an_open_form_keeps_the_views_switch_off() {
     assert!(
         frame.contains("hello"),
         "and it typed an `l` where it was aimed: {frame}"
+    );
+}
+
+// --- the import prefill (MOD-9 milestone 4, T3; plan D96) -------------------------------------
+
+/// Appends a version carrying `source`, as an import would, over `expected`.
+async fn append_source(
+    store: &MemStore,
+    skill_id: SkillId,
+    body: &str,
+    source: serde_json::Value,
+    expected: Option<i32>,
+) {
+    let outcome = store
+        .add_skill_version(
+            NewSkillVersion {
+                skill_id,
+                body: body.to_owned(),
+                source,
+                created_by: ids::USER,
+            },
+            expected,
+        )
+        .await
+        .expect("the direct write");
+    assert!(
+        matches!(outcome, CasOutcome::Applied(_)),
+        "the append applied"
+    );
+}
+
+/// A `source` as the import writes it: the whole frontmatter, verbatim, under the same keys.
+fn imported_source(frontmatter: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "format": "skill-md",
+        "path": "/x/skills/demo/SKILL.md",
+        "imported_at": "2026-09-28T12:00:00+00:00",
+        "frontmatter": frontmatter,
+        "issues": [],
+    })
+}
+
+/// A skill the library already holds gets a v3 that says it activates on Rust globs, written
+/// straight into the store as an import would have. The form is opened on the cell where the
+/// attachment already is.
+#[tokio::test]
+async fn a_new_attachment_prefills_activation_and_globs_from_the_imported_source() {
+    let store = MemStore::demo();
+    append_source(
+        &store,
+        ids::SKILL_RUST_STYLE,
+        "# v3\n",
+        imported_source(serde_json::json!({
+            "name": "rust-style",
+            "description": "House style.",
+            "globs": ["**/*.rs", "src/**/*.toml"],
+        })),
+        Some(2),
+    )
+    .await;
+    let mut harness = matrix(open_over(store).await).await;
+    go_to(&mut harness, "vulkan-tutorials");
+
+    harness.key("a");
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        frame.contains("**/*.rs"),
+        "the file's globs seeded the field:\n{frame}"
+    );
+    assert!(
+        frame.contains("src/**/*.toml"),
+        "both of them, not the first:\n{frame}"
+    );
+    assert!(
+        frame.contains("g") && frame.contains("glob"),
+        "and the activation is the file's, not the default: {frame}"
+    );
+}
+
+/// D96: an existing attachment is never re-seeded. A maintainer who saved `off` over an imported
+/// `always` must find it still `off` the next time they open the cell.
+#[tokio::test]
+async fn an_existing_attachment_is_never_reseeded_from_a_source() {
+    let store = MemStore::demo();
+    // The skill's head carries an import provenance, and the cell the cursor lands on has a row.
+    append_source(
+        &store,
+        ids::SKILL_RUST_STYLE,
+        "# v3\n",
+        imported_source(serde_json::json!({
+            "name": "rust-style",
+            "description": "House style.",
+            "globs": ["**/*.rs"],
+        })),
+        Some(2),
+    )
+    .await;
+    let mut harness = matrix(open_over(store).await).await;
+    go_to(&mut harness, "vulkan-tutorials");
+
+    // `e` opens the form on the stored row, without writing.
+    harness.key("e");
+    harness.settle().await;
+    let before = harness.render();
+    assert!(before.contains(" globs:"), "the form is open:\n{before}");
+
+    harness.key("esc");
+    harness.settle().await;
+    harness.key("e");
+    harness.settle().await;
+
+    assert_eq!(
+        harness.render(),
+        before,
+        "the same cell opens the same form twice: a stored row is never re-seeded, even when the \
+         skill it points at was imported"
+    );
+}
+
+/// A skill typed in the TUI carries `source = {}`, and prefills nothing — which is what the form
+/// looked like before this milestone.
+#[tokio::test]
+async fn a_skill_with_no_source_prefills_nothing() {
+    let store = MemStore::demo();
+    let mut harness = matrix(open_over(store.clone()).await).await;
+    go_to(&mut harness, "vulkan-tutorials");
+
+    // `a` opens the form and saves it in one code path, so what the row ends up holding is the
+    // prefill, tested rather than displayed.
+    harness.key("a");
+    harness.settle().await;
+
+    let row = only(&store).await.expect("the new row");
+    assert_eq!(row.activation, Activation::Always, "the form's own default");
+    assert!(
+        row.globs.is_empty(),
+        "and no globs were invented: {:?}",
+        row.globs
+    );
+    assert!(
+        row.languages.is_empty(),
+        "nor languages: {:?}",
+        row.languages
+    );
+    assert!(
+        !notice(&harness.render()).contains("prefills"),
+        "a skill with no source gets no hint"
+    );
+}
+
+/// The prefill seeds the *field*; `Form::effective()` is still what gets written, so the stored
+/// globs are the effective ones — the language map's expansion included.
+#[tokio::test]
+async fn the_prefilled_globs_are_the_ones_the_save_writes() {
+    let store = MemStore::demo();
+    append_source(
+        &store,
+        ids::SKILL_RUST_STYLE,
+        "# v3\n",
+        imported_source(serde_json::json!({
+            "name": "rust-style",
+            "description": "House style.",
+            "globs": ["custom/**/*.rs"],
+            "languages": ["rust"],
+        })),
+        Some(2),
+    )
+    .await;
+    let mut harness = matrix(open_over(store.clone()).await).await;
+    go_to(&mut harness, "vulkan-tutorials");
+    harness.key("a");
+    harness.settle().await;
+    harness.key("ctrl-s");
+    harness.settle().await;
+
+    let row = only(&store).await.expect("the new row");
+    assert_eq!(
+        row.activation,
+        Activation::Glob,
+        "the file's activation was saved"
+    );
+    assert!(
+        row.globs.contains(&"custom/**/*.rs".to_owned()),
+        "the file's own glob is in the stored row: {:?}",
+        row.globs
+    );
+    assert!(
+        row.globs.len() > 1,
+        "and the language map's expansion is unioned in, because `effective()` is the only source \
+         of the written globs: {:?}",
+        row.globs
+    );
+    assert_eq!(
+        row.languages,
+        vec!["rust".to_owned()],
+        "the language is stored as authored"
     );
 }

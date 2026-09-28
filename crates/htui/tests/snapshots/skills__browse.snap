@@ -1,5 +1,6 @@
 ---
 source: crates/htui/tests/skills.rs
+assertion_line: 216
 expression: frame
 ---
 Graphics · DESKTOP-HTUI · memory · 0 runs
@@ -30,5 +31,5 @@ Graphics · DESKTOP-HTUI · memory · 0 runs
 │                                            ││                                                    │
 └────────────────────────────────────────────┘└────────────────────────────────────────────────────┘
 
- j/k move  ,/. version  b base  d diff  e description  E edit  n new  r reload
+ j/k move  ,/. version  b base  d diff  e description  E edit  n new  i import  r reload
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces

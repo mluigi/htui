@@ -1,0 +1,35 @@
+---
+source: crates/htui/tests/skills.rs
+assertion_line: 1180
+expression: frame
+---
+Graphics · DESKTOP-HTUI · memory · 0 runs
+ 1 Backlog  2 Skills  3 Settings  4 Chat
+ Skills │ Templates
+
+  >! /nonexistent/htui-import-report — could not read `/nonexistent/htui-import-report` (No such
+ file or directory (os error 2))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ j/k move  r reload  Esc back
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces

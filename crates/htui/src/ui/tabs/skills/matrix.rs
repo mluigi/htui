@@ -27,6 +27,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use htui_core::model::language::{
     LANGUAGE_GLOBS, effective_globs as expand_languages, languages as LANGUAGE_NAMES,
 };
+use htui_core::model::skill_import::ImportPrefill;
 use htui_core::model::{
     Activation, NewSkillBinding, PhaseId, ProjectId, SkillAttachmentRow, SkillBindingId, SkillId,
     SkillVersion,
@@ -720,6 +721,15 @@ impl MatrixView {
 
     /// Opens the form over the selected cell, prefilled with what the store holds and with the
     /// defaults a cell with no row gets.
+    ///
+    /// **A cell with no row is also prefilled from the skill's imported source** (D96, §6 item
+    /// 11): the version in force carries the file's frontmatter verbatim, and ANA-22 §7.3's
+    /// activation keys prefill the form. The source is re-read here rather than carried over from
+    /// the import, so a skill imported last week and attached today is prefilled too.
+    ///
+    /// **An existing row is never re-seeded.** Its stored values are the truth: a maintainer who
+    /// saved `off` over an imported `always` must not find it back the next time they open the
+    /// cell.
     fn open_form(&mut self, ctx: &Ctx<'_>) {
         let levels = levels(self, ctx);
         let (Some(entry), Some(level)) =
@@ -741,26 +751,45 @@ impl MatrixView {
                 .find_map(|glob| htui_core::prompt::glob::compile(glob).ok())
                 .and_then(|pattern| pattern.repo.clone())
         });
-        let globs = row.map_or_else(String::new, |row| {
+        let stored_globs = row.map_or_else(String::new, |row| {
             row.globs
                 .iter()
                 .map(|glob| unqualified(glob, qualifier.as_deref()))
                 .collect::<Vec<_>>()
                 .join("\n")
         });
+        // Only a cell with no row is prefilled; a stored row's values are never overwritten.
+        let prefill = row
+            .is_none()
+            .then(|| import_prefill(self, entry.id, level.axis));
+        let globs = match (&prefill, stored_globs.is_empty()) {
+            (Some(prefill), true) => prefill.globs.join("\n"),
+            _ => stored_globs,
+        };
         self.form = Some(Form {
             skill_id: entry.id,
             name: entry.name.clone(),
             level: level.axis,
             token: row.map(|row| row.updated_at),
-            activation: row.map_or(Activation::Always, |row| row.activation),
+            activation: row.map_or_else(
+                || {
+                    prefill
+                        .as_ref()
+                        .and_then(|prefill| prefill.activation)
+                        .unwrap_or(Activation::Always)
+                },
+                |row| row.activation,
+            ),
             pin: row
                 .and_then(|row| row.pinned_version)
                 .map_or(Pin::Latest, Pin::Version),
             globs: TextArea::with_text(&globs),
-            languages: TextArea::with_text(
-                &row.map_or_else(String::new, |row| row.languages.join("\n")),
-            ),
+            languages: TextArea::with_text(&match (prefill.as_ref(), row) {
+                (Some(prefill), None) if !prefill.languages.is_empty() => {
+                    prefill.languages.join("\n")
+                }
+                _ => row.map_or_else(String::new, |row| row.languages.join("\n")),
+            }),
             position: TextField::with_text(
                 &row.map_or_else(|| "0".to_owned(), |row| row.position.to_string()),
             ),
@@ -768,7 +797,12 @@ impl MatrixView {
             field: 0,
         });
         self.scroll.reset();
-        self.notice = None;
+        // §7.3's last row says a model-decided or manual file becomes `always` here, so the hint
+        // travels with the form rather than living only in the import's report.
+        self.notice = prefill
+            .as_ref()
+            .and_then(|prefill| prefill.hint)
+            .map(|hint| Notice::Info(hint.to_owned()));
     }
 
     /// `A`: `always → glob → off → always`, in the store's own `CHECK` order.
@@ -1303,6 +1337,23 @@ fn cell_text(view: &MatrixView, skill: SkillId, axis: Axis) -> String {
 }
 
 /// The versions of the skill a pin has to name.
+/// ANA-22 §6 item 11's prefill, re-derived from the version in force for `skill` at `axis`.
+///
+/// The pinned version when the cell names one, the head otherwise — the same rule
+/// `SkillBinding::version_in_force` applies to a binding, and the same one `cell_text` shows. A
+/// version typed in the TUI carries `source = {}` and prefills nothing, which is what an empty
+/// form has always looked like.
+fn import_prefill(view: &MatrixView, skill: SkillId, axis: Axis) -> ImportPrefill {
+    let known = versions(view, skill);
+    let in_force = match cell(view, skill, axis).and_then(|row| row.pinned_version) {
+        Some(pinned) => known.iter().find(|row| row.version == pinned),
+        None => known.last(),
+    };
+    in_force.map_or_else(ImportPrefill::default, |version| {
+        htui_core::model::skill_import::prefill_from_source(&version.source)
+    })
+}
+
 fn versions(view: &MatrixView, skill: SkillId) -> &[SkillVersion] {
     view.snapshot
         .as_ref()

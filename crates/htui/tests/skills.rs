@@ -945,3 +945,287 @@ async fn the_strip_text_is_unchanged() {
         "{frame}"
     );
 }
+
+// --- the import surface (MOD-9 milestone 4, T3) -----------------------------------------------
+
+/// A `SKILL.md` in a temp directory, returning the directory (held for the test) and the path.
+fn skill_file(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    let nested = dir.join(name);
+    std::fs::create_dir_all(&nested).expect("mkdir");
+    let path = nested.join("SKILL.md");
+    std::fs::write(
+        &path,
+        format!("---\nname: {name}\ndescription: The {name} skill.\n---\n{body}"),
+    )
+    .expect("write");
+    path
+}
+
+/// The path, `Enter`, and the reply — for a form a test has already opened. The form returns to
+/// Browse immediately, so the library is on screen while the worker walks.
+async fn submit_path(harness: &mut Harness, path: &std::path::Path) {
+    type_text(harness, &path.display().to_string());
+    harness.key("enter");
+    harness.settle().await;
+}
+
+/// `i`, then the path and the reply. **Not** for a test that has already pressed `i`: the second
+/// press lands in the field as a literal `i`, which is how this helper was first caught.
+async fn import(harness: &mut Harness, path: &std::path::Path) {
+    // A report from a previous import is open: `Esc` closes it, and is a no-op in Browse, so the
+    // next `i` reaches the browse map rather than the field.
+    harness.key("esc");
+    harness.settle().await;
+    harness.key("i");
+    harness.settle().await;
+    submit_path(harness, path).await;
+}
+
+#[tokio::test]
+async fn i_opens_a_path_form_and_enter_imports_the_path() {
+    let store = MemStore::demo();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = skill_file(dir.path(), "imported-skill", "# Imported\n");
+    let mut harness = open_over(store.clone()).await;
+
+    harness.key("i");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains(" import a skill "),
+        "the form is titled:\n{frame}"
+    );
+    assert!(
+        hint(&frame).contains("Enter import"),
+        "and hinted: {}",
+        hint(&frame)
+    );
+    assert!(
+        !hint(&frame).contains("Ctrl+S save"),
+        "the editor hint is not showing"
+    );
+
+    submit_path(&mut harness, &path).await;
+
+    let head = head(&store, "imported-skill")
+        .await
+        .unwrap_or_else(|| panic!("the skill is in the library:\n{}", harness.render()));
+    assert_eq!(head.version, 1, "a new name starts at v1");
+    assert_eq!(head.body, "# Imported\n");
+    assert_eq!(
+        head.source["format"],
+        serde_json::json!("skill-md"),
+        "the import wrote its provenance: {}",
+        head.source
+    );
+}
+
+#[tokio::test]
+async fn esc_leaves_the_path_form_and_sends_nothing() {
+    let store = MemStore::demo();
+    let before = library(&store).await.len();
+    let mut harness = open_over(store.clone()).await;
+
+    harness.key("i");
+    harness.settle().await;
+    type_text(&mut harness, "/nowhere/at/all");
+    harness.key("esc");
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        !frame.contains(" import a skill "),
+        "the form is closed:\n{frame}"
+    );
+    assert!(
+        hint(&frame).contains("i import"),
+        "browse is back: {}",
+        hint(&frame)
+    );
+    assert_eq!(
+        library(&store).await.len(),
+        before,
+        "`Esc` sent no request, so the library is untouched"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_path_is_refused_before_anything_is_sent() {
+    let store = MemStore::demo();
+    let before = library(&store).await.len();
+    let mut harness = open_over(store.clone()).await;
+
+    harness.key("i");
+    harness.settle().await;
+    harness.key("enter");
+    harness.settle().await;
+
+    assert!(
+        notice(&harness.render()).contains("type a path"),
+        "an empty path says so: {}",
+        notice(&harness.render())
+    );
+    assert_eq!(library(&store).await.len(), before, "and nothing was sent");
+}
+
+#[tokio::test]
+async fn a_second_import_of_the_same_body_adds_no_version() {
+    let store = MemStore::demo();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = skill_file(dir.path(), "twice-skill", "# Same\n");
+    let mut harness = open_over(store.clone()).await;
+
+    import(&mut harness, &path).await;
+    import(&mut harness, &path).await;
+
+    assert_eq!(
+        head(&store, "twice-skill").await.expect("present").version,
+        1,
+        "ANA-22 §6 item 12: an identical body appends nothing"
+    );
+    assert!(
+        notice(&harness.render()).contains("unchanged 1"),
+        "and the counts say so: {}",
+        notice(&harness.render())
+    );
+}
+
+#[tokio::test]
+async fn a_changed_body_gets_a_new_version_and_the_description_moves() {
+    let store = MemStore::demo();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = skill_file(dir.path(), "revised-skill", "# One\n");
+    let mut harness = open_over(store.clone()).await;
+    import(&mut harness, &path).await;
+
+    std::fs::write(
+        &path,
+        "---\nname: revised-skill\ndescription: Revised.\n---\n# Two\n",
+    )
+    .expect("write");
+    import(&mut harness, &path).await;
+
+    let head = head(&store, "revised-skill").await.expect("present");
+    assert_eq!(head.version, 2);
+    assert_eq!(head.body, "# Two\n");
+    let entry = library(&store)
+        .await
+        .into_iter()
+        .find(|entry| entry.skill.name == "revised-skill")
+        .expect("present");
+    assert_eq!(entry.skill.description, "Revised.");
+}
+
+#[tokio::test]
+async fn a_refused_file_opens_the_report_and_the_rest_still_imports() {
+    let store = MemStore::demo();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let good = skill_file(dir.path(), "good-skill", "# Good\n");
+    let bad = dir.path().join("My Skill.md");
+    std::fs::write(&bad, "---\nname: My Skill\ndescription: d\n---\nB\n").expect("write");
+    let mut harness = open_over(store.clone()).await;
+
+    // The bad path first, so the report has something in it.
+    import(&mut harness, &bad).await;
+    assert!(
+        head(&store, "good-skill").await.is_none(),
+        "the good file is not touched by the bad one"
+    );
+    import(&mut harness, &good).await;
+    assert!(
+        head(&store, "good-skill").await.is_some(),
+        "the good file imported"
+    );
+
+    // A refused path opens the report, and the refusal is in it.
+    import(&mut harness, &bad).await;
+    let frame = harness.render();
+    assert!(
+        hint(&frame).contains("Esc back"),
+        "the report is open: {}",
+        hint(&frame)
+    );
+    assert!(
+        frame.contains('!') && frame.contains("1-64 characters"),
+        "the writer's own sentence is in the report:\n{frame}"
+    );
+    assert!(
+        !frame.contains("import a skill"),
+        "a clean import does not open a form"
+    );
+}
+
+/// A clean import says so in the notice; anything refused or skipped opens the report, because a
+/// report the reader has to dismiss to learn that nothing went wrong is one they learn to dismiss.
+#[tokio::test]
+async fn a_clean_import_leaves_a_notice_and_no_report() {
+    let store = MemStore::demo();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = skill_file(dir.path(), "clean-skill", "# Clean\n");
+    let mut harness = open_over(store.clone()).await;
+
+    import(&mut harness, &path).await;
+
+    let frame = harness.render();
+    assert!(notice(&frame).contains("imported 1"), "{}", notice(&frame));
+    assert!(
+        hint(&frame).contains("i import"),
+        "still browsing: {}",
+        hint(&frame)
+    );
+}
+
+#[tokio::test]
+async fn a_missing_path_is_refused_in_one_sentence() {
+    let store = MemStore::demo();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut harness = open_over(store.clone()).await;
+
+    import(&mut harness, &dir.path().join("nope")).await;
+
+    let frame = harness.render();
+    assert!(
+        hint(&frame).contains("Esc back"),
+        "a refusal opens the report"
+    );
+    assert!(
+        frame.contains("could not read"),
+        "in one sentence:\n{frame}"
+    );
+}
+
+/// The report is the per-file record §9 asks for, and it is a list rather than a count.
+///
+/// The path is a fixed one that cannot exist, so the snapshot is stable: a temporary directory
+/// would put a random name in every run and the snapshot would never compare equal twice.
+#[tokio::test]
+async fn the_import_report_lists_every_outcome() {
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+
+    import(
+        &mut harness,
+        std::path::Path::new("/nonexistent/htui-import-report"),
+    )
+    .await;
+
+    let frame = harness.render();
+    assert!(
+        frame.contains(" >! "),
+        "the refused file leads the report:\n{frame}"
+    );
+    assert!(hint(&frame).contains("Esc back"), "{}", hint(&frame));
+    insta::assert_snapshot!("import_report", frame);
+}
+
+/// The strip text and the switch line are the shell's, and this milestone adds neither.
+#[tokio::test]
+async fn the_strip_text_is_unchanged_by_the_import_surface() {
+    let mut harness = open().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains(" 1 Backlog  2 Skills  3 Settings  4 Chat"),
+        "{frame}"
+    );
+    assert!(frame.contains(" Skills \u{2502} Templates"), "{frame}");
+}

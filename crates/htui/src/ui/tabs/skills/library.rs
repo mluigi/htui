@@ -30,6 +30,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{ExternalEdit, ExternalEditOutcome};
+use crate::skill_import::ImportOutcome;
 use crate::skills::{READ_NAME, REQUEST_NAMES, SkillBody, SkillsSnapshot};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::backlog::detail::Scroll;
@@ -40,6 +41,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// The `StoreRequest::SaveSkill` name, what `busy` holds while it is in flight. The slice index,
 /// not a literal, so the two cannot drift (`request_names_match_the_name_arms`).
 const SAVE_NAME: &str = REQUEST_NAMES[1];
+
+/// The `StoreRequest::ImportSkills` name, what `busy` holds while a walk is in flight. The slice
+/// index, for the reason [`SAVE_NAME`] carries.
+const IMPORT_NAME: &str = REQUEST_NAMES[4];
 
 /// How many rows the notice may wrap to before it is cut; one when it fits.
 const NOTICE_LINES: usize = 2;
@@ -90,10 +95,25 @@ const SCROLL_HINT: &str = " J/K PgUp/PgDn scroll ";
 /// The hint row in Browse. The Templates view's clauses in its order, with the skills verbs: no
 /// `D default` (a skill has no compiled seed) and no `h/l view` (the tab owns those).
 const BROWSE_HINT: &str = "j/k move  ,/. version  b base  d diff  e description  E edit  \
-                           n new  r reload";
+                           n new  i import  r reload";
 
 /// The hint row while naming a skill or editing its description.
 const NAMING_HINT: &str = "Tab next field  Enter confirm  Esc cancel";
+
+/// The hint row in the import form.
+const IMPORT_HINT: &str = "Enter import  Esc cancel";
+
+/// The hint row in the import report.
+const REPORT_HINT: &str = "j/k move  r reload  Esc back";
+
+/// An import went out.
+const IMPORTING: &str = "importing\u{2026}";
+
+/// `Enter` on an empty path.
+const ENTER_A_PATH: &str = "type a path to a SKILL.md file or a directory";
+
+/// The report with nothing in it.
+const NOTHING_IMPORTED: &str = "nothing to import at that path";
 
 /// The hint row in the editor, before the cursor's `L{line}:C{col}`.
 const EDIT_HINT: &str = "Ctrl+S save  Ctrl+E $EDITOR  Esc cancel";
@@ -180,6 +200,8 @@ pub(super) struct SkillsView {
     /// The editor's last drawn height: what `PageUp`/`PageDown` move by. A `Cell` because the
     /// height is known only in `render(&self)`.
     page: Cell<u16>,
+    /// The report's highlighted row, an index into the outcomes.
+    report_cursor: usize,
 }
 
 /// One row of the library, derived from the snapshot on demand.
@@ -215,6 +237,21 @@ enum Mode {
         focus: Focus,
         /// `true` when the name is fixed (`e`), so a typing key never reaches it.
         fixed_name: bool,
+    },
+    /// `i`: the path to import. One field, because one line is one path — a path may contain a
+    /// space, and nothing here splits on one (OQ-24).
+    ImportPath {
+        /// The path, exactly as typed.
+        field: TextField,
+    },
+    /// The answer to an import: one row per file, in the order the files were named or found.
+    ///
+    /// **Open only when something was refused or skipped** (D102). A clean import says so in the
+    /// notice instead, because a report the reader must dismiss to learn that nothing went wrong
+    /// is a report most people learn to dismiss.
+    Report {
+        /// Every outcome, in order.
+        outcomes: Vec<ImportOutcome>,
     },
     /// `E`, or `Enter` on the form: the body editor.
     Editing(Editor),
@@ -335,6 +372,25 @@ enum Pane {
     Diff,
 }
 
+/// One report row: its sign, its text, and whether it is something the maintainer must act on.
+fn outcome_row(outcome: &ImportOutcome) -> (char, String, bool) {
+    match outcome {
+        ImportOutcome::Imported { name, version, .. }
+        | ImportOutcome::Updated { name, version, .. } => {
+            ('+', format!("{name} v{version}"), false)
+        }
+        ImportOutcome::Unchanged { name, path } => {
+            ('=', format!("{name} \u{2014} unchanged ({path})"), false)
+        }
+        ImportOutcome::Refused { path, message } => {
+            ('!', format!("{path} \u{2014} {message}"), true)
+        }
+        ImportOutcome::Skipped { path, reason } => {
+            ('\u{b7}', format!("{path} \u{2014} {reason}"), true)
+        }
+    }
+}
+
 /// A key with no modifier but `SHIFT`, which is how a terminal reports a capital.
 fn plain(key: &KeyEvent) -> bool {
     (key.modifiers - KeyModifiers::SHIFT).is_empty()
@@ -369,6 +425,8 @@ impl SkillsView {
         match self.mode {
             Mode::Browse => self.on_browse_key(key, ctx),
             Mode::Naming { .. } => self.on_naming_key(key),
+            Mode::ImportPath { .. } => self.on_import_key(key, ctx),
+            Mode::Report { .. } => self.on_report_key(key, ctx),
             Mode::Editing(_) => self.on_editor_key(key, ctx),
         }
     }
@@ -383,6 +441,15 @@ impl SkillsView {
                 self.snapshot = Some((**snapshot).clone());
                 self.unavailable = None;
                 self.land_save();
+                self.clamp_cursor();
+            }
+            StoreReply::SkillImports(imports) => {
+                if !in_scope(&imports.snapshot, ctx) {
+                    return;
+                }
+                self.snapshot = Some(imports.snapshot.clone());
+                self.unavailable = None;
+                self.land_import(imports.report.clone());
                 self.clamp_cursor();
             }
             StoreReply::SkillsStale(snapshot) => {
@@ -421,6 +488,43 @@ impl SkillsView {
             }
             _ => {}
         }
+    }
+
+    /// An import came back: the counts, and the report when something was refused or skipped.
+    ///
+    /// The reply is its own variant, not `Skills`, so `land_save` cannot mistake an import for a
+    /// save's answer — the two carry different `busy` names, and only this arm fires for the
+    /// import one.
+    fn land_import(&mut self, report: Vec<ImportOutcome>) {
+        if self.busy != Some(IMPORT_NAME) {
+            return;
+        }
+        self.busy = None;
+        let count =
+            |wanted: fn(&ImportOutcome) -> bool| report.iter().filter(|row| wanted(row)).count();
+        let (imported, updated, unchanged) = (
+            count(|row| matches!(row, ImportOutcome::Imported { .. })),
+            count(|row| matches!(row, ImportOutcome::Updated { .. })),
+            count(|row| matches!(row, ImportOutcome::Unchanged { .. })),
+        );
+        let troubled = report.iter().any(|row| {
+            matches!(
+                row,
+                ImportOutcome::Refused { .. } | ImportOutcome::Skipped { .. }
+            )
+        });
+        if troubled {
+            self.notice = None;
+            self.scroll.reset();
+            self.report_cursor = 0;
+            self.mode = Mode::Report { outcomes: report };
+            return;
+        }
+        self.notice = Some(Notice::Info(if report.is_empty() {
+            NOTHING_IMPORTED.to_owned()
+        } else {
+            format!("imported {imported}, updated {updated}, unchanged {unchanged}")
+        }));
     }
 
     /// The `$EDITOR` handoff came back. No handoff pending (the scope changed meanwhile): ignored.
@@ -487,6 +591,14 @@ impl SkillsView {
                 self.render_browse(frame, content, ctx);
                 BROWSE_HINT.to_owned()
             }
+            Mode::ImportPath { .. } => {
+                self.render_browse(frame, content, ctx);
+                IMPORT_HINT.to_owned()
+            }
+            Mode::Report { .. } => {
+                self.render_report(frame, content, ctx);
+                REPORT_HINT.to_owned()
+            }
         };
         frame.render_widget(
             Paragraph::new(
@@ -519,6 +631,7 @@ impl SkillsView {
                 ctx.request(StoreRequest::Skills(ctx.scope.clone()));
             }
             KeyCode::Char('n') => self.open_naming(),
+            KeyCode::Char('i') => self.open_import(),
             KeyCode::Char('J' | 'K') | KeyCode::PageDown | KeyCode::PageUp => {
                 return self.scroll.on_key(key, self.pane_rows.get());
             }
@@ -699,6 +812,97 @@ impl SkillsView {
                 self.confirm_naming();
                 Handled::Consumed
             }
+        }
+    }
+
+    /// `i`: the import form, one empty field.
+    fn open_import(&mut self) {
+        self.notice = None;
+        self.scroll.reset();
+        self.mode = Mode::ImportPath {
+            field: TextField::new(),
+        };
+    }
+
+    /// The import form. `Enter` sends one path and returns to Browse, so the library is on screen
+    /// while the worker walks — a walk is unbounded work and the view shows no progress for it.
+    fn on_import_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let Mode::ImportPath { field } = &mut self.mode else {
+            return Handled::Pass;
+        };
+        match field.on_key(key) {
+            FieldOutcome::Consumed => Handled::Consumed,
+            FieldOutcome::Pass => Handled::Pass,
+            FieldOutcome::Cancel => {
+                self.mode = Mode::Browse;
+                self.notice = None;
+                Handled::Consumed
+            }
+            FieldOutcome::Submit => {
+                let path = field.text().unwrap_or_default().trim().to_owned();
+                if path.is_empty() {
+                    self.notice = Some(Notice::Error(ENTER_A_PATH.to_owned()));
+                    return Handled::Consumed;
+                }
+                if let Some(busy) = self.busy {
+                    self.notice = Some(Notice::Error(format!("`{busy}` is still in flight")));
+                    return Handled::Consumed;
+                }
+                self.busy = Some(IMPORT_NAME);
+                self.notice = Some(Notice::Info(IMPORTING.to_owned()));
+                self.mode = Mode::Browse;
+                ctx.request(StoreRequest::ImportSkills {
+                    scope: ctx.scope.clone(),
+                    paths: vec![path],
+                });
+                Handled::Consumed
+            }
+        }
+    }
+
+    /// The import report: scroll it, reload the library behind it, `Esc` back to Browse.
+    ///
+    /// Every key here is one the browse map already owns, so the report is a mode rather than a
+    /// pane over Browse, and `Esc` is the one that leaves it.
+    fn on_report_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        if !plain(&key) {
+            return Handled::Pass;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Browse;
+                self.notice = None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.move_report(true),
+            KeyCode::Char('k') | KeyCode::Up => self.move_report(false),
+            KeyCode::Char('J' | 'K') | KeyCode::PageDown | KeyCode::PageUp => {
+                return self.scroll.on_key(key, self.pane_rows.get());
+            }
+            KeyCode::Char('r') => {
+                self.notice = None;
+                ctx.request(StoreRequest::Skills(ctx.scope.clone()));
+            }
+            _ => return Handled::Pass,
+        }
+        Handled::Consumed
+    }
+
+    /// The report's cursor, over the outcome rows rather than the library's.
+    fn move_report(&mut self, down: bool) {
+        let Mode::Report { outcomes } = &mut self.mode else {
+            return;
+        };
+        if outcomes.is_empty() {
+            return;
+        }
+        if down {
+            self.report_cursor += 1;
+        } else {
+            self.report_cursor = self.report_cursor.saturating_sub(1);
+        }
+        let last = outcomes.len() - 1;
+        if self.report_cursor > last {
+            self.report_cursor = last;
         }
     }
 
@@ -1083,6 +1287,19 @@ impl SkillsView {
     /// body, or the diff. The caller wraps and scrolls them.
     fn pane(&self, width: u16, ctx: &Ctx<'_>) -> (String, Vec<Line<'static>>) {
         let theme = ctx.theme;
+        if let Mode::ImportPath { field } = &self.mode {
+            let label = " path: ";
+            let budget = width.saturating_sub(u16::try_from(label.chars().count()).unwrap_or(0));
+            let mut spans = vec![Span::styled(label, theme.base)];
+            spans.extend(field.line(budget, true, theme).spans);
+            return (
+                " import a skill ".to_owned(),
+                vec![
+                    Line::from(spans),
+                    Line::styled("a file, or a directory of SKILL.md files", theme.dim),
+                ],
+            );
+        }
         if let Mode::Naming {
             name,
             description,
@@ -1163,6 +1380,47 @@ impl SkillsView {
             format!(" diff {label} \u{2192} v{} ", shown.version),
             diff::lines(&unified, theme),
         )
+    }
+
+    /// The import report: one row per outcome, the cursor on one of them.
+    ///
+    /// The sign is the outcome's own verb — `+` written, `=` unchanged, `!` refused, `\u{b7}` left
+    /// alone — because a report is read in a column, and the word for each would be the same word
+    /// nine times over.
+    fn render_report(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+        let Mode::Report { outcomes } = &self.mode else {
+            return;
+        };
+        let inner = area.inner(ratatui::layout::Margin::new(1, 1));
+        self.pane_rows.set(outcomes.len());
+        let lines: Vec<Line<'static>> = outcomes
+            .iter()
+            .enumerate()
+            .map(|(at, outcome)| {
+                let (sign, text, problem) = outcome_row(outcome);
+                let style = if problem {
+                    ctx.theme.error
+                } else {
+                    ctx.theme.dim
+                };
+                Line::from(vec![
+                    Span::styled(
+                        format!(
+                            " {}{sign} ",
+                            if at == self.report_cursor { '>' } else { ' ' }
+                        ),
+                        ctx.theme.base,
+                    ),
+                    Span::styled(text, style),
+                ])
+            })
+            .collect();
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((self.scroll.offset(), 0)),
+            inner,
+        );
     }
 
     /// The editor: the draft on the left, what a save does on the right.
@@ -1310,7 +1568,7 @@ mod tests {
         let map = Keymap::default_global();
         let claimed = [
             "j", "k", "down", "up", "r", "n", "e", "E", ",", ".", "b", "d", "J", "K", "pagedown",
-            "pageup", "ctrl-s", "ctrl-e",
+            "pageup", "ctrl-s", "ctrl-e", "i",
         ];
         for spec in claimed {
             let chord = KeyChord::parse(spec).unwrap_or_else(|| panic!("`{spec}` parses"));
