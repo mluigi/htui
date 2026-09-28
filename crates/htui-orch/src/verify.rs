@@ -13,8 +13,8 @@
 //! command that was asked for and could not be run, and it never fails a step (`:443`).
 //!
 //! The shell is plan D30's: `sh -c` on Unix, `cmd /C` on Windows, with the process environment
-//! unchanged, stdout and stderr merged and tail-capped at 64 KiB, masked by the engine's
-//! `Scrubber` before it is handed back, under a semaphore keyed `verify`, and with the step
+//! restricted to runtime paths, stdout and stderr merged and tail-capped at 64 KiB, masked by
+//! the engine's `Scrubber` before it is handed back, under a semaphore keyed `verify`, and with the step
 //! deadline's remainder as the timeout. The process handling is `isolate/git.rs`'s
 //! [`Cli`](crate::isolate::git::Cli) contract verb for verb — a supervised child whose whole group
 //! a kill reaches, both pipes read concurrently so neither can fill and stall it, and the cap kept
@@ -53,6 +53,22 @@ const SHELL: (&str, &str) = ("sh", "-c");
 /// The Windows shell, same contract (plan D30).
 #[cfg(windows)]
 const SHELL: (&str, &str) = ("cmd", "/C");
+
+/// Only runtime paths may cross into repository-controlled verification commands. In particular,
+/// do not inherit credentials, proxy URLs, shell startup hooks or language runtime options.
+/// No secrets are passed: the caller's scrubber need not know the host's environment values.
+const VERIFY_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "SYSTEMROOT",
+    "WINDIR",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+];
 
 // The reasons an `unavailable` report carries, one named function per sentence — the house style
 // of `htui_core::store::traits`'s refusals and of `isolate/git.rs`'s failure classes. The operator
@@ -319,12 +335,17 @@ impl ShellVerifier {
         step: StepId,
     ) -> VerifyReport {
         let started_at = self.clock.now();
-        // The process environment is handed to the child unchanged (plan D30): ANA-2 `:493` asks
-        // for "the agent's environment minus the secrets" and the walk's `SessionSpec.env` is
-        // empty this milestone, so the agent's environment *is* this process's.
+        // An empty SessionSpec.env does not imply an empty host environment. Clear inheritance
+        // on every spawn (including the Windows fallback) before restoring runtime paths.
         let build = || {
             let mut shell = tokio::process::Command::new(&self.shell);
             shell
+                .env_clear()
+                .envs(
+                    VERIFY_ENV
+                        .iter()
+                        .filter_map(|key| std::env::var_os(key).map(|value| (*key, value))),
+                )
                 .arg(SHELL.1)
                 .arg(command)
                 .current_dir(cwd)
@@ -597,6 +618,86 @@ mod tests {
             .expect("a report");
         assert_eq!(report.outcome, VerifyOutcome::Pass);
         assert!(report.output.contains("here"), "output: {}", report.output);
+    }
+
+    /// Seed a separate verifier process: mutating this test runner's environment is unsafe.
+    /// Prefix-free secrets must never reach either pipe, even with the production empty masker.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_secrets_are_excluded_from_verification() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const CHILD: &str = "HTUI_VERIFY_ENV_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().expect("a temporary directory");
+            let probe = dir.path().join("htui-verify-env-probe");
+            std::fs::write(&probe, "#!/bin/sh\necho path-ok\n").expect("write probe");
+            std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700))
+                .expect("make probe executable");
+            let mut paths = vec![dir.path().to_path_buf()];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            let output =
+                tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+                    .args([
+                        "--exact",
+                        "verify::tests::host_secrets_are_excluded_from_verification",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env(
+                        "DATABASE_PASSWORD",
+                        "opaque-password-without-a-known-prefix",
+                    )
+                    .env("UNCLASSIFIED_VALUE", "another-opaque-credential")
+                    .env("BASH_ENV", "/nonexistent/htui-startup-hook")
+                    .env("HOME", dir.path())
+                    .env("PATH", std::env::join_paths(paths).expect("search path"))
+                    .output()
+                    .await
+                    .expect("start verifier test process");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let report = verifier()
+            .run(request(
+                "htui-verify-env-probe; printf 'stdout=%s\\n' \"${DATABASE_PASSWORD-unset}\"; \
+                 printf 'stderr=%s\\n' \"${UNCLASSIFIED_VALUE-unset}\" >&2; \
+                 printf 'hook=%s\\nchild=%s\\nhome=%s\\n' \"${BASH_ENV-unset}\" \
+                 \"${HTUI_VERIFY_ENV_TEST_CHILD-unset}\" \"$HOME\"; exit 3",
+                dir.path().to_path_buf(),
+            ))
+            .await
+            .expect("a report");
+        assert_eq!(report.outcome, VerifyOutcome::Fail);
+        assert_eq!(report.exit_code, Some(3));
+        for line in [
+            "path-ok",
+            "stdout=unset",
+            "stderr=unset",
+            "hook=unset",
+            "child=unset",
+        ] {
+            assert!(
+                report.output.lines().any(|actual| actual == line),
+                "{}",
+                report.output
+            );
+        }
+        assert!(
+            report
+                .output
+                .contains(&format!("home={}\n", std::env::var("HOME").unwrap()))
+        );
+        assert!(!report.output.contains("opaque-"));
     }
 
     /// A command whose binary is missing is **not** `unavailable`: the shell ran, reported it and
