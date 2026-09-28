@@ -375,13 +375,21 @@ pub struct AgentRuntime {
     started: Vec<StepId>,
     grace: Duration,
     /// Tasks this runtime spawned that answer a request of their own: today the probe's (MOD-2
-    /// D53). Swept when finished, awaited by [`finish_background`](Self::finish_background),
-    /// aborted by [`shutdown`](Self::shutdown).
+    /// D53), a chat's staleness re-probe's (plan D55) and the prompt preview's (plan D102). Swept
+    /// when finished, awaited by [`finish_background`](Self::finish_background), aborted by
+    /// [`shutdown`](Self::shutdown).
     ///
     /// The runtime owns the handle for the same reason it owns a chat's: a bare `tokio::spawn`
     /// inside the worker loop would leave a probe with a 60-second handshake running after the UI
     /// is gone, with nobody able to name it.
-    background: Vec<JoinHandle<()>>,
+    ///
+    /// One collection of two kinds of task: some **write `agent_box`**, some only read. The split
+    /// is [`Background`]'s tag, stated once at each push site, and
+    /// [`claim_is_free`](Self::claim_is_free) consults the writing half — a preview holds no claim,
+    /// so holding `j` in the Backlog detail no longer refuses `i` in Settings (MOD-31 D5).
+    /// [`background_len`](Self::background_len) counts them all; the half is
+    /// [`writing_background_len`](Self::writing_background_len).
+    background: Vec<Background>,
     /// The rows a `ChatStart` re-probe is running for, so two overlapping chats do not each start
     /// one for the same `(agent_id, box_id)` (blueprint H-9).
     ///
@@ -452,6 +460,81 @@ impl core::fmt::Debug for AgentRuntime {
             .field("live", &self.live.len())
             .field("box_probe", &self.box_probe.is_some())
             .finish()
+    }
+}
+
+/// One task this runtime owns in [`background`](Self::background), and what it writes (MOD-31 D1).
+///
+/// The collection mixes two kinds of work and the guard consults only one of them: a probe and a
+/// chat's staleness re-probe both end by writing `agent_box`, and a prompt preview **reaches no
+/// write method** (plan D102) — it reads a dozen tables, walks the filesystem and records nothing.
+/// So a preview held in the Backlog detail used to refuse an install, a login, a `ProbeBox` and a
+/// connect's registration probe, with a sentence about a probe that was not running.
+///
+/// The tag is a promise and the constructor is where it is made. There is no bool field and no
+/// other way in, so a fifth push site has to name what its task does rather than pass a guess —
+/// and a reviewer greps for `Background::reading` and checks each against the task it names.
+struct Background {
+    /// The task. Reached only through [`task`](Self::task) and [`into_task`](Self::into_task), so
+    /// nothing outside this module can take the handle and drop the tag.
+    task: JoinHandle<()>,
+    /// What the task writes, decided once, at the push site that knows the spawned future.
+    writes: Writes,
+}
+
+/// What a background task writes, and therefore whether it holds the install claim (MOD-31 D1).
+///
+/// An enum rather than a bool for [`LivePhase`](LivePhase)'s reason: the name is the claim, and
+/// `reads: true` at a push site would be a maintainer's guess with nothing to grep for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Writes {
+    /// The task ends by writing `agent_box` for at least one row.
+    AgentBox,
+    /// The task reaches no write method: it reads, and answers on the frame channel.
+    Nothing,
+}
+
+impl Background {
+    /// A task that **writes `agent_box`** for at least one row, so
+    /// [`claim_is_free`](Self::claim_is_free) must see it.
+    ///
+    /// The promise: a task pushed here is one an install's re-probe would race on the same row
+    /// (hazard H-10, MOD-21 D19), and the guard is entitled to refuse the install beside it. A task
+    /// that writes nothing, or that writes some other table, does not belong here.
+    fn writing(task: JoinHandle<()>) -> Self {
+        Self {
+            task,
+            writes: Writes::AgentBox,
+        }
+    }
+
+    /// A task that **reaches no write method** (plan D102's "the preview writes nothing").
+    ///
+    /// The promise: the task records nothing, so it holds no claim and leaves no row for an
+    /// install to race. Promoting the preview to [`writing`](Self::writing) the day `run_preview`
+    /// grows a write is one word at one call site — which is the whole reason the tag lives here
+    /// and not in the guard.
+    fn reading(task: JoinHandle<()>) -> Self {
+        Self {
+            task,
+            writes: Writes::Nothing,
+        }
+    }
+
+    /// The task, borrowed: for the sweep, which looks at every entry and keeps most of them.
+    fn task(&self) -> &JoinHandle<()> {
+        &self.task
+    }
+
+    /// The task, by move: for the wait and the abort, which consume the entry.
+    fn into_task(self) -> JoinHandle<()> {
+        self.task
+    }
+
+    /// Whether this task writes `agent_box`, which is the one question
+    /// [`claim_is_free`](Self::claim_is_free) asks of the collection.
+    fn writes_agent_box(&self) -> bool {
+        matches!(self.writes, Writes::AgentBox)
     }
 }
 
@@ -628,6 +711,23 @@ impl AgentRuntime {
         self.background.len()
     }
 
+    /// How many of those background tasks write `agent_box` — the set `claim_is_free` consults.
+    ///
+    /// The narrow half of [`background_len`](Self::background_len), and the one a test that says
+    /// "a preview holds no claim" needs: a total cannot say whether the entry inside it is one the
+    /// guard would refuse on (MOD-31 D4).
+    ///
+    /// The predicate is named through a closure rather than as `Background::writes_agent_box`,
+    /// because `filter` hands it `&&Background` and a method on `&self` is a `fn(&Background)`:
+    /// the same path spelled as a function item is a trait-bound error, not a clippy lint.
+    #[must_use]
+    pub fn writing_background_len(&self) -> usize {
+        self.background
+            .iter()
+            .filter(|entry| entry.writes_agent_box())
+            .count()
+    }
+
     /// Awaits every background task, each under `limit`; one past it is aborted and named.
     ///
     /// The deterministic end the test harness needs: a probe answers through the reply channel
@@ -642,7 +742,8 @@ impl AgentRuntime {
         // Every preview named here is one of the tasks about to be awaited, so the right to cancel
         // it dies with the handle (review finding M3).
         self.previews.clear();
-        for handle in std::mem::take(&mut self.background) {
+        for entry in std::mem::take(&mut self.background) {
+            let handle = entry.into_task();
             let abort = handle.abort_handle();
             if tokio::time::timeout(limit, handle).await.is_err() {
                 abort.abort();
@@ -1019,7 +1120,7 @@ impl AgentRuntime {
         self.live.retain(|_, chat| !chat.commands.is_closed());
         // The same sweep for the tasks that answer their own request: a probe that has answered is
         // not a probe still running, and `background_len` is what a test reads.
-        self.background.retain(|task| !task.is_finished());
+        self.background.retain(|entry| !entry.task().is_finished());
         // And for the right to cancel a preview, which must not outlive the task it names: an
         // origin whose preview has answered has nothing left to supersede (review finding M3).
         self.previews.retain(|_, preview| !preview.is_finished());
@@ -1097,8 +1198,8 @@ impl AgentRuntime {
             }
         }
         self.previews.clear();
-        for task in std::mem::take(&mut self.background) {
-            task.abort();
+        for entry in std::mem::take(&mut self.background) {
+            entry.into_task().abort();
         }
         // MOD-7 D27: the box probe is aborted like the agent probe; each version child dies with
         // its `ChildGuard`, and a probe cut short recorded nothing, so the next launch retries.
@@ -1162,13 +1263,14 @@ impl AgentRuntime {
         // Blueprint D35: the injected env when a test gave one, else this process's own.
         let (env, _) = self.probe_env()?;
 
-        self.background.push(tokio::spawn(run_probe(ProbeArgs {
-            writer,
-            box_id,
-            agents,
-            env,
-            frames: Frames::new(replies.clone(), addr),
-        })));
+        self.background
+            .push(Background::writing(tokio::spawn(run_probe(ProbeArgs {
+                writer,
+                box_id,
+                agents,
+                env,
+                frames: Frames::new(replies.clone(), addr),
+            }))));
         Ok(Served::Deferred)
     }
 
@@ -1254,7 +1356,7 @@ impl AgentRuntime {
         if let Some(superseded) = self.previews.insert(origin, task.abort_handle()) {
             superseded.abort();
         }
-        self.background.push(task);
+        self.background.push(Background::reading(task));
         Served::Deferred
     }
 
@@ -1755,7 +1857,8 @@ impl AgentRuntime {
             && !self.box_probe_running();
         let reprobe = match (stale, reprobe) {
             (true, Some(args)) => {
-                self.background.push(tokio::spawn(run_reprobe(args)));
+                self.background
+                    .push(Background::writing(tokio::spawn(run_reprobe(args))));
                 None
             }
             (_, held) => held,
@@ -8238,9 +8341,9 @@ done
         let mut runtime = box_runtime(tmp.path());
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        runtime
-            .background
-            .push(Background::writing(tokio::spawn(std::future::pending::<()>())));
+        runtime.background.push(Background::writing(tokio::spawn(
+            std::future::pending::<()>(),
+        )));
         runtime.on_online(&backend, &tx);
 
         assert!(!runtime.box_probe_running());
