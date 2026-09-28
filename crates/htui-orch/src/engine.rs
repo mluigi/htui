@@ -12672,6 +12672,140 @@ mod tests {
         }
     }
 
+    /// MOD-9 H-24: on a `fan_out > 1` group the two rows of the previous attempt are siblings, and
+    /// only one of them is the step this retry is a retry **of**. `with_excerpts` resolves the
+    /// previous attempt through `winner_at` for the reason `forwarded` does — the file set has to
+    /// be the same attempt's as the diff, or the prompt describes a step that never ran.
+    ///
+    /// `winner_at` itself is pinned in `status.rs`, and this pins the **call site**, which nothing
+    /// did: replacing it with the blueprint's "the highest earlier attempt at this position" and a
+    /// `max_by_key` leaves every other case in this file green, because every one of them runs a
+    /// `fan_out = 1` group of exactly one row where the two lookups cannot disagree. So the
+    /// sibling is built to make them disagree — index 0 is selected, index 1 is not, and
+    /// `max_by_key` over a tie returns the **last** row, which is the other one.
+    #[tokio::test]
+    async fn a_fanout_group_asks_about_the_selected_candidates_rows() {
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (repo, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        glob_the_tests_skill(&harness, &["**/*.md"]).await;
+
+        // The other candidate of the same slot: created, settled as the loser, and given its own
+        // tree and commit rows so a request that named it would be visibly wrong.
+        let sibling = harness
+            .orch
+            .store
+            .create_step(NewRunStep {
+                id: StepId::new(),
+                run_id: row.id,
+                position: prd.position,
+                attempt: 1,
+                fanout_index: 1,
+                phase_name: prd.phase_name.clone(),
+                agent_id: None,
+                model: None,
+            })
+            .await
+            .expect("`UNIQUE (run_id, position, attempt, fanout_index)` is free at index 1");
+        for step in [&prd, &sibling] {
+            harness
+                .orch
+                .store
+                .upsert_step_tree(
+                    step.id,
+                    &[htui_core::model::RunStepTree {
+                        run_step_id: step.id,
+                        repo_id: repo,
+                        mode: htui_core::model::Isolation::Worktree,
+                        path: format!("/fake/trees/{}", step.id),
+                        base_ref: "fake:base:0".to_owned(),
+                        dirty: false,
+                    }],
+                )
+                .await
+                .expect("the tree row is written");
+            harness
+                .orch
+                .store
+                .record_commits(
+                    step.id,
+                    &[htui_core::model::RunStepCommit {
+                        run_step_id: step.id,
+                        repo_id: repo,
+                        before_hash: "fake:base:0".to_owned(),
+                        after_hash: Some("fake:after:0".to_owned()),
+                    }],
+                )
+                .await
+                .expect("the commit row is written");
+        }
+        harness
+            .orch
+            .store
+            .select_fanout(
+                row.id,
+                prd.position,
+                1,
+                prd.id,
+                Some("the judge picked it".to_owned()),
+            )
+            .await
+            .expect("the slot settles on the parked `prd` candidate");
+        let settled = harness
+            .orch
+            .steps(row.id)
+            .await
+            .into_iter()
+            .find(|step| step.id == prd.id)
+            .expect("the `prd` row is still there");
+        assert_eq!(
+            settled.selected,
+            Some(true),
+            "the prologue: the selection is on index 0, and index 1 is the loser"
+        );
+
+        // The step this pass runs: the same slot, attempt 2, exactly as `RetryStep` would leave it.
+        let mut second = prd.clone();
+        second.attempt = 2;
+        harness.orch.isolator.script_changed_paths(vec![RepoPath {
+            repo: "htui".to_owned(),
+            path: "docs/notes.md".to_owned(),
+        }]);
+        harness_engine!(harness.orch, engine);
+
+        let mut spec = engine
+            .phase_spec(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                true,
+            )
+            .await
+            .expect("the spec is built")
+            .expect("`prd` requires nothing");
+        engine
+            .with_excerpts(&row, &second, ids::HTUI_FEAT_3, &mut spec)
+            .await
+            .expect("no store fault");
+
+        let last = harness
+            .orch
+            .isolator
+            .changed_path_requests()
+            .pop()
+            .expect("the pass asked once");
+        assert_eq!(
+            (last.trees, last.commits),
+            (vec![prd.id], vec![prd.id]),
+            "H-24: the selected candidate's rows, which are the rows `forwarded` diffs. A `max_by_key` \
+             over `(position, attempt)` returns the last row of the tie -- the loser -- and every \
+             other case in this file would still pass, because they are all `fan_out = 1`"
+        );
+    }
+
     /// MOD-9 D89: `FEAT-3`'s project-level `tests` attachment, flipped from `Always` to `Glob`
     /// through the real writer and under the row's own `updated_at` token.
     ///
