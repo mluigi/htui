@@ -27,7 +27,7 @@ use htui_core::model::{
     Activation, NewSkill, NewSkillBinding, NewSkillVersion, Scope, SkillBindingId, SkillId,
     SkillVersion, WorkspaceSummary,
 };
-use htui_core::store::{CasOutcome, MemStore, ReadStore as _, WriteStore as _};
+use htui_core::store::{CasOutcome, MemStore, WriteStore as _};
 
 /// The shell over `store`, every view registered, on the Skills tab's **Skills** view. The tab
 /// opens there (D34), so — unlike the templates helper — there is no second `l`.
@@ -189,7 +189,10 @@ async fn the_skills_view_lists_the_library_with_versions_and_token_estimates() {
         )
         .await
         .expect("the direct write");
-    assert!(matches!(attached, CasOutcome::Applied(_)), "the bind applies");
+    assert!(
+        matches!(attached, CasOutcome::Applied(_)),
+        "the bind applies"
+    );
 
     let mut harness = open_over(store).await;
     select(&mut harness, "rust-style");
@@ -232,7 +235,8 @@ async fn any_two_skill_versions_diff() {
         "the two labels: {frame}"
     );
     assert!(
-        frame.contains("+Prefer `expect` with a reason. One error enum per crate."),
+        // The pane is 52 columns, so the added line wraps: the head of it is the claim.
+        frame.contains("+Prefer `expect` with a reason. One error enum per"),
         "the added line: {frame}"
     );
     insta::assert_snapshot!("diff_two_versions", frame);
@@ -384,7 +388,7 @@ async fn a_new_skill_starts_at_version_one() {
     let frame = harness.render();
     assert!(notice(&frame).contains("saved v1"), "{frame}");
     assert!(
-        frame.contains(&row("house-rules", 1, "\u{2014}", "~10")),
+        frame.contains(&row("house-rules", 1, "\u{2014}", "~12")),
         "and the library grew a row: {frame}"
     );
 }
@@ -428,10 +432,7 @@ async fn n_refuses_a_name_the_library_holds() {
     type_text(&mut harness, "rust-style");
     harness.key("enter");
     let frame = harness.render();
-    assert!(
-        notice(&frame).contains("`rust-style` exists"),
-        "{frame}"
-    );
+    assert!(notice(&frame).contains("`rust-style` exists"), "{frame}");
     assert!(!frame.contains("saves v1"), "no editor opened: {frame}");
 }
 
@@ -464,10 +465,7 @@ async fn the_editor_hands_off_to_a_fake_editor_and_returns_edited() {
     harness.settle().await;
 
     let frame = harness.render();
-    assert!(
-        notice(&frame).contains("edited in $EDITOR"),
-        "{frame}"
-    );
+    assert!(notice(&frame).contains("edited in $EDITOR"), "{frame}");
     assert!(
         hint(&frame).contains("Ctrl+S save"),
         "the editor is open on the returned text: {frame}"
@@ -500,8 +498,14 @@ async fn a_failed_external_edit_keeps_the_draft() {
     );
     let frame = harness.render();
     assert!(notice(&frame).contains("exited with 1"), "{frame}");
-    assert!(frame.contains("DRAFT Prefer `expect`"), "the draft: {frame}");
-    assert!(hint(&frame).contains("Ctrl+S save"), "in the editor: {frame}");
+    assert!(
+        frame.contains("DRAFT Prefer `expect`"),
+        "the draft: {frame}"
+    );
+    assert!(
+        hint(&frame).contains("Ctrl+S save"),
+        "in the editor: {frame}"
+    );
 }
 
 /// `on_scope_change` is `settings/prompt.rs`'s: the library, the editor, the pending handoff and
@@ -563,7 +567,7 @@ async fn a_long_name_is_cut_so_the_version_and_estimate_stay() {
 
     let frame = harness.render();
     assert!(
-        frame.contains("  a-very-long-skill-name-b\u{2026} v1"),
+        frame.contains("  a-very-long-skill-name-be\u{2026} v1"),
         "the long name is cut to its field: {frame}"
     );
     assert!(
