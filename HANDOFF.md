@@ -14,31 +14,38 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-26):** **MOD-7 was done** (`docs/decisions/mod/mod-7.md`), all four
-milestones: a box is keyed on its `box.toml` id and checked by a keyed machine fingerprint
-(migration `0005_box_identity`); a probe fills hardware, tools and tags; Settings > Boxes edits
-declared tags and quirks as a compare-and-set; `R-ORCH-10` refuses a missing tag at enqueue and at
-claim; and milestone 4 infers repo paths under the workspace root (Settings > Hierarchy `i`, manual
-fallback `b`) and puts excerpts read from those roots into phase prompts and the preview (the judge
-keeps none, D109). MOD-49 is unblocked; a MOD-4 test flake seen at its gate is CLEAN-5.
-Before it, **ANA-22 was concluded** (`docs/decisions/ana/ana-22.md`): a skill
-is pure library content attached at global, project or phase level, and the attachment carries the
-activation (`always`, `glob`, `off`; language compiled to globs); it unblocks MOD-9 milestones 3 and 4. MOD-9's
-PRD is up (`.claude/prds/mod-9-skill-library-templates.prd.md`); agent help while editing is MOD-55.
-Before it, **MOD-38 was done** (`docs/decisions/mod/mod-38.md`): migration
-`0006_requirements` adds `item.resolution` and the requirement tables behind new store methods on
-MemStore, PgStore and the cache; `closed` is now reachable only through `close_out`, which takes a
-resolution (amends ANA-2 §4.3). MOD-39 (Requirements tab) is unblocked.
+**Current status (2026-09-28):** **MOD-9 milestone 3 landed** (`2d5a4fd`..`614ac2f`): skills are
+editable and bindable. Four compare-and-set writers (`upsert_skill`, `add_skill_version`,
+`set_skill_binding`, `remove_skill_binding`) on both stores; the hand-written glob matcher
+`htui_core::prompt::glob` behind `activation = glob`, chosen at the plan gate **over `globset`**, so
+no dependency was added; `select` now records `matched` with the path it matched, or `no_match`,
+beside `no_path`; `Isolator::changed_paths` feeds both the matcher and `ExcerptRequest.changed_paths`
+and makes `TIER2_PREV_DIFF` live in production; the Skills tab has its `Skills` view and its
+attachments matrix with a global row, the language → globs map and a repo picker; the override
+clone copies phase attachments, so the clone-gap note can fire. `R-SKL-3`'s five verbs each have a
+test. **MOD-9 milestone 4 is next** (a SKILL.md import, ANA-22 §5.7 and §7.3). Before it, **MOD-7
+was done** (`docs/decisions/mod/mod-7.md`), all four milestones: a box is keyed on its `box.toml` id
+and checked by a keyed machine fingerprint (migration `0005_box_identity`); a probe fills hardware,
+tools and tags; Settings > Boxes edits declared tags and quirks as a compare-and-set; `R-ORCH-10`
+refuses a missing tag at enqueue and at claim; and milestone 4 infers repo paths under the workspace
+root (Settings > Hierarchy `i`, manual fallback `b`) and puts excerpts read from those roots into
+phase prompts and the preview (the judge keeps none, D109). MOD-49 is unblocked; a MOD-4 test flake
+seen at its gate is CLEAN-5. Before it, **ANA-22 was concluded**
+(`docs/decisions/ana/ana-22.md`): a skill is pure library content attached at global, project or
+phase level, and the attachment carries the activation (`always`, `glob`, `off`; language compiled
+to globs). MOD-9's PRD is up (`.claude/prds/mod-9-skill-library-templates.prd.md`); agent help while
+editing is MOD-55.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
-(MOD-38) and `0007_skill_attachments` (MOD-9 milestone 2; cache: `0001`..`0004`), so **the next
-migration is `0008`** (cache: `0005`).
-`max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
-(done, all four milestones), MOD-38 and MOD-9 milestones 1 and 2: store conformance `CASES` 77,
-`READ_CASES` 14, `htui-orch` `CASES` 72, `GraphSource` 7 methods, `StoreRequest` 69, `StoreReply`
-40, `hierarchy::REQUEST_NAMES` 13, 268 `.sqlx` files, 88 `crates/htui/tests/snapshots`,
-`MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 34 pinned commented
-columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 2` with `skill_choices`.
+(MOD-38), `0007_skill_attachments` (MOD-9 milestone 2) and `0008_skill_match` (MOD-9
+milestone 3, comment only), so **the next migration is `0009`**. Cache: `0001`..`0004`.
+`max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-9
+milestone 3 (measured 2026-09-28): store conformance `CASES` 81, `READ_CASES` 14,
+`EXPECTED_CASES` 81, `htui-orch` `CASES` 72, `GraphSource` 8 methods, `WriteStore` 83 methods,
+`StoreRequest` 73, `StoreReply` 42, `hierarchy::REQUEST_NAMES` 13, 281 `.sqlx` files, 97
+`crates/htui/tests/snapshots`, `MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip
+columns), 34 pinned commented columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 2`
+with `skill_choices`, whose entries carry a `matched` path.
 Excerpts reach phase prompts since MOD-7 milestone 4, so a phase-prompt digest recorded before
 2026-09-26 does not compare with a later one; handoff digests are unchanged.
 `cargo doc --workspace --no-deps --keep-going` shows exactly six baseline errors (`htui-core`
@@ -349,6 +356,27 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   `is_override` (`NewStepGraph` has no such field), so the engine's clone-gap note cannot fire
   until the clone sets it (review finding 2); and reading bindings before versions is now the
   race-safe order for the writers (review finding 5).
+  **Phase 3 landed (`2d5a4fd`..`614ac2f`, 2026-09-28):** milestone 3, skills editable and bindable —
+  `upsert_skill`, `add_skill_version`, `set_skill_binding` and `remove_skill_binding` as
+  compare-and-set writers on both stores (four conformance cases, a Postgres CAS race, and
+  `WriteStore` 79 → 83); the hand-written glob matcher `htui_core::prompt::glob` behind
+  `activation = glob`, so no dependency was added (plan D70, decided at the gate over
+  `globset`); `ExcerptSet.listed` carrying the walk's enumeration and `PromptSpec`'s
+  `skill_files` / `skill_matches`, so `select` records `matched` with its path, or `no_match`,
+  beside `no_path` (`SkillChoice` 7 → 8 keys); `Isolator::changed_paths`, which feeds both the
+  matcher and `ExcerptRequest.changed_paths` and makes `TIER2_PREV_DIFF` live in production
+  (D89, the maintainer's OQ-15 override); the Skills tab's `Skills` view (library, versions, diff,
+  editor, `$EDITOR`, save, per-skill token estimate) and its attachments matrix with a global row,
+  the language → globs map and a repo picker; `NewStepGraph.is_override` and the override clone
+  copying phase attachments through `GraphSource::phase_attachments`, so the clone-gap note can
+  finally fire; migration `0008_skill_match.sql` (comment only). Plan
+  `.claude/plans/mod-9-skills-editable.plan.md`, blueprint
+  `.claude/plans/mod-9-skills-editable.blueprint.md`. Review found one CRITICAL the reviewers
+  caught and the fix agent's own brief overstated: the matcher's `**` rewind resumed at the
+  current path position instead of the one where the `**` began, a false negative on ordinary
+  patterns (`**/*.rs` against `vendor/x.rs/y.rs`), fixed and pinned by rows in `the_dialect_table`.
+  **Milestone 4 is next** (a SKILL.md import, ANA-22 §5.7's hand-written frontmatter reader and
+  §7.3's mapping — a skill file, not a path in this repo).
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
   pattern masks, fail-closed persistence gate, Settings tab secret provider section. **No longer
