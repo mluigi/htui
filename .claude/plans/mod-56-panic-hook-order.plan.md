@@ -56,7 +56,9 @@ hooks") — the order is the contract, and only the app can honour it when it al
 - **D220 — the test asserts the *effect*, not the predicate.** The existing test already pins
   `restores_the_terminal()` per panic. What is untested — and what MOD-56 is about — is that the
   decision *reaches* the restore. The new half drives the real chain with a counting restore and
-  asserts: three contained panics leave the count at 0, one uncontained panic raises it to 1.
+  asserts: a contained provider panic leaves the count at 0, the following uncontained panic
+  raises it to 1 — the second assert is the control that makes the first one non-vacuous
+  (amended at blueprint: the earlier "three contained panics" wording contradicted Task 0).
   Before the fix the count would be 1 after the first contained panic.
 - **D221 — `TerminalGuard::enter` keeps its comment and its shape.** It still must not call
   `ratatui::init()`, and now for a second reason: after D217 any ratatui init would stack an
@@ -121,6 +123,9 @@ halves are one commit's worth of work and one reviewer pass covers both.
    which the repo's own convention argues against.
 3. **A future `ratatui::init` call anywhere re-breaks this.** Mitigated by D221's comment, which
    now names *this* bug as the reason, not just hook stacking.
+4. **The workspace lints `unused_qualifications = "warn"`** and the gate runs `-D warnings`, so
+   `std::io::stdout()` and `crossterm::…` must stay fully qualified (the file's existing style). The
+   only import line that changes is the `use ratatui::…` one.
 
 ## Validation
 
@@ -160,7 +165,7 @@ screen. Then `Ctrl-C`/kill the process ungracefully and confirm the terminal is 
 | 2 | that hook is installed before `enable_raw_mode`, so a failure mid-init is covered |
 | 3 | `ratatui::init()` is exactly `try_init().expect(...)` |
 | 4 | `ratatui::restore()` is a plain `fn() -> ()` usable as an `Fn() + Send + Sync + 'static` |
-| 5 | `CrosstermBackend` and `Terminal` are reachable from the `ratatui` crate root in 0.30.2 |
+| 5 | `CrosstermBackend` and `Terminal` are both nameable in 0.30.2 — `Terminal` at the crate root, `CrosstermBackend` under `ratatui::backend` (amended at blueprint: "crate root" was wrong for `CrosstermBackend`) |
 | 6 | `crossterm` is a direct dependency of the `htui` crate at the same version `ratatui-crossterm` uses |
 | 7 | `terminal::init()` has exactly one call site (`lib.rs::run`) |
 | 8 | no other file in the workspace calls `set_hook`/`take_hook` |
@@ -174,11 +179,11 @@ Fact-checked 2026-09-28 against `ratatui-0.30.2` in the local registry and the t
 
 | # | Claim | Verdict | Evidence |
 |---|---|---|---|
-| 1 | `try_init` installs a hook that calls `restore()` unconditionally before the previous hook | verified | `ratatui-0.30.2/src/init.rs:397-403` calls `set_panic_hook()`; `:566-572` is `take_hook()` then `Box::new(move |info| { restore(); hook(info) })` — `restore` first, inner hook second |
+| 1 | `try_init` installs a hook that calls `restore()` unconditionally before the previous hook | verified | `ratatui-0.30.2/src/init.rs:397-402`, `set_panic_hook()` at `:398` (line range corrected at blueprint); `:566-572` is `take_hook()` then `Box::new(move |info| { restore(); hook(info) })` — `restore` first, inner hook second |
 | 2 | that hook is installed before `enable_raw_mode` | verified | same three lines: `set_panic_hook(); enable_raw_mode()?; execute!(stdout(), EnterAlternateScreen)?;` |
 | 3 | `ratatui::init()` is `try_init().expect(...)` | verified | `init.rs:365-367` |
 | 4 | `ratatui::restore` is a plain `fn() -> ()` | verified | `init.rs:524-529` — `pub fn restore()`, errors are `eprintln`ed, never propagated |
-| 5 | `CrosstermBackend` and `Terminal` are reachable from the crate root | verified | `lib.rs:479` re-exports `Terminal`; `lib.rs:504-508` `pub mod backend` re-exports `CrosstermBackend` (crossterm feature on by default — the workspace already builds `DefaultTerminal`). `init.rs:213`: `DefaultTerminal = Terminal<CrosstermBackend<Stdout>>`, so `CrosstermBackend::new(std::io::stdout())` is the right backend |
+| 5 | `CrosstermBackend` and `Terminal` are both nameable | verified | `lib.rs:479` re-exports `Terminal`; `lib.rs:504-508` `pub mod backend` re-exports `CrosstermBackend` (crossterm feature on by default — the workspace already builds `DefaultTerminal`). `init.rs:213`: `DefaultTerminal = Terminal<CrosstermBackend<Stdout>>`, so `CrosstermBackend::new(std::io::stdout())` is the right backend |
 | 6 | `crossterm` is a direct dependency at the version ratatui uses | verified | `crates/htui/Cargo.toml:35` `crossterm = { workspace = true }`; `Cargo.lock` holds one `crossterm 0.29.0` and `ratatui-crossterm 0.1.2` depends on it — no version skew with `enter` |
 | 7 | one call site for `terminal::init` | verified | graph text search: `crates/htui/src/lib.rs:123` only (the other hit is the MOD-56 HANDOFF line itself) |
 | 8 | no other workspace file calls `set_hook`/`take_hook` | verified | graph text search `set_hook`: 3 hits — `terminal.rs:37`, and two in `tests/panic_hook.rs` (its module doc and the test's own recorder) |
