@@ -6023,29 +6023,33 @@ pub(crate) mod tests {
                 &envelope(2, StoreRequest::InstallPlan { agent_id }),
             )
             .await;
-        // **Not** `assert!(matches!(planned, Served::Deferred))`, and not "the install succeeded"
-        // either. This case pins the *absence of the refusal*, and absence of a refusal is not
-        // presence of a success: `install_plan` gets past the guard, spawns `run_plan`, and the
-        // registry is unrouted, so the pre-flight fails for the fixture's own reasons. A success
-        // assertion would be a claim this fixture cannot support, and `Served::Deferred` would pass
-        // on a runtime that refused the plan for some *other* reason — which is the bug's own
-        // failure mode, wrong-reason instead of no-reason.
+        // `Deferred`, and **not** "the install succeeded". This case pins the decision `serve`
+        // returned, not the plan's outcome: `install_plan` gets past the guard, spawns `run_plan`,
+        // and the registry is unrouted, so the pre-flight fails for the fixture's own reasons —
+        // asynchronously, inside the spawned task, after `install_plan` has already returned
+        // `Deferred`. Asserting on that failure would be asserting on the fixture, and there is no
+        // way to await the reply here without giving `run_plan` the one thing this case must not
+        // grant it: an `await` of the test's own between the preview and the install, which
+        // `sweep_finished` would use to drop the very entry whose presence makes the case mean
+        // anything.
         //
-        // **Two** sentences are checked, and the second is load-bearing. Naming only the new one
-        // makes the assert vacuous: the pre-fix guard refuses with *other words*, so a runtime
-        // that is still broken never produces the string this case looks for. Written that way it
-        // passed against the very code it exists to fail. The old sentence is therefore pinned as
-        // the bug's fingerprint, so "the guard declined to fire" is total rather than partial. No
-        // other refusal carries either substring: the login and install arms name an agent id, and
-        // `BOX_PROBE_RUNNING` says "is running", not "already running".
-        if let Served::Reply(StoreReply::Failed { request, message }) = &planned {
-            assert_eq!(*request, "install_plan");
-            assert!(
-                !message.contains("already writing this box")
-                    && !message.contains("already running on this box"),
-                "a preview writes no `agent_box` row, so it holds no claim (MOD-31 D5): {message}"
-            );
-        }
+        // The positive form is what makes this bite, and the old `if let` shape is what hid it.
+        // `serve` converts **every** `Err` out of `install_plan` into
+        // `Served::Reply(StoreReply::Failed)`, so a refusal is never `Deferred`: an
+        // `if let … = &planned` was skipped outright whenever the answer was not a `Failed`, and
+        // matched vacuously when it *was* one for any other reason — an
+        // `installing_runtime` that stopped attaching its installer fails at `install_config`,
+        // which is checked before `claim_is_free`, and the whole claim went untested in green.
+        // Naming the guard's two sentences instead did not close that hole either: it only asked
+        // that a refusal be *some other* refusal, so the pre-fix guard's own wording was never
+        // what a passing assert had to exclude. Here every precondition — `install_config`,
+        // `recording_writer`, `registered_box`, `claim_is_free`, `row_for`, `declares_a_source` —
+        // has to have returned `Ok` and the spawn has to have happened, so a runtime that refused
+        // for any reason at all, the pre-fix guard's included, goes red right here.
+        assert!(
+            matches!(planned, Served::Deferred),
+            "a preview writes no `agent_box` row, so it holds no claim (MOD-31 D5): {planned:?}"
+        );
         runtime.shutdown(Duration::ZERO).await;
     }
 
@@ -6168,17 +6172,16 @@ pub(crate) mod tests {
         let probed = runtime
             .serve(&backend, &tx, &envelope(2, StoreRequest::ProbeBox))
             .await;
-        // The same rule as the install case, and for the same two reasons: the *refusal* is what is
-        // pinned rather than the probe's outcome, and both of the guard's sentences are checked so
-        // the assert is not vacuous against the pre-fix guard. See that case's comment for why.
-        if let Served::Reply(StoreReply::Failed { request, message }) = &probed {
-            assert_eq!(*request, "probe_box");
-            assert!(
-                !message.contains("already writing this box")
-                    && !message.contains("already running on this box"),
-                "a preview writes no `agent_box` row, so it holds no claim (MOD-31 D5): {message}"
-            );
-        }
+        // The same rule, and for the same reasons as the install case: the *decision* is pinned
+        // rather than the probe's outcome, and the positive form is what closes the hole an `if
+        // let` leaves. See that case's comment for why — `serve` turns every `Err` out of
+        // `probe_box` into `Served::Reply(Failed)`, so `Deferred` can only mean that
+        // `registered_box` and `claim_is_free` both let it through, and the pre-fix guard's
+        // refusal is then not one of the ways this assert can pass.
+        assert!(
+            matches!(probed, Served::Deferred),
+            "a preview writes no `agent_box` row, so it holds no claim (MOD-31 D5): {probed:?}"
+        );
         // A `ProbeBox` that got past the guard really does spawn a box probe, so this case has to
         // finish it rather than leave it behind a drop. `never_probed` is the unresolvable
         // registry, so it resolves in milliseconds and spawns no adapter anywhere near the suite.
