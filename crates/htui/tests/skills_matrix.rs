@@ -793,6 +793,45 @@ async fn a_qualified_attachment_reopens_without_a_second_qualifier() {
     );
 }
 
+/// H-37: a language the map does not hold contributes nothing and is **not** a refusal
+/// (D83) — but it is said, because a silent no-op is indistinguishable from a broken one. The
+/// write still goes out, and `languages` keeps the name the map could not expand.
+#[tokio::test]
+async fn a_language_the_map_does_not_hold_is_said_and_the_save_still_goes_out() {
+    let store = MemStore::demo();
+    let mut harness = matrix(open_over(store.clone()).await).await;
+
+    harness.key("e");
+    type_text(&mut harness, "docs/**");
+    harness.key("tab");
+    type_text(&mut harness, "cobol");
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("no language named `cobol` in the map"),
+        "the form's notice names the language it did not know, which is H-37's half that \
+         `effective_globs` cannot do on its own: {frame}"
+    );
+    assert!(
+        frame.contains("  docs/**"),
+        "and the effective globs are the typed glob alone, because an unknown name expands to \
+         nothing: {frame}"
+    );
+
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let row = only(&store).await.expect("the row the form wrote");
+    assert_eq!(
+        row.globs,
+        ["docs/**"],
+        "D83: an unknown name is not a refusal, so the write went out"
+    );
+    assert_eq!(
+        row.languages,
+        ["cobol"],
+        "and `languages` keeps what was typed, so the row still says what it could not expand"
+    );
+}
+
 /// A global attachment cannot name a repo, so the picker is refused there before it is even asked
 /// for — the same rule the writer enforces on a qualified glob, and the reason a global row can
 /// never carry one.
