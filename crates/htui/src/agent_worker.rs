@@ -6118,8 +6118,8 @@ pub(crate) mod tests {
             other => panic!("a re-probe and an install race on `agent_box`: {other:?}"),
         }
         // The refusal is at the claim, which is before `row_for`, so `acp_fake_row`'s lack of a
-        // `discovery.install` never comes into it, and nothing was spawned to be torn down: the
-        // 404-free path leaves the chat and the re-probe for `shutdown`.
+        // `discovery.install` never comes into it, and nothing was spawned behind it: no plan, no
+        // registry read, no `/registry.json` route. The chat and the re-probe go with `shutdown`.
         runtime.shutdown(Duration::ZERO).await;
     }
 
