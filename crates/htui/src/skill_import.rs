@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use htui_core::model::skill::SkillEntry;
-use htui_core::model::skill_import::{ParsedSkill, SKILL_FILE, parse, prefill_from_source};
+use htui_core::model::skill_import::{ParsedSkill, SKILL_FILE, parse};
 use htui_core::model::{NewSkill, NewSkillVersion, SkillId, UserId};
 use htui_core::store::{CasOutcome, Result, StoreError, WriteStore};
 use htui_store::{Backend, DATABASE_UNREACHABLE};
@@ -328,13 +328,18 @@ async fn write_one(
 /// Reads a file as text, refusing in one sentence each — the two sentences
 /// [`crate::editor::run`] already uses, because they are the ones a maintainer has read before.
 fn read_text(path: &Path) -> std::result::Result<String, String> {
-    let bytes = std::fs::read(path)
+    // The cap is asked of the file **before** it is read, not after: a refusal that has already
+    // pulled two gigabytes into memory is not a refusal.
+    let size = std::fs::metadata(path)
+        .map(|metadata| metadata.len())
         .map_err(|error| format!("could not read this file ({error}); nothing was imported"))?;
-    if bytes.len() as u64 > MAX_BYTES {
+    if size > MAX_BYTES {
         return Err(format!(
             "the file is over the {MAX_BYTES}-byte cap; nothing was imported"
         ));
     }
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("could not read this file ({error}); nothing was imported"))?;
     String::from_utf8(bytes).map_err(|_| "the file is not UTF-8; nothing was imported".to_owned())
 }
 
@@ -431,13 +436,6 @@ async fn write_skill(
             message: error.to_string(),
         },
     }
-}
-
-/// The prefill a stored version carries, for the attachments matrix (D96). Re-exported here so the
-/// view reaches one module for the whole import shape.
-#[must_use]
-pub fn prefill_of(source: &serde_json::Value) -> htui_core::model::skill_import::ImportPrefill {
-    prefill_from_source(source)
 }
 
 #[cfg(test)]
@@ -871,5 +869,45 @@ mod tests {
             shown.contains("secretive"),
             "but the name and the path do: {shown}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::{MAX_BYTES, read_text};
+
+    /// The cap is asked of the file before it is read. A file one byte over is refused, and the
+    /// refusal names the cap rather than the read.
+    #[test]
+    fn a_file_over_the_cap_is_refused_and_a_file_under_it_is_not() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let small = dir.path().join("small.md");
+        std::fs::write(&small, vec![b'x'; 8]).expect("write");
+        assert!(read_text(&small).is_ok(), "a file under the cap reads");
+
+        let big = dir.path().join("big.md");
+        std::fs::write(&big, vec![b'x'; MAX_BYTES as usize + 1]).expect("write");
+        let refusal = read_text(&big).expect_err("one byte over the cap is refused");
+        assert!(
+            refusal.contains(&format!("{MAX_BYTES}-byte cap")),
+            "the refusal names the cap, not a read error: {refusal}"
+        );
+        assert!(read_text(&big).is_err(), "and it stays refused");
+    }
+
+    #[test]
+    fn a_missing_file_is_refused_in_the_readers_own_sentence() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let refusal = read_text(&dir.path().join("gone.md")).expect_err("no such file");
+        assert!(refusal.contains("could not read this file"), "{refusal}");
+    }
+
+    #[test]
+    fn a_file_that_is_not_utf8_is_refused() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("binary.md");
+        std::fs::write(&path, [0xff, 0xfe, 0x00]).expect("write");
+        let refusal = read_text(&path).expect_err("not UTF-8");
+        assert!(refusal.contains("not UTF-8"), "{refusal}");
     }
 }
