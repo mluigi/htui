@@ -10,6 +10,7 @@
 //! no raw mode while the event loop carried on drawing into it. The wedged-UI shape, from a defect
 //! the assembler had already decided to survive.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use htui_agent::excerpt::{PROVIDER_THREAD_PREFIX, run_providers};
@@ -125,5 +126,39 @@ fn a_contained_provider_panic_leaves_the_terminal_alone() {
         restores,
         "a panic the process does not survive still gives the terminal back — that is the whole \
          reason the hook exists"
+    );
+
+    // The second half of MOD-56, and the half that was missing: everything above pins the
+    // *decision*, and the decision was right while the terminal was still torn down underneath the
+    // event loop, because the hook that asked it was ratatui's inner one and ratatui's outer one
+    // restored regardless of the answer. So this drives the real chain, with a counting restore
+    // standing where `ratatui::restore` stands in production. It goes *over* a recorder rather
+    // than replacing one — these are the same expected panics as the three above, and a default
+    // hook underneath would print three unwind backtraces that read as a failure.
+    let restored = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&restored);
+    std::panic::set_hook(Box::new(|_info| {}));
+    htui::terminal::install_panic_hook_restoring(move || {
+        counter.fetch_add(1, Ordering::Relaxed);
+    });
+
+    // A contained panic, inline, on this thread — the case that `catch_unwind` swallows without
+    // stopping the hook, and the one H-20 exists for.
+    let (_, set) = run_providers(&inline, &owned.as_request());
+    assert_eq!(set, vec!["boom@0.1:panic".to_owned()]);
+    assert_eq!(
+        restored.load(Ordering::Relaxed),
+        0,
+        "a `false` from the predicate has to reach the restore, or the terminal goes down under a \
+         running event loop (MOD-56)"
+    );
+
+    // And then the panic the process does not survive, on this same thread.
+    let _ = std::panic::catch_unwind(|| panic!("the shell itself"));
+    assert_eq!(
+        restored.load(Ordering::Relaxed),
+        1,
+        "an uncontained panic still gives the terminal back — that is the whole reason the hook \
+         exists"
     );
 }
