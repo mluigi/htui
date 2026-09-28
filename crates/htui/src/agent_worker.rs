@@ -5955,6 +5955,231 @@ pub(crate) mod tests {
         runtime.shutdown(Duration::ZERO).await;
     }
 
+    /// MOD-31 D5, the bug in one test: a prompt preview reaches no write method (plan D102), so it
+    /// holds no claim and a live one does not refuse an install.
+    ///
+    /// Hold `j` in the Backlog detail — a task that reads a dozen tables, walks the filesystem and
+    /// records nothing — and press `i` in Settings. Before the split this came back *"a probe is
+    /// already running on this box"* while the only thing alive was the preview, and no probe had
+    /// been asked for.
+    ///
+    /// The three `serve` calls are adjacent on purpose: `serve` sweeps finished tasks as its first
+    /// statement, so an `await` of my own between the preview and the install could sweep the very
+    /// entry whose presence makes this case mean anything.
+    #[tokio::test]
+    async fn a_running_preview_does_not_refuse_an_install() {
+        // `unresolvable_registry` for the same reason the sibling above uses it, and **no**
+        // `fixture.route("/registry.json", …)`: this case never wants a *long* registry read, only
+        // a short one. Unrouted, the responder answers 404 in milliseconds, so the plan task ends
+        // long before the teardown rather than being waited out by it.
+        let store = unresolvable_registry().await;
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&install_row(agent_id, "demo", true))
+            .await
+            .expect("the row lands");
+        let backend = Backend::memory(store);
+        let fixture = Fixture::start().await;
+        let tmp = tempfile::tempdir().expect("a temporary install root");
+        let mut runtime = installing_runtime(&fixture, &tmp.path().join("agents"));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        // A preview first: deferred, owned by the runtime, and holding no claim. `HTUI_FEAT_1` is a
+        // real demo item, so the task does real work and is still unfinished when the next request
+        // sweeps — which is what keeps the entry in the collection the guard consults.
+        let previewed = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(
+                    1,
+                    StoreRequest::PromptPreview {
+                        item: ids::HTUI_FEAT_1,
+                        template_name: None,
+                        scope: scope(),
+                    },
+                ),
+            )
+            .await;
+        assert!(
+            matches!(previewed, Served::Deferred),
+            "the preview is deferred to the runtime's own task (`R-NF-3`): {previewed:?}"
+        );
+        assert_eq!(
+            runtime.background_len(),
+            1,
+            "the runtime owns one task, which is the fact `R-NF-3` asks for"
+        );
+        assert_eq!(
+            runtime.writing_background_len(),
+            0,
+            "and that task writes no `agent_box` row, so it is not in the guard's set (MOD-31 D4)"
+        );
+
+        let planned = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(2, StoreRequest::InstallPlan { agent_id }),
+            )
+            .await;
+        // **Not** `assert!(matches!(planned, Served::Deferred))`, and not "the install succeeded"
+        // either. This case pins the *absence of the refusal*, and absence of a refusal is not
+        // presence of a success: `install_plan` gets past the guard, spawns `run_plan`, and the
+        // registry is unrouted, so the pre-flight fails for the fixture's own reasons. A success
+        // assertion would be a claim this fixture cannot support.
+        //
+        // Two rewrites are worth naming, because both look like improvements. Asserting
+        // `Served::Deferred` would pass on a runtime that refused the plan for some *other*
+        // reason — which is the bug's own failure mode, wrong-reason instead of no-reason. And
+        // asserting `!message.contains("probe is already running")` would pin nothing at all: that
+        // sentence is gone from the tree, so it is vacuously absent on every path, before and
+        // after the fix. The property under test is the guard declining to fire, so the substring
+        // is the guard's own words.
+        if let Served::Reply(StoreReply::Failed { request, message }) = &planned {
+            assert_eq!(*request, "install_plan");
+            assert!(
+                !message.contains("already writing this box"),
+                "a preview writes no `agent_box` row, so it holds no claim (MOD-31 D5): {message}"
+            );
+        }
+        runtime.shutdown(Duration::ZERO).await;
+    }
+
+    /// MOD-31 D5 and D6, the other half of the claim: a chat's staleness re-probe **does** write
+    /// `agent_box`, so it holds the claim exactly as a probe does, and the refusal names both
+    /// kinds of task that do.
+    ///
+    /// OQ-3's conservative answer, pinned. Narrowing the guard to the writing half would have been
+    /// wrong for a re-probe — the hazard is the same one a probe carries, on the same row — so this
+    /// case is here to stop a future reader "simplifying" the re-probe's push site to `reading`.
+    ///
+    /// The staging is `a_chat_start_on_a_stale_acp_row_re_probes_in_the_background` **plus** an
+    /// installer, because the two cannot be combined from either fixture alone:
+    /// `installing_runtime`'s `DriverFactory::new()` registers no `acp` transport, so a `ChatStart`
+    /// on an `acp` row is refused by `driver_for` before the re-probe is ever considered; and a
+    /// runtime with no installer answers "this runtime has no installer" at
+    /// [`install_config`](Self::install_config), which is checked before the claim.
+    #[tokio::test]
+    async fn a_running_chat_reprobe_still_refuses_an_install() {
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&acp_fake_row(agent_id))
+            .await
+            .expect("the acp row lands");
+        let backend = Backend::memory(store);
+        let fixture = Fixture::start().await;
+        let tmp = tempfile::tempdir().expect("a temporary install root");
+        let mut runtime =
+            AgentRuntime::new(acp_factory(Script::one_turn(vec![ScriptEvent::Emit(
+                DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            )])))
+            .with_grace(Duration::from_millis(0))
+            .with_installer(InstallConfig::new(
+                fixture.base(),
+                Some(tmp.path().join("agents")),
+            ));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let started = runtime
+            .serve(&backend, &tx, &envelope(1, start(agent_id, "hello")))
+            .await;
+        assert!(
+            matches!(started, Served::Start { .. }),
+            "the chat starts on what resolution already gave it: {started:?}"
+        );
+        assert_eq!(
+            runtime.writing_background_len(),
+            1,
+            "an unprobed `acp` row is re-probed beside the chat, and the re-probe writes `agent_box`"
+        );
+
+        match runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(2, StoreRequest::InstallPlan { agent_id }),
+            )
+            .await
+        {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "install_plan");
+                assert!(
+                    message.contains("is already writing this box"),
+                    "the refusal names the re-probe as well as the probe (MOD-31 D6): {message}"
+                );
+            }
+            other => panic!("a re-probe and an install race on `agent_box`: {other:?}"),
+        }
+        // The refusal is at the claim, which is before `row_for`, so `acp_fake_row`'s lack of a
+        // `discovery.install` never comes into it, and nothing was spawned to be torn down: the
+        // 404-free path leaves the chat and the re-probe for `shutdown`.
+        runtime.shutdown(Duration::ZERO).await;
+    }
+
+    /// MOD-31 D5, the caller the HANDOFF does not mention: [`StoreRequest::ProbeBox`] is the path
+    /// an `Online` swap's registration probe goes through, and `on_online` skips it **silently** —
+    /// it only logs `tracing::info!` and records nothing, so the box stays unprobed until the next
+    /// swap. The install case above at least tells the user something; this one says nothing at
+    /// all, which is why it needs its own test rather than riding along on that one.
+    ///
+    /// Its staging is *not* the install case's: [`probe_box`](Self::probe_box) never calls
+    /// `install_config`, so it needs no `Fixture` and no installer. Routing a 30-second
+    /// `/registry.json` here would buy nothing — this path spawns a **box** probe, not a plan — and
+    /// `finish_background` would then wait out the delay.
+    #[tokio::test]
+    async fn a_running_preview_does_not_refuse_a_box_probe() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let store = never_probed().await;
+        let backend = Backend::memory(store);
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let previewed = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(
+                    1,
+                    StoreRequest::PromptPreview {
+                        item: ids::HTUI_FEAT_1,
+                        template_name: None,
+                        scope: scope(),
+                    },
+                ),
+            )
+            .await;
+        assert!(
+            matches!(previewed, Served::Deferred),
+            "the preview is deferred to the runtime's own task (`R-NF-3`): {previewed:?}"
+        );
+        assert_eq!(
+            runtime.writing_background_len(),
+            0,
+            "and it holds no claim (MOD-31 D4), so it is not in the guard's set"
+        );
+
+        let probed = runtime
+            .serve(&backend, &tx, &envelope(2, StoreRequest::ProbeBox))
+            .await;
+        // The same rule as the install case, for the same two reasons: the *refusal* is what is
+        // pinned, not the probe's outcome. See that case's comment for why.
+        if let Served::Reply(StoreReply::Failed { request, message }) = &probed {
+            assert_eq!(*request, "probe_box");
+            assert!(
+                !message.contains("already writing this box"),
+                "a preview writes no `agent_box` row, so it holds no claim (MOD-31 D5): {message}"
+            );
+        }
+        // A `ProbeBox` that got past the guard really does spawn a box probe, so this case has to
+        // finish it rather than leave it behind a drop. `never_probed` is the unresolvable
+        // registry, so it resolves in milliseconds and spawns no adapter anywhere near the suite.
+        runtime.finish_background(Duration::from_secs(10)).await;
+    }
+
     /// A row whose `discovery` declares no source is refused **by the row**, with the pre-flight's
     /// own sentence and without a request: the answer is in the document the worker already holds.
     #[tokio::test]
