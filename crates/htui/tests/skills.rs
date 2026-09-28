@@ -389,6 +389,61 @@ async fn a_save_appends_a_version_and_moves_the_head() {
     );
 }
 
+/// D101's second token on the other side of a save that *did* land: `land_save`'s "later edits
+/// kept" branch moves `updated_at` with `token`, so the `Ctrl+S` the notice offers appends
+/// instead of answering `SkillsStale` — and the notice is not a lie while the head sits at v3.
+/// The Templates view pins the same shape in `keys_typed_while_a_save_is_in_flight_are_kept`.
+#[tokio::test]
+async fn keys_typed_while_a_save_is_in_flight_are_kept() {
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+    select(&mut harness, "rust-style");
+    harness.key("E");
+    type_text(&mut harness, "A");
+    harness.key("ctrl-s");
+    // The save is queued, not served: these keys land while it is in flight.
+    type_text(&mut harness, "B");
+    harness.settle().await;
+
+    let row = head(&store, "rust-style").await.expect("a head");
+    assert_eq!(row.version, 3, "the head's plus one");
+    assert!(
+        row.body.starts_with("APrefer `expect`"),
+        "v3 is the body that was sent: {:?}",
+        row.body
+    );
+    let frame = harness.render();
+    assert!(
+        frame.contains("ABPrefer `expect`"),
+        "the later edit is kept: {frame}"
+    );
+    assert!(
+        hint(&frame).contains("Ctrl+S save"),
+        "the editor stays open: {frame}"
+    );
+    assert!(
+        notice(&frame).contains("saved v3") && notice(&frame).contains("Ctrl+S saves them as v4"),
+        "{frame}"
+    );
+    assert!(frame.contains("saves v4"), "the token moved to v3: {frame}");
+
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let row = head(&store, "rust-style").await.expect("a head");
+    assert_eq!(row.version, 4, "the second `Ctrl+S` appended");
+    assert!(
+        row.body.starts_with("ABPrefer `expect`"),
+        "with the characters typed while the first save was in flight: {:?}",
+        row.body
+    );
+    let frame = harness.render();
+    assert!(notice(&frame).contains("saved v4"), "{frame}");
+    assert!(
+        !hint(&frame).contains("Ctrl+S save"),
+        "back in Browse: {frame}"
+    );
+}
+
 /// `n` creates: a name no row holds, an empty body, and a save that lands as **v1** — not v2,
 /// because the head token of a skill that does not exist is `None`. The form's second field is
 /// `skill.description`, not part of the body.
