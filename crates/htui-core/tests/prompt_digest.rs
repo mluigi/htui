@@ -1570,6 +1570,73 @@ fn a_masked_record_survives_a_second_pass_unchanged() {
     );
 }
 
+/// The one walk both `to_value` pins share: every `.rs` file under the workspace, symlinks
+/// skipped so the traversal cannot cycle, `target` and hidden directories pruned.
+///
+/// Bounded to the **workspace root** (`CARGO_MANIFEST_DIR/../..`) rather than `CARGO_MANIFEST_DIR/..`.
+/// The first version walked `crates/`, which in a packaged build holding only `htui-core` is a
+/// directory with nothing in it — the test then passed vacuously while claiming to have checked
+/// the tree.
+fn each_workspace_rust_file(mut visit: impl FnMut(&std::path::Path, &str)) {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("crates").is_dir())
+        .expect("htui-core sits in a workspace with a crates/ directory")
+        .to_path_buf();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("a readable workspace directory") {
+            let entry = entry.expect("a readable entry");
+            let kind = entry.file_type().expect("a readable file type");
+            if kind.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if kind.is_dir() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if name == "target" || name.starts_with('.') {
+                    continue;
+                }
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path).expect("a readable source file");
+                visit(&path, &source);
+            }
+        }
+    }
+}
+
+/// True when this `serde_json::to_value(` call's argument text names a record.
+///
+/// **Why the argument and not a list of whole lines.** The first version of this pin matched
+/// literal strings like `"serde_json::to_value(&record)"`, which is an ordinary expression for any
+/// type: the first unrelated `fn f(record: &Foo)` in any crate would have failed the test with a
+/// message asserting a `TrimRecord` bypass. Reading the *argument* and asking whether it names a
+/// record is the rule the message was always about, and it catches the forms the code actually
+/// uses — `&prompt.trim`, `&prompts.forward.trim`, `trim`, `&record` — without a needle per
+/// spelling.
+///
+/// `self` is deliberately **not** in the rule, and that was measured rather than assumed. Adding
+/// it flagged two lines on the first run, both false: `payload_sections_value` at
+/// `prompt/mod.rs:345`, which serialises `self.payload_sections()` — a `Vec<SectionEntry>`, not a
+/// record — and a doc comment in `probe.rs` that *names* `serde_json::to_value` in prose. Outside
+/// `trim.rs` a record is never the receiver; it is `trim` or `record`. A `BTreeMap`-with-string-
+/// keys is likewise not a hazard, which is why the map pin below bans only the hashing maps.
+fn serialises_a_record(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("//") {
+        return false;
+    }
+    let Some(call) = line.split_once("serde_json::to_value(") else {
+        return false;
+    };
+    let argument = call.1.split(')').next().unwrap_or_default();
+    argument.contains("trim") || argument.contains("record")
+}
+
 #[test]
 fn a_trim_record_is_never_serialised_outside_to_value() {
     // MOD-32, review finding. `TrimRecord` is `pub` and still derives `Serialize`, so
@@ -1579,43 +1646,87 @@ fn a_trim_record_is_never_serialised_outside_to_value() {
     // the unscrubbed *expression*, so the guarantee that a record is scrubbed before it is
     // persisted is a convention, and this is the grep that keeps it one. Same idiom and the same
     // reason as `the_only_section_entry_constructor_is_the_records_projection` above.
-    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates/htui-core has a parent")
-        .to_path_buf();
     let mut offenders: Vec<String> = Vec::new();
-    let mut stack = vec![crates.clone()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("a readable crate directory") {
-            let path = entry.expect("a readable entry").path();
-            if path.is_dir() {
-                if path.file_name().is_some_and(|name| name == "target") {
-                    continue;
-                }
-                stack.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                let source = std::fs::read_to_string(&path).expect("a readable source file");
-                let serialises_a_record = [
-                    "serde_json::to_value(&prompt.trim)",
-                    "serde_json::to_value(&prompts.forward.trim)",
-                    "serde_json::to_value(&record)",
-                    "serde_json::to_value(&self)",
-                    "serde_json::to_value(trim)",
-                ]
-                .iter()
-                .any(|needle| source.contains(needle));
-                if serialises_a_record
-                    && !path.ends_with("prompt/trim.rs")
-                    && !path.ends_with("tests/prompt_digest.rs")
-                {
-                    offenders.push(path.display().to_string());
-                }
+    each_workspace_rust_file(|path, source| {
+        let allowed = path.ends_with("prompt/trim.rs")
+            || path
+                .file_name()
+                .is_some_and(|name| name == "prompt_digest.rs");
+        if allowed {
+            return;
+        }
+        for (number, line) in source.lines().enumerate() {
+            if serialises_a_record(line) {
+                offenders.push(format!("{}:{}", path.display(), number + 1));
             }
         }
-    }
+    });
     assert!(
         offenders.is_empty(),
         "a `TrimRecord` is serialised outside `TrimRecord::to_value`, which is the bypass MOD-32 \
          removed and the one that must not come back: {offenders:?}"
     );
+}
+
+#[test]
+fn the_engine_scrubs_the_record_with_the_scrubber_it_holds() {
+    // MOD-32, review finding. The signature change forces *a* `&dyn Scrubber`, not *the* one the
+    // run holds. Swapping `self.parts.scrubber` for a locally built `MinimalScrubber::new([])` at
+    // any of the three sites compiles, passes every behavioural case in this file, and silently
+    // disables the masking half on every path where the scrubber is populated — which is what
+    // happens the moment the run engine's empty secret list (`run_worker.rs:1253`) is fixed. So the
+    // argument is pinned here, not just the call.
+    let engine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/htui-orch/src/engine.rs");
+    let source = std::fs::read_to_string(&engine).expect("the engine is a readable source file");
+
+    assert_eq!(
+        source.matches("to_value(self.parts.scrubber").count(),
+        3,
+        "the three `set_step_prompt` sites pass the scrubber the run holds; one is added or removed \
+         here, and `set_step_prompt`'s production caller list has to stay in step with it"
+    );
+    for (number, line) in source.lines().enumerate() {
+        if line.contains("to_value(") && !line.contains("to_value(self.parts.scrubber") {
+            panic!(
+                "engine.rs:{}: a `to_value(` that does not pass `self.parts.scrubber`: {}",
+                number + 1,
+                line.trim()
+            );
+        }
+    }
+}
+
+#[test]
+fn the_record_graph_holds_no_map_that_could_break_the_null_argument() {
+    // MOD-32, review finding. The engine's `Value::Null` argument leans on "no map in the record
+    // graph": `serde_json::to_value` fails on a map whose keys are not strings, and a `HashMap`
+    // field is the one way to introduce that. `the_prompt_module_reads_no_clock` bans the type for
+    // `crates/htui-core/src/prompt/`'s nine files, but the record graph reaches past them — into
+    // `model/skill.rs` for `SkillChoice`/`SkillLevel`/`Activation` and `model/ids.rs` for
+    // `SkillId` — so that guard was narrower than the claim it was cited for. This is the guard
+    // that covers the whole graph, and it is deliberately not folded into the clock test: "reads no
+    // clock" and "serialises to an object" are different invariants with different blast radii.
+    const GRAPH: [(&str, &str); 3] = [
+        ("prompt/trim.rs", include_str!("../src/prompt/trim.rs")),
+        ("model/skill.rs", include_str!("../src/model/skill.rs")),
+        ("model/ids.rs", include_str!("../src/model/ids.rs")),
+    ];
+    for (name, source) in GRAPH {
+        // Comments excluded, and the shipped/test cut is deliberately **not** borrowed from the
+        // clock test. `trim.rs` names `BTreeMap` in prose — its own module doc explains that
+        // `serde_json::Map` is one — and a `BTreeMap<String, _>` is harmless, because a map only
+        // breaks the second failure mode when its keys are not strings. The hazard is the hashing
+        // maps, whose key type is chosen by whoever writes the field.
+        for forbidden in ["HashMap", "HashSet"] {
+            assert!(
+                !source.lines().any(|line| {
+                    !line.trim_start().starts_with("//") && line.contains(forbidden)
+                }),
+                "`{name}` names `{forbidden}`: an unordered map in the record graph is the one \
+                 thing that could make `serde_json::to_value` fail, which `to_value` would turn \
+                 into a `Null` `run_step.trim_record`"
+            );
+        }
+    }
 }

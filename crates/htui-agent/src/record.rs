@@ -244,9 +244,15 @@ pub enum RecordError {
     /// is what loses the rows.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// Something credential-shaped survived scrubbing. Reported once, from
-    /// [`Recorder::finish`]; the offending row was already dropped and replaced by a
-    /// `scrub_residue` error row when it happened.
+    /// Something credential-shaped survived scrubbing. **Two producers, and only one of them
+    /// drops anything.**
+    ///
+    /// The recorder's own path, from [`Recorder::finish`]: the offending row was already dropped
+    /// and replaced by a `scrub_residue` error row when it happened, and the variant is reported
+    /// once. The orchestrator's path, since MOD-32, is `TrimRecord::to_value` refusing a run
+    /// step's record before it is persisted — nothing was recorded and no `scrub_residue` row
+    /// exists, because there was no row to drop. The two are indistinguishable to a reader of the
+    /// run's failure reason, which is why the downstream variant at `command.rs` names both.
     #[error(transparent)]
     Unmasked(#[from] Unmasked),
     /// A payload could not be turned into JSON. Only a transport that produced a
