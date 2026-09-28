@@ -8199,8 +8199,10 @@ done
         );
     }
 
-    /// Blueprint D27: a finished background task (a preview, a chat re-probe) does not hold the
-    /// claim: `sweep_finished` clears it before `on_online` asks.
+    /// Blueprint D27: a finished background task does not hold the claim — `sweep_finished` clears
+    /// it before `on_online` asks. The entry below is tagged `writing` on purpose, so the sweep is
+    /// the only thing that frees the claim here (MOD-31 D2); a `reading` entry would be free
+    /// already, and the sweep would be untested.
     #[tokio::test]
     async fn a_finished_background_task_does_not_stop_the_registration_probe() {
         let tmp = tempfile::tempdir().expect("temp box");
@@ -8209,8 +8211,14 @@ done
         let mut runtime = box_runtime(tmp.path());
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        runtime.background.push(tokio::spawn(async {}));
-        while !runtime.background.iter().all(JoinHandle::is_finished) {
+        runtime
+            .background
+            .push(Background::writing(tokio::spawn(async {})));
+        while !runtime
+            .background
+            .iter()
+            .all(|entry| entry.task().is_finished())
+        {
             tokio::task::yield_now().await;
         }
         runtime.on_online(&backend, &tx);
@@ -8232,14 +8240,14 @@ done
 
         runtime
             .background
-            .push(tokio::spawn(std::future::pending::<()>()));
+            .push(Background::writing(tokio::spawn(std::future::pending::<()>())));
         runtime.on_online(&backend, &tx);
 
         assert!(!runtime.box_probe_running());
         assert_eq!(runtime.background_len(), 1, "the held task is still there");
         assert!(sent(&mut rx).is_empty(), "a skipped probe says nothing");
-        for task in std::mem::take(&mut runtime.background) {
-            task.abort();
+        for entry in std::mem::take(&mut runtime.background) {
+            entry.into_task().abort();
         }
         assert_eq!(this_box_record(&store).await.row.last_probed_at, None);
     }
