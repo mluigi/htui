@@ -188,15 +188,18 @@ struct Form {
     pin: Pin,
     /// The globs, one per line — what the store receives, which is why a reopen shows the
     /// **effective** list and not a separately-typed one: the language expansion is already in
-    /// it, and [`expand_languages`] de-duplicates, so saving again is a no-op.
+    /// it, and [`expand_languages`] de-duplicates, so saving again is a no-op. The one thing
+    /// that is **not** in the field is the `<repo>:` prefix [`Form::qualifier`] puts back on
+    /// every line, so a reopen qualifies a row exactly once.
     globs: TextArea,
     /// The languages, one per line, each of which [`LANGUAGE_GLOBS`] expands at save.
     languages: TextArea,
     /// `skill_binding.position`, typed.
     position: TextField,
     /// The `<repo>:` the picker wrote, prepended to every **typed** glob; `None` for a bare glob.
-    /// Read back off the stored globs when the form opens, so reopening a qualified attachment
-    /// and saving it again does not strip the qualifier.
+    /// Read back off the stored globs when the form opens, and the same prefix is then stripped
+    /// off the field by [`unqualified`], so reopening a qualified attachment and saving it again
+    /// leaves the qualifier on and does not double it.
     qualifier: Option<String>,
     /// Which of the three fields `Tab` is on.
     field: usize,
@@ -247,6 +250,28 @@ fn plain(key: &KeyEvent) -> bool {
 /// One line of a sub-list under a pane section header, indented two columns past the header.
 fn sub(text: &str, theme: &Theme) -> Line<'static> {
     Line::styled(format!("  {text}"), theme.base)
+}
+
+/// A stored glob with the form's own `<repo>:` prefix taken off, which is what the globs field
+/// holds: [`Form::typed_globs`] puts the qualifier back on every line, so a field seeded with
+/// the stored strings would save `repo:repo:`. A glob that names no repo, or names a **different**
+/// one, is left exactly as it is — the qualifier is one repo, and anything else in a stored glob
+/// is the row's own text.
+fn unqualified(glob: &str, repo: Option<&str>) -> String {
+    let Some(repo) = repo else {
+        return glob.to_owned();
+    };
+    if htui_core::prompt::glob::compile(glob)
+        .ok()
+        .and_then(|p| p.repo)
+        .as_deref()
+        != Some(repo)
+    {
+        return glob.to_owned();
+    }
+    glob.strip_prefix(&format!("{repo}:"))
+        .unwrap_or(glob)
+        .to_owned()
 }
 
 /// `text` cut to `width` chars with an ellipsis, so a long name cannot push the cells after it
@@ -314,12 +339,14 @@ impl Form {
     }
 
     /// The globs the field holds, each carrying the repo qualifier when the picker set one.
+    /// A line that already carries **that** qualifier is left alone: the field can be typed into,
+    /// and a glob typed as `repo:src/**` under a `repo` qualifier is one glob, not two.
     fn typed_globs(&self) -> Vec<String> {
         Self::lines_of(&self.globs)
             .into_iter()
             .map(|glob| match &self.qualifier {
-                Some(repo) => format!("{repo}:{glob}"),
-                None => glob,
+                Some(repo) if !glob.starts_with(&format!("{repo}:")) => format!("{repo}:{glob}"),
+                _ => glob,
             })
             .collect()
     }
@@ -681,15 +708,24 @@ impl MatrixView {
             return;
         };
         let row = cell(self, entry.id, level.axis);
-        let globs = row.map_or_else(String::new, |row| row.globs.join("\n"));
         // A stored glob is the **effective** list, qualifier and all, so the qualifier is read
         // back off it: a reopened qualified attachment saved again is the same row, not a bare
-        // one.
+        // one. The field then holds that same list with **the qualifier stripped**, because
+        // `typed_globs` puts it back on every line — seeding the field with the stored strings
+        // would save `repo:repo:`, which the matcher refuses with an error about a glob the
+        // user never typed.
         let qualifier = row.and_then(|row| {
             row.globs
                 .iter()
                 .find_map(|glob| htui_core::prompt::glob::compile(glob).ok())
                 .and_then(|pattern| pattern.repo.clone())
+        });
+        let globs = row.map_or_else(String::new, |row| {
+            row.globs
+                .iter()
+                .map(|glob| unqualified(glob, qualifier.as_deref()))
+                .collect::<Vec<_>>()
+                .join("\n")
         });
         self.form = Some(Form {
             skill_id: entry.id,
@@ -1406,6 +1442,53 @@ mod tests {
         assert!(
             printed.contains("tests"),
             "the library key is not user text: {printed}"
+        );
+    }
+
+    /// The reviewer found the reopen qualified twice: the form seeds its field with the **stored**
+    /// list, which already carries the `<repo>:`, and `typed_globs` puts it back on every line.
+    /// Both halves are pinned here, because either alone would leave the row uneditable.
+    #[test]
+    fn a_qualifier_is_written_once_over_a_reopened_glob() {
+        let form = |globs: &str| super::Form {
+            skill_id: htui_core::fixtures::ids::SKILL_TESTS,
+            name: "tests".to_owned(),
+            level: super::Axis::Project(htui_core::fixtures::ids::PROJECT_VULKAN),
+            token: None,
+            activation: htui_core::model::Activation::Glob,
+            pin: super::Pin::Latest,
+            globs: crate::ui::TextArea::with_text(globs),
+            languages: crate::ui::TextArea::with_text(""),
+            position: crate::ui::TextField::with_text("0"),
+            qualifier: Some("tutorials".to_owned()),
+            field: 0,
+        };
+        assert_eq!(
+            form("**/*.rs").typed_globs(),
+            ["tutorials:**/*.rs"],
+            "a bare line takes the qualifier the picker chose"
+        );
+        assert_eq!(
+            form("tutorials:**/*.rs").typed_globs(),
+            ["tutorials:**/*.rs"],
+            "a line that already carries **that** qualifier is one glob, not two — this is what a \
+             reopen seeds the field with"
+        );
+        assert_eq!(
+            form("api:**\ntutorials:**").typed_globs(),
+            ["tutorials:api:**", "tutorials:**"],
+            "and a line naming a different repo is the row's own text, which the form's single \
+             qualifier cannot mean"
+        );
+        assert_eq!(
+            super::unqualified("tutorials:**/*.rs", Some("tutorials")),
+            "**/*.rs",
+            "the field is seeded with the stored list, not the stored strings"
+        );
+        assert_eq!(
+            super::unqualified("api:**", Some("tutorials")),
+            "api:**",
+            "a glob the form's qualifier does not name is left alone"
         );
     }
 
