@@ -21,6 +21,7 @@ use htui_core::model::{
 use htui_core::store::{CasOutcome, Result, StoreError, WriteStore};
 use htui_store::{Backend, DATABASE_UNREACHABLE};
 
+use crate::skill_import::{self, SkillImports};
 use crate::store_worker::{StoreReply, StoreRequest};
 
 /// The library and the scope's attachments, as the two views draw them.
@@ -141,16 +142,17 @@ pub async fn snapshot(backend: &Backend, scope: &Scope) -> Result<SkillsSnapshot
     })
 }
 
-/// The four request names, in [`StoreRequest`] order.
+/// The five request names, in [`StoreRequest`] order.
 ///
-/// The views' `Failed` match reads from here. [`StoreRequest::name`]'s arms spell the same four as
+/// The views' `Failed` match reads from here. [`StoreRequest::name`]'s arms spell the same five as
 /// literals, because it is a `const fn`, and `request_names_match_the_name_arms` pins them to this
 /// list, so a name changed in one place and not the other fails there.
-pub const REQUEST_NAMES: [&str; 4] = [
+pub const REQUEST_NAMES: [&str; 5] = [
     "skills",
     "save_skill",
     "set_skill_binding",
     "remove_skill_binding",
+    "import_skills",
 ];
 
 /// The **read**'s name: a refused read leaves the view with no library, where a refused write
@@ -275,7 +277,17 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 CasOutcome::Stale(_) => stale(backend, scope).await,
             }
         }
-        // `try_serve` routes exactly this module's four variants here, so the last arm is
+        StoreRequest::ImportSkills { scope, paths } => {
+            // The filesystem is read here and not in the view (`R-NF-3`): the walk is unbounded work
+            // and the UI task must not carry it. The reply re-reads the whole library, so the
+            // report travels beside a snapshot the view renders from rather than a row it patches.
+            let report = skill_import::import(backend, paths).await?;
+            Ok(StoreReply::SkillImports(Box::new(SkillImports {
+                snapshot: snapshot(backend, scope).await?,
+                report,
+            })))
+        }
+        // `try_serve` routes exactly this module's five variants here, so the last arm is
         // unreachable from the shell; a caller that reached it anyway is better told which request
         // it sent than killed.
         other => Err(StoreError::Backend(format!(
@@ -851,21 +863,26 @@ mod tests {
             save(&scope, "house-rules", "", "", None, None),
             set(&scope, ids::SKILL_TESTS, None, None, 0, None),
             StoreRequest::RemoveSkillBinding {
-                scope,
+                scope: scope.clone(),
                 id: ids::BINDING_HTUI_TESTS,
                 expected: chrono::Utc::now(),
+            },
+            StoreRequest::ImportSkills {
+                scope,
+                paths: Vec::new(),
             },
         ];
         let names: Vec<&str> = samples.iter().map(StoreRequest::name).collect();
         assert_eq!(names, REQUEST_NAMES);
     }
 
-    /// `try_serve` or-serves this module's four variants into one arm beside every other
+    /// `try_serve` or-serves this module's five variants into one arm beside every other
     /// module's, and each of those functions takes the same `&StoreRequest`, so a variant
     /// or-ed into the wrong one compiles clean and is answered by that module's refusal
-    /// sentence. Only this seam builds [`StoreReply::Skills`], so the reply pins the routing.
+    /// sentence. Only this seam builds [`StoreReply::Skills`] and [`StoreReply::SkillImports`],
+    /// so the reply pins the routing.
     #[tokio::test]
-    async fn every_one_of_the_four_is_routed_to_this_seam() {
+    async fn every_one_of_the_five_is_routed_to_this_seam() {
         let backend = demo();
         let scope = platform_scope(&backend).await;
         let row = read(&backend, &scope)
@@ -885,20 +902,28 @@ mod tests {
                 None,
             ),
             StoreRequest::RemoveSkillBinding {
-                scope,
+                scope: scope.clone(),
                 id: row.id,
                 expected: row.updated_at,
+            },
+            // An empty path list still exercises the routing: the reply is built before the walk.
+            StoreRequest::ImportSkills {
+                scope,
+                paths: Vec::new(),
             },
         ];
 
         for request in &samples {
+            let name = request.name();
             let reply = store_worker::serve(&backend, request).await;
-            assert!(
-                matches!(reply, StoreReply::Skills(_)),
-                "`try_serve` routes `{}` here; a variant or-ed into another module's arm answers \
-                 that module's `not a … request` sentence instead",
-                request.name()
-            );
+            let routed = match reply {
+                StoreReply::Skills(_) | StoreReply::SkillImports(_) => true,
+                other => panic!(
+                    "`try_serve` routes `{name}` here; a variant or-ed into another module's arm \
+                     answers that module's `not a … request` sentence instead, not {other:?}"
+                ),
+            };
+            assert!(routed, "{name}");
         }
     }
 

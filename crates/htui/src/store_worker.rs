@@ -43,6 +43,7 @@ use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, InferReport, MirrorAfterDelete};
 use crate::prompt_settings::{self, SettingsSnapshot};
 use crate::run_worker::{LiveChats, RunRuntime, RunServed};
+use crate::skill_import::SkillImports;
 use crate::skills::{self, SkillBody, SkillsSnapshot};
 use crate::templates::{self, TemplateBody, TemplatesSnapshot};
 use crate::ui::overlay::OverlayId;
@@ -610,6 +611,16 @@ pub enum StoreRequest {
         /// The `updated_at` the matrix listed.
         expected: DateTime<Utc>,
     },
+    /// Imports `SKILL.md` files from the paths named, each of which may be a file or a directory
+    /// (MOD-9 milestone 4, D97). The **worker** reads the filesystem: `R-NF-3` keeps the walk off
+    /// the UI task, and the view types a path and nothing else.
+    ImportSkills {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The paths as the maintainer typed them, in that order. A path is never split: one line
+        /// of the import form is one path, so a path containing a space is one path.
+        paths: Vec<String>,
+    },
     /// The connection as the Settings > Connection section shows it (MOD-15 M6, D4): backend
     /// label, whether a DSN is stored (never the DSN), the mirror's `cache_meta`, the last dial.
     ConnectionInfo,
@@ -719,6 +730,8 @@ impl StoreRequest {
             Self::SaveSkill { .. } => "save_skill",
             Self::SetSkillBinding { .. } => "set_skill_binding",
             Self::RemoveSkillBinding { .. } => "remove_skill_binding",
+            // The five of `skills::REQUEST_NAMES`, in that order (MOD-9 D81, milestone 4 D97).
+            Self::ImportSkills { .. } => "import_skills",
             // The four of `connection::REQUEST_NAMES`, in that order (MOD-15 M6 D4).
             Self::ConnectionInfo => "connection_info",
             Self::SetDsn(_) => "set_dsn",
@@ -901,6 +914,11 @@ pub enum StoreReply {
     /// A skill write missed its token (PRD D8, D101): the store as it is now, for the editor to
     /// reload against. The editor keeps its typed text and its draft.
     SkillsStale(Box<SkillsSnapshot>),
+    /// The library after an import, and what happened to every file it touched
+    /// ([`StoreRequest::ImportSkills`], MOD-9 milestone 4 D97). One variant and not two: a file
+    /// that lost its token is reported in `report` while the rest of the batch lands, so there is
+    /// no `SkillsStale` shape to answer.
+    SkillImports(Box<SkillImports>),
     /// `ConnectionInfo`, and every connection writer's success (D4): the section re-renders from
     /// it and never patches a field of its own into what it already had.
     Connection(ConnectionSnapshot),
@@ -1205,7 +1223,8 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::Skills(..)
         | StoreRequest::SaveSkill { .. }
         | StoreRequest::SetSkillBinding { .. }
-        | StoreRequest::RemoveSkillBinding { .. } => skills::serve(backend, request).await?,
+        | StoreRequest::RemoveSkillBinding { .. }
+        | StoreRequest::ImportSkills { .. } => skills::serve(backend, request).await?,
         // The four connection requests, or-ed for the same reason the twenty-five above are: a
         // guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would
         // be an E0004 here (MOD-15 M3 plan F-12, M6 plan D9). Only the read is answered: the three
