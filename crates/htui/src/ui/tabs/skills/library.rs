@@ -521,7 +521,7 @@ impl SkillsView {
             KeyCode::Char(c @ (',' | '.' | 'b' | 'd' | 'e' | 'E')) => {
                 self.notice = None;
                 match self.selected() {
-                    Some(name) => self.on_skill_key(c, name, ctx),
+                    Some(name) => self.on_skill_key(c, name),
                     None if !self.rows().is_empty() => {
                         self.notice = Some(Notice::Info(SELECT_A_SKILL.to_owned()));
                     }
@@ -534,7 +534,12 @@ impl SkillsView {
     }
 
     /// A version, diff or edit key with a skill under the cursor.
-    fn on_skill_key(&mut self, key: char, name: String, ctx: &Ctx<'_>) {
+    ///
+    /// No `Ctx`: every one of these keys is answered out of the snapshot the last read left, and
+    /// none of them sends a request. The Templates view's twin takes one because its `E` hands
+    /// the body to `$EDITOR`; here `Ctrl+E` does that, from inside the editor, where the
+    /// `hand_off` that emits it is.
+    fn on_skill_key(&mut self, key: char, name: String) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -599,7 +604,6 @@ impl SkillsView {
             }
             _ => {}
         }
-        let _ = ctx;
     }
 
     /// `n`: the form, both fields empty.
