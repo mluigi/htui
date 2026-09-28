@@ -21,9 +21,18 @@ pub fn to_value(&self, scrubber: &dyn Scrubber) -> Result<Value, Unmasked> {
 
 All three engine sites call it. The first hop of the error chain is explicit —
 `Unmasked` converts to `RecordError` (`record.rs:251`) and `RecordError` converts to
-`EngineError` (`command.rs:490`), and `?` applies exactly one `From`; no new error variant was
-added. The step fails after stage 3 and before any session starts, so nothing is persisted and
-no token is spent.
+`EngineError` (`command.rs:493`), and `?` applies exactly one `From`; no new error variant was
+added.
+
+A refusal is raised before the record is written and before that step's own session starts, so
+nothing is persisted and the step spends no token. It is **not**, however, a step failure in the
+usual sense: the `?` propagates to `fail_hard` / `fail_candidate` / `fail_judge`, each of which
+settles the run as `RunStatus::Failed` with the rendered message as an **untyped** `run.failure`
+— outside the closed `RunFailure` vocabulary — and runs `cleanup_run`. It does not block the item
+the way the assembler's own refusals do through `refuse_prompt`, so an item whose
+`template.name`, a caller note or a repo slug trips a prefix rule is left actionable and will be
+re-run into the same abort. Plan **D8** chose that shape over moving the scrub into `assemble`;
+the maintainer reviewed the consequence and chose to document it rather than change it.
 
 The pass is **whole-record and enumerates nothing**: one `scrub` over the serialised `Value`,
 reaching every string leaf and every object key. That is the point of the fix, not a stylistic
@@ -79,6 +88,9 @@ an unscrubbed record, and the SQLite cache mirror only ever carries what Postgre
 | `968e418` | the pins |
 | `5377a8f` | the implementation blueprint |
 | `8c1e92f` | the review gate: a pin that could not fail, and docs that claimed more than the code |
+| `921654e` | the refusal's real cost, and the status narrative stripped |
+| `b01e90f` | the close-out, and MOD-59 opened |
+| `d9836b7` | the vacuous workspace walk, and two reverts nothing caught |
 
 Branch `mod-32`, branched off `mod-58`'s `8cc3fda`. Plan:
 `.claude/plans/mod-32-trim-record-scrub.plan.md`.
@@ -86,9 +98,9 @@ Branch `mod-32`, branched off `mod-58`'s `8cc3fda`. Plan:
 ## Tests, and the mutations behind them
 
 Five pins in `crates/htui-core/tests/prompt_digest.rs`, where the assembler's own scrub cases
-already live, plus a grep guard. A pass is a guarantee; the mutations are the proof it bites.
-Each was applied, run, and reverted — the maintainer authorised each explicitly, and `trim.rs` is
-clean in every case.
+already live, plus three grep guards over the whole workspace. A pass is a guarantee; the
+mutations are the proof it bites. Each was applied, run, and reverted — the maintainer authorised
+each explicitly, and `trim.rs` is clean in every case.
 
 | # | Mutation | Observed |
 |---|---|---|
@@ -132,6 +144,24 @@ One reversion nothing catches, recorded rather than left for a reader to find: a
 layer**, replacing `.map_err(RecordError::from)?` with `.unwrap_or(Value::Null)` compiles and
 leaves every pin green. The plan's coverage map claimed "compile-forced by the signature" for the
 three sites, which is true of `to_value` and false of the `?` that consumes it.
+
+**Three guards a signature cannot enforce**, added at the second review. `TrimRecord` is `pub` and
+still derives `Serialize`, so `serde_json::to_value(&trim)` stays valid Rust — the grep guard is
+what keeps the rule a convention. The signature forces *a* `&dyn Scrubber`, not *the* one the run
+holds, so swapping a site for a locally built `MinimalScrubber::new([])` compiles, passes every
+behavioural case, and silently disables the masking half the moment the run engine's secret list
+is populated; a second guard pins the three sites to `self.parts.scrubber`. And a `HashMap` in the
+record graph is the one thing that could make `serde_json::to_value` fail and so turn a record
+into `Value::Null`, so a third bans the hashing maps across the whole graph —
+`the_prompt_module_reads_no_clock` covers `prompt/`'s nine files, but the graph reaches into
+`model/skill.rs` and `model/ids.rs` and that guard was narrower than the claim it was cited for.
+
+Two of those three guards failed on their first run, both against themselves. The serialiser guard
+flagged `payload_sections_value` at `prompt/mod.rs:345` — a `Vec<SectionEntry>`, not a record —
+and a doc comment in `probe.rs` naming `serde_json::to_value` in prose, because the rule matched a
+bare `self`. The map guard flagged `trim.rs` for a `BTreeMap` that appears only in prose
+explaining that `serde_json::Map` is one; a `BTreeMap<String, _>` is harmless and only the hashing
+maps are a hazard. Both rules were narrowed against the measurement rather than argued for.
 
 ## A note on how this ran
 
