@@ -1,6 +1,6 @@
 # Plan: MOD-32 — the `trim_record` write path is not scrubbed
 
-**Status: DRAFT — awaiting the maintainer's CONFIRM gate. Nothing below has been implemented.**
+**Status: CONFIRMED by the maintainer 2026-09-28, as written.**
 
 **Source**: `HANDOFF.md:239-250` (MOD-32, found at MOD-2 close-out, 2026-09-15; previously deferred
 as F-80 and again at the MOD-7 milestone 4 review, MEDIUM).
