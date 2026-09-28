@@ -344,10 +344,10 @@ impl Form {
         match self.field {
             0 => self.globs.cursor_line_col(),
             1 => self.languages.cursor_line_col(),
-            _ => {
-                let _ = &self.position;
-                (0, self.position.len())
-            }
+            // A `TextField` has one line and a char cursor, so its column is its length: the
+            // hint's `L1:C{len+1}` is the cell just past the last character, which is where the
+            // field draws its cursor.
+            _ => (0, self.position.len()),
         }
     }
 
@@ -1370,6 +1370,42 @@ mod tests {
             invalid_skill_name("House Rules").contains("must be 1-64 characters of `[a-z0-9-]`"),
             "the name rule is one function beside the template's, and the library view shows it \
              verbatim for the same reason"
+        );
+    }
+
+    /// H-30: the view derives `Debug` down to the open form, and a glob and a language name are
+    /// what a maintainer types. The two multi-line fields are `TextArea`s and the position is a
+    /// `TextField`, so all three print lengths — the same rule the Templates body editor and the
+    /// `$EDITOR` handoff follow.
+    #[test]
+    fn an_open_form_debug_prints_lengths_not_text() {
+        let form = super::Form {
+            skill_id: htui_core::fixtures::ids::SKILL_TESTS,
+            name: "tests".to_owned(),
+            level: super::Axis::Global,
+            token: None,
+            activation: htui_core::model::Activation::Glob,
+            pin: super::Pin::Latest,
+            globs: crate::ui::TextArea::with_text("secret-glob\nsecond-line"),
+            languages: crate::ui::TextArea::with_text("cobol"),
+            position: crate::ui::TextField::with_text("4242"),
+            qualifier: Some("private-repo".to_owned()),
+            field: 0,
+        };
+        let printed = format!("{form:?}");
+        for secret in ["secret-glob", "second-line", "cobol", "4242"] {
+            assert!(
+                !printed.contains(secret),
+                "`{secret}` reached a `Debug`: {printed}"
+            );
+        }
+        assert!(
+            printed.contains("line_count: 2"),
+            "the globs area: {printed}"
+        );
+        assert!(
+            printed.contains("tests"),
+            "the library key is not user text: {printed}"
         );
     }
 
