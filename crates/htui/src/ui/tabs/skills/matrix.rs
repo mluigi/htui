@@ -25,7 +25,7 @@ use core::cell::Cell;
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use htui_core::model::language::{
-    effective_globs as expand_languages, languages as LANGUAGE_NAMES,
+    LANGUAGE_GLOBS, effective_globs as expand_languages, languages as LANGUAGE_NAMES,
 };
 use htui_core::model::{
     Activation, NewSkillBinding, PhaseId, ProjectId, SkillAttachmentRow, SkillBindingId, SkillId,
@@ -250,6 +250,21 @@ fn plain(key: &KeyEvent) -> bool {
 /// One line of a sub-list under a pane section header, indented two columns past the header.
 fn sub(text: &str, theme: &Theme) -> Line<'static> {
     Line::styled(format!("  {text}"), theme.base)
+}
+
+/// H-37: the first language name the form holds that [`LANGUAGE_GLOBS`] does not, in the
+/// blueprint's sentence, or `None` when every name is in the map.
+///
+/// A name the map lacks contributes nothing and is **not** a refusal (D83) — the save still goes
+/// out with the name in `languages` — so this is `Info`, and it is the only thing that tells a
+/// maintainer who mistyped `cobol` that nothing was expanded for it.
+fn unknown_language(form: &Form) -> Option<String> {
+    form.language_names().into_iter().find_map(|name| {
+        let known = LANGUAGE_GLOBS
+            .iter()
+            .any(|(candidate, _)| *candidate == name);
+        (!known).then(|| format!("no language named `{name}` in the map"))
+    })
 }
 
 /// A stored glob with the form's own `<repo>:` prefix taken off, which is what the globs field
@@ -625,6 +640,12 @@ impl MatrixView {
                     1 => form.languages.on_key(key, FIELD_ROWS),
                     _ => form.position.on_key(key),
                 };
+                // H-37: the languages field is the one place an unknown name is a silent no-op,
+                // so it is also the one place the form can say so. The notice follows the field,
+                // which means it clears as soon as the name is one the map holds.
+                if form.field == 1 {
+                    self.notice = unknown_language(form).map(Notice::Info);
+                }
                 return match outcome {
                     FieldOutcome::Pass => Handled::Pass,
                     FieldOutcome::Consumed | FieldOutcome::Submit | FieldOutcome::Cancel => {
