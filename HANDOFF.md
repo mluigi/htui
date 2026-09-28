@@ -14,7 +14,8 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-28):** **CLEAN-5 was done** (`docs/decisions/clean/clean-5.md`): the MOD-4
+**Current status (2026-09-28):** **TOOL-3 was decided** (`docs/decisions/tool/tool-3.md`): the maintainer accepted that `cargo clippy --target x86_64-pc-windows-msvc` cannot run here — it dies in `ring`'s build script with `cc-rs: failed to find tool "lib.exe"` — so **MOD-16 is the only Windows check** and no C toolchain is installed to replace it. Re-verified unchanged 2026-09-28, and green for **neither** crate: `ring` reaches `-p htui` through sqlx on a path that predates MOD-20, and MOD-20's reqwest/rustls extended the same failure to `-p htui-agent`. MOD-20's plan D21 and its Validation block are amended so nothing still asserts a gate that never went green, and the README section says up front that its command does not run here. MOD-20's Windows code was reviewed by eye, never linted.
+Before it, **CLEAN-5 was done** (`docs/decisions/clean/clean-5.md`): the MOD-4
 merge-hook test no longer waits a fixed 3 s for a merge whose future it dropped; it polls every
 100 ms for the landed state with a 30 s deadline that reports what it saw, so a hung merge is
 diagnosed rather than timed out. The whole `gix_isolator` file passes (34), including under a
@@ -450,9 +451,15 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   edge, keyboard navigation that re-roots the Backlog selection; the `open graph` action of
   `R-TUI-2`. Not blocked (MOD-1 landed; replaces `ui/tabs/backlog/detail/graph.rs` only).
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
-  `R-NF-3`, `R-HIS-1`. Every Windows-only path MOD-2 compile- and lint-checked from Linux but
-  never ran. `cargo clippy --target x86_64-pc-windows-msvc -p htui-agent` is green and has already
-  caught two defects a Linux build cannot see (`c4d65ba`), but four facts are runtime facts:
+  `R-NF-3`, `R-HIS-1`. **This is now the only Windows check** (TOOL-3 decided 2026-09-28,
+  `docs/decisions/tool/tool-3.md`): the maintainer accepted that
+  `cargo clippy --target x86_64-pc-windows-msvc` cannot run on this box, so this item carries the
+  runtime half *and* the compile-level branch coverage that was lost. The line was green when
+  MOD-2 wrote this entry and had caught two defects a Linux build cannot see (`c4d65ba`); it is
+  green for neither crate now, `ring`'s build script being the blocker on a path that predates
+  MOD-20. Every Windows-only path MOD-2 and MOD-20 wrote was never ran. Beyond the four runtime
+  facts below, this item also inherits the branch coverage `ring` took away — see TOOL-3's "What
+  MOD-16 inherits". The four runtime facts are:
   the job object's kill-on-close guarantee leaves no `node`/`claude` process behind (`docs/ANA-4.md`
   §11 criterion 11's Windows half); `CreateProcess` refuses a `.cmd` shim, so `${claude}` resolving
   to one must fail with a message naming the shim rather than a bare `os error 193`;
@@ -740,28 +747,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 
 ### Tooling findings
 
-- [ ] **TOOL-3 - The Windows lint target cannot be built on this box, and MOD-20 made that bite.**
-  `R-NF-3`, `R-AGT-1`. `cargo clippy --target x86_64-pc-windows-msvc` dies in `ring`'s build script
-  with `error occurred in cc-rs: failed to find tool "lib.exe"`: cross-compiling `ring`'s C needs an
-  MSVC-capable compiler, and this box has `gcc` only (`cc-rs` reports *"GNU compiler is not
-  supported for this target"*; `AR_x86_64_pc_windows_msvc=llvm-lib` gets one step further and dies
-  on *"not a COFF object"*). No `clang`, no `clang-cl`, no `cargo-xwin`, no `zig`, no `sudo`.
-  **Pre-existing for `-p htui`** — `ring` reaches it as `ring ← rustls ← sqlx-core ← sqlx ←
-  htui-core ← htui-store`, a path that predates MOD-20 — but MOD-20's `reqwest`/`rustls` brought it
-  into `htui-agent`'s graph too, which is the crate the README's own command names
-  (`README.md` "Checking the Windows-only code from Linux"). That command is the safety net MOD-2
-  milestone 3 credited with catching two defects a Linux build cannot see, and it is now green on
-  neither crate, so MOD-20's Windows-conditional code (`archive.rs`'s `cfg(unix)`/`cfg(not(unix))`
-  arms, `Layout::promote`'s retry, the `canonicalize` on both sides of the post-promote check) was
-  reviewed by eye rather than linted. Three ways out, none taken: install a C toolchain that can
-  target MSVC without `sudo` (`cargo install cargo-zigbuild` + `pip install ziglang` is the
-  sudo-free one; `cargo-xwin` needs `clang`); scope the lint line to a feature set that excludes
-  TLS, which lints most code but not `install/http.rs`; or accept the loss and let **MOD-16** be the
-  only Windows check. **This is a maintainer decision, and MOD-16 inherits the runtime half
-  either way.** MOD-20's plan D21 and its Validation block both name lint lines that currently
-  cannot run — whichever way this goes, they need amending. Found during MOD-20 T2 on 2026-09-09.
-  being reaped before the assertion reads `/proc/<pid>`.
-
 ## Summary
 
 | Area    | Open                                                                                     |
@@ -769,4 +754,4 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | ANA-N   | 2 (ANA-23 licensed coding benchmark source, ANA-24 learned weights)                            |
 | MOD-N   | 41 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
-| TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
+| TOOL-N  | 0 |
