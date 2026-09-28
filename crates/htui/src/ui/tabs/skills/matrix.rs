@@ -1408,14 +1408,25 @@ mod tests {
         );
     }
 
-    /// The names the form lists under the language field, so a maintainer can see what the map
-    /// holds without reading the source.
+    /// The names the form lists under the language field, as the **literal** fourteen, so a
+    /// maintainer can see what the map holds without reading the source.
+    ///
+    /// The reviewer found this compared `languages()` with itself: `LANGUAGE_NAMES` is an alias of
+    /// exactly [`htui_core::model::language::languages`], so the assertion could never fail and
+    /// gave false confidence that the form's list was pinned. [`htui_core`]'s
+    /// `the_map_is_sorted_and_has_no_duplicate` already owns the order; what the view adds is
+    /// *which* names, and a literal is the only thing that can say that.
     #[test]
     fn the_language_list_is_the_map_own_order() {
         assert_eq!(
-            LANGUAGE_NAMES(),
-            htui_core::model::language::languages(),
-            "the list and the map cannot be two orders"
+            LANGUAGE_NAMES().join(" "),
+            "c cpp csharp go java javascript markdown python rust shell sql toml typescript yaml",
+            "D83's fourteen names in the map's own order, which is the order the form's `known:` \
+             line prints and the order a stored `TEXT[]` is stable under"
+        );
+        assert!(
+            LANGUAGE_NAMES().windows(2).all(|pair| pair[0] < pair[1]),
+            "and strictly ascending, so a rendered list and a stored array cannot be two orders"
         );
         assert!(
             LANGUAGE_NAMES().contains(&"shell"),
