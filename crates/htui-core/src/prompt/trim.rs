@@ -39,6 +39,7 @@ use crate::prompt::excerpt::{Excerpt, ExcerptAudit};
 use crate::prompt::render::{self, Rendered, UpstreamState};
 use crate::prompt::template::{Placeholder, TemplateRole};
 use crate::prompt::{AssembleError, JudgeCandidate, PromptSpec, SectionName, TemplateRef};
+use crate::scrub::{Scrubber, Unmasked};
 
 /// §4.4's floor for `item` and `judge_task`: half the body, and never fewer than this many lines.
 const ITEM_FLOOR_LINES: usize = 80;
@@ -211,10 +212,36 @@ pub struct TrimRecord {
 }
 
 impl TrimRecord {
-    /// The record as JSON, for `run_step.trim_record`.
-    #[must_use]
-    pub fn to_value(&self) -> Value {
-        serde_json::to_value(self).unwrap_or(Value::Null)
+    /// The record as JSON, for `run_step.trim_record` — **the only serialisation of a record, and
+    /// the only one that may be persisted.**
+    ///
+    /// The `scrub` pass is whole-record and enumerates nothing: one call over the serialised
+    /// [`Value`], reaching every string leaf **and every object key** (`scrub.rs:141-163`). That is
+    /// what keeps the rule true when the next field is added — the defect this item fixes is a
+    /// guarantee that was an enumeration, and an enumeration goes stale the day someone forgets
+    /// to extend it. It is the same pass the assembler applies to the rendered bytes one layer up
+    /// (`prompt/mod.rs:472-483`), and it is the same call the recorder makes on every payload
+    /// (`record.rs`): scrub, then persist, or refuse and persist nothing.
+    ///
+    /// Masking is idempotent (`scrub.rs:52`, the `[REDACTED]` step-over at `:124-129`), so a
+    /// caller that scrubs twice records the same bytes both times and an already-masked record is
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`Unmasked`] when a string leaf still matches a credential rule after masking. `R-SEC-3`
+    /// is fail-closed, so the caller must **not** persist the value at all: in the engine that
+    /// fails the step before any session starts and before a token is spent. The error names a
+    /// rule and a JSON pointer and never the offending text — its `Display` and `Debug` are part
+    /// of the security contract (`scrub.rs:60-71`), and both are persisted in an `error` event.
+    ///
+    /// An **encode** failure is deliberately not an error here: it becomes `Value::Null`, which
+    /// scrubs clean because it has no string leaf. See the note at the engine's call site for why
+    /// that is unreachable for this type.
+    pub fn to_value(&self, scrubber: &dyn Scrubber) -> Result<Value, Unmasked> {
+        let mut value = serde_json::to_value(self).unwrap_or(Value::Null);
+        scrubber.scrub(&mut value)?;
+        Ok(value)
     }
 
     /// **The** `sections[]` map (ANA-5 `:1551-1554`): `{name, tokens_after, trimmed}`, same order.

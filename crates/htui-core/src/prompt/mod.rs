@@ -892,10 +892,14 @@ struct ScrubbedInputs {
 ///
 /// It checks the four strings [`assemble`] masks for an excerpt (`repo`, `path`, `content`, and
 /// `provider` when there is one), in that order, so every file kept here is one `assemble` will not
-/// refuse over. The note names the rule and never the content. Because `trim_record.notes` is
-/// persisted unscrubbed, a note names a repo or path only when the scrubber returns it unchanged —
-/// neither refused nor masked (a known secret inside a file name is masked, and naming it would
-/// leak it). `repo:path` is named only when both are unchanged, the repo alone when only it is:
+/// refuse over. The note names the rule and never the content. `trim_record.notes` is now scrubbed
+/// whole before the write ([`TrimRecord::to_value`], MOD-32), so a masked value can no longer leak
+/// through a note. The rule below is kept anyway, on the ground that survives: it is the
+/// **clearer** sentence, not the safer one. A note that named a masked repo would read ``a file in
+/// repo `[REDACTED]` dropped`` — an assertion about a value no reader can resolve — where the
+/// convention gives ``a file dropped; the scrubber refused it``. So a note here names a repo or
+/// path only when the scrubber returns it unchanged, neither refused nor masked.
+/// `repo:path` is named only when both are unchanged, the repo alone when only it is:
 /// - ``excerpt: `repo:path` dropped; the scrubber refused it (rule `…`)`` (content or provider,
 ///   repo and path unchanged);
 /// - ``excerpt: a file in repo `repo` dropped; the scrubber refused it (rule `…`)`` (content or

@@ -3138,12 +3138,21 @@ where
                 return self.refuse_prompt(run, step, phase, &err).await.map(Some);
             }
         };
-        // `unwrap_or(Value::Null)` here wrote a **null** `trim_record` and said nothing: the row
-        // that records which sections were dropped and why would silently become "there was no
-        // record", which is the one thing `run_step.trim_record` exists to rule out.
-        let trim = serde_json::to_value(&prompt.trim).map_err(|err| {
-            htui_agent::RecordError::Encode(format!("the step's trim record: {err}"))
-        })?;
+        // `unwrap_or(Value::Null)` here once wrote a **null** `trim_record` and said nothing: the
+        // row that records which sections were dropped and why would silently become "there was
+        // no record", which is the one thing `run_step.trim_record` exists to rule out. That is
+        // inside `to_value` now, and it is unreachable for this record: every key is a field name
+        // or a `&'static str`, no `Serialize` in the graph returns `Err`, and `serde_json` writes
+        // a non-finite float as `null` rather than failing — so `reserve` cannot fail either. A
+        // `Null` that did appear would scrub clean (no string leaf) and would be the one thing
+        // this row must never hold, which is why it is argued here rather than left implied.
+        // The `map_err` is one hop of the two and is not optional: `?` applies exactly one
+        // `From`, and `EngineError` has one for `RecordError` (`command.rs:490`), not for the
+        // `Unmasked` behind it.
+        let trim = prompt
+            .trim
+            .to_value(self.parts.scrubber)
+            .map_err(htui_agent::RecordError::from)?;
         self.parts
             .store
             .set_step_prompt(step.id, &prompt.digest, &trim)
@@ -3723,9 +3732,10 @@ where
         self.parts.store.record_commits(step.id, &before).await?;
 
         // -- stage 3: the group's one prompt (plan D58) ----------------------------------------
-        let trim = serde_json::to_value(&prompt.trim).map_err(|err| {
-            htui_agent::RecordError::Encode(format!("the step's trim record: {err}"))
-        })?;
+        let trim = prompt
+            .trim
+            .to_value(self.parts.scrubber)
+            .map_err(htui_agent::RecordError::from)?;
         self.parts
             .store
             .set_step_prompt(step.id, &prompt.digest, &trim)
@@ -4544,9 +4554,11 @@ where
             .isolator
             .prepare(run.id, judge.id, &[], Isolation::Local, None)
             .await?;
-        let trim = serde_json::to_value(&prompts.forward.trim).map_err(|err| {
-            htui_agent::RecordError::Encode(format!("the judge's trim record: {err}"))
-        })?;
+        let trim = prompts
+            .forward
+            .trim
+            .to_value(self.parts.scrubber)
+            .map_err(htui_agent::RecordError::from)?;
         self.parts
             .store
             .set_step_prompt(judge.id, &prompts.forward.digest, &trim)

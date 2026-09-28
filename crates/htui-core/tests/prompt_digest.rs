@@ -941,7 +941,7 @@ fn reserve_target_is_integer_arithmetic() {
     assert_eq!(record.target, 108_000, "§5.1's worked example");
     assert!((record.reserve - 0.10).abs() < f64::EPSILON);
     assert_eq!(
-        serde_json::to_value(&record).expect("plain data")["budget_source"],
+        record.to_value(&scrubber()).expect("plain data")["budget_source"],
         serde_json::json!("project")
     );
 }
@@ -960,8 +960,19 @@ fn to_value_is_byte_stable_and_carries_the_documented_keys() {
     // serialisation is **byte-stable** — deterministic under either map type — and the column is
     // `JSONB`, which reorders keys on the way in regardless. Nothing in the assembler reads a key
     // order, and `prompt_digest` is over the text and never over this record.
-    let first = ok(&fixtures::phase_implement_attempt2()).trim.to_value();
-    let second = ok(&fixtures::phase_implement_attempt2()).trim.to_value();
+    //
+    // Both serialisations go through `TrimRecord::to_value`, so what is compared here is the
+    // **scrubbed** form — the one the engine persists — and the key set checked below is read off
+    // the scrubbed object. With an empty scrubber the two are the same bytes, which is the point:
+    // the assertion is about the serialiser, not about the scrubbing.
+    let first = ok(&fixtures::phase_implement_attempt2())
+        .trim
+        .to_value(&scrubber())
+        .expect("plain data");
+    let second = ok(&fixtures::phase_implement_attempt2())
+        .trim
+        .to_value(&scrubber())
+        .expect("plain data");
     assert_eq!(
         serde_json::to_string(&first).expect("plain data"),
         serde_json::to_string(&second).expect("plain data"),
