@@ -528,6 +528,88 @@ async fn n_refuses_a_name_the_library_holds() {
     assert!(!frame.contains("saves v1"), "no editor opened: {frame}");
 }
 
+/// `e` is the description verb, and **the name is not a verb this view has**: the form opens with
+/// the library key prefilled and fixed, so the cursor still walks the field but a typing key never
+/// reaches it, and what `Enter` opens carries the edited one-liner into the save.
+#[tokio::test]
+async fn e_edits_the_description_and_never_the_name() {
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+    select(&mut harness, "rust-style");
+    harness.key("e");
+    let frame = harness.render();
+    assert!(
+        frame.contains(" name and description "),
+        "the two-field form, the same one `n` opens: {frame}"
+    );
+    assert!(
+        frame.contains(" name: rust-style"),
+        "the name is prefilled: {frame}"
+    );
+    assert_eq!(
+        hint(&frame),
+        " Tab next field  Enter confirm  Esc cancel",
+        "and the hint is the form's, not a browse key's: {frame}"
+    );
+
+    // `Tab` walks the cursor onto the name (H-32) and the field reads as a field — but nothing
+    // typed there lands. The whole frame is compared, because the fixed name is drawn from its
+    // first char and a prefix test would pass on a longer one.
+    harness.key("tab");
+    let before = harness.render();
+    type_text(&mut harness, "renamed");
+    assert_eq!(
+        harness.render(),
+        before,
+        "`e` fixed the name, so a typing key does not reach it"
+    );
+
+    harness.key("shift-tab");
+    let stored = library(&store)
+        .await
+        .into_iter()
+        .find(|entry| entry.skill.name == "rust-style")
+        .expect("the fixture's row")
+        .skill
+        .description;
+    harness.key("home");
+    for _ in 0..stored.chars().count() {
+        harness.key("delete");
+    }
+    type_text(&mut harness, "the ones we always follow");
+    let frame = harness.render();
+    assert!(
+        frame.contains(" description: the ones we always follow"),
+        "the description the save will carry: {frame}"
+    );
+
+    harness.key("enter");
+    let frame = harness.render();
+    assert!(
+        frame.contains(" rust-style \u{b7} editing from v2, saves v3 "),
+        "`Enter` opens the editor on the skill `e` was opened on: {frame}"
+    );
+    harness.key("ctrl-s");
+    harness.settle().await;
+
+    let entry = library(&store)
+        .await
+        .into_iter()
+        .find(|entry| entry.skill.name == "rust-style")
+        .expect("the row");
+    assert_eq!(entry.skill.description, "the ones we always follow");
+    assert_eq!(
+        entry.versions.last().map(|row| row.version),
+        Some(3),
+        "and the body appended as usual"
+    );
+    assert_eq!(
+        library(&store).await.len(),
+        2,
+        "and no `renamed` row: a save never moves the library key, so there was nothing to create"
+    );
+}
+
 /// `E` opens the editor on the shown version; `Ctrl+E` hands the draft to `$EDITOR`; the return
 /// opens the editor on the text and **nothing is sent** — there is no `parse` here, because a
 /// skill body is markdown and there is no byte offset to point at.
