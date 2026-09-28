@@ -395,11 +395,16 @@ ls crates/htui/src/snapshots | wc -l            # 1
 # Corrected by fact-check: the first two greps as originally written each found ONE
 # match, not two, and `widthed_by_chars` matched nothing at all. These are the
 # patterns that actually catch every stale site.
-grep -rn 'unicode-width' crates/ --include='*.rs'                       # expect nothing
+# Corrected again at implementation: the gates below name the two *stale sentences*, not the
+# string "unicode-width". After this item the crate is declared and its module doc explains how
+# it is used, so a grep for the bare name would match the correct new text.
+grep -rn 'no `unicode-width` is declared' crates/ --include='*.rs'      # expect nothing
+grep -rn '(no `unicode-width`)' crates/ --include='*.rs'               # expect nothing
 grep -rn 'windowed_by_chars_not_cells' crates/ --include='*.rs'         # expect nothing
 grep -rn 'one char is otherwise one cell\|counted in `char`s' crates/htui/src/ui/  # expect nothing
-grep -rn 'UnicodeWidthChar' crates/htui/src/ui/                         # expect nothing
-grep -rn 'unicode_width\|unicode_segmentation' crates/ --include='*.rs' # expect nothing
+# No per-`char` width sum in either *widget*. `cells.rs` names `UnicodeWidthChar` five times on
+# purpose: in the doc saying why it is not used, and in two tests proving the sum is wrong.
+grep -rn 'UnicodeWidthChar' crates/htui/src/ui/text_field.rs crates/htui/src/ui/text_area.rs  # expect nothing
 # R-4: R-NF-1 is NOT gateable from this box (see R-4). Do not run a windows check
 # that dies in ring's build script and reports nothing about this change.
 ```
