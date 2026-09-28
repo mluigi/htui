@@ -19,7 +19,12 @@
 /// matcher, and it would fail loudly if a language were ever given a `**` in the wrong place.
 pub const LANGUAGE_GLOBS: &[(&str, &[&str])] = &[
     ("c", &["**/*.c", "**/*.h"]),
-    ("cpp", &["**/*.cc", "**/*.cpp", "**/*.cxx", "**/*.hh", "**/*.hpp", "**/*.hxx"]),
+    (
+        "cpp",
+        &[
+            "**/*.cc", "**/*.cpp", "**/*.cxx", "**/*.hh", "**/*.hpp", "**/*.hxx",
+        ],
+    ),
     ("csharp", &["**/*.cs"]),
     ("go", &["**/*.go"]),
     ("java", &["**/*.java"]),
@@ -108,7 +113,10 @@ mod tests {
         }
         assert_eq!(
             languages(),
-            LANGUAGE_GLOBS.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            LANGUAGE_GLOBS
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
             "the completion list is the map's own order"
         );
     }
@@ -135,13 +143,7 @@ mod tests {
         let union = effective_globs(["docs/**"], ["shell", "rust"]);
         assert_eq!(
             union,
-            [
-                "docs/**",
-                "**/*.sh",
-                "**/*.bash",
-                "**/*.zsh",
-                "**/*.rs",
-            ],
+            ["docs/**", "**/*.sh", "**/*.bash", "**/*.zsh", "**/*.rs",],
             "typed first, then each named language's patterns in the order they were named"
         );
         assert_eq!(
