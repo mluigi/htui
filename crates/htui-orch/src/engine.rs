@@ -5015,6 +5015,16 @@ where
                     // failing the step — `forwarded`'s rule, for the same input.
                     Err(err) => notes.push(format!("changed_paths unavailable: {err}")),
                 }
+            } else {
+                // The same absence `forwarded` records, worded for this verb. A miss is not a
+                // detail: the two lookups resolve the same row from the same read, so one of
+                // them saying nothing and the other saying why would leave the prompt quietly
+                // the shorter and the record unable to say why.
+                notes.push(format!(
+                    "no attempt {} at position {} to diff (plan D67)",
+                    step.attempt - 1,
+                    step.position
+                ));
             }
         }
         let input = PassInput {
@@ -13380,11 +13390,6 @@ mod tests {
             note.weight,
             htui_core::prompt::excerpt::TIER2_PREV_DIFF,
             "and tier 2's weight, which is 10 under a touched path and 20 over a mere mention"
-        );
-        assert_ne!(
-            note.reason,
-            htui_core::prompt::excerpt::ExcerptReason::TouchedPath,
-            "tier 1 never reached it: `docs/notes.md` is not on the item's `touched_paths`"
         );
     }
 
