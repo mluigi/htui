@@ -6,10 +6,10 @@ them.
 **Design authority:** MOD-7 milestone 3 plan **D80**, **D81** and blueprint **D94**
 (`.claude/plans/mod-7-capability-refusal.plan.md`, `.blueprint.md:958`). This item adds no design
 of its own.
-**Artifacts:** plan and blueprint,
+**Artifacts:** plan and blueprint:
 [`.claude/plans/mod-58-claim-time-test-gaps.plan.md`](../../../.claude/plans/mod-58-claim-time-test-gaps.plan.md)
-and [`.blueprint.md`](../../../.claude/plans/mod-58-claim-time-test-gaps.blueprint.md). No PRD —
-routed as a plan on 2026-09-28, 0 of C1–C4 fired.
+([`.claude/plans/mod-58-claim-time-test-gaps.blueprint.md`](../../../.claude/plans/mod-58-claim-time-test-gaps.blueprint.md)).
+No PRD — routed as a plan on 2026-09-28, 0 of C1–C4 fired.
 **Commits:** `c9e24c9`..`726dea8`, nine commits, on `mod-58`.
 
 ## What shipped
