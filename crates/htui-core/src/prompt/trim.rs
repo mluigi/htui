@@ -245,13 +245,26 @@ impl TrimRecord {
     /// # Errors
     ///
     /// [`Unmasked`] when a string leaf still matches a credential rule after masking. `R-SEC-3`
-    /// is fail-closed, so the caller must **not** persist the value at all: in the engine that
-    /// fails the step before any session starts and before a token is spent. The error names a
-    /// rule and a JSON pointer and never the offending text — its `Display` and `Debug` are part
-    /// of the security contract (`scrub.rs:61-78`). At this call site the rendered error reaches
-    /// the run's failure reason and an item note, not a `session_event` row; the recorder's own
-    /// `residue_row` is what writes the `error` event `scrub.rs:63-65` describes. The security
-    /// point is the same either way: `path` is assembled from masked keys, so no text leaks.
+    /// is fail-closed, so the caller must **not** persist the value at all.
+    ///
+    /// **What that costs the caller, stated plainly.** The refusal is raised before the record is
+    /// written and before this step's own session starts, so nothing is persisted and this step
+    /// spends no token. It is not, however, a *step* failure in the sense the word usually means:
+    /// at the engine's three call sites the `?` propagates to `fail_hard` / `fail_candidate` /
+    /// `fail_judge`, each of which settles the run as `RunStatus::Failed` with the rendered
+    /// message as an **untyped** reason (`run.failure`, outside the closed `RunFailure` vocabulary)
+    /// and runs `cleanup_run`. It does **not** block the item the way the assembler's own
+    /// refusals do through `refuse_prompt`, so an item whose `template.name`, a caller note or a
+    /// repo slug trips a prefix rule is left actionable and will be re-run into the same abort.
+    /// That is the shape plan D8 chose over moving the scrub into `assemble`, and the trade is
+    /// recorded there rather than smoothed over here.
+    ///
+    /// The error names a rule and a JSON pointer and never the offending text — its `Display` and
+    /// `Debug` are part of the security contract (`scrub.rs:61-78`). At this call site the
+    /// rendered error reaches the run's failure reason and an item note, not a `session_event` row;
+    /// the recorder's own `residue_row` is what writes the `error` event `scrub.rs:63-65`
+    /// describes. The security point is the same either way: `path` is assembled from masked
+    /// keys, so no text leaks.
     ///
     /// An **encode** failure is deliberately not an error here: it becomes `Value::Null`, which
     /// scrubs clean because it has no string leaf. See the note at the engine's call site for why

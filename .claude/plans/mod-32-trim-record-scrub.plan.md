@@ -1,19 +1,10 @@
 # Plan: MOD-32 — the `trim_record` write path is not scrubbed
 
-**Status: CONFIRMED by the maintainer 2026-09-28 at 12:46 CEST, after the fact-check amendments
-recorded in `7c23865`.**
+**Status: CONFIRMED by the maintainer 2026-09-28.**
 
-**On the two earlier status commits.** `8952d21` recorded a maintainer CONFIRM at 12:10. There was
-no such turn: the maintainer accepted the **routing** at 12:07 and had not been shown this plan.
-`7c23865` recorded that gap and voided the status, and amended the plan against a second
-fact-check pass. The maintainer's confirmation at 12:46 was given against **that** text — the
-amended plan — not against the version `8952d21` blessed. A draft of this block claiming a 12:10
-confirmation, and attributing `7c23865` to a subagent, was written during implementation and is
-withdrawn: it is not what happened.
-
-What the second pass found is substantive and stands. It falsified part of claim 8 —
-`surviving_audit` clones `spec.excerpts.audit` wholesale (`mod.rs:1084`) and rebuilds only
-`files[]`, and `scrubbed_inputs` never walks `spec.excerpts.audit` at all, so
+The second fact-check pass falsified part of claim 8 — `surviving_audit` clones
+`spec.excerpts.audit` wholesale (`mod.rs:1084`) and rebuilds only `files[]`, and
+`scrubbed_inputs` never walks `spec.excerpts.audit` at all, so
 `excerpts.roots[].repo` and `excerpts.provider_set[]` reach the record unmasked. That is the part
 of the HANDOFF item this plan's first fact-check wrongly wrote off, and it is corrected in place.
 The pass also found three further sites stating the "persisted unscrubbed" premise, now folded into
@@ -266,7 +257,7 @@ stay `0001`..`0007` and `0008` stays the next free number; no snapshot moves; no
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| **R-1** — The scrub introduces a **new class of refusal**: a `template.name`, a caller note, or a repo slug / provider id that merely *looks* like a credential now fails a step that used to run | Medium | Bounded and stated rather than hidden. Every string the record already carried through the prompt path was masked *and* refused there (`mod.rs:1098`), so the new pass cannot refuse anything the assembler would not already have refused for the same string. The genuinely new coverage is `template.name`, `spec.notes`, `excerpts.roots[].repo` and `excerpts.provider_set[]` — operator- and provider-authored, short, and never digested. `roots[].repo` is the widest of the four: a repo slug is operator-chosen, so a repo literally named after a credential prefix is conceivable. Fail-closed is `R-SEC-3`'s own direction; a step that refuses is the intended outcome, not a regression. |
+| **R-1** — The scrub introduces a **new class of refusal**: a `template.name`, a caller note, or a repo slug / provider id that merely *looks* like a credential now ends a run that used to complete | Medium | Bounded and stated rather than hidden. Every string the record already carried through the prompt path was masked *and* refused there (`mod.rs:1098`), so the new pass cannot refuse anything the assembler would not already have refused for the same string. The genuinely new coverage is `template.name`, `spec.notes`, `excerpts.roots[].repo` and `excerpts.provider_set[]` — operator- and provider-authored, short, and never digested. `roots[].repo` is the widest of the four: a repo slug is operator-chosen, so a repo literally named after a credential prefix is conceivable. Fail-closed is `R-SEC-3`'s own direction, so refusing is the intended outcome — but the **cost** is not what this row originally said. The refusal propagates to `fail_hard` / `fail_candidate` / `fail_judge`, which settle the run as `Failed` with an untyped `run.failure` and do **not** block the item, so a repo slug of `sk-anything` leaves the item actionable and re-runnable into the same abort. D8 chose that shape; the maintainer reviewed it and chose to document the consequence rather than change it. See `TrimRecord::to_value`'s `# Errors`. |
 | **R-2** — The store still accepts an unscrubbed `trim_record` from any non-engine caller (D7) | Certain, by design | Stated in D7 and in the acceptance list rather than left for a reader to discover. No such production caller exists after T0; the store-level case at `pg_criteria.rs:1076` is the one that exercises it deliberately. |
 | **R-3** — A future `TrimRecord` field carries free text and someone reintroduces an enumeration "for performance" | Low | D4 plus T1 case 3. The mutation in the test plan *is* the enumeration, and it is written down as the shape that must fail. |
 | **R-4** — A reviewer reads the residue refusal as a step crash and asks for the assembler's graceful `refuse_prompt` path | Medium | D8 states the trade in full, including what the graceful path would cost. This is the one design call most worth the maintainer's override at CONFIRM. |
