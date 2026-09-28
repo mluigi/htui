@@ -14,7 +14,16 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-28):** **MOD-58 was done** (`docs/decisions/mod/mod-58.md`): the two
+**Current status (2026-09-28):** **MOD-32 was done** (`docs/decisions/mod/mod-32.md`): the
+`run_step.trim_record` write is now scrubbed whole — `TrimRecord::to_value` takes a `&dyn Scrubber`,
+returns `Result<Value, Unmasked>`, and all three engine call sites go through it, so a
+credential-shaped record string fails the step before any session starts. The guarantee is
+field-agnostic because the defect *was* an enumeration; `template.name`, `PromptSpec.notes` and the
+`excerpts` audit's `roots[].repo` / `provider_set[]` were all unmasked. The masking half is still
+inert on the run path (the engine's secret list is empty) — that is **MOD-59**, opened at the
+review gate. The store is still not the enforcement point: it will accept an unscrubbed
+`trim_record` from any non-engine caller.
+Before it, **MOD-58 was done** (`docs/decisions/mod/mod-58.md`): the two
 claim-time tag rules are now pinned per store — `NotClaimable` outranks `MissingTags` for a run aimed
 at another box, and blueprint D94's no-item case is never refused. Four tests, no production
 behaviour change, no shared trait method, no migration, and no count pin moved. The gate's Postgres
@@ -30,8 +39,6 @@ Before it, **ANA-22 was concluded** (`docs/decisions/ana/ana-22.md`): a skill
 is pure library content attached at global, project or phase level, and the attachment carries the
 activation (`always`, `glob`, `off`; language compiled to globs); it unblocks MOD-9 milestones 3 and 4. MOD-9's
 PRD is up (`.claude/prds/mod-9-skill-library-templates.prd.md`); agent help while editing is MOD-55.
-MOD-38's resolution work (migration `0006_requirements`, `close_out` taking a resolution) is in
-`docs/decisions/mod/mod-38.md`; MOD-39 (Requirements tab) is unblocked.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
 (MOD-38) and `0007_skill_attachments` (MOD-9 milestone 2; cache: `0001`..`0004`), so **the next
@@ -236,19 +243,19 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   only **read** (the preview, plan D102's "the preview writes nothing"). Split `background` by what a
   task writes, and let the install guard consult the writing half only. `background_len` is read by
   tests, so the split has to keep an answer for them. Found at MOD-2 close-out, 2026-09-15.
-- [ ] **MOD-32 - `trim_record`'s own strings reach the store unscrubbed** (from MOD-2, finding
-  F-80). `R-SEC-3`, `R-PRM-3`. MOD-2's assembler scrubs every **digested** byte at the input layer
-  (D100 as corrected by the milestone-9 CRITICAL, `f48b82b`), so nothing unmasked reaches the model
-  or `prompt_digest`. The record written beside it does not get the same pass: `trim_record.notes`,
-  the `excerpts` audit's paths and root strings, and `budget_source`/`estimator` text are generated
-  strings serialised straight into `run_step.trim_record` by `set_step_prompt`. The exposure is small
-  by construction — the strings are repo-relative paths and enum spellings — but `R-SEC-3` gates the
-  **persist** path rather than the prompt path, and a fail-closed scrubber that is not called is not
-  fail-closed. Decide between scrubbing `TrimRecord::to_value()`'s output before the write and
-  refusing the write on residue, the way the assembler refuses. **Not MOD-10's**: MOD-10 replaces the
-  `Scrubber` implementation behind an unchanged trait; this is a missing call site. Found at MOD-2
-  close-out, 2026-09-15.
-
+- [ ] **MOD-59 - The run engine's scrubber masks nothing** (from the MOD-32 review gate).
+  `R-SEC-3`. MOD-32 made `TrimRecord::to_value` scrub the whole record before the write, and
+  `scrub` does two things: mask the resolved secrets, then fail closed on residue. Only the second
+  is live on the run path. The run engine builds its `MinimalScrubber` with an **empty** secret
+  list — `run_worker.rs:1253` and `:935` both pass `std::iter::empty::<String>()` — and `mask`
+  returns its input unchanged when the list is empty (`scrub.rs:119-121`). So the eight
+  `PREFIX_RULES` and the PEM marker fire, and a record string that merely *equals* a resolved
+  secret is still stored verbatim. The chat path does build a populated one, from `spec.env`
+  (`agent_worker.rs:3059`), but it never reaches `set_step_prompt`. Build the run engine's
+  scrubber from the run's resolved secrets the way the chat path does, so the masking half of
+  the pass is live everywhere. Not MOD-32's: that item fixed the call site, and it fixed the
+  residue half; this is the other half, inert for a reason that lives a layer above it. Found
+  2026-09-28.
 - [ ] **MOD-28 - rataflow execution view (from ANA-12).** Add `rataflow` dependency, implement `ExecutionGraph` widget mapping `RunStep` and `SessionEvent` lists to a node graph, add view toggle to Runs tab (`R-TUI-4`), and wire mouse/keyboard events for standard run actions.
 - [ ] **MOD-26 - Declarative Agent Personas (from ANA-13).** Build Markdown/Frontmatter parser in `htui-core`, discover from `~/.config/htui/agents.d/`, map to `SessionSpec` overrides (model, tools).
   **Relates to ANA-16** (`docs/ANA-16.md` §6.2, §8): personas should be registry rows rather than a
@@ -741,6 +748,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-21 per-model weights)                                                                  |
-| MOD-N   | 40 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 40 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor, MOD-59 run scrubber masks nothing; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-5 merge-hook test flake)                |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
