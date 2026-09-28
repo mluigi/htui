@@ -127,8 +127,10 @@ queue anyway). The gates are re-run on the real tree after each task.
   2. `item_id` naming a row that is gone — create a run on a second item, then
      `store.write(|s| { s.items.remove(&item); })`. Claim: `Claim::Admitted`. This is the arm that
      would answer `NotFound { entity: "item" }` if `claim_run` used `require_item`.
-  - Use separate items and separate runs for the two arms: the first arm's claim moves its item to
-    `in_progress`, and a second `create_run` on the same item would then be refused by §4.3.
+  - Use separate items and separate runs for the two arms, so the two share no state. (The first
+    arm's item is *not* moved to `in_progress` by its claim — that run has `item_id: None`, so the
+    admitted branch's item transition is skipped — but a second item keeps the arms independent
+    whatever that branch does.)
 - **Validate**: `cargo test -p htui-core --all-features -- --test-threads=1`;
   `cargo clippy -p htui-core --all-features --all-targets -- -D warnings`;
   `cargo fmt --all -- --check`.
@@ -202,6 +204,16 @@ rule on purpose and confirm the case fails, then revert:
 Report the observed failure line for each of the four mutations in the task's report. A pin that
 cannot fail is not a pin.
 
+**What the `MemStore` D94 mutation actually proved.** The reported result for the T1 case-2 swap
+(`items.get` → `and_then(|item| self.require_item(&item).ok())`) is accurate as a fact but was
+reported as if it caught the whole case. It is caught by the **second arm only**: with
+`item_id: None`, `and_then` short-circuits before the closure ever runs, so the first arm is
+unaffected by that shape of mutation. Arm A needs the demand written in the `map`-shaped form —
+`claimed.item_id.map(|item| self.require_item(&item)).transpose()?` or equivalent, which *is*
+evaluated for `None` — to fail. The case as a whole does bite, which is why it stands; the claim
+is narrowed here so nobody later reads the first arm as independently guarded against a
+row-level demand.
+
 **Coverage map.** Four cases, two stores, two rules:
 
 | Rule | `MemStore` | `PgStore` |
@@ -221,6 +233,7 @@ moves; no `StoreRequest` / `StoreReply` variant is added.
 | **R-2** — The in-file `MemStore` cases reach private state (`State.boxes`, `State.items`, `MemStore::write`), so they can construct a state the store cannot reach | Medium | Every step goes through `State`'s own invariants: the second box is a clone of a real row (D2), and the two D94 arms are exactly the two shapes D94 names. A future change that made either shape unreachable would have to change the test, which is the signal wanted |
 | **R-3** — A `pg_criteria` failure is read as a real failure when the dev Postgres is in recovery (`SQLSTATE 57P03`) | High on this box | Re-run the case alone before believing it; `df -h /` first (project memory: the dev Postgres crash-loops under disk pressure) |
 | **R-4** — The maintainer would rather have one shared conformance case and pay for a `WriteStore` method | Low | D1 states the cost plainly; the maintainer holds the shared surface closed for this item, and a trait method would touch `mem.rs`, `pg/write.rs`, `writer.rs` and the two test doubles |
+| **R-5** — Known cosmetic asymmetry: the two stores' second boxes are not the same shape of row | Low | Accepted. `MemStore` clones the fixture's `BoxRow` and so carries its `probed_tags`/`declared_tags`; the Postgres box is planted by an untyped `INSERT` that leaves both to their `'{}'` defaults and `machine_fingerprint` NULL. Irrelevant to the rule under test — it reads the *claiming* box (`ids::BOX`) in both cases — but a future case that cared about the second box's tags would have to raise the fidelity of the planted row |
 
 ## Validation
 
