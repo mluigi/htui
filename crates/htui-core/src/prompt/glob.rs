@@ -581,11 +581,15 @@ fn ranges(body: &str) -> Option<(bool, Vec<(char, char)>)> {
 /// shallowest match, and the recorded path is the walk's first.
 fn segments_match(segs: &[Segment], parts: &[&str]) -> bool {
     let (mut s, mut p) = (0usize, 0usize);
-    let mut star: Option<usize> = None;
+    // The mark is `(segment index, path position)`, as `toks_match` below already does it: a
+    // rewind has to resume where the `**` **began**, not where the walk failed. A mark that
+    // carried only the index advanced the path from the failure, skipping the component the `**`
+    // had already eaten, and every one of those was a false negative.
+    let mut star: Option<(usize, usize)> = None;
     while p < parts.len() {
         match segs.get(s) {
             Some(Segment::AnyComponents) => {
-                star = Some(s);
+                star = Some((s, p));
                 s += 1;
             }
             Some(segment) if segment_matches(segment, parts[p]) => {
@@ -593,12 +597,12 @@ fn segments_match(segs: &[Segment], parts: &[&str]) -> bool {
                 p += 1;
             }
             _ => {
-                let Some(star_at) = star else {
+                let Some((star_at, mark)) = star else {
                     return false;
                 };
                 s = star_at + 1;
-                p += 1;
-                star = Some(star_at);
+                p = mark + 1;
+                star = Some((star_at, mark + 1));
             }
         }
     }
@@ -731,6 +735,22 @@ mod tests {
             !compiled.matches(&format!("{}x.py", "a/".repeat(20))),
             "and the last component still has to match"
         );
+
+        // The same shape with the counts **unequal**, so this is not the correctness case again:
+        // twenty `**` against five components means the walk runs out of path long before it runs
+        // out of pattern, and every one of the trailing `**` has to be absorbed by the trailing
+        // `all` rather than by the loop.
+        let globstars = "**/".repeat(20);
+        let compiled = compile(&format!("{globstars}x.rs")).expect("twenty globstars again");
+        let path = format!("{}x.rs", "a/".repeat(4));
+        assert!(
+            compiled.matches(&path),
+            "twenty `**` against five components matches"
+        );
+        assert!(
+            !compiled.matches(&format!("{}x.py", "a/".repeat(4))),
+            "and the last component still has to match"
+        );
     }
 
     /// Compiles `pattern` and asserts it does (or does not) match `path`. This is plan D71's dialect
@@ -761,6 +781,26 @@ mod tests {
             ("a/**/b", "a/b", true),
             ("a/**/b", "a/x/y/b", true),
             ("a/**/b", "a/x/y", false),
+            // A `**` that has already eaten a component still has to give it back: the rewind
+            // resumes where the `**` began, not where the walk failed. These are the shapes a
+            // mark that carries only the pattern index gets wrong (false negatives: the dialect
+            // promises zero or more whole components, so everything here is a `true`).
+            ("**/*.rs", "vendor/x.rs/y.rs", true),
+            ("**/*.rs", "vendor/x.rs/y.py", false),
+            ("**/*/README.md", "a/b/README.md", true),
+            ("**/a", "x/a/a", true),
+            ("**/a", "x/a/b", false),
+            ("a/**/b", "a/b/b", true),
+            // `**` reaches past as many components as it likes, so the alternation only has to win
+            // the **last** component: `**` takes `x` and `c` and `{a,b}` takes the `a`.
+            ("**/{a,b}", "x/a/a", true),
+            ("**/{a,b}", "x/c/a", true),
+            ("**/{a,b}", "x/c/ab", false),
+            ("**/{a,b}", "x/c/d", false),
+            // Two `**`, so the mark has to be carried rather than dropped: a "fix" that cleared it
+            // on the second rewind would still pass the single-`**` rows and fail these.
+            ("**/a/**/b", "q/a/r/a/s/b", true),
+            ("**/a/**/b", "q/a/r/a/s/c", false),
             // `?` is exactly one non-`/` character.
             ("?.rs", "a.rs", true),
             ("?.rs", "ab.rs", false),
