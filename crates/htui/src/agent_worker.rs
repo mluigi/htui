@@ -1639,15 +1639,25 @@ impl AgentRuntime {
                 live.agent_id
             )));
         }
-        // A probe writes `agent_box` for every row, and an install's re-probe writes one of them.
-        // Run together, they race on the same row and the last write wins — so the claim covers a
-        // probe in flight too. The Settings section's own `probing` flag is not enough: **any**
+        // A probe writes `agent_box` for every enabled row, and an install's re-probe writes one of
+        // them — and so does a chat's staleness re-probe, which is why the sentence names both.
+        // Run together, they race on the same row and the last write wins, so the claim covers a
+        // writing background task while it is in flight.
+        //
+        // A prompt preview is in the same collection and holds **no** claim: `run_preview` reaches
+        // no write method (plan D102), so there is no row for an install to race. Before the split
+        // this arm tested the whole collection, and holding `j` in the Backlog detail refused `i`
+        // here — plus a login, a `ProbeBox` and a connect's registration probe — with a sentence
+        // about a probe that was not running (MOD-31 D5).
+        //
+        // The Settings section's own `probing` flag is not enough either way: **any**
         // `StoreReply::Agents` clears it (`ui/tabs/settings/agents.rs`, module doc), and
         // `wants_requests` re-issues `Agents` on every activation, so `r` → switch tab → back → `i`
         // reaches here with `run_probe` still running.
-        if !self.background.is_empty() {
+        if self.background.iter().any(Background::writes_agent_box) {
             return Err(StoreError::Backend(
-                "a probe is already running on this box; install once it has finished".to_owned(),
+                "a probe or a re-probe is already writing this box; install once it has finished"
+                    .to_owned(),
             ));
         }
         Ok(())
