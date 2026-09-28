@@ -438,6 +438,72 @@ async fn a_pin_follows_latest_until_it_is_set_and_cleared() {
     );
 }
 
+/// `skill_binding.position` is a form field like any other: `Tab` reaches it, the typed whole
+/// number is what the store receives, and the cell's `·` becomes the row that carries it.
+#[tokio::test]
+async fn the_form_writes_the_position_it_was_given() {
+    let store = MemStore::demo();
+    let mut harness = matrix(open_over(store.clone()).await).await;
+    go_to(&mut harness, "vulkan-tutorials");
+
+    harness.key("a");
+    harness.settle().await;
+    assert_eq!(
+        only(&store).await.expect("the row").position,
+        0,
+        "the default"
+    );
+
+    harness.key("e");
+    harness.key("tab");
+    harness.key("tab");
+    harness.key("home");
+    harness.key("delete");
+    type_text(&mut harness, "7");
+    assert!(
+        harness.render().contains(" position:   7"),
+        "the field reads what was typed: {}",
+        harness.render()
+    );
+    harness.key("ctrl-s");
+    harness.settle().await;
+
+    let row = only(&store).await.expect("the row");
+    assert_eq!(
+        row.position, 7,
+        "the store received the field, not the default"
+    );
+    assert_eq!(
+        row.pinned_version, None,
+        "and a save writes the columns it was given: `Tab` past the pin left it following latest"
+    );
+}
+
+/// A `position` that is not a whole number is refused here rather than sent: the writer has no
+/// `position` rule and never had one, so this sentence is the view's own and says so.
+#[tokio::test]
+async fn a_position_that_is_not_a_whole_number_is_refused_before_it_is_sent() {
+    let store = MemStore::demo();
+    let mut harness = matrix(open_over(store.clone()).await).await;
+    harness.key("e");
+    harness.key("tab");
+    harness.key("tab");
+    // The field opens on the row's own `position`, so the typed value replaces it rather than
+    // following it.
+    harness.key("home");
+    harness.key("delete");
+    type_text(&mut harness, "seven");
+    harness.key("ctrl-s");
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("skill_binding.position must be a whole number, at `seven`"),
+        "the view's own sentence, which names the value: {frame}"
+    );
+    assert!(attachments(&store).await.is_empty(), "and nothing was sent");
+}
+
 /// D78: `activation = glob` with no glob is refused, in the writer's own sentence, and **nothing
 /// is sent** — the store is the only thing that could tell the two apart.
 #[tokio::test]
