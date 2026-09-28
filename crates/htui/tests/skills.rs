@@ -444,6 +444,41 @@ async fn keys_typed_while_a_save_is_in_flight_are_kept() {
     );
 }
 
+/// The save's own answer is what closes the editor, so `Esc` while one is in flight is refused:
+/// leaving now would leave the reply with no editor to land on and `busy` with nothing to clear
+/// it, and the draft could never be saved again for the rest of the session.
+#[tokio::test]
+async fn esc_is_refused_while_a_save_is_in_flight() {
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+    select(&mut harness, "rust-style");
+    harness.key("E");
+    type_text(&mut harness, "A");
+    harness.key("ctrl-s");
+    harness.key("esc");
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("`save_skill` is still in flight"),
+        "the refusal names the request that is in flight: {frame}"
+    );
+    assert!(
+        hint(&frame).contains("Ctrl+S save"),
+        "and the editor is still open, because the save has not been answered yet: {frame}"
+    );
+
+    harness.settle().await;
+    let row = head(&store, "rust-style").await.expect("a head");
+    assert_eq!(
+        row.version, 3,
+        "the save that was already in flight still landed"
+    );
+    assert!(
+        row.body.starts_with("APrefer `expect`"),
+        "with the draft it carried: {:?}",
+        row.body
+    );
+}
+
 /// `n` creates: a name no row holds, an empty body, and a save that lands as **v1** — not v2,
 /// because the head token of a skill that does not exist is `None`. The form's second field is
 /// `skill.description`, not part of the body.
