@@ -13,12 +13,15 @@
 > priority order), `R-ORCH-11` (the run records what was chosen), `R-ID-6` (no model in a
 > bookkeeping path).
 >
-> **Status (2026-09-25): open, draft verdict.** §5 is a draft verdict from a first research pass.
-> ANA-21 stays open until the second-hand figures in §3.3 and the initial values in §5.7 are
-> re-read from primary sources (the first pass ran behind a proxy that blocked most benchmark and
-> vendor pages) and the maintainer calls in §7 are made. No new item is spawned: MOD-36 already
-> owns the implementation and would inherit §5 and §6. One requirement clarification is proposed
-> for the maintainer (§7), not applied.
+> **Status (2026-09-28): open, verdict re-grounded, maintainer calls outstanding.** §3.3 has been
+> re-read from primary sources: Artificial Analysis (Terminal-Bench 4.0 and Intelligence Index
+> v4.3.2), Vals, the Epoch benchmark hub, the Scale SEAL SWE-bench Pro board, the Arena mirror and
+> both vendor pricing pages were all read first-hand on 2026-09-28, with no page blocked. Four of
+> the draft's figures did not survive that read and are corrected in §3.3; three of the seeded
+> values lost their stated basis and are now under-determined (§5.7, §7). ANA-21 stays open until
+> the maintainer calls in §7 are made. No new item is spawned: MOD-36 already owns the
+> implementation and would inherit §5 and §6. One requirement clarification is proposed for the
+> maintainer (§7), not applied.
 
 ---
 
@@ -39,12 +42,13 @@ the shape by example ("Gemini Flash 30, Claude Opus 5.5 60") and asked for:
 
 The survey behind this document ran four readers in parallel: the tree, public quality benchmarks,
 published pricing and latency, and prior art on model routers and on learning weights from
-preferences. **Source caveat:** the session's egress proxy blocked direct reads of most benchmark
-and vendor sites (arxiv, Artificial Analysis, Scale, Vals, Epoch, OpenRouter, ai.google.dev,
-openai.com). Only GitHub-hosted data and Anthropic's pricing pages were read first-hand; every other
-figure in §3 comes from search-result summaries of the cited page. The verdict does not depend on
-any single number (it deliberately uses coarse tiers, §5.1), but the initial values in §5.7 must be
-re-checked against a primary export before MOD-36 seeds them (§6, item 7).
+preferences. A second pass on **2026-09-28** re-read every figure this document leans on from its
+primary source, with the egress proxy in place and no page blocked. §3.3 carries that pass;
+`docs/ANA-21-recheck-2026-09-28.md` carries the full per-source record of what reproduced and what
+did not. The verdict does not depend on any single number (it deliberately uses coarse tiers,
+§5.1), and the coarse tiering absorbed the re-read: **no model changed tier as a result of it.**
+What the re-read did change is the *stated basis* for three seeded values, which are now
+under-determined and are the subject of the new §7 items.
 
 ## 2. Surface as read
 
@@ -149,8 +153,8 @@ has, so weights are **coarse tiers**. And htui runs every model inside a harness
 
 | Task kind | Usable independent sources | Not usable | Notes |
 |---|---|---|---|
-| Implement | Terminal-Bench 4.0 as run by Artificial Analysis and Vals (fixed Terminus 2 harness); SWE-bench Pro standardized (Scale SEAL); SWE-rebench (fixed scaffold, fresh issues); Epoch SWE-ECI (IRT latent over the SWE benchmarks) | SWE-bench Verified (saturated at 96-97%, contamination found, archived by Vals 2026-09-01); Aider polyglot (unmaintained, no 2026 models); LiveCodeBench (saturated, algorithmic) | Vendor SWE-bench Pro (up to 89.9%) and SEAL's standardized run (top 61.5%) are different measurements and never share a scale. Terminal-Bench versions are not comparable (Gemini 3.8 Flash: 87.6% on 2.1, 19.7% on 4.0) |
-| Analysis | Artificial Analysis Intelligence Index (same version only); Epoch ECI; HLE as run by AA | GPQA Diamond (saturated, floor filter only) | The AA index is rescaled between versions (GPT-6 Astra 61 → 53, Sonnet 5 53 → 38 at v4.3); every stored value needs its version |
+| Implement | Terminal-Bench 4.0 as run by Artificial Analysis and Vals (fixed Terminus 2 harness); SWE-bench Pro standardized (Scale SEAL); SWE-rebench (fixed scaffold, fresh issues) | SWE-bench Verified (saturated at 96-97%, contamination found, archived by Vals 2026-09-01); Aider polyglot (unmaintained, no 2026 models); LiveCodeBench (saturated, algorithmic) | Vendor SWE-bench Pro (up to 89.9%) and SEAL's standardized run (top 61.5%, re-read 2026-09-28) are different measurements and never share a scale. Terminal-Bench versions are not comparable (Gemini 3.8 Flash: 87.6% on 2.1, 19.7% on 4.0), and the Epoch hub's own Terminal-Bench export is a 2.x file, not 4.0. **SEAL is stale against the current frontier** — newest Anthropic row Opus 4.6, newest Google row Gemini 3.1 Pro — so it can place only one seeded model, and the 2026-09-28 drop of SWE-ECI from the Epoch hub leaves the IRT-over-SWE option unavailable for now |
+| Analysis | Artificial Analysis Intelligence Index (same version only); Epoch ECI; HLE as run by AA | GPQA Diamond (saturated, floor filter only) | The AA index is rescaled between versions (GPT-6 Astra 61 → 52.7 at v4.3.2); every stored value needs its version. **Coverage is the binding constraint, not availability**: at v4.3.2 the index scores no Sonnet 5 variant, no Haiku 4.5 and no Gemini 3.7 Flash or 3.1 Pro, and Epoch's ECI has no Opus 5.5 at all |
 | Review | None at model level | Martian Code Review Bench ranks products, not models; CodeReviewBench is 30 PRs on dated models | Derive from implement and analysis |
 | Judge | None current | JudgeBench and RewardBench 2 have no current frontier entries; a June 2026 study of 21 judges found rankings shift up to 14 places across benchmarks (arXiv 2606.19544) | Self- and same-family preference is documented (+10 to +25 points self, +3.4 to +8.4 same family) |
 
@@ -162,30 +166,97 @@ fetched into or shipped with htui. Arena has no official API.
 
 ### 3.3 Independent figures behind the initial tiers
 
-Second-hand (search summaries of the cited pages) unless marked first-hand; see §1's caveat.
+Every figure below was re-read from its primary source on **2026-09-28**; nothing here is
+second-hand. Where a figure the 2026-09-25 draft carried did not reproduce, that is stated rather
+than quietly dropped. Access record: `docs/ANA-21-recheck-2026-09-28.md`.
 
-| Model | Terminal-Bench 4.0, independent | AA Intelligence Index v4.3.x | Other |
-|---|---|---|---|
-| Claude Opus 5.5 | 59.6 (AA), 61.6 (Vals) | 58 max, 56 xhigh, 51 medium | Arena Code 1818 ±21 (first-hand, mirror 2026-09-25) |
-| GPT-6 Astra | 59.1 (AA max), 57.1 (Vals) | 53 | ECI 166 |
-| Claude Fable 5.1 | 52.0 (AA max), 49.5 (Vals) | 53 | ECI 164, SWE-ECI 167 |
-| Claude Opus 5 | 49.0 (AA max), 45.5 (Vals) | 51 | |
-| GPT-6 Sol / GPT-5.6 Sol | 43 / 37 (AA) | 48 max / 47 | |
-| Claude Sonnet 5 | ⚠ 8 (one aggregator, conflicts with its vendor figures) | 38 max, 28 medium | |
-| Gemini 3.1 Pro | — | — | SWE-bench Pro SEAL 46.1 |
-| Gemini 3.8 Flash | 19.7 (AA) | 59 at launch, **pre-v4.3**, not comparable | Arena Text 1493 ±9 |
-| Gemini 3.7 Flash | 11.2 (source unclear) | 56 at launch, pre-v4.3 | Arena Text 1490 ±8 (first-hand) |
-| Claude Haiku 4.5 | — | 15 (non-reasoning) | |
+**Terminal-Bench 4.0** — two independent runs of the same 66-task set. Artificial Analysis (page
+payload) and Vals (`https://www.vals.ai/benchmarks/terminal-bench-4`, updated 2026-09-22; Terminus
+2 harness, avg@3, 8-hour limit per task, no partial credit):
 
-The per-task-kind gap is real: Gemini Flash is bottom-tier on Terminal-Bench 4.0 yet sits inside the
-frontier cluster on Arena Text, and Epoch finds Claude over-performs on SWE relative to its general
-ECI. A single global weight would misplace both.
+| Model | Artificial Analysis | Vals |
+|---|---|---|
+| Claude Opus 5.5 | 59.6 (xhigh 59.6, high 56.6) | 61.62 |
+| GPT-6 Astra | 59.1 (xhigh 59.6, high 54.0) | 57.07 |
+| Claude Fable 5.1 | 52.0 (xhigh 55.1) | 49.49 |
+| Claude Opus 5 | 49.0 | 45.45 |
+| GPT-6 Sol / GPT-5.6 Sol | 43.9 / 39.9 | — / 27.78 |
+| Gemini 3.8 Flash | 19.7 | 13.13 |
+| Claude Sonnet 5 | **no row** | 8.08 |
+| Gemini 3.7 Flash | **no row** | 6.06 |
+| Claude Haiku 4.5 | **no row** | **no row** |
+
+Two things this read settles. **Sonnet 5's 8.08 is a Vals figure, not an aggregator's.** Vals
+itemises the row and records that seven of its task attempts were provider refusals scored as
+failures, so the number understates the model by an unknown amount; the same page records
+provider-side fallback on four Anthropic rows, and counting Opus 5.5's 30 fallback-served attempts
+as failures moves it from 61.62 to 53.54, behind Astra. **And neither run separates Gemini 3.7 from
+3.8 Flash the way the version numbers suggest**: Vals scores 3.7 at 6.06, *below* 3.8's 13.13.
+
+**Artificial Analysis Intelligence Index v4.3.2** (the page title confirms v4.3.2). Claude Opus 5.5
+57.6 (xhigh 56.0, high 53.6, medium 51.2); Claude Fable 5.1 53.4; GPT-6 Astra 52.7; Claude Opus 5
+50.8; GPT-6 Sol 47.5; GPT-5.6 Sol 47.0; **Gemini 3.8 Flash 40.9**. No scored record exists for any
+Claude Sonnet 5 variant, for Claude Haiku 4.5, or for any Gemini 3.7 Flash or Gemini 3.1 Pro
+variant on this index — those slugs appear in the page only as unscored release entries.
+
+**Epoch Capabilities Index** (`https://epoch.ai/data/benchmark_data.zip`, `eci_scores.csv`, 268
+scored models, CC BY 4.0). GPT-6 Astra 166.6; Claude Fable 5.1 165.0; Claude Opus 5 162.67;
+GPT-5.6 Sol 161.99; Gemini 3.7 Flash 157.72; Gemini 3.8 Flash 157.13; **Claude Sonnet 5 156.34
+[153.45, 159.15]**; Gemini 3.1 Pro 154.92; **Claude Haiku 4.5 142.42**. **Claude Opus 5.5 is not
+in the dataset at all**, so the index cannot separate the frontier coding leader from Fable 5.1.
+The hub also ships no SWE-ECI file, so the draft's "SWE-ECI 167" for Fable 5.1 has no referent in
+the current export. Its `terminalbench_external.csv` is a Terminal-Bench 2.x export (top score
+0.847), not 4.0 — the version trap of §3.2, confirmed first-hand.
+
+**SWE-bench Pro, Scale SEAL** (`https://labs.scale.com/leaderboard/swe_bench_pro_public`). Muse
+Spark 1.1 61.50 ± 3.10; gpt-5.4 (xHigh) 59.10 ± 3.56; gemini-3.1-pro (thinking) 46.10 ± 3.60;
+Claude Sonnet 4.5 43.60. The board is **stale against every model this verdict seeds**: its newest
+Anthropic row is Opus 4.6 and its newest Google row is Gemini 3.1 Pro. It places no Opus 5.x, no
+Sonnet 5 and no Gemini 3.7/3.8 Flash, so it can only ever justify the `gemini-3.1-pro-low` row.
+
+**Arena** (GitHub mirror read 2026-09-28; leaderboards last updated 2026-09-25). Code: Claude Opus
+5.5 max 1827 ± 18; GPT-6 Astra max 1792 ± 11; Claude Fable 5.1 max 1751 ± 10; Gemini 3.7 Flash
+high 1593 ± 8; Gemini 3.8 Flash high 1580 ± 8. Text: the top twenty span 1476–1509; Claude Opus 5.5
+high 1509 ± 12; Gemini 3.8 Flash high 1492 ± 5; Gemini 3.7 Flash high 1488 ± 5; Gemini 3.1 Pro
+preview 1487 ± 3. Neither board's top thirty contains Claude Sonnet 5 or Claude Haiku 4.5.
+
+Four corrections this read forces, none of which moves a model across a tier:
+
+1. **Sonnet 5's draft basis does not exist.** The draft's "AA 38 at max, 28 at medium" is not
+   reproducible — AA scores no Sonnet 5 variant, and Arena does not place it. The only current
+   first-hand figure is Vals' 8.08, confounded by refusals. Sonnet 5 has **no independent
+   analysis-kind figure at all**.
+2. **Haiku 4.5's draft basis does not exist either.** The draft's "AA 15" is not reproducible —
+   Haiku 4.5 is absent from AA entirely. Epoch ECI 142.42 is its only current figure.
+3. **Gemini 3.8 Flash is comparable on the AA index after all.** The draft set it aside as "59 at
+   launch, pre-v4.3, not comparable". At v4.3.2 it reads 40.9, in the bottom third — which agrees
+   with its Terminal-Bench 4.0 placement and cuts against the draft's use of Arena Text alone to
+   keep it in the analysis tier.
+4. **Effort levels are separable on one source only.** Arena carries `-high` Gemini rows and no
+   `-medium` or `-low` rows; AA, Vals, Epoch and SEAL score un-suffixed models. The
+   `-medium`, `-low` and `gemini-3.6-flash-*` strings in the seed therefore have **no independent
+   figure at all**, and §5.6 step 3's "one tier below" has nothing to anchor it.
+
+The per-task-kind gap the verdict was built on survives, and hardens. Gemini Flash is bottom of
+both Terminal-Bench 4.0 runs and of the AA index, yet sits inside the Arena Text cluster (1492,
+1488) and inside Epoch's frontier ECI band (157.13, 157.72). **Gemini 3.7 Flash outranks Gemini 3.8
+Flash on every non-Terminal-Bench source checked** — ECI, Arena Code and Arena Text — the opposite
+of the version ordering the seed assumes, and the seed's default model is the 3.7 string. A single
+global weight would misplace both families.
 
 ### 3.4 Prices
 
-Per 1M tokens, input/output: Opus 5.5 4/20, Opus 5 5/25, Fable 5.1 10/50, Sonnet 5 2/10, Haiku 4.5
-1/5 (Anthropic pricing page, first-hand); Gemini 3.7 and 3.8 Flash 0.75/3.75 until 2026-12-31, then
-1.50/7.50; Gemini 3.1 Pro 2/12 (≤200K); GPT-6 Sol 2/10 (second-hand). Thinking is billed as output
+Per 1M tokens, input/output, all first-hand on 2026-09-28. Anthropic: Opus 5.5 4/20, Opus 5 5/25,
+Fable 5.1 10/50, Sonnet 5 2/10, Haiku 4.5 1/5. Gemini: 3.7 Flash, 3.8 Flash **and 3.6 Flash** all
+0.75/3.75 until 2026-12-31, then 1.50/7.50; Gemini 3.1 Pro 2/12 (≤200K), 4/18 above it. GPT-6 Sol
+2/10 is the one price here not read from its vendor page; `openai.com` was not fetched in this pass
+and the figure stays second-hand.
+
+Two pricing facts sharpen the §4.4 argument. Anthropic's page now states that Sonnet 5's 2/10 was
+launch pricing and that **the scheduled rise to 3/15 on 2026-09-01 will not occur**, so a price
+that was once a dated promotion is now permanent — exactly the kind of silent reorder §4.4 says a
+weight must not inherit. And the Gemini discount covers three model families, not two, so the
+2027-01-01 step hits every `agy` string at once rather than a subset. Thinking is billed as output
 everywhere and cannot be turned off on Opus 5.5 or Fable 5.x, so cost per task depends on effort far
 more than on list price. All three vendors express subscription quota as an opaque 5-hour window
 plus a weekly cap, never as tokens or dollars. Machine-readable price feeds exist (models.dev
@@ -327,33 +398,39 @@ it is allowed under `R-ID-6`.
 
 ### 5.7 Initial values
 
+The values below are the draft's, unchanged. The 2026-09-28 re-read moved no model across a tier, so
+they survive as placed; what it changed is that **three rows no longer have the basis the draft gave
+them**, and those rows are marked ⚠ and turned into maintainer calls in §7. Until §7 is answered the
+marked rows are seeds awaiting a decision, not findings.
+
 `claude` and `claude-cli` (the same map; the model strings are Claude Code's aliases, which resolve
 to the current model of each line, so the map is re-checked when an alias moves):
 
-| Model string | `"*"` | `implement`, `fix`, `reproduce` | Basis |
+| Model string | `"*"` | `implement`, `fix`, `reproduce` | Basis, re-read 2026-09-28 |
 |---|---|---|---|
-| `opus` (Opus 5.5 today) | 95 | 95 | Top of TB 4.0 (AA, Vals) and of AA index v4.3 |
-| `sonnet` (Sonnet 5) | 65 | 65 | AA 38 at max; its only independent TB 4.0 figure is an unconfirmed aggregator value, so no lower tier until verified |
-| `haiku` (Haiku 4.5) | 25 | 25 | AA 15, non-reasoning |
-| `*` (including `default`) | 65 | 65 | `default` resolves per account plan, so it takes the conservative tier |
+| `opus` (Opus 5.5 today) | 95 | 95 | Holds and is the best-evidenced row in the table: top of both Terminal-Bench 4.0 runs (59.6 AA, 61.62 Vals), top of AA Intelligence Index v4.3.2 (57.6), top of Arena Code (1827 ± 18) and Text (1509 ± 12) |
+| ⚠ `sonnet` (Sonnet 5) | 65 | 65 | **Basis withdrawn.** The draft's "AA 38 at max" is not reproducible — AA scores no Sonnet 5 variant and Arena does not place it in either top thirty. The only current first-hand figure is Vals' 8.08 on Terminal-Bench 4.0, confounded by seven provider refusals scored as failures, and Epoch ECI 156.34 [153.45, 159.15] puts it *below* Gemini 3.8 Flash's 157.13. 65 is retained as a conservative hold, not as a finding — §7 item 4 |
+| `haiku` (Haiku 4.5) | 25 | 25 | Tier holds on a different basis: the draft's "AA 15" is not reproducible (Haiku 4.5 is absent from AA), but Epoch ECI 142.42 is ~14 points below the 156–157 frontier band, which supports D |
+| `*` (including `default`) | 65 | 65 | Unchanged. `default` resolves per account plan, so it takes the conservative tier |
 
 `agy`:
 
-| Model string | `"*"` | `implement`, `fix`, `reproduce` | Basis |
+| Model string | `"*"` | `implement`, `fix`, `reproduce` | Basis, re-read 2026-09-28 |
 |---|---|---|---|
-| `gemini-3.8-flash-high` | 65 | 45 | TB 4.0 19.7 (AA); Arena Text inside the frontier cluster; AA index not comparable across versions |
-| `gemini-3.7-flash-high` | 65 | 45 | TB 4.0 11.2, within TB 4.0's interval of 3.8 |
-| `gemini-3.8-flash-medium`, `gemini-3.7-flash-medium`, `gemini-3.6-flash-high` | 45 | 25 | One tier below the next effort or version up (§5.6 step 3) |
-| `gemini-3.8-flash-low`, `gemini-3.7-flash-low`, `gemini-3.6-flash-medium`, `gemini-3.6-flash-low` | 25 | 25 | Floor |
-| `gemini-3.1-pro-low` | 65 | 45 | SWE-bench Pro SEAL 46.1 at default effort; low effort |
-| `*` (including `gemini-pro-agent`, whose underlying model is undocumented) | 45 | 45 | Unknown model |
+| `gemini-3.8-flash-high` | 65 | 45 | Confirmed on three sources: bottom of both TB 4.0 runs (19.7 AA, 13.13 Vals), bottom third of AA II v4.3.2 (40.9 — the draft had set this aside as pre-v4.3 and uncomparable), inside the Arena Text cluster (1492 ± 5) and Epoch's frontier ECI band (157.13). The analysis tier now rests on Arena Text and ECI, not on a version-mismatched AA figure; the 45 coding tier is defensible but the coding evidence is now two independent runs, not one — §7 item 5 |
+| ⚠ `gemini-3.7-flash-high` | 65 | 45 | **Ordering inverted.** Vals scores 3.7 at 6.06, *below* 3.8's 13.13 — the reverse of the draft's "11.2, within 4.0's interval of 3.8". But 3.7 leads on all three non-TB4.0 sources: ECI 157.72 vs 157.13, Arena Code 1593 vs 1580, Arena Text 1488 vs 1492. It is the seed's `default_model` and the higher of the two on general measures — §7 item 6 |
+| ⚠ `gemini-3.8-flash-medium`, `gemini-3.7-flash-medium`, `gemini-3.6-flash-high` | 45 | 25 | **No figure of any kind.** Arena carries `-high` rows only; AA, Vals, Epoch and SEAL score un-suffixed models. §5.6 step 3's "one tier below" has no anchor to step below from — §7 item 7 |
+| ⚠ `gemini-3.8-flash-low`, `gemini-3.7-flash-low`, `gemini-3.6-flash-medium`, `gemini-3.6-flash-low` | 25 | 25 | **No figure of any kind**, same reason. The floor is defensible as a floor, but it is an assertion, not a derivation — §7 item 7 |
+| `gemini-3.1-pro-low` | 65 | 45 | SEAL 46.10 ± 3.60 confirmed first-hand, plus Arena Text 1487 ± 3 (n=119,196) and ECI 154.92. **One mismatch survives:** SEAL's row is `gemini-3.1-pro (thinking)`, an un-suffixed default-effort run, while the seeded string is `-low` effort, so the figure does not describe the effort level it is being used to justify — §7 item 8 |
+| `*` (including `gemini-pro-agent`, whose underlying model is undocumented) | 45 | 45 | Unchanged. Unknown model |
 
 Read together: on a coding phase whose candidates are `claude/opus` then `agy/gemini-3.8-flash-high`
 then `claude/sonnet`, fan-out 3 gives slot 0 `claude/opus`, slot 1 `claude/sonnet` (65 beats 45),
 slot 2 `agy/gemini-3.8-flash-high`. On a `research` phase with the same candidates, slot 1 goes to
 `agy/gemini-3.8-flash-high`: it ties `claude/sonnet` at 65 and wins the tie because its agent is not
 yet used. This matches the maintainer's example ordering (Opus above Flash) without committing to
-its numbers.
+its numbers. **Both sentences depend on `sonnet` sitting at 65**, which is exactly the value §7 item
+4 puts back to the maintainer.
 
 ## 6. What MOD-36 inherits
 
@@ -376,11 +453,18 @@ its numbers.
 5. Mixed-family budgeting stays as it is: every prompt uses `TokenEstimator::DEFAULT`, which is
    already the tightest (§2.6). Revisit only if an item starts choosing the estimator per model.
 6. Each candidate already draws on its own agent's quota through the walk; no change.
-7. Re-check §5.7's basis figures against Epoch's CSV and the AA/Vals pages before seeding; a changed
-   figure moves a model only if it crosses a tier.
+7. **Done 2026-09-28** — §5.7's basis figures were re-read from Epoch's CSV export, the AA and
+   Vals Terminal-Bench 4.0 pages, the AA Intelligence Index v4.3.2, the SEAL board and the Arena
+   mirror; the record is `docs/ANA-21-recheck-2026-09-28.md`. No figure crossed a tier. Four draft
+   figures did not reproduce and three seeded rows lost their basis (§3.3, §5.7, §7 items 4–8).
+   **MOD-36 must not seed the ⚠ rows until §7 is answered.**
 8. MOD-23's editor surfaces `settings.weights` alongside the model list and default model.
 
 ## 7. Open for the maintainer
+
+Items 1–3 are the draft's. Items 4–8 are new, and all five new ones come out of the 2026-09-28
+re-read: they are places where the primary sources do not determine a value, so the analysis cannot
+close them by reading harder. None is answered here.
 
 1. **`R-AGT-8` clarification (proposed, not applied).** §5.5 keeps the requirement true for slot 0.
    Proposed added sentence: "When the phase fans out, the remaining candidate slots are apportioned
@@ -391,13 +475,47 @@ its numbers.
    explicit priority order `R-AGT-8` and `R-ORCH-1` give the maintainer.
 3. **Learned weights** are deferred behind the volume trigger in §5.6 rather than spawned as an item
    now.
+4. **`sonnet` at 65, with its basis withdrawn.** The only current first-hand figure for Sonnet 5 is
+   Vals' 8.08 on Terminal-Bench 4.0, depressed by seven provider refusals scored as failures, plus
+   Epoch ECI 156.34 [153.45, 159.15] — below Gemini 3.8 Flash. Options: hold 65 as a conservative
+   prior and say so in the seed's `basis`; drop it to the tier ECI supports; or treat Sonnet 5 as
+   unscored and default it to the `"*"` row. The third option is the only one the public record
+   actually supports, and it is the one the draft's own §5.6 rule ("use a vendor figure only where
+   no independent run exists, and drop it one tier") reaches when the honest input is "no figure".
+5. **`gemini-3.8-flash-high` coding tier at 45.** The draft rested this on one AA figure. There are
+   now two independent Terminal-Bench 4.0 runs agreeing it is bottom-tier (19.7 and 13.13) and the
+   AA index agreeing (40.9). 45 is defensible; 25 is arguable on the same evidence. §5.6 step 2
+   does not separate them, because TB 4.0's own interval is wide at that score.
+6. **Gemini 3.7 Flash ranked below 3.8 Flash on coding.** Vals scores 6.06 vs 13.13; every other
+   source ranks 3.7 *above* 3.8. The seed's `default_model` is 3.7. Options: keep the version
+   ordering §5.6 step 3 assumes; let the single strongest coding signal (Vals) govern; or split the
+   coding tier and the analysis tier between the two versions. Note the seed's default and §6's
+   guidance interact here — the maintainer may also want to revisit which string is the default.
+7. **The seven `-medium` / `-low` / `gemini-3.6-flash-*` rows have no independent figure.** §5.6
+   step 3 assumes effort levels degrade monotonically, which no source tests: Arena carries `-high`
+   only, and the other four sources ignore effort entirely. Options: keep the one-tier-per-step
+   convention as a stated assumption; flatten every sub-`high` Gemini string to the `-high` value;
+   or seed them at the floor and let the maintainer raise them once effort-separated numbers exist.
+8. **`gemini-3.1-pro-low` is justified by a different effort level than the string names.** SEAL's
+   row is `gemini-3.1-pro (thinking)`, an un-suffixed default-effort run; the seeded string is
+   `-low`. Options: keep 65/45 and record the mismatch in `basis`; apply §5.6 step 3 and drop it a
+   tier for the effort gap; or drop the effort suffix from the seeded string.
 
 ## 8. Risks
 
 - **Alias drift.** `opus`/`sonnet` move to new models without any row changing, so a weight can go
   stale silently. The mitigation is §5.6's refresh trigger and the date in `weights.basis`.
-- **Second-hand figures.** §3.3 was not read from primary pages. Tiers absorb small errors; the one
-  that could move a tier is Sonnet 5's conflicting Terminal-Bench figure.
+- **Under-determined rows, closed 2026-09-28.** The draft's risk was that §3.3 was second-hand. It
+  no longer is — every figure is now read from a primary source, and the re-read cost nothing in
+  tier movement. The risk it exposed instead is that **five of the twelve seeded rows rest on no
+  independent measurement at all** (§7 items 4–8): Sonnet 5's stated basis did not exist, and no
+  source scores any Gemini effort level below `-high`. A weight that no public source can check is
+  a maintainer assertion wearing a benchmark's clothes, and the seed should say which rows those
+  are.
+- **Source coverage moves faster than the verdict.** Opus 5.5 is absent from Epoch's ECI, Sonnet 5
+  and Haiku 4.5 are absent from AA's index and from both Arena boards, SEAL has not published an
+  Opus 5.x row, and the SWE-ECI file the draft leaned on is gone from the Epoch hub. The
+  independent-measurement set is narrower than the frontier, and it will keep shifting.
 - **Harness gap.** Public numbers come from other scaffolds (§3.1); htui's own outcomes are the only
   fix, which is the learned follow-up.
 - **Judge bias** once models mix; §6 item 4.
@@ -406,34 +524,48 @@ its numbers.
 
 Tree: file:line references inline in §2.
 
+**Access record.** Every source marked *re-read* below was fetched first-hand on **2026-09-28**,
+with no page blocked. What reproduced, what did not, and what could not be checked is recorded in
+`docs/ANA-21-recheck-2026-09-28.md`. Sources the re-read did not touch are marked *not re-read*.
+
 Benchmarks and resolution:
-- Liu et al., *Coding Agents Have Converged*, https://arxiv.org/abs/2609.17394
+- Liu et al., *Coding Agents Have Converged*, https://arxiv.org/abs/2609.17394 — *re-read*, abstract
+  read in full; every figure in §3.1 reproduced exactly
+- Terminal-Bench 4.0 as run by Artificial Analysis, https://artificialanalysis.ai/evaluations/terminalbench-4-0
+  — *re-read*, 34 scored models parsed from the page payload
+- Terminal-Bench 4.0 as run by Vals, https://www.vals.ai/benchmarks/terminal-bench-4 — *re-read*,
+  board updated 2026-09-22; 34 rows, avg@3, Terminus 2
+- Artificial Analysis Intelligence Index **v4.3.2**,
+  https://artificialanalysis.ai/evaluations/artificial-analysis-intelligence-index — *re-read*,
+  32 scored models
+- Epoch Capabilities Index, https://epoch.ai/data/benchmark_data.zip — *re-read*, 268 scored models
+  in `epoch_capabilities_index/eci_scores.csv`; **no SWE-ECI file in the 2026-09 export**, and
+  `terminalbench_external.csv` is a 2.x file. CC BY 4.0. Also https://epoch.ai/eci,
+  https://github.com/epoch-research/eci-public — *not re-read*
+- SWE-bench Pro (Scale SEAL), https://labs.scale.com/leaderboard/swe_bench_pro_public — *re-read*,
+  25 rows; newest Anthropic row Opus 4.6, newest Google row Gemini 3.1 Pro
+- Arena mirror, https://raw.githubusercontent.com/oolong-tea-2026/arena-ai-leaderboards/main/data/2026-09-28/code.json
+  and `.../text.json` — *re-read*; leaderboards last updated 2026-09-25, 30 models each
 - SWE-bench results, https://github.com/SWE-bench/experiments; Vals SWE-bench archive,
-  https://www.vals.ai/benchmarks/swebench
-- SWE-bench Pro (Scale SEAL), https://labs.scale.com/leaderboard/swe_bench_pro_public;
-  SWE-Bench Pro Verified, https://arxiv.org/abs/2609.08149
-- Terminal-Bench 4.0, https://www.tbench.ai/news/terminal-bench-4-0,
-  https://github.com/harbor-framework/terminal-bench; independent runs
-  https://artificialanalysis.ai/evaluations/terminalbench-4-0,
-  https://www.vals.ai/benchmarks/terminal-bench-4; version churn
-  https://flowtivity.ai/blog/terminal-bench-4-score-crash/
-- SWE-rebench, https://swe-rebench.com/; DeepSWE, https://deepswe.datacurve.ai/blog/deepswe-v1-1
-- Artificial Analysis Intelligence Index, https://artificialanalysis.ai/evaluations/artificial-analysis-intelligence-index,
-  https://artificialanalysis.ai/articles/claude-opus-5-5, terms https://artificialanalysis.ai/data-api
-- Epoch Capabilities Index and data (CC BY 4.0), https://epoch.ai/eci,
-  https://epoch.ai/data/benchmark_data.zip, https://github.com/epoch-research/eci-public
-- Arena daily mirror (read first-hand),
-  https://raw.githubusercontent.com/oolong-tea-2026/arena-ai-leaderboards/main/data/2026-09-25/code.json
-  and `.../text.json`
+  https://www.vals.ai/benchmarks/swebench — *not re-read*
+- SWE-Bench Pro Verified, https://arxiv.org/abs/2609.08149 — *not re-read*
+- Terminal-Bench 4.0 background, https://www.tbench.ai/news/terminal-bench-4-0,
+  https://github.com/harbor-framework/terminal-bench; version churn
+  https://flowtivity.ai/blog/terminal-bench-4-score-crash/ — *not re-read*; Vals' methodology
+  section independently confirms the 66-task set, seven categories and the 8-hour limit
+- SWE-rebench, https://swe-rebench.com/; DeepSWE, https://deepswe.datacurve.ai/blog/deepswe-v1-1 —
+  *not re-read*
 - Judge evaluation: https://github.com/ScalerLab/JudgeBench, https://arxiv.org/abs/2506.01937,
-  https://arxiv.org/abs/2606.19544
+  https://arxiv.org/abs/2606.19544 — *not re-read*
 
 Pricing and quotas:
-- Anthropic pricing (first-hand), https://platform.claude.com/docs/en/about-claude/pricing
-- Gemini pricing, https://ai.google.dev/gemini-api/docs/pricing
+- Anthropic pricing, https://platform.claude.com/docs/en/about-claude/pricing — *re-read* in full
+- Gemini pricing, https://ai.google.dev/gemini-api/docs/pricing — *re-read*
 - models.dev, https://github.com/sst/models.dev; LiteLLM cost map,
   https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json;
-  OpenRouter models API, https://openrouter.ai/docs/guides/overview/models
+  OpenRouter models API, https://openrouter.ai/docs/guides/overview/models — *not re-read*
+- `openai.com` pricing for GPT-6 Sol — **not fetched in either pass**; §3.4's 2/10 stays
+  second-hand
 
 Routing and learning from preferences:
 - LiteLLM routing, https://docs.litellm.ai/docs/routing; Portkey load balancing,
