@@ -147,8 +147,16 @@ pub(super) struct SkillsView {
     cursor: usize,
     /// The version shown for the selected skill; `None` is the head.
     shown: Option<i32>,
-    /// What `d` diffs against; `None` is the shown version's predecessor.
-    base: Option<DiffBase>,
+    /// The version `d` diffs against; `None` is the shown version's predecessor.
+    ///
+    /// **A plain `Option<i32>`, not the Templates view's `DiffBase` enum.** That enum's second
+    /// variant is the compiled default (`prompt::body_of`), and a skill has no compiled seed, so
+    /// the `D` it answers here would have no key to press. The blueprint's third variant — the
+    /// oldest stored version — went with it, and so did the first: nothing constructed
+    /// `Predecessor`, and it outlived `Oldest` only because [`pane`](Self::pane) matches it in
+    /// the same arm as `None`, which satisfies the dead-code lint with a dead arm rather than
+    /// with a live one. An `Option` says the same thing with one variant that is built.
+    base: Option<i32>,
     /// Which pane the Browse layout shows.
     pane: Pane,
     /// The pane's first drawn row (`J`/`K`, `PageDown`/`PageUp`). Back to the top whenever the
@@ -322,20 +330,6 @@ enum Pane {
     Body,
     /// The diff from the base to the shown version.
     Diff,
-}
-
-/// What `d` diffs the shown version against.
-///
-/// **Two variants, not the Templates view's three**: the Templates view's `D` diffs against the
-/// compiled default, and a skill has no compiled seed, so the "default" of that key would have no
-/// key to press.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum DiffBase {
-    /// The shown version's predecessor.
-    #[default]
-    Predecessor,
-    /// One named version (`b`).
-    Version(i32),
 }
 
 /// A key with no modifier but `SHIFT`, which is how a terminal reports a capital.
@@ -572,7 +566,7 @@ impl SkillsView {
                 self.scroll.reset();
             }
             'b' => {
-                self.base = Some(DiffBase::Version(shown_version));
+                self.base = Some(shown_version);
                 self.notice = Some(Notice::Info(format!("base v{shown_version}")));
             }
             'd' => {
@@ -1133,10 +1127,10 @@ impl SkillsView {
             );
         }
         let base = match self.base {
-            Some(DiffBase::Version(version)) => snapshot
+            Some(version) => snapshot
                 .version(&name, version)
                 .map(|row| (format!("v{version}"), row.body.as_str())),
-            Some(DiffBase::Predecessor) | None => snapshot
+            None => snapshot
                 .version(&name, shown.version - 1)
                 .map(|row| (format!("v{}", row.version), row.body.as_str())),
         };
