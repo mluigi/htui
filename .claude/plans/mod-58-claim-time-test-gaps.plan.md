@@ -51,7 +51,7 @@ Neither gap needs a shared trait method (D1), a migration, or a new dependency.
 | # | Decision | Why |
 |---|---|---|
 | D1 | **Both gaps are pinned per store, not in the shared conformance suite**: a `pg_criteria.rs` case for `PgStore` and in-file unit tests in `mem.rs` for `MemStore`. | The shared suite is `WriteStore`-generic and has no way to mint a second `box` row: `traits.rs` has no box-creating method (`upsert_agent_box` writes `agent_box`, not `box`; `record_box_probe` updates an existing row). Adding one would be a cross-store change to the shared conformance surface, which the maintainer holds closed for this item. The item text already names this placement. |
-| D2 | **The second `box` row is planted by the test itself, not through the store.** Postgres: raw `INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version)` with the *untyped* `sqlx::query(...).bind(...)` form. `MemStore`: insert a cloned fixture `BoxRow` with a fresh id and hostname into `State.boxes` through the private `MemStore::write`. | `create_run` requires the target box to exist in both stores (`mem.rs:3537-3543`; `REFERENCES box(id)` at `0001_init.sql:455`), so a run cannot be aimed at a box that is not there. The untyped form is the existing precedent (`connect.rs:147`, `cache.rs:1865`) and keeps `.sqlx/` at 268. |
+| D2 | **The second `box` row is planted by the test itself, not through the store.** Postgres: raw `INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version)` with the *untyped* `sqlx::query(...).bind(...)` form. `MemStore`: insert a cloned fixture `BoxRow` with a fresh id and hostname into `State.boxes` through the private `MemStore::write`. | `create_run` requires the target box to exist in both stores (`mem.rs:3537-3543`; `REFERENCES box(id)` at `0001_init.sql:455`), so a run cannot be aimed at a box that is not there. The untyped form is the existing precedent (`connect.rs:147`, `cache.rs:1865`) and keeps `.sqlx/` at 268. **The hostname is `'elsewhere'` for legibility, not because a constraint forces it:** `UNIQUE (user_id, hostname)` from `0001_init.sql:73` was dropped by `0005_box_identity.sql:15` (ANA-16 C4: it made a renamed box a duplicate primary key). |
 | D3 | **The (a) case asserts the refusal *and* that nothing was written**: `Claim::NotClaimable`, the run row equal to what `create_run` returned, and the item still `Status::Queued`. | A refusal that wrote nothing is half the rule (the module doc at `mem.rs:3583-3585` says so). Asserting the verdict alone would still pass if the tag branch ran first and the run were then rolled back. |
 | D4 | **D94 is pinned twice on `MemStore` (`item_id: None`, and `item_id` naming a row that is gone) and once on Postgres (a `queued` run inserted with `item_id = NULL`).** | `run.item_id` is `ON DELETE CASCADE` (`0001_init.sql:450`), so in Postgres a deleted item takes its run and the "row is gone" half is unreachable there. `MemStore` can express both, and both are the two arms of D94's sentence. |
 | D5 | **The Postgres D94 run is inserted with the untyped `sqlx::query` form**, `kind = 'graph'`, `graph_snapshot = '{}'::jsonb`. | `ck_run_graph_snapshot` (`0003_orchestration.sql:47-48`) only requires a graph run's snapshot to be non-NULL; the check is `NOT VALID`, so it is enforced for new rows and the value's shape is not tested. Keeping the insert out of `query!` keeps `.sqlx/` at 268 (D2). |
@@ -139,22 +139,33 @@ queue anyway). The gates are re-run on the real tree after each task.
   `finish_run_holds_the_item_while_another_run_is_live` (`:3676`).
 - **Boilerplate**: the file's own — `let Some(db) = common::demo_db().await else { return; };` at
   the top (`:3557`) and `db.drop_db().await;` at the bottom (`:3675`). `db.store` is the `PgStore`,
-  `db.pool` the raw pool. `race_run` (`:902`) is the file's `NewRun` helper.
+  `db.pool` the raw pool. `race_run` (`:902`) is the file's `NewRun` helper. `race_item` (`:64`) is
+  `fn race_item(kind_id: ItemKindId, title: &str) -> NewItem` — the `kind_id` is mandatory (omit it
+  and the insert is a `23503`) and it hard-codes `required_tags: Vec::new()`. The attribute is
+  `#[tokio::test(flavor = "multi_thread")]`, as in the other 35 cases in the file.
 - **Case 1 — `a_missing_tags_run_aimed_at_another_box_is_not_claimable`**
   1. Plant the second box with the untyped form, copying the column list and the
      `(SELECT id FROM app_user ORDER BY created_at, id LIMIT 1)` sub-select from `connect.rs:147-151`,
-     with `hostname = 'elsewhere'`. The fixture user's own box is `ids::BOX`, and
-     `UNIQUE (user_id, hostname)` (`0001_init.sql:73`) is why the hostname must differ.
-  2. Mint an item with `required_tags: ["cuda"]` (`race_item`, `:64`, with the tags set) and
-     `create_run(NewRun { target_box_id: other, ..race_run(item) })`. Keep the returned row.
-  3. `claim_run(run, ids::BOX, …)` must be `Claim::NotClaimable`; the run row must equal the
+     with `hostname = 'elsewhere'` (legibility — the unique constraint that once forced it is gone,
+     D2). The seven columns named are exactly the `NOT NULL`-without-default columns of
+     `0001_init.sql:53-74`.
+  2. Mint an item with `required_tags: ["cuda"]` — `race_item(ids::KIND_HTUI_FEAT, title)` with the
+     tags overridden — and `create_run(NewRun { target_box_id: other, ..race_run(item) })`. Keep the
+     returned row.
+  3. **Before the claim, assert the tag rule is armed**: `db.store.missing_tags(item, ids::BOX)` is
+     `["cuda"]`. Without this, a `required_tags` override that silently did nothing would leave the
+     case answering `NotClaimable` for the wrong reason. The committed MemStore case has this guard
+     at `mem.rs:7928-7935`; copy its shape.
+  4. `claim_run(run, ids::BOX, …)` must be `Claim::NotClaimable`; the run row must equal the
      `create_run` row and the item must still be `Status::Queued` (D3).
 - **Case 2 — `a_run_with_no_item_is_never_refused_for_tags`**
   1. Insert the run directly: untyped `INSERT INTO run (id, project_id, item_id, kind, mode,
      status, target_box_id, graph_snapshot, started_by, queued_at) VALUES ($1, $2, NULL, 'graph',
      'manual', 'queued', $3, '{}'::jsonb, $4, $5)`. `repo_scope` defaults to `'{}'`
      (`0003_orchestration.sql:36`), which by hazard H-10 overlaps nothing, so the claim can only be
-     refused by the tag rule — and the tag rule is what the case says is never reached.
+     refused by the tag rule — and the tag rule is what the case says is never reached. The
+     `NOT NULL`-without-default columns are `project_id`, `kind`, `mode`, `target_box_id` and
+     `started_by`, all supplied.
   2. `claim_run(run, ids::BOX, …)` must be `Claim::Admitted`; the run reads back `running` with
      `executing_box_id == Some(ids::BOX)`.
 - **Validate**:
@@ -180,9 +191,13 @@ rule on purpose and confirm the case fails, then revert:
   hoisting the predicate into a binding and returning after the `let` still leaves the `MissingTags`
   write block after the return, so nothing is written and the case still passes. That weaker form
   is not a mutation and would report a false green (found by the T1 implementer).
-- T1 and T0, case 2: swap `items.get` for `require_item` (`mem.rs:3612`) and the join for an inner
-  join that demands a row (`pg/write.rs:3075`). The case must fail with
-  `NotFound { entity: "item" }` / a non-empty tag list.
+- T1 and T0, case 2: swap `items.get` for `require_item` (`mem.rs:3612`). **The Postgres half is not
+  a swap** — the join at `pg/write.rs:3075` is already an inner join and there is no `require_item`
+  equivalent in the SQL. D94 there is the *absence* of a row-level demand, so the mutation is to
+  **add** one: a `require_item`-equivalent between `:3063` and `:3071` that answers
+  `NotFound { entity: "item" }` when `item_id` is NULL. The case must then fail with that error.
+  (Found by the blueprint pass; the plan's original "swap the join for an inner join" was not
+  expressible and would have produced a false green.)
 
 Report the observed failure line for each of the four mutations in the task's report. A pin that
 cannot fail is not a pin.
@@ -279,7 +294,7 @@ Every claim is a statement about the tree at `68c058f`, checked in the table bel
 | 7 | `pg_criteria.rs` has the per-case database boilerplate and raw pool access | verified | `common::demo_db()` at `:3557`; `db.drop_db()` at `:3675`; `&db.pool` at `:651`, `:3559` |
 | 8 | A second `box` row is insertable from a test with the untyped `sqlx::query` form, so `.sqlx/` does not move | verified | `connect.rs:147-151`, `cache.rs:1865`; only `query!` macros write `.sqlx` entries |
 | 9 | The in-file `mem.rs` test module can reach `MemStore::write` and `State.boxes` | verified | `mem.rs:5878` `#[cfg(all(test, feature = "test-support"))] mod tests` is a child of `mem`; `write` at `:743` is private to it; `boxes` at `:91` |
-| 10 | A second box needs only id, user, hostname, os_family, os_version, arch, htui_version | verified | `0001_init.sql:53-73` (every other column has a default; `machine_fingerprint` is nullable, `0005_box_identity.sql:17-18`; `UNIQUE (user_id, hostname)` at `:73`) |
+| 10 | A second box needs only id, user, hostname, os_family, os_version, arch, htui_version | verified | `0001_init.sql:53-74` (every other column has a default; `machine_fingerprint` is nullable, `0005_box_identity.sql:17-18`). **Amended at blueprint:** `UNIQUE (user_id, hostname)` is gone — `0005_box_identity.sql:15` drops it — so a distinct hostname is a readability choice, not a constraint |
 | 11 | The Postgres D94 insert needs no valid snapshot value | verified | `0003_orchestration.sql:47-48` `CHECK (kind <> 'graph' OR graph_snapshot IS NOT NULL) NOT VALID` |
 | 12 | The target-box half of the rule is unpinned today | verified | `conformance.rs:4716-4879` asserts the failed-run half (`:4802-4816`); `:4287-4469` asserts `NotClaimable` only for a status reason (`:4452`) |
 | 13 | D94 is unpinned in both stores | verified | `mem.rs:3606-3614` and `pg/write.rs:3067-3086` carry the rule; no case in `conformance.rs`, `pg_criteria.rs` or `mem.rs`'s tests builds a run with no item |
