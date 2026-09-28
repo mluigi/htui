@@ -65,7 +65,11 @@ here as *MOD-7 D-n*). Risks **R-1…R-6**, open questions **OQ-1…OQ-3**, tasks
 
 ---
 
-## Open questions for the maintainer
+## Open questions for the maintainer (all answered 2026-09-28)
+
+**Answers: OQ-1 = A, OQ-2 = keep the meaning, OQ-3 = yes and rename the sentence.** The
+maintainer took the recommended default on all three, so D1–D7 stand as drafted and no part of this
+plan needs re-cutting. The alternatives are kept below as the record of what was weighed.
 
 - **OQ-1 — The shape of the split.** Three candidates, weighed below.
   **Default (recommended): A — one collection of tagged entries**, `Vec<Background>` where
