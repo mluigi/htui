@@ -12499,6 +12499,174 @@ mod tests {
         );
     }
 
+    /// MOD-9 D73/D97: the engine fills `skill_matches`, and this is the half a `glob` attachment
+    /// rests on. `select` reads the map, so while it was `None` every `glob` candidate in a real
+    /// run took the `None` arm and recorded `no_path`: `matched` and `no_match` were reasons no
+    /// production prompt could carry, and the `SKILLS_NOTE` the preview shows the operator
+    /// described a walk the record did not reflect.
+    ///
+    /// `src/lib.rs` is the easy half — listed *and* excerpted — so what this pins is the fill
+    /// itself. That the file set is the walk's **listing** rather than its excerpt set is the other
+    /// half, and `the_phase_specs_file_set_is_the_walks_listing_and_not_its_excerpts` holds it.
+    #[tokio::test]
+    async fn a_phase_step_whose_glob_matches_renders_the_skill() {
+        use htui_core::model::ChoiceReason;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_repo, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        glob_the_tests_skill(&harness, &["**/*.rs"]).await;
+        harness_engine!(harness.orch, engine);
+
+        let prompt = engine
+            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .await
+            .expect("no store fault")
+            .expect("the `prd` prompt assembles");
+
+        let choice = prompt
+            .trim
+            .skill_choices
+            .iter()
+            .find(|choice| choice.skill == ids::SKILL_TESTS)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the flipped attachment is a candidate: {:?}",
+                    prompt.trim.skill_choices
+                )
+            });
+        assert_eq!(
+            (choice.reason, choice.active),
+            (ChoiceReason::Matched, true),
+            "D73/D97: the file set resolved and matched, so this is `matched` and the skill renders"
+        );
+        assert_eq!(
+            choice.matched.as_deref(),
+            Some("htui:src/lib.rs"),
+            "D71: the recorded value is the `<repo>:<path>` that fired"
+        );
+        assert!(
+            prompt.text.contains("<skill name=\"tests\""),
+            "and the rendered prompt carries it: {}",
+            prompt.text
+        );
+    }
+
+    /// The paired negative: the file set **ran** and matched nothing, which is `no_match` and is
+    /// not `no_path`. The distinction is D97's whole reason for the field being an `Option`, so it
+    /// is pinned on a real walk rather than on the fixture literal `prompt_skills.rs` uses.
+    ///
+    /// The other three attachments are still `Always`, so the step is not left with no reason at
+    /// all — only this one is asked to distinguish.
+    #[tokio::test]
+    async fn a_glob_skill_records_no_match_when_the_file_set_ran_and_missed() {
+        use htui_core::model::ChoiceReason;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_repo, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        glob_the_tests_skill(&harness, &["**/*.py"]).await;
+        harness_engine!(harness.orch, engine);
+
+        let prompt = engine
+            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .await
+            .expect("no store fault")
+            .expect("the `prd` prompt assembles");
+
+        let choice = prompt
+            .trim
+            .skill_choices
+            .iter()
+            .find(|choice| choice.skill == ids::SKILL_TESTS)
+            .expect("the flipped attachment is a candidate");
+        assert_eq!(
+            (choice.reason, choice.active, choice.matched.as_deref()),
+            (ChoiceReason::NoMatch, false, None),
+            "D74/D97: the walk ran, the glob matched nothing, and the record says exactly that — \
+             `no_path` would be a claim that there was no file set, which is false here"
+        );
+        assert!(
+            !prompt.text.contains("<skill name=\"tests\""),
+            "and nothing renders for a skill that did not match"
+        );
+    }
+
+    /// The judge reads no file, so it resolves no file set — and `no_path` is the truth for it
+    /// however the phase step goes. Without this the fill in `with_excerpts` could be hoisted into
+    /// `phase_spec`, where a judge and a handoff would start matching against an empty walk.
+    ///
+    /// The judge body is given a `{{skills}}` first: the shipped `judge` template places none, and
+    /// `select` answers `not_placed` before it ever reads an activation.
+    #[tokio::test]
+    async fn a_judge_step_still_records_no_path() {
+        use htui_core::model::{ChoiceReason, NewPromptTemplate, PromptTemplateId};
+        use htui_core::store::CasOutcome;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_repo, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        glob_the_tests_skill(&harness, &["**/*.rs"]).await;
+        let implement = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == "implement")
+            .expect("the feature graph has an implement phase");
+        // The shipped body with a `{{skills}}` line added, not a replacement: a judge template
+        // must keep its `{{candidates}}`, or the writer refuses it.
+        let default = htui_core::prompt::body_of("judge").expect("`judge` has a default body");
+        let body = default.replacen("{{task}}\n", "{{task}}\n{{skills}}\n", 1);
+        assert_ne!(
+            body, default,
+            "the default places `{{{{task}}}}` on its own line"
+        );
+        let appended = harness
+            .orch
+            .store
+            .append_prompt_template(
+                NewPromptTemplate {
+                    id: PromptTemplateId::new(),
+                    project_id: ids::PROJECT_HTUI,
+                    name: "judge".to_owned(),
+                    body,
+                    created_by: harness.orch.user(),
+                },
+                Some(1),
+            )
+            .await
+            .expect("a judge body may place `{{skills}}` (D48)");
+        assert!(matches!(appended, CasOutcome::Applied(_)), "{appended:?}");
+        harness_engine!(harness.orch, engine);
+
+        let prompts = engine
+            .judge_prompts(&row, &snapshot, implement, 1, &[&prd])
+            .await
+            .expect("the judge's inputs are read")
+            .expect("the judge assembles");
+
+        for label in ["forward", "reversed"] {
+            let choices = if label == "forward" {
+                &prompts.forward.trim.skill_choices
+            } else {
+                &prompts.reversed.trim.skill_choices
+            };
+            let choice = choices
+                .iter()
+                .find(|choice| choice.skill == ids::SKILL_TESTS)
+                .unwrap_or_else(|| panic!("the judged phase's candidate is recorded: {choices:?}"));
+            assert_eq!(
+                (choice.reason, choice.matched.as_deref()),
+                (ChoiceReason::NoPath, None),
+                "D73/D97: the judge's file set is empty and its `skill_matches` is `None`, so the \
+                 same attachment that records `matched` on the phase step records `no_path` here. \
+                 The {label} order"
+            );
+        }
+    }
+
     /// MOD-9 D89: `FEAT-3`'s project-level `tests` attachment, flipped from `Always` to `Glob`
     /// through the real writer and under the row's own `updated_at` token.
     ///

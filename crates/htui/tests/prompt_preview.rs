@@ -22,11 +22,11 @@ use htui::ui::tabs::backlog::BacklogTab;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Activation, ChoiceReason, ItemId, ItemPatch, NewRepo, RepoBoxPath, RepoId, Scope, SkillChoice,
-    SkillLevel, WorkspaceSummary,
+    Activation, ChoiceReason, ItemId, ItemPatch, NewRepo, NewSkillBinding, RepoBoxPath, RepoId,
+    Scope, SkillChoice, SkillLevel, WorkspaceSummary,
 };
 use htui_core::prompt::excerpt::RootSource;
-use htui_core::store::{MemStore, ReadStore as _, UpdateOutcome, WriteStore as _};
+use htui_core::store::{CasOutcome, MemStore, ReadStore as _, UpdateOutcome, WriteStore as _};
 use htui_store::Backend;
 
 /// How far right the Prompt sub-tab sits: Body, Runs, Graph, Documents, Notes, **Prompt**.
@@ -405,6 +405,131 @@ async fn the_preview_carries_the_phase_skills_of_the_matching_phase() {
     assert!(
         !notes.iter().any(|note| note.starts_with(NO_PHASE)),
         "a phase uses `implement`, so there is no no-phase note: {notes:#?}"
+    );
+}
+
+/// The project-level `tests` attachment flipped to `Glob` over `globs`, through the real writer.
+///
+/// The flip is the prologue and not a detail. Every attachment the demo fixture ships is `Always`,
+/// so a preview case that wanted a `glob` decision and did not plant one would watch the record
+/// say `always` and call itself green — the same hazard the engine's excerpt cases name as H-22.
+async fn glob_the_tests_skill(store: &MemStore, globs: &[&str]) {
+    let attached = store
+        .skill_attachments(&[ids::PROJECT_HTUI])
+        .await
+        .expect("the memory store never fails")
+        .into_iter()
+        .find(|row| row.skill_id == ids::SKILL_TESTS)
+        .expect("the fixture binds `tests` at the project level");
+    let applied = store
+        .set_skill_binding(
+            NewSkillBinding {
+                id: attached.id,
+                skill_id: attached.skill_id,
+                project_id: attached.project_id,
+                phase_id: attached.phase_id,
+                pinned_version: attached.pinned_version,
+                position: attached.position,
+                activation: Activation::Glob,
+                globs: globs.iter().map(|glob| (*glob).to_owned()).collect(),
+                languages: attached.languages.clone(),
+            },
+            Some(attached.updated_at),
+        )
+        .await
+        .expect("the row's own token is current");
+    let CasOutcome::Applied(row) = applied else {
+        panic!("the attachment is flipped to glob, not left where it was: {applied:?}");
+    };
+    assert_eq!(
+        row.globs, globs,
+        "and it carries the globs the matcher will read"
+    );
+}
+
+/// MOD-9 D73: the preview runs the same walk a step does, so a `glob` attachment is matched
+/// against it — and the record says which of `matched` and `no_match` it was, not `no_path`.
+///
+/// The checkout is the point. `a_project_with_a_checkout` puts `src/lib.rs` on this box and
+/// FEAT-1 on it as a touched path, so the walk has something to match and the halves differ only
+/// in the glob: `**/*.rs` fires, `**/*.py` does not. The second half is not decoration — D97's
+/// whole reason for `skill_matches` being an `Option` is that "the set ran and matched nothing"
+/// and "there was no file set" are different records, and only the first of them is true here.
+#[tokio::test]
+async fn the_preview_matches_a_glob_attachment_against_its_own_walk() {
+    let (store, _dir) = a_project_with_a_checkout().await;
+    glob_the_tests_skill(&store, &["**/*.rs"]).await;
+    let scope = platform_scope().await;
+    let preview = preview::build(
+        &Backend::memory(store),
+        item_id("FEAT-1").await,
+        Some("implement"),
+        &scope,
+    )
+    .await
+    .expect("the demo store answers every prompt read");
+    let assembled = preview.outcome.as_ref().expect("the demo item assembles");
+
+    let choice = assembled
+        .trim
+        .skill_choices
+        .iter()
+        .find(|choice| choice.skill == ids::SKILL_TESTS)
+        .unwrap_or_else(|| {
+            panic!(
+                "the flipped attachment is a candidate: {:#?}",
+                assembled.trim.skill_choices
+            )
+        });
+    assert_eq!(
+        (choice.reason, choice.active),
+        (ChoiceReason::Matched, true),
+        "D71/D73: `src/lib.rs` is in this box's walk and `**/*.rs` names it"
+    );
+    assert_eq!(
+        choice.matched.as_deref(),
+        Some("htui:src/lib.rs"),
+        "D71: the recorded value is the `<repo>:<path>` that fired"
+    );
+    assert!(
+        assembled
+            .text
+            .contains("<skill name=\"tests\" version=\"1\">"),
+        "and the matched skill renders: {}",
+        assembled.text
+    );
+}
+
+#[tokio::test]
+async fn the_preview_records_no_match_for_a_glob_nothing_matches() {
+    let (store, _dir) = a_project_with_a_checkout().await;
+    glob_the_tests_skill(&store, &["**/*.py"]).await;
+    let scope = platform_scope().await;
+    let preview = preview::build(
+        &Backend::memory(store),
+        item_id("FEAT-1").await,
+        Some("implement"),
+        &scope,
+    )
+    .await
+    .expect("the demo store answers every prompt read");
+    let assembled = preview.outcome.as_ref().expect("the demo item assembles");
+
+    let choice = assembled
+        .trim
+        .skill_choices
+        .iter()
+        .find(|choice| choice.skill == ids::SKILL_TESTS)
+        .expect("the flipped attachment is a candidate");
+    assert_eq!(
+        (choice.reason, choice.active, choice.matched.as_deref()),
+        (ChoiceReason::NoMatch, false, None),
+        "D74/D97: the walk ran over a real checkout and `**/*.py` named nothing in it, so the \
+         record says `no_match` — `no_path` would claim there was no file set, which is false"
+    );
+    assert!(
+        !assembled.text.contains("<skill name=\"tests\""),
+        "and nothing renders for a skill that did not match"
     );
 }
 
