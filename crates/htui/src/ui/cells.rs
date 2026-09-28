@@ -20,10 +20,6 @@
 //! `•`, `U+FFFD`, every box-drawing char — are 1 cell under `width()` and 2 under `width_cjk()`,
 //! and `…` and `•` are two of the glyphs `TextField` draws itself. `ratatui` uses `width()`.
 
-// MOD-54 T0 lands this module before the widgets that consume it (T1, T2), so `-D warnings`
-// would fail the clippy gate on `dead_code` in between. Removed at the end of T1.
-#![allow(dead_code)]
-
 use unicode_segmentation::UnicodeSegmentation as _;
 use unicode_width::UnicodeWidthStr;
 

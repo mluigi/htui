@@ -1,10 +1,13 @@
-//! One single-line text field with a char cursor and an optional mask (MOD-15 milestone 3, D1;
-//! PRD D1). The widget MOD-22, MOD-23 and the connection section's DSN entry consume.
+//! One single-line text field with a grapheme cursor and an optional mask (MOD-15 milestone 3, D1;
+//! PRD D1; MOD-54 D3). The widget MOD-22, MOD-23 and the connection section's DSN entry consume.
 //!
-//! Width is counted in `char`s, not display columns: no `unicode-width` is declared anywhere in
-//! the workspace, and every field this widget opens holds a slug, a name, a branch, a path or a
-//! DSN. Multi-line, history, bracketed paste, a reveal toggle and validation are deliberately not
-//! built.
+//! Width is counted in **display cells** and the cursor steps by **grapheme cluster**, both through
+//! [`crate::ui::cells`] (MOD-54 D1, D2), so a CJK or emoji line occupies the columns it is drawn
+//! in rather than one column per code point, and `Left`/`Backspace` cannot split a combining
+//! sequence. Every cell count in this file comes from that one module, so it cannot drift from
+//! `ratatui`, which is what actually draws the result.
+//!
+//! Multi-line, history, bracketed paste, a reveal toggle and validation are deliberately not built.
 //!
 //! **`Zeroizing` arrived with milestone 6** (D3), and it covers exactly this much: the buffer is
 //! wiped when the field drops, when [`clear`](TextField::clear) is called, and — because
@@ -17,9 +20,11 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use unicode_segmentation::UnicodeSegmentation as _;
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::ui::Theme;
+use crate::ui::cells::{cell_width, graphemes};
 
 /// What one key did to the field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +40,7 @@ pub enum FieldOutcome {
     Pass,
 }
 
-/// A single-line buffer with a cursor, counted in `char`s.
+/// A single-line buffer with a cursor, stepped in graphemes.
 #[derive(Clone, Default)]
 pub struct TextField {
     /// What was typed. Never printed by [`Debug`](core::fmt::Debug).
@@ -44,9 +49,10 @@ pub struct TextField {
     /// the reason the type is the same for both, since a field that zeroized only when masked
     /// would be one `masked: false` away from not zeroizing at all.
     text: Zeroizing<String>,
-    /// Char index, `0..=text.chars().count()`.
+    /// Grapheme index, `0..=len()`.
     cursor: usize,
-    /// Whether [`line`](TextField::line) draws `•` per char and [`text`](TextField::text) refuses.
+    /// Whether [`line`](TextField::line) draws `•` per grapheme and [`text`](TextField::text)
+    /// refuses.
     masked: bool,
 }
 
@@ -70,7 +76,7 @@ impl TextField {
         Self::default()
     }
 
-    /// An empty masked field: it draws `•` per char and [`text`](TextField::text) is `None`.
+    /// An empty masked field: it draws `•` per grapheme and [`text`](TextField::text) is `None`.
     ///
     /// Reserves 256 bytes, so a DSN of ordinary length never reallocates — a `String` that grows
     /// past its capacity copies its bytes into a new allocation and frees the old one **unwiped**,
@@ -94,8 +100,8 @@ impl TextField {
     #[must_use]
     pub fn with_text(text: &str) -> Self {
         Self {
+            cursor: graphemes(text).count(),
             text: Zeroizing::new(text.to_owned()),
-            cursor: text.chars().count(),
             masked: false,
         }
     }
@@ -197,10 +203,13 @@ impl TextField {
         self.cursor = 0;
     }
 
-    /// How many `char`s are in the buffer.
+    /// How many grapheme clusters are in the buffer.
+    ///
+    /// The same number the mask draws a `•` for, so the dots and the `(n)` printed beside them
+    /// can never disagree (MOD-54 D6). For ASCII that is the code point count, unchanged.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.text.chars().count()
+        graphemes(&self.text).count()
     }
 
     /// Whether nothing has been typed.
@@ -215,12 +224,17 @@ impl TextField {
         self.masked
     }
 
-    /// The field as one line `width` cells wide, for the caller to place in its own `Rect`.
+    /// The field as one line of at most `width` **cells**, for the caller to place in its own
+    /// `Rect`.
     ///
-    /// A window of the chars ending at the cursor, with a leading `…` when the start is clipped
-    /// and nothing at all when the end is; the cursor cell (a space past the last char) carries
+    /// A window of the graphemes ending at the cursor, counted in display cells, with a leading `…`
+    /// when the start is clipped and nothing at all when the end is; the cursor cell carries
     /// `theme.selected` while `focused`. A masked field appends a dim ` (n)` and the window is
     /// sized around it. Computed on every call — nothing is cached, so a resize needs no event.
+    ///
+    /// Two invariants hold at any width: the drawn line is never wider than `width` cells, and the
+    /// cursor is always on screen. The second is why a cluster too wide for the whole window is
+    /// replaced by a single styled space rather than drawn and allowed to overrun (MOD-54 D10).
     #[must_use]
     pub fn line(&self, width: u16, focused: bool, theme: &Theme) -> Line<'static> {
         let width = usize::from(width);
@@ -229,46 +243,95 @@ impl TextField {
         } else {
             String::new()
         };
-        let budget = width.saturating_sub(suffix.chars().count());
-        let glyphs: Vec<char> = if self.masked {
-            core::iter::repeat_n('•', self.len()).collect()
+        let budget = width.saturating_sub(cell_width(&suffix));
+        let glyphs: Vec<&str> = if self.masked {
+            vec!["•"; self.len()]
         } else {
-            self.text.chars().collect()
+            graphemes(&self.text).collect()
         };
 
-        // `budget` cells hold `['…'] + before + cursor cell + after`, so the cursor is always on
-        // screen; below two cells there is room for the cursor and nothing else.
-        let (start, ellipsis) = if budget < 2 {
-            (self.cursor, false)
-        } else if self.cursor < budget {
-            // `cursor < budget` is `cursor + 1 <= budget`: the whole head plus the cursor cell fit.
-            (0, false)
-        } else {
-            (self.cursor + 2 - budget, true)
+        // The cell under the cursor: the cluster there, or a space past the end of the buffer. A
+        // cluster of no width still needs a cell to sit in, or the cursor has nowhere to go — and
+        // `ratatui` filters every zero-width string out of what it writes, so such a cluster
+        // would draw as nothing at all (D14). `U+FFFD` is this widget's existing "a character is
+        // here with no glyph".
+        let at: String = match glyphs.get(self.cursor) {
+            Some(g) if cell_width(g) == 0 => "\u{fffd}".to_owned(),
+            Some(g) => (*g).to_owned(),
+            None => " ".to_owned(),
         };
-        let before: String = glyphs[start.min(glyphs.len())..self.cursor.min(glyphs.len())]
+        let at_width = cell_width(&at);
+        let head_width: usize = glyphs[..self.cursor.min(glyphs.len())]
             .iter()
-            .collect();
-        let at = glyphs.get(self.cursor).copied().unwrap_or(' ');
-        let room = budget
-            .saturating_sub(usize::from(ellipsis))
-            .saturating_sub(before.chars().count())
-            .saturating_sub(1);
-        let after: String = glyphs
-            .iter()
-            .skip(self.cursor.saturating_add(1))
-            .take(room)
-            .collect();
+            .map(|g| cell_width(g))
+            .sum();
 
         let cursor_style: Style = if focused { theme.selected } else { theme.base };
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(5);
+
+        // A cluster wider than the whole window cannot be drawn and cannot be split, and
+        // `ratatui` would stop the string at it and draw nothing — leaving an invisible cursor. So
+        // the cursor takes the one cell it has (D10).
+        if at_width > budget {
+            spans.push(Span::styled(" ".to_owned(), cursor_style));
+            if !suffix.is_empty() {
+                spans.push(Span::styled(suffix, theme.dim));
+            }
+            return Line::from(spans);
+        }
+
+        // `budget` cells hold `['…'] + before + the cursor cell + after`, so the cursor is always
+        // on screen; below two cells there is room for the cursor and nothing else.
+        let (start, ellipsis) = if head_width + at_width <= budget {
+            // `head_width + at_width <= budget` is today's `cursor < budget`: the whole head plus
+            // the cursor cell fit.
+            (0, false)
+        } else {
+            // Otherwise show as much of the tail as fits: the smallest `start` whose shown tail
+            // leaves room for the ellipsis and the cursor cell. The scan runs upward and sums the
+            // *hidden* head, so `head_width - head` is the width of what is shown.
+            let room = budget - at_width - 1;
+            let mut head = 0;
+            let mut start = 0;
+            for g in glyphs.iter().take(self.cursor.min(glyphs.len())) {
+                if head_width - head <= room {
+                    break;
+                }
+                head += cell_width(g);
+                start += 1;
+            }
+            (start, true)
+        };
+
+        let before: String = glyphs[start.min(glyphs.len())..self.cursor.min(glyphs.len())]
+            .iter()
+            .map(|g| (*g).to_owned())
+            .collect();
+        let before_width = cell_width(&before);
+
         if ellipsis {
             spans.push(Span::styled("…", theme.dim));
         }
         if !before.is_empty() {
             spans.push(Span::styled(before, theme.base));
         }
-        spans.push(Span::styled(at.to_string(), cursor_style));
+        spans.push(Span::styled(at, cursor_style));
+
+        // The tail, whole clusters only: the first that would overrun the window ends it.
+        let room = budget
+            .saturating_sub(usize::from(ellipsis))
+            .saturating_sub(before_width)
+            .saturating_sub(at_width);
+        let mut used = 0;
+        let mut after = String::new();
+        for g in glyphs.iter().skip(self.cursor + 1) {
+            let w = cell_width(g);
+            if used + w > room {
+                break;
+            }
+            used += w;
+            after.push_str(g);
+        }
         if !after.is_empty() {
             spans.push(Span::styled(after, theme.base));
         }
@@ -278,19 +341,29 @@ impl TextField {
         Line::from(spans)
     }
 
-    /// Byte offset of char `index`, or the buffer's length past the end.
+    /// Byte offset of grapheme `index`, or the buffer's length past the end.
     fn byte_of(&self, index: usize) -> usize {
         self.text
-            .char_indices()
+            .grapheme_indices(true)
             .nth(index)
             .map_or(self.text.len(), |(byte, _)| byte)
     }
 
-    /// Inserts one char at the cursor and steps over it.
+    /// Inserts one char at the cursor and steps over the whole cluster it joined.
+    ///
+    /// A combining mark, a ZWJ or a variation selector merges into the cluster **before** it, so
+    /// the cluster count does not grow and `cursor += 1` would leave the cursor past the end of
+    /// the buffer. The count is recomputed instead: the number of clusters starting before the
+    /// byte just past the insertion. That is 1 for `"a"` + `U+0301` (one cluster, cursor at the
+    /// end), and 1 for `"ab"` + a mark at 1 (two clusters, cursor on the `b`).
     fn insert(&mut self, c: char) {
-        let byte = self.byte_of(self.cursor);
-        self.text.insert(byte, c);
-        self.cursor += 1;
+        let at = self.byte_of(self.cursor);
+        self.text.insert(at, c);
+        self.cursor = self
+            .text
+            .grapheme_indices(true)
+            .take_while(|(byte, _)| *byte < at + c.len_utf8())
+            .count();
     }
 }
 
@@ -324,6 +397,17 @@ mod tests {
             .to_owned()
     }
 
+    /// The widget's own line, spans joined: the string `ratatui` is handed. Unlike the rendered
+    /// buffer this keeps a wide cluster as one string, so it can be measured in cells.
+    fn line_text(field: &TextField, width: u16, focused: bool) -> String {
+        field
+            .line(width, focused, &Theme::default())
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
     #[test]
     fn inserts_at_the_cursor() {
         let mut field = TextField::with_text("ac");
@@ -335,7 +419,7 @@ mod tests {
         assert_eq!(field.text(), Some("abc"), "`b` lands before `c`");
         assert_eq!(field.len(), 3);
 
-        // A multi-byte char: the cursor is a char index, so inserting after it is not a byte + 1.
+        // A multi-byte char: the cursor is a grapheme index, so inserting after it is not a byte + 1.
         let mut wide = TextField::with_text("é");
         wide.on_key(key(KeyCode::Home));
         wide.on_key(key(KeyCode::Char('a')));
@@ -612,5 +696,178 @@ mod tests {
         let rendered = format!("{masked:?}");
         assert!(!rendered.contains("secret"), "{rendered}");
         assert!(rendered.contains("masked: true"), "{rendered}");
+    }
+
+    // ---- MOD-54 ---------------------------------------------------------------------------------
+
+    /// D4: a wide grapheme is two cells, so a field holding two of them is not as long as its
+    /// code point count says.
+    #[test]
+    fn a_wide_grapheme_is_two_cells() {
+        let field = TextField::with_text("漢字");
+        assert_eq!(
+            line_text(&field, 6, true),
+            "漢字 ",
+            "four cells and the cursor's cell"
+        );
+        assert!(
+            cell_width(&line_text(&field, 6, true)) <= 6,
+            "and never past the six cells it was given"
+        );
+    }
+
+    /// D4: the window is sized in cells. Twelve CJK clusters are twenty-four cells, so a ten-cell
+    /// window shows four of them and an ellipsis, not nine of them and a half.
+    #[test]
+    fn the_window_counts_cells_not_chars() {
+        let field = TextField::with_text(&"一".repeat(12));
+        let row = line_text(&field, 10, true);
+        assert_eq!(row, format!("…{} ", "一".repeat(4)), "{row:?}");
+        assert_eq!(cell_width(&row), 10, "exactly the window it was given");
+    }
+
+    /// D5: `ratatui` writes the style onto the first cell of a grapheme and then *resets* the
+    /// continuation cell, so no `Span` can reverse both. The first cell carries the cursor.
+    #[test]
+    fn a_wide_cursor_cell_highlights_its_first_cell() {
+        let mut field = TextField::with_text("漢字");
+        field.on_key(key(KeyCode::Home));
+        let buffer = drawn(&field, 6, true);
+        assert!(
+            buffer[(0, 0)].modifier.contains(Modifier::REVERSED),
+            "the cluster's first cell carries the cursor"
+        );
+        assert!(
+            !buffer[(1, 0)].modifier.contains(Modifier::REVERSED),
+            "and its continuation cell is not styled, because `ratatui` resets it"
+        );
+    }
+
+    /// D3: the cursor steps by cluster, so it never lands inside a combining sequence or between
+    /// the halves of a ZWJ sequence.
+    #[test]
+    fn left_and_right_step_by_grapheme() {
+        let mut field = TextField::with_text("a\u{301}👨‍👩‍👧c");
+        assert_eq!(
+            field.len(),
+            3,
+            "base+mark is one, the family emoji is one, and `c`"
+        );
+        field.on_key(key(KeyCode::End));
+        assert_eq!(field.cursor, 3);
+
+        field.on_key(key(KeyCode::Right));
+        assert_eq!(field.cursor, 3, "right at the end does nothing");
+        for _ in 0..2 {
+            field.on_key(key(KeyCode::Left));
+        }
+        assert_eq!(
+            field.cursor, 1,
+            "one step over the family emoji, not into it"
+        );
+        field.on_key(key(KeyCode::Right));
+        assert_eq!(field.cursor, 2, "and back past the whole cluster");
+    }
+
+    /// D3: `Backspace` removes a whole cluster, leaving no orphaned mark behind.
+    #[test]
+    fn backspace_removes_a_whole_grapheme() {
+        let mut field = TextField::with_text("a\u{301}b");
+        field.on_key(key(KeyCode::Backspace));
+        assert_eq!(
+            field.text(),
+            Some("a\u{301}"),
+            "not a base and a stray mark"
+        );
+    }
+
+    /// D3's `insert`: a typed mark merges into the cluster before it, so the count does not grow
+    /// and `cursor += 1` would leave the cursor past the end of the buffer. This is the assertion
+    /// that catches the naive port.
+    #[test]
+    fn a_typed_combining_mark_joins_the_cluster_before_it() {
+        let mut field = TextField::new();
+        for c in ["a", "\u{301}", "b"] {
+            field.on_key(key(KeyCode::Char(c.chars().next().expect("one char"))));
+        }
+        assert_eq!(field.text(), Some("a\u{301}b"));
+        assert_eq!(field.len(), 2, "the mark and its base are one cluster");
+        assert_eq!(field.cursor, 2, "and the cursor is after `b`");
+    }
+
+    /// D10: a wide grapheme that does not fit is dropped whole, never half-drawn at the edge.
+    #[test]
+    fn a_wide_grapheme_that_does_not_fit_is_dropped_not_split() {
+        let field = TextField::with_text("一x");
+        let row = line_text(&field, 3, true);
+        assert_eq!(row, "…x ", "the two-cell cluster is dropped, not split");
+        assert_eq!(cell_width(&row), 3);
+    }
+
+    /// D10's exception: a cluster wider than the whole window still has to leave a visible cursor.
+    #[test]
+    fn a_wide_cursor_in_a_one_cell_field_draws_a_space() {
+        let mut field = TextField::with_text("一");
+        field.on_key(key(KeyCode::Home));
+        assert_eq!(
+            line_text(&field, 1, true),
+            " ",
+            "the cursor stays visible in a field that cannot hold the cluster"
+        );
+    }
+
+    /// D14: a zero-width cluster occupies no cell, so the cursor draws `U+FFFD` in one — otherwise
+    /// `ratatui` filters it out and the cursor vanishes.
+    #[test]
+    fn a_zero_width_cluster_at_the_cursor_draws_a_replacement_glyph() {
+        let mut field = TextField::with_text("\u{301}a");
+        field.on_key(key(KeyCode::Home));
+        assert_eq!(
+            line_text(&field, 3, true),
+            "\u{fffd}a",
+            "a cell for a cluster that is no width"
+        );
+    }
+
+    /// D6: the mask draws one dot per grapheme and prints that same number, so a decomposed and a
+    /// precomposed `é` read as the two characters a person typed, not as three code points.
+    #[test]
+    fn a_masked_field_counts_graphemes_not_code_points() {
+        let mut field = TextField::masked();
+        for c in ["\u{e9}", "e", "\u{301}"] {
+            field.on_key(key(KeyCode::Char(c.chars().next().expect("one char"))));
+        }
+        assert_eq!(field.len(), 2, "two graphemes, three code points");
+        assert_eq!(drawn_text(&field, 12, true), "••  (2)");
+    }
+
+    /// D17c: today's exact expectations, inlined. The item's regression net is that a rendering
+    /// change for narrow text is a diff someone can read, not a rewritten test that looks the same.
+    #[test]
+    fn ascii_rendering_is_unchanged() {
+        assert_eq!(
+            drawn_text(&TextField::with_text("abcdefghijkl"), 10, true),
+            "…efghijkl"
+        );
+        assert_eq!(drawn_text(&TextField::with_text("abc"), 10, true), "abc");
+
+        let mut at_five = TextField::with_text("abcdefghijkl");
+        at_five.on_key(key(KeyCode::Home));
+        for _ in 0..5 {
+            at_five.on_key(key(KeyCode::Right));
+        }
+        assert_eq!(drawn_text(&at_five, 10, true), "abcdefghij");
+
+        let mut masked = TextField::masked();
+        for c in "hunter2".chars() {
+            masked.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(drawn_text(&masked, 12, true), "•••••••  (7)");
+
+        let mut long = TextField::masked();
+        for c in "0123456789ab".chars() {
+            long.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(drawn_text(&long, 8, true), "…•  (12)");
     }
 }
