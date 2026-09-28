@@ -754,6 +754,14 @@ async fn a_failed_external_edit_keeps_the_draft() {
 /// `on_scope_change` is `settings/prompt.rs`'s: the library, the editor, the pending handoff and
 /// the write in flight all belong to the workspace that was left, and only the notice survives —
 /// because the scope change is often the consequence of what it reports.
+///
+/// **This is the plan's `an_editor_keeps_the_draft_when_the_scope_changes`, inverted, and the
+/// promise is withdrawn.** That name is `mod-9-skills-editable.plan.md:319`; the rule it
+/// contradicts is milestone 1's D6 — "`on_scope_change` drops the snapshot and any open editor"
+/// — which `templates.rs::on_scope_change` already follows and which this tab shares. A kept
+/// draft would also be holding two compare-and-set tokens for a snapshot the scope change has
+/// just discarded, so the save it offers would be stale by construction. The behaviour is right
+/// and the plan's line is not; this test is the record of which one won.
 #[tokio::test]
 async fn a_scope_change_drops_the_editor_and_keeps_the_notice() {
     let store = MemStore::demo();

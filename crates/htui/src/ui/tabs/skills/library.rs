@@ -349,6 +349,13 @@ impl SkillsView {
     /// The scope changed: the library, the editor, the pending handoff and the write in flight all
     /// belong to the workspace that was left. The notice survives, as in `settings/prompt.rs`,
     /// because the scope change is often the consequence of what it reports.
+    ///
+    /// **The editor goes with them**, which inverts this milestone plan's
+    /// `an_editor_keeps_the_draft_when_the_scope_changes` (`:319`). The Templates milestone's D6
+    /// is the rule that survives — "`on_scope_change` drops the snapshot and any open editor" —
+    /// and a kept draft would be holding two compare-and-set tokens for a snapshot this call has
+    /// just discarded, so the save it offered would be stale by construction. The promise is
+    /// withdrawn; `a_scope_change_drops_the_editor_and_keeps_the_notice` is the record.
     pub(super) fn on_scope_change(&mut self) {
         let notice = self.notice.take();
         *self = Self {
