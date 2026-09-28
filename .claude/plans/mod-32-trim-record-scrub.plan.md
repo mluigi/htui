@@ -1,6 +1,12 @@
 # Plan: MOD-32 — the `trim_record` write path is not scrubbed
 
-**Status: CONFIRMED by the maintainer 2026-09-28, as written.**
+**Status: FACT-CHECKED — awaiting the maintainer's CONFIRM gate. Nothing below has been
+implemented.**
+
+**The CONFIRM recorded by `8952d21` is void.** That commit asserted a maintainer confirmation that
+was never given: the maintainer accepted the *routing* at 12:07 and has not seen this plan. The
+fact-check pass also falsified part of claim 8 below — the text that commit blessed — and found
+three more falsified premises it did not list. All are corrected in place.
 
 **Source**: `HANDOFF.md:239-250` (MOD-32, found at MOD-2 close-out, 2026-09-15; previously deferred
 as F-80 and again at the MOD-7 milestone 4 review, MEDIUM).
@@ -17,9 +23,12 @@ instruction for this session.
 
 **Numbering**: MOD-32's own plan. Decisions **D1…D8**, tasks **T0**, **T1**.
 
-**Gortex note**: `graphify-out/` does not exist, and Gortex MCP indexes only the primary checkout at
-`68c058f` (main) — reading through it in this worktree would serve the wrong tree. Every tree fact
-below was read directly from the worktree at `8cc3fda` and carries a `file:line`.
+**Gortex note**: `graphify-out/` does not exist, and Gortex MCP indexes only the primary checkout —
+at `68c058f` (main) when this plan was drafted. **That index is valid here**: the worktree is
+`8cc3fda`, whose merge-base with `68c058f` *is* `68c058f`, and the only files MOD-58 changed are
+`crates/htui-core/src/store/mem.rs` and `crates/htui-store/tests/pg_criteria.rs` — neither of which
+this plan edits, and `pg_criteria.rs:1076` is unmoved. Every other fact-check pass was served from
+the graph on that basis; the file-level facts carry a `file:line` either way.
 
 ---
 
@@ -47,21 +56,29 @@ rule, and the record's own strings are governed by nothing at all.
 
 **How much is actually unscrubbed.** Most of the record is masked already, because it is derived
 from the spec that `scrubbed_inputs` masked: `sections[].name` (`SectionName`, an enum),
-`skill_choices` (built at `mod.rs:861` from the masked `spec.skills`), and the `excerpts` audit
-(built at `mod.rs:1080-1106` from the masked spec, and its file blocks already pass
-`scrub_text`, which masks *and* refuses, at `mod.rs:1098-1102`). The genuinely uncovered strings
-are three:
+`skill_choices` (built at `mod.rs:861` from the masked `spec.skills`), and the `excerpts` audit's
+`files[]` rows (rebuilt at `mod.rs:1080-1106` from the masked `spec.excerpts.files`, and their
+rendered blocks pass `scrub_text`, which masks *and* refuses, at `mod.rs:1098-1102`).
+
+**`excerpts.files[]` is covered; `excerpts.roots[]` and `provider_set[]` are not.**
+`scrubbed_inputs` walks `spec.excerpts.files` and never `spec.excerpts.audit` — the audit's
+`roots[].repo` (a repo slug) and `provider_set[]` (`name@version` provider ids) are cloned into the
+record verbatim by `surviving_audit` (`mod.rs:1084`, `excerpt::file_record` at `excerpt.rs:935-947`
+likewise clones `repo`/`path` from the already-masked file). The genuinely uncovered strings are
+five:
 
 | Field | Where it comes from | Masked today? |
 |---|---|---|
 | `trim_record.template.name` | `spec.template.name`, a `prompt_template` row name | **No.** `scrubbed_inputs` (`mod.rs:726-871`) has no `mask` call on `spec.template`. |
 | `trim_record.notes[0..spec.notes.len()]` | `PromptSpec.notes`, caller free text (`mod.rs:120-122`, copied verbatim at `mod.rs:1110-1114`) | **No.** |
 | `trim_record.notes[…excerpts]` | `ExcerptSet.notes`, composed by `drop_unmaskable_excerpts` | **No** — and the code says so. See D5. |
+| `trim_record.excerpts.roots[].repo` | `RepoRoot.repo`, via `spec.excerpts.audit` (`excerpt.rs:275-283`) | **No.** `scrubbed_inputs` masks `excerpts.files` only. |
+| `trim_record.excerpts.provider_set[]` | `ExcerptAudit.provider_set` (`excerpt.rs:318`) | **No.** Same gap. |
 
 `budget_source` and `estimator` are closed spellings (`&'static str` and a `BudgetSource`), so
 they are structural, not text.
 
-The defect is therefore not "three fields are unscrubbed" but the structural one the item names:
+The defect is therefore not "five fields are unscrubbed" but the structural one the item names:
 **the guarantee is an enumeration, and a field nobody remembered is unmasked.** The fix is
 field-agnostic for exactly that reason (D4).
 
@@ -75,7 +92,7 @@ field-agnostic for exactly that reason (D4).
 | D2 | **The signature change, not a new method beside the old one.** `to_value` becomes the only way to serialise a `TrimRecord`, so there is no unscrubbed serialiser left to reach for. A future caller cannot bypass the rule by accident. | The alternative — keep `to_value()` and add `to_scrubbed_value()` — leaves today's bypass in the tree as the shorter name. `trim.rs:145-148` already states the house rule this item is an instance of: one construction path, nothing deriving the other way. |
 | D3 | **The refusal surfaces as `RecordError::Unmasked` and fails the step, exactly as any other `set_step_prompt` failure does today.** | `record.rs:247-251` already carries `Unmasked(#[from] Unmasked)`, and the three engine functions already convert `RecordError` into their own error. **No new error variant.** The step fails after stage 3 and **before any session starts**, so nothing is persisted and no token is spent — which is the half of `R-SEC-3` that is about *persist*. It is not the graceful `refuse_prompt` block the assembler's own refusals take (D8). |
 | D4 | **One whole-record pass, enumerating nothing.** The scrubber walks the serialised `Value` — every string leaf and every object key — in a single `scrub` call. | The three uncovered fields above are what the enumeration misses *today*. A field-agnostic pass is the only shape that stays true when the next `TrimRecord` field is added, and it is the same rule the assembler already applies to the rendered bytes (`mod.rs:472-483`). |
-| D5 | **The excerpt-note convention at `mod.rs:890-907` stays; only its rationale sentence changes.** | `drop_unmaskable_excerpts` deliberately names a repo or path only when the scrubber returned it unchanged, on the stated ground that "`trim_record.notes` is persisted unscrubbed" (`:895-896`). That ground is now false, so the sentence is corrected — but the convention itself is a *stricter, cheaper* guarantee for that one producer than the record-wide pass, and is left in place. Recording a falsified premise rather than quietly deleting the code is the mod-58 precedent. |
+| D5 | **The excerpt-note convention stays; its rationale sentence is corrected in all three places the premise is written down.** | `drop_unmaskable_excerpts` deliberately names a repo or path only when the scrubber returned it unchanged, on the stated ground that "`trim_record.notes` is persisted unscrubbed" (`mod.rs:895-896`). That ground is now false, so the sentence is corrected — but the convention itself is a *stricter, cheaper* guarantee for that one producer than the record-wide pass, and is left in place. The fact-check found the same false premise in **two more places the first draft missed**: `mod.rs:966` ("`trim_record.notes` is persisted unscrubbed and the preview shows it") and `htui-agent/src/excerpt.rs:924`. A test comment at `htui-agent/tests/excerpt.rs:1291` states it a third time. All four are comment-only corrections. Recording a falsified premise rather than quietly deleting the code is the mod-58 precedent. |
 | D6 | **No store change, on either side.** `set_step_prompt` keeps its signature; `traits.rs`, `mem.rs`, `writer.rs`, `pg/write.rs` and `conformance.rs` are untouched. | The store has no scrubber and giving it one is a shared trait change across both backends plus the two test doubles — the R-4 shape the mod-58 plan declined. The input-layer precedent `f48b82b` put the scrub above the store, not in it. |
 | D7 | **The store-level case `pg_criteria.rs:1076` is deliberately left writing a hand-built record.** | It exercises `set_step_prompt` with a literal `json!({ "v": 1 })`, not the production path, and it asserts what the *column* holds. Changing it would test nothing this item fixes. **The honest limit, stated once and plainly: the store will still accept an unscrubbed `trim_record` from a caller that is not the engine.** After this item there is no such production caller (D1's site list is exhaustive), but the store is not, and will not become, the enforcement point. |
 | D8 | **The residue refusal is a step error, not a `StageThree::Refused` block.** | Moving the check into `assemble` would buy the graceful path, but `assemble` returns a typed `TrimRecord`, so a scrub there would have to be either (a) a field-by-field enumeration — the defect again — or (b) a `Value` round-trip, which needs `Deserialize` on the whole record graph and collides with the four `skip_serializing_if` fields on `Section` (`trim.rs:115-125`) that will not round-trip without `#[serde(default)]`. Paying that for a nicer error message is the wrong trade for a fail-closed persist gate. If the maintainer wants the graceful path, that is a different plan and D8 is where it is argued. |
@@ -91,7 +108,9 @@ field-agnostic for exactly that reason (D4).
 | `crates/htui-core/src/fixtures.rs` | edit | T0 | one call site, `:2489` |
 | `crates/htui-core/tests/prompt_skills.rs` | edit | T0 | two call sites, `:128`, `:212` |
 | `crates/htui-core/tests/prompt_digest.rs` | edit | T0, T1 | two call sites, `:963-964`; new cases in T1 |
-| `crates/htui-core/src/prompt/mod.rs` | edit | T0 | the D5 comment at `:895-896` |
+| `crates/htui-core/src/prompt/mod.rs` | edit | T0 | the D5 comments at `:895-896` and `:966` |
+| `crates/htui-agent/src/excerpt.rs` | comment only | T0 | the D5 doc sentence at `:924` |
+| `crates/htui-agent/tests/excerpt.rs` | comment only | T0 | the D5 test comment at `:1291` |
 
 **Not touched, on purpose:** `crates/htui-core/src/store/traits.rs`, `crates/htui-core/src/store/mem.rs`,
 `crates/htui-core/src/store/conformance.rs`, `crates/htui-store/src/writer.rs`,
@@ -113,7 +132,7 @@ run **serially on the main thread**, T0 then T1.
 
 | Task | Files (complete list) | Parallel |
 |---|---|---|
-| T0 | `trim.rs`, `engine.rs`, `fixtures.rs`, `prompt_skills.rs`, `prompt_digest.rs`, `prompt/mod.rs` | serial; run first |
+| T0 | `trim.rs`, `engine.rs`, `fixtures.rs`, `prompt_skills.rs`, `prompt_digest.rs`, `prompt/mod.rs`, `htui-agent/src/excerpt.rs`, `htui-agent/tests/excerpt.rs` | serial; run first |
 | T1 | `prompt_digest.rs`, `trim.rs` | serial; run second |
 
 **Conditions binding on both implementers:**
@@ -161,10 +180,13 @@ run **serially on the main thread**, T0 then T1.
   **`prompt_digest.rs:963-964`**: pass `&MinimalScrubber::new([])` (the file's existing
   stand-in, `prompt/fixtures.rs:740` already spells it that way) and unwrap or `expect` the
   `Result`. **A fixture that starts failing here is a finding, not a nuisance** — see T1 case 3.
-- **`crates/htui-core/src/prompt/mod.rs:895-896`**: correct the premise. The sentence becomes:
-  the record is now scrubbed whole before the write, and this convention is kept because it is a
-  stricter guarantee for this producer than the record-wide pass — a note here never names a value
-  the scrubber would have masked, so the note itself carries no trace of it.
+- **The four falsified premises, comment only (D5).** `crates/htui-core/src/prompt/mod.rs:895-896`
+  and `:966`, `crates/htui-agent/src/excerpt.rs:924`, `crates/htui-agent/tests/excerpt.rs:1291`. Each
+  sentence that says `trim_record.notes` is persisted unscrubbed becomes: the record is scrubbed
+  whole before the write, and this producer's convention is kept because it is a stricter guarantee
+  for that one producer than the record-wide pass — a note here never names a value the scrubber
+  would have masked, so the note itself carries no trace of it. **Comment only: no behaviour in
+  `htui-agent` changes in this item.**
 - **Validate**: `cargo build --workspace --all-features`;
   `cargo test -p htui-core --all-features -- --test-threads=1`;
   `cargo clippy --workspace --all-features --all-targets -- -D warnings`;
@@ -188,7 +210,10 @@ run **serially on the main thread**, T0 then T1.
 - **Case 3 — `the_template_name_is_reached` (the falsification guard).** A spec whose
   `template.name` is `"sk-ant-api03-zzzzzzzz"`. Case 2 already proves the pass walks `notes`;
   this proves it walks a field the old enumeration never named, which is the actual defect (D4).
-  If a future change reverts to a field list, this is the case that fails.
+  If a future change reverts to a field list, this is the case that fails. **Extend it to a second
+  spec whose `excerpts.audit.roots[0].repo` carries the same string** — that field is the one the
+  first draft of this plan wrongly recorded as already masked, so it is the field most worth a
+  pin.
 - **In-file case in `trim.rs`**: `to_value` is idempotent under masking, and a record whose
   strings are already `[REDACTED]` serialises unchanged. This is what lets D1 be safe for a caller
   that scrubs twice.
@@ -229,7 +254,7 @@ stay `0001`..`0007` and `0008` stays the next free number; no snapshot moves; no
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| **R-1** — The scrub introduces a **new class of refusal**: a `template.name` or a caller note that merely *looks* like a credential now fails a step that used to run | Medium | Bounded and stated rather than hidden. Every string the record already carried through the prompt path was masked *and* refused there (`mod.rs:1098`), so the new pass cannot refuse anything the assembler would not already have refused for the same string. The genuinely new coverage is `template.name` and `spec.notes`, which are operator-authored and short. Fail-closed is `R-SEC-3`'s own direction; a step that refuses is the intended outcome, not a regression. |
+| **R-1** — The scrub introduces a **new class of refusal**: a `template.name`, a caller note, or a repo slug / provider id that merely *looks* like a credential now fails a step that used to run | Medium | Bounded and stated rather than hidden. Every string the record already carried through the prompt path was masked *and* refused there (`mod.rs:1098`), so the new pass cannot refuse anything the assembler would not already have refused for the same string. The genuinely new coverage is `template.name`, `spec.notes`, `excerpts.roots[].repo` and `excerpts.provider_set[]` — operator- and provider-authored, short, and never digested. `roots[].repo` is the widest of the four: a repo slug is operator-chosen, so a repo literally named after a credential prefix is conceivable. Fail-closed is `R-SEC-3`'s own direction; a step that refuses is the intended outcome, not a regression. |
 | **R-2** — The store still accepts an unscrubbed `trim_record` from any non-engine caller (D7) | Certain, by design | Stated in D7 and in the acceptance list rather than left for a reader to discover. No such production caller exists after T0; the store-level case at `pg_criteria.rs:1076` is the one that exercises it deliberately. |
 | **R-3** — A future `TrimRecord` field carries free text and someone reintroduces an enumeration "for performance" | Low | D4 plus T1 case 3. The mutation in the test plan *is* the enumeration, and it is written down as the shape that must fail. |
 | **R-4** — A reviewer reads the residue refusal as a step crash and asks for the assembler's graceful `refuse_prompt` path | Medium | D8 states the trade in full, including what the graceful path would cost. This is the one design call most worth the maintainer's override at CONFIRM. |
@@ -275,12 +300,14 @@ alone.
 
 - **`HANDOFF.md:246-248` — "The exposure is small by construction — the strings are repo-relative
   paths and enum spellings."** Partly **falsified, and the correction is the plan.** Most of the
-  record is indeed derived from already-masked spec data, and `excerpts`' paths and root strings
-  pass `scrub_text` at `mod.rs:1098-1102` — the item names `excerpts` as uncovered and it is
-  covered. But three fields are not masked at all, and two of them are not what the item
-  describes: `PromptSpec.notes` is **caller free text** (`mod.rs:120-122`), not a repo-relative
-  path, and `template.name` is a row name the item does not mention. The exposure is still small;
-  the enumeration is what is wrong, which is why D4 is field-agnostic.
+  record is indeed derived from already-masked spec data, and `excerpts.files[]`' paths do pass
+  `scrub_text` at `mod.rs:1098-1102` — the item names `excerpts` as uncovered and half of it is
+  covered. But `excerpts.roots[]` and `provider_set[]` are **not**: `scrubbed_inputs` never
+  touches `spec.excerpts.audit`, so the root strings the item names *are* the part that leaks.
+  Two further fields are not what the item describes at all: `PromptSpec.notes` is **caller free
+  text** (`mod.rs:120-122`), not a repo-relative path, and `template.name` is a row name the item
+  does not mention. The exposure is still small; the enumeration is what is wrong, which is why D4
+  is field-agnostic.
 - **`HANDOFF.md:247-248` — "Decide between scrubbing `TrimRecord::to_value()`'s output before the
   write and refusing the write on residue, the way the assembler refuses."** **The two are not
   alternatives.** `Scrubber::scrub` masks in place *and then* returns `Err(Unmasked)` on residue
@@ -296,12 +323,17 @@ alone.
   MOD-10 remains free to replace `MinimalScrubber` and inherit the fix.
 - **`HANDOFF.md:239` — "from MOD-2, finding F-80".** The MOD-7 milestone 4 review (MEDIUM) already
   hit the neighbouring half and MOD-7 D119/D129 worked around it: `mod.rs:895-896` says in as many
-  words that `trim_record.notes` is persisted unscrubbed. That comment is the second deferral
-  recorded in the source, and D5 is what happens to it.
+  words that `trim_record.notes` is persisted unscrubbed. That premise is written in **four**
+  places, not one (D5), which is what a deferral that outlived two review cycles looks like from
+  the inside. D5 is what happens to all four.
 
 ## Claims to verify
 
-Every claim is a statement about the tree at `8cc3fda`, checked in the table below.
+Every claim is a statement about the tree at `8cc3fda`, checked in the table below. Claims 1–21 were
+checked when the plan was drafted. **Claims 22–27 are a second pass**, run after `8952d21` recorded a
+maintainer CONFIRM that was never given; that pass falsified claim 8 in part and turned up three
+premise sites the first pass had missed (23–25). Verdicts below are as amended, not as first
+written — a claim the first pass got wrong is more useful recorded than quietly fixed.
 
 ## Verified claims
 
@@ -314,8 +346,8 @@ Every claim is a statement about the tree at `8cc3fda`, checked in the table bel
 | 5 | `spec.notes` is never masked | verified | `notes()` at `mod.rs:1110-1114` clones `spec.notes` verbatim; the field is declared at `mod.rs:120-122`; no `mask` call in `scrubbed_inputs` names it |
 | 6 | `spec.excerpts.notes` is never masked, and the code says so | verified | `mod.rs:890-907`, in particular `:895-896` "Because `trim_record.notes` is persisted unscrubbed" |
 | 7 | `skill_choices` is built from the **masked** spec | verified | `mod.rs:455` rebinds `spec` to `&masked.spec`; `mod.rs:861` calls `select(BoundSkill::collapse(spec.skills.clone()), placed)` after that rebinding |
-| 8 | The `excerpts` audit's paths and root strings already pass a mask-and-refuse | verified | `surviving_audit` (`mod.rs:1080-1106`) runs `scrub_text(scrubber, &render::file_block(file), …)?` at `:1098-1102` over the masked spec's files |
-| 9 | The excerpt *files* are masked in the input pass | verified | `mod.rs:784-792` — `file.repo`, `file.path`, `file.content`, `file.provider` |
+| 8 | The `excerpts` audit's paths **and root strings** already pass a mask-and-refuse | **partly falsified — amended** | True of `files[]`: `surviving_audit` (`mod.rs:1080-1106`) runs `scrub_text(scrubber, &render::file_block(file), …)?` at `:1098-1102` over the masked spec's files. **False of `roots[]` and `provider_set[]`:** `scrubbed_inputs` walks `spec.excerpts.files` and never `spec.excerpts.audit`, and `surviving_audit` clones the audit wholesale at `mod.rs:1084` (`audit.files` is then rebuilt, `audit.roots`/`provider_set` are not). `file_record` (`excerpt.rs:935-947`) takes no `Scrubber` and clones `repo`/`path` — safe only because its `excerpt` argument is the already-masked file. |
+| 9 | The excerpt *files* are masked in the input pass | verified | `mod.rs:784-792` — `file.repo`, `file.path`, `file.content`, `file.provider`; the loop is over `spec.excerpts.files` and names no other field of `ExcerptSet` |
 | 10 | `budget_source` and `estimator` are closed spellings, not free text | verified | `trim.rs:191` `crate::prompt::settings::BudgetSource`; `trim.rs:196` `&'static str` set from `spec.estimator.id` |
 | 11 | `Scrubber::scrub` masks in place and *then* fails closed on residue | verified | `scrub.rs:50` (doc), `:228-233` (`mask_value` then `find_residue`) |
 | 12 | The assembler does exactly that, in that order | verified | `mod.rs:453-454` (input mask) then `:477-483` (rendered residue scan) |
@@ -328,3 +360,9 @@ Every claim is a statement about the tree at `8cc3fda`, checked in the table bel
 | 19 | `Section`'s four `Option` fields would not survive a `Value` round-trip | verified | `trim.rs:115`, `:118`, `:121`, `:124` — each carries `skip_serializing_if = "Option::is_none"` with no matching `#[serde(default)]`; `Section` derives `Serialize` only (`:102`) |
 | 20 | The assembler's scrub cases live in `prompt_digest.rs` | verified | `prompt_digest.rs:732` and `:1101-1106` destructure `AssembleError::Unmasked` |
 | 21 | `.sqlx` holds 268 entries and the last migration is `0007` | verified | `ls crates/htui-store/.sqlx \| wc -l` → 268; `migrations/` holds `0001_init`..`0007_skill_attachments` |
+| 22 | `withhold_unmaskable_notes` runs over the excerpt pass's own notes, and the caller's notes are appended after it | verified | `htui-agent/src/excerpt.rs:1011` calls it, `:1012` calls `drop_unmaskable_excerpts`, `:1013-1014` appends the caller's `notes` **after** both. The panic/cancel path at `:993-1006` returns `unscanned(&roots, caps, notes)` with no withholding at all. The producer of one of those caller notes is `with_excerpts` (`engine.rs:4950-4953`), which formats a repo id into free text. |
+| 23 | `mod.rs:966` states the same falsified premise the plan corrected at `:895-896` | verified | "`trim_record.notes` is persisted unscrubbed and the preview shows it" — the draft listed only `:895-896` |
+| 24 | `htui-agent/src/excerpt.rs:924` states it a third time | verified | "`reader returned it, and `trim_record.notes` is persisted unscrubbed, so a note the scrubber`" |
+| 25 | `htui-agent/tests/excerpt.rs:1291` states it a fourth time, in a test comment | verified | "`trim_record.notes` is persisted unscrubbed. A file under a directory named after a known" — the test itself, `excerpts_for_never_persists_a_note_naming_a_masked_path`, stays |
+| 26 | Neither store validates or scrubs `trim` | verified | `PgStore::set_step_prompt` (`pg/write.rs:1440-1459`) binds `$3` straight into `UPDATE run_step SET … trim_record = $3`; `State::set_step_prompt` (`mem.rs:1483-1501`) clones the `Value` |
+| 27 | `State::finish_step` / `PgStore::finish_step` are a **second** writer of the column | verified | `mem.rs:3938-3957` overwrites `row.trim_record` when the outcome carries one; Postgres uses `trim_record = COALESCE($4, trim_record)`. **No orchestrator path ever populates it** — every `StepOutcome` the engine builds sets `trim_record: None` (`engine.rs:1413, 2292, 3202, 3800, 4241`; `recover.rs:849`), so this is a latent second write path, not a live leak. Recorded so D7's "the store is not the enforcement point" is stated against both writers. |
