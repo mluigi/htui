@@ -241,7 +241,7 @@ impl Pattern {
     ///
     /// The cost is linear in the tokens of a component times the length of the path, and linear in
     /// the components of the pattern times the components of the path: `*` and `**` backtrack
-    /// through a mark rather than through a recursive retry of every suffix (see [`toks_match`]).
+    /// through a mark rather than through a recursive retry of every suffix (see `toks_match`).
     #[must_use]
     pub fn matches(&self, path: &str) -> bool {
         let parts: Vec<&str> = path.split('/').collect();
