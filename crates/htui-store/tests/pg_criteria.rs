@@ -3733,15 +3733,11 @@ async fn a_missing_tags_run_aimed_at_another_box_is_not_claimable() {
     );
 
     let at = Utc::now();
+    let owner = uuid::Uuid::now_v7();
+    let until = at + TimeDelta::minutes(5);
     assert_eq!(
         db.store
-            .claim_run(
-                run.id,
-                ids::BOX,
-                uuid::Uuid::now_v7(),
-                at,
-                at + TimeDelta::minutes(5)
-            )
+            .claim_run(run.id, ids::BOX, owner, at, until)
             .await
             .expect("the claim is answered"),
         Claim::NotClaimable,
@@ -3751,6 +3747,16 @@ async fn a_missing_tags_run_aimed_at_another_box_is_not_claimable() {
         db.store.run(run.id).await.expect("the run reads back"),
         Some(run.clone()),
         "the refusal wrote nothing to the run: not even the `MissingTags` failure row"
+    );
+    // `lease_owner` is a column the `Run` struct does not carry, so the row comparison above
+    // cannot see it: the refused branch has to be pinned through the CAS it would have gone
+    // through, which is `Ok(false)` when no lease owner matches.
+    assert!(
+        !db.store
+            .refresh_lease(run.id, owner, until)
+            .await
+            .expect("the lease refresh is answered"),
+        "the refusal took no lease"
     );
     assert_eq!(
         db.store
@@ -3771,10 +3777,15 @@ async fn a_missing_tags_run_aimed_at_another_box_is_not_claimable() {
 /// and `missing` stays empty.
 ///
 /// The run is planted raw because `NewRun.item_id` is a non-optional `ItemId`, so `create_run`
-/// cannot mint this shape (plan D4). `repo_scope` is left to its `'{}'` default: an empty scope
-/// shares no repo (hazard H-10), so the live-rows query returns nothing and the claim cannot be
-/// refused for overlap - the tag rule is the only rule left, and the tag rule is what this case
-/// says is never reached.
+/// cannot mint this shape (plan D4). `repo_scope` is written out as an explicit empty array rather
+/// than left to the column's `'{}'` default, so a future migration moving that default cannot
+/// change what this case plants. An empty scope shares no repo (hazard H-10), so the live-rows
+/// query returns nothing and the claim cannot be refused for overlap - the tag rule is the only
+/// rule left, and the tag rule is what this case says is never reached.
+///
+/// It leans on the fixture box being free: nothing is `running` on `ids::BOX` when the case
+/// starts, so §4.7's slot rule admits the claim. The first slot is enough, but a fixture that
+/// started a run on the box would answer `SlotFull` and blame the tag rule.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_run_with_no_item_is_never_refused_for_tags() {
     let Some(db) = common::demo_db().await else {
@@ -3782,10 +3793,18 @@ async fn a_run_with_no_item_is_never_refused_for_tags() {
     };
     let id = RunId::new();
     let at = Utc::now();
+    assert_eq!(
+        db.store
+            .active_runs_on_box(ids::BOX)
+            .await
+            .expect("the slot count is answered"),
+        0,
+        "the precondition: the fixture box starts free, or this case would answer `SlotFull`"
+    );
     sqlx::query(
         "INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id, \
-         graph_snapshot, started_by, queued_at) \
-         VALUES ($1, $2, NULL, 'graph', 'manual', 'queued', $3, '{}'::jsonb, $4, $5)",
+         graph_snapshot, started_by, queued_at, repo_scope) \
+         VALUES ($1, $2, NULL, 'graph', 'manual', 'queued', $3, '{}'::jsonb, $4, $5, '{}'::uuid[])",
     )
     .bind(id.as_uuid())
     .bind(ids::PROJECT_HTUI.as_uuid())

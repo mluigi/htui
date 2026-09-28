@@ -7892,9 +7892,11 @@ mod tests {
     #[tokio::test]
     async fn a_missing_tags_run_aimed_at_another_box_is_not_claimable() {
         let store = MemStore::demo();
-        // A genuine second box row, not a stub: a clone of the fixture's, so it carries the probed
-        // and declared tags a real registration leaves behind, under a hostname of its own
-        // (`UNIQUE (user_id, hostname)`), which `create_run` needs to find.
+        // A real second box row, because `create_run` looks `target_box_id` up in `state.boxes`
+        // and refuses a run whose box is missing. A clone of the fixture's, so it carries the
+        // probed and declared tags a real registration leaves behind, and a hostname of its own.
+        // Neither of those is load-bearing: the rule reads the *claiming* box's tags, and that is
+        // `ids::BOX` either way.
         let other = BoxId::new();
         let mut elsewhere = store
             .box_row(ids::BOX)
@@ -7945,15 +7947,11 @@ mod tests {
         );
 
         let at = Utc::now();
+        let owner = Uuid::now_v7();
+        let until = at + TimeDelta::minutes(5);
         assert_eq!(
             store
-                .claim_run(
-                    run.id,
-                    ids::BOX,
-                    Uuid::now_v7(),
-                    at,
-                    at + TimeDelta::minutes(5)
-                )
+                .claim_run(run.id, ids::BOX, owner, at, until)
                 .await
                 .expect("the claim is answered"),
             Claim::NotClaimable,
@@ -7963,6 +7961,15 @@ mod tests {
             store.run(run.id).await.expect("the run reads back"),
             Some(run.clone()),
             "the refusal wrote nothing to the run: not even the `MissingTags` failure row"
+        );
+        // `lease_owner` is not a `Run` field on this store, so the row comparison above cannot
+        // see it: the refused branch has to be pinned through the CAS it would have gone through.
+        assert!(
+            !store
+                .refresh_lease(run.id, owner, until)
+                .await
+                .expect("the lease refresh is answered"),
+            "the refusal took no lease"
         );
         assert_eq!(
             store
@@ -7976,10 +7983,20 @@ mod tests {
         );
     }
 
-    /// Blueprint D94, both of its arms: a run with no item — `item_id` is `NULL` as a chat run's
-    /// is, or the row it names is gone — has no tags to check, so the tag check is never reached
-    /// and the claim is admitted. `claim_run` asks `items.get`, not `require_item`, mirroring the
-    /// Postgres join that finds no row.
+    /// Blueprint D94, both of its arms: a run with no item — `item_id` is `NULL`, or the row it
+    /// names is gone — has no tags to check, so the tag check is never reached and the claim is
+    /// admitted. `claim_run` asks `items.get`, not `require_item`, mirroring the Postgres join that
+    /// finds no row.
+    ///
+    /// Both arms are defensive pins on shapes the store cannot currently mint: `NewRun.item_id` is
+    /// a non-optional `ItemId` and there is no `delete_item` on the store, so no public call
+    /// reaches either one. A chat run is not a vehicle either — `start_chat_run` inserts at
+    /// `RunStatus::Running`, which is `NotClaimable` at the status half of the rule, so it never
+    /// reaches the tag query. What the case is for is a future writer that made `item_id`
+    /// nullable, or added a delete path.
+    ///
+    /// It leans on the fixture box's `max_concurrent_items: 2`: the first arm's run is still
+    /// `running` on `ids::BOX` when the second claims, so only the second slot admits it.
     #[tokio::test]
     async fn a_run_with_no_item_is_never_refused_for_tags() {
         let store = MemStore::demo();
@@ -8000,7 +8017,7 @@ mod tests {
                 .await
                 .expect("the claim is answered"),
             Claim::Admitted,
-            "no item, no tags, no refusal: the second arm a chat run reaches"
+            "no item, no tags, no refusal: the tag check is skipped"
         );
         let claimed = store
             .run(run)
@@ -8010,12 +8027,12 @@ mod tests {
         assert_eq!(claimed.status, RunStatus::Running);
         assert_eq!(claimed.executing_box_id, Some(ids::BOX));
         assert_eq!(
-            claimed.item_id, None,
-            "it is still the run that was claimed"
+            claimed.lease_expires_at,
+            Some(until),
+            "the admitted claim wrote the lease it was handed"
         );
 
-        // A second item, because the first arm's claim left its item `in_progress` and §4.3 would
-        // refuse a second `create_run` on it.
+        // A second item of its own, so the two arms share no state.
         let orphan = store
             .mint_item(NewItem {
                 id: ItemId::new(),
