@@ -880,7 +880,27 @@ fn the_six_template_snapshots_do_not_move() {
             include_str!("snapshots/templates__unknown_placeholder_cursor.snap"),
         ),
     ];
-    assert_eq!(snapshots.len(), 6, "milestone 1 shipped six");
+    // The count is read off the directory rather than off the array above. An array literal's
+    // length is a compile-time constant, so an assertion over it can never move — and a seventh
+    // `templates__*.snap` is exactly the coupling milestone 1 warned about, which the loop below
+    // would never see.
+    let shipped: Vec<String> =
+        std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots"))
+            .expect("the snapshot directory")
+            .map(|entry| {
+                entry
+                    .expect("a directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with("templates__") && name.ends_with(".snap"))
+            .collect();
+    assert_eq!(
+        shipped.len(),
+        snapshots.len(),
+        "milestone 1 shipped six, and the directory now holds {shipped:?}"
+    );
     for (name, text) in snapshots {
         assert!(
             text.contains(" Skills \u{2502} Templates"),
