@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[ANA-21](docs/decisions/ana/ana-21.md)** - Per-model weights for agent assignment, derived from public sources (concluded, 2026-09-28)
 - **[MOD-7](docs/decisions/mod/mod-7.md)** - Box registry + capabilities (done, 2026-09-26)
 - **[ANA-22](docs/decisions/ana/ana-22.md)** - How a skill is stored and when it activates (concluded, 2026-09-25)
 - **[MOD-38](docs/decisions/mod/mod-38.md)** - Requirements schema, seam and close-out resolution (done, 2026-09-25)

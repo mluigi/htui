@@ -13,15 +13,17 @@
 > priority order), `R-ORCH-11` (the run records what was chosen), `R-ID-6` (no model in a
 > bookkeeping path).
 >
-> **Status (2026-09-28): open, verdict re-grounded, maintainer calls outstanding.** §3.3 has been
-> re-read from primary sources: Artificial Analysis (Terminal-Bench 4.0 and Intelligence Index
-> v4.3.2), Vals, the Epoch benchmark hub, the Scale SEAL SWE-bench Pro board, the Arena mirror and
-> both vendor pricing pages were all read first-hand on 2026-09-28, with no page blocked. Four of
-> the draft's figures did not survive that read and are corrected in §3.3; three of the seeded
-> values lost their stated basis and are now under-determined (§5.7, §7). ANA-21 stays open until
-> the maintainer calls in §7 are made. No new item is spawned: MOD-36 already owns the
-> implementation and would inherit §5 and §6. One requirement clarification is proposed for the
-> maintainer (§7), not applied.
+> **Status (2026-09-28): concluded.** §3.3 was re-read from primary sources — Artificial Analysis
+> (Terminal-Bench 4.0 and Intelligence Index v4.3.2), Vals, the Epoch benchmark hub, the Scale SEAL
+> board, the Arena mirror and both vendor pricing pages, all first-hand, with no page blocked. Four
+> of the draft's figures did not survive that read and are corrected in §3.3. The maintainer settled
+> every open call on 2026-09-28; §7 records the ten decisions. The verdict's shape is a coarse
+> ordinal tier keyed on phase name, cost excluded, the weight living in `agent.settings.weights`, and
+> a refresh that is a **source registry** rather than a hardcoded fetcher: Epoch (CC BY 4.0) is
+> fetched for the analysis axis, the implement axis is maintained and dated with an undated entry
+> resolving to 0, and two follow-up items are spawned (learned weights; better benchmark sources).
+> No implementation code is written here; MOD-36 owns the implementation and inherits §5 and §6.
+> Close-out: `docs/decisions/ana/ana-21.md`.
 
 ---
 
@@ -158,11 +160,25 @@ has, so weights are **coarse tiers**. And htui runs every model inside a harness
 | Review | None at model level | Martian Code Review Bench ranks products, not models; CodeReviewBench is 30 PRs on dated models | Derive from implement and analysis |
 | Judge | None current | JudgeBench and RewardBench 2 have no current frontier entries; a June 2026 study of 21 judges found rankings shift up to 14 places across benchmarks (arXiv 2606.19544) | Self- and same-family preference is documented (+10 to +25 points self, +3.4 to +8.4 same family) |
 
-Licences matter for anything htui ships. **Epoch's benchmark hub is CC BY 4.0** (CSV zip, MIT
-fitting code) and is the only aggregate that can be quoted into a checked-in seed with attribution.
-Artificial Analysis's free API is internal-use only, with no redistribution, and its terms bar
-products that give model-selection guidance; its numbers may be cited in this document but never
-fetched into or shipped with htui. Arena has no official API.
+Licences matter for anything htui ships, and a 2026-09-28 probe of every candidate settled which
+ones are usable:
+
+| Source | Reachable | Machine-readable | Licence | Verdict |
+|---|---|---|---|---|
+| **Epoch** benchmark hub | yes, plain HTTP zip | yes, `eci_scores.csv`, 268 models | **CC BY 4.0** (fitting code MIT) | **the only source that may be both fetched and shipped**, with attribution |
+| Harbor / **tbench.ai** (official TB 4.0) | yes | no — tRPC endpoint, no static JSON (`/api/leaderboard`, `/trpc/…`, `/leaderboard.json` all 404) | code Apache-2.0; **results unlicensed** | blocked, and it is the prize: the only effort-separated board found |
+| Artificial Analysis | yes | API exists | internal-use only; **bars products giving model-selection guidance** | numbers citable here, never fetched into or shipped with htui |
+| Vals | yes | no API, HTML only | not granted | blocked |
+| Scale SEAL | yes | no API, HTML only | not granted | blocked, and stale (newest Anthropic row Opus 4.6) |
+| Arena | yes | `arena-rank` is Apache-2.0 *code* | no official results API | the GitHub mirror used in §3.3 is a third-party scrape and is not a dependency |
+| SWE-bench/experiments | yes | yes | **no licence declared** | moot: Verified is archived and saturated |
+| LiveBench | yes | repo live (daily) | NOASSERTION | general capability only, not agentic coding |
+| SWE-rebench | yes | no public API found | not granted | blocked |
+
+A weight map is model-selection guidance by construction, which is what puts AA out of scope no
+matter how convenient its API would be. Everything else is blocked on endpoint or licence, not on
+principle — which is why the source registry in §5.4 exists and why finding a better source is a
+separate item.
 
 ### 3.3 Independent figures behind the initial tiers
 
@@ -303,6 +319,15 @@ Manual; scripted from public feeds; or learned from htui's verdicts. A scripted 
 licence limits of §3.2, into brittle name mapping between sources and htui's per-installation model
 strings (§2.1), and into benchmark version churn. Learning has no data yet and a known bias loop.
 
+**Resolved 2026-09-28: all three, split by axis.** The maintainer asked for fetched weights rather
+than hardcoded ones, and the 2026-09-28 probe (§5.6) found that the licence limit is narrower than
+the draft assumed — one source, Epoch, is both directly fetchable and CC BY 4.0, so the analysis
+axis is genuinely fetched. It also found the opposite limit the draft had not hit: the coding axis
+has *no* dynamically-permissible source at all, so it stays maintained rather than manual-in-name-
+only, and its entries are dated so staleness resolves to 0 instead of to a wrong number. Learning
+is tracked by its own item. The brittle name mapping and version churn are handled by the source
+registry rather than solved.
+
 ## 5. Verdict
 
 ### 5.1 A weight is a coarse ordinal tier
@@ -335,10 +360,27 @@ one.
 ```jsonc
 // agent.settings.weights — registry data, R-AGT-5
 {
-  "basis": { "source": "ANA-21", "date": "2026-09-25" },   // provenance of the whole map
+  "basis": { "source": "ANA-21", "date": "2026-09-28" },   // provenance of the whole map
+
+  // the scoring-source registry (§5.6). Extensible: adding a source is data,
+  // not code. `dynamic` says whether htui fetches it; `redistributable` says
+  // whether its numbers may be written into a seed at all.
+  "sources": [
+    { "id": "epoch-eci", "axis": "analysis",
+      "url": "https://epoch.ai/data/benchmark_data.zip",
+      "licence": "CC BY 4.0", "redistributable": true, "dynamic": true },
+    { "id": "tbench-4-0", "axis": "implement",
+      "url": "https://www.tbench.ai/leaderboard",
+      "licence": "unset", "redistributable": false, "dynamic": false,
+      "note": "official TB 4.0 board and the only effort-separated source found; blocked on its results licence" }
+  ],
+
   "models": {
-    "<model string as in phase_agent.model>": { "*": 80, "implement": 95 },
-    "*": { "*": 50 }                                          // any model string not listed
+    "<model string as in phase_agent.model>": {
+      "*":        { "weight": 65, "date": "2026-09-28", "sources": ["epoch-eci"] },
+      "implement":{ "weight": 95, "date": "2026-09-28", "sources": ["epoch-eci", "tbench-4-0"] }
+    },
+    "*": { "*": { "weight": 50, "date": null, "sources": [] } }   // any model string not listed
   }
 }
 ```
@@ -349,6 +391,12 @@ unparseable `weights` key resolves every candidate to 50, which makes MOD-36's s
 priority order, so an upgraded database behaves like `FirstCandidate` for slot 0 until weights are
 set. Model strings are matched exactly (aliases such as `opus` are their own keys).
 
+**The date is load-bearing.** A resolved entry whose `date` is absent or unparseable yields **0**,
+not its `weight` — 0 already means "never given an extra fan-out slot" (§5.1), so an undated weight
+degrades to "not offered" rather than to a stale number. Only the top-level fallback of 50 is
+undated, and it exists solely for the upgrade path above. `sources` records provenance; an entry
+naming a source with `redistributable: false` is refused at write time, not at read time.
+
 Weights resolved at `StartRun` are frozen into the run's graph snapshot as a new
 `SnapshotCandidate.weight: Option<u8>` with `#[serde(default)]` (absent reads as 50), so crash
 recovery re-selects against the same values and the run records what drove the choice
@@ -358,7 +406,8 @@ recovery re-selects against the same values and the run records what drove the c
 
 Given `eligible` (the walk's output, in priority order), the snapshot weights and `fanout_index`:
 
-1. **Slot 0 is `eligible[0]`**, the first eligible candidate in priority order. This keeps
+1. **Slot 0 is `eligible[0]`**, the first eligible candidate in priority order. Confirmed by the
+   maintainer 2026-09-28 (§7.2). This keeps
    `R-AGT-8` literally true for the primary candidate and for every `fan_out = 1` phase, so weights
    never override the maintainer's explicit ordering of the lead candidate.
 2. The other eligible candidates with weight > 0 are sorted by, in order: weight descending; an
@@ -372,65 +421,106 @@ Given `eligible` (the walk's output, in priority order), the snapshot weights an
 The rule is a pure function of its inputs, so it is crash-stable and can be pinned by table tests.
 It uses no randomness, no quota utilization and no clock.
 
-### 5.6 Refresh: manual, from a named procedure
+### 5.6 Refresh: a named procedure over a registry of sources
 
-Weights are edited by the maintainer: through MOD-23's agents editor once it exists, by SQL until
-then. They are re-derived when a seeded model string changes, when a model is added to an agent, or
-when a new benchmark version lands, following this procedure:
+The maintainer asked for weights that are fetched and updated rather than hardcoded. That is
+correct, and it is bounded by two facts the 2026-09-28 pass established: **only one source is both
+directly fetchable and licensed for what htui would do with it**, and the axis that most needs
+refreshing is the one that source does not cover.
 
-1. Take independent runs only (§3.2): Terminal-Bench 4.0 (AA or Vals) and SEAL/SWE-rebench for
-   implement; the AA Intelligence Index (one version) or Epoch ECI for analysis. Use a vendor figure
-   only where no independent run exists, and drop it one tier.
+**What can be fetched today.** Epoch's benchmark hub is plain HTTP, CC BY 4.0, and ships an
+`eci_scores.csv` covering 268 models. It is the analysis axis. Everything else fails on licence or
+on endpoint: Artificial Analysis's API is internal-use only and bars products that give
+model-selection guidance, which a weight map is; Vals and SEAL publish no API; Arena has no
+official results API; Harbor's tbench.ai is the official Terminal-Bench 4.0 board and the only
+effort-separated source found, but its results sit behind an undocumented tRPC endpoint with no
+licence grant. A probe of all of these, with the licence each carries, is in
+`docs/ANA-21-recheck-2026-09-28.md` §1 and §9.
+
+**So the shape is a registry, not a fetcher.** `weights.sources` (§5.4) lists each source with its
+axis, URL, licence, and two booleans: `dynamic` (may htui fetch it?) and `redistributable` (may its
+numbers be written into a seed?). Today exactly one entry is `dynamic: true`. Enabling the next one
+is a data edit to that array plus a parser, never a change to the resolution rule or to the schema,
+which is what keeps the infrastructure extensible instead of hardcoded to Epoch. An entry with
+`redistributable: false` is refused at write time, so a licence change cannot leak into a seed by
+inattention.
+
+**The axes refresh differently, and the asymmetry is deliberate.**
+
+- *Analysis axis* — fetched. htui pulls the Epoch export, applies the procedure below, and writes
+  dated entries with Epoch cited. Nothing hardcoded survives a refresh on this axis.
+- *Implement axis* — maintained, and dated. No dynamically-usable source exists, so these values
+  are the maintainer's, entered through MOD-23's agents editor once it exists and by SQL until
+  then, each carrying the source and date it came from. **An entry whose `date` is missing or
+  unparseable resolves to 0** (§5.4), so a coding weight cannot go stale silently: it stops being
+  offered for a slot rather than being quietly used. Combined with the tier convention, this is the
+  §8 alias-drift mitigation applied to the values rather than to the model names.
+
+**The procedure for deriving a weight from a source**, unchanged in substance from the draft:
+
+1. Take independent runs only (§3.2). Use a vendor figure only where no independent run exists, and
+   drop it one tier.
 2. Place each model in the tier of the nearest frontier leader whose figure is within the
    benchmark's own interval; start a new tier only below that interval.
-3. Treat each effort level as its own entry; when an effort variant has no figure, place it one tier
-   below the next-higher effort of the same model (AA's Opus 5.5 spread, 51 at medium to 58 at max,
-   is about one tier).
-4. Record the date in `weights.basis` and cite Epoch (CC BY 4.0) where its data was used.
+3. Treat each effort level as its own entry **only where a source separates effort levels**. Where
+   none does, a sub-`high` string takes its family's `-high` value verbatim rather than being
+   guessed one tier down — the rule as the draft wrote it had no anchor and was replaced for that
+   reason (§7.7).
+4. Record the date on the entry and name the sources it used; cite Epoch (CC BY 4.0) wherever its
+   data contributed.
 
-htui fetches nothing at runtime and ships no scraper (§4.5). **Learned weights are deferred, not
-rejected.** Their data is already recorded (§2.5), so the trigger is a volume one: once MOD-36 and
-MOD-11 are both done and a project holds on the order of 100 judged cross-model groups, a follow-up
-analysis should fit a Bayesian Bradley-Terry model with a Plackett-Luce top-1 likelihood per verdict,
-the §5.7 tier as the prior, and a same-family-as-judge covariate, shown read-only beside the manual
-weights before anything is applied automatically. The fit is deterministic arithmetic over rows, so
-it is allowed under `R-ID-6`.
+**Learned weights are deferred, not rejected** — but the maintainer asked for the follow-up to be
+tracked rather than remembered, so it is opened as its own item rather than left to the volume
+trigger. The data it needs is already recorded (§2.5); the trigger is once MOD-36 and MOD-11 are
+both done and a project holds on the order of 100 judged cross-model groups, at which point a
+Bayesian Bradley-Terry fit with a Plackett-Luce top-1 likelihood per verdict takes the §5.7 tier as
+its prior and a same-family-as-judge covariate, shown read-only beside the manual weights before
+anything is applied automatically. The fit is deterministic arithmetic over rows, so it is allowed
+under `R-ID-6`.
+
+**Finding better sources is its own item.** The single most valuable thing missing is an
+effort-separated, licensed, machine-readable coding benchmark; the second is any dynamically
+permitted Terminal-Bench 4.0 mirror. Both are research questions with their own licence
+investigation, so they are opened as a separate ANA item rather than settled here.
 
 ### 5.7 Initial values
 
-The values below are the draft's, unchanged. The 2026-09-28 re-read moved no model across a tier, so
-they survive as placed; what it changed is that **three rows no longer have the basis the draft gave
-them**, and those rows are marked ⚠ and turned into maintainer calls in §7. Until §7 is answered the
-marked rows are seeds awaiting a decision, not findings.
+Settled by the maintainer on 2026-09-28 against the §3.3 re-read; every row carries the source and
+date its value came from, because §5.6 makes an undated weight resolve to 0. The coding axis is
+Terminal-Bench 4.0 (two independent runs) and the analysis axis is Epoch ECI with the Arena boards
+as the tie-break, per §7.2.
 
 `claude` and `claude-cli` (the same map; the model strings are Claude Code's aliases, which resolve
 to the current model of each line, so the map is re-checked when an alias moves):
 
 | Model string | `"*"` | `implement`, `fix`, `reproduce` | Basis, re-read 2026-09-28 |
 |---|---|---|---|
-| `opus` (Opus 5.5 today) | 95 | 95 | Holds and is the best-evidenced row in the table: top of both Terminal-Bench 4.0 runs (59.6 AA, 61.62 Vals), top of AA Intelligence Index v4.3.2 (57.6), top of Arena Code (1827 ± 18) and Text (1509 ± 12) |
-| ⚠ `sonnet` (Sonnet 5) | 65 | 65 | **Basis withdrawn.** The draft's "AA 38 at max" is not reproducible — AA scores no Sonnet 5 variant and Arena does not place it in either top thirty. The only current first-hand figure is Vals' 8.08 on Terminal-Bench 4.0, confounded by seven provider refusals scored as failures, and Epoch ECI 156.34 [153.45, 159.15] puts it *below* Gemini 3.8 Flash's 157.13. 65 is retained as a conservative hold, not as a finding — §7 item 4 |
-| `haiku` (Haiku 4.5) | 25 | 25 | Tier holds on a different basis: the draft's "AA 15" is not reproducible (Haiku 4.5 is absent from AA), but Epoch ECI 142.42 is ~14 points below the 156–157 frontier band, which supports D |
-| `*` (including `default`) | 65 | 65 | Unchanged. `default` resolves per account plan, so it takes the conservative tier |
+| `opus` (Opus 5.5 today) | 95 | 95 | TB 4.0 59.6 AA / 61.62 Vals; AA II v4.3.2 57.6; Arena Code 1827 ± 18, Text 1509 ± 12. Not in Epoch ECI. Best-evidenced row in the table |
+| `haiku` (Haiku 4.5) | 25 | 25 | Epoch ECI 142.42, roughly 14 points below the 156-157 frontier band. Absent from AA and from both Arena top thirties |
+| `*` (including `default` **and `sonnet`**) | 65 | 65 | The conservative catch-all. `sonnet` is **deliberately not a key** (§7.4): it has no independent analysis-kind figure, so it resolves here rather than carrying a number no source can check |
 
 `agy`:
 
 | Model string | `"*"` | `implement`, `fix`, `reproduce` | Basis, re-read 2026-09-28 |
 |---|---|---|---|
-| `gemini-3.8-flash-high` | 65 | 45 | Confirmed on three sources: bottom of both TB 4.0 runs (19.7 AA, 13.13 Vals), bottom third of AA II v4.3.2 (40.9 — the draft had set this aside as pre-v4.3 and uncomparable), inside the Arena Text cluster (1492 ± 5) and Epoch's frontier ECI band (157.13). The analysis tier now rests on Arena Text and ECI, not on a version-mismatched AA figure; the 45 coding tier is defensible but the coding evidence is now two independent runs, not one — §7 item 5 |
-| ⚠ `gemini-3.7-flash-high` | 65 | 45 | **Ordering inverted.** Vals scores 3.7 at 6.06, *below* 3.8's 13.13 — the reverse of the draft's "11.2, within 4.0's interval of 3.8". But 3.7 leads on all three non-TB4.0 sources: ECI 157.72 vs 157.13, Arena Code 1593 vs 1580, Arena Text 1488 vs 1492. It is the seed's `default_model` and the higher of the two on general measures — §7 item 6 |
-| ⚠ `gemini-3.8-flash-medium`, `gemini-3.7-flash-medium`, `gemini-3.6-flash-high` | 45 | 25 | **No figure of any kind.** Arena carries `-high` rows only; AA, Vals, Epoch and SEAL score un-suffixed models. §5.6 step 3's "one tier below" has no anchor to step below from — §7 item 7 |
-| ⚠ `gemini-3.8-flash-low`, `gemini-3.7-flash-low`, `gemini-3.6-flash-medium`, `gemini-3.6-flash-low` | 25 | 25 | **No figure of any kind**, same reason. The floor is defensible as a floor, but it is an assertion, not a derivation — §7 item 7 |
-| `gemini-3.1-pro-low` | 65 | 45 | SEAL 46.10 ± 3.60 confirmed first-hand, plus Arena Text 1487 ± 3 (n=119,196) and ECI 154.92. **One mismatch survives:** SEAL's row is `gemini-3.1-pro (thinking)`, an un-suffixed default-effort run, while the seeded string is `-low` effort, so the figure does not describe the effort level it is being used to justify — §7 item 8 |
-| `*` (including `gemini-pro-agent`, whose underlying model is undocumented) | 45 | 45 | Unchanged. Unknown model |
+| `gemini-3.7-flash-high` | 80 | 25 | **Leads 3.8 on the analysis axis** (§7.2): ECI 157.72 vs 157.13, Arena Code 1593 ± 8 vs 1580 ± 8, Arena Text 1488 ± 5 vs 1492 ± 5. **Trails it on the coding axis**: Vals TB 4.0 6.06 vs 13.13 |
+| `gemini-3.8-flash-high` | 65 | 45 | TB 4.0 19.7 AA / 13.13 Vals, AA II v4.3.2 40.9; ECI 157.13, Arena Code 1580 ± 8, Text 1492 ± 5 |
+| `gemini-3.6-flash-high` | 45 | 25 | ECI 154.36, Arena Text 1482 ± 5; Vals TB 4.0 4.54, the lowest of the three Flash versions on coding |
+| `gemini-3.1-pro-low` | 45 | 25 | SEAL 46.10 ± 3.60, Arena Text 1487 ± 3 (n = 119,196), ECI 154.92 - all for the **un-suffixed** model. **Dropped one tier from 65/45 for the effort gap** (§7.8, §5.6 step 3) |
+| `gemini-3.8-flash-medium`, `gemini-3.7-flash-medium`, `gemini-3.8-flash-low`, `gemini-3.7-flash-low`, `gemini-3.6-flash-medium`, `gemini-3.6-flash-low` | *their family's `-high` value* | *same* | **Flattened** (§7.7). No source scores any effort level below `-high`, so the ladder is removed rather than guessed: each takes `gemini-3.{8,7,6}-flash-high` verbatim |
+| `*` (including `gemini-pro-agent`, whose underlying model is undocumented) | 45 | 45 | Unknown model |
 
-Read together: on a coding phase whose candidates are `claude/opus` then `agy/gemini-3.8-flash-high`
-then `claude/sonnet`, fan-out 3 gives slot 0 `claude/opus`, slot 1 `claude/sonnet` (65 beats 45),
-slot 2 `agy/gemini-3.8-flash-high`. On a `research` phase with the same candidates, slot 1 goes to
-`agy/gemini-3.8-flash-high`: it ties `claude/sonnet` at 65 and wins the tie because its agent is not
-yet used. This matches the maintainer's example ordering (Opus above Flash) without committing to
-its numbers. **Both sentences depend on `sonnet` sitting at 65**, which is exactly the value §7 item
-4 puts back to the maintainer.
+Read together: on a coding phase whose candidates are `claude/opus`, then `agy/gemini-3.8-flash-high`,
+then `claude/sonnet`, fan-out 3 gives slot 0 `claude/opus`, slot 1 `claude/sonnet` (65, via the `*`
+row), slot 2 `agy/gemini-3.8-flash-high` (45). On a `research` phase with the same candidates slot 1
+goes to `claude/sonnet` at 65 and slot 2 to `agy/gemini-3.8-flash-high`, which now ties it;
+`gemini-3.7-flash-high` at 80 would take slot 1 ahead of both, and wins the agent-diversity
+tie-break over `claude/sonnet` regardless. This matches the maintainer's example ordering (Opus
+above Flash) without committing to its numbers.
+
+**The `-medium` and `-low` rows now carry no distinct weight at all.** Six of the eleven seeded
+`agy` strings resolve to their family's `-high` value, which is the honest encoding of "no source
+measures this" and costs the fan-out the diversity an assumed effort ladder would have bought.
 
 ## 6. What MOD-36 inherits
 
@@ -456,66 +546,70 @@ its numbers. **Both sentences depend on `sonnet` sitting at 65**, which is exact
 7. **Done 2026-09-28** — §5.7's basis figures were re-read from Epoch's CSV export, the AA and
    Vals Terminal-Bench 4.0 pages, the AA Intelligence Index v4.3.2, the SEAL board and the Arena
    mirror; the record is `docs/ANA-21-recheck-2026-09-28.md`. No figure crossed a tier. Four draft
-   figures did not reproduce and three seeded rows lost their basis (§3.3, §5.7, §7 items 4–8).
-   **MOD-36 must not seed the ⚠ rows until §7 is answered.**
+   figures did not reproduce and five seeded rows lost their basis (§3.3, §5.7). The maintainer
+   settled all of them on 2026-09-28 (§7); the values in §5.7 are the settled ones and are what
+   MOD-36 seeds.
 8. MOD-23's editor surfaces `settings.weights` alongside the model list and default model.
 
-## 7. Open for the maintainer
+## 7. Decisions taken (maintainer, 2026-09-28)
 
-Items 1–3 are the draft's. Items 4–8 are new, and all five new ones come out of the 2026-09-28
-re-read: they are places where the primary sources do not determine a value, so the analysis cannot
-close them by reading harder. None is answered here.
+Every call this document had open is now made. Items 1-3 are the draft's; items 4-8 came out of
+the primary-source re-read, where the sources did not determine a value. The refresh design
+(§4.5, §5.6) was settled in the same session.
 
-1. **`R-AGT-8` clarification (proposed, not applied).** §5.5 keeps the requirement true for slot 0.
-   Proposed added sentence: "When the phase fans out, the remaining candidate slots are apportioned
-   across the other eligible candidates by their per-model weight (ANA-21)." Requirements change
-   only by explicit maintainer decision.
-2. **Slot 0.** The verdict gives slot 0 to the first eligible candidate, not the highest-weighted
-   one. The alternative (top weight first) spreads by weight entirely but lets weights override the
-   explicit priority order `R-AGT-8` and `R-ORCH-1` give the maintainer.
-3. **Learned weights** are deferred behind the volume trigger in §5.6 rather than spawned as an item
-   now.
-4. **`sonnet` at 65, with its basis withdrawn.** The only current first-hand figure for Sonnet 5 is
-   Vals' 8.08 on Terminal-Bench 4.0, depressed by seven provider refusals scored as failures, plus
-   Epoch ECI 156.34 [153.45, 159.15] — below Gemini 3.8 Flash. Options: hold 65 as a conservative
-   prior and say so in the seed's `basis`; drop it to the tier ECI supports; or treat Sonnet 5 as
-   unscored and default it to the `"*"` row. The third option is the only one the public record
-   actually supports, and it is the one the draft's own §5.6 rule ("use a vendor figure only where
-   no independent run exists, and drop it one tier") reaches when the honest input is "no figure".
-5. **`gemini-3.8-flash-high` coding tier at 45.** The draft rested this on one AA figure. There are
-   now two independent Terminal-Bench 4.0 runs agreeing it is bottom-tier (19.7 and 13.13) and the
-   AA index agreeing (40.9). 45 is defensible; 25 is arguable on the same evidence. §5.6 step 2
-   does not separate them, because TB 4.0's own interval is wide at that score.
-6. **Gemini 3.7 Flash ranked below 3.8 Flash on coding.** Vals scores 6.06 vs 13.13; every other
-   source ranks 3.7 *above* 3.8. The seed's `default_model` is 3.7. Options: keep the version
-   ordering §5.6 step 3 assumes; let the single strongest coding signal (Vals) govern; or split the
-   coding tier and the analysis tier between the two versions. Note the seed's default and §6's
-   guidance interact here — the maintainer may also want to revisit which string is the default.
-7. **The seven `-medium` / `-low` / `gemini-3.6-flash-*` rows have no independent figure.** §5.6
-   step 3 assumes effort levels degrade monotonically, which no source tests: Arena carries `-high`
-   only, and the other four sources ignore effort entirely. Options: keep the one-tier-per-step
-   convention as a stated assumption; flatten every sub-`high` Gemini string to the `-high` value;
-   or seed them at the floor and let the maintainer raise them once effort-separated numbers exist.
-8. **`gemini-3.1-pro-low` is justified by a different effort level than the string names.** SEAL's
-   row is `gemini-3.1-pro (thinking)`, an un-suffixed default-effort run; the seeded string is
-   `-low`. Options: keep 65/45 and record the mismatch in `basis`; apply §5.6 step 3 and drop it a
-   tier for the effort gap; or drop the effort suffix from the seeded string.
+1. **`R-AGT-8` clarification — APPLIED.** The added sentence stands as proposed: "When the phase
+   fans out, the remaining candidate slots are apportioned across the other eligible candidates by
+   their per-model weight (ANA-21)." It is correct as written because decision 2 kept slot 0 on
+   priority order. `docs/REQUIREMENTS.md` carries the amendment.
+2. **Slot 0 — first eligible candidate, not the highest weight.** The draft's choice. `R-AGT-8`
+   and `R-ORCH-1` stay literally true for the primary candidate and for every `fan_out = 1` phase;
+   weights only ever affect rival slots.
+3. **Learned weights — SPAWNED, not deferred.** The volume trigger is unchanged (§5.6) but the
+   follow-up is an item, so the analysis is not lost when the trigger is reached.
+4. **`sonnet` — treated as unscored, not seeded as a key.** Removed from the `claude` map; it
+   resolves through the `"*"` row at 65 on both axes. This is the only option the public record
+   supports, and the one §5.6's own rule reaches when the honest input is "no figure".
+5. **`gemini-3.8-flash-high` coding tier — kept at 45.** Two independent Terminal-Bench 4.0 runs
+   (19.7, 13.13) and AA index 40.9 now agree it is bottom-tier, but TB 4.0's own interval is wide
+   near that score, and §5.6 step 2 does not license a new tier below 45 on this evidence.
+6. **Gemini 3.7 vs 3.8 Flash — split by task kind.** 3.7 takes the analysis axis (ECI 157.72, Arena
+   Code 1593, Arena Text 1488 all ahead of 3.8) and 3.8 takes the coding axis (Vals 13.13 vs
+   6.06). Seeded as `gemini-3.7-flash-high` 80/25 and `gemini-3.8-flash-high` 65/45. The
+   `default_model` on the `agy` seed is left as it is; changing it is a registry decision this item
+   does not make.
+7. **Unmeasured effort rows — flattened, not guessed.** Every `gemini-3.{8,7,6}-flash-{medium,low}`
+   string takes its family's `-high` value verbatim on both axes. The one-tier-per-step assumption
+   is withdrawn: no source measures effort below `-high`, so there was nothing to step down from.
+8. **`gemini-3.1-pro-low` — one tier dropped for the effort gap.** 65/45 becomes 45/25 under §5.6
+   step 3, because SEAL's 46.10 describes the un-suffixed model and the seeded string is `-low`.
+   Arena Text 1487 and ECI 154.92 describe the same un-suffixed model, so all three supporting
+   figures carry the same mismatch and none of them is discarded.
+9. **Refresh — a source registry, not a hardcoded fetcher.** Epoch (CC BY 4.0) is fetched for the
+   analysis axis and is the only `dynamic: true` entry today. The implement axis has no
+   dynamically-permissible source, so it is maintained and **dated**, and an entry with no
+   parseable date resolves to 0 rather than to a stale number. The registry is data, so adding a
+   source is not a schema change (§5.4, §5.6).
+10. **Finding better sources — SPAWNED.** An effort-separated, licensed, machine-readable coding
+    benchmark is the known gap; the licence investigation is its own research question.
 
 ## 8. Risks
 
 - **Alias drift.** `opus`/`sonnet` move to new models without any row changing, so a weight can go
-  stale silently. The mitigation is §5.6's refresh trigger and the date in `weights.basis`.
-- **Under-determined rows, closed 2026-09-28.** The draft's risk was that §3.3 was second-hand. It
-  no longer is — every figure is now read from a primary source, and the re-read cost nothing in
-  tier movement. The risk it exposed instead is that **five of the twelve seeded rows rest on no
-  independent measurement at all** (§7 items 4–8): Sonnet 5's stated basis did not exist, and no
-  source scores any Gemini effort level below `-high`. A weight that no public source can check is
-  a maintainer assertion wearing a benchmark's clothes, and the seed should say which rows those
-  are.
+  stale silently. The mitigation is now load-bearing rather than advisory: an entry whose `date` is
+  missing or unparseable resolves to 0 (§5.4), so a stale coding weight stops being offered for a
+  slot instead of being used.
+- **Coding-axis staleness, bounded but not solved.** Epoch refreshes the analysis axis on demand;
+  the implement axis has no dynamically-permissible source and is the maintainer's to maintain. The
+  date rule makes the failure mode visible rather than silent, but the values are still manual.
+  This is the gap the spawned sources item exists to close.
 - **Source coverage moves faster than the verdict.** Opus 5.5 is absent from Epoch's ECI, Sonnet 5
   and Haiku 4.5 are absent from AA's index and from both Arena boards, SEAL has not published an
   Opus 5.x row, and the SWE-ECI file the draft leaned on is gone from the Epoch hub. The
   independent-measurement set is narrower than the frontier, and it will keep shifting.
+- **A licence can change under a stored value.** The registry records `redistributable` and refuses
+  a non-redistributable source at write time, but a source's terms can change after a number is
+  already in a seed. A refresh that re-checks the registry would catch it; a hand-edited coding
+  entry would not.
 - **Harness gap.** Public numbers come from other scaffolds (§3.1); htui's own outcomes are the only
   fix, which is the learned follow-up.
 - **Judge bias** once models mix; §6 item 4.

@@ -14,7 +14,20 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-26):** **MOD-7 was done** (`docs/decisions/mod/mod-7.md`), all four
+**Current status (2026-09-28):** **ANA-21 was concluded** (`docs/decisions/ana/ana-21.md`): a
+model weight is a coarse ordinal tier (S 95, A 80, B 65, C 45, D 25, 0 = never given a slot) keyed on
+the phase's `name` in `agent.settings.weights`, cost excluded because all three seeded agents are
+`subscription`; slot 0 stays `eligible[0]` so the priority order stands and only rival slots are
+apportioned, and `R-AGT-8` was amended to say so. Every figure was re-read from its primary source
+on 2026-09-28 (`docs/ANA-21-recheck-2026-09-28.md`); no model changed tier, but four draft figures
+did not reproduce — the draft's Sonnet 5 and Haiku 4.5 bases do not exist on Artificial Analysis at
+all, the SWE-ECI file is gone from the Epoch hub, and Opus 5.5 is absent from Epoch ECI. The
+refresh is a **source registry**, not a hardcoded fetcher: Epoch (CC BY 4.0) is the only source
+both fetchable and licensed for this use, so the analysis axis is fetched and the implement axis is
+maintained and dated, an undated entry resolving to 0 rather than to a stale number. Two follow-ups
+are spawned: **ANA-23** (find a licensed, effort-separated coding benchmark source) and **ANA-24**
+(learn weights from judge verdicts, behind its volume trigger). MOD-36 is unblocked.
+Before it, **MOD-7 was done** (`docs/decisions/mod/mod-7.md`), all four
 milestones: a box is keyed on its `box.toml` id and checked by a keyed machine fingerprint
 (migration `0005_box_identity`); a probe fills hardware, tools and tags; Settings > Boxes edits
 declared tags and quirks as a compare-and-set; `R-ORCH-10` refuses a missing tag at enqueue and at
@@ -25,10 +38,6 @@ Before it, **ANA-22 was concluded** (`docs/decisions/ana/ana-22.md`): a skill
 is pure library content attached at global, project or phase level, and the attachment carries the
 activation (`always`, `glob`, `off`; language compiled to globs); it unblocks MOD-9 milestones 3 and 4. MOD-9's
 PRD is up (`.claude/prds/mod-9-skill-library-templates.prd.md`); agent help while editing is MOD-55.
-Before it, **MOD-38 was done** (`docs/decisions/mod/mod-38.md`): migration
-`0006_requirements` adds `item.resolution` and the requirement tables behind new store methods on
-MemStore, PgStore and the cache; `closed` is now reachable only through `close_out`, which takes a
-resolution (amends ANA-2 §4.3). MOD-39 (Requirements tab) is unblocked.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
 (MOD-38) and `0007_skill_attachments` (MOD-9 milestone 2; cache: `0001`..`0004`), so **the next
@@ -88,21 +97,41 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 ### Analyses
 
 
-- [ ] **ANA-21 - Per-model weights for agent assignment, derived from public sources** (from MOD-4
-  milestone 4, OQ-7; maintainer-requested 2026-09-23; MOD-4 is done, `docs/decisions/mod/mod-4.md`).
-  `R-AGT-8`, `R-ORCH-7`. Blocks MOD-36.
-  Research how to give each configured agent/model a weight (e.g. Gemini Flash 30, Claude Opus 5.5
-  60) that MOD-36 uses to choose which models run a phase's fan-out candidates. Survey public signals
-  (coding and reasoning benchmarks, leaderboards, published pricing and latency), decide whether
-  weights are per task kind (analysis, implement, review, judge) or global, and whether cost enters
-  the weight or stays a separate quota concern (ANA-4). Deliver: the weight table's schema and where
-  it lives (`agent` row, `app_setting`, or a new table), a refresh method (manual, scripted from
-  named sources, or learned from htui's own judge verdicts), and initial values for the seeded agents.
-  **Findings committed (2026-09-25):** draft verdict in `docs/ANA-21.md` (coarse tiers per phase
-  name in `agent.settings.weights`, cost kept out, deterministic slot rule, manual refresh, draft
-  initial values). Still open: the session's proxy blocked most benchmark and vendor pages, so the
-  figures in §3.3 and the initial values in §5.7 are second-hand and must be re-read from primary
-  sources, and the maintainer calls in §7 are undecided. No close-out yet.
+- [ ] **ANA-23 - A licensed, effort-separated coding benchmark source for the weight map** (from
+  ANA-21; ANA-21 is done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`, `R-ORCH-7`.
+  ANA-21's refresh is a source registry, and exactly one entry in it can be fetched today: Epoch
+  (CC BY 4.0), which covers the **analysis** axis only. The implement axis has no
+  dynamically-permissible source at all, so its weights are the maintainer's, entered by hand and
+  dated, and an undated entry resolves to 0 rather than to a stale number. Research the gap:
+  1. Find a machine-readable, redistribution-licensed source of agentic **coding** benchmark
+     results. The prize is Harbor's tbench.ai: it is the official Terminal-Bench 4.0 board and the
+     only source found that publishes `reasoning_effort` per row, so it would close the
+     effort-separation gap that forced ANA-21 to flatten every `-medium`/`-low` string onto its
+     family's `-high` value. Its results sit behind an undocumented tRPC endpoint and carry no
+     licence grant; the harness repo is Apache-2.0. Establish whether the results are separately
+     licensed, and by what terms.
+  2. Establish whether any Terminal-Bench 4.0 results mirror exists with terms that permit fetching
+     them into a product that gives model-selection guidance. Artificial Analysis's API is
+     explicitly out of scope: it is internal-use only and bars exactly this use.
+  3. Re-probe the sources ANA-21 recorded as blocked, since licences and endpoints move: Vals, Scale
+     SEAL, Arena, SWE-bench/experiments, SWE-rebench, LiveBench, epoch-research/eci-public.
+  4. Deliver a verdict naming which sources are `dynamic: true` and which `redistributable: true`,
+     so ANA-21's `weights.sources` registry (§5.4) can be extended as a data edit. Blocked on
+     nothing; do it whenever.
+- [ ] **ANA-24 - Learn per-model weights from htui's own judge verdicts** (from ANA-21; ANA-21 is
+  done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`, `R-ORCH-7`, `R-ID-6`.
+  ANA-21 deferred learned weights behind a volume trigger but the maintainer asked for it to be
+  tracked rather than remembered. **Trigger: do not start until MOD-36 and MOD-11 are both done and
+  a project holds on the order of 100 judged cross-model groups.** The data is already recorded —
+  candidate `run_step` rows carry `agent_id`, `model`, `selected` and `verify_outcome`, and the
+  judge row (`fanout_index = -1`) carries its own `agent_id`/`model` — so no new logging is needed.
+  Fit a Bayesian Bradley-Terry model with a Plackett-Luce top-1 likelihood per verdict, taking
+  ANA-21's tier as the prior and a same-family-as-judge covariate, since the documented self- and
+  same-family preference (+10 to +25 points self, +3.4 to +8.4 same family) is as large as the
+  signal being measured. Show the fit read-only beside the manual weights before anything is applied
+  automatically. The fit is deterministic arithmetic over rows, so it is allowed under `R-ID-6`.
+  Judge choice itself is out of scope: ANA-21 §2.2 established the judge is never asked of the
+  selector, and MOD-36 owns the judge-identity hardening.
 
 ### Next features
 - [ ] **MOD-39 - Requirements tab and item traceability** (from ANA-11; MOD-38 done,
@@ -185,12 +214,14 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
     A promotion refused at the bind is already handed the stream (blueprint D185); the interval
     before the follow is served is not covered (T7 repair `9f7cc5c`, `agent_worker.rs` `Stream`).
 - [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
-  OQ-7; blocked on ANA-21 only, since MOD-4 is done, `docs/decisions/mod/mod-4.md`). `R-AGT-8`,
+  OQ-7; ANA-21 is done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`,
   `R-ORCH-7`. Milestone 4 runs every candidate of a group on the
   one agent the walk selects (rival sampling). This item spreads candidates across the eligible
   agents by weight: a weighted `AgentSelector` (the seam milestone 4 leaves per-candidate) picks each
   `fanout_index`'s agent from the walk's eligible list using ANA-21's weights, so the judge compares
-  different models on the same task. Open points to settle in the plan: the prompt is assembled once
+  different models on the same task. Slot 0 stays `eligible[0]` and only the rival slots are
+  apportioned, so the priority order stands (`docs/ANA-21.md` §5.5, §7.2). Open points to settle in
+  the plan: the prompt is assembled once
   per group, but token budgeting uses one agent's estimator (`TokenEstimator::for_agent`), so mixed
   families need either the tightest budget or per-candidate trimming, which breaks "identical prompt
   across siblings" (ANA-5 `:1870`); each candidate draws on its own agent's quota; the judge must not
@@ -744,7 +775,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 1 (ANA-21 per-model weights)                                                                  |
+| ANA-N   | 2 (ANA-23 licensed coding benchmark source, ANA-24 learned weights)                            |
 | MOD-N   | 41 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-5 merge-hook test flake)                |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
