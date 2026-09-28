@@ -645,6 +645,40 @@ async fn e_edits_the_description_and_never_the_name() {
     );
 }
 
+/// `e` then `Enter` opens the editor on the **head**, the same place `E` opens it when nothing is
+/// pinned, and the comment above `confirm_naming`'s `fixed` branch now says so. Pinning v1 first
+/// is what makes the choice observable: the two keys would disagree if the form opened on the
+/// shown version, and a save would then carry the head's tokens beside v1's body.
+#[tokio::test]
+async fn e_then_enter_opens_the_editor_on_the_head() {
+    let store = MemStore::demo();
+    let mut harness = open_over(store.clone()).await;
+    select(&mut harness, "rust-style");
+    harness.key(",");
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} rust-style v1 (head v2)"),
+        "v1 is shown, so the head is not what the pane is drawing: {frame}"
+    );
+
+    harness.key("e");
+    harness.key("enter");
+    let frame = harness.render();
+    assert!(
+        frame.contains(" rust-style \u{b7} editing from v2, saves v3 "),
+        "the head, not the shown v1: {frame}"
+    );
+
+    harness.key("ctrl-s");
+    harness.settle().await;
+    let row = head(&store, "rust-style").await.expect("a head");
+    assert_eq!(row.version, 3, "the head's plus one");
+    assert_eq!(
+        row.body, "Prefer `expect` with a reason. One error enum per crate.",
+        "v2's body, which v1 does not have: the tokens are the head's, so the body is too"
+    );
+}
+
 /// `E` opens the editor on the shown version; `Ctrl+E` hands the draft to `$EDITOR`; the return
 /// opens the editor on the text and **nothing is sent** — there is no `parse` here, because a
 /// skill body is markdown and there is no byte offset to point at.

@@ -717,9 +717,12 @@ impl SkillsView {
             *fixed_name,
         );
         if fixed {
-            // `e` opened on a skill the snapshot holds, so its head and its `updated_at` are
-            // right there: the editor opens on the shown version with the two tokens a save
-            // needs (D101) and the body the pane was showing.
+            // `e` opened on a skill the snapshot holds, so its head and its `updated_at` are right
+            // there (D101). The editor opens on the **head**, not on the shown version: a save
+            // appends to the head, so the head's body is the one whose successor the title will
+            // name, and the head's tokens beside an older body would invite an edit that could
+            // never be the version the pane claims. `E` agrees — it opens on `shown_row`, which
+            // is the head whenever nothing is pinned.
             let head = self.snapshot.as_ref().and_then(|s| s.head(&name)).cloned();
             let updated_at = self
                 .snapshot
