@@ -14,7 +14,7 @@ use htui_core::prompt::render::elision_marker;
 use htui_core::prompt::{
     AssembleError, AssembledPrompt, PromptSpec, SectionName, TrimStrategy, assemble, fixtures,
 };
-use htui_core::scrub::MinimalScrubber;
+use htui_core::scrub::{MinimalScrubber, Scrubber};
 
 /// The scrubber every test passes: no configured secrets, and still fail-closed on the prefix
 /// rules (`scrub.rs:114-120`), which is exactly what a production caller with no session secrets
@@ -1389,13 +1389,16 @@ fn the_record_vocabularies_spell_themselves_once() {
 #[test]
 fn a_known_secret_in_a_caller_note_is_masked_in_the_record() {
     // MOD-32, T1 case 1. `PromptSpec.notes` is caller free text, copied verbatim into
-    // `trim_record.notes` at `prompt/mod.rs:1110-1114`, and no `mask` call in `scrubbed_inputs`
+    // `trim_record.notes` at `prompt/mod.rs:1115-1119`, and no `mask` call in `scrubbed_inputs`
     // reaches it — so nothing scrubbed the record's own strings on the way to the store.
     //
     // This case pins the **masking** half, not the scanning half, and the distinction is the
     // point: a known secret is maskable, so a pass that only refused would fail a step over a
-    // value the scrubber can remove. The engine's caller hands in a `MinimalScrubber` holding
-    // exactly these strings (`record.rs:362`).
+    // value the scrubber can remove. Note what it does *not* claim — the run engine builds its
+    // scrubber with an empty secret list (`run_worker.rs:1253`), so on that path the masking half
+    // is inert and only the residue scan fires. This case pins the pass itself, with a populated
+    // scrubber, which is the configuration the chat path's recorder uses and the one a future fix
+    // to the run engine's scrubber would turn on. See `TrimRecord::to_value`'s doc.
     let mut spec = fixtures::phase_implement_attempt2();
     spec.notes = vec![format!("clamped hops to {SECRET} on this box")];
     let prompt = ok(&spec);
@@ -1526,25 +1529,93 @@ fn the_audit_root_and_provider_strings_are_reached_by_the_pass() {
 }
 
 #[test]
-fn scrubbing_a_record_twice_changes_nothing() {
-    // MOD-32, T1 case 4. `to_value` masks, so a caller that serialises a record whose strings are
-    // already masked must record the same bytes. Without this, an idempotence bug would make the
-    // second write differ from the first and the column's bytes depend on how many times a
-    // payload passed through.
+fn a_masked_record_survives_a_second_pass_unchanged() {
+    // MOD-32, T1 case 4, rewritten after the review gate.
+    //
+    // The first version of this case called `to_value` twice on the same **unmasked**
+    // `prompt.trim` and compared the two results, which asserts that a pure function is pure:
+    // both calls mask the same input the same way, so they agree however `mask` behaves, and a
+    // `mask` that re-masked the `[REDACTED]` marker would have passed. The property worth
+    // pinning is the one the comment claimed — *a record whose strings are already masked must
+    // serialise to the same bytes* — and it is only reachable by feeding an already-masked value
+    // back in. That is a live path, not a hypothetical one: `scrubbed_inputs` masks
+    // `excerpts.files[].repo`/`.path` and `skill_choices[].name` before `to_value` sees them, and
+    // with an empty secret list `mask` short-circuits at `scrub.rs:119-121` and cannot double-mask
+    // at all, so a populated scrubber is the only configuration where this can bite.
     let mut spec = fixtures::phase_implement_attempt2();
     spec.notes = vec![format!("clamped hops to {SECRET}")];
-    let prompt = ok(&spec);
     let scrubber = MinimalScrubber::new([SECRET.to_owned()]);
+    let prompt = assemble(&spec, &scrubber).expect("the fixture must assemble");
 
     let once = prompt.trim.to_value(&scrubber).expect("maskable");
-    let twice = prompt
-        .trim
-        .to_value(&scrubber)
-        .expect("already masked, still clean");
-    assert_eq!(once, twice, "masking is idempotent (`scrub.rs:52`)");
+    let rendered = once.to_string();
+    assert!(
+        rendered.contains("[REDACTED]"),
+        "the record must actually carry a mask, or this case is vacuous: {rendered}"
+    );
+    assert!(!rendered.contains(SECRET), "and no secret: {rendered}");
+
+    let mut again = once.clone();
+    scrubber
+        .scrub(&mut again)
+        .expect("a record that is already masked is still clean");
     assert_eq!(
-        twice["notes"][0],
+        once, again,
+        "masking is idempotent (`scrub.rs:52`): a second pass over a masked record changes nothing"
+    );
+    assert_eq!(
+        again["notes"][0],
         serde_json::json!("clamped hops to [REDACTED]"),
         "and the second pass does not mask the marker again"
+    );
+}
+
+#[test]
+fn a_trim_record_is_never_serialised_outside_to_value() {
+    // MOD-32, review finding. `TrimRecord` is `pub` and still derives `Serialize`, so
+    // `serde_json::to_value(&trim)` — the literal line this item deleted from the engine at all
+    // three sites — remains valid Rust and nothing in the build fails if it comes back. The
+    // signature change removed the *unscrubbed serialiser method*; it did not and cannot remove
+    // the unscrubbed *expression*, so the guarantee that a record is scrubbed before it is
+    // persisted is a convention, and this is the grep that keeps it one. Same idiom and the same
+    // reason as `the_only_section_entry_constructor_is_the_records_projection` above.
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/htui-core has a parent")
+        .to_path_buf();
+    let mut offenders: Vec<String> = Vec::new();
+    let mut stack = vec![crates.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("a readable crate directory") {
+            let path = entry.expect("a readable entry").path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name == "target") {
+                    continue;
+                }
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path).expect("a readable source file");
+                let serialises_a_record = [
+                    "serde_json::to_value(&prompt.trim)",
+                    "serde_json::to_value(&prompts.forward.trim)",
+                    "serde_json::to_value(&record)",
+                    "serde_json::to_value(&self)",
+                    "serde_json::to_value(trim)",
+                ]
+                .iter()
+                .any(|needle| source.contains(needle));
+                if serialises_a_record
+                    && !path.ends_with("prompt/trim.rs")
+                    && !path.ends_with("tests/prompt_digest.rs")
+                {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a `TrimRecord` is serialised outside `TrimRecord::to_value`, which is the bypass MOD-32 \
+         removed and the one that must not come back: {offenders:?}"
     );
 }

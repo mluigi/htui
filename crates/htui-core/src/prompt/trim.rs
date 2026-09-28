@@ -213,19 +213,34 @@ pub struct TrimRecord {
 
 impl TrimRecord {
     /// The record as JSON, for `run_step.trim_record` — **the only serialisation of a record, and
-    /// the only one that may be persisted.**
+    /// the only one that may be persisted.** A convention, not a compiler guarantee: `TrimRecord`
+    /// is `pub` and still derives `Serialize`, so `serde_json::to_value(&trim)` stays valid Rust
+    /// and nothing in the build fails if it comes back. `a_trim_record_is_never_serialised_outside_to_value`
+    /// (`tests/prompt_digest.rs`) is the grep that keeps it one convention.
     ///
     /// The `scrub` pass is whole-record and enumerates nothing: one call over the serialised
-    /// [`Value`], reaching every string leaf **and every object key** (`scrub.rs:141-163`). That is
+    /// [`Value`], reaching every string leaf **and every object key** (`scrub.rs:142-166`). That is
     /// what keeps the rule true when the next field is added — the defect this item fixes is a
     /// guarantee that was an enumeration, and an enumeration goes stale the day someone forgets
     /// to extend it. It is the same pass the assembler applies to the rendered bytes one layer up
     /// (`prompt/mod.rs:472-483`), and it is the same call the recorder makes on every payload
     /// (`record.rs`): scrub, then persist, or refuse and persist nothing.
     ///
+    /// **What this guarantees today, and what it does not.** `scrub` masks, then fails closed on
+    /// residue. The residue half is live on every production path: the run engine hands in a
+    /// `MinimalScrubber` with an **empty** secret list (`run_worker.rs:1253`), so what fires there
+    /// is the prefix rules and the PEM marker, and a credential-shaped record string stops the
+    /// write. The **masking** half is inert on that path — `mask` returns its input unchanged when
+    /// the list is empty (`scrub.rs:119-121`) — so a record string that merely *equals* a resolved
+    /// secret is still stored verbatim. That is a property of how the run engine builds its
+    /// scrubber, not of this pass; the chat path, which does build one from resolved env
+    /// (`agent_worker.rs:3059`), never reaches this method. Recorded rather than papered over:
+    /// `R-SEC-3` requires the fail-closed half, and this delivers it.
+    ///
     /// Masking is idempotent (`scrub.rs:52`, the `[REDACTED]` step-over at `:124-129`), so a
-    /// caller that scrubs twice records the same bytes both times and an already-masked record is
-    /// unchanged.
+    /// caller that scrubs twice records the same bytes both times. That matters on the paths that
+    /// do hold a populated list, where `excerpts.files[].repo`/`.path` and `skill_choices[].name`
+    /// arrive already masked by `scrubbed_inputs`.
     ///
     /// # Errors
     ///
@@ -233,7 +248,10 @@ impl TrimRecord {
     /// is fail-closed, so the caller must **not** persist the value at all: in the engine that
     /// fails the step before any session starts and before a token is spent. The error names a
     /// rule and a JSON pointer and never the offending text — its `Display` and `Debug` are part
-    /// of the security contract (`scrub.rs:60-71`), and both are persisted in an `error` event.
+    /// of the security contract (`scrub.rs:61-78`). At this call site the rendered error reaches
+    /// the run's failure reason and an item note, not a `session_event` row; the recorder's own
+    /// `residue_row` is what writes the `error` event `scrub.rs:63-65` describes. The security
+    /// point is the same either way: `path` is assembled from masked keys, so no text leaks.
     ///
     /// An **encode** failure is deliberately not an error here: it becomes `Value::Null`, which
     /// scrubs clean because it has no string leaf. See the note at the engine's call site for why

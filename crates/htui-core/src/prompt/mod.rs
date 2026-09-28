@@ -967,12 +967,14 @@ const WITHHELD_NOTE: &str =
 /// `repo:path` a pass's note names straight from the filesystem never reaches `trim_record.notes`
 /// in plain text (MOD-7 milestone 4, P-2, D129).
 ///
-/// `trim_record.notes` is now scrubbed whole before the write ([`TrimRecord::to_value`], MOD-32)
-/// and the preview shows it, and
-/// [`excerpt::select`]'s own notes name a listed or read path as the reader returned it: one over
-/// `max_file_bytes`, one that could not be read, one declared but excluded, one not repo-relative.
-/// A path under a directory named after a known secret would otherwise be stored as it is. A note
-/// is kept only when the scrubber returns it unchanged, the same test
+/// The record-wide pass ([`TrimRecord::to_value`], MOD-32) now scrubs `trim_record.notes` whole
+/// before the write, and the preview shows it. So this function is no longer load-bearing for
+/// safety — it is kept as a second line of defence, and for the reason the sibling at
+/// [`drop_unmaskable_excerpts`] gives: a withheld note reads as a withheld note, where a masked
+/// one would read "a file in repo `[REDACTED]` dropped", which names a value no reader can
+/// resolve. [`excerpt::select`]'s own notes name a listed or read path as the reader returned it —
+/// one over `max_file_bytes`, one that could not be read, one declared but excluded, one not
+/// repo-relative — and a note is kept only when the scrubber returns it unchanged, the same test
 /// [`drop_unmaskable_excerpts`] applies before naming a repo or path; the replacement keeps the
 /// note's place and names nothing. A caller runs this on the pass's notes **before**
 /// [`drop_unmaskable_excerpts`] appends its own, which are already built to be safe.
