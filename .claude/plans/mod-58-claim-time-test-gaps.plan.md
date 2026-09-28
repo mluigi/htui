@@ -174,7 +174,12 @@ red-then-green discipline is replaced by the mutation check below.
 **Mutation check — the only honest proof that a pin bites.** After each task's cases pass, break the
 rule on purpose and confirm the case fails, then revert:
 - T1 and T0, case 1: move the target-box check *after* the tag check in the store under test. The
-  case must fail with `MissingTags` where it asserts `NotClaimable`.
+  case must fail with `MissingTags` where it asserts `NotClaimable`. **The move has to place the
+  `return Ok(Claim::NotClaimable)` after the whole `if !missing.is_empty() { … return
+  Ok(Claim::MissingTags { missing }); }` block, not merely after the *computation* of `missing`** —
+  hoisting the predicate into a binding and returning after the `let` still leaves the `MissingTags`
+  write block after the return, so nothing is written and the case still passes. That weaker form
+  is not a mutation and would report a false green (found by the T1 implementer).
 - T1 and T0, case 2: swap `items.get` for `require_item` (`mem.rs:3612`) and the join for an inner
   join that demands a row (`pg/write.rs:3075`). The case must fail with
   `NotFound { entity: "item" }` / a non-empty tag list.
