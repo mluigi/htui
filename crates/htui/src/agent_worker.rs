@@ -5906,7 +5906,7 @@ pub(crate) mod tests {
             Served::Reply(StoreReply::Failed { request, message }) => {
                 assert_eq!(request, "install_plan");
                 assert!(
-                    message.contains("probe is already running"),
+                    message.contains("is already writing this box"),
                     "the refusal names what holds the box: {message}"
                 );
             }
