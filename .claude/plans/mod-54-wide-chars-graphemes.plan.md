@@ -1,6 +1,9 @@
 # Plan: MOD-54 — wide characters and graphemes in the text widgets
 
-> **Status: fact-checked, awaiting the maintainer's CONFIRM and answers to OQ-1…OQ-3.**
+> **Status: CONFIRMED 2026-09-28** by the maintainer, with OQ-1/OQ-2/OQ-3 answered as this plan's
+> defaults. Cleared for the implementation phase.
+>
+> **Fact-check, complete:**
 > The fact-check ran three passes — a compile probe against `unicode-width 0.2.2` /
 > `unicode-segmentation 1.13.3`, a line-by-line tree audit of all 45 navigation claims, and a
 > run of the five rows the drafting pass had left `unverified`. **No design decision was
@@ -45,12 +48,14 @@ from `/media/projects/htui-mod-54` and every crate claim from the cargo registry
 
 ---
 
-## Open questions for the maintainer
+## Open questions for the maintainer — **all three answered at CONFIRM, 2026-09-28**
 
-Each has a default this plan adopts so implementation is not blocked. The design is otherwise fully
-determined; these three are the only places where two defensible answers exist.
+Each was put to the maintainer over the fact-checked plan and each is **answered as the default this
+plan adopts**, so implementation is unblocked. The alternatives are kept below as the record of what
+was rejected, not as live options.
 
-- [ ] **OQ-1 — Does the widget replicate `ratatui`'s halfwidth-katakana correction?** `ratatui`'s
+- [x] **OQ-1 — Does the widget replicate `ratatui`'s halfwidth-katakana correction?** **Answered:
+      yes, replicate it** (D2). `ratatui`'s
       buffer measures a grapheme as `UnicodeWidthStr::width(s)` **plus one cell per `U+FF9E`/`U+FF9F`**
       (`ratatui-core-0.1.2/src/buffer/cell_width.rs:34-46`, citing Ruby reline #832 and Microsoft
       Terminal #18087), because `unicode-width` reports those two as zero-width `Grapheme_Extend`
@@ -59,14 +64,16 @@ determined; these three are the only places where two defensible answers exist.
       construction. **Alternative:** plain `UnicodeWidthStr::width`, one cell of drift at the end of
       any line containing `ｶﾞ`-style halfwidth katakana. Replicated is recommended only because the
       whole point of the item is that the arithmetic and the drawing cannot disagree.
-- [ ] **OQ-2 — Does `TextField::len()` change meaning?** It is `pub` and is documented as a `char`
+- [x] **OQ-2 — Does `TextField::len()` change meaning?** **Answered: yes, it becomes a grapheme
+      count** (D3). It is `pub` and is documented as a `char`
       count. It is also the mask's dot count and the ` (n)` suffix, so if `len()` stayed a char count
       the mask would draw one dot per grapheme and print a different number. **Default (D3): `len()`
       becomes a grapheme count** and its doc, the `cursor` field's doc, and
       `connection.rs:12`'s "one `\u{2022}` per character and a count" are reworded. **Alternative:**
       keep `len()` as chars and add `grapheme_len()`, so `Debug`'s `len:` and the on-screen count
       report different units — a worse lie than a changed unit.
-- [ ] **OQ-3 — What does the cursor highlight look like on a two-cell grapheme?** `ratatui` writes the
+- [x] **OQ-3 — What does the cursor highlight look like on a two-cell grapheme?** **Answered: the
+      first cell only** (D5). `ratatui` writes the
       style onto the first cell and then `reset()`s the continuation cell to `Cell::EMPTY`
       (`ratatui-core-0.1.2/src/buffer/buffer.rs:361-366`, `cell.rs` `reset()` = `*self = Self::EMPTY`),
       so **one styled `Span` cannot reverse both cells of a wide grapheme**. **Default (D5): emit the
