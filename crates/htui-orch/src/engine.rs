@@ -97,6 +97,12 @@ const PROMOTED_AT_A_GATE: &str = "promoted by the maintainer at a gate";
 /// `run_step.fanout_index` of a slot's judge row (`docs/ANA-2.md` §4.5, plan D51).
 const JUDGE_FANOUT_INDEX: i32 = -1;
 
+/// MOD-9 D89: how many changed paths the skill file set records refusing before it stops naming
+/// them. The pass's own cap is `excerpt::DENIED_NOTE_CAP` (20) and this is the same number for the
+/// same reason: an isolator that answers with a whole tree must not be able to write a note per
+/// file into a prompt that is budgeted.
+const DENIED_UNION_NOTE_CAP: usize = 20;
+
 /// A failed judge's park reason when its row carries no `gate_note` — a crash between D51's two
 /// failure writes left it `awaiting_approval`, or another writer failed it.
 const JUDGE_FAILED: &str = "judge failed";
@@ -5019,15 +5025,36 @@ where
             changed_paths: changed.clone(),
             notes,
         };
-        let excerpts = excerpts_for(spec, input, &self.parts.app, self.parts.scrubber).await;
+        let mut excerpts = excerpts_for(spec, input, &self.parts.app, self.parts.scrubber).await;
         // MOD-9 D72/D73/D89: the walk is the file set a `glob` attachment is matched against, and
         // the enumeration is deliberately a superset of what the budget paid for — a skill may fire
         // on a file this prompt never showed the model. The previous attempt's changed paths join
         // it, de-duplicated on `(repo, path)` and **after** the listing, so a path both could name
         // is the walk's, and the recorded `matched` path is the walk's first.
+        //
+        // The union applies the walk's own two path guards, which H-21's "the matcher does not
+        // re-filter" leaves to exactly here: `Pattern::matches` is a pure function of the name, so
+        // a name nothing filtered would match any glob. `listed` is already past both, and `changed`
+        // is `git diff --name-only -z` verbatim, so without this the file set would carry a
+        // lockfile or a secret the excerpt pass denied by rule — a file no prompt showed, matched by
+        // a `glob`, and recorded as `matched`. The denial is noted rather than silent, because the
+        // walk's own `declared but denied` note is written from the paths the reader returned and so
+        // never fires for a name that is in no tree at all.
+        let mut denied = 0usize;
         spec.skill_files = {
             let mut files = excerpts.listed.clone();
             for path in changed {
+                if let Some(rule) = htui_core::prompt::excerpt::denied_path(&path.path) {
+                    if denied < DENIED_UNION_NOTE_CAP {
+                        denied += 1;
+                        excerpts.notes.push(format!(
+                            "excerpt: `{}:{}` was reported changed but is not a file the matcher may \
+                             see: excluded by rule `{rule}`; never added to the skill file set",
+                            path.repo, path.path
+                        ));
+                    }
+                    continue;
+                }
                 if !files.contains(&path) {
                     files.push(path);
                 }

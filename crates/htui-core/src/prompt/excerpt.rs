@@ -960,6 +960,22 @@ fn is_repo_relative(path: &str) -> bool {
     !path.split('/').any(|segment| segment == "..")
 }
 
+/// The two path-only guards the walk applies to a name, as one predicate, named (MOD-9 D89).
+///
+/// [`select`] applies [`skip_by_path`] and then [`is_repo_relative`] itself, because it counts the
+/// first and words the second differently. A caller that has a name and **no walk** needs the
+/// answer and nothing more — the engine unioning the previous attempt's changed paths into
+/// [`PromptSpec::skill_files`](crate::prompt::PromptSpec::skill_files) is the one, and its input is
+/// verbatim `git diff --name-only -z` output, which no filter has touched. Composing the two
+/// functions rather than restating their rules is what keeps the two file sets — the walk's and the
+/// union's — from disagreeing about which names are files at all.
+///
+/// `not_repo_relative` is this function's own name for the second guard, which returns a `bool`.
+#[must_use]
+pub fn denied_path(path: &str) -> Option<&'static str> {
+    skip_by_path(path).or_else(|| (!is_repo_relative(path)).then_some("not_repo_relative"))
+}
+
 /// §4.5 step 8: the window one file contributes, and what it cost to cut it.
 ///
 /// Returns `(content, first_line, last_line, truncated, elided_lines, elided_bytes)`. `want` is a
@@ -2362,6 +2378,18 @@ mod tests {
         assert_eq!(skip_by_path(".git/config"), Some("git"));
         assert_eq!(skip_by_path(".env.production"), Some("secret_denylist"));
         assert_eq!(skip_by_path("Cargo.lock"), Some("lockfile_or_minified"));
+        // MOD-9 D89: the same two guards as one predicate, for a caller that has a name and no
+        // walk. The first arm is `skip_by_path`'s own answer, so the rules cannot drift apart;
+        // the second is the guard `select` applies right after it, given a name so the caller can
+        // record which one fired.
+        assert_eq!(denied_path("Cargo.lock"), Some("lockfile_or_minified"));
+        assert_eq!(denied_path(".git/config"), Some("git"));
+        assert_eq!(denied_path("/etc/passwd"), Some("not_repo_relative"));
+        assert_eq!(denied_path("C:\\secrets"), Some("not_repo_relative"));
+        assert_eq!(denied_path("a/../b.rs"), Some("not_repo_relative"));
+        assert_eq!(denied_path(""), Some("not_repo_relative"));
+        assert_eq!(denied_path("src/lib.rs"), None);
+        assert_eq!(denied_path("a/b/../c.rs"), Some("not_repo_relative"));
         for path in [
             "crates/htui-core/src/prompt/mod.rs",
             "src/environment.rs",
