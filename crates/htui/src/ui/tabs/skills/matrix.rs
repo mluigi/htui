@@ -1543,11 +1543,13 @@ mod tests {
             updated_at: chrono::DateTime::UNIX_EPOCH,
             versions: Vec::new(),
         };
-        let mut view = super::MatrixView::default();
-        view.snapshot = Some(crate::skills::SkillsSnapshot {
-            skills: vec![skill("rust-style"), skill("tests")],
-            attachments: Vec::new(),
-        });
+        let view = super::MatrixView {
+            snapshot: Some(crate::skills::SkillsSnapshot {
+                skills: vec![skill("rust-style"), skill("tests")],
+                attachments: Vec::new(),
+            }),
+            ..Default::default()
+        };
         let level = |label: &str| super::Level {
             axis: super::Axis::Global,
             label: label.to_owned(),
