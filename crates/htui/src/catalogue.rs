@@ -192,6 +192,8 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                     project_id: *project,
                     name: name.clone(),
                     description: description.clone(),
+                    // A maintainer-created graph is never a clone (plan D85, site 1).
+                    is_override: false,
                 })
                 .await?;
             reread(&writer, scope).await

@@ -6309,12 +6309,12 @@ mod tests {
         Activation, AgentBox, AgentId, BoxId, BoxProbe, ChatRunSpec, CitationKind, Claim,
         DocumentId, GateOutcome, GraphSnapshot, Isolation, ItemId, ItemKindPatch, NewDocument,
         NewItem, NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun,
-        NewRunStep, NewSkill, NewSkillBinding, NewSkillVersion, NoteId, OverlapRule, PhaseId,
-        Priority, ProbedTool, ProjectId, RepoId, RequirementAreaId, RequirementId,
+        NewRunStep, NewSkill, NewSkillBinding, NewSkillVersion, NewStepGraph, NoteId, OverlapRule,
+        PhaseId, Priority, ProbedTool, ProjectId, RepoId, RequirementAreaId, RequirementId,
         RequirementPatch, RequirementUpdate, Resolution, RunId, RunKind, RunMode, RunStatus,
         RunStepCommit, RunStepTree, Scope, Skill, SkillBinding, SkillBindingId, SkillId,
-        SkillLevel, SkillVersion, SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome,
-        StepStatus, UserId, VerifyOutcome,
+        SkillLevel, SkillVersion, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepId,
+        StepOutcome, StepStatus, UserId, VerifyOutcome,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -9339,6 +9339,78 @@ mod tests {
             store.add_note(duplicate).await,
             Err(StoreError::Constraint(_))
         ));
+    }
+
+    /// MOD-9 plan D85, OQ-16: `NewStepGraph::is_override` is the column, not a hard-coded `false`.
+    /// The `true` is what `override_graph`'s clone is, and the `false` is what every other
+    /// construction site is — one writer setting it `true` is the whole point of the field, and a
+    /// store that dropped it would make `Engine::phase_skills`'s override note unreachable in
+    /// production, which is the defect this milestone closes.
+    #[tokio::test]
+    async fn create_step_graph_honours_its_new_is_override_field() {
+        let store = MemStore::demo();
+        let id = StepGraphId::new();
+        let row = store
+            .create_step_graph(NewStepGraph {
+                id,
+                project_id: ids::PROJECT_HTUI,
+                name: "an-override".to_owned(),
+                description: String::new(),
+                is_override: true,
+            })
+            .await
+            .expect("the graph lands");
+        assert!(
+            row.is_override,
+            "the row the writer answers carries what it was asked for"
+        );
+        assert_eq!(
+            store
+                .step_graph(id)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the graph is there")
+                .is_override,
+            true,
+            "and so does the read, so `GraphSnapshot` can carry the marker into the record"
+        );
+        assert!(
+            store
+                .step_graphs(ids::PROJECT_HTUI)
+                .await
+                .expect("MemStore never fails a read")
+                .iter()
+                .any(|graph| graph.id == id && graph.is_override),
+            "the project listing shows it, which is where a graph is demoted out of the catalogue"
+        );
+
+        // The other half: a graph created the ordinary way is not an override, and the demo's own
+        // four seeded graphs are all `false` — the fixture sets the field at every site.
+        let ordinary = store
+            .create_step_graph(NewStepGraph {
+                id: StepGraphId::new(),
+                project_id: ids::PROJECT_HTUI,
+                name: "an-ordinary-graph".to_owned(),
+                description: String::new(),
+                is_override: false,
+            })
+            .await
+            .expect("the graph lands");
+        assert!(
+            !ordinary.is_override,
+            "a maintainer-created graph is never a clone"
+        );
+        for graph in store
+            .step_graphs(ids::PROJECT_HTUI)
+            .await
+            .expect("MemStore never fails a read")
+        {
+            assert_eq!(
+                graph.is_override,
+                graph.name == "an-override",
+                "only the row this case created with `true` is marked: {graph:?}"
+            );
+        }
     }
 
     /// The eleven inherent reads of ANA-2 §8 that `Backend`'s `match self` will dispatch (plan

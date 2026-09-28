@@ -3273,6 +3273,7 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
             project_id: ids::PROJECT_HTUI,
             name: "release".to_owned(),
             description: "Cut a release".to_owned(),
+            is_override: false,
         })
         .await
         .expect(CASE);
@@ -3283,6 +3284,7 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
             project_id: ids::PROJECT_HTUI,
             name: "analysis".to_owned(),
             description: String::new(),
+            is_override: false,
         })
         .await;
     assert!(

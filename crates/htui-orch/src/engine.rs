@@ -6268,6 +6268,7 @@ mod tests {
                     project_id: row.project_id,
                     name: format!("{}-edited", row.key),
                     description: "a test's edit of the live graph".to_owned(),
+                    is_override: false,
                 })
                 .await
                 .expect("the name is fresh");
@@ -14076,11 +14077,12 @@ mod tests {
         );
     }
 
-    /// Plan R-15, the clone gap: an override graph's phases carry no attachment of their own
-    /// until MOD-9 milestone 3, and the record says so. No writer can set `is_override` on a
-    /// snapshot, so the case edits the decoded one (blueprint D67).
+    /// Plan R-15 and MOD-9 D85: an override graph's phases carry a **copy** of the source phase's
+    /// attachments, made when the clone was written, and the record says so — because a copy that
+    /// silently stopped following its source would read as a bug. No writer can set `is_override`
+    /// on a snapshot, so the case edits the decoded one (blueprint D67).
     #[tokio::test]
-    async fn an_override_graph_notes_the_clone_gap() {
+    async fn an_override_graph_notes_that_its_attachments_were_copied() {
         let harness = Harness::new().await;
         let (row, mut snapshot, prd) = skills_prologue(&harness).await;
         snapshot.graph.is_override = true;
