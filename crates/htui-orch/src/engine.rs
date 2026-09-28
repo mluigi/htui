@@ -5061,6 +5061,14 @@ where
             }
             files
         };
+        // MOD-9 D73/D97: what `select` reads, and the reason the field is an `Option` — `Some` is
+        // "the set ran", which is `matched` or `no_match`; `None` is "no set resolved", which is
+        // `no_path` and is what the judge, the handoff and every fixture mean. Filled from
+        // `skill_files` and not from `listed`, so it sees the previous attempt's changed paths too.
+        spec.skill_matches = Some(htui_core::prompt::glob::matched_skills(
+            &spec.skills,
+            &spec.skill_files,
+        ));
         spec.excerpts = excerpts;
         Ok(())
     }
@@ -5177,13 +5185,10 @@ where
             // winning (`model::skill::resolve`); the assembler's `select` decides which render and
             // records every candidate in `trim_record.skill_choices`.
             skills,
-            // MOD-9 D73/D97: `with_excerpts` fills `skill_files` for a phase prompt, after the
-            // walk. `skill_matches` is the map `select` reads, and nothing fills it yet — the
-            // matcher is owed the line that follows that walk, here and in `preview::build` — so
-            // every `glob` candidate on both paths records `no_path`, and `matched`/`no_match` are
-            // not yet reachable in a real run. This builder is also the promote/handoff path's, and
-            // a handoff never reads a file, so it starts with no file set at all, which is `no_path`
-            // rather than `no_match` and will stay right.
+            // MOD-9 D73/D97: `with_excerpts` fills both of these for a phase prompt, after the
+            // walk. This builder is also the promote/handoff path's, and a handoff never reads a
+            // file, so it starts with no file set at all, which is `no_path` rather than
+            // `no_match` and will stay right.
             skill_files: Vec::new(),
             skill_matches: None,
             // The pass runs in `assemble_prompt` (`Self::with_excerpts`, MOD-7 milestone 4 D125),

@@ -105,14 +105,13 @@ pub struct PromptSpec {
     /// selects (MOD-9 D43).
     pub skills: Vec<BoundSkill>,
     /// MOD-9 D73/D89: the step's file set for glob activation — the walk's listing
-    /// ([`ExcerptSet::listed`]), which from D89 is unioned with the previous attempt's changed
-    /// paths, de-duplicated on `(repo, path)` and in that order. Filled by the engine's
-    /// `with_excerpts` and by the `htui` crate's `preview::build`; empty wherever no file set
-    /// resolved.
+    /// ([`ExcerptSet::listed`]) unioned with the previous attempt's changed paths, de-duplicated
+    /// on `(repo, path)` and in that order. Filled by the engine's `with_excerpts` and by the
+    /// `htui` crate's `preview::build`; empty wherever no file set resolved.
     ///
-    /// Until D89 lands the union is absent and so is the de-duplication: today the field is the
-    /// listing verbatim, which carries no duplicates because `excerpt_roots` yields one root per
-    /// repo and a walk cannot list a path twice.
+    /// The union applies the walk's own two path guards to the changed paths before adding them
+    /// ([`excerpt::denied_path`]), so the set holds the same names the walk would have listed and
+    /// the matcher — which does not re-filter — cannot fire on a file the excerpt pass denied.
     pub skill_files: Vec<RepoPath>,
     /// MOD-9 D73/D97: what [`matched_skills`](crate::prompt::glob::matched_skills) fired on, or
     /// `None` when **no** file set resolved — which is what `select` records as `no_path`, and is

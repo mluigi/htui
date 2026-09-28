@@ -82,19 +82,11 @@ const DOCUMENTS_NOTE: &str = "preview: documents are latest-per-kind; ANA-2 inpu
 /// Blueprint H-21: `documents_of_kinds(item, &[])` would otherwise return `summary` too.
 const SUMMARY_NOTE: &str = "preview: the `summary` kind is excluded from documents; §4.3 renders \
                             it as upstream context instead";
-/// MOD-9 D45/D73: which phase's attachments the preview shows, and what its file set is.
-///
-/// The sentence names the walk, not the recorded reason, and that is deliberate. The blueprint's
-/// §3.7 text says a glob attachment "is matched against this box's excerpt walk, as it is in a
-/// run", which is not yet true of the *record*: `spec.skill_files` is filled (D89) and
-/// `spec.skill_matches` — the map `select` reads — is not, so a `glob` candidate still records
-/// `no_path` here and in a run alike. When that field is filled this sentence is re-worded to say
-/// `matched`; until then it says the half that does not depend on it, which is that the walk runs
-/// and, with no previous attempt, its listing is the whole set.
+/// MOD-9 D73: which phase's attachments the preview shows, and that it runs the same walk a step
+/// does, so a `glob` attachment here records `matched` or `no_match` exactly as it would there.
 const SKILLS_NOTE: &str = "preview: phase-level skills come from the first phase of the item's \
                            graph that uses this template; a glob attachment is matched against \
-                           this box's excerpt walk, and with no previous attempt that walk's \
-                           listing is the whole file set";
+                           this box's excerpt walk, as it is in a run";
 
 /// MOD-9 D45's second note: no phase of the item's graph uses the chosen template, or the item
 /// resolves to no graph, so only global and project attachments apply.
@@ -300,12 +292,9 @@ pub async fn build(
         upstream,
         box_profile,
         skills,
-        // MOD-9 D73: the walk below fills `skill_files`, immediately before `assemble`, so the
-        // preview resolves a file set exactly as a step does. `skill_matches` is the map `select`
-        // reads, and nothing fills it yet — the matcher is owed the line that follows that walk,
-        // here and in `Engine::with_excerpts` — so every `glob` candidate here records `no_path`
-        // even though the preview does run a real walk. `prompt::STAND_INS` says so to the operator
-        // in the notes.
+        // MOD-9 D73: the walk below fills both of these, immediately before `assemble`, so the
+        // preview resolves a file set and matches it exactly as a step does. Nothing is resolved
+        // before the walk runs, which is what the two empty values say.
         skill_files: Vec::new(),
         skill_matches: None,
         excerpts: ExcerptSet::default(),
@@ -326,9 +315,14 @@ pub async fn build(
     let scrubber = MinimalScrubber::new([]);
     // The engine's own pass, one call (MOD-7 P-1): the preview's bytes and a run's cannot drift.
     spec.excerpts = excerpts_for(&spec, input, &app, &scrubber).await;
-    // MOD-9 D73: the preview runs the same walk a step does, so it fills the same field. There is
-    // no previous attempt here, so the listing is the whole file set.
+    // MOD-9 D73: the preview runs the same walk a step does, so it fills the same two fields.
+    // There is no previous attempt here, so the walk's listing is the whole file set — and the
+    // `Some` is what separates a `no_match` from a `no_path` (D97).
     spec.skill_files = spec.excerpts.listed.clone();
+    spec.skill_matches = Some(htui_core::prompt::glob::matched_skills(
+        &spec.skills,
+        &spec.skill_files,
+    ));
 
     Ok(PromptPreview {
         item,
