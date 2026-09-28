@@ -14,7 +14,12 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-26):** **MOD-7 was done** (`docs/decisions/mod/mod-7.md`), all four
+**Current status (2026-09-28):** **MOD-58 was done** (`docs/decisions/mod/mod-58.md`): the two
+claim-time tag rules are now pinned per store — `NotClaimable` outranks `MissingTags` for a run aimed
+at another box, and blueprint D94's no-item case is never refused. Four tests, no production
+behaviour change, no shared trait method, no migration, and no count pin moved. The gate's Postgres
+DSN is now password-free via `~/.pgpass`.
+Before it, **MOD-7 was done** (`docs/decisions/mod/mod-7.md`), all four
 milestones: a box is keyed on its `box.toml` id and checked by a keyed machine fingerprint
 (migration `0005_box_identity`); a probe fills hardware, tools and tags; Settings > Boxes edits
 declared tags and quirks as a compare-and-set; `R-ORCH-10` refuses a missing tag at enqueue and at
@@ -25,10 +30,8 @@ Before it, **ANA-22 was concluded** (`docs/decisions/ana/ana-22.md`): a skill
 is pure library content attached at global, project or phase level, and the attachment carries the
 activation (`always`, `glob`, `off`; language compiled to globs); it unblocks MOD-9 milestones 3 and 4. MOD-9's
 PRD is up (`.claude/prds/mod-9-skill-library-templates.prd.md`); agent help while editing is MOD-55.
-Before it, **MOD-38 was done** (`docs/decisions/mod/mod-38.md`): migration
-`0006_requirements` adds `item.resolution` and the requirement tables behind new store methods on
-MemStore, PgStore and the cache; `closed` is now reachable only through `close_out`, which takes a
-resolution (amends ANA-2 §4.3). MOD-39 (Requirements tab) is unblocked.
+MOD-38's resolution work (migration `0006_requirements`, `close_out` taking a resolution) is in
+`docs/decisions/mod/mod-38.md`; MOD-39 (Requirements tab) is unblocked.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
 (MOD-38) and `0007_skill_attachments` (MOD-9 milestone 2; cache: `0001`..`0004`), so **the next
@@ -266,13 +269,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   `Left`/`Backspace` can split a combining sequence. Measure by display width (`unicode-width`) and
   step by grapheme (`unicode-segmentation`) in both widgets together; declaring those crates is a
   dependency decision. Found 2026-09-26.
-- [ ] **MOD-58 - Two claim-time test gaps** (from MOD-7 milestone 3 review). `R-ORCH-10`. Neither
-  store pins (a) a run with missing tags that is `NotClaimable` because its `target_box_id` is
-  another box (only the cancelled-run half of plan D81's `NotClaimable` rule is pinned), nor (b)
-  plan D94, a run with no item (or whose item row is gone) is never refused for tags. The shared
-  store conformance has no trait method to make a second box, so (a) wants a `pg_criteria` case
-  that inserts a second `box` row plus a MemStore unit test in `mem.rs`; (b) fits either. Found
-  2026-09-26.
 - [ ] **MOD-49 - Interactive path picker for repo and workspace roots** (from MOD-7). `R-BOX-4`,
   `R-TUI-8`. MOD-7 D5 infers each repo's path on a box and falls back to a typed path in a text box
   when inference fails; as built, the typed fallback is Settings > Hierarchy's `b` (MOD-7 milestone
@@ -745,6 +741,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-21 per-model weights)                                                                  |
-| MOD-N   | 41 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 40 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-5 merge-hook test flake)                |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
