@@ -85,6 +85,7 @@ pub mod hierarchy;
 pub mod ids;
 pub mod item;
 pub mod kind;
+pub mod language;
 pub mod link;
 pub mod note;
 pub mod overlap;
@@ -121,6 +122,7 @@ pub use kind::{
     NewStepGraph, PhaseAgent, PhasePatch, ProjectSettings, PromptTemplate, ResolvedGraph,
     ResolvedPhase, StepGraph, StepGraphPatch, StepGraphPhase,
 };
+pub use language::{LANGUAGE_GLOBS, effective_globs, languages};
 pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode, UpstreamEntry};
 pub use note::{NewNote, Note};
 pub use overlap::{

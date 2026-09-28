@@ -3,13 +3,22 @@
 //! The Templates view (`templates`) is MOD-9 milestone 1: the scope's prompt templates, their
 //! versions, a line diff, and an editor that saves through `parse`. The Skills view (`library`) is
 //! milestone 3's: the global skill library, its versions, a line diff, and an editor that saves a
-//! markdown body behind two compare-and-set tokens.
+//! markdown body behind two compare-and-set tokens. The **attachments matrix** (`matrix`) is
+//! milestone 3's other half: one row per level and one column per skill, the activation form and
+//! the repo picker.
+//!
+//! The matrix is a mode of the Skills view rather than a third name on the switch line, and that
+//! is forced: the line is milestone 1's and byte-identical in the six `templates__*.snap` files
+//! (H-15, H-28), so a third segment would move all six. `m` opens it and `Esc` closes it, and
+//! while it is up the tab's own `h`/`l`/`[`/`]` yield to it — which is the same trade the per-view
+//! `captures_input` guard already makes for the editors.
 //!
 //! The tab reads **both** on activation whichever view is shown, so switching views needs no
 //! request and no view is left holding a snapshot from a workspace it has left. The switch line
 //! and the strip text belong to the shell and are byte-identical to what milestone 1 shipped.
 
 mod library;
+mod matrix;
 mod templates;
 
 use htui_core::model::Scope;
@@ -22,10 +31,15 @@ use crate::app::{Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::registry::{Tab, TabId};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use library::SkillsView;
+use matrix::MatrixView;
 use templates::TemplatesView;
+
+/// The key that opens and closes the attachments matrix: free in `Keymap::default_global`
+/// (D102), in neither view's browse keys, and not `w`, which the workspace switcher owns.
+const MATRIX_KEY: char = 'm';
 
 /// The Skills tab (MOD-9 PRD D1): `Skills | Templates`.
 #[derive(Debug, Default)]
@@ -36,6 +50,9 @@ pub struct SkillsTab {
     templates: TemplatesView,
     /// The Skills view, alive whichever view is shown, for the same reason.
     library: SkillsView,
+    /// The attachments matrix, alive whichever view is shown, and **shown over both**: it is a
+    /// mode of the Skills view, and it has no name on the switch line (H-15).
+    matrix: MatrixView,
 }
 
 /// The two views of the switch line.
@@ -66,17 +83,26 @@ impl SkillsTab {
         };
     }
 
-    /// The shown view's own input guard.
+    /// A key with no modifier but `SHIFT`, which is how a terminal reports a capital. The matrix's
+    /// key is a lower-case letter, so a shifted one is a chord and not a second binding.
+    fn plain(&self, key: &KeyEvent) -> bool {
+        (key.modifiers - KeyModifiers::SHIFT).is_empty()
+    }
+
+    /// The shown view's own input guard, and the matrix's.
     ///
     /// **Per view, not one flag**: each holds its own `captures_input`, and a global one would
     /// lock the tab's `h`/`l`/`[`/`]` out while the *other* view's editor is open — which cannot
     /// happen, because the other view's editor is not drawn — and would miss the case it is for,
-    /// which is that `l` is a letter inside a form, not a view switch.
+    /// which is that `l` is a letter inside a form, not a view switch. The matrix is its own mode
+    /// and takes every key while it is up, so `Left`/`Right` move the selected skill rather than
+    /// switching views.
     fn capturing(&self) -> bool {
-        match self.view {
-            View::Skills => self.library.captures_input(),
-            View::Templates => self.templates.captures_input(),
-        }
+        self.matrix.is_open()
+            || match self.view {
+                View::Skills => self.library.captures_input(),
+                View::Templates => self.templates.captures_input(),
+            }
     }
 }
 
@@ -102,16 +128,28 @@ impl Tab for SkillsTab {
     fn on_scope_change(&mut self, _scope: &Scope) {
         self.templates.on_scope_change();
         self.library.on_scope_change();
+        self.matrix.on_scope_change();
     }
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        // The matrix is a mode, not a view: while it is up it takes every key, `Esc` and the
+        // arrows included.
+        if self.matrix.is_open() {
+            return self.matrix.on_key(key, ctx);
+        }
         // An open editor or form owns every key it uses: `l` is a letter there, not a view
-        // switch (the chat composer's and the Settings sections' rule).
+        // switch (the chat composer's and the Settings sections' rule). This is checked **before**
+        // the matrix's own key, so a draft can still contain an `m`.
         if self.capturing() {
             return match self.view {
                 View::Skills => self.library.on_key(key, ctx),
                 View::Templates => self.templates.on_key(key, ctx),
             };
+        }
+        // And the matrix's key, which opens it. It is checked before the switch line's arms and
+        // after the editors', so `m` is a letter in a form and the matrix's key in Browse.
+        if key.code == KeyCode::Char(MATRIX_KEY) && self.plain(&key) {
+            return self.matrix.on_key(key, ctx);
         }
         match key.code {
             KeyCode::Char('h' | 'l' | '[' | ']') | KeyCode::Left | KeyCode::Right => {
@@ -128,6 +166,7 @@ impl Tab for SkillsTab {
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         self.templates.on_reply(reply, ctx);
         self.library.on_reply(reply, ctx);
+        self.matrix.on_reply(reply, ctx);
     }
 
     fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
@@ -153,6 +192,10 @@ impl Tab for SkillsTab {
             ])),
             switch,
         );
+        if self.matrix.is_open() {
+            self.matrix.render(frame, body, ctx);
+            return;
+        }
         match self.view {
             View::Skills => self.library.render(frame, body, ctx),
             View::Templates => self.templates.render(frame, body, ctx),
