@@ -196,10 +196,15 @@ pub trait Isolator: Send + Sync + fmt::Debug {
         commits: &'a [RunStepCommit],
     ) -> IsolatorFuture<'a, Option<DiffBlock>>;
 
-    /// MOD-9 D89: the repo-relative paths the previous attempt's commits touched, one entry per
-    /// `(repo, path)`, in `commits` order and then git's own order. Empty when no row committed
+    /// MOD-9 D89: the repo-relative paths the previous attempt's commits touched, in `commits`
+    /// order and then git's own order, one entry per name git lists. Empty when no row committed
     /// anything, and when `git` is unusable — the file set is a hint, and its absence degrades a
     /// prompt rather than failing it.
+    ///
+    /// The list is not unique: two rows of one repository carry the same `(repo, path)`, and it is
+    /// the consumer that de-duplicates. A caller reading only this doc must not assume one entry
+    /// per file — see [`GixIsolator::changed_paths`](crate::isolate::real::GixIsolator), which says
+    /// why git's own list is passed through verbatim.
     ///
     /// This is the input the excerpt ranker's tier 2 has always read
     /// ([`ExcerptRequest::changed_paths`](htui_core::prompt::excerpt::ExcerptRequest::changed_paths))
