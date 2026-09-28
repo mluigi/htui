@@ -268,15 +268,15 @@ impl TextArea {
             return Vec::new();
         }
         let (line, _) = self.cursor_line_col();
-        let from = line_start(&self.text, self.cursor);
-        let to = line_end(&self.text, self.cursor);
+        let row_start = line_start(&self.text, self.cursor);
+        let row_end = line_end(&self.text, self.cursor);
         // The drawn column, not the char or cluster column: the viewport and the highlight both
         // count a tab as the cells it draws as, and a wide cluster as the two it takes.
-        let col: usize = drawn(&self.text[from..self.cursor])
+        let col: usize = drawn(&self.text[row_start..self.cursor])
             .iter()
             .map(|(_, _, cells)| cells)
             .sum();
-        let row = drawn(&self.text[from..to]);
+        let row = drawn(&self.text[row_start..row_end]);
         let row_starts = start_columns(&row);
         let at_width = row
             .get(row_starts.partition_point(|&c| c < col))
