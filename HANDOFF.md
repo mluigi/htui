@@ -14,7 +14,12 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-28):** **ANA-21 was concluded** (`docs/decisions/ana/ana-21.md`): a
+**Current status (2026-09-28):** **CLEAN-5 was done** (`docs/decisions/clean/clean-5.md`): the MOD-4
+merge-hook test no longer waits a fixed 3 s for a merge whose future it dropped; it polls every
+100 ms for the landed state with a 30 s deadline that reports what it saw, so a hung merge is
+diagnosed rather than timed out. The whole `gix_isolator` file passes (34), including under a
+12-way CPU load, which is the condition that produced the flake.
+Before it, **ANA-21 was concluded** (`docs/decisions/ana/ana-21.md`): a
 model weight is a coarse ordinal tier (S 95, A 80, B 65, C 45, D 25, 0 = never given a slot) keyed on
 the phase's `name` in `agent.settings.weights`, cost excluded because all three seeded agents are
 `subscription`; slot 0 stays `eligible[0]` so the priority order stands and only rival slots are
@@ -33,11 +38,7 @@ milestones: a box is keyed on its `box.toml` id and checked by a keyed machine f
 declared tags and quirks as a compare-and-set; `R-ORCH-10` refuses a missing tag at enqueue and at
 claim; and milestone 4 infers repo paths under the workspace root (Settings > Hierarchy `i`, manual
 fallback `b`) and puts excerpts read from those roots into phase prompts and the preview (the judge
-keeps none, D109). MOD-49 is unblocked; a MOD-4 test flake seen at its gate is CLEAN-5.
-Before it, **ANA-22 was concluded** (`docs/decisions/ana/ana-22.md`): a skill
-is pure library content attached at global, project or phase level, and the attachment carries the
-activation (`always`, `glob`, `off`; language compiled to globs); it unblocks MOD-9 milestones 3 and 4. MOD-9's
-PRD is up (`.claude/prds/mod-9-skill-library-templates.prd.md`); agent help while editing is MOD-55.
+keeps none, D109). MOD-49 is unblocked.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
 (MOD-38) and `0007_skill_attachments` (MOD-9 milestone 2; cache: `0001`..`0004`), so **the next
@@ -726,16 +727,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   in a change that first pins which stop reason each shipped loop case reaches, because the fix can
   change that. Source: `.claude/plans/mod-4-orch-fanout.blueprint.md` F-B and §11, carried unchanged
   through milestones 5 and 6 (`docs/decisions/mod/mod-4.md`, "Carried").
-- [ ] **CLEAN-5 - `a_merge_dropped_mid_hook_still_lands_and_leaves_no_merge_head` flakes under
-  load** (from MOD-7 milestone 4 gate; the test is MOD-4's, `62777f4`). `R-ORCH-8`.
-  `crates/htui-orch/tests/gix_isolator.rs` drops a `merge_no_ff` future after 300 ms while the
-  primary's `pre-merge-commit` hook runs `sleep 2`, then waits a **fixed 3 s** before asserting
-  that the merge landed with parents `[before, after]`, no `index.lock` and no `MERGE_HEAD`. Under
-  load the detached `git merge` has not finished by then: `git log -1 --format=%P HEAD` is empty and
-  the case fails. It failed 1 of 3 runs alone at MOD-7 milestone 4's gate (2026-09-26) and is not
-  caused by MOD-7. Suggested fix, test-only: replace the fixed sleep with a poll (every 100 ms,
-  deadline about 30 s) until `%P` reads `before after` and neither `index.lock` nor `MERGE_HEAD`
-  exists, then run the existing assertions; the deadline keeps a real hang loud.
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
@@ -777,5 +768,5 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-23 licensed coding benchmark source, ANA-24 learned weights)                            |
 | MOD-N   | 41 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-5 merge-hook test flake)                |
+| CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

@@ -3332,9 +3332,28 @@ async fn a_merge_dropped_mid_hook_still_lands_and_leaves_no_merge_head() {
         dropped.is_err(),
         "the merge was still inside its hook when its future was dropped: {dropped:?}"
     );
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
+    // The dropped `git merge` keeps running after its future is dropped, and the 2 s hook it is
+    // inside can outlast any fixed wait under load (CLEAN-5). Poll for the state the assertions
+    // below check rather than guessing a sleep, and carry the failure on a deadline so a real
+    // hang stays loud instead of being mistaken for a slow merge.
     let dot_git = primary.join(".git");
+    let want_parents = format!("{before} {after}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let parents = git_out(&git, &primary, &["log", "-1", "--format=%P", "HEAD"]).await;
+        let index_lock = dot_git.join("index.lock").exists();
+        let merge_head = dot_git.join("MERGE_HEAD").exists();
+        if parents == want_parents && !index_lock && !merge_head {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the dropped merge did not land within 30s: HEAD parents {parents:?}, want \
+             {want_parents:?}, index.lock {index_lock}, MERGE_HEAD {merge_head}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     assert!(
         !dot_git.join("index.lock").exists(),
         "no index.lock is left behind"
@@ -3345,7 +3364,7 @@ async fn a_merge_dropped_mid_hook_still_lands_and_leaves_no_merge_head() {
     );
     assert_eq!(
         git_out(&git, &primary, &["log", "-1", "--format=%P", "HEAD"]).await,
-        format!("{before} {after}"),
+        want_parents,
         "the merge landed with D25's parents [before, after]"
     );
     assert_eq!(porcelain_status(&git, &primary).await, "", "and clean");

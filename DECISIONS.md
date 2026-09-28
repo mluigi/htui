@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[CLEAN-5](docs/decisions/clean/clean-5.md)** - `a_merge_dropped_mid_hook_still_lands_and_leaves_no_merge_head` flakes under load (done, 2026-09-28)
 - **[ANA-21](docs/decisions/ana/ana-21.md)** - Per-model weights for agent assignment, derived from public sources (concluded, 2026-09-28)
 - **[MOD-7](docs/decisions/mod/mod-7.md)** - Box registry + capabilities (done, 2026-09-26)
 - **[ANA-22](docs/decisions/ana/ana-22.md)** - How a skill is stored and when it activates (concluded, 2026-09-25)
