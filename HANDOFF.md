@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-26):** **MOD-7 was done** (`docs/decisions/mod/mod-7.md`), all four
+**Current status (2026-09-28):** **MOD-56 was done** (`docs/decisions/mod/mod-56.md`): `terminal::init`
+builds the terminal itself instead of calling `ratatui::init`, so htui's panic hook is the outermost
+one and `restores_the_terminal()` is consulted before anything restores — a provider panic that
+`run_providers` contains (H-20) no longer tears the terminal down mid-session. `tests/panic_hook.rs`
+drives the real chain; `tests/panic_hook_order.rs` is a source guard that fails if a ratatui init
+comes back. Closes MOD-9 milestone-1 blueprint finding F-U.
+Before it, **MOD-7 was done** (`docs/decisions/mod/mod-7.md`), all four
 milestones: a box is keyed on its `box.toml` id and checked by a keyed machine fingerprint
 (migration `0005_box_identity`); a probe fills hardware, tools and tags; Settings > Boxes edits
 declared tags and quirks as a compare-and-set; `R-ORCH-10` refuses a missing tag at enqueue and at
@@ -25,10 +31,6 @@ Before it, **ANA-22 was concluded** (`docs/decisions/ana/ana-22.md`): a skill
 is pure library content attached at global, project or phase level, and the attachment carries the
 activation (`always`, `glob`, `off`; language compiled to globs); it unblocks MOD-9 milestones 3 and 4. MOD-9's
 PRD is up (`.claude/prds/mod-9-skill-library-templates.prd.md`); agent help while editing is MOD-55.
-Before it, **MOD-38 was done** (`docs/decisions/mod/mod-38.md`): migration
-`0006_requirements` adds `item.resolution` and the requirement tables behind new store methods on
-MemStore, PgStore and the cache; `closed` is now reachable only through `close_out`, which takes a
-resolution (amends ANA-2 §4.3). MOD-39 (Requirements tab) is unblocked.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
 (MOD-38) and `0007_skill_attachments` (MOD-9 milestone 2; cache: `0001`..`0004`), so **the next
@@ -661,18 +663,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   which agent and model answer (the chat driver or a one-shot CLI call), whether the exchange is
   recorded, and how secrets in a body are scrubbed before they leave. Blocked on MOD-9 milestone 1.
 
-- [ ] **MOD-56 - htui's panic hook is wrapped by ratatui's, so a contained panic still restores the
-  terminal** (from MOD-9, milestone-1 blueprint finding F-U; maintainer-decided 2026-09-26).
-  `R-ID-1`, `R-TUI-1`. `terminal::init` (`crates/htui/src/terminal.rs:26-43`) installs htui's
-  **conditional** hook and then calls `ratatui::init()`, whose `try_init` wraps whatever hook is
-  current in ratatui's **unconditional** `restore()` (`ratatui-0.30.2/src/init.rs:397-403`,
-  `:566-572`). So a panic that `htui_agent::excerpt::run_providers` contains (MOD-2 review M1,
-  H-20) still drops the terminal out of raw mode and the alternate screen mid-session, and
-  `restores_the_terminal()` is never consulted first; `tests/panic_hook.rs` tests only the
-  predicate. Fix shape: initialise without ratatui's hook (build the terminal the way `enter`
-  already does, `terminal.rs:88`) or install htui's hook after `ratatui::init` with `take_hook`
-  dropping ratatui's, plus a test that runs the real hook chain. Not blocked.
-
 - [ ] **MOD-57 - Run the external editor inside the TUI pane** (from MOD-9, merge of MOD-7
   milestone 2, maintainer-decided 2026-09-26). `R-TUI-1`, `R-TUI-7`, `R-NF-1`. Today `E`/`Ctrl+E`
   in the Templates editor (and any later user of the shared `ui::TextArea`) suspends the whole TUI
@@ -745,6 +735,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-21 per-model weights)                                                                  |
-| MOD-N   | 41 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 40 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-55 agent help in the editor, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-5 merge-hook test flake)                |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

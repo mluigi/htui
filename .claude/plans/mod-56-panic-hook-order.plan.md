@@ -1,8 +1,11 @@
 # Plan: MOD-56 — htui's panic hook runs inside ratatui's, so a contained panic still restores the terminal
 
-> **Status: fact-checked, awaiting the CONFIRM gate** (2026-09-28). 11 claims: 11 verified, 0
-> amended, 0 falsified; the verdicts are in "Verified claims" at the end. No amendment changed a
-> decision.
+> **Status: done** (2026-09-28). Confirmed by the maintainer, implemented on branch `mod-56`
+> (`ffc2ffd`, review fixes `8867c86` and `bff43f8`), closed out in
+> [`docs/decisions/mod/mod-56.md`](../../../docs/decisions/mod/mod-56.md). Fact-check: 11 claims,
+> 11 verified, 0 falsified; verdicts in "Verified claims" below. Three of them were later corrected
+> by the blueprint (the `ratatui::backend::` path on claim 5, the `init.rs:398-402` range on claim 1,
+> and D220's panic count), and Risk 3 was rewritten after the review raised its severity.
 
 **Source**: `HANDOFF.md` MOD-56 (from MOD-9, milestone-1 blueprint finding F-U; maintainer-decided
 2026-09-26). `terminal::init` installs htui's conditional hook and then calls `ratatui::init()`,
