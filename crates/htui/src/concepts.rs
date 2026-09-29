@@ -15,7 +15,7 @@ use htui_store::embed::FastEmbedder;
 use htui_store::pg::CONNECT_TIMEOUT;
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::vector::{Hit, PointType, QdrantStore, SearchQuery, VectorStore as _};
-use htui_store::vector_sync::Indexer;
+use htui_store::vector_sync::{Indexer, SyncReport};
 use htui_store::{HeadlessError, PgStore, identity, secret};
 
 /// Options of `--search-items`.
@@ -43,6 +43,15 @@ pub const DECISION_RESOLUTIONS: [Resolution; 3] = [
     Resolution::Concluded,
     Resolution::Rejected,
 ];
+
+/// The search both front ends send (MOD-64 D239): `text` in `projects`, narrowed to decisions (items
+/// closed as one of [`DECISION_RESOLUTIONS`], and their documents) when `decisions` is set, at most
+/// `limit` hits. No type or status filter: `--search-items` has none either.
+#[must_use]
+pub fn query(text: &str, projects: Vec<ProjectId>, decisions: bool, limit: u64) -> SearchQuery {
+    let _ = (text, projects, decisions, limit);
+    todo!()
+}
 
 /// Builds the Qdrant settings from what the keyring holds.
 ///
@@ -127,7 +136,7 @@ async fn scopes(pg: &PgStore, project: Option<&str>) -> anyhow::Result<Vec<Scope
 /// Missing settings, an unreachable Postgres or Qdrant, a model that cannot load.
 pub async fn index_items(project: Option<&str>) -> anyhow::Result<()> {
     let (pg, store) = open().await?;
-    let mut report = htui_store::vector_sync::SyncReport::default();
+    let mut report = SyncReport::default();
     for scope in scopes(&pg, project).await? {
         report += Indexer::sync(&pg, &scope, &store).await?;
     }
@@ -203,6 +212,14 @@ pub fn format_hit(hit: &Hit) -> String {
         hit.score,
         hit.snippet
     )
+}
+
+/// What one index run did, as one line (MOD-64 D237, D239): `htui --index-items` prints it on
+/// stderr and the search overlay under its hits.
+#[must_use]
+pub fn report_line(report: &SyncReport) -> String {
+    let _ = report;
+    todo!()
 }
 
 #[cfg(test)]
@@ -312,4 +329,43 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn query_narrows_to_decisions_only_when_asked() {
+        let projects = vec![
+            ProjectId(Uuid::from_u128(2)),
+            ProjectId(Uuid::from_u128(1)),
+        ];
+        for decisions in [false, true] {
+            let q = query("closed items", projects.clone(), decisions, 7);
+            assert_eq!(q.text, "closed items");
+            assert_eq!(q.projects, projects);
+            assert_eq!(q.limit, 7);
+            assert!(q.types.is_empty() && q.statuses.is_empty(), "{q:?}");
+            let expected = if decisions {
+                DECISION_RESOLUTIONS.to_vec()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(q.resolutions, expected, "decisions = {decisions}");
+        }
+    }
+
+    #[test]
+    fn report_line_is_index_items_wording() {
+        let report = SyncReport {
+            items_rebuilt: 1,
+            items_unchanged: 2,
+            requirements_rebuilt: 3,
+            requirements_unchanged: 4,
+            points_upserted: 5,
+            points_deleted: 6,
+        };
+        assert_eq!(
+            report_line(&report),
+            "indexed: 1 item(s) rebuilt, 2 unchanged; 3 requirement(s) rebuilt, 4 unchanged; \
+             5 point(s) written, 6 removed"
+        );
+    }
+
 }
