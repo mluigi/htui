@@ -4077,7 +4077,8 @@ async fn a_live_lease_blocks_an_answer_from_another_process<H: CaseHarness>(harn
 /// MOD-40 plan D1, D2 (ANA-16 C1): a walk suspended between its session and its settle, whose run
 /// another process adopted meanwhile, wakes and writes nothing to the step. Its `finish_step` is
 /// fenced by the owner it walked under, and so is a recorder built the way the engine builds one.
-/// The adopter's row and log stand.
+/// The adopter's row and log stand. The fence reads as a taken lease: the caller gets `LeaseLost`
+/// and the isolator releases the run's guards once, as a heartbeat's abandon would.
 async fn a_suspended_walk_cannot_write_after_adoption<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     primary_repo(&orch).await;
@@ -4127,9 +4128,13 @@ async fn a_suspended_walk_cannot_write_after_adoption<H: CaseHarness>(harness: &
     wake.notify_one();
     let woke = walk.await;
     assert!(
-        matches!(&woke, Err(EngineError::Store(htui_core::store::StoreError::Fenced { step }))
-            if *step == prd.id),
+        matches!(&woke, Err(EngineError::LeaseLost { run: lost }) if *lost == run),
         "{woke:?}"
+    );
+    assert_eq!(
+        orch.isolator().releases(),
+        1,
+        "the fenced walk's guards are released, once"
     );
     assert_eq!(
         step_at(&other, run, 0, 1).await,

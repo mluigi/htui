@@ -1667,8 +1667,11 @@ where
     /// walk is dropped where it stands, **before** anything else. An expired run then enters
     /// [`DeadWalks`] (plan D140), so the next sweep gives its lease back. Then
     /// `Isolator::release` drops this process's guards for the run (D99), and the caller gets
-    /// [`EngineError::LeaseLost`]. Generic over the walk's output, so one wrapper serves every
-    /// command's post-unpark tail (blueprint F-M).
+    /// [`EngineError::LeaseLost`]. A walk's own `Err` that is the store's `Fenced` (MOD-40 plan
+    /// D2: another process adopted the run before the heartbeat saw it) is an abandon too: the
+    /// guards are released, no lease is given back, and the caller gets `LeaseLost`. Generic
+    /// over the walk's output, so one wrapper serves every command's post-unpark tail
+    /// (blueprint F-M).
     ///
     /// **A runtime with a time driver is required** (blueprint H-3): the heartbeat sleeps on
     /// `tokio::time::sleep`, so every engine entry that walks — [`Self::dispatch`],
@@ -1699,11 +1702,11 @@ where
     }
 
     /// [`Self::walk_leased`]'s race of `walk` against the heartbeat, without its releases: the
-    /// outer `Err` is the heartbeat's [`EngineError::LeaseLost`], with the walk already dropped,
-    /// [`DeadWalks`] and the guards handled as `walk_leased` documents; the inner `Result` is the
-    /// walk's own answer, which the caller settles. `AcceptArtifact`'s window uses it directly
-    /// (plan D86): its run is parked, so a walk's release on `Ok` would give back the lease its
-    /// `AnswerGate(Approved)` tail is about to renew.
+    /// outer `Err` is [`EngineError::LeaseLost`], the heartbeat's or a fenced walk's, with the
+    /// walk already dropped, [`DeadWalks`] and the guards handled as `walk_leased` documents; the
+    /// inner `Result` is the walk's own answer, which the caller settles. `AcceptArtifact`'s
+    /// window uses it directly (plan D86): its run is parked, so a walk's release on `Ok` would
+    /// give back the lease its `AnswerGate(Approved)` tail is about to renew.
     async fn heartbeaten<T, F>(
         &self,
         run: RunId,
@@ -1724,6 +1727,19 @@ where
         // Both boxed: `select` needs `Unpin`, and dropping `select`'s output does not drop a
         // stack-pinned walk (blueprint H-11). A boxed one goes when its box does.
         match futures::future::select(Box::pin(walk), Box::pin(beat)).await {
+            // MOD-40 review: a walk the store fenced (`Fenced`, from its recorder or its settle)
+            // wrote under a lease another process adopted before this heartbeat noticed. It is
+            // the abandon below, reached by the walk rather than the beat: the guards go, and
+            // the lease is a stranger's, so nothing gives it back.
+            Either::Left((Err(err), beat)) if is_fenced(&err) => {
+                drop(beat);
+                self.release_guards(
+                    run,
+                    "releasing the run's guards after a fenced write failed",
+                )
+                .await;
+                Err(EngineError::LeaseLost { run })
+            }
             Either::Left((out, beat)) => {
                 drop(beat);
                 Ok(out)
@@ -5711,6 +5727,20 @@ struct JudgePrompts {
     template: SnapshotTemplate,
 }
 
+/// MOD-40 review: whether `err` is the store's [`StoreError::Fenced`], however the walk carried
+/// it: a settle write's own, or the recorder's through [`htui_agent::RecordError`] or
+/// [`htui_agent::error::DriverError`].
+const fn is_fenced(err: &EngineError) -> bool {
+    matches!(
+        err,
+        EngineError::Store(StoreError::Fenced { .. })
+            | EngineError::Record(htui_agent::RecordError::Store(StoreError::Fenced { .. }))
+            | EngineError::Driver(htui_agent::error::DriverError::Store(
+                StoreError::Fenced { .. }
+            ))
+    )
+}
+
 /// The `fanout_index` of a candidate the judge prompt's trimmer dropped outright (plan D53).
 fn dropped_candidate(forward: &AssembledPrompt) -> Option<i32> {
     forward
@@ -8304,6 +8334,180 @@ mod tests {
             !harness.orch.dead_walks.contains(run),
             "plan D140: an abandoned walk's lease is the stranger's, so it is never a dead walk"
         );
+    }
+
+    /// MOD-40 review: a walk whose run another process adopted **mid-session** is refused by the
+    /// store's fence at its next recorder or settle write, not by its heartbeat. That refusal is
+    /// a taken lease all the same: the isolator releases the run's guards once and the caller
+    /// reads `LeaseLost`, so no `shared_serialized` guard outlives the walk. The adopter's lease
+    /// stands.
+    #[tokio::test]
+    async fn a_walk_fenced_mid_session_releases_its_guards() {
+        use std::sync::Arc;
+
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        let stalled = Arc::new(tokio::sync::Notify::new());
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let graphs = harness.orch.graphs();
+        let driver = |_candidate: &SnapshotCandidate,
+                      key: &SessionKey<'_>|
+         -> Box<dyn htui_agent::driver::AgentDriver> {
+            Box::new(SuspendingDriver {
+                inner: harness.orch.driver_for_key(key),
+                stalled: Arc::clone(&stalled),
+                wake: Arc::clone(&wake),
+            })
+        };
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let engine = super::Engine::new(
+            super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
+                .await
+                .expect("the harness has a box"),
+        );
+
+        let mut walk = Box::pin(engine.dispatch(Command::StartRun {
+            item: ids::HTUI_FEAT_3,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        }));
+        if let futures::future::Either::Left(_) =
+            futures::future::select(walk.as_mut(), Box::pin(stalled.notified())).await
+        {
+            panic!("the walk finished instead of suspending mid-session");
+        }
+        let run = harness
+            .orch
+            .store
+            .runs(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|run| run.status == RunStatus::Running)
+            .expect("the suspended walk left the run `running`")
+            .id;
+        let other = harness.orch.restarted();
+        assert_eq!(
+            super::sweep_fake(&other)
+                .await
+                .expect("the sweep adopts")
+                .iter()
+                .map(|adopted| adopted.run)
+                .collect::<Vec<_>>(),
+            [run],
+            "the second process adopts the run mid-session"
+        );
+
+        wake.notify_one();
+        let refused = walk
+            .await
+            .expect_err("the woken session's writes are fenced");
+        assert!(
+            matches!(refused, EngineError::LeaseLost { run: lost } if lost == run),
+            "{refused}"
+        );
+        assert_eq!(
+            harness.orch.isolator.releases(),
+            1,
+            "the fenced walk's guards are released, once"
+        );
+        assert!(
+            other
+                .store
+                .refresh_lease(run, other.owner(), TimeDelta::minutes(1))
+                .await
+                .expect("MemStore refreshes"),
+            "the adopter still holds the lease"
+        );
+    }
+
+    /// An [`AgentDriver`](htui_agent::driver::AgentDriver) whose session signals `stalled` at its
+    /// first pull and waits for `wake` before playing `inner`'s: a walk suspended mid-session.
+    #[derive(Debug)]
+    struct SuspendingDriver {
+        inner: Box<dyn htui_agent::driver::AgentDriver>,
+        stalled: std::sync::Arc<tokio::sync::Notify>,
+        wake: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl htui_agent::driver::AgentDriver for SuspendingDriver {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn caps(&self) -> DriverCaps {
+            self.inner.caps()
+        }
+
+        fn start<'a>(
+            &'a self,
+            spec: htui_agent::driver::SessionSpec,
+            prompt: String,
+        ) -> htui_agent::driver::DriverFuture<'a, Box<dyn htui_agent::driver::AgentSession>>
+        {
+            Box::pin(async move {
+                let inner = self.inner.start(spec, prompt).await?;
+                Ok(Box::new(SuspendingSession {
+                    inner,
+                    suspend: Some((
+                        std::sync::Arc::clone(&self.stalled),
+                        std::sync::Arc::clone(&self.wake),
+                    )),
+                })
+                    as Box<dyn htui_agent::driver::AgentSession>)
+            })
+        }
+    }
+
+    /// [`SuspendingDriver`]'s session: `suspend` is taken by the first pull.
+    #[derive(Debug)]
+    struct SuspendingSession {
+        inner: Box<dyn htui_agent::driver::AgentSession>,
+        suspend: Option<(
+            std::sync::Arc<tokio::sync::Notify>,
+            std::sync::Arc<tokio::sync::Notify>,
+        )>,
+    }
+
+    impl htui_agent::driver::AgentSession for SuspendingSession {
+        fn session_ref(&self) -> Option<&htui_agent::driver::AgentSessionRef> {
+            self.inner.session_ref()
+        }
+
+        fn next_event<'a>(
+            &'a mut self,
+        ) -> htui_agent::driver::DriverFuture<'a, Option<htui_agent::event::DriverEnvelope>>
+        {
+            Box::pin(async move {
+                if let Some((stalled, wake)) = self.suspend.take() {
+                    stalled.notify_one();
+                    wake.notified().await;
+                }
+                self.inner.next_event().await
+            })
+        }
+
+        fn send_follow_up<'a>(
+            &'a mut self,
+            text: String,
+        ) -> htui_agent::driver::DriverFuture<'a, ()> {
+            self.inner.send_follow_up(text)
+        }
+
+        fn answer_permission<'a>(
+            &'a mut self,
+            request_id: htui_agent::driver::PermissionRequestId,
+            answer: htui_agent::driver::PermissionAnswer,
+        ) -> htui_agent::driver::DriverFuture<'a, ()> {
+            self.inner.answer_permission(request_id, answer)
+        }
+
+        fn cancel<'a>(
+            &'a mut self,
+            grace: std::time::Duration,
+        ) -> htui_agent::driver::DriverFuture<'a, ()> {
+            self.inner.cancel(grace)
+        }
     }
 
     /// Plan D122 (review H1): a walk whose every refresh fails stops itself one `refresh` before
