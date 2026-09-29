@@ -716,7 +716,8 @@ pub enum StoreRequest {
         /// The deciding item's key, as typed.
         deciding: String,
     },
-    /// `cite(item, requirement, kind, None)`: a human citation. Not gated (plan P5).
+    /// `cite(item, requirement, kind, None)`: a human citation. Not gated (plan P5); `addresses`
+    /// or `reserves` of a requirement of the item's project only (PRD D4).
     CiteRequirement {
         /// The citing item.
         item: ItemId,

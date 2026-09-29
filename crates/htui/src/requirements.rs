@@ -12,7 +12,15 @@
 //! project's requirements owner's (`requirement_spec.owner_id`). A project with no spec is
 //! anyone's until the first gated write claims it. Every input check runs *before* the gate and
 //! the gate is the last step before the write (MOD-39 blueprint F-9), so a write refused for its
-//! input never claims a spec. Cite, uncite and re-confirm are not gated (ANA-11 §6).
+//! input never claims a spec. The store refusals the worker can see coming are checked there too:
+//! an area code the project already has, and an amend or withdraw of a requirement withdrawn at
+//! the version it names. What only the store decides (an author or box row gone since the worker
+//! read it, a racing write) still refuses after the gate, and the claimed spec stays.
+//!
+//! Cite, uncite and re-confirm are not gated (ANA-11 §6). A cite is PRD D4's: `addresses` or
+//! `reserves`, of a requirement of the item's own project. `amends` and `withdraws` are the
+//! decisions an amend or withdraw records, which plan P9 never uncites, so a hand-made one would
+//! be a decision nobody could take back and that no maintainer made.
 //!
 //! **The deciding item** of an amend or withdraw is typed as a key (plan P6) and looked up in the
 //! requirement's project only, matched exactly after `trim` and ASCII upper-casing: the store's
@@ -34,7 +42,8 @@ use htui_core::model::{
     RequirementState, RequirementUpdate, Scope, UserId,
 };
 use htui_core::store::{
-    CasOutcome, ReadStore as _, Result, StoreError, WriteStore as _, invalid_area_code,
+    CasOutcome, ReadStore as _, Result, StoreError, WriteStore as _, already_exists,
+    invalid_area_code, requirement_withdrawn,
 };
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 
@@ -264,6 +273,19 @@ pub fn decision_citation_stays(kind: CitationKind) -> String {
     format!("a `{kind}` citation records a decision; it is not uncited")
 }
 
+/// PRD D4: a human cites `addresses` or `reserves`; `amends` and `withdraws` are recorded by the
+/// gated amend and withdraw.
+#[must_use]
+pub fn decision_citation_not_cited(kind: CitationKind) -> String {
+    format!("a `{kind}` citation records a decision; an amend or a withdraw makes it, not a cite")
+}
+
+/// PRD D4: an item cites a requirement of its own project; `project` is the item's slug.
+#[must_use]
+pub fn requirement_of_another_project(key: &str, project: &str) -> String {
+    format!("{key} is not a requirement of {project}")
+}
+
 /// One read of the scope: for each id of `scope.project_ids`, in that order, the spec, the areas
 /// and every requirement. N reads on purpose, per event and never per keystroke.
 ///
@@ -339,14 +361,7 @@ pub async fn detail(backend: &Backend, id: RequirementId) -> Result<RequirementD
 /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item; whatever else the backend
 /// reports.
 pub async fn citations(backend: &Backend, item: ItemId) -> Result<ItemCitations> {
-    let project_id = backend
-        .item(item)
-        .await?
-        .ok_or_else(|| StoreError::NotFound {
-            entity: "item",
-            id: item.to_string(),
-        })?
-        .project_id;
+    let project_id = item_project(backend, item).await?;
     let active = RequirementFilter {
         states: Some(vec![RequirementState::Active]),
         ..RequirementFilter::default()
@@ -390,15 +405,22 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             if title.is_empty() {
                 return Err(StoreError::Constraint(BLANK_AREA_TITLE.to_owned()));
             }
-            let me = backend.this_user().await?;
-            gate(backend, &writer, *project, me).await?;
-            let position = writer
-                .requirement_areas(*project)
-                .await?
+            // Read before the gate: a code the project already has is the store's refusal, and
+            // the store would give it only after the gate had claimed a spec (blueprint F-9).
+            let areas = writer.requirement_areas(*project).await?;
+            if areas.iter().any(|area| area.code == code) {
+                return Err(StoreError::Constraint(already_exists(
+                    "requirement_area.code",
+                    code,
+                )));
+            }
+            let position = areas
                 .iter()
                 .map(|area| area.position)
                 .max()
                 .map_or(0, |last| last + 1);
+            let me = backend.this_user().await?;
+            gate(backend, &writer, *project, me).await?;
             writer
                 .create_requirement_area(NewRequirementArea {
                     id: RequirementAreaId::new(),
@@ -463,7 +485,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
         } => {
             let writer = write_access(backend)?;
             refuse_blank_body(body)?;
-            let project = requirement_project(backend, *id).await?;
+            let project = revisable(backend, *id, *expected_version).await?;
             let deciding = deciding_item(backend, scope, project, deciding).await?;
             let me = backend.this_user().await?;
             let box_id = backend.box_info().await?.map(|row| row.box_id);
@@ -488,7 +510,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             deciding,
         } => {
             let writer = write_access(backend)?;
-            let project = requirement_project(backend, *id).await?;
+            let project = revisable(backend, *id, *expected_version).await?;
             let deciding = deciding_item(backend, scope, project, deciding).await?;
             let me = backend.this_user().await?;
             let box_id = backend.box_info().await?.map(|row| row.box_id);
@@ -504,6 +526,26 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             kind,
         } => {
             let writer = write_access(backend)?;
+            // PRD D4, checked before the store: it would take `amends` / `withdraws` too, and a
+            // requirement of any project.
+            if matches!(kind, CitationKind::Amends | CitationKind::Withdraws) {
+                return Err(StoreError::Constraint(decision_citation_not_cited(*kind)));
+            }
+            let project = item_project(backend, *item).await?;
+            let cited =
+                backend
+                    .requirement(*requirement)
+                    .await?
+                    .ok_or_else(|| StoreError::NotFound {
+                        entity: "requirement",
+                        id: requirement.to_string(),
+                    })?;
+            if cited.project_id != project {
+                return Err(StoreError::Constraint(requirement_of_another_project(
+                    &cited.key,
+                    &project_label(backend, project).await?,
+                )));
+            }
             // `None`: a human citation, which is what `proposed_by_step_id` records (ANA-11 §4.3).
             writer.cite(*item, *requirement, *kind, None).await?;
             answer_citations(backend, *item).await
@@ -555,16 +597,41 @@ fn refuse_blank_body(body: &RequirementText) -> Result<()> {
     }
 }
 
-/// The requirement's project. A requirement is never deleted, so `NotFound` is not a race here
-/// and stays an error rather than a stale answer.
-async fn requirement_project(backend: &Backend, id: RequirementId) -> Result<ProjectId> {
-    backend
+/// The project of a requirement about to be amended or withdrawn at `expected_version`. A
+/// requirement is never deleted, so `NotFound` is not a race here and stays an error rather than a
+/// stale answer.
+///
+/// A requirement withdrawn at `expected_version` is refused here, in the store's words
+/// ([`requirement_withdrawn`]): the store refuses it only after [`gate`] has claimed a spec
+/// (blueprint F-9). At any other version it goes on, because the store checks divergence first
+/// and answers stale.
+async fn revisable(
+    backend: &Backend,
+    id: RequirementId,
+    expected_version: i32,
+) -> Result<ProjectId> {
+    let row = backend
         .requirement(id)
         .await?
-        .map(|row| row.project_id)
         .ok_or_else(|| StoreError::NotFound {
             entity: "requirement",
             id: id.to_string(),
+        })?;
+    if row.version == expected_version && row.state == RequirementState::Withdrawn {
+        return Err(StoreError::Constraint(requirement_withdrawn(&row.key)));
+    }
+    Ok(row.project_id)
+}
+
+/// The item's project.
+async fn item_project(backend: &Backend, item: ItemId) -> Result<ProjectId> {
+    backend
+        .item(item)
+        .await?
+        .map(|row| row.project_id)
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "item",
+            id: item.to_string(),
         })
 }
 
@@ -579,6 +646,10 @@ async fn project_label(backend: &Backend, project: ProjectId) -> Result<String> 
 /// Plan P6 and blueprint F-11: the item of `project` whose key is exactly `key`, trimmed and
 /// ASCII upper-cased (item keys are ASCII upper). The store's text filter narrows the read, and
 /// the exact match drops what it also finds (`ANA-10` for `ANA-1`, a title containing the key).
+///
+/// The read's scope is `project` alone, in the request's workspace: `items` never looks outside
+/// its scope, so the request's own scope would refuse every key of a requirement whose project it
+/// has left (a scope switch while the form was open).
 async fn deciding_item(
     backend: &Backend,
     scope: &Scope,
@@ -589,13 +660,17 @@ async fn deciding_item(
     if wanted.is_empty() {
         return Err(StoreError::Constraint(DECIDING_KEY_NEEDED.to_owned()));
     }
+    let only = Scope {
+        workspace_id: scope.workspace_id,
+        project_ids: vec![project],
+    };
     let filter = ItemFilter {
         project_ids: Some(vec![project]),
         text: Some(wanted.clone()),
         ..ItemFilter::default()
     };
     let found = backend
-        .items(scope, &filter)
+        .items(&only, &filter)
         .await?
         .into_iter()
         .find(|row| row.key == wanted);
@@ -613,13 +688,28 @@ async fn deciding_item(
 /// created the spec between the read and the write, and its owner decides, as it would have had
 /// the read come a moment later.
 async fn gate(backend: &Backend, writer: &Writer, project: ProjectId, me: UserId) -> Result<()> {
-    let owner = match writer.requirement_spec(project).await? {
+    let read = writer.requirement_spec(project).await?;
+    gate_after_read(backend, writer, project, me, read).await
+}
+
+/// [`gate`] from its read on, apart so a test can hand it the `None` that a racing claim has made
+/// stale.
+async fn gate_after_read(
+    backend: &Backend,
+    writer: &Writer,
+    project: ProjectId,
+    me: UserId,
+    read: Option<RequirementSpec>,
+) -> Result<()> {
+    let owner = match read {
         Some(spec) => spec.owner_id,
         None => match writer
             .set_requirement_spec(project, None, me, String::new())
             .await?
         {
-            CasOutcome::Applied(spec) | CasOutcome::Stale(spec) => spec.owner_id,
+            CasOutcome::Applied(spec) => spec.owner_id,
+            // Another session's claim won; its owner decides, and that may not be `me`.
+            CasOutcome::Stale(spec) => spec.owner_id,
         },
     };
     if owner == me {
@@ -660,17 +750,21 @@ mod tests {
     use super::{
         BLANK_AREA_TITLE, BLANK_BODY, CITATIONS_NAME, DECIDING_KEY_NEEDED, DETAIL_NAME,
         ItemCitations, READ_NAME, REQUEST_NAMES, RequirementDetail, RequirementText,
-        RequirementsSnapshot, decision_citation_stays, is_citation_write, is_tab_write,
-        matches_filter, no_deciding_item, not_the_maintainer, serve,
+        RequirementsSnapshot, decision_citation_not_cited, decision_citation_stays,
+        gate_after_read, is_citation_write, is_tab_write, matches_filter, no_deciding_item,
+        not_the_maintainer, requirement_of_another_project, serve,
     };
     use crate::store_worker::{self, StoreReply, StoreRequest};
     use chrono::TimeDelta;
     use htui_core::fixtures::{self, ids};
     use htui_core::model::{
-        AppUser, CitationKind, ItemId, Priority, ProjectId, RequirementAreaId, RequirementId,
-        RequirementState, Scope, UserId,
+        AppUser, CitationKind, ItemId, NewRequirement, NewRequirementArea, Priority, ProjectId,
+        RequirementAreaId, RequirementId, RequirementState, RequirementUpdate, Scope, UserId,
     };
-    use htui_core::store::{MemStore, StoreError, invalid_area_code};
+    use htui_core::store::{
+        MemStore, ReadStore as _, StoreError, WriteStore as _, already_exists, invalid_area_code,
+        requirement_withdrawn,
+    };
     use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE};
 
     fn demo() -> Backend {
@@ -1298,6 +1392,244 @@ mod tests {
             cited(&citations_of(&backend, ids::HTUI_ANA_2).await),
             [(ids::REQ_ENT_1, CitationKind::Amends, false)],
             "the decision stays"
+        );
+    }
+
+    /// An agy area `API` and its `R-API-1`, written straight to the store so agy keeps no spec (the
+    /// schema allows areas without one); `withdrawn` also withdraws it, leaving it at version 2.
+    async fn agy_requirement(backend: &Backend, withdrawn: bool) -> RequirementId {
+        let writer = backend.writer().expect("a memory store has a writer");
+        let area = RequirementAreaId::new();
+        writer
+            .create_requirement_area(NewRequirementArea {
+                id: area,
+                project_id: ids::PROJECT_AGY,
+                code: "API".to_owned(),
+                title: "Interface".to_owned(),
+                description: String::new(),
+                position: 0,
+            })
+            .await
+            .expect("an area needs no spec");
+        let id = RequirementId::new();
+        writer
+            .mint_requirement(
+                area,
+                NewRequirement {
+                    id,
+                    body: "Body.".to_owned(),
+                    rationale: String::new(),
+                    priority: Priority::Must,
+                    created_by: ids::USER,
+                    box_id: None,
+                },
+            )
+            .await
+            .expect("a mint needs no spec");
+        if withdrawn {
+            let update = writer
+                .withdraw_requirement(id, 1, ids::AGY_FEAT_1, ids::USER, None)
+                .await
+                .expect("a withdraw needs no spec");
+            assert!(
+                matches!(update, RequirementUpdate::Updated(_)),
+                "{update:?}"
+            );
+        }
+        id
+    }
+
+    /// PRD D4: a hand-made `amends` or `withdraws` citation would be a decision no maintainer
+    /// made and plan P9 would never let go of; and an item cites its own project's requirements.
+    #[tokio::test]
+    async fn a_cite_is_addresses_or_reserves_of_the_items_own_project() {
+        let backend = demo();
+        let before = citations_of(&backend, ids::HTUI_FEAT_1).await;
+
+        for kind in [CitationKind::Amends, CitationKind::Withdraws] {
+            let request = StoreRequest::CiteRequirement {
+                item: ids::HTUI_FEAT_1,
+                requirement: ids::REQ_ENT_2,
+                kind,
+            };
+            match store_worker::serve(&backend, &request).await {
+                StoreReply::Failed { request, message } => {
+                    assert_eq!(request, "cite_requirement");
+                    assert!(
+                        message.contains(&decision_citation_not_cited(kind)),
+                        "{message}"
+                    );
+                }
+                other => panic!("a `{kind}` cite is refused, not {other:?}"),
+            }
+        }
+        assert_eq!(
+            citations_of(&backend, ids::HTUI_FEAT_1).await,
+            before,
+            "nothing is cited"
+        );
+
+        let elsewhere = serve(
+            &backend,
+            &StoreRequest::CiteRequirement {
+                item: ids::AGY_FEAT_1,
+                requirement: ids::REQ_ENT_2,
+                kind: CitationKind::Addresses,
+            },
+        )
+        .await;
+        assert_eq!(
+            elsewhere.err(),
+            Some(StoreError::Constraint(requirement_of_another_project(
+                "R-ENT-2", "agy"
+            )))
+        );
+        assert!(
+            citations_of(&backend, ids::AGY_FEAT_1)
+                .await
+                .citations
+                .is_empty(),
+            "agy's FEAT-1 cites nothing"
+        );
+    }
+
+    /// Blueprint F-9 on a project with areas but no spec: a duplicate area code, an amend or
+    /// withdraw of a requirement withdrawn at the version it names, a blank body and an unknown
+    /// deciding key are all refused before the gate could claim the spec.
+    #[tokio::test]
+    async fn a_refusal_the_worker_can_see_coming_claims_no_spec() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+        let id = agy_requirement(&backend, true).await;
+
+        let duplicate = serve(
+            &backend,
+            &create_area(&scope, ids::PROJECT_AGY, " API ", "Again"),
+        )
+        .await;
+        assert_eq!(
+            duplicate.err(),
+            Some(StoreError::Constraint(already_exists(
+                "requirement_area.code",
+                "API"
+            )))
+        );
+
+        let withdrawn = Some(StoreError::Constraint(requirement_withdrawn("R-API-1")));
+        let amended = serve(&backend, &amend(&scope, id, 2, "FEAT-1")).await;
+        assert_eq!(amended.err(), withdrawn, "amend at the head");
+        let withdrawn_again = serve(&backend, &withdraw(&scope, id, 2, "FEAT-1")).await;
+        assert_eq!(withdrawn_again.err(), withdrawn, "withdraw at the head");
+
+        let mut blank = amend(&scope, id, 1, "FEAT-1");
+        if let StoreRequest::AmendRequirement { body, .. } = &mut blank {
+            *body = RequirementText::new("  ");
+        }
+        assert_eq!(
+            serve(&backend, &blank).await.err(),
+            Some(StoreError::Constraint(BLANK_BODY.to_owned()))
+        );
+        let unknown = Some(StoreError::Constraint(no_deciding_item("FEAT-99", "agy")));
+        let amended = serve(&backend, &amend(&scope, id, 1, "FEAT-99")).await;
+        assert_eq!(amended.err(), unknown, "amend by an unknown key");
+        let withdrawn_by = serve(&backend, &withdraw(&scope, id, 1, "FEAT-99")).await;
+        assert_eq!(withdrawn_by.err(), unknown, "withdraw by an unknown key");
+
+        assert_eq!(
+            read(&backend, &scope)
+                .await
+                .project(ids::PROJECT_AGY)
+                .expect("agy")
+                .spec,
+            None,
+            "a refused write claims nothing"
+        );
+    }
+
+    /// Plan P5's race: the gate read no spec, and another session's claim landed before this one.
+    /// The `Stale` claim hands the decision to the winner's owner.
+    #[tokio::test]
+    async fn a_claim_that_lost_the_race_leaves_the_decision_to_the_winner() {
+        let backend = stranger_first();
+        let stranger = backend
+            .this_user()
+            .await
+            .expect("the stranger is this user");
+        let writer = backend.writer().expect("a memory store has a writer");
+        let spec = backend
+            .requirement_spec(ids::PROJECT_HTUI)
+            .await
+            .expect("a memory read");
+        assert_eq!(spec.as_ref().map(|spec| spec.owner_id), Some(ids::USER));
+
+        // `None`: the read that htui's existing spec has since made stale.
+        let lost = gate_after_read(&backend, &writer, ids::PROJECT_HTUI, stranger, None).await;
+        assert_eq!(
+            lost.err(),
+            Some(StoreError::Constraint(not_the_maintainer("htui"))),
+            "the winner is not the stranger"
+        );
+        gate_after_read(&backend, &writer, ids::PROJECT_HTUI, ids::USER, None)
+            .await
+            .expect("the winner's owner passes");
+
+        assert_eq!(
+            backend
+                .requirement_spec(ids::PROJECT_HTUI)
+                .await
+                .expect("a memory read"),
+            spec,
+            "a stale claim writes nothing"
+        );
+    }
+
+    /// Blueprint F-10: a store with no row for this user reads rather than failing, and such a user
+    /// maintains a project with no spec and no other.
+    #[tokio::test]
+    async fn a_user_the_store_does_not_know_maintains_only_a_project_with_no_spec() {
+        let mut data = fixtures::demo_data();
+        data.users.clear();
+        let backend = Backend::memory(MemStore::from_demo(data));
+        assert!(backend.this_user().await.is_err(), "no user row");
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+        };
+
+        let snapshot = read(&backend, &scope).await;
+
+        let htui = snapshot.project(ids::PROJECT_HTUI).expect("htui");
+        assert!(htui.spec.is_some(), "htui has a spec");
+        assert!(!htui.maintainer, "and nobody unknown owns it");
+        assert!(
+            snapshot.project(ids::PROJECT_AGY).expect("agy").maintainer,
+            "a project with no spec is anyone's"
+        );
+    }
+
+    /// Plan P6 searches the requirement's project, whatever scope the request carries: a form sent
+    /// after a scope switch still finds its deciding item.
+    #[tokio::test]
+    async fn the_deciding_item_is_found_outside_the_request_scope() {
+        let backend = demo();
+        let agy_only = Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_AGY],
+        };
+
+        let reply = serve(&backend, &amend(&agy_only, ids::REQ_ENT_1, 2, "ANA-2")).await;
+
+        let Ok(StoreReply::Requirements(after)) = reply else {
+            panic!("the amend applies, got {reply:?}")
+        };
+        assert!(after.is_for(&agy_only), "the answer is the request's scope");
+        let revisions = detail_of(&backend, ids::REQ_ENT_1)
+            .await
+            .revisions
+            .expect("a memory store keeps revisions");
+        assert_eq!(
+            revisions.last().map(|row| row.deciding_key.as_deref()),
+            Some(Some("ANA-2"))
         );
     }
 
