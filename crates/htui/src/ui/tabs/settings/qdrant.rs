@@ -178,13 +178,14 @@ impl QdrantSection {
                         return Handled::Consumed;
                     }
                     self.mode = Mode::Browse;
-                    ctx.request(StoreRequest::SetQdrantUrl(url));
+                    self.send(StoreRequest::SetQdrantUrl(url), ctx);
                 }
                 if let Some(key_text) = key_to_submit {
                     self.mode = Mode::Browse;
-                    ctx.request(StoreRequest::SetQdrantApiKey(zeroize::Zeroizing::new(
-                        key_text,
-                    )));
+                    self.send(
+                        StoreRequest::SetQdrantApiKey(zeroize::Zeroizing::new(key_text)),
+                        ctx,
+                    );
                 }
                 Handled::Consumed
             }
@@ -200,7 +201,7 @@ impl QdrantSection {
             Mode::ConfirmClear => match key.code {
                 KeyCode::Char('y') => {
                     self.mode = Mode::Browse;
-                    ctx.request(StoreRequest::ClearQdrantSettings);
+                    self.send(StoreRequest::ClearQdrantSettings, ctx);
                 }
                 KeyCode::Char('n') | KeyCode::Esc => self.mode = Mode::Browse,
                 _ => {}
@@ -208,6 +209,14 @@ impl QdrantSection {
             _ => return Handled::Pass,
         }
         Handled::Consumed
+    }
+
+    /// Sends one write and remembers its name until the reply, so `on_snapshot` can say what it
+    /// did and a failure lands on this section (the Connection section's `send`).
+    fn send(&mut self, request: StoreRequest, ctx: &Ctx<'_>) {
+        self.busy = Some(request.name());
+        self.notice = None;
+        ctx.request(request);
     }
 
     fn hint_text(&self) -> String {
@@ -339,7 +348,12 @@ impl SettingsSection for QdrantSection {
                 self.move_cursor(false);
                 Handled::Consumed
             }
-            KeyCode::Char('r') => Handled::Pass,
+            // A re-read, never refused: it is how the unavailable state recovers (MOD-63). It sets
+            // no `busy`, like the Connection section's `r`.
+            KeyCode::Char('r') => {
+                ctx.request(StoreRequest::QdrantInfo);
+                Handled::Consumed
+            }
             _ => Handled::Pass,
         }
     }

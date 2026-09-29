@@ -5,6 +5,7 @@
 #![cfg(feature = "testkit")]
 
 use htui::app::{Action, Ctx, Handled};
+use htui::qdrant_settings_info::{QdrantSnapshot, QdrantState};
 use htui::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
@@ -2646,4 +2647,123 @@ async fn a_failed_or_idle_flow_leaves_a_notice_and_an_idle_section() {
         "the notice says what happened rather than implying the user did it: {rendered}"
     );
     assert!(rendered.contains("a authenticate"), "{rendered}");
+}
+
+/// A Qdrant snapshot with the URL stored and no key.
+fn qdrant_stored() -> QdrantSnapshot {
+    QdrantSnapshot {
+        url_state: QdrantState::Stored,
+        key_state: QdrantState::NotStored,
+        url_summary: Some("https://qdrant.example:6334".to_owned()),
+    }
+}
+
+/// The store requests a section sent since the queue was last drained.
+fn requests_of(bench: &SectionBench) -> Vec<StoreRequest> {
+    bench
+        .drained()
+        .into_iter()
+        .filter_map(|action| match action {
+            Action::Store(request) => Some(request),
+            _ => None,
+        })
+        .collect()
+}
+
+/// MOD-63: the hints advertise `r reload`, so `r` re-reads, and the unavailable state (whose only
+/// hint is `r reload`) recovers through it without leaving the section.
+#[tokio::test]
+async fn qdrant_r_re_reads_and_recovers_the_unavailable_state() {
+    let bench = SectionBench::new().await;
+    let mut section = QdrantSection::new();
+    bench.reply(&mut section, &StoreReply::Qdrant(qdrant_stored()));
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "r"), Handled::Consumed);
+    assert!(
+        matches!(requests_of(&bench).as_slice(), [StoreRequest::QdrantInfo]),
+        "one read from the browse state"
+    );
+
+    let mut section = QdrantSection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "qdrant_info",
+            message: "the keyring is locked".to_owned(),
+        },
+    );
+    let _ = bench.drained();
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(rendered.contains("r reload"), "{rendered}");
+    assert!(!rendered.contains("e edit"), "{rendered}");
+
+    assert_eq!(bench.key(&mut section, "r"), Handled::Consumed);
+    assert!(
+        matches!(requests_of(&bench).as_slice(), [StoreRequest::QdrantInfo]),
+        "one read from the unavailable state"
+    );
+    bench.reply(&mut section, &StoreReply::Qdrant(qdrant_stored()));
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        rendered.contains("e edit"),
+        "the fresh snapshot ends the outage: {rendered}"
+    );
+}
+
+/// A write remembers its name until the reply, so its snapshot says what it did and its failure
+/// lands on the section.
+#[tokio::test]
+async fn a_qdrant_write_says_what_it_did_or_why_it_failed() {
+    let bench = SectionBench::new().await;
+    let mut section = QdrantSection::new();
+    bench.reply(&mut section, &StoreReply::Qdrant(qdrant_stored()));
+    let _ = bench.drained();
+
+    bench.key(&mut section, "c");
+    bench.key(&mut section, "y");
+    assert!(
+        matches!(
+            requests_of(&bench).as_slice(),
+            [StoreRequest::ClearQdrantSettings]
+        ),
+        "y sends the clear"
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        rendered.contains("clear_qdrant_settings in flight"),
+        "{rendered}"
+    );
+    bench.reply(
+        &mut section,
+        &StoreReply::Qdrant(QdrantSnapshot {
+            url_state: QdrantState::NotStored,
+            key_state: QdrantState::NotStored,
+            url_summary: None,
+        }),
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        rendered.contains("the Qdrant settings are gone from the keyring"),
+        "{rendered}"
+    );
+
+    let mut section = QdrantSection::new();
+    bench.reply(&mut section, &StoreReply::Qdrant(qdrant_stored()));
+    bench.key(&mut section, "c");
+    bench.key(&mut section, "y");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "clear_qdrant_settings",
+            message: "the keyring refused the delete".to_owned(),
+        },
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        rendered.contains("the keyring refused the delete"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("in flight"), "{rendered}");
 }
