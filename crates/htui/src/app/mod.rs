@@ -10,7 +10,7 @@ pub use state::{App, Ctx, EDITOR_NEEDS_A_TAB, Emit, TopBarState};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::keymap::{Binding, KeyChord, KeyScope};
-use crate::ui::overlay::{MigrationPrompt, WorkspaceSwitcher};
+use crate::ui::overlay::{ConceptsSearch, MigrationPrompt, WorkspaceSwitcher};
 use crate::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection, PromptSection,
     QdrantSection,
@@ -73,6 +73,11 @@ pub fn register_all(app: &mut App) {
         action: Action::Overlay(OverlayAction::Open(WorkspaceSwitcher::ID)),
         help: "workspaces",
     });
+
+    // MOD-64 D236: the concepts search, global `Ctrl+F`. A chord, so no tab's letters and no text
+    // field's input can take it (every text widget passes chords, blueprint F7).
+    app.overlay_factories
+        .register(ConceptsSearch::ID, || Box::new(ConceptsSearch::new()));
 
     app.startup_overlay = Some(WorkspaceSwitcher::ID);
 
