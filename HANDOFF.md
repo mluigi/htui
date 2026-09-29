@@ -19,6 +19,9 @@ verify command keeps htui's process environment unchanged (plan D30), and PR #20
 closed unmerged. The agent it checks already runs with that same environment, so an allowlist on the
 verifier alone hid nothing and broke real verifiers. The rule that remains sits on **MOD-10**:
 resolved secrets in the agent's `SessionSpec.env` must never be handed to the verifier.
+The same day, **MOD-9 milestone 4 landed** (SKILL.md import, PR #21; see MOD-9 below), and two
+security fixes merged without an item: PR #16 pins the ACP session's file access to its directory
+(path traversal), and PR #19 bounds `.gitignore` reads and skips non-regular files in the excerpt walk.
 Before it, **MOD-32 was done** (`docs/decisions/mod/mod-32.md`): the
 `run_step.trim_record` write is now scrubbed whole — `TrimRecord::to_value` takes a `&dyn Scrubber`,
 returns `Result<Value, Unmasked>`, and all three engine call sites go through it, so a
@@ -33,59 +36,16 @@ claim-time tag rules are now pinned per store — `NotClaimable` outranks `Missi
 at another box, and blueprint D94's no-item case is never refused. Four tests, no production
 behaviour change, no shared trait method, no migration, and no count pin moved. The gate's Postgres
 DSN is now password-free via `~/.pgpass`.
-Before it, **MOD-54 was done**
-(`docs/decisions/mod/mod-54.md`): `TextField` and `TextArea` measure display cells and step by
-grapheme through the new private `crates/htui/src/ui/cells.rs`, so a CJK or emoji line occupies
-the columns it is drawn in and `Backspace` cannot split a combining sequence. It declares
-`unicode-width` and `unicode-segmentation`, both already in the graph via `ratatui-core`; no
-snapshot moved. The rest of the display-width problem is **MOD-60**. `R-NF-1` is argued, not
-gated: a Windows cross-check of `-p htui` cannot run on this box, and MOD-16 carries it.
-Before it, **MOD-31 was done** (`docs/decisions/mod/mod-31.md`):
-`AgentRuntime.background` is now tagged by what each task writes, and the install guard consults
-only the writing half. A running prompt preview — which writes nothing (MOD-2 D102) — no longer
-refuses an install, a login, a `ProbeBox` or the `Online` swap's registration probe, and the
-refusal now names a re-probe as well as a probe. One guard line repaired all five callers;
-`ProbeAgents` never shared the claim and still does not (recorded, not changed).
-Before it, **MOD-56 was done** (`docs/decisions/mod/mod-56.md`): `terminal::init`
-builds the terminal itself instead of calling `ratatui::init`, so htui's panic hook is the outermost
-one and `restores_the_terminal()` is consulted before anything restores — a provider panic that
-`run_providers` contains (H-20) no longer tears the terminal down mid-session. `tests/panic_hook.rs`
-drives the real chain; `tests/panic_hook_order.rs` is a source guard that fails if a ratatui init
-comes back. Closes MOD-9 milestone-1 blueprint finding F-U.
-Before it, **TOOL-3 was decided** (`docs/decisions/tool/tool-3.md`): the maintainer accepted that `cargo clippy --target x86_64-pc-windows-msvc` cannot run here — it dies in `ring`'s build script with `cc-rs: failed to find tool "lib.exe"` — so **MOD-16 is the only Windows check** and no C toolchain is installed to replace it. Re-verified unchanged 2026-09-28, and green for **neither** crate: `ring` reaches `-p htui` through sqlx on a path that predates MOD-20, and MOD-20's reqwest/rustls extended the same failure to `-p htui-agent`. MOD-20's plan D21 and its Validation block are amended so nothing still asserts a gate that never went green, and the README section says up front that its command does not run here. MOD-20's Windows code was reviewed by eye, never linted.
-Before it, **CLEAN-5 was done** (`docs/decisions/clean/clean-5.md`): the MOD-4
-merge-hook test no longer waits a fixed 3 s for a merge whose future it dropped; it polls every
-100 ms for the landed state with a 30 s deadline that reports what it saw, so a hung merge is
-diagnosed rather than timed out. The whole `gix_isolator` file passes (34), including under a
-12-way CPU load, which is the condition that produced the flake.
-Before it, **ANA-21 was concluded** (`docs/decisions/ana/ana-21.md`): a
-model weight is a coarse ordinal tier (S 95, A 80, B 65, C 45, D 25, 0 = never given a slot) keyed on
-the phase's `name` in `agent.settings.weights`, cost excluded because all three seeded agents are
-`subscription`; slot 0 stays `eligible[0]` so the priority order stands and only rival slots are
-apportioned, and `R-AGT-8` was amended to say so. Every figure was re-read from its primary source
-on 2026-09-28 (`docs/ANA-21-recheck-2026-09-28.md`); no model changed tier, but four draft figures
-did not reproduce — the draft's Sonnet 5 and Haiku 4.5 bases do not exist on Artificial Analysis at
-all, the SWE-ECI file is gone from the Epoch hub, and Opus 5.5 is absent from Epoch ECI. The
-refresh is a **source registry**, not a hardcoded fetcher: Epoch (CC BY 4.0) is the only source
-both fetchable and licensed for this use, so the analysis axis is fetched and the implement axis is
-maintained and dated, an undated entry resolving to 0 rather than to a stale number. Two follow-ups
-are spawned: **ANA-24** (find a licensed, effort-separated coding benchmark source) and **ANA-25**
-(learn weights from judge verdicts, behind its volume trigger). MOD-36 is unblocked.
-Before it, **MOD-7 was done** (`docs/decisions/mod/mod-7.md`), all four
-milestones: a box is keyed on its `box.toml` id and checked by a keyed machine fingerprint
-(migration `0005_box_identity`); a probe fills hardware, tools and tags; Settings > Boxes edits
-declared tags and quirks as a compare-and-set; `R-ORCH-10` refuses a missing tag at enqueue and at
-claim; and milestone 4 infers repo paths under the workspace root (Settings > Hierarchy `i`, manual
-fallback `b`) and puts excerpts read from those roots into phase prompts and the preview (the judge
-keeps none, D109). MOD-49 is unblocked.
+Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
 (MOD-38) and `0007_skill_attachments` (MOD-9 milestone 2; cache: `0001`..`0004`), so **the next
 migration is `0008`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
-(done, all four milestones), MOD-38 and MOD-9 milestones 1 and 2: store conformance `CASES` 77,
-`READ_CASES` 14, `htui-orch` `CASES` 72, `GraphSource` 7 methods, `StoreRequest` 69, `StoreReply`
-40, `hierarchy::REQUEST_NAMES` 13, 268 `.sqlx` files, 88 `crates/htui/tests/snapshots`,
+(done, all four milestones), MOD-38 and MOD-9 milestones 1 to 4 (re-counted 2026-09-29 at
+`215bc33`): store conformance `CASES` 83,
+`READ_CASES` 14, `htui-orch` `CASES` 72, `GraphSource` 7 methods, `StoreRequest` 75, `StoreReply`
+43, `hierarchy::REQUEST_NAMES` 13, 281 `.sqlx` files, 96 `crates/htui/tests/snapshots`,
 `MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 34 pinned commented
 columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 2` with `skill_choices`.
 Excerpts reach phase prompts since MOD-7 milestone 4, so a phase-prompt digest recorded before
@@ -210,7 +170,9 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
     Postgres; milestone 5's D96 closed its crash half. Nothing writes `gate_outcome = skipped`, so a
     `never`/`on_failure` pass leaves the gate NULL and the step list renders `—` (engine blueprint
     F-K, H-9, H-10; drive plan, "What this milestone touches").
-  - **R-6**: nothing writes `phase_agent` for an override graph copy, or `is_override`. The plans
+  - **R-6**: nothing writes `phase_agent` for an override graph copy: `WriteStore` has no
+    `phase_agent` writer at all. The `is_override` half is closed, since MOD-9 milestone 3's
+    `override_graph` (`crates/htui-orch/src/graph.rs`) writes it on every copy. The plans
     named MOD-15's phase editor as its owner, but MOD-15 closed on 2026-09-17, so it lands here
     (engine blueprint F-J; drive plan, "What this milestone touches").
   - **R-29**: Postgres stores `queued_at` in microseconds and `MemStore` in nanoseconds, so a
@@ -397,8 +359,8 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   `docs/decisions/mod/mod-15.md`): `htui_core::seed` writes all ten at version 1 on create. **PRD:**
   `.claude/prds/mod-9-skill-library-templates.prd.md` (2026-09-25) — everything in the Skills tab
   (templates and skills views, no Settings section), in-app `TextArea` plus `$EDITOR`, bound skills
-  wired into engine and preview. Milestones 1 (templates editable) and 2 (skills reach the run) are
-  open; milestones 3 (skill writers, bindings) and 4 (SKILL.md import) follow ANA-22's verdict
+  wired into engine and preview. Milestones 1 (templates editable), 2 (skills reach the run), 3 (skill
+  writers, bindings) and 4 (SKILL.md import) have landed, the last two following ANA-22's verdict
   (`docs/decisions/ana/ana-22.md`, concluded 2026-09-25: skills attached at global, project or phase
   level with the activation on the attachment, §7 schema and import mapping, §8 phasing).
   Agent help while editing is MOD-55.
@@ -470,7 +432,9 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   blocked** — MOD-2 is done (`docs/decisions/mod/mod-2.md`) and shipped the `Scrubber` seam with the
   fail-closed `MinimalScrubber` this item replaces *behind an unchanged trait*. Its call sites are
   already fail-closed on every digested byte (MOD-2 D100 as corrected by that milestone's CRITICAL);
-  the one **missing** call site is **MOD-32**, not this item. **MOD-4 wired no secrets** (done,
+  the one call site that was **missing** was **MOD-32**'s, now done
+  (`docs/decisions/mod/mod-32.md`). **MOD-61** builds the run engine's scrubber from the run's
+  resolved secrets, which this item supplies, so the two land together or MOD-61 goes first. **MOD-4 wired no secrets** (done,
   `docs/decisions/mod/mod-4.md`, plan D176): `htui-orch`'s `drive_once` builds every graph
   `SessionSpec` with an empty `env`, and its comment names this item as the one that fills it.
   **Relates to ANA-16** (`docs/ANA-16.md` §8, §9): open question on where secrets resolve, on the
@@ -506,9 +470,10 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   `docs/ANA-2.md` (§4.10, §9): `ready_items` per ANA-9 §7.4 in full, the same `claim_run`
   admission as MOD-4, batch caps as `SUM(run_step.usage)`, escalations in the queue overlay, the
   `scheduler_window` key stored but not enforced; a graph with a `gate_hard` phase is never fully
-  unattended, so `FIX`/`CLEAN`/`TOOL` are the first targets. Per ANA-10 (`docs/ANA-10.md` §4.8):
-  `ready_items` must be **rewritten** for SQLite as well as implemented for Postgres — `<@` and
-  `= ANY($projects)` have no SQLite spelling — which is why auto mode is not part of MOD-4's M8.
+  unattended, so `FIX`/`CLEAN`/`TOOL` are the first targets. ANA-10's SQLite rewrite of
+  `ready_items` (`docs/ANA-10.md` §4.8) is withdrawn with its verdict (MOD-25,
+  `docs/decisions/mod/mod-25.md`): the SQLite cache is a read mirror, so `ready_items` is written for
+  `PgStore` and `MemStore` only.
   **Not blocked**: MOD-4 is done (`docs/decisions/mod/mod-4.md`); `claim_run`'s admission, the
   overlap predicate, the lease, the sweep and `run_worker.rs` are there to reuse. **MOD-7 is done**
   (`docs/decisions/mod/mod-7.md`) and supplies what the capability filter needs: real
@@ -555,8 +520,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   `seal_one`'s numbered fallback must not lose a tail). Also run the Postgres suites there: the
   cache is SQLite on a different filesystem, and `append_pending`'s `OpenOptions::append` and the
   `.jsonl.open` sealing have never met a Windows file lock. Needs a Windows box with `node` and
-  `claude-agent-acp` installed; milestone 5 is the first milestone whose own work touches the
-  spawn path, so this can run before or beside it. Not blocked, and **MOD-2 is now done across all
+  `claude-agent-acp` installed. Not blocked, and **MOD-2 is now done across all
   nine milestones** (`docs/decisions/mod/mod-2.md`), so the full Windows surface is here rather than
   accumulating. Milestone 9 added one more runtime fact to the list: `htui_agent::excerpt::FsRepoReader`
   is the **first `htui-agent` code that traverses arbitrary repositories**, and its guarantees are
@@ -655,7 +619,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   — a box with no DSN browses read-only and edits nothing, so there is no second path to build here
   (`docs/decisions/mod/mod-25.md`; ANA-10's `R-AGT-4` amendment is withdrawn with the mode). **Not
   blocked**, and can start now. File collisions to expect in that one section file: MOD-2
-  milestone 7 adds a quota column to this table (plan D73), MOD-12 owns the Settings caps section,
+  milestone 7 already added a quota column to this table (plan D73), MOD-12 owns the Settings caps section,
   MOD-15 **already landed** kinds and step graphs there (`docs/decisions/mod/mod-15.md`).
   **Budget warning inherited from MOD-2 milestone 7 (plan D76,
   T47/T48):** the table now runs eight columns with **no width slack left** — each sits at its own
@@ -728,7 +692,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   parked ACP request, so engine-driven ACP steps fail on their first permission request today. The
   worker records `permission_request`, waits on a `permission_answer` row, then answers the session;
   cancel and follow-up become command rows. Answers from another box go through the relay, never
-  `take_lease`. Blocked on MOD-4 (M6); MOD-41 consumes it.
+  `take_lease`. MOD-41 consumes it.
   **MOD-4 M6 landed without closing this gap** (MOD-4 done, `docs/decisions/mod/mod-4.md`): the
   engine still drives a graph step through `pump` (`crates/htui-orch/src/engine.rs:5146`, `pump` now
   at `crates/htui-agent/src/record.rs:1725-1743`) with the default `PermissionPolicy`, so engine-driven
@@ -784,7 +748,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   edited, the role's placeholder table and the maintainer's request to a configured agent and offers
   the reply as a proposed edit, shown as a diff and saved only through the same `parse` gate. Open:
   which agent and model answer (the chat driver or a one-shot CLI call), whether the exchange is
-  recorded, and how secrets in a body are scrubbed before they leave. Blocked on MOD-9 milestone 1.
+  recorded, and how secrets in a body are scrubbed before they leave. Not blocked: MOD-9 milestone 1 (templates editable) landed 2026-09-25.
 
 - [ ] **MOD-57 - Run the external editor inside the TUI pane** (from MOD-9, merge of MOD-7
   milestone 2, maintainer-decided 2026-09-26). `R-TUI-1`, `R-TUI-7`, `R-NF-1`. Today `E`/`Ctrl+E`
