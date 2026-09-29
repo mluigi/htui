@@ -375,13 +375,21 @@ pub struct AgentRuntime {
     started: Vec<StepId>,
     grace: Duration,
     /// Tasks this runtime spawned that answer a request of their own: today the probe's (MOD-2
-    /// D53). Swept when finished, awaited by [`finish_background`](Self::finish_background),
-    /// aborted by [`shutdown`](Self::shutdown).
+    /// D53), a chat's staleness re-probe's (plan D55) and the prompt preview's (plan D102). Swept
+    /// when finished, awaited by [`finish_background`](Self::finish_background), aborted by
+    /// [`shutdown`](Self::shutdown).
     ///
     /// The runtime owns the handle for the same reason it owns a chat's: a bare `tokio::spawn`
     /// inside the worker loop would leave a probe with a 60-second handshake running after the UI
     /// is gone, with nobody able to name it.
-    background: Vec<JoinHandle<()>>,
+    ///
+    /// One collection of two kinds of task: some **write `agent_box`**, some only read. The split
+    /// is [`Background`]'s tag, stated once at each push site, and
+    /// [`claim_is_free`](Self::claim_is_free) consults the writing half — a preview holds no claim,
+    /// so holding `j` in the Backlog detail no longer refuses `i` in Settings (MOD-31 D5).
+    /// [`background_len`](Self::background_len) counts them all; the half is
+    /// [`writing_background_len`](Self::writing_background_len).
+    background: Vec<Background>,
     /// The rows a `ChatStart` re-probe is running for, so two overlapping chats do not each start
     /// one for the same `(agent_id, box_id)` (blueprint H-9).
     ///
@@ -452,6 +460,81 @@ impl core::fmt::Debug for AgentRuntime {
             .field("live", &self.live.len())
             .field("box_probe", &self.box_probe.is_some())
             .finish()
+    }
+}
+
+/// One task this runtime owns in [`background`](AgentRuntime::background), and what it writes (MOD-31 D1).
+///
+/// The collection mixes two kinds of work and the guard consults only one of them: a probe and a
+/// chat's staleness re-probe both end by writing `agent_box`, and a prompt preview **reaches no
+/// write method** (plan D102) — it reads a dozen tables, walks the filesystem and records nothing.
+/// So a preview held in the Backlog detail used to refuse an install, a login, a `ProbeBox` and a
+/// connect's registration probe, with a sentence about a probe that was not running.
+///
+/// The tag is a promise and the constructor is where it is made. There is no bool field and no
+/// other way in, so a fifth push site has to name what its task does rather than pass a guess —
+/// and a reviewer greps for `Background::reading` and checks each against the task it names.
+struct Background {
+    /// The task. Reached only through [`task`](Self::task) and [`into_task`](Self::into_task), so
+    /// nothing outside this module can take the handle and drop the tag.
+    task: JoinHandle<()>,
+    /// What the task writes, decided once, at the push site that knows the spawned future.
+    writes: Writes,
+}
+
+/// What a background task writes, and therefore whether it holds the install claim (MOD-31 D1).
+///
+/// An enum rather than a bool for [`LivePhase`](LivePhase)'s reason: the name is the claim, and
+/// `reads: true` at a push site would be a maintainer's guess with nothing to grep for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Writes {
+    /// The task ends by writing `agent_box` for at least one row.
+    AgentBox,
+    /// The task reaches no write method: it reads, and answers on the reply channel.
+    Nothing,
+}
+
+impl Background {
+    /// A task that **writes `agent_box`** for at least one row, so
+    /// [`claim_is_free`](AgentRuntime::claim_is_free) must see it.
+    ///
+    /// The promise: a task pushed here is one an install's re-probe would race on the same row
+    /// (hazard H-10, MOD-21 D19), and the guard is entitled to refuse the install beside it. A task
+    /// that writes nothing, or that writes some other table, does not belong here.
+    fn writing(task: JoinHandle<()>) -> Self {
+        Self {
+            task,
+            writes: Writes::AgentBox,
+        }
+    }
+
+    /// A task that **reaches no write method** (plan D102's "the preview writes nothing").
+    ///
+    /// The promise: the task records nothing, so it holds no claim and leaves no row for an
+    /// install to race. Promoting the preview to [`writing`](Self::writing) the day `run_preview`
+    /// grows a write is one word at one call site — which is the whole reason the tag lives here
+    /// and not in the guard.
+    fn reading(task: JoinHandle<()>) -> Self {
+        Self {
+            task,
+            writes: Writes::Nothing,
+        }
+    }
+
+    /// The task, borrowed: for the sweep, which looks at every entry and keeps most of them.
+    fn task(&self) -> &JoinHandle<()> {
+        &self.task
+    }
+
+    /// The task, by move: for the wait and the abort, which consume the entry.
+    fn into_task(self) -> JoinHandle<()> {
+        self.task
+    }
+
+    /// Whether this task writes `agent_box`, which is the one question
+    /// [`claim_is_free`](AgentRuntime::claim_is_free) asks of the collection.
+    fn writes_agent_box(&self) -> bool {
+        matches!(self.writes, Writes::AgentBox)
     }
 }
 
@@ -628,6 +711,27 @@ impl AgentRuntime {
         self.background.len()
     }
 
+    /// How many of those background tasks write `agent_box` — the set `claim_is_free` consults.
+    ///
+    /// The narrow half of [`background_len`](Self::background_len), and the one a test that says
+    /// "a preview holds no claim" needs: a total cannot say whether the entry inside it is one the
+    /// guard would refuse on (MOD-31 D4).
+    ///
+    /// The predicate is named through a closure rather than as `Background::writes_agent_box`,
+    /// because `filter` hands it `&&Background` and a method on `&self` is a `fn(&Background)`:
+    /// the same path spelled as a function item is a trait-bound error, not a clippy lint.
+    /// [`claim_is_free`](Self::claim_is_free) asks the same question of the same collection and
+    /// spells it `any(Background::writes_agent_box)` instead, because `any` hands it
+    /// `&Background` and so takes the function item directly — `any` takes `FnMut(Self::Item)`
+    /// where `filter` takes `FnMut(&Self::Item)`. Neither spelling is the other's mistake.
+    #[must_use]
+    pub fn writing_background_len(&self) -> usize {
+        self.background
+            .iter()
+            .filter(|entry| entry.writes_agent_box())
+            .count()
+    }
+
     /// Awaits every background task, each under `limit`; one past it is aborted and named.
     ///
     /// The deterministic end the test harness needs: a probe answers through the reply channel
@@ -642,7 +746,8 @@ impl AgentRuntime {
         // Every preview named here is one of the tasks about to be awaited, so the right to cancel
         // it dies with the handle (review finding M3).
         self.previews.clear();
-        for handle in std::mem::take(&mut self.background) {
+        for entry in std::mem::take(&mut self.background) {
+            let handle = entry.into_task();
             let abort = handle.abort_handle();
             if tokio::time::timeout(limit, handle).await.is_err() {
                 abort.abort();
@@ -1019,7 +1124,7 @@ impl AgentRuntime {
         self.live.retain(|_, chat| !chat.commands.is_closed());
         // The same sweep for the tasks that answer their own request: a probe that has answered is
         // not a probe still running, and `background_len` is what a test reads.
-        self.background.retain(|task| !task.is_finished());
+        self.background.retain(|entry| !entry.task().is_finished());
         // And for the right to cancel a preview, which must not outlive the task it names: an
         // origin whose preview has answered has nothing left to supersede (review finding M3).
         self.previews.retain(|_, preview| !preview.is_finished());
@@ -1097,8 +1202,8 @@ impl AgentRuntime {
             }
         }
         self.previews.clear();
-        for task in std::mem::take(&mut self.background) {
-            task.abort();
+        for entry in std::mem::take(&mut self.background) {
+            entry.into_task().abort();
         }
         // MOD-7 D27: the box probe is aborted like the agent probe; each version child dies with
         // its `ChildGuard`, and a probe cut short recorded nothing, so the next launch retries.
@@ -1162,13 +1267,14 @@ impl AgentRuntime {
         // Blueprint D35: the injected env when a test gave one, else this process's own.
         let (env, _) = self.probe_env()?;
 
-        self.background.push(tokio::spawn(run_probe(ProbeArgs {
-            writer,
-            box_id,
-            agents,
-            env,
-            frames: Frames::new(replies.clone(), addr),
-        })));
+        self.background
+            .push(Background::writing(tokio::spawn(run_probe(ProbeArgs {
+                writer,
+                box_id,
+                agents,
+                env,
+                frames: Frames::new(replies.clone(), addr),
+            }))));
         Ok(Served::Deferred)
     }
 
@@ -1254,7 +1360,7 @@ impl AgentRuntime {
         if let Some(superseded) = self.previews.insert(origin, task.abort_handle()) {
             superseded.abort();
         }
-        self.background.push(task);
+        self.background.push(Background::reading(task));
         Served::Deferred
     }
 
@@ -1537,15 +1643,25 @@ impl AgentRuntime {
                 live.agent_id
             )));
         }
-        // A probe writes `agent_box` for every row, and an install's re-probe writes one of them.
-        // Run together, they race on the same row and the last write wins — so the claim covers a
-        // probe in flight too. The Settings section's own `probing` flag is not enough: **any**
+        // A probe writes `agent_box` for every enabled row, and an install's re-probe writes one of
+        // them — and so does a chat's staleness re-probe, which is why the sentence names both.
+        // Run together, they race on the same row and the last write wins, so the claim covers a
+        // writing background task while it is in flight.
+        //
+        // A prompt preview is in the same collection and holds **no** claim: `run_preview` reaches
+        // no write method (plan D102), so there is no row for an install to race. Before the split
+        // this arm tested the whole collection, and holding `j` in the Backlog detail refused `i`
+        // here — plus a login, a `ProbeBox` and a connect's registration probe — with a sentence
+        // about a probe that was not running (MOD-31 D5).
+        //
+        // The Settings section's own `probing` flag is not enough either way: **any**
         // `StoreReply::Agents` clears it (`ui/tabs/settings/agents.rs`, module doc), and
         // `wants_requests` re-issues `Agents` on every activation, so `r` → switch tab → back → `i`
         // reaches here with `run_probe` still running.
-        if !self.background.is_empty() {
+        if self.background.iter().any(Background::writes_agent_box) {
             return Err(StoreError::Backend(
-                "a probe is already running on this box; install once it has finished".to_owned(),
+                "a probe or a re-probe is already writing this box; install once it has finished"
+                    .to_owned(),
             ));
         }
         Ok(())
@@ -1755,7 +1871,8 @@ impl AgentRuntime {
             && !self.box_probe_running();
         let reprobe = match (stale, reprobe) {
             (true, Some(args)) => {
-                self.background.push(tokio::spawn(run_reprobe(args)));
+                self.background
+                    .push(Background::writing(tokio::spawn(run_reprobe(args))));
                 None
             }
             (_, held) => held,
@@ -5803,7 +5920,7 @@ pub(crate) mod tests {
             Served::Reply(StoreReply::Failed { request, message }) => {
                 assert_eq!(request, "install_plan");
                 assert!(
-                    message.contains("probe is already running"),
+                    message.contains("is already writing this box"),
                     "the refusal names what holds the box: {message}"
                 );
             }
@@ -5840,6 +5957,244 @@ pub(crate) mod tests {
             other => panic!("a probe beside an install races on `agent_box`: {other:?}"),
         }
         runtime.shutdown(Duration::ZERO).await;
+    }
+
+    /// MOD-31 D5, the bug in one test: a prompt preview reaches no write method (plan D102), so it
+    /// holds no claim and a live one does not refuse an install.
+    ///
+    /// Hold `j` in the Backlog detail — a task that reads a dozen tables, walks the filesystem and
+    /// records nothing — and press `i` in Settings. Before the split this came back *"a probe is
+    /// already running on this box"* while the only thing alive was the preview, and no probe had
+    /// been asked for.
+    ///
+    /// The two `serve` calls are adjacent on purpose: `serve` sweeps finished tasks as its first
+    /// statement, so an `await` of my own between the preview and the install could sweep the very
+    /// entry whose presence makes this case mean anything.
+    #[tokio::test]
+    async fn a_running_preview_does_not_refuse_an_install() {
+        // `unresolvable_registry` for the same reason the sibling above uses it, and **no**
+        // `fixture.route("/registry.json", …)`: this case never wants a *long* registry read, only
+        // a short one. Unrouted, the responder answers 404 in milliseconds, so the plan task ends
+        // long before the teardown rather than being waited out by it.
+        let store = unresolvable_registry().await;
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&install_row(agent_id, "demo", true))
+            .await
+            .expect("the row lands");
+        let backend = Backend::memory(store);
+        let fixture = Fixture::start().await;
+        let tmp = tempfile::tempdir().expect("a temporary install root");
+        let mut runtime = installing_runtime(&fixture, &tmp.path().join("agents"));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        // A preview first: deferred, owned by the runtime, and holding no claim. `HTUI_FEAT_1` is a
+        // real demo item, so the task does real work and is still unfinished when the next request
+        // sweeps — which is what keeps the entry in the collection the guard consults.
+        let previewed = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(
+                    1,
+                    StoreRequest::PromptPreview {
+                        item: ids::HTUI_FEAT_1,
+                        template_name: None,
+                        scope: scope(),
+                    },
+                ),
+            )
+            .await;
+        assert!(
+            matches!(previewed, Served::Deferred),
+            "the preview is deferred to the runtime's own task (`R-NF-3`): {previewed:?}"
+        );
+        assert_eq!(
+            runtime.background_len(),
+            1,
+            "the runtime owns one task, which is the fact `R-NF-3` asks for"
+        );
+        assert_eq!(
+            runtime.writing_background_len(),
+            0,
+            "and that task writes no `agent_box` row, so it is not in the guard's set (MOD-31 D4)"
+        );
+
+        let planned = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(2, StoreRequest::InstallPlan { agent_id }),
+            )
+            .await;
+        // `Deferred`, and **not** "the install succeeded". This case pins the decision `serve`
+        // returned, not the plan's outcome: `install_plan` gets past the guard, spawns `run_plan`,
+        // and the registry is unrouted, so the pre-flight fails for the fixture's own reasons —
+        // asynchronously, inside the spawned task, after `install_plan` has already returned
+        // `Deferred`. Asserting on that failure would be asserting on the fixture, and there is no
+        // way to await the reply here without giving `run_plan` the one thing this case must not
+        // grant it: an `await` of the test's own between the preview and the install, which
+        // `sweep_finished` would use to drop the very entry whose presence makes the case mean
+        // anything.
+        //
+        // The positive form is what makes this bite, and the old `if let` shape is what hid it.
+        // `serve` converts **every** `Err` out of `install_plan` into
+        // `Served::Reply(StoreReply::Failed)`, so a refusal is never `Deferred`: an
+        // `if let … = &planned` was skipped outright whenever the answer was not a `Failed`, and
+        // matched vacuously when it *was* one for any other reason — an
+        // `installing_runtime` that stopped attaching its installer fails at `install_config`,
+        // which is checked before `claim_is_free`, and the whole claim went untested in green.
+        // Naming the guard's two sentences instead did not close that hole either: it only asked
+        // that a refusal be *some other* refusal, so the pre-fix guard's own wording was never
+        // what a passing assert had to exclude. Here every precondition — `install_config`,
+        // `recording_writer`, `registered_box`, `claim_is_free`, `row_for`, `declares_a_source` —
+        // has to have returned `Ok` and the spawn has to have happened, so a runtime that refused
+        // for any reason at all, the pre-fix guard's included, goes red right here.
+        assert!(
+            matches!(planned, Served::Deferred),
+            "a preview writes no `agent_box` row, so it holds no claim (MOD-31 D5): {planned:?}"
+        );
+        runtime.shutdown(Duration::ZERO).await;
+    }
+
+    /// MOD-31 D5 and D6, the other half of the claim: a chat's staleness re-probe **does** write
+    /// `agent_box`, so it holds the claim exactly as a probe does, and the refusal names both
+    /// kinds of task that do.
+    ///
+    /// OQ-3's conservative answer, pinned. Narrowing the guard to the writing half would have been
+    /// wrong for a re-probe — the hazard is the same one a probe carries, on the same row — so this
+    /// case is here to stop a future reader "simplifying" the re-probe's push site to `reading`.
+    ///
+    /// The staging is `a_chat_start_on_a_stale_acp_row_re_probes_in_the_background` **plus** an
+    /// installer, because the two cannot be combined from either fixture alone:
+    /// `installing_runtime`'s `DriverFactory::new()` registers no `acp` transport, so a `ChatStart`
+    /// on an `acp` row is refused by `driver_for` before the re-probe is ever considered; and a
+    /// runtime with no installer answers "this runtime has no installer" at
+    /// [`install_config`](Self::install_config), which is checked before the claim.
+    #[tokio::test]
+    async fn a_running_chat_reprobe_still_refuses_an_install() {
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&acp_fake_row(agent_id))
+            .await
+            .expect("the acp row lands");
+        let backend = Backend::memory(store);
+        let fixture = Fixture::start().await;
+        let tmp = tempfile::tempdir().expect("a temporary install root");
+        let mut runtime =
+            AgentRuntime::new(acp_factory(Script::one_turn(vec![ScriptEvent::Emit(
+                DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            )])))
+            .with_grace(Duration::from_millis(0))
+            .with_installer(InstallConfig::new(
+                fixture.base(),
+                Some(tmp.path().join("agents")),
+            ));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let started = runtime
+            .serve(&backend, &tx, &envelope(1, start(agent_id, "hello")))
+            .await;
+        assert!(
+            matches!(started, Served::Start { .. }),
+            "the chat starts on what resolution already gave it: {started:?}"
+        );
+        assert_eq!(
+            runtime.writing_background_len(),
+            1,
+            "an unprobed `acp` row is re-probed beside the chat, and the re-probe writes `agent_box`"
+        );
+
+        match runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(2, StoreRequest::InstallPlan { agent_id }),
+            )
+            .await
+        {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "install_plan");
+                assert!(
+                    message.contains("is already writing this box"),
+                    "the refusal names the re-probe as well as the probe (MOD-31 D6): {message}"
+                );
+            }
+            other => panic!("a re-probe and an install race on `agent_box`: {other:?}"),
+        }
+        // The refusal is at the claim, which is before `row_for`, so `acp_fake_row`'s lack of a
+        // `discovery.install` never comes into it, and nothing was spawned behind it: no plan, no
+        // registry read, no `/registry.json` route. The chat and the re-probe go with `shutdown`.
+        runtime.shutdown(Duration::ZERO).await;
+    }
+
+    /// MOD-31 D5, the caller the HANDOFF does not mention: [`StoreRequest::ProbeBox`] is the path
+    /// an `Online` swap's registration probe goes through, and `on_online` skips it **silently** —
+    /// it only logs `tracing::info!` and records nothing, so the box stays unprobed until the next
+    /// swap. The install case above at least tells the user something; this one says nothing at
+    /// all, which is why it needs its own test rather than riding along on that one.
+    ///
+    /// Its staging is *not* the install case's: [`probe_box`](Self::probe_box) never calls
+    /// `install_config`, so it needs no `Fixture` and no installer. Routing a 30-second
+    /// `/registry.json` here would buy nothing — this path spawns a **box** probe, not a plan — and
+    /// `finish_background` would then wait out the delay.
+    #[tokio::test]
+    async fn a_running_preview_does_not_refuse_a_box_probe() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let store = never_probed().await;
+        let backend = Backend::memory(store);
+        let mut runtime = box_runtime(tmp.path());
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let previewed = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(
+                    1,
+                    StoreRequest::PromptPreview {
+                        item: ids::HTUI_FEAT_1,
+                        template_name: None,
+                        scope: scope(),
+                    },
+                ),
+            )
+            .await;
+        assert!(
+            matches!(previewed, Served::Deferred),
+            "the preview is deferred to the runtime's own task (`R-NF-3`): {previewed:?}"
+        );
+        assert_eq!(
+            runtime.background_len(),
+            1,
+            "the preview is in the collection, so the zero below is about which entry it is"
+        );
+        assert_eq!(
+            runtime.writing_background_len(),
+            0,
+            "and it holds no claim (MOD-31 D4), so it is not in the guard's set"
+        );
+
+        let probed = runtime
+            .serve(&backend, &tx, &envelope(2, StoreRequest::ProbeBox))
+            .await;
+        // The same rule, and for the same reasons as the install case: the *decision* is pinned
+        // rather than the probe's outcome, and the positive form is what closes the hole an `if
+        // let` leaves. See that case's comment for why — `serve` turns every `Err` out of
+        // `probe_box` into `Served::Reply(Failed)`, so `Deferred` can only mean that
+        // `registered_box` and `claim_is_free` both let it through, and the pre-fix guard's
+        // refusal is then not one of the ways this assert can pass.
+        assert!(
+            matches!(probed, Served::Deferred),
+            "a preview writes no `agent_box` row, so it holds no claim (MOD-31 D5): {probed:?}"
+        );
+        // A `ProbeBox` that got past the guard really does spawn a box probe, so this case has to
+        // finish it rather than leave it behind a drop. `never_probed` is the unresolvable
+        // registry, so it resolves in milliseconds and spawns no adapter anywhere near the suite.
+        runtime.finish_background(Duration::from_secs(10)).await;
     }
 
     /// A row whose `discovery` declares no source is refused **by the row**, with the pre-flight's
@@ -8199,8 +8554,10 @@ done
         );
     }
 
-    /// Blueprint D27: a finished background task (a preview, a chat re-probe) does not hold the
-    /// claim: `sweep_finished` clears it before `on_online` asks.
+    /// Blueprint D27: a finished background task does not hold the claim — `sweep_finished` clears
+    /// it before `on_online` asks. The entry below is tagged `writing` on purpose, so the sweep is
+    /// the only thing that frees the claim here (MOD-31 D2); a `reading` entry would be free
+    /// already, and the sweep would be untested.
     #[tokio::test]
     async fn a_finished_background_task_does_not_stop_the_registration_probe() {
         let tmp = tempfile::tempdir().expect("temp box");
@@ -8209,8 +8566,14 @@ done
         let mut runtime = box_runtime(tmp.path());
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        runtime.background.push(tokio::spawn(async {}));
-        while !runtime.background.iter().all(JoinHandle::is_finished) {
+        runtime
+            .background
+            .push(Background::writing(tokio::spawn(async {})));
+        while !runtime
+            .background
+            .iter()
+            .all(|entry| entry.task().is_finished())
+        {
             tokio::task::yield_now().await;
         }
         runtime.on_online(&backend, &tx);
@@ -8230,16 +8593,16 @@ done
         let mut runtime = box_runtime(tmp.path());
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        runtime
-            .background
-            .push(tokio::spawn(std::future::pending::<()>()));
+        runtime.background.push(Background::writing(tokio::spawn(
+            std::future::pending::<()>(),
+        )));
         runtime.on_online(&backend, &tx);
 
         assert!(!runtime.box_probe_running());
         assert_eq!(runtime.background_len(), 1, "the held task is still there");
         assert!(sent(&mut rx).is_empty(), "a skipped probe says nothing");
-        for task in std::mem::take(&mut runtime.background) {
-            task.abort();
+        for entry in std::mem::take(&mut runtime.background) {
+            entry.into_task().abort();
         }
         assert_eq!(this_box_record(&store).await.row.last_probed_at, None);
     }

@@ -9,7 +9,7 @@
 //! so there is exactly one source of truth.
 //!
 //! **Nothing recoverable is ever drawn.** The DSN field is
-//! [`TextField::masked`](crate::ui::TextField::masked): one `\u{2022}` per character and a count,
+//! [`TextField::masked`](crate::ui::TextField::masked): one `\u{2022}` per grapheme and a count,
 //! with no reveal toggle anywhere in this file, and the buffer is zeroizing. No `Debug` in this
 //! module prints a buffer or a notice's text, because [`crate::store_worker::RequestEnvelope`] and
 //! every section derive `Debug` and one `tracing::debug!` is all it takes to put a line in the
