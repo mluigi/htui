@@ -5982,7 +5982,7 @@ pub(crate) mod tests {
         let store = unresolvable_registry().await;
         let agent_id = AgentId::new();
         store
-            .upsert_agent(&install_row(agent_id, "demo", true))
+            .upsert_agent(&install_row(agent_id, "demo", true), None)
             .await
             .expect("the row lands");
         let backend = Backend::memory(store);
@@ -6079,7 +6079,7 @@ pub(crate) mod tests {
         let store = MemStore::demo();
         let agent_id = AgentId::new();
         store
-            .upsert_agent(&acp_fake_row(agent_id))
+            .upsert_agent(&acp_fake_row(agent_id), None)
             .await
             .expect("the acp row lands");
         let backend = Backend::memory(store);
