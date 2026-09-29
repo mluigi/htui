@@ -31,4 +31,4 @@ Graphics · DESKTOP-HTUI · memory · 0 runs
 └────────────────────────────────────────────────────────────┘└────────────────────────────────────┘
  this phase template never places {{item}} — Ctrl+S again saves anyway
  Ctrl+S save  Ctrl+E $EDITOR  Esc cancel  L1:C20
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find

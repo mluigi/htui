@@ -31,4 +31,4 @@ Graphics · DESKTOP-HTUI · memory · 0 runs
 └──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
 
  j/k  ,/. version  b base  d diff  e edit  E $EDITOR  n new  I import  i info  a attach  r reload
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find

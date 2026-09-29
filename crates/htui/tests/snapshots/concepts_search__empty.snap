@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/concepts_search.rs
+expression: frame
+---
+Platform · DESKTOP-HTUI · memory · 1 run
+ 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+┌ Backlog (11) ───────────────────────────────────────┐┌ ANA-1 ────────────────────────────────────┐
+│▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
+│  ANA-1    done               Data model, box regist…││Data model, box registry and sync topology │
+│  ANA-2    open               Orchestrator step grap…││ANA-1  ANA  done                           │
+│ ┌ Search concepts ─────────────────────────────────────────────────────────────────────────────┐ │
+│ │scope all projects · decisions off                                                            │ │
+│ │query                                                                                         │ │
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│▾│                                                                                              │a│
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│ │                                                                                              │ │
+│ │type a query; Enter searches                                                                  │ │
+│ │                                                                                              │ │
+│ │Enter search/open  Up/Dn move  Ctrl+D decisions  Ctrl+P project  Ctrl+R re-index  Esc close   │ │
+│ └──────────────────────────────────────────────────────────────────────────────────────────────┘e│
+│                                                     ││numbers it brings in.                      │
+│                                                     ││                                           │
+│                                                     ││                                           │
+│                                                     ││                                           │
+└─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find

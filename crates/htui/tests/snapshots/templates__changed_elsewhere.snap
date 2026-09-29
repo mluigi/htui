@@ -31,4 +31,4 @@ Graphics · DESKTOP-HTUI · memory · 0 runs
  saved elsewhere since you opened it — v2 is now the latest; your draft is kept and Ctrl+S saves it
  as v3
  Ctrl+S save  Ctrl+E $EDITOR  Esc cancel  L1:C7
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find

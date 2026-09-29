@@ -13,15 +13,22 @@
 //! in this box and nothing else.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use htui_core::model::{ProjectId, Scope};
-use htui_store::vector::{Hit, SearchQuery};
+use htui_core::model::{ProjectId, ProjectRef, Scope};
+use htui_store::vector::{Hit, Owner, SearchQuery};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use crate::app::{Ctx, Handled};
+use crate::app::{Action, Ctx, Handled, OverlayAction, RevealTarget};
+use crate::concepts;
+use crate::concepts_worker::ConceptsReply;
 use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::TextField;
+use crate::ui::cells::{cell_width, graphemes};
+use crate::ui::layout::centered;
 use crate::ui::overlay::registry::{Overlay, OverlayId};
+use crate::ui::{FieldOutcome, TextField, Theme};
 
 /// The box's title.
 const TITLE: &str = "Search concepts";
@@ -130,6 +137,137 @@ impl ConceptsSearch {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// The projects a search or an index run covers: the workspace's, or the one cycled to (D233).
+    fn projects(&self, scope: &Scope) -> Vec<ProjectId> {
+        self.project
+            .map_or_else(|| scope.project_ids.clone(), |project| vec![project])
+    }
+
+    /// The search the overlay's state asks for now.
+    fn current(&self, scope: &Scope) -> SearchQuery {
+        concepts::query(
+            self.field.text().unwrap_or_default().trim(),
+            self.projects(scope),
+            self.decisions,
+            concepts::DEFAULT_LIMIT,
+        )
+    }
+
+    /// Whether the query or a toggle moved since the last search was sent (blueprint D255).
+    fn changed(&self, scope: &Scope) -> bool {
+        self.sent.as_ref() != Some(&self.current(scope))
+    }
+
+    /// `Ctrl+P`: every project, then each in the workspace's order, then every project again. A
+    /// project no longer in the workspace falls back to every project.
+    fn cycle_project(&mut self, projects: &[ProjectRef]) {
+        self.project = match self.project {
+            None => projects.first().map(|project| project.project_id),
+            Some(current) => projects
+                .iter()
+                .position(|project| project.project_id == current)
+                .and_then(|at| projects.get(at + 1))
+                .map(|project| project.project_id),
+        };
+    }
+
+    /// `Ctrl+R`: re-index the current scope (D237). The reply prints the CLI's report line.
+    fn reindex(&mut self, ctx: &Ctx<'_>) {
+        let project_ids = self.projects(ctx.scope);
+        if project_ids.is_empty() {
+            self.notice = Some(NO_PROJECTS);
+            return;
+        }
+        self.index = IndexLine::Running;
+        ctx.request(StoreRequest::IndexConcepts {
+            scope: Scope {
+                workspace_id: ctx.scope.workspace_id,
+                project_ids,
+            },
+        });
+    }
+
+    /// `Enter` (D234, blueprint D255): search when the state moved since the last search, else
+    /// open the highlighted hit — close, then reveal, both applied by the same drain (D235).
+    fn enter(&mut self, ctx: &Ctx<'_>) {
+        let query = self.current(ctx.scope);
+        if self.sent.as_ref() != Some(&query) {
+            if query.projects.is_empty() {
+                self.notice = Some(NO_PROJECTS);
+            } else if query.text.is_empty() {
+                self.notice = Some(EMPTY_QUERY);
+            } else {
+                self.sent = Some(query.clone());
+                self.searching = true;
+                self.hits.clear();
+                self.cursor = 0;
+                self.error = None;
+                self.notice = None;
+                ctx.request(StoreRequest::SearchConcepts(query));
+            }
+            return;
+        }
+        if self.searching {
+            return;
+        }
+        if let Some(hit) = self.hits.get(self.cursor) {
+            ctx.emit(Action::Overlay(OverlayAction::Close));
+            ctx.emit(Action::Reveal(target(hit)));
+        }
+    }
+
+    /// The header: the scope and the decisions toggle.
+    fn header(&self, projects: &[ProjectRef]) -> String {
+        let scope = self.project.map_or_else(
+            || ALL_PROJECTS.to_owned(),
+            |id| {
+                projects
+                    .iter()
+                    .find(|project| project.project_id == id)
+                    .map_or_else(|| id.to_string(), |project| project.slug.clone())
+            },
+        );
+        let decisions = if self.decisions { "on" } else { "off" };
+        format!("scope {scope} · decisions {decisions}")
+    }
+
+    /// The search's status row, first match wins (§5.5).
+    fn status(&self, scope: &Scope, theme: &Theme) -> (String, Style) {
+        if let Some(notice) = self.notice {
+            return (notice.to_owned(), theme.dim);
+        }
+        if let Some(error) = &self.error {
+            return (error.clone(), theme.error);
+        }
+        if self.searching {
+            let text = if self.answered { SEARCHING } else { LOADING };
+            return (text.to_owned(), theme.dim);
+        }
+        if self.sent.is_none() {
+            return (IDLE.to_owned(), theme.dim);
+        }
+        let mut text = if self.hits.is_empty() {
+            NO_MATCHES.to_owned()
+        } else {
+            format!("{} hit(s)", self.hits.len())
+        };
+        if self.changed(scope) {
+            text.push_str(" · ");
+            text.push_str(CHANGED);
+        }
+        (text, theme.dim)
+    }
+
+    /// The `Ctrl+R` row.
+    fn index_line(&self, theme: &Theme) -> (String, Style) {
+        match &self.index {
+            IndexLine::Idle => (String::new(), theme.dim),
+            IndexLine::Running => (INDEXING.to_owned(), theme.dim),
+            IndexLine::Done(line) => (line.clone(), theme.dim),
+            IndexLine::Failed(message) => (message.clone(), theme.error),
+        }
+    }
 }
 
 impl Overlay for ConceptsSearch {
@@ -150,23 +288,179 @@ impl Overlay for ConceptsSearch {
         Vec::new()
     }
 
-    fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
-        todo!()
+    fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let chord = key.modifiers - KeyModifiers::SHIFT;
+        if chord == KeyModifiers::CONTROL {
+            match key.code {
+                KeyCode::Char('d' | 'D') => {
+                    self.decisions = !self.decisions;
+                    return Handled::Consumed;
+                }
+                KeyCode::Char('p' | 'P') => {
+                    self.cycle_project(ctx.projects);
+                    return Handled::Consumed;
+                }
+                KeyCode::Char('r' | 'R') => {
+                    self.reindex(ctx);
+                    return Handled::Consumed;
+                }
+                _ => {}
+            }
+        }
+        // Every other chord is the shell's: `Ctrl+C` quits from here too (D261).
+        if !chord.is_empty() {
+            return Handled::Pass;
+        }
+        match key.code {
+            KeyCode::Up => {
+                self.cursor = self.cursor.saturating_sub(1);
+                Handled::Consumed
+            }
+            KeyCode::Down => {
+                if self.cursor + 1 < self.hits.len() {
+                    self.cursor += 1;
+                }
+                Handled::Consumed
+            }
+            _ => match self.field.on_key(key) {
+                FieldOutcome::Consumed => {
+                    self.notice = None;
+                    Handled::Consumed
+                }
+                FieldOutcome::Submit => {
+                    self.enter(ctx);
+                    Handled::Consumed
+                }
+                // `Esc` reaches the wildcard close; `Tab` and the rest are swallowed by `is_modal`.
+                FieldOutcome::Cancel | FieldOutcome::Pass => Handled::Pass,
+            },
+        }
     }
 
-    fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {
-        todo!()
+    fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
+        let StoreReply::Concepts(reply) = reply else {
+            return;
+        };
+        match &**reply {
+            ConceptsReply::Hits { query, outcome } => {
+                // A list answers the search it echoes; any other is an older one's.
+                if self.sent.as_ref() != Some(query) {
+                    return;
+                }
+                self.searching = false;
+                self.answered = true;
+                match outcome {
+                    Ok(hits) => {
+                        self.hits.clone_from(hits);
+                        self.cursor = 0;
+                        self.error = None;
+                    }
+                    Err(message) => {
+                        self.hits.clear();
+                        self.error = Some(message.clone());
+                        // So `Enter` retries the same search.
+                        self.sent = None;
+                    }
+                }
+            }
+            ConceptsReply::Indexed(Ok(report)) => {
+                self.index = IndexLine::Done(concepts::report_line(report));
+            }
+            ConceptsReply::Indexed(Err(message)) => {
+                self.index = IndexLine::Failed(message.clone());
+            }
+        }
     }
 
-    fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {
-        todo!()
+    fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+        let theme = ctx.theme;
+        let width = area.width.saturating_sub(MARGIN).min(MAX_WIDTH);
+        let box_area = centered(area, width, BOX_HEIGHT);
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .title(Span::styled(format!(" {TITLE} "), theme.title));
+        let inner = block.inner(box_area);
+        frame.render_widget(Clear, box_area);
+        frame.render_widget(block, box_area);
+
+        let [header, query, _blank, hits, status, index, hint] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(HIT_ROWS),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+        let cells = usize::from(inner.width);
+        let row = |text: &str, style: Style| Paragraph::new(Line::styled(clip(text, cells), style));
+
+        frame.render_widget(row(&self.header(ctx.projects), theme.dim), header);
+
+        let label = u16::try_from(cell_width(QUERY_LABEL)).unwrap_or(u16::MAX);
+        let mut spans = vec![Span::styled(QUERY_LABEL, theme.dim)];
+        spans.extend(
+            self.field
+                .line(inner.width.saturating_sub(label), true, theme)
+                .spans,
+        );
+        frame.render_widget(Paragraph::new(Line::from(spans)), query);
+
+        let hit_cells = cells.saturating_sub(cell_width(CURSOR));
+        let lines: Vec<Line<'static>> = self
+            .hits
+            .iter()
+            .enumerate()
+            .map(|(at, hit)| {
+                let selected = at == self.cursor;
+                let marker = if selected { CURSOR } else { NO_CURSOR };
+                let style = if selected { theme.accent } else { theme.base };
+                Line::styled(
+                    format!("{marker}{}", clip(&concepts::format_hit(hit), hit_cells)),
+                    style,
+                )
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), hits);
+
+        let (text, style) = self.status(ctx.scope, theme);
+        frame.render_widget(row(&text, style), status);
+        let (text, style) = self.index_line(theme);
+        frame.render_widget(row(&text, style), index);
+        frame.render_widget(row(HINT, theme.dim), hint);
+    }
+}
+
+/// What `Enter` on `hit` reveals: its item (a document hit's owner item) or its requirement, with
+/// the key the tab's miss sentence names (D235, blueprint D248).
+fn target(hit: &Hit) -> RevealTarget {
+    match hit.owner {
+        Owner::Item(id) => RevealTarget::Item {
+            id,
+            key: hit.key.clone(),
+        },
+        Owner::Requirement(id) => RevealTarget::Requirement {
+            id,
+            key: hit.key.clone(),
+        },
     }
 }
 
 /// `text` cut to at most `cells` display cells, at a grapheme boundary (MOD-54's measure): a wide
 /// glyph that would pass the edge is left out whole, never split.
-fn clip(_text: &str, _cells: usize) -> String {
-    todo!()
+fn clip(text: &str, cells: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for grapheme in graphemes(text) {
+        let width = cell_width(grapheme);
+        if used + width > cells {
+            break;
+        }
+        used += width;
+        out.push_str(grapheme);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -270,8 +564,13 @@ mod tests {
             let mut out = String::new();
             for y in 0..buffer.area.height {
                 let mut line = String::new();
-                for x in 0..buffer.area.width {
-                    line.push_str(buffer[(x, y)].symbol());
+                let mut x = 0;
+                while x < buffer.area.width {
+                    // A wide glyph's second cell is drawn by the glyph: skip it, so the line
+                    // reads as the text it was drawn from.
+                    let symbol = buffer[(x, y)].symbol();
+                    line.push_str(symbol);
+                    x += u16::try_from(cell_width(symbol).max(1)).unwrap_or(1);
                 }
                 out.push_str(line.trim_end());
                 out.push('\n');
@@ -601,11 +900,9 @@ mod tests {
             ..Default::default()
         };
         bench.reply(&mut search, ConceptsReply::Indexed(Ok(report)));
-        assert!(
-            bench
-                .render(&search)
-                .contains(&concepts::report_line(&report))
-        );
+        // Wider than the box, which clips it like every other row.
+        let line = clip(&concepts::report_line(&report), 94);
+        assert!(bench.render(&search).contains(&line), "{line}");
 
         bench.reply(
             &mut search,
@@ -639,10 +936,11 @@ mod tests {
         let frame = bench.render(&search);
         let expected = clip(&concepts::format_hit(&long), 92);
         assert!(frame.contains(&expected), "{frame}");
+        // 45 cells of key, place and score, then 23 wide glyphs: a 24th would pass the 92nd cell.
         assert_eq!(
             cell_width(&expected),
-            92,
-            "whole wide glyphs up to the edge"
+            91,
+            "whole wide glyphs, none split at the edge"
         );
         assert_eq!(clip("abc", 2), "ab");
         assert_eq!(

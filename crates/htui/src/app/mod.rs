@@ -44,6 +44,8 @@ use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsT
 ///    belong here for the same reason the `w` binding does.
 /// 6. The Backlog and Requirements tabs are named as the tabs that reveal items and requirements
 ///    (MOD-64 D235).
+/// 7. The concepts search's factory goes in and global `Ctrl+F` is bound to opening it (MOD-64
+///    D236), a chord so no tab's letters and no text field's input can take it.
 ///
 /// Calling this twice would stack a second switcher; the shell calls it exactly once, between
 /// [`App::new`] and [`App::start`].
@@ -78,6 +80,12 @@ pub fn register_all(app: &mut App) {
     // field's input can take it (every text widget passes chords, blueprint F7).
     app.overlay_factories
         .register(ConceptsSearch::ID, || Box::new(ConceptsSearch::new()));
+    app.keymap.bind(Binding {
+        scope: KeyScope::Global,
+        key: KeyChord::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        action: Action::Overlay(OverlayAction::Open(ConceptsSearch::ID)),
+        help: "find",
+    });
 
     app.startup_overlay = Some(WorkspaceSwitcher::ID);
 
