@@ -785,7 +785,15 @@ impl RequirementsTab {
         self.sent = None;
         self.mode = Mode::Browse;
         self.notice = Some(Notice::Info(message));
-        self.reveal(row, ctx);
+        self.select_row(row, ctx);
+        true
+    }
+
+    /// Makes `row` visible, puts the cursor on it and re-reads its detail: `land`'s tail, shared
+    /// with a reveal (MOD-64 D235). The detail is re-read even when `row` was already selected —
+    /// `land` needs that, the row having just been written.
+    fn select_row(&mut self, row: Row, ctx: &Ctx<'_>) {
+        self.unhide(row, ctx);
         if self.selected != Some(row) {
             self.detail = None;
             self.scroll.reset();
@@ -795,11 +803,10 @@ impl RequirementsTab {
         if let Row::Requirement(id) = row {
             ctx.request(StoreRequest::RequirementDetail(id));
         }
-        true
     }
 
     /// Makes `row` visible: unfolds what hides it, and drops a filter that would.
-    fn reveal(&mut self, row: Row, ctx: &Ctx<'_>) {
+    fn unhide(&mut self, row: Row, ctx: &Ctx<'_>) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
