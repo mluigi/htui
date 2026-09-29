@@ -260,9 +260,11 @@ no_ctl() {
 }
 
 # open_items SHA — "ID<TAB>title" for every open checklist line of HANDOFF.md at SHA.
+# Prefixes from workflow-patterns.sh (PREFIX_ALT); titles lose control characters.
 open_items() {
-    git -C "$HOST" show "$1:HANDOFF.md" 2>/dev/null \
-        | sed -nE 's/^- \[ \] \*\*((ANA|MOD|NEXT|VAL|TOOL|CLEAN)-[0-9]+) - ([^*]*).*/\1\t\3/p'
+    git -C "$HOST" cat-file blob "$1:HANDOFF.md" 2>/dev/null \
+        | LC_ALL=C sed -nE "s/^- \\[ \\] \\*\\*((${PREFIX_ALT})-[0-9]+) - ([^*]*).*/\\1\t\\3/p" \
+        | LC_ALL=C sed 's/[\x01-\x08\x0b-\x1f\x7f]//g'
 }
 
 global_ignore_file() {
@@ -538,7 +540,7 @@ pick_run() {
 
 norm_item() { # $1=raw -> canonical ID on stdout, or die 2
     local item="${1^^}"
-    [[ "$item" =~ $ITEM_RE ]] || die 2 "not an item ID: $1 (ANA|MOD|NEXT|VAL|TOOL|CLEAN-<n>)"
+    [[ "$item" =~ $ITEM_RE ]] || die 2 "not an item ID: ${1//[[:cntrl:]]/} (${PREFIX_ALT}-<n>)"
     printf '%s' "$item"
 }
 
@@ -606,7 +608,9 @@ cmd_up() {
     done
     [[ "$cpus" =~ ^[0-9]+(\.[0-9]+)?$ && "$cpus" != 0 ]] || usage_die "--cpus needs a positive number, got '$cpus'"
     [[ -n "$ref" && "$ref" != -* && "$ref" != *[[:cntrl:]]* ]] || usage_die "--from needs a ref, got '$ref'"
-    [[ -z "$item" ]] || item="$(norm_item "$item")"
+    if [[ -n "$item" ]]; then
+        item="$(norm_item "$item")" || exit $?
+    fi
     host_repo
 
     # 1. image
@@ -634,7 +638,7 @@ cmd_up() {
         local pick
         pick="$(printf '%s' "$choices" | gum filter --header "Open items on $ref" \
             --placeholder "type to filter; enter starts a sandbox")" || die 1 "nothing chosen"
-        item="$(norm_item "${pick%% *}")"
+        item="$(norm_item "${pick%% *}")" || exit $?
     fi
     awk -F'\t' -v id="$item" '$1 == id { found = 1 } END { exit !found }' <<<"$open" \
         || die 1 "$item is not open on $ref (${sha:0:12}) — only open HANDOFF items get a sandbox"
@@ -676,6 +680,9 @@ cmd_up() {
 
     # 7. clone, under the runs lock
     lock_runs
+    # Ctrl-C / TERM from here to the registry write: the same cleanup as a failed clone.
+    trap 'up_abort 130 "interrupted — removed the half-made run dir"' INT
+    trap 'up_abort 143 "terminated (interrupted) — removed the half-made run dir"' TERM
     [[ -e "$RUNS/$item" ]] && { unlock_runs; die 1 "run exists for $item — scripts/hr attach $item / scripts/hr down $item"; }
     [[ -e "$run_dir" ]] && { unlock_runs; die 1 "stale run dir $run_dir (no registered run) — inspect and remove it by hand"; }
     mkdir -p "$run_dir" || { unlock_runs; die 3 "cannot create $run_dir"; }
@@ -714,6 +721,7 @@ cmd_up() {
         [created_at]="$(now_utc)" [collected_sha]='' [collected_at]='')
     write_reg "$item"
     UP_CREATED=0
+    trap - INT TERM
     unlock_runs
 
     # 9. containers
@@ -744,7 +752,7 @@ cmd_attach() {
     if [[ -z "$item" ]]; then
         item="$(pick_run "Attach to which run?")" || exit $?
     fi
-    item="$(norm_item "$item")"
+    item="$(norm_item "$item")" || exit $?
     load_run "$item" 1
     if ! dev_running; then
         # Runs made before the cargo-empty file existed; and `docker volume prune --all` may have
@@ -789,6 +797,7 @@ ls_rows() {
             fi
         fi
         disk="$(du -sh "${RUN[run_dir]}" 2>/dev/null | cut -f1)"
+        ahead="${ahead//[[:cntrl:]]/}"
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$item" "$state" "${RUN[branch]:-hr/$item}" "$ahead" \
             "${disk:-?}" "${RUN[root_kind]:-?}"
     done < <(registered_items)
@@ -853,7 +862,7 @@ cmd_collect() {
     if [[ -z "$item" ]]; then
         item="$(pick_run "Collect which run?")" || exit $?
     fi
-    item="$(norm_item "$item")"
+    item="$(norm_item "$item")" || exit $?
     load_run "$item" 0
     local branch="refs/heads/hr/$item"
     clone_ok || die 1 "clone missing at $SRC (or its .git is not a directory)"
@@ -887,10 +896,13 @@ cmd_collect() {
     # object the sandbox made is fsck'd on the way in.
     git -C "$HOST" -c core.hooksPath=/dev/null -c transfer.fsckObjects=true fetch -q --no-tags \
         --no-write-fetch-head --no-recurse-submodules "$SRC" "$spec" || die 3 "git fetch from $SRC failed"
-    set_reg "$item" "collected_sha=$tip" "collected_at=$(now_utc)"
-    echo "hr: collected hr/$item at ${tip:0:12} — commits not on main:"
-    git -C "$HOST" --no-pager log --oneline "refs/heads/main..$branch" 2>/dev/null \
-        || git -C "$HOST" --no-pager log --oneline -n 20 "$branch"
+    # What the host now has (the sandbox may have committed since `tip` was read).
+    local got
+    got="$(git -C "$HOST" rev-parse --verify -q "$branch^{commit}")" || die 3 "hr/$item missing on the host after the fetch"
+    set_reg "$item" "collected_sha=$got" "collected_at=$(now_utc)"
+    echo "hr: collected hr/$item at ${got:0:12} — commits not on main:"
+    { git -C "$HOST" --no-pager log --oneline "refs/heads/main..$branch" 2>/dev/null \
+        || git -C "$HOST" --no-pager log --oneline -n 20 "$branch"; } | no_ctl
 
     [[ "$merge" -eq 1 ]] || return 0
 
@@ -922,7 +934,7 @@ cmd_collect() {
         die 3 "git merge of hr/$item into $current failed (see above); nothing merged"
     fi
     echo "hr: merging hr/$item into $current stopped on conflicts:"
-    sed 's/^/  /' <<<"$conflicted"
+    no_ctl <<<"$conflicted" | sed 's/^/  /'
     local f docs_only=1
     while IFS= read -r f; do
         case "$f" in
@@ -1032,7 +1044,7 @@ cmd_down() {
     if [[ -z "$item" ]]; then
         item="$(pick_run "Stop which run?")" || exit $?
     fi
-    item="$(norm_item "$item")"
+    item="$(norm_item "$item")" || exit $?
     load_run "$item" 0
     if [[ "$purge" -eq 0 ]]; then
         spin "Stopping $PROJECT" "${COMPOSE[@]}" down || die 3 "docker compose down failed for $PROJECT"

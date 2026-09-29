@@ -1003,6 +1003,93 @@ hr_selfhost() {
     [[ -e "$BATS_TEST_TMPDIR/claude-launched" ]]
 }
 
+@test "36. a malformed ID -> 2 on every verb (never the picker, never an empty item)" {
+    mk_run MOD-5
+    local v
+    for v in "collect FOO-1" "collect mod5" "down mod5" "down FOO-1 --purge --yes" "attach FOO-1"; do
+        # shellcheck disable=SC2086
+        run --separate-stderr "$HR" $v </dev/null
+        [[ $status -eq 2 && "$stderr" == *'not an item ID'* ]] || { echo "hr $v: $status $stderr" >&2; return 1; }
+    done
+    # In a terminal, `up FOO-1` must not fall through to the picker (which would ask for gum).
+    HR_INTERACTIVE=1 HR_NO_GUM=1 run --separate-stderr "$HR" up FOO-1
+    [[ $status -eq 2 && "$stderr" == *'not an item ID: FOO-1'* && "$stderr" != *gum* ]]
+    [[ "$stderr" == *'ANA|MOD|NEXT|VAL|TOOL|CLEAN'* ]]
+}
+
+@test "37. collected_sha is the host ref after the fetch, even if the sandbox committed meanwhile" {
+    mk_run MOD-5
+    local src real
+    src="$(src_of MOD-5)"
+    real="$(command -v git)"
+    # A git that, on the host's fetch, first lets the "sandbox" commit once more.
+    mkdir -p "$BATS_TEST_TMPDIR/gitshim"
+    cat >"$BATS_TEST_TMPDIR/gitshim/git" <<EOF
+#!/bin/bash
+if [[ " \$* " == *" fetch "* && ! -e "$BATS_TEST_TMPDIR/raced" ]]; then
+    : >"$BATS_TEST_TMPDIR/raced"
+    printf 'race\n' >"$src/race.txt"
+    "$real" -C "$src" add race.txt
+    "$real" -C "$src" -c user.name=s -c user.email=s@x.invalid commit -q -m race
+fi
+exec "$real" "\$@"
+EOF
+    chmod +x "$BATS_TEST_TMPDIR/gitshim/git"
+    PATH="$BATS_TEST_TMPDIR/gitshim:$PATH" run --separate-stderr "$HR" collect MOD-5
+    [[ $status -eq 0 && -e "$BATS_TEST_TMPDIR/raced" ]]
+    [[ "$(reg_get MOD-5 collected_sha)" == "$(git -C "$HR_HOST_REPO" rev-parse refs/heads/hr/MOD-5)" ]]
+}
+
+@test "38. Ctrl-C (INT) or TERM during up's clone removes the half-made run dir; no registry" {
+    local real sig pid i
+    real="$(command -v git)"
+    mkdir -p "$BATS_TEST_TMPDIR/gitshim"
+    printf '#!/bin/bash\nif [[ "$1" == clone ]]; then : >"%s/cloning"; sleep 30; fi\nexec "%s" "$@"\n' \
+        "$BATS_TEST_TMPDIR" "$real" >"$BATS_TEST_TMPDIR/gitshim/git"
+    chmod +x "$BATS_TEST_TMPDIR/gitshim/git"
+    for sig in INT TERM; do
+        rm -f "$BATS_TEST_TMPDIR/cloning"
+        # Own process group (as a terminal's foreground job), INT not ignored (background jobs
+        # of a non-interactive shell start with it ignored).
+        PATH="$BATS_TEST_TMPDIR/gitshim:$PATH" setsid env --default-signal=INT "$HR" up MOD-5 \
+            >"$BATS_TEST_TMPDIR/up.out" 2>&1 &
+        pid=$!
+        for i in $(seq 1 100); do [[ -e "$BATS_TEST_TMPDIR/cloning" ]] && break; sleep 0.1; done
+        [[ -e "$BATS_TEST_TMPDIR/cloning" && -d "$HR_ROOT/MOD-5" ]]
+        kill -s "$sig" -- "-$pid"
+        wait "$pid" && return 1
+        cat "$BATS_TEST_TMPDIR/up.out"
+        [[ ! -e "$HR_ROOT/MOD-5" && ! -e "$(reg_of MOD-5)" ]]
+        grep -q 'interrupted' "$BATS_TEST_TMPDIR/up.out"
+    done
+    # The lock was released: a plain up works.
+    run --separate-stderr "$HR" up MOD-5
+    [[ $status -eq 0 ]]
+}
+
+@test "39. HANDOFF titles, sandbox commit subjects and conflict paths reach the terminal without control characters" {
+    # A title with an OSC escape, in the up picker (a fake gum records what it is shown).
+    sed -i 's/^- \[ \] \*\*MOD-4 - Thing\.\*\* body$/- [ ] **MOD-4 - Thing\x1b]0;pwned\x07.** body/' "$HR_HOST_REPO/HANDOFF.md"
+    git -C "$HR_HOST_REPO" commit -q -am 'escape in a title'
+    local fb="$BATS_TEST_TMPDIR/fakebin"
+    mkdir -p "$fb"
+    printf '#!/bin/bash\ncase "$1" in\n  filter) tee "%s/picker.in" | tail -n 1 ;;\n  spin) while [[ "$1" != -- ]]; do shift; done; shift; exec "$@" ;;\nesac\n' \
+        "$BATS_TEST_TMPDIR" >"$fb/gum"
+    chmod +x "$fb/gum"
+    PATH="$fb:$PATH" HR_INTERACTIVE=1 run --separate-stderr "$HR" up --yes
+    [[ $status -eq 0 ]]
+    grep -q 'MOD-4  Thing' "$BATS_TEST_TMPDIR/picker.in"
+    ! grep -q $'[\x01-\x08\x0b-\x1f\x7f]' "$BATS_TEST_TMPDIR/picker.in" || false
+
+    # A sandbox commit subject with escapes, in collect's log.
+    src_commit MOD-5 notes/esc.txt 'x' $'evil \e]0;pwned\a\e[2J subject'
+    run --separate-stderr "$HR" collect MOD-5
+    [[ $status -eq 0 && "$output" == *'evil ]0;pwned[2J subject'* ]]
+    [[ "$output$stderr" != *$'\e'* && "$output$stderr" != *$'\a'* ]]
+    run --separate-stderr "$HR" ls
+    [[ "$output$stderr" != *$'\e'* ]]
+}
+
 # ---------------------------------------------------------------------------------------------
 # Docker (real image and daemon; fixture host repo; run once: bats --filter-tags docker tests/hr/hr.bats)
 
