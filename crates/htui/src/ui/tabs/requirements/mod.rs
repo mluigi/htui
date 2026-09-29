@@ -1602,7 +1602,7 @@ mod tests {
         bench.key(&mut tab, KeyCode::Enter);
         bench.typed(&mut tab, "R-ENT-1");
         bench.key(&mut tab, KeyCode::Enter);
-        bench.emit.take();
+        let _ = bench.emit.take();
 
         let withdrawn = with_ent_1(snapshot, 3, RequirementState::Withdrawn);
         bench.reply(
@@ -1746,7 +1746,7 @@ mod tests {
                 message: "refused".to_owned(),
             },
         );
-        bench.emit.take();
+        let _ = bench.emit.take();
 
         bench.reply(&mut tab, &StoreReply::Requirements(Box::new(snapshot)));
 
@@ -1771,7 +1771,7 @@ mod tests {
         }
         bench.typed(&mut tab, "ANA-2");
         bench.key(&mut tab, KeyCode::Enter);
-        bench.emit.take();
+        let _ = bench.emit.take();
         let withdrawn = with_ent_1(snapshot, 3, RequirementState::Withdrawn);
         bench.reply(
             &mut tab,
@@ -1781,7 +1781,7 @@ mod tests {
             matches!(tab.mode, Mode::Requirement(_)),
             "the amend keeps its text"
         );
-        bench.emit.take();
+        let _ = bench.emit.take();
 
         save(&bench, &mut tab);
 

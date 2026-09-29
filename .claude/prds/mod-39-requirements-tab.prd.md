@@ -176,14 +176,14 @@ and the markdown workflow can later cut over (ANA-11 §6 phase 3) with MOD-13 as
 
 ## Milestones
 
-| # | Milestone | Proves |
-|---|---|---|
-| 1 | Worker module: requests, replies, snapshot, maintainer gate, deciding-item resolution | `serve` tests on MemStore, two users |
-| 2 | Requirements tab, read side: tree, detail, coverage, revisions, filter, dimmed withdrawn | Harness snapshots on the demo |
-| 3 | Tab writes: area, mint, amend, withdraw, stale handling | Harness key sequences + snapshots; Pg case |
-| 4 | Item detail citations: suspect marker, re-confirm (+ cite/uncite per D4) | Harness snapshots; strip-width test |
-| 5 | Close-out resolution picker + CLEAN-6 | Runs unit tests, `runs_pg.rs` |
-| 6 | Close-out bookkeeping, pins, write-up | Validator green |
+| # | Milestone | Proves | Status | Plan |
+|---|---|---|---|---|
+| 1 | Worker module: requests, replies, snapshot, maintainer gate, deciding-item resolution | `serve` tests on MemStore, two users | complete | [plan](../plans/mod-39-requirements-tab.plan.md) |
+| 2 | Requirements tab, read side: tree, detail, coverage, revisions, filter, dimmed withdrawn | Harness snapshots on the demo | complete | [plan](../plans/mod-39-requirements-tab.plan.md) |
+| 3 | Tab writes: area, mint, amend, withdraw, stale handling | Harness key sequences + snapshots; Pg case | complete | [plan](../plans/mod-39-requirements-tab.plan.md) |
+| 4 | Item detail citations: suspect marker, re-confirm (+ cite/uncite per D4) | Harness snapshots; strip-width test | complete | [plan](../plans/mod-39-requirements-tab.plan.md) |
+| 5 | Close-out resolution picker + CLEAN-6 | Runs unit tests, `runs_pg.rs` | complete | [plan](../plans/mod-39-requirements-tab.plan.md) |
+| 6 | Close-out bookkeeping, pins, write-up | Validator green | complete | [plan](../plans/mod-39-requirements-tab.plan.md) |
 
 ## Open risks
 
