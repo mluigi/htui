@@ -56,6 +56,8 @@ SELF="$SELF_ROOT/scripts/hr"
 COMPOSE_FILE="$SELF_ROOT/docker/hr/compose.hr.yaml"
 HR_MINT_BIN="$SELF_ROOT/scripts/hr-mint"
 WF_DIR="$SELF_ROOT/.claude/skills/handoff-run/scripts"
+# Sourced once, at start, from the checkout hr runs from — before any `collect --merge` can change
+# it. The validator a merge runs is taken from the pre-merge HEAD instead (review H6).
 # shellcheck source=../.claude/skills/handoff-run/scripts/workflow-patterns.sh
 source "$WF_DIR/workflow-patterns.sh"
 
@@ -892,10 +894,20 @@ cmd_collect() {
 
     [[ "$merge" -eq 1 ]] || return 0
 
-    local current
+    # Pre-merge, from the host's HEAD: the validator (and what it sources) that judges the merge,
+    # and what the run changes in files that drive tools or a claude session on the host. After
+    # the merge, both would be the run's own versions (review H6).
+    local current vdir f sensitive
     current="$(git -C "$HOST" symbolic-ref --short HEAD)"
+    vdir="$(mktemp -d)" || die 3 "cannot create a temp dir"
+    trap 'rm -rf -- "$vdir"' EXIT
+    for f in validate-workflow-docs.sh workflow-patterns.sh; do
+        git -C "$HOST" cat-file blob "HEAD:.claude/skills/handoff-run/scripts/$f" >"$vdir/$f" 2>/dev/null \
+            || die 2 "cannot read .claude/skills/handoff-run/scripts/$f at HEAD of $HOST (the merge is validated with it)"
+    done
+    sensitive="$(git -C "$HOST" --no-pager diff --stat "HEAD...$branch" -- .claude scripts docker 2>/dev/null)"
     if git -C "$HOST" merge --no-ff --no-edit -m "Merge hr/$item (sandbox run)" "$branch"; then
-        if ! bash "$WF_DIR/validate-workflow-docs.sh" --repo-root "$HOST"; then
+        if ! bash "$vdir/validate-workflow-docs.sh" --repo-root "$HOST"; then
             die 1 "merged hr/$item into $current, but the validator is red — fix before pushing"
         fi
         echo "hr: merged hr/$item into $current. Nothing was pushed."
@@ -920,7 +932,16 @@ cmd_collect() {
     done <<<"$conflicted"
     if [[ "$docs_only" -eq 1 ]]; then
         printf '%s\n' "$MERGE_RECIPE"
-        if fancy && { [[ "$yes" -eq 1 ]] || gum confirm "Open a host claude session primed with this recipe?"; }; then
+        local prompt="Open a host claude session primed with this recipe?" ask=0
+        if [[ -n "$sensitive" ]] && fancy; then
+            # The session starts in the half-merged tree: it loads the run's .claude settings,
+            # hooks and skills. Show them; --yes does not answer this one.
+            echo "hr: hr/$item changes files that configure or run tools here (pre-merge diff):"
+            no_ctl <<<"$sensitive" | sed 's/^/  /'
+            prompt="Open a host claude session in the merged tree, with the changes above loaded?"
+            ask=1
+        fi
+        if fancy && { [[ "$yes" -eq 1 && "$ask" -eq 0 ]] || gum confirm "$prompt"; }; then
             (cd "$HOST" && claude "$(recipe_prompt "$item" "$(tr '\n' ' ' <<<"$conflicted")")")
         fi
         die 1 "merge in progress in $HOST — finish it (recipe above) or back out with git merge --abort"

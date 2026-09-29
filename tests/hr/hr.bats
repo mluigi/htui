@@ -928,6 +928,81 @@ purge_state() {
     [[ $status -eq 0 && ! -e "$HR_ROOT/MOD-5" && -f "$canary/keep" && -d "$(src_of MOD-4)/.git" ]]
 }
 
+# hr_selfhost — commit this checkout's hr (+ what it sources and runs) into the fixture host repo,
+# as on the real host, where scripts/hr runs from the repo it merges into. Prints that hr's path.
+hr_selfhost() {
+    local f
+    for f in scripts/hr scripts/hr-mint docker/hr/compose.hr.yaml \
+        .claude/skills/handoff-run/scripts/workflow-patterns.sh \
+        .claude/skills/handoff-run/scripts/validate-workflow-docs.sh \
+        .claude/skills/handoff-run/scripts/next-item-id.sh; do
+        mkdir -p "$HR_HOST_REPO/${f%/*}"
+        cp -p "$HR_TEST_REPO_ROOT/$f" "$HR_HOST_REPO/$f"
+    done
+    git -C "$HR_HOST_REPO" add -A scripts docker .claude/skills >/dev/null
+    git -C "$HR_HOST_REPO" commit -q -m 'hr itself'
+    printf '%s/scripts/hr' "$HR_HOST_REPO"
+}
+
+@test "34. collect --merge validates with the pre-merge validator, never the one the run branch brings" {
+    local hrx
+    hrx="$(hr_selfhost)"
+    mk_run MOD-5
+    local src wf=.claude/skills/handoff-run/scripts
+    src="$(src_of MOD-5)"
+    # The run branch rewrites the validator and the patterns file it sources.
+    sed -i "2i touch '$BATS_TEST_TMPDIR/validator-ran'" "$src/$wf/validate-workflow-docs.sh"
+    sed -i "1i touch '$BATS_TEST_TMPDIR/patterns-ran'" "$src/$wf/workflow-patterns.sh"
+    git -C "$src" -c user.name=s -c user.email=s@x.invalid commit -q -am 'sandbox rewrites the validator'
+    run --separate-stderr "$hrx" collect MOD-5 --merge
+    echo "$output$stderr"
+    [[ $status -eq 0 ]]
+    [[ "$output$stderr" == *'0 error(s)'* ]]
+    # The merge landed (the hostile files are in the host tree now) but never ran.
+    grep -q 'validator-ran' "$HR_HOST_REPO/$wf/validate-workflow-docs.sh"
+    [[ ! -e "$BATS_TEST_TMPDIR/validator-ran" && ! -e "$BATS_TEST_TMPDIR/patterns-ran" ]]
+}
+
+@test "35. doc-conflict recipe session: when the run changed .claude/scripts/docker, show them and always ask" {
+    mk_run MOD-4
+    mk_run MOD-5
+    local s4 s5
+    s4="$(src_of MOD-4)"
+    s5="$(src_of MOD-5)"
+    # Both runs conflict with the host on HANDOFF.md; MOD-5 also brings a .claude/settings.json.
+    sed -i 's/^- \[ \] \*\*MOD-4 - Thing\.\*\* body$/- [ ] **MOD-4 - Thing.** sandbox body/' "$s4/HANDOFF.md" "$s5/HANDOFF.md"
+    git -C "$s4" -c user.name=s -c user.email=s@x.invalid commit -q -am 'sandbox edits MOD-4'
+    printf '{"hooks": {"SessionStart": "evil"}}\n' >"$s5/.claude/settings.json"
+    git -C "$s5" add .claude/settings.json
+    git -C "$s5" -c user.name=s -c user.email=s@x.invalid commit -q -am 'sandbox edits MOD-4 and settings'
+    sed -i 's/^- \[ \] \*\*MOD-4 - Thing\.\*\* body$/- [ ] **MOD-4 - Thing.** host body/' "$HR_HOST_REPO/HANDOFF.md"
+    git -C "$HR_HOST_REPO" commit -q -am 'host edits MOD-4'
+
+    local fb="$BATS_TEST_TMPDIR/fakebin"
+    mkdir -p "$fb"
+    printf '#!/bin/sh\ntouch "%s/claude-launched"\n' "$BATS_TEST_TMPDIR" >"$fb/claude"
+    printf '#!/bin/sh\necho "$*" >>"%s/gum.log"\n[ "$1" = confirm ] && exit "${FAKE_GUM_CONFIRM:-1}"\nexit 0\n' \
+        "$BATS_TEST_TMPDIR" >"$fb/gum"
+    chmod +x "$fb/claude" "$fb/gum"
+    local -a env=(PATH="$fb:$PATH" HR_INTERACTIVE=1)
+
+    # MOD-5: --yes does not skip the question; the stat names the file; declined -> no claude.
+    run --separate-stderr env "${env[@]}" "$HR" collect MOD-5 --merge --yes
+    [[ $status -eq 1 ]]
+    [[ "$output" == *'.claude/settings.json'* ]]
+    grep -q '^confirm ' "$BATS_TEST_TMPDIR/gum.log"
+    [[ ! -e "$BATS_TEST_TMPDIR/claude-launched" ]]
+    git -C "$HR_HOST_REPO" merge --abort
+
+    # MOD-4 (docs only): --yes still launches it without asking, as before.
+    : >"$BATS_TEST_TMPDIR/gum.log"
+    run --separate-stderr env "${env[@]}" "$HR" collect MOD-4 --merge --yes
+    [[ $status -eq 1 ]]
+    [[ "$output" != *'.claude/settings.json'* ]]
+    ! grep -q '^confirm ' "$BATS_TEST_TMPDIR/gum.log" || false
+    [[ -e "$BATS_TEST_TMPDIR/claude-launched" ]]
+}
+
 # ---------------------------------------------------------------------------------------------
 # Docker (real image and daemon; fixture host repo; run once: bats --filter-tags docker tests/hr/hr.bats)
 

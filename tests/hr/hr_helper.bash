@@ -45,6 +45,13 @@ hr_setup() {
 
     hr_fake_home "$HOME" || return 1
     make_fixture "$HR_HOST_REPO" || return 1
+    # As on the real host, HEAD carries the validator `collect --merge` takes from it (review H6).
+    local wf=.claude/skills/handoff-run/scripts f
+    mkdir -p "$HR_HOST_REPO/$wf"
+    for f in validate-workflow-docs.sh workflow-patterns.sh; do
+        cp "$HR_WF_SCRIPTS/$f" "$HR_HOST_REPO/$wf/$f" || return 1
+    done
+    git -C "$HR_HOST_REPO" add -- "$wf" && git -C "$HR_HOST_REPO" commit -q -m 'workflow scripts' || return 1
     # The real repo ignores .remember/ through its own .remember/.gitignore; the fixture via exclude.
     printf '/.remember/\n' >>"$HR_HOST_REPO/.git/info/exclude"
     # Untracked, globally ignored (fake ~/.config/git/ignore), as on the real host.
