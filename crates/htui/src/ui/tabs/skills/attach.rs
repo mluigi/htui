@@ -11,10 +11,17 @@
 //!
 //! A `glob` attachment is written and shown, but nothing matches it before PRD milestone 5 (D86,
 //! OQ-14): its row says so, as a run's record says `no_path`.
+//!
+//! A form over a row with **no** attachment is prefilled from the imported `source` of the
+//! skill's head (milestone 4, plan D96): ANA-22 §7.3's activation, globs and languages, read back
+//! through [`prefill_from_source`], the one definition the import itself used. A stored row is
+//! never re-seeded, and the prefill feeds the fields, never the row: [`build`] over the fields is
+//! still the only source of what a save writes.
 
 use chrono::{DateTime, Utc};
 use htui_core::model::skill::resolve;
 use htui_core::model::skill_glob::{canonical_globs, split_list};
+use htui_core::model::skill_import::prefill_from_source;
 use htui_core::model::skill_language;
 use htui_core::model::{
     Activation, Attachment, BindingChange, PhaseId, ProjectId, SkillBinding, SkillBindingKey,
@@ -336,7 +343,13 @@ impl AttachPane {
             KeyCode::Char('k') | KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Enter => {
                 if let Some(row) = rows.get(self.cursor) {
-                    self.mode = AttachMode::Form(self.open_form(*row, snapshot, ctx));
+                    let (form, hint) = self.open_form(*row, snapshot, ctx);
+                    self.mode = AttachMode::Form(form);
+                    // §7.3's last row: a model-decided or manual file became `always` here, and
+                    // the maintainer is told so beside the form rather than only in the report.
+                    if let Some(hint) = hint {
+                        return AttachOutcome::Notice(Notice::Info(hint.to_owned()));
+                    }
                 }
             }
             KeyCode::Char('x') => {
@@ -368,21 +381,38 @@ impl AttachPane {
     /// `Enter` on a row: the stored attachment, or the defaults for a new one (`always`, `latest`,
     /// 0, nothing typed). The globs field holds the stored globs minus the stored languages'
     /// expansion (D102), so a re-save is the same attachment and the field shows what was typed.
-    fn open_form(&self, row: ARow, snapshot: &SkillsSnapshot, ctx: &Ctx<'_>) -> Form {
+    ///
+    /// A new one is prefilled from the imported `source` of the version it would put in force —
+    /// the head, since its pin starts at `latest` (D96) — and answers §7.3's hint beside it. The
+    /// source is re-read here rather than carried over from the import, so a skill imported last
+    /// week and attached today is prefilled too; a version typed in the TUI has `source = {}` and
+    /// prefills nothing. **A stored row is never re-seeded**: a maintainer who saved `off` over an
+    /// imported `always` finds it still `off`.
+    fn open_form(
+        &self,
+        row: ARow,
+        snapshot: &SkillsSnapshot,
+        ctx: &Ctx<'_>,
+    ) -> (Form, Option<&'static str>) {
         let key = self.key_of(row, snapshot);
         let target = target(row, snapshot, ctx);
         let Some(stored) = snapshot.binding(key) else {
-            return Form {
+            let prefill = snapshot
+                .head(self.skill)
+                .map(|head| prefill_from_source(&head.source))
+                .unwrap_or_default();
+            let form = Form {
                 key,
                 target,
                 token: None,
-                activation: Activation::Always,
+                activation: prefill.activation.unwrap_or(Activation::Always),
                 pin: TextField::with_text("latest"),
                 position: TextField::with_text("0"),
-                languages: TextField::new(),
-                globs: TextField::new(),
+                languages: TextField::with_text(&prefill.languages.join(", ")),
+                globs: TextField::with_text(&prefill.globs.join(", ")),
                 focus: FormField::Activation,
             };
+            return (form, prefill.hint);
         };
         let expanded = skill_language::expand(&stored.languages).unwrap_or_default();
         let typed: Vec<&str> = stored
@@ -391,7 +421,7 @@ impl AttachPane {
             .filter(|glob| !expanded.contains(glob))
             .map(String::as_str)
             .collect();
-        Form {
+        let form = Form {
             key,
             target,
             token: Some(stored.updated_at),
@@ -405,7 +435,8 @@ impl AttachPane {
             languages: TextField::with_text(&stored.languages.join(", ")),
             globs: TextField::with_text(&typed.join(", ")),
             focus: FormField::Activation,
-        }
+        };
+        (form, None)
     }
 
     /// The form (D103: `Enter` and `Ctrl+S` both save, `Esc` closes without asking).

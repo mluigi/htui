@@ -13,6 +13,10 @@
 //!
 //! The estimate is the skill's own block as the assembler renders it, without the section frame it
 //! shares with the other skills (D99, F-I): what adding this skill to a prompt costs.
+//!
+//! Milestone 4 adds the import (plan D102): `I` opens a one-line path form, `Enter` sends
+//! `ImportSkills` and returns to Browse while the worker walks, and the reply either says the
+//! counts in the notice or, when a file was refused or skipped, opens a per-file report.
 
 use core::cell::Cell;
 
@@ -33,6 +37,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use super::attach::{AttachOutcome, AttachPane};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{ExternalEdit, ExternalEditOutcome};
+use crate::skill_import::ImportOutcome;
 use crate::skills::{READ_NAME, REQUEST_NAMES, SkillsSnapshot, StaleWhat};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::TemplateBody;
@@ -43,6 +48,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// How many rows the notice may wrap to before it is cut; one when it fits.
 const NOTICE_LINES: usize = 2;
+
+/// The `StoreRequest::ImportSkills` name: what `busy` holds while a walk is in flight. The slice
+/// index rather than a literal, so the two cannot drift (`request_names_match_the_name_arms`).
+const IMPORT_NAME: &str = REQUEST_NAMES[5];
 
 /// The list's width, borders included: `  {name:<22} v{head:<3}` is 29 chars, a longer name cut
 /// to [`NAME_WIDTH`].
@@ -94,9 +103,10 @@ const BINDING_CHANGED_ELSEWHERE: &str = "this attachment changed elsewhere \u{20
 const DETACH_CHANGED_ELSEWHERE: &str = "this attachment changed elsewhere \u{2014} nothing was \
                                         detached; its row shows it as it is now";
 
-/// The hint row in Browse (96 chars: `j/k` carries no word so the row fits 100 columns).
-const BROWSE_HINT: &str = "j/k  ,/. version  b base  d diff  e edit  E $EDITOR  n new  i info  \
-                           a attach  r reload  h/l view";
+/// The hint row in Browse (96 chars: `j/k` carries no word so the row fits 100 columns). `I
+/// import` took the room `h/l view` had: the switch line right above names both views.
+const BROWSE_HINT: &str = "j/k  ,/. version  b base  d diff  e edit  E $EDITOR  n new  I import  \
+                           i info  a attach  r reload";
 
 /// The pane's bottom border while its lines overflow it.
 const SCROLL_HINT: &str = " J/K PgUp/PgDn scroll ";
@@ -109,6 +119,21 @@ const INFO_HINT: &str = "Tab field  Ctrl+S save  Esc cancel";
 
 /// The hint row in the editor, before the cursor's `L{line}:C{col}`.
 const EDIT_HINT: &str = "Ctrl+S save  Ctrl+E $EDITOR  Esc cancel";
+
+/// The hint row on the import form.
+const IMPORT_HINT: &str = "Enter import  Esc cancel";
+
+/// The hint row on the import report.
+const REPORT_HINT: &str = "j/k move  r reload  Esc back";
+
+/// An import went out.
+const IMPORTING: &str = "importing\u{2026}";
+
+/// `Enter` on an empty path.
+const ENTER_A_PATH: &str = "type a path to a SKILL.md file or a directory";
+
+/// An import that found nothing to import.
+const NOTHING_IMPORTED: &str = "nothing to import at that path";
 
 /// `SkillsStale` over an open editor: the Templates view's sentence (`templates.rs`).
 fn version_changed_elsewhere(head: i32) -> String {
@@ -213,6 +238,23 @@ enum Mode {
     Info(InfoForm),
     /// `e`, `n`'s step 3, or an `$EDITOR` return.
     Editing(Editor),
+    /// `I`: the path to import. One field, because one line is one path — a path may contain a
+    /// space, and nothing here splits on one (OQ-24).
+    ImportPath {
+        /// The path, exactly as typed.
+        field: TextField,
+    },
+    /// The answer to an import, one row per file in the order the files were named or found.
+    ///
+    /// **Opened only when something was refused or skipped** (D102). A clean import says so in
+    /// the notice instead, because a report the reader must dismiss to learn that nothing went
+    /// wrong is a report most people learn to dismiss.
+    Report {
+        /// Every outcome, in order.
+        outcomes: Vec<ImportOutcome>,
+        /// The highlighted row.
+        cursor: usize,
+    },
 }
 
 /// The rename form. Its `updated_at` is the compare-and-set token (D76).
@@ -407,6 +449,29 @@ pub(super) enum Notice {
     Error(String),
 }
 
+/// One report row: its sign, its text, and whether it is something the maintainer must act on.
+///
+/// The sign is the outcome's own verb — `+` written, `=` unchanged, `!` refused, `\u{b7}` left
+/// alone — because a report is read down a column, and the word for each would be the same word
+/// nine times over.
+fn outcome_row(outcome: &ImportOutcome) -> (char, String, bool) {
+    match outcome {
+        ImportOutcome::Imported { name, version, .. }
+        | ImportOutcome::Updated { name, version, .. } => {
+            ('+', format!("{name} v{version}"), false)
+        }
+        ImportOutcome::Unchanged { name, path } => {
+            ('=', format!("{name} \u{2014} unchanged ({path})"), false)
+        }
+        ImportOutcome::Refused { path, message } => {
+            ('!', format!("{path} \u{2014} {message}"), true)
+        }
+        ImportOutcome::Skipped { path, reason } => {
+            ('\u{b7}', format!("{path} \u{2014} {reason}"), true)
+        }
+    }
+}
+
 /// A key with no modifier but `SHIFT`, which is how a terminal reports a capital.
 fn plain(key: &KeyEvent) -> bool {
     (key.modifiers - KeyModifiers::SHIFT).is_empty()
@@ -421,7 +486,7 @@ impl LibraryView {
     /// Whether an editor, a prompt, the rename form, or the attachments pane's form, picker or
     /// question is taking every key (D100).
     pub(super) fn captures_input(&self) -> bool {
-        !matches!(self.mode, Mode::Browse)
+        !matches!(self.mode, Mode::Browse | Mode::Report { .. })
             || self.attach.as_ref().is_some_and(AttachPane::captures_input)
     }
 
@@ -446,6 +511,8 @@ impl LibraryView {
             Mode::Naming { .. } | Mode::Describing { .. } => self.on_naming_key(key),
             Mode::Info(_) => self.on_info_key(key, ctx),
             Mode::Editing(_) => self.on_editor_key(key, ctx),
+            Mode::ImportPath { .. } => self.on_import_key(key, ctx),
+            Mode::Report { .. } => self.on_report_key(key, ctx),
         }
     }
 
@@ -477,6 +544,15 @@ impl LibraryView {
                     );
                     self.stale(*what, detach);
                 }
+                self.clamp();
+            }
+            StoreReply::SkillImports(imports) => {
+                if !in_scope(&imports.snapshot, ctx) {
+                    return;
+                }
+                self.snapshot = Some(imports.snapshot.clone());
+                self.unavailable = None;
+                self.land_import(&imports.report);
                 self.clamp();
             }
             StoreReply::Failed { request, message } if *request == READ_NAME => {
@@ -552,12 +628,17 @@ impl LibraryView {
                 let (line, col) = editor.area.cursor_line_col();
                 format!("{EDIT_HINT}  L{}:C{}", line + 1, col + 1)
             }
+            (_, _, Mode::Report { outcomes, cursor }) => {
+                self.render_report(frame, content, outcomes, *cursor, ctx);
+                REPORT_HINT.to_owned()
+            }
             (_, _, mode) => {
                 self.render_browse(frame, content, ctx);
                 match mode {
                     Mode::Naming { .. } | Mode::Describing { .. } => NAMING_HINT,
                     Mode::Info(_) => INFO_HINT,
-                    Mode::Browse | Mode::Editing(_) => BROWSE_HINT,
+                    Mode::ImportPath { .. } => IMPORT_HINT,
+                    Mode::Browse | Mode::Editing(_) | Mode::Report { .. } => BROWSE_HINT,
                 }
                 .to_owned()
             }
@@ -599,6 +680,12 @@ impl LibraryView {
                         field: TextField::new(),
                     };
                 }
+            }
+            KeyCode::Char('I') => {
+                self.notice = None;
+                self.mode = Mode::ImportPath {
+                    field: TextField::new(),
+                };
             }
             KeyCode::Char('J' | 'K') | KeyCode::PageDown | KeyCode::PageUp => {
                 return self.scroll.on_key(key, self.pane_rows.get());
@@ -722,6 +809,68 @@ impl LibraryView {
                 Handled::Consumed
             }
         }
+    }
+
+    /// The import form (D102). `Enter` sends one path and returns to Browse, so the library is on
+    /// screen while the worker walks; `Esc` closes it and sends nothing.
+    fn on_import_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let Mode::ImportPath { field } = &mut self.mode else {
+            return Handled::Pass;
+        };
+        match field.on_key(key) {
+            FieldOutcome::Consumed => Handled::Consumed,
+            FieldOutcome::Pass => Handled::Pass,
+            FieldOutcome::Cancel => {
+                self.mode = Mode::Browse;
+                self.notice = None;
+                Handled::Consumed
+            }
+            FieldOutcome::Submit => {
+                let path = field.text().unwrap_or_default().trim().to_owned();
+                if path.is_empty() {
+                    self.notice = Some(Notice::Error(ENTER_A_PATH.to_owned()));
+                } else if let Some(busy) = self.busy {
+                    self.notice = Some(Notice::Error(in_flight(busy)));
+                } else {
+                    self.busy = Some(IMPORT_NAME);
+                    self.notice = Some(Notice::Info(IMPORTING.to_owned()));
+                    self.mode = Mode::Browse;
+                    ctx.request(StoreRequest::ImportSkills {
+                        scope: ctx.scope.clone(),
+                        paths: vec![path],
+                    });
+                }
+                Handled::Consumed
+            }
+        }
+    }
+
+    /// The import report: `j`/`k` move, `J`/`K` scroll, `r` re-reads the library behind it, `Esc`
+    /// returns to Browse. Every other key passes, so the tab and the shell keep theirs.
+    fn on_report_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        if !plain(&key) {
+            return Handled::Pass;
+        }
+        let Mode::Report { outcomes, cursor } = &mut self.mode else {
+            return Handled::Pass;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Browse;
+                self.notice = None;
+                self.scroll.reset();
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                *cursor = (*cursor + 1).min(outcomes.len().saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => *cursor = cursor.saturating_sub(1),
+            KeyCode::Char('J' | 'K') | KeyCode::PageDown | KeyCode::PageUp => {
+                return self.scroll.on_key(key, self.pane_rows.get());
+            }
+            KeyCode::Char('r') => ctx.request(StoreRequest::Skills(ctx.scope.clone())),
+            _ => return Handled::Pass,
+        }
+        Handled::Consumed
     }
 
     /// `Enter` on a new name (D71): an invalid or taken name is refused and the prompt stays;
@@ -1086,6 +1235,48 @@ impl LibraryView {
         }
     }
 
+    /// An import came back (D102): the counts in the notice, or the report when a file was refused
+    /// or skipped. Only the import's own reply lands it — the reply is its own variant, so a
+    /// `Skills` read can never be mistaken for it.
+    ///
+    /// The report opens only over Browse. Keys typed while the walk was in flight may have opened
+    /// an editor or a form, and a report that replaced it would throw a draft away: there the
+    /// notice says what the report would have, in counts.
+    fn land_import(&mut self, report: &[ImportOutcome]) {
+        if self.busy != Some(IMPORT_NAME) {
+            return;
+        }
+        self.busy = None;
+        let count =
+            |wanted: fn(&ImportOutcome) -> bool| report.iter().filter(|row| wanted(row)).count();
+        let written = count(|row| matches!(row, ImportOutcome::Imported { .. }));
+        let updated = count(|row| matches!(row, ImportOutcome::Updated { .. }));
+        let unchanged = count(|row| matches!(row, ImportOutcome::Unchanged { .. }));
+        let refused = count(|row| matches!(row, ImportOutcome::Refused { .. }));
+        let skipped = count(|row| matches!(row, ImportOutcome::Skipped { .. }));
+        let counts = format!("imported {written}, updated {updated}, unchanged {unchanged}");
+        if refused + skipped == 0 {
+            self.notice = Some(Notice::Info(if report.is_empty() {
+                NOTHING_IMPORTED.to_owned()
+            } else {
+                counts
+            }));
+            return;
+        }
+        if matches!(self.mode, Mode::Browse) && self.attach.is_none() {
+            self.notice = None;
+            self.scroll.reset();
+            self.mode = Mode::Report {
+                outcomes: report.to_vec(),
+                cursor: 0,
+            };
+        } else {
+            self.notice = Some(Notice::Error(format!(
+                "{counts}, refused {refused}, skipped {skipped}"
+            )));
+        }
+    }
+
     /// A version landed (a create's v1 or an append): the cursor goes onto the skill and the pane
     /// back to its head's body. Keys typed while the save was in flight still edited the draft;
     /// when they did, the editor stays open on them with the token at the saved version, so the
@@ -1323,7 +1514,26 @@ impl LibraryView {
                 return prompt(format!("description of {name}: "), field);
             }
             Mode::Info(form) => return self.info_pane(form, width, theme),
-            Mode::Browse | Mode::Editing(_) => {}
+            Mode::ImportPath { field } => {
+                let label = "path: ";
+                let budget =
+                    width.saturating_sub(u16::try_from(label.chars().count()).unwrap_or(0));
+                let mut spans = vec![Span::styled(label, theme.base)];
+                spans.extend(field.line(budget, true, theme).spans);
+                return (
+                    " import skills ".to_owned(),
+                    vec![
+                        Line::from(spans),
+                        Line::default(),
+                        Line::styled(
+                            "a SKILL.md or rules file, or a directory: its */SKILL.md, and the \
+                             *.md / *.mdc of a rules directory",
+                            theme.dim,
+                        ),
+                    ],
+                );
+            }
+            Mode::Browse | Mode::Editing(_) | Mode::Report { .. } => {}
         }
         let dim = |text: &str| {
             (
@@ -1413,6 +1623,51 @@ impl LibraryView {
                 line("description", &form.description, form.focus == 1),
             ],
         )
+    }
+
+    /// The import report over the whole content: one row per outcome, the cursor on one of them,
+    /// the rows that need acting on in the error style.
+    fn render_report(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        outcomes: &[ImportOutcome],
+        cursor: usize,
+        ctx: &Ctx<'_>,
+    ) {
+        let block = Block::new().borders(Borders::ALL).title(" import report ");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let width = usize::from(inner.width).max(1);
+        let lines: Vec<Line<'static>> = outcomes
+            .iter()
+            .enumerate()
+            .map(|(at, outcome)| {
+                let (sign, text, problem) = outcome_row(outcome);
+                let marker = if at == cursor { '>' } else { ' ' };
+                let style = if problem {
+                    ctx.theme.error
+                } else {
+                    ctx.theme.dim
+                };
+                Line::from(vec![
+                    Span::styled(format!("{marker}{sign} "), ctx.theme.base),
+                    Span::styled(text, style),
+                ])
+            })
+            .collect();
+        self.pane_rows.set(
+            lines
+                .iter()
+                .map(|line| line.width().div_ceil(width).max(1))
+                .sum(),
+        );
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((self.scroll.offset(), 0)),
+            inner,
+        );
     }
 
     /// The editor over the whole content, its title carrying the draft's estimate (D82).
