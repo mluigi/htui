@@ -617,20 +617,29 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     [[ $status -eq 0 && "$output" == *MOD-5* ]]
 }
 
-@test "26. a registry in the old place (\$HR_STATE/runs) moves to HR_RUNS on first use, then is validated" {
+@test "26. a registry in the old place (\$HR_STATE/runs) moves to HR_RUNS once, then is validated" {
     mk_run MOD-5
-    mkdir -p "$HR_STATE/runs"
-    mv "$(reg_of MOD-5)" "$HR_STATE/runs/MOD-5"
-    : >"$HR_STATE/runs.lock"
+    # That up already recorded this state dir as migrated (there was nothing to move). Act as if
+    # an hr from before the registry move had made the run.
+    grep -qxF "$HR_STATE" "$HR_RUNS/.migrated"
+    local good="$BATS_TEST_TMPDIR/reg.good"
+    cp "$(reg_of MOD-5)" "$good"
+    old_registry() { # the registry back in $HR_STATE/runs, no migration record
+        rm -f "$HR_RUNS/.migrated"
+        mkdir -p "$HR_STATE/runs"
+        mv "$(reg_of MOD-5)" "$HR_STATE/runs/MOD-5"
+        : >"$HR_STATE/runs.lock"
+    }
+    old_registry
     run --separate-stderr "$HR" ls
     [[ $status -eq 0 ]]
     [[ "$stderr" == *"moved 1 registry entries from $HR_STATE/runs"* ]]
     [[ "$output" == *MOD-5* ]]
     [[ -f "$(reg_of MOD-5)" && ! -e "$HR_STATE/runs" && ! -e "$HR_STATE/runs.lock" ]]
+    grep -qxF "$HR_STATE" "$HR_RUNS/.migrated"
 
-    # A sandbox-edited entry is moved, then refused like any other.
-    mkdir -p "$HR_STATE/runs"
-    mv "$(reg_of MOD-5)" "$HR_STATE/runs/MOD-5"
+    # A sandbox-edited entry is moved by that one migration, then refused like any other.
+    old_registry
     sed -i 's/^project=.*/project=htui/' "$HR_STATE/runs/MOD-5"
     : >"$HR_TEST_DOCKER_LOG"
     run --separate-stderr "$HR" down MOD-5 --purge --force --yes
@@ -638,18 +647,21 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     [[ "$stderr" == *'project'* ]]
     [[ -d "$(src_of MOD-5)/.git" ]]
     ! grep -q '^compose' "$HR_TEST_DOCKER_LOG" || false
+    cp "$good" "$(reg_of MOD-5)"
 
-    # In both places -> refused, neither touched; the old dir as a symlink -> refused.
-    cp "$(reg_of MOD-5)" "$BATS_TEST_TMPDIR/both"
+    # In both places before the migration -> refused, neither touched, nothing recorded.
+    rm -f "$HR_RUNS/.migrated"
     mkdir -p "$HR_STATE/runs"
-    cp "$BATS_TEST_TMPDIR/both" "$HR_STATE/runs/MOD-5"
+    cp "$good" "$HR_STATE/runs/MOD-5"
     run --separate-stderr "$HR" ls
     [[ $status -eq 3 && "$stderr" == *'both'* ]]
-    [[ -f "$HR_STATE/runs/MOD-5" && -f "$(reg_of MOD-5)" ]]
+    [[ -f "$HR_STATE/runs/MOD-5" && -f "$(reg_of MOD-5)" && ! -e "$HR_RUNS/.migrated" ]]
+    # The old place as a symlink before the migration: nothing to import, a warning, recorded.
     rm -rf "$HR_STATE/runs"
     ln -s "$HR_RUNS" "$HR_STATE/runs"
     run --separate-stderr "$HR" ls
-    [[ $status -eq 3 && "$stderr" == *'not a directory'* ]]
+    [[ $status -eq 0 && "$stderr" == *'not a directory'* && "$output" == *MOD-5* ]]
+    grep -qxF "$HR_STATE" "$HR_RUNS/.migrated"
 }
 
 @test "27. the lease file vanished after hr-mint --init -> up, gc, down --purge refuse (1); never recreated" {
@@ -1208,6 +1220,41 @@ EOF
     [[ $status -eq 0 ]]
     grep -qxF "HR_CLAUDE_PROJECT=$name" "$env"
     grep -qxF "HR_CLAUDE_MASK=$HR_ROOT/MOD-5/claude-mask" "$env"
+}
+
+@test "44. after the migration \$HR_STATE/runs is never imported again; it only warns, once per call" {
+    mk_run MOD-5
+    grep -qxF "$HR_STATE" "$HR_RUNS/.migrated"
+    local good="$BATS_TEST_TMPDIR/reg.good"
+    cp "$(reg_of MOD-5)" "$good"
+    # A sandbox plants entries in the old place: a new run, and a changed copy of MOD-5.
+    mkdir -p "$HR_STATE/runs"
+    sed 's/MOD-5/MOD-4/g; s/mod-5/mod-4/g' "$good" >"$HR_STATE/runs/MOD-4"
+    sed 's/^project=.*/project=htui/' "$good" >"$HR_STATE/runs/MOD-5"
+    local v
+    for v in ls "collect MOD-5" "down MOD-5" "attach MOD-5"; do
+        # shellcheck disable=SC2086
+        run --separate-stderr "$HR" $v </dev/null
+        [[ $status -eq 0 ]] || { echo "hr $v: $status $stderr" >&2; return 1; }
+        [[ "$(grep -c "$HR_STATE/runs" <<<"$stderr")" -eq 1 ]] || { echo "hr $v: $stderr" >&2; return 1; }
+        [[ "$stderr" != *"registry entries"* ]]
+        [[ ! -e "$(reg_of MOD-4)" && -f "$HR_STATE/runs/MOD-4" ]]
+        cmp <(grep -v '^collected_' "$(reg_of MOD-5)") <(grep -v '^collected_' "$good")
+    done
+    run --separate-stderr "$HR" ls
+    [[ "$output" != *MOD-4* ]]
+    # A plain file, or a symlink, there: the same warning, never a dead verb.
+    rm -rf "$HR_STATE/runs"
+    : >"$HR_STATE/runs"
+    run --separate-stderr "$HR" ls
+    [[ $status -eq 0 && "$output" == *MOD-5* && "$(grep -c "$HR_STATE/runs" <<<"$stderr")" -eq 1 ]]
+    rm "$HR_STATE/runs"
+    ln -s /nonexistent "$HR_STATE/runs"
+    run --separate-stderr "$HR" ls
+    [[ $status -eq 0 && "$output" == *MOD-5* && "$(grep -c "$HR_STATE/runs" <<<"$stderr")" -eq 1 ]]
+    rm "$HR_STATE/runs"
+    run --separate-stderr "$HR" ls
+    [[ $status -eq 0 && "$stderr" != *"$HR_STATE/runs"* ]]
 }
 
 # ---------------------------------------------------------------------------------------------

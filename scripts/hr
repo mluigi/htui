@@ -38,7 +38,8 @@
 # Run registry $HR_RUNS/<ITEM> (owned by this script; key=value, written tmp+mv under flock
 # $HR_RUNS/.lock, parsed and validated, never sourced). HR_RUNS is host-only: the registry names
 # what gets mounted rw and what `down -v` removes, so no sandbox may write it (review H4); a
-# registry left in the old place, $HR_STATE/runs, is moved there on first use. ID leases belong to
+# registry left in the old place, $HR_STATE/runs, is moved there once per state dir (recorded in
+# $HR_RUNS/.migrated), and never read again after that (re-review M-B). ID leases belong to
 # scripts/hr-mint alone; $HR_RUNS/.leases-initialized records (host-only) that a state dir had
 # leasing on, so a lease file a sandbox deleted is refused rather than silently recreated.
 # Design: .claude/plans/tool-7-hr-sandbox.plan.md, blueprint §T4. Linux only.
@@ -68,6 +69,7 @@ STATE="$(realpath -ms "${HR_STATE:-$DEFAULT_STATE}")"
 RUNS="$(realpath -ms "${HR_RUNS:-/media/projects/htui-hr/.runs}")"
 RUNS_LOCK="$RUNS/.lock"
 LEASE_MARK="$RUNS/.leases-initialized"
+MIGRATED_MARK="$RUNS/.migrated"
 OLD_RUNS="$STATE/runs"
 ROOT_HDD="$(realpath -ms "${HR_ROOT:-/media/projects/htui-hr}")"
 ROOT_SSD="$(realpath -ms "${HR_SSD_ROOT:-$HOME/htui-hr}")"
@@ -371,12 +373,28 @@ check_runs_dir() {
 }
 
 # migrate_registry — a registry from before review H4 lived in $HR_STATE/runs, which every sandbox
-# can write: move its entries to the host-only HR_RUNS (read_reg validates them like any other).
+# can write: move its entries to the host-only HR_RUNS (read_reg validates them like any other),
+# once per state dir. $HR_RUNS/.migrated (host-only) records each state dir done; after that
+# nothing is ever imported from $HR_STATE/runs again — a sandbox could plant entries there at any
+# time (re-review M-B) — and whatever is there only draws one warning per call.
 migrate_registry() {
-    [[ -e "$OLD_RUNS" || -L "$OLD_RUNS" ]] || return 0
-    [[ -d "$OLD_RUNS" && ! -L "$OLD_RUNS" ]] \
-        || die 3 "$OLD_RUNS is not a directory (a sandbox?) — the registry lives in $RUNS now; inspect and remove it by hand"
+    if grep -qxF -- "$STATE" "$MIGRATED_MARK" 2>/dev/null; then
+        [[ -e "$OLD_RUNS" || -L "$OLD_RUNS" ]] \
+            && warn "ignoring $OLD_RUNS: the registry moved to $RUNS already, nothing is imported from there any more (a sandbox can write it) — inspect and remove it by hand"
+        return 0
+    fi
     lock_runs
+    if [[ ! -e "$OLD_RUNS" && ! -L "$OLD_RUNS" ]]; then
+        mark_migrated
+        unlock_runs
+        return 0
+    fi
+    if [[ ! -d "$OLD_RUNS" || -L "$OLD_RUNS" ]]; then
+        warn "ignoring $OLD_RUNS: not a directory (a sandbox?), nothing to import; the registry lives in $RUNS — inspect and remove it by hand"
+        mark_migrated
+        unlock_runs
+        return 0
+    fi
     local f name n=0 left=0
     for f in "$OLD_RUNS"/* "$OLD_RUNS"/.[!.]*; do
         [[ -e "$f" || -L "$f" ]] || continue
@@ -397,7 +415,13 @@ migrate_registry() {
         warn "left $OLD_RUNS in place: $left entries that are not registry files — inspect and remove it by hand"
     fi
     [[ "$n" -gt 0 ]] && warn "moved $n registry entries from $OLD_RUNS to the host-only $RUNS"
+    mark_migrated
     unlock_runs
+}
+
+# mark_migrated — record (under the runs lock) that $STATE's old registry has been dealt with.
+mark_migrated() {
+    printf '%s\n' "$STATE" >>"$MIGRATED_MARK" || die 3 "cannot write $MIGRATED_MARK"
 }
 
 # ID leases: hr-mint --init creates the lease file on the host; the host-only marker then remembers
