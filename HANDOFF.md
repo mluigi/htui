@@ -19,7 +19,7 @@
 grapheme through the new private `crates/htui/src/ui/cells.rs`, so a CJK or emoji line occupies
 the columns it is drawn in and `Backspace` cannot split a combining sequence. It declares
 `unicode-width` and `unicode-segmentation`, both already in the graph via `ratatui-core`; no
-snapshot moved. The rest of the display-width problem is **MOD-59**. `R-NF-1` is argued, not
+snapshot moved. The rest of the display-width problem is **MOD-60**. `R-NF-1` is argued, not
 gated: a Windows cross-check of `-p htui` cannot run on this box, and MOD-16 carries it.
 Before it, **MOD-7 was done** (`docs/decisions/mod/mod-7.md`), all four
 milestones: a box is keyed on its `box.toml` id and checked by a keyed machine fingerprint
@@ -262,7 +262,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   side reintroduces the superseded-seq bug `16079aa` fixed, so the fix belongs in the runtime:
   catch the panic (or notice a panicked `JoinHandle` in `sweep_finished`) and send the task's
   terminal reply with a failure. Found 2026-09-26.
-- [ ] **MOD-59 - Display width in every hand-laid-out row** (from MOD-54, plan D18). `R-TUI-1`,
+- [ ] **MOD-60 - Display width in every hand-laid-out row** (from MOD-54, plan D18). `R-TUI-1`,
   `R-NF-1`. MOD-54 made `TextField` and `TextArea` count cells instead of code points through
   `crate::ui::cells`; every other place that lays text out in `char`s has the identical class of
   bug and is untouched on purpose. In order of severity: `crates/htui/src/ui/diff.rs` (the
@@ -691,7 +691,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   included. The alternative, nvim's `--embed` RPC UI (`nvim-rs`), is nvim-only and was not
   preferred. The three crates are not in `Cargo.lock`, so the plan owns that dependency decision.
   Not blocked. Its in-app widget draws through `ui::cells` (MOD-54, done:
-  `docs/decisions/mod/mod-54.md`); the rest of the display-width work is MOD-59.
+  `docs/decisions/mod/mod-54.md`); the rest of the display-width work is MOD-60.
 
 ### Deferred backlog
 
@@ -753,6 +753,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-21 per-model weights)                                                                  |
-| MOD-N   | 41 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-58 claim test gaps, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor, MOD-59 display width; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 41 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-58 claim test gaps, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor, MOD-60 display width; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-5 merge-hook test flake)                |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

@@ -118,7 +118,7 @@ rewrites that package's dependency list, so the lock legitimately moves and a ma
 
 ## Follow-up
 
-**MOD-59** carries the rest of the display-width problem, which this item deliberately did not
+**MOD-60** carries the rest of the display-width problem, which this item deliberately did not
 touch: `ui/diff.rs`, `ui/top_bar.rs`, the chat transcript, and every hand-laid-out row under the
 settings and backlog sections. `diff.rs` is the sharpest — a CJK diff hunk overrunning its pane —
 and should be first. The boundary is recorded rather than crossed because the HANDOFF item named
