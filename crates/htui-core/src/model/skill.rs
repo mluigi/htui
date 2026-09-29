@@ -1,10 +1,10 @@
 //! Skills, their versions and their bindings (`docs/ANA-9.md` §5.6), plus the `R-SKL-2`
 //! resolution the prompt's skills section renders (`docs/ANA-5.md` §4.2).
 //!
-//! The writers are MOD-9 milestone 3's (`WriteStore::create_skill` and three others); a `glob`
-//! attachment fires from PRD milestone 5 (D86). Since MOD-9 milestone 2 (ANA-22 §6-§7) a skill
-//! attaches globally, to a project or to one phase; [`resolve`] picks the most specific
-//! attachment per skill, and [`select`] decides, per step, which winners render and records why.
+//! The writers are MOD-9 milestone 3's (`WriteStore::create_skill` and three others). Since MOD-9
+//! milestone 2 (ANA-22 §6-§7) a skill attaches globally, to a project or to one phase; [`resolve`]
+//! picks the most specific attachment per skill, and [`select`] decides, per step, which winners
+//! render and records why — a `glob` winner against the step's [`StepFiles`] (MOD-9 D111).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::model::ids::{PhaseId, ProjectId, SkillBindingId, SkillId, UserId};
+use crate::model::skill_glob::SkillGlobs;
 
 str_enum!(
     /// `skill_binding.activation` (ANA-22 §6 item 4): whether the winning attachment puts its
@@ -20,8 +21,8 @@ str_enum!(
         /// Always rendered. The column default, so every binding written before `0007` is
         /// unchanged.
         Always => "always",
-        /// Rendered when the step's file set matches `globs` (PRD milestone 5, D86). Until the
-        /// matcher fires, a `glob` winner is inactive and records `no_path` (plan D40, OQ-12).
+        /// Rendered when the step's file set matches `globs`: `matched`, else `no_match` or
+        /// `no_path` (MOD-9 D111).
         Glob => "glob",
         /// Attached more broadly but not here: a narrower `off` hides a broader attachment.
         Off => "off",
@@ -115,7 +116,8 @@ pub struct SkillBinding {
     /// `skill_binding.activation`.
     pub activation: Activation,
     /// `skill_binding.globs`: the effective globs, non-empty when `activation` is `Glob`
-    /// (`skill_binding_glob_needs_globs`). Nothing matches them before PRD milestone 5 (D86).
+    /// (`skill_binding_glob_needs_globs`); `select` matches them against the step's files (MOD-9
+    /// D111).
     pub globs: Vec<String>,
     /// `skill_binding.languages`: as authored, display only; the matcher reads `globs`.
     pub languages: Vec<String>,
@@ -302,7 +304,7 @@ pub struct BoundSkill {
     pub level: SkillLevel,
     /// The winning attachment's activation, which [`select`] reads.
     pub activation: Activation,
-    /// The winning attachment's globs, for PRD milestone 5's matcher (D86). Recorded nowhere yet.
+    /// The winning attachment's globs, matched by `select` against `StepFiles`, MOD-9 D111.
     pub globs: Vec<String>,
 }
 
@@ -455,21 +457,21 @@ pub struct StepFiles {
 impl StepFiles {
     /// Marks `repo` as listed, with no file added.
     pub fn reach(&mut self, repo: &str) {
-        let _ = repo;
-        todo!()
+        self.repos.entry(repo.to_owned()).or_default();
     }
 
     /// Adds `repo:path`, reaching `repo`.
     pub fn insert(&mut self, repo: &str, path: &str) {
-        let _ = (repo, path);
-        todo!()
+        self.repos
+            .entry(repo.to_owned())
+            .or_default()
+            .insert(path.to_owned());
     }
 
     /// Whether `repo` was reached.
     #[must_use]
     pub fn is_reached(&self, repo: &str) -> bool {
-        let _ = repo;
-        todo!()
+        self.repos.contains_key(repo)
     }
 
     /// Every reached repo and its paths, in repo byte order, paths in byte order.
@@ -482,46 +484,49 @@ impl StepFiles {
     /// Keeps the `(repo, path)` pairs `keep` answers `true` for; a repo stays reached even when
     /// every path under it goes (MOD-9 D132).
     pub fn retain(&mut self, mut keep: impl FnMut(&str, &str) -> bool) {
-        let _ = &mut keep;
-        todo!()
+        for (repo, paths) in &mut self.repos {
+            paths.retain(|path| keep(repo, path));
+        }
     }
 
     /// Whether no repo was reached (MOD-9 D137).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        todo!()
+        self.repos.is_empty()
     }
 }
 
-/// Plan D40: decides every candidate, in order, for one step. Pure.
+/// Plan D40, MOD-9 D111: decides every candidate, in order, for one step. Pure.
 ///
 /// The rules, first match wins: a body that does not place `{{skills}}` (`placed == false`) makes
-/// every candidate `not_placed`; `version: None` is `missing_version`; `Off` is `off`; `Glob` is
-/// `no_path` (no step resolves a root before PRD milestone 5, D86; OQ-12); `Always` is `always`
-/// and the only active outcome. Returns the active candidates in input order — which is collapse
-/// order, the render order — and one [`SkillChoice`] per candidate in the same order.
+/// every candidate `not_placed`; `version: None` is `missing_version`; `Off` is `off`; `Always` is
+/// `always`; a `Glob` whose stored globs no longer compile is `no_match` (R-53); a `Glob` matching
+/// a file of `files` is `matched`, with the first match in `(repo bytes, path bytes)` order as
+/// its `path` (D113); any other `Glob` is `no_match` when `files` reached a repo its globs can
+/// match in (D112), else `no_path`. `always` and `matched` are the active outcomes. Returns the
+/// active candidates in input order — which is collapse order, the render order — and one
+/// [`SkillChoice`] per candidate in the same order.
 #[must_use]
 pub fn select(
     candidates: Vec<BoundSkill>,
     placed: bool,
     files: &StepFiles,
 ) -> (Vec<BoundSkill>, Vec<SkillChoice>) {
-    let _ = files;
     let mut active = Vec::with_capacity(candidates.len());
     let mut choices = Vec::with_capacity(candidates.len());
     for skill in candidates {
-        let reason = if !placed {
-            ChoiceReason::NotPlaced
+        let (reason, path) = if !placed {
+            (ChoiceReason::NotPlaced, None)
         } else if skill.version.is_none() {
-            ChoiceReason::MissingVersion
+            (ChoiceReason::MissingVersion, None)
         } else {
             match skill.activation {
-                Activation::Off => ChoiceReason::Off,
-                Activation::Glob => ChoiceReason::NoPath,
-                Activation::Always => ChoiceReason::Always,
+                Activation::Off => (ChoiceReason::Off, None),
+                Activation::Glob => glob_reason(&skill.globs, files),
+                Activation::Always => (ChoiceReason::Always, None),
             }
         };
-        let is_active = reason == ChoiceReason::Always;
+        let is_active = matches!(reason, ChoiceReason::Always | ChoiceReason::Matched);
         choices.push(SkillChoice {
             skill: skill.skill_id,
             name: skill.name.clone(),
@@ -530,7 +535,7 @@ pub fn select(
             activation: skill.activation,
             active: is_active,
             reason,
-            path: None,
+            path,
         });
         if is_active {
             active.push(skill);
@@ -539,12 +544,32 @@ pub fn select(
     (active, choices)
 }
 
+/// MOD-9 D111-D113: one `glob` winner's reason over the step's files, and the matched
+/// `<repo>:<path>`. `files.repos()` is byte order, so the first hit is the deterministic one.
+fn glob_reason(globs: &[String], files: &StepFiles) -> (ChoiceReason, Option<String>) {
+    // MOD-9 D111 (R-53): globs stored before a refusal rule changed are a quiet `no_match`.
+    let Ok(compiled) = SkillGlobs::compile(globs) else {
+        return (ChoiceReason::NoMatch, None);
+    };
+    for (repo, paths) in files.repos() {
+        if let Some(path) = compiled.first_match(repo, paths.iter().map(String::as_str)) {
+            return (ChoiceReason::Matched, Some(format!("{repo}:{path}")));
+        }
+    }
+    if files.repos().any(|(repo, _)| compiled.reaches(repo)) {
+        (ChoiceReason::NoMatch, None)
+    } else {
+        (ChoiceReason::NoPath, None)
+    }
+}
+
 /// MOD-9 D111: whether a walk could change any choice — the collapsed winners hold a `Glob`
 /// with a version. `BoundSkill::collapse` first, so a project `glob` under a phase `off` is not one.
 #[must_use]
 pub fn needs_files(candidates: &[BoundSkill]) -> bool {
-    let _ = candidates;
-    todo!()
+    BoundSkill::collapse(candidates.to_vec())
+        .iter()
+        .any(|skill| skill.activation == Activation::Glob && skill.version.is_some())
 }
 
 #[cfg(test)]

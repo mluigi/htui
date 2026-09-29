@@ -174,7 +174,7 @@ pub fn split_list(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// A compiled attachment, for PRD milestone 5's `select` (D86). Tested now, called there.
+/// A compiled attachment: `select`'s matcher (MOD-9 D111).
 #[derive(Debug, Clone)]
 pub struct SkillGlobs {
     /// Each glob's qualifier and matcher, in stored order.
@@ -215,8 +215,9 @@ impl SkillGlobs {
     /// with `repo`.
     #[must_use]
     pub fn reaches(&self, repo: &str) -> bool {
-        let _ = repo;
-        todo!()
+        self.globs
+            .iter()
+            .any(|(qualifier, _)| qualifier.as_deref().is_none_or(|own| own == repo))
     }
 }
 
