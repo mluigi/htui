@@ -384,9 +384,29 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   first, then refused). Review `rust-reviewer` APPROVE WITH FIXES: findings 1, 2, 4, 5, 7 and the
   acceptance gap (a phase `off` over a global `always`, end to end) applied (`22822ca`..`e5db119`);
   finding 3 opened as MOD-59; finding 8 accepted (documented residue in `crates/htui/src/skills.rs`).
-  **Milestone 4 (import of skill files) is next.** Carry into it: the Skills view cannot open an editor
-  on a skill with no version (review finding 6, `library.rs` `on_skill_key`), which import is the
-  first writer able to produce; and a `glob` attachment still records `no_path` until row 5.
+  **Phase 4 landed (`09fd007`..`6af3f53`, 2026-09-29):** milestone 4, SKILL.md import, ported
+  from PR #10 (`4abb49a`..`bbac75c`) onto the milestone 3 above; #10's own milestone 3 was not taken.
+  A hand-written frontmatter reader (`model::frontmatter`, no YAML dependency, per-key issues with
+  byte and line, block scalars accepted) and ANA-22 §7.3's mapping (`model::skill_import`,
+  `prefill_from_source`); `StoreRequest::ImportSkills` / `StoreReply::SkillImports`
+  (`skills::REQUEST_NAMES` 5 → 6) walking a file or directory on the store worker
+  (`crate::skill_import`: any SKILL.md to depth 4, a rules directory's `*.md`/`*.mdc`, a hidden tool
+  root's rules child only, bundled `scripts/`/`references/`/`assets/` skipped and listed, 64-file
+  and 256 KiB caps asked before the read) and writing through `create_skill`, or through
+  `update_skill` for a moved description and `add_skill_version` for a changed body when the name
+  exists — never an attachment; the Skills
+  view's `I` path form and per-file report; the attachments pane prefilling a new attachment from
+  the head's `source`. Three review findings fixed in the port: a hidden tool root collected its own
+  markdown and skipped its rules files, a `<name>.instructions.md` or snake-case stem was refused,
+  and a name repeated in one import answered a spurious stale refusal. No migration, no
+  `WriteStore` method, no `.sqlx` file, no dependency. Plan
+  `.claude/plans/mod-9-skill-import.plan.md`, blueprint
+  `.claude/plans/mod-9-skill-import.blueprint.md`, each headed by the port's departures.
+  **Row 5 (glob attachments fire) is next, and is the last open part of MOD-9.** Carry into it: a
+  `glob` attachment still records `no_path`, and an imported file's globs prefill the form but
+  match nothing until row 5. Still open from milestone 3: the Skills view cannot open an editor on
+  a skill with no version (review finding 6, `library.rs` `on_skill_key`); import cannot produce
+  one (`create_skill` writes v1 with the row), so only a hand-written row can.
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
   pattern masks, fail-closed persistence gate, Settings tab secret provider section. **No longer
