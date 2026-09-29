@@ -433,6 +433,38 @@ set_reg() {
 LOCAL_MOUNTS=("$HOME/.local/bin" "$HOME/.local/share/mise/installs" "$HOME/.local/share/uv/python"
     "$HOME/.local/share/uv/tools")
 
+# What of ~/.claude a run does not see (re-review M-C; compose.hr.yaml masks them): directories
+# get an empty tmpfs, files a per-run empty file from RUN_DIR/claude-mask. Everything else in
+# ~/.claude stays shared read-write, and projects/<the run's project> is bound back.
+CLAUDE_MASK_DIRS=(projects file-history paste-cache shell-snapshots session-env session-data sessions
+    jobs daemon backups metrics .remember)
+CLAUDE_MASK_FILES=(history.jsonl bash-commands.log cost-tracker.log)
+
+# claude_project NAME_VAR — Claude Code's ~/.claude/projects/<name> for HOST (every character
+# outside [A-Za-z0-9] becomes '-'; longer names than 200 get a hash suffix, not reproduced here).
+claude_project() {
+    local LC_ALL=C name="${HOST//[^a-zA-Z0-9]/-}"
+    [[ ${#name} -le 200 ]] || die 2 "the host repo path $HOST is too long for Claude's project dir name (over 200 characters)"
+    printf '%s' "$name"
+}
+
+# prepare_claude_mounts RUN_DIR — every mount point compose puts inside ~/.claude exists on the
+# host, owned by the user (Docker would create a missing one root-owned in the host's ~/.claude);
+# existing entries are left as they are. RUN_DIR/claude-mask holds the run's empty files.
+prepare_claude_mounts() {
+    local rd="$1" c="$HOME/.claude" d f
+    mkdir -p "$c/projects/$HR_CLAUDE_PROJECT" || return 1
+    for d in "${CLAUDE_MASK_DIRS[@]}"; do mkdir -p "$c/$d" || return 1; done
+    for f in "${CLAUDE_MASK_FILES[@]}"; do
+        [[ -e "$c/$f" || -L "$c/$f" ]] || (umask 077 && : >"$c/$f") || return 1
+    done
+    mkdir -p "$rd/claude-mask" || return 1
+    for f in "${CLAUDE_MASK_FILES[@]}"; do
+        [[ -f "$rd/claude-mask/$f" && ! -L "$rd/claude-mask/$f" ]] && continue
+        rm -rf -- "${rd:?}/claude-mask/$f" && (umask 077 && : >"$rd/claude-mask/$f") || return 1
+    done
+}
+
 # make_cargo_empty RUN_DIR — the empty read-only file compose binds over the shared cargo volume's
 # config/credentials files (review M5). Outside src/, so the sandbox cannot write it.
 make_cargo_empty() {
@@ -520,6 +552,8 @@ host_env() {
         email="${email:-hr@localhost}"
     fi
     export HR_GIT_NAME="$name" HR_GIT_EMAIL="$email"
+    HR_CLAUDE_PROJECT="$(claude_project)" || exit $?
+    export HR_CLAUDE_PROJECT
     resolve_mise_path "$strict"
 }
 
@@ -537,6 +571,7 @@ load_run() {
     export HR_SRC="${RUN[run_dir]}/src"
     export HR_CLAUDE_JSON="${RUN[run_dir]}/claude.json"
     export HR_CARGO_EMPTY="${RUN[run_dir]}/cargo-empty"
+    export HR_CLAUDE_MASK="${RUN[run_dir]}/claude-mask"
     export HR_CPUS="${RUN[cpus]:-4}"
     SRC="$HR_SRC"
     set_compose "${RUN[project]:-hr-${item,,}}"
@@ -746,6 +781,7 @@ cmd_up() {
     mkdir -p "$SRC/.remember" || up_abort 3 "cannot create $SRC/.remember"
     install -m 600 "$HOME/.claude.json" "$run_dir/claude.json" || up_abort 3 "cannot snapshot ~/.claude.json"
     make_cargo_empty "$run_dir" || up_abort 3 "cannot create $run_dir/cargo-empty"
+    prepare_claude_mounts "$run_dir" || up_abort 3 "cannot create the ~/.claude mount points or $run_dir/claude-mask"
 
     # 8. registry before compose, so `down --purge --force` can clean a failed up
     RUN=([item]="$item" [project]="hr-${item,,}" [branch]="hr/$item" [run_dir]="$run_dir"
@@ -758,7 +794,7 @@ cmd_up() {
 
     # 9. containers
     export HR_ITEM="$item" HR_SRC="$SRC" HR_CLAUDE_JSON="$run_dir/claude.json" HR_CPUS="$cpus"
-    export HR_CARGO_EMPTY="$run_dir/cargo-empty"
+    export HR_CARGO_EMPTY="$run_dir/cargo-empty" HR_CLAUDE_MASK="$run_dir/claude-mask"
     set_compose "hr-${item,,}"
     spin "Starting $PROJECT" "${COMPOSE[@]}" up -d --wait \
         || die 3 "docker compose up failed for $PROJECT — clean up with: scripts/hr down $item --purge --force"
@@ -789,6 +825,8 @@ cmd_attach() {
         # Runs made before the cargo-empty file existed; and `docker volume prune --all` may have
         # dropped the external cargo volume (both idempotent).
         make_cargo_empty "${RUN[run_dir]}" || die 3 "cannot create ${RUN[run_dir]}/cargo-empty"
+        prepare_claude_mounts "${RUN[run_dir]}" \
+            || die 3 "cannot create the ~/.claude mount points or ${RUN[run_dir]}/claude-mask"
         "$DOCKER" volume create "$CARGO_VOLUME" >/dev/null || die 3 "cannot create volume $CARGO_VOLUME"
         cargo_volume_ok
         spin "Starting $PROJECT" "${COMPOSE[@]}" up -d --wait || die 3 "docker compose up failed for $PROJECT"

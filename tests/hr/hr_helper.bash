@@ -163,11 +163,22 @@ compose_config() {
     local v
     local -a e=()
     for v in $(grep -oE '\$\{[A-Z_]+:\?\}' "$HR_COMPOSE_FILE" | tr -d '${}:?' | sort -u); do
-        e+=("$v=/$v")
+        case "$v" in
+            HR_CLAUDE_PROJECT) e+=("$v=-$v") ;;   # a directory name, not a path
+            *) e+=("$v=/$v") ;;
+        esac
     done
     env -i PATH="$PATH" HOME="$HOME" "${e[@]}" docker compose -p hr-contract -f "$HR_COMPOSE_FILE" \
         config --format json
 }
+
+# claude_project_of PATH — Claude Code's ~/.claude/projects/<name> for a working directory.
+claude_project_of() { local LC_ALL=C p="$1"; printf '%s' "${p//[^a-zA-Z0-9]/-}"; }
+
+# The ~/.claude entries every run masks (re-review M-C): tmpfs dirs, per-run empty files.
+HR_CLAUDE_MASK_DIRS=(projects file-history paste-cache shell-snapshots session-env session-data sessions
+    jobs daemon backups metrics .remember)
+HR_CLAUDE_MASK_FILES=(history.jsonl bash-commands.log cost-tracker.log)
 
 # src_of ITEM [ROOT] — the run's clone.
 src_of() { printf '%s/%s/src' "${2:-$HR_ROOT}" "$1"; }
@@ -275,6 +286,11 @@ hr_docker_teardown() {
         ids="$(docker network ls -q --filter "label=com.docker.compose.project=$proj")"
         [[ -n "$ids" ]] && docker network rm $ids >/dev/null 2>&1
     done
+    # `up` makes the fixture's (empty) project dir in ~/.claude/projects as the mount point of the
+    # one project a run keeps; remove it again (rmdir: never anything with content in it).
+    local pd
+    pd="$HOME/.claude/projects/$(claude_project_of "$BATS_TEST_TMPDIR/host")"
+    [[ -n "${HR_DOCKER_ITEMS[*]:-}" && -d "$pd" && ! -L "$pd" ]] && rmdir -- "$pd" 2>/dev/null
     return 0
 }
 

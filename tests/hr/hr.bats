@@ -1148,6 +1148,68 @@ EOF
     [[ $status -eq 0 ]]
 }
 
+@test "42. compose: ~/.claude stays rw, cross-project data is masked, the run's own project comes back rw" {
+    local cfg vols
+    cfg="$(compose_config)"
+    vols="$(jq -c '[.services.dev.volumes[] | {type, source, target, ro: (.read_only // false)}]' <<<"$cfg")"
+    local c=/HR_HOME/.claude
+    # Still the whole ~/.claude read-write: credentials, settings, plugins, skills, agents.
+    jq -e --arg c "$c" 'any(.[]; . == {type: "bind", source: $c, target: $c, ro: false})' <<<"$vols" >/dev/null
+    local d f i_tmp i_bind
+    for d in "${HR_CLAUDE_MASK_DIRS[@]}"; do
+        jq -e --arg t "$c/$d" 'any(.[]; . == {type: "tmpfs", source: null, target: $t, ro: false})' <<<"$vols" >/dev/null \
+            || { echo "no tmpfs over $d" >&2; return 1; }
+    done
+    for f in "${HR_CLAUDE_MASK_FILES[@]}"; do
+        jq -e --arg s "/HR_CLAUDE_MASK/$f" --arg t "$c/$f" \
+            'any(.[]; . == {type: "bind", source: $s, target: $t, ro: false})' <<<"$vols" >/dev/null \
+            || { echo "no per-run file over $f" >&2; return 1; }
+    done
+    # The run's own project dir (auto-memory, its sessions), bound back rw after the tmpfs.
+    local p="$c/projects/-HR_CLAUDE_PROJECT"
+    jq -e --arg p "$p" 'any(.[]; . == {type: "bind", source: $p, target: $p, ro: false})' <<<"$vols" >/dev/null
+    i_tmp="$(jq --arg t "$c/projects" 'map(.target) | index($t)' <<<"$vols")"
+    i_bind="$(jq --arg t "$p" 'map(.target) | index($t)' <<<"$vols")"
+    [[ "$i_tmp" -lt "$i_bind" ]]
+    # Writable by the user: Docker gives a tmpfs the mode of the directory under it otherwise.
+    [[ "$(jq --arg c "$c/" '[.services.dev.volumes[] | select(.type == "tmpfs" and (.target | startswith($c))) | .tmpfs.mode] | unique' <<<"$cfg" | tr -d ' \n')" \
+        == '[1023]' ]]
+    # Nothing else under ~/.claude is mounted: the list above is the whole mask.
+    [[ "$(jq --arg c "$c/" '[.[] | select(.target | startswith($c))] | length' <<<"$vols")" \
+        -eq $((${#HR_CLAUDE_MASK_DIRS[@]} + ${#HR_CLAUDE_MASK_FILES[@]} + 1)) ]]
+}
+
+@test "43. up/attach: the Claude project name, the mount points on the host, the per-run empty files" {
+    run --separate-stderr "$HR" up MOD-5
+    [[ $status -eq 0 ]]
+    local env="$HR_TEST_DOCKER_LOG.env" name d f
+    name="$(claude_project_of "$HR_HOST_REPO")"
+    [[ "$name" == -* && "$name" != *[!a-zA-Z0-9-]* ]]
+    grep -qxF "HR_CLAUDE_PROJECT=$name" "$env"
+    grep -qxF "HR_CLAUDE_MASK=$HR_ROOT/MOD-5/claude-mask" "$env"
+    # Mount points exist, as directories owned by the user (Docker would make them root-owned).
+    [[ -d "$HOME/.claude/projects/$name" && -O "$HOME/.claude/projects/$name" ]]
+    for d in "${HR_CLAUDE_MASK_DIRS[@]}"; do [[ -d "$HOME/.claude/$d" && -O "$HOME/.claude/$d" ]]; done
+    for f in "${HR_CLAUDE_MASK_FILES[@]}"; do
+        [[ -f "$HOME/.claude/$f" && -O "$HOME/.claude/$f" ]]
+        [[ -f "$HR_ROOT/MOD-5/claude-mask/$f" && ! -s "$HR_ROOT/MOD-5/claude-mask/$f" ]]
+        [[ "$(stat -c %a "$HR_ROOT/MOD-5/claude-mask/$f")" == 600 ]]
+    done
+    # Existing host data is never touched: only missing mount points are created.
+    printf 'host history\n' >"$HOME/.claude/history.jsonl"
+    # A run made before the mask existed gets it on attach; down still parses (the vars are set).
+    rm -rf "$HR_ROOT/MOD-5/claude-mask"
+    : >"$HR_TEST_DOCKER_LOG"
+    run --separate-stderr "$HR" attach MOD-5 </dev/null
+    [[ $status -eq 0 && -f "$HR_ROOT/MOD-5/claude-mask/history.jsonl" ]]
+    [[ ! -s "$HR_ROOT/MOD-5/claude-mask/history.jsonl" ]]
+    [[ "$(cat "$HOME/.claude/history.jsonl")" == 'host history' ]]
+    run --separate-stderr "$HR" down MOD-5
+    [[ $status -eq 0 ]]
+    grep -qxF "HR_CLAUDE_PROJECT=$name" "$env"
+    grep -qxF "HR_CLAUDE_MASK=$HR_ROOT/MOD-5/claude-mask" "$env"
+}
+
 # ---------------------------------------------------------------------------------------------
 # Docker (real image and daemon; fixture host repo; run once: bats --filter-tags docker tests/hr/hr.bats)
 
@@ -1207,6 +1269,22 @@ EOF
     [[ "$(dexec TOOL-9001 uvx --version)" == 'uvx 0.12.'* ]]
     [[ "$(dexec TOOL-9001 "$HOME/.local/bin/python3" --version)" == 'Python 3.'* ]]
     dexec TOOL-9001 graphify --help >/dev/null
+
+    # M-C: of ~/.claude/projects only the run's own project is there; the other cross-project data
+    # is empty (its host copy untouched); the login and settings are still shared.
+    [[ "$(dexec TOOL-9001 bash -c 'ls -A ~/.claude/projects')" == "$(claude_project_of "$HR_HOST_REPO")" ]]
+    local d
+    for d in "${HR_CLAUDE_MASK_DIRS[@]}"; do
+        [[ "$d" == projects ]] && continue
+        [[ -z "$(dexec TOOL-9001 bash -c "ls -A ~/.claude/$d")" ]] || { echo "~/.claude/$d not empty" >&2; return 1; }
+    done
+    for f in "${HR_CLAUDE_MASK_FILES[@]}"; do
+        [[ -z "$(dexec TOOL-9001 bash -c "cat ~/.claude/$f")" ]] || { echo "~/.claude/$f not empty" >&2; return 1; }
+    done
+    dexec TOOL-9001 test -s "$HOME/.claude/.credentials.json"
+    dexec TOOL-9001 test -s "$HOME/.claude/settings.json"
+    dexec TOOL-9001 test -d "$HOME/.claude/plugins"
+    dexec TOOL-9001 test -d "$HOME/.claude/skills"
 
     # H2: the host's dev Postgres/Qdrant are published on loopback only, so the bridge gateway
     # (the host, seen from the run's network) refuses 5439 and 6333.
