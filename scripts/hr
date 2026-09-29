@@ -460,10 +460,12 @@ LOCAL_MOUNTS=("$HOME/.local/bin" "$HOME/.local/share/mise/installs" "$HOME/.loca
 
 # What of ~/.claude a run does not see (re-review M-C; compose.hr.yaml masks them): directories
 # get an empty tmpfs, files a per-run empty file from RUN_DIR/claude-mask. Everything else in
-# ~/.claude stays shared read-write, and projects/<the run's project> is bound back.
+# ~/.claude stays shared read-write, and projects/<the run's project> is bound back. Files are
+# paths relative to ~/.claude (security/log.txt: the security plugin's log of every project; its
+# agent-sdk-venv beside it stays shared).
 CLAUDE_MASK_DIRS=(projects file-history paste-cache shell-snapshots session-env session-data sessions
     jobs daemon backups metrics .remember)
-CLAUDE_MASK_FILES=(history.jsonl bash-commands.log cost-tracker.log)
+CLAUDE_MASK_FILES=(history.jsonl bash-commands.log cost-tracker.log security/log.txt)
 
 # claude_project NAME_VAR — Claude Code's ~/.claude/projects/<name> for HOST (every character
 # outside [A-Za-z0-9] becomes '-'; longer names than 200 get a hash suffix, not reproduced here).
@@ -481,12 +483,14 @@ prepare_claude_mounts() {
     mkdir -p "$c/projects/$HR_CLAUDE_PROJECT" || return 1
     for d in "${CLAUDE_MASK_DIRS[@]}"; do mkdir -p "$c/$d" || return 1; done
     for f in "${CLAUDE_MASK_FILES[@]}"; do
-        [[ -e "$c/$f" || -L "$c/$f" ]] || (umask 077 && : >"$c/$f") || return 1
+        [[ -e "$c/$f" || -L "$c/$f" ]] || { mkdir -p "$(dirname -- "$c/$f")" && (umask 077 && : >"$c/$f"); } \
+            || return 1
     done
     mkdir -p "$rd/claude-mask" || return 1
     for f in "${CLAUDE_MASK_FILES[@]}"; do
         [[ -f "$rd/claude-mask/$f" && ! -L "$rd/claude-mask/$f" ]] && continue
-        rm -rf -- "${rd:?}/claude-mask/$f" && (umask 077 && : >"$rd/claude-mask/$f") || return 1
+        mkdir -p "$(dirname -- "$rd/claude-mask/$f")" && rm -rf -- "${rd:?}/claude-mask/$f" \
+            && (umask 077 && : >"$rd/claude-mask/$f") || return 1
     done
 }
 

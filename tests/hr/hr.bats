@@ -1146,6 +1146,11 @@ EOF
     # M-A: cargo runs cargo-<cmd> from CARGO_HOME/bin ahead of PATH, so it must be empty and read-only.
     [[ "$(jq -c '.services.dev.volumes[] | select(.target == "/HR_HOME/.cargo/bin") | [.type, .read_only]' <<<"$cfg")" \
         == '["tmpfs",true]' ]]
+    # Sized, like every tmpfs: never the default half of the host's RAM.
+    [[ "$(jq -c '.services.dev.volumes[] | select(.target == "/HR_HOME/.cargo/bin") | .tmpfs.size' <<<"$cfg")" \
+        == '"1048576"' ]]
+    [[ "$(jq '[.services[].volumes[]? | select(.type == "tmpfs" and (.tmpfs.size // null) == null)] | length' <<<"$cfg")" \
+        -eq 0 ]]
     # Residual: extracted crate sources per run, in a volume `down -v` removes (not external).
     [[ "$(jq -c '.services.dev.volumes[] | select(.target == "/HR_HOME/.cargo/registry/src") | [.type, .source]' <<<"$cfg")" \
         == '["volume","cargo-src"]' ]]
@@ -1206,6 +1211,9 @@ EOF
     for d in "${HR_CLAUDE_MASK_DIRS[@]}"; do
         jq -e --arg t "$c/$d" 'any(.[]; . == {type: "tmpfs", source: null, target: $t, ro: false})' <<<"$vols" >/dev/null \
             || { echo "no tmpfs over $d" >&2; return 1; }
+        # Sized: a tmpfs defaults to half of the host's RAM.
+        [[ "$(jq -r --arg t "$c/$d" '.services.dev.volumes[] | select(.target == $t) | .tmpfs.size' <<<"$cfg")" \
+            == "${HR_CLAUDE_TMPFS_SIZE[$d]}" ]] || { echo "tmpfs over $d: wrong or no size" >&2; return 1; }
     done
     for f in "${HR_CLAUDE_MASK_FILES[@]}"; do
         jq -e --arg s "/HR_CLAUDE_MASK/$f" --arg t "$c/$f" \
@@ -1221,12 +1229,19 @@ EOF
     # Writable by the user: Docker gives a tmpfs the mode of the directory under it otherwise.
     [[ "$(jq --arg c "$c/" '[.services.dev.volumes[] | select(.type == "tmpfs" and (.target | startswith($c))) | .tmpfs.mode] | unique' <<<"$cfg" | tr -d ' \n')" \
         == '[1023]' ]]
-    # Nothing else under ~/.claude is mounted: the list above is the whole mask.
+    # Nothing else under ~/.claude is mounted: the list above is the whole mask. In particular
+    # ~/.claude/security itself stays shared (the security plugin's agent-sdk-venv); only its
+    # cross-project log.txt is masked, and the per-session plugin state is not (threat model).
     [[ "$(jq --arg c "$c/" '[.[] | select(.target | startswith($c))] | length' <<<"$vols")" \
         -eq $((${#HR_CLAUDE_MASK_DIRS[@]} + ${#HR_CLAUDE_MASK_FILES[@]} + 1)) ]]
+    jq -e --arg t "$c/security/log.txt" 'any(.[]; .target == $t)' <<<"$vols" >/dev/null
+    ! jq -e --arg t "$c/security" 'any(.[]; .target == $t)' <<<"$vols" >/dev/null || false
 }
 
 @test "43. up/attach: the Claude project name, the mount points on the host, the per-run empty files" {
+    # The security plugin's venv lives next to the masked log.txt: it stays as it is.
+    mkdir -p "$HOME/.claude/security/agent-sdk-venv/bin"
+    printf 'venv\n' >"$HOME/.claude/security/agent-sdk-venv/bin/marker"
     run --separate-stderr "$HR" up MOD-5
     [[ $status -eq 0 ]]
     local env="$HR_TEST_DOCKER_LOG.env" name d f
@@ -1242,15 +1257,20 @@ EOF
         [[ -f "$HR_ROOT/MOD-5/claude-mask/$f" && ! -s "$HR_ROOT/MOD-5/claude-mask/$f" ]]
         [[ "$(stat -c %a "$HR_ROOT/MOD-5/claude-mask/$f")" == 600 ]]
     done
+    [[ "$(cat "$HOME/.claude/security/agent-sdk-venv/bin/marker")" == venv ]]
     # Existing host data is never touched: only missing mount points are created.
     printf 'host history\n' >"$HOME/.claude/history.jsonl"
+    printf 'host security log\n' >"$HOME/.claude/security/log.txt"
     # A run made before the mask existed gets it on attach; down still parses (the vars are set).
     rm -rf "$HR_ROOT/MOD-5/claude-mask"
     : >"$HR_TEST_DOCKER_LOG"
     run --separate-stderr "$HR" attach MOD-5 </dev/null
     [[ $status -eq 0 && -f "$HR_ROOT/MOD-5/claude-mask/history.jsonl" ]]
     [[ ! -s "$HR_ROOT/MOD-5/claude-mask/history.jsonl" ]]
+    [[ -f "$HR_ROOT/MOD-5/claude-mask/security/log.txt" && ! -s "$HR_ROOT/MOD-5/claude-mask/security/log.txt" ]]
     [[ "$(cat "$HOME/.claude/history.jsonl")" == 'host history' ]]
+    [[ "$(cat "$HOME/.claude/security/log.txt")" == 'host security log' ]]
+    [[ "$(cat "$HOME/.claude/security/agent-sdk-venv/bin/marker")" == venv ]]
     run --separate-stderr "$HR" down MOD-5
     [[ $status -eq 0 ]]
     grep -qxF "HR_CLAUDE_PROJECT=$name" "$env"
@@ -1500,6 +1520,16 @@ EOF
     dexec TOOL-9001 test -s "$HOME/.claude/settings.json"
     dexec TOOL-9001 test -d "$HOME/.claude/plugins"
     dexec TOOL-9001 test -d "$HOME/.claude/skills"
+    # Of ~/.claude/security only log.txt is masked (in the loop above); the plugin's venv is shared.
+    if [[ -d "$HOME/.claude/security/agent-sdk-venv" ]]; then
+        dexec TOOL-9001 test -d "$HOME/.claude/security/agent-sdk-venv"
+    fi
+    # The tmpfs masks carry the sizes compose gives them (none is half of the host's RAM).
+    local opts
+    opts="$(dexec TOOL-9001 findmnt -no OPTIONS "$HOME/.claude/projects")"
+    [[ "$opts" == *'size=262144k'* ]] || { echo "projects tmpfs: $opts" >&2; return 1; }
+    opts="$(dexec TOOL-9001 findmnt -no OPTIONS "$HOME/.claude/sessions")"
+    [[ "$opts" == *'size=16384k'* ]] || { echo "sessions tmpfs: $opts" >&2; return 1; }
 
     # H2: the host's dev Postgres/Qdrant are published on loopback only, so the bridge gateway
     # (the host, seen from the run's network) refuses 5439 and 6333.

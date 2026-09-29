@@ -100,23 +100,32 @@ services:
       # read-write over the projects tmpfs: its auto-memory and sessions are shared with the host.
       # scripts/hr creates every mount point on the host first, owned by the user. Docker mounts
       # parents before children whatever the order; the list keeps that order anyway.
+      # Every tmpfs has a size: the default is half of the host's RAM, each. They are RAM while
+      # used and die with the container. projects 256m: the run's own project is bound over it and
+      # does not count, but Claude files the transcripts of sessions started elsewhere (subagents
+      # in the run's linked worktrees, a cwd of /tmp) there, and those reach tens of MB.
+      # file-history 128m: pre-edit copies of every file the run's sessions edit (the host holds
+      # ~25 MB across all of its sessions, at most ~3 MB for one). paste-cache 64m: pasted images.
+      # The rest 16m: small per-session state (the host's copies are a few MB at most).
       - {type: bind, source: "${HR_HOME:?}/.claude",         target: "${HR_HOME:?}/.claude",                bind: {create_host_path: false}}
-      - {type: tmpfs, target: "${HR_HOME:?}/.claude/projects", tmpfs: {mode: 0o1777}}          # every project's transcripts and memory
+      - {type: tmpfs, target: "${HR_HOME:?}/.claude/projects", tmpfs: {mode: 0o1777, size: 256m}}        # every project's transcripts and memory
       - {type: bind, source: "${HR_HOME:?}/.claude/projects/${HR_CLAUDE_PROJECT:?}", target: "${HR_HOME:?}/.claude/projects/${HR_CLAUDE_PROJECT:?}", bind: {create_host_path: false}}
-      - {type: tmpfs, target: "${HR_HOME:?}/.claude/file-history", tmpfs: {mode: 0o1777}}      # pre-edit copies of files, every project
-      - {type: tmpfs, target: "${HR_HOME:?}/.claude/paste-cache", tmpfs: {mode: 0o1777}}       # pasted text and images
-      - {type: tmpfs, target: "${HR_HOME:?}/.claude/shell-snapshots", tmpfs: {mode: 0o1777}}   # the host shell's functions, aliases, env
-      - {type: tmpfs, target: "${HR_HOME:?}/.claude/session-env", tmpfs: {mode: 0o1777}}       # per-session environment
-      - {type: tmpfs, target: "${HR_HOME:?}/.claude/session-data", tmpfs: {mode: 0o1777}}      # per-session summaries (a plugin)
-      - {type: tmpfs, target: "${HR_HOME:?}/.claude/sessions", tmpfs: {mode: 0o1777}}          # the host's live sessions and their keys
-      - {type: tmpfs, target: "${HR_HOME:?}/.claude/daemon", tmpfs: {mode: 0o1777}}            # the host Claude daemon's control key
-      - {type: tmpfs, target: "${HR_HOME:?}/.claude/jobs", tmpfs: {mode: 0o1777}}              # the host's background jobs
-      - {type: tmpfs, target: "${HR_HOME:?}/.claude/backups", tmpfs: {mode: 0o1777}}           # copies of the host ~/.claude.json
-      - {type: tmpfs, target: "${HR_HOME:?}/.claude/metrics", tmpfs: {mode: 0o1777}}           # per-session costs, every project
-      - {type: tmpfs, target: "${HR_HOME:?}/.claude/.remember", tmpfs: {mode: 0o1777}}         # remember notes of sessions in ~/.claude
+      - {type: tmpfs, target: "${HR_HOME:?}/.claude/file-history", tmpfs: {mode: 0o1777, size: 128m}}    # pre-edit copies of files, every project
+      - {type: tmpfs, target: "${HR_HOME:?}/.claude/paste-cache", tmpfs: {mode: 0o1777, size: 64m}}      # pasted text and images
+      - {type: tmpfs, target: "${HR_HOME:?}/.claude/shell-snapshots", tmpfs: {mode: 0o1777, size: 16m}}  # the host shell's functions, aliases, env
+      - {type: tmpfs, target: "${HR_HOME:?}/.claude/session-env", tmpfs: {mode: 0o1777, size: 16m}}      # per-session environment
+      - {type: tmpfs, target: "${HR_HOME:?}/.claude/session-data", tmpfs: {mode: 0o1777, size: 16m}}     # per-session summaries (a plugin)
+      - {type: tmpfs, target: "${HR_HOME:?}/.claude/sessions", tmpfs: {mode: 0o1777, size: 16m}}         # the host's live sessions and their keys
+      - {type: tmpfs, target: "${HR_HOME:?}/.claude/daemon", tmpfs: {mode: 0o1777, size: 16m}}           # the host Claude daemon's control key
+      - {type: tmpfs, target: "${HR_HOME:?}/.claude/jobs", tmpfs: {mode: 0o1777, size: 16m}}             # the host's background jobs
+      - {type: tmpfs, target: "${HR_HOME:?}/.claude/backups", tmpfs: {mode: 0o1777, size: 16m}}          # copies of the host ~/.claude.json
+      - {type: tmpfs, target: "${HR_HOME:?}/.claude/metrics", tmpfs: {mode: 0o1777, size: 16m}}          # per-session costs, every project
+      - {type: tmpfs, target: "${HR_HOME:?}/.claude/.remember", tmpfs: {mode: 0o1777, size: 16m}}        # remember notes of sessions in ~/.claude
       - {type: bind, source: "${HR_CLAUDE_MASK:?}/history.jsonl",     target: "${HR_HOME:?}/.claude/history.jsonl",     bind: {create_host_path: false}}
       - {type: bind, source: "${HR_CLAUDE_MASK:?}/bash-commands.log", target: "${HR_HOME:?}/.claude/bash-commands.log", bind: {create_host_path: false}}
       - {type: bind, source: "${HR_CLAUDE_MASK:?}/cost-tracker.log",  target: "${HR_HOME:?}/.claude/cost-tracker.log",  bind: {create_host_path: false}}
+      # The security plugin's log, every project's (its agent-sdk-venv next to it stays shared).
+      - {type: bind, source: "${HR_CLAUDE_MASK:?}/security/log.txt",  target: "${HR_HOME:?}/.claude/security/log.txt",  bind: {create_host_path: false}}
       - {type: volume, source: gortex,                       target: "${HR_HOME:?}/.gortex"}
       - {type: bind, source: "${HR_HOME:?}/.gortex/config.yaml",  target: "${HR_HOME:?}/.gortex/config.yaml",  read_only: true, bind: {create_host_path: false}}
       - {type: bind, source: "${HR_HOME:?}/.gortex/instructions", target: "${HR_HOME:?}/.gortex/instructions", read_only: true, bind: {create_host_path: false}}
@@ -133,7 +142,7 @@ services:
       # (re-review M-A). scripts/hr checks these mount points before every `up` (re-review L8b).
       # The extracted crate sources are per run (re-review residual): cargo re-extracts them from
       # the shared download cache; the package lock at the volume root stays shared.
-      - {type: tmpfs,  target: "${HR_HOME:?}/.cargo/bin", read_only: true}
+      - {type: tmpfs,  target: "${HR_HOME:?}/.cargo/bin", read_only: true, tmpfs: {size: 1m}}   # read-only and empty: 1m is only a bound
       - {type: volume, source: cargo-src,                    target: "${HR_HOME:?}/.cargo/registry/src"}
       - {type: bind, source: "${HR_CARGO_EMPTY:?}", target: "${HR_HOME:?}/.cargo/config",           read_only: true, bind: {create_host_path: false}}
       - {type: bind, source: "${HR_CARGO_EMPTY:?}", target: "${HR_HOME:?}/.cargo/config.toml",      read_only: true, bind: {create_host_path: false}}

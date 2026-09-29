@@ -178,7 +178,11 @@ claude_project_of() { local LC_ALL=C p="$1"; printf '%s' "${p//[^a-zA-Z0-9]/-}";
 # The ~/.claude entries every run masks (re-review M-C): tmpfs dirs, per-run empty files.
 HR_CLAUDE_MASK_DIRS=(projects file-history paste-cache shell-snapshots session-env session-data sessions
     jobs daemon backups metrics .remember)
-HR_CLAUDE_MASK_FILES=(history.jsonl bash-commands.log cost-tracker.log)
+HR_CLAUDE_MASK_FILES=(history.jsonl bash-commands.log cost-tracker.log security/log.txt)
+# The size compose.hr.yaml gives each of those tmpfs mounts, in bytes (none may default to half the RAM).
+declare -gA HR_CLAUDE_TMPFS_SIZE=([projects]=268435456 [file-history]=134217728 [paste-cache]=67108864)
+for _d in "${HR_CLAUDE_MASK_DIRS[@]}"; do : "${HR_CLAUDE_TMPFS_SIZE[$_d]:=16777216}"; done
+unset _d
 
 # src_of ITEM [ROOT] — the run's clone.
 src_of() { printf '%s/%s/src' "${2:-$HR_ROOT}" "$1"; }

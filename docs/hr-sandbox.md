@@ -438,8 +438,8 @@ runs rather than letting them pile up.
 | `~/.local/bin`, `~/.local/share/mise/installs`, `~/.local/share/uv/python`, `~/.local/share/uv/tools` (claude, gortex, graphify, headroom, uv) | same paths | read-only; nothing else of `~/.local` |
 | `~/.claude` (login, settings, plugins, skills, agents, commands) | same path | read-write, shared by all runs, except what the next rows mask |
 | `~/.claude/projects/-home-mluigi-projects-htui` (this project's auto-memory and sessions) | same path | read-write, shared |
-| the rest of `~/.claude/projects`, and `file-history`, `paste-cache`, `shell-snapshots`, `session-env`, `session-data`, `sessions`, `daemon`, `jobs`, `backups`, `metrics`, `.remember` in `~/.claude` | an empty `tmpfs` each | per container, gone when it stops |
-| `~/.claude/history.jsonl`, `bash-commands.log`, `cost-tracker.log` | an empty file each, from `claude-mask/` in the run directory | per run |
+| the rest of `~/.claude/projects`, and `file-history`, `paste-cache`, `shell-snapshots`, `session-env`, `session-data`, `sessions`, `daemon`, `jobs`, `backups`, `metrics`, `.remember` in `~/.claude` | an empty `tmpfs` each (256 MB for `projects`, 128 MB `file-history`, 64 MB `paste-cache`, 16 MB the rest) | per container, gone when it stops |
+| `~/.claude/history.jsonl`, `bash-commands.log`, `cost-tracker.log`, `security/log.txt` | an empty file each, from `claude-mask/` in the run directory | per run |
 | `~/.claude.json` | a private copy | changes inside do not flow back |
 | `~/.gortex` config, instructions, models | same path | read-only |
 | `~/.headroom`, `~/.serena`, `~/.cache/uv` | same path | read-write, shared |
@@ -505,7 +505,8 @@ What stays protected:
 - the rest of `~/.claude`: other projects' transcripts and memory, `file-history`, `paste-cache`,
   `shell-snapshots`, `session-env`, `session-data`, the host's live `sessions`, the Claude
   `daemon`'s control key, `jobs`, `backups` of `~/.claude.json`, `metrics`, `.remember`, your
-  prompt `history.jsonl`, `bash-commands.log` and `cost-tracker.log` are masked in every run;
+  prompt `history.jsonl`, `bash-commands.log`, `cost-tracker.log` and the security plugin's
+  `security/log.txt` (every project's) are masked in every run;
 - the rest of `~/.local`: only the four tool directories are mounted, read-only, so no keyrings,
   uv or gh credentials, or editor undo histories reach a run.
 
@@ -520,6 +521,14 @@ What to do about it:
 
 Known residuals:
 
+- Per-session plugin state in `~/.claude` stays shared, by choice:
+  `security_warnings_state_<session id>.json` (and its `.lock`, at the top and in `security/`) and
+  the `.caveman-*` files
+  (`.caveman-sessions/<session id>.mode`, `.caveman-active`, `.caveman-mode-log.jsonl`). They are
+  keyed by session id and hold no transcript content: modes and `{ts, mode, prev, session_id}`
+  rows (caveman); which warnings a session was shown, the paths it touched, a baseline commit and
+  its last findings (security-guidance), a few hundred bytes each. A run can read that metadata of
+  other sessions and change their modes or warning state.
 - The download cache and index in `htui-hr-cargo` are shared. Extracted sources are per run now, so
   editing another run's `registry/src` is out; but a run that rewrites a cached `.crate` (and its
   index entry) can still get code into a later extraction in another run. `docker volume rm
