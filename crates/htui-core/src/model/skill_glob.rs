@@ -210,6 +210,14 @@ impl SkillGlobs {
             })
         })
     }
+
+    /// MOD-9 D112: whether any glob can match in `repo`: an unqualified one, or one qualified
+    /// with `repo`.
+    #[must_use]
+    pub fn reaches(&self, repo: &str) -> bool {
+        let _ = repo;
+        todo!()
+    }
 }
 
 /// The one builder (D72): `literal_separator(true)`, `backslash_escape(true)`,
@@ -437,5 +445,19 @@ mod tests {
             "`htui:src/**` does not match in `web`; the bare `**/*.md` does"
         );
         assert_eq!(globs.first_match("web", ["src/x.rs"]), None);
+    }
+
+    /// MOD-9 D112: a bare glob reaches every repo, a qualified one only its own.
+    #[test]
+    fn reaches_follows_the_qualifier() {
+        let compile = |globs: &[&str]| SkillGlobs::compile(&strings(globs)).expect("compiles");
+        assert!(compile(&["**/*.rs"]).reaches("anything"));
+        assert!(compile(&["web:**/*.ts"]).reaches("web"));
+        assert!(!compile(&["web:**/*.ts"]).reaches("htui"));
+        assert!(
+            compile(&["web:a", "b"]).reaches("htui"),
+            "the bare `b` reaches `htui`"
+        );
+        assert!(!compile(&[]).reaches("htui"), "no glob reaches nothing");
     }
 }

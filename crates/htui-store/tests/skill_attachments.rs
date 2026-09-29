@@ -16,7 +16,7 @@ use htui_store::testkit as common;
 
 use chrono::Utc;
 use htui_core::fixtures::{DemoData, demo_data, ids};
-use htui_core::model::skill::select;
+use htui_core::model::skill::{StepFiles, select};
 use htui_core::model::{
     Activation, ChoiceReason, PhaseId, ProjectId, Skill, SkillBinding, SkillBindingId, SkillId,
     SkillLevel, SkillVersion,
@@ -297,7 +297,7 @@ async fn an_off_phase_attachment_hides_a_project_skill() {
         "the phase row wins over the project row"
     );
 
-    let (active, choices) = select(candidates, true);
+    let (active, choices) = select(candidates, true, &StepFiles::default());
     assert_eq!(
         active.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
         vec!["rust-style"],

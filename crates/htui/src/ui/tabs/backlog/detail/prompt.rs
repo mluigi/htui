@@ -485,6 +485,7 @@ mod tests {
             activation: Activation::Off,
             active: false,
             reason: ChoiceReason::Off,
+            path: None,
         });
         // The fixture records no note, and the block's place is "before the notes".
         assembled.trim.notes.push("a note".to_owned());

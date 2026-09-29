@@ -90,6 +90,7 @@ fn an_off_skill_is_not_rendered_and_is_recorded_off() {
             activation: Activation::Off,
             active: false,
             reason: ChoiceReason::Off,
+            path: None,
         }
     );
     assert!(prompt.trim.skill_choices[0].active);

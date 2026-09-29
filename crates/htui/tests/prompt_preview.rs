@@ -362,6 +362,7 @@ fn active(
         activation: Activation::Always,
         active: true,
         reason: ChoiceReason::Always,
+        path: None,
     }
 }
 

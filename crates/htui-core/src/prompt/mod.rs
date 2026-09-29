@@ -54,7 +54,7 @@ use serde_json::Value;
 
 use crate::model::box_::BoxProfile;
 use crate::model::link::UpstreamEntry;
-use crate::model::skill::{BoundSkill, SkillChoice, select};
+use crate::model::skill::{BoundSkill, SkillChoice, StepFiles, select};
 use crate::prompt::render::Rendered;
 use crate::prompt::trim::{Inputs, Trimmer};
 use crate::scrub::Scrubber;
@@ -858,7 +858,11 @@ fn scrubbed_inputs(
     // MOD-9 D43: collapse the candidates, then decide them. Only the active ones render, are
     // estimated and meet the cap; every candidate is recorded.
     let placed = parsed.used.contains(&Placeholder::Skills);
-    let (skills, skill_choices) = select(BoundSkill::collapse(spec.skills.clone()), placed);
+    let (skills, skill_choices) = select(
+        BoundSkill::collapse(spec.skills.clone()),
+        placed,
+        &StepFiles::default(),
+    );
     let candidates = judge_candidates(&spec);
     Ok(ScrubbedInputs {
         spec,
