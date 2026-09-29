@@ -948,4 +948,128 @@ mod tests {
         assert_eq!(app.status, Some(report.status_line()));
         assert!(seen.borrow().is_empty(), "no tab saw it");
     }
+
+    /// What an [`Asking`] overlay was handed.
+    type Answers = Rc<RefCell<Vec<StoreReply>>>;
+
+    /// An overlay that asks for `Workspaces` on `s` and never on open, so a reopened one has no
+    /// request of its own to overwrite the staleness entry with (MOD-64 D240, blueprint F8).
+    struct Asking {
+        seen: Answers,
+    }
+
+    impl Asking {
+        const ID: OverlayId = OverlayId("asking");
+    }
+
+    impl Overlay for Asking {
+        fn id(&self) -> OverlayId {
+            Self::ID
+        }
+        fn title(&self) -> &str {
+            "Asking"
+        }
+        fn is_modal(&self) -> bool {
+            true
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+            if key.code == KeyCode::Char('s') {
+                ctx.request(StoreRequest::Workspaces);
+                return Handled::Consumed;
+            }
+            Handled::Pass
+        }
+        fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
+            self.seen.borrow_mut().push(reply.clone());
+        }
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+    }
+
+    /// A shell with [`Asking`] registered, and what every instance of it is handed.
+    fn asking_shell() -> (App, UnboundedReceiver<RequestEnvelope>, Answers) {
+        let (mut app, rx, _seen) = shell();
+        let answers = Answers::default();
+        let shared = Rc::clone(&answers);
+        app.overlay_factories.register(Asking::ID, move || {
+            Box::new(Asking {
+                seen: Rc::clone(&shared),
+            })
+        });
+        (app, rx, answers)
+    }
+
+    /// Opens [`Asking`], presses `s` and answers the `seq` of the `Workspaces` it sent.
+    fn open_and_ask(app: &mut App, rx: &mut UnboundedReceiver<RequestEnvelope>) -> u64 {
+        app.update(Action::Overlay(OverlayAction::Open(Asking::ID)));
+        app.on_key(KeyEvent::from(KeyCode::Char('s')));
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|envelope| {
+                envelope.origin == Origin::Overlay(Asking::ID)
+                    && matches!(envelope.request, StoreRequest::Workspaces)
+            })
+            .expect("the overlay asked")
+            .seq
+    }
+
+    /// The `Workspaces` answer to `seq`, addressed to [`Asking`].
+    fn answer(seq: u64) -> Action {
+        Action::Reply(ReplyEnvelope {
+            seq,
+            origin: Origin::Overlay(Asking::ID),
+            reply: StoreReply::Workspaces(Vec::new()),
+        })
+    }
+
+    /// MOD-64 D240: `latest` is keyed by origin, so without the fix a reopened overlay under the
+    /// same id takes the answer to a request its closed predecessor made.
+    #[test]
+    fn a_reply_to_a_closed_overlay_never_reaches_the_next_one() {
+        let (mut app, mut rx, answers) = asking_shell();
+        let seq = open_and_ask(&mut app, &mut rx);
+
+        app.update(Action::Overlay(OverlayAction::Close));
+        app.update(Action::Overlay(OverlayAction::Open(Asking::ID)));
+        app.update(answer(seq));
+        assert!(
+            answers.borrow().is_empty(),
+            "the reopened overlay never asked"
+        );
+    }
+
+    #[test]
+    fn close_all_and_a_scope_change_forget_an_overlays_requests_too() {
+        let (mut app, mut rx, answers) = asking_shell();
+
+        let seq = open_and_ask(&mut app, &mut rx);
+        app.update(Action::Overlay(OverlayAction::CloseAll));
+        app.update(Action::Overlay(OverlayAction::Open(Asking::ID)));
+        app.update(answer(seq));
+        assert!(answers.borrow().is_empty(), "CloseAll forgets");
+
+        app.update(Action::Overlay(OverlayAction::CloseAll));
+        let seq = open_and_ask(&mut app, &mut rx);
+        app.update(Action::SetScope {
+            workspace: workspace("Platform"),
+        });
+        app.update(Action::Overlay(OverlayAction::Open(Asking::ID)));
+        app.update(answer(seq));
+        assert!(answers.borrow().is_empty(), "a scope change forgets");
+    }
+
+    #[test]
+    fn closing_the_top_overlay_keeps_the_one_below_fresh() {
+        let (mut app, mut rx, answers) = asking_shell();
+        let seq = open_and_ask(&mut app, &mut rx);
+        app.push_overlay(Box::new(Popup));
+
+        app.update(Action::Overlay(OverlayAction::Close));
+        app.update(answer(seq));
+        assert!(
+            matches!(answers.borrow().as_slice(), [StoreReply::Workspaces(listed)] if listed.is_empty()),
+            "the overlay below still waits for its answer"
+        );
+    }
 }
