@@ -18,7 +18,7 @@
 //! what pins it. Nor does any statement write `updated_at` on an update path - the `BEFORE UPDATE`
 //! trigger of the migration owns it, and `RETURNING` sees the trigger-modified row.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord,
     BoxRow, BoxSettings, BoxTool, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId,
@@ -3613,8 +3613,9 @@ impl WriteStore for PgStore {
         box_id: BoxId,
         owner: Uuid,
         at: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> Result<Claim> {
+        let lease_until = at + ttl;
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
         let claimed = sqlx::query!(
@@ -3809,7 +3810,8 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::NotFound`] `{ entity: "run" }` when there is no such run at all, told apart
     /// from "not ours" by the one follow-up read [`WriteStore::transition`] has always used.
-    async fn refresh_lease(&self, run: RunId, owner: Uuid, until: DateTime<Utc>) -> Result<bool> {
+    async fn refresh_lease(&self, run: RunId, owner: Uuid, ttl: TimeDelta) -> Result<bool> {
+        let until = Utc::now() + ttl;
         let moved = sqlx::query!(
             "UPDATE run SET lease_expires_at = $3 WHERE id = $1 AND lease_owner = $2",
             run.as_uuid(),
@@ -3855,13 +3857,9 @@ impl WriteStore for PgStore {
     /// # Errors
     ///
     /// The backend's own failures only.
-    async fn adopt_runs(
-        &self,
-        box_id: BoxId,
-        owner: Uuid,
-        now: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
-    ) -> Result<Vec<Run>> {
+    async fn adopt_runs(&self, box_id: BoxId, owner: Uuid, ttl: TimeDelta) -> Result<Vec<Run>> {
+        let now = Utc::now();
+        let lease_until = now + ttl;
         sqlx::query_as!(
             Run,
             r#"
@@ -3926,9 +3924,10 @@ impl WriteStore for PgStore {
         run: RunId,
         box_id: BoxId,
         owner: Uuid,
-        now: DateTime<Utc>,
-        until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> Result<bool> {
+        let now = Utc::now();
+        let until = now + ttl;
         let moved = sqlx::query!(
             "UPDATE run \
                 SET lease_owner      = $3, \
@@ -3980,7 +3979,8 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::NotFound`] `{ entity: "run" }` when there is no such run at all, told apart
     /// from "not ours" by the follow-up read [`WriteStore::refresh_lease`] uses.
-    async fn release_lease(&self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
+    async fn release_lease(&self, run: RunId, owner: Uuid) -> Result<bool> {
+        let now = Utc::now();
         let moved = sqlx::query!(
             "UPDATE run SET lease_owner = NULL, lease_expires_at = $3 \
               WHERE id = $1 AND lease_owner = $2",

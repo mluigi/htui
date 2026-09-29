@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow,
@@ -1035,46 +1035,32 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
         box_id: BoxId,
         owner: Uuid,
         at: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> StoreResult<Claim> {
-        self.inner
-            .claim_run(run, box_id, owner, at, lease_until)
-            .await
+        self.inner.claim_run(run, box_id, owner, at, ttl).await
     }
-    async fn refresh_lease(
-        &self,
-        run: RunId,
-        owner: Uuid,
-        until: DateTime<Utc>,
-    ) -> StoreResult<bool> {
-        self.inner.refresh_lease(run, owner, until).await
+    async fn refresh_lease(&self, run: RunId, owner: Uuid, ttl: TimeDelta) -> StoreResult<bool> {
+        self.inner.refresh_lease(run, owner, ttl).await
     }
     async fn adopt_runs(
         &self,
         box_id: BoxId,
         owner: Uuid,
-        now: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> StoreResult<Vec<Run>> {
-        self.inner.adopt_runs(box_id, owner, now, lease_until).await
+        self.inner.adopt_runs(box_id, owner, ttl).await
     }
     async fn take_lease(
         &self,
         run: RunId,
         box_id: BoxId,
         owner: Uuid,
-        now: DateTime<Utc>,
-        until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> StoreResult<bool> {
-        self.inner.take_lease(run, box_id, owner, now, until).await
+        self.inner.take_lease(run, box_id, owner, ttl).await
     }
-    async fn release_lease(
-        &self,
-        run: RunId,
-        owner: Uuid,
-        now: DateTime<Utc>,
-    ) -> StoreResult<bool> {
-        self.inner.release_lease(run, owner, now).await
+    async fn release_lease(&self, run: RunId, owner: Uuid) -> StoreResult<bool> {
+        self.inner.release_lease(run, owner).await
     }
     async fn create_step(&self, new: NewRunStep) -> StoreResult<RunStep> {
         self.inner.create_step(new).await

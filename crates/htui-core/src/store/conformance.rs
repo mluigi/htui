@@ -35,8 +35,8 @@ use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::store::error::StoreError;
 use crate::store::traits::{
-    CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StepFence, UpdateOutcome,
-    WriteStore, already_exists, citation_key, illegal_move, invalid_area_code,
+    CasOutcome, DeleteReach, DeleteTarget, MAX_LEASE_TTL, ReadStore, SettingRung, StepFence,
+    UpdateOutcome, WriteStore, already_exists, citation_key, illegal_move, invalid_area_code,
     requirement_withdrawn, resolution_not_closable, withdrawn_requirement_cited,
 };
 
@@ -137,6 +137,7 @@ pub const CASES: &[&str] = &[
     "upsert_agent_with_none_inserts_and_is_stale_when_present",
     "upsert_agent_with_a_spent_token_is_stale_and_writes_nothing",
     "upsert_agent_with_the_current_token_applies",
+    "a_lease_ttl_out_of_range_is_refused",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -327,6 +328,7 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "upsert_agent_with_the_current_token_applies" => {
             upsert_agent_with_the_current_token_applies(store).await
         }
+        "a_lease_ttl_out_of_range_is_refused" => a_lease_ttl_out_of_range_is_refused(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -4091,9 +4093,10 @@ async fn settings_phase_rung_writes_token_budget_only<S: WriteStore>(store: &S) 
 /// The caller's clock at `timestamptz`'s own resolution, which is what every §8 writer's stamp has
 /// to be.
 ///
-/// Blueprint F-S puts the clock in the caller's hands for `started_at`, `finished_at`,
-/// `lease_expires_at` and `promoted_at`, and the cases below read those columns back and compare
-/// them with the value they passed. A raw [`Utc::now`] is nanoseconds on Linux; Postgres keeps
+/// Blueprint F-S puts the clock in the caller's hands for `started_at`, `finished_at` and
+/// `promoted_at`, and the cases below read those columns back and compare them with the value they
+/// passed. `lease_expires_at` was in that list until MOD-40 plan D10 made it the store's clock plus
+/// a TTL; [`assert_leased_for`] reads it. A raw [`Utc::now`] is nanoseconds on Linux; Postgres keeps
 /// [`TIMESTAMPTZ_DIGITS`] of them and `MemStore` keeps all of them, so an untruncated reading makes
 /// the two backends disagree about a column neither of them changed. [`ChatRunSpec::mint`] has
 /// truncated for the same reason since MOD-2; this is the §8 writers' half of it, and `PgStore`
@@ -4102,6 +4105,9 @@ async fn settings_phase_rung_writes_token_budget_only<S: WriteStore>(store: &S) 
 fn seam_clock() -> DateTime<Utc> {
     Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS)
 }
+
+/// The TTL the lease cases claim with: live for the whole case on any store (MOD-40 plan D10).
+const LEASE: TimeDelta = TimeDelta::minutes(5);
 
 /// The smallest `R-ORCH-11` snapshot [`WriteStore::create_run`] accepts: the `htui` FEAT graph,
 /// no phases, and the settings the seed rungs resolve to.
@@ -4224,6 +4230,28 @@ async fn run_row<S: ReadStore>(case: &str, store: &S, run: RunId) -> Run {
         .await
         .expect(case)
         .unwrap_or_else(|| panic!("{case}: run {run} exists"))
+}
+
+/// MOD-40 blueprint B29: `run`'s lease was written for `ttl` by the write that last stamped the
+/// row. A lease is the store's clock plus a TTL (plan D10), and a generic case cannot read that
+/// clock, so the expiry is read against the row's own `updated_at`, which the same write stamped
+/// on the same clock: `MemStore` stamps both from one read (the span is exactly `ttl`); Postgres
+/// stamps `updated_at` in its `BEFORE UPDATE` trigger, a few µs after the `SET` read
+/// `clock_timestamp()` (the span is `ttl` less that gap). A released lease is `ttl = 0`.
+///
+/// Holds only while the lease write is the row's last write; read the row right after it.
+///
+/// # Panics
+/// When the run holds no lease or the span is outside `(ttl - 1 s, ttl]`.
+pub fn assert_leased_for(case: &str, run: &Run, ttl: TimeDelta, what: &str) {
+    let Some(expiry) = run.lease_expires_at else {
+        panic!("{case}: {what}: the run holds no lease");
+    };
+    let span = expiry - run.updated_at;
+    assert!(
+        span <= ttl && span > ttl - TimeDelta::seconds(1),
+        "{case}: {what}: the lease runs {span} past the write that stamped it, not {ttl}"
+    );
 }
 
 /// The item row, or a panic naming the case.
@@ -4447,11 +4475,10 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
 
     let owner = Uuid::now_v7();
     let at = seam_clock();
-    let until = at + TimeDelta::minutes(5);
 
     assert_eq!(
         store
-            .claim_run(first, ids::BOX, owner, at, until)
+            .claim_run(first, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -4478,10 +4505,11 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
         Some(ids::BOX),
         "{CASE}: the lease names the box"
     );
-    assert_eq!(
-        claimed.lease_expires_at,
-        Some(until),
-        "{CASE}: the lease expires when the caller said"
+    assert_leased_for(
+        CASE,
+        &claimed,
+        LEASE,
+        "the lease runs its TTL from the store's clock",
     );
     assert_eq!(
         item_row(CASE, store, ids::HTUI_ANA_2).await.status,
@@ -4491,7 +4519,7 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
 
     assert_eq!(
         store
-            .claim_run(second, ids::BOX, owner, at, until)
+            .claim_run(second, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Overlaps {
@@ -4513,7 +4541,7 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
 
     assert_eq!(
         store
-            .claim_run(third, ids::BOX, owner, at, until)
+            .claim_run(third, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -4525,7 +4553,7 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
     );
     assert_eq!(
         store
-            .claim_run(fourth, ids::BOX, owner, at, until)
+            .claim_run(fourth, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::SlotFull {
@@ -4548,7 +4576,7 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
     );
     assert_eq!(
         store
-            .claim_run(second, ids::BOX, owner, at, until)
+            .claim_run(second, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Overlaps {
@@ -4559,7 +4587,7 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
     );
     assert_eq!(
         store
-            .claim_run(fourth, ids::BOX, owner, at, until)
+            .claim_run(fourth, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -4568,7 +4596,7 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
 
     assert_eq!(
         store
-            .claim_run(first, ids::BOX, owner, at, until)
+            .claim_run(first, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::NotClaimable,
@@ -4576,14 +4604,14 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
     );
 
     let no_box = store
-        .claim_run(second, BoxId::new(), owner, at, until)
+        .claim_run(second, BoxId::new(), owner, at, LEASE)
         .await;
     assert!(
         matches!(no_box, Err(StoreError::NotFound { entity: "box", .. })),
         "{CASE}: an unknown box is NotFound, got {no_box:?}"
     );
     let no_run = store
-        .claim_run(RunId::new(), BoxId::new(), owner, at, until)
+        .claim_run(RunId::new(), BoxId::new(), owner, at, LEASE)
         .await;
     assert!(
         matches!(no_run, Err(StoreError::NotFound { entity: "run", .. })),
@@ -4692,8 +4720,7 @@ async fn claim_run_applies_the_isolation_and_path_rules<S: WriteStore>(store: &S
 
     let owner = Uuid::now_v7();
     let claimed_at = at + TimeDelta::minutes(1);
-    let until = claimed_at + TimeDelta::minutes(5);
-    let claim = |run: RunId| store.claim_run(run, ids::BOX, owner, claimed_at, until);
+    let claim = |run: RunId| store.claim_run(run, ids::BOX, owner, claimed_at, LEASE);
 
     assert_eq!(
         claim(a).await.expect(CASE),
@@ -4840,7 +4867,6 @@ async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStor
     const CASE: &str = "claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks";
     let owner = Uuid::now_v7();
     let at = seam_clock();
-    let until = at + TimeDelta::minutes(5);
 
     let ana = store
         .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
@@ -4849,7 +4875,7 @@ async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStor
         .id;
     assert_eq!(
         store
-            .claim_run(ana, ids::BOX, owner, at, until)
+            .claim_run(ana, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -4879,7 +4905,7 @@ async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStor
     let missing = tags(&["docker", "vulkan"]);
     assert_eq!(
         store
-            .claim_run(run, ids::BOX, owner, at, until)
+            .claim_run(run, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::MissingTags {
@@ -4926,7 +4952,7 @@ async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStor
 
     assert_eq!(
         store
-            .claim_run(run, ids::BOX, owner, at, until)
+            .claim_run(run, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::NotClaimable,
@@ -4945,7 +4971,7 @@ async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStor
         .id;
     assert_eq!(
         store
-            .claim_run(clean, ids::BOX, owner, at, until)
+            .claim_run(clean, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -4988,7 +5014,7 @@ async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStor
         .id;
     assert_eq!(
         store
-            .claim_run(rerun, ids::BOX, owner, at, until)
+            .claim_run(rerun, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -5009,7 +5035,6 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
     const CASE: &str = "claim_run_checks_tags_after_claimability_and_before_the_slot";
     let owner = Uuid::now_v7();
     let at = seam_clock();
-    let until = at + TimeDelta::minutes(5);
 
     // Claimability first: a cancelled run is not claimable, and nothing is written.
     let cancelled_item = mint_tagged(CASE, store, "Cancelled", &["vulkan"]).await;
@@ -5024,7 +5049,7 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
         .expect(CASE);
     assert_eq!(
         store
-            .claim_run(cancelled, ids::BOX, owner, at, until)
+            .claim_run(cancelled, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::NotClaimable,
@@ -5056,7 +5081,7 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
         .id;
     assert_eq!(
         store
-            .claim_run(ana, ids::BOX, owner, at, until)
+            .claim_run(ana, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -5070,7 +5095,7 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
         .id;
     assert_eq!(
         store
-            .claim_run(overlapping, ids::BOX, owner, at, until)
+            .claim_run(overlapping, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::MissingTags {
@@ -5094,7 +5119,7 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
         .id;
     assert_eq!(
         store
-            .claim_run(overlap_control, ids::BOX, owner, at, until)
+            .claim_run(overlap_control, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Overlaps {
@@ -5112,7 +5137,7 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
         .id;
     assert_eq!(
         store
-            .claim_run(clean, ids::BOX, owner, at, until)
+            .claim_run(clean, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -5126,7 +5151,7 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
         .id;
     assert_eq!(
         store
-            .claim_run(full, ids::BOX, owner, at, until)
+            .claim_run(full, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::MissingTags {
@@ -5144,7 +5169,7 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
         .id;
     assert_eq!(
         store
-            .claim_run(control, ids::BOX, owner, at, until)
+            .claim_run(control, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::SlotFull {
@@ -5166,7 +5191,6 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
     let first_owner = Uuid::now_v7();
     let second_owner = Uuid::now_v7();
     let at = seam_clock();
-    let until = at + TimeDelta::minutes(5);
     let run = store
         .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
         .await
@@ -5174,14 +5198,14 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
         .id;
     assert_eq!(
         store
-            .claim_run(run, ids::BOX, first_owner, at, until)
+            .claim_run(run, ids::BOX, first_owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
         "{CASE}: the run is admitted"
     );
 
-    let extended = until + TimeDelta::minutes(5);
+    let extended = TimeDelta::minutes(10);
     assert!(
         store
             .refresh_lease(run, first_owner, extended)
@@ -5189,22 +5213,23 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
             .expect(CASE),
         "{CASE}: the owner extends its own lease"
     );
-    assert_eq!(
-        run_row(CASE, store, run).await.lease_expires_at,
-        Some(extended),
-        "{CASE}: the new expiry is stored"
+    assert_leased_for(
+        CASE,
+        &run_row(CASE, store, run).await,
+        extended,
+        "the new expiry is stored",
     );
-    let stranger = extended + TimeDelta::minutes(5);
+    let before = run_row(CASE, store, run).await;
     assert!(
         !store
-            .refresh_lease(run, second_owner, stranger)
+            .refresh_lease(run, second_owner, TimeDelta::minutes(15))
             .await
             .expect(CASE),
         "{CASE}: a stranger's heartbeat is zero rows, which means abandon"
     );
     assert_eq!(
-        run_row(CASE, store, run).await.lease_expires_at,
-        Some(extended),
+        run_row(CASE, store, run).await,
+        before,
         "{CASE}: a refused heartbeat writes nothing"
     );
     let unknown = store
@@ -5215,27 +5240,24 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
         "{CASE}: an unknown run is NotFound, got {unknown:?}"
     );
 
-    let swept = extended + TimeDelta::minutes(10);
+    let swept = TimeDelta::minutes(15);
     assert!(
         store
-            .adopt_runs(
-                ids::BOX,
-                second_owner,
-                extended - TimeDelta::seconds(1),
-                swept,
-            )
+            .adopt_runs(ids::BOX, second_owner, swept)
             .await
             .expect(CASE)
             .is_empty(),
         "{CASE}: a live lease is not abandoned"
     );
+    assert!(
+        store
+            .refresh_lease(run, first_owner, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: the first owner's lease lapses (MOD-40: a zero TTL)"
+    );
     let adopted = store
-        .adopt_runs(
-            ids::BOX,
-            second_owner,
-            extended + TimeDelta::seconds(1),
-            swept,
-        )
+        .adopt_runs(ids::BOX, second_owner, swept)
         .await
         .expect(CASE);
     assert_eq!(
@@ -5243,10 +5265,11 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
         vec![run],
         "{CASE}: the expired lease is adopted"
     );
-    assert_eq!(
-        adopted.first().and_then(|row| row.lease_expires_at),
-        Some(swept),
-        "{CASE}: the adopted row carries the sweeper's expiry"
+    assert_leased_for(
+        CASE,
+        &adopted[0],
+        swept,
+        "the adopted row carries the sweeper's expiry",
     );
     assert!(
         !store
@@ -5264,12 +5287,14 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
     );
     assert!(
         store
-            .adopt_runs(
-                ids::BOX,
-                second_owner,
-                swept + TimeDelta::seconds(1),
-                swept + TimeDelta::minutes(5),
-            )
+            .refresh_lease(run, second_owner, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: the sweeper's lease lapses (MOD-40: a zero TTL)"
+    );
+    assert!(
+        store
+            .adopt_runs(ids::BOX, second_owner, TimeDelta::minutes(5))
             .await
             .expect(CASE)
             .is_empty(),
@@ -5277,12 +5302,7 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
     );
     assert_eq!(
         store
-            .adopt_runs(
-                ids::BOX,
-                first_owner,
-                swept + TimeDelta::seconds(1),
-                swept + TimeDelta::minutes(5),
-            )
+            .adopt_runs(ids::BOX, first_owner, TimeDelta::minutes(5))
             .await
             .expect(CASE)
             .iter()
@@ -5293,7 +5313,7 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
     );
     assert!(
         store
-            .adopt_runs(BoxId::new(), second_owner, swept, swept)
+            .adopt_runs(BoxId::new(), second_owner, TimeDelta::zero())
             .await
             .expect(CASE)
             .is_empty(),
@@ -5310,7 +5330,7 @@ async fn take_lease_moves_only_our_own_or_an_expired_lease<S: WriteStore>(store:
     const CASE: &str = "take_lease_moves_only_our_own_or_an_expired_lease";
     let (x, y, z) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
     let at = seam_clock();
-    let minutes = |n: i64| at + TimeDelta::minutes(n);
+    let minutes = TimeDelta::minutes;
     let run = store
         .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
         .await
@@ -5322,46 +5342,55 @@ async fn take_lease_moves_only_our_own_or_an_expired_lease<S: WriteStore>(store:
             .await
             .expect(CASE),
         Claim::Admitted,
-        "{CASE}: X claims the run until at + 5 min"
+        "{CASE}: X claims the run for five minutes"
     );
 
+    let before = run_row(CASE, store, run).await;
     assert!(
         !store
-            .take_lease(run, ids::BOX, y, at, minutes(10))
+            .take_lease(run, ids::BOX, y, minutes(10))
             .await
             .expect(CASE),
         "{CASE}: X's lease is live, so Y cannot take it"
     );
     assert_eq!(
-        run_row(CASE, store, run).await.lease_expires_at,
-        Some(minutes(5)),
+        run_row(CASE, store, run).await,
+        before,
         "{CASE}: a refused take writes nothing"
     );
     assert!(
         store
-            .take_lease(run, ids::BOX, x, at, minutes(10))
+            .take_lease(run, ids::BOX, x, minutes(10))
             .await
             .expect(CASE),
         "{CASE}: X renews its own live lease"
     );
-    assert_eq!(
-        run_row(CASE, store, run).await.lease_expires_at,
-        Some(minutes(10)),
-        "{CASE}: the renewal stores the new expiry"
+    assert_leased_for(
+        CASE,
+        &run_row(CASE, store, run).await,
+        minutes(10),
+        "the renewal stores the new expiry",
     );
     assert!(
         store
-            .take_lease(run, ids::BOX, y, minutes(11), minutes(20))
+            .refresh_lease(run, x, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: X's lease lapses (MOD-40: a zero TTL)"
+    );
+    assert!(
+        store
+            .take_lease(run, ids::BOX, y, minutes(9))
             .await
             .expect(CASE),
         "{CASE}: once X's lease has expired, Y takes it"
     );
     assert!(
-        !store.refresh_lease(run, x, minutes(20)).await.expect(CASE),
+        !store.refresh_lease(run, x, minutes(9)).await.expect(CASE),
         "{CASE}: X has lost it"
     );
     assert!(
-        store.refresh_lease(run, y, minutes(20)).await.expect(CASE),
+        store.refresh_lease(run, y, minutes(9)).await.expect(CASE),
         "{CASE}: Y holds it"
     );
 
@@ -5371,32 +5400,41 @@ async fn take_lease_moves_only_our_own_or_an_expired_lease<S: WriteStore>(store:
                 run,
                 RunStatus::Running,
                 RunStatus::AwaitingApproval,
-                minutes(11)
+                at + minutes(11)
             )
             .await
             .expect(CASE),
         "{CASE}: the run parks at a gate"
     );
     assert!(
-        store.refresh_lease(run, y, minutes(11)).await.expect(CASE),
+        store
+            .refresh_lease(run, y, TimeDelta::zero())
+            .await
+            .expect(CASE),
         "{CASE}: Y releases the lease at the park (lease_expires_at = now)"
     );
     assert!(
         store
-            .take_lease(run, ids::BOX, z, minutes(11), minutes(30))
+            .take_lease(run, ids::BOX, z, minutes(19))
             .await
             .expect(CASE),
         "{CASE}: a released lease on a parked run is Z's to take"
     );
     let taken = run_row(CASE, store, run).await;
     assert_eq!(
-        (taken.lease_box_id, taken.lease_expires_at),
-        (Some(ids::BOX), Some(minutes(30))),
-        "{CASE}: the take writes the box and the expiry"
+        taken.lease_box_id,
+        Some(ids::BOX),
+        "{CASE}: the take writes the box"
+    );
+    assert_leased_for(
+        CASE,
+        &taken,
+        minutes(19),
+        "the take writes the box and the expiry",
     );
     assert!(
         !store
-            .take_lease(run, BoxId::new(), z, minutes(40), minutes(50))
+            .take_lease(run, BoxId::new(), z, minutes(10))
             .await
             .expect(CASE),
         "{CASE}: a run executing on another box is not takeable"
@@ -5414,7 +5452,7 @@ async fn take_lease_moves_only_our_own_or_an_expired_lease<S: WriteStore>(store:
         .id;
     assert!(
         !store
-            .take_lease(queued, ids::BOX, z, at, minutes(5))
+            .take_lease(queued, ids::BOX, z, minutes(5))
             .await
             .expect(CASE),
         "{CASE}: an unclaimed queued run has no lease to take"
@@ -5432,26 +5470,26 @@ async fn take_lease_moves_only_our_own_or_an_expired_lease<S: WriteStore>(store:
         .id;
     assert_eq!(
         store
-            .claim_run(finished, ids::BOX, x, at, minutes(5))
+            .claim_run(finished, ids::BOX, x, at, TimeDelta::zero())
             .await
             .expect(CASE),
         Claim::Admitted,
-        "{CASE}: the second run is admitted"
+        "{CASE}: the second run is admitted, its lease lapsed at once"
     );
     store
-        .finish_run(finished, RunStatus::Done, None, minutes(1))
+        .finish_run(finished, RunStatus::Done, None, at + minutes(1))
         .await
         .expect(CASE);
     assert!(
         !store
-            .take_lease(finished, ids::BOX, x, minutes(10), minutes(20))
+            .take_lease(finished, ids::BOX, x, minutes(10))
             .await
             .expect(CASE),
         "{CASE}: a terminal run is not takeable, even by its own expired owner"
     );
 
     let unknown = store
-        .take_lease(RunId::new(), ids::BOX, x, at, minutes(5))
+        .take_lease(RunId::new(), ids::BOX, x, minutes(5))
         .await;
     assert!(
         matches!(unknown, Err(StoreError::NotFound { entity: "run", .. })),
@@ -5469,7 +5507,7 @@ async fn release_lease_frees_the_run_for_its_own_sweep<S: WriteStore>(store: &S)
     const CASE: &str = "release_lease_frees_the_run_for_its_own_sweep";
     let (x, y) = (Uuid::now_v7(), Uuid::now_v7());
     let at = seam_clock();
-    let minutes = |n: i64| at + TimeDelta::minutes(n);
+    let minutes = TimeDelta::minutes;
     let run = store
         .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
         .await
@@ -5481,16 +5519,17 @@ async fn release_lease_frees_the_run_for_its_own_sweep<S: WriteStore>(store: &S)
             .await
             .expect(CASE),
         Claim::Admitted,
-        "{CASE}: X claims the run until at + 5 min"
+        "{CASE}: X claims the run for five minutes"
     );
 
+    let before = run_row(CASE, store, run).await;
     assert!(
-        !store.release_lease(run, y, minutes(1)).await.expect(CASE),
+        !store.release_lease(run, y).await.expect(CASE),
         "{CASE}: Y does not hold the lease, so Y's release is zero rows"
     );
     assert_eq!(
-        run_row(CASE, store, run).await.lease_expires_at,
-        Some(minutes(5)),
+        run_row(CASE, store, run).await,
+        before,
         "{CASE}: a refused release writes nothing"
     );
     assert!(
@@ -5499,26 +5538,32 @@ async fn release_lease_frees_the_run_for_its_own_sweep<S: WriteStore>(store: &S)
     );
 
     assert!(
-        store.release_lease(run, x, minutes(1)).await.expect(CASE),
+        store.release_lease(run, x).await.expect(CASE),
         "{CASE}: X gives its own lease back"
     );
     let released = run_row(CASE, store, run).await;
     assert_eq!(
-        (released.lease_box_id, released.lease_expires_at),
-        (Some(ids::BOX), Some(minutes(1))),
-        "{CASE}: the expiry reads `now`; the box that held the lease is kept"
+        released.lease_box_id,
+        Some(ids::BOX),
+        "{CASE}: the box that held the lease is kept"
+    );
+    assert_leased_for(
+        CASE,
+        &released,
+        TimeDelta::zero(),
+        "the expiry reads the store's now; the box that held the lease is kept",
     );
     assert!(
         !store.refresh_lease(run, x, minutes(10)).await.expect(CASE),
         "{CASE}: the owner is cleared, so X's late heartbeat matches no row"
     );
     assert!(
-        !store.release_lease(run, x, minutes(1)).await.expect(CASE),
+        !store.release_lease(run, x).await.expect(CASE),
         "{CASE}: a second release finds nothing of X's"
     );
 
     let adopted = store
-        .adopt_runs(ids::BOX, x, minutes(1), minutes(10))
+        .adopt_runs(ids::BOX, x, minutes(10))
         .await
         .expect(CASE);
     assert_eq!(
@@ -5531,7 +5576,7 @@ async fn release_lease_frees_the_run_for_its_own_sweep<S: WriteStore>(store: &S)
         "{CASE}: the adoption made the lease X's again"
     );
 
-    let unknown = store.release_lease(RunId::new(), x, minutes(1)).await;
+    let unknown = store.release_lease(RunId::new(), x).await;
     assert!(
         matches!(unknown, Err(StoreError::NotFound { entity: "run", .. })),
         "{CASE}: an unknown run is NotFound, got {unknown:?}"
@@ -5544,7 +5589,7 @@ async fn release_lease_frees_the_run_for_its_own_sweep<S: WriteStore>(store: &S)
 // a writer whose run another process took is answered `Fenced` and writes nothing.
 // ------------------------------------------------------------------------------------------
 
-/// MOD-40 D1: a fresh run claimed by `a` until `at + 5 min`, with one step. The fence cases start
+/// MOD-40 D1: a fresh run claimed by `a` for [`LEASE`], with one step. The fence cases start
 /// here; the run is `HTUI_ANA_2`'s, as the lease cases' are.
 async fn leased_step<S: WriteStore>(
     case: &str,
@@ -5559,11 +5604,11 @@ async fn leased_step<S: WriteStore>(
         .id;
     assert_eq!(
         store
-            .claim_run(run, ids::BOX, a, at, at + TimeDelta::minutes(5))
+            .claim_run(run, ids::BOX, a, at, LEASE)
             .await
             .expect(case),
         Claim::Admitted,
-        "{case}: A claims the run until at + 5 min"
+        "{case}: A claims the run for five minutes"
     );
     let step = store
         .create_step(new_run_step(run, 0, 1, 0))
@@ -5573,17 +5618,19 @@ async fn leased_step<S: WriteStore>(
     (run, step)
 }
 
-/// B takes the run's lapsed lease, as a sweep's `adopt_runs` does to a suspended holder.
-async fn taken_by<S: WriteStore>(case: &str, store: &S, run: RunId, b: Uuid, at: DateTime<Utc>) {
+/// B takes the run's lapsed lease, as a sweep's `adopt_runs` does to a suspended holder. A's
+/// lapse is a zero-TTL refresh (MOD-40 plan D10).
+async fn taken_by<S: WriteStore>(case: &str, store: &S, run: RunId, a: Uuid, b: Uuid) {
     assert!(
         store
-            .take_lease(
-                run,
-                ids::BOX,
-                b,
-                at + TimeDelta::minutes(6),
-                at + TimeDelta::minutes(20)
-            )
+            .refresh_lease(run, a, TimeDelta::zero())
+            .await
+            .expect(case),
+        "{case}: A's lease lapses, as a suspended holder's does"
+    );
+    assert!(
+        store
+            .take_lease(run, ids::BOX, b, TimeDelta::minutes(14))
             .await
             .expect(case),
         "{case}: B takes A's lapsed lease"
@@ -5669,7 +5716,7 @@ async fn a_stale_owner_writes_nothing_to_the_step<S: WriteStore>(store: &S) {
         )
         .await
         .expect(CASE);
-    taken_by(CASE, store, run, b, at).await;
+    taken_by(CASE, store, run, a, b).await;
     let row = step_row(CASE, store, run, step).await;
     let log = log_of(CASE, store, step).await;
 
@@ -5715,7 +5762,7 @@ async fn the_new_owner_writes_the_step<S: WriteStore>(store: &S) {
         2,
         "{CASE}: A writes its step while it holds the lease"
     );
-    taken_by(CASE, store, run, b, at).await;
+    taken_by(CASE, store, run, a, b).await;
 
     let more: Vec<SessionEvent> = (2..4).map(|seq| chat_event(step, seq)).collect();
     assert_eq!(
@@ -5865,10 +5912,7 @@ async fn an_unleased_fence_is_refused_on_a_leased_run<S: WriteStore>(store: &S) 
     );
 
     assert!(
-        store
-            .release_lease(run, a, at + TimeDelta::minutes(1))
-            .await
-            .expect(CASE),
+        store.release_lease(run, a).await.expect(CASE),
         "{CASE}: A gives its lease back, as a park does"
     );
     assert_eq!(
@@ -5950,7 +5994,7 @@ async fn a_missing_step_keeps_its_old_error_not_fenced<S: WriteStore>(store: &S)
     let at = seam_clock();
     let orphan = StepId::new();
     let (run, step) = leased_step(CASE, store, a, at).await;
-    taken_by(CASE, store, run, b, at).await;
+    taken_by(CASE, store, run, a, b).await;
 
     for fence in [StepFence::Unleased, StepFence::Lease(Uuid::now_v7())] {
         let append = store.append_events(fence, &[chat_event(orphan, 0)]).await;
@@ -6397,6 +6441,108 @@ async fn upsert_agent_with_the_current_token_applies<S: WriteStore>(store: &S) {
             })
         ),
         "{CASE}: a token for an id no row has is NotFound, got {ghost:?}"
+    );
+}
+
+/// MOD-40 blueprint B27: a lease TTL below zero or past [`MAX_LEASE_TTL`] is `Constraint` from
+/// every method that takes one, checked before any row is read (an unknown run is the same
+/// refusal, not `NotFound`), and writes nothing. Both bounds are accepted.
+async fn a_lease_ttl_out_of_range_is_refused<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_lease_ttl_out_of_range_is_refused";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let out_of_range = [
+        TimeDelta::microseconds(-1),
+        MAX_LEASE_TTL + TimeDelta::microseconds(1),
+    ];
+    let refused = |answer: Result<(), StoreError>, what: &str| {
+        assert!(
+            matches!(answer, Err(StoreError::Constraint(_))),
+            "{CASE}: {what} is Constraint, got {answer:?}"
+        );
+    };
+    let run = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    let queued = run_row(CASE, store, run).await;
+    for ttl in out_of_range {
+        refused(
+            store
+                .claim_run(run, ids::BOX, owner, at, ttl)
+                .await
+                .map(|_| ()),
+            "a claim",
+        );
+        refused(
+            store
+                .claim_run(RunId::new(), ids::BOX, owner, at, ttl)
+                .await
+                .map(|_| ()),
+            "a claim of an unknown run",
+        );
+    }
+    assert_eq!(
+        run_row(CASE, store, run).await,
+        queued,
+        "{CASE}: a refused claim writes nothing"
+    );
+
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, MAX_LEASE_TTL)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: the longest TTL is admitted"
+    );
+    let claimed = run_row(CASE, store, run).await;
+    assert_leased_for(CASE, &claimed, MAX_LEASE_TTL, "the longest lease");
+    for ttl in out_of_range {
+        refused(
+            store.refresh_lease(run, owner, ttl).await.map(|_| ()),
+            "a refresh",
+        );
+        refused(
+            store
+                .refresh_lease(RunId::new(), owner, ttl)
+                .await
+                .map(|_| ()),
+            "a refresh of an unknown run",
+        );
+        refused(
+            store
+                .take_lease(run, ids::BOX, owner, ttl)
+                .await
+                .map(|_| ()),
+            "a take",
+        );
+        refused(
+            store
+                .adopt_runs(ids::BOX, Uuid::now_v7(), ttl)
+                .await
+                .map(|_| ()),
+            "a sweep",
+        );
+    }
+    assert_eq!(
+        run_row(CASE, store, run).await,
+        claimed,
+        "{CASE}: the refusals wrote nothing"
+    );
+    assert!(
+        store
+            .refresh_lease(run, owner, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: a zero TTL is accepted"
+    );
+    assert_leased_for(
+        CASE,
+        &run_row(CASE, store, run).await,
+        TimeDelta::zero(),
+        "a zero lease",
     );
 }
 
@@ -11139,7 +11285,6 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
     const CASE: &str = "finish_run_moves_run_and_item_together";
     let owner = Uuid::now_v7();
     let at = seam_clock();
-    let until = at + TimeDelta::minutes(5);
 
     // Leg 1: `done` reaches the item, and the finish stamps the caller's instant.
     let before = item_row(CASE, store, ids::HTUI_ANA_2).await;
@@ -11150,7 +11295,7 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
         .id;
     assert_eq!(
         store
-            .claim_run(first, ids::BOX, owner, at, until)
+            .claim_run(first, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -11208,7 +11353,7 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
     for run in [left, right] {
         assert_eq!(
             store
-                .claim_run(run, ids::BOX, owner, at, until)
+                .claim_run(run, ids::BOX, owner, at, LEASE)
                 .await
                 .expect(CASE),
             Claim::Admitted,
@@ -11247,7 +11392,7 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
         .id;
     assert_eq!(
         store
-            .claim_run(failing, ids::BOX, owner, at, until)
+            .claim_run(failing, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,

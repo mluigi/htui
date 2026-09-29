@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 
 use serde_json::Value;
 
@@ -53,7 +53,7 @@ use crate::store::traits::{
     citation_key, close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
     finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project,
     invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
-    legal_move, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
+    lease_ttl_micros, legal_move, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
     prompt_template_key, prompt_template_refusal, references_no_row, requirement_withdrawn,
     reserved_phase_name, resolution_not_closable, row_names_another_step, run_is_terminal,
     skill_body_refusal, skill_patch_refusal, skill_version_key, step_is_not_promotable,
@@ -3980,7 +3980,7 @@ impl State {
         box_id: BoxId,
         owner: Uuid,
         at: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
         now: DateTime<Utc>,
     ) -> Result<Claim> {
         let claimed = self.require_run(run)?.clone();
@@ -4077,7 +4077,7 @@ impl State {
             row.executing_box_id = Some(box_id);
             row.started_at = row.started_at.or(Some(at));
             row.lease_box_id = Some(box_id);
-            row.lease_expires_at = Some(lease_until);
+            row.lease_expires_at = Some(now + ttl);
             row.updated_at = now;
         }
         self.lease_owners.insert(run, owner);
@@ -4098,7 +4098,7 @@ impl State {
         &mut self,
         run: RunId,
         owner: Uuid,
-        until: DateTime<Utc>,
+        ttl: TimeDelta,
         now: DateTime<Utc>,
     ) -> Result<bool> {
         self.require_run(run)?;
@@ -4106,20 +4106,19 @@ impl State {
             return Ok(false);
         }
         if let Some(row) = self.runs.get_mut(&run) {
-            row.lease_expires_at = Some(until);
+            row.lease_expires_at = Some(now + ttl);
             row.updated_at = now;
         }
         Ok(true)
     }
 
     /// ANA-2 §4.9's sweep: every abandoned lease on the box that is not already `owner`'s becomes
-    /// `owner`'s (plan D88).
+    /// `owner`'s (plan D88). Expiry is judged by this handle's clock (MOD-40 plan D10).
     fn adopt_runs(
         &mut self,
         box_id: BoxId,
         owner: Uuid,
-        at: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
         now: DateTime<Utc>,
     ) -> Vec<Run> {
         let mut abandoned: Vec<(DateTime<Utc>, RunId)> = self
@@ -4128,7 +4127,7 @@ impl State {
             .filter(|row| {
                 row.status == RunStatus::Running
                     && row.executing_box_id == Some(box_id)
-                    && row.lease_expires_at.is_none_or(|until| until <= at)
+                    && row.lease_expires_at.is_none_or(|until| until <= now)
                     // Plan D88: never this process's own lease, even an expired one.
                     && self.lease_owners.get(&row.id) != Some(&owner)
             })
@@ -4141,7 +4140,7 @@ impl State {
             self.lease_owners.insert(id, owner);
             if let Some(row) = self.runs.get_mut(&id) {
                 row.lease_box_id = Some(box_id);
-                row.lease_expires_at = Some(lease_until);
+                row.lease_expires_at = Some(now + ttl);
                 row.updated_at = now;
                 adopted.push(row.clone());
             }
@@ -4155,8 +4154,7 @@ impl State {
         run: RunId,
         box_id: BoxId,
         owner: Uuid,
-        at: DateTime<Utc>,
-        until: DateTime<Utc>,
+        ttl: TimeDelta,
         now: DateTime<Utc>,
     ) -> Result<bool> {
         self.require_run(run)?;
@@ -4169,32 +4167,26 @@ impl State {
         };
         let takeable = matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval)
             && row.executing_box_id == Some(box_id)
-            && (ours_or_free || row.lease_expires_at.is_none_or(|expiry| expiry <= at));
+            && (ours_or_free || row.lease_expires_at.is_none_or(|expiry| expiry <= now));
         if !takeable {
             return Ok(false);
         }
         row.lease_box_id = Some(box_id);
-        row.lease_expires_at = Some(until);
+        row.lease_expires_at = Some(now + ttl);
         row.updated_at = now;
         self.lease_owners.insert(run, owner);
         Ok(true)
     }
 
     /// Plan D139: a compare-and-set on `lease_owner` that clears it; `false` writes nothing.
-    fn release_lease(
-        &mut self,
-        run: RunId,
-        owner: Uuid,
-        at: DateTime<Utc>,
-        now: DateTime<Utc>,
-    ) -> Result<bool> {
+    fn release_lease(&mut self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
         self.require_run(run)?;
         if self.lease_owners.get(&run) != Some(&owner) {
             return Ok(false);
         }
         self.lease_owners.remove(&run);
         if let Some(row) = self.runs.get_mut(&run) {
-            row.lease_expires_at = Some(at);
+            row.lease_expires_at = Some(now);
             row.updated_at = now;
         }
         Ok(true)
@@ -6049,28 +6041,25 @@ impl WriteStore for MemStore {
         box_id: BoxId,
         owner: Uuid,
         at: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> Result<Claim> {
+        let ttl = TimeDelta::microseconds(lease_ttl_micros(ttl)?);
         let now = self.now();
-        self.write(|state| state.claim_run(run, box_id, owner, at, lease_until, now))
+        self.write(|state| state.claim_run(run, box_id, owner, at, ttl, now))
     }
 
-    async fn refresh_lease(&self, run: RunId, owner: Uuid, until: DateTime<Utc>) -> Result<bool> {
+    async fn refresh_lease(&self, run: RunId, owner: Uuid, ttl: TimeDelta) -> Result<bool> {
         #[cfg(feature = "test-support")]
         self.check_fault(MemFault::RefreshLease)?;
+        let ttl = TimeDelta::microseconds(lease_ttl_micros(ttl)?);
         let now = self.now();
-        self.write(|state| state.refresh_lease(run, owner, until, now))
+        self.write(|state| state.refresh_lease(run, owner, ttl, now))
     }
 
-    async fn adopt_runs(
-        &self,
-        box_id: BoxId,
-        owner: Uuid,
-        at: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
-    ) -> Result<Vec<Run>> {
+    async fn adopt_runs(&self, box_id: BoxId, owner: Uuid, ttl: TimeDelta) -> Result<Vec<Run>> {
+        let ttl = TimeDelta::microseconds(lease_ttl_micros(ttl)?);
         let now = self.now();
-        Ok(self.write(|state| state.adopt_runs(box_id, owner, at, lease_until, now)))
+        Ok(self.write(|state| state.adopt_runs(box_id, owner, ttl, now)))
     }
 
     async fn take_lease(
@@ -6078,18 +6067,18 @@ impl WriteStore for MemStore {
         run: RunId,
         box_id: BoxId,
         owner: Uuid,
-        now: DateTime<Utc>,
-        until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> Result<bool> {
-        let stamp = self.now();
-        self.write(|state| state.take_lease(run, box_id, owner, now, until, stamp))
+        let ttl = TimeDelta::microseconds(lease_ttl_micros(ttl)?);
+        let now = self.now();
+        self.write(|state| state.take_lease(run, box_id, owner, ttl, now))
     }
 
-    async fn release_lease(&self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
+    async fn release_lease(&self, run: RunId, owner: Uuid) -> Result<bool> {
         #[cfg(feature = "test-support")]
         self.check_fault(MemFault::ReleaseLease)?;
-        let stamp = self.now();
-        self.write(|state| state.release_lease(run, owner, now, stamp))
+        let now = self.now();
+        self.write(|state| state.release_lease(run, owner, now))
     }
 
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
@@ -6429,19 +6418,20 @@ mod tests {
         let store = MemStore::demo();
         let clone = store.clone();
         let ghost = RunId::new();
-        let now = Utc::now();
 
         store.set_fault(super::MemFault::ReleaseLease, true);
         assert!(
             matches!(
-                clone.release_lease(ghost, Uuid::now_v7(), now).await,
+                clone.release_lease(ghost, Uuid::now_v7()).await,
                 Err(StoreError::Unreachable(_))
             ),
             "the clone shares the switch, and the missing row is never looked up"
         );
         assert!(
             matches!(
-                clone.refresh_lease(ghost, Uuid::now_v7(), now).await,
+                clone
+                    .refresh_lease(ghost, Uuid::now_v7(), TimeDelta::zero())
+                    .await,
                 Err(StoreError::NotFound { .. })
             ),
             "only the named write fails"
@@ -6450,7 +6440,7 @@ mod tests {
         store.set_fault(super::MemFault::ReleaseLease, false);
         assert!(
             matches!(
-                clone.release_lease(ghost, Uuid::now_v7(), now).await,
+                clone.release_lease(ghost, Uuid::now_v7()).await,
                 Err(StoreError::NotFound { .. })
             ),
             "switched off, the write answers as it did"
@@ -8367,11 +8357,15 @@ mod tests {
     /// slot count is `box.settings.max_concurrent_items`.
     #[tokio::test]
     async fn claim_run_refuses_an_overlapping_scope_and_a_full_box() {
-        let store = MemStore::demo();
+        // MOD-40 plan D10: the lease is this handle's clock plus the TTL, so the case clocks its
+        // handle and reads `at` from it (truncated, as every clock is).
+        let clock = TestClock::at(Utc::now());
+        let at = clock.now();
+        let store = MemStore::demo().with_clock(Arc::new(clock.clone()));
         let repo = a_repo(&store, "core").await;
         let owner = Uuid::now_v7();
-        let at = Utc::now();
-        let until = at + TimeDelta::minutes(5);
+        let ttl = TimeDelta::minutes(5);
+        let until = at + ttl;
 
         let queue = |item, project, scope: Vec<RepoId>| {
             let store = &store;
@@ -8390,7 +8384,7 @@ mod tests {
 
         assert_eq!(
             store
-                .claim_run(first, ids::BOX, owner, at, until)
+                .claim_run(first, ids::BOX, owner, at, ttl)
                 .await
                 .expect("the claim is answered"),
             Claim::Admitted,
@@ -8419,7 +8413,7 @@ mod tests {
 
         assert_eq!(
             store
-                .claim_run(second, ids::BOX, owner, at, until)
+                .claim_run(second, ids::BOX, owner, at, ttl)
                 .await
                 .expect("the claim is answered"),
             Claim::Overlaps {
@@ -8441,7 +8435,7 @@ mod tests {
 
         assert_eq!(
             store
-                .claim_run(third, ids::BOX, owner, at, until)
+                .claim_run(third, ids::BOX, owner, at, ttl)
                 .await
                 .expect("the claim is answered"),
             Claim::Admitted,
@@ -8449,7 +8443,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .claim_run(fourth, ids::BOX, owner, at, until)
+                .claim_run(fourth, ids::BOX, owner, at, ttl)
                 .await
                 .expect("the claim is answered"),
             Claim::SlotFull {
@@ -8460,7 +8454,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .claim_run(first, ids::BOX, owner, at, until)
+                .claim_run(first, ids::BOX, owner, at, ttl)
                 .await
                 .expect("the claim is answered"),
             Claim::NotClaimable,
@@ -8469,9 +8463,7 @@ mod tests {
 
         assert!(
             matches!(
-                store
-                    .claim_run(second, BoxId::new(), owner, at, until)
-                    .await,
+                store.claim_run(second, BoxId::new(), owner, at, ttl).await,
                 Err(StoreError::NotFound { entity: "box", .. })
             ),
             "the box is looked up after the run"
@@ -8479,7 +8471,7 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .claim_run(RunId::new(), BoxId::new(), owner, at, until)
+                    .claim_run(RunId::new(), BoxId::new(), owner, at, ttl)
                     .await,
                 Err(StoreError::NotFound { entity: "run", .. })
             ),
@@ -8558,10 +8550,9 @@ mod tests {
 
         let at = Utc::now();
         let owner = Uuid::now_v7();
-        let until = at + TimeDelta::minutes(5);
         assert_eq!(
             store
-                .claim_run(run.id, ids::BOX, owner, at, until)
+                .claim_run(run.id, ids::BOX, owner, at, TimeDelta::minutes(5))
                 .await
                 .expect("the claim is answered"),
             Claim::NotClaimable,
@@ -8576,7 +8567,7 @@ mod tests {
         // see it: the refused branch has to be pinned through the CAS it would have gone through.
         assert!(
             !store
-                .refresh_lease(run.id, owner, until)
+                .refresh_lease(run.id, owner, TimeDelta::minutes(5))
                 .await
                 .expect("the lease refresh is answered"),
             "the refusal took no lease"
@@ -8609,9 +8600,12 @@ mod tests {
     /// `running` on `ids::BOX` when the second claims, so only the second slot admits it.
     #[tokio::test]
     async fn a_run_with_no_item_is_never_refused_for_tags() {
-        let store = MemStore::demo();
-        let at = Utc::now();
-        let until = at + TimeDelta::minutes(5);
+        // MOD-40 plan D10: the lease is this handle's clock plus the TTL.
+        let clock = TestClock::at(Utc::now());
+        let at = clock.now();
+        let store = MemStore::demo().with_clock(Arc::new(clock.clone()));
+        let ttl = TimeDelta::minutes(5);
+        let until = at + ttl;
 
         let run = store
             .create_run(graph_run(ids::HTUI_ANA_2, ids::PROJECT_HTUI, Vec::new()))
@@ -8623,7 +8617,7 @@ mod tests {
         });
         assert_eq!(
             store
-                .claim_run(run, ids::BOX, Uuid::now_v7(), at, until)
+                .claim_run(run, ids::BOX, Uuid::now_v7(), at, ttl)
                 .await
                 .expect("the claim is answered"),
             Claim::Admitted,
@@ -8639,7 +8633,7 @@ mod tests {
         assert_eq!(
             claimed.lease_expires_at,
             Some(until),
-            "the admitted claim wrote the lease it was handed"
+            "the admitted claim wrote the lease its TTL asked for"
         );
 
         // A second item of its own, so the two arms share no state.
@@ -8670,7 +8664,7 @@ mod tests {
         });
         assert_eq!(
             store
-                .claim_run(orphaned, ids::BOX, Uuid::now_v7(), at, until)
+                .claim_run(orphaned, ids::BOX, Uuid::now_v7(), at, ttl)
                 .await
                 .expect("the claim is answered"),
             Claim::Admitted,
@@ -8689,10 +8683,14 @@ mod tests {
     /// expired lease from whoever held it.
     #[tokio::test]
     async fn a_lease_refresh_is_a_cas_on_its_owner_and_the_sweep_adopts_it() {
-        let store = MemStore::demo();
+        // MOD-40 plan D10: a lease is this handle's clock plus a TTL, so the case moves the
+        // clock where it used to pass an instant, and asks for the TTL that lands on the old
+        // expiry; every expiry below is the exact instant it was.
+        let clock = TestClock::at(Utc::now());
+        let at = clock.now();
+        let store = MemStore::demo().with_clock(Arc::new(clock.clone()));
         let first_owner = Uuid::now_v7();
         let second_owner = Uuid::now_v7();
-        let at = Utc::now();
         let until = at + TimeDelta::minutes(5);
 
         let run = store
@@ -8702,7 +8700,7 @@ mod tests {
             .id;
         assert_eq!(
             store
-                .claim_run(run, ids::BOX, first_owner, at, until)
+                .claim_run(run, ids::BOX, first_owner, at, until - at)
                 .await
                 .expect("the claim is answered"),
             Claim::Admitted
@@ -8711,7 +8709,7 @@ mod tests {
         let extended = until + TimeDelta::minutes(5);
         assert!(
             store
-                .refresh_lease(run, first_owner, extended)
+                .refresh_lease(run, first_owner, extended - clock.now())
                 .await
                 .expect("the refresh is answered"),
             "the owner extends its own lease"
@@ -8727,7 +8725,11 @@ mod tests {
         );
         assert!(
             !store
-                .refresh_lease(run, second_owner, extended + TimeDelta::minutes(5))
+                .refresh_lease(
+                    run,
+                    second_owner,
+                    extended + TimeDelta::minutes(5) - clock.now()
+                )
                 .await
                 .expect("the refresh is answered"),
             "a stranger's heartbeat is zero rows, which means abandon"
@@ -8735,7 +8737,7 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .refresh_lease(RunId::new(), first_owner, extended)
+                    .refresh_lease(RunId::new(), first_owner, extended - clock.now())
                     .await,
                 Err(StoreError::NotFound { entity: "run", .. })
             ),
@@ -8743,26 +8745,18 @@ mod tests {
         );
 
         let swept = extended + TimeDelta::minutes(5);
+        clock.set(extended - TimeDelta::seconds(1));
         assert!(
             store
-                .adopt_runs(
-                    ids::BOX,
-                    second_owner,
-                    extended - TimeDelta::seconds(1),
-                    swept
-                )
+                .adopt_runs(ids::BOX, second_owner, swept - clock.now())
                 .await
                 .expect("the sweep is answered")
                 .is_empty(),
             "a live lease is not abandoned"
         );
+        clock.set(extended + TimeDelta::seconds(1));
         let adopted = store
-            .adopt_runs(
-                ids::BOX,
-                second_owner,
-                extended + TimeDelta::seconds(1),
-                swept,
-            )
+            .adopt_runs(ids::BOX, second_owner, swept - clock.now())
             .await
             .expect("the sweep is answered");
         assert_eq!(
@@ -8773,22 +8767,23 @@ mod tests {
         assert_eq!(adopted[0].lease_expires_at, Some(swept));
         assert!(
             !store
-                .refresh_lease(run, first_owner, swept)
+                .refresh_lease(run, first_owner, swept - clock.now())
                 .await
                 .expect("the refresh is answered"),
             "the old owner has lost it"
         );
         assert!(
             store
-                .refresh_lease(run, second_owner, swept)
+                .refresh_lease(run, second_owner, swept - clock.now())
                 .await
                 .expect("the refresh is answered"),
             "the new owner holds it"
         );
         let later = swept + TimeDelta::minutes(5);
+        clock.set(swept + TimeDelta::seconds(1));
         assert!(
             store
-                .adopt_runs(ids::BOX, second_owner, swept + TimeDelta::seconds(1), later)
+                .adopt_runs(ids::BOX, second_owner, later - clock.now())
                 .await
                 .expect("the sweep is answered")
                 .is_empty(),
@@ -8796,7 +8791,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .adopt_runs(ids::BOX, first_owner, swept + TimeDelta::seconds(1), later)
+                .adopt_runs(ids::BOX, first_owner, later - clock.now())
                 .await
                 .expect("the sweep is answered")
                 .iter()
@@ -8807,7 +8802,7 @@ mod tests {
         );
         assert!(
             store
-                .adopt_runs(BoxId::new(), second_owner, swept, swept)
+                .adopt_runs(BoxId::new(), second_owner, TimeDelta::zero())
                 .await
                 .expect("the sweep is answered")
                 .is_empty(),
@@ -9865,13 +9860,7 @@ mod tests {
         let at = Utc::now();
         assert_eq!(
             store
-                .claim_run(
-                    run,
-                    ids::BOX,
-                    Uuid::now_v7(),
-                    at,
-                    at + TimeDelta::minutes(5),
-                )
+                .claim_run(run, ids::BOX, Uuid::now_v7(), at, TimeDelta::minutes(5),)
                 .await
                 .expect("the claim is answered"),
             Claim::Admitted

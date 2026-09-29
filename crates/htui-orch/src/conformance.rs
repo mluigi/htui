@@ -36,7 +36,9 @@ use crate::command::{
     Command, CommandOutcome, EngineError, GateAnswer, OpeningPath, Rest, UnblockCase,
 };
 use crate::engine::{Adopted, Next, Resume};
-use crate::fake::{FakeIsolator, FakeOrchestrator, FakeVerifier, ScriptedStep, TestClock};
+use crate::fake::{
+    FakeIsolator, FakeOrchestrator, FakeVerifier, RESTART_GAP, ScriptedStep, TestClock,
+};
 use crate::isolate::Clock as _;
 use crate::status::RunFailure;
 
@@ -4010,7 +4012,6 @@ async fn a_parked_run_releases_its_lease_and_an_answer_takes_it<H: CaseHarness>(
         "the second process walked `plan` and parked at its gate"
     );
 
-    let later = other.clock().now() + TimeDelta::minutes(1);
     assert_eq!(
         run_of(&orch, run).await.lease_expires_at,
         Some(other.clock().now()),
@@ -4019,7 +4020,7 @@ async fn a_parked_run_releases_its_lease_and_an_answer_takes_it<H: CaseHarness>(
     assert!(
         !orch
             .store()
-            .refresh_lease(run, orch.owner(), later)
+            .refresh_lease(run, orch.owner(), TimeDelta::minutes(1))
             .await
             .expect("MemStore refreshes"),
         "and no longer the first's"
@@ -4039,8 +4040,7 @@ async fn a_live_lease_blocks_an_answer_from_another_process<H: CaseHarness>(harn
                 run,
                 ids::BOX,
                 orch.owner(),
-                orch.clock().now(),
-                other.clock().now() + TimeDelta::days(1)
+                TimeDelta::days(1) + RESTART_GAP
             )
             .await
             .expect("MemStore takes the lease"),
@@ -4166,11 +4166,7 @@ async fn a_suspended_walk_cannot_write_after_adoption<H: CaseHarness>(harness: &
     assert!(
         other
             .store()
-            .refresh_lease(
-                run,
-                other.owner(),
-                other.clock().now() + TimeDelta::minutes(1)
-            )
+            .refresh_lease(run, other.owner(), TimeDelta::minutes(1))
             .await
             .expect("MemStore refreshes"),
         "the adopter still holds the lease"
@@ -4774,7 +4770,7 @@ async fn the_sweep_never_touches_a_parked_run_or_a_live_lease<H: CaseHarness>(ha
     let other = orch.restarted();
     assert!(
         orch.store()
-            .refresh_lease(live, orch.owner(), other.clock().now() + TimeDelta::days(1))
+            .refresh_lease(live, orch.owner(), TimeDelta::days(1) + RESTART_GAP)
             .await
             .expect("MemStore refreshes"),
         "the first process's heartbeat is still beating"
@@ -4999,8 +4995,7 @@ async fn cancel_meets_a_live_lease_and_writes_nothing<H: CaseHarness>(harness: &
                 run,
                 ids::BOX,
                 orch.owner(),
-                orch.clock().now(),
-                other.clock().now() + TimeDelta::days(1)
+                TimeDelta::days(1) + RESTART_GAP
             )
             .await
             .expect("MemStore takes the lease"),

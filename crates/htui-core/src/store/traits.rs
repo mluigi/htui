@@ -29,7 +29,7 @@
 //! **MOD-9 milestone 3** adds the skill readers to `WriteStore` beside their writers (plan D75),
 //! as MOD-15 did; the bound-skill read the prompt uses stays inherent.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -992,19 +992,24 @@ pub trait WriteStore: ReadStore {
     /// [`OverlapRule::NotIsolated`](crate::model::OverlapRule::NotIsolated).
     ///
     /// On [`Claim::Admitted`] the run moves `queued -> running` with `executing_box_id = box_id`,
-    /// `started_at = at`, `lease_box_id = box_id`, `lease_owner = owner`,
-    /// `lease_expires_at = lease_until`, and the item `queued -> in_progress`. On
-    /// [`Claim::MissingTags`] the run moves `queued -> failed` with `failure` =
-    /// [`missing_tags_failure`](crate::model::missing_tags_failure) of the list and
-    /// `finished_at = at`, and its item `queued -> blocked`, in the same transaction;
+    /// `started_at = at`, `lease_box_id = box_id`, `lease_owner = owner`, and `lease_expires_at`
+    /// the **store's** clock plus `ttl` (MOD-40 plan D10: Postgres's `clock_timestamp()`), and the
+    /// item `queued -> in_progress`. On [`Claim::MissingTags`] the run moves `queued -> failed`
+    /// with `failure` = [`missing_tags_failure`](crate::model::missing_tags_failure) of the list
+    /// and `finished_at = at`, and its item `queued -> blocked`, in the same transaction;
     /// `executing_box_id`, `started_at` and the lease stay unset, so no slot is taken. Every other
     /// answer writes nothing.
+    ///
+    /// `at` is the caller's clock, like every other stamp of the run's timeline; only the lease is
+    /// the store's, because only the lease is compared by another process (MOD-40 blueprint B25).
     ///
     /// The two predicates range over two different sets, and `awaiting_approval` is where they
     /// part: a parked run consumes no compute and so holds no slot, but it still owns its trees
     /// and its unmerged branch and so still refuses an overlapping scope (§4.7, invariant 6).
     ///
     /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a `ttl` outside
+    /// [`lease_ttl_micros`]'s range, before anything is read;
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown run (`"run"`)
     /// or box (`"box"`), the run looked up first.
     async fn claim_run(
@@ -1013,45 +1018,45 @@ pub trait WriteStore: ReadStore {
         box_id: BoxId,
         owner: Uuid,
         at: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> Result<Claim>;
 
-    /// ANA-2 §4.9's heartbeat: `UPDATE run SET lease_expires_at = until WHERE id = run AND
-    /// lease_owner = owner`. `Ok(false)` = zero rows = abandon; the run exists but is not ours.
+    /// ANA-2 §4.9's heartbeat: `UPDATE run SET lease_expires_at = <store now> + ttl WHERE id = run
+    /// AND lease_owner = owner`. `Ok(false)` = zero rows = abandon; the run exists but is not
+    /// ours. The expiry is the store's clock (MOD-40 plan D10) and is not returned: the caller
+    /// fences on its own clock, from the instant it sent the refresh (plan OQ-2).
     ///
     /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a `ttl` out of range;
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`.
-    async fn refresh_lease(&self, run: RunId, owner: Uuid, until: DateTime<Utc>) -> Result<bool>;
+    async fn refresh_lease(&self, run: RunId, owner: Uuid, ttl: TimeDelta) -> Result<bool>;
 
     /// ANA-2 §4.9's sweep: every `running` run whose `executing_box_id` is `box_id` and whose
-    /// lease is `NULL` or expired at `now` becomes ours (`lease_owner = owner`,
-    /// `lease_expires_at = lease_until`). Returns the adopted rows in `queued_at` order, ties
-    /// broken by `id` so the order is total and the same on every backend; empty when nothing was
-    /// abandoned. A box that does not exist adopts nothing (`Ok(vec![])`).
+    /// lease is `NULL` or expired **by the store's clock** becomes ours (`lease_owner = owner`,
+    /// `lease_expires_at` = the store's clock plus `ttl`). Returns the adopted rows in `queued_at`
+    /// order, ties broken by `id` so the order is total and the same on every backend; empty when
+    /// nothing was abandoned. A box that does not exist adopts nothing (`Ok(vec![])`).
     ///
     /// **Never** a run whose `lease_owner` is `owner` (plan D88): a process whose heartbeat
     /// stalled past its TTL must not adopt its own live walk and run it twice under one owner.
     ///
     /// # Errors
-    /// The backend's own failures only.
-    async fn adopt_runs(
-        &self,
-        box_id: BoxId,
-        owner: Uuid,
-        now: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
-    ) -> Result<Vec<Run>>;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a `ttl` out of range;
+    /// the backend's own failures.
+    async fn adopt_runs(&self, box_id: BoxId, owner: Uuid, ttl: TimeDelta) -> Result<Vec<Run>>;
 
     /// Plan D87: the lease of a run that is ours or free, taken before a command's first write on
     /// a parked or running run. `UPDATE run SET lease_owner = owner, lease_box_id = box_id,
-    /// lease_expires_at = until WHERE id = run AND status IN ('running','awaiting_approval') AND
-    /// executing_box_id = box_id AND (lease_owner = owner OR lease_owner IS NULL OR
-    /// lease_expires_at IS NULL OR lease_expires_at <= now)`.
+    /// lease_expires_at = <store now> + ttl WHERE id = run AND status IN
+    /// ('running','awaiting_approval') AND executing_box_id = box_id AND (lease_owner = owner OR
+    /// lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= <store now>)`.
     ///
-    /// `Ok(false)` = zero rows: another owner holds a live lease, or the run is not takeable here
-    /// (not `running`/`awaiting_approval`, or executing on another box). Nothing is written then.
+    /// `Ok(false)` = zero rows: another owner holds a lease live by the store's clock, or the run
+    /// is not takeable here (not `running`/`awaiting_approval`, or executing on another box).
+    /// Nothing is written then.
     ///
     /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a `ttl` out of range;
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`, told
     /// apart from "not takeable" by one follow-up read.
     async fn take_lease(
@@ -1059,13 +1064,12 @@ pub trait WriteStore: ReadStore {
         run: RunId,
         box_id: BoxId,
         owner: Uuid,
-        now: DateTime<Utc>,
-        until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> Result<bool>;
 
-    /// Plan D139: gives a lease back. `UPDATE run SET lease_owner = NULL, lease_expires_at = now
-    /// WHERE id = run AND lease_owner = owner`. `Ok(false)` = zero rows = not ours, and nothing
-    /// is written.
+    /// Plan D139: gives a lease back. `UPDATE run SET lease_owner = NULL, lease_expires_at =
+    /// <store now> WHERE id = run AND lease_owner = owner`. `Ok(false)` = zero rows = not ours,
+    /// and nothing is written.
     ///
     /// The owner is cleared, not only the expiry. Plan D88 keeps [`adopt_runs`] off a run whose
     /// `lease_owner` is the sweeper, so a lease released with [`refresh_lease`] stayed out of its
@@ -1085,7 +1089,7 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`, told
     /// apart from "not ours" by one follow-up read.
-    async fn release_lease(&self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool>;
+    async fn release_lease(&self, run: RunId, owner: Uuid) -> Result<bool>;
 
     /// Inserts a step at `pending`. `fanout_index = -1` is the judge and is accepted.
     ///
@@ -1837,6 +1841,31 @@ pub fn item_kind_is_held(prefix: &str, items: u64) -> String {
 // `MemStore` and `PgStore` refuse the same input with the same sentence. The FK refusals reuse
 // `references_no_row`, which is the sentence `MemStore` already gave `run.project_id` and
 // `session_event.run_step_id` before this milestone gave it a name.
+
+/// The longest lease TTL a store accepts: 365 days, the bound `htui-orch`'s `LeaseTimes::from_app`
+/// already clamps `lease_ttl_seconds` to, so `now + ttl` never overflows an instant and the µs
+/// count Postgres multiplies stays below 2^53, where a `float8` product is exact (MOD-40 blueprint
+/// P-13, B27).
+pub const MAX_LEASE_TTL: TimeDelta = TimeDelta::seconds(365 * 24 * 60 * 60);
+
+/// MOD-40 plan D10 (blueprint B27): a lease TTL as the whole microseconds both stores add to their
+/// own clock, or the one refusal both give.
+///
+/// Sub-microsecond parts are dropped (`TIMESTAMPTZ` has none), so Postgres, which binds the
+/// count, and `MemStore`, which adds `TimeDelta::microseconds(count)`, add the same span.
+///
+/// # Errors
+/// [`StoreError::Constraint`](crate::store::StoreError::Constraint) naming the TTL when it is
+/// negative or longer than [`MAX_LEASE_TTL`]. Checked before any row is read, so an out-of-range
+/// TTL on an unknown run is this refusal, not `NotFound`.
+pub fn lease_ttl_micros(ttl: TimeDelta) -> Result<i64> {
+    match ttl.num_microseconds() {
+        Some(micros) if ttl >= TimeDelta::zero() && ttl <= MAX_LEASE_TTL => Ok(micros),
+        _ => Err(crate::store::StoreError::Constraint(format!(
+            "lease ttl {ttl} is outside 0 ..= {MAX_LEASE_TTL}"
+        ))),
+    }
+}
 
 /// A foreign key that names no row, in the sentence both stores give it.
 #[must_use]

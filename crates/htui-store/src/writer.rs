@@ -20,7 +20,7 @@
 //! chat-tab snapshot run against it, and a seam only the production backend can exercise is a seam
 //! no test covers.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::{
     Agent, AgentBox, AgentId, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow,
     ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId,
@@ -814,31 +814,25 @@ impl WriteStore for Writer {
         box_id: BoxId,
         owner: Uuid,
         at: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> Result<Claim> {
         match self {
-            Self::Memory(store) => store.claim_run(run, box_id, owner, at, lease_until).await,
-            Self::Online(pg) => pg.claim_run(run, box_id, owner, at, lease_until).await,
+            Self::Memory(store) => store.claim_run(run, box_id, owner, at, ttl).await,
+            Self::Online(pg) => pg.claim_run(run, box_id, owner, at, ttl).await,
         }
     }
 
-    async fn refresh_lease(&self, run: RunId, owner: Uuid, until: DateTime<Utc>) -> Result<bool> {
+    async fn refresh_lease(&self, run: RunId, owner: Uuid, ttl: TimeDelta) -> Result<bool> {
         match self {
-            Self::Memory(store) => store.refresh_lease(run, owner, until).await,
-            Self::Online(pg) => pg.refresh_lease(run, owner, until).await,
+            Self::Memory(store) => store.refresh_lease(run, owner, ttl).await,
+            Self::Online(pg) => pg.refresh_lease(run, owner, ttl).await,
         }
     }
 
-    async fn adopt_runs(
-        &self,
-        box_id: BoxId,
-        owner: Uuid,
-        now: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
-    ) -> Result<Vec<Run>> {
+    async fn adopt_runs(&self, box_id: BoxId, owner: Uuid, ttl: TimeDelta) -> Result<Vec<Run>> {
         match self {
-            Self::Memory(store) => store.adopt_runs(box_id, owner, now, lease_until).await,
-            Self::Online(pg) => pg.adopt_runs(box_id, owner, now, lease_until).await,
+            Self::Memory(store) => store.adopt_runs(box_id, owner, ttl).await,
+            Self::Online(pg) => pg.adopt_runs(box_id, owner, ttl).await,
         }
     }
 
@@ -847,19 +841,18 @@ impl WriteStore for Writer {
         run: RunId,
         box_id: BoxId,
         owner: Uuid,
-        now: DateTime<Utc>,
-        until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> Result<bool> {
         match self {
-            Self::Memory(store) => store.take_lease(run, box_id, owner, now, until).await,
-            Self::Online(pg) => pg.take_lease(run, box_id, owner, now, until).await,
+            Self::Memory(store) => store.take_lease(run, box_id, owner, ttl).await,
+            Self::Online(pg) => pg.take_lease(run, box_id, owner, ttl).await,
         }
     }
 
-    async fn release_lease(&self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
+    async fn release_lease(&self, run: RunId, owner: Uuid) -> Result<bool> {
         match self {
-            Self::Memory(store) => store.release_lease(run, owner, now).await,
-            Self::Online(pg) => pg.release_lease(run, owner, now).await,
+            Self::Memory(store) => store.release_lease(run, owner).await,
+            Self::Online(pg) => pg.release_lease(run, owner).await,
         }
     }
 

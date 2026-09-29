@@ -3456,8 +3456,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// A run of `item` another process claimed an hour ago and never renewed: `running`, its
-    /// lease expired, its owner not this one. No step was created.
+    /// A run of `item` another process claimed an hour ago (`started_at`) under a lease that
+    /// lapsed at once: `running`, its lease expired, its owner not this one. No step was created.
     async fn stranded(fixture: &Fixture, item: ItemId) -> RunId {
         let backend = Backend::memory(fixture.store.clone());
         let row = fixture.item(item).await;
@@ -3492,13 +3492,7 @@ pub(crate) mod tests {
             .expect("the run lands");
         let claim = fixture
             .store
-            .claim_run(
-                run,
-                ids::BOX,
-                Uuid::now_v7(),
-                past,
-                past + TimeDelta::minutes(1),
-            )
+            .claim_run(run, ids::BOX, Uuid::now_v7(), past, TimeDelta::zero())
             .await
             .expect("the claim answers");
         assert!(claim.is_admitted(), "{claim}");

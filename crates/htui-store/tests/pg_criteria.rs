@@ -27,6 +27,7 @@ use htui_core::model::{
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
+use htui_core::store::conformance::assert_leased_for;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, SettingRung, StepFence, UpdateOutcome,
     WriteStore as _,
@@ -678,11 +679,11 @@ async fn admission_is_serialised_by_the_box_row_lock() {
         .expect("second pool")
         .store;
     let at = Utc::now();
-    let until = at + TimeDelta::minutes(5);
+    let ttl = TimeDelta::minutes(5);
     let (one, two) = tokio::join!(
         db.store
-            .claim_run(first, ids::BOX, uuid::Uuid::now_v7(), at, until),
-        other.claim_run(second, ids::BOX, uuid::Uuid::now_v7(), at, until),
+            .claim_run(first, ids::BOX, uuid::Uuid::now_v7(), at, ttl),
+        other.claim_run(second, ids::BOX, uuid::Uuid::now_v7(), at, ttl),
     );
     let one = one.expect("the first claim must not fail");
     let two = two.expect("the second claim must not fail");
@@ -757,11 +758,11 @@ async fn two_sweeps_adopt_each_expired_run_once() {
             .id;
         assert_eq!(
             db.store
-                .claim_run(run, ids::BOX, crashed, at, at - TimeDelta::minutes(1))
+                .claim_run(run, ids::BOX, crashed, at, TimeDelta::zero())
                 .await
                 .expect("the claim must not fail"),
             Claim::Admitted,
-            "both runs fit the fixture box's two slots, under a lease already expired"
+            "both runs fit the fixture box's two slots, under a lease that lapses at once"
         );
         expired.push(run);
     }
@@ -770,11 +771,10 @@ async fn two_sweeps_adopt_each_expired_run_once() {
         .await
         .expect("second pool")
         .store;
-    let until = at + TimeDelta::minutes(5);
     let (a, b) = tokio::join!(
         db.store
-            .adopt_runs(ids::BOX, uuid::Uuid::now_v7(), at, until),
-        other.adopt_runs(ids::BOX, uuid::Uuid::now_v7(), at, until),
+            .adopt_runs(ids::BOX, uuid::Uuid::now_v7(), TimeDelta::minutes(5)),
+        other.adopt_runs(ids::BOX, uuid::Uuid::now_v7(), TimeDelta::minutes(5)),
     );
     let a: Vec<RunId> = a
         .expect("the first sweep must not fail")
@@ -829,7 +829,7 @@ async fn two_takes_of_one_released_lease_admit_one() {
         .id;
     assert_eq!(
         db.store
-            .claim_run(run, ids::BOX, first_owner, at, at + TimeDelta::minutes(5))
+            .claim_run(run, ids::BOX, first_owner, at, TimeDelta::minutes(5))
             .await
             .expect("the claim must not fail"),
         Claim::Admitted,
@@ -844,7 +844,7 @@ async fn two_takes_of_one_released_lease_admit_one() {
     );
     assert!(
         db.store
-            .release_lease(run, first_owner, at)
+            .release_lease(run, first_owner)
             .await
             .expect("the release must not fail"),
         "the walk that parked it releases its lease (owner cleared, lease_expires_at = now: plan D139)"
@@ -854,11 +854,11 @@ async fn two_takes_of_one_released_lease_admit_one() {
         .await
         .expect("second pool")
         .store;
-    let (one_until, two_until) = (at + TimeDelta::minutes(10), at + TimeDelta::minutes(20));
+    let (one_ttl, two_ttl) = (TimeDelta::minutes(10), TimeDelta::minutes(20));
     let (one, two) = tokio::join!(
         db.store
-            .take_lease(run, ids::BOX, uuid::Uuid::now_v7(), at, one_until),
-        other.take_lease(run, ids::BOX, uuid::Uuid::now_v7(), at, two_until),
+            .take_lease(run, ids::BOX, uuid::Uuid::now_v7(), one_ttl),
+        other.take_lease(run, ids::BOX, uuid::Uuid::now_v7(), two_ttl),
     );
     let one = one.expect("the first take must not fail");
     let two = two.expect("the second take must not fail");
@@ -868,16 +868,191 @@ async fn two_takes_of_one_released_lease_admit_one() {
         1,
         "exactly one take may win a released lease, got ({one}, {two})"
     );
-    let winner = if one { one_until } else { two_until };
-    assert_eq!(
-        db.store
+    // The two TTLs are ten minutes apart, so the helper's one-second window tells them apart.
+    let winner = if one { one_ttl } else { two_ttl };
+    assert_leased_for(
+        "two_takes_of_one_released_lease_admit_one",
+        &db.store
             .run(run)
             .await
             .expect("read must not fail")
+            .expect("the run exists"),
+        winner,
+        "the stored expiry is the winner's",
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-40 plan D10 (C2): every lease a lease method writes, and every expiry one compares, is
+/// the database's `clock_timestamp()`. The caller's clock is a day slow and enters nothing but
+/// `started_at` (blueprint B25). Each expiry lies between two `clock_timestamp()` reads taken
+/// around its write, plus the TTL.
+#[tokio::test(flavor = "multi_thread")]
+async fn lease_times_are_the_databases() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (a, b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let slow = (Utc::now() - TimeDelta::days(1)).trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let (pool, store) = (&db.pool, &db.store);
+    let db_now = || async move {
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT clock_timestamp()")
+            .fetch_one(pool)
+            .await
+            .expect("read the database's clock")
+    };
+    let row = || async move {
+        store
+            .run(ids::RUN_2)
+            .await
+            .expect("read must not fail")
             .expect("the run exists")
-            .lease_expires_at,
-        Some(winner),
-        "the stored expiry is the winner's"
+    };
+    let bracketed = |lease: Option<DateTime<Utc>>,
+                     from: DateTime<Utc>,
+                     to: DateTime<Utc>,
+                     ttl: TimeDelta,
+                     what: &str| {
+        let lease = lease.unwrap_or_else(|| panic!("{what}: no lease"));
+        assert!(
+            from + ttl <= lease && lease <= to + ttl,
+            "{what}: {lease} is not the database's clock plus {ttl} (read {from} .. {to})"
+        );
+    };
+
+    let from = db_now().await;
+    assert_eq!(
+        store
+            .claim_run(ids::RUN_2, ids::BOX, a, slow, TimeDelta::minutes(5))
+            .await
+            .expect("the claim must not fail"),
+        Claim::Admitted,
+        "A claims the queued fixture run"
+    );
+    let to = db_now().await;
+    let claimed = row().await;
+    assert_eq!(
+        claimed.started_at,
+        Some(slow),
+        "started_at is the caller's clock (B25)"
+    );
+    bracketed(
+        claimed.lease_expires_at,
+        from,
+        to,
+        TimeDelta::minutes(5),
+        "the claim",
+    );
+
+    let from = db_now().await;
+    assert!(
+        store
+            .refresh_lease(ids::RUN_2, a, TimeDelta::minutes(10))
+            .await
+            .expect("the refresh must not fail"),
+        "A refreshes its own lease"
+    );
+    let to = db_now().await;
+    bracketed(
+        row().await.lease_expires_at,
+        from,
+        to,
+        TimeDelta::minutes(10),
+        "the refresh",
+    );
+
+    let from = db_now().await;
+    assert!(
+        store
+            .take_lease(ids::RUN_2, ids::BOX, a, TimeDelta::minutes(15))
+            .await
+            .expect("the take must not fail"),
+        "A renews its own lease"
+    );
+    let to = db_now().await;
+    bracketed(
+        row().await.lease_expires_at,
+        from,
+        to,
+        TimeDelta::minutes(15),
+        "the renewal",
+    );
+
+    let from = db_now().await;
+    assert!(
+        store
+            .release_lease(ids::RUN_2, a)
+            .await
+            .expect("the release must not fail"),
+        "A gives its lease back"
+    );
+    let to = db_now().await;
+    bracketed(
+        row().await.lease_expires_at,
+        from,
+        to,
+        TimeDelta::zero(),
+        "the release",
+    );
+
+    let from = db_now().await;
+    let adopted = store
+        .adopt_runs(ids::BOX, b, TimeDelta::minutes(7))
+        .await
+        .expect("the sweep must not fail");
+    let to = db_now().await;
+    assert_eq!(
+        adopted.iter().map(|run| run.id).collect::<Vec<_>>(),
+        [ids::RUN_2],
+        "B's sweep adopts the released run"
+    );
+    bracketed(
+        row().await.lease_expires_at,
+        from,
+        to,
+        TimeDelta::minutes(7),
+        "the adoption",
+    );
+
+    // Expiry is compared on the database's clock too: a lease planted 1 s in the past is a
+    // stranger's to take, one planted an hour ahead is not, whatever the caller's clock says.
+    let plant = |seconds: i64, owner: uuid::Uuid| async move {
+        sqlx::query(
+            "UPDATE run SET lease_owner = $1, \
+                            lease_expires_at = clock_timestamp() + $2 * interval '1 second' \
+              WHERE id = $3",
+        )
+        .bind(owner)
+        .bind(seconds)
+        .bind(ids::RUN_2.as_uuid())
+        .execute(pool)
+        .await
+        .expect("plant a lease");
+    };
+    plant(-1, b).await;
+    assert!(
+        store
+            .take_lease(ids::RUN_2, ids::BOX, a, TimeDelta::minutes(5))
+            .await
+            .expect("the take must not fail"),
+        "a lease lapsed by the database's clock is taken"
+    );
+    plant(60 * 60, b).await;
+    assert!(
+        !store
+            .take_lease(ids::RUN_2, ids::BOX, a, TimeDelta::minutes(5))
+            .await
+            .expect("the take must not fail"),
+        "a lease live by the database's clock is refused"
+    );
+    assert!(
+        store
+            .adopt_runs(ids::BOX, a, TimeDelta::minutes(5))
+            .await
+            .expect("the sweep must not fail")
+            .is_empty(),
+        "and not swept"
     );
 
     db.drop_db().await;
@@ -3733,7 +3908,6 @@ async fn finish_run_holds_the_item_while_another_run_is_live() {
     };
     let owner = uuid::Uuid::now_v7();
     let at = Utc::now();
-    let until = at + TimeDelta::minutes(5);
 
     let closed_at = async |item: ItemId| {
         sqlx::query_scalar!(
@@ -3767,7 +3941,7 @@ async fn finish_run_holds_the_item_while_another_run_is_live() {
     for run in [left, right] {
         assert_eq!(
             db.store
-                .claim_run(run, ids::BOX, owner, at, until)
+                .claim_run(run, ids::BOX, owner, at, TimeDelta::minutes(5))
                 .await
                 .expect("the claim must not fail"),
             Claim::Admitted,
@@ -3908,10 +4082,9 @@ async fn a_missing_tags_run_aimed_at_another_box_is_not_claimable() {
 
     let at = Utc::now();
     let owner = uuid::Uuid::now_v7();
-    let until = at + TimeDelta::minutes(5);
     assert_eq!(
         db.store
-            .claim_run(run.id, ids::BOX, owner, at, until)
+            .claim_run(run.id, ids::BOX, owner, at, TimeDelta::minutes(5))
             .await
             .expect("the claim is answered"),
         Claim::NotClaimable,
@@ -3927,7 +4100,7 @@ async fn a_missing_tags_run_aimed_at_another_box_is_not_claimable() {
     // through, which is `Ok(false)` when no lease owner matches.
     assert!(
         !db.store
-            .refresh_lease(run.id, owner, until)
+            .refresh_lease(run.id, owner, TimeDelta::minutes(5))
             .await
             .expect("the lease refresh is answered"),
         "the refusal took no lease"
@@ -3990,13 +4163,9 @@ async fn a_run_with_no_item_is_never_refused_for_tags() {
     .expect("plant a queued run with no item");
 
     let owner = uuid::Uuid::now_v7();
-    // `timestamptz` is microsecond-resolution, so the lease comes back truncated from the
-    // nanoseconds it was handed. `MemStore` keeps every digit, which is why the same assertion
-    // needs no truncation there; `ChatRunSpec::mint` truncates for the same reason.
-    let until = (at + TimeDelta::minutes(5)).trunc_subsecs(TIMESTAMPTZ_DIGITS);
     assert_eq!(
         db.store
-            .claim_run(id, ids::BOX, owner, at, until)
+            .claim_run(id, ids::BOX, owner, at, TimeDelta::minutes(5))
             .await
             .expect("the claim is answered"),
         Claim::Admitted,
@@ -4010,10 +4179,11 @@ async fn a_run_with_no_item_is_never_refused_for_tags() {
         .expect("it exists");
     assert_eq!(claimed.status, RunStatus::Running);
     assert_eq!(claimed.executing_box_id, Some(ids::BOX));
-    assert_eq!(
-        claimed.lease_expires_at,
-        Some(until),
-        "the admitted claim wrote the lease it was handed"
+    assert_leased_for(
+        "a_run_with_no_item_is_never_refused_for_tags",
+        &claimed,
+        TimeDelta::minutes(5),
+        "the admitted claim wrote the lease its TTL asked for",
     );
 
     db.drop_db().await;
@@ -4295,7 +4465,7 @@ async fn a_lease_take_committed_mid_write_fences_it() {
     let now = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
     assert_eq!(
         db.store
-            .claim_run(ids::RUN_2, ids::BOX, a, now, now + TimeDelta::minutes(5))
+            .claim_run(ids::RUN_2, ids::BOX, a, now, TimeDelta::minutes(5))
             .await
             .expect("the claim must not fail"),
         Claim::Admitted,

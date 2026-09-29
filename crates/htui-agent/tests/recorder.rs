@@ -774,46 +774,32 @@ impl WriteStore for SpyStore {
         box_id: BoxId,
         owner: Uuid,
         at: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> StoreResult<Claim> {
-        self.inner
-            .claim_run(run, box_id, owner, at, lease_until)
-            .await
+        self.inner.claim_run(run, box_id, owner, at, ttl).await
     }
-    async fn refresh_lease(
-        &self,
-        run: RunId,
-        owner: Uuid,
-        until: DateTime<Utc>,
-    ) -> StoreResult<bool> {
-        self.inner.refresh_lease(run, owner, until).await
+    async fn refresh_lease(&self, run: RunId, owner: Uuid, ttl: TimeDelta) -> StoreResult<bool> {
+        self.inner.refresh_lease(run, owner, ttl).await
     }
     async fn adopt_runs(
         &self,
         box_id: BoxId,
         owner: Uuid,
-        now: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> StoreResult<Vec<Run>> {
-        self.inner.adopt_runs(box_id, owner, now, lease_until).await
+        self.inner.adopt_runs(box_id, owner, ttl).await
     }
     async fn take_lease(
         &self,
         run: RunId,
         box_id: BoxId,
         owner: Uuid,
-        now: DateTime<Utc>,
-        until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> StoreResult<bool> {
-        self.inner.take_lease(run, box_id, owner, now, until).await
+        self.inner.take_lease(run, box_id, owner, ttl).await
     }
-    async fn release_lease(
-        &self,
-        run: RunId,
-        owner: Uuid,
-        now: DateTime<Utc>,
-    ) -> StoreResult<bool> {
-        self.inner.release_lease(run, owner, now).await
+    async fn release_lease(&self, run: RunId, owner: Uuid) -> StoreResult<bool> {
+        self.inner.release_lease(run, owner).await
     }
     async fn create_step(&self, new: NewRunStep) -> StoreResult<RunStep> {
         self.inner.create_step(new).await
@@ -3474,13 +3460,7 @@ async fn the_fence_rides_every_write() {
     assert_eq!(
         store
             .inner
-            .claim_run(
-                ids::RUN_2,
-                ids::BOX,
-                owner,
-                at(),
-                at() + TimeDelta::minutes(5)
-            )
+            .claim_run(ids::RUN_2, ids::BOX, owner, at(), TimeDelta::minutes(5))
             .await
             .expect("the claim must not fail"),
         Claim::Admitted,
@@ -3539,17 +3519,21 @@ async fn the_fence_rides_every_write() {
         "the usage write rode the fence: under `Unleased` it would be `Fenced`"
     );
 
-    // (3) Another process takes the lapsed lease: the old owner writes nothing more.
+    // (3) Another process takes the lapsed lease: the old owner writes nothing more. The lease
+    // lapses by a zero-TTL refresh (MOD-40 plan D10), which keeps `lease_owner` and so leaves
+    // the step fence admitting `owner` until the take.
     assert!(
         store
             .inner
-            .take_lease(
-                ids::RUN_2,
-                ids::BOX,
-                stranger,
-                at() + TimeDelta::minutes(6),
-                at() + TimeDelta::minutes(20),
-            )
+            .refresh_lease(ids::RUN_2, owner, TimeDelta::zero())
+            .await
+            .expect("the refresh must not fail"),
+        "the walk's lease lapses"
+    );
+    assert!(
+        store
+            .inner
+            .take_lease(ids::RUN_2, ids::BOX, stranger, TimeDelta::minutes(14))
             .await
             .expect("the take must not fail"),
         "the stranger takes the lapsed lease"
