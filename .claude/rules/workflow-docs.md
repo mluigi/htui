@@ -60,6 +60,11 @@ The mint is **purely file-derived and offline**. It reads the working tree and n
 network source, no index service, no generated answer. A mint that cannot enumerate its inputs
 deterministically is not a mint.
 
+**Lease raise (sandbox runs, TOOL-7).** While `scripts/hr-mint --leasing` succeeds, the minted ID is
+max(the tree mint above, highest leased ID for the prefix + 1). The lease file (`id-leases.tsv` in
+the hr state dir) is local and flock-guarded, and it is enumerable like the tree. A lease can only
+raise the ID, never lower it; a leased ID that is never filed is a gap, never reused.
+
 An item can spawn another: an `ANA-N` verdict commonly spawns a `MOD-N` implementation task (e.g.
 ANA-11 to MOD-16) - note the origin in the `MOD-N` entry ("from ANA-11").
 
