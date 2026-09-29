@@ -1,7 +1,7 @@
 //! The agent registry editor of `Settings > Agents` (MOD-23): the draft a form produces, the rules
-//! that parse it, and (T2) the three writes served in the store loop.
+//! that parse it, and [`serve`], the three writes served in the store loop.
 //!
-//! Everything here but `serve` is pure: no clock, no id, no store, so the section can run it on the
+//! Everything here but [`serve`] is pure: no clock, no id, no store, so the section can run it on the
 //! UI task (`R-NF-3`) and the worker runs it again before it writes (plan D247). Nothing here reads
 //! or branches on an agent's name (`R-AGT-5`): a name is only ever checked against the character
 //! rule of [`valid_name`]. Nothing here prints `launch.env` (`R-SEC-2`): the form never holds it,
@@ -10,7 +10,11 @@
 use chrono::{DateTime, Utc};
 use htui_agent::launch::AgentLaunch;
 use htui_core::model::{Agent, AgentId, Billing, Transport};
+use htui_core::store::{Result as StoreResult, StoreError};
+use htui_store::{Backend, REGISTRY_ON_SERVER_ONLY};
 use serde_json::Value;
+
+use crate::store_worker::{StoreReply, StoreRequest};
 
 // F-15: the `y`/`n` convention is the Settings tab's, kept in one place, so this store-side module
 // borrows it from the UI module rather than owning a second copy.
@@ -448,6 +452,74 @@ fn checked_launch(launch: Value) -> Result<Value, Refusal> {
             "the merged launch document is not a valid AgentLaunch",
         )),
     }
+}
+
+/// The three request names, in [`StoreRequest`] order (plan D241).
+///
+/// [`StoreRequest::name`]'s arms and the section's `Failed` match both read from here, so a fourth
+/// request cannot be named in one place and matched in the other.
+pub const REQUEST_NAMES: [&str; 3] = ["create_agent", "edit_agent", "set_agent_on_box"];
+
+/// What one registry write did (plan D240), carried by `StoreReply::AgentWritten` beside the
+/// registry re-read. Ids, names and the switch only: no `launch`, so no `env` (`R-SEC-2`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentWrite {
+    /// A new row landed.
+    Created {
+        /// The id the worker minted.
+        id: AgentId,
+        /// The row's name, as stored.
+        name: String,
+    },
+    /// The edit applied.
+    Edited {
+        /// The row.
+        id: AgentId,
+        /// The row's name, which an edit never changes (plan D233).
+        name: String,
+    },
+    /// The token was spent: the row changed since the form read it. Nothing was written.
+    Stale {
+        /// The row.
+        id: AgentId,
+    },
+    /// The row is gone. Nothing was written.
+    Gone {
+        /// The row the request named.
+        id: AgentId,
+    },
+    /// This box's switch for the agent is now `enabled` (plan D242).
+    Switched {
+        /// The agent.
+        id: AgentId,
+        /// The agent's name, from the re-read (blueprint D256).
+        name: String,
+        /// The switch as written: `false` is switched off on this box, `true` is the probe's
+        /// verdict again.
+        enabled: bool,
+    },
+}
+
+/// Serves `CreateAgent`, `EditAgent` and `SetAgentOnBox` (plan D239-D241) in the store loop.
+///
+/// Offline there is no writer, and all three are `Err(Unreachable(REGISTRY_ON_SERVER_ONLY))`
+/// before any read (MOD-25). A refused name or field is `Ok(Failed)` carrying the section's own
+/// sentence, byte for byte (plan D247, blueprint D250). A store refusal, such as a taken name,
+/// propagates as `Err`, so an `Unreachable` still drops an `Online` backend onto the mirror. Every
+/// write that reached the store answers `StoreReply::AgentWritten` with the registry re-read.
+///
+/// Known residue, `box_settings`'s: a re-read that fails after an applied write answers `Failed`,
+/// though the row has changed.
+///
+/// # Errors
+///
+/// Whatever the store reports, `Unreachable` offline, and `Backend` for a request that is not one
+/// of the three.
+pub async fn serve(backend: &Backend, request: &StoreRequest) -> StoreResult<StoreReply> {
+    let _writer = backend
+        .writer()
+        .ok_or_else(|| StoreError::Unreachable(REGISTRY_ON_SERVER_ONLY.to_owned()))?;
+    todo!("MOD-23 T2 (b): serve {}", request.name())
 }
 
 #[cfg(test)]

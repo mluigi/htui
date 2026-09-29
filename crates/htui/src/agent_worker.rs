@@ -5929,6 +5929,86 @@ pub(crate) mod tests {
         );
     }
 
+    /// MOD-23 D243: a row the human switched off on this box stays off in the probe's own reply,
+    /// as the store keeps it (`enabled AND NOT user_off`), though the probe finds it `ready`. The
+    /// row is a `cli` row whose `launch` is a literal command with no `discovery`, so it probes
+    /// `ready` and nothing is spawned: a `cli` row has no handshake. (Blueprint F-10 said `acp`,
+    /// but an `acp` row with no `discovery` does run tier 2: `probe.rs`'s `is_none_or`.) The box
+    /// probe shares `probe_agents_on`, so this covers its reply too.
+    #[tokio::test]
+    async fn a_probe_reply_keeps_a_switched_off_row_off() {
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let command = tmp.path().join("agent-bin");
+        std::fs::write(&command, "").expect("the literal command exists");
+        let store = MemStore::demo();
+        let now = Utc::now();
+        let agent = Agent {
+            id: AgentId::new(),
+            name: "agent-literal".to_owned(),
+            transport: Transport::Cli,
+            launch: json!({ "command": command.to_string_lossy(), "args": [], "env": {} }),
+            models: Vec::new(),
+            default_model: None,
+            billing: htui_core::model::Billing::Subscription,
+            enabled: true,
+            settings: json!({}),
+            created_at: now,
+            updated_at: now,
+        };
+        store
+            .upsert_agent(&agent, None)
+            .await
+            .expect("the new row lands");
+        store
+            .set_agent_box_enabled(agent.id, ids::BOX, false)
+            .await
+            .expect("the switch lands");
+        let rows: Vec<_> = store
+            .agents()
+            .await
+            .expect("the memory store never fails")
+            .into_iter()
+            .filter(|summary| summary.agent.id == agent.id)
+            .collect();
+        assert!(rows[0].user_off, "the read carries the switch");
+
+        let replied = probe_agents_on(
+            &Writer::Memory(store.clone()),
+            ids::BOX,
+            rows,
+            &ProbeEnv::host(tmp.path().to_path_buf()).without_versions(),
+        )
+        .await
+        .expect("the memory store never fails");
+
+        let on_box = replied[0].on_box.as_ref().expect("the probe wrote a row");
+        assert_eq!(
+            on_box
+                .probe
+                .as_ref()
+                .and_then(|probe| probe.get("status"))
+                .and_then(Value::as_str),
+            Some("ready"),
+            "a literal command resolves without a spawn"
+        );
+        assert!(
+            !on_box.enabled,
+            "the reply says what the store kept: a switched-off row stays off"
+        );
+        let stored = store
+            .agents()
+            .await
+            .expect("the memory store never fails")
+            .into_iter()
+            .find(|summary| summary.agent.id == agent.id)
+            .expect("the row is still listed");
+        assert!(stored.user_off);
+        assert!(
+            !stored.on_box.expect("the probe's row").enabled,
+            "the store kept the veto"
+        );
+    }
+
     /// A runtime that installs from `fixture` into `root`, and knows no transport at all.
     ///
     /// `DriverFactory::new()`: an install never builds a driver, and a runtime that could would
