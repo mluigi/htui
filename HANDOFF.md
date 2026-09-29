@@ -20,12 +20,14 @@ and document points carry `item.resolution`, and `htui --search-items --decision
 closed as done, concluded or rejected (maintainer). The collection is now `htui_concepts_v2`, so the
 first `--index-items` after upgrading rebuilds everything; `R-STO-8` was amended in place. It
 minted **MOD-64** (concepts search in the TUI).
+Before it, **MOD-53 was done** (`docs/decisions/mod/mod-53.md`): every task
+the agent runtime spawns now goes through one wrapper that catches a panic and sends that task's own
+terminal failure, so `probing`, a running install or login, or a chat's pending start can no longer
+stay set forever. The same window tells the panic hook the panic is survived, so it no longer gives
+the terminal back under the running UI.
 Before it, **MOD-52 was done** (`docs/decisions/mod/mod-52.md`): `ctrl-c`
 quits htui from anywhere, bound globally and on the overlay wildcard, so it works over the modal
 switcher and inside a half-typed field. Making the keys configurable is **ANA-26**.
-Before it, **MOD-63 was done** (`docs/decisions/mod/mod-63.md`): `r` in
-Settings › Qdrant re-reads the keyring, so the unavailable state recovers in place, and the section's
-writes now set `busy`, so their stored/cleared notices and in-flight hint finally show.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -277,14 +279,15 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   **Relates to ANA-16** (`docs/ANA-16.md` §6.2, §8): personas should be registry rows rather than a
   per-box directory, so they are distributed like the rest of the config (MOD-48).
 - [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`); the MCP half needs MOD-11.
-- [ ] **MOD-53 - Runtime tasks always send a terminal reply** (from MOD-7 milestone 2 review).
-  `R-NF-3`, `R-TUI-8`. A panic inside a spawned runtime task (`run_box_probe`, `run_probe`, the
-  install and login tasks in `crates/htui/src/agent_worker.rs`) is dropped by `sweep_finished`
-  without a reply, so the UI flag that waits for it (`probing` in the Settings agents and boxes
-  sections, and the like) stays set for the rest of the session. Clearing such a flag from the UI
-  side reintroduces the superseded-seq bug `16079aa` fixed, so the fix belongs in the runtime:
-  catch the panic (or notice a panicked `JoinHandle` in `sweep_finished`) and send the task's
-  terminal reply with a failure. Found 2026-09-26.
+- [ ] **MOD-65 - A panic on a blocking thread a runtime task starts leaves the terminal alone**
+  (from MOD-53). `R-NF-3`, `R-TUI-8`. MOD-53 made every task the agent runtime spawns answer its
+  request on a panic and polls it inside `htui_agent::excerpt::contain`, so the panic hook leaves the
+  terminal alone. A panic on a `spawn_blocking` thread such a task starts is outside that window:
+  the install's unpack (`htui-agent` install pipeline) and `SystemHardware::read`'s `system_facts`
+  (`htui-agent/src/box_probe/hardware.rs`). The task still answers, because tokio hands the panic
+  back as a `JoinError`, but the hook on the blocking thread is not vouched for and still calls
+  `ratatui::restore()` under the running UI. Open the same window on those threads (a closure
+  wrapped in `contain`, or a small `spawn_blocking` helper that does it). Found 2026-09-29.
 - [ ] **MOD-60 - Display width in every hand-laid-out row** (from MOD-54, plan D18). `R-TUI-1`,
   `R-NF-1`. MOD-54 made `TextField` and `TextArea` count cells instead of code points through
   `crate::ui::cells`; every other place that lays text out in `char`s has the identical class of
@@ -804,6 +807,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 4 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-26 configurable hotkeys) |
-| MOD-N   | 37 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 37 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-6 Runs pane approve doc)                |
 | TOOL-N  | 0 |
