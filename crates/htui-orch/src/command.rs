@@ -127,7 +127,8 @@ pub enum Command {
     },
     /// `R-TUI-9`'s close-out (plan D167): one `summary` document and the item `closed` as
     /// `resolution` (MOD-38 PRD D2). The engine builds the summary; the caller names the item
-    /// and the resolution — until MOD-39, the one [`close_out_enabled`] answers.
+    /// and the resolution: the Runs pane's picker starts on the one [`close_out_enabled`]
+    /// answers and sends the one picked (MOD-39 plan P13).
     CloseOut {
         /// The item to close.
         item: ItemId,
@@ -597,9 +598,11 @@ pub enum EngineError {
         /// The command's exit code, when it had one.
         exit_code: Option<i32>,
     },
-    /// Plan D167: close-out needs a finished item (ANA-2 §4.10, `docs/ANA-2.md:1380-1392`).
+    /// Plan D167: close-out needs an item ANA-11 §4.2's law closes (`open`, `blocked`, `failed`
+    /// or `done`; MOD-39 plan P13 added `open` to the Runs pane).
     #[error(
-        "item {item} is `{status}`; close-out needs `done`, `failed` or `blocked` (ANA-2 §4.10)"
+        "item {item} is `{status}`; close-out needs `open`, `blocked`, `failed` or `done` \
+         (ANA-11 §4.2)"
     )]
     NotClosable {
         /// The item named.
@@ -1181,13 +1184,13 @@ pub fn unblock_enabled(item: &Item, runs: &[(Run, Cursor)]) -> Result<UnblockCas
     })
 }
 
-/// `R-TUI-9`'s close-out (MOD-4 plan D167, ANA-2 §4.10): no run of the item is active, and the
-/// item is `done`, `failed` or `blocked` — the refusals `WriteStore::close_out` re-checks inside
-/// its own transaction, stated here so the Runs tab greys the key by them — and the resolution
-/// the Runs pane closes with ([`Resolution::default_for`], MOD-38 plan D6).
+/// `R-TUI-9`'s close-out (MOD-4 plan D167, ANA-11 §4.2): no run of the item is active, and the
+/// item is `open`, `blocked`, `failed` or `done` — the refusals `WriteStore::close_out` re-checks
+/// inside its own transaction, stated here so the Runs tab greys the key by them — and the
+/// resolution the Runs pane's picker starts on ([`Resolution::default_for`], MOD-39 plan P13).
 ///
-/// The store also closes an `open` item as one of the four non-success resolutions; until
-/// MOD-39's picker the Runs pane does not offer that, so `default_for`'s `None` is refused here.
+/// The picker then offers every resolution that [`Resolution::closes_from`] the item's status,
+/// and [`Command::CloseOut`] sends the one picked; the store stays the authority on the pair.
 ///
 /// # Errors
 /// [`EngineError::RunStatus`] naming the first live run, then [`EngineError::NotClosable`] when
@@ -1836,11 +1839,11 @@ mod tests {
             (
                 EngineError::NotClosable {
                     item,
-                    status: Status::Open,
+                    status: Status::Queued,
                 },
                 format!(
-                    "item {item} is `open`; close-out needs `done`, `failed` or `blocked` (ANA-2 \
-                     §4.10)"
+                    "item {item} is `queued`; close-out needs `open`, `blocked`, `failed` or \
+                     `done` (ANA-11 §4.2)"
                 ),
             ),
             (
@@ -2170,8 +2173,9 @@ mod tests {
     }
 
     /// MOD-4 plan D167: close-out is refused while a run of the item is active, then for an item
-    /// §4.10 does not close; an item it closes answers the resolution the Runs pane closes it as
-    /// (MOD-38 plan D6: `done` -> `done`, `failed` and `blocked` -> `withdrawn`).
+    /// ANA-11 §4.2 does not close; an item it closes answers the resolution the Runs pane's picker
+    /// starts on (MOD-39 plan P13: `done` -> `done`; `open`, `failed` and `blocked` ->
+    /// `withdrawn`).
     #[test]
     fn close_out_needs_no_live_run_and_a_closable_item() {
         let parked = parked_run();
@@ -2179,6 +2183,7 @@ mod tests {
         finished.status = RunStatus::Done;
         for (status, resolution) in [
             (Status::Done, Resolution::Done),
+            (Status::Open, Resolution::Withdrawn),
             (Status::Failed, Resolution::Withdrawn),
             (Status::Blocked, Resolution::Withdrawn),
         ] {
@@ -2204,7 +2209,6 @@ mod tests {
             "the live run is named before the item: {refused}"
         );
         for status in [
-            Status::Open,
             Status::Queued,
             Status::InProgress,
             Status::AwaitingApproval,

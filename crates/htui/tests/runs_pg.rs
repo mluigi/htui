@@ -991,6 +991,45 @@ async fn close_out_is_one_transaction_on_postgres() {
     stack.finish().await;
 }
 
+/// MOD-39 plan P13 on Postgres: an `open` item with no run is closable now, and the engine's
+/// close-out lands the resolution the Runs pane's picker sends: `ANA-2` closes as `withdrawn`
+/// with one `summary` document, which `PgStore::close_out`'s own `closes_from` check accepts.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_open_item_closes_as_withdrawn_on_postgres() {
+    let Some(mut stack) = Stack::new(None).await else {
+        return;
+    };
+    let item = ids::HTUI_ANA_2;
+    assert_eq!(stack.item(item).await.status, Status::Open);
+    assert!(
+        stack.run_ids(item).await.is_empty(),
+        "the fixture runs nothing on ANA-2"
+    );
+    assert!(
+        stack.summaries(item).await.is_empty(),
+        "the fixture holds no summary"
+    );
+
+    stack
+        .command(Command::CloseOut {
+            item,
+            resolution: Resolution::Withdrawn,
+        })
+        .await;
+    assert_eq!(stack.take_status(), None, "the close-out was accepted");
+    assert_eq!(
+        stack.summaries(item).await.len(),
+        1,
+        "exactly one summary document"
+    );
+    let closed = stack.item(item).await;
+    assert_eq!(closed.status, Status::Closed);
+    assert_eq!(closed.resolution, Some(Resolution::Withdrawn));
+    assert!(closed.closed_at.is_some(), "`closed_at` is set");
+
+    stack.finish().await;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Plan D161's edge
 // ---------------------------------------------------------------------------------------------

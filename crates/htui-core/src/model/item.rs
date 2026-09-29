@@ -101,13 +101,13 @@ impl Resolution {
         }
     }
 
-    /// PRD D2 / plan D6: the resolution the Runs pane closes with until MOD-39's picker. `done`
-    /// closes as `Done`; `blocked` and `failed` close as `Withdrawn`; nothing else is offered.
+    /// The resolution the Runs pane's picker starts on (MOD-39 plan P13): `done` starts on
+    /// `Done`; `open`, `blocked` and `failed` on `Withdrawn`; nothing else is closable.
     #[must_use]
     pub const fn default_for(status: Status) -> Option<Self> {
         match status {
             Status::Done => Some(Self::Done),
-            Status::Blocked | Status::Failed => Some(Self::Withdrawn),
+            Status::Open | Status::Blocked | Status::Failed => Some(Self::Withdrawn),
             _ => None,
         }
     }
@@ -435,7 +435,7 @@ mod tests {
         assert_eq!(
             defaults,
             [
-                (Status::Open, None),
+                (Status::Open, Some(Resolution::Withdrawn)),
                 (Status::Queued, None),
                 (Status::InProgress, None),
                 (Status::AwaitingApproval, None),
