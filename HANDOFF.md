@@ -803,6 +803,15 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 
 ### Tooling findings
 
+- [ ] **TOOL-7 - Containerized handoff-run sandboxes.** Run 3–4 `/handoff-run` lifecycles
+  concurrently without interference: one compose project per run (`hr-<item>`) with a dev
+  toolchain image plus a private Postgres 16 / Qdrant v1.19.1 sharing one network namespace (same
+  `localhost:5439`/`6333`/`6334` as the host, nothing published); a fresh clone of the read-only
+  host repo on branch `hr/<ITEM>`; no git credentials inside — the host runs
+  `scripts/hr collect [--merge]`; gum-driven `scripts/hr` (build/up/attach/ls/collect/down/gc);
+  cross-run ID leases via `scripts/hr-mint`; a `handoff-run` sandbox mode (`HR_SANDBOX=1`).
+  Design: `.claude/plans/tool-7-hr-sandbox.plan.md`.
+
 ## Summary
 
 | Area    | Open                                                                                     |
@@ -810,4 +819,4 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | ANA-N   | 4 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-26 configurable hotkeys) |
 | MOD-N   | 35 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-7 offline-buffer leftovers)            |
-| TOOL-N  | 0 |
+| TOOL-N  | 1 (TOOL-7 handoff-run sandboxes) |
