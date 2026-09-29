@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-29):** **MOD-50 was done** (`docs/decisions/mod/mod-50.md`): the
+**Current status (2026-09-29):** **MOD-40 was done** (`docs/decisions/mod/mod-40.md`): step
+writes (`append_events`, `set_step_usage`, `finish_step`) are fenced by the run's lease owner, so a
+process that wakes after its run was adopted writes nothing to its old step. Lease times are
+stamped by Postgres, quota writes keep the newest, agent edits are a compare-and-set, the store
+worker beats `box.last_seen_at`, and a headless connect never migrates and refuses a build below
+`htui_target_version` (`R-STO-5` amended). No migration. **MOD-41** is no longer blocked.
+Before it, **MOD-50 was done** (`docs/decisions/mod/mod-50.md`): the
 concepts index now holds requirement rows as `type = requirement` points (withdrawn ones kept), item
 and document points carry `item.resolution`, and `htui --search-items --decisions` keeps items
 closed as done, concluded or rejected (maintainer). The collection is now `htui_concepts_v2`, so the
@@ -25,19 +31,15 @@ the agent runtime spawns now goes through one wrapper that catches a panic and s
 terminal failure, so `probing`, a running install or login, or a chat's pending start can no longer
 stay set forever. The same window tells the panic hook the panic is survived, so it no longer gives
 the terminal back under the running UI.
-Before it, **MOD-52 was done** (`docs/decisions/mod/mod-52.md`): `ctrl-c`
-quits htui from anywhere, bound globally and on the overlay wildcard, so it works over the modal
-switcher and inside a half-typed field. Making the keys configurable is **ANA-26**.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
 (MOD-38) and `0007_skill_attachments` (MOD-9 milestone 2; cache: `0001`..`0004`), so **the next
 migration is `0008`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
-(done, all four milestones), MOD-38 and MOD-9 milestones 1 to 4 (re-counted 2026-09-29 at
-`215bc33`): store conformance `CASES` 83,
-`READ_CASES` 14, `htui-orch` `CASES` 72, `GraphSource` 7 methods, `StoreRequest` 75, `StoreReply`
-43, `hierarchy::REQUEST_NAMES` 13, 281 `.sqlx` files, 96 `crates/htui/tests/snapshots`,
+(done, all four milestones), MOD-38, MOD-9 milestones 1 to 4 and MOD-40 (re-counted 2026-09-29):
+store conformance `CASES` 96, `READ_CASES` 14, `htui-orch` `CASES` 73, `GraphSource` 7 methods, `StoreRequest` 75, `StoreReply`
+43, `hierarchy::REQUEST_NAMES` 13, 288 `.sqlx` files, 96 `crates/htui/tests/snapshots`,
 `MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 34 pinned commented
 columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 2` with `skill_choices`.
 Excerpts reach phase prompts since MOD-7 milestone 4, so a phase-prompt digest recorded before
@@ -650,22 +652,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   Blocked on MOD-41. Relates to ANA-16 (`docs/ANA-16.md` §8), which flagged the conflict this
   decision settles.
 
-- [ ] **MOD-40 - Multi-writer store hardening** (from ANA-16, `docs/ANA-16.md` §6.1, §8 item 1). `R-ID-3`, `R-HIS-1`.
-  Close the gaps C1-C8 that apply with or without a server. C1: step writes (`append_events`,
-  `set_step_usage`, `finish_step`) are checked against the run's `lease_owner`. C8: an error on a short
-  insert outside replay. C2: lease times from SQL `clock_timestamp()`. C3: quota writes ordered by
-  `quota_at`. C6: an `updated_at` CAS on `upsert_agent`. C7: any box-settings writer is a CAS. C4: box
-  keyed on the `box.toml` id instead of the hostname, plus a box heartbeat bumping `last_seen_at`.
-  C5: a headless connect never migrates; `htui_version` compared against a target. **Open question
-  for the maintainer:** `R-STO-5` amendment ("a headless worker never migrates; it refuses and
-  reports"). No dependencies; blocks MOD-41.
-  **C4's re-key moved to MOD-7** (MOD-7 PRD D1, 2026-09-25) **and landed there** (MOD-7 done,
-  `docs/decisions/mod/mod-7.md`, migration `0005_box_identity`): registration is keyed on the
-  `box.toml` id with a machine-fingerprint check. MOD-7's box writers are compare-and-set (C7 for
-  them). This item keeps C4's box heartbeat bumping
-  `last_seen_at`.
-  **MOD-4 M6 landed** (MOD-4 done, `docs/decisions/mod/mod-4.md`): C1 and C8 now guard shipped
-  code, the step write paths `run_worker.rs` and the engine drive in production.
 - [ ] **MOD-41 - Headless worker (`htui worker`)** (from ANA-16, §8 item 2). `R-ORCH-12`, `R-ID-2`,
   `R-STO-1`, `R-NF-2`, `R-NF-3`. A ratatui-free entry point hosting MOD-4 M6's run supervision (lease
   refresh, sweep, one engine task per claimed run, claims only `target_box_id = self`). Reaches the
@@ -674,9 +660,16 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   `run_worker` in a library both binaries link. **Open questions for the maintainer (requirement
   amendments):** `R-ID-2` (as `R-ORCH-12` foresees); `R-ORCH-12` moves from later to must; `R-STO-1`
   headless DSN source (keyring `linux-native` or a systemd credential, `Cargo.toml:45-46` compiles
-  only `sync-secret-service`). Blocked on MOD-40 (the MOD-4 (M6) and MOD-7 dependencies are met;
-  MOD-7 is done, `docs/decisions/mod/mod-7.md`, so the worker can register through its id-keyed
-  `register_box`).
+  only `sync-secret-service`). No blockers left: MOD-40 is done (`docs/decisions/mod/mod-40.md`),
+  and the MOD-4 (M6) and MOD-7 dependencies are met (MOD-7 is done, `docs/decisions/mod/mod-7.md`,
+  so the worker can register through its id-keyed `register_box`).
+  **MOD-40 left these here** (`docs/decisions/mod/mod-40.md`): the worker connects with
+  `PgStore::connect_headless`, which never migrates and refuses a pending schema or a build below
+  `htui_target_version`. Only `append_events`, `set_step_usage` and `finish_step` are fenced by lease
+  owner. `set_step_prompt`, `upsert_step_tree`, `record_commits` and the sink's output document are
+  still unfenced step writes, and a holder that wakes after `done` makes the last two before its
+  fenced `finish_step`. The heartbeat's self-fence reads the wall clock, so an NTP step or a suspend
+  during a lease still moves it; a monotonic clock is this item's (MOD-40 blueprint F-38).
   **MOD-4 M6 landed without these asks, so they are this item's** (MOD-4 done,
   `docs/decisions/mod/mod-4.md`): `run_worker` still lives in the TUI crate
   (`crates/htui/src/run_worker.rs`, whose crate depends on `ratatui` and `crossterm`), so moving it
@@ -732,7 +725,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   (optional self-hosted server), `R-ID-2` (self-hosted control plane is not a cloud service),
   `R-ORCH-12` ("polling Postgres or the control plane"), `R-STO-1` (worker holds a box-scoped
   revocable key), `R-STO-5` (server owns migrations for workers), `R-USR-3` (roles enforced in the
-  server). Blocked on MOD-40, MOD-41, MOD-42.
+  server). Blocked on MOD-41, MOD-42 (MOD-40 is done, `docs/decisions/mod/mod-40.md`).
 - [ ] **MOD-48 - Config manager and secret distribution (phase 2)** (from ANA-16, §6.2, §8 item 9).
   `R-ID-3`, `R-AGT-9`, `R-AGT-10`, `R-SEC-1`, `R-SEC-2`. `GetManifest`/`WatchManifest` over agent
   registry, box profiles, settings, images, target build and digest; full resync on a stale cursor;
@@ -807,6 +800,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 4 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-26 configurable hotkeys) |
-| MOD-N   | 37 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 36 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-6 Runs pane approve doc)                |
 | TOOL-N  | 0 |

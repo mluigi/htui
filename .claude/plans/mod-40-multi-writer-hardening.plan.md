@@ -1,6 +1,6 @@
 # Plan: MOD-40 — Multi-writer store hardening
 
-**Status: CONFIRMED by the maintainer 2026-09-26, OQ-1 and OQ-2 as recommended.**
+**Status: IMPLEMENTED 2026-09-29 (all four milestones; write-up `docs/decisions/mod/mod-40.md`). CONFIRMED by the maintainer 2026-09-26, OQ-1 and OQ-2 as recommended.**
 
 **Source**: `.claude/prds/mod-40-multi-writer-hardening.prd.md`, all four milestones, with its gate
 decisions PRD D1-D3 (maintainer, 2026-09-26, "all recomm"). Design: `docs/ANA-16.md` §6.1, gaps
