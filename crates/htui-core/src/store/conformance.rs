@@ -4097,11 +4097,11 @@ async fn settings_phase_rung_writes_token_budget_only<S: WriteStore>(store: &S) 
 /// `promoted_at`, and the cases below read those columns back and compare them with the value they
 /// passed. `lease_expires_at` was in that list until MOD-40 plan D10 made it the store's clock
 /// plus a TTL; [`assert_leased_for`] reads it. A raw [`Utc::now`] is nanoseconds on Linux;
-/// Postgres keeps [`TIMESTAMPTZ_DIGITS`] of them and `MemStore` keeps all of them, so an untruncated reading makes
-/// the two backends disagree about a column neither of them changed. [`ChatRunSpec::mint`] has
-/// truncated for the same reason since MOD-2; this is the §8 writers' half of it, and `PgStore`
-/// cannot fix it on its own — a store that truncated on the way in would still hand back something
-/// the caller's own variable no longer equals.
+/// Postgres keeps [`TIMESTAMPTZ_DIGITS`] of them and `MemStore` keeps all of them, so an
+/// untruncated reading makes the two backends disagree about a column neither of them changed.
+/// [`ChatRunSpec::mint`] has truncated for the same reason since MOD-2; this is the §8 writers'
+/// half of it, and `PgStore` cannot fix it on its own — a store that truncated on the way in would
+/// still hand back something the caller's own variable no longer equals.
 fn seam_clock() -> DateTime<Utc> {
     Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS)
 }

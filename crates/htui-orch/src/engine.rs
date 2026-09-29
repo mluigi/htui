@@ -1893,9 +1893,9 @@ where
 
     /// Plan D87/D139: the store's `release_lease(run, owner)`. The lease reads as expired at once,
     /// by the store's clock, and has no owner, so every process's sweep may adopt the run, this
-    /// one's included (plan D88 skips only a row this process still owns). A heartbeat refresh that hung and
-    /// commits after the release matches no row, so it cannot take the lease back. A zero-row
-    /// answer is ignored and an error is warned; neither is raised.
+    /// one's included (plan D88 skips only a row this process still owns). A heartbeat refresh
+    /// that hung and commits after the release matches no row, so it cannot take the lease back.
+    /// A zero-row answer is ignored and an error is warned; neither is raised.
     ///
     /// Plan D140: a release that fails puts the run in [`DeadWalks`], and the next
     /// [`Self::sweep`] tries again. Any answer from the store takes the run out. Plan D151:
