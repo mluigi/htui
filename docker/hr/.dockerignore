@@ -1,0 +1,3 @@
+# The htui-hr-dev image copies nothing from its build context (docker/hr): everything is fetched
+# at build time or bind-mounted at run time. Ignore it all so the context stays empty.
+*
