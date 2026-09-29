@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # hr-mint — cross-run item-ID leases for /handoff-run sandboxes (TOOL-7). Wraps the owned-ID mint
 # (`next-item-id.sh --id-only`) with a flock'd lease file shared by every sandbox and the host, so
-# two runs spawning items in parallel never mint the same ID: the result is
-# max(tree next, highest leased ID of that prefix + 1), recorded as a lease row before it is printed.
+# two runs spawning items in parallel never mint the same ID: the result is max(tree next,
+# [in a sandbox] host tree next, highest leased ID of that prefix + 1), recorded as a lease row
+# before it is printed.
 # next-item-id.sh / .ps1 stay untouched; a leased-then-abandoned ID is a harmless gap.
 #
 # Usage:
@@ -12,7 +13,15 @@
 #   scripts/hr-mint --prune [--ref main] [--repo-root R] [--purged-owner B]...
 #
 # Mint prints the ID on stdout and nothing else; provenance, the "leasing off" notice and the
-# recent same-prefix leases of other runs ("ask before filing" list) go to stderr.
+# recent same-prefix leases of other runs ("ask before filing" list) go to stderr:
+#   hr-mint: leased MOD-71 for hr/MOD-65 (tree next MOD-66, host next MOD-66, lease floor MOD-70)
+# The ID is max(tree next, host next, lease floor + 1); each source can only raise it.
+# "host next" (sandbox only; "unavailable" when skipped or failed) is next-item-id.sh on the host
+# repo, read-only at ${HR_HOST_TREE:-/host/htui}: it catches IDs that reached host main without a
+# lease. An unreadable host tree is a stderr note, a failing host mint a stderr warning; neither
+# blocks (the host tree is not this run's data). The host itself never consults it.
+# Titles and owners are stored without control characters, and lease rows are printed without
+# them (sibling list, prune lines, unparseable-line errors): a sandbox's row reaches the host tty.
 #
 # Leasing is on when the lease file exists, when the lock is stamped (an earlier --init created
 # the lease file), or always in a sandbox (HR_SANDBOX=1). It fails closed whenever it is on but
@@ -100,12 +109,14 @@ contains() {
     return 1
 }
 
-# One line, no field separators: tab/CR/LF -> space, then trim.
+# One line, no field separators: tab/CR/LF -> space, other control characters (ESC, BEL, DEL,
+# C1) dropped - a row written in a sandbox is printed on the host terminal - then trim.
 one_line() {
     local s="$1"
     s="${s//$'\t'/ }"
     s="${s//$'\r'/ }"
     s="${s//$'\n'/ }"
+    s="${s//[[:cntrl:]]/}"
     s="${s#"${s%%[![:space:]]*}"}"
     s="${s%"${s##*[![:space:]]}"}"
     printf '%s' "$s"
@@ -135,7 +146,7 @@ read_leases() {
             LEASE_TS[i]="${BASH_REMATCH[3]}"
             LEASE_TITLE[i]="${BASH_REMATCH[4]}"
         else
-            die 1 "lease file line $n unparseable - fix or remove it by hand ($LEASES): $line"
+            die 1 "lease file line $n unparseable - fix or remove it by hand ($LEASES): ${line//[[:cntrl:]]/}"
         fi
     done <"$LEASES"
 }
@@ -245,6 +256,27 @@ tree_mint() {
     TREE_ID="$out"
 }
 
+# Sandbox only: the tree mint of the host repo (read-only at ${HR_HOST_TREE:-/host/htui}), so an
+# ID that reached host main without a lease (filed elsewhere, or before leasing) still raises the
+# mint. Sets HOST_ID, or leaves it empty. Never blocks: the host tree is not this run's data, so
+# an unreadable tree is a note and a failing mint a warning.
+host_tree_mint() {
+    HOST_ID=''
+    local host="${HR_HOST_TREE:-/host/htui}" out rc
+    if [[ ! -d "$host" || ! -r "$host" || ! -x "$host" ]]; then
+        echo "hr-mint: host tree $host not readable - skipped (no host raise)" >&2
+        return 0
+    fi
+    out="$(bash "$NEXT_ID" --prefix "$PREFIX" --id-only --repo-root "$host" 9>&-)"
+    rc=$?
+    if [[ $rc -eq 0 && "$out" =~ ^${PREFIX}-[0-9]+$ ]]; then
+        HOST_ID="$out"
+        return 0
+    fi
+    [[ -n "$out" ]] && printf '%s\n' "$out" >&2
+    echo "hr-mint: warning: host tree mint failed (next-item-id.sh exit $rc on $host) - no host raise; the host tree is not this run's data, so the mint goes on" >&2
+}
+
 do_mint() {
     if ! leasing_or_die; then
         tree_mint
@@ -257,13 +289,23 @@ do_mint() {
         return 0
     fi
 
+    # Outside the lock: it only reads a read-only tree.
+    local host_s=''
+    if in_sandbox; then
+        host_tree_mint
+        host_s=", host next ${HOST_ID:-unavailable}"
+    fi
+
     take_lock
     read_leases
     tree_mint
-    local floor tree_n n id now
+    local floor tree_n host_n=0 n id now
     floor="$(lease_floor "$PREFIX")"
     tree_n="${TREE_ID#"$PREFIX"-}"
+    [[ -n "${HOST_ID:-}" ]] && host_n="${HOST_ID#"$PREFIX"-}"
+    # Every source can only raise the ID: max(tree next, host next, lease floor + 1).
     n=$((10#$tree_n > floor + 1 ? 10#$tree_n : floor + 1))
+    ((10#$host_n > n)) && n=$((10#$host_n))
     id="$PREFIX-$n"
     now="$(date -u +%FT%TZ)"
     # A last line without its newline (hand edit) would swallow our row: add one first.
@@ -277,7 +319,7 @@ do_mint() {
     printf '%s\n' "$id"
     local floor_s=none
     [[ $floor -gt 0 ]] && floor_s="$PREFIX-$floor"
-    echo "hr-mint: leased $id for $OWNER (tree next $TREE_ID, lease floor $floor_s)" >&2
+    echo "hr-mint: leased $id for $OWNER (tree next $TREE_ID$host_s, lease floor $floor_s)" >&2
 
     # Other leases of this prefix from the last N days - the row just written excluded.
     local cutoff i header=0
@@ -289,7 +331,9 @@ do_mint() {
             echo "hr-mint: other $PREFIX leases in the last $SIBLING_DAYS days - ask the maintainer before filing if one is the same problem:" >&2
             header=1
         fi
-        printf '  %s  %s  %s  %s\n' "${LEASE_ID[i]}" "${LEASE_OWNER[i]}" "${LEASE_TS[i]}" "${LEASE_TITLE[i]}" >&2
+        # Rows may come from a sandbox or a hand edit: no control characters reach the terminal.
+        printf '  %s  %s  %s  %s\n' "${LEASE_ID[i]}" "${LEASE_OWNER[i]//[[:cntrl:]]/}" "${LEASE_TS[i]}" \
+            "${LEASE_TITLE[i]//[[:cntrl:]]/}" >&2
     done
     return 0
 }
@@ -350,7 +394,7 @@ do_prune() {
         fi
         if [[ -n "$why" ]]; then
             pruned=$((pruned + 1))
-            echo "hr-mint: prune ${LEASE_ID[i]} (${LEASE_OWNER[i]}): $why" >&2
+            echo "hr-mint: prune ${LEASE_ID[i]} (${LEASE_OWNER[i]//[[:cntrl:]]/}): ${why//[[:cntrl:]]/}" >&2
         else
             kept=$((kept + 1))
             keep+=("${LEASE_LINE[i]}")

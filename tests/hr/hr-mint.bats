@@ -496,3 +496,88 @@ TS_ROW_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
     [[ $status -eq 0 ]]
     cmp "$(lease_file)" "$BATS_TEST_TMPDIR/before"
 }
+
+@test "24. control characters: stripped from a --title on write, and from lease rows and prune lines on print" {
+    init_leases
+    local esc=$'\e' bel=$'\a'
+    seed_lease MOD-7 $'hr/\e[2Jevil' "$(ts_ago '1 day ago')" $'Title \e]0;pwned\a\e[31mred\e[0m'
+    seed_lease MOD-3 $'hr/\e[2Jevil' "$(ts_ago '1 day ago')" $'on main \e[5m'
+    run --separate-stderr mint --prefix MOD --title $'Mine \e[31mred\e[0m\x7f' --branch $'hr/\e[1mB'
+    [[ $status -eq 0 ]]
+    [[ "$output" == 'MOD-8' ]]
+    [[ "$stderr" != *"$esc"* && "$stderr" != *"$bel"* ]]
+    [[ "$stderr" == *'  MOD-7  hr/[2Jevil  '*'  Title ]0;pwned[31mred[0m'* ]]
+    [[ "$(lease_rows | tail -n 1 | cut -f2)" == 'hr/[1mB' ]]
+    [[ "$(lease_rows | tail -n 1 | cut -f4-)" == 'Mine [31mred[0m' ]]
+
+    run --separate-stderr "$HR_MINT" --prune --repo-root "$FIX"
+    [[ $status -eq 0 ]]
+    [[ "$stderr" == *'prune MOD-3 (hr/[2Jevil): on main'* ]]
+    [[ "$stderr" != *"$esc"* ]]
+
+    # An unparseable line is echoed on the host terminal as well.
+    printf 'junk \e[2J line\n' >>"$(lease_file)"
+    run --separate-stderr mint --prefix MOD --title x
+    [[ $status -eq 1 ]]
+    [[ "$stderr" == *'unparseable'*'junk [2J line'* ]]
+    [[ "$stderr" != *"$esc"* ]]
+}
+
+@test "25. sandbox: a readable host tree raises the mint and never lowers it; the host itself ignores it" {
+    init_leases
+    # The run's tree is ahead of a plain host tree: the host next never lowers the mint.
+    printf -- '- [ ] **MOD-9 - Run-only item.** body\n' >>"$FIX/HANDOFF.md"
+    local low="$BATS_TEST_TMPDIR/host-low" high="$BATS_TEST_TMPDIR/host-high"
+    make_fixture "$low"
+    HR_SANDBOX=1 HR_HOST_TREE="$low" run --separate-stderr mint --prefix MOD --title 'a'
+    [[ $status -eq 0 ]]
+    [[ "$output" == 'MOD-10' ]]
+    [[ "$stderr" == *'(tree next MOD-10, host next MOD-6, lease floor none)'* ]]
+
+    # Host main carries an item that was never leased (filed elsewhere): it raises the mint.
+    make_fixture "$high"
+    printf -- '- [ ] **MOD-12 - Filed on another machine.** body\n' >>"$high/HANDOFF.md"
+    HR_SANDBOX=1 HR_HOST_TREE="$high" run --separate-stderr mint --prefix MOD --title 'b'
+    [[ $status -eq 0 ]]
+    [[ "$output" == 'MOD-13' ]]
+    [[ "$stderr" == *'(tree next MOD-10, host next MOD-13, lease floor MOD-10)'* ]]
+    [[ "$(lease_ids | tr '\n' ' ')" == 'MOD-10 MOD-13 ' ]]
+
+    # On the host the host tree is not consulted.
+    HR_HOST_TREE="$high" run --separate-stderr mint --prefix MOD --title 'c'
+    [[ $status -eq 0 ]]
+    [[ "$output" == 'MOD-14' ]]
+    [[ "$stderr" == *'(tree next MOD-10, lease floor MOD-13)'* ]]
+    [[ "$stderr" != *'host next'* ]]
+}
+
+@test "26. sandbox: an unreadable host tree is skipped with a note; a failing host mint only warns" {
+    init_leases
+    HR_SANDBOX=1 run --separate-stderr mint --prefix MOD --title 'a'
+    [[ $status -eq 0 ]]
+    [[ "$output" == 'MOD-6' ]]
+    [[ "$stderr" == *"host tree $HR_HOST_TREE not readable - skipped"* ]]
+    [[ "$stderr" == *'(tree next MOD-6, host next unavailable, lease floor none)'* ]]
+
+    if [[ $(id -u) -ne 0 ]]; then
+        local locked="$BATS_TEST_TMPDIR/host-locked"
+        make_fixture "$locked"
+        chmod 000 "$locked"
+        HR_SANDBOX=1 HR_HOST_TREE="$locked" run --separate-stderr mint --prefix MOD --title 'b'
+        chmod 755 "$locked"
+        [[ $status -eq 0 ]]
+        [[ "$output" == 'MOD-7' ]]
+        [[ "$stderr" == *"host tree $locked not readable - skipped"* ]]
+    fi
+
+    # The host tree is not this run's data: its findings warn, they do not block.
+    local broken="$BATS_TEST_TMPDIR/host-broken"
+    make_fixture "$broken"
+    printf -- '- [ ] **MOD-40 - Twice.** body\n- [ ] **MOD-40 - Twice.** body\n' >>"$broken/HANDOFF.md"
+    HR_SANDBOX=1 HR_HOST_TREE="$broken" run --separate-stderr mint --prefix MOD --title 'c'
+    [[ $status -eq 0 ]]
+    [[ "$output" == 'MOD-8' || ( $(id -u) -eq 0 && "$output" == 'MOD-7' ) ]]
+    [[ "$stderr" == *'duplicate-id'* ]]
+    [[ "$stderr" == *'warning: host tree mint failed'*'exit 1'* ]]
+    [[ "$stderr" == *'host next unavailable'* ]]
+}
