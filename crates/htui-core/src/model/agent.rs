@@ -67,7 +67,8 @@ pub struct AgentBox {
     pub agent_id: AgentId,
     /// `agent_box.box_id`.
     pub box_id: BoxId,
-    /// `agent_box.enabled`.
+    /// `agent_box.enabled`: the probe's verdict (`ready`), vetoed by the per-box switch
+    /// ([`AgentSummary::user_off`], MOD-23 D242).
     pub enabled: bool,
     /// `agent_box.version` as reported by the installed agent.
     pub version: Option<String>,

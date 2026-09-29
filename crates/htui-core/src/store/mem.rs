@@ -177,6 +177,10 @@ struct State {
     /// `agent_box`, keyed as its composite primary key is. Empty until something probes a box:
     /// no fixture loads it (MOD-2 plan D3).
     agent_boxes: HashMap<(AgentId, BoxId), AgentBox>,
+    /// `agent_box.user_off` (MOD-23 D242): the `(agent, box)` pairs the human switched off. A
+    /// side set rather than an `AgentBox` field, because the column is not part of the row type.
+    /// Written by [`WriteStore::set_agent_box_enabled`] only.
+    agent_boxes_off: HashSet<(AgentId, BoxId)>,
     /// `item_key_counter` (§4.1): the highest number minted per `(project, prefix)`.
     item_key_counter: HashMap<(ProjectId, String), i32>,
     /// `item`.
@@ -294,6 +298,7 @@ impl MemStore {
             app_settings: BTreeMap::new(),
             agents: data.agents.into_iter().map(|row| (row.id, row)).collect(),
             agent_boxes: HashMap::new(),
+            agent_boxes_off: HashSet::new(),
             item_key_counter: data.item_key_counter,
             items: data.items.into_iter().map(|row| (row.id, row)).collect(),
             revisions: data
@@ -1484,7 +1489,9 @@ impl State {
                     .this_box
                     .and_then(|box_id| self.agent_boxes.get(&(agent.id, box_id)))
                     .cloned(),
-                user_off: false,
+                user_off: self
+                    .this_box
+                    .is_some_and(|box_id| self.agent_boxes_off.contains(&(agent.id, box_id))),
             })
             .collect()
     }
@@ -1654,6 +1661,11 @@ impl State {
     /// puts the stored pair back, which is the `SET quota = EXCLUDED.quota` the statement no longer
     /// carries. The two backends have to agree here or the conformance case passes on one and
     /// fails on the other.
+    ///
+    /// On the update, `enabled` is ANDed with the per-box switch (MOD-23 D242), which is
+    /// `SET enabled = EXCLUDED.enabled AND NOT user_off`: a row the human switched off on this box
+    /// stays off whatever the probe proposes. The insert is unchanged, since a fresh row has no
+    /// switch.
     fn upsert_agent_box(&mut self, row: &AgentBox, now: DateTime<Utc>) -> Result<()> {
         if !self.agents.contains_key(&row.agent_id) {
             return Err(StoreError::Constraint(format!(
@@ -1667,7 +1679,10 @@ impl State {
                 row.box_id
             )));
         }
-        match self.agent_boxes.get_mut(&(row.agent_id, row.box_id)) {
+        let key = (row.agent_id, row.box_id);
+        // Read before `get_mut` borrows `agent_boxes`: MOD-23 D242's veto.
+        let switched_off = self.agent_boxes_off.contains(&key);
+        match self.agent_boxes.get_mut(&key) {
             Some(stored) => {
                 // D74: `*stored = row.clone()` is this backend's spelling of
                 // `SET quota = EXCLUDED.quota`, so the stored pair is taken out and put back.
@@ -1675,6 +1690,7 @@ impl State {
                 *stored = row.clone();
                 stored.quota = quota;
                 stored.quota_at = quota_at;
+                stored.enabled = row.enabled && !switched_off;
                 stored.updated_at = now;
             }
             None => {
@@ -1684,7 +1700,7 @@ impl State {
                     quota_at: None,
                     ..row.clone()
                 };
-                self.agent_boxes.insert((row.agent_id, row.box_id), fresh);
+                self.agent_boxes.insert(key, fresh);
             }
         }
         Ok(())
@@ -1729,7 +1745,47 @@ impl State {
         enabled: bool,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        todo!("MOD-23 T0: the per-box switch ({agent_id}, {box_id}, {enabled}, {now})")
+        if !self.agents.contains_key(&agent_id) {
+            return Err(StoreError::Constraint(format!(
+                "agent_box.agent_id `{agent_id}` references no agent"
+            )));
+        }
+        if !self.boxes.contains_key(&box_id) {
+            return Err(StoreError::Constraint(format!(
+                "agent_box.box_id `{box_id}` references no box"
+            )));
+        }
+        let key = (agent_id, box_id);
+        if enabled {
+            self.agent_boxes_off.remove(&key);
+        } else {
+            self.agent_boxes_off.insert(key);
+        }
+        match self.agent_boxes.get_mut(&key) {
+            Some(row) => {
+                row.enabled = enabled && probe_says_ready(row.probe.as_ref());
+                row.updated_at = now;
+            }
+            None => {
+                // The column defaults of Postgres's two-column `INSERT`: never probed.
+                self.agent_boxes.insert(
+                    key,
+                    AgentBox {
+                        agent_id,
+                        box_id,
+                        enabled,
+                        version: None,
+                        path: None,
+                        probed_at: None,
+                        quota: None,
+                        quota_at: None,
+                        updated_at: now,
+                        probe: None,
+                    },
+                );
+            }
+        }
+        Ok(())
     }
 
     /// One box probe (MOD-7 D10): the nine probe columns, the whole `box_tool` set and the spec
@@ -5528,6 +5584,14 @@ struct ProjectReach {
 /// never wider than `u64` on a target this ships to, and the `try_from` says so without an `as`.
 fn rows(count: usize) -> u64 {
     u64::try_from(count).unwrap_or(u64::MAX)
+}
+
+/// The stored probe's verdict when the per-box switch goes back on (MOD-23 D242, blueprint D249):
+/// Postgres's `probe IS NULL OR COALESCE(probe->>'status' = 'ready', false)`, written out. No
+/// document is `true`; a document is ready only when its `status` is the string `ready`, so a
+/// JSON `null` and a document without a `status` are both `false`, as the `COALESCE` makes them.
+fn probe_says_ready(probe: Option<&Value>) -> bool {
+    probe.is_none_or(|doc| doc.get("status").and_then(Value::as_str) == Some("ready"))
 }
 
 /// The refusal both writers of `project.settings` give a blob that is not a JSON object (D7).

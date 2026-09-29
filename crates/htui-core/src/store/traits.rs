@@ -28,6 +28,9 @@
 //!
 //! **MOD-9 milestone 3** adds the skill readers to `WriteStore` beside their writers (plan D75),
 //! as MOD-15 did; the bound-skill read the prompt uses stays inherent.
+//!
+//! **MOD-23** adds one narrow writer, [`WriteStore::set_agent_box_enabled`], the per-box switch
+//! (plan D242).
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
@@ -367,6 +370,11 @@ pub trait WriteStore: ReadStore {
     /// the one sharp edge the design keeps, and `store::conformance`'s
     /// `upsert_agent_box_cannot_write_quota` is what pins it.
     ///
+    /// Since MOD-23 (D242) the update writes `enabled` as `row.enabled && !user_off`: a row the
+    /// human switched off on this box stays off whatever the probe proposes. The insert is
+    /// unchanged, since a fresh row has `user_off = false`.
+    /// [`set_agent_box_enabled`](WriteStore::set_agent_box_enabled) is the switch.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the agent or the box
@@ -393,9 +401,9 @@ pub trait WriteStore: ReadStore {
     /// the latch always has a document, and a row nobody has latched into is `NULL` from its
     /// insert. **MOD-7 is the caller that will**: unregistering an agent from a box, or a
     /// re-registration that must not carry the last box's allowance forward, has to put the pair
-    /// back to `NULL`, and that is when these two parameters become `Option`s across the six
+    /// back to `NULL`, and that is when these two parameters become `Option`s across the five
     /// implementations and `store::conformance`. Widening them before there is a caller would be
-    /// six signatures changed to express a case no code can reach.
+    /// five signatures changed to express a case no code can reach.
     ///
     /// # Newest wins (MOD-40 plan D4)
     ///
