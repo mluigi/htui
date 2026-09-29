@@ -14,7 +14,10 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-29):** **MOD-62 was decided** (`docs/decisions/mod/mod-62.md`): a
+**Current status (2026-09-29):** **MOD-63 was done** (`docs/decisions/mod/mod-63.md`): `r` in
+Settings › Qdrant re-reads the keyring, so the unavailable state recovers in place, and the section's
+writes now set `busy`, so their stored/cleared notices and in-flight hint finally show.
+Before it, **MOD-62 was decided** (`docs/decisions/mod/mod-62.md`): a
 verify command keeps htui's process environment unchanged (plan D30), and PR #20's allowlist was
 closed unmerged. The agent it checks already runs with that same environment, so an allowlist on the
 verifier alone hid nothing and broke real verifiers. The rule that remains sits on **MOD-10**:
@@ -31,11 +34,6 @@ field-agnostic because the defect *was* an enumeration; `template.name`, `Prompt
 inert on the run path (the engine's secret list is empty) — that is **MOD-61**, opened at the
 review gate. The store is still not the enforcement point: it will accept an unscrubbed
 `trim_record` from any non-engine caller.
-Before it, **MOD-58 was done** (`docs/decisions/mod/mod-58.md`): the two
-claim-time tag rules are now pinned per store — `NotClaimable` outranks `MissingTags` for a run aimed
-at another box, and blueprint D94's no-item case is never refused. Four tests, no production
-behaviour change, no shared trait method, no migration, and no count pin moved. The gate's Postgres
-DSN is now password-free via `~/.pgpass`.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -762,13 +760,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   preferred. The three crates are not in `Cargo.lock`, so the plan owns that dependency decision.
   Not blocked. Its in-app widget draws through `ui::cells` (MOD-54, done:
   `docs/decisions/mod/mod-54.md`); the rest of the display-width work is MOD-60.
-- [ ] **MOD-63 - Settings › Qdrant `r` does nothing** (from the README rewrite, 2026-09-29).
-  `R-TUI-8`. The section's hints advertise `r reload` (`HINT_BROWSE` and `HINT_NO_SNAPSHOT`,
-  `crates/htui/src/ui/tabs/settings/qdrant.rs:24-25`), but `on_key` passes `r` on (`:342`) and no
-  tab or global binding takes it, so the key does nothing. Every other Settings section reloads on
-  `r`. It bites hardest in the unavailable state, whose only hint is `r reload`: the section cannot
-  recover without leaving it. Make `r` re-request `StoreRequest::QdrantInfo` (the section's
-  `wants_requests`), and pin it with a settings test.
 
 ### Deferred backlog
 
@@ -803,6 +794,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 40 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-61 run scrubber masks nothing, MOD-63 Qdrant `r` reload; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 39 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-61 run scrubber masks nothing; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-6 Runs pane approve doc)                |
 | TOOL-N  | 0 |

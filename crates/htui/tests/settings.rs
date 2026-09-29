@@ -2767,3 +2767,32 @@ async fn a_qdrant_write_says_what_it_did_or_why_it_failed() {
     );
     assert!(!rendered.contains("in flight"), "{rendered}");
 }
+
+/// One write at a time: while one is out, `e` and `c` are refused by name, and `r` is not refused
+/// because it is how a lost reply recovers.
+#[tokio::test]
+async fn a_qdrant_write_in_flight_refuses_e_and_c_but_not_r() {
+    let bench = SectionBench::new().await;
+    let mut section = QdrantSection::new();
+    bench.reply(&mut section, &StoreReply::Qdrant(qdrant_stored()));
+    bench.key(&mut section, "c");
+    bench.key(&mut section, "y");
+    let _ = bench.drained();
+
+    for chord in ["e", "c"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Consumed);
+        assert!(requests_of(&bench).is_empty(), "`{chord}` sends nothing");
+        assert!(!section.captures_input(), "`{chord}` opens nothing");
+        let rendered = render_section(&section, &bench.ctx());
+        assert!(
+            rendered.contains("`clear_qdrant_settings` is still in flight"),
+            "`{chord}` is refused by name: {rendered}"
+        );
+    }
+
+    assert_eq!(bench.key(&mut section, "r"), Handled::Consumed);
+    assert!(
+        matches!(requests_of(&bench).as_slice(), [StoreRequest::QdrantInfo]),
+        "one read, with a write still out"
+    );
+}

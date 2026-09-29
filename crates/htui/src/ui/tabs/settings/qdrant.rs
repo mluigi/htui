@@ -114,7 +114,8 @@ impl QdrantSection {
     }
 
     fn move_cursor(&mut self, down: bool) {
-        if self.blocked() {
+        // Moving the cursor is not a write, so a write in flight does not stop it.
+        if self.snapshot.is_none() || self.unavailable.is_some() {
             return;
         }
         if down {
@@ -124,8 +125,14 @@ impl QdrantSection {
         }
     }
 
-    fn blocked(&self) -> bool {
-        self.busy.is_some() || self.unavailable.is_some() || self.snapshot.is_none()
+    /// Whether a key that opens an editor or a question is refused right now. A write in flight
+    /// says so, as the Connection section's does; `r` is deliberately not on this path.
+    fn blocked(&mut self) -> bool {
+        if let Some(busy) = self.busy {
+            self.refuse(format!("`{busy}` is still in flight"));
+            return true;
+        }
+        self.unavailable.is_some() || self.snapshot.is_none()
     }
 
     fn open_edit(&mut self) {
@@ -252,6 +259,11 @@ impl QdrantSection {
         self.notice = Some(Notice::Error(text));
     }
 
+    /// A fresh snapshot, and the write that asked for it, if any, says what it did.
+    ///
+    /// `busy` is the whole of the attribution: a `Qdrant` reply names no request, the same trade
+    /// the Connection section makes. `r` sets no `busy`, so a reload sent just before a write can
+    /// land first and be taken as the write's answer (the worker answers in order).
     fn on_snapshot(&mut self, snapshot: &QdrantSnapshot) {
         let write = self.busy.take();
         self.unavailable = None;
