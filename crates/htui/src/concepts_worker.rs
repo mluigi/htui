@@ -68,43 +68,71 @@ impl QdrantIndex {
     /// An index with no model loaded yet.
     #[must_use]
     pub fn new() -> Self {
-        todo!()
+        Self::default()
     }
 
     /// The model, loading it on first use (F9, blueprint D245).
     async fn embedder(&self) -> Result<FastEmbedder, String> {
-        todo!()
+        let cell = Arc::clone(&self.embedder);
+        // Its own task: a superseded search that is aborted mid-load must not cancel the load, or
+        // the next search starts a second download (F9). A concurrent search waits on this init,
+        // and a failed one leaves the cell empty for the next search to retry.
+        tokio::spawn(async move {
+            cell.get_or_try_init(|| async {
+                tokio::task::spawn_blocking(FastEmbedder::new)
+                    .await
+                    .map_err(|e| format!("the embedding model's loader stopped: {e}"))?
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .cloned()
+        })
+        .await
+        .map_err(|e| format!("the embedding model's loader stopped: {e}"))?
     }
 
     /// Qdrant at `settings`, over the shared model.
-    async fn connect(&self, settings: &QdrantSettings) -> Result<QdrantStore<FastEmbedder>, String> {
-        let _ = settings;
-        let _ = self.embedder().await;
-        todo!()
+    async fn connect(
+        &self,
+        settings: &QdrantSettings,
+    ) -> Result<QdrantStore<FastEmbedder>, String> {
+        let embedder = self.embedder().await?;
+        QdrantStore::connect(settings, embedder)
+            .await
+            .map_err(|e| format!("cannot reach Qdrant: {e}"))
     }
 }
 
 /// The keyring's URL and key, read on the blocking pool (`QdrantSnapshot::fetch`'s rule), then
 /// `concepts::settings_from`.
 async fn qdrant_settings() -> Result<QdrantSettings, String> {
-    let _ = (secret::get_qdrant_url, StoreError::Backend);
-    todo!()
+    let (url, api_key) = tokio::task::spawn_blocking(|| {
+        Ok::<_, StoreError>((secret::get_qdrant_url()?, secret::get_qdrant_api_key()?))
+    })
+    .await
+    .map_err(|e| format!("the keyring read stopped: {e}"))?
+    .map_err(|e| e.to_string())?;
+    crate::concepts::settings_from(url, api_key).map_err(|e| format!("{e:#}"))
 }
 
+// Settings before the model, in both: a box with no URL fails in microseconds without downloading
+// anything.
 impl ConceptIndex for QdrantIndex {
     fn search(&self, query: SearchQuery) -> BoxFuture<'_, Result<Vec<Hit>, String>> {
         Box::pin(async move {
             let settings = qdrant_settings().await?;
             let store = self.connect(&settings).await?;
-            let _ = (store, query);
-            todo!()
+            store.search(&query).await.map_err(|e| e.to_string())
         })
     }
 
     fn sync(&self, backend: Backend, scope: Scope) -> BoxFuture<'_, Result<SyncReport, String>> {
         Box::pin(async move {
-            let _ = (backend, scope, Indexer);
-            todo!()
+            let settings = qdrant_settings().await?;
+            let store = self.connect(&settings).await?;
+            Indexer::sync(&backend, &scope, &store)
+                .await
+                .map_err(|e| e.to_string())
         })
     }
 }
@@ -127,21 +155,25 @@ impl MemIndex {
     /// An empty index.
     #[must_use]
     pub fn new() -> Self {
-        todo!()
+        Self::default()
     }
 
     /// Every call answers `Err(message)` (after the delay, if any).
     #[must_use]
     pub fn failing(self, message: impl Into<String>) -> Self {
-        let _ = message.into();
-        todo!()
+        Self {
+            failure: Some(message.into()),
+            ..self
+        }
     }
 
     /// Every call sleeps `by` first (`tokio::time::sleep`, so a paused clock advances it).
     #[must_use]
     pub fn delayed(self, by: Duration) -> Self {
-        let _ = by;
-        todo!()
+        Self {
+            delay: Some(by),
+            ..self
+        }
     }
 
     /// The fake store, for assertions.
@@ -155,8 +187,17 @@ impl MemIndex {
     /// # Panics
     /// If the sync fails, which `MemVectorStore` never does over a memory backend.
     pub async fn seed(&self, backend: &Backend, scope: &Scope) -> SyncReport {
-        let _ = (backend, scope);
-        todo!()
+        Indexer::sync(backend, scope, &self.store)
+            .await
+            .expect("a memory index over a memory backend never fails")
+    }
+
+    /// The configured wait, then the configured failure, if any.
+    async fn pause(&self) -> Result<(), String> {
+        if let Some(by) = self.delay {
+            tokio::time::sleep(by).await;
+        }
+        self.failure.clone().map_or(Ok(()), Err)
     }
 }
 
@@ -164,15 +205,17 @@ impl MemIndex {
 impl ConceptIndex for MemIndex {
     fn search(&self, query: SearchQuery) -> BoxFuture<'_, Result<Vec<Hit>, String>> {
         Box::pin(async move {
-            let _ = query;
-            todo!()
+            self.pause().await?;
+            self.store.search(&query).await.map_err(|e| e.to_string())
         })
     }
 
     fn sync(&self, backend: Backend, scope: Scope) -> BoxFuture<'_, Result<SyncReport, String>> {
         Box::pin(async move {
-            let _ = (backend, scope);
-            todo!()
+            self.pause().await?;
+            Indexer::sync(&backend, &scope, &self.store)
+                .await
+                .map_err(|e| e.to_string())
         })
     }
 }
@@ -209,38 +252,112 @@ impl ConceptsRuntime {
     /// A runtime over `index`.
     #[must_use]
     pub fn new(index: Arc<dyn ConceptIndex>) -> Self {
-        let _ = index;
-        todo!()
+        Self {
+            index,
+            tasks: HashMap::new(),
+        }
     }
 
     /// Over [`QdrantIndex`]: what `store_worker::spawn_with_runtimes` builds (D231).
     #[must_use]
     pub fn production() -> Self {
-        todo!()
+        Self::new(Arc::new(QdrantIndex::new()))
     }
 
     /// Spawns the request's task and answers `Deferred`, or answers now. Awaits nothing.
+    ///
+    /// Not `async`: the two things it does are a `match` and a `tokio::spawn`, so the worker's
+    /// `select!` arm returns having awaited nothing at all (`R-NF-3`). The backend clone is a
+    /// snapshot, not the backend: it cannot perform the swap the worker owns (the preview's rule).
     pub fn serve(
         &mut self,
         backend: &Backend,
         replies: &mpsc::UnboundedSender<ReplyEnvelope>,
         envelope: &RequestEnvelope,
     ) -> ConceptsServed {
-        let _ = (backend, replies, envelope, ConceptsReply::Indexed);
-        todo!()
+        self.tasks.retain(|_, task| !task.is_finished());
+        let key = (
+            envelope.origin.clone(),
+            std::mem::discriminant(&envelope.request),
+        );
+        let (seq, origin) = (envelope.seq, envelope.origin.clone());
+        let index = Arc::clone(&self.index);
+        let replies = replies.clone();
+        let task = match &envelope.request {
+            StoreRequest::SearchConcepts(query) => {
+                // D233: no projects is no search; the index would say `[]` too.
+                if query.projects.is_empty() || query.limit == 0 {
+                    return ConceptsServed::Reply(StoreReply::Concepts(Box::new(
+                        ConceptsReply::Hits {
+                            query: query.clone(),
+                            outcome: Ok(Vec::new()),
+                        },
+                    )));
+                }
+                let query = query.clone();
+                tokio::spawn(async move {
+                    let outcome = index.search(query.clone()).await;
+                    let reply = ConceptsReply::Hits { query, outcome };
+                    let _ = replies.send(ReplyEnvelope {
+                        seq,
+                        origin,
+                        reply: StoreReply::Concepts(Box::new(reply)),
+                    });
+                })
+            }
+            StoreRequest::IndexConcepts { scope } => {
+                if scope.project_ids.is_empty() {
+                    return ConceptsServed::Reply(StoreReply::Concepts(Box::new(
+                        ConceptsReply::Indexed(Ok(SyncReport::default())),
+                    )));
+                }
+                let (backend, scope) = (backend.clone(), scope.clone());
+                tokio::spawn(async move {
+                    let outcome = index.sync(backend, scope).await;
+                    let _ = replies.send(ReplyEnvelope {
+                        seq,
+                        origin,
+                        reply: StoreReply::Concepts(Box::new(ConceptsReply::Indexed(outcome))),
+                    });
+                })
+            }
+            // The loop routes only the two above here; the two runtimes' rule for anything else.
+            other => {
+                return ConceptsServed::Reply(StoreReply::Failed {
+                    request: other.name(),
+                    message: "not a concepts request".to_owned(),
+                });
+            }
+        };
+        // The previous request of this kind from this view is work whose answer the staleness
+        // index is already committed to dropping. Aborting a search is safe anywhere; aborting an
+        // index run half-way leaves what the next run rebuilds.
+        if let Some(superseded) = self.tasks.insert(key, task) {
+            superseded.abort();
+        }
+        ConceptsServed::Deferred
     }
 
     /// Harness only (`RunRuntime::settle`'s shape): awaits every task, each within `limit`, and
     /// answers how many did not finish (they are aborted).
     pub async fn settle(&mut self, limit: Duration) -> usize {
-        let _ = limit;
-        todo!()
+        let mut stuck = 0;
+        for task in std::mem::take(&mut self.tasks).into_values() {
+            let abort = task.abort_handle();
+            if tokio::time::timeout(limit, task).await.is_err() {
+                abort.abort();
+                stuck += 1;
+            }
+        }
+        stuck
     }
 
     /// The UI is gone: every task is aborted. An index run stopped half-way is safe: the next run
     /// rebuilds what it did not reach.
     pub fn shutdown(&mut self) {
-        todo!()
+        for task in std::mem::take(&mut self.tasks).into_values() {
+            task.abort();
+        }
     }
 }
 
@@ -436,7 +553,11 @@ mod tests {
         };
         let (echoed, outcome) = hits(&reply);
         assert_eq!(echoed, &query);
-        assert_eq!(outcome, &Ok(Vec::new()), "the failing index was never called");
+        assert_eq!(
+            outcome,
+            &Ok(Vec::new()),
+            "the failing index was never called"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -489,7 +610,11 @@ mod tests {
                 },
             ),
         );
-        let second = runtime.serve(&backend, &tx, &envelope(2, StoreRequest::SearchConcepts(query)));
+        let second = runtime.serve(
+            &backend,
+            &tx,
+            &envelope(2, StoreRequest::SearchConcepts(query)),
+        );
         assert!(matches!(first, ConceptsServed::Deferred), "{first:?}");
         assert!(matches!(second, ConceptsServed::Deferred), "{second:?}");
         assert_eq!(runtime.settle(Duration::from_secs(10)).await, 0);
@@ -569,7 +694,10 @@ mod tests {
         let (_, scope) = platform().await;
         let search = StoreRequest::SearchConcepts(concepts::query("x", Vec::new(), false, 1));
         assert_eq!(REQUEST_NAMES[0], search.name());
-        assert_eq!(REQUEST_NAMES[1], StoreRequest::IndexConcepts { scope }.name());
+        assert_eq!(
+            REQUEST_NAMES[1],
+            StoreRequest::IndexConcepts { scope }.name()
+        );
     }
 
     /// The keyring fake is one process-wide slot: run under `--test-threads=1`.
@@ -601,14 +729,22 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let query = concepts::query("anything", scope.project_ids.clone(), false, 10);
 
-        runtime.serve(&backend, &tx, &envelope(1, StoreRequest::SearchConcepts(query)));
+        runtime.serve(
+            &backend,
+            &tx,
+            &envelope(1, StoreRequest::SearchConcepts(query)),
+        );
         runtime.serve(
             &backend,
             &tx,
             &envelope(2, StoreRequest::IndexConcepts { scope }),
         );
         runtime.shutdown();
-        assert_eq!(runtime.settle(Duration::from_millis(1)).await, 0, "nothing left");
+        assert_eq!(
+            runtime.settle(Duration::from_millis(1)).await,
+            0,
+            "nothing left"
+        );
         tokio::time::sleep(Duration::from_secs(7200)).await;
         assert!(rx.try_recv().is_err(), "no aborted task answered");
     }
