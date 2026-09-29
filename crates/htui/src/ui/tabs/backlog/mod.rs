@@ -184,6 +184,12 @@ impl BacklogTab {
             .or_else(|| rows.first());
         self.go(first_item.copied(), ctx);
     }
+
+    /// Unfolds `project` and moves the cursor to `id`, reading its detail (MOD-64 D235).
+    fn select_item(&mut self, id: ItemId, project: ProjectId, ctx: &Ctx<'_>) {
+        self.folded.retain(|folded| *folded != project);
+        self.go(Some(Selection::Item(id)), ctx);
+    }
 }
 
 impl Tab for BacklogTab {
@@ -207,6 +213,7 @@ impl Tab for BacklogTab {
         self.folded.clear();
         self.selected = None;
         self.detail.on_item_change(None);
+        self.pending_reveal = None;
     }
 
     /// A capturing sub-tab (a typed note, a typed-back key, a `y`/`n`) gets every key first: the
@@ -248,6 +255,13 @@ impl Tab for BacklogTab {
             self.items.clone_from(items);
             let live: Vec<ProjectId> = self.items.iter().map(|item| item.project_id).collect();
             self.folded.retain(|project| live.contains(project));
+            // MOD-64 D251: a reveal of an item that was not loaded is decided by this list.
+            if let Some((id, key)) = self.pending_reveal.take() {
+                match self.items.iter().find(|item| item.id == id) {
+                    Some(item) => self.select_item(id, item.project_id, ctx),
+                    None => ctx.emit(Action::Error(not_in_this_backlog(&key))),
+                }
+            }
             self.reselect(ctx);
             return;
         }
@@ -273,8 +287,31 @@ impl Tab for BacklogTab {
         );
     }
 
-    fn reveal(&mut self, _target: &RevealTarget, _ctx: &mut Ctx<'_>) -> bool {
-        todo!("MOD-64 D235")
+    fn reveal(&mut self, target: &RevealTarget, ctx: &mut Ctx<'_>) -> bool {
+        let RevealTarget::Item { id, key } = target else {
+            return false;
+        };
+        // A half-typed note or reject reason would be lost by the move (`go` resets the sub-tabs).
+        if self.detail.captures_input() {
+            ctx.emit(Action::Error(CLOSE_THE_FIELD_FIRST.to_owned()));
+            return true;
+        }
+        match self.items.iter().find(|item| item.id == *id) {
+            Some(item) => {
+                let project = item.project_id;
+                self.pending_reveal = None;
+                self.select_item(*id, project, ctx);
+            }
+            // Not loaded, or not in the rows read so far: re-read and decide on arrival (D251).
+            None => {
+                self.pending_reveal = Some((*id, key.clone()));
+                ctx.request(StoreRequest::Items {
+                    scope: ctx.scope.clone(),
+                    filter: ItemFilter::default(),
+                });
+            }
+        }
+        true
     }
 }
 

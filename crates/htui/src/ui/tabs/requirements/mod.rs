@@ -814,6 +814,13 @@ impl RequirementsTab {
         }
     }
 
+    /// Whether the last read holds requirement `id` (MOD-64 D235).
+    fn holds(&self, id: RequirementId) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.requirement(id).is_some())
+    }
+
     /// Makes `row` visible: unfolds what hides it, and drops a filter that would.
     fn unhide(&mut self, row: Row, ctx: &Ctx<'_>) {
         let Some(snapshot) = &self.snapshot else {
@@ -1119,6 +1126,14 @@ impl Tab for RequirementsTab {
                     self.sent = None;
                     self.notice = Some(Notice::Error(message));
                 }
+                // MOD-64 D251: a reveal of a requirement that was not read is decided by this one.
+                if let Some((id, key)) = self.pending_reveal.take() {
+                    if self.holds(id) {
+                        self.select_row(Row::Requirement(id), ctx);
+                    } else {
+                        self.notice = Some(Notice::Error(not_in_these_requirements(&key)));
+                    }
+                }
                 self.reselect(ctx);
             }
             StoreReply::RequirementsStale(snapshot) => {
@@ -1145,6 +1160,8 @@ impl Tab for RequirementsTab {
                 }
             }
             StoreReply::Failed { request, message } if *request == READ_NAME => {
+                // D251: a refused read must not leave a jump armed for a later one.
+                self.pending_reveal = None;
                 if let Some(refused) = self.verifying.take() {
                     // The check could not be made: report the mint's own refusal.
                     self.busy = None;
@@ -1218,8 +1235,29 @@ impl Tab for RequirementsTab {
         frame.render_widget(Paragraph::new(self.hint(ctx.theme)), hint_row);
     }
 
-    fn reveal(&mut self, _target: &RevealTarget, _ctx: &mut Ctx<'_>) -> bool {
-        todo!("MOD-64 D235")
+    fn reveal(&mut self, target: &RevealTarget, ctx: &mut Ctx<'_>) -> bool {
+        let RevealTarget::Requirement { id, key } = target else {
+            return false;
+        };
+        match self.mode {
+            Mode::Browse => {}
+            // The typed filter is kept as applied; `unhide` drops it if it hides the row.
+            Mode::Filter { .. } => self.mode = Mode::Browse,
+            // An open form keeps its text: the reveal says why it did not move (D252).
+            Mode::NewArea(_) | Mode::Requirement(_) | Mode::Withdraw(_) => {
+                self.notice = Some(Notice::Error(CLOSE_THE_FIELD_FIRST.to_owned()));
+                return true;
+            }
+        }
+        if self.holds(*id) {
+            self.pending_reveal = None;
+            self.select_row(Row::Requirement(*id), ctx);
+        } else {
+            // Not read yet, or minted since: re-read and decide on arrival (D251).
+            self.pending_reveal = Some((*id, key.clone()));
+            ctx.request(StoreRequest::Requirements(ctx.scope.clone()));
+        }
+        true
     }
 }
 

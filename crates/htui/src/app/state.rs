@@ -183,8 +183,8 @@ pub struct App {
     /// replay nothing, which the status line says rather than the shell swallowing the key.
     pub replay_tab: Option<TabId>,
     /// Which tab reveals which kind of entity (MOD-64 D235). Set by
-    /// [`register_all`](crate::app::register_all), ids for the reason `replay_tab` is one: the shell
-    /// names no concrete view. A kind with no entry reveals nothing.
+    /// [`register_all`](crate::app::register_all), ids for the reason `replay_tab` is one: the
+    /// shell names no concrete view. A kind with no entry reveals nothing.
     pub reveal_tabs: Vec<(RevealKind, TabId)>,
     /// Whether the migration prompt has already been offered this session.
     ///

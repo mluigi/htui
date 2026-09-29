@@ -190,12 +190,51 @@ impl App {
         );
     }
 
-    /// Selects an entity in the tab registered for its kind (MOD-64 D235): focus that tab — which
-    /// re-sends its `wants_requests` if it was not the active one — then hand it the target with a
-    /// `Ctx` of its own, as `finish_external_edit` does, and drain what it emitted. A kind nothing
-    /// is registered for is a no-op, logged.
-    fn reveal(&mut self, _target: &RevealTarget) {
-        todo!("MOD-64 D235")
+    /// Selects an entity in the tab registered for its kind (MOD-64 D235): focus that tab —
+    /// which re-sends its `wants_requests` if it was not the active one — then hand it the target
+    /// with a `Ctx` of its own, as `finish_external_edit` does, and drain what it emitted. A kind
+    /// nothing is registered for is a no-op, logged.
+    fn reveal(&mut self, target: &RevealTarget) {
+        let kind = target.kind();
+        let Some(tab) = self
+            .reveal_tabs
+            .iter()
+            .find(|(registered, _)| *registered == kind)
+            .map(|(_, tab)| *tab)
+        else {
+            tracing::debug!(?kind, "no tab reveals this kind");
+            return;
+        };
+        self.update_tab(TabAction::Focus(tab));
+        let origin = Origin::Tab(tab);
+        {
+            let Self {
+                scope,
+                projects,
+                top_bar,
+                keymap,
+                theme,
+                emit,
+                tabs,
+                ..
+            } = self;
+            let Some(view) = tabs.by_id_mut(tab) else {
+                return;
+            };
+            let mut ctx = Ctx::new(
+                scope,
+                projects,
+                top_bar,
+                keymap,
+                theme,
+                origin.clone(),
+                emit,
+            );
+            if !view.reveal(target, &mut ctx) {
+                tracing::debug!(%tab, "the tab does not reveal this target");
+            }
+        }
+        self.drain(&origin);
     }
 
     /// A reply came back: top bar first, then the staleness gate, then the addressee.
