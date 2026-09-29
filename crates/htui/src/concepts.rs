@@ -177,7 +177,7 @@ pub fn format_hit(hit: &Hit) -> String {
     // document kind are stripped here, so nothing stored can drive the terminal it is printed on.
     let clean = |s: &str| s.chars().filter(|c| !c.is_control()).collect::<String>();
     format!(
-        "{:<10} {:<18} {:.3}  {}",
+        "{:<10} {:<26} {:.3}  {}",
         clean(&hit.key),
         clean(&place),
         hit.score,

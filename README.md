@@ -343,7 +343,11 @@ Each result says what matched: an item, one of its documents, or a requirement. 
 shows how it closed, for example `item (rejected)`, and a withdrawn requirement shows
 `requirement (withdrawn)`.
 
-Run `--index-items` again to pick up changes.
+Run `--index-items` again to pick up changes. After upgrading from a version that did not index
+requirements, the first `--index-items` rebuilds the whole index into a new collection,
+`htui_concepts_v2`. The old `htui_concepts_v1` collection is no longer read; you can drop it with
+`curl -X DELETE http://localhost:6333/collections/htui_concepts_v1` (Qdrant's HTTP port, not the
+gRPC one).
 
 ## Where htui keeps its files
 

@@ -1,4 +1,4 @@
-//! The concepts index: items and their documents in Qdrant, searched by meaning and by exact
+//! The concepts index: items, their documents and requirements in Qdrant, searched by meaning and by exact
 //! term at once (MOD-34, `R-STO-8`, `docs/ANA-19.md` §3.3, `docs/ANA-20.md` §3).
 //!
 //! One collection holds every project (ANA-20 §3.4); the tenant is `project_id`, and a point's
@@ -130,6 +130,42 @@ impl Subject {
         match self {
             Self::Item { id, .. } => Owner::Item(*id),
             Self::Requirement { id, .. } => Owner::Requirement(*id),
+        }
+    }
+
+    /// The item's status; `None` for a requirement.
+    #[must_use]
+    pub const fn status(&self) -> Option<Status> {
+        match self {
+            Self::Item { status, .. } => Some(*status),
+            Self::Requirement { .. } => None,
+        }
+    }
+
+    /// The item's resolution; `None` for an item that is not closed and for a requirement.
+    #[must_use]
+    pub const fn resolution(&self) -> Option<Resolution> {
+        match self {
+            Self::Item { resolution, .. } => *resolution,
+            Self::Requirement { .. } => None,
+        }
+    }
+
+    /// The requirement's state; `None` for an item.
+    #[must_use]
+    pub const fn state(&self) -> Option<RequirementState> {
+        match self {
+            Self::Requirement { state, .. } => Some(*state),
+            Self::Item { .. } => None,
+        }
+    }
+
+    /// The requirement's version; `None` for an item.
+    #[must_use]
+    pub const fn version(&self) -> Option<i32> {
+        match self {
+            Self::Requirement { version, .. } => Some(*version),
+            Self::Item { .. } => None,
         }
     }
 }
@@ -273,9 +309,9 @@ pub struct SearchQuery {
     /// Item statuses to return; empty means all. A requirement has no status, so a non-empty
     /// list leaves requirements out.
     pub statuses: Vec<Status>,
-    /// Item resolutions to return; empty means all. Only a closed item has one, so a non-empty
-    /// list keeps closed items alone: `--decisions` asks for `done`, `concluded` and `rejected`
-    /// (MOD-50 D223).
+    /// Item resolutions to return; empty means all. Only a closed item and its documents carry
+    /// one, so a non-empty list never returns a requirement or an item that is not closed:
+    /// `--decisions` asks for `done`, `concluded` and `rejected` (MOD-50 D223).
     pub resolutions: Vec<Resolution>,
     /// Most hits returned.
     pub limit: u64,
@@ -366,6 +402,13 @@ fn payload(point: &ConceptPoint) -> HashMap<String, Value> {
             if let Some(r) = resolution {
                 p.insert(RESOLUTION.to_owned(), Value::from(r.as_str()));
             }
+            // Only an item has documents; a requirement point never writes these keys.
+            if let Some(doc) = &point.document {
+                p.insert(DOCUMENT_ID.to_owned(), Value::from(doc.id.0.to_string()));
+                p.insert(DOC_KIND.to_owned(), Value::from(doc.kind.clone()));
+                p.insert(DOC_VERSION.to_owned(), Value::from(i64::from(doc.version)));
+                p.insert(CHUNK.to_owned(), Value::from(i64::from(doc.chunk)));
+            }
         }
         Subject::Requirement {
             id,
@@ -380,12 +423,6 @@ fn payload(point: &ConceptPoint) -> HashMap<String, Value> {
             p.insert(STATE.to_owned(), Value::from(state.as_str()));
             p.insert(VERSION.to_owned(), Value::from(i64::from(*version)));
         }
-    }
-    if let Some(doc) = &point.document {
-        p.insert(DOCUMENT_ID.to_owned(), Value::from(doc.id.0.to_string()));
-        p.insert(DOC_KIND.to_owned(), Value::from(doc.kind.clone()));
-        p.insert(DOC_VERSION.to_owned(), Value::from(i64::from(doc.version)));
-        p.insert(CHUNK.to_owned(), Value::from(i64::from(doc.chunk)));
     }
     p
 }
@@ -736,22 +773,6 @@ impl<E: DenseEmbedder> VectorStore for QdrantStore<E> {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
-const fn item_status(subject: &Subject) -> Option<Status> {
-    match subject {
-        Subject::Item { status, .. } => Some(*status),
-        Subject::Requirement { .. } => None,
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-const fn item_resolution(subject: &Subject) -> Option<Resolution> {
-    match subject {
-        Subject::Item { resolution, .. } => *resolution,
-        Subject::Requirement { .. } => None,
-    }
-}
-
 /// An in-memory [`VectorStore`] for tests. Search ranks by how many query terms a point's text
 /// shares, which is enough to prove scoping and filtering, not relevance.
 #[cfg(any(test, feature = "test-support"))]
@@ -819,11 +840,8 @@ impl VectorStore for MemVectorStore {
                 point_type: p.point_type(),
                 owner: p.subject.owner(),
                 updated_at: p.updated_at,
-                status: item_status(&p.subject),
-                version: match &p.subject {
-                    Subject::Requirement { version, .. } => Some(*version),
-                    Subject::Item { .. } => None,
-                },
+                status: p.subject.status(),
+                version: p.subject.version(),
                 document_id: p.document.as_ref().map(|d| d.id),
             })
             .collect())
@@ -841,11 +859,15 @@ impl VectorStore for MemVectorStore {
             // A missing field fails a non-empty filter, as Qdrant's `match any` does.
             .filter(|p| {
                 query.statuses.is_empty()
-                    || item_status(&p.subject).is_some_and(|s| query.statuses.contains(&s))
+                    || p.subject
+                        .status()
+                        .is_some_and(|s| query.statuses.contains(&s))
             })
             .filter(|p| {
                 query.resolutions.is_empty()
-                    || item_resolution(&p.subject).is_some_and(|r| query.resolutions.contains(&r))
+                    || p.subject
+                        .resolution()
+                        .is_some_and(|r| query.resolutions.contains(&r))
             })
             .filter_map(|p| {
                 let own = bm25::tokenize(&p.text);
@@ -856,11 +878,8 @@ impl VectorStore for MemVectorStore {
                     owner: p.subject.owner(),
                     key: p.key.clone(),
                     document: p.document.as_ref().map(|d| (d.id, d.kind.clone())),
-                    resolution: item_resolution(&p.subject),
-                    state: match &p.subject {
-                        Subject::Requirement { state, .. } => Some(*state),
-                        Subject::Item { .. } => None,
-                    },
+                    resolution: p.subject.resolution(),
+                    state: p.subject.state(),
                     score,
                     snippet: snippet(&p.text),
                 })
@@ -1020,6 +1039,18 @@ mod tests {
         );
         assert_eq!(h.resolution, Some(Resolution::Rejected));
         assert_eq!(h.state, None);
+    }
+
+    #[test]
+    fn a_requirement_point_never_writes_document_keys() {
+        let odd = ConceptPoint {
+            document: Some(doc(0)),
+            ..requirement(RequirementState::Active)
+        };
+        let payload = payload(&odd);
+        assert!(!payload.contains_key(DOCUMENT_ID));
+        assert!(!payload.contains_key(DOC_KIND));
+        assert_eq!(hit(&payload, 0.5).unwrap().document, None);
     }
 
     #[test]

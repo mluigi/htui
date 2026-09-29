@@ -15,8 +15,8 @@ use crate::vector::{
     ConceptPoint, DocumentRef, IndexedPoint, Owner, PointType, Subject, VectorStore,
 };
 use htui_core::model::{
-    Document, DocumentId, Item, ItemFilter, ItemId, Requirement, RequirementFilter, RequirementId,
-    Scope,
+    Document, DocumentId, Item, ItemFilter, ItemId, ProjectId, Requirement, RequirementFilter,
+    RequirementId, Scope,
 };
 use htui_core::store::{ReadStore, StoreError};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -25,6 +25,9 @@ use uuid::Uuid;
 /// Longest section of a document embedded as one point, in characters. BGE-small reads about 512
 /// tokens; 2000 characters of English prose stays under that.
 pub const MAX_CHUNK_CHARS: usize = 2000;
+
+/// Most requirement points written in one upsert.
+const UPSERT_BATCH: usize = 256;
 
 /// What one [`Indexer::sync`] did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -39,7 +42,8 @@ pub struct SyncReport {
     pub requirements_unchanged: usize,
     /// Points written.
     pub points_upserted: usize,
-    /// Points removed: stale sections, superseded documents, items no longer listed.
+    /// Points removed: stale sections, superseded documents, items and requirements no longer
+    /// listed.
     pub points_deleted: usize,
 }
 
@@ -131,7 +135,7 @@ impl Indexer {
 /// and points of rows the store no longer lists deleted.
 async fn sync_requirements(
     read: &impl ReadStore,
-    project: htui_core::model::ProjectId,
+    project: ProjectId,
     mut indexed: HashMap<RequirementId, Vec<IndexedPoint>>,
     store: &impl VectorStore,
 ) -> Result<SyncReport, StoreError> {
@@ -159,7 +163,11 @@ async fn sync_requirements(
     stale.extend(indexed.into_values().flatten().map(|p| p.id));
     report.points_upserted += points.len();
     report.points_deleted += stale.len();
-    store.upsert(points).await?;
+    // Bounded batches: a first build of a large spec would otherwise embed and send every
+    // requirement of the project in one request.
+    for batch in points.chunks(UPSERT_BATCH) {
+        store.upsert(batch.to_vec()).await?;
+    }
     store.delete(stale).await?;
     Ok(report)
 }
@@ -293,7 +301,7 @@ mod tests {
         p.subject.owner().item()
     }
 
-    fn scope(projects: Vec<htui_core::model::ProjectId>) -> Scope {
+    fn scope(projects: Vec<ProjectId>) -> Scope {
         Scope {
             workspace_id: ids::WORKSPACE_PLATFORM,
             project_ids: projects,
@@ -628,17 +636,33 @@ mod tests {
     async fn a_closed_item_carries_its_resolution_on_every_point() {
         let read = MemStore::demo();
         let store = MemVectorStore::new();
+        let fix = read.item(ids::HTUI_FIX_1).await.unwrap().unwrap();
+        assert_eq!(fix.status, Status::Closed);
+        // The demo's closed item has no documents; give it one, so the document half is pinned.
+        read.write_document(NewDocument {
+            id: DocumentId::new(),
+            item_id: fix.id,
+            kind: "summary".into(),
+            title: "Summary".into(),
+            body: "## Verdict\nrestore the terminal".into(),
+            produced_by_step_id: None,
+            created_by: ids::USER,
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
         Indexer::sync(&read, &scope(vec![ids::PROJECT_HTUI]), &store)
             .await
             .unwrap();
-        let fix = read.item(ids::HTUI_FIX_1).await.unwrap().unwrap();
-        assert_eq!(fix.status, Status::Closed);
         let points: Vec<_> = store
             .points()
             .into_iter()
             .filter(|p| item_of(p) == Some(fix.id))
             .collect();
-        assert!(!points.is_empty());
+        assert!(
+            points.iter().any(|p| p.point_type() == PointType::Document),
+            "{points:?}"
+        );
         assert!(points.iter().all(|p| matches!(
             p.subject,
             Subject::Item {

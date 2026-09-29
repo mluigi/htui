@@ -277,7 +277,11 @@ async fn a_resolution_filter_keeps_decisions_and_leaves_requirements_out() {
     );
     for hit in &hits {
         assert_ne!(hit.point_type, PointType::Requirement);
-        assert!(hit.resolution.is_some(), "{hit:?}");
+        assert!(
+            hit.resolution
+                .is_some_and(|r| decisions.resolutions.contains(&r)),
+            "{hit:?}"
+        );
     }
 
     // A resolution the demo's closed items do not have finds none of them.
