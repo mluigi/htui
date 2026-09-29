@@ -14,7 +14,7 @@ use htui_core::prompt::render::elision_marker;
 use htui_core::prompt::{
     AssembleError, AssembledPrompt, PromptSpec, SectionName, TrimStrategy, assemble, fixtures,
 };
-use htui_core::scrub::MinimalScrubber;
+use htui_core::scrub::{MinimalScrubber, Scrubber};
 
 /// The scrubber every test passes: no configured secrets, and still fail-closed on the prefix
 /// rules (`scrub.rs:114-120`), which is exactly what a production caller with no session secrets
@@ -941,7 +941,7 @@ fn reserve_target_is_integer_arithmetic() {
     assert_eq!(record.target, 108_000, "§5.1's worked example");
     assert!((record.reserve - 0.10).abs() < f64::EPSILON);
     assert_eq!(
-        serde_json::to_value(&record).expect("plain data")["budget_source"],
+        record.to_value(&scrubber()).expect("plain data")["budget_source"],
         serde_json::json!("project")
     );
 }
@@ -960,8 +960,19 @@ fn to_value_is_byte_stable_and_carries_the_documented_keys() {
     // serialisation is **byte-stable** — deterministic under either map type — and the column is
     // `JSONB`, which reorders keys on the way in regardless. Nothing in the assembler reads a key
     // order, and `prompt_digest` is over the text and never over this record.
-    let first = ok(&fixtures::phase_implement_attempt2()).trim.to_value();
-    let second = ok(&fixtures::phase_implement_attempt2()).trim.to_value();
+    //
+    // Both serialisations go through `TrimRecord::to_value`, so what is compared here is the
+    // **scrubbed** form — the one the engine persists — and the key set checked below is read off
+    // the scrubbed object. With an empty scrubber the two are the same bytes, which is the point:
+    // the assertion is about the serialiser, not about the scrubbing.
+    let first = ok(&fixtures::phase_implement_attempt2())
+        .trim
+        .to_value(&scrubber())
+        .expect("plain data");
+    let second = ok(&fixtures::phase_implement_attempt2())
+        .trim
+        .to_value(&scrubber())
+        .expect("plain data");
     assert_eq!(
         serde_json::to_string(&first).expect("plain data"),
         serde_json::to_string(&second).expect("plain data"),
@@ -1372,5 +1383,350 @@ fn the_record_vocabularies_spell_themselves_once() {
         RootSource::NoPath,
     ] {
         assert_eq!(source.as_str(), serialised(&source), "{source:?}");
+    }
+}
+
+#[test]
+fn a_known_secret_in_a_caller_note_is_masked_in_the_record() {
+    // MOD-32, T1 case 1. `PromptSpec.notes` is caller free text, copied verbatim into
+    // `trim_record.notes` at `prompt/mod.rs:1115-1119`, and no `mask` call in `scrubbed_inputs`
+    // reaches it — so nothing scrubbed the record's own strings on the way to the store.
+    //
+    // This case pins the **masking** half, not the scanning half, and the distinction is the
+    // point: a known secret is maskable, so a pass that only refused would fail a step over a
+    // value the scrubber can remove. Note what it does *not* claim — the run engine builds its
+    // scrubber with an empty secret list (`run_worker.rs:1253`), so on that path the masking half
+    // is inert and only the residue scan fires. This case pins the pass itself, with a populated
+    // scrubber, which is the configuration the chat path's recorder uses and the one a future fix
+    // to the run engine's scrubber would turn on. See `TrimRecord::to_value`'s doc.
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.notes = vec![format!("clamped hops to {SECRET} on this box")];
+    let prompt = ok(&spec);
+
+    let value = prompt
+        .trim
+        .to_value(&MinimalScrubber::new([SECRET.to_owned()]))
+        .expect("a maskable secret in a caller note is masked, not refused");
+    assert_eq!(
+        value["notes"][0],
+        serde_json::json!("clamped hops to [REDACTED] on this box"),
+        "the note is masked in the value that is persisted, at the note's own index"
+    );
+    assert!(
+        !value.to_string().contains(SECRET),
+        "no leaf of the persisted record may carry the secret: {value}"
+    );
+}
+
+#[test]
+fn a_credential_shaped_string_in_the_record_refuses_the_serialisation() {
+    // MOD-32, T1 case 2. The fail-closed half, on the persist path: `R-SEC-3` gates what is
+    // written, and a credential-shaped string the scrubber cannot mask must stop the write
+    // rather than reach `run_step.trim_record`.
+    //
+    // Case 1 proves the pass masks; this proves it also *refuses*, and a scan that only looked
+    // would let a case 1 style masking bug through in the other direction. Together they are the
+    // one call: mask, then fail closed on residue (`scrub.rs:228-233`).
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.notes = vec!["the key is AKIAAAAAAAAAAAAAAAAA".to_owned()];
+    let prompt = ok(&spec);
+
+    let error = prompt
+        .trim
+        .to_value(&scrubber())
+        .expect_err("`R-SEC-3` is fail-closed on the persist path too");
+
+    assert_eq!(
+        error.rule, "aws_access_key_id",
+        "the rule names the finding"
+    );
+    assert_eq!(
+        error.path, "/notes/0",
+        "the pointer locates the note, which is the fact a maintainer can act on"
+    );
+    // This error is logged and persisted in an `error` event, so its `Display` and `Debug` are
+    // the security contract (`scrub.rs:60-71`) and neither may repeat the text.
+    for rendered in [&error.to_string(), &format!("{error:?}")] {
+        assert!(!rendered.contains("AKIA"), "leaked: {rendered}");
+        assert!(
+            !rendered.contains("AAAAAAAAAAAAAAAAAA"),
+            "leaked: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn the_template_name_is_reached_by_a_pass_that_enumerates_nothing() {
+    // MOD-32, T1 case 3 — the falsification guard, and the only case here that is about the
+    // *shape* of the fix rather than its behaviour.
+    //
+    // `spec.template.name` is a `prompt_template` row name that no `mask` call in
+    // `scrubbed_inputs` names, and the HANDOFF item did not predict it: the fields it named are
+    // already covered. So the defect was never "these three strings" — it was a guarantee
+    // expressed as an enumeration, which goes stale the day a field is added and nobody extends
+    // it. This case is what a future reversion to a field list fails on, and the mutation in the
+    // task report (mask `self.notes` only) is exactly that reversion.
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.template.name = "sk-ant-api03-DEADBEEF".to_owned();
+    let prompt = ok(&spec);
+
+    let error = prompt
+        .trim
+        .to_value(&scrubber())
+        .expect_err("a field no mask call ever named is still reached by the whole-record pass");
+
+    assert_eq!(error.rule, "anthropic_api_key");
+    assert_eq!(error.path, "/template/name");
+    assert!(!error.to_string().contains("DEADBEEF"), "{}", error);
+}
+
+#[test]
+fn the_audit_root_and_provider_strings_are_reached_by_the_pass() {
+    // MOD-32, T1 case 3b — the pair the plan's **first** fact-check wrongly wrote off.
+    //
+    // `scrubbed_inputs` walks `spec.excerpts.files` and never `spec.excerpts.audit`, and
+    // `surviving_audit` clones the audit wholesale (`prompt/mod.rs:1084`), rebuilding only
+    // `files[]`. So `excerpts.roots[].repo` and `excerpts.provider_set[]` reach the record exactly
+    // as the reader produced them — the root strings are, in the HANDOFF item's own words, the
+    // part that leaks. They are the two fields a future reversion to a field list would most
+    // plausibly miss, because they sit in the same struct as the fields that are covered.
+    let mut roots_spec = fixtures::phase_implement_attempt2();
+    assert!(
+        !roots_spec.excerpts.audit.roots.is_empty(),
+        "the fixture carries a root record, which is what this case mutates"
+    );
+    roots_spec.excerpts.audit.roots[0].repo = "sk-ant-api03-ROOTSLUG".to_owned();
+    let root_error = ok(&roots_spec)
+        .trim
+        .to_value(&scrubber())
+        .expect_err("an audit root slug is a record string like any other");
+    assert_eq!(
+        root_error.rule, "anthropic_api_key",
+        "the rule names the finding"
+    );
+    assert_eq!(
+        root_error.path, "/excerpts/roots/0/repo",
+        "and the pointer locates the root record, not the files array"
+    );
+    assert!(!root_error.to_string().contains("ROOTSLUG"), "{root_error}");
+
+    let mut provider_spec = fixtures::phase_implement_attempt2();
+    assert!(
+        !provider_spec.excerpts.audit.provider_set.is_empty(),
+        "the fixture carries a provider id, which is what this case mutates"
+    );
+    provider_spec.excerpts.audit.provider_set[0] = "AKIAAAAAAAAAAAAAAAAA@2".to_owned();
+    let provider_error = ok(&provider_spec)
+        .trim
+        .to_value(&scrubber())
+        .expect_err("a provider id is a record string like any other");
+    assert_eq!(provider_error.rule, "aws_access_key_id");
+    assert_eq!(provider_error.path, "/excerpts/provider_set/0");
+    assert!(
+        !provider_error.to_string().contains("AKIA"),
+        "{provider_error}"
+    );
+}
+
+#[test]
+fn a_masked_record_survives_a_second_pass_unchanged() {
+    // MOD-32, T1 case 4, rewritten after the review gate.
+    //
+    // The first version of this case called `to_value` twice on the same **unmasked**
+    // `prompt.trim` and compared the two results, which asserts that a pure function is pure:
+    // both calls mask the same input the same way, so they agree however `mask` behaves, and a
+    // `mask` that re-masked the `[REDACTED]` marker would have passed. The property worth
+    // pinning is the one the comment claimed — *a record whose strings are already masked must
+    // serialise to the same bytes* — and it is only reachable by feeding an already-masked value
+    // back in. That is a live path, not a hypothetical one: `scrubbed_inputs` masks
+    // `excerpts.files[].repo`/`.path` and `skill_choices[].name` before `to_value` sees them, and
+    // with an empty secret list `mask` short-circuits at `scrub.rs:119-121` and cannot double-mask
+    // at all, so a populated scrubber is the only configuration where this can bite.
+    let mut spec = fixtures::phase_implement_attempt2();
+    spec.notes = vec![format!("clamped hops to {SECRET}")];
+    let scrubber = MinimalScrubber::new([SECRET.to_owned()]);
+    let prompt = assemble(&spec, &scrubber).expect("the fixture must assemble");
+
+    let once = prompt.trim.to_value(&scrubber).expect("maskable");
+    let rendered = once.to_string();
+    assert!(
+        rendered.contains("[REDACTED]"),
+        "the record must actually carry a mask, or this case is vacuous: {rendered}"
+    );
+    assert!(!rendered.contains(SECRET), "and no secret: {rendered}");
+
+    let mut again = once.clone();
+    scrubber
+        .scrub(&mut again)
+        .expect("a record that is already masked is still clean");
+    assert_eq!(
+        once, again,
+        "masking is idempotent (`scrub.rs:52`): a second pass over a masked record changes nothing"
+    );
+    assert_eq!(
+        again["notes"][0],
+        serde_json::json!("clamped hops to [REDACTED]"),
+        "and the second pass does not mask the marker again"
+    );
+}
+
+/// The one walk both `to_value` pins share: every `.rs` file under the workspace, symlinks
+/// skipped so the traversal cannot cycle, `target` and hidden directories pruned.
+///
+/// Bounded to the **workspace root** (`CARGO_MANIFEST_DIR/../..`) rather than `CARGO_MANIFEST_DIR/..`.
+/// The first version walked `crates/`, which in a packaged build holding only `htui-core` is a
+/// directory with nothing in it — the test then passed vacuously while claiming to have checked
+/// the tree.
+fn each_workspace_rust_file(mut visit: impl FnMut(&std::path::Path, &str)) {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("crates").is_dir())
+        .expect("htui-core sits in a workspace with a crates/ directory")
+        .to_path_buf();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("a readable workspace directory") {
+            let entry = entry.expect("a readable entry");
+            let kind = entry.file_type().expect("a readable file type");
+            if kind.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if kind.is_dir() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if name == "target" || name.starts_with('.') {
+                    continue;
+                }
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path).expect("a readable source file");
+                visit(&path, &source);
+            }
+        }
+    }
+}
+
+/// True when this `serde_json::to_value(` call's argument text names a record.
+///
+/// **Why the argument and not a list of whole lines.** The first version of this pin matched
+/// literal strings like `"serde_json::to_value(&record)"`, which is an ordinary expression for any
+/// type: the first unrelated `fn f(record: &Foo)` in any crate would have failed the test with a
+/// message asserting a `TrimRecord` bypass. Reading the *argument* and asking whether it names a
+/// record is the rule the message was always about, and it catches the forms the code actually
+/// uses — `&prompt.trim`, `&prompts.forward.trim`, `trim`, `&record` — without a needle per
+/// spelling.
+///
+/// `self` is deliberately **not** in the rule, and that was measured rather than assumed. Adding
+/// it flagged two lines on the first run, both false: `payload_sections_value` at
+/// `prompt/mod.rs:345`, which serialises `self.payload_sections()` — a `Vec<SectionEntry>`, not a
+/// record — and a doc comment in `probe.rs` that *names* `serde_json::to_value` in prose. Outside
+/// `trim.rs` a record is never the receiver; it is `trim` or `record`. A `BTreeMap`-with-string-
+/// keys is likewise not a hazard, which is why the map pin below bans only the hashing maps.
+fn serialises_a_record(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("//") {
+        return false;
+    }
+    let Some(call) = line.split_once("serde_json::to_value(") else {
+        return false;
+    };
+    let argument = call.1.split(')').next().unwrap_or_default();
+    argument.contains("trim") || argument.contains("record")
+}
+
+#[test]
+fn a_trim_record_is_never_serialised_outside_to_value() {
+    // MOD-32, review finding. `TrimRecord` is `pub` and still derives `Serialize`, so
+    // `serde_json::to_value(&trim)` — the literal line this item deleted from the engine at all
+    // three sites — remains valid Rust and nothing in the build fails if it comes back. The
+    // signature change removed the *unscrubbed serialiser method*; it did not and cannot remove
+    // the unscrubbed *expression*, so the guarantee that a record is scrubbed before it is
+    // persisted is a convention, and this is the grep that keeps it one. Same idiom and the same
+    // reason as `the_only_section_entry_constructor_is_the_records_projection` above.
+    let mut offenders: Vec<String> = Vec::new();
+    each_workspace_rust_file(|path, source| {
+        let allowed = path.ends_with("prompt/trim.rs")
+            || path
+                .file_name()
+                .is_some_and(|name| name == "prompt_digest.rs");
+        if allowed {
+            return;
+        }
+        for (number, line) in source.lines().enumerate() {
+            if serialises_a_record(line) {
+                offenders.push(format!("{}:{}", path.display(), number + 1));
+            }
+        }
+    });
+    assert!(
+        offenders.is_empty(),
+        "a `TrimRecord` is serialised outside `TrimRecord::to_value`, which is the bypass MOD-32 \
+         removed and the one that must not come back: {offenders:?}"
+    );
+}
+
+#[test]
+fn the_engine_scrubs_the_record_with_the_scrubber_it_holds() {
+    // MOD-32, review finding. The signature change forces *a* `&dyn Scrubber`, not *the* one the
+    // run holds. Swapping `self.parts.scrubber` for a locally built `MinimalScrubber::new([])` at
+    // any of the three sites compiles, passes every behavioural case in this file, and silently
+    // disables the masking half on every path where the scrubber is populated — which is what
+    // happens the moment the run engine's empty secret list (`run_worker.rs:1253`) is fixed. So the
+    // argument is pinned here, not just the call.
+    let engine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/htui-orch/src/engine.rs");
+    let source = std::fs::read_to_string(&engine).expect("the engine is a readable source file");
+
+    assert_eq!(
+        source.matches("to_value(self.parts.scrubber").count(),
+        3,
+        "the three `set_step_prompt` sites pass the scrubber the run holds; one is added or removed \
+         here, and `set_step_prompt`'s production caller list has to stay in step with it"
+    );
+    for (number, line) in source.lines().enumerate() {
+        if line.contains("to_value(") && !line.contains("to_value(self.parts.scrubber") {
+            panic!(
+                "engine.rs:{}: a `to_value(` that does not pass `self.parts.scrubber`: {}",
+                number + 1,
+                line.trim()
+            );
+        }
+    }
+}
+
+#[test]
+fn the_record_graph_holds_no_map_that_could_break_the_null_argument() {
+    // MOD-32, review finding. The engine's `Value::Null` argument leans on "no map in the record
+    // graph": `serde_json::to_value` fails on a map whose keys are not strings, and a `HashMap`
+    // field is the one way to introduce that. `the_prompt_module_reads_no_clock` bans the type for
+    // `crates/htui-core/src/prompt/`'s nine files, but the record graph reaches past them — into
+    // `model/skill.rs` for `SkillChoice`/`SkillLevel`/`Activation` and `model/ids.rs` for
+    // `SkillId` — so that guard was narrower than the claim it was cited for. This is the guard
+    // that covers the whole graph, and it is deliberately not folded into the clock test: "reads no
+    // clock" and "serialises to an object" are different invariants with different blast radii.
+    const GRAPH: [(&str, &str); 3] = [
+        ("prompt/trim.rs", include_str!("../src/prompt/trim.rs")),
+        ("model/skill.rs", include_str!("../src/model/skill.rs")),
+        ("model/ids.rs", include_str!("../src/model/ids.rs")),
+    ];
+    for (name, source) in GRAPH {
+        // Comments excluded, and the shipped/test cut is deliberately **not** borrowed from the
+        // clock test. `trim.rs` names `BTreeMap` in prose — its own module doc explains that
+        // `serde_json::Map` is one — and a `BTreeMap<String, _>` is harmless, because a map only
+        // breaks the second failure mode when its keys are not strings. The hazard is the hashing
+        // maps, whose key type is chosen by whoever writes the field.
+        for forbidden in ["HashMap", "HashSet"] {
+            assert!(
+                !source.lines().any(|line| {
+                    !line.trim_start().starts_with("//") && line.contains(forbidden)
+                }),
+                "`{name}` names `{forbidden}`: an unordered map in the record graph is the one \
+                 thing that could make `serde_json::to_value` fail, which `to_value` would turn \
+                 into a `Null` `run_step.trim_record`"
+            );
+        }
     }
 }
