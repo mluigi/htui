@@ -72,6 +72,9 @@ pub struct QdrantSection {
     snapshot: Option<QdrantSnapshot>,
     unavailable: Option<String>,
     busy: Option<&'static str>,
+    /// An `r` re-read is out. The worker answers in order, and a newer read supersedes an older one
+    /// at the app's staleness gate, so the next snapshot is that read's answer, never a write's.
+    read_out: bool,
     opened_for_empty: bool,
     cursor: usize,
 }
@@ -100,6 +103,7 @@ impl QdrantSection {
             snapshot: None,
             unavailable: None,
             busy: None,
+            read_out: false,
             opened_for_empty: false,
             cursor: 0,
         }
@@ -114,7 +118,8 @@ impl QdrantSection {
     }
 
     fn move_cursor(&mut self, down: bool) {
-        if self.blocked() {
+        // Moving the cursor is not a write, so a write in flight does not stop it.
+        if self.snapshot.is_none() || self.unavailable.is_some() {
             return;
         }
         if down {
@@ -124,8 +129,14 @@ impl QdrantSection {
         }
     }
 
-    fn blocked(&self) -> bool {
-        self.busy.is_some() || self.unavailable.is_some() || self.snapshot.is_none()
+    /// Whether a key that opens an editor or a question is refused right now. A write in flight
+    /// says so, as the Connection section's does; `r` is deliberately not on this path.
+    fn blocked(&mut self) -> bool {
+        if let Some(busy) = self.busy {
+            self.refuse(format!("`{busy}` is still in flight"));
+            return true;
+        }
+        self.unavailable.is_some() || self.snapshot.is_none()
     }
 
     fn open_edit(&mut self) {
@@ -178,13 +189,14 @@ impl QdrantSection {
                         return Handled::Consumed;
                     }
                     self.mode = Mode::Browse;
-                    ctx.request(StoreRequest::SetQdrantUrl(url));
+                    self.send(StoreRequest::SetQdrantUrl(url), ctx);
                 }
                 if let Some(key_text) = key_to_submit {
                     self.mode = Mode::Browse;
-                    ctx.request(StoreRequest::SetQdrantApiKey(zeroize::Zeroizing::new(
-                        key_text,
-                    )));
+                    self.send(
+                        StoreRequest::SetQdrantApiKey(zeroize::Zeroizing::new(key_text)),
+                        ctx,
+                    );
                 }
                 Handled::Consumed
             }
@@ -200,7 +212,7 @@ impl QdrantSection {
             Mode::ConfirmClear => match key.code {
                 KeyCode::Char('y') => {
                     self.mode = Mode::Browse;
-                    ctx.request(StoreRequest::ClearQdrantSettings);
+                    self.send(StoreRequest::ClearQdrantSettings, ctx);
                 }
                 KeyCode::Char('n') | KeyCode::Esc => self.mode = Mode::Browse,
                 _ => {}
@@ -208,6 +220,14 @@ impl QdrantSection {
             _ => return Handled::Pass,
         }
         Handled::Consumed
+    }
+
+    /// Sends one write and remembers its name until the reply, so `on_snapshot` can say what it
+    /// did and a failure lands on this section (the Connection section's `send`).
+    fn send(&mut self, request: StoreRequest, ctx: &Ctx<'_>) {
+        self.busy = Some(request.name());
+        self.notice = None;
+        ctx.request(request);
     }
 
     fn hint_text(&self) -> String {
@@ -243,8 +263,18 @@ impl QdrantSection {
         self.notice = Some(Notice::Error(text));
     }
 
+    /// A fresh snapshot, and the write that asked for it, if any, says what it did.
+    ///
+    /// A `Qdrant` reply names no request, so attribution is by order. A snapshot that lands while
+    /// an `r` re-read is out answers that read and leaves `busy` alone, so a reload sent just before
+    /// a write can never report the write as stored or cleared before it has run. A write sent
+    /// before the `r` answers first, so its notice waits for the read's snapshot and is then true.
     fn on_snapshot(&mut self, snapshot: &QdrantSnapshot) {
-        let write = self.busy.take();
+        let write = if std::mem::take(&mut self.read_out) {
+            None
+        } else {
+            self.busy.take()
+        };
         self.unavailable = None;
         self.snapshot = Some(snapshot.clone());
 
@@ -339,7 +369,13 @@ impl SettingsSection for QdrantSection {
                 self.move_cursor(false);
                 Handled::Consumed
             }
-            KeyCode::Char('r') => Handled::Pass,
+            // A re-read, never refused: it is how the unavailable state recovers (MOD-63). It sets
+            // no `busy`, like the Connection section's `r`.
+            KeyCode::Char('r') => {
+                self.read_out = true;
+                ctx.request(StoreRequest::QdrantInfo);
+                Handled::Consumed
+            }
             _ => Handled::Pass,
         }
     }
@@ -352,6 +388,7 @@ impl SettingsSection for QdrantSection {
                 self.busy = None;
                 self.refuse(message.clone());
             } else if *request == "qdrant_info" {
+                self.read_out = false;
                 self.unavailable = Some(message.clone());
             }
         }

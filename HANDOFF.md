@@ -20,23 +20,12 @@ and document points carry `item.resolution`, and `htui --search-items --decision
 closed as done, concluded or rejected (maintainer). The collection is now `htui_concepts_v2`, so the
 first `--index-items` after upgrading rebuilds everything; `R-STO-8` was amended in place. It
 minted **MOD-64** (concepts search in the TUI).
-Before it, **MOD-62 was decided** (`docs/decisions/mod/mod-62.md`): a
-verify command keeps htui's process environment unchanged (plan D30), and PR #20's allowlist was
-closed unmerged. The agent it checks already runs with that same environment, so an allowlist on the
-verifier alone hid nothing and broke real verifiers. The rule that remains sits on **MOD-10**:
-resolved secrets in the agent's `SessionSpec.env` must never be handed to the verifier.
-The same day, **MOD-9 milestone 4 landed** (SKILL.md import, PR #21; see MOD-9 below), and two
-security fixes merged without an item: PR #16 pins the ACP session's file access to its directory
-(path traversal), and PR #19 bounds `.gitignore` reads and skips non-regular files in the excerpt walk.
-Before it, **MOD-32 was done** (`docs/decisions/mod/mod-32.md`): the
-`run_step.trim_record` write is now scrubbed whole — `TrimRecord::to_value` takes a `&dyn Scrubber`,
-returns `Result<Value, Unmasked>`, and all three engine call sites go through it, so a
-credential-shaped record string fails the step before any session starts. The guarantee is
-field-agnostic because the defect *was* an enumeration; `template.name`, `PromptSpec.notes` and the
-`excerpts` audit's `roots[].repo` / `provider_set[]` were all unmasked. The masking half is still
-inert on the run path (the engine's secret list is empty) — that is **MOD-61**, opened at the
-review gate. The store is still not the enforcement point: it will accept an unscrubbed
-`trim_record` from any non-engine caller.
+Before it, **MOD-52 was done** (`docs/decisions/mod/mod-52.md`): `ctrl-c`
+quits htui from anywhere, bound globally and on the overlay wildcard, so it works over the modal
+switcher and inside a half-typed field. Making the keys configurable is **ANA-26**.
+Before it, **MOD-63 was done** (`docs/decisions/mod/mod-63.md`): `r` in
+Settings › Qdrant re-reads the keyring, so the unavailable state recovers in place, and the section's
+writes now set `busy`, so their stored/cleared notices and in-flight hint finally show.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -144,6 +133,27 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   automatically. The fit is deterministic arithmetic over rows, so it is allowed under `R-ID-6`.
   Judge choice itself is out of scope: ANA-21 §2.2 established the judge is never asked of the
   selector, and MOD-36 owns the judge-identity hardening.
+- [ ] **ANA-26 - Configurable hotkeys** (maintainer-requested 2026-09-29, during MOD-52;
+  `docs/decisions/mod/mod-52.md`). `R-TUI-1`. The maintainer wants htui's hotkeys configurable.
+  Today only a thin table is data: `Keymap::default_global` (`crates/htui/src/keymap.rs`) holds the
+  global and overlay-wildcard bindings (`q`, `ctrl-c`, `Tab`, `1`..`9`, `?`, `Esc`, plus `w` from
+  `register_all`), and `KeyChord::parse` already reads spec strings such as `"ctrl-c"`. Every tab,
+  section and overlay key is a hard-coded `KeyCode` match in its own `on_key` (about 23 files under
+  `crates/htui/src/ui`), and the hint lines spell the keys as string constants (`HINT_*`, about 36),
+  so rebinding the table alone would leave those keys fixed and the hints wrong. Analyze and decide:
+  1. Scope: the global and overlay table only, or every tab and section key. The latter means
+     routing each `on_key` through named actions, and the shared letters (`e`, `c`, `r`, `j`/`k`
+     across the Settings sections) need one action name or several.
+  2. Where the bindings live and who owns them: a local file under the user's config dir, the
+     store's settings, or both with an override order. Per user, per box or per workspace, and how
+     R-TUI-1 and `docs/REQUIREMENTS.md` should say so (a requirement change needs the maintainer).
+  3. Validation at load: duplicate chords in one scope, a printable key bound where a text field
+     captures it, and whether `ctrl-c` quit may be unbound or is fixed (MOD-52 relies on every
+     capturing section passing `CONTROL` chords on).
+  4. How hints and the `?` help follow a rebinding, since both are generated from the table only
+     for the global scope today.
+  5. Prior art in other ratatui/crossterm TUIs (gitui, helix, yazi, lazygit's keybinding config).
+  Deliver a verdict and the `MOD-N` that implements it.
 
 ### Next features
 - [ ] **MOD-39 - Requirements tab and item traceability** (from ANA-11; MOD-38 done,
@@ -262,19 +272,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   is maintainer-only. Its write-up should carry the ANA-5 sections it touches.
   **Relates to ANA-16** (`docs/ANA-16.md` §5.3, §8): a container child box has its own hostname,
   distinct from its parent's (MOD-44), so the switch and the digest split also cover child boxes.
-- [ ] **MOD-61 - The run engine's scrubber masks nothing** (from the MOD-32 review gate).
-  `R-SEC-3`. MOD-32 made `TrimRecord::to_value` scrub the whole record before the write, and
-  `scrub` does two things: mask the resolved secrets, then fail closed on residue. Only the second
-  is live on the run path. The run engine builds its `MinimalScrubber` with an **empty** secret
-  list — `run_worker.rs:1253` and `:935` both pass `std::iter::empty::<String>()` — and `mask`
-  returns its input unchanged when the list is empty (`scrub.rs:119-121`). So the eight
-  `PREFIX_RULES` and the PEM marker fire, and a record string that merely *equals* a resolved
-  secret is still stored verbatim. The chat path does build a populated one, from `spec.env`
-  (`agent_worker.rs:3059`), but it never reaches `set_step_prompt`. Build the run engine's
-  scrubber from the run's resolved secrets the way the chat path does, so the masking half of
-  the pass is live everywhere. Not MOD-32's: that item fixed the call site, and it fixed the
-  residue half; this is the other half, inert for a reason that lives a layer above it. Found
-  2026-09-28.
 - [ ] **MOD-28 - rataflow execution view (from ANA-12).** Add `rataflow` dependency, implement `ExecutionGraph` widget mapping `RunStep` and `SessionEvent` lists to a node graph, add view toggle to Runs tab (`R-TUI-4`), and wire mouse/keyboard events for standard run actions.
 - [ ] **MOD-26 - Declarative Agent Personas (from ANA-13).** Build Markdown/Frontmatter parser in `htui-core`, discover from `~/.config/htui/agents.d/`, map to `SessionSpec` overrides (model, tools).
   **Relates to ANA-16** (`docs/ANA-16.md` §6.2, §8): personas should be registry rows rather than a
@@ -330,12 +327,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   `.claude/plans/mod-7-box-settings-section.plan.md`. Unblocked: MOD-7 is done
   (`docs/decisions/mod/mod-7.md`); its milestone 2 landed
   (the Boxes section, `crates/htui/src/ui/tabs/settings/boxes.rs`, and `crate::box_settings`).
-- [ ] **MOD-52 - `ctrl-c` does not quit `htui`** (from MOD-7 milestone 2 plan fact-check). `R-TUI-1`.
-  Crossterm's raw mode clears `ISIG`, so `ctrl-c` raises no `SIGINT`, and no `ctrl-` chord is bound:
-  `Keymap::default_global` (`crates/htui/src/keymap.rs:198-238`) binds `q`, `Tab`, `BackTab`,
-  `1`-`9`, `?` and the overlay `Esc`. Sections nevertheless pass `CONTROL` chords through "so `ctrl-c`
-  still quits", and several comments say it quits. Decide whether `ctrl-c` should quit (bind it
-  globally, respecting text-input capture) or not (correct the comments). Found 2026-09-26.
 - [ ] **MOD-9 - Skill library and templates.** `R-SKL-1..4`, `R-PRM-4`, `R-TUI-7`. Versioned skills,
   project and phase bindings, template rows, Skills tab editor with version diff, import of
   existing skill markdown files. Per ANA-5 (`docs/ANA-5.md` §4.1, §5.4): template save validation
@@ -429,8 +420,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   fail-closed `MinimalScrubber` this item replaces *behind an unchanged trait*. Its call sites are
   already fail-closed on every digested byte (MOD-2 D100 as corrected by that milestone's CRITICAL);
   the one call site that was **missing** was **MOD-32**'s, now done
-  (`docs/decisions/mod/mod-32.md`). **MOD-61** builds the run engine's scrubber from the run's
-  resolved secrets, which this item supplies, so the two land together or MOD-61 goes first. **MOD-4 wired no secrets** (done,
+  (`docs/decisions/mod/mod-32.md`). **MOD-4 wired no secrets** (done,
   `docs/decisions/mod/mod-4.md`, plan D176): `htui-orch`'s `drive_once` builds every graph
   `SessionSpec` with an empty `env`, and its comment names this item as the one that fills it.
   **Relates to ANA-16** (`docs/ANA-16.md` §8, §9): open question on where secrets resolve, on the
@@ -439,6 +429,15 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   with resolved secrets, that map must never reach `htui-orch/src/verify.rs`. The verifier keeps
   htui's own process environment (plan D30) and scrubs its output. A test pinning that the verify
   child does not see a resolved secret belongs to this item.
+  **Run engine scrubber (MOD-61, folded in 2026-09-29):** the run engine's `MinimalScrubber` is
+  built with an empty secret list (`crates/htui/src/run_worker.rs:1253`), so `scrub`'s masking half
+  is inert on the run path and a `trim_record` string equal to a secret would be stored verbatim.
+  When this item resolves a run's secrets, build that scrubber from the **same** map that fills the
+  step's `SessionSpec.env` (`htui-orch` `drive_once`, `engine.rs:5349`), so the two cannot drift;
+  the chat path already does this from `spec.env` (`agent_worker.rs:3176`) and needs the same map.
+  The verifier's scrubber (`run_worker.rs:935`) stays pattern-only: handing it the map would put
+  the resolved secrets inside `verify.rs`. A test pinning that a record string equal to a resolved
+  secret is stored as `[REDACTED]` belongs to this item.
 - [ ] **MOD-11 - htui MCP server.** `R-MCP-1..4`. Tools `item_link`, `item_status`,
   `document_write`, `note_add`, `box_profile`, `command_run`; per-step scoping; command queue with
   per-box class limits; per-phase exposure. Per ANA-2 (`docs/ANA-2.md` §4.2, §8, risk 11):
@@ -758,13 +757,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   preferred. The three crates are not in `Cargo.lock`, so the plan owns that dependency decision.
   Not blocked. Its in-app widget draws through `ui::cells` (MOD-54, done:
   `docs/decisions/mod/mod-54.md`); the rest of the display-width work is MOD-60.
-- [ ] **MOD-63 - Settings › Qdrant `r` does nothing** (from the README rewrite, 2026-09-29).
-  `R-TUI-8`. The section's hints advertise `r reload` (`HINT_BROWSE` and `HINT_NO_SNAPSHOT`,
-  `crates/htui/src/ui/tabs/settings/qdrant.rs:24-25`), but `on_key` passes `r` on (`:342`) and no
-  tab or global binding takes it, so the key does nothing. Every other Settings section reloads on
-  `r`. It bites hardest in the unavailable state, whose only hint is `r reload`: the section cannot
-  recover without leaving it. Make `r` re-request `StoreRequest::QdrantInfo` (the section's
-  `wants_requests`), and pin it with a settings test.
 - [ ] **MOD-64 - Concepts search in the TUI** (from MOD-50, 2026-09-29). `R-STO-8`, `R-TUI-2`.
   The concepts index is reachable only from the command line today (`htui --index-items`,
   `htui --search-items [--decisions]`, `crates/htui/src/concepts.rs`); inside the TUI, Qdrant is
@@ -811,7 +803,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 40 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-61 run scrubber masks nothing, MOD-63 Qdrant `r` reload, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 4 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-26 configurable hotkeys) |
+| MOD-N   | 37 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-6 Runs pane approve doc)                |
 | TOOL-N  | 0 |
