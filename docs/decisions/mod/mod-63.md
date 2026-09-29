@@ -45,10 +45,20 @@ close-out commit:
 - `blocked()` now refuses `e` and `c` by name (`` `clear_qdrant_settings` is still in flight ``),
   the way the Connection section does. Before, it refused silently.
 - `j`/`k` no longer wait for a write, because moving the cursor is not a write.
-- `on_snapshot` now documents the attribution trade it shares with Connection. A reply names no
-  request, so an `r` sent just before a write can land first and be taken as the write's answer.
+- `on_snapshot`'s attribution is documented.
 
 A third test, `a_qdrant_write_in_flight_refuses_e_and_c_but_not_r`, pins that behaviour.
+
+CodeRabbit then flagged the attribution itself (medium, security). A `Qdrant` reply names no
+request, so an `r` sent just before a write could land first and be taken as the write's answer. The
+section would then say the settings were stored or **cleared** before the write had run, and it
+kept saying so if the write then failed. The Connection section makes the same trade. Tagging the
+reply with its request would mean changing `store_worker.rs`, which MOD-40 owns, so the fix stays
+in the section instead: `r` sets `read_out`, and a snapshot that lands while it is set answers the
+read and leaves `busy` alone. This is sound because the worker answers in order and the app's
+staleness gate drops a superseded read. A write sent before the `r` answers first, so its notice
+waits for the read's snapshot and is true when shown. A fourth test,
+`a_qdrant_reload_just_before_a_write_is_not_taken_as_its_answer`, pins it and fails without the fix.
 
 One nit stays as is: the tests use a small `requests_of` helper rather than matching
 `bench.drained()` inline.

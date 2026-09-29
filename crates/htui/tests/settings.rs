@@ -2796,3 +2796,51 @@ async fn a_qdrant_write_in_flight_refuses_e_and_c_but_not_r() {
         "one read, with a write still out"
     );
 }
+
+/// A reload sent just before a write lands first; it answers the reload, so the section never
+/// says the settings were cleared before the clear has run, and the clear's refusal still lands.
+#[tokio::test]
+async fn a_qdrant_reload_just_before_a_write_is_not_taken_as_its_answer() {
+    let bench = SectionBench::new().await;
+    let mut section = QdrantSection::new();
+    bench.reply(&mut section, &StoreReply::Qdrant(qdrant_stored()));
+    bench.key(&mut section, "r");
+    bench.key(&mut section, "c");
+    bench.key(&mut section, "y");
+    assert!(
+        matches!(
+            requests_of(&bench).as_slice(),
+            [StoreRequest::QdrantInfo, StoreRequest::ClearQdrantSettings]
+        ),
+        "the read, then the clear"
+    );
+
+    // The read's pre-clear snapshot comes back first.
+    bench.reply(&mut section, &StoreReply::Qdrant(qdrant_stored()));
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        !rendered.contains("the Qdrant settings are gone from the keyring"),
+        "the read is not the clear's answer: {rendered}"
+    );
+    assert!(
+        rendered.contains("clear_qdrant_settings in flight"),
+        "the clear is still out: {rendered}"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "clear_qdrant_settings",
+            message: "the keyring refused the delete".to_owned(),
+        },
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        rendered.contains("the keyring refused the delete"),
+        "the refusal lands on the section: {rendered}"
+    );
+    assert!(
+        !rendered.contains("the Qdrant settings are gone from the keyring"),
+        "{rendered}"
+    );
+}

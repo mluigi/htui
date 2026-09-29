@@ -72,6 +72,9 @@ pub struct QdrantSection {
     snapshot: Option<QdrantSnapshot>,
     unavailable: Option<String>,
     busy: Option<&'static str>,
+    /// An `r` re-read is out. The worker answers in order, and a newer read supersedes an older one
+    /// at the app's staleness gate, so the next snapshot is that read's answer, never a write's.
+    read_out: bool,
     opened_for_empty: bool,
     cursor: usize,
 }
@@ -100,6 +103,7 @@ impl QdrantSection {
             snapshot: None,
             unavailable: None,
             busy: None,
+            read_out: false,
             opened_for_empty: false,
             cursor: 0,
         }
@@ -261,11 +265,16 @@ impl QdrantSection {
 
     /// A fresh snapshot, and the write that asked for it, if any, says what it did.
     ///
-    /// `busy` is the whole of the attribution: a `Qdrant` reply names no request, the same trade
-    /// the Connection section makes. `r` sets no `busy`, so a reload sent just before a write can
-    /// land first and be taken as the write's answer (the worker answers in order).
+    /// A `Qdrant` reply names no request, so attribution is by order. A snapshot that lands while
+    /// an `r` re-read is out answers that read and leaves `busy` alone, so a reload sent just before
+    /// a write can never report the write as stored or cleared before it has run. A write sent
+    /// before the `r` answers first, so its notice waits for the read's snapshot and is then true.
     fn on_snapshot(&mut self, snapshot: &QdrantSnapshot) {
-        let write = self.busy.take();
+        let write = if std::mem::take(&mut self.read_out) {
+            None
+        } else {
+            self.busy.take()
+        };
         self.unavailable = None;
         self.snapshot = Some(snapshot.clone());
 
@@ -363,6 +372,7 @@ impl SettingsSection for QdrantSection {
             // A re-read, never refused: it is how the unavailable state recovers (MOD-63). It sets
             // no `busy`, like the Connection section's `r`.
             KeyCode::Char('r') => {
+                self.read_out = true;
                 ctx.request(StoreRequest::QdrantInfo);
                 Handled::Consumed
             }
@@ -378,6 +388,7 @@ impl SettingsSection for QdrantSection {
                 self.busy = None;
                 self.refuse(message.clone());
             } else if *request == "qdrant_info" {
+                self.read_out = false;
                 self.unavailable = Some(message.clone());
             }
         }
