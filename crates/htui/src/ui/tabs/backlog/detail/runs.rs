@@ -24,7 +24,11 @@
 //! | `c` | run | `CancelRun`, after a `y` |
 //! | `T` | run | a retry of the run's cleanup |
 //! | `u` / `R` | item | `Unblock` / `StartRun` |
-//! | `C` | item | close-out: the counts and a resolution picked with `←`/`→` (legal ones only), a `y`, then the item key typed back (D167, MOD-39 plan P13) |
+//! | `C` | item | close-out: the counts, a picked resolution, a `y`, the key typed back (D167) |
+//!
+//! At the close-out's counts `←`/`→` (and `h`/`l`) pick the resolution among the legal ones for
+//! the item's status (`Resolution::closes_from`), starting on `Resolution::default_for` (MOD-39
+//! plan P13).
 
 use core::cell::Cell;
 use htui_core::model::{

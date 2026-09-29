@@ -992,10 +992,24 @@ async fn close_out_is_one_transaction_on_postgres() {
 }
 
 /// MOD-39 plan P13 on Postgres: an `open` item with no run is closable now, and the engine's
-/// close-out lands the resolution the Runs pane's picker sends: `ANA-2` closes as `withdrawn`
-/// with one `summary` document, which `PgStore::close_out`'s own `closes_from` check accepts.
+/// close-out lands the picker's starting resolution: `ANA-2` closes as `withdrawn` with one
+/// `summary` document, which `PgStore::close_out`'s own `closes_from` check accepts.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_open_item_closes_as_withdrawn_on_postgres() {
+    closes_open_ana_2_as(Resolution::Withdrawn).await;
+}
+
+/// MOD-39 plan P13 on Postgres: a resolution picked away from the default is the one that lands.
+/// `rejected` is not what `close_out_enabled` answers for an `open` item, so an engine that
+/// closed with its own default instead of the command's resolution fails here.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_open_item_closes_as_the_picked_resolution_on_postgres() {
+    closes_open_ana_2_as(Resolution::Rejected).await;
+}
+
+/// Closes `ANA-2`, `open` with no run, as `resolution` through the shell, and checks the row and
+/// the one summary document Postgres holds afterwards.
+async fn closes_open_ana_2_as(resolution: Resolution) {
     let Some(mut stack) = Stack::new(None).await else {
         return;
     };
@@ -1010,12 +1024,7 @@ async fn an_open_item_closes_as_withdrawn_on_postgres() {
         "the fixture holds no summary"
     );
 
-    stack
-        .command(Command::CloseOut {
-            item,
-            resolution: Resolution::Withdrawn,
-        })
-        .await;
+    stack.command(Command::CloseOut { item, resolution }).await;
     assert_eq!(stack.take_status(), None, "the close-out was accepted");
     assert_eq!(
         stack.summaries(item).await.len(),
@@ -1024,7 +1033,7 @@ async fn an_open_item_closes_as_withdrawn_on_postgres() {
     );
     let closed = stack.item(item).await;
     assert_eq!(closed.status, Status::Closed);
-    assert_eq!(closed.resolution, Some(Resolution::Withdrawn));
+    assert_eq!(closed.resolution, Some(resolution));
     assert!(closed.closed_at.is_some(), "`closed_at` is set");
 
     stack.finish().await;
