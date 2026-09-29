@@ -326,6 +326,12 @@ impl App {
             .any(|((known, _), newest)| known == origin && *newest == seq)
     }
 
+    /// Forgets every staleness entry of `origin` (MOD-64 D240), so no reply to a request made before
+    /// this can pass [`App::is_fresh`] again.
+    pub(super) fn forget(&mut self, origin: &Origin) {
+        self.latest.retain(|(known, _), _| known != origin);
+    }
+
     /// Applies every action views emitted while the shell held them borrowed.
     ///
     /// `Action::Store` is stamped with `origin` here: that is why the action itself carries none.

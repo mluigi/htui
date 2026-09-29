@@ -11,6 +11,7 @@ use crate::app::state::{App, Ctx, EDITOR_NEEDS_A_TAB};
 use crate::connection::DsnState;
 use crate::run_worker::OrchRequest;
 use crate::store_worker::{Origin, ReplyEnvelope, StoreReply, StoreRequest};
+use crate::ui::overlay::{Overlay, OverlayId};
 use crate::ui::tabs::SettingsTab;
 use crate::ui::tabs::settings::ConnectionSection;
 
@@ -83,8 +84,34 @@ impl App {
                     tracing::warn!(overlay = %id, "no factory registered");
                 }
             }
-            OverlayAction::Close => self.overlays.pop(),
-            OverlayAction::CloseAll => self.overlays.clear(),
+            OverlayAction::Close => self.close_top_overlay(),
+            OverlayAction::CloseAll => self.close_every_overlay(),
+        }
+    }
+
+    /// Pops the top overlay and forgets its requests (MOD-64 D240): `latest` is keyed by origin, and
+    /// a later overlay under the same id would otherwise take a reply to one of this one's.
+    fn close_top_overlay(&mut self) {
+        let Some(id) = self.overlays.top().map(Overlay::id) else {
+            return;
+        };
+        self.overlays.pop();
+        self.forget_overlay(id);
+    }
+
+    /// Closes every overlay and forgets their requests (D240): `CloseAll` and a scope change.
+    fn close_every_overlay(&mut self) {
+        let ids: Vec<OverlayId> = self.overlays.iter().map(Overlay::id).collect();
+        self.overlays.clear();
+        for id in ids {
+            self.forget_overlay(id);
+        }
+    }
+
+    /// [`App::forget`] for `Origin::Overlay(id)`, unless an overlay under that id is still open.
+    fn forget_overlay(&mut self, id: OverlayId) {
+        if !self.overlays.iter().any(|open| open.id() == id) {
+            self.forget(&Origin::Overlay(id));
         }
     }
 
@@ -119,7 +146,7 @@ impl App {
         for tab in self.tabs.iter_mut() {
             tab.on_scope_change(&scope);
         }
-        self.overlays.clear();
+        self.close_every_overlay();
         self.activate_tab();
         self.dispatch(Origin::App, StoreRequest::ActiveRuns { scope });
     }
