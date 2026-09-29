@@ -11,19 +11,27 @@ rule wins.
    **When leasing is on, lease the ID.** On Linux, if `scripts/hr-mint --leasing` exits 0
    (always inside a sandbox; on the host once `scripts/hr up` has been used — nothing turns it
    off again), mint with `scripts/hr-mint --prefix <PREFIX> --title "<one-line title>"` instead of the
-   commands below. It runs the same `next-item-id.sh` over this tree and returns the higher of
-   that and the highest ID of the prefix already leased + 1, so parallel runs never share an ID;
-   the owned-ID rule below still decides the floor and a lease can only raise it (law:
+   commands below. It runs the same `next-item-id.sh` over this tree — and, inside a sandbox,
+   over the read-only host tree at `/host/htui` too — and returns the highest of those and the
+   highest ID of the prefix already leased + 1, so parallel runs never share an ID; the owned-ID
+   rule below still decides the floor and every other source can only raise it (law:
    `workflow-docs.md`, "Lease raise"). Stdout is the
-   bare ID. Stderr says how it was reached —
-   `hr-mint: leased MOD-6 for hr/MOD-65 (tree next MOD-6, lease floor none)` — and, under
+   bare ID. Stderr says how it was reached — in a sandbox
+   `hr-mint: leased MOD-6 for hr/MOD-65 (tree next MOD-6, host next MOD-6, lease floor none)`
+   (`host next unavailable` after a `hr-mint: host tree … not readable` note or a
+   `hr-mint: warning: host tree mint failed …`; neither blocks), on the host the same without
+   `host next` — and, under
    `hr-mint: other MOD leases in the last 7 days - ask the maintainer before filing if one is the same problem:`,
    lists other leases for the prefix with their titles. If one looks like the same problem, ask
    the maintainer before filing; on reuse, cite that ID instead (a leased-but-unused ID is a
-   harmless gap). **Non-zero exit blocks the mint** exactly as below — `1` findings or an
-   unparseable lease file, `2` usage, `3` lock timeout or state-dir I/O; never fall back to the
-   plain script while leasing is on, that is how two runs mint one ID. A `hr-mint: leasing off`
-   notice means the ID came from the tree alone. Otherwise:
+   harmless gap). **Non-zero exit blocks the mint** exactly as below — `1` findings, an
+   unparseable lease file, or a lease file missing while leasing is on (in a sandbox:
+   `hr-mint: in a sandbox (HR_SANDBOX=1) leasing is required, but there is no lease file at …`
+   or `… no state dir at …`; on the host: `hr-mint: lease file vanished: …`), `2` usage, `3`
+   lock timeout or state-dir I/O; never fall back to the plain script while leasing is on, that
+   is how two runs mint one ID. A missing lease file is the maintainer's to restore on the host
+   (`docs/hr-sandbox.md`); report it and stop. A `hr-mint: leasing off` notice — only on a host
+   that never ran `scripts/hr-mint --init` — means the ID came from the tree alone. Otherwise:
 
    ```
    bash .claude/skills/handoff-run/scripts/next-item-id.sh --prefix <PREFIX>   # macOS/Linux

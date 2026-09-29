@@ -69,12 +69,17 @@ When leasing is on (Linux: `scripts/hr-mint --leasing` exits 0 — always in a s
 `scripts/hr up` has been used), mint with
 `scripts/hr-mint --prefix <PREFIX> --title "<title>"` instead — except under `--dry-run`, which runs only the read-only
 report above and notes that the real mint is leased and may be higher. `hr-mint`'s stderr line
-(`hr-mint: leased <ID> for <owner> (tree next <ID>, lease floor <ID>|none)`) replaces `max open / archived` in the
-verdict's `ID mint:` field, and its sibling listing (`hr-mint: other <PREFIX> leases in the last 7 days - …`, one
-`<id>  <owner>  <ts>  <title>` row each) goes in the verdict too: a title that looks like the same problem is put to the
-maintainer before anything is written. A rejected verdict leaves the leased ID as a harmless gap. Non-zero exit blocks
-here as well (`1` findings / unparseable lease file, `2` usage, `3` lock or state-dir I/O) — never fall back to
-`next-item-id.sh` while leasing is on. Rules and lifecycle: `../handoff-run/references/lifecycle.md` P0.
+(`hr-mint: leased <ID> for <owner> (tree next <ID>, host next <ID>|unavailable, lease floor <ID>|none)`; the
+`host next` part only in a sandbox, where the read-only host tree `/host/htui` is a third raise-only source) replaces
+`max open / archived` in the verdict's `ID mint:` field, and its sibling listing
+(`hr-mint: other <PREFIX> leases in the last 7 days - …`, one `<id>  <owner>  <ts>  <title>` row each) goes in the
+verdict too: a title that looks like the same problem is put to the maintainer before anything is written. A rejected
+verdict leaves the leased ID as a harmless gap. Non-zero exit blocks here as well (`1` findings, unparseable lease file,
+or a lease file missing while leasing is on — `hr-mint: in a sandbox (HR_SANDBOX=1) leasing is required, but there is
+no lease file at …` or `hr-mint: lease file vanished: …`, which the maintainer resolves on the host; `2` usage; `3`
+lock or state-dir I/O) — never fall back to `next-item-id.sh` while leasing is on. A `hr-mint: leasing off` notice
+(only on a host that never ran `scripts/hr-mint --init`) means a plain tree mint. Rules and lifecycle:
+`../handoff-run/references/lifecycle.md` P0.
 
 The rule it implements (owned-ID method, `../handoff-run/references/lifecycle.md` P0): max over open checklist lines
 (`^- \[ \] \*\*PREFIX-N`) in `HANDOFF.md` **plus** the archive — index lines (`^- \*\*\[PREFIX-N\]`) in
@@ -102,7 +107,7 @@ Print, before any write:
 Item:      <PREFIX-N> — <title>
 Prefix:    <chosen> (runner-up: <alt> — <one-line reason>, if ambiguous)
 ID mint:   max open <a> / archived <b> → <PREFIX-N>
-           (leasing on: leased <PREFIX-N> for <owner> (tree next …, lease floor …) + sibling rows, or none)
+           (leasing on: leased <PREFIX-N> for <owner> (tree next …[, host next …], lease floor …) + sibling rows, or none)
 Section:   <existing header matched | proposed new section from law table>
 Line:      <the drafted checklist line>
 Links:     <cross-link edits to make elsewhere, or none>

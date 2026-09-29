@@ -61,7 +61,8 @@ network source, no index service, no generated answer. A mint that cannot enumer
 deterministically is not a mint.
 
 **Lease raise (sandbox runs, TOOL-7).** While `scripts/hr-mint --leasing` succeeds, the minted ID is
-max(the tree mint above, highest leased ID for the prefix + 1). The lease file (`id-leases.tsv` in
+max(the tree mint above, highest leased ID for the prefix + 1); inside a sandbox the host tree
+(`/host/htui`, read-only) is also a raise-only input. The lease file (`id-leases.tsv` in
 the hr state dir) is local and flock-guarded, and it is enumerable like the tree. A lease can only
 raise the ID, never lower it; a leased ID that is never filed is a gap, never reused.
 

@@ -51,6 +51,10 @@ Use it instead of hand-editing `HANDOFF.md` — the ID mint and the recount are 
 go wrong by hand. The mint script is runnable on its own in any repo (`-All` for a per-prefix
 report) and **blocks on a non-zero exit**: an unparseable index line or a leftover legacy write-up
 section means the ID space cannot be trusted, and minting over it is how an ID gets reused.
+`scripts/hr-mint` blocks the same way, and also when leasing is on but its lease file is missing
+(`hr-mint: in a sandbox (HR_SANDBOX=1) leasing is required, but there is no lease file at …`, or
+on the host `hr-mint: lease file vanished: …`): restore it on the host (`docs/hr-sandbox.md`),
+never fall back to the plain script.
 
 ## `/handoff-run` — the spine
 

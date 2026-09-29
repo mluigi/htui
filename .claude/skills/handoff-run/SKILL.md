@@ -170,10 +170,15 @@ reviewer gate included — is unchanged.
 - **Steps 1 / 1.5 — the item is `$HR_ITEM`.** `next`, or a bare `/handoff-run`, resolves to it with no
   selection subagent. A different ID is asked, never followed silently: the item was chosen on the host
   by `scripts/hr up`, whose picker already hides items that have a run.
-- **New items (lifecycle P0) mint through `scripts/hr-mint`** — the lease file always exists in a
-  sandbox. Its sibling listing is how two runs avoid filing one problem under two IDs: when a listed
-  title looks like the same issue, ask the maintainer before filing; on reuse, cite the sibling's ID in
-  this run's phase note instead of creating the item.
+- **New items (lifecycle P0) mint through `scripts/hr-mint`** — leasing is always on in a sandbox, and
+  the mint also raises by the read-only host tree at `/host/htui`
+  (`hr-mint: leased <ID> for hr/<ITEM> (tree next <ID>, host next <ID>|unavailable, lease floor <ID>|none)`).
+  A missing lease file or state dir is exit `1`, never a tree-only mint
+  (`hr-mint: in a sandbox (HR_SANDBOX=1) leasing is required, but there is no lease file at /hr-state/id-leases.tsv - nothing done; the maintainer restores it on the host`):
+  stop and report it; never fall back to `next-item-id.sh`, and never run `scripts/hr-mint --init`
+  here (it is host-only and refuses). Its sibling listing is how two runs avoid filing one problem
+  under two IDs: when a listed title looks like the same issue, ask the maintainer before filing; on
+  reuse, cite the sibling's ID in this run's phase note instead of creating the item.
 - **Database** — `psql -h localhost -p 5439 -U postgres` (trust auth, no password).
   `HTUI_TEST_DATABASE_URL` and `HTUI_TEST_QDRANT_URL` are already set. There is no `docker` here: a
   recipe that says `docker exec htui-postgres psql …` becomes the same `psql` command against
