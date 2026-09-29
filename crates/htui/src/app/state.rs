@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use std::cell::RefCell;
 use tokio::sync::mpsc;
 
-use crate::app::action::{Action, Handled};
+use crate::app::action::{Action, Handled, RevealKind};
 use crate::editor::{ExternalEdit, ExternalEditOutcome};
 use crate::keymap::{KeyChord, KeyScope, Keymap};
 use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
@@ -182,6 +182,10 @@ pub struct App {
     /// it, and the shell must not name a concrete one to do so. `None` means this build can
     /// replay nothing, which the status line says rather than the shell swallowing the key.
     pub replay_tab: Option<TabId>,
+    /// Which tab reveals which kind of entity (MOD-64 D235). Set by
+    /// [`register_all`](crate::app::register_all), ids for the reason `replay_tab` is one: the shell
+    /// names no concrete view. A kind with no entry reveals nothing.
+    pub reveal_tabs: Vec<(RevealKind, TabId)>,
     /// Whether the migration prompt has already been offered this session.
     ///
     /// `StoreState` is re-read every fourth tick, so without this an answered `n` would re-open
@@ -238,6 +242,7 @@ impl App {
             startup_overlay: None,
             migration_overlay: None,
             replay_tab: None,
+            reveal_tabs: Vec::new(),
             migration_prompt_shown: false,
             below_target_shown: false,
             connection_redirect_done: false,
@@ -326,8 +331,8 @@ impl App {
             .any(|((known, _), newest)| known == origin && *newest == seq)
     }
 
-    /// Forgets every staleness entry of `origin` (MOD-64 D240), so no reply to a request made before
-    /// this can pass [`App::is_fresh`] again.
+    /// Forgets every staleness entry of `origin` (MOD-64 D240), so no reply to a request made
+    /// before this can pass [`App::is_fresh`] again.
     pub(super) fn forget(&mut self, origin: &Origin) {
         self.latest.retain(|(known, _), _| known != origin);
     }

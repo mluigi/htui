@@ -11,13 +11,13 @@ use htui_core::model::{ItemFilter, ItemId, ItemSummary, ProjectId, Scope};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 
-use crate::app::{Ctx, Handled};
+use crate::app::{Action, Ctx, Handled, RevealTarget};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::backlog::detail::{
     BodyTab, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab, RunsTab,
 };
 use crate::ui::tabs::backlog::list::{ListView, Selection};
-use crate::ui::tabs::registry::{Tab, TabId};
+use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Width of the list pane, as a percentage of the body region.
@@ -46,6 +46,9 @@ pub struct BacklogTab {
     selected: Option<Selection>,
     /// Body, Runs, Graph, Docs, Notes, Prompt, Reqs, in that order.
     detail: DetailRegistry,
+    /// A reveal waiting for the next `Items` reply (MOD-64 D235), with the key its miss is
+    /// reported by.
+    pending_reveal: Option<(ItemId, String)>,
 }
 
 impl Default for BacklogTab {
@@ -75,6 +78,7 @@ impl BacklogTab {
             folded: Vec::new(),
             selected: None,
             detail,
+            pending_reveal: None,
         }
     }
 
@@ -268,6 +272,10 @@ impl Tab for BacklogTab {
             ctx,
         );
     }
+
+    fn reveal(&mut self, _target: &RevealTarget, _ctx: &mut Ctx<'_>) -> bool {
+        todo!("MOD-64 D235")
+    }
 }
 
 /// Splits the body region into the list pane and the detail pane.
@@ -277,6 +285,12 @@ fn panes(area: Rect) -> [Rect; 2] {
         Constraint::Percentage(DETAIL_PERCENT),
     ])
     .areas(area)
+}
+
+/// The Backlog's sentence for a reveal of an item this workspace does not hold (MOD-64 D235, F5).
+#[must_use]
+pub fn not_in_this_backlog(key: &str) -> String {
+    format!("{key} is not in this workspace's backlog")
 }
 
 #[cfg(test)]
@@ -362,6 +376,7 @@ mod tests {
             folded: Vec::new(),
             selected: Some(first),
             detail,
+            pending_reveal: None,
         };
 
         let (top_bar, keymap, theme, emit) = (

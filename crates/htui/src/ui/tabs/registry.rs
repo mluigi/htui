@@ -11,7 +11,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{Ctx, Handled};
+use crate::app::{Ctx, Handled, RevealTarget};
 use crate::editor::ExternalEditOutcome;
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
@@ -21,6 +21,9 @@ use crossterm::event::KeyEvent;
 /// Stable identity of a tab. The string is also the key of its [`KeyScope`](crate::keymap::KeyScope).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TabId(pub &'static str);
+
+/// What a tab says when a reveal arrives over a field the user is typing in (MOD-64 D252).
+pub const CLOSE_THE_FIELD_FIRST: &str = "close the open field (Esc) first, then open the hit again";
 
 impl core::fmt::Display for TabId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -61,6 +64,13 @@ pub trait Tab {
     /// The `$EDITOR` handoff this tab asked for came back (MOD-9 D10). Defaulted, the trait's
     /// second default after `focus_section`, so no other tab changes.
     fn on_external_edit(&mut self, _outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {}
+    /// Selects `target` (MOD-64 D235): unfold or clear what hides it, move the cursor, read its
+    /// detail; or, when this tab has not loaded it, keep it until the next list reply. `false` when
+    /// this tab shows no such thing — every tab but Backlog and Requirements, which is what the
+    /// default says. The trait's third default, after `focus_section` and `on_external_edit`.
+    fn reveal(&mut self, _target: &RevealTarget, _ctx: &mut Ctx<'_>) -> bool {
+        false
+    }
 }
 
 /// Every registered tab, in registration order, plus which one is active.

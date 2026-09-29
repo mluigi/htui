@@ -6,7 +6,7 @@
 use htui_core::model::{RunId, Scope, StepId, WorkspaceId, WorkspaceSummary};
 use htui_orch::Command;
 
-use crate::app::action::{Action, OverlayAction, TabAction};
+use crate::app::action::{Action, OverlayAction, RevealTarget, TabAction};
 use crate::app::state::{App, Ctx, EDITOR_NEEDS_A_TAB};
 use crate::connection::DsnState;
 use crate::run_worker::OrchRequest;
@@ -30,6 +30,7 @@ impl App {
             Action::SetScope { workspace } => self.set_scope(workspace),
             Action::Replay { step_id } => self.replay(step_id),
             Action::Promote { run, step } => self.promote(run, step),
+            Action::Reveal(target) => self.reveal(&target),
             // The unstamped path (`Origin::App`, or a keymap binding): only a tab can open the
             // editor, because only a tab can be handed the outcome (MOD-9 D10).
             Action::EditExternally(_) => self.status = Some(EDITOR_NEEDS_A_TAB.to_owned()),
@@ -89,8 +90,8 @@ impl App {
         }
     }
 
-    /// Pops the top overlay and forgets its requests (MOD-64 D240): `latest` is keyed by origin, and
-    /// a later overlay under the same id would otherwise take a reply to one of this one's.
+    /// Pops the top overlay and forgets its requests (MOD-64 D240): `latest` is keyed by origin,
+    /// and a later overlay under the same id would otherwise take a reply to one of this one's.
     fn close_top_overlay(&mut self) {
         let Some(id) = self.overlays.top().map(Overlay::id) else {
             return;
@@ -187,6 +188,14 @@ impl App {
                 chat_open: false,
             })),
         );
+    }
+
+    /// Selects an entity in the tab registered for its kind (MOD-64 D235): focus that tab — which
+    /// re-sends its `wants_requests` if it was not the active one — then hand it the target with a
+    /// `Ctx` of its own, as `finish_external_edit` does, and drain what it emitted. A kind nothing
+    /// is registered for is a no-op, logged.
+    fn reveal(&mut self, _target: &RevealTarget) {
+        todo!("MOD-64 D235")
     }
 
     /// A reply came back: top bar first, then the staleness gate, then the addressee.
@@ -401,8 +410,8 @@ fn below_target_notice(target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Handled;
     use crate::app::state::EDITOR_NEEDS_A_TAB;
+    use crate::app::{Handled, RevealKind};
     use crate::editor::{ExternalEdit, ExternalEditOutcome};
     use crate::keymap::Keymap;
     use crate::store_worker::RequestEnvelope;
@@ -1094,9 +1103,95 @@ mod tests {
 
         app.update(Action::Overlay(OverlayAction::Close));
         app.update(answer(seq));
-        assert!(
-            matches!(answers.borrow().as_slice(), [StoreReply::Workspaces(listed)] if listed.is_empty()),
-            "the overlay below still waits for its answer"
+        let delivered = matches!(
+            answers.borrow().as_slice(),
+            [StoreReply::Workspaces(listed)] if listed.is_empty()
         );
+        assert!(delivered, "the overlay below still waits for its answer");
+    }
+
+    /// What a [`Revealer`] was handed.
+    type Revealed = Rc<RefCell<Vec<RevealTarget>>>;
+
+    /// A tab that reveals items: it records the target and asks for `Items`, as the Backlog does
+    /// for an item it has not loaded (MOD-64 D235). It asks for nothing on activation, so the
+    /// `Items` on the wire is the reveal's.
+    struct Revealer {
+        revealed: Revealed,
+    }
+
+    impl Revealer {
+        const ID: TabId = TabId("revealer");
+    }
+
+    impl Tab for Revealer {
+        fn id(&self) -> TabId {
+            Self::ID
+        }
+        fn title(&self) -> &str {
+            "Revealer"
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_scope_change(&mut self, _scope: &Scope) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+        fn reveal(&mut self, target: &RevealTarget, ctx: &mut Ctx<'_>) -> bool {
+            self.revealed.borrow_mut().push(target.clone());
+            ctx.request(StoreRequest::Items {
+                scope: ctx.scope.clone(),
+                filter: ItemFilter::default(),
+            });
+            true
+        }
+    }
+
+    /// A shell whose recorder tab is active, with a [`Revealer`] registered after it and named as
+    /// the tab that reveals items.
+    fn revealing_shell() -> (App, UnboundedReceiver<RequestEnvelope>, Revealed) {
+        let (mut app, mut rx, _seen) = shell();
+        let revealed = Revealed::default();
+        app.register_tab(Box::new(Revealer {
+            revealed: Rc::clone(&revealed),
+        }));
+        app.reveal_tabs = vec![(RevealKind::Item, Revealer::ID)];
+        while rx.try_recv().is_ok() {}
+        assert_eq!(app.tabs.active_id(), Some(Recorder::ID));
+        (app, rx, revealed)
+    }
+
+    #[test]
+    fn reveal_focuses_the_registered_tab_and_hands_it_the_target() {
+        let (mut app, mut rx, revealed) = revealing_shell();
+        let target = RevealTarget::Item {
+            id: ItemId::new(),
+            key: "FEAT-1".to_owned(),
+        };
+
+        app.update(Action::Reveal(target.clone()));
+        assert_eq!(app.tabs.active_id(), Some(Revealer::ID));
+        assert_eq!(*revealed.borrow(), vec![target]);
+        let asked = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|envelope| matches!(envelope.request, StoreRequest::Items { .. }))
+            .expect("what the tab emitted was drained");
+        assert_eq!(asked.origin, Origin::Tab(Revealer::ID));
+    }
+
+    #[test]
+    fn a_reveal_kind_no_tab_is_registered_for_does_nothing() {
+        let (mut app, mut rx, revealed) = revealing_shell();
+
+        app.update(Action::Reveal(RevealTarget::Requirement {
+            id: htui_core::model::RequirementId::new(),
+            key: "R-STO-1".to_owned(),
+        }));
+        assert_eq!(app.tabs.active_id(), Some(Recorder::ID));
+        assert_eq!(app.status, None);
+        assert!(revealed.borrow().is_empty());
+        assert!(rx.try_recv().is_err(), "nothing is asked for");
     }
 }
