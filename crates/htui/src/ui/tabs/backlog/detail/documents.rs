@@ -44,8 +44,9 @@ impl DetailTab for DocumentsTab {
         Self::ID
     }
 
+    /// "Docs", not "Documents": the seventh sub-tab needed the five columns (MOD-39 plan P12).
     fn title(&self) -> &str {
-        "Documents"
+        "Docs"
     }
 
     fn on_item_change(&mut self, item: Option<ItemId>) {
