@@ -978,6 +978,13 @@ purge_run() {
     parent="$(realpath -ms "${rd%/*}")"
     [[ "$parent" == "$ROOT_HDD" || "$parent" == "$ROOT_SSD" ]] \
         || die 1 "refusing to purge $item: $rd is not under HR_ROOT ($ROOT_HDD) or HR_SSD_ROOT ($ROOT_SSD)"
+    # The rm -rf below must hit the run dir itself: not through a symlink planted at its path, and
+    # its parent must physically be the root it claims (read_reg already pinned the spelling).
+    [[ -L "$rd" ]] && die 1 "refusing to purge $item: $rd is a symlink (to $(readlink -- "$rd" | no_ctl)) — inspect it by hand"
+    if [[ -e "$rd" ]]; then
+        [[ -d "$rd" && "$(realpath -e -- "${rd%/*}" 2>/dev/null)" == "$(realpath -e -- "$parent" 2>/dev/null)" ]] \
+            || die 1 "refusing to purge $item: $rd is not a directory directly under $parent"
+    fi
     spin "Removing $PROJECT" "${COMPOSE[@]}" down -v || die 3 "docker compose down -v failed for $PROJECT"
     if [[ -e "$rd" ]]; then
         rm -rf -- "$rd" 2>/dev/null || { chmod -R u+w -- "$rd" 2>/dev/null; rm -rf -- "$rd"; } \

@@ -51,7 +51,7 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     [[ $status -eq 1 ]]
     [[ ! -e "$HR_ROOT/MOD-99" && ! -e "$HR_ROOT/MOD-3" ]]
     [[ ! -e "$(reg_of MOD-99)" ]]
-    ! grep -q '^compose' "$HR_TEST_DOCKER_LOG"
+    ! grep -q '^compose' "$HR_TEST_DOCKER_LOG" || false
 }
 
 @test "3. up MOD-5: clone, branch, origin, excludes, copies, registry, compose call; host untouched" {
@@ -191,7 +191,7 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     [[ $status -eq 1 ]]
     [[ "$stderr" == *'run exists'* ]]
     [[ "$(git -C "$(src_of MOD-5)" rev-parse HEAD)" == "$tip" ]]
-    ! grep -q '^compose' "$HR_TEST_DOCKER_LOG"
+    ! grep -q '^compose' "$HR_TEST_DOCKER_LOG" || false
     run --separate-stderr "$HR" up MOD-5 --ssd
     [[ $status -eq 1 ]]
     [[ ! -e "$HR_SSD_ROOT/MOD-5" ]]
@@ -277,7 +277,7 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     : >"$HR_TEST_DOCKER_LOG"
     HR_TEST_DOCKER_RUNNING=hr-mod-5 run --separate-stderr "$HR" attach MOD-5 --shell </dev/null
     [[ $status -eq 0 ]]
-    ! grep -q ' up ' "$HR_TEST_DOCKER_LOG"
+    ! grep -q ' up ' "$HR_TEST_DOCKER_LOG" || false
     grep -qE -- " exec (-T )?-e TERM -e COLORTERM dev bash -l$" "$HR_TEST_DOCKER_LOG"
 
     run --separate-stderr "$HR" attach MOD-4
@@ -354,9 +354,9 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     [[ $status -eq 1 ]]
     [[ "$stderr" == *'DECISIONS.md'* ]]
     [[ "$(git -C "$HR_HOST_REPO" rev-parse HEAD)" == "$head" ]]
-    ! git -C "$HR_HOST_REPO" rev-parse -q --verify MERGE_HEAD
+    ! git -C "$HR_HOST_REPO" rev-parse -q --verify MERGE_HEAD || false
     # Refused before anything was written: not even the fetch.
-    ! git -C "$HR_HOST_REPO" rev-parse -q --verify refs/heads/hr/MOD-5
+    ! git -C "$HR_HOST_REPO" rev-parse -q --verify refs/heads/hr/MOD-5 || false
 }
 
 @test "13. collect --merge on a clean tree: 2-parent merge into the current branch, validator green" {
@@ -417,7 +417,7 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     run --separate-stderr "$HR" down MOD-5
     [[ $status -eq 0 ]]
     grep -qxF "compose -p hr-mod-5 -f $HR_COMPOSE_FILE down" "$HR_TEST_DOCKER_LOG"
-    ! grep -q -- ' -v' "$HR_TEST_DOCKER_LOG"
+    ! grep -q -- ' -v' "$HR_TEST_DOCKER_LOG" || false
     [[ -d "$(src_of MOD-5)/.git" && -f "$(reg_of MOD-5)" ]]
 }
 
@@ -427,7 +427,7 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     [[ $status -eq 1 ]]
     [[ "$stderr" == *'not collected'* ]]
     [[ -d "$(src_of MOD-5)/.git" && -f "$(reg_of MOD-5)" ]]
-    ! grep -q 'down' "$HR_TEST_DOCKER_LOG"
+    ! grep -q 'down' "$HR_TEST_DOCKER_LOG" || false
 
     "$HR" collect MOD-5 >/dev/null 2>&1
     printf 'dirty\n' >>"$(src_of MOD-5)/HANDOFF.md"
@@ -454,7 +454,7 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     [[ $status -eq 1 ]]
     [[ "$stderr" == *'needs confirmation'* ]]
     [[ -d "$(src_of MOD-5)/.git" && -f "$(reg_of MOD-5)" ]]
-    ! grep -q 'down' "$HR_TEST_DOCKER_LOG"
+    ! grep -q 'down' "$HR_TEST_DOCKER_LOG" || false
 }
 
 @test "19. down --purge --yes after collect: down -v, run dir + registry gone, leases untouched" {
@@ -466,7 +466,7 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     run --separate-stderr "$HR" down MOD-5 --purge --yes
     [[ $status -eq 0 ]]
     grep -qxF "compose -p hr-mod-5 -f $HR_COMPOSE_FILE down -v" "$HR_TEST_DOCKER_LOG"
-    ! grep -q 'volume rm' "$HR_TEST_DOCKER_LOG"
+    ! grep -q 'volume rm' "$HR_TEST_DOCKER_LOG" || false
     [[ ! -e "$HR_ROOT/MOD-5" && ! -e "$(reg_of MOD-5)" ]]
     [[ -d "$HR_ROOT" ]]
     cmp "$(lease_file)" "$BATS_TEST_TMPDIR/leases.before"
@@ -890,6 +890,44 @@ purge_state() {
     [[ $n -gt 0 && $fetches -eq 1 ]]
 }
 
+@test "33. the purge rm -rf guard: a run dir outside the roots, of another item, or a symlink is never deleted" {
+    mk_run MOD-4
+    mk_run MOD-5
+    local reg good="$BATS_TEST_TMPDIR/reg.good" canary="$BATS_TEST_TMPDIR/canary"
+    reg="$(reg_of MOD-5)"
+    cp "$reg" "$good"
+    mkdir -p "$canary" && : >"$canary/keep"
+
+    # Outside the roots / another item's dir: refused before anything runs (registry validation).
+    local rd
+    for rd in "$canary" "$HR_ROOT/MOD-4" "$HR_ROOT/../canary"; do
+        cp "$good" "$reg"
+        reg_set MOD-5 run_dir "$rd"
+        : >"$HR_TEST_DOCKER_LOG"
+        run --separate-stderr "$HR" down MOD-5 --purge --force --yes
+        [[ $status -eq 3 && "$stderr" == *'run_dir'* ]]
+        [[ -f "$canary/keep" && -d "$(src_of MOD-4)/.git" && -d "$(src_of MOD-5)/.git" ]]
+        ! grep -q . "$HR_TEST_DOCKER_LOG" || false
+    done
+    cp "$good" "$reg"
+
+    # The run dir swapped for a symlink: refused, neither the link nor its target touched.
+    mv "$HR_ROOT/MOD-5" "$BATS_TEST_TMPDIR/moved"
+    ln -s "$canary" "$HR_ROOT/MOD-5"
+    run --separate-stderr "$HR" down MOD-5 --purge --force --yes
+    [[ $status -eq 1 && "$stderr" == *'symlink'* ]]
+    [[ -L "$HR_ROOT/MOD-5" && -f "$canary/keep" && -f "$(reg_of MOD-5)" ]]
+    ! grep -q -- 'down -v' "$HR_TEST_DOCKER_LOG" || false
+    rm "$HR_ROOT/MOD-5"
+    mv "$BATS_TEST_TMPDIR/moved" "$HR_ROOT/MOD-5"
+
+    # Symlinks inside the clone are removed, not followed.
+    ln -s "$canary" "$(src_of MOD-5)/evil"
+    ln -s "$canary/keep" "$(src_of MOD-5)/evil-file"
+    run --separate-stderr "$HR" down MOD-5 --purge --force --yes
+    [[ $status -eq 0 && ! -e "$HR_ROOT/MOD-5" && -f "$canary/keep" && -d "$(src_of MOD-4)/.git" ]]
+}
+
 # ---------------------------------------------------------------------------------------------
 # Docker (real image and daemon; fixture host repo; run once: bats --filter-tags docker tests/hr/hr.bats)
 
@@ -919,7 +957,7 @@ purge_state() {
     done
     [[ $ok -eq 1 ]]
     [[ -z "$(dexec TOOL-9001 git config --global credential.helper || true)" ]]
-    ! dexec TOOL-9001 touch /host/htui/x
+    run ! dexec TOOL-9001 touch /host/htui/x
     [[ "$(dexec TOOL-9001 git -C "$HR_HOST_REPO" symbolic-ref --short HEAD)" == hr/TOOL-9001 ]]
     [[ "$(dexec TOOL-9001 git -C "$HR_HOST_REPO" remote get-url origin)" == /host/htui ]]
     dexec TOOL-9001 git -C "$HR_HOST_REPO" fetch -q origin
