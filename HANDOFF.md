@@ -778,6 +778,18 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   in a change that first pins which stop reason each shipped loop case reaches, because the fix can
   change that. Source: `.claude/plans/mod-4-orch-fanout.blueprint.md` F-B and §11, carried unchanged
   through milestones 5 and 6 (`docs/decisions/mod/mod-4.md`, "Carried").
+- [ ] **CLEAN-7 - Leftovers of the removed offline chat buffer** (from MOD-39, 2026-09-29).
+  `R-NF-3`. MOD-25 refused offline chats and the buffer machinery was deleted later; MOD-39 fixed
+  the comments (`docs/decisions/mod/mod-39.md`), which left code and text: the Settings rebuild
+  confirm still says "the pending/ buffer" survives (`ui/tabs/settings/connection.rs` ~140 and
+  ~996, asserted in `tests/connection.rs` and the `connection__confirm` snapshot);
+  `RefreshSettings::this_user` (`htui-store/src/cache/refresh.rs`) is set and never read;
+  `agent_worker.rs` `quota_latch_for` always answers `Some` and it and `project_caps_for` take an
+  unused `_writer`; `writer_label` still rides `StoreReply::ChatAccepted` and `ChatArgs` though the
+  Chat tab ignores it; and test names and messages still say upload or buffered
+  (`mem.rs` `a_chat_run_mints_the_two_rows_the_offline_upload_would`, `recorder.rs` ~1531,
+  `agent_worker.rs` ~5828/5976/7170, `chat_offline.rs`, `tests/cache.rs` `pending_event`).
+  No behaviour change.
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
@@ -797,5 +809,5 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 4 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-26 configurable hotkeys) |
 | MOD-N   | 35 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                              |
+| CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-7 offline-buffer leftovers)            |
 | TOOL-N  | 0 |
