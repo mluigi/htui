@@ -3675,6 +3675,176 @@ async fn finish_run_holds_the_item_while_another_run_is_live() {
     db.drop_db().await;
 }
 
+/// R-ORCH-10's claim-time check (MOD-7 milestone 3, D80, D81) and MOD-58 plan D3: a run aimed at
+/// another box is `NotClaimable` even when its item needs a tag the claiming box lacks, and the
+/// refusal writes nothing. `claim_run` decides claimability before the tag check, so an armed tag
+/// rule never gets a turn.
+///
+/// The second box is a real row, planted raw because no `WriteStore` method creates one (plan D1,
+/// D2), and `create_run` needs it to exist for the run's `target_box_id` foreign key. The untyped
+/// form keeps `.sqlx/` where it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_tags_run_aimed_at_another_box_is_not_claimable() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let other = BoxId::new();
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version) \
+         VALUES ($1, (SELECT id FROM app_user ORDER BY created_at, id LIMIT 1), 'elsewhere', \
+                 'linux', '', 'x86_64', '0.0.0')",
+    )
+    .bind(other.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("plant the second box");
+
+    let item = db
+        .store
+        .mint_item(NewItem {
+            required_tags: vec!["cuda".to_owned()],
+            ..race_item(ids::KIND_HTUI_FEAT, "needs a GPU toolchain")
+        })
+        .await
+        .expect("the mint lands")
+        .id;
+    // The tag rule has to be armed for this case to mean anything: without it the run would
+    // answer `NotClaimable` for the same reason whether or not the rule is ordered first.
+    assert_eq!(
+        db.store
+            .missing_tags(item, ids::BOX)
+            .await
+            .expect("the tags read back"),
+        vec!["cuda".to_owned()],
+        "the tag rule is armed: the claiming box probes rust/msvc/cmake and declares gpu"
+    );
+
+    let run = db
+        .store
+        .create_run(NewRun {
+            target_box_id: other,
+            ..race_run(item)
+        })
+        .await
+        .expect("the run is queued");
+    assert_eq!(
+        run.target_box_id, other,
+        "the run is aimed at the second box, so this cannot pass by aiming at `ids::BOX`"
+    );
+
+    let at = Utc::now();
+    let owner = uuid::Uuid::now_v7();
+    let until = at + TimeDelta::minutes(5);
+    assert_eq!(
+        db.store
+            .claim_run(run.id, ids::BOX, owner, at, until)
+            .await
+            .expect("the claim is answered"),
+        Claim::NotClaimable,
+        "a run aimed at another box is not claimable, and that outranks the tag rule"
+    );
+    assert_eq!(
+        db.store.run(run.id).await.expect("the run reads back"),
+        Some(run.clone()),
+        "the refusal wrote nothing to the run: not even the `MissingTags` failure row"
+    );
+    // `lease_owner` is a column the `Run` struct does not carry, so the row comparison above
+    // cannot see it: the refused branch has to be pinned through the CAS it would have gone
+    // through, which is `Ok(false)` when no lease owner matches.
+    assert!(
+        !db.store
+            .refresh_lease(run.id, owner, until)
+            .await
+            .expect("the lease refresh is answered"),
+        "the refusal took no lease"
+    );
+    assert_eq!(
+        db.store
+            .item(item)
+            .await
+            .expect("the item reads back")
+            .expect("it exists")
+            .status,
+        Status::Queued,
+        "the refusal wrote nothing to the item either: it is not blocked"
+    );
+
+    db.drop_db().await;
+}
+
+/// Blueprint D94: a run with no item has no tags to check, so the tag rule is never reached and
+/// the claim is admitted. The tag query joins through `run.item_id`, so a `NULL` one finds no row
+/// and `missing` stays empty.
+///
+/// The run is planted raw because `NewRun.item_id` is a non-optional `ItemId`, so `create_run`
+/// cannot mint this shape (plan D4). `repo_scope` is written out as an explicit empty array rather
+/// than left to the column's `'{}'` default, so a future migration moving that default cannot
+/// change what this case plants. An empty scope shares no repo (hazard H-10), so the live-rows
+/// query returns nothing and the claim cannot be refused for overlap - the tag rule is the only
+/// rule left, and the tag rule is what this case says is never reached.
+///
+/// It leans on the fixture box being free: nothing is `running` on `ids::BOX` when the case
+/// starts, so §4.7's slot rule admits the claim. The first slot is enough, but a fixture that
+/// started a run on the box would answer `SlotFull` and blame the tag rule.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_with_no_item_is_never_refused_for_tags() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let id = RunId::new();
+    let at = Utc::now();
+    assert_eq!(
+        db.store
+            .active_runs_on_box(ids::BOX)
+            .await
+            .expect("the slot count is answered"),
+        0,
+        "the precondition: the fixture box starts free, or this case would answer `SlotFull`"
+    );
+    sqlx::query(
+        "INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id, \
+         graph_snapshot, started_by, queued_at, repo_scope) \
+         VALUES ($1, $2, NULL, 'graph', 'manual', 'queued', $3, '{}'::jsonb, $4, $5, '{}'::uuid[])",
+    )
+    .bind(id.as_uuid())
+    .bind(ids::PROJECT_HTUI.as_uuid())
+    .bind(ids::BOX.as_uuid())
+    .bind(ids::USER.as_uuid())
+    .bind(at)
+    .execute(&db.pool)
+    .await
+    .expect("plant a queued run with no item");
+
+    let owner = uuid::Uuid::now_v7();
+    // `timestamptz` is microsecond-resolution, so the lease comes back truncated from the
+    // nanoseconds it was handed. `MemStore` keeps every digit, which is why the same assertion
+    // needs no truncation there; `ChatRunSpec::mint` truncates for the same reason.
+    let until = (at + TimeDelta::minutes(5)).trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    assert_eq!(
+        db.store
+            .claim_run(id, ids::BOX, owner, at, until)
+            .await
+            .expect("the claim is answered"),
+        Claim::Admitted,
+        "no item, no tags, no refusal: the tag rule is never reached"
+    );
+    let claimed = db
+        .store
+        .run(id)
+        .await
+        .expect("the run reads back")
+        .expect("it exists");
+    assert_eq!(claimed.status, RunStatus::Running);
+    assert_eq!(claimed.executing_box_id, Some(ids::BOX));
+    assert_eq!(
+        claimed.lease_expires_at,
+        Some(until),
+        "the admitted claim wrote the lease it was handed"
+    );
+
+    db.drop_db().await;
+}
+
 /// Plan D31's row against a real server: what `store::conformance`'s `verify_run_is_recorded`
 /// asserts of both stores, plus the two things only Postgres can answer.
 ///

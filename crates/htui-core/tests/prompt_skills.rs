@@ -125,7 +125,7 @@ fn a_missing_version_records_missing_version() {
     assert_eq!(choice.reason, ChoiceReason::MissingVersion);
     assert!(!choice.active);
     assert_eq!(
-        prompt.trim.to_value()["skill_choices"][1]["version"],
+        prompt.trim.to_value(&scrubber()).expect("plain data")["skill_choices"][1]["version"],
         serde_json::Value::Null,
         "D55: no version in force serialises `null`"
     );
@@ -209,7 +209,11 @@ fn choices_follow_the_collapse_order_and_carry_masked_names() {
         vec!["rust-style", "deploy-[REDACTED]"],
         "choices are in collapse order `(position, name bytes)`, not input order, and masked"
     );
-    let serialised = prompt.trim.to_value().to_string();
+    let serialised = prompt
+        .trim
+        .to_value(&scrubber())
+        .expect("plain data")
+        .to_string();
     assert!(!serialised.contains("s3cr3t"), "{serialised}");
 }
 

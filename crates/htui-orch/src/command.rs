@@ -485,7 +485,10 @@ pub enum EngineError {
     /// Stage 3 could not assemble the prompt.
     #[error(transparent)]
     Prompt(#[from] AssembleError),
-    /// Stage 4's recorder refused a write, or found scrub residue.
+    /// Scrub residue, or a refused write. **Two stages reach this variant**: stage 3, where
+    /// [`htui_core::prompt::TrimRecord::to_value`] refuses the record before it is persisted, and
+    /// stage 4, where the recorder refuses a payload. A reader of the run's failure reason cannot
+    /// tell them apart — the variant is `#[error(transparent)]` and both are the same rule.
     #[error(transparent)]
     Record(#[from] htui_agent::RecordError),
     /// The driver failed, or the session's stream closed before its `done`.

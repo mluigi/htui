@@ -1357,11 +1357,17 @@ async fn excerpts_for_drops_a_file_the_scrubber_refuses() {
 
 #[tokio::test]
 async fn excerpts_for_never_persists_a_note_naming_a_masked_path() {
-    // Review finding M-1. `select`'s own notes name `repo:path` as the reader listed it, and
-    // `trim_record.notes` is persisted unscrubbed. A file under a directory named after a known
-    // secret that the reader lists but cannot read — here, bytes that are not UTF-8 — would put
-    // the secret in the stored record. (An oversize file cannot reach this note through
-    // `FsRepoReader`: the walk's skip rule 5 never lists it, so it names nothing.)
+    // Review finding M-1. `select`'s own notes name `repo:path` as the reader listed it. A file
+    // under a directory named after a known secret that the reader lists but cannot read — here,
+    // bytes that are not UTF-8 — would have put the secret in the stored record.
+    //
+    // It no longer would: the record-wide pass ([`TrimRecord::to_value`], MOD-32) masks
+    // `trim_record.notes` before the write, and that is the first line of defence. This case is
+    // kept as the second, and for a narrower reason than safety — it pins the note's **wording**,
+    // that a withheld note reads as a withheld note rather than as "a file in repo
+    // `[REDACTED]` dropped", which names a value no reader can resolve. (An oversize file cannot
+    // reach this note through `FsRepoReader`: the walk's skip rule 5 never lists it, so it names
+    // nothing.)
     let secret = "hunter2hunter2";
     let dir = tempfile::tempdir().expect("a throwaway root");
     write(
