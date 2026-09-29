@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM skill_binding WHERE id = $1 AND updated_at = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a893986f0ffa8aa550a56a596458e7a56e0a2e144d52002febad4afa785550d7"
+}

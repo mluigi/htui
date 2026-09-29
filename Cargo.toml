@@ -52,6 +52,8 @@ zeroize            = "1.9"
 dirs               = "6"
 gethostname        = "1.1"
 sha2               = "0.10"
+# MOD-9 D72 (OQ-15): skill attachment globs. `log` off; its other deps are already locked.
+globset            = { version = "0.4.20", default-features = false }
 # MOD-7 D1: the box fingerprint, HMAC-SHA256 keyed by the OS machine identity. 0.12 because it
 # shares `digest 0.10` with `sha2` above and is already compiled on Linux (dbus-secret-service).
 hmac               = "0.12"

@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/skills.rs
+expression: frame
+---
+Platform · DESKTOP-HTUI · memory · 1 run
+ 1 Backlog  2 Skills  3 Settings  4 Chat
+ Skills │ Templates
+┌ attachments · tests ─────────────────────────────────────────────────────────────────────────────┐
+│  global                       —                                                                  │
+│* htui                         always · latest · pos 0                                            │
+│    analysis › research        —                                                                  │
+│    analysis › verdict         —                                                                  │
+│    bug › reproduce            —                                                                  │
+│    bug › fix                  —                                                                  │
+│    bug › review               —                                                                  │
+│    feature › prd              —                                                                  │
+│    feature › plan             —                                                                  │
+│    feature › implement        —                                                                  │
+│    feature › review           —                                                                  │
+│    refactor › plan            —                                                                  │
+│    refactor › implement       —                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ edit tests · htui ───────────────────────────────────────────────────────────────────────────────┐
+│activation  glob  (Space cycles)                                                                  │
+│pin         latest                                                                                │
+│position    0                                                                                     │
+│languages   rust                                                                                  │
+│globs       src/**                                                                                │
+│effective:  src/**, **/*.rs, **/Cargo.toml                                                        │
+│a bare glob matches in every repo of the project; <repo>:<glob> matches in that repo only         │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ Tab/Up/Down field  Space activation  Ctrl+R repo  Ctrl+S save  Esc cancel
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces

@@ -364,3 +364,9 @@ seed (at least `rust`, `c`, `cpp`, `python`, `typescript`, `javascript`, `go`, `
   milestone 3's matcher. `collapse` takes one list carrying `level` rather than three (plan D39).
   The choice rides a new top-level `skill_choices` in the trim record (§9's open point). The verdict
   is unchanged.
+- 2026-09-26 — **phasing amended by the maintainer** (MOD-9 milestone 3 plan,
+  `.claude/plans/mod-9-skills-editable.plan.md`, OQ-14/OQ-15): milestone 3 shipped the writers
+  (as `create_skill`, `update_skill`, `add_skill_version`, `set_skill_binding`), the attachments
+  pane, the language map and the glob matcher (`globset`, §8's open choice) used at save, and the
+  clone gap; glob *firing* over §5.4's F2 file set moved to a new MOD-9 PRD milestone 5. A `glob`
+  attachment records `no_path` until then. The verdict is unchanged.

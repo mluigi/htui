@@ -67,7 +67,7 @@ scored as failures.
    order and `R-AGT-8` stays literally true for the lead candidate and for every `fan_out = 1`
    phase.
 3. **Learned weights are spawned**, not left to the volume trigger — see `docs/decisions/ana/`
-   entry index for the follow-up, ANA-24.
+   entry index for the follow-up, ANA-25.
 4. **`sonnet` is not seeded as a key.** It has no independent analysis-kind figure, so it resolves
    through the `"*"` row at 65 on both axes. The only option the public record supports, and where
    §5.6's own rule lands when the honest input is "no figure".
@@ -85,7 +85,7 @@ scored as failures.
 9. **Refresh is a source registry, not a hardcoded fetcher.** The maintainer asked for fetched
    weights rather than hardcoded ones, and the verdict now does that for the axis where it is
    lawful to. See below.
-10. **Finding better sources is spawned** as ANA-23.
+10. **Finding better sources is spawned** as ANA-24.
 
 ## The refresh, and what the licence actually allows
 
@@ -107,7 +107,7 @@ Apache-2.0. So implement-axis weights are the maintainer's, and each is **dated*
 stops being offered for a slot instead of being quietly used. That turns §8's alias-drift
 mitigation from advisory into load-bearing.
 
-ANA-23 exists to close the implement-axis gap and to re-probe the blocked sources, since licences
+ANA-24 exists to close the implement-axis gap and to re-probe the blocked sources, since licences
 and endpoints move.
 
 ## What MOD-36 inherits
@@ -134,4 +134,4 @@ is `for_model` and no production code calls it).
 - `204c543` — re-read every benchmark figure from its primary source; four draft figures corrected,
   three seeded bases withdrawn, `docs/ANA-21-recheck-2026-09-28.md` added
 - close-out commit — the ten maintainer decisions, the source registry, the R-AGT-8 amendment, the
-  spawn of ANA-23 and ANA-24
+  spawn of ANA-24 and ANA-25
