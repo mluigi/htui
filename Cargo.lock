@@ -3051,6 +3051,7 @@ dependencies = [
  "sentry-anyhow",
  "sentry-tracing",
  "serde_json",
+ "shell-words",
  "similar 3.2.0",
  "sqlx",
  "tempfile",

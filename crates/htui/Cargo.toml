@@ -58,6 +58,8 @@ similar            = { workspace = true }
 # MOD-54 D1: display-cell width and grapheme boundaries for the text widgets.
 unicode-width         = { workspace = true }
 unicode-segmentation   = { workspace = true }
+# MOD-23 D236: the agent form's args field.
+shell-words            = { workspace = true }
 
 [dev-dependencies]
 # The chat tab's snapshots drive the fake transport through the same registry the ACP one uses.

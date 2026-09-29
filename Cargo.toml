@@ -128,6 +128,9 @@ gix                   = { version = "0.87.1", default-features = false, features
 # instance -- relaxing it to `0.1` would compile a second copy.
 unicode-width         = "0.2"
 unicode-segmentation   = "1.13"
+# MOD-23 D236 (OQ-2): the agent form's `args` field as POSIX shell words. 1.1.1 is already compiled
+# as a dependency of agent-client-protocol, so this promotes a transitive crate and adds nothing.
+shell-words            = "1.1"
 
 [workspace.lints.rust]
 unsafe_code                   = "forbid"
