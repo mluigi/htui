@@ -1158,8 +1158,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        7,
-        "the later applies migrate nothing"
+        8,
+        "the later applies migrate nothing (eight embedded migrations since MOD-9 milestone 5's \
+         0008_trim_record_v3.sql)"
     );
 
     db.drop_db().await;
