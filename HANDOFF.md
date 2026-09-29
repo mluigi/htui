@@ -157,6 +157,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   Index `requirement` rows into the concepts collection as `type = requirement` points (the type
   MOD-34 reserved), and add `item.resolution` to the item point payload so
   `htui --search-items --decisions` filters on resolution instead of meaning "done or closed".
+  The TUI side of the search is **MOD-64**.
 - [ ] **MOD-37 - Orchestrator hardening follow-ups** (from MOD-4). `R-ORCH-3`, `R-ORCH-5`,
   `R-ORCH-8`, `R-ORCH-9`, `R-TUI-4`, `R-HIS-1`, `R-NF-3`. MOD-4 closed with these risks carried and
   no other item owns them. Each is small, known and recorded; none blocks a manual run today. Pick
@@ -769,6 +770,17 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   `r`. It bites hardest in the unavailable state, whose only hint is `r reload`: the section cannot
   recover without leaving it. Make `r` re-request `StoreRequest::QdrantInfo` (the section's
   `wants_requests`), and pin it with a settings test.
+- [ ] **MOD-64 - Concepts search in the TUI** (from MOD-50, 2026-09-29). `R-STO-8`, `R-TUI-2`.
+  The concepts index is reachable only from the command line today (`htui --index-items`,
+  `htui --search-items [--decisions]`, `crates/htui/src/concepts.rs`); inside the TUI, Qdrant is
+  only a Settings section. Add a search overlay: free text, scoped to the selected project or all,
+  a decisions toggle, and hits listed as `concepts::format_hit` prints them. Enter on an item or
+  document hit selects that item in the Backlog; a requirement hit opens it in MOD-39's
+  Requirements tab once that exists. Embedding the query loads the model synchronously
+  (`FastEmbedder::new`, MOD-34 review), so the search runs off the UI thread, and a missing or
+  unreachable Qdrant is an inline error that affects nothing else (`R-STO-8`). Whether the TUI also
+  offers a re-index action, or leaves that to MOD-41's background sync, is this item's call. Best
+  after MOD-50 (requirement points and the resolution filter) and MOD-39.
 
 ### Deferred backlog
 
@@ -803,6 +815,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 40 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-61 run scrubber masks nothing, MOD-63 Qdrant `r` reload; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 41 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-61 run scrubber masks nothing, MOD-63 Qdrant `r` reload, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-6 Runs pane approve doc)                |
 | TOOL-N  | 0 |
