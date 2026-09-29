@@ -20,8 +20,8 @@ requirement tree, coverage with suspect markers, the revision trail with each de
 maintainer-only create, amend and withdraw (the maintainer is the project's requirement-spec owner).
 Item detail gained a **Reqs** sub-tab ("Documents" is now "Docs") to re-confirm, cite and uncite,
 and the Runs pane's close-out picks the resolution, so an `open` item can now close as withdrawn,
-rejected, superseded or duplicate. CLEAN-6 was folded in. No migration and no store change. It
-minted **CLEAN-7** (a stale `engine.rs` doc comment).
+rejected, superseded or duplicate. CLEAN-6 was folded in, and the stale `Engine::close_out` doc comments were fixed once
+MOD-40 released `engine.rs`. No migration and no store change.
 Before it, **MOD-40 was done** (`docs/decisions/mod/mod-40.md`): step
 writes (`append_events`, `set_step_usage`, `finish_step`) are fenced by the run's lease owner, so a
 process that wakes after its run was adopted writes nothing to its old step. Lease times are
@@ -778,13 +778,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   in a change that first pins which stop reason each shipped loop case reaches, because the fix can
   change that. Source: `.claude/plans/mod-4-orch-fanout.blueprint.md` F-B and §11, carried unchanged
   through milestones 5 and 6 (`docs/decisions/mod/mod-4.md`, "Carried").
-- [ ] **CLEAN-7 - `Engine::close_out` doc still says `open` is refused** (from MOD-39,
-  2026-09-29). `R-TUI-9`. The doc comment on `Engine::close_out` (`crates/htui-orch/src/engine.rs`
-  ~1550) reads "Until MOD-39 the guard still refuses an `open` item". MOD-39 made
-  `Resolution::default_for(Open)` answer `Withdrawn`, so `close_out_enabled` lets an `open` item
-  through and the Runs pane's picker offers the four non-success resolutions
-  (`docs/decisions/mod/mod-39.md`). Only the comment changes. Left because `engine.rs` belonged to
-  MOD-40 while MOD-39 ran; MOD-40 is done, so it is free now.
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
@@ -804,5 +797,5 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 4 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-26 configurable hotkeys) |
 | MOD-N   | 35 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-7 stale `Engine::close_out` doc)       |
+| CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                              |
 | TOOL-N  | 0 |

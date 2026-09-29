@@ -50,6 +50,9 @@ findings), plus the close-out commit.
 - **CLEAN-6.** The Runs pane module doc now reads "approve (`AnswerGate`) / reject with a typed
   note" (`crates/htui/src/ui/tabs/backlog/detail/runs.rs`).
 - **README.md** covers the tab, the sub-tab and the picker.
+- **Stale `engine.rs` docs.** Once MOD-40 had landed, the `Engine::close_out` and
+  `close_out_preview` doc comments were brought in line with the picker (the maintainer asked for
+  them here rather than as a separate item).
 
 ## Review
 
@@ -63,9 +66,6 @@ refusal frees only the write in flight; an amend over a head withdrawn elsewhere
 
 ## Carried
 
-- **CLEAN-7**: the `Engine::close_out` doc comment in `crates/htui-orch/src/engine.rs` (~1550)
-  still says "Until MOD-39 the guard still refuses an `open` item"; `engine.rs` was MOD-40's while
-  this ran.
 - **MOD-60**: the tab's `tree::pad`/`clip` and the Reqs pane's `cut` count `char`s, and on a narrow
   pane `pad` cuts the ` · read-only` marker before the project name.
 - **MOD-59**: the Requirements tab lands writes by content like the Skills tab; a reply that names
