@@ -1677,7 +1677,7 @@ async fn set_agent_box_quota_leaves_probe_byte_identical() {
                 ..
             })
         ),
-        "`rows_affected() == 0` is the `NotFound`; there is no insert path, got {missing:?}"
+        "a key no row has is the `NotFound`; there is no insert path, got {missing:?}"
     );
 
     db.drop_db().await;

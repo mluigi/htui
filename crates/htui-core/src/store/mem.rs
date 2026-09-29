@@ -1611,7 +1611,8 @@ impl State {
 
     /// The two-column quota latch of `docs/ANA-4.md` §7 (plan D67): an existing row only, with
     /// `updated_at` bumped as `set_step_usage` bumps it and Postgres's `BEFORE UPDATE` trigger
-    /// does it there.
+    /// does it there, and newest `quota_at` wins (MOD-40 plan D4): an older one is `Ok(false)` and
+    /// writes nothing, not even `updated_at`.
     fn set_agent_box_quota(
         &mut self,
         agent_id: AgentId,
@@ -1627,6 +1628,9 @@ impl State {
                 entity: "agent_box",
                 id: format!("{agent_id}/{box_id}"),
             })?;
+        if row.quota_at.is_some_and(|stored| stored > quota_at) {
+            return Ok(false);
+        }
         row.quota = Some(quota);
         row.quota_at = Some(quota_at);
         row.updated_at = now;

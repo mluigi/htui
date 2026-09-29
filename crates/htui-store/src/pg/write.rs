@@ -1161,14 +1161,18 @@ impl WriteStore for PgStore {
     }
 
     /// The two-column quota latch of `docs/ANA-4.md` §7 (MOD-2 plan D67), keyed on the composite
-    /// primary key.
+    /// primary key, newest `quota_at` winning (MOD-40 plan D4).
     ///
     /// Two columns and no more: `probe` and the four discovery columns belong to the probe, which
     /// may be re-running beside this write. `updated_at` is the migration's `BEFORE UPDATE`
     /// trigger's - `agent_box` is in the `0001_init.sql:577` loop, and "no write path may set
-    /// `updated_at` by hand" is that loop's own rule. `rows_affected() == 0` is the `NotFound`:
-    /// there is no insert path, because a row that has never been probed has no columns to latch
-    /// into.
+    /// `updated_at` by hand" is that loop's own rule.
+    ///
+    /// One statement answers both facts the trait tells apart (MOD-40 blueprint B11): `written`
+    /// from the guarded `UPDATE`, and `present` from the same statement's snapshot, so "absent"
+    /// and "a newer quota is stored" can never be confused by a row that appears between two
+    /// reads. Under `READ COMMITTED` the `UPDATE` re-checks its `WHERE` on the newest version of
+    /// a row a concurrent latch just committed, so of two racing latches the older one loses.
     ///
     /// # Errors
     ///
@@ -1180,24 +1184,34 @@ impl WriteStore for PgStore {
         quota: Value,
         quota_at: DateTime<Utc>,
     ) -> Result<bool> {
-        let updated = sqlx::query!(
-            "UPDATE agent_box SET quota = $3, quota_at = $4 WHERE agent_id = $1 AND box_id = $2",
+        let verdict = sqlx::query!(
+            r#"
+            WITH latched AS (
+                UPDATE agent_box
+                   SET quota = $3, quota_at = $4
+                 WHERE agent_id = $1 AND box_id = $2
+                   AND (quota_at IS NULL OR quota_at <= $4)
+                RETURNING 1
+            )
+            SELECT EXISTS (SELECT 1 FROM latched) AS "written!",
+                   EXISTS (SELECT 1 FROM agent_box
+                            WHERE agent_id = $1 AND box_id = $2) AS "present!"
+            "#,
             agent_id.as_uuid(),
             box_id.as_uuid(),
             &quota,
             quota_at,
         )
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
-        .map_err(map_sqlx)?
-        .rows_affected();
-        if updated == 0 {
+        .map_err(map_sqlx)?;
+        if !verdict.present {
             return Err(StoreError::NotFound {
                 entity: "agent_box",
                 id: format!("{agent_id}/{box_id}"),
             });
         }
-        Ok(updated == 1)
+        Ok(verdict.written)
     }
 
     /// One box probe in one transaction (MOD-7 D10): the nine probe columns of the row, then the
