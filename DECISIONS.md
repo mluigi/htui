@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-54](docs/decisions/mod/mod-54.md)** - Wide characters and graphemes in the text widgets (done, 2026-09-28)
 - **[MOD-31](docs/decisions/mod/mod-31.md)** - A running prompt preview makes an adapter install refuse (done, 2026-09-28)
 - **[MOD-56](docs/decisions/mod/mod-56.md)** - htui's panic hook is the outermost one (done, 2026-09-28)
 - **[TOOL-3](docs/decisions/tool/tool-3.md)** - The Windows lint target cannot be built on this box, and MOD-20 made that bite (decided, 2026-09-28)
