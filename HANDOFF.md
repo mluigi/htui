@@ -14,7 +14,10 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-29):** **MOD-61 was folded into MOD-10** (`docs/decisions/mod/mod-61.md`):
+**Current status (2026-09-29):** **MOD-63 was done** (`docs/decisions/mod/mod-63.md`): `r` in
+Settings › Qdrant re-reads the keyring, so the unavailable state recovers in place, and the section's
+writes now set `busy`, so their stored/cleared notices and in-flight hint finally show.
+Before it, **MOD-61 was folded into MOD-10** (`docs/decisions/mod/mod-61.md`):
 there are no resolved secrets on any path yet (every production `SessionSpec.env` is empty, the run
 engine's `engine.rs:5349` included), so a run-path scrubber built from them would carry an empty list.
 The run engine's scrubber is now MOD-10's to build, from the same map that fills the session env;
@@ -27,15 +30,6 @@ resolved secrets in the agent's `SessionSpec.env` must never be handed to the ve
 The same day, **MOD-9 milestone 4 landed** (SKILL.md import, PR #21; see MOD-9 below), and two
 security fixes merged without an item: PR #16 pins the ACP session's file access to its directory
 (path traversal), and PR #19 bounds `.gitignore` reads and skips non-regular files in the excerpt walk.
-Before it, **MOD-32 was done** (`docs/decisions/mod/mod-32.md`): the
-`run_step.trim_record` write is now scrubbed whole — `TrimRecord::to_value` takes a `&dyn Scrubber`,
-returns `Result<Value, Unmasked>`, and all three engine call sites go through it, so a
-credential-shaped record string fails the step before any session starts. The guarantee is
-field-agnostic because the defect *was* an enumeration; `template.name`, `PromptSpec.notes` and the
-`excerpts` audit's `roots[].repo` / `provider_set[]` were all unmasked. The masking half is still
-inert on the run path (the engine's secret list is empty); MOD-10 now owns that. The store is
-still not the enforcement point: it will accept an unscrubbed `trim_record` from any non-engine
-caller.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -757,13 +751,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   preferred. The three crates are not in `Cargo.lock`, so the plan owns that dependency decision.
   Not blocked. Its in-app widget draws through `ui::cells` (MOD-54, done:
   `docs/decisions/mod/mod-54.md`); the rest of the display-width work is MOD-60.
-- [ ] **MOD-63 - Settings › Qdrant `r` does nothing** (from the README rewrite, 2026-09-29).
-  `R-TUI-8`. The section's hints advertise `r reload` (`HINT_BROWSE` and `HINT_NO_SNAPSHOT`,
-  `crates/htui/src/ui/tabs/settings/qdrant.rs:24-25`), but `on_key` passes `r` on (`:342`) and no
-  tab or global binding takes it, so the key does nothing. Every other Settings section reloads on
-  `r`. It bites hardest in the unavailable state, whose only hint is `r reload`: the section cannot
-  recover without leaving it. Make `r` re-request `StoreRequest::QdrantInfo` (the section's
-  `wants_requests`), and pin it with a settings test.
 
 ### Deferred backlog
 
@@ -798,6 +785,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 39 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-63 Qdrant `r` reload; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 38 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-6 Runs pane approve doc)                |
 | TOOL-N  | 0 |
