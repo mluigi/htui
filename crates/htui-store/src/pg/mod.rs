@@ -482,14 +482,30 @@ impl PgStore {
     /// The box heartbeat (MOD-40 plan D7, `docs/ANA-16.md` C4): stamps `box.last_seen_at` with the
     /// server's `clock_timestamp()` and answers whether a row had `id`.
     ///
-    /// Not written yet: answers `false` without a statement (MOD-40 T5, red).
+    /// One column, the only one registration refreshes that no reconnect-free session would
+    /// otherwise move: never `hostname`, the probe columns, the tags, `quirks`, `settings`,
+    /// `machine_fingerprint` or `edit_version`, so a beat cannot stale an open box editor. The
+    /// migration's `BEFORE UPDATE` trigger moves `updated_at` with it (`0001_init.sql:575-580`),
+    /// which nothing keys on: the editors' token is `edit_version`, and the mirror re-reads the
+    /// own box row whole each pass (MOD-40 blueprint F-21).
+    ///
+    /// The time is the database's, like [`PgStore::register_box`]'s: a box whose clock is off
+    /// still reports when the server last heard from it. Nothing reads `last_seen_at` yet (PRD out
+    /// of scope: liveness is ANA-2's `DeadWalks`, not this stamp).
     ///
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
     pub async fn touch_box(&self, id: BoxId) -> Result<bool> {
-        let _ = id;
-        Ok(false)
+        let touched = sqlx::query!(
+            "UPDATE box SET last_seen_at = clock_timestamp() WHERE id = $1",
+            id.as_uuid(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        Ok(touched == 1)
     }
 
     /// The pool, for the refresh task (`cache::refresh`) and for the tests.
