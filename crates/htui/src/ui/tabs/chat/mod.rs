@@ -40,7 +40,7 @@ use crate::run_worker::{OrchReply, Via};
 use crate::store_worker::{ChatFrame, StoreReply, StoreRequest};
 use crate::ui::tabs::registry::{Tab, TabId};
 use composer::{Composer, ComposerOutcome};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use permission::PermissionStrip;
 use transcript::{Transcript, TranscriptRow};
 
@@ -461,6 +461,14 @@ impl Tab for ChatTab {
         // A refusal is transient: it says what the last key could not do, and the next one clears
         // it whatever it was.
         self.refusal = None;
+        // A chord is the shell's (`Ctrl+F`, `Ctrl+C`), never composer text: every other text widget
+        // passes it the same way (`TextField::on_key`, MOD-64 F7).
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Handled::Pass;
+        }
         // Before the composer, before the digits, before anything that could send: a replay is a
         // mode with no command path at all (D40), and `on_key_replay` is handed no `ctx` to prove
         // it. An open composer underneath keeps its text — it simply cannot be typed into until
@@ -1157,5 +1165,34 @@ mod tests {
             None,
             "a step with rows shows the rows"
         );
+    }
+
+    /// MOD-64 F7 (D256): with the composer open, a chord is the shell's (`Ctrl+F` opens the
+    /// concepts search, `Ctrl+C` quits), never composer text.
+    #[test]
+    fn a_chord_passes_to_the_shell_with_the_composer_open() {
+        let shell = Shell::new();
+        let mut tab = ChatTab::new();
+        assert_eq!(
+            tab.on_key(key(KeyCode::Char('i')), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        tab.on_key(key(KeyCode::Char('h')), &mut shell.ctx());
+        assert!(tab.composer.is_active(), "`i` opens the composer");
+
+        for chord in [
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
+        ] {
+            assert_eq!(
+                tab.on_key(chord, &mut shell.ctx()),
+                Handled::Pass,
+                "{chord:?} reaches the shell"
+            );
+        }
+        assert_eq!(tab.composer.text(), "h", "no chord typed into the composer");
+        assert!(tab.composer.is_active(), "and the composer stays open");
+        assert!(shell.emit.is_empty(), "the tab sent nothing");
     }
 }
