@@ -773,9 +773,11 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
         box_id: BoxId,
         quota: Value,
         quota_at: DateTime<Utc>,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<bool> {
         // The write first, the log after: the `set_step_usage` rule above, for the same reason.
-        self.inner
+        // Every call the store accepted is logged, written or not (MOD-40 plan D4).
+        let written = self
+            .inner
             .set_agent_box_quota(agent_id, box_id, quota.clone(), quota_at)
             .await?;
         self.quota_calls
@@ -787,7 +789,7 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
                 quota,
                 quota_at,
             });
-        Ok(())
+        Ok(written)
     }
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> StoreResult<()> {
         self.inner.start_chat_run(chat).await

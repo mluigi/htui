@@ -375,17 +375,30 @@ pub trait WriteStore: ReadStore {
     /// implementations and `store::conformance`. Widening them before there is a caller would be
     /// six signatures changed to express a case no code can reach.
     ///
+    /// # Newest wins (MOD-40 plan D4)
+    ///
+    /// The write lands only when `quota_at` is at least the stored one: `quota_at IS NULL OR
+    /// quota_at <= $quota_at`. Two chats on one box latch the same row from two processes, and a
+    /// report that arrives late must not overwrite a newer allowance with an older one. `<=`, not
+    /// `<`: a second latch of the same instant rewrites the document, which is how one session
+    /// refreshes the spend under an unchanged `observed_at`. Callers pass microseconds, as the
+    /// recorder does (`stamp`), so the comparison means the same on every store.
+    ///
+    /// Answers `true` when the pair was written and `false` when an equal-or-newer `quota_at`
+    /// was already stored and nothing was written. `false` is not an error: the latch is
+    /// best-effort, and "somebody newer got there first" is the ordering working.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) with `entity: "agent_box"` and
-    /// id `"<agent_id>/<box_id>"` when no row has that key.
+    /// id `"<agent_id>/<box_id>"` when no row has that key, whatever `quota_at` is.
     async fn set_agent_box_quota(
         &self,
         agent_id: AgentId,
         box_id: BoxId,
         quota: Value,
         quota_at: DateTime<Utc>,
-    ) -> Result<()>;
+    ) -> Result<bool>;
 
     /// Writes one box probe (MOD-7 D10): the hardware columns, `probed_tags`, `htui_version`,
     /// `last_probed_at` and `probe_spec_digest`, and replaces this box's `box_tool` set, in one
@@ -415,6 +428,12 @@ pub trait WriteStore: ReadStore {
     /// `hostname`, the probe columns, `htui_version`, `settings`, `machine_fingerprint`,
     /// `probe_spec_digest`, `last_seen_at` or `box_tool`. Registration and the probe never write
     /// `edit_version`, so neither can stale an open editor.
+    ///
+    /// **Every human writer of `box` is this compare-and-set** (MOD-40 plan D6, `docs/ANA-16.md`
+    /// C7). `box.settings`, which admission reads under `claim_run`'s row lock, has **no** writer
+    /// at all today: registration, the probe and this editor all leave it at its default. The first
+    /// one extends [`BoxEdit`] and rides this statement's `edit_version` guard; a second, unguarded
+    /// `UPDATE box SET settings` would let two editors overwrite each other silently.
     ///
     /// Answers [`CasOutcome::Applied`] with the row as written, or [`CasOutcome::Stale`] with the
     /// row as it is now when `expected` is spent (nothing is written).

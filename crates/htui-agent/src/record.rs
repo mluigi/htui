@@ -1231,7 +1231,12 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             .set_agent_box_quota(latch.agent_id, latch.box_id, quota.to_value(), at)
             .await
         {
-            Ok(()) => {}
+            Ok(true) => {}
+            // MOD-40 plan D4: another session on this box latched a newer allowance first. The
+            // latch stays armed: this session's next report may well be the newest again.
+            Ok(false) => tracing::debug!(
+                "a newer quota is already latched on this agent_box row; this one is older"
+            ),
             Err(StoreError::Unreachable(reason)) => {
                 tracing::info!(
                     %reason,

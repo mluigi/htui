@@ -131,6 +131,9 @@ pub const CASES: &[&str] = &[
     "an_unleased_fence_is_refused_on_a_leased_run",
     "a_replayed_batch_under_the_right_fence_is_ok_zero",
     "a_missing_step_keeps_its_old_error_not_fenced",
+    "an_older_quota_is_a_no_op",
+    "an_equal_quota_at_rewrites_idempotently",
+    "a_missing_agent_box_is_not_found",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -307,6 +310,11 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "a_missing_step_keeps_its_old_error_not_fenced" => {
             a_missing_step_keeps_its_old_error_not_fenced(store).await
         }
+        "an_older_quota_is_a_no_op" => an_older_quota_is_a_no_op(store).await,
+        "an_equal_quota_at_rewrites_idempotently" => {
+            an_equal_quota_at_rewrites_idempotently(store).await
+        }
+        "a_missing_agent_box_is_not_found" => a_missing_agent_box_is_not_found(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -1668,15 +1676,20 @@ async fn set_agent_box_quota_updates_two_columns_or_not_found<S: WriteStore>(sto
         .await
         .expect("set_agent_box_quota_updates_two_columns_or_not_found: the probed row must land");
 
-    store
-        .set_agent_box_quota(
-            ids::AGENT_CLAUDE,
-            ids::BOX,
-            json!({ "source": "none", "spend": { "session_micros": 7, "currency": "USD" } }),
-            Utc::now(),
-        )
-        .await
-        .expect("set_agent_box_quota_updates_two_columns_or_not_found: the latch lands on a row");
+    assert!(
+        store
+            .set_agent_box_quota(
+                ids::AGENT_CLAUDE,
+                ids::BOX,
+                json!({ "source": "none", "spend": { "session_micros": 7, "currency": "USD" } }),
+                Utc::now(),
+            )
+            .await
+            .expect(
+                "set_agent_box_quota_updates_two_columns_or_not_found: the latch lands on a row"
+            ),
+        "set_agent_box_quota_updates_two_columns_or_not_found: a first latch writes"
+    );
 
     let missing = store
         .set_agent_box_quota(
@@ -5951,6 +5964,139 @@ async fn a_missing_step_keeps_its_old_error_not_fenced<S: WriteStore>(store: &S)
     assert!(
         log_of(CASE, store, step).await.is_empty(),
         "{CASE}: the refused batch wrote none of its rows"
+    );
+}
+
+/// MOD-40 D4: `AGENT_CLAUDE`'s probed `agent_box` row on the fixture box, with no quota yet, as
+/// `set_agent_box_quota_updates_two_columns_or_not_found` plants it.
+async fn quota_row<S: WriteStore>(case: &str, store: &S, t0: DateTime<Utc>) {
+    store
+        .upsert_agent_box(&AgentBox {
+            agent_id: ids::AGENT_CLAUDE,
+            box_id: ids::BOX,
+            enabled: true,
+            version: Some("1.2.3".to_owned()),
+            path: Some("/usr/bin/claude".to_owned()),
+            probed_at: Some(t0),
+            quota: None,
+            quota_at: None,
+            updated_at: t0,
+            probe: Some(json!({ "status": "ready", "source": "probe" })),
+        })
+        .await
+        .unwrap_or_else(|err| panic!("{case}: the probed row must land: {err:?}"));
+}
+
+/// One quota latch on `AGENT_CLAUDE`'s fixture-box row: whether it was written, or a panic naming
+/// the case and the error.
+async fn latch<S: WriteStore>(case: &str, store: &S, quota: Value, at: DateTime<Utc>) -> bool {
+    store
+        .set_agent_box_quota(ids::AGENT_CLAUDE, ids::BOX, quota, at)
+        .await
+        .unwrap_or_else(|err| panic!("{case}: the latch at {at} finds its row: {err:?}"))
+}
+
+/// MOD-40 plan D4: newest `quota_at` wins. A latch older than the stored one is `Ok(false)` and
+/// writes nothing — not `NotFound`, and not an overwrite — while a newer one still lands.
+///
+/// That the refused latch left the stored pair **byte for byte** is asserted where the row can be
+/// read back (`mem.rs::an_older_quota_leaves_the_stored_pair_alone` and
+/// `pg_criteria.rs::an_older_quota_leaves_the_row_byte_identical`); here the order itself shows
+/// it: had the older latch landed, the one between it and the stored instant would land too.
+async fn an_older_quota_is_a_no_op<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_older_quota_is_a_no_op";
+    let t0 = seam_clock();
+    quota_row(CASE, store, t0).await;
+    let (t1, t2) = (t0 + TimeDelta::minutes(1), t0 + TimeDelta::minutes(2));
+    let mid = t0 + TimeDelta::seconds(90);
+
+    assert!(
+        latch(CASE, store, json!({ "v": 2 }), t2).await,
+        "{CASE}: the first latch lands on a row with no quota"
+    );
+    assert!(
+        !latch(CASE, store, json!({ "v": 1 }), t1).await,
+        "{CASE}: an older quota is a no-op, not NotFound"
+    );
+    assert!(
+        !latch(CASE, store, json!({ "v": 15 }), mid).await,
+        "{CASE}: t2 is still the stored instant: had t1 overwritten it, t1.5 would have landed"
+    );
+    assert!(
+        latch(CASE, store, json!({ "v": 3 }), t0 + TimeDelta::minutes(3)).await,
+        "{CASE}: a newer one still lands"
+    );
+}
+
+/// MOD-40 plan D4: the guard is `<=`, so a latch of the stored instant rewrites the document —
+/// how one session refreshes its spend under an unchanged `observed_at` — and does so
+/// idempotently, while one microsecond older is older.
+async fn an_equal_quota_at_rewrites_idempotently<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_equal_quota_at_rewrites_idempotently";
+    let t0 = seam_clock();
+    quota_row(CASE, store, t0).await;
+    let t = t0 + TimeDelta::minutes(1);
+
+    assert!(
+        latch(CASE, store, json!({ "v": 1 }), t).await,
+        "{CASE}: the first latch lands"
+    );
+    assert!(
+        latch(CASE, store, json!({ "v": 2 }), t).await,
+        "{CASE}: `<=`: the same instant rewrites, which is how one session refreshes its spend"
+    );
+    assert!(
+        latch(CASE, store, json!({ "v": 2 }), t).await,
+        "{CASE}: the same latch again is written again, idempotently"
+    );
+    assert!(
+        !latch(
+            CASE,
+            store,
+            json!({ "v": 0 }),
+            t - TimeDelta::microseconds(1)
+        )
+        .await,
+        "{CASE}: one microsecond older is older"
+    );
+}
+
+/// MOD-40 plan D4: a key with no `agent_box` row is `NotFound`, however old the latch — absence
+/// is never mistaken for "a newer quota is stored" — and a row with a `NULL` `quota_at` accepts
+/// any instant at all.
+async fn a_missing_agent_box_is_not_found<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_missing_agent_box_is_not_found";
+    let t0 = seam_clock();
+    let ancient = t0 - TimeDelta::days(3650);
+
+    for (agent_id, box_id) in [
+        (AgentId::new(), ids::BOX),
+        (ids::AGENT_CLAUDE, BoxId::new()),
+        (ids::AGENT_CLAUDE, ids::BOX),
+    ] {
+        let missing = store
+            .set_agent_box_quota(agent_id, box_id, json!({ "v": 0 }), ancient)
+            .await;
+        match missing {
+            Err(StoreError::NotFound {
+                entity: "agent_box",
+                id,
+            }) => assert_eq!(
+                id,
+                format!("{agent_id}/{box_id}"),
+                "{CASE}: the refusal names the key"
+            ),
+            other => panic!(
+                "{CASE}: absence is never mistaken for an older quota; {agent_id}/{box_id} is \
+                 NotFound on agent_box, got {other:?}"
+            ),
+        }
+    }
+
+    quota_row(CASE, store, t0).await;
+    assert!(
+        latch(CASE, store, json!({ "v": 0 }), ancient).await,
+        "{CASE}: a `NULL` quota_at accepts anything, however old"
     );
 }
 

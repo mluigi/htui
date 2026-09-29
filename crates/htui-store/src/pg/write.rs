@@ -1179,7 +1179,7 @@ impl WriteStore for PgStore {
         box_id: BoxId,
         quota: Value,
         quota_at: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let updated = sqlx::query!(
             "UPDATE agent_box SET quota = $3, quota_at = $4 WHERE agent_id = $1 AND box_id = $2",
             agent_id.as_uuid(),
@@ -1197,7 +1197,7 @@ impl WriteStore for PgStore {
                 id: format!("{agent_id}/{box_id}"),
             });
         }
-        Ok(())
+        Ok(updated == 1)
     }
 
     /// One box probe in one transaction (MOD-7 D10): the nine probe columns of the row, then the

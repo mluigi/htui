@@ -1619,7 +1619,7 @@ impl State {
         quota: Value,
         quota_at: DateTime<Utc>,
         now: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let row = self
             .agent_boxes
             .get_mut(&(agent_id, box_id))
@@ -1630,7 +1630,7 @@ impl State {
         row.quota = Some(quota);
         row.quota_at = Some(quota_at);
         row.updated_at = now;
-        Ok(())
+        Ok(true)
     }
 
     /// One box probe (MOD-7 D10): the nine probe columns, the whole `box_tool` set and the spec
@@ -5640,7 +5640,7 @@ impl WriteStore for MemStore {
         box_id: BoxId,
         quota: Value,
         quota_at: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let now = Utc::now();
         self.write(|state| state.set_agent_box_quota(agent_id, box_id, quota, quota_at, now))
     }
@@ -6902,10 +6902,13 @@ mod tests {
             "spend": { "session_micros": 351, "currency": "USD" },
         });
         let quota_at = Utc::now();
-        store
-            .set_agent_box_quota(ids::AGENT_CLAUDE, ids::BOX, quota.clone(), quota_at)
-            .await
-            .expect("the latch lands on the probed row");
+        assert!(
+            store
+                .set_agent_box_quota(ids::AGENT_CLAUDE, ids::BOX, quota.clone(), quota_at)
+                .await
+                .expect("the latch lands on the probed row"),
+            "a first latch writes"
+        );
 
         let after = store
             .agents()
@@ -6952,6 +6955,75 @@ mod tests {
                 })
             ),
             "a row that has never been probed has no columns to latch into, got {missing:?}"
+        );
+    }
+
+    /// MOD-40 plan D4: a latch older than the stored `quota_at` is `Ok(false)` and writes
+    /// nothing — not the document, not the instant, and not `updated_at` either, which Postgres's
+    /// `BEFORE UPDATE` trigger would not move for a guarded `UPDATE` that matched no row. The
+    /// conformance case `an_older_quota_is_a_no_op` pins the order through the seam; this reads
+    /// the stored pair back.
+    #[tokio::test]
+    async fn an_older_quota_leaves_the_stored_pair_alone() {
+        let store = MemStore::demo();
+        let probed_at = Utc::now() - TimeDelta::hours(3);
+        store
+            .upsert_agent_box(&AgentBox {
+                agent_id: ids::AGENT_CLAUDE,
+                box_id: ids::BOX,
+                enabled: true,
+                version: Some("1.2.3".to_owned()),
+                path: Some("claude".to_owned()),
+                probed_at: Some(probed_at),
+                quota: None,
+                quota_at: None,
+                updated_at: probed_at,
+                probe: Some(serde_json::json!({ "status": "ready", "source": "probe" })),
+            })
+            .await
+            .expect("the probe row lands");
+        let t2 = Utc::now();
+        let t1 = t2 - TimeDelta::minutes(1);
+        assert!(
+            store
+                .set_agent_box_quota(
+                    ids::AGENT_CLAUDE,
+                    ids::BOX,
+                    serde_json::json!({ "v": 2 }),
+                    t2
+                )
+                .await
+                .expect("the newer latch finds its row"),
+            "the first latch writes"
+        );
+        let stored = || {
+            store
+                .read(|state| {
+                    state
+                        .agent_boxes
+                        .get(&(ids::AGENT_CLAUDE, ids::BOX))
+                        .cloned()
+                })
+                .expect("the row is stored")
+        };
+        let before = stored();
+
+        assert!(
+            !store
+                .set_agent_box_quota(
+                    ids::AGENT_CLAUDE,
+                    ids::BOX,
+                    serde_json::json!({ "v": 1 }),
+                    t1
+                )
+                .await
+                .expect("the older latch finds its row"),
+            "an older latch is refused"
+        );
+        assert_eq!(
+            stored(),
+            before,
+            "a refused latch writes nothing, not even the trigger's stamp"
         );
     }
 

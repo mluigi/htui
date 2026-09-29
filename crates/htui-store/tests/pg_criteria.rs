@@ -1604,15 +1604,18 @@ async fn set_agent_box_quota_leaves_probe_byte_identical() {
     let quota_at: DateTime<Utc> = "2026-09-10T09:00:00.000456Z"
         .parse()
         .expect("a microsecond-precision literal");
-    db.store
-        .set_agent_box_quota(
-            ids::AGENT_CLAUDE,
-            db.store.this_box(),
-            quota.clone(),
-            quota_at,
-        )
-        .await
-        .expect("the latch lands on the probed row");
+    assert!(
+        db.store
+            .set_agent_box_quota(
+                ids::AGENT_CLAUDE,
+                db.store.this_box(),
+                quota.clone(),
+                quota_at,
+            )
+            .await
+            .expect("the latch lands on the probed row"),
+        "a first latch writes"
+    );
 
     let row = sqlx::query(
         "SELECT probe, quota, quota_at, updated_at, enabled, version, path, probed_at \
@@ -1803,6 +1806,74 @@ async fn an_upsert_can_neither_set_nor_clear_the_quota_columns() {
         "clearing a latch is `set_agent_box_quota`'s too; an upsert has no way to do it"
     );
     assert_eq!(quota_at, Some(latched_at));
+
+    db.drop_db().await;
+}
+
+/// MOD-40 plan D4: a latch older than the stored `quota_at` writes **nothing** — the whole row,
+/// read as `jsonb`, is byte-identical across it, `updated_at` included: a guarded `UPDATE` that
+/// matched no row fires no `BEFORE UPDATE` trigger. The conformance case
+/// `an_older_quota_is_a_no_op` pins the order through the seam; this is the SQL-level read-back.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_quota_leaves_the_row_byte_identical() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    // Microsecond literals, `timestamptz`'s resolution, as the latch case above.
+    let probed_at: DateTime<Utc> = "2026-09-10T06:00:00.000123Z"
+        .parse()
+        .expect("a microsecond-precision literal");
+    let t2: DateTime<Utc> = "2026-09-10T09:00:00.000456Z"
+        .parse()
+        .expect("a microsecond-precision literal");
+    let t1 = t2 - TimeDelta::minutes(1);
+    let box_id = db.store.this_box();
+    db.store
+        .upsert_agent_box(&AgentBox {
+            agent_id: ids::AGENT_CLAUDE,
+            box_id,
+            enabled: true,
+            version: Some("0.7.1".to_owned()),
+            path: Some("/usr/bin/node".to_owned()),
+            probed_at: Some(probed_at),
+            quota: None,
+            quota_at: None,
+            updated_at: probed_at,
+            probe: Some(serde_json::json!({ "status": "ready", "source": "probe" })),
+        })
+        .await
+        .expect("the probe row lands");
+    assert!(
+        db.store
+            .set_agent_box_quota(ids::AGENT_CLAUDE, box_id, serde_json::json!({ "v": 2 }), t2)
+            .await
+            .expect("the newer latch finds its row"),
+        "the first latch writes"
+    );
+    let row = || async {
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT to_jsonb(ab) FROM agent_box ab WHERE agent_id = $1 AND box_id = $2",
+        )
+        .bind(ids::AGENT_CLAUDE.as_uuid())
+        .bind(box_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the latched row")
+    };
+    let before = row().await;
+
+    assert!(
+        !db.store
+            .set_agent_box_quota(ids::AGENT_CLAUDE, box_id, serde_json::json!({ "v": 1 }), t1)
+            .await
+            .expect("the older latch finds its row"),
+        "an older latch is refused"
+    );
+    assert_eq!(
+        row().await,
+        before,
+        "a refused latch leaves the whole row byte-identical, `updated_at` included"
+    );
 
     db.drop_db().await;
 }

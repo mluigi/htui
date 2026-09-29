@@ -504,7 +504,7 @@ impl WriteStore for SpyStore {
         box_id: BoxId,
         quota: Value,
         quota_at: DateTime<Utc>,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<bool> {
         // The attempt is logged before the outcome is decided, because a refused latch has to be
         // countable; both guards are taken and dropped with no `.await` in scope.
         self.quota_calls

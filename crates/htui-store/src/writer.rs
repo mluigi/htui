@@ -376,7 +376,7 @@ impl WriteStore for Writer {
         box_id: BoxId,
         quota: Value,
         quota_at: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         match self {
             Self::Memory(store) => {
                 store
