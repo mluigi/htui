@@ -561,7 +561,12 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     dexec TOOL-9001 git -C "$HR_HOST_REPO" fetch -q origin
     [[ "$(dexec TOOL-9001 printenv HR_SANDBOX)" == 1 ]]
     [[ "$(dexec TOOL-9001 stat -c %U "$HR_HOST_REPO/.remember")" == "$(id -un)" ]]
-    [[ -z "$(docker ps --filter label=com.docker.compose.project=hr-tool-9001 --format '{{.Ports}}' | tr -d '[:space:]')" ]]
+    # Exposed-only ports (5432/tcp, 6333/tcp) are listed too; a published one reads host:port->port.
+    local ports
+    ports="$(docker ps --filter label=com.docker.compose.project=hr-tool-9001 --format '{{.Names}} {{.Ports}}')"
+    echo "$ports"
+    [[ "$(wc -l <<<"$ports")" -eq 3 ]]
+    [[ "$ports" != *'->'* ]]
     [[ "$(stat -c %U "$HR_HOST_REPO/.remember")" == "$(id -un)" ]]
     run --separate-stderr "$HR" ls
     [[ "$output" == *'TOOL-9001'*'running'* ]]
