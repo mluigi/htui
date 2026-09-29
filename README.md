@@ -1,138 +1,142 @@
 # htui
 
-`htui` is a keyboard-driven terminal UI for a single developer's cross-box workflow store: it opens
-on a **workspace**, lists that workspace's items grouped by project, and shows the selected item's
-body, runs, link graph, documents and notes side by side. The product contract it implements is
-`docs/REQUIREMENTS.md` (`R-TUI-1..3` for the surfaces, `R-NF-1` for the platforms, `R-NF-3` for
-"the UI never blocks"), and the data it shows is shaped by `docs/ANA-9.md`, the concluded data
-model: every view reads through the ANA-9 §6.1 store seam (`ReadStore` / `WriteStore` / `Backend`)
-rather than through a database handle, so the in-memory store of MOD-1, the Postgres store and the
-per-box SQLite cache all sit behind the same seam without a single view changing.
+`htui` is a keyboard-driven terminal app for running a backlog of work through AI coding agents.
+It keeps your work items, their documents, the runs agents performed and full chat transcripts in
+one Postgres database, and lets you browse and drive all of it from the terminal, across several
+projects, repositories and machines.
 
-The store lives on **Postgres 16 or newer** (the schema uses `UNIQUE NULLS NOT DISTINCT`, a
-Postgres 15 feature; 16 is the floor the suite runs against). A mirror of what you browse is kept
-in a local SQLite file, so `htui` starts and renders with the server unreachable.
+- **One place for everything.** Items, documents, notes, runs, skills and prompt templates live in
+  Postgres. Credentials live in your OS keyring, never in a config file.
+- **Works offline.** A local copy of what you browse is kept on each machine, so `htui` opens
+  instantly and stays readable when the server is out of reach.
+- **Talks to real agents.** Chat with Claude Code or Google's Antigravity (`agy`) from inside the
+  app, and replay any recorded conversation later.
+- **Drives runs step by step.** Start a run on an item, approve or reject each step, retry, cancel
+  and close out, all from the Backlog.
+- **Never blocks.** Network, database and agent work happen in the background, so the UI stays
+  responsive.
 
-## Build
+It runs on Windows 10+, Linux and macOS.
 
-Requires **rustc 1.98+** (edition 2024; `rust-toolchain.toml` pins 1.98.1 exactly, so `rustup` will
-fetch it on first build).
+## Contents
 
-`workspace.package.rust-version` says `1.98` too, and the two numbers are deliberately the same.
-The declared MSRV had been `1.85`, which was never true: the locked `sqlx-core 0.9.0` declares
-`rust-version = "1.94.0"` and `ratatui 0.30.2` declares `1.88.0`, so nothing below 1.94 has been
-able to build this workspace for some time. `docs/ANA-4.md` §4.2 proposed `1.88` (the ACP SDK's own
-floor); MOD-2 raised it to the toolchain pin instead, on the reasoning that with an *exact* pin the
-only MSRV that is simultaneously true and checkable is the one everyone actually runs. `clippy.toml`
-carries the same number, or clippy silently lints against the older one.
+- [Quick start](#quick-start)
+- [Building from source](#building-from-source)
+- [Connecting to your database](#connecting-to-your-database)
+- [Using htui](#using-htui)
+- [Setting up agents](#setting-up-agents)
+- [Search](#search)
+- [Where htui keeps its files](#where-htui-keeps-its-files)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
+- [Further reading](#further-reading)
 
-```
-cargo build --release
-```
+## Quick start
 
-The binary lands in `target/release/htui` (`target/release/htui.exe` on Windows).
-
-## Run
+Try it without a database, using built-in sample data:
 
 ```
 cargo run -p htui -- --demo
 ```
 
-| Flag | Meaning |
+The demo opens on the **Graphics** workspace with a few projects, items, runs, notes and
+documents to look around. Press `?` at any time to see the keys for the screen you are on, and `q`
+to quit.
+
+## Building from source
+
+You need:
+
+- **Rust 1.98.1.** The exact version is pinned in `rust-toolchain.toml`, so `rustup` downloads it
+  on your first build.
+- **On Linux:** the D-Bus development files and `pkg-config`, which the keyring integration builds
+  against (`sudo apt install libdbus-1-dev pkg-config` on Debian and Ubuntu).
+- **Network access on the first build.** The embedding model runtime (ONNX Runtime) is downloaded
+  while building. On a machine without that access, see
+  [Building without network access](#building-without-network-access).
+- **`git`** on your `PATH`, for running work in repositories.
+
+Then build:
+
+```
+cargo build --release
+```
+
+The binary is `target/release/htui` (`target/release/htui.exe` on Windows).
+
+### Toolchain
+
+`workspace.package.rust-version` in `Cargo.toml` and `clippy.toml` both say `1.98`, matching the
+pinned toolchain on purpose: with an exact pin, the only minimum version that is both true and
+checkable is the one everybody actually builds with. Keep all three in step when you move the pin.
+
+### Command-line options
+
+| Option | What it does |
 |---|---|
-| `--demo` | Load the deterministic demo fixture (two workspaces, three projects, items, runs, notes and documents) into memory instead of connecting. |
-| `--offline` | Open from the local cache and never attempt a connection. |
-| `--set-dsn` | Read a Postgres DSN from stdin, store it in the OS keyring and exit. |
-| `--clear-dsn` | Remove the stored DSN from the OS keyring and exit. |
-| `--log <PATH>` | Append `tracing` output to a file. Never stdout — stdout is the TUI. Also read from `HTUI_LOG`; `HTUI_LOG_FILTER` overrides the default `info` level. |
-| `--help`, `--version` | Print usage / version and exit. |
+| `--demo` | Start with the built-in sample data in memory instead of connecting to a database. |
+| `--offline` | Open from the local copy only and never try to connect. |
+| `--set-dsn` | Read a Postgres connection string from standard input, save it in the OS keyring and exit. |
+| `--clear-dsn` | Remove the saved connection string from the OS keyring and exit. |
+| `--index-items` | Update the search index from the database, then exit. See [Search](#search). |
+| `--search-items <QUERY>` | Search items and their documents, print the results and exit. |
+| `--project <SLUG>` | With `--index-items` or `--search-items`: only this project. |
+| `--decisions` | With `--search-items`: only done and closed items, and their documents. |
+| `--limit <N>` | With `--search-items`: how many results to print, from 1 to 1000 (default 10). |
+| `--log <PATH>` | Append logs to a file. Also read from `HTUI_LOG`; `HTUI_LOG_FILTER` changes the level (default `info`). Logs never go to the terminal, since the terminal is the app. |
+| `--help`, `--version` | Print usage or the version and exit. |
 
-With `--demo` the shell enters the first workspace by name (`Graphics`) and opens on the Backlog
-tab. With an empty store nothing can be entered, so the workspace switcher stays up over the shell
-reading `no workspaces` — creating one is MOD-15.
+## Connecting to your database
 
-## The database connection
+`htui` needs **Postgres 16 or newer**.
 
-### Storing the DSN
+### Run a local server
 
-The DSN lives in the **OS keyring** — Windows Credential Manager, macOS Keychain, the Linux secret
-service — under service `htui`, user `postgres-dsn`. There is no environment-variable fallback and
-no configuration file for it (`R-STO-1`), so the DSN never reaches `argv` or a shell history.
-
-```
-htui --set-dsn        # then paste the DSN and press Enter
-htui --clear-dsn      # removes the entry again
-```
-
-Both flags exit before the TUI starts. The DSN is read from stdin, so it can also be piped in:
-
-```
-echo postgres://postgres:htui@localhost:5439/htui | htui --set-dsn
-```
-
-TLS is whatever the DSN asks for (`?sslmode=require`, …); nothing overrides it (`R-STO-2`).
-
-Since MOD-15 milestone 6 the two flags are no longer the only way in: **Settings › Connection**
-does the same thing from inside the running program, which is where the DSN's second, third and
-fourth change belong. `e` opens a masked field — one `•` per character and a count, no reveal
-toggle, and the text is wiped rather than dropped — and `Enter` stores it, re-opens the mirror
-under the new database's fingerprint and connects **without a restart**. A DSN that does not parse
-is refused at the field with one of five fixed sentences (`not a URL`, `no host`,
-`unsupported sslmode`, `port out of range`, `unrecognised parameter`); nothing is stored, echoed or
-logged on that path. `c` removes the entry (this session keeps its current connection until you
-quit) and `R` rebuilds the local mirror, naming what survives and what goes before it acts.
-
-A box whose keyring is empty opens **on that field**, rather than parking offline pointing at a
-flag it cannot reach. `--set-dsn` remains, unchanged, for scripted and headless use.
-
-### A development server
-
-`compose.yaml` at the repo root runs the minimum supported server, `postgres:16`, on host port
-**5439**, so a locally installed Postgres on 5432 never collides:
+The repository includes a `compose.yaml` that starts Postgres 16 on port **5439**, so it does not
+clash with a Postgres you may already have on 5432:
 
 ```
 docker compose up -d
 echo postgres://postgres:htui@localhost:5439/htui | htui --set-dsn
 ```
 
-The container's `htui` database is the one to point the TUI at; `postgres` is the maintenance
-database the test suite creates its throwaway databases through.
+The same file also starts Qdrant, which is only needed for [Search](#search).
 
-### Startup, offline mode and the cache
+### Save your connection string
 
-`htui` opens the local mirror first and renders from it immediately, then connects on a background
-task (ANA-9 §4.4): the UI never waits for the network. The store field of the top bar says which
-state it is in.
+The connection string (DSN) is stored in your **OS keyring**: Windows Credential Manager, the macOS
+Keychain, or the Secret Service on Linux. There is no environment variable or config file for it,
+so it never ends up in your shell history or process list.
+
+You can save it in either of two ways:
+
+- **From inside the app:** open **Settings › Connection** and press `e`. The input is masked. Press
+  `Enter` to save, and `htui` connects straight away without a restart. A machine with no saved
+  connection opens on this screen automatically.
+- **From the command line:** run `htui --set-dsn`, paste the DSN and press `Enter`. You can also
+  pipe it in, as in the example above. `htui --clear-dsn` removes it again.
+
+TLS follows whatever your DSN asks for, for example `?sslmode=require`.
+
+### Online and offline
+
+`htui` opens from its local copy first and connects in the background. The top bar shows where it
+stands:
 
 | Top bar | Meaning |
 |---|---|
-| `memory` | `--demo`: an in-process store, no server and no cache. |
+| `memory` | Running with `--demo`. No server and no local copy. |
 | `connecting` | The first connection attempt has not answered yet. |
-| `online` | Connected. Reads go to Postgres and the cursor pass keeps the mirror warm in the background. |
-| `offline · 3m` | No connection for three minutes (`s` / `m` / `h`). Reads come from the mirror and there is no write path at all. |
+| `online` | Connected. The local copy is kept up to date in the background. |
+| `offline · 3m` | No connection for three minutes. You can browse what was copied locally, but nothing can be changed and no chat or run can start. |
 
-An offline shell retries every 30 seconds and switches to `online` on its own. `--offline` skips
-connecting entirely, which is the way to look at the cache on purpose.
+While offline, `htui` retries every 30 seconds and goes back online on its own. Use `--offline` to
+look at the local copy on purpose.
 
-The cache lives next to the box identity under the user's configuration directory —
-`%APPDATA%\htui` on Windows, `~/.config/htui` on Linux, `~/Library/Application Support/htui` on
-macOS:
+### Database upgrades
 
-```
-%APPDATA%\htui\box.toml                                # this box's id (UUIDv7) and its hostname
-%APPDATA%\htui\cache\<fingerprint>\cache.sqlite        # the mirror, one per server
-%APPDATA%\htui\cache\<fingerprint>\pending\*.jsonl     # chat buffers from an earlier build, uploaded on connect
-```
-
-`<fingerprint>` is `sha256(host:port/dbname)` and never contains credentials, so pointing `htui` at
-a second server gives it a second mirror rather than a mixed one. `box.toml` is minted on first
-launch and its id survives a hostname change (`R-BOX-4`). Deleting `cache/` is safe: it is refilled
-from the server, and it is rebuilt automatically when the server's schema version changes.
-
-### The migration prompt
-
-A schema that is behind this binary is **never migrated without being asked** (`R-STO-5`). When the
-connected database is behind, a modal box appears:
+When a new version of `htui` needs to upgrade your database, it asks first and never upgrades on
+its own:
 
 ```
 3 schema migrations are pending. Apply them now?
@@ -140,342 +144,244 @@ connected database is behind, a modal box appears:
 y apply · n / Esc stay offline
 ```
 
-`y` applies them and goes online; `n` and `Esc` leave the database untouched and the shell reading
-from the cache. The question is asked once per session. A database whose schema is *newer* than
-this binary, or whose applied migrations have different checksums, is refused outright: the top bar
-stays offline and the reason is on the status line.
+Press `y` to upgrade and go online, or `n` / `Esc` to leave the database untouched and keep
+browsing the local copy. If the database is *newer* than your copy of `htui`, `htui` stays offline
+and says why on the status line; update `htui` to connect.
 
-## Keys
+## Using htui
 
-Keys are a table, not a `match`: a key reaches the topmost overlay first, then the overlay's
-bindings, then the active tab, then the tab's bindings, then the global table.
+Everything happens in a **workspace**. Press `w` to switch workspaces. If the database has none
+yet, create one in **Settings › Hierarchy** with `N`.
 
-### Global
+`htui` has four tabs. Switch with `Tab` / `Shift+Tab` or the number keys `1` to `4`.
+
+| Tab | What it is for |
+|---|---|
+| **1 Backlog** | The workspace's items, grouped by project, with details on the right. This is also where you drive runs. |
+| **2 Skills** | Your skill library and prompt templates: browse versions, compare them, edit, import, and attach skills to projects and repositories. |
+| **3 Settings** | Agents, workspaces and projects, item kinds, prompt settings, the database connection, the search server and this machine's profile. |
+| **4 Chat** | A live conversation with an agent, and replays of recorded ones. |
+
+**Press `?` on any screen for its full list of keys.** The ones below are the essentials.
+
+### Everywhere
 
 | Key | Action |
 |---|---|
 | `q` | Quit |
 | `Tab` / `Shift+Tab` | Next / previous tab |
-| `1` … `9` | Select a tab by position (`1` Backlog, `2` Skills, `3` Settings) |
-| `w` | Open the workspace switcher |
-| `?` | Toggle the key help box |
+| `1` … `4` | Go to a tab |
+| `w` | Switch workspace |
+| `?` | Show or hide the key help |
+| `Esc` | Close the open pop-up |
 
-### Workspace switcher (overlay)
+Most lists use `j` / `k` (or the arrow keys) to move, and `h` / `l` (or `[` / `]`) to switch
+between sub-tabs or sections.
 
-| Key | Action |
-|---|---|
-| `j` / `Down` | Next workspace |
-| `k` / `Up` | Previous workspace |
-| `Enter` | Enter the selected workspace (changes the scope) |
-| `Esc` | Close the overlay |
+### Backlog
 
-`Esc` closes any overlay; the switcher is modal, so a key it does not handle never reaches the tab
-underneath.
-
-### Schema prompt (overlay)
+Select an item on the left to see it on the right. The detail pane has six sub-tabs: **Body**,
+**Runs**, **Graph** (linked items), **Documents**, **Notes** and **Prompt**.
 
 | Key | Action |
 |---|---|
-| `y` | Apply the pending migrations and go online |
-| `n` / `Esc` | Leave the database untouched and stay on the cache |
+| `j` / `k`, `g` / `G` | Move, jump to the first / last row |
+| `Enter` on a project | Fold or unfold the project |
+| `h` / `l` | Previous / next detail sub-tab |
+| `J` / `K`, `PageUp` / `PageDown` | Scroll the detail pane |
 
-The prompt has no key that opens it: it is opened by the shell when the connected database reports
-pending migrations, and never by the user.
-
-### Backlog tab
-
-| Key | Action |
-|---|---|
-| `j` / `Down` | Next row |
-| `k` / `Up` | Previous row |
-| `g` / `Home` | First row |
-| `G` / `End` | Last row |
-| `Enter` | Fold or unfold the project group, when the cursor is on a project header |
-| `l` / `]` / `Right` | Next detail sub-tab |
-| `h` / `[` / `Left` | Previous detail sub-tab |
-| `J` / `K` | Scroll the detail pane one row down / up — in **Runs**, move the cursor over the runs and their steps |
-| `PageDown` / `PageUp` | Scroll the detail pane ten rows |
-| `Enter` (in **Runs**) | Replay the selected step in the Chat tab, read-only |
-| `n` / `p` (in **Prompt**) | Preview the next / previous template of this item's project |
-
-The six detail sub-tabs are **Body**, **Runs**, **Graph**, **Documents**, **Notes** and **Prompt**
-(`R-TUI-3`). The Skills tab is still a placeholder; the Settings tab lists the agent registry.
-
-A step row in **Runs** shows a second line whenever a prompt was assembled for it: the estimated
-token count (`~36k`) and a `!` when any section was trimmed to fit the budget.
-
-### The prompt preview
-
-The **Prompt** sub-tab shows the exact prompt a step on this item would be given (`R-PRM-1..3`) —
-assembled by the same code a run uses, and **read-only**: it writes no row, records no event and
-starts no session.
-
-It renders four things, in order:
-
-- the **digest** — the `sha256` of the canonical prompt text, which is what `run_step.prompt_digest`
-  stores and what makes two fan-out siblings provably identical;
-- the **budget and section table** — the token budget, which setting answered it
-  (`budget_source`: a phase override, a project setting, an `app_setting` row, or the compiled-in
-  default), the estimator id, and one row per section with its tokens before and after trimming, the
-  trim strategy that was applied and whether it fired;
-- the **excerpt audit** — which repository roots resolved, which files were selected and at what
-  size, which were skipped and under which rule, and which excerpt providers answered;
-- the **canonical text** itself, verbatim, scrolled with `J` / `K`.
-
-Nothing in the header is parsed out of the text: every line comes from the trim record's own fields,
-so a `</section>` inside a document body is inert.
-
-`n` and `p` cycle through the templates the item's project has, so the same item can be previewed as
-`prd`, `plan`, `implement` and so on. Three inputs a real run gets from the orchestrator are not
-available yet and are **declared rather than defaulted** — they appear in the record's `notes` —
-namely the attempt number (the preview assumes 1), which documents a phase would receive (the
-preview takes the latest version of each kind), and the repository working trees (the preview
-resolves none, so the excerpt section is absent and each repo records `no_path`).
-
-The preview needs the database: on a box that cannot reach its Postgres it refuses with one sentence
-rather than showing a prompt assembled from partial data.
-
-### Chat tab
-
-A live conversation with an agent (`R-TUI-6`). The first prompt starts a session, records it
-against a `chat` run, and streams what the agent does back into the transcript.
+**Runs.** The Runs sub-tab lists an item's runs and their steps. Move between steps with `J` / `K`.
+If an action isn't allowed right now, the status line says why and nothing happens.
 
 | Key | Action |
 |---|---|
-| `i` / `Enter` | Compose; `Enter` sends, `Esc` leaves the composer |
-| `a` | Next enabled agent, before the first prompt |
-| `1`..`9` | Answer the permission request the agent is waiting on |
-| `Esc` `Esc` | End the session (the first `Esc` arms it; any other key, and opening a replay, disarms) |
-| `t` | Fold or unfold the agent's thoughts |
-| `j` / `k` / `g` / `G` | Scroll the transcript |
+| `R` | Start a run on the item |
+| `a` / `x` | Approve / reject the step (rejecting asks for a note) |
+| `r` | Retry the step |
+| `s` | Pick this step as the winner of a fan-out |
+| `A` | Accept the step's output |
+| `o` | Read the step's output document |
+| `p` | Continue the step as a chat |
+| `Enter` | Replay the step's conversation in the Chat tab |
+| `c` | Cancel the run |
+| `T` | Retry the run's cleanup |
+| `u` | Unblock the item |
+| `C` | Close out the item (asks you to type the item's key to confirm) |
 
-The header names the agent, the model, the project and the agent-side session id. A banner under
-it lists what the session **cannot** do — permission requests, edit proposals, plans — whenever
-the transport reports less than the full profile; it is computed from the driver's own
-capabilities, not from `agent.transport`.
+Runs need a connection to the database.
 
-A chat cannot be started while the shell is offline. With Postgres unreachable the shell opens
-read-only from the mirror, the top bar reads `offline · <age>`, and the first prompt is refused with
-one sentence — `the database is unreachable: this box browses its read-only cache and starts no run`
-— rather than being recorded locally. A `cache/<fingerprint>/pending/` buffer left by an earlier
-build is still uploaded on the next successful connection, which inserts that run, its step and
-every event in one transaction; nothing writes a new one.
-Ending the app cancels every live session and waits for its process tree to die before the process
-exits.
+**Prompt.** The Prompt sub-tab shows exactly what an agent would be sent for this item: the
+assembled text, its token budget, what was trimmed to fit, and which files were picked as
+context. `n` / `p` switch between the project's templates. Looking at a prompt changes nothing and
+starts nothing.
 
-**Replay.** `Enter` on a step in the Backlog tab's Runs pane reopens that step's recorded log over
-the Chat tab, rendered by the same transcript the live view uses (`R-HIS-2`). It is read-only: the
-tab sends nothing while it is open, `1`..`9` answer nothing, and `Esc` closes it and puts the live
-conversation back exactly as it was. A step this box has never synced says so rather than reading
-as a conversation that said nothing.
+### Chat
 
-| Key | Action (while a replay is open) |
+| Key | Action |
 |---|---|
-| `Esc` | Leave the replay |
-| `t` | Fold or unfold the thoughts |
-| `j` / `k` | Scroll the replayed transcript |
+| `i` / `Enter` | Write a message (`Enter` sends, `Esc` stops writing) |
+| `a` | Pick another agent (before the first message) |
+| `1` … `9` | Answer the agent's permission request |
+| `Esc` `Esc` | End the conversation |
+| `t` | Show or hide the agent's thinking |
+| `j` / `k`, `g` / `G` | Scroll |
 
-Two environment knobs, both off by default:
+The header shows the agent, the model and the project. If the agent can't do something, such as
+ask for permission or propose edits, a banner says so before you start typing.
 
-| Variable | Effect |
+Chats need a connection to the database. When you quit, `htui` stops every running agent and waits
+for it to exit.
+
+**Replays** open read-only over the Chat tab. `Esc` closes the replay and brings back your live
+conversation exactly as it was.
+
+### Settings
+
+| Section | What you do there |
 |---|---|
-| `HTUI_KEEP_RAW_EVENTS=1` | Keep the verbatim wire message on every recorded row. `project.settings.keep_raw_events` replaces this once the project editor exists |
-| `HTUI_TOOL_<NAME>` | Override one `${name}` placeholder of `agent.launch` — `HTUI_TOOL_NODE`, `HTUI_TOOL_CLAUDE_AGENT_ACP`, … — for a box whose layout the built-in resolver does not understand |
+| **Agents** | See which agents work on this machine (`r` checks again), install an agent's adapter (`i`), and log in (`a`). |
+| **Hierarchy** | Create and edit workspaces (`N`), projects and repositories (`n`), and tell `htui` where each repository lives on this machine (`b`, or `i` to detect them). |
+| **Kinds** | Item kinds, their phases and step graphs. |
+| **Prompt** | Prompt settings such as the token budget. |
+| **Connection** | The database connection string (`e` edit, `c` clear) and rebuilding the local copy (`R`). |
+| **Qdrant** | The search server's address and API key (`e` edit, `c` clear). |
+| **Boxes** | This machine's profile: tags (`t`), quirks (`e`) and a fresh check of its tools (`p`). |
 
-### Spending caps
+Deleting in **Hierarchy** shows what would be removed and asks you to type a confirmation, because
+it cannot be undone.
 
-Two keys of `project.settings`, both **USD micros** (1 000 000 = one dollar) and both absent by
-default, which means unbounded:
+## Setting up agents
 
-| Key | Effect |
+`htui` comes with three agents:
+
+| Agent | What it is |
 |---|---|
-| `per_token_cap_run` | The most one run may spend. The recorder compares the run's accumulated `cost_micros` after every usage report and, on reaching the cap, cancels the session: the step's last two rows are `error{code:"cap_exceeded"}` and `done{stop_reason:"cancelled"}`, and the run closes failed |
-| `per_token_cap_batch` | Read and reported, **not** enforced yet — a batch spans runs the orchestrator does not create yet, so MOD-12 owns it (`docs/ANA-4.md` §9) |
+| `claude` | Claude Code over ACP, the Agent Client Protocol. **The recommended choice.** |
+| `claude-cli` | Claude Code through its command-line JSON stream. A fallback for when the ACP adapter can't be installed. |
+| `agy` | Google Antigravity, through Google's ACP server. |
 
-Micros rather than dollars because the figure a cap is compared against is an integer of micros, and
-a float cap against an integer total is a rounding argument waiting to happen. `0` is a real cap and
-cancels on the first report that carries any cost; a negative or non-integer value **refuses the
-chat** rather than being ignored, because a cap the operator wrote and the app quietly dropped is
-the worse failure.
+Check **Settings › Agents** to see which ones work on this machine.
 
-Both figures are client-side estimates the agent reports, so a cap is a **guard rail and never a
-billing statement** — it can differ from the invoice, and the cancellation message says so.
+### Installing an adapter
 
-### Remaining allowance
+Some agents need a separate adapter program. For `agy`, that is Google's `agy_acp_server`, which
+the `agy` command-line tool does not install. In **Settings › Agents**, select the agent and press
+`i`. Before anything is downloaded, `htui` shows what it will install: the version, where it comes
+from, its size, where it will go, its licence, and whether its checksum can be verified. Press `y`
+to go ahead, `n` to decline, or `x` to stop an install in progress.
 
-`Settings > Agents` carries a `quota` column per agent for this box: the tightest window as a
-percentage with its reset date for a subscription agent, session spend for a per-token one, and `—`
-for an agent that reports nothing (which is every agent whose registry row declares
-`settings.quota.source: "none"`).
+Adapters are installed under:
 
-The value is **latched passively** — every usage report a running chat sees updates it, which costs
-nothing — so `r` re-probes the row but **cannot** refresh quota: a probe handshake reports no
-allowance at all. The section says so on its hint line rather than leaving it to be discovered.
-An offline box latches nothing, and has nothing to latch: a chat off the server is refused before
-it starts, and the mirror holds no `agent_box` row to hold the figure.
+- Linux: `~/.local/share/htui/agents` (or `$XDG_DATA_HOME/htui/agents`)
+- macOS: `~/Library/Application Support/htui/agents`
+- Windows: `%LOCALAPPDATA%\htui\agents`
 
-### Agents that speak no ACP
+Set `HTUI_AGENTS_ROOT` to install somewhere else. If `htui` can't download the adapter (no network,
+a proxy), it shows the steps to install it by hand instead. Unpack the **whole** archive, not just
+the server, and make sure the server file is executable.
 
-Most of what `htui` does with an agent it does over ACP, and an agent that does not speak it is not
-therefore unusable. `claude` also has a headless JSON stream — `claude -p --output-format
-stream-json` — and the registry carries a second row, **`claude-cli`**, that drives it. It is the
-same chat tab, the same recorder, the same rows in the store and the same replay.
+### Logging in
 
-It is a **degraded** path, and the degradation is declared rather than discovered. Three event kinds
-the stream cannot carry are missing, and the chat tab says so in its banner before you type
-anything:
+An installed adapter still has to be logged in. For `agy`, logging into the `agy` command-line tool
+is not enough: the adapter keeps its own credential. In **Settings › Agents**, press `a` on the
+agent, pick a login method with `j` / `k` and `Enter`, and press `o` to open the link the agent
+gives you. `x` cancels.
 
-| Missing | Why, and what happens instead |
+`htui` never sees or stores your agent credentials. It starts the agent's own login flow and then
+checks the agent again, so what **Settings › Agents** shows is what actually works.
+
+Two of `agy`'s methods, **Gemini API key** and **Gemini Enterprise Agent Platform**, are not
+browser logins. They need an environment variable (for example `GEMINI_API_KEY`) set before you
+start `htui`, and the agent tells you which one.
+
+### Claude Code without ACP
+
+Use `claude` when you can. `claude-cli` uses the same Claude Code login but has fewer abilities:
+
+- It can't ask you for permission. Its permission mode setting decides instead, and refusals show
+  up in the transcript.
+- It shows edits as the tool calls that made them, not as diffs you can review.
+- It doesn't produce plans.
+
+### Spending limits
+
+A project can cap how much a single run may spend, with the `per_token_cap_run` project setting.
+The value is in **millionths of a dollar**, so `5000000` means $5. When a run reaches the cap, the
+agent is stopped and the run fails with a clear message. An invalid value refuses the chat rather
+than being ignored.
+
+The figures are the agent's own estimates, so treat a cap as a safety net, not as your bill.
+`per_token_cap_batch` can be set but is not enforced yet.
+
+**Settings › Agents** also shows the remaining allowance per agent where the agent reports one,
+such as a subscription's usage window. It updates as you chat.
+
+## Search
+
+`htui` can search your items and their documents by meaning and by exact words. This is optional
+and needs a [Qdrant](https://qdrant.tech/) server, which `docker compose up -d` also starts.
+
+1. In **Settings › Qdrant**, press `e` and enter the server's gRPC address (with the included
+   `compose.yaml`, that is `http://localhost:6334`), then an API key if your server needs one.
+   Both are kept in the OS keyring.
+2. Build the index:
+
+   ```
+   htui --index-items
+   ```
+
+   The first run downloads a small embedding model into your user cache directory.
+3. Search:
+
+   ```
+   htui --search-items "retry after timeout"
+   htui --search-items "database choice" --decisions --project my-project --limit 5
+   ```
+
+Run `--index-items` again to pick up changes.
+
+## Where htui keeps its files
+
+Everything local lives in your user configuration directory: `~/.config/htui` on Linux,
+`~/Library/Application Support/htui` on macOS, `%APPDATA%\htui` on Windows.
+
+| Path | What it is |
 |---|---|
-| `permission_request` | The stream has no permission channel. The row's `settings.cli.permission_mode` decides, the CLI applies it, and a refusal arrives as a `permission_answer` row marked `by: policy` — a denial you can see in the transcript, but not one you can answer. Answering in-app needs an out-of-band MCP prompt tool, which is MOD-11. |
-| `edit_proposal` | No diff crosses this wire. An edit shows up as the `Edit` or `Write` tool call that made it, after the fact. |
-| `plan` | Not produced by this transport. |
+| `box.toml` | This machine's identity. It survives a hostname change. |
+| `cache/<id>/cache.sqlite` | The local copy of one database. Each server gets its own folder, and the name never contains your credentials. |
 
-Cost also behaves differently and the difference is visible: over ACP an agent reports spend as it
-goes, so a per-run cap can stop a turn part-way. Here the whole turn's cost arrives **once**, on the
-terminal result, by which time the turn is over. So `htui` passes `--max-budget-usd` as well, and
-the cap is enforced by the CLI itself, server-side, while the turn runs.
+Deleting `cache/` is safe: it is refilled from the server. You can also rebuild it from
+**Settings › Connection** with `R`.
 
-**Prefer the ACP row** (`claude`) when both work: it gives you inline permissions, diffs, plans and a
-live spending brake. Reach for `claude-cli` when the ACP adapter cannot be installed or run on a
-box, or when you want the CLI's own behaviour. Both rows are the same agent and the same
-credential — `claude-cli` requires the ordinary `claude` login, and nothing else.
+## Troubleshooting
 
-## Installing an agent's adapter
-
-`claude` reaches ACP through an npm adapter the probe can find on its own. `agy` does not: Google
-ships a separate first-party server, `agy_acp_server`, that is not on `PATH` and not installed by
-the `agy` CLI. Since `R-AGT-10` `htui` installs it for you. In **Settings > Agents**, `j`/`k` pick
-a row and `i` installs it. There is no code path per agent: the source is the row's own
-`agent.launch.discovery.install`, which names an ACP registry id, and the installer writes where
-that row's glob already looks (`R-AGT-5`). A row that declares no source says so instead.
-
-`i` spends one registry read and one `HEAD`, then draws a consent pane — the agent and the version,
-the archive's URL and its size, the directory it unpacks into, the licence and its terms URL,
-whether the digest will be verified or cannot be, whether the disk holds it, and which installed
-versions this one replaces. `y` accepts, `n` / `Esc` declines, `x` stops a running install.
-**Nothing is downloaded before `y`.** Where the registry publishes a `sha256` it is checked before
-anything is unpacked and a mismatch refuses the install; `antigravity-acp` publishes none, which
-the pane says before the download, so `htui` records the digest of what it actually received and a
-later re-install of the same version that differs is detectable. `agy_acp_server` is proprietary,
-which is why the terms are on screen before a byte is fetched; consent is remembered per box in
-`<install root>/<id>/manifest.json`.
-
-The install root is `HTUI_AGENTS_ROOT`, seeded from this platform's local data directory:
-`~/.local/share/htui/agents` on Linux (`$XDG_DATA_HOME` when it is set),
-`~/Library/Application Support/htui/agents` on macOS, `%LOCALAPPDATA%\htui\agents` on Windows.
-Setting the variable moves the tree, which is the knob for a box that wants 1.9 GB per version
-somewhere else; `HTUI_TOOL_<NAME>` still wins over anything installed, for a layout no pattern
-describes. Afterwards `htui` **re-probes**, and the `on this box` cell is the probe's answer rather
-than the installer's claim: a tree that unpacked perfectly but cannot handshake reads `failed`.
-
-Offline, behind a proxy that refuses, or against a registry that will not answer, the action
-degrades to manual steps derived from the same row — the registry URL, the entry id, this box's
-platform key, the directory to unpack the whole archive into, the file to make executable, and the
-`HTUI_TOOL_<NAME>` override. Three things hold whichever way the adapter arrives. Unpack the
-**whole** archive rather than the server alone: `localharness_external` ships beside it, and though
-the handshake does not need it (verified) a live turn may. **The executable bit matters** —
-`launch::spawn` runs `which` even on an absolute path, which rejects a file without it. And **the
-Linux argument is mandatory**: `agent.launch` appends `--uid=` on Linux with its value deliberately
-empty; without it the server's startup path tries to drop privileges to a `nobody` group and aborts
-(`Check failed: LookupGIDByGroupName(…)`) before it reads a byte of stdin. The probe applies the
-append, which is why `Settings > r` is what makes a chat launch a working `agy`.
-
-## Logging an agent in
-
-An installed adapter is not a usable one. `agy_acp_server` keeps its credential under
-`$GEMINI_HOME/antigravity-acp/` (default `~/.gemini/antigravity-acp/`) — a *sibling of, and
-separate from*, the `agy` CLI's own directory, so being logged into the CLI does not log in the
-adapter, and until that directory holds a token the probe records `unauthenticated`.
-
-Since `R-AGT-9` that state is actionable from the app. In **Settings > Agents**, `a` on the
-highlighted row starts a login. The agent is asked which methods it accepts and answers with its
-own words — `agy` offers "Log in with Google", "Log in with Gemini Enterprise", "Gemini API key"
-and "Gemini Enterprise Agent Platform" — `j`/`k` and `Enter` choose one, `o` opens the link the
-agent prints, and `x` cancels. Where the agent advertises logging out, the chooser offers that too.
-No agent name and no method id appears anywhere in the code: the list comes off the wire
-(`R-AGT-5`).
-
-**`htui` never reads, holds or stores the credential.** It triggers the agent's own flow and
-watches what happens; the token is written by the vendor, where the vendor keeps it. What the app
-records afterwards is a **re-probe**, so the `on this box` cell is the probe's verdict and not the
-login's claim — a flow that reported success into a box holding no credential still reads
-`unauthenticated`. Authentication is a fact about a box, never about a registry row: the `agent`
-row is byte-identical before and after.
-
-Two of the four methods are not browser flows at all. `gemini-api-key` and `agent-platform` want a
-variable in the environment the adapter is *launched from*, and the agent says so itself
-(`The GEMINI_API_KEY environment variable must be set…`). `htui` relays that rather than hiding the
-method; injecting the value is the secret provider's job (`R-SEC-1..4`, MOD-10), not this flow's.
-
-A login is paced by a human, so it has no timeout — only `x`, and a cap on **silence** that ends a
-flow nobody is watching. While it waits, the rest of the app keeps working: the flow runs off the
-worker loop like every other long operation (`R-NF-3`).
-
-One thing the app cannot fix for you yet. The agent opens its own redirect listener on
-**this box's** loopback, on a fresh port per attempt. If you run `htui` on a server, the link your
-browser opens redirects to `127.0.0.1` on *your* machine, where nothing is listening. Until MOD-22
-lands, finish the flow by copying the failed `http://127.0.0.1:<port>/?code=…&state=…` out of the
-address bar and re-issuing it on the box:
+**Logging in an agent on a remote machine.** When `htui` runs on a server, the agent's login link
+redirects your browser to `127.0.0.1` on *your* computer, where nothing is listening. Copy the
+failed address (`http://127.0.0.1:<port>/?code=…&state=…`) from the browser's address bar and
+open it on the server:
 
 ```bash
 curl -s "http://127.0.0.1:<port>/?code=…&state=…"
 ```
 
-The adapter takes the code from its own loopback and the login completes. Forwarding the port
-(`ssh -L`) is the other route and works on some setups; the paste-back works on all of them.
+Forwarding the port with `ssh -L` also works on some setups.
 
-## Platforms
+**Garbled lines or boxes on Windows.** Use **Windows Terminal**. The old console (`conhost.exe`,
+or `cmd.exe` outside Windows Terminal) works, but box-drawing characters depend on its font and
+code page.
 
-`R-NF-1` is Windows 10+, Linux and macOS, and nothing in the crate is platform-specific: the
-terminal layer is `crossterm` and the drawing layer is `ratatui`.
+**An agent reads `failed` or `unauthenticated`.** Press `r` in **Settings › Agents** to check again,
+`i` to reinstall the adapter, or `a` to log in.
 
-- **Windows**: **Windows Terminal** is the target and the only configuration the rendering is
-  tuned for — it has the Unicode box-drawing characters, the middle dot in the top bar and the
-  colour depth the theme assumes.
-- **Legacy `conhost.exe`** (the old console host, and `cmd.exe` windows opened outside Windows
-  Terminal) is **best-effort**: it runs, but box-drawing and the `·` separator depend on the
-  console code page and the font, so expect replacement characters with a raster font.
-- **Linux / macOS**: any `xterm`-compatible terminal with UTF-8. Not built on either in MOD-1
-  (this box has only the Windows target installed); the crate uses only `crossterm` and
-  `ratatui`, so nothing is expected to be platform-specific, but it is unverified.
+**The agent program isn't found.** Point `htui` at it with an `HTUI_TOOL_<NAME>` environment
+variable, for example `HTUI_TOOL_NODE` or `HTUI_TOOL_CLAUDE_AGENT_ACP`.
 
-### Checking the Windows-only code from Linux
+**Something went wrong and you want details.** Start `htui` with `--log htui.log` and look at the
+file.
 
-`htui-agent` is the only crate with `#[cfg(windows)]` code — the job object, `CREATE_NO_WINDOW`
-and the `PATHEXT`-aware command lookup of `launch.rs`. On a Linux box that code is never
-compiled by an ordinary build, so the intended check is the Windows target:
+## Development
 
-```bash
-rustup target add x86_64-pc-windows-msvc
-cargo clippy --target x86_64-pc-windows-msvc -p htui-agent --all-targets --all-features -- -D warnings
-```
-
-**This command does not run on a Linux box without an MSVC-capable C compiler, and this project
-does not require one.** `htui-agent` reaches `ring` (through `reqwest`/`rustls`) and `ring`'s build
-script cross-compiles C, so the line dies in `cc-rs` with `failed to find tool "lib.exe"` after
-warning `GNU compiler is not supported for this target`. The same failure is pre-existing for
-`-p htui`, whose `ring` path runs `ring <- rustls <- sqlx-core <- sqlx <- htui-core <- htui-store`.
-The line was green for `htui-agent` before `ring` entered its graph; it is not green now on either
-crate.
-
-The maintainer accepted that loss on 2026-09-28 (`TOOL-3`), so **Windows code is not lint-checked
-from Linux, and this section describes a check you cannot run here.** It previously caught two
-things a Linux build cannot see (an enum whose variants are lopsided only on Windows, and a
-binding used only under `cfg(unix)`); nothing replaces that. `MOD-16` is the only Windows check.
-If you want the lint line back, it needs a C toolchain that can target MSVC without root
-(`cargo install cargo-zigbuild` plus `pip install ziglang`); `cargo-xwin` needs `clang`.
-
-**The cross-target lint proves the code builds, not that it behaves.** The job object's kill-on-close guarantee, the
-`.cmd` shim that `CreateProcess` refuses, and `CREATE_NO_WINDOW` are runtime facts about Windows
-and are verified by running the suite there — `cargo test -p htui-agent` plus the `#[ignore]` live
-tests. That is now the only Windows check there is. The rest of the workspace does not cross-check
-from Linux either, for the same `ring` reason.
-
-The terminal is restored on every exit path, panics included: a panic hook runs `ratatui::restore()`
-before the default hook prints, and the terminal guard restores again on drop.
-
-## Tests
+### Tests
 
 ```
 cargo test --workspace --all-features
@@ -483,29 +389,37 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-features --all-targets -- -D warnings
 ```
 
-### Tests that need a server
-
-The Postgres and cache suites read **`HTUI_TEST_DATABASE_URL`**, a *maintenance* DSN whose user may
-`CREATEDB`. Each test creates its own `htui_test_<hex>` database, migrates it and drops it on its
-last line. With the variable unset every such test prints `skipped: HTUI_TEST_DATABASE_URL not set`
-and passes, so the command above stays green on a box without a server.
+Tests that need Postgres read `HTUI_TEST_DATABASE_URL`, a DSN for a user allowed to create
+databases. Each test creates its own `htui_test_<hex>` database and drops it when it finishes.
+Without the variable those tests print `skipped: HTUI_TEST_DATABASE_URL not set` and pass.
 
 ```
 docker compose up -d
 HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres cargo test --workspace --all-features
 ```
 
-Nothing under `%APPDATA%\htui` is touched by the suite: every test mints its `box.toml` and opens
-its mirror in a throwaway directory, and the keyring tests use their own `htui-test-<pid>` service
-rather than the real entry. A test process killed mid-run can leave a database behind; they all
-carry the `htui_test_` prefix, so `DROP DATABASE htui_test_…` is the cleanup.
+The Qdrant tests read `HTUI_TEST_QDRANT_URL` the same way (`http://localhost:6334` with the
+included `compose.yaml`).
 
-### `sqlx` offline query data
+The test suite never touches your real configuration directory or keyring entry. A test run that is
+killed halfway can leave `htui_test_…` databases behind; drop them by hand.
 
-Postgres queries are checked at compile time against the **committed** `crates/htui-store/.sqlx/`
-data, with `SQLX_OFFLINE=true` in `.cargo/config.toml`, so `cargo build`, `clippy` and `doc` never
-need a server. After adding or changing a `query!`, regenerate it **from inside the crate** —
-`cargo sqlx prepare` has no `-p` flag and writes to the manifest directory:
+Keep an eye on free disk space. `target/` grows quickly, and a full disk makes Postgres tests fail
+in confusing ways (`the database system is in recovery mode`). Deleting
+`target/debug/incremental` is usually enough.
+
+### UI snapshots
+
+The UI tests compare rendered screens against `insta` snapshots in `crates/htui/tests/snapshots/`
+and `crates/htui/src/snapshots/`. When you change a screen on purpose, re-record them with
+`INSTA_UPDATE=always cargo test --workspace --all-features`, run the suite again without the
+variable to check they match, and commit the `.snap` files.
+
+### Changing SQL queries
+
+Postgres queries are checked at compile time against the committed data in
+`crates/htui-store/.sqlx/`, so building never needs a database. After adding or changing a
+`query!`, regenerate that data from inside the crate:
 
 ```
 cargo install sqlx-cli --no-default-features --features postgres,sqlite   # once
@@ -516,46 +430,26 @@ cd crates/htui-store
 DATABASE_URL=postgres://postgres:htui@localhost:5439/htui_sqlx cargo sqlx prepare -- --all-targets --all-features
 ```
 
-`--all-targets --all-features` is not optional: without it the queries inside `#[cfg(test)]`,
-inside `tests/*.rs` and behind the `demo` feature are garbage-collected out of the cache.
-`cargo sqlx prepare --check` is the CI form. The SQLite mirror is checked at run time instead and
-contributes no files.
+Keep `--all-targets --all-features`: without them, the queries used only by tests and the demo are
+dropped. `cargo sqlx prepare --check` verifies the data is current.
 
-The UI tests are `insta` snapshots rendered against a `TestBackend` at 100x30 through
-`htui::testkit::Harness`, which serves store requests inline: no sleeps, no spawned worker, so a
-snapshot is byte-stable. Snapshots live next to their tests in `crates/htui/tests/snapshots/` and
-`crates/htui/src/snapshots/`. When a change moves a rendering on purpose, re-record with
-`INSTA_UPDATE=always cargo test --workspace --all-features`, then run the suite again without the
-variable to confirm the recorded snapshots match, and commit the `.snap` files.
+### Building without network access
 
-## Scope
+The ONNX Runtime download at build time can be skipped by pointing `ORT_LIB_LOCATION` at a local
+copy of onnxruntime 1.18 (and adding its `lib/` folder to `LD_LIBRARY_PATH` on Linux).
 
-MOD-1 was the **scaffold**: the shell, the key table, the tab and overlay registries, the store
-worker seam and read-only views over an in-memory store loaded with demo fixtures.
+### Keeping raw agent messages
 
-**MOD-6** adds the real store: `crates/htui-store` with the ANA-9 §5 Postgres schema and its
-backend (`PgStore`), the per-box SQLite mirror (`CacheStore`) with the background cursor refresh,
-the box identity, the keyring DSN and the `Backend` enum the store worker holds. Item editing is
-still MOD-13's: the write paths exist on `PgStore` and no view calls them yet.
+Set `HTUI_KEEP_RAW_EVENTS=1` to store the original wire message alongside every recorded chat
+event. It is off by default.
 
-**MOD-2** is landing `crates/htui-agent`: the `AgentDriver` / `AgentSession` seam of
-`docs/ANA-4.md` §4.1, the driver event model, the session recorder (coalescing, `seq`/`turn`,
-scrub-before-persist), a `FakeDriver` and one transport-neutral conformance list every transport
-must pass. Milestone 2 adds the launch recipe — `agent.launch` / `agent.settings` as types,
-`${tool}` resolution against a per-box tool map, and a supervised spawn (job object on Windows,
-process group on unix) — plus the agent registry section of the Settings tab. No wire protocol
-yet: `claude` over ACP is milestone 3, so the crate holds the SDK but starts no session.
+### Windows-specific code
 
-The rest is tracked as its own item and lands as an additive module — a file plus one registration
-line, with no change to the event loop:
+Only `htui-agent` has Windows-only code (process supervision and command lookup). It can't be
+lint-checked from Linux without a C toolchain that targets MSVC, so check it by running
+`cargo test -p htui-agent` on Windows, including the ignored live tests.
 
-| Deferred to | What |
-|---|---|
-| **MOD-13** | Filters and item editing (new, edit, close) |
-| **MOD-14** | Navigable Graph traversal, re-rooting and multi-hop |
-| **MOD-15** | Hierarchy management: creating workspaces, projects, repos and item kinds |
-| **MOD-4** | Run actions: run, approve, reject, retry, cancel |
-| **MOD-2** | The Chat tab |
+## Further reading
 
-The TUI scope is always a workspace (a single project still lives in one), and the store seam is
-`docs/ANA-9.md` §6.1 — read it before changing a signature there.
+- [`CONCEPTS.md`](CONCEPTS.md): what `htui` is, and the design decisions behind it.
+- [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md): the full requirements.
