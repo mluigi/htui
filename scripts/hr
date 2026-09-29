@@ -1,0 +1,647 @@
+#!/usr/bin/env bash
+# hr — host driver for containerized /handoff-run sandboxes (TOOL-7). One run = one docker compose
+# project `hr-<item>` (docker/hr/compose.hr.yaml): a fresh clone of this repo on branch hr/<ITEM>,
+# a private Postgres + Qdrant, and the htui-hr-dev toolchain image. Work leaves a sandbox only when
+# the maintainer collects it here, on the host; nothing is ever pushed.
+#
+# Usage:
+#   scripts/hr                                   # gum menu (terminal only)
+#   scripts/hr build
+#   scripts/hr up [ITEM] [--ssd] [--from REF] [--cpus N] [--yes]
+#   scripts/hr attach [ITEM] [--shell]
+#   scripts/hr ls [--tsv]
+#   scripts/hr collect ITEM [--merge] [--force] [--yes]
+#   scripts/hr down ITEM [--purge] [--force] [--yes]
+#   scripts/hr gc [--yes]
+#
+# Interaction uses gum (terminal only); every verb also takes plain arguments. Without a terminal a
+# missing choice is a usage error and a confirmation needs --yes.
+#
+# Environment (all optional):
+#   HR_ROOT       run dirs on the HDD        (default /media/projects/htui-hr)
+#   HR_SSD_ROOT   run dirs with `up --ssd`   (default ~/htui-hr)
+#   HR_STATE      run registry + ID leases   (default /media/projects/htui-hr/.state)
+#   HR_HOST_REPO  host repo main worktree    (default: the main worktree of this script's repo)
+#   HR_IMAGE      toolchain image tag        (default htui-hr-dev)
+#   HR_MISE_PATH  PATH dirs for claude/uv/rg inside the sandbox (default: resolved from mise)
+#   HR_DOCKER     docker binary              (default docker; the tests stub it)
+#   HR_INTERACTIVE  auto (default: stdin and stdout are terminals) | 1 | 0
+#   HR_NO_GUM=1   behave as if gum were not installed
+# Everything scripts/hr exports to compose is the env contract in the header of
+# docker/hr/compose.hr.yaml (blueprint §T1).
+#
+# Exit codes: 0 ok, 1 refused (duplicate run, item not open, dirty tree, non-fast-forward,
+#             uncollected, conflict, no confirmation), 2 usage / missing dependency,
+#             3 external failure (docker, git clone/fetch, IO).
+#
+# Run registry $HR_STATE/runs/<ITEM> (owned by this script; key=value, written tmp+mv under
+# flock $HR_STATE/runs.lock, parsed, never sourced). ID leases belong to scripts/hr-mint alone.
+# Design: .claude/plans/tool-7-hr-sandbox.plan.md, blueprint §T4. Linux only.
+
+set -u
+
+case "$(uname -s 2>/dev/null || echo unknown)" in
+    Linux) ;;
+    *) echo "hr: Linux-only (TOOL-7 sandboxes need Docker on a Linux host)" >&2; exit 2 ;;
+esac
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF_ROOT="$(readlink -f "$SCRIPT_DIR/..")"
+SELF="$SELF_ROOT/scripts/hr"
+COMPOSE_FILE="$SELF_ROOT/docker/hr/compose.hr.yaml"
+HR_MINT_BIN="$SELF_ROOT/scripts/hr-mint"
+WF_DIR="$SELF_ROOT/.claude/skills/handoff-run/scripts"
+# shellcheck source=../.claude/skills/handoff-run/scripts/workflow-patterns.sh
+source "$WF_DIR/workflow-patterns.sh"
+
+DOCKER="${HR_DOCKER:-docker}"
+IMAGE="${HR_IMAGE:-htui-hr-dev}"
+STATE="$(realpath -ms "${HR_STATE:-/media/projects/htui-hr/.state}")"
+RUNS="$STATE/runs"
+ROOT_HDD="$(realpath -ms "${HR_ROOT:-/media/projects/htui-hr}")"
+ROOT_SSD="$(realpath -ms "${HR_SSD_ROOT:-$HOME/htui-hr}")"
+CARGO_VOLUME=htui-hr-cargo
+TAB=$'\t'
+REG_HEADER='# hr run registry v1 - owner: scripts/hr'
+REG_KEYS=(item project branch run_dir root_kind base_ref base_sha cpus created_at collected_sha collected_at)
+ITEM_RE="^(${ID_ALT})\$"
+
+HOST=''
+SRC=''
+PROJECT=''
+COMPOSE=()
+declare -A RUN=()
+
+# ---- output / interaction ----
+
+die() { # $1=exit code, rest=message
+    local rc="$1"
+    shift
+    echo "hr: $*" >&2
+    exit "$rc"
+}
+warn() { echo "hr: $*" >&2; }
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/hr                       (gum menu; terminal only)
+       scripts/hr build
+       scripts/hr up [ITEM] [--ssd] [--from REF] [--cpus N] [--yes]
+       scripts/hr attach [ITEM] [--shell]
+       scripts/hr ls [--tsv]
+       scripts/hr collect ITEM [--merge] [--force] [--yes]
+       scripts/hr down ITEM [--purge] [--force] [--yes]
+       scripts/hr gc [--yes]
+User guide: docs/hr-sandbox.md
+EOF
+}
+
+usage_die() {
+    [[ $# -gt 0 ]] && echo "hr: $*" >&2
+    usage >&2
+    exit 2
+}
+
+interactive() {
+    case "${HR_INTERACTIVE:-auto}" in
+        1 | yes | true) return 0 ;;
+        0 | no | false) return 1 ;;
+        *) [[ -t 0 && -t 1 ]] ;;
+    esac
+}
+
+have_gum() {
+    [[ -z "${HR_NO_GUM:-}" || "${HR_NO_GUM}" == 0 ]] && command -v gum >/dev/null 2>&1
+}
+
+need_gum() {
+    have_gum || die 2 "gum not found (apt install gum) — or pass the arguments"
+}
+
+# gum for display only when a person is watching and gum is there; plain otherwise.
+fancy() { interactive && have_gum; }
+
+# spin TITLE CMD... — gum spinner in a terminal, the plain command otherwise.
+spin() {
+    local title="$1"
+    shift
+    if fancy; then
+        gum spin --show-error --title "$title" -- "$@"
+    else
+        "$@"
+    fi
+}
+
+# confirm YES PROMPT — 0 when confirmed. YES=1 (--yes) skips the question; without a terminal
+# a confirmation is refused (exit 1) rather than assumed.
+confirm() {
+    local yes="$1" prompt="$2"
+    [[ "$yes" -eq 1 ]] && return 0
+    interactive || die 1 "needs confirmation: pass --yes (or run it in a terminal) — $prompt"
+    need_gum
+    gum confirm "$prompt"
+}
+
+now_utc() { date -u +%FT%TZ; }
+
+# ---- host repo / git ----
+
+# The host repo: HR_HOST_REPO, else the main worktree of this script's repo (a linked worktree's
+# common dir is the main one's .git).
+host_repo() {
+    [[ -n "$HOST" ]] && return 0
+    if [[ -n "${HR_HOST_REPO:-}" ]]; then
+        HOST="$(realpath -ms "$HR_HOST_REPO")"
+    else
+        local common
+        common="$(git -C "$SELF_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+            || die 2 "cannot find the host repo from $SELF_ROOT (set HR_HOST_REPO)"
+        HOST="$(dirname "$common")"
+    fi
+    git -C "$HOST" rev-parse --git-dir >/dev/null 2>&1 || die 2 "host repo $HOST is not a git repository"
+}
+
+# Every host-side git call inside a clone goes through here: the clone's .git/config is writable
+# from the sandbox, so nothing it names may execute on the host (F14).
+src_git() {
+    git --no-pager -C "$SRC" -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+        -c core.untrackedCache=false "$@"
+}
+
+# open_items SHA — "ID<TAB>title" for every open checklist line of HANDOFF.md at SHA.
+open_items() {
+    git -C "$HOST" show "$1:HANDOFF.md" 2>/dev/null \
+        | sed -nE 's/^- \[ \] \*\*((ANA|MOD|NEXT|VAL|TOOL|CLEAN)-[0-9]+) - ([^*]*).*/\1\t\3/p'
+}
+
+global_ignore_file() {
+    local f
+    f="$(git config --global --path core.excludesFile 2>/dev/null)"
+    [[ -n "$f" ]] || f="${XDG_CONFIG_HOME:-$HOME/.config}/git/ignore"
+    printf '%s' "$f"
+}
+
+# ---- run registry ----
+
+registered_items() {
+    local f
+    [[ -d "$RUNS" ]] || return 0
+    for f in "$RUNS"/*; do
+        [[ -f "$f" ]] || continue
+        f="${f##*/}"
+        [[ "$f" =~ $ITEM_RE ]] && printf '%s\n' "$f"
+    done
+}
+
+# read_reg ITEM — fill RUN[] from the registry file; 1 if there is none.
+read_reg() {
+    local file="$RUNS/$1" k v
+    [[ -f "$file" ]] || return 1
+    RUN=()
+    while IFS='=' read -r k v || [[ -n "$k" ]]; do
+        [[ -z "$k" || "$k" == '#'* ]] && continue
+        case " ${REG_KEYS[*]} " in
+            *" $k "*) RUN[$k]="$v" ;;
+        esac
+    done <"$file"
+    [[ "${RUN[item]:-}" == "$1" ]] || die 3 "registry $file is corrupt (item=${RUN[item]:-})"
+}
+
+# write_reg ITEM — RUN[] to the registry file, tmp + mv. Caller holds the runs lock.
+write_reg() {
+    local file="$RUNS/$1" tmp k
+    tmp="$RUNS/.$1.tmp.$$"
+    {
+        printf '%s\n' "$REG_HEADER"
+        for k in "${REG_KEYS[@]}"; do printf '%s=%s\n' "$k" "${RUN[$k]:-}"; done
+    } >"$tmp" 2>/dev/null && mv -f "$tmp" "$file" || {
+        rm -f "$tmp"
+        die 3 "cannot write $file"
+    }
+}
+
+RUNS_FD=''
+lock_runs() {
+    mkdir -p "$RUNS" 2>/dev/null || die 3 "cannot create $RUNS"
+    exec {RUNS_FD}>>"$STATE/runs.lock" || die 3 "cannot open $STATE/runs.lock"
+    flock -w 30 "$RUNS_FD" || die 3 "timed out waiting for $STATE/runs.lock"
+}
+unlock_runs() {
+    [[ -n "$RUNS_FD" ]] && exec {RUNS_FD}>&-
+    RUNS_FD=''
+}
+
+# set_reg ITEM k=v... — update registry fields under the lock.
+set_reg() {
+    local item="$1" kv
+    shift
+    lock_runs
+    read_reg "$item" || { unlock_runs; die 1 "no registered run $item"; }
+    for kv in "$@"; do RUN[${kv%%=*}]="${kv#*=}"; done
+    write_reg "$item"
+    unlock_runs
+}
+
+# ---- compose env (the contract in docker/hr/compose.hr.yaml) ----
+
+# resolve_mise_path STRICT — HR_MISE_PATH unless preset: claude and uv (required; before the stale
+# uv in ~/.local/bin), ripgrep (optional). Colon-joined, no trailing slashes. Never mise shims.
+resolve_mise_path() {
+    local strict="$1"
+    if [[ -n "${HR_MISE_PATH:-}" ]]; then
+        export HR_MISE_PATH
+        return 0
+    fi
+    local m="$HOME/.local/share/mise/installs" d
+    local -a parts=()
+    if [[ -x "$m/claude/latest/claude" ]]; then
+        parts+=("$m/claude/latest")
+    elif [[ "$strict" -eq 1 ]]; then
+        die 2 "claude not found at $m/claude/latest/claude (install it with mise, or set HR_MISE_PATH)"
+    fi
+    if [[ -x "$m/uv/latest/.mise-bins/uv" ]]; then
+        parts+=("$m/uv/latest/.mise-bins")
+    elif [[ "$strict" -eq 1 ]]; then
+        die 2 "uv not found at $m/uv/latest/.mise-bins/uv (install it with mise, or set HR_MISE_PATH)"
+    fi
+    for d in "$m"/ripgrep/latest/ripgrep-*/; do
+        [[ -d "$d" ]] && parts+=("${d%/}")
+    done
+    [[ ${#parts[@]} -gt 0 ]] || parts=(/usr/bin)
+    local IFS=:
+    export HR_MISE_PATH="${parts[*]}"
+}
+
+# host_env STRICT — the host-derived half of the contract. STRICT=1 (up, attach: containers may be
+# created) refuses a missing git identity; otherwise (down, ps) placeholders keep compose parsing.
+host_env() {
+    local strict="$1"
+    host_repo
+    export HR_HOST_REPO="$HOST"
+    export HR_HOME="$HOME"
+    export HR_UID HR_GID
+    HR_UID="$(id -u)"
+    HR_GID="$(id -g)"
+    export HR_STATE_HOST="$STATE"
+    export HR_IMAGE="$IMAGE"
+    local name email
+    name="$(git -C "$HOST" config user.name 2>/dev/null)"
+    email="$(git -C "$HOST" config user.email 2>/dev/null)"
+    if [[ -z "$name" || -z "$email" ]]; then
+        [[ "$strict" -eq 1 ]] && die 2 "git user.name / user.email not set for $HOST (the sandbox commits as that identity)"
+        name="${name:-hr}"
+        email="${email:-hr@localhost}"
+    fi
+    export HR_GIT_NAME="$name" HR_GIT_EMAIL="$email"
+    resolve_mise_path "$strict"
+}
+
+set_compose() { # $1=project
+    PROJECT="$1"
+    COMPOSE=("$DOCKER" compose -p "$PROJECT" -f "$COMPOSE_FILE")
+}
+
+# load_run ITEM STRICT — registry + env for an existing run.
+load_run() {
+    local item="$1" strict="${2:-0}"
+    read_reg "$item" || die 1 "no registered run $item (scripts/hr ls)"
+    host_env "$strict"
+    export HR_ITEM="$item"
+    export HR_SRC="${RUN[run_dir]}/src"
+    export HR_CLAUDE_JSON="${RUN[run_dir]}/claude.json"
+    export HR_CPUS="${RUN[cpus]:-4}"
+    SRC="$HR_SRC"
+    set_compose "${RUN[project]:-hr-${item,,}}"
+}
+
+# dev_running — the run's dev container is up (compose ps; live state always from Docker).
+dev_running() {
+    [[ -n "$("${COMPOSE[@]}" ps --status running -q dev 2>/dev/null)" ]]
+}
+
+# is_collected ITEM — the clone's hr/ITEM tip is on the host, in hr/ITEM or in main. After
+# load_run. A run with no commits passes (its tip is the base).
+is_collected() {
+    local item="$1" tip
+    [[ -d "$SRC/.git" ]] || return 1
+    tip="$(src_git rev-parse --verify -q "refs/heads/hr/$item^{commit}")" || return 1
+    git -C "$HOST" cat-file -e "$tip^{commit}" 2>/dev/null || return 1
+    git -C "$HOST" merge-base --is-ancestor "$tip" "refs/heads/hr/$item" 2>/dev/null && return 0
+    git -C "$HOST" merge-base --is-ancestor "$tip" refs/heads/main 2>/dev/null
+}
+
+# pick_run HEADER — gum choice over registered runs (terminal only).
+pick_run() {
+    interactive || usage_die "an ITEM is required without a terminal"
+    need_gum
+    local -a items
+    mapfile -t items < <(registered_items)
+    [[ ${#items[@]} -gt 0 ]] || die 1 "no registered runs"
+    gum choose --header "$1" "${items[@]}" || die 1 "nothing chosen"
+}
+
+norm_item() { # $1=raw -> canonical ID on stdout, or die 2
+    local item="${1^^}"
+    [[ "$item" =~ $ITEM_RE ]] || die 2 "not an item ID: $1 (ANA|MOD|NEXT|VAL|TOOL|CLEAN-<n>)"
+    printf '%s' "$item"
+}
+
+# ---- build ----
+
+cmd_build() {
+    [[ $# -eq 0 ]] || usage_die "build takes no arguments"
+    local -a args=(build -t "$IMAGE" -f "$SELF_ROOT/docker/hr/Dockerfile"
+        --build-arg "HR_USER=$(id -un)" --build-arg "HR_UID=$(id -u)"
+        --build-arg "HR_GID=$(id -g)" --build-arg "HR_HOME=$HOME" "$SELF_ROOT/docker/hr")
+    if fancy; then
+        gum spin --show-output --title "Building $IMAGE" -- "$DOCKER" "${args[@]}" || die 3 "docker build failed"
+    else
+        "$DOCKER" "${args[@]}" || die 3 "docker build failed"
+    fi
+    "$DOCKER" volume create "$CARGO_VOLUME" >/dev/null || die 3 "cannot create volume $CARGO_VOLUME"
+    echo "hr: built $IMAGE for $(id -un) ($(id -u):$(id -g), $HOME)"
+}
+
+# check_image — present, and built for this host's uid/gid/home (labels).
+check_image() {
+    local fmt='{{index .Config.Labels "hr.uid"}} {{index .Config.Labels "hr.gid"}} {{index .Config.Labels "hr.home"}}'
+    local labels want
+    if ! labels="$("$DOCKER" image inspect -f "$fmt" "$IMAGE" 2>/dev/null)"; then
+        if interactive; then
+            need_gum
+            gum confirm "Image $IMAGE not found. Build it now?" || die 2 "image $IMAGE not found — run scripts/hr build"
+            cmd_build
+            labels="$("$DOCKER" image inspect -f "$fmt" "$IMAGE" 2>/dev/null)" || die 3 "image $IMAGE still missing after build"
+        else
+            die 2 "image $IMAGE not found — run scripts/hr build"
+        fi
+    fi
+    want="$(id -u) $(id -g) $HOME"
+    [[ "$labels" == "$want" ]] \
+        || die 2 "image $IMAGE was built for uid/gid/home '$labels', this host is '$want' — rebuild: scripts/hr build"
+}
+
+# ---- up ----
+
+UP_RUN_DIR=''
+UP_CREATED=0
+up_abort() { # $1=rc, rest=message — undo a half-made run dir (before the registry exists)
+    local rc="$1"
+    shift
+    if [[ "$UP_CREATED" -eq 1 && -n "$UP_RUN_DIR" && -d "$UP_RUN_DIR" ]]; then
+        rm -rf -- "$UP_RUN_DIR"
+    fi
+    unlock_runs
+    die "$rc" "$@"
+}
+
+cmd_up() {
+    local item='' ssd=0 ref=main cpus=4 yes=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ssd) ssd=1; shift ;;
+            --from) [[ $# -ge 2 ]] || usage_die "--from needs a ref"; ref="$2"; shift 2 ;;
+            --cpus) [[ $# -ge 2 ]] || usage_die "--cpus needs a number"; cpus="$2"; shift 2 ;;
+            --yes | -y) yes=1; shift ;;
+            -h | --help) usage; exit 0 ;;
+            -*) usage_die "unknown option for up: $1" ;;
+            *) [[ -z "$item" ]] || usage_die "up takes one ITEM"; item="$1"; shift ;;
+        esac
+    done
+    [[ "$cpus" =~ ^[0-9]+(\.[0-9]+)?$ && "$cpus" != 0 ]] || usage_die "--cpus needs a positive number, got '$cpus'"
+    [[ -n "$ref" && "$ref" != -* ]] || usage_die "--from needs a ref, got '$ref'"
+    [[ -z "$item" ]] || item="$(norm_item "$item")"
+    host_repo
+
+    # 1. image
+    check_image
+
+    # 2. the committed ref the clone takes
+    local sha
+    sha="$(git -C "$HOST" rev-parse --verify -q "$ref^{commit}")" || die 2 "'$ref' is not a commit in $HOST"
+
+    # 3. the item: open on that commit, no run yet
+    local open
+    open="$(open_items "$sha")"
+    if [[ -z "$item" ]]; then
+        interactive || usage_die "an ITEM is required without a terminal"
+        need_gum
+        local -A have=()
+        local i
+        while IFS= read -r i; do [[ -n "$i" ]] && have[$i]=1; done < <(registered_items)
+        local choices='' id title
+        while IFS="$TAB" read -r id title; do
+            [[ -z "$id" || -n "${have[$id]:-}" ]] && continue
+            choices+="$id  $title"$'\n'
+        done <<<"$open"
+        [[ -n "$choices" ]] || die 1 "no open items without a run on $ref"
+        local pick
+        pick="$(printf '%s' "$choices" | gum filter --header "Open items on $ref" \
+            --placeholder "type to filter; enter starts a sandbox")" || die 1 "nothing chosen"
+        item="$(norm_item "${pick%% *}")"
+    fi
+    awk -F'\t' -v id="$item" '$1 == id { found = 1 } END { exit !found }' <<<"$open" \
+        || die 1 "$item is not open on $ref (${sha:0:12}) — only open HANDOFF items get a sandbox"
+
+    # 4. duplicate / leftovers (re-checked under the lock below)
+    local root root_kind=hdd
+    root="$ROOT_HDD"
+    [[ "$ssd" -eq 1 ]] && { root="$ROOT_SSD"; root_kind=ssd; }
+    local run_dir="$root/$item"
+    [[ -e "$RUNS/$item" ]] && die 1 "run exists for $item — scripts/hr attach $item / scripts/hr down $item"
+    [[ -e "$run_dir" ]] && die 1 "stale run dir $run_dir (no registered run) — inspect and remove it by hand"
+
+    # 5. uncommitted workflow files on the host do not travel
+    local dirty
+    dirty="$(git -C "$HOST" status --porcelain --untracked-files=all -- .claude HANDOFF.md DECISIONS.md 2>/dev/null \
+        | grep -vE '^.. \.claude/settings\.local\.json$')"
+    if [[ -n "$dirty" ]]; then
+        warn "uncommitted workflow files on the host:"
+        sed 's/^/  /' <<<"$dirty" >&2
+        warn "the clone takes committed $ref only (${sha:0:12})"
+        if interactive && [[ "$yes" -eq 0 ]]; then
+            need_gum
+            gum confirm --default=true "Continue with committed $ref?" || die 1 "cancelled"
+        fi
+    fi
+
+    # 6. preflight: every host source the compose file mounts, the state dir, leasing on
+    local p
+    for p in "$HOME/.local" "$HOME/.claude" "$HOME/.claude.json" "$HOME/.gortex/config.yaml" \
+        "$HOME/.gortex/instructions" "$HOME/.gortex/models"; do
+        [[ -e "$p" ]] || die 2 "missing $p (the sandbox mounts or copies it)"
+    done
+    host_env 1
+    mkdir -p "$HOME/.headroom" "$HOME/.serena" "$HOME/.cache/uv" "$HOST/.remember" "$RUNS" \
+        || die 3 "cannot create the host-side mount sources"
+    HR_STATE="$STATE" "$HR_MINT_BIN" --init || die 3 "scripts/hr-mint --init failed"
+
+    # 7. clone, under the runs lock
+    lock_runs
+    [[ -e "$RUNS/$item" ]] && { unlock_runs; die 1 "run exists for $item — scripts/hr attach $item / scripts/hr down $item"; }
+    [[ -e "$run_dir" ]] && { unlock_runs; die 1 "stale run dir $run_dir (no registered run) — inspect and remove it by hand"; }
+    mkdir -p "$run_dir" || { unlock_runs; die 3 "cannot create $run_dir"; }
+    UP_RUN_DIR="$run_dir"
+    UP_CREATED=1
+    SRC="$run_dir/src"
+    spin "Cloning $HOST" git clone -q --no-hardlinks --no-checkout "$HOST" "$SRC" \
+        || up_abort 3 "git clone of $HOST failed"
+    src_git switch -q -c "hr/$item" "$sha" || up_abort 3 "cannot check out hr/$item at ${sha:0:12}"
+    # Inside the container the host repo is /host/htui (read-only); the host path is the clone.
+    src_git remote set-url origin /host/htui || up_abort 3 "cannot set origin"
+    src_git config remote.origin.pushurl no-push-from-sandbox || up_abort 3 "cannot set pushurl"
+    local exclude="$SRC/.git/info/exclude" gi
+    gi="$(global_ignore_file)"
+    mkdir -p "${exclude%/*}"
+    {
+        if [[ -f "$gi" ]]; then
+            printf '# host global excludes (%s), copied by scripts/hr up\n' "$gi"
+            cat "$gi"
+            printf '\n'
+        fi
+        printf '# copied in by scripts/hr up, untracked\n/.claude/settings.local.json\n'
+    } >>"$exclude" || up_abort 3 "cannot write $exclude"
+    if [[ -f "$HOST/.claude/settings.local.json" ]]; then
+        mkdir -p "$SRC/.claude" && cp -p "$HOST/.claude/settings.local.json" "$SRC/.claude/" \
+            || up_abort 3 "cannot copy .claude/settings.local.json"
+    fi
+    # Mount point of the shared .remember; Docker would create it root-owned.
+    mkdir -p "$SRC/.remember" || up_abort 3 "cannot create $SRC/.remember"
+    install -m 600 "$HOME/.claude.json" "$run_dir/claude.json" || up_abort 3 "cannot snapshot ~/.claude.json"
+
+    # 8. registry before compose, so `down --purge --force` can clean a failed up
+    RUN=([item]="$item" [project]="hr-${item,,}" [branch]="hr/$item" [run_dir]="$run_dir"
+        [root_kind]="$root_kind" [base_ref]="$ref" [base_sha]="$sha" [cpus]="$cpus"
+        [created_at]="$(now_utc)" [collected_sha]='' [collected_at]='')
+    write_reg "$item"
+    UP_CREATED=0
+    unlock_runs
+
+    # 9. containers
+    export HR_ITEM="$item" HR_SRC="$SRC" HR_CLAUDE_JSON="$run_dir/claude.json" HR_CPUS="$cpus"
+    set_compose "hr-${item,,}"
+    "$DOCKER" volume create "$CARGO_VOLUME" >/dev/null || die 3 "cannot create volume $CARGO_VOLUME"
+    spin "Starting $PROJECT" "${COMPOSE[@]}" up -d --wait \
+        || die 3 "docker compose up failed for $PROJECT — clean up with: scripts/hr down $item --purge --force"
+
+    # 10.
+    echo "hr: $item is up — $run_dir ($root_kind), branch hr/$item from $ref ${sha:0:12}, ${cpus} cpus"
+    echo "attach: scripts/hr attach $item"
+}
+
+# ---- attach ----
+
+cmd_attach() {
+    local item='' shell=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --shell) shell=1; shift ;;
+            -h | --help) usage; exit 0 ;;
+            -*) usage_die "unknown option for attach: $1" ;;
+            *) [[ -z "$item" ]] || usage_die "attach takes one ITEM"; item="$1"; shift ;;
+        esac
+    done
+    if [[ -z "$item" ]]; then
+        item="$(pick_run "Attach to which run?")" || exit $?
+    fi
+    item="$(norm_item "$item")"
+    load_run "$item" 1
+    if ! dev_running; then
+        spin "Starting $PROJECT" "${COMPOSE[@]}" up -d --wait || die 3 "docker compose up failed for $PROJECT"
+    fi
+    local -a tty=()
+    [[ -t 0 && -t 1 ]] || tty=(-T)
+    if [[ "$shell" -eq 1 ]]; then
+        exec "${COMPOSE[@]}" exec "${tty[@]}" -e TERM -e COLORTERM dev bash -l
+    fi
+    exec "${COMPOSE[@]}" exec "${tty[@]}" -e TERM -e COLORTERM dev claude --dangerously-skip-permissions
+}
+
+# ---- ls ----
+
+ls_rows() {
+    host_repo
+    local main item state ahead disk
+    main="$(git -C "$HOST" rev-parse --verify -q 'refs/heads/main^{commit}')"
+    printf 'ITEM\tSTATE\tBRANCH\tAHEAD\tDISK\tROOT\n'
+    while IFS= read -r item; do
+        [[ -n "$item" ]] || continue
+        load_run "$item" 0
+        if dev_running; then
+            state=running
+        elif [[ -n "$("${COMPOSE[@]}" ps -a -q 2>/dev/null)" ]]; then
+            state=stopped
+        else
+            state=down
+        fi
+        is_collected "$item" && state+=+collected
+        ahead='?'
+        if [[ -d "$SRC/.git" ]]; then
+            if [[ -n "$main" ]] && src_git cat-file -e "$main^{commit}" 2>/dev/null; then
+                ahead="$(src_git rev-list --count "$main..refs/heads/hr/$item" 2>/dev/null || echo '?')"
+            else
+                # host main moved to commits the clone never saw: count from the base instead
+                ahead="$(src_git rev-list --count "${RUN[base_sha]}..refs/heads/hr/$item" 2>/dev/null || echo '?')*"
+            fi
+        fi
+        disk="$(du -sh "${RUN[run_dir]}" 2>/dev/null | cut -f1)"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$item" "$state" "${RUN[branch]:-hr/$item}" "$ahead" \
+            "${disk:-?}" "${RUN[root_kind]:-?}"
+    done < <(registered_items)
+}
+
+cmd_ls() {
+    local tsv=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --tsv) tsv=1; shift ;;
+            -h | --help) usage; exit 0 ;;
+            *) usage_die "unknown argument for ls: $1" ;;
+        esac
+    done
+    if [[ "$tsv" -eq 1 ]]; then
+        ls_rows
+        return 0
+    fi
+    if fancy; then
+        local rows
+        rows="$(gum spin --show-stdout --title "Measuring runs" -- "$SELF" ls --tsv)" || die 3 "ls failed"
+        tail -n +2 <<<"$rows" | gum table -p -s "$TAB" -c ITEM,STATE,BRANCH,AHEAD,DISK,ROOT
+    else
+        ls_rows | column -t -s "$TAB"
+    fi
+}
+
+# ---- collect / down / gc ----
+
+cmd_collect() { die 2 "collect: not implemented yet"; }
+cmd_down() { die 2 "down: not implemented yet"; }
+cmd_gc() { die 2 "gc: not implemented yet"; }
+
+# ---- main ----
+
+VERBS=(build up attach ls collect down gc)
+
+main() {
+    [[ "${HR_SANDBOX:-}" == 1 ]] && die 2 "scripts/hr is host-only; this shell is inside a sandbox (HR_SANDBOX=1)"
+    local verb="${1:-}"
+    [[ $# -gt 0 ]] && shift
+    if [[ -z "$verb" ]]; then
+        interactive || usage_die
+        need_gum
+        verb="$(gum choose --header "scripts/hr — /handoff-run sandboxes" "${VERBS[@]}")" || exit 1
+    fi
+    case "$verb" in
+        build) cmd_build "$@" ;;
+        up) cmd_up "$@" ;;
+        attach) cmd_attach "$@" ;;
+        ls) cmd_ls "$@" ;;
+        collect) cmd_collect "$@" ;;
+        down) cmd_down "$@" ;;
+        gc) cmd_gc "$@" ;;
+        -h | --help | help) usage; exit 0 ;;
+        *) usage_die "unknown verb: $verb" ;;
+    esac
+}
+
+main "$@"
