@@ -1006,8 +1006,8 @@ fn to_value_is_byte_stable_and_carries_the_documented_keys() {
     );
     assert_eq!(
         first["v"],
-        serde_json::json!(2),
-        "MOD-9 D42 bumped the record"
+        serde_json::json!(3),
+        "MOD-9 D118 bumped the record to v 3"
     );
     // `phase_implement_attempt2` carries one `Always` skill, placed by the implement body.
     let choices = first["skill_choices"]

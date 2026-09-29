@@ -14,6 +14,8 @@
 
 use serde::Serialize;
 
+use crate::model::skill::StepFiles;
+
 /// The glob metacharacters ANA-2 §4.7 truncates a `touched_paths` entry at (`docs/ANA-2.md:1074`).
 const GLOB_META: [char; 4] = ['*', '?', '[', '{'];
 
@@ -1026,6 +1028,56 @@ fn joined(lines: &[&str]) -> String {
     out
 }
 
+/// MOD-9 D114: §4.5 steps 1-2 on their own — every root resolved and listed once, path-only skip
+/// rules applied — so the excerpt selection and the `glob` file set share one walk.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listing {
+    /// One per repo in `req.roots`, repo byte order (becomes `audit.roots`).
+    pub roots: Vec<RootRecord>,
+    /// Every surviving listed file, root order then the reader's order.
+    pub files: Vec<RepoPath>,
+    /// The repos whose `RepoReader::list` succeeded, repo byte order.
+    pub listed: Vec<String>,
+    /// Steps 1-2's notes, in `select`'s old order (the F-101 note is not here).
+    pub notes: Vec<String>,
+}
+
+/// MOD-9 D114: §4.5 steps 1 and 2 — resolve a root per repo, list under it, apply the path-only
+/// skip rules — exactly as [`select`] ran them before the split. Every failure is a note: a
+/// `no_path` root, an unlistable repo, a partial listing, a declared file a rule excludes, a path
+/// that is not repo-relative, and a count per skip rule.
+#[must_use]
+pub fn list(reader: &dyn RepoReader, req: &ExcerptRequest<'_>) -> Listing {
+    let _ = (reader, req);
+    todo!()
+}
+
+/// MOD-9 D114: §4.5 steps 3 to 10 over a [`list`]ing the caller already holds, so the reader is
+/// never asked to list again. The notes start with the F-101 caps note, then `listing.notes`, then
+/// the selection's own — [`select`]'s order before the split.
+#[must_use]
+pub fn select_listed(
+    reader: &dyn RepoReader,
+    req: &ExcerptRequest<'_>,
+    listing: &Listing,
+    merged: Vec<ExcerptCandidate>,
+    providers: Vec<String>,
+    est: crate::prompt::TokenEstimator,
+) -> ExcerptSet {
+    let _ = (reader, req, listing, merged, providers, est);
+    todo!()
+}
+
+/// MOD-9 D115: the F2 set. Every repo of `listing.listed` is reached; a listed file is kept when
+/// `touched` is empty or some prefix covers it (the narrowing is global: a repo no prefix names
+/// keeps its reach and loses its files); then every changed path the listing's rules would keep —
+/// repo-relative, past [`skip_by_path`] — is added, reaching its repo even with no root.
+#[must_use]
+pub fn step_files(listing: &Listing, touched: &[PathPrefix], changed: &[RepoPath]) -> StepFiles {
+    let _ = (listing, touched, changed);
+    todo!()
+}
+
 /// §4.5 steps 1–10 over a reader and a candidate list already merged from every provider.
 ///
 /// Pure over `reader`: with an in-memory double no filesystem is touched, which is what makes the
@@ -1677,6 +1729,8 @@ mod tests {
         /// A limit of the reader's own, as `htui_agent::excerpt::FsRepoReader` carries one:
         /// `list` hides anything over it and `read` refuses. [`u64::MAX`] enforces nothing.
         max_file_bytes: u64,
+        /// MOD-9 D115: repos whose `list` fails, as an unreadable root does.
+        unlistable: std::collections::BTreeSet<String>,
     }
 
     impl Default for MapReader {
@@ -1695,7 +1749,14 @@ mod tests {
                 hidden: std::collections::BTreeMap::new(),
                 truncated: false,
                 max_file_bytes: u64::MAX,
+                unlistable: std::collections::BTreeSet::new(),
             }
+        }
+
+        /// MOD-9 D115: a reader whose `list` of `repo` fails.
+        fn unlistable(mut self, repo: &str) -> Self {
+            self.unlistable.insert(repo.to_owned());
+            self
         }
 
         fn hiding(mut self, files: &[(&str, &str, &str)]) -> Self {
@@ -1724,6 +1785,9 @@ mod tests {
 
     impl RepoReader for MapReader {
         fn list(&self, root: &RepoRoot, _cap: u32) -> Result<(Vec<String>, bool), ProviderError> {
+            if self.unlistable.contains(&root.repo) {
+                return Err(ProviderError::new("map", "unlistable"));
+            }
             Ok((
                 self.files
                     .iter()
@@ -1768,6 +1832,234 @@ mod tests {
             root: std::path::PathBuf::from("/nowhere"),
             source: RootSource::RunStepTree,
         }
+    }
+
+    /// MOD-9 D114: a [`MapReader`] that counts its `list` calls.
+    #[derive(Debug)]
+    struct CountingReader {
+        inner: MapReader,
+        lists: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingReader {
+        fn new(inner: MapReader) -> Self {
+            Self {
+                inner,
+                lists: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn lists(&self) -> usize {
+            self.lists.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl RepoReader for CountingReader {
+        fn list(&self, root: &RepoRoot, cap: u32) -> Result<(Vec<String>, bool), ProviderError> {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.list(root, cap)
+        }
+
+        fn read(&self, root: &RepoRoot, path: &str) -> Result<String, ProviderError> {
+            self.inner.read(root, path)
+        }
+
+        fn max_file_bytes(&self) -> u64 {
+            self.inner.max_file_bytes()
+        }
+    }
+
+    fn repo_path(repo: &str, path: &str) -> RepoPath {
+        RepoPath {
+            repo: repo.to_owned(),
+            path: path.to_owned(),
+        }
+    }
+
+    /// The listing `step_files`' cases share: `htui:{src/a.rs, docs/b.md}` and `docs:{x.md}`.
+    fn two_repo_listing() -> Listing {
+        Listing {
+            listed: vec!["docs".to_owned(), "htui".to_owned()],
+            files: vec![
+                repo_path("docs", "x.md"),
+                repo_path("htui", "docs/b.md"),
+                repo_path("htui", "src/a.rs"),
+            ],
+            ..Listing::default()
+        }
+    }
+
+    /// A [`StepFiles`] reaching `reached` and holding `files`.
+    fn step_set(reached: &[&str], files: &[(&str, &str)]) -> StepFiles {
+        let mut set = StepFiles::default();
+        for repo in reached {
+            set.reach(repo);
+        }
+        for (repo, path) in files {
+            set.insert(repo, path);
+        }
+        set
+    }
+
+    /// MOD-9 D114/D136: `select` is `list` then `select_listed`, and the listing's notes keep their
+    /// old place and order — per root in repo byte order, then declared-denied, then per-rule
+    /// counts — right after the F-101 caps note.
+    #[test]
+    fn select_is_list_then_select_listed() {
+        let mut owned = request("nothing\n", &["**"], &[]);
+        owned.roots = vec![
+            RepoRoot {
+                source: RootSource::NoPath,
+                ..root("agy")
+            },
+            root("htui"),
+        ];
+        let mut reader = MapReader::with(&[
+            ("htui", "src/a.rs", "fn a() {}\n"),
+            ("htui", ".env", "X=1\n"),
+            ("htui", "/abs.rs", "fn b() {}\n"),
+        ])
+        .refusing_over(1_000);
+        reader.truncated = true;
+        let req = owned.as_request();
+
+        let listing = list(&reader, &req);
+        let listed_notes = vec![
+            "excerpt: no readable root for repo `agy`; nothing was scanned".to_owned(),
+            "excerpt: repo `htui` hit the scan cap of 20000 files; the listing is partial"
+                .to_owned(),
+            "excerpt: listed path `htui:/abs.rs` is not repo-relative; dropped".to_owned(),
+            "excerpt: `htui:.env` is declared but excluded by rule `secret_denylist`; never \
+             selected"
+                .to_owned(),
+            "excerpt: 1 path(s) skipped by rule `secret_denylist`".to_owned(),
+        ];
+        assert_eq!(listing.notes, listed_notes, "steps 1-2's notes, in order");
+        assert_eq!(listing.listed, vec!["htui".to_owned()]);
+        assert_eq!(listing.files, vec![repo_path("htui", "src/a.rs")]);
+
+        let est = crate::prompt::TokenEstimator::DEFAULT;
+        let whole = select(&reader, &req, Vec::new(), Vec::new(), est);
+        let split = select_listed(&reader, &req, &listing, Vec::new(), Vec::new(), est);
+        assert_eq!(whole, split, "select is list then select_listed");
+        assert!(
+            whole.notes[0].starts_with(
+                "excerpt: the reader's max_file_bytes (1000) is below the configured \
+                 excerpt_max_file_bytes (524288)"
+            ),
+            "the F-101 note comes first: {:?}",
+            whole.notes
+        );
+        assert_eq!(
+            whole.notes[1..=listed_notes.len()],
+            listed_notes[..],
+            "then the listing's notes, unmoved"
+        );
+        assert_eq!(whole.audit.roots, listing.roots);
+    }
+
+    /// MOD-9 D114: `list` lists each root once; `select_listed` never lists.
+    #[test]
+    fn select_listed_never_lists() {
+        let files = [
+            ("htui", "src/a.rs", "fn a() {}\n"),
+            ("docs", "x.md", "# x\n"),
+        ];
+        let mut owned = request("nothing\n", &["**"], &[]);
+        owned.roots = vec![root("htui"), root("docs")];
+        let req = owned.as_request();
+        let est = crate::prompt::TokenEstimator::DEFAULT;
+
+        let reader = CountingReader::new(MapReader::with(&files));
+        let listing = list(&reader, &req);
+        assert_eq!(reader.lists(), 2, "one list per root");
+        let _ = select_listed(&reader, &req, &listing, Vec::new(), Vec::new(), est);
+        assert_eq!(reader.lists(), 2, "select_listed reuses the listing");
+
+        let fresh = CountingReader::new(MapReader::with(&files));
+        let _ = select(&fresh, &req, Vec::new(), Vec::new(), est);
+        assert_eq!(fresh.lists(), 2, "select lists once per root");
+    }
+
+    /// MOD-9 D115: touched prefixes narrow the whole listing; a repo no prefix names stays reached.
+    #[test]
+    fn step_files_narrows_to_touched_prefixes() {
+        let touched = [PathPrefix::parse("src/", "htui")];
+        assert_eq!(
+            step_files(&two_repo_listing(), &touched, &[]),
+            step_set(&["docs"], &[("htui", "src/a.rs")]),
+        );
+    }
+
+    /// MOD-9 D115: with no touched paths the whole listing is the file set.
+    #[test]
+    fn step_files_keeps_the_whole_listing_without_touched_paths() {
+        assert_eq!(
+            step_files(&two_repo_listing(), &[], &[]),
+            step_set(
+                &[],
+                &[
+                    ("docs", "x.md"),
+                    ("htui", "docs/b.md"),
+                    ("htui", "src/a.rs")
+                ]
+            ),
+        );
+    }
+
+    /// MOD-9 D115: changed paths join after the narrowing, reaching a repo with no root.
+    #[test]
+    fn step_files_adds_changed_paths_after_the_narrowing() {
+        let touched = [PathPrefix::parse("src/", "htui")];
+        let changed = [repo_path("htui", "docs/b.md"), repo_path("web", "c.rs")];
+        let set = step_files(&two_repo_listing(), &touched, &changed);
+        assert_eq!(
+            set,
+            step_set(
+                &["docs"],
+                &[("htui", "docs/b.md"), ("htui", "src/a.rs"), ("web", "c.rs")]
+            ),
+        );
+        assert!(set.is_reached("web"), "a changed path reaches its repo");
+    }
+
+    /// MOD-9 D115: a changed path the walk's rules would drop is match evidence nowhere, and
+    /// reaches nothing.
+    #[test]
+    fn step_files_drops_a_denied_or_non_relative_changed_path() {
+        let changed = [
+            repo_path("htui", ".env"),
+            repo_path("htui", "/abs"),
+            repo_path("htui", "../x"),
+            repo_path("htui", ""),
+        ];
+        let set = step_files(&Listing::default(), &[], &changed);
+        assert_eq!(set, StepFiles::default());
+        assert!(set.is_empty());
+    }
+
+    /// MOD-9 D115: a repo whose `list` failed is not reached, and the listing says why.
+    #[test]
+    fn a_repo_that_could_not_be_listed_is_not_reached() {
+        let reader = MapReader::with(&[
+            ("htui", "src/a.rs", "fn a() {}\n"),
+            ("broken", "b.rs", "fn b() {}\n"),
+        ])
+        .unlistable("broken");
+        let mut owned = request("nothing\n", &[], &[]);
+        owned.roots = vec![root("htui"), root("broken")];
+        let listing = list(&reader, &owned.as_request());
+        assert_eq!(listing.listed, vec!["htui".to_owned()]);
+        let set = step_files(&listing, &[], &[]);
+        assert!(set.is_reached("htui"));
+        assert!(!set.is_reached("broken"));
+        assert!(
+            listing
+                .notes
+                .contains(&"excerpt: repo `broken` could not be listed: unlistable".to_owned()),
+            "{:?}",
+            listing.notes
+        );
     }
 
     #[test]

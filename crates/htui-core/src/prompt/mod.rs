@@ -101,6 +101,11 @@ pub struct PromptSpec {
     pub skills: Vec<BoundSkill>,
     /// §4.5's read and windowed excerpts, with the audit half the ranker filled.
     pub excerpts: ExcerptSet,
+    /// MOD-9 D110/D117: the F2 file set a `glob` attachment matches against — the excerpt walk's
+    /// listing under the step's roots, narrowed to `touched_paths`, plus the previous attempt's
+    /// changed paths, already scrub-filtered (D116). `StepFiles::default()` reaches no repo, so a
+    /// `glob` winner records `no_path`: the judge's, the handoff's, every hand-built spec's.
+    pub step_files: StepFiles,
     /// Whether `R-MCP-4`'s `command_run` exposure is on for this phase (§4.2 `:484`).
     pub command_queue: bool,
     /// The previous attempt's verification output; `None` on attempt 1.
@@ -963,6 +968,16 @@ pub fn drop_unmaskable_excerpts(set: &mut ExcerptSet, scrubber: &dyn Scrubber) {
     set.files = kept;
 }
 
+/// MOD-9 D116: withholds from `glob` matching every file whose repo slug or path the scrubber
+/// refuses (`refused_rule`), so a refused path can never be the recorded match (the record is
+/// scrubbed fail-closed, `TrimRecord::to_value`). Count only — the note names no repo and no
+/// path, stricter than `drop_unmaskable_excerpts`. `None` when nothing was withheld.
+#[must_use]
+pub fn drop_unmaskable_files(files: &mut StepFiles, scrubber: &dyn Scrubber) -> Option<String> {
+    let _ = (files, scrubber);
+    todo!()
+}
+
 /// What [`withhold_unmaskable_notes`] puts in place of a note it withholds.
 const WITHHELD_NOTE: &str =
     "excerpt: a note was withheld; it named a string the scrubber masks or refuses";
@@ -1175,6 +1190,44 @@ mod tests {
         }
         assert!(SectionName::FailureReason.is_protected(TemplateRole::Handoff));
         assert!(!SectionName::FailureReason.is_protected(TemplateRole::Phase));
+    }
+
+    /// MOD-9 D116: a refused repo slug or path is withheld from matching, counted, never named;
+    /// a repo stays reached when every path under it goes (D132).
+    #[test]
+    fn drop_unmaskable_files_withholds_and_counts_without_naming() {
+        let scrubber = crate::scrub::MinimalScrubber::new([]);
+        let mut files = StepFiles::default();
+        for (repo, path) in [
+            ("htui", "src/a.rs"),
+            ("htui", "src/sk-live.rs"),
+            ("htui", "docs/ghp_token.md"),
+            ("sk-repo", "x.rs"),
+        ] {
+            files.insert(repo, path);
+        }
+
+        let note = drop_unmaskable_files(&mut files, &scrubber);
+        assert_eq!(
+            note.as_deref(),
+            Some("skills: 3 path(s) withheld from glob matching; the scrubber refused them")
+        );
+        let note = note.unwrap_or_default();
+        assert!(
+            !note.contains("sk-") && !note.contains("ghp_"),
+            "the note names nothing"
+        );
+        let mut kept = StepFiles::default();
+        kept.insert("htui", "src/a.rs");
+        kept.reach("sk-repo");
+        assert_eq!(files, kept, "the refused repo stays reached with no file");
+
+        assert_eq!(
+            drop_unmaskable_files(&mut files, &scrubber),
+            None,
+            "nothing left to withhold"
+        );
+        assert_eq!(files, kept);
     }
 }
 

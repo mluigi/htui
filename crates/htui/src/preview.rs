@@ -27,7 +27,7 @@
 //! four missing tables; `htui` is an online-only program and says so in one sentence.
 
 use htui_agent::excerpt::{PassInput, excerpt_roots, excerpts_for, touched_prefixes};
-use htui_core::model::{ItemId, PromptScope, RepoId, Scope};
+use htui_core::model::{ItemId, PromptScope, RepoId, Scope, StepFiles};
 use htui_core::prompt::excerpt::ExcerptSet;
 use htui_core::prompt::{
     AssembledPrompt, DEFAULT_TEMPLATES, InputDocument, PromptSpec, TemplateRef, TemplateRole,
@@ -289,6 +289,7 @@ pub async fn build(
         box_profile,
         skills,
         excerpts: ExcerptSet::default(),
+        step_files: StepFiles::default(),
         command_queue: false,
         verify_failure: None,
         previous_diff: None,

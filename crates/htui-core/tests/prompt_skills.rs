@@ -9,7 +9,7 @@
 //! `command-queue` v1 at position 1 — and assembles.
 #![cfg(feature = "test-support")]
 
-use htui_core::model::{Activation, ChoiceReason, SkillChoice, SkillLevel};
+use htui_core::model::{Activation, ChoiceReason, SkillChoice, SkillLevel, StepFiles};
 use htui_core::prompt::{
     AssembleError, AssembledPrompt, PromptSpec, SectionName, assemble, fixtures,
 };
@@ -29,6 +29,24 @@ fn ok(spec: &PromptSpec) -> AssembledPrompt {
 fn base() -> PromptSpec {
     let mut spec = fixtures::phase_skills_over_cap();
     spec.max_skill_tokens = 20_000;
+    spec
+}
+
+/// MOD-9 D110: a step's file set holding each `(repo, path)`.
+fn files(entries: &[(&str, &str)]) -> StepFiles {
+    let mut files = StepFiles::default();
+    for &(repo, path) in entries {
+        files.insert(repo, path);
+    }
+    files
+}
+
+/// `base()` with `command-queue` attached as `glob` `**/*.rs` over `step_files`.
+fn glob_over(step_files: StepFiles) -> PromptSpec {
+    let mut spec = base();
+    spec.skills[1].activation = Activation::Glob;
+    spec.skills[1].globs = vec!["**/*.rs".to_owned()];
+    spec.step_files = step_files;
     spec
 }
 
@@ -98,7 +116,7 @@ fn an_off_skill_is_not_rendered_and_is_recorded_off() {
 }
 
 #[test]
-fn a_glob_skill_records_no_path_before_milestone_3() {
+fn a_glob_skill_with_no_step_files_records_no_path() {
     let mut spec = base();
     spec.skills[1].activation = Activation::Glob;
     spec.skills[1].globs = vec!["**/*.rs".to_owned()];
@@ -106,12 +124,114 @@ fn a_glob_skill_records_no_path_before_milestone_3() {
 
     assert!(
         !prompt.text.contains("name=\"command-queue\""),
-        "OQ-12: no step resolves a root before milestone 3, so a `glob` winner is inactive"
+        "MOD-9 D117: default `StepFiles` reaches no repo, so a `glob` winner is inactive"
     );
     let choice = &prompt.trim.skill_choices[1];
     assert_eq!(choice.reason, ChoiceReason::NoPath);
     assert_eq!(choice.activation, Activation::Glob);
     assert!(!choice.active);
+}
+
+/// MOD-9 D117: a matched `glob` renders the bytes an `always` one would; only the record differs.
+#[test]
+fn a_matched_glob_renders_like_always_and_records_the_path() {
+    let glob = ok(&glob_over(files(&[("htui", "src/lib.rs")])));
+    let always = ok(&base());
+
+    assert_eq!(
+        glob.digest, always.digest,
+        "the path is recorded, not rendered"
+    );
+    assert_eq!(glob.text, always.text);
+    assert_eq!(glob.trim.sections, always.trim.sections);
+    assert_eq!(glob.trim.skill_choices[0], always.trim.skill_choices[0]);
+    assert_eq!(
+        glob.trim.skill_choices[1],
+        SkillChoice {
+            activation: Activation::Glob,
+            reason: ChoiceReason::Matched,
+            path: Some("htui:src/lib.rs".to_owned()),
+            ..always.trim.skill_choices[1].clone()
+        }
+    );
+    assert!(glob.trim.skill_choices[1].active);
+}
+
+/// MOD-9 D109: a reached repo with no matching file is `no_match`, and renders what `off` does.
+#[test]
+fn a_glob_with_no_match_renders_nothing() {
+    let glob = ok(&glob_over(files(&[("htui", "docs/a.md")])));
+    let mut off = base();
+    off.skills[1].activation = Activation::Off;
+    let off = ok(&off);
+
+    assert!(!glob.text.contains("name=\"command-queue\""));
+    let choice = &glob.trim.skill_choices[1];
+    assert_eq!(choice.reason, ChoiceReason::NoMatch);
+    assert!(!choice.active);
+    assert_eq!(choice.path, None);
+    assert_eq!(glob.digest, off.digest, "an unmatched `glob` is inactive");
+}
+
+/// MOD-9 D117: the matched path is masked in the record as a skill name is.
+#[test]
+fn a_matched_path_is_masked_in_the_record() {
+    let secret = MinimalScrubber::new(["s3cr3t".to_owned()]);
+    for (step_files, want) in [
+        (
+            files(&[("htui", "src/s3cr3t.rs")]),
+            "htui:src/[REDACTED].rs",
+        ),
+        (
+            files(&[("s3cr3t-repo", "src/lib.rs")]),
+            "[REDACTED]-repo:src/lib.rs",
+        ),
+    ] {
+        let prompt = assemble(&glob_over(step_files), &secret)
+            .unwrap_or_else(|error| panic!("the spec must assemble: {error}"));
+        let choice = &prompt.trim.skill_choices[1];
+        assert_eq!(choice.reason, ChoiceReason::Matched);
+        assert_eq!(choice.path.as_deref(), Some(want));
+        let serialised = prompt
+            .trim
+            .to_value(&secret)
+            .expect("plain data")
+            .to_string();
+        assert!(!serialised.contains("s3cr3t"), "{serialised}");
+    }
+}
+
+/// MOD-9 D117: a matched `glob` is active, so it is estimated and meets the cap.
+#[test]
+fn the_skills_cap_counts_a_matched_glob() {
+    let mut single_spec = base();
+    single_spec.skills.truncate(1);
+    single_spec.max_skill_tokens = i64::MAX;
+    let single = skills_row(&ok(&single_spec))
+        .expect("one `Always` skill renders the section")
+        .tokens_before;
+    assert!(single > 0);
+
+    let mut matched = glob_over(files(&[("htui", "src/lib.rs")]));
+    matched.max_skill_tokens = single;
+    match assemble(&matched, &scrubber()) {
+        Err(AssembleError::SkillsExceedCap { tokens, cap }) => {
+            assert!(tokens > single, "the matched skill is paid for");
+            assert_eq!(cap, single);
+        }
+        other => panic!("two active skills over a one-skill cap must refuse: {other:?}"),
+    }
+
+    let mut unmatched = matched.clone();
+    unmatched.step_files = StepFiles::default();
+    let prompt = assemble(&unmatched, &scrubber())
+        .unwrap_or_else(|error| panic!("an unmatched `glob` is not estimated: {error}"));
+    assert_eq!(
+        skills_row(&prompt)
+            .expect("the active skill renders")
+            .tokens_before,
+        single,
+    );
 }
 
 #[test]
@@ -250,7 +370,7 @@ fn the_digest_moves_only_when_the_active_set_moves() {
     );
     assert_eq!(
         off.digest, glob.digest,
-        "`off` and `glob` are both inactive before milestone 3"
+        "`off` and an unmatched `glob` are both inactive"
     );
     assert_ne!(
         glob.trim.skill_choices, off.trim.skill_choices,

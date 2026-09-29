@@ -16,7 +16,7 @@ use crate::model::box_::BoxProfile;
 use crate::model::ids::{ItemId, SkillId, StepId};
 use crate::model::item::Status;
 use crate::model::link::UpstreamEntry;
-use crate::model::skill::{Activation, BoundSkill, SkillLevel};
+use crate::model::skill::{Activation, BoundSkill, SkillLevel, StepFiles};
 use crate::model::{EventKind, EventRole, OsFamily, SessionEvent};
 use crate::prompt::excerpt::{
     Excerpt, ExcerptAudit, ExcerptCaps, ExcerptReason, ExcerptSet, FileRecord, RepoRoot,
@@ -233,6 +233,7 @@ pub fn phase_implement_attempt2() -> PromptSpec {
             audit,
             notes: Vec::new(),
         },
+        step_files: StepFiles::default(),
         command_queue: true,
         verify_failure: Some(VerifyFailure {
             exit_code: 101,
@@ -289,6 +290,7 @@ pub fn phase_all_empty() -> PromptSpec {
         },
         skills: Vec::new(),
         excerpts: ExcerptSet::default(),
+        step_files: StepFiles::default(),
         command_queue: false,
         verify_failure: None,
         previous_diff: None,
@@ -379,6 +381,7 @@ pub fn judge_three_candidates() -> PromptSpec {
         box_profile: demo_box(),
         skills: Vec::new(),
         excerpts: ExcerptSet::default(),
+        step_files: StepFiles::default(),
         command_queue: false,
         verify_failure: None,
         previous_diff: None,
@@ -521,6 +524,7 @@ pub fn handoff_basic() -> PromptSpec {
         box_profile: demo_box(),
         skills: Vec::new(),
         excerpts: ExcerptSet::default(),
+        step_files: StepFiles::default(),
         command_queue: false,
         verify_failure: None,
         previous_diff: None,

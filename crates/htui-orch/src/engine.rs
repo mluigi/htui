@@ -32,8 +32,8 @@ use htui_core::model::{
     EventKind, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote,
     NewRun, NewRunStep, NoteId, Project, ProjectId, ProjectSettings, PromptScope, Repo, RepoId,
     Resolution, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary,
-    SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepId, StepOutcome, StepStatus,
-    TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome, missing_tags_failure,
+    SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOutcome,
+    StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoRoot, RootSource};
 use htui_core::prompt::{
@@ -4439,6 +4439,7 @@ where
             // No pass for a judge (plan D109): its placeholder set cannot place `{{excerpts}}`
             // (`template.rs:188-215`), so a file read here could only reach the audit.
             excerpts: no_excerpts(caps),
+            step_files: StepFiles::default(),
             command_queue: false,
             verify_failure: None,
             previous_diff: None,
@@ -5134,6 +5135,9 @@ where
             // a file. So the caps are recorded and nothing else, and `with_excerpts` replaces this
             // for a phase prompt.
             excerpts: no_excerpts(caps),
+            // MOD-9 D117: reaches no repo here, for the same reason as `excerpts`: the handoff
+            // matches nothing, and `with_excerpts` replaces it for a phase prompt.
+            step_files: StepFiles::default(),
             command_queue: phase.command_queue != htui_core::model::CommandQueue::Off,
             // Plan D67: what the previous attempt's winner left — its failed verify and its diff —
             // forwarded to a phase step's next attempt; `None` on attempt 1 and for a judge.
