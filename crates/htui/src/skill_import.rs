@@ -995,7 +995,7 @@ mod tests {
             "---\nname: house-rules\ndescription: A new description.\n---\n\n",
         )
         .expect("write");
-        let report = run(&backend, &[label.clone()]).await;
+        let report = run(&backend, std::slice::from_ref(&label)).await;
 
         assert_eq!(
             report,
