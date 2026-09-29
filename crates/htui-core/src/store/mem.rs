@@ -6841,8 +6841,7 @@ mod tests {
         );
     }
 
-    /// The chat pair of plan D4: the columns `pending.rs` writes, with `running` in place of the
-    /// upload's terminal values, and `finish_chat_run` closing both rows.
+    /// The chat pair of plan D4: both rows minted `running`, and `finish_chat_run` closing both.
     #[tokio::test]
     async fn a_chat_run_mints_the_two_rows_the_offline_upload_would() {
         let store = MemStore::demo();

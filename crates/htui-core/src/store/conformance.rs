@@ -1471,10 +1471,6 @@ async fn set_step_usage_writes_usage_and_digest<S: WriteStore>(store: &S) {
 /// `start_chat_run` mints the `run` / `run_step` pair a free-standing chat records into, is a
 /// no-op on replay, leaves every item's run list alone, and `finish_chat_run` closes both rows
 /// (plan D4).
-///
-/// It is the same *pair of rows*, addressed by the same client-side ids, that
-/// `crates/htui-store/src/cache/pending.rs` inserts on upload - not the same column values: see
-/// [`ChatRunSpec`] for the asymmetry `ON CONFLICT (id) DO NOTHING` leaves between the two paths.
 async fn start_chat_run_mints_chat_rows<S: WriteStore>(store: &S) {
     let before = store
         .runs(ids::HTUI_FEAT_1)

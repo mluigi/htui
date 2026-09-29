@@ -11,8 +11,8 @@
 //!
 //! [`replay`] is [`record`] read backwards (plan D37): a persisted row back into the envelope the
 //! live path renders, so a reopened step and a running one reach the chat tab through one
-//! transcript. Milestone 4's offline sink is a `WriteStore` arm in `htui-store`, so this crate
-//! still records through the trait and knows nothing about where the rows land (plan D34).
+//! transcript. This crate records through the `WriteStore` trait and knows nothing about where the
+//! rows land (plan D34).
 //!
 //! [`probe`] is milestone 5's answer to "what can *this box* run" (plan D45–D51): the tiered
 //! resolver `tools` delegates to, the glob walker and the version capture that fill

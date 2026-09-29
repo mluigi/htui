@@ -111,7 +111,7 @@ fn canonical(mut graph: LinkGraph) -> LinkGraph {
     graph
 }
 
-/// One synthetic event of a pending buffer.
+/// One synthetic `session_event` row.
 fn pending_event(step: StepId, seq: i32) -> SessionEvent {
     SessionEvent {
         run_step_id: step,
@@ -133,8 +133,6 @@ fn pending_event(step: StepId, seq: i32) -> SessionEvent {
         at: fixtures::demo_at(3, i64::from(seq)),
     }
 }
-
-/// Writes `pending/<project>.<run>.jsonl` and returns its path.
 
 // ------------------------------------------------------------------------------------------------
 // A pass mirrors the demo
@@ -1899,7 +1897,7 @@ async fn a_pass_keeps_only_this_box_in_the_mirror() {
     teardown(db, &[&cache]).await;
 }
 
-/// The registry read an offline chat resolves its driver through (D31).
+/// The registry read the offline arm answers from the mirror (D31).
 #[tokio::test]
 async fn an_offline_backend_lists_the_mirrored_registry() {
     let Some(db) = common::demo_db().await else {
@@ -2174,7 +2172,3 @@ async fn a_week_old_full_refresh_clears_the_cursors_without_a_rebuild() {
 
     teardown(db, &[&reopened]).await;
 }
-
-// ------------------------------------------------------------------------------------------------
-// §11.7, the offline chat buffer
-// ------------------------------------------------------------------------------------------------

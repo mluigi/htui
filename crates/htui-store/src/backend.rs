@@ -59,8 +59,7 @@ pub enum Backend {
     },
     /// Postgres unreachable: reads come from the mirror and there is **no** write path at all
     /// (MOD-25, [`Backend::writer`]). Between MOD-2 milestone 4 and MOD-25 there was one — the
-    /// offline chat buffer under `<cache_dir>/pending/` — and a buffer an earlier build left there
-    /// is still uploaded on the next connection; nothing new is ever appended to it.
+    /// offline chat buffer under `<cache_dir>/pending/` — and it has since been removed.
     Offline {
         /// The mirror.
         cache: CacheStore,
@@ -141,11 +140,7 @@ impl Backend {
     /// it answered `Some(Writer::Buffered(..))`: a chat that could not reach Postgres recorded
     /// into `<cache_dir>/pending/` and the refresher uploaded it on the next connection. MOD-25
     /// made `htui` online-only, so that chat is now refused with
-    /// [`DATABASE_UNREACHABLE`] instead. This one arm is the whole
-    /// disable: `Writer::Buffered` and `BufferedWriter` stay in the tree and keep
-    /// compiling for one release so the reversal is restoring this arm and nothing else, and the
-    /// upload side stays live — `upload_pending` still runs on every refresh pass, so a buffer an
-    /// earlier build left on disk still lands. A later CLEAN item deletes the machinery.
+    /// [`DATABASE_UNREACHABLE`] instead, and the buffer and its upload have since been removed.
     ///
     /// The `Option` the return type always was is what made that a one-arm change rather than a
     /// signature change at every call site — which is exactly what this doc reserved it for.
@@ -164,8 +159,8 @@ impl Backend {
     /// in who started it, which is what keeps `R-NF-3` a fact about ownership rather than a habit.
     ///
     /// [`Backend::Offline`] resolves it from the mirror since MOD-2 milestone 4 (plan D33):
-    /// [`CacheStore::this_user`] looks up the OS-derived name the online seed used, so an offline
-    /// chat names the author the server already has instead of refusing outright.
+    /// [`CacheStore::this_user`] looks up the OS-derived name the online seed used, so the mirror
+    /// names the author the server already has instead of refusing outright.
     ///
     /// # Errors
     ///
@@ -293,9 +288,8 @@ impl Backend {
     ///
     /// This read used to refuse on [`Backend::Offline`], because neither table was mirrored. Since
     /// MOD-2 milestone 4 `agent` **is** (plan D31), so the arm answers from the mirror with every
-    /// `on_box` set to `None`: an offline chat has to resolve a driver, and a refusal there is the
-    /// difference between a chat that records to disk and no chat at all. `agent_box` stays
-    /// server-side, so offline the Settings tab lists the rows as "not probed"
+    /// `on_box` set to `None`. That arm was added for the offline chat, which MOD-25 refuses.
+    /// `agent_box` stays server-side, so offline the Settings tab lists the rows as "not probed"
     /// ([`AgentSummary::on_box`]) where it used to show a failed read; its failure arm stays for a
     /// genuine server error, which this no longer is.
     ///
@@ -314,9 +308,9 @@ impl Backend {
     /// (MOD-2 plan D70).
     ///
     /// Every arm answers, including the offline one: `project.settings` is mirrored
-    /// (`cache_migrations/0001_mirror.sql:57-61`), so the per-run token cap in that document is
-    /// enforced by a chat that happened offline exactly as by one that did not. That is the whole
-    /// reason the cap lives in this column and not in a new table or an env knob.
+    /// (`cache_migrations/0001_mirror.sql:57-61`). Before MOD-25 that let an offline chat enforce
+    /// the per-run token cap exactly as an online one did, which is why the cap lives in this
+    /// column and not in a new table or an env knob.
     ///
     /// # Errors
     ///
@@ -606,7 +600,7 @@ fn prompt_offline() -> StoreError {
 /// [`DATABASE_UNREACHABLE`] rather than minting a constant: that
 /// sentence already covers reads - "this box browses its read-only cache and starts no run" is
 /// exactly what a box that cannot resolve a graph or count a slot has to be told, and it is the
-/// same sentence [`BufferedWriter`](crate::BufferedWriter) gives for the writers these reads feed.
+/// same sentence a chat off the server is refused with ([`Backend::writer`]).
 fn orchestration_offline() -> StoreError {
     StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned())
 }

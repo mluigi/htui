@@ -151,9 +151,9 @@ pub fn db_fingerprint(dsn: &str) -> String {
 
 /// The cache directory for a DSN: `<root>/cache/<db_fingerprint>` (ANA-9 §4.4).
 ///
-/// Holds `cache.sqlite` and `pending/`; MOD-6 T3 fills it. `root` is a caller-supplied config
-/// root ([`config_root`] in production, a temporary directory under test), so nothing here reaches
-/// into the user's real configuration. Pure: computes a path, creates nothing.
+/// Holds `cache.sqlite`; MOD-6 T3 fills it. `root` is a caller-supplied config root
+/// ([`config_root`] in production, a temporary directory under test), so nothing here reaches into
+/// the user's real configuration. Pure: computes a path, creates nothing.
 #[must_use]
 pub fn cache_dir(root: &Path, dsn: &str) -> PathBuf {
     root.join("cache").join(db_fingerprint(dsn))
@@ -163,8 +163,7 @@ pub fn cache_dir(root: &Path, dsn: &str) -> PathBuf {
 ///
 /// One definition, two callers: [`crate::PgStore::seed_if_empty`] stamps a first, empty database
 /// with it, and [`crate::CacheStore::this_user`] looks the mirrored row up by it (MOD-2 plan D33).
-/// Two copies of this rule would mean an offline chat naming an author the server does not have,
-/// and `upload_pending` inserting a stranger.
+/// Two copies of this rule would mean the mirror naming an author the server does not have.
 #[must_use]
 pub fn os_user_name() -> String {
     for key in ["USERNAME", "USER"] {

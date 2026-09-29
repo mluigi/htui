@@ -7,12 +7,11 @@
 //! --all-features` green on a box without Postgres.
 //!
 //! This lived under `tests/common/` until MOD-2 milestone 4 (T21). It moved into the library
-//! behind the `test-support` feature because `docs/ANA-4.md` §11 criterion 12 is one sentence with
-//! two halves - a **driver** writes the offline buffer, a **server** lands it - and only the `htui`
-//! crate depends on both `htui-agent` and this one. A captured fixture as the joint between the
-//! two would not fail when the recorder and the uploader drift, which is the whole point of the
-//! criterion. `htui-core::fixtures` sets the precedent: test-only data, in the library, behind a
-//! feature.
+//! behind the `test-support` feature for `docs/ANA-4.md` §11 criterion 12 - a **driver** wrote the
+//! offline buffer, a **server** landed it - which only the `htui` crate, depending on both
+//! `htui-agent` and this one, could prove. MOD-25 withdrew that criterion and the buffer has since
+//! been removed; the harness stayed. `htui-core::fixtures` sets the precedent: test-only data, in
+//! the library, behind a feature.
 
 use std::path::PathBuf;
 use std::str::FromStr as _;
@@ -371,9 +370,9 @@ pub fn fake_dsn() -> Option<String> {
 /// cannot drift from `cache::refresh`'s bind lists by accident.
 ///
 /// Six tables, and deliberately only six: `app_user`, the own `box` row, `workspace`,
-/// `workspace_project`, `project` and `agent` - everything an offline chat resolves before it can
-/// start (`docs/ANA-4.md` §4.1: the box, the user, the registry row, the project it belongs to).
-/// Items, runs and events are the cursor-driven tables and no offline *write* path needs them.
+/// `workspace_project`, `project` and `agent` - everything a chat resolves before it can start
+/// (`docs/ANA-4.md` §4.1: the box, the user, the registry row, the project it belongs to). Items,
+/// runs and events are the cursor-driven tables, and there is no offline *write* path (MOD-25).
 ///
 /// Only `demo.this_box`'s row is written, because §4.4 says the mirror holds the own `box` row and
 /// no other.

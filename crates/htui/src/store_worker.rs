@@ -925,14 +925,11 @@ pub enum StoreReply {
         session_ref: Option<AgentSessionRef>,
         /// What this transport can do, for the tab's capability banner.
         caps: DriverCaps,
-        /// `Writer::label()` of the store this chat records into: `memory` or `online` (MOD-2 D42;
-        /// `buffered` is the third label, which no accepted chat has carried since MOD-25 made an
-        /// offline one refuse).
+        /// `Writer::label()` of the store this chat records into: `memory` or `online` (MOD-2 D42).
         ///
-        /// It travels on the acceptance because the tab must be able to say that a conversation is
-        /// only on this disk, and it cannot ask: `R-NF-3` keeps every store handle on the worker's
-        /// side, and inferring "offline therefore buffered" from the top bar would be a guess about
-        /// a backend the tab does not hold.
+        /// It was carried so the tab could say that a conversation was only on this disk (the
+        /// `buffered` label, gone since MOD-25 made an offline chat refuse); the tab ignores it
+        /// now.
         writer_label: &'static str,
     },
     /// Answer to [`StoreRequest::StoreState`].

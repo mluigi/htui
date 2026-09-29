@@ -445,8 +445,7 @@ impl Stack {
     ///
     /// The Harness polls a chat future once per round and a round ends when nothing progressed. A
     /// chat recording into Postgres is `Pending` on the server between polls, which a single
-    /// `drive` cannot tell from a chat waiting on the user (`testkit.rs`'s own note on
-    /// `Writer::Buffered`), so this waits on the rows instead.
+    /// `drive` cannot tell from a chat waiting on the user, so this waits on the rows instead.
     async fn drive_until<F, Fut>(&mut self, what: &str, mut done: F)
     where
         F: FnMut(PgStore) -> Fut,

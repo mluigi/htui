@@ -1254,14 +1254,12 @@ impl AgentRuntime {
         if self.box_probe_running() {
             return Err(StoreError::Backend(BOX_PROBE_RUNNING.to_owned()));
         }
-        // Since MOD-25 an offline backend answers `None` here, so this closure fires where the
-        // guard below used to; the guard is kept, unreachable, for the reversal.
+        // An offline backend hands out no writer (MOD-25), so a probe off the server is refused
+        // with plan D52's sentence. It is checked here rather than discovered on the write,
+        // because by then the spawns have happened.
         let writer = backend.writer().ok_or_else(|| {
             StoreError::Unreachable(htui_store::REGISTRY_ON_SERVER_ONLY.to_owned())
         })?;
-        // `Writer::Buffered` refuses `upsert_agent_box` with this same sentence (plan D52). It is
-        // checked here rather than discovered on the write, because by then the spawns have
-        // happened.
         let box_id = backend
             .box_info()
             .await?
@@ -1759,11 +1757,11 @@ impl AgentRuntime {
         prompt: String,
     ) -> Result<Served, StoreError> {
         // `htui` is online-only since MOD-25: an offline backend hands out no writer, and a chat
-        // it cannot record is refused here rather than run into a buffer nobody reads. This is the
-        // one place the unreachable-database sentence is answered — `R-STO-4`'s "No item creation,
-        // no runs", rendered by the status line as `chat_start: <sentence>` and by the Chat body.
-        // The milestone-4 behaviour it replaces (`Writer::Buffered` into `<cache_dir>/pending/`,
-        // plan D34) is withdrawn; the machinery is kept one release for the reversal.
+        // it cannot record is refused here. This is the one place the unreachable-database
+        // sentence is answered — `R-STO-4`'s "No item creation, no runs", rendered by the status
+        // line as `chat_start: <sentence>` and by the Chat body.
+        // The milestone-4 behaviour it replaced (`Writer::Buffered` into `<cache_dir>/pending/`,
+        // plan D34) has since been removed.
         let writer = backend
             .writer()
             .ok_or_else(|| StoreError::Unreachable(htui_store::DATABASE_UNREACHABLE.to_owned()))?;
@@ -1816,7 +1814,7 @@ impl AgentRuntime {
         // above and deliberately so: settings that do not parse are settings that are not set, but
         // a cap an operator wrote and `htui` ignored is the risk table's "wrong by a factor of a
         // million" pointing the other way — a run that was supposed to be bounded and was not. An
-        // absent *row* is [`project_caps_for`]'s question, and its answer differs offline.
+        // absent *row* is [`project_caps_for`]'s question.
         let project_caps = project_caps_for(
             &writer,
             project_id,
@@ -1885,14 +1883,12 @@ impl AgentRuntime {
         // `tools::resolve` gave it, because coupling a chat's start to a 60-second handshake
         // timeout would make a stale row a minute of waiting.
         //
-        // Three conditions, each for its own reason. `acp`, because tier 2 *is* `initialize` and
-        // a `cli` row has none (milestone 8's problem). Not `Writer::Buffered`, because it
-        // refuses `upsert_agent_box` (plan D52) and a probe with nowhere to write its answer
-        // would spawn an adapter to throw it away. And stale, or there is nothing to learn.
+        // Two conditions, each for its own reason. `acp`, because tier 2 *is* `initialize` and a
+        // `cli` row has none (milestone 8's problem). And stale, or there is nothing to learn.
         //
-        // The first two are properties of the *row and the writer* and hold for D60's trigger
-        // too, so they are what builds the arguments; staleness is the third trigger's own
-        // condition and is applied to the spawn alone.
+        // The first is a property of the *row* and holds for D60's trigger too, so it is what
+        // builds the arguments; staleness is the third trigger's own condition and is applied to
+        // the spawn alone.
         let reprobe = (summary.agent.transport == Transport::Acp).then(|| ReprobeArgs {
             writer: writer.clone(),
             box_id,
@@ -2000,8 +1996,8 @@ const PROMOTE_STEP: &str = crate::run_worker::ORCH_NAMES[5];
 pub struct ChatArgs {
     driver: Box<dyn AgentDriver>,
     writer: Writer,
-    /// [`Writer::label`], taken before the writer moves: what the tab's header says about where
-    /// this conversation is being kept (plan D42).
+    /// [`Writer::label`], taken before the writer moves, for `StoreReply::ChatAccepted`
+    /// (plan D42).
     writer_label: &'static str,
     /// What the session records against (blueprint D205).
     binding: ChatBinding,
@@ -2013,9 +2009,8 @@ pub struct ChatArgs {
     frames: Frames,
     grace: Duration,
     /// Plan D60: `Some` when a spawn failure should refresh this box's row for this agent. `None`
-    /// for a `cli` row (tier 2 is `initialize`, which a `cli` row has none of), for a buffered
-    /// writer (`upsert_agent_box` is refused, plan D52), and for a chat whose staleness re-probe
-    /// is already running — a second one would race it for the same row.
+    /// for a `cli` row (tier 2 is `initialize`, which a `cli` row has none of), and for a chat
+    /// whose staleness re-probe is already running — a second one would race it for the same row.
     reprobe: Option<ReprobeArgs>,
     /// Plan D70: `project.settings`'s two token caps, read at `ChatStart`.
     ///
@@ -2023,8 +2018,8 @@ pub struct ChatArgs {
     /// These are what the **project** allows it to spend, and two fields called `caps` in one
     /// struct would be one bug away from each other.
     project_caps: ProjectCaps,
-    /// Plan D66-D68: the `agent_box` row this chat latches its allowance into, or `None` with the
-    /// reason already logged by [`quota_latch_for`].
+    /// Plan D66-D68: the `agent_box` row this chat latches its allowance into
+    /// ([`quota_latch_for`]).
     quota_latch: Option<QuotaLatch>,
 }
 
@@ -2043,22 +2038,14 @@ impl core::fmt::Debug for ChatArgs {
 }
 
 /// The caps a chat enforces, out of `project.settings` (plan D70) — and what an **absent** row
-/// means, which is not the same question online and offline (review M-3).
+/// means.
 ///
-/// Online a `None` is a chat whose project is not in the database the chat is about to write to:
-/// the id came from the tab's own scope, read from that same database, so the row went away under
-/// the chat and refusing is the honest answer.
+/// A `None` is a chat whose project is not in the database the chat is about to write to: the id
+/// came from the tab's own scope, read from that same database, so the row went away under the
+/// chat and refusing is the honest answer. Before MOD-25 an offline chat read the row from the
+/// mirror and took an unmirrored project as `{}` (review M-3); a chat now starts only online.
 ///
-/// Offline the row comes from the **mirror**, and a mirror is a snapshot. A project created on the
-/// server since the last sync has no row here, and such a chat used to start perfectly well —
-/// [`Writer::Buffered`]'s `start_chat_run` reads no project at all, so nothing but this read
-/// refuses it. Turning that into a refusal would be a regression bought for nothing, so an
-/// unmirrored project is read as `{}`: unbounded, with a log line naming the situation. A cap the
-/// mirror *does* hold is enforced exactly as online, which is the property plan D70 chose this
-/// column for.
-///
-/// A document that does not parse refuses either way — that is `start_chat`'s own comment, and
-/// this function is where the two answers are told apart rather than folded into one `ok_or`.
+/// A document that does not parse refuses too — that is `start_chat`'s own comment.
 fn project_caps_for(
     _writer: &Writer,
     project_id: ProjectId,
@@ -2076,18 +2063,11 @@ fn project_caps_for(
     ProjectCaps::from_settings(&settings).map_err(|err| StoreError::Constraint(err.to_string()))
 }
 
-/// The `agent_box` row a chat latches its allowance into, or `None` with the reason logged
-/// (plan D66-D68).
+/// The `agent_box` row a chat latches its allowance into (plan D66-D68).
 ///
-/// The decision is made **here**, at chat start, rather than discovered on the first `usage` row:
-/// a [`Writer::Buffered`] refuses every registry write with
-/// [`REGISTRY_ON_SERVER_ONLY`](htui_store::REGISTRY_ON_SERVER_ONLY) (`recording_writer`, plan D52),
-/// because the offline mirror has no `agent_box` table at all — deliberately. A buffered chat
-/// therefore left the last server-side value standing and buffered the `usage` rows that
-/// re-derive it after upload, which is what `R-HIS-1` actually asks for; failing or retrying a
-/// turn over an advisory allowance figure would trade the requirement for the courtesy. Since
-/// MOD-25 an offline chat is refused before any of this, and the arm below is kept for the
-/// reversal.
+/// The decision is made **here**, at chat start, rather than discovered on the first `usage` row.
+/// Before MOD-25 a buffered offline chat got `None`, because the offline mirror has no `agent_box`
+/// table to latch into (plan D52); a chat now starts only online, so every chat gets a latch.
 ///
 /// `source` is `agent.settings.quota.source` and `billing` is `agent.billing`, both read off the
 /// row. Nothing here looks at `agent.name` (`R-AGT-5`) — the name is logged, and a log line is not
@@ -2535,11 +2515,10 @@ async fn run_reprobe(args: ReprobeArgs) {
 
 /// The writer of a backend that can hold an `agent_box` row, or the refusal that names why not.
 ///
-/// `Writer::Buffered` refuses `upsert_agent_box` with `REGISTRY_ON_SERVER_ONLY` (plan D52), and
-/// the whole point of asking here is to hear that sentence before the work rather than after it.
+/// An offline backend hands out no writer (MOD-25), which this answers with
+/// `REGISTRY_ON_SERVER_ONLY` (plan D52): the whole point of asking here is to hear that sentence
+/// before the work rather than after it.
 fn recording_writer(backend: &Backend) -> Result<Writer, StoreError> {
-    // Since MOD-25 an offline backend answers `None` here, so this closure fires where the guard
-    // below used to; the guard is kept, unreachable, for the reversal.
     let writer = backend
         .writer()
         .ok_or_else(|| StoreError::Unreachable(htui_store::REGISTRY_ON_SERVER_ONLY.to_owned()))?;

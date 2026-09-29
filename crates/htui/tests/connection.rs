@@ -576,9 +576,8 @@ async fn rebuild_cache_empties_the_mirrored_tables_and_keeps_the_meta() {
         .await
         .expect("the mirror is seeded");
     let before = cache.meta().await.expect("a seeded mirror has meta");
-    // `project`, not `item`: `seed_mirror` writes the six unscoped tables an offline *write* path
-    // needs, and the cursor-driven ones are not among them. It is one of `MIRRORED_TABLES` either
-    // way.
+    // `project`, not `item`: `seed_mirror` writes six unscoped tables, and the cursor-driven ones
+    // are not among them. It is one of `MIRRORED_TABLES` either way.
     let projects: i64 = sqlx::query_scalar("SELECT count(*) FROM project")
         .fetch_one(cache.pool())
         .await

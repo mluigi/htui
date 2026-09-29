@@ -45,10 +45,10 @@
 //! Criterion 7 is a statement about `run_step.usage`, and no `ReadStore` method returns that column
 //! (`chat_usage_pg.rs:113-126` says why, and reaches it with a raw `SELECT`). This file records
 //! into a [`MemStore`], as `chat_live.rs` does, so the column is not reachable at all from here.
-//! What is reachable is the **one summing rule** both writers share
-//! ([`UsageTotals::from_rows`](htui_core::model::UsageTotals::from_rows), plan D36): the online
-//! recorder sums the deltas as they arrive and writes that document to the column, and the offline
-//! uploader re-derives it from the same rows. So the sum asserted here **is** the document, checked
+//! What is reachable is the **one summing rule**
+//! ([`UsageTotals::from_rows`](htui_core::model::UsageTotals::from_rows), plan D36): the recorder
+//! sums the deltas as they arrive and writes that document to the column, and `from_rows`
+//! re-derives it from the same rows. So the sum asserted here **is** the document, checked
 //! against an independent hand sum of the persisted payloads, and the column-side identity is
 //! pinned on real Postgres by `chat_usage_pg.rs` and transport-neutrally by the store conformance
 //! case `usage_deltas_sum_to_step_usage`. Blueprint F-T57 names this the route and puts the

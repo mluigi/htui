@@ -2,8 +2,8 @@
 //!
 //! A struct field never holds a bare [`Uuid`] (blueprint B.1): mixing an `ItemId` with a
 //! `ProjectId` is then a compile error rather than a runtime lookup miss. New identifiers are
-//! minted client-side as UUIDv7 (§3), so the offline chat buffer can name a row before Postgres is
-//! reachable and B-tree inserts stay ordered.
+//! minted client-side as UUIDv7 (§3), so a row is named before Postgres has answered and B-tree
+//! inserts stay ordered.
 
 use core::fmt;
 use core::str::FromStr;

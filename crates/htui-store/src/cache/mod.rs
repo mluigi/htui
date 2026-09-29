@@ -108,10 +108,8 @@ pub struct CacheMeta {
 impl CacheStore {
     /// Opens `<root>/cache/<fingerprint>/cache.sqlite`, creating and migrating it if needed.
     ///
-    /// Creates `<root>/cache/<fingerprint>/` and its `pending/` subdirectory, seals any offline
-    /// chat buffer a previous run left open (`pending::seal_orphaned`, `[H-1]`), then connects
-    /// with `create_if_missing`, WAL journalling, a five-second busy timeout and **foreign keys
-    /// off**:
+    /// Creates `<root>/cache/<fingerprint>/`, then connects with `create_if_missing`, WAL
+    /// journalling, a five-second busy timeout and **foreign keys off**:
     /// the mirror is fed in foreign-key order by one writer, and a partial mirror must not refuse a
     /// row whose parent is not mirrored yet.
     ///
@@ -128,10 +126,8 @@ impl CacheStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Backend`] when the directory cannot be created, `pending/` cannot be listed
-    /// or the file cannot be removed, and whatever the driver or the migrator reports otherwise. A
-    /// buffer that cannot be *sealed* is not one of them: `pending::seal_orphaned` warns and
-    /// carries on, because an unreadable best-effort buffer must not cost the user `start()`.
+    /// [`StoreError::Backend`] when the directory cannot be created or the file cannot be removed,
+    /// and whatever the driver or the migrator reports otherwise.
     pub async fn open(root: &Path, fingerprint: &str, schema_version: i64) -> Result<Self> {
         let dir = root.join("cache").join(fingerprint);
         create_dir(&dir)?;
