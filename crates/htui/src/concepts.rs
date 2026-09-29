@@ -49,8 +49,18 @@ pub const DECISION_RESOLUTIONS: [Resolution; 3] = [
 /// `limit` hits. No type or status filter: `--search-items` has none either.
 #[must_use]
 pub fn query(text: &str, projects: Vec<ProjectId>, decisions: bool, limit: u64) -> SearchQuery {
-    let _ = (text, projects, decisions, limit);
-    todo!()
+    SearchQuery {
+        text: text.to_owned(),
+        projects,
+        types: Vec::new(),
+        statuses: Vec::new(),
+        resolutions: if decisions {
+            DECISION_RESOLUTIONS.to_vec()
+        } else {
+            Vec::new()
+        },
+        limit,
+    }
 }
 
 /// Builds the Qdrant settings from what the keyring holds.
@@ -140,16 +150,7 @@ pub async fn index_items(project: Option<&str>) -> anyhow::Result<()> {
     for scope in scopes(&pg, project).await? {
         report += Indexer::sync(&pg, &scope, &store).await?;
     }
-    eprintln!(
-        "indexed: {} item(s) rebuilt, {} unchanged; {} requirement(s) rebuilt, {} unchanged; \
-         {} point(s) written, {} removed",
-        report.items_rebuilt,
-        report.items_unchanged,
-        report.requirements_rebuilt,
-        report.requirements_unchanged,
-        report.points_upserted,
-        report.points_deleted
-    );
+    eprintln!("{}", report_line(&report));
     Ok(())
 }
 
@@ -165,18 +166,7 @@ pub async fn search_items(options: &SearchOptions) -> anyhow::Result<()> {
         .into_iter()
         .flat_map(|s| s.project_ids)
         .collect();
-    let query = SearchQuery {
-        text: options.query.clone(),
-        projects,
-        types: Vec::new(),
-        statuses: Vec::new(),
-        resolutions: if options.decisions {
-            DECISION_RESOLUTIONS.to_vec()
-        } else {
-            Vec::new()
-        },
-        limit: options.limit,
-    };
+    let query = query(&options.query, projects, options.decisions, options.limit);
     let hits = store.search(&query).await?;
     if hits.is_empty() {
         eprintln!("no matches (run `htui --index-items` if the index is empty)");
@@ -218,8 +208,16 @@ pub fn format_hit(hit: &Hit) -> String {
 /// stderr and the search overlay under its hits.
 #[must_use]
 pub fn report_line(report: &SyncReport) -> String {
-    let _ = report;
-    todo!()
+    format!(
+        "indexed: {} item(s) rebuilt, {} unchanged; {} requirement(s) rebuilt, {} unchanged; \
+         {} point(s) written, {} removed",
+        report.items_rebuilt,
+        report.items_unchanged,
+        report.requirements_rebuilt,
+        report.requirements_unchanged,
+        report.points_upserted,
+        report.points_deleted
+    )
 }
 
 #[cfg(test)]
@@ -332,10 +330,7 @@ mod tests {
 
     #[test]
     fn query_narrows_to_decisions_only_when_asked() {
-        let projects = vec![
-            ProjectId(Uuid::from_u128(2)),
-            ProjectId(Uuid::from_u128(1)),
-        ];
+        let projects = vec![ProjectId(Uuid::from_u128(2)), ProjectId(Uuid::from_u128(1))];
         for decisions in [false, true] {
             let q = query("closed items", projects.clone(), decisions, 7);
             assert_eq!(q.text, "closed items");
@@ -368,4 +363,11 @@ mod tests {
         );
     }
 
+    /// The search runtime shares one loaded model between its tasks (MOD-64 D238); `htui-store`'s
+    /// own tests build without `local-embed`, so the check lives here (D258).
+    #[test]
+    fn fast_embedder_is_clone() {
+        fn clone_of<T: Clone>() {}
+        clone_of::<FastEmbedder>();
+    }
 }

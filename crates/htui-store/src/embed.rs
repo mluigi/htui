@@ -20,8 +20,10 @@ pub trait DenseEmbedder {
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, StoreError>;
 }
 
-/// BGE-small-en-v1.5 through `fastembed-rs`, run on the blocking pool.
+/// BGE-small-en-v1.5 through `fastembed-rs`, run on the blocking pool. Cheap to clone: the
+/// model is shared (MOD-64 D238).
 #[cfg(feature = "local-embed")]
+#[derive(Clone)]
 pub struct FastEmbedder {
     model: std::sync::Arc<fastembed::TextEmbedding>,
 }
