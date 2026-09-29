@@ -1890,6 +1890,84 @@ async fn an_older_quota_leaves_the_row_byte_identical() {
     db.drop_db().await;
 }
 
+/// MOD-40 plan D7 (C4): the box heartbeat stamps `last_seen_at` with the server's clock and
+/// touches nothing else. The rest of the row is read as `jsonb` minus the two columns the beat
+/// and its trigger move, and compared whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn touch_box_advances_last_seen_at() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let id = db.store.this_box();
+    let row = || async {
+        let row = sqlx::query(
+            "SELECT last_seen_at, to_jsonb(b) - 'last_seen_at' - 'updated_at' AS rest \
+             FROM box b WHERE id = $1",
+        )
+        .bind(id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the registered box row");
+        (
+            row.get::<DateTime<Utc>, _>("last_seen_at"),
+            row.get::<serde_json::Value, _>("rest"),
+        )
+    };
+    let (seen0, rest0) = row().await;
+    let server: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the server clock");
+
+    assert!(
+        db.store
+            .touch_box(id)
+            .await
+            .expect("the heartbeat reaches the server"),
+        "the registered box has a row to touch"
+    );
+    let (seen1, rest1) = row().await;
+    assert!(
+        seen1 > seen0,
+        "the beat moved `last_seen_at`: {seen0} -> {seen1}"
+    );
+    assert!(
+        seen1 >= server,
+        "the stamp is the server's, taken after the read: {seen1} < {server}"
+    );
+    assert_eq!(
+        rest1, rest0,
+        "a heartbeat writes `last_seen_at` and nothing a person, the probe or registration owns; \
+         `edit_version` included"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-40 plan D7: a heartbeat for an id with no row answers `false` and inserts nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn touch_box_on_an_unknown_box_is_false() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let before = common::count(&db.pool, "box").await;
+
+    assert!(
+        !db.store
+            .touch_box(BoxId::new())
+            .await
+            .expect("a heartbeat for an unknown id is not an error"),
+        "an unknown id has no row to touch"
+    );
+    assert_eq!(
+        common::count(&db.pool, "box").await,
+        before,
+        "no insert path: an unknown id is `false`, never a row"
+    );
+
+    db.drop_db().await;
+}
+
 /// MOD-2 milestone 9's five inherent prompt reads (blueprint B.13), against the fixture.
 ///
 /// `prompt_template`, `skill`, `skill_version`, `skill_binding` and `box_tool` are the prompt

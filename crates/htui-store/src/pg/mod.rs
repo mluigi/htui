@@ -479,6 +479,19 @@ impl PgStore {
         Ok(answer)
     }
 
+    /// The box heartbeat (MOD-40 plan D7, `docs/ANA-16.md` C4): stamps `box.last_seen_at` with the
+    /// server's `clock_timestamp()` and answers whether a row had `id`.
+    ///
+    /// Not written yet: answers `false` without a statement (MOD-40 T5, red).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn touch_box(&self, id: BoxId) -> Result<bool> {
+        let _ = id;
+        Ok(false)
+    }
+
     /// The pool, for the refresh task (`cache::refresh`) and for the tests.
     #[must_use]
     pub const fn pool(&self) -> &PgPool {
