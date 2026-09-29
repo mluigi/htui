@@ -22,7 +22,7 @@ use htui_core::model::{
     EventRole, GraphSnapshot, Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch,
     NewCommandRun, NewItem, NewProject, NewRepo, NewRequirement, NewRun, NewWorkspace, Priority,
     ProjectId, RepoId, RequirementId, RunId, RunMode, RunStatus, RunStepTree, SessionEvent,
-    SnapshotGraph, SnapshotSettings, Status, StepId, TIMESTAMPTZ_DIGITS, Transport,
+    SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome, TIMESTAMPTZ_DIGITS, Transport,
     WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
@@ -4448,21 +4448,15 @@ async fn upsert_step_tree_writes_the_primary_isolation_path() {
     db.drop_db().await;
 }
 
-/// MOD-40 blueprint B2: a step write racing an uncommitted lease take waits for it, then answers
-/// `Fenced`, and writes nothing.
-///
-/// Under `READ COMMITTED` a join reads `run` and does not lock it, so without the `FOR SHARE` in
-/// the append's `lease` CTE the write would see the pre-take row and commit after the take. Here
-/// the take is a raw `UPDATE run SET lease_owner` inside an open transaction, standing in for a
-/// `take_lease` or `adopt_runs` whose commit has not landed yet: the write must still be waiting
-/// on its row lock when checked, and must re-read the committed owner once the take commits.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_lease_take_committed_mid_write_fences_it() {
-    let Some(db) = common::demo_db().await else {
-        return;
-    };
-    let (a, b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
-    let now = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+/// MOD-40 blueprint B2: `a` claims the queued fixture run, then `b`'s take of its lease is written
+/// in a transaction left open, standing in for a `take_lease` or `adopt_runs` whose commit has not
+/// landed yet. The caller commits it once its racing write is seen waiting.
+async fn an_uncommitted_take(
+    db: &common::TestDb,
+    a: uuid::Uuid,
+    b: uuid::Uuid,
+    now: DateTime<Utc>,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
     assert_eq!(
         db.store
             .claim_run(ids::RUN_2, ids::BOX, a, now, TimeDelta::minutes(5))
@@ -4471,7 +4465,6 @@ async fn a_lease_take_committed_mid_write_fences_it() {
         Claim::Admitted,
         "A claims the queued fixture run"
     );
-
     let mut tx = db.pool.begin().await.expect("begin");
     sqlx::query("UPDATE run SET lease_owner = $1 WHERE id = $2")
         .bind(b)
@@ -4479,6 +4472,54 @@ async fn a_lease_take_committed_mid_write_fences_it() {
         .execute(&mut *tx)
         .await
         .expect("B's take, uncommitted");
+    tx
+}
+
+/// Waits until a backend of this database waits on a lock, bounded, then checks `write` has not
+/// answered: the proof that it is blocked on the take's row lock (`FOR SHARE`) and not merely
+/// slow.
+async fn wait_for_the_take<T>(db: &common::TestDb, write: &mut tokio::task::JoinHandle<T>) {
+    let started = std::time::Instant::now();
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the write never waited on the take's row lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut *write)
+            .await
+            .is_err(),
+        "the write answered while the take was uncommitted"
+    );
+}
+
+/// MOD-40 blueprint B2: a step write racing an uncommitted lease take waits for it, then answers
+/// `Fenced`, and writes nothing.
+///
+/// Under `READ COMMITTED` a join reads `run` and does not lock it, so without the `FOR SHARE` in
+/// the append's `lease` CTE the write would see the pre-take row and commit after the take. The
+/// write must still be waiting on its row lock when checked, and must re-read the committed owner
+/// once the take commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_take_committed_mid_write_fences_it() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (a, b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let now = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let tx = an_uncommitted_take(&db, a, b, now).await;
 
     let store = db.store.clone();
     let row = SessionEvent {
@@ -4492,13 +4533,9 @@ async fn a_lease_take_committed_mid_write_fences_it() {
         raw: None,
         at: now,
     };
-    let handle =
+    let mut handle =
         tokio::spawn(async move { store.append_events(StepFence::Lease(a), &[row]).await });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(
-        !handle.is_finished(),
-        "the write waits on the take's row lock (`FOR SHARE OF r`)"
-    );
+    wait_for_the_take(&db, &mut handle).await;
 
     tx.commit().await.expect("B's take commits");
     let answer = handle.await.expect("the write task must not panic");
@@ -4513,6 +4550,59 @@ async fn a_lease_take_committed_mid_write_fences_it() {
             .expect("read must not fail")
             .is_none(),
         "the fenced write left no row"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-40 blueprint B2, the settle's shape: `finish_step`'s fence is an `EXISTS … FOR SHARE`
+/// sub-select rather than the append's CTE, and a take committed while it waits fences it the
+/// same way. The step's settle columns are left as they were.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_take_committed_mid_settle_fences_it() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (a, b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let now = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let settle_columns = || async {
+        sqlx::query_as::<_, (Option<DateTime<Utc>>, Option<i32>)>(
+            "SELECT finished_at, verify_exit_code FROM run_step WHERE id = $1",
+        )
+        .bind(ids::STEP_R2_PRD.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the step's settle columns")
+    };
+    let before = settle_columns().await;
+    let tx = an_uncommitted_take(&db, a, b, now).await;
+
+    let store = db.store.clone();
+    let outcome = StepOutcome {
+        exit_code: None,
+        usage: None,
+        trim_record: None,
+        verify_outcome: None,
+        verify_exit_code: Some(0),
+        finished_at: now,
+    };
+    let mut handle = tokio::spawn(async move {
+        store
+            .finish_step(StepFence::Lease(a), ids::STEP_R2_PRD, outcome)
+            .await
+    });
+    wait_for_the_take(&db, &mut handle).await;
+
+    tx.commit().await.expect("B's take commits");
+    let answer = handle.await.expect("the settle task must not panic");
+    assert!(
+        matches!(answer, Err(htui_core::store::StoreError::Fenced { step }) if step == ids::STEP_R2_PRD),
+        "the settle re-reads the committed owner and is fenced, got {answer:?}"
+    );
+    assert_eq!(
+        settle_columns().await,
+        before,
+        "the fenced settle wrote nothing"
     );
 
     db.drop_db().await;
