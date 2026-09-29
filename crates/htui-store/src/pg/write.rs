@@ -45,11 +45,11 @@ use htui_core::store::{
     chat_step_status, check_attachment, citation_key, close_out_needs_a_summary, expected_on_row,
     failure_disagrees_with_status, finish_run_item_mirror, finish_run_needs_a_terminal_status,
     graph_not_in_project, illegal_move, invalid_area_code, invalid_prefix, item_has_a_live_run,
-    item_kind_is_held, item_not_in_project, legal_move, new_skill_refusal, not_a_fanout_candidate,
-    not_a_terminal_status, prompt_template_key, prompt_template_refusal, references_no_row,
-    requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_step,
-    run_is_terminal, skill_body_refusal, skill_patch_refusal, skill_version_key,
-    step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
+    item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move, new_skill_refusal,
+    not_a_fanout_candidate, not_a_terminal_status, prompt_template_key, prompt_template_refusal,
+    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
+    row_names_another_step, run_is_terminal, skill_body_refusal, skill_patch_refusal,
+    skill_version_key, step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
     withdrawn_requirement_cited,
 };
 use serde_json::Value;
@@ -3574,6 +3574,12 @@ impl WriteStore for PgStore {
 
     /// ANA-2 §4.7's admission, one transaction with the box row locked for its whole length.
     ///
+    /// The lease's expiry is `clock_timestamp()` plus the TTL, in the statement that admits the
+    /// run, so no process's clock enters a lease (MOD-40 plan D10); `started_at` and a
+    /// `MissingTags` `finished_at` are the caller's `at` (blueprint B25). The product
+    /// `$5 * interval '1 microsecond'` keeps the span in the interval's time field, so the sum is
+    /// absolute in any session `TimeZone` (P-13).
+    ///
     /// `SELECT ... FOR UPDATE` on `box` is the critical section (§4.7, `docs/ANA-2.md:1094`): the
     /// slot count and the overlap check are read-then-write decisions, and without the lock two
     /// claimers can both read "one slot free" and both take it. The Postgres-only pin is
@@ -3594,8 +3600,9 @@ impl WriteStore for PgStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] `{ entity: "run" }` or `{ entity: "box" }`, the run looked up
-    /// first. Every refusal that is not an error is an `Ok` [`Claim`] other than
+    /// [`StoreError::Constraint`] for a TTL outside [`lease_ttl_micros`]'s range, before the
+    /// transaction opens. [`StoreError::NotFound`] `{ entity: "run" }` or `{ entity: "box" }`, the
+    /// run looked up first. Every refusal that is not an error is an `Ok` [`Claim`] other than
     /// [`Claim::Admitted`], with nothing written, except [`Claim::MissingTags`]: the run is failed
     /// and its item blocked in this same transaction, which is then committed (MOD-7 milestone 3,
     /// D80). The run row and the box row are both locked `FOR UPDATE` before the tag read, so a
@@ -3615,7 +3622,7 @@ impl WriteStore for PgStore {
         at: DateTime<Utc>,
         ttl: TimeDelta,
     ) -> Result<Claim> {
-        let lease_until = at + ttl;
+        let ttl = lease_ttl_micros(ttl)?;
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
         let claimed = sqlx::query!(
@@ -3773,13 +3780,13 @@ impl WriteStore for PgStore {
                     started_at       = COALESCE(started_at, $4), \
                     lease_box_id     = $2, \
                     lease_owner      = $3, \
-                    lease_expires_at = $5 \
+                    lease_expires_at = clock_timestamp() + $5::bigint * interval '1 microsecond' \
               WHERE id = $1 AND status = 'queued'",
             run.as_uuid(),
             box_id.as_uuid(),
             owner,
             at,
-            lease_until,
+            ttl,
         )
         .execute(&mut *tx)
         .await
@@ -3804,19 +3811,23 @@ impl WriteStore for PgStore {
     ///
     /// Zero rows is the abandon signal, and it is `Ok(false)` rather than an error — the caller is
     /// meant to stop working, not to crash. `lease_owner` is not a [`Run`] field (blueprint F-S),
-    /// so this answer is the only way ownership is observable.
+    /// so this answer is the only way ownership is observable. The new expiry is
+    /// `clock_timestamp()` plus the TTL (MOD-40 plan D10).
     ///
     /// # Errors
     ///
+    /// [`StoreError::Constraint`] for a TTL out of range, before anything is read.
     /// [`StoreError::NotFound`] `{ entity: "run" }` when there is no such run at all, told apart
     /// from "not ours" by the one follow-up read [`WriteStore::transition`] has always used.
     async fn refresh_lease(&self, run: RunId, owner: Uuid, ttl: TimeDelta) -> Result<bool> {
-        let until = Utc::now() + ttl;
+        let ttl = lease_ttl_micros(ttl)?;
         let moved = sqlx::query!(
-            "UPDATE run SET lease_expires_at = $3 WHERE id = $1 AND lease_owner = $2",
+            "UPDATE run \
+                SET lease_expires_at = clock_timestamp() + $3::bigint * interval '1 microsecond' \
+              WHERE id = $1 AND lease_owner = $2",
             run.as_uuid(),
             owner,
-            until,
+            ttl,
         )
         .execute(&self.pool)
         .await
@@ -3843,8 +3854,9 @@ impl WriteStore for PgStore {
         }
     }
 
-    /// ANA-2 §4.9's sweep: every `running` run on the box whose lease is `NULL` or expired at
-    /// `now`, and is not already `owner`'s (plan D88), becomes `owner`'s, in one statement.
+    /// ANA-2 §4.9's sweep: every `running` run on the box whose lease is `NULL` or expired by
+    /// `clock_timestamp()`, and is not already `owner`'s (plan D88), becomes `owner`'s, in one
+    /// statement, its lease `clock_timestamp()` plus the TTL (MOD-40 plan D10).
     ///
     /// The candidates are locked in `(queued_at, id)` order with `FOR UPDATE SKIP LOCKED`
     /// (blueprint A-5): two concurrent sweeps never wait on each other's row locks and cannot
@@ -3856,10 +3868,10 @@ impl WriteStore for PgStore {
     ///
     /// # Errors
     ///
-    /// The backend's own failures only.
+    /// [`StoreError::Constraint`] for a TTL out of range, before anything is read; otherwise the
+    /// backend's own failures only.
     async fn adopt_runs(&self, box_id: BoxId, owner: Uuid, ttl: TimeDelta) -> Result<Vec<Run>> {
-        let now = Utc::now();
-        let lease_until = now + ttl;
+        let ttl = lease_ttl_micros(ttl)?;
         sqlx::query_as!(
             Run,
             r#"
@@ -3868,7 +3880,7 @@ impl WriteStore for PgStore {
                   FROM run
                  WHERE executing_box_id = $1
                    AND status = 'running'
-                   AND (lease_expires_at IS NULL OR lease_expires_at <= $3)
+                   AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())
                    AND lease_owner IS DISTINCT FROM $2
                  ORDER BY queued_at, id
                    FOR UPDATE SKIP LOCKED
@@ -3877,7 +3889,7 @@ impl WriteStore for PgStore {
                 UPDATE run r
                    SET lease_owner      = $2,
                        lease_box_id     = $1,
-                       lease_expires_at = $4
+                       lease_expires_at = clock_timestamp() + $3::bigint * interval '1 microsecond'
                   FROM candidates c
                  WHERE r.id = c.id
              RETURNING r.*
@@ -3905,8 +3917,7 @@ impl WriteStore for PgStore {
             "#,
             box_id.as_uuid(),
             owner,
-            now,
-            lease_until,
+            ttl,
         )
         .fetch_all(&self.pool)
         .await
@@ -3915,8 +3926,14 @@ impl WriteStore for PgStore {
 
     /// Plan D87: the lease of a run that is ours or free, in one compare-and-set `UPDATE`.
     ///
+    /// Expiry is judged, and the new one stamped, by `clock_timestamp()` (MOD-40 plan D10). Under
+    /// READ COMMITTED a take that waits on another's row lock re-evaluates its `WHERE` against the
+    /// committed row, and `clock_timestamp()` is volatile, so the re-check reads the clock after
+    /// the wait (`pg_criteria.rs::two_takes_of_one_released_lease_admit_one`).
+    ///
     /// # Errors
     ///
+    /// [`StoreError::Constraint`] for a TTL out of range, before anything is read.
     /// [`StoreError::NotFound`] `{ entity: "run" }` when there is no such run at all, told apart
     /// from "not takeable" by the follow-up read [`WriteStore::refresh_lease`] uses.
     async fn take_lease(
@@ -3926,23 +3943,21 @@ impl WriteStore for PgStore {
         owner: Uuid,
         ttl: TimeDelta,
     ) -> Result<bool> {
-        let now = Utc::now();
-        let until = now + ttl;
+        let ttl = lease_ttl_micros(ttl)?;
         let moved = sqlx::query!(
             "UPDATE run \
                 SET lease_owner      = $3, \
                     lease_box_id     = $2, \
-                    lease_expires_at = $5 \
+                    lease_expires_at = clock_timestamp() + $4::bigint * interval '1 microsecond' \
               WHERE id = $1 \
                 AND status IN ('running','awaiting_approval') \
                 AND executing_box_id = $2 \
                 AND (lease_owner = $3 OR lease_owner IS NULL \
-                     OR lease_expires_at IS NULL OR lease_expires_at <= $4)",
+                     OR lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())",
             run.as_uuid(),
             box_id.as_uuid(),
             owner,
-            now,
-            until,
+            ttl,
         )
         .execute(&self.pool)
         .await
@@ -3973,20 +3988,19 @@ impl WriteStore for PgStore {
     ///
     /// Clearing `lease_owner` is what lets this process's own sweep adopt the run (plan D88 skips
     /// only a row whose owner is the sweeper). A heartbeat `UPDATE` that commits after this one
-    /// filters on `lease_owner = $2` and so matches no row.
+    /// filters on `lease_owner = $2` and so matches no row. The expiry is `clock_timestamp()`, so
+    /// the lease reads as lapsed at once by every process's comparison (MOD-40 plan D10).
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] `{ entity: "run" }` when there is no such run at all, told apart
     /// from "not ours" by the follow-up read [`WriteStore::refresh_lease`] uses.
     async fn release_lease(&self, run: RunId, owner: Uuid) -> Result<bool> {
-        let now = Utc::now();
         let moved = sqlx::query!(
-            "UPDATE run SET lease_owner = NULL, lease_expires_at = $3 \
+            "UPDATE run SET lease_owner = NULL, lease_expires_at = clock_timestamp() \
               WHERE id = $1 AND lease_owner = $2",
             run.as_uuid(),
             owner,
-            now,
         )
         .execute(&self.pool)
         .await

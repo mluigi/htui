@@ -1783,7 +1783,11 @@ where
                 expected: "running | awaiting_approval",
             });
         }
-        if row.lease_expires_at.is_some_and(|until| until > self.now()) {
+        // MOD-40 blueprint B26: no clock is read. A take on a `running` or parked run is refused
+        // for one of two reasons only: the run executes on another box, or another owner's lease
+        // had not lapsed by the store's clock. The expiry is the store's, and comparing it with
+        // this process's clock would reintroduce the skew D10 removed.
+        if row.executing_box_id == Some(self.parts.box_id) {
             return Err(EngineError::LeaseHeld { run });
         }
         Err(EngineError::RunStatus {
@@ -1794,8 +1798,9 @@ where
     }
 
     /// The store's `take_lease(run, box, owner, ttl)` and its bare answer: the local instant the
-    /// lease lapses by at the earliest, `now + ttl` with `now` read before the take (plan D143), `None` for "not takeable here", which
-    /// [`Self::take_lease`] words and the sweep skips (plan D126).
+    /// lease lapses by at the earliest, `now + ttl` with `now` read before the take (plan D143),
+    /// `None` for "not takeable here", which [`Self::take_lease`] words and the sweep skips (plan
+    /// D126).
     ///
     /// Plan D140: a run taken here is about to be walked, so it leaves [`DeadWalks`]. The sweep
     /// must not give back the lease of a live walk.
@@ -1871,8 +1876,8 @@ where
     }
 
     /// Plan D87/D139: the store's `release_lease(run, owner)`. The lease reads as expired at once,
-    /// by the store's clock, and has no owner, so every process's sweep may adopt the run, this one's included
-    /// (plan D88 skips only a row this process still owns). A heartbeat refresh that hung and
+    /// by the store's clock, and has no owner, so every process's sweep may adopt the run, this
+    /// one's included (plan D88 skips only a row this process still owns). A heartbeat refresh that hung and
     /// commits after the release matches no row, so it cannot take the lease back. A zero-row
     /// answer is ignored and an error is warned; neither is raised.
     ///
