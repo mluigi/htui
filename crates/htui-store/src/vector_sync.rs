@@ -5,9 +5,19 @@
 //! `updated_at` or its `status` differs from its item point (a status move does not touch
 //! `updated_at`), or when the set of its latest documents differs from its document points.
 //! Rebuilding an item rewrites all of its points, because every document point repeats the item's
-//! status for the "decisions only" filter. Items the store no longer lists lose their points.
-use crate::vector::{ConceptPoint, DocumentRef, IndexedPoint, PointType, VectorStore};
-use htui_core::model::{Document, DocumentId, Item, ItemFilter, ItemId, Scope};
+//! status and resolution for the "decisions only" filter. Items the store no longer lists lose
+//! their points.
+//!
+//! Requirements follow (MOD-50 D226): one point per row, withdrawn ones included, rebuilt when the
+//! row's `version` differs from the point's (every amend and withdraw bumps it), and removed when
+//! the row is gone.
+use crate::vector::{
+    ConceptPoint, DocumentRef, IndexedPoint, Owner, PointType, Subject, VectorStore,
+};
+use htui_core::model::{
+    Document, DocumentId, Item, ItemFilter, ItemId, ProjectId, Requirement, RequirementFilter,
+    RequirementId, Scope,
+};
 use htui_core::store::{ReadStore, StoreError};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use uuid::Uuid;
@@ -16,6 +26,9 @@ use uuid::Uuid;
 /// tokens; 2000 characters of English prose stays under that.
 pub const MAX_CHUNK_CHARS: usize = 2000;
 
+/// Most requirement points written in one upsert.
+const UPSERT_BATCH: usize = 256;
+
 /// What one [`Indexer::sync`] did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SyncReport {
@@ -23,9 +36,14 @@ pub struct SyncReport {
     pub items_rebuilt: usize,
     /// Items already in step.
     pub items_unchanged: usize,
+    /// Requirements whose point was (re)built.
+    pub requirements_rebuilt: usize,
+    /// Requirements already in step.
+    pub requirements_unchanged: usize,
     /// Points written.
     pub points_upserted: usize,
-    /// Points removed: stale sections, superseded documents, items no longer listed.
+    /// Points removed: stale sections, superseded documents, items and requirements no longer
+    /// listed.
     pub points_deleted: usize,
 }
 
@@ -33,6 +51,8 @@ impl std::ops::AddAssign for SyncReport {
     fn add_assign(&mut self, other: Self) {
         self.items_rebuilt += other.items_rebuilt;
         self.items_unchanged += other.items_unchanged;
+        self.requirements_rebuilt += other.requirements_rebuilt;
+        self.requirements_unchanged += other.requirements_unchanged;
         self.points_upserted += other.points_upserted;
         self.points_deleted += other.points_deleted;
     }
@@ -57,8 +77,12 @@ impl Indexer {
             };
             let items = read.items(&one, &ItemFilter::default()).await?;
             let mut indexed: HashMap<ItemId, Vec<IndexedPoint>> = HashMap::new();
+            let mut requirement_points: HashMap<RequirementId, Vec<IndexedPoint>> = HashMap::new();
             for point in store.indexed(project).await? {
-                indexed.entry(point.item_id).or_default().push(point);
+                match point.owner {
+                    Owner::Item(id) => indexed.entry(id).or_default().push(point),
+                    Owner::Requirement(id) => requirement_points.entry(id).or_default().push(point),
+                }
             }
 
             for summary in items {
@@ -67,7 +91,7 @@ impl Indexer {
                 let item_fresh = old.iter().any(|p| {
                     p.point_type == PointType::Item
                         && p.updated_at == summary.updated_at
-                        && p.status == summary.status
+                        && p.status == Some(summary.status)
                 });
                 let old_docs: BTreeSet<DocumentId> =
                     old.iter().filter_map(|p| p.document_id).collect();
@@ -97,12 +121,55 @@ impl Indexer {
                 store.delete(stale).await?;
             }
 
+            report += sync_requirements(read, project, requirement_points, store).await?;
+
             let orphans: Vec<Uuid> = indexed.into_values().flatten().map(|p| p.id).collect();
             report.points_deleted += orphans.len();
             store.delete(orphans).await?;
         }
         Ok(report)
     }
+}
+
+/// The requirement half of one project's sync: one listing, stale points rebuilt in one upsert,
+/// and points of rows the store no longer lists deleted.
+async fn sync_requirements(
+    read: &impl ReadStore,
+    project: ProjectId,
+    mut indexed: HashMap<RequirementId, Vec<IndexedPoint>>,
+    store: &impl VectorStore,
+) -> Result<SyncReport, StoreError> {
+    let mut report = SyncReport::default();
+    let mut points = Vec::new();
+    let mut stale = Vec::new();
+    for row in read
+        .requirements(project, &RequirementFilter::default())
+        .await?
+    {
+        let old = indexed.remove(&row.id).unwrap_or_default();
+        let point = requirement_point(&row);
+        let id = point.id();
+        if old
+            .iter()
+            .any(|p| p.id == id && p.version == Some(row.version))
+        {
+            report.requirements_unchanged += 1;
+            continue;
+        }
+        stale.extend(old.iter().map(|p| p.id).filter(|old| *old != id));
+        report.requirements_rebuilt += 1;
+        points.push(point);
+    }
+    stale.extend(indexed.into_values().flatten().map(|p| p.id));
+    report.points_upserted += points.len();
+    report.points_deleted += stale.len();
+    // Bounded batches: a first build of a large spec would otherwise embed and send every
+    // requirement of the project in one request.
+    for batch in points.chunks(UPSERT_BATCH) {
+        store.upsert(batch.to_vec()).await?;
+    }
+    store.delete(stale).await?;
+    Ok(report)
 }
 
 /// The ID of the latest version of each document kind the item has.
@@ -124,15 +191,43 @@ async fn latest_documents(
 #[must_use]
 pub fn item_point(item: &Item) -> ConceptPoint {
     ConceptPoint {
-        point_type: PointType::Item,
-        item_id: item.id,
+        subject: item_subject(item),
         key: item.key.clone(),
         project_id: item.project_id,
-        kind_id: item.kind_id,
-        status: item.status,
         updated_at: item.updated_at,
         document: None,
         text: format!("{} {}\n\n{}", item.key, item.title, item.body),
+    }
+}
+
+/// What every point of `item` says about it.
+fn item_subject(item: &Item) -> Subject {
+    Subject::Item {
+        id: item.id,
+        kind_id: item.kind_id,
+        status: item.status,
+        resolution: item.resolution,
+    }
+}
+
+/// A requirement's point: its key, body and rationale (MOD-50 D224).
+#[must_use]
+pub fn requirement_point(row: &Requirement) -> ConceptPoint {
+    ConceptPoint {
+        subject: Subject::Requirement {
+            id: row.id,
+            area_code: row.area_code.clone(),
+            priority: row.priority,
+            state: row.state,
+            version: row.version,
+        },
+        key: row.key.clone(),
+        project_id: row.project_id,
+        updated_at: row.updated_at,
+        document: None,
+        text: format!("{} {}\n\n{}", row.key, row.body, row.rationale)
+            .trim_end()
+            .to_owned(),
     }
 }
 
@@ -149,12 +244,9 @@ pub fn document_points(item: &Item, doc: &Document) -> Vec<ConceptPoint> {
         .into_iter()
         .enumerate()
         .map(|(chunk, section)| ConceptPoint {
-            point_type: PointType::Document,
-            item_id: item.id,
+            subject: item_subject(item),
             key: item.key.clone(),
             project_id: item.project_id,
-            kind_id: item.kind_id,
-            status: item.status,
             updated_at: item.updated_at,
             document: Some(DocumentRef {
                 id: doc.id,
@@ -200,10 +292,16 @@ mod tests {
     use crate::vector::MemVectorStore;
     use chrono::Utc;
     use htui_core::fixtures::ids;
-    use htui_core::model::{ItemPatch, NewDocument, Status};
+    use htui_core::model::{
+        ItemPatch, NewDocument, RequirementPatch, RequirementState, Resolution, Status,
+    };
     use htui_core::store::{MemStore, WriteStore};
 
-    fn scope(projects: Vec<htui_core::model::ProjectId>) -> Scope {
+    fn item_of(p: &ConceptPoint) -> Option<ItemId> {
+        p.subject.owner().item()
+    }
+
+    fn scope(projects: Vec<ProjectId>) -> Scope {
         Scope {
             workspace_id: ids::WORKSPACE_PLATFORM,
             project_ids: projects,
@@ -261,7 +359,7 @@ mod tests {
         assert_eq!(
             points
                 .iter()
-                .filter(|p| p.point_type == PointType::Item)
+                .filter(|p| p.point_type() == PointType::Item)
                 .count(),
             items.len()
         );
@@ -269,7 +367,7 @@ mod tests {
         let latest = latest_documents(&read, with_docs.id).await.unwrap();
         let indexed_docs: BTreeSet<DocumentId> = points
             .iter()
-            .filter(|p| p.item_id == with_docs.id)
+            .filter(|p| item_of(p) == Some(with_docs.id))
             .filter_map(|p| p.document.as_ref().map(|d| d.id))
             .collect();
         assert_eq!(indexed_docs, latest);
@@ -312,7 +410,7 @@ mod tests {
         let text = store
             .points()
             .into_iter()
-            .find(|p| p.item_id == item.id && p.point_type == PointType::Item)
+            .find(|p| item_of(p) == Some(item.id) && p.point_type() == PointType::Item)
             .unwrap()
             .text;
         assert!(text.contains("rewritten body about vector search"));
@@ -337,8 +435,8 @@ mod tests {
             store
                 .points()
                 .iter()
-                .filter(|p| p.item_id == item.id)
-                .all(|p| p.status == to)
+                .filter(|p| item_of(p) == Some(item.id))
+                .all(|p| matches!(p.subject, Subject::Item { status, .. } if status == to))
         );
     }
 
@@ -392,19 +490,192 @@ mod tests {
             .count();
         // An item the store does not have, as if it had been removed since the last sync.
         let mut ghost = item_point(&item_with_documents(&read).await);
-        ghost.item_id = ItemId::new();
+        let ghost_id = ItemId::new();
+        if let Subject::Item { id, .. } = &mut ghost.subject {
+            *id = ghost_id;
+        }
         store.upsert(vec![ghost.clone()]).await.unwrap();
 
         let report = Indexer::sync(&read, &scope(vec![ids::PROJECT_HTUI]), &store)
             .await
             .unwrap();
         assert_eq!(report.points_deleted, 1);
-        assert!(store.points().iter().all(|p| p.item_id != ghost.item_id));
+        assert!(store.points().iter().all(|p| item_of(p) != Some(ghost_id)));
         let agy_after = store
             .points()
             .iter()
             .filter(|p| p.project_id == ids::PROJECT_AGY)
             .count();
         assert_eq!(agy_before, agy_after);
+    }
+
+    fn requirement_points(store: &MemVectorStore) -> Vec<ConceptPoint> {
+        store
+            .points()
+            .into_iter()
+            .filter(|p| p.point_type() == PointType::Requirement)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn requirements_get_one_point_each_and_a_second_sync_writes_nothing() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let s = scope(vec![ids::PROJECT_HTUI]);
+        let first = Indexer::sync(&read, &s, &store).await.unwrap();
+        let rows = read
+            .requirements(ids::PROJECT_HTUI, &RequirementFilter::default())
+            .await
+            .unwrap();
+        assert!(!rows.is_empty(), "the demo fixture has htui requirements");
+        assert_eq!(first.requirements_rebuilt, rows.len());
+        let points = requirement_points(&store);
+        assert_eq!(points.len(), rows.len());
+        for row in &rows {
+            let p = points
+                .iter()
+                .find(|p| p.subject.owner().requirement() == Some(row.id))
+                .expect("a point per row");
+            assert_eq!(p.key, row.key);
+            assert!(p.text.starts_with(&format!("{} {}", row.key, row.body)));
+            assert!(p.text.contains(&row.rationale));
+        }
+
+        let second = Indexer::sync(&read, &s, &store).await.unwrap();
+        assert_eq!(second.requirements_rebuilt, 0);
+        assert_eq!(second.requirements_unchanged, rows.len());
+        assert_eq!(second.points_upserted, 0);
+        assert_eq!(second.points_deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn an_amended_requirement_is_rebuilt_alone() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let s = scope(vec![ids::PROJECT_HTUI]);
+        Indexer::sync(&read, &s, &store).await.unwrap();
+        let row = read.requirement(ids::REQ_STO_1).await.unwrap().unwrap();
+        read.amend_requirement(
+            row.id,
+            row.version,
+            RequirementPatch {
+                body: Some("Search finds requirements by meaning.".into()),
+                rationale: None,
+                priority: None,
+                author_id: ids::USER,
+                box_id: Some(ids::BOX),
+                reason: "amended".into(),
+            },
+            ids::HTUI_FEAT_3,
+        )
+        .await
+        .unwrap();
+        let report = Indexer::sync(&read, &s, &store).await.unwrap();
+        assert_eq!(report.requirements_rebuilt, 1);
+        assert_eq!(report.items_rebuilt, 0);
+        assert_eq!(report.points_upserted, 1);
+        let p = requirement_points(&store)
+            .into_iter()
+            .find(|p| p.subject.owner().requirement() == Some(row.id))
+            .unwrap();
+        assert!(p.text.contains("Search finds requirements by meaning."));
+        assert!(
+            matches!(p.subject, Subject::Requirement { version, .. } if version == row.version + 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_requirement_keeps_its_point_with_its_state() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let s = scope(vec![ids::PROJECT_HTUI]);
+        Indexer::sync(&read, &s, &store).await.unwrap();
+        let row = read.requirement(ids::REQ_STO_1).await.unwrap().unwrap();
+        read.withdraw_requirement(
+            row.id,
+            row.version,
+            ids::HTUI_FEAT_3,
+            ids::USER,
+            Some(ids::BOX),
+        )
+        .await
+        .unwrap();
+        let report = Indexer::sync(&read, &s, &store).await.unwrap();
+        assert_eq!(report.requirements_rebuilt, 1);
+        let p = requirement_points(&store)
+            .into_iter()
+            .find(|p| p.subject.owner().requirement() == Some(row.id))
+            .expect("a withdrawn requirement stays indexed");
+        assert!(matches!(
+            p.subject,
+            Subject::Requirement {
+                state: RequirementState::Withdrawn,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn points_of_requirements_no_longer_listed_are_deleted() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let s = scope(vec![ids::PROJECT_HTUI]);
+        Indexer::sync(&read, &s, &store).await.unwrap();
+        let row = read.requirement(ids::REQ_STO_1).await.unwrap().unwrap();
+        let mut ghost = requirement_point(&row);
+        if let Subject::Requirement { id, .. } = &mut ghost.subject {
+            *id = RequirementId::new();
+        }
+        store.upsert(vec![ghost.clone()]).await.unwrap();
+        let report = Indexer::sync(&read, &s, &store).await.unwrap();
+        assert_eq!(report.points_deleted, 1);
+        assert!(store.points().iter().all(|p| p.id() != ghost.id()));
+    }
+
+    #[tokio::test]
+    async fn a_closed_item_carries_its_resolution_on_every_point() {
+        let read = MemStore::demo();
+        let store = MemVectorStore::new();
+        let fix = read.item(ids::HTUI_FIX_1).await.unwrap().unwrap();
+        assert_eq!(fix.status, Status::Closed);
+        // The demo's closed item has no documents; give it one, so the document half is pinned.
+        read.write_document(NewDocument {
+            id: DocumentId::new(),
+            item_id: fix.id,
+            kind: "summary".into(),
+            title: "Summary".into(),
+            body: "## Verdict\nrestore the terminal".into(),
+            produced_by_step_id: None,
+            created_by: ids::USER,
+            created_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+        Indexer::sync(&read, &scope(vec![ids::PROJECT_HTUI]), &store)
+            .await
+            .unwrap();
+        let points: Vec<_> = store
+            .points()
+            .into_iter()
+            .filter(|p| item_of(p) == Some(fix.id))
+            .collect();
+        assert!(
+            points.iter().any(|p| p.point_type() == PointType::Document),
+            "{points:?}"
+        );
+        assert!(points.iter().all(|p| matches!(
+            p.subject,
+            Subject::Item {
+                resolution: Some(Resolution::Done),
+                ..
+            }
+        )));
+        assert!(
+            store
+                .points()
+                .iter()
+                .filter(|p| matches!(p.subject, Subject::Item { status, .. } if status != Status::Closed))
+                .all(|p| matches!(p.subject, Subject::Item { resolution: None, .. }))
+        );
     }
 }

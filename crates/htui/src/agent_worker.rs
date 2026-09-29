@@ -617,20 +617,26 @@ impl AgentRuntime {
                 return;
             }
         };
-        self.box_probe = Some(tokio::spawn(run_box_probe(BoxProbeArgs {
-            backend: backend.clone(),
-            writer,
-            env,
-            hardware,
-            decide: true,
-            frames: Frames::new(
-                replies.clone(),
-                ReplyAddr {
-                    seq: UNSOLICITED,
-                    origin: Origin::App,
-                },
-            ),
-        })));
+        let frames = Frames::new(
+            replies.clone(),
+            ReplyAddr {
+                seq: UNSOLICITED,
+                origin: Origin::App,
+            },
+        );
+        let answer = frames.answer(registration_probe_failed);
+        self.box_probe = Some(tokio::spawn(answering(
+            "box probe",
+            run_box_probe(BoxProbeArgs {
+                backend: backend.clone(),
+                writer,
+                env,
+                hardware,
+                decide: true,
+                frames,
+            }),
+            Some(answer),
+        )));
     }
 
     /// The production runtime: every transport this build ships, which is whatever
@@ -955,6 +961,7 @@ impl AgentRuntime {
         );
         self.started.push(step_id);
 
+        let answer = frames.answer(chat_failed);
         let args = ChatArgs {
             driver,
             writer,
@@ -973,7 +980,7 @@ impl AgentRuntime {
         };
         Ok(Served::Start {
             step_id,
-            task: Box::pin(run_chat(args)),
+            task: Box::pin(answering("chat", run_chat(args), Some(answer))),
         })
     }
 
@@ -1267,14 +1274,20 @@ impl AgentRuntime {
         // Blueprint D35: the injected env when a test gave one, else this process's own.
         let (env, _) = self.probe_env()?;
 
+        let frames = Frames::new(replies.clone(), addr);
+        let answer = frames.answer(probe_agents_failed);
         self.background
-            .push(Background::writing(tokio::spawn(run_probe(ProbeArgs {
-                writer,
-                box_id,
-                agents,
-                env,
-                frames: Frames::new(replies.clone(), addr),
-            }))));
+            .push(Background::writing(tokio::spawn(answering(
+                "agent probe",
+                run_probe(ProbeArgs {
+                    writer,
+                    box_id,
+                    agents,
+                    env,
+                    frames,
+                }),
+                Some(answer),
+            ))));
         Ok(Served::Deferred)
     }
 
@@ -1298,14 +1311,20 @@ impl AgentRuntime {
         self.claim_is_free()?;
         let (env, hardware) = self.probe_env()?;
 
-        self.box_probe = Some(tokio::spawn(run_box_probe(BoxProbeArgs {
-            backend: backend.clone(),
-            writer,
-            env,
-            hardware,
-            decide: false,
-            frames: Frames::new(replies.clone(), addr),
-        })));
+        let frames = Frames::new(replies.clone(), addr);
+        let answer = frames.answer(box_probe_failed);
+        self.box_probe = Some(tokio::spawn(answering(
+            "box probe",
+            run_box_probe(BoxProbeArgs {
+                backend: backend.clone(),
+                writer,
+                env,
+                hardware,
+                decide: false,
+                frames,
+            }),
+            Some(answer),
+        )));
         Ok(Served::Deferred)
     }
 
@@ -1344,13 +1363,18 @@ impl AgentRuntime {
             ));
         }
         let origin = addr.origin.clone();
-        let task = tokio::spawn(crate::preview::run_preview(
-            backend.clone(),
-            item,
-            template_name,
-            scope,
-            replies.clone(),
-            addr,
+        let answer = Answer::at(replies.clone(), addr.clone(), preview_failed);
+        let task = tokio::spawn(answering(
+            "prompt preview",
+            crate::preview::run_preview(
+                backend.clone(),
+                item,
+                template_name,
+                scope,
+                replies.clone(),
+                addr,
+            ),
+            Some(answer),
         ));
         // The previous preview for this origin, if it is still running, is work whose answer the
         // staleness index is already committed to dropping (review finding M3). Aborting is safe at
@@ -1398,14 +1422,20 @@ impl AgentRuntime {
         })?;
 
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(run_plan(
-            PlanArgs {
-                config,
-                agent,
-                cwd,
-                frames: Frames::new(replies.clone(), addr),
-            },
-            cancel.clone(),
+        let frames = Frames::new(replies.clone(), addr);
+        let answer = frames.answer(install_failed);
+        let task = tokio::spawn(answering(
+            "install plan",
+            run_plan(
+                PlanArgs {
+                    config,
+                    agent,
+                    cwd,
+                    frames,
+                },
+                cancel.clone(),
+            ),
+            Some(answer),
         ));
         self.install = Some(LiveInstall {
             agent_id,
@@ -1441,17 +1471,23 @@ impl AgentRuntime {
 
         let agent_id = summary.agent.id;
         let cancel = CancellationToken::new();
-        let task = tokio::spawn(run_install(InstallArgs {
-            config,
-            plan,
-            writer,
-            box_id,
-            agent: summary.agent,
-            existing: summary.on_box,
-            cwd,
-            cancel: cancel.clone(),
-            frames: Frames::new(replies.clone(), addr),
-        }));
+        let frames = Frames::new(replies.clone(), addr);
+        let answer = frames.answer(install_failed);
+        let task = tokio::spawn(answering(
+            "install",
+            run_install(InstallArgs {
+                config,
+                plan,
+                writer,
+                box_id,
+                agent: summary.agent,
+                existing: summary.on_box,
+                cwd,
+                cancel: cancel.clone(),
+                frames,
+            }),
+            Some(answer),
+        ));
         self.install = Some(LiveInstall {
             agent_id,
             phase: LivePhase::Installing,
@@ -1545,18 +1581,24 @@ impl AgentRuntime {
 
         let cancel = CancellationToken::new();
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(run_auth(AuthArgs {
-            driver,
-            agent: summary.agent,
-            existing: summary.on_box,
-            box_id,
-            writer,
-            cwd,
-            cancel: cancel.clone(),
-            commands: commands_rx,
-            opener: self.opener.clone(),
-            frames: Frames::new(replies.clone(), addr),
-        }));
+        let frames = Frames::new(replies.clone(), addr);
+        let answer = frames.answer(auth_failed);
+        let task = tokio::spawn(answering(
+            "login",
+            run_auth(AuthArgs {
+                driver,
+                agent: summary.agent,
+                existing: summary.on_box,
+                box_id,
+                writer,
+                cwd,
+                cancel: cancel.clone(),
+                commands: commands_rx,
+                opener: self.opener.clone(),
+                frames,
+            }),
+            Some(answer),
+        ));
         self.auth = Some(LiveAuth {
             agent_id,
             cancel,
@@ -1872,13 +1914,18 @@ impl AgentRuntime {
         let reprobe = match (stale, reprobe) {
             (true, Some(args)) => {
                 self.background
-                    .push(Background::writing(tokio::spawn(run_reprobe(args))));
+                    .push(Background::writing(tokio::spawn(answering(
+                        "re-probe",
+                        run_reprobe(args),
+                        None,
+                    ))));
                 None
             }
             (_, held) => held,
         };
 
         let step_id = chat.step_id;
+        let answer = frames.answer(chat_failed);
         let args = ChatArgs {
             driver,
             writer,
@@ -1897,7 +1944,7 @@ impl AgentRuntime {
         };
         Ok(Served::Start {
             step_id,
-            task: Box::pin(run_chat(args)),
+            task: Box::pin(answering("chat", run_chat(args), Some(answer))),
         })
     }
 }
@@ -3132,6 +3179,173 @@ impl Frames {
             reply,
         });
     }
+}
+
+/// The replies a task owes its request if it panics: the ones that end the request (MOD-53).
+///
+/// A plain `fn` so every spawn site names its own, and so the answer carries no state of the task
+/// it outlives. More than one because a chat's stream ends the way its own failures end it:
+/// `Failed`, then `Ended`.
+type LastWord = fn(String) -> Vec<StoreReply>;
+
+/// Where a panicked task's [`LastWord`] goes: the task's reply channel and its stream (MOD-53).
+///
+/// The [`Stream`] rather than a copied [`ReplyAddr`], so a chat that has moved to a later request's
+/// address is answered where its frames were going, not where they started.
+struct Answer {
+    tx: mpsc::UnboundedSender<ReplyEnvelope>,
+    stream: Stream,
+    last_word: LastWord,
+}
+
+impl Answer {
+    /// An answer at a fixed `addr`, for a task that sends through something other than [`Frames`].
+    fn at(tx: mpsc::UnboundedSender<ReplyEnvelope>, addr: ReplyAddr, last_word: LastWord) -> Self {
+        Frames::new(tx, addr).answer(last_word)
+    }
+
+    /// Sends the last word for `message` at the stream's address as it is now.
+    fn send(self, message: String) {
+        let addr = self.stream.lock().addr.clone();
+        for reply in (self.last_word)(message) {
+            // A UI that has gone away is not an error, as in `Frames::send`.
+            let _ = self.tx.send(ReplyEnvelope {
+                seq: addr.seq,
+                origin: addr.origin.clone(),
+                reply,
+            });
+        }
+    }
+}
+
+impl Frames {
+    /// What a panic in the task that owns these frames answers with, at their stream (MOD-53).
+    fn answer(&self, last_word: LastWord) -> Answer {
+        Answer {
+            tx: self.tx.clone(),
+            stream: self.stream.clone(),
+            last_word,
+        }
+    }
+}
+
+/// A panicked agent probe's last word: the `probe_agents` failure that clears the Agents
+/// section's `probing` (MOD-53).
+fn probe_agents_failed(message: String) -> Vec<StoreReply> {
+    vec![StoreReply::Failed {
+        request: "probe_agents",
+        message,
+    }]
+}
+
+/// A panicked `ProbeBox`'s last word: the `probe_box` failure its refusals already use, which
+/// clears the Boxes section's `probing` and puts the sentence on its notice line (MOD-53).
+fn box_probe_failed(message: String) -> Vec<StoreReply> {
+    vec![StoreReply::Failed {
+        request: "probe_box",
+        message,
+    }]
+}
+
+/// A panicked registration probe's last word: a report with `box_failed` set. It answers at
+/// `UNSOLICITED`, where the freshness gate drops a `Failed` unread; a `BoxProbed` is rendered above
+/// the gate (`App::observe_reply`).
+fn registration_probe_failed(message: String) -> Vec<StoreReply> {
+    vec![StoreReply::BoxProbed(BoxProbeReport {
+        box_failed: Some(message),
+        ..BoxProbeReport::default()
+    })]
+}
+
+/// A panicked prompt preview's last word.
+fn preview_failed(message: String) -> Vec<StoreReply> {
+    vec![StoreReply::Failed {
+        request: crate::store_worker::PROMPT_PREVIEW,
+        message,
+    }]
+}
+
+/// A panicked plan's or install's last word: the terminal frame that closes the section's pane.
+fn install_failed(message: String) -> Vec<StoreReply> {
+    vec![StoreReply::Install(InstallFrame::Failed {
+        message,
+        manual: None,
+    })]
+}
+
+/// A panicked login's last word: the terminal frame that returns the section to idle. Sent at the
+/// `AuthStart`'s address: `run_auth` moves its stream to an `AuthChoose`'s in a local, not in
+/// `Frames`, and the start's `seq` stays fresh for the whole flow because a choose is another
+/// request kind.
+fn auth_failed(message: String) -> Vec<StoreReply> {
+    vec![StoreReply::Auth(AuthFrame::Failed { message })]
+}
+
+/// A panicked chat's last words, as its transport failures end it: `Failed`, which clears a
+/// pending start, then `Ended`, which tells an accepted session it is over so the tab stops
+/// sending to a chat the runtime has already swept. `Cancelled`, because the last turn was cut.
+fn chat_failed(message: String) -> Vec<StoreReply> {
+    vec![
+        StoreReply::Chat(ChatFrame::Failed { message }),
+        StoreReply::Chat(ChatFrame::Ended {
+            stop_reason: StopReason::Cancelled,
+        }),
+    ]
+}
+
+/// `task`, polled so that a panic inside it ends the request instead of the terminal (MOD-53).
+///
+/// Every task the runtime spawns goes through here. A panic used to be dropped twice over: tokio
+/// kept it in a `JoinHandle` that [`sweep_finished`](AgentRuntime::sweep_finished) forgets
+/// unread, so the flag the UI raised for the request (`probing`, a running install or login, a
+/// chat's pending start) stayed set for the rest of the session; and the process hook
+/// (`terminal::install_panic_hook`) ran first and gave the terminal back under a live event loop,
+/// because nothing marked the panic as one the process survives.
+///
+/// So each poll runs inside [`contain`](htui_agent::excerpt::contain) and `catch_unwind`. On an
+/// unwind the task is dropped, which runs whatever guards it still held (a `ChildGuard` kills its
+/// child, a `ReprobeClaim` releases its row), the panic is logged, and `answer`, when the task owes
+/// one, is sent. The reply goes out at once, not at the next sweep, because the sweep only runs
+/// when another request arrives. Cancelling is untouched: an aborted task is dropped at an await
+/// and never reaches the catch, so a superseded preview or a shutdown still answers nothing.
+///
+/// A panic on a thread the task starts (`spawn_blocking`, a provider thread) is not caught here;
+/// it comes back to the task as an error, as it always did.
+async fn answering<F>(name: &'static str, task: F, answer: Option<Answer>)
+where
+    F: Future<Output = ()>,
+{
+    let mut task = Box::pin(task);
+    let caught = std::future::poll_fn(|cx| {
+        htui_agent::excerpt::contain(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.as_mut().poll(cx)))
+        })
+        .map_or_else(
+            |payload| std::task::Poll::Ready(Err(payload)),
+            |poll| poll.map(Ok),
+        )
+    })
+    .await;
+    // Before the answer: whatever the task still held is let go of first, so a request the answer
+    // prompts finds the child reaped and the claim free.
+    drop(task);
+    let Err(payload) = caught else {
+        return;
+    };
+    let message = format!("the {name} task panicked: {}", panic_text(payload.as_ref()));
+    tracing::error!(task = name, %message, "a runtime task panicked; its request is answered as failed");
+    if let Some(answer) = answer {
+        answer.send(message);
+    }
+}
+
+/// A panic payload as text: the `&str` or `String` `panic!` builds, else a placeholder.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("a non-text payload")
 }
 
 /// How one turn ended.
@@ -8830,5 +9044,270 @@ done
     #[test]
     fn htui_version_is_the_binary_s_version() {
         assert_eq!(htui_store::HTUI_VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-53: a task that panics still answers its request, and leaves the terminal alone
+    // -----------------------------------------------------------------------------------------
+
+    /// Hardware whose read panics: the box probe's own seam, used to put a panic inside the task.
+    #[derive(Debug)]
+    struct PanickingHardware;
+
+    impl HardwareSource for PanickingHardware {
+        fn read<'a>(&'a self, _env: &'a ProbeEnv) -> box_probe::hardware::HardwareFuture<'a> {
+            Box::pin(async { panic!("the hardware read blew up") })
+        }
+    }
+
+    /// A transport whose sessions panic as they start.
+    #[derive(Debug)]
+    struct PanickingDriver;
+
+    impl AgentDriver for PanickingDriver {
+        fn name(&self) -> &str {
+            "panicking-fixture"
+        }
+
+        fn caps(&self) -> DriverCaps {
+            DriverCaps::default()
+        }
+
+        fn start<'a>(
+            &'a self,
+            _spec: SessionSpec,
+            _prompt: String,
+        ) -> htui_agent::driver::DriverFuture<'a, Box<dyn AgentSession>> {
+            Box::pin(async { panic!("the adapter blew up on start") })
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanickingBuilder;
+
+    impl htui_agent::registry::TransportBuilder for PanickingBuilder {
+        fn build(
+            &self,
+            _agent: &Agent,
+            _on_box: Option<&AgentBox>,
+            _caps: DriverCaps,
+        ) -> Result<Box<dyn AgentDriver>, DriverError> {
+            Ok(Box::new(PanickingDriver))
+        }
+    }
+
+    fn settings_addr(seq: Seq) -> ReplyAddr {
+        ReplyAddr {
+            seq,
+            origin: Origin::Tab(crate::ui::tabs::TabId("settings")),
+        }
+    }
+
+    /// The wrapper's whole contract: a panic becomes the task's last word, at the stream's address
+    /// as it is when the panic lands, and the terminal is not given back on the way.
+    #[tokio::test]
+    async fn a_panicking_task_answers_with_its_last_word_at_the_stream_s_address() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let frames = Frames::new(tx, settings_addr(3));
+        let answer = frames.answer(probe_agents_failed);
+        let contained = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&contained);
+
+        answering(
+            "agent probe",
+            async move {
+                // The stream moves, as a chat's does when a later request adopts it.
+                frames.stream.lock().addr = settings_addr(9);
+                *seen.lock().expect("unpoisoned") = Some(!crate::terminal::restores_the_terminal());
+                tokio::task::yield_now().await;
+                panic!("probe went sideways");
+            },
+            Some(answer),
+        )
+        .await;
+
+        let replies = sent(&mut rx);
+        assert_eq!(replies.len(), 1, "exactly one reply: {replies:?}");
+        assert_eq!(replies[0].seq, 9, "at the moved address");
+        match &replies[0].reply {
+            StoreReply::Failed { request, message } => {
+                assert_eq!(*request, "probe_agents");
+                assert_eq!(
+                    message,
+                    "the agent probe task panicked: probe went sideways"
+                );
+            }
+            other => panic!("the last word: {other:?}"),
+        }
+        assert_eq!(
+            *contained.lock().expect("unpoisoned"),
+            Some(true),
+            "the hook would have left the terminal alone"
+        );
+        assert!(
+            crate::terminal::restores_the_terminal(),
+            "and the window closed again"
+        );
+    }
+
+    /// A task that ends normally owes no last word, and a `String` payload reads as itself.
+    #[tokio::test]
+    async fn only_a_panic_sends_the_last_word() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let answer = Answer::at(tx.clone(), settings_addr(1), install_failed);
+        answering("install", async {}, Some(answer)).await;
+        assert!(sent(&mut rx).is_empty(), "a clean exit adds nothing");
+
+        let answer = Answer::at(tx, settings_addr(2), install_failed);
+        let code = 7;
+        answering(
+            "install",
+            async move { panic!("exit code {code}") },
+            Some(answer),
+        )
+        .await;
+        let replies = sent(&mut rx);
+        assert!(
+            matches!(
+                &replies[..],
+                [ReplyEnvelope { seq: 2, reply: StoreReply::Install(InstallFrame::Failed { message, manual: None }), .. }]
+                    if message == "the install task panicked: exit code 7"
+            ),
+            "{replies:?}"
+        );
+    }
+
+    /// The case the item was found on: a box probe that panics clears the section's `probing`,
+    /// because the `probe_box` failure arrives, and the slot is free for the next `p`.
+    #[tokio::test]
+    async fn a_box_probe_that_panics_answers_probe_box_and_frees_the_slot() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let store = never_probed().await;
+        let backend = Backend::memory(store.clone());
+        let mut runtime = AgentRuntime::new(DriverFactory::production())
+            .with_probe_env(fake_env(tmp.path()), Arc::new(PanickingHardware));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let request = RequestEnvelope {
+            seq: 7,
+            origin: Origin::Tab(crate::ui::tabs::TabId("settings")),
+            request: StoreRequest::ProbeBox,
+        };
+
+        let served = runtime.serve(&backend, &tx, &request).await;
+        assert!(matches!(served, Served::Deferred), "{served:?}");
+        let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the panicked probe answers")
+            .expect("the channel is open");
+        // Not `finish_background`, which takes the slot itself: the task has to finish on its
+        // own for the sweep inside the next `serve` to release it.
+        for _ in 0..1_000 {
+            if !runtime.box_probe_running() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!runtime.box_probe_running(), "the panicked task finished");
+
+        let mut replies = vec![first];
+        replies.extend(sent(&mut rx));
+        assert_eq!(replies.len(), 1, "exactly one reply: {replies:?}");
+        assert_eq!(replies[0].seq, 7);
+        match &replies[0].reply {
+            StoreReply::Failed { request, message } => {
+                assert_eq!(*request, StoreRequest::ProbeBox.name());
+                assert!(
+                    message.contains("the hardware read blew up"),
+                    "the panic is named: {message}"
+                );
+            }
+            other => panic!("a panicked box probe answers probe_box: {other:?}"),
+        }
+
+        let again = RequestEnvelope { seq: 8, ..request };
+        let served = runtime.serve(&backend, &tx, &again).await;
+        assert!(
+            matches!(served, Served::Deferred),
+            "the slot was released, so a second probe starts: {served:?}"
+        );
+        runtime.finish_background(Duration::from_secs(10)).await;
+    }
+
+    /// A chat whose session panics ends its stream with a `Failed` frame, which is what clears the
+    /// chat tab's pending start.
+    #[tokio::test]
+    async fn a_chat_that_panics_ends_its_stream_with_failed_then_ended() {
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&fake_row(agent_id), None)
+            .await
+            .expect("the fake row lands");
+        let mut factory = DriverFactory::new();
+        factory.register("cli/fake", Box::new(PanickingBuilder));
+        let backend = Backend::memory(store);
+        let mut runtime = AgentRuntime::new(factory).with_grace(Duration::from_millis(0));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let Served::Start { task, .. } = runtime
+            .serve(&backend, &tx, &envelope(7, start(agent_id, "hi")))
+            .await
+        else {
+            panic!("a chat start opens a session")
+        };
+        task.await;
+
+        let replies = sent(&mut rx);
+        let [.., failed, ended] = &replies[..] else {
+            panic!("the stream ends with two frames: {replies:?}")
+        };
+        assert_eq!((failed.seq, ended.seq), (7, 7));
+        assert!(
+            matches!(
+                &failed.reply,
+                StoreReply::Chat(ChatFrame::Failed { message })
+                    if message.contains("the adapter blew up on start")
+            ),
+            "{replies:?}"
+        );
+        // And then `Ended`, as a transport failure ends it: an accepted session in the tab would
+        // otherwise go on sending to a chat the runtime has already swept.
+        assert!(
+            matches!(
+                &ended.reply,
+                StoreReply::Chat(ChatFrame::Ended {
+                    stop_reason: StopReason::Cancelled
+                })
+            ),
+            "{replies:?}"
+        );
+    }
+
+    /// The registration probe answers at `UNSOLICITED`, where only a `BoxProbed` is rendered, so a
+    /// panic there is a report with `box_failed` set rather than a `Failed` the gate would drop.
+    #[tokio::test]
+    async fn a_registration_probe_that_panics_reports_box_failed() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let backend = Backend::memory(never_probed().await);
+        let mut runtime = AgentRuntime::new(DriverFactory::production())
+            .with_registration_probe()
+            .with_probe_env(fake_env(tmp.path()), Arc::new(PanickingHardware));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        swap(&mut runtime, &backend, &tx).await;
+
+        let report = the_report(&sent(&mut rx));
+        assert!(
+            report
+                .box_failed
+                .as_deref()
+                .is_some_and(|message| message.contains("the hardware read blew up")),
+            "{report:?}"
+        );
+        assert!(
+            report.status_line().contains("the hardware read blew up"),
+            "the status line says so: {}",
+            report.status_line()
+        );
     }
 }

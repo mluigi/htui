@@ -686,7 +686,7 @@ enum Outcome {
 pub const PROVIDER_THREAD_PREFIX: &str = "excerpt-provider:";
 
 thread_local! {
-    /// Whether this thread is inside a [`propose_caught`] window right now.
+    /// Whether this thread is inside a [`propose_caught`] or [`contain`] window right now.
     static CONTAINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -707,6 +707,19 @@ thread_local! {
 #[must_use]
 pub fn panic_is_contained() -> bool {
     CONTAINED.with(std::cell::Cell::get)
+}
+
+/// Runs `f` with [`panic_is_contained`] true on this thread, for a caller that catches the unwind
+/// itself (MOD-56's hook question, asked by a second catcher).
+///
+/// MOD-53: `htui`'s agent runtime polls every task it spawns inside `catch_unwind` and answers the
+/// request with a failure, so a panic there is one the process survives, exactly as a provider's
+/// is. Without this window the hook would give the terminal back on the way through. The window
+/// must span the `catch_unwind`, not only the call inside it, because the hook runs during the
+/// unwind; and it restores the previous value, so it nests inside a provider window and vice versa.
+pub fn contain<R>(f: impl FnOnce() -> R) -> R {
+    let _contained = Contained::enter();
+    f()
 }
 
 /// Sets [`CONTAINED`] for the lifetime of a provider call, restoring the **previous** value rather
@@ -1153,5 +1166,22 @@ mod tests {
     fn normalise_folds_crlf_and_drops_the_bom() {
         assert_eq!(normalise("\u{feff}a\r\nb\rc\n"), "a\nb\nc\n");
         assert_eq!(normalise(""), "");
+    }
+
+    /// MOD-53: `contain` opens the same window a provider call does, and closes it back to what it
+    /// was rather than to `false`, so it nests either way round.
+    #[test]
+    fn contain_opens_the_window_and_restores_the_previous_value() {
+        assert!(!panic_is_contained(), "a plain thread is not contained");
+        let inside = contain(|| {
+            let nested = contain(panic_is_contained);
+            (panic_is_contained(), nested, panic_is_contained())
+        });
+        assert_eq!(inside, (true, true, true), "nesting keeps the outer window");
+        assert!(!panic_is_contained(), "and the window closes after");
+
+        let caught = contain(|| std::panic::catch_unwind(|| panic!("contained on purpose")));
+        assert!(caught.is_err());
+        assert!(!panic_is_contained(), "an unwind inside still closes it");
     }
 }

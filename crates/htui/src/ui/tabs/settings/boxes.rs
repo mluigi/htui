@@ -336,7 +336,7 @@ impl BoxesSection {
     /// One key while an editor is open: the widget answers first, so every letter is text.
     ///
     /// Everything the widget passes on is swallowed rather than offered to the shell, except
-    /// `CONTROL` chords (the kinds rule; `ctrl-c` quitting is MOD-52's).
+    /// `CONTROL` chords (the kinds rule), so `ctrl-c` still quits.
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let outcome = match &mut self.mode {
             Mode::Browse => return Handled::Pass,

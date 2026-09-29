@@ -10,7 +10,7 @@
 //! Both connect headless (`PgStore::connect_headless`, MOD-40 plan D8): a pending schema or a
 //! build below the database's target version is refused, never migrated.
 use anyhow::{Context as _, bail};
-use htui_core::model::{ProjectId, Scope, Status};
+use htui_core::model::{ProjectId, RequirementState, Resolution, Scope};
 use htui_store::embed::FastEmbedder;
 use htui_store::pg::CONNECT_TIMEOUT;
 use htui_store::qdrant_settings::QdrantSettings;
@@ -25,7 +25,7 @@ pub struct SearchOptions {
     pub query: String,
     /// Restrict to one project, by slug.
     pub project: Option<String>,
-    /// Closed and done items and their documents only (ANA-11 §4.2's decisions).
+    /// Decisions only (ANA-11 §4.2): items closed as [`DECISION_RESOLUTIONS`], and their documents.
     pub decisions: bool,
     /// Most hits printed.
     pub limit: u64,
@@ -34,9 +34,15 @@ pub struct SearchOptions {
 /// Hits `--search-items` prints when `--limit` is not given.
 pub const DEFAULT_LIMIT: u64 = 10;
 
-/// The statuses `--decisions` keeps: the two terminal ones a decision can close with until MOD-38
-/// adds `item.resolution`.
-pub const DECISION_STATUSES: [Status; 2] = [Status::Done, Status::Closed];
+/// The resolutions `--decisions` keeps (MOD-50 D223, maintainer): an item closed as withdrawn
+/// ("dropped without a decision"), duplicate or superseded records no decision in force, and a
+/// done item that was never closed out has none yet. Requirements carry no resolution, so they are
+/// left out too.
+pub const DECISION_RESOLUTIONS: [Resolution; 3] = [
+    Resolution::Done,
+    Resolution::Concluded,
+    Resolution::Rejected,
+];
 
 /// Builds the Qdrant settings from what the keyring holds.
 ///
@@ -126,8 +132,14 @@ pub async fn index_items(project: Option<&str>) -> anyhow::Result<()> {
         report += Indexer::sync(&pg, &scope, &store).await?;
     }
     eprintln!(
-        "indexed: {} item(s) rebuilt, {} unchanged; {} point(s) written, {} removed",
-        report.items_rebuilt, report.items_unchanged, report.points_upserted, report.points_deleted
+        "indexed: {} item(s) rebuilt, {} unchanged; {} requirement(s) rebuilt, {} unchanged; \
+         {} point(s) written, {} removed",
+        report.items_rebuilt,
+        report.items_unchanged,
+        report.requirements_rebuilt,
+        report.requirements_unchanged,
+        report.points_upserted,
+        report.points_deleted
     );
     Ok(())
 }
@@ -148,8 +160,9 @@ pub async fn search_items(options: &SearchOptions) -> anyhow::Result<()> {
         text: options.query.clone(),
         projects,
         types: Vec::new(),
-        statuses: if options.decisions {
-            DECISION_STATUSES.to_vec()
+        statuses: Vec::new(),
+        resolutions: if options.decisions {
+            DECISION_RESOLUTIONS.to_vec()
         } else {
             Vec::new()
         },
@@ -165,18 +178,26 @@ pub async fn search_items(options: &SearchOptions) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One result line: key, where it matched, score and snippet.
+/// One result line: key, where it matched, score and snippet. Where it matched names a closed
+/// item's resolution and a withdrawn requirement (MOD-50 D227): `--decisions` lists `rejected`
+/// next to `done`, and a rejected decision must not read as an adopted one.
 #[must_use]
 pub fn format_hit(hit: &Hit) -> String {
     let place = match (&hit.point_type, &hit.document) {
         (PointType::Document, Some((_, kind))) => format!("{kind} document"),
+        (PointType::Requirement, _) => "requirement".to_owned(),
         _ => "item".to_owned(),
+    };
+    let place = match (hit.resolution, hit.state) {
+        (Some(resolution), _) => format!("{place} ({resolution})"),
+        (None, Some(RequirementState::Withdrawn)) => format!("{place} (withdrawn)"),
+        _ => place,
     };
     // The snippet is already stripped of control characters (`vector::snippet`); the key and the
     // document kind are stripped here, so nothing stored can drive the terminal it is printed on.
     let clean = |s: &str| s.chars().filter(|c| !c.is_control()).collect::<String>();
     format!(
-        "{:<10} {:<18} {:.3}  {}",
+        "{:<10} {:<26} {:.3}  {}",
         clean(&hit.key),
         clean(&place),
         hit.score,
@@ -187,8 +208,22 @@ pub fn format_hit(hit: &Hit) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use htui_core::model::{DocumentId, ItemId};
+    use htui_core::model::{DocumentId, ItemId, RequirementId};
+    use htui_store::vector::Owner;
     use uuid::Uuid;
+
+    fn hit(point_type: PointType, document: Option<&str>) -> Hit {
+        Hit {
+            point_type,
+            owner: Owner::Item(ItemId(Uuid::nil())),
+            key: "ANA-11".into(),
+            document: document.map(|kind| (DocumentId(Uuid::nil()), kind.to_owned())),
+            resolution: None,
+            state: None,
+            score: 0.5,
+            snippet: "a decision is a closed item".into(),
+        }
+    }
 
     #[test]
     fn a_missing_url_names_where_to_set_it() {
@@ -219,18 +254,62 @@ mod tests {
 
     #[test]
     fn hits_print_key_place_score_and_snippet() {
-        let hit = Hit {
-            point_type: PointType::Document,
-            item_id: ItemId(Uuid::nil()),
-            key: "ANA-11".into(),
-            document: Some((DocumentId(Uuid::nil()), "summary".into())),
-            score: 0.5,
-            snippet: "a decision is a closed item".into(),
-        };
-        let line = format_hit(&hit);
+        let line = format_hit(&hit(PointType::Document, Some("summary")));
         assert!(line.starts_with("ANA-11"));
         assert!(line.contains("summary document"));
         assert!(line.contains("0.500"));
         assert!(line.ends_with("a decision is a closed item"));
+    }
+
+    #[test]
+    fn an_open_item_prints_as_before() {
+        let line = format_hit(&hit(PointType::Item, None));
+        assert!(line.contains("item "), "{line}");
+        assert!(!line.contains('('), "{line}");
+    }
+
+    #[test]
+    fn a_closed_item_and_its_documents_name_the_resolution() {
+        let rejected = Hit {
+            resolution: Some(Resolution::Rejected),
+            ..hit(PointType::Item, None)
+        };
+        assert!(format_hit(&rejected).contains("item (rejected)"));
+        let done_doc = Hit {
+            resolution: Some(Resolution::Done),
+            ..hit(PointType::Document, Some("summary"))
+        };
+        assert!(format_hit(&done_doc).contains("summary document (done)"));
+    }
+
+    #[test]
+    fn requirements_print_as_such_and_say_when_withdrawn() {
+        let active = Hit {
+            owner: Owner::Requirement(RequirementId(Uuid::nil())),
+            key: "R-STO-8".into(),
+            state: Some(RequirementState::Active),
+            ..hit(PointType::Requirement, None)
+        };
+        let line = format_hit(&active);
+        assert!(line.starts_with("R-STO-8"), "{line}");
+        assert!(line.contains("requirement "), "{line}");
+        assert!(!line.contains('('), "{line}");
+        let withdrawn = Hit {
+            state: Some(RequirementState::Withdrawn),
+            ..active
+        };
+        assert!(format_hit(&withdrawn).contains("requirement (withdrawn)"));
+    }
+
+    #[test]
+    fn decisions_are_done_concluded_and_rejected() {
+        assert_eq!(
+            DECISION_RESOLUTIONS,
+            [
+                Resolution::Done,
+                Resolution::Concluded,
+                Resolution::Rejected
+            ]
+        );
     }
 }

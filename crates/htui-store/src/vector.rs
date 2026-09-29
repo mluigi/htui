@@ -1,16 +1,20 @@
-//! The concepts index: items and their documents in Qdrant, searched by meaning and by exact
+//! The concepts index: items, their documents and requirements in Qdrant, searched by meaning and by exact
 //! term at once (MOD-34, `R-STO-8`, `docs/ANA-19.md` §3.3, `docs/ANA-20.md` §3).
 //!
 //! One collection holds every project (ANA-20 §3.4); the tenant is `project_id`, and a point's
-//! `type` says what it indexes. Postgres stays the source of truth (`R-STO-1`): every point can be
-//! rebuilt from an item or a document row, and [`crate::vector_sync::Indexer`] is what keeps the
-//! two in step. Qdrant errors are [`StoreError::Backend`], never [`StoreError::Unreachable`], so
+//! `type` says what it indexes: an item, a section of one of its documents, or a requirement
+//! (MOD-50). Postgres stays the source of truth (`R-STO-1`): every point can be rebuilt from an
+//! item, document or requirement row, and [`crate::vector_sync::Indexer`] is what keeps the two in
+//! step. Qdrant errors are [`StoreError::Backend`], never [`StoreError::Unreachable`], so
 //! nothing that reads the latter as "Postgres went away" can mistake a down vector store for it.
 use crate::bm25::{self, SparseVector};
 use crate::embed::DenseEmbedder;
 use crate::qdrant_settings::QdrantSettings;
 use chrono::{DateTime, Utc};
-use htui_core::model::{DocumentId, ItemId, ItemKindId, ProjectId, Status};
+use htui_core::model::{
+    DocumentId, ItemId, ItemKindId, Priority, ProjectId, RequirementId, RequirementState,
+    Resolution, Status,
+};
 use htui_core::store::StoreError;
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
@@ -26,8 +30,10 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 /// The collection name. Versioned: a change to the vector layout or the payload gets a new name
-/// rather than a migration, since the whole index can be rebuilt from Postgres.
-pub const COLLECTION: &str = "htui_concepts_v1";
+/// rather than a migration, since the whole index can be rebuilt from Postgres. `v2` (MOD-50 D222)
+/// added `resolution` and requirement points: a `v1` point of an item closed before then would
+/// never have been rebuilt, since neither its `updated_at` nor its status moves again.
+pub const COLLECTION: &str = "htui_concepts_v2";
 /// Name of the dense vector.
 pub const DENSE: &str = "dense";
 /// Name of the sparse (BM25) vector.
@@ -42,12 +48,18 @@ const KEY: &str = "key";
 const PROJECT_ID: &str = "project_id";
 const KIND_ID: &str = "kind_id";
 const STATUS: &str = "status";
+const RESOLUTION: &str = "resolution";
 const UPDATED_AT: &str = "updated_at";
 const DOCUMENT_ID: &str = "document_id";
 const DOC_KIND: &str = "doc_kind";
 const DOC_VERSION: &str = "doc_version";
 const CHUNK: &str = "chunk";
 const SNIPPET: &str = "snippet";
+const REQUIREMENT_ID: &str = "requirement_id";
+const AREA_CODE: &str = "area_code";
+const PRIORITY: &str = "priority";
+const STATE: &str = "state";
+const VERSION: &str = "version";
 
 /// What a point indexes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,15 +68,18 @@ pub enum PointType {
     Item,
     /// One section of an item's latest document of some kind.
     Document,
+    /// A requirement's key, body and rationale (MOD-50).
+    Requirement,
 }
 
 impl PointType {
-    /// The payload text of this type. `requirement` is reserved for MOD-38's table.
+    /// The payload text of this type.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Item => "item",
             Self::Document => "document",
+            Self::Requirement => "requirement",
         }
     }
 
@@ -72,7 +87,114 @@ impl PointType {
         match s {
             "item" => Some(Self::Item),
             "document" => Some(Self::Document),
+            "requirement" => Some(Self::Requirement),
             _ => None,
+        }
+    }
+}
+
+/// The row a point was built from, with what its payload says about it (MOD-50 D225).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Subject {
+    /// An item, for its own point and for the points of its documents.
+    Item {
+        /// `item.id`.
+        id: ItemId,
+        /// `item.kind_id`.
+        kind_id: ItemKindId,
+        /// `item.status`.
+        status: Status,
+        /// `item.resolution`: `Some` exactly when the item is closed, so a search can ask for
+        /// decisions (MOD-50 D223).
+        resolution: Option<Resolution>,
+    },
+    /// A requirement row.
+    Requirement {
+        /// `requirement.id`.
+        id: RequirementId,
+        /// `requirement.area_code`.
+        area_code: String,
+        /// `requirement.priority`.
+        priority: Priority,
+        /// `requirement.state`; a withdrawn requirement stays indexed (MOD-50 D224).
+        state: RequirementState,
+        /// `requirement.version`, what the indexer compares (MOD-50 D226).
+        version: i32,
+    },
+}
+
+impl Subject {
+    /// Which row this is, without the rest of it.
+    #[must_use]
+    pub const fn owner(&self) -> Owner {
+        match self {
+            Self::Item { id, .. } => Owner::Item(*id),
+            Self::Requirement { id, .. } => Owner::Requirement(*id),
+        }
+    }
+
+    /// The item's status; `None` for a requirement.
+    #[must_use]
+    pub const fn status(&self) -> Option<Status> {
+        match self {
+            Self::Item { status, .. } => Some(*status),
+            Self::Requirement { .. } => None,
+        }
+    }
+
+    /// The item's resolution; `None` for an item that is not closed and for a requirement.
+    #[must_use]
+    pub const fn resolution(&self) -> Option<Resolution> {
+        match self {
+            Self::Item { resolution, .. } => *resolution,
+            Self::Requirement { .. } => None,
+        }
+    }
+
+    /// The requirement's state; `None` for an item.
+    #[must_use]
+    pub const fn state(&self) -> Option<RequirementState> {
+        match self {
+            Self::Requirement { state, .. } => Some(*state),
+            Self::Item { .. } => None,
+        }
+    }
+
+    /// The requirement's version; `None` for an item.
+    #[must_use]
+    pub const fn version(&self) -> Option<i32> {
+        match self {
+            Self::Requirement { version, .. } => Some(*version),
+            Self::Item { .. } => None,
+        }
+    }
+}
+
+/// The row a point belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Owner {
+    /// An item, or the item a document belongs to.
+    Item(ItemId),
+    /// A requirement.
+    Requirement(RequirementId),
+}
+
+impl Owner {
+    /// The item, when the owner is one.
+    #[must_use]
+    pub const fn item(self) -> Option<ItemId> {
+        match self {
+            Self::Item(id) => Some(id),
+            Self::Requirement(_) => None,
+        }
+    }
+
+    /// The requirement, when the owner is one.
+    #[must_use]
+    pub const fn requirement(self) -> Option<RequirementId> {
+        match self {
+            Self::Requirement(id) => Some(id),
+            Self::Item(_) => None,
         }
     }
 }
@@ -93,34 +215,40 @@ pub struct DocumentRef {
 /// One point to write: the text to embed plus what the payload says about it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConceptPoint {
-    /// Item or document section.
-    pub point_type: PointType,
-    /// The item, or the item the document belongs to.
-    pub item_id: ItemId,
-    /// The item's key, e.g. `MOD-34`.
+    /// The item or requirement the point was built from.
+    pub subject: Subject,
+    /// The item's or the requirement's key, e.g. `MOD-34` or `R-STO-8`.
     pub key: String,
-    /// The item's project.
+    /// The row's project.
     pub project_id: ProjectId,
-    /// The item's kind.
-    pub kind_id: ItemKindId,
-    /// The item's status, so a search can ask for closed items (decisions) only.
-    pub status: Status,
-    /// The item's `updated_at` when this point was built.
+    /// The row's `updated_at` when this point was built.
     pub updated_at: DateTime<Utc>,
-    /// Set on document points.
+    /// Set on document points, which only an item has.
     pub document: Option<DocumentRef>,
     /// The text embedded, dense and sparse.
     pub text: String,
 }
 
 impl ConceptPoint {
+    /// What the point indexes: a requirement, a document section, or an item.
+    #[must_use]
+    pub const fn point_type(&self) -> PointType {
+        match (&self.subject, &self.document) {
+            (Subject::Requirement { .. }, _) => PointType::Requirement,
+            (Subject::Item { .. }, Some(_)) => PointType::Document,
+            (Subject::Item { .. }, None) => PointType::Item,
+        }
+    }
+
     /// The point's ID: the item's UUID for an item point; for a document section, a UUID (version
-    /// 8) derived from SHA-256 of the document ID and section number. Both stable forever.
+    /// 8) derived from SHA-256 of the document ID and section number; for a requirement, one
+    /// derived the same way from its ID. All stable forever.
     #[must_use]
     pub fn id(&self) -> Uuid {
-        match &self.document {
-            None => self.item_id.0,
-            Some(doc) => document_point_id(doc.id, doc.chunk),
+        match (&self.subject, &self.document) {
+            (Subject::Requirement { id, .. }, _) => requirement_point_id(*id),
+            (Subject::Item { .. }, Some(doc)) => document_point_id(doc.id, doc.chunk),
+            (Subject::Item { id, .. }, None) => id.0,
         }
     }
 }
@@ -137,20 +265,34 @@ pub fn document_point_id(id: DocumentId, chunk: u32) -> Uuid {
     uuid::Builder::from_custom_bytes(bytes).into_uuid()
 }
 
+/// The ID of requirement `id`'s point. Derived rather than the requirement's own UUID, so it can
+/// never meet an item point's (MOD-50 D224).
+#[must_use]
+pub fn requirement_point_id(id: RequirementId) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(b"htui-concepts/requirement\0");
+    hasher.update(id.0.as_bytes());
+    let digest = hasher.finalize();
+    let bytes: [u8; 16] = digest[..16].try_into().expect("16 bytes");
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
+}
+
 /// What the index holds for one point, as the indexer needs it to decide what changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexedPoint {
     /// Point ID.
     pub id: Uuid,
-    /// Item or document section.
+    /// Item, document section or requirement.
     pub point_type: PointType,
-    /// The item it belongs to.
-    pub item_id: ItemId,
-    /// The item's `updated_at` when the point was built.
+    /// The item or requirement it belongs to.
+    pub owner: Owner,
+    /// The row's `updated_at` when the point was built.
     pub updated_at: DateTime<Utc>,
-    /// The item's status when the point was built. Compared on its own because a status move
-    /// (`WriteStore::transition`) does not touch `updated_at`.
-    pub status: Status,
+    /// The item's status when the point was built, on item and document points. Compared on its
+    /// own because a status move (`WriteStore::transition`) does not touch `updated_at`.
+    pub status: Option<Status>,
+    /// The requirement's version when the point was built, on requirement points.
+    pub version: Option<i32>,
     /// Set on document points.
     pub document_id: Option<DocumentId>,
 }
@@ -164,8 +306,13 @@ pub struct SearchQuery {
     pub projects: Vec<ProjectId>,
     /// Point types to return; empty means all.
     pub types: Vec<PointType>,
-    /// Item statuses to return; empty means all. `[Closed]` asks for decisions.
+    /// Item statuses to return; empty means all. A requirement has no status, so a non-empty
+    /// list leaves requirements out.
     pub statuses: Vec<Status>,
+    /// Item resolutions to return; empty means all. Only a closed item and its documents carry
+    /// one, so a non-empty list never returns a requirement or an item that is not closed:
+    /// `--decisions` asks for `done`, `concluded` and `rejected` (MOD-50 D223).
+    pub resolutions: Vec<Resolution>,
     /// Most hits returned.
     pub limit: u64,
 }
@@ -173,14 +320,18 @@ pub struct SearchQuery {
 /// One search result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
-    /// Item or document section.
+    /// Item, document section or requirement.
     pub point_type: PointType,
-    /// The item.
-    pub item_id: ItemId,
-    /// The item's key.
+    /// The item or requirement.
+    pub owner: Owner,
+    /// The item's or the requirement's key.
     pub key: String,
     /// The document and its kind, on document hits.
     pub document: Option<(DocumentId, String)>,
+    /// The item's resolution, on hits of a closed item and its documents.
+    pub resolution: Option<Resolution>,
+    /// The requirement's state, on requirement hits.
+    pub state: Option<RequirementState>,
     /// Fused rank score; higher is better, comparable only within one search.
     pub score: f32,
     /// The start of the indexed text.
@@ -224,26 +375,54 @@ fn snippet(text: &str) -> String {
 /// The payload of a point, as Qdrant stores it.
 fn payload(point: &ConceptPoint) -> HashMap<String, Value> {
     let mut p = HashMap::from([
-        (TYPE.to_owned(), Value::from(point.point_type.as_str())),
-        (ITEM_ID.to_owned(), Value::from(point.item_id.0.to_string())),
+        (TYPE.to_owned(), Value::from(point.point_type().as_str())),
         (KEY.to_owned(), Value::from(point.key.clone())),
         (
             PROJECT_ID.to_owned(),
             Value::from(point.project_id.0.to_string()),
         ),
-        (KIND_ID.to_owned(), Value::from(point.kind_id.0.to_string())),
-        (STATUS.to_owned(), Value::from(point.status.as_str())),
         (
             UPDATED_AT.to_owned(),
             Value::from(point.updated_at.to_rfc3339()),
         ),
         (SNIPPET.to_owned(), Value::from(snippet(&point.text))),
     ]);
-    if let Some(doc) = &point.document {
-        p.insert(DOCUMENT_ID.to_owned(), Value::from(doc.id.0.to_string()));
-        p.insert(DOC_KIND.to_owned(), Value::from(doc.kind.clone()));
-        p.insert(DOC_VERSION.to_owned(), Value::from(i64::from(doc.version)));
-        p.insert(CHUNK.to_owned(), Value::from(i64::from(doc.chunk)));
+    match &point.subject {
+        Subject::Item {
+            id,
+            kind_id,
+            status,
+            resolution,
+        } => {
+            p.insert(ITEM_ID.to_owned(), Value::from(id.0.to_string()));
+            p.insert(KIND_ID.to_owned(), Value::from(kind_id.0.to_string()));
+            p.insert(STATUS.to_owned(), Value::from(status.as_str()));
+            // Absent, not null, on an item that is not closed: a resolution filter then leaves it
+            // out the same way it leaves out a requirement.
+            if let Some(r) = resolution {
+                p.insert(RESOLUTION.to_owned(), Value::from(r.as_str()));
+            }
+            // Only an item has documents; a requirement point never writes these keys.
+            if let Some(doc) = &point.document {
+                p.insert(DOCUMENT_ID.to_owned(), Value::from(doc.id.0.to_string()));
+                p.insert(DOC_KIND.to_owned(), Value::from(doc.kind.clone()));
+                p.insert(DOC_VERSION.to_owned(), Value::from(i64::from(doc.version)));
+                p.insert(CHUNK.to_owned(), Value::from(i64::from(doc.chunk)));
+            }
+        }
+        Subject::Requirement {
+            id,
+            area_code,
+            priority,
+            state,
+            version,
+        } => {
+            p.insert(REQUIREMENT_ID.to_owned(), Value::from(id.0.to_string()));
+            p.insert(AREA_CODE.to_owned(), Value::from(area_code.clone()));
+            p.insert(PRIORITY.to_owned(), Value::from(priority.as_str()));
+            p.insert(STATE.to_owned(), Value::from(state.as_str()));
+            p.insert(VERSION.to_owned(), Value::from(i64::from(*version)));
+        }
     }
     p
 }
@@ -263,15 +442,39 @@ fn point_uuid(id: Option<&PointId>) -> Option<Uuid> {
     }
 }
 
+/// The owner a payload names, by its type: a requirement point names a requirement, every other
+/// point an item.
+fn owner_of(point_type: PointType, payload: &HashMap<String, Value>) -> Option<Owner> {
+    Some(match point_type {
+        PointType::Requirement => {
+            Owner::Requirement(RequirementId(uuid_of(payload, REQUIREMENT_ID)?))
+        }
+        PointType::Item | PointType::Document => Owner::Item(ItemId(uuid_of(payload, ITEM_ID)?)),
+    })
+}
+
+fn parsed<T: FromStr>(payload: &HashMap<String, Value>, key: &str) -> Option<T> {
+    text_of(payload, key).and_then(|s| T::from_str(s).ok())
+}
+
 fn indexed_point(id: Option<&PointId>, payload: &HashMap<String, Value>) -> Option<IndexedPoint> {
+    let point_type = PointType::parse(text_of(payload, TYPE)?)?;
+    let (status, version) = match point_type {
+        PointType::Requirement => (
+            None,
+            Some(i32::try_from(payload.get(VERSION)?.as_integer()?).ok()?),
+        ),
+        PointType::Item | PointType::Document => (Some(parsed(payload, STATUS)?), None),
+    };
     Some(IndexedPoint {
         id: point_uuid(id)?,
-        point_type: PointType::parse(text_of(payload, TYPE)?)?,
-        item_id: ItemId(uuid_of(payload, ITEM_ID)?),
+        point_type,
+        owner: owner_of(point_type, payload)?,
         updated_at: DateTime::parse_from_rfc3339(text_of(payload, UPDATED_AT)?)
             .ok()?
             .with_timezone(&Utc),
-        status: Status::from_str(text_of(payload, STATUS)?).ok()?,
+        status,
+        version,
         document_id: uuid_of(payload, DOCUMENT_ID).map(DocumentId),
     })
 }
@@ -281,17 +484,20 @@ fn hit(payload: &HashMap<String, Value>, score: f32) -> Option<Hit> {
         (Some(id), Some(kind)) => Some((DocumentId(id), kind.to_owned())),
         _ => None,
     };
+    let point_type = PointType::parse(text_of(payload, TYPE)?)?;
     Some(Hit {
-        point_type: PointType::parse(text_of(payload, TYPE)?)?,
-        item_id: ItemId(uuid_of(payload, ITEM_ID)?),
+        point_type,
+        owner: owner_of(point_type, payload)?,
         key: text_of(payload, KEY)?.to_owned(),
         document,
+        resolution: parsed(payload, RESOLUTION),
+        state: parsed(payload, STATE),
         score,
         snippet: text_of(payload, SNIPPET).unwrap_or_default().to_owned(),
     })
 }
 
-/// The filter a search applies: its projects, and its types and statuses when given.
+/// The filter a search applies: its projects, and its types, statuses and resolutions when given.
 fn search_filter(query: &SearchQuery) -> Filter {
     let mut must = vec![Condition::matches(
         PROJECT_ID,
@@ -318,6 +524,18 @@ fn search_filter(query: &SearchQuery) -> Filter {
                 .statuses
                 .iter()
                 .map(|s| s.as_str().to_owned())
+                .collect::<Vec<_>>(),
+        ));
+    }
+    // A point without the key fails the match, so this also leaves out requirements and every
+    // item that is not closed (MOD-50 D223).
+    if !query.resolutions.is_empty() {
+        must.push(Condition::matches(
+            RESOLUTION,
+            query
+                .resolutions
+                .iter()
+                .map(|r| r.as_str().to_owned())
                 .collect::<Vec<_>>(),
         ));
     }
@@ -395,7 +613,7 @@ impl<E: DenseEmbedder> QdrantStore<E> {
         }
         // Every time, not only on creation: re-creating an existing index is a no-op in Qdrant, and
         // a first run that died between the collection and its indexes is repaired here.
-        for field in [TYPE, PROJECT_ID, STATUS, ITEM_ID] {
+        for field in [TYPE, PROJECT_ID, STATUS, RESOLUTION, ITEM_ID] {
             self.client
                 .create_field_index(
                     CreateFieldIndexCollectionBuilder::new(
@@ -619,10 +837,11 @@ impl VectorStore for MemVectorStore {
             .filter(|p| p.project_id == project)
             .map(|p| IndexedPoint {
                 id: p.id(),
-                point_type: p.point_type,
-                item_id: p.item_id,
+                point_type: p.point_type(),
+                owner: p.subject.owner(),
                 updated_at: p.updated_at,
-                status: p.status,
+                status: p.subject.status(),
+                version: p.subject.version(),
                 document_id: p.document.as_ref().map(|d| d.id),
             })
             .collect())
@@ -636,17 +855,31 @@ impl VectorStore for MemVectorStore {
             .expect("poisoned")
             .values()
             .filter(|p| query.projects.contains(&p.project_id))
-            .filter(|p| query.types.is_empty() || query.types.contains(&p.point_type))
-            .filter(|p| query.statuses.is_empty() || query.statuses.contains(&p.status))
+            .filter(|p| query.types.is_empty() || query.types.contains(&p.point_type()))
+            // A missing field fails a non-empty filter, as Qdrant's `match any` does.
+            .filter(|p| {
+                query.statuses.is_empty()
+                    || p.subject
+                        .status()
+                        .is_some_and(|s| query.statuses.contains(&s))
+            })
+            .filter(|p| {
+                query.resolutions.is_empty()
+                    || p.subject
+                        .resolution()
+                        .is_some_and(|r| query.resolutions.contains(&r))
+            })
             .filter_map(|p| {
                 let own = bm25::tokenize(&p.text);
                 #[allow(clippy::cast_precision_loss)]
                 let score = terms.iter().filter(|t| own.contains(t)).count() as f32;
                 (score > 0.0).then(|| Hit {
-                    point_type: p.point_type,
-                    item_id: p.item_id,
+                    point_type: p.point_type(),
+                    owner: p.subject.owner(),
                     key: p.key.clone(),
                     document: p.document.as_ref().map(|d| (d.id, d.kind.clone())),
+                    resolution: p.subject.resolution(),
+                    state: p.subject.state(),
                     score,
                     snippet: snippet(&p.text),
                 })
@@ -662,23 +895,67 @@ impl VectorStore for MemVectorStore {
 mod tests {
     use super::*;
 
+    fn at() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-25T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
     fn point(document: Option<DocumentRef>) -> ConceptPoint {
         ConceptPoint {
-            point_type: if document.is_some() {
-                PointType::Document
-            } else {
-                PointType::Item
+            subject: Subject::Item {
+                id: ItemId(Uuid::from_u128(1)),
+                kind_id: ItemKindId(Uuid::from_u128(3)),
+                status: Status::Closed,
+                resolution: Some(Resolution::Rejected),
             },
-            item_id: ItemId(Uuid::from_u128(1)),
             key: "MOD-34".into(),
             project_id: ProjectId(Uuid::from_u128(2)),
-            kind_id: ItemKindId(Uuid::from_u128(3)),
-            status: Status::Closed,
-            updated_at: DateTime::parse_from_rfc3339("2026-09-25T10:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            updated_at: at(),
             document,
             text: "MOD-34 Qdrant related concepts search".into(),
+        }
+    }
+
+    fn requirement(state: RequirementState) -> ConceptPoint {
+        ConceptPoint {
+            subject: Subject::Requirement {
+                id: RequirementId(Uuid::from_u128(1)),
+                area_code: "STO".into(),
+                priority: Priority::Must,
+                state,
+                version: 3,
+            },
+            key: "R-STO-8".into(),
+            project_id: ProjectId(Uuid::from_u128(2)),
+            updated_at: at(),
+            document: None,
+            text: "R-STO-8 Semantic search over items and requirements".into(),
+        }
+    }
+
+    fn open_item() -> ConceptPoint {
+        ConceptPoint {
+            subject: Subject::Item {
+                id: ItemId(Uuid::from_u128(5)),
+                kind_id: ItemKindId(Uuid::from_u128(3)),
+                status: Status::Open,
+                resolution: None,
+            },
+            key: "MOD-99".into(),
+            text: "MOD-99 Qdrant search still open".into(),
+            ..point(None)
+        }
+    }
+
+    fn scoped(text: &str) -> SearchQuery {
+        SearchQuery {
+            text: text.into(),
+            projects: vec![ProjectId(Uuid::from_u128(2))],
+            types: vec![],
+            statuses: vec![],
+            resolutions: vec![],
+            limit: 10,
         }
     }
 
@@ -694,6 +971,39 @@ mod tests {
     #[test]
     fn item_points_use_the_item_uuid() {
         assert_eq!(point(None).id(), Uuid::from_u128(1));
+    }
+
+    #[test]
+    fn point_types_follow_the_subject_and_the_document() {
+        assert_eq!(point(None).point_type(), PointType::Item);
+        assert_eq!(point(Some(doc(0))).point_type(), PointType::Document);
+        assert_eq!(
+            requirement(RequirementState::Active).point_type(),
+            PointType::Requirement
+        );
+        for t in [PointType::Item, PointType::Document, PointType::Requirement] {
+            assert_eq!(PointType::parse(t.as_str()), Some(t));
+        }
+    }
+
+    #[test]
+    fn requirement_point_ids_are_derived_and_never_the_raw_uuid() {
+        let r = requirement(RequirementState::Active);
+        let id = RequirementId(Uuid::from_u128(1));
+        assert_eq!(r.id(), requirement_point_id(id));
+        assert_eq!(r.id().get_version_num(), 8);
+        // The item of the same UUID keeps its raw ID, so the two points never meet.
+        assert_eq!(point(None).id(), Uuid::from_u128(1));
+        assert_ne!(r.id(), point(None).id());
+        // Golden: a change here orphans every requirement point already indexed.
+        assert_eq!(
+            requirement_point_id(id).to_string(),
+            "48f650ab-a53f-80b5-bb0a-bca4d0a2b825"
+        );
+        assert_ne!(
+            requirement_point_id(id),
+            document_point_id(DocumentId(Uuid::from_u128(1)), 0)
+        );
     }
 
     #[test]
@@ -717,14 +1027,64 @@ mod tests {
         let indexed = indexed_point(Some(&id), &payload).unwrap();
         assert_eq!(indexed.id, p.id());
         assert_eq!(indexed.updated_at, p.updated_at);
-        assert_eq!(indexed.status, Status::Closed);
         assert_eq!(indexed.document_id, Some(DocumentId(Uuid::from_u128(4))));
+        assert_eq!(indexed.status, Some(Status::Closed));
+        assert_eq!(indexed.version, None);
+        assert_eq!(indexed.owner, Owner::Item(ItemId(Uuid::from_u128(1))));
         let h = hit(&payload, 0.5).unwrap();
         assert_eq!(h.key, "MOD-34");
         assert_eq!(
             h.document,
             Some((DocumentId(Uuid::from_u128(4)), "summary".into()))
         );
+        assert_eq!(h.resolution, Some(Resolution::Rejected));
+        assert_eq!(h.state, None);
+    }
+
+    #[test]
+    fn a_requirement_point_never_writes_document_keys() {
+        let odd = ConceptPoint {
+            document: Some(doc(0)),
+            ..requirement(RequirementState::Active)
+        };
+        let payload = payload(&odd);
+        assert!(!payload.contains_key(DOCUMENT_ID));
+        assert!(!payload.contains_key(DOC_KIND));
+        assert_eq!(hit(&payload, 0.5).unwrap().document, None);
+    }
+
+    #[test]
+    fn an_open_item_has_no_resolution_key() {
+        let payload = payload(&open_item());
+        assert!(!payload.contains_key(RESOLUTION));
+        assert_eq!(hit(&payload, 0.5).unwrap().resolution, None);
+    }
+
+    #[test]
+    fn a_requirement_payload_round_trips() {
+        let p = requirement(RequirementState::Withdrawn);
+        let payload = payload(&p);
+        assert_eq!(text_of(&payload, TYPE), Some("requirement"));
+        assert_eq!(text_of(&payload, AREA_CODE), Some("STO"));
+        assert_eq!(text_of(&payload, PRIORITY), Some("must"));
+        assert_eq!(text_of(&payload, STATE), Some("withdrawn"));
+        assert!(!payload.contains_key(ITEM_ID));
+        assert!(!payload.contains_key(STATUS));
+        assert!(!payload.contains_key(RESOLUTION));
+        let id = PointId::from(p.id().to_string());
+        let indexed = indexed_point(Some(&id), &payload).unwrap();
+        assert_eq!(indexed.point_type, PointType::Requirement);
+        assert_eq!(
+            indexed.owner,
+            Owner::Requirement(RequirementId(Uuid::from_u128(1)))
+        );
+        assert_eq!(indexed.version, Some(3));
+        assert_eq!(indexed.status, None);
+        let h = hit(&payload, 0.5).unwrap();
+        assert_eq!(h.key, "R-STO-8");
+        assert_eq!(h.state, Some(RequirementState::Withdrawn));
+        assert_eq!(h.resolution, None);
+        assert_eq!(h.document, None);
     }
 
     #[test]
@@ -737,20 +1097,15 @@ mod tests {
 
     #[test]
     fn filter_always_scopes_by_project_and_adds_given_sets() {
-        let base = SearchQuery {
-            text: "q".into(),
-            projects: vec![ProjectId(Uuid::from_u128(2))],
-            types: vec![],
-            statuses: vec![],
-            limit: 5,
-        };
+        let base = scoped("q");
         assert_eq!(search_filter(&base).must.len(), 1);
         let narrowed = SearchQuery {
             types: vec![PointType::Document],
             statuses: vec![Status::Closed],
+            resolutions: vec![Resolution::Done],
             ..base
         };
-        assert_eq!(search_filter(&narrowed).must.len(), 3);
+        assert_eq!(search_filter(&narrowed).must.len(), 4);
     }
 
     #[tokio::test]
@@ -761,11 +1116,8 @@ mod tests {
             .await
             .unwrap();
         let q = SearchQuery {
-            text: "qdrant".into(),
-            projects: vec![ProjectId(Uuid::from_u128(2))],
             types: vec![PointType::Item],
-            statuses: vec![],
-            limit: 10,
+            ..scoped("qdrant")
         };
         let hits = store.search(&q).await.unwrap();
         assert_eq!(hits.len(), 1);
@@ -775,5 +1127,42 @@ mod tests {
             ..q
         };
         assert!(store.search(&other).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_resolution_filter_keeps_closed_items_only() {
+        let store = MemVectorStore::new();
+        store
+            .upsert(vec![
+                point(None),
+                point(Some(doc(0))),
+                open_item(),
+                requirement(RequirementState::Active),
+            ])
+            .await
+            .unwrap();
+        let everything = store.search(&scoped("search")).await.unwrap();
+        assert_eq!(everything.len(), 4);
+        let rejected = SearchQuery {
+            resolutions: vec![Resolution::Rejected],
+            ..scoped("search")
+        };
+        let hits = store.search(&rejected).await.unwrap();
+        assert_eq!(hits.len(), 2, "the item and its document, {hits:?}");
+        assert!(
+            hits.iter()
+                .all(|h| h.resolution == Some(Resolution::Rejected))
+        );
+        let done = SearchQuery {
+            resolutions: vec![Resolution::Done],
+            ..scoped("search")
+        };
+        assert!(store.search(&done).await.unwrap().is_empty());
+        let closed = SearchQuery {
+            statuses: vec![Status::Closed, Status::Open],
+            ..scoped("search")
+        };
+        let hits = store.search(&closed).await.unwrap();
+        assert!(hits.iter().all(|h| h.point_type != PointType::Requirement));
     }
 }
