@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/skills.rs
+expression: frame
+---
+Platform · DESKTOP-HTUI · memory · 1 run
+ 1 Backlog  2 Skills  3 Settings  4 Chat
+ Skills │ Templates
+┌ attachments · tests ─────────────────────────────────────────────────────────────────────────────┐
+│  global                       —                                                                  │
+│* htui                         always · latest · pos 0                                            │
+│    analysis › research        —                                                                  │
+│    analysis › verdict         —                                                                  │
+│    bug › reproduce            —                                                                  │
+│    bug › fix                  —                                                                  │
+│    bug › review               —                                                                  │
+│    feature › prd              —                                                                  │
+│    feature › plan             —                                                                  │
+│    feature › implement        —                                                                  │
+│    feature › review           —                                                                  │
+│    refactor › plan            —                                                                  │
+│    refactor › implement       —                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ repos of htui ───────────────────────────────────────────────────────────────────────────────────┐
+│core                                                                                              │
+│web                                                                                               │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ j/k move  Enter insert  Esc back
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces

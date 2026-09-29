@@ -52,6 +52,8 @@ zeroize            = "1.9"
 dirs               = "6"
 gethostname        = "1.1"
 sha2               = "0.10"
+# MOD-9 D72 (OQ-15): skill attachment globs. `log` off; its other deps are already locked.
+globset            = { version = "0.4.20", default-features = false }
 # MOD-7 D1: the box fingerprint, HMAC-SHA256 keyed by the OS machine identity. 0.12 because it
 # shares `digest 0.10` with `sha2` above and is already compiled on Linux (dbus-secret-service).
 hmac               = "0.12"
@@ -73,6 +75,8 @@ process-wrap          = { version = "10.0.0", features = ["tokio1", "creation-fl
 windows               = { version = "0.62.2", features = ["Win32_System_Threading"] }
 # ACP edit_proposal.diff (htui-agent); milestone 4's previous_diff renderer (MOD-4 M3 plan OQ-4)
 similar               = "3.2.0"
+# ACP file access must remain beneath pinned session directories, including through symlinks.
+cap-std               = "3.4.5"
 which                 = "8.0.6"
 # MOD-2 milestone 5 (plan D47): the probe compiles `VersionProbe.pattern` and compares a captured
 # version with `VersionProbe.min`. Both were already in the graph as transitive dependencies

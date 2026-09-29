@@ -83,11 +83,6 @@ const JUDGE_TEMPLATE: &str = "judge";
 /// (MOD-4 plan D163, `crates/htui-core/src/prompt/defaults.rs`).
 const HANDOFF_TEMPLATE: &str = "handoff";
 
-/// MOD-9 D44: an override graph's phase ids are minted by the clone, which copies no
-/// `skill_binding` (`graph.rs:350-355`), so its steps see global and project attachments only.
-const OVERRIDE_SKILLS_NOTE: &str =
-    "skills: an override graph's phases carry no phase-level attachments until MOD-9 milestone 3";
-
 /// A handoff's `failure_reason` when neither the run nor the step recorded one: the maintainer
 /// promoted a step that was waiting at its gate (blueprint §7.5).
 const PROMOTED_AT_A_GATE: &str = "promoted by the maintainer at a gate";
@@ -5121,8 +5116,8 @@ where
     /// `SnapshotPhase` carries no `PhaseId` (`model/run.rs:488-527`) and resolution re-densifies
     /// positions (`graph.rs:286-300`), so the live row is found by `(graph id, name)`, which
     /// `UNIQUE (graph_id, name)` makes exact (`0001_init.sql:247`). A phase renamed or deleted
-    /// since the snapshot, and every phase of an override graph, get a note rather than a silent
-    /// loss of their phase-level attachments (plan R-15).
+    /// since the snapshot gets a note rather than a silent loss of its phase-level attachments
+    /// (plan R-15). An override graph's phases carry their own copies (MOD-9 D80).
     async fn phase_skills(
         &self,
         project: ProjectId,
@@ -5144,9 +5139,6 @@ where
                  applied",
                 phase.name, snapshot.graph.name
             ));
-        }
-        if snapshot.graph.is_override {
-            notes.push(OVERRIDE_SKILLS_NOTE.to_owned());
         }
         let skills = self.parts.graphs.bound_skills(project, phase_id).await?;
         Ok(skills)
@@ -6154,6 +6146,7 @@ mod tests {
                     project_id: row.project_id,
                     name: format!("{}-edited", row.key),
                     description: "a test's edit of the live graph".to_owned(),
+                    is_override: false,
                 })
                 .await
                 .expect("the name is fresh");
@@ -12860,6 +12853,115 @@ mod tests {
         );
     }
 
+    /// MOD-9 D75/D78 end to end: a global `always` attachment and an `off` one on `implement`,
+    /// both written through `set_skill_binding`. `implement`'s step records the skill `off` and
+    /// renders nothing of it; `prd`, which has no phase-level row, records it `always` and active.
+    #[tokio::test]
+    async fn a_phase_off_attachment_turns_a_global_skill_off_for_that_phase_only() {
+        use htui_core::model::{
+            Activation, Attachment, BindingChange, ChoiceReason, NewSkill, SkillBindingKey, SkillId,
+        };
+        use htui_core::store::CasOutcome;
+
+        let harness = Harness::new().await;
+        let (row, snapshot, prd) = skills_prologue(&harness).await;
+        let store = &harness.orch.store;
+        let (skill, _) = store
+            .create_skill(NewSkill {
+                id: SkillId::new(),
+                name: "docs-style".to_owned(),
+                description: String::new(),
+                body: "Write in the active voice.".to_owned(),
+                source: serde_json::json!({}),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("a new skill");
+        let attach = |activation| {
+            BindingChange::Attach(Attachment {
+                pinned_version: None,
+                position: 0,
+                activation,
+                globs: Vec::new(),
+                languages: Vec::new(),
+            })
+        };
+        let global = store
+            .set_skill_binding(
+                SkillBindingKey {
+                    skill: skill.id,
+                    project: None,
+                    phase: None,
+                },
+                None,
+                attach(Activation::Always),
+            )
+            .await
+            .expect("the global attach is legal");
+        assert!(matches!(global, CasOutcome::Applied(Some(_))), "{global:?}");
+        let off = store
+            .set_skill_binding(
+                SkillBindingKey {
+                    skill: skill.id,
+                    project: Some(ids::PROJECT_HTUI),
+                    phase: Some(ids::PHASE_HTUI_IMPLEMENT),
+                },
+                None,
+                attach(Activation::Off),
+            )
+            .await
+            .expect("the phase attach is legal");
+        assert!(matches!(off, CasOutcome::Applied(Some(_))), "{off:?}");
+
+        let docs = |choices: &[htui_core::model::SkillChoice]| {
+            choice_rows(choices)
+                .into_iter()
+                .find(|(name, ..)| name == "docs-style")
+                .expect("`docs-style` is a recorded candidate")
+        };
+
+        let (_, implement) = implement_prompt(&harness, &row, &snapshot, &prd).await;
+        assert_eq!(
+            docs(&implement.trim.skill_choices),
+            ("docs-style".to_owned(), Some(1), false, ChoiceReason::Off),
+            "the phase's `off` wins over the global `always`"
+        );
+        assert!(
+            !implement.text.contains("<skill name=\"docs-style\""),
+            "an `off` skill does not render: {}",
+            implement.text
+        );
+
+        harness_engine!(harness.orch, engine);
+        assert_eq!(snapshot.phases[0].name, "prd");
+        let spec = engine
+            .phase_spec(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                true,
+            )
+            .await
+            .expect("the spec is built")
+            .expect("`prd` requires nothing");
+        let other = htui_core::prompt::assemble(&spec, &htui_core::scrub::MinimalScrubber::new([]))
+            .expect("the demo `prd` assembles");
+        assert_eq!(
+            docs(&other.trim.skill_choices),
+            ("docs-style".to_owned(), Some(1), true, ChoiceReason::Always),
+            "another phase takes the global `always`"
+        );
+        assert!(
+            other
+                .text
+                .contains("<skill name=\"docs-style\" version=\"1\">"),
+            "and renders it: {}",
+            other.text
+        );
+    }
+
     /// Plan R-15: a phase renamed after the snapshot is not found by `(graph id, name)`, so its
     /// phase-level attachments cannot be applied — and the record says so, rather than losing them
     /// silently.
@@ -12913,24 +13015,6 @@ mod tests {
         assert!(
             spec.notes.contains(&expected),
             "{expected:?} in {:?}",
-            spec.notes
-        );
-    }
-
-    /// Plan R-15, the clone gap: an override graph's phases carry no attachment of their own
-    /// until MOD-9 milestone 3, and the record says so. No writer can set `is_override` on a
-    /// snapshot, so the case edits the decoded one (blueprint D67).
-    #[tokio::test]
-    async fn an_override_graph_notes_the_clone_gap() {
-        let harness = Harness::new().await;
-        let (row, mut snapshot, prd) = skills_prologue(&harness).await;
-        snapshot.graph.is_override = true;
-        let (spec, _) = implement_prompt(&harness, &row, &snapshot, &prd).await;
-        assert!(
-            spec.notes
-                .iter()
-                .any(|note| note == super::OVERRIDE_SKILLS_NOTE),
-            "{:?}",
             spec.notes
         );
     }
