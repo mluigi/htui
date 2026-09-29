@@ -641,8 +641,18 @@ impl Isolator for FakeIsolator {
         commits: &'a [RunStepCommit],
     ) -> IsolatorFuture<'a, ChangedPaths> {
         Box::pin(async move {
-            let _ = (trees, commits);
-            todo!("MOD-9 D119")
+            self.changed_path_requests
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .push(DiffRequest {
+                    trees: trees.iter().map(|row| row.run_step_id).collect(),
+                    commits: commits.iter().map(|row| row.run_step_id).collect(),
+                });
+            self.changed
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .pop_front()
+                .unwrap_or_else(|| Ok(ChangedPaths::default()))
         })
     }
 

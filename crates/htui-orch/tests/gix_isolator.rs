@@ -2021,10 +2021,7 @@ impl Isolator for StallAfterReconcile<'_> {
         trees: &'a [RunStepTree],
         commits: &'a [RunStepCommit],
     ) -> IsolatorFuture<'a, ChangedPaths> {
-        Box::pin(async move {
-            let _ = (trees, commits);
-            todo!("MOD-9 D119")
-        })
+        self.inner.changed_paths(trees, commits)
     }
 
     fn reconcile<'a>(

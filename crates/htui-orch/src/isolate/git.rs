@@ -365,6 +365,27 @@ impl Cli {
         extra_env: &[(&str, &str)],
         stdout: Capture,
     ) -> Result<Exited, IsolateError> {
+        let captured = self
+            .run_captured(verb, cwd, args, extra_env, stdout)
+            .await?;
+        Ok(Exited {
+            code: captured.code,
+            stdout: captured.stdout.into_string(),
+            stderr: captured.stderr,
+        })
+    }
+
+    /// MOD-9 D130: [`run_capturing`](Cli::run_capturing)'s body, with stdout handed back as the
+    /// undecoded sink, so [`name_only`](Cli::name_only) can read bytes where every other verb
+    /// reads text.
+    async fn run_captured(
+        &self,
+        verb: &'static str,
+        cwd: &Path,
+        args: &[&OsStr],
+        extra_env: &[(&str, &str)],
+        stdout: Capture,
+    ) -> Result<Captured, IsolateError> {
         let build = || {
             let mut command = self.command(cwd);
             command.args(args);
@@ -379,6 +400,7 @@ impl Cli {
         let out = std::sync::Mutex::new(match stdout {
             Capture::Tail => Sink::Tail(TailBuffer::new(CAPTURE_TAIL)),
             Capture::Head => Sink::Head(HeadBuffer::new(DIFF_CAP)),
+            Capture::HeadBytes => Sink::HeadBytes(HeadBuffer::new(DIFF_CAP)),
         });
         let err = std::sync::Mutex::new(Sink::Tail(TailBuffer::new(CAPTURE_TAIL)));
         let stdout = child.stdout().take();
@@ -405,9 +427,9 @@ impl Cli {
                 let status = status.map_err(|err| {
                     IsolateError::Git(format!("git {verb}: waiting failed: {err}"))
                 })?;
-                Ok(Exited {
+                Ok(Captured {
                     code: status.code(),
-                    stdout: into_string(out),
+                    stdout: into_sink(out),
                     stderr: into_string(err),
                 })
             }
@@ -428,6 +450,19 @@ enum Capture {
     Tail,
     /// The first [`DIFF_CAP`] bytes: a patch is read from its first header (D55).
     Head,
+    /// MOD-9 D130: the first [`DIFF_CAP`] bytes, never decoded.
+    HeadBytes,
+}
+
+/// MOD-9 D130: one verb's exit and its undecoded stdout sink.
+#[derive(Debug)]
+struct Captured {
+    /// `None` when the child was killed by a signal.
+    code: Option<i32>,
+    /// The stdout capture as [`Capture`] asked for it.
+    stdout: Sink,
+    /// The last [`CAPTURE_TAIL`] bytes of stderr, lossily decoded.
+    stderr: String,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -845,7 +880,7 @@ impl Cli {
     ///
     /// The flags are [`diff`](Cli::diff)'s discipline plus `-z`, which removes git's path quoting,
     /// and `--no-renames`, which lists a rename under its old and its new name. The bytes are never
-    /// decoded as a whole ([`parse_name_only`]): a lossy decode would turn a non-UTF-8 name into a
+    /// decoded as a whole (`parse_name_only`): a lossy decode would turn a non-UTF-8 name into a
     /// plausible path. Not retried: a read (M3 D39).
     ///
     /// # Errors
@@ -857,8 +892,31 @@ impl Cli {
         before: &str,
         after: &str,
     ) -> Result<NameOnly, IsolateError> {
-        let _ = (repo, before, after);
-        todo!("MOD-9 D119")
+        let args = [
+            OsStr::new("diff"),
+            OsStr::new("--no-color"),
+            OsStr::new("--name-only"),
+            OsStr::new("-z"),
+            OsStr::new("--no-renames"),
+            OsStr::new("--no-ext-diff"),
+            OsStr::new("--no-textconv"),
+            OsStr::new(before),
+            OsStr::new(after),
+            OsStr::new("--"),
+        ];
+        let captured = self
+            .run_captured("diff", repo, &args, &[], Capture::HeadBytes)
+            .await?;
+        if captured.code != Some(0) {
+            return Err(Exited {
+                code: captured.code,
+                stdout: String::new(),
+                stderr: captured.stderr,
+            }
+            .failure("diff"));
+        }
+        let (bytes, overflowed) = captured.stdout.into_bytes();
+        Ok(parse_name_only(&bytes, overflowed))
     }
 }
 
@@ -875,8 +933,19 @@ pub struct NameOnly {
 /// entry, partial when the cap cut it); a non-UTF-8 or empty entry is dropped; `truncated =
 /// overflowed`.
 fn parse_name_only(bytes: &[u8], overflowed: bool) -> NameOnly {
-    let _ = (bytes, overflowed);
-    todo!("MOD-9 D130")
+    let mut segments: Vec<&[u8]> = bytes.split(|byte| *byte == 0).collect();
+    // `-z` ends every whole entry with a NUL, so the last segment is empty when git finished and
+    // the cut entry when the cap stopped it: either way it is not a name.
+    segments.pop();
+    NameOnly {
+        paths: segments
+            .into_iter()
+            .filter(|segment| !segment.is_empty())
+            .filter_map(|segment| std::str::from_utf8(segment).ok())
+            .map(str::to_owned)
+            .collect(),
+        truncated: overflowed,
+    }
 }
 
 /// The sleeps between retries (plan D39): 200, 400 and 800 ms, so four attempts in all.
@@ -1149,7 +1218,7 @@ impl HeadBuffer {
     /// MOD-9 D130: the kept bytes and whether anything was dropped after them.
     #[must_use]
     pub fn into_bytes(self) -> (Vec<u8>, bool) {
-        todo!("MOD-9 D130")
+        (self.kept, self.overflowed)
     }
 
     /// The buffer as text, lossily, with `\n[diff truncated at 64 KiB]` appended when it
@@ -1166,25 +1235,39 @@ impl HeadBuffer {
     }
 }
 
-/// One pipe's capture: a tail for everything but `diff`'s stdout, which keeps its head.
+/// One pipe's capture: a tail for everything but `diff`'s stdout, which keeps its head — as text
+/// for the patch, as bytes for the names (MOD-9 D130).
 #[derive(Debug)]
 enum Sink {
     Tail(TailBuffer),
     Head(HeadBuffer),
+    HeadBytes(HeadBuffer),
 }
 
 impl Sink {
     fn push(&mut self, chunk: &[u8]) {
         match self {
             Self::Tail(tail) => tail.push(chunk),
-            Self::Head(head) => head.push(chunk),
+            Self::Head(head) | Self::HeadBytes(head) => head.push(chunk),
         }
     }
 
+    /// The capture as text; a byte head is decoded lossily with no truncation marker (MOD-9
+    /// D130), since nothing reads it as text.
     fn into_string(self) -> String {
         match self {
             Self::Tail(tail) => tail.into_string(),
             Self::Head(head) => head.into_string(),
+            Self::HeadBytes(head) => String::from_utf8_lossy(&head.into_bytes().0).into_owned(),
+        }
+    }
+
+    /// MOD-9 D130: the capture's bytes and whether a head dropped any; a tail does not record
+    /// what it dropped and reports `false`.
+    fn into_bytes(self) -> (Vec<u8>, bool) {
+        match self {
+            Self::Tail(tail) => (tail.bytes.into(), false),
+            Self::Head(head) | Self::HeadBytes(head) => head.into_bytes(),
         }
     }
 }
@@ -1215,9 +1298,13 @@ async fn read_tail(
 
 /// The text a shared capture holds.
 fn into_string(tail: std::sync::Mutex<Sink>) -> String {
+    into_sink(tail).into_string()
+}
+
+/// MOD-9 D130: the capture a shared sink holds, undecoded.
+fn into_sink(tail: std::sync::Mutex<Sink>) -> Sink {
     tail.into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .into_string()
 }
 
 /// Kills a supervised child's whole group and waits for it — for at most [`KILL_GRACE`].
