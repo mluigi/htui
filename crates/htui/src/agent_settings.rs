@@ -10,7 +10,7 @@
 use chrono::{DateTime, Utc};
 use htui_agent::launch::AgentLaunch;
 use htui_core::model::{Agent, AgentId, Billing, Transport};
-use htui_core::store::{Result as StoreResult, StoreError};
+use htui_core::store::{CasOutcome, Result as StoreResult, StoreError, WriteStore};
 use htui_store::{Backend, REGISTRY_ON_SERVER_ONLY};
 use serde_json::Value;
 
@@ -516,10 +516,143 @@ pub enum AgentWrite {
 /// Whatever the store reports, `Unreachable` offline, and `Backend` for a request that is not one
 /// of the three.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> StoreResult<StoreReply> {
-    let _writer = backend
+    let writer = backend
         .writer()
         .ok_or_else(|| StoreError::Unreachable(REGISTRY_ON_SERVER_ONLY.to_owned()))?;
-    todo!("MOD-23 T2 (b): serve {}", request.name())
+
+    let outcome = match request {
+        StoreRequest::CreateAgent {
+            name,
+            draft,
+            settings_from,
+        } => {
+            // The section's rules first, so a refusal costs no read.
+            if let Err(refusal) = parse_name(name).and_then(|_| check_draft(draft)) {
+                return Ok(refused(request, &refusal));
+            }
+            // OQ-5: the source row's `settings`, or `{}`. A source gone since the form opened is
+            // not a reason to refuse: the header named it, and the row starts empty.
+            let settings = match settings_from {
+                Some(source) => backend
+                    .agents()
+                    .await?
+                    .into_iter()
+                    .find(|summary| summary.agent.id == *source)
+                    .map_or_else(empty_settings, |summary| summary.agent.settings),
+                None => empty_settings(),
+            };
+            let row = match new_agent(AgentId::new(), name.clone(), draft, settings, Utc::now()) {
+                Ok(row) => row,
+                Err(refusal) => return Ok(refused(request, &refusal)),
+            };
+            match writer.upsert_agent(&row, None).await? {
+                CasOutcome::Applied(stored) => AgentWrite::Created {
+                    id: stored.id,
+                    name: stored.name,
+                },
+                // An id already stored: unreachable with a UUIDv7 minted here, and not a stale
+                // form, so not `Stale` (blueprint F-8).
+                CasOutcome::Stale(_) => {
+                    return Ok(StoreReply::Failed {
+                        request: request.name(),
+                        message: format!(
+                            "agent id `{}` is already stored; nothing was written",
+                            row.id
+                        ),
+                    });
+                }
+            }
+        }
+        StoreRequest::EditAgent {
+            agent_id,
+            expected,
+            draft,
+        } => {
+            let stored = backend
+                .agents()
+                .await?
+                .into_iter()
+                .find(|summary| summary.agent.id == *agent_id);
+            match stored {
+                None => AgentWrite::Gone { id: *agent_id },
+                Some(stored) => {
+                    let merged = match apply_draft(&stored.agent, draft) {
+                        Ok(merged) => merged,
+                        Err(refusal) => return Ok(refused(request, &refusal)),
+                    };
+                    // `expected` is the section's, read from a reply: never `stored`'s, which
+                    // would make every edit win (MOD-40 blueprint F-17).
+                    match writer.upsert_agent(&merged, Some(*expected)).await {
+                        Ok(CasOutcome::Applied(row)) => AgentWrite::Edited {
+                            id: row.id,
+                            name: row.name,
+                        },
+                        Ok(CasOutcome::Stale(_)) => AgentWrite::Stale { id: *agent_id },
+                        Err(StoreError::NotFound {
+                            entity: "agent", ..
+                        }) => AgentWrite::Gone { id: *agent_id },
+                        Err(other) => return Err(other),
+                    }
+                }
+            }
+        }
+        StoreRequest::SetAgentOnBox { agent_id, enabled } => {
+            let Some(info) = backend.box_info().await? else {
+                return Ok(StoreReply::Failed {
+                    request: request.name(),
+                    message: UNREGISTERED_BOX.to_owned(),
+                });
+            };
+            writer
+                .set_agent_box_enabled(*agent_id, info.box_id, *enabled)
+                .await?;
+            let agents = backend.agents().await?;
+            // Blueprint D256: the name is the re-read's; a row the re-read lacks is gone.
+            let outcome = agents
+                .iter()
+                .find(|summary| summary.agent.id == *agent_id)
+                .map_or(AgentWrite::Gone { id: *agent_id }, |summary| {
+                    AgentWrite::Switched {
+                        id: *agent_id,
+                        name: summary.agent.name.clone(),
+                        enabled: *enabled,
+                    }
+                });
+            return Ok(StoreReply::AgentWritten { agents, outcome });
+        }
+        // `try_serve` routes exactly this module's three variants here, so the last arm is
+        // unreachable from the shell; a caller that reached it anyway is better told which request
+        // it sent than killed.
+        other => {
+            return Err(StoreError::Backend(format!(
+                "not an agent registry request: {}",
+                other.name()
+            )));
+        }
+    };
+
+    // Every outcome carries the registry as it is now: the section renders the whole list, and a
+    // row patched in locally would be a second source of truth.
+    let agents = backend.agents().await?;
+    Ok(StoreReply::AgentWritten { agents, outcome })
+}
+
+/// What `SetAgentOnBox` answers before this box is registered (blueprint F-23).
+const UNREGISTERED_BOX: &str =
+    "this box is not registered yet; the per-box switch needs its agent_box row";
+
+/// A refused name or field as the worker answers it (blueprint D250): `Failed`, carrying the
+/// section's own sentence byte for byte, never through a `StoreError`'s prefix.
+fn refused(request: &StoreRequest, refusal: &Refusal) -> StoreReply {
+    StoreReply::Failed {
+        request: request.name(),
+        message: refusal.to_string(),
+    }
+}
+
+/// A new row's `settings` when no source row supplies one (OQ-5).
+fn empty_settings() -> Value {
+    Value::Object(serde_json::Map::new())
 }
 
 #[cfg(test)]
