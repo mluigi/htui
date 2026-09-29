@@ -7,14 +7,16 @@
 # ~/.gitconfig, ~/.git-credentials, ~/.ssh.
 # Design: .claude/plans/tool-7-hr-sandbox.plan.md; env contract: .claude/plans/tool-7-hr-sandbox.blueprint.md §T1.
 services:
-  init:            # one-shot: named-volume roots are created root-owned
+  init:            # one-shot: named-volume roots, and mount points Docker makes, are created root-owned
     image: ${HR_IMAGE:-htui-hr-dev}
     user: "0:0"
     network_mode: none
-    command: ["chown", "${HR_UID:?}:${HR_GID:?}", "${HR_HOME:?}/.gortex", "${HR_HOME:?}/.cargo"]
+    command: ["chown", "${HR_UID:?}:${HR_GID:?}", "${HR_HOME:?}/.gortex", "${HR_HOME:?}/.cargo",
+              "${HR_HOME:?}/.cargo/registry", "${HR_HOME:?}/.cargo/registry/src"]
     volumes:
-      - {type: volume, source: gortex, target: "${HR_HOME:?}/.gortex"}
-      - {type: volume, source: cargo,  target: "${HR_HOME:?}/.cargo"}
+      - {type: volume, source: gortex,    target: "${HR_HOME:?}/.gortex"}
+      - {type: volume, source: cargo,     target: "${HR_HOME:?}/.cargo"}
+      - {type: volume, source: cargo-src, target: "${HR_HOME:?}/.cargo/registry/src"}
 
   postgres:
     image: postgres:16
@@ -63,14 +65,16 @@ services:
       # tool dir even for ephemeral tools; a per-container tool dir keeps the host's uv tools untouched (TOOL-7 T2).
       UV_TOOL_DIR: /tmp/uv-tools
       # `cargo install` lands per container, never in the shared cargo volume (review M5); its bin
-      # dir is last on PATH, so nothing a run installs can shadow the toolchain.
+      # dir is last on PATH, so nothing a run installs can put a new command ahead of the toolchain.
       CARGO_INSTALL_ROOT: /tmp/cargo-install
       GIT_AUTHOR_NAME: ${HR_GIT_NAME:?}
       GIT_AUTHOR_EMAIL: ${HR_GIT_EMAIL:?}
       GIT_COMMITTER_NAME: ${HR_GIT_NAME:?}
       GIT_COMMITTER_EMAIL: ${HR_GIT_EMAIL:?}
       # mise dirs first: ~/.local/bin holds a stale uv/uvx that would shadow mise's. No
-      # ~/.cargo/bin: that dir is in the shared cargo volume, writable by every run (review M5).
+      # ~/.cargo/bin: that dir is in the shared cargo volume (review M5). Leaving it off PATH is not
+      # enough - cargo searches $CARGO_HOME/bin for subcommands ahead of PATH - so it is also an
+      # empty read-only tmpfs below (re-review M-A).
       PATH: ${HR_MISE_PATH:?}:/opt/rust/cargo/bin:${HR_HOME:?}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/tmp/cargo-install/bin
       TERM: ${TERM:-xterm-256color}
       COLORTERM: ${COLORTERM:-truecolor}
@@ -98,8 +102,15 @@ services:
       - {type: bind, source: "${HR_HOME:?}/.cache/uv",       target: "${HR_HOME:?}/.cache/uv",              bind: {create_host_path: false}}
       - {type: volume, source: cargo,                        target: "${HR_HOME:?}/.cargo"}
       # The cargo volume is shared by every run: one run must not reconfigure the others' builds
-      # (review M5). Cargo reads config[.toml] and credentials[.toml] from CARGO_HOME; one empty
-      # read-only host file over all four (same inode, so cargo does not warn that both exist).
+      # or tools (review M5). Cargo reads config[.toml] and credentials[.toml] from CARGO_HOME; one
+      # empty read-only host file over all four (same inode, so cargo does not warn that both
+      # exist). Cargo runs `cargo-<cmd>` from CARGO_HOME/bin before PATH, whether or not it is on
+      # PATH: an empty read-only tmpfs over it, so a cargo-sqlx a run planted there never runs
+      # (re-review M-A). scripts/hr checks these mount points before every `up` (re-review L8b).
+      # The extracted crate sources are per run (re-review residual): cargo re-extracts them from
+      # the shared download cache; the package lock at the volume root stays shared.
+      - {type: tmpfs,  target: "${HR_HOME:?}/.cargo/bin", read_only: true}
+      - {type: volume, source: cargo-src,                    target: "${HR_HOME:?}/.cargo/registry/src"}
       - {type: bind, source: "${HR_CARGO_EMPTY:?}", target: "${HR_HOME:?}/.cargo/config",           read_only: true, bind: {create_host_path: false}}
       - {type: bind, source: "${HR_CARGO_EMPTY:?}", target: "${HR_HOME:?}/.cargo/config.toml",      read_only: true, bind: {create_host_path: false}}
       - {type: bind, source: "${HR_CARGO_EMPTY:?}", target: "${HR_HOME:?}/.cargo/credentials",      read_only: true, bind: {create_host_path: false}}
@@ -109,6 +120,7 @@ volumes:
   pgdata:
   qdrant:
   gortex:
+  cargo-src:       # per run, so `down -v` removes it
   cargo:
     external: true
     name: htui-hr-cargo

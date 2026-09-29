@@ -20,7 +20,8 @@ hr_clear_env() {
     unset HR_SANDBOX HR_ITEM HR_SRC HR_CLAUDE_JSON HR_CPUS HR_IMAGE HR_NO_GUM HR_GIT_NAME \
         HR_GIT_EMAIL HR_HOME HR_UID HR_GID HR_STATE_HOST HR_MISE_PATH HR_INTERACTIVE HR_DOCKER \
         HR_ROOT HR_SSD_ROOT HR_RUNS HR_HOST_REPO XDG_CONFIG_HOME GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
-        GIT_CONFIG_GLOBAL HR_TEST_DOCKER_IMAGE HR_TEST_DOCKER_RUNNING HR_TEST_DOCKER_FAIL_UP
+        GIT_CONFIG_GLOBAL HR_TEST_DOCKER_IMAGE HR_TEST_DOCKER_RUNNING HR_TEST_DOCKER_FAIL_UP \
+        HR_TEST_DOCKER_RUN HR_TEST_DOCKER_VOLUMES HR_CLAUDE_PROJECT HR_CLAUDE_MASK
 }
 
 # Per-test baseline for the non-Docker cases.
@@ -34,9 +35,10 @@ hr_setup() {
     export HR_RUNS="$BATS_TEST_TMPDIR/runs"
     export HR_DOCKER="$BATS_TEST_TMPDIR/bin/docker"
     export HR_TEST_DOCKER_LOG="$BATS_TEST_TMPDIR/docker.log"
+    export HR_TEST_DOCKER_VOLUMES="$BATS_TEST_TMPDIR/volumes"
     local p
     for p in "$HOME" "$HR_HOST_REPO" "$HR_ROOT" "$HR_SSD_ROOT" "$HR_RUNS" "$HR_STATE" "$HR_DOCKER" \
-        "$HR_TEST_DOCKER_LOG"; do
+        "$HR_TEST_DOCKER_LOG" "$HR_TEST_DOCKER_VOLUMES"; do
         hr_assert_tmp_path "$p" || return 1
     done
     export GIT_CONFIG_NOSYSTEM=1
@@ -80,7 +82,9 @@ hr_fake_home() {
 # HR_TEST_DOCKER_FAIL_UP=1 (`compose ... up` exits 1).
 # `docker run` (hr's throwaway status-check container) is emulated on the host by default: the
 # -v SRC:DST mount becomes a path swap (an argument equal to DST, and -w, map to SRC), then the
-# entrypoint runs here. Only for benign fixture clones — HR_TEST_DOCKER_RUN=clean answers "clean"
+# entrypoint runs here; a named volume (`-v htui-hr-cargo:/v`) is the directory
+# $HR_TEST_DOCKER_VOLUMES/<name>, which `volume create` makes. Only for benign fixture clones —
+# HR_TEST_DOCKER_RUN=clean answers "clean"
 # (exit 0) without running anything, =dirty prints a canned finding (exit 1), =fail exits 125.
 hr_stub_docker() {
     mkdir -p "$(dirname "$HR_DOCKER")"
@@ -94,7 +98,10 @@ if [[ "$1" == run ]]; then
         case "$1" in
             --rm) shift ;;
             --pull | --name | --network | --cap-drop | --security-opt | -u) shift 2 ;;
-            -v) IFS=: read -r src dst _ <<<"$2"; shift 2 ;;
+            -v) IFS=: read -r src dst _ <<<"$2"
+                # A named volume is a directory under $HR_TEST_DOCKER_VOLUMES.
+                [[ "$src" == /* ]] || src="$HR_TEST_DOCKER_VOLUMES/$src"
+                shift 2 ;;
             -w) wd="$2"; shift 2 ;;
             --entrypoint) ep="$2"; shift 2 ;;
             -*) echo "stub docker run: unexpected option $1" >&2; exit 125 ;;
@@ -116,6 +123,7 @@ if [[ "$1" == run ]]; then
     exec "$ep" "${args[@]}"
 fi
 case "$1 ${2:-}" in
+    "volume create") mkdir -p "$HR_TEST_DOCKER_VOLUMES/$3"; exit 0 ;;
     "image inspect")
         case "${HR_TEST_DOCKER_IMAGE:-ok}" in
             missing) echo "Error: No such image: ${*: -1}" >&2; exit 1 ;;
@@ -147,6 +155,19 @@ EOF
 
 # docker_log — the stub's call log.
 docker_log() { cat "$HR_TEST_DOCKER_LOG"; }
+
+# compose_config — compose.hr.yaml as `docker compose config --format json` resolves it, with every
+# `${X:?}` set to "/X" (HR_HOME=/HR_HOME, ...). Only the real docker CLI's parser runs: no daemon.
+compose_config() {
+    command -v docker >/dev/null 2>&1 || skip "docker CLI not installed"
+    local v
+    local -a e=()
+    for v in $(grep -oE '\$\{[A-Z_]+:\?\}' "$HR_COMPOSE_FILE" | tr -d '${}:?' | sort -u); do
+        e+=("$v=/$v")
+    done
+    env -i PATH="$PATH" HOME="$HOME" "${e[@]}" docker compose -p hr-contract -f "$HR_COMPOSE_FILE" \
+        config --format json
+}
 
 # src_of ITEM [ROOT] — the run's clone.
 src_of() { printf '%s/%s/src' "${2:-$HR_ROOT}" "$1"; }

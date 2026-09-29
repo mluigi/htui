@@ -441,6 +441,36 @@ make_cargo_empty() {
     rm -f -- "$f" && : >"$f" && chmod 444 "$f"
 }
 
+# The shared cargo volume's mount points (compose.hr.yaml binds over them): the four files, and
+# bin/, registry/, registry/src directories. Runs inside cargo_volume_check's container, with the
+# volume read-only at $1; prints every name that is a symlink or of the wrong kind.
+# shellcheck disable=SC2016
+CARGO_CHECK_SCRIPT='v=$1
+for n in config config.toml credentials credentials.toml; do
+    if [ -L "$v/$n" ] || { [ -e "$v/$n" ] && [ ! -f "$v/$n" ]; }; then echo "$n"; fi
+done
+for n in bin registry registry/src; do
+    if [ -L "$v/$n" ] || { [ -e "$v/$n" ] && [ ! -d "$v/$n" ]; }; then echo "$n"; fi
+done'
+
+# cargo_volume_ok — before compose creates a container: every mount point in the shared cargo
+# volume is absent or of the kind compose mounts over it. A sandbox cannot swap one while it is
+# mounted, but a wrong kind (config.toml turned into a directory, bin/ into a file or a symlink)
+# would break every later `up` or send a mount elsewhere (re-review L8b). Fails, never repairs:
+# the volume is shared, and a swapped mount point is a sign to look at, not to erase.
+cargo_volume_ok() {
+    local out rc
+    out="$(timeout 120 "$DOCKER" run --rm --pull never --network none --cap-drop ALL \
+        --security-opt no-new-privileges -u "$(id -u):$(id -g)" -v "$CARGO_VOLUME:/v:ro" \
+        --entrypoint sh "$IMAGE" -c "$CARGO_CHECK_SCRIPT" hr-cargo-check /v 2>&1)"
+    rc=$?
+    [[ "$rc" -eq 0 ]] || die 3 "cannot check the shared cargo volume $CARGO_VOLUME (docker run exit $rc): $(no_ctl <<<"$out")"
+    [[ -z "$out" ]] && return 0
+    local n list=''
+    while IFS= read -r n; do list+=" $n"; done < <(no_ctl <<<"$out")
+    die 3 "the shared cargo volume $CARGO_VOLUME has the wrong kind of entry (or a symlink) where compose mounts:${list} — a sandbox replaced it. Inspect it, then remove it: docker run --rm -v $CARGO_VOLUME:/v --entrypoint rm $IMAGE -rf --$(printf ' /v/%s' ${list})"
+}
+
 # resolve_mise_path STRICT — HR_MISE_PATH unless preset: claude and uv (required; before the stale
 # uv in ~/.local/bin), ripgrep (optional). Colon-joined, no trailing slashes. Never mise shims.
 resolve_mise_path() {
@@ -677,6 +707,8 @@ cmd_up() {
     [[ "$STATE" == "$DEFAULT_STATE" ]] \
         || warn "HR_STATE is non-default: export HR_STATE=$STATE in your shell profile, or host skill mints will not see the leases"
     init_leases
+    "$DOCKER" volume create "$CARGO_VOLUME" >/dev/null || die 3 "cannot create volume $CARGO_VOLUME"
+    cargo_volume_ok
 
     # 7. clone, under the runs lock
     lock_runs
@@ -728,7 +760,6 @@ cmd_up() {
     export HR_ITEM="$item" HR_SRC="$SRC" HR_CLAUDE_JSON="$run_dir/claude.json" HR_CPUS="$cpus"
     export HR_CARGO_EMPTY="$run_dir/cargo-empty"
     set_compose "hr-${item,,}"
-    "$DOCKER" volume create "$CARGO_VOLUME" >/dev/null || die 3 "cannot create volume $CARGO_VOLUME"
     spin "Starting $PROJECT" "${COMPOSE[@]}" up -d --wait \
         || die 3 "docker compose up failed for $PROJECT — clean up with: scripts/hr down $item --purge --force"
 
@@ -759,6 +790,7 @@ cmd_attach() {
         # dropped the external cargo volume (both idempotent).
         make_cargo_empty "${RUN[run_dir]}" || die 3 "cannot create ${RUN[run_dir]}/cargo-empty"
         "$DOCKER" volume create "$CARGO_VOLUME" >/dev/null || die 3 "cannot create volume $CARGO_VOLUME"
+        cargo_volume_ok
         spin "Starting $PROJECT" "${COMPOSE[@]}" up -d --wait || die 3 "docker compose up failed for $PROJECT"
     fi
     local -a tty=()

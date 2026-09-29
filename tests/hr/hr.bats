@@ -1091,6 +1091,64 @@ EOF
 }
 
 # ---------------------------------------------------------------------------------------------
+# re-review (TOOL-7): cargo volume, ~/.claude narrowing, registry migration, merge confirmation
+
+@test "40. compose: ~/.cargo/bin is an empty read-only tmpfs; registry/src is a per-run volume" {
+    local cfg
+    cfg="$(compose_config)"
+    # M-A: cargo runs cargo-<cmd> from CARGO_HOME/bin ahead of PATH, so it must be empty and read-only.
+    [[ "$(jq -c '.services.dev.volumes[] | select(.target == "/HR_HOME/.cargo/bin") | [.type, .read_only]' <<<"$cfg")" \
+        == '["tmpfs",true]' ]]
+    # Residual: extracted crate sources per run, in a volume `down -v` removes (not external).
+    [[ "$(jq -c '.services.dev.volumes[] | select(.target == "/HR_HOME/.cargo/registry/src") | [.type, .source]' <<<"$cfg")" \
+        == '["volume","cargo-src"]' ]]
+    [[ "$(jq -c '.volumes["cargo-src"] | [.name, .external]' <<<"$cfg")" == '["hr-contract_cargo-src",null]' ]]
+    # init chowns the mount points Docker creates root-owned.
+    [[ "$(jq -c '.services.init.command' <<<"$cfg")" == *'"/HR_HOME/.cargo/registry","/HR_HOME/.cargo/registry/src"'* ]]
+    [[ "$(jq -c '.services.init.volumes[] | select(.target == "/HR_HOME/.cargo/registry/src") | .source' <<<"$cfg")" \
+        == '"cargo-src"' ]]
+}
+
+@test "41. up and attach refuse a tampered cargo-volume mount point (3), naming it; a clean volume passes" {
+    local vol="$HR_TEST_DOCKER_VOLUMES/htui-hr-cargo"
+    run --separate-stderr "$HR" up MOD-5
+    [[ $status -eq 0 ]]
+    # The check runs in a throwaway container before compose up.
+    local check up
+    check="$(grep -n '^run .*htui-hr-cargo:' "$HR_TEST_DOCKER_LOG" | head -n 1 | cut -d: -f1)"
+    up="$(grep -n ' up -d --wait$' "$HR_TEST_DOCKER_LOG" | cut -d: -f1)"
+    [[ -n "$check" && -n "$up" && "$check" -lt "$up" ]]
+    grep -q '^run .* --network none --cap-drop ALL .*-v htui-hr-cargo:/v:ro ' "$HR_TEST_DOCKER_LOG"
+
+    # A sandbox swapped a mount-point file for a directory, and bin/ for a file.
+    local n
+    for n in config config.toml credentials credentials.toml bin registry registry/src; do
+        mkdir -p "$vol/registry"
+        rm -rf "${vol:?}/$n"
+        case "$n" in
+            bin | registry | registry/src) : >"$vol/$n" ;;
+            *) mkdir -p "$vol/$n/x" ;;
+        esac
+        : >"$HR_TEST_DOCKER_LOG"
+        run --separate-stderr "$HR" attach MOD-5 </dev/null
+        [[ $status -eq 3 && "$stderr" == *"htui-hr-cargo"*"$n"* ]] || { echo "$n: $status $stderr" >&2; return 1; }
+        ! grep -q ' up ' "$HR_TEST_DOCKER_LOG" || false
+        rm -rf "${vol:?}/$n"
+    done
+    # A symlink in place of a mount point is refused too.
+    ln -s /etc "$vol/bin"
+    run --separate-stderr "$HR" up MOD-4
+    [[ $status -eq 3 && "$stderr" == *'bin'* ]]
+    [[ ! -e "$HR_ROOT/MOD-4" && ! -e "$(reg_of MOD-4)" ]]
+    rm "$vol/bin"
+    # Mount points of the right kind (as Docker leaves them) pass.
+    mkdir -p "$vol/bin" "$vol/registry/src"
+    : >"$vol/config.toml"
+    run --separate-stderr "$HR" up MOD-4
+    [[ $status -eq 0 ]]
+}
+
+# ---------------------------------------------------------------------------------------------
 # Docker (real image and daemon; fixture host repo; run once: bats --filter-tags docker tests/hr/hr.bats)
 
 # bats test_tags=docker
@@ -1175,6 +1233,16 @@ EOF
     run --separate-stderr dexec TOOL-9001 bash -c 'cd /tmp && cargo new -q --vcs none hr-probe && cd hr-probe && cargo metadata -q --no-deps --offline --format-version 1 >/dev/null'
     [[ $status -eq 0 ]]
     [[ "$stderr" != *warning* ]]
+    # M-A: cargo looks in CARGO_HOME/bin for cargo-<cmd> ahead of PATH: it is empty and read-only,
+    # so `cargo sqlx` is always the image's.
+    [[ -z "$(dexec TOOL-9001 bash -c 'ls -A ~/.cargo/bin')" ]]
+    run ! dexec TOOL-9001 bash -c 'touch ~/.cargo/bin/cargo-sqlx'
+    [[ "$(dexec TOOL-9001 bash -c 'command -v cargo-sqlx')" == /opt/rust/cargo/bin/cargo-sqlx ]]
+    [[ "$(dexec TOOL-9001 bash -c 'cd /tmp/hr-probe && cargo sqlx --version')" == *'0.9.0'* ]]
+    # Residual: the extracted crate sources are a per-run volume, owned by the user.
+    dexec TOOL-9001 mountpoint -q "$HOME/.cargo/registry/src"
+    [[ "$(dexec TOOL-9001 stat -c %U "$HOME/.cargo/registry/src")" == "$(id -un)" ]]
+    [[ "$(docker volume ls -q --filter label=com.docker.compose.project=hr-tool-9001 | grep -c '_cargo-src$')" -eq 1 ]]
 
     run --separate-stderr "$HR" ls
     [[ "$output" == *'TOOL-9001'*'running'* ]]
@@ -1190,6 +1258,10 @@ EOF
     dexec TOOL-9001 psql -h localhost -p 5439 -U postgres -qc 'create table only_in_a (x int)'
     [[ "$(dexec TOOL-9001 psql -h localhost -p 5439 -U postgres -tAc "select to_regclass('only_in_a') is not null")" == t ]]
     [[ "$(dexec TOOL-9002 psql -h localhost -p 5439 -U postgres -tAc "select to_regclass('only_in_a') is not null")" == f ]]
+    # Extracted crate sources are per run: what one run writes there, the other does not compile.
+    dexec TOOL-9001 bash -c 'touch ~/.cargo/registry/src/only-in-a'
+    dexec TOOL-9001 test -e "$HOME/.cargo/registry/src/only-in-a"
+    run ! dexec TOOL-9002 test -e "$HOME/.cargo/registry/src/only-in-a"
 }
 
 # bats test_tags=docker
