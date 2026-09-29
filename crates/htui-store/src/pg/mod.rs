@@ -16,6 +16,8 @@ use chrono::Utc;
 use htui_core::model::agent::seed_rows;
 use htui_core::model::{BoxId, OsFamily, UserId};
 use htui_core::store::{Result, StoreError};
+use serde_json::Value;
+use sqlx::PgConnection;
 use sqlx::migrate::Migrate as _;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
@@ -101,6 +103,7 @@ pub struct PgStore {
     this_box: BoxId,
     this_user: UserId,
     registration: Option<Registration>,
+    below_target: Option<String>,
 }
 
 /// What [`PgStore::connect`] found: a usable store plus the state of its schema.
@@ -180,6 +183,11 @@ impl PgStore {
     /// they differ, writing [`PgStore::identity`] through
     /// [`identity::store`](crate::identity::store) - `PgStore` never writes `box.toml` itself.
     ///
+    /// **Target version (MOD-40 plan D9)**: over an up-to-date schema the stored
+    /// `htui_target_version` is read, and a build below it is recorded in
+    /// [`PgStore::below_target`] and otherwise carries on: a TUI warns, it does not refuse (PRD
+    /// D3). A pending schema reads nothing; `apply_migrations` decides.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Backend`] with `schema is newer than this htui` when an applied version is not
@@ -206,13 +214,7 @@ impl PgStore {
         identity: &Identity,
         connect_timeout: Duration,
     ) -> Result<Connected> {
-        let options = PgConnectOptions::from_str(dsn).map_err(map_sqlx)?;
-        let pool = PgPoolOptions::new()
-            .max_connections(8)
-            .acquire_timeout(connect_timeout)
-            .connect_with(options)
-            .await
-            .map_err(map_sqlx)?;
+        let pool = open_pool(dsn, connect_timeout).await?;
 
         let migrations = schema_state(&pool).await?;
         let mut store = Self {
@@ -221,8 +223,10 @@ impl PgStore {
             this_box: BoxId::default(),
             this_user: UserId::default(),
             registration: None,
+            below_target: None,
         };
         if migrations == MigrationState::UpToDate {
+            store.below_target = tui_below_target(&store.pool).await?;
             store.bootstrap().await?;
         }
         Ok(Connected { store, migrations })
@@ -230,23 +234,59 @@ impl PgStore {
 
     /// Connects for a process with no one to ask (MOD-40 plan D8): refuses rather than migrates.
     ///
-    /// Not written yet: delegates to [`PgStore::connect_with`] and refuses a pending schema
-    /// (MOD-40 T6, red).
+    /// Order (blueprint B19), every refusal before any write: open the pool; read the schema
+    /// state **without** creating the migrations table (a missing table is every embedded
+    /// migration pending; a role that cannot create tables can still connect, F-22); refuse a
+    /// dirty, newer or drifted schema as [`PgStore::connect`] does, and a pending one; refuse a
+    /// build below the stored target version, and a target that is not a version; then seed and
+    /// register exactly as `connect` does, so `this_box` and `this_user` are filled. "Never
+    /// migrates" is not "never writes": the bootstrap writes `app_user`, `capability_tag`,
+    /// `app_setting` defaults, the seeded agents and this box's row, as `connect` always has.
     ///
     /// # Errors
     ///
-    /// [`HeadlessError::Store`] for everything [`PgStore::connect`] refuses;
-    /// [`HeadlessError::MigrationsPending`].
+    /// [`HeadlessError::Store`] for everything [`PgStore::connect`] refuses, and for a malformed
+    /// target; [`HeadlessError::MigrationsPending`]; [`HeadlessError::BelowTarget`].
     pub async fn connect_headless(
         dsn: &str,
         identity: &Identity,
         connect_timeout: Duration,
     ) -> core::result::Result<Self, HeadlessError> {
-        let connected = Self::connect_with(dsn, identity, connect_timeout).await?;
-        if let MigrationState::Pending(n) = connected.migrations {
+        let pool = open_pool(dsn, connect_timeout).await?;
+        let mut conn = pool.acquire().await.map_err(map_sqlx)?;
+        let migrations = if migrations_table_exists(&mut conn).await? {
+            applied_state(&mut conn).await?
+        } else {
+            MigrationState::Pending(embedded_migrations())
+        };
+        drop(conn);
+        if let MigrationState::Pending(n) = migrations {
             return Err(HeadlessError::MigrationsPending(n));
         }
-        Ok(connected.store)
+        if let Some(stored) = stored_target(&pool).await? {
+            let target = parse_target(&stored).map_err(|text| {
+                StoreError::Backend(format!(
+                    "app_setting.{TARGET_VERSION_KEY} holds {text}, which is not a version; a \
+                     headless process does not guess"
+                ))
+            })?;
+            if this_version() < target {
+                return Err(HeadlessError::BelowTarget {
+                    ours: HTUI_VERSION.to_owned(),
+                    target: target.to_string(),
+                });
+            }
+        }
+        let mut store = Self {
+            pool,
+            identity: identity.clone(),
+            this_box: BoxId::default(),
+            this_user: UserId::default(),
+            registration: None,
+            below_target: None,
+        };
+        store.bootstrap().await?;
+        Ok(store)
     }
 
     /// A store over a pool that has **never** connected, for tests that need an `Online`
@@ -276,6 +316,7 @@ impl PgStore {
             this_box: BoxId::default(),
             this_user: UserId::default(),
             registration: None,
+            below_target: None,
         })
     }
 
@@ -288,9 +329,16 @@ impl PgStore {
     ///
     /// The same refusals as [`PgStore::connect`]: `Migrator::run` re-checks the applied set, so the
     /// two paths cannot disagree.
+    ///
+    /// Then raises `app_setting.htui_target_version` to this build's [`HTUI_VERSION`] and never
+    /// lowers it (MOD-40 plan D9), so a headless process older than the last migrator refuses to
+    /// run against the schema it migrated. A target that stays above this build is kept in
+    /// [`PgStore::below_target`].
     pub async fn apply_migrations(&mut self) -> Result<()> {
         MIGRATOR.run(&self.pool).await.map_err(map_migrate)?;
-        self.bootstrap().await
+        self.bootstrap().await?;
+        self.below_target = raise_target(&self.pool).await?;
+        Ok(())
     }
 
     /// Seeds ANA-9 §5.10's global part if it is not there, and returns the single `app_user`.
@@ -609,10 +657,16 @@ impl PgStore {
     }
 
     /// The database's target version when this build's [`HTUI_VERSION`] is below it (MOD-40
-    /// plan D9). Not read yet: always `None` (MOD-40 T6, red).
+    /// plan D9, blueprint B16): read by [`PgStore::connect`] over an up-to-date schema, and
+    /// recomputed by [`PgStore::apply_migrations`], which may raise the target but never lowers
+    /// it. `None` when this build is at or above the target, when none is stored, and on a
+    /// store whose pending schema has not been applied yet.
+    ///
+    /// A TUI below the target runs and says so once (PRD D3); a headless process never gets a
+    /// store to ask ([`PgStore::connect_headless`] refuses).
     #[must_use]
-    pub const fn below_target(&self) -> Option<&str> {
-        None
+    pub fn below_target(&self) -> Option<&str> {
+        self.below_target.as_deref()
     }
 
     /// Seeds, reads this machine's fingerprint and registers this box (plan D5, MOD-7 D1-D3).
@@ -646,7 +700,7 @@ struct NewBoxRow<'a> {
 
 impl NewBoxRow<'_> {
     /// Inserts the row under `id` unless one exists; `true` when it inserted.
-    async fn insert(&self, conn: &mut sqlx::PgConnection, id: BoxId) -> Result<bool> {
+    async fn insert(&self, conn: &mut PgConnection, id: BoxId) -> Result<bool> {
         let inserted = sqlx::query!(
             r#"
             INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version,
@@ -670,17 +724,35 @@ impl NewBoxRow<'_> {
     }
 }
 
-/// Compares `_sqlx_migrations` against the embedded set (ANA-9 §5.0).
+/// The pool both connects open: eight connections, `connect_timeout` to acquire one.
+async fn open_pool(dsn: &str, connect_timeout: Duration) -> Result<PgPool> {
+    let options = PgConnectOptions::from_str(dsn).map_err(map_sqlx)?;
+    PgPoolOptions::new()
+        .max_connections(8)
+        .acquire_timeout(connect_timeout)
+        .connect_with(options)
+        .await
+        .map_err(map_sqlx)
+}
+
+/// Compares `_sqlx_migrations` against the embedded set (ANA-9 §5.0), creating the empty
+/// bookkeeping table first when there is none — the TUI's path, which may go on to migrate.
 ///
 /// `list_applied_migrations` takes the table name in sqlx 0.9 and lives on `PgConnection`, not on
 /// `PgPool`, so a connection is acquired first (blueprint H.7).
 async fn schema_state(pool: &PgPool) -> Result<MigrationState> {
-    let table = MIGRATOR.table_name.as_ref();
     let mut conn = pool.acquire().await.map_err(map_sqlx)?;
-
-    conn.ensure_migrations_table(table)
+    conn.ensure_migrations_table(MIGRATOR.table_name.as_ref())
         .await
         .map_err(map_migrate)?;
+    applied_state(&mut conn).await
+}
+
+/// The read-only half of [`schema_state`] (MOD-40 blueprint B15): refuses a dirty version, a
+/// newer applied version and checksum drift, and counts what is pending. Writes nothing, so a
+/// headless process may run it under a role that cannot create a table.
+async fn applied_state(conn: &mut PgConnection) -> Result<MigrationState> {
+    let table = MIGRATOR.table_name.as_ref();
     if let Some(version) = conn.dirty_version(table).await.map_err(map_migrate)? {
         return Err(StoreError::Backend(format!(
             "migration {version} is partially applied; fix it and remove its `{table}` row"
@@ -690,7 +762,6 @@ async fn schema_state(pool: &PgPool) -> Result<MigrationState> {
         .list_applied_migrations(table)
         .await
         .map_err(map_migrate)?;
-    drop(conn);
 
     for entry in &applied {
         if !MIGRATOR.version_exists(entry.version) {
@@ -719,6 +790,26 @@ async fn schema_state(pool: &PgPool) -> Result<MigrationState> {
     }
 }
 
+/// Whether the migrations table exists at all, without creating it (blueprint B15, F-22).
+async fn migrations_table_exists(conn: &mut PgConnection) -> Result<bool> {
+    sqlx::query_scalar!(
+        r#"SELECT to_regclass($1) IS NOT NULL AS "exists!""#,
+        MIGRATOR.table_name.as_ref(),
+    )
+    .fetch_one(conn)
+    .await
+    .map_err(map_sqlx)
+}
+
+/// How many embedded up-migrations there are: a database with no migrations table has all of
+/// them pending.
+fn embedded_migrations() -> usize {
+    MIGRATOR
+        .iter()
+        .filter(|m| !m.migration_type.is_down_migration())
+        .count()
+}
+
 /// `std::env::consts::OS` mapped onto the three values `box.os_family` allows.
 fn this_os_family() -> OsFamily {
     match OsFamily::from_str(std::env::consts::OS) {
@@ -731,4 +822,118 @@ fn this_os_family() -> OsFamily {
             OsFamily::Linux
         }
     }
+}
+
+/// This build's version. `CARGO_PKG_VERSION` is semver by cargo's own rule, so the parse cannot
+/// fail on a build cargo produced.
+fn this_version() -> semver::Version {
+    semver::Version::parse(HTUI_VERSION).expect("CARGO_PKG_VERSION is a semver version")
+}
+
+/// A stored target, parsed: the version, or the stored JSON as text when it is not a string
+/// holding one (MOD-40 blueprint B18).
+fn parse_target(stored: &Value) -> core::result::Result<semver::Version, String> {
+    stored
+        .as_str()
+        .and_then(|text| semver::Version::parse(text).ok())
+        .ok_or_else(|| stored.to_string())
+}
+
+/// The stored target document, if any.
+///
+/// The statement is `stored_setting`'s `App` text byte for byte (`read.rs`), so the two share
+/// one `.sqlx` entry.
+async fn stored_target(pool: &PgPool) -> Result<Option<Value>> {
+    let row = sqlx::query!(
+        "SELECT value, updated_at FROM app_setting WHERE key = $1",
+        TARGET_VERSION_KEY,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx)?;
+    Ok(row.map(|row| row.value))
+}
+
+/// What a TUI makes of the stored target: the target when this build is below it, `None`
+/// otherwise. A malformed one is logged and ignored: a TUI runs (B18).
+async fn tui_below_target(pool: &PgPool) -> Result<Option<String>> {
+    let Some(stored) = stored_target(pool).await? else {
+        return Ok(None);
+    };
+    match parse_target(&stored) {
+        Ok(target) if this_version() < target => Ok(Some(target.to_string())),
+        Ok(_) => Ok(None),
+        Err(text) => {
+            tracing::warn!(
+                stored = %text,
+                "app_setting.{TARGET_VERSION_KEY} is not a version; ignoring it"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Raises the target to this build's version, never lowering it (MOD-40 plan D9, blueprint
+/// B17), and answers the target when it is still above this build.
+///
+/// One transaction, three statements. The insert goes first because a `FOR UPDATE` on a row that
+/// does not exist locks nothing: two first appliers would both read "absent" and the second
+/// insert would fail on the primary key after its migrations had already run. `ON CONFLICT DO
+/// NOTHING` makes the second wait for the first's commit and then do nothing; the locked read
+/// that follows sees the committed row, and the comparison and the update run under that lock,
+/// so two appliers of different versions leave the higher one whichever commits first.
+///
+/// A stored value that is not a version is replaced with this build's (B18): the TUI that has
+/// just migrated the database is the authority on what it now needs.
+async fn raise_target(pool: &PgPool) -> Result<Option<String>> {
+    let ours = this_version();
+    let mut tx = pool.begin().await.map_err(map_sqlx)?;
+    let inserted = sqlx::query!(
+        "INSERT INTO app_setting (key, value) VALUES ($1, to_jsonb($2::text)) \
+         ON CONFLICT (key) DO NOTHING",
+        TARGET_VERSION_KEY,
+        HTUI_VERSION,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx)?
+    .rows_affected();
+    let mut above = None;
+    if inserted == 0 {
+        let stored = sqlx::query_scalar!(
+            "SELECT value FROM app_setting WHERE key = $1 FOR UPDATE",
+            TARGET_VERSION_KEY,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let raise = match stored.as_ref().map(parse_target) {
+            // Deleted by hand between the two statements: the next apply inserts it.
+            None => false,
+            Some(Ok(target)) if target > ours => {
+                above = Some(target.to_string());
+                false
+            }
+            Some(Ok(target)) => target < ours,
+            Some(Err(text)) => {
+                tracing::warn!(
+                    stored = %text,
+                    "app_setting.{TARGET_VERSION_KEY} is not a version; replacing it with this build's"
+                );
+                true
+            }
+        };
+        if raise {
+            sqlx::query!(
+                "UPDATE app_setting SET value = to_jsonb($2::text) WHERE key = $1",
+                TARGET_VERSION_KEY,
+                HTUI_VERSION,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+    }
+    tx.commit().await.map_err(map_sqlx)?;
+    Ok(above)
 }

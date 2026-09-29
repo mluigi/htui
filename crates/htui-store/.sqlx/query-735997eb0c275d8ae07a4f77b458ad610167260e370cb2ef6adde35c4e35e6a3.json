@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO app_setting (key, value) VALUES ($1, to_jsonb($2::text)) ON CONFLICT (key) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "735997eb0c275d8ae07a4f77b458ad610167260e370cb2ef6adde35c4e35e6a3"
+}

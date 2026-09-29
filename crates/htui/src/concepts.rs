@@ -6,13 +6,17 @@
 //! Postgres that does not answer is one line on stderr and a non-zero exit, and nothing else is
 //! affected (`docs/ANA-19.md` §2 invariant 3). The automatic sync belongs to the headless worker
 //! (MOD-41) and the agent-facing tool to the MCP server (MOD-11).
+//!
+//! Both connect headless (`PgStore::connect_headless`, MOD-40 plan D8): a pending schema or a
+//! build below the database's target version is refused, never migrated.
 use anyhow::{Context as _, bail};
 use htui_core::model::{ProjectId, Scope, Status};
 use htui_store::embed::FastEmbedder;
+use htui_store::pg::CONNECT_TIMEOUT;
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::vector::{Hit, PointType, QdrantStore, SearchQuery, VectorStore as _};
 use htui_store::vector_sync::Indexer;
-use htui_store::{MigrationState, PgStore, identity, secret};
+use htui_store::{HeadlessError, PgStore, identity, secret};
 
 /// Options of `--search-items`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,17 +59,22 @@ async fn open() -> anyhow::Result<(PgStore, QdrantStore<FastEmbedder>)> {
         bail!("no Postgres DSN is stored; run `htui --set-dsn` first");
     };
     let identity = identity::load_or_mint(&identity::config_root()?)?;
-    let connected = PgStore::connect(&dsn, &identity)
-        .await
-        .context("cannot reach Postgres")?;
-    if let MigrationState::Pending(n) = connected.migrations {
-        bail!("{n} schema migration(s) are pending; start `htui` once to apply them");
-    }
+    let pg = match PgStore::connect_headless(&dsn, &identity, CONNECT_TIMEOUT).await {
+        Ok(pg) => pg,
+        // The bail text is today's, kept byte for byte (plan D8).
+        Err(HeadlessError::MigrationsPending(n)) => {
+            bail!("{n} schema migration(s) are pending; start `htui` once to apply them")
+        }
+        Err(HeadlessError::Store(err)) => {
+            return Err(anyhow::Error::new(err).context("cannot reach Postgres"));
+        }
+        Err(below @ HeadlessError::BelowTarget { .. }) => return Err(below.into()),
+    };
     let embedder = FastEmbedder::new()?;
     let store = QdrantStore::connect(&settings, embedder)
         .await
         .context("cannot reach Qdrant")?;
-    Ok((connected.store, store))
+    Ok((pg, store))
 }
 
 /// Every workspace's projects as scopes, narrowed to one project slug when given.

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE app_setting SET value = to_jsonb($2::text) WHERE key = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "13d1322590046977c1541331aa16ae58f19fc595ed238d9352b25e13c8838985"
+}
