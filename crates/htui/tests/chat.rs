@@ -33,12 +33,12 @@ use htui_agent::event::{
 };
 use htui_agent::fake::{FakeAdapter, FakeDriver};
 use htui_agent::registry::DriverFactory;
-use htui_core::fixtures::ids;
+use htui_core::fixtures::{edit_agent, ids};
 use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, DocumentId, EventKind, ItemId, NewDocument, NewRepo, RepoId,
     RunId, RunMode, RunStatus, RunStep, SessionEvent, SnapshotPhase, StepId, StepStatus, Transport,
 };
-use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+use htui_core::store::{MemStore, ReadStore as _, StepFence, WriteStore as _};
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
 use htui_orch::{Command, GateAnswer};
 use serde_json::json;
@@ -104,10 +104,10 @@ async fn harness_with(script: Script, transport: Transport) -> (Harness, MemStor
     for summary in store.agents().await.expect("the fixture's agents") {
         let mut row = summary.agent;
         row.enabled = false;
-        store.upsert_agent(&row).await.expect("the row is disabled");
+        edit_agent(&store, &row).await.expect("the row is disabled");
     }
     store
-        .upsert_agent(&scripted_row(AgentId::new(), transport))
+        .upsert_agent(&scripted_row(AgentId::new(), transport), None)
         .await
         .expect("the scripted row lands");
 
@@ -753,16 +753,19 @@ async fn an_unanswered_permission_replays_parked_but_answers_nothing() {
             .expect("epoch is a time"),
     };
     store
-        .append_events(&[
-            row(0, EventKind::Prompt, json!({ "text": "clean the build" })),
-            row(
-                1,
-                EventKind::PermissionRequest,
-                json!({ "request_id": "req-1", "tool_call_id": "call-1",
+        .append_events(
+            StepFence::Unleased,
+            &[
+                row(0, EventKind::Prompt, json!({ "text": "clean the build" })),
+                row(
+                    1,
+                    EventKind::PermissionRequest,
+                    json!({ "request_id": "req-1", "tool_call_id": "call-1",
                         "options": [{ "id": "allow", "label": "Allow once",
                                       "kind": "allow_once" }] }),
-            ),
-        ])
+                ),
+            ],
+        )
         .await
         .expect("the rows land on the fixture's step");
 
@@ -944,11 +947,11 @@ async fn graph_store() -> MemStore {
     for summary in store.agents().await.expect("the fixture's agents") {
         let mut row = summary.agent;
         row.enabled = false;
-        store.upsert_agent(&row).await.expect("the row is disabled");
+        edit_agent(&store, &row).await.expect("the row is disabled");
     }
     let agent_id = AgentId::new();
     store
-        .upsert_agent(&scripted_row(agent_id, Transport::Acp))
+        .upsert_agent(&scripted_row(agent_id, Transport::Acp), None)
         .await
         .expect("the scripted row lands");
     store
@@ -1688,7 +1691,7 @@ async fn promoting_a_running_step_preempts_its_walk() {
 async fn a_harness_without_a_runtime_renders_the_refusal() {
     let store = MemStore::demo();
     store
-        .upsert_agent(&scripted_row(AgentId::new(), Transport::Cli))
+        .upsert_agent(&scripted_row(AgentId::new(), Transport::Cli), None)
         .await
         .expect("the row lands");
     let mut harness = Harness::over(store).with_tab(Box::new(ChatTab::new()));

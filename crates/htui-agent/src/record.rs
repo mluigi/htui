@@ -103,7 +103,7 @@ use htui_core::model::{
     StepId, UsageTotals, quota::normalize,
 };
 use htui_core::scrub::{Scrubber, Unmasked};
-use htui_core::store::{StoreError, WriteStore};
+use htui_core::store::{StepFence, StoreError, WriteStore};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -237,11 +237,17 @@ impl AnsweredBy {
 /// driver's direction exists so [`pump`] can return one error type.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RecordError {
-    /// The store refused the write. **Nothing was committed**: `seq` did not advance, and the
-    /// rows that flush had numbered stay owed inside the recorder, to be written at those same
-    /// numbers by the next flush - a retry, `finish`, or milestone 4's offline sink. The caller
-    /// decides whether to retry, go offline (milestone 4) or fail the step; dropping the recorder
-    /// is what loses the rows.
+    /// The store refused a write, or a fresh batch collided (MOD-40 plan D3).
+    ///
+    /// A **refusal** — any store error — leaves the rows that flush had numbered owed inside the
+    /// recorder, re-offered at those same numbers by the next flush (a retry, or
+    /// [`Recorder::finish`]); dropping the recorder is what loses them. A step whose run another
+    /// process adopted answers [`StoreError::Fenced`] here, and so does every later write.
+    ///
+    /// A **collision** is [`StoreError::Constraint`] naming `seq`s "already held: a second writer
+    /// on this step": rows the recorder had never offered came back short, so another writer holds
+    /// those numbers. They are **not** owed again; re-offering them would be a replay and would
+    /// hide the second writer.
     #[error(transparent)]
     Store(#[from] StoreError),
     /// Something credential-shaped survived scrubbing. **Two producers, and only one of them
@@ -277,7 +283,8 @@ impl From<RecordError> for DriverError {
 /// What a finished recorder wrote.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RecorderSummary {
-    /// Rows the store accepted. Lower than `seq` only if a replay found rows already stored.
+    /// Rows the store accepted. Lower than `seq` when a replay found rows already stored, or when
+    /// a fresh batch collided (reported as an error).
     pub rows: usize,
     /// The next unused `seq`, i.e. the number of rows the recorder authored.
     pub seq: i32,
@@ -390,18 +397,20 @@ pub struct Recorder<'a, S: WriteStore> {
     /// render frame goes out at the announcement ([`Recorder::send_ui`]) and only the database write
     /// waits.
     held: BTreeMap<EditKey, HeldEdit>,
-    /// Rows already numbered and owed to the store. They keep their `seq` and go out ahead of the
-    /// buffer on the next flush, which is what makes a failed append cost a retry rather than a
-    /// hole in the log.
+    /// Rows offered to the store once, by a flush the store answered with an error (MOD-40 plan
+    /// D3). The error may have come after the commit (a reply the connection lost), so some or
+    /// all of them may be stored already. The next flush re-offers them **alone**, first, at the
+    /// `seq` they were given, and a short count there is the replay finding its own rows.
     ///
-    /// Two things land here: a batch a flush numbered and the store then refused, and a held
-    /// `edit_proposal` whose call has closed. So the batch a flush offers is **not** necessarily
-    /// ascending in `seq` — a released row's number was reserved before a refused batch's were — and
-    /// that is safe on every path, verified rather than assumed: `append_events` inserts row by row
-    /// from an explicit `seq` with `ON CONFLICT (run_step_id, seq) DO NOTHING` (`pg/write.rs`),
-    /// `MemStore` does the same scan, every reader orders by `seq`, and the offline buffer's loader
-    /// dedupes on `(run_step_id, seq)` and sorts by `seq` before it uploads (`cache/pending.rs`).
+    /// Not necessarily ascending in `seq`, which is safe: `append_events` inserts from an explicit
+    /// `seq` with `ON CONFLICT (run_step_id, seq) DO NOTHING`, `MemStore` does the same scan, and
+    /// every reader orders by `seq`.
     unflushed: Vec<SessionEvent>,
+    /// Rows numbered and owed but **never offered** (MOD-40 blueprint B4): a held `edit_proposal`
+    /// whose call closed ([`Recorder::release_held`]), and a batch a flush numbered and could not
+    /// offer because the replay ahead of it was refused. They go out in the next flush's fresh
+    /// call, where every row must land.
+    unoffered: Vec<SessionEvent>,
 
     next_seq: i32,
     turn: i32,
@@ -422,6 +431,9 @@ pub struct Recorder<'a, S: WriteStore> {
     last_quota_raw: Option<Value>,
     /// Plan D70: the per-run cap this session is bounded by, or `None` for an unbounded run.
     run_cap: Option<RunCap>,
+    /// MOD-40 plan D2: the lease every row, usage and digest write of this session is made
+    /// under. [`StepFence::Unleased`] unless [`Recorder::with_fence`] says otherwise.
+    fence: StepFence,
     /// Set by the first breach and never cleared: a later `usage` row reports no second verdict,
     /// because the session it would cancel is already being closed.
     cap_breached: Option<CapBreach>,
@@ -442,6 +454,7 @@ impl<S: WriteStore> core::fmt::Debug for Recorder<'_, S> {
             .field("buffer_kind", &self.buffer_kind)
             .field("held", &self.held.len())
             .field("unflushed", &self.unflushed.len())
+            .field("unoffered", &self.unoffered.len())
             .field("next_seq", &self.next_seq)
             .field("turn", &self.turn)
             .field("dropped", &self.dropped)
@@ -450,6 +463,7 @@ impl<S: WriteStore> core::fmt::Debug for Recorder<'_, S> {
             // not what a recorder log is about either.
             .field("quota_latch", &self.quota_latch.is_some())
             .field("run_cap", &self.run_cap)
+            .field("fence", &self.fence)
             .field("cap_breached", &self.cap_breached)
             .finish()
     }
@@ -479,6 +493,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             open_message_id: None,
             held: BTreeMap::new(),
             unflushed: Vec::new(),
+            unoffered: Vec::new(),
             next_seq: 0,
             turn: 0,
             turns: 0,
@@ -489,6 +504,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             quota_latch: None,
             last_quota_raw: None,
             run_cap: None,
+            fence: StepFence::Unleased,
             cap_breached: None,
             residue: None,
             dropped: 0,
@@ -561,6 +577,19 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     #[must_use]
     pub fn with_run_cap(mut self, cap: RunCap) -> Self {
         self.run_cap = Some(cap);
+        self
+    }
+
+    /// Writes every row, the usage and the digest under `fence` (MOD-40 plan D2).
+    ///
+    /// A builder for [`Recorder::with_quota_latch`]'s reason: most recorders are a chat's, whose
+    /// run holds no lease, and [`StepFence::Unleased`] is the default. The engine passes the lease
+    /// its walk holds. A recorder that forgets it on a leased run is refused with
+    /// [`StoreError::Fenced`] at its first write, loudly; one whose lease another process took
+    /// writes nothing more.
+    #[must_use]
+    pub fn with_fence(mut self, fence: StepFence) -> Self {
+        self.fence = fence;
         self
     }
 
@@ -1006,31 +1035,30 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// chunks only exists once the run is assembled; masking is idempotent, so scrubbing the
     /// already-scrubbed pieces again costs a pass and changes nothing.
     ///
-    /// **Failure-atomic.** The batch is numbered into a local vector and `rows` moves only once the
-    /// store has said `Ok`. A store that refuses keeps the numbered batch in `unflushed`, so the
-    /// next flush offers those rows again, ahead of anything buffered since and at the very `seq`
-    /// they were given: with one writer, a failed append costs a retry and never a hole. Re-offering
-    /// is safe because `append_events` skips a `(run_step_id, seq)` it already holds, so a partially
-    /// applied batch cannot be written twice.
+    /// **Two calls, replay first (MOD-40 plan D3).** Rows a refused call already offered
+    /// (`unflushed`) go out alone: some may be stored, so a short count is fine. Then the fresh rows
+    /// — `unoffered` and the buffer, numbered here — go out together, and every one must land: a
+    /// short count means another writer holds those `seq`s, which is reported as a
+    /// [`StoreError::Constraint`] and **not** re-queued. A store error on either call keeps its rows
+    /// owed at their numbers, so with one writer a failed append costs a retry and never a hole.
     ///
-    /// `next_seq` advances at **numbering** time rather than at commit, because since plan D77 it is
-    /// not only the flush that hands out numbers — a held `edit_proposal` reserves one at its
-    /// announcement. A refused batch keeps the numbers it was given (they are on the rows in
-    /// `unflushed`, which are not renumbered), so the counter and the log still agree; advancing it
-    /// only on success would let a reservation collide with a refused batch's numbers.
+    /// `next_seq` advances at **numbering** time, because since plan D77 a held `edit_proposal`
+    /// reserves one at its announcement: a refused batch keeps the numbers it was given, and
+    /// advancing only on success would let a reservation collide with them. A collided `seq` stays
+    /// spent, so the recorder never offers it again. `rows` grows by what each call reports landed.
     ///
     /// **What it does not do is clear the held rows.** That was T46's defect: `(tool_call_id, path)`
     /// identity is a domain fact and a flush is a persistence detail.
     async fn flush(&mut self) -> Result<(), RecordError> {
         self.buffer_kind = None;
         self.open_message_id = None;
-        if self.buffer.is_empty() && self.unflushed.is_empty() {
+        if self.buffer.is_empty() && self.unflushed.is_empty() && self.unoffered.is_empty() {
             return Ok(());
         }
 
         let pending = core::mem::take(&mut self.buffer);
-        let mut rows = core::mem::take(&mut self.unflushed);
-        rows.reserve(pending.len());
+        let mut fresh = core::mem::take(&mut self.unoffered);
+        fresh.reserve(pending.len());
         for mut row in pending {
             let outcome = self.scrubber.scrub(&mut row.payload);
             let row = match outcome {
@@ -1043,15 +1071,37 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             let seq = self.next_seq;
             self.next_seq += 1;
             let turn = self.turn;
-            rows.push(self.event_row(row, seq, turn));
+            fresh.push(self.event_row(row, seq, turn));
         }
-        match self.store.append_events(&rows).await {
+
+        if !self.unflushed.is_empty() {
+            let replay = core::mem::take(&mut self.unflushed);
+            match self.store.append_events(self.fence, &replay).await {
+                Ok(written) => self.rows += written,
+                Err(error) => {
+                    self.unflushed = replay;
+                    self.unoffered = fresh;
+                    return Err(RecordError::Store(error));
+                }
+            }
+        }
+
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        match self.store.append_events(self.fence, &fresh).await {
             Ok(written) => {
                 self.rows += written;
-                Ok(())
+                if written == fresh.len() {
+                    Ok(())
+                } else {
+                    Err(RecordError::Store(StoreError::Constraint(seq_collision(
+                        self.step, &fresh, written,
+                    ))))
+                }
             }
             Err(error) => {
-                self.unflushed = rows;
+                self.unflushed = fresh;
                 Err(RecordError::Store(error))
             }
         }
@@ -1071,7 +1121,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     ///    [`enforce_breach`]), whose closing pair must not be written over a hole;
     /// 4. [`Recorder::finish`], the backstop under all three.
     ///
-    /// The row goes to `unflushed` rather than to `buffer`: it is already numbered, and `buffer`
+    /// The row goes to `unoffered` rather than to `buffer`: it is already numbered, and `buffer`
     /// holds rows that take their `seq` at the flush. The final scrub pass — the one that catches a
     /// secret no single announcement carried (`R-SEC-3`) — happens here instead of in the flush, for
     /// the same reason, and a refusal replaces the row with a `scrub_residue` row at that same `seq`
@@ -1105,7 +1155,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
                 }
             };
             let event = self.event_row(row, seq, turn);
-            self.unflushed.push(event);
+            self.unoffered.push(event);
         }
     }
 
@@ -1117,7 +1167,9 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         }
         let usage = self.usage.to_value();
         let digest = self.digest_pending.take();
-        self.store.set_step_usage(self.step, usage, digest).await?;
+        self.store
+            .set_step_usage(self.fence, self.step, usage, digest)
+            .await?;
         self.usage_dirty = false;
         Ok(())
     }
@@ -1185,7 +1237,12 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             .set_agent_box_quota(latch.agent_id, latch.box_id, quota.to_value(), at)
             .await
         {
-            Ok(()) => {}
+            Ok(true) => {}
+            // MOD-40 plan D4: another session on this box latched a newer allowance first. The
+            // latch stays armed: this session's next report may well be the newest again.
+            Ok(false) => tracing::debug!(
+                "a newer quota is already latched on this agent_box row; this one is older"
+            ),
             Err(StoreError::Unreachable(reason)) => {
                 tracing::info!(
                     %reason,
@@ -1430,9 +1487,9 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// It is **not** exempt from `run_step.usage`. A persisted `usage` row is summed from its
     /// document, not from its typed event ([`UsageTotals::add_payload`]), so masking costs it only
     /// the keys masking made unreadable. Skipping it here would be a real divergence rather than a
-    /// tidiness: `upload_pending` sums *every* persisted `usage` row of a chat that happened
-    /// offline (MOD-2 plan D36), so an online step and the same step uploaded from a buffer would
-    /// disagree for exactly this one row shape.
+    /// tidiness: `run_step.usage` is the sum of *every* persisted `usage` row of the step (MOD-2
+    /// plan D36's one rule), so the column and the log it summarizes would disagree for exactly
+    /// this one row shape.
     ///
     /// **A breach outlives a refused flush.** The sum and [`Recorder::check_cap`] run before the
     /// trailing flush, so by the time that flush can fail the verdict is already spent: `spent` is
@@ -1440,7 +1497,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// store error returned *instead of* the verdict would therefore disarm the cap for the rest
     /// of the session — one masked row plus one store fault, and a capped run continues
     /// unbounded — so the verdict wins and the error is logged. Nothing is lost by that: a refused
-    /// flush commits nothing and keeps its numbered rows in `unflushed`, which
+    /// flush commits nothing and keeps its numbered rows owed, which
     /// [`Recorder::record_cap_breach`]'s own flush re-offers **ahead of** the closing pair
     /// (blueprint H-2), so the breaching row is written by the very sequence the verdict triggers.
     async fn record_unreadable(
@@ -1478,8 +1535,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             (Err(err), Some(breach)) => {
                 tracing::warn!(
                     %err,
-                    "the flush of a breaching row was refused; the cap is enforced anyway and the \
-                     row is written with the closing pair (blueprint H-2)"
+                    "the flush of a breaching row failed; the cap is enforced anyway (blueprint H-2)"
                 );
                 Ok(Some(breach))
             }
@@ -1566,6 +1622,18 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
             }
         }
     }
+}
+
+/// The refusal a fresh batch that landed short answers with (MOD-40 plan D3): some `seq` it
+/// numbered is already held on the step, which cannot happen with one writer.
+fn seq_collision(step: StepId, fresh: &[SessionEvent], written: usize) -> String {
+    let low = fresh.iter().map(|row| row.seq).min().unwrap_or_default();
+    let high = fresh.iter().map(|row| row.seq).max().unwrap_or_default();
+    format!(
+        "session_event seq {low}..={high} of run_step `{step}`: {written} of {} landed, the rest \
+         already held: a second writer on this step",
+        fresh.len()
+    )
 }
 
 /// The `error` row that stands in for a payload the scrubber refused.
@@ -1816,7 +1884,7 @@ mod tests {
         ChatRunSpec, EventKind, EventRole, RunStep, SessionEvent, StepId, UsageTotals,
     };
     use htui_core::scrub::MinimalScrubber;
-    use htui_core::store::{MemStore, ReadStore, WriteStore};
+    use htui_core::store::{MemStore, ReadStore, StepFence, WriteStore};
     use serde_json::{Value, json};
 
     use super::{Recorder, RecorderSummary};
@@ -1948,7 +2016,7 @@ mod tests {
     /// `ReadStore::step_events`.
     async fn seed(store: &MemStore, step: StepId, rows: &[SessionEvent]) -> Vec<SessionEvent> {
         store
-            .append_events(rows)
+            .append_events(StepFence::Unleased, rows)
             .await
             .expect("the earlier log must land");
         log(store, step).await
@@ -2132,7 +2200,12 @@ mod tests {
         let tail = seed(&store, chat.step_id, &earlier).await;
         // The pre-promotion recorder left the column at the earlier spend.
         store
-            .set_step_usage(chat.step_id, UsageTotals::from_rows(&tail).to_value(), None)
+            .set_step_usage(
+                StepFence::Unleased,
+                chat.step_id,
+                UsageTotals::from_rows(&tail).to_value(),
+                None,
+            )
             .await
             .expect("the earlier spend must land");
 

@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow,
@@ -50,7 +50,7 @@ use htui_core::prompt::settings::SettingKey;
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, Result as StoreResult, SettingRung,
-    StoredSetting, UpdateOutcome, WriteStore,
+    StepFence, StoredSetting, UpdateOutcome, WriteStore,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -277,10 +277,10 @@ const RESIDUE: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwx";
 ///
 /// # Panics
 ///
-/// Never: the constant is a valid instant.
+/// Never: `htui_core::clock::epoch` is a valid instant.
 #[must_use]
 pub fn epoch() -> DateTime<Utc> {
-    DateTime::from_timestamp_millis(1_788_393_600_000).expect("the suite epoch is a valid instant")
+    htui_core::clock::epoch()
 }
 
 /// The scrubber every case records through: `MinimalScrubber` over the session's one env value.
@@ -723,11 +723,12 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> StoreResult<bool> {
         self.inner.transition(id, from, to).await
     }
-    async fn append_events(&self, events: &[SessionEvent]) -> StoreResult<usize> {
-        self.inner.append_events(events).await
+    async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> StoreResult<usize> {
+        self.inner.append_events(fence, events).await
     }
     async fn set_step_usage(
         &self,
+        fence: StepFence,
         step: StepId,
         usage: Value,
         prompt_digest: Option<String>,
@@ -735,7 +736,7 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
         // The write first, the log after: the guard is taken and dropped with no `.await` inside
         // its scope.
         self.inner
-            .set_step_usage(step, usage.clone(), prompt_digest.clone())
+            .set_step_usage(fence, step, usage.clone(), prompt_digest.clone())
             .await?;
         self.calls
             .lock()
@@ -746,8 +747,12 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
             });
         Ok(())
     }
-    async fn upsert_agent(&self, agent: &Agent) -> StoreResult<()> {
-        self.inner.upsert_agent(agent).await
+    async fn upsert_agent(
+        &self,
+        agent: &Agent,
+        expected: Option<DateTime<Utc>>,
+    ) -> StoreResult<CasOutcome<Agent>> {
+        self.inner.upsert_agent(agent, expected).await
     }
     async fn upsert_agent_box(&self, row: &AgentBox) -> StoreResult<()> {
         self.inner.upsert_agent_box(row).await
@@ -772,9 +777,11 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
         box_id: BoxId,
         quota: Value,
         quota_at: DateTime<Utc>,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<bool> {
         // The write first, the log after: the `set_step_usage` rule above, for the same reason.
-        self.inner
+        // Every call the store accepted is logged, written or not (MOD-40 plan D4).
+        let written = self
+            .inner
             .set_agent_box_quota(agent_id, box_id, quota.clone(), quota_at)
             .await?;
         self.quota_calls
@@ -786,7 +793,7 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
                 quota,
                 quota_at,
             });
-        Ok(())
+        Ok(written)
     }
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> StoreResult<()> {
         self.inner.start_chat_run(chat).await
@@ -1028,46 +1035,32 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
         box_id: BoxId,
         owner: Uuid,
         at: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> StoreResult<Claim> {
-        self.inner
-            .claim_run(run, box_id, owner, at, lease_until)
-            .await
+        self.inner.claim_run(run, box_id, owner, at, ttl).await
     }
-    async fn refresh_lease(
-        &self,
-        run: RunId,
-        owner: Uuid,
-        until: DateTime<Utc>,
-    ) -> StoreResult<bool> {
-        self.inner.refresh_lease(run, owner, until).await
+    async fn refresh_lease(&self, run: RunId, owner: Uuid, ttl: TimeDelta) -> StoreResult<bool> {
+        self.inner.refresh_lease(run, owner, ttl).await
     }
     async fn adopt_runs(
         &self,
         box_id: BoxId,
         owner: Uuid,
-        now: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> StoreResult<Vec<Run>> {
-        self.inner.adopt_runs(box_id, owner, now, lease_until).await
+        self.inner.adopt_runs(box_id, owner, ttl).await
     }
     async fn take_lease(
         &self,
         run: RunId,
         box_id: BoxId,
         owner: Uuid,
-        now: DateTime<Utc>,
-        until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> StoreResult<bool> {
-        self.inner.take_lease(run, box_id, owner, now, until).await
+        self.inner.take_lease(run, box_id, owner, ttl).await
     }
-    async fn release_lease(
-        &self,
-        run: RunId,
-        owner: Uuid,
-        now: DateTime<Utc>,
-    ) -> StoreResult<bool> {
-        self.inner.release_lease(run, owner, now).await
+    async fn release_lease(&self, run: RunId, owner: Uuid) -> StoreResult<bool> {
+        self.inner.release_lease(run, owner).await
     }
     async fn create_step(&self, new: NewRunStep) -> StoreResult<RunStep> {
         self.inner.create_step(new).await
@@ -1090,8 +1083,13 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     ) -> StoreResult<bool> {
         self.inner.transition_step(step, from, to, at).await
     }
-    async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> StoreResult<()> {
-        self.inner.finish_step(step, outcome).await
+    async fn finish_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        outcome: StepOutcome,
+    ) -> StoreResult<()> {
+        self.inner.finish_step(fence, step, outcome).await
     }
     async fn interrupt_step(
         &self,

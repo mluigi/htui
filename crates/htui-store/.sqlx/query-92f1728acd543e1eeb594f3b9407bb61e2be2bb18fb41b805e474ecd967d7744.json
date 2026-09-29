@@ -1,0 +1,148 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id            AS \"id: AgentId\",\n                   name,\n                   transport     AS \"transport: htui_core::model::Transport\",\n                   launch,\n                   models,\n                   default_model,\n                   billing       AS \"billing: htui_core::model::Billing\",\n                   enabled,\n                   settings,\n                   created_at,\n                   updated_at\n              FROM agent\n             WHERE id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "transport: htui_core::model::Transport",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "transport"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "launch",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "launch"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "models",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "models"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "default_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "default_model"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "billing: htui_core::model::Billing",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "billing"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "enabled",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "enabled"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "settings",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "settings"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "92f1728acd543e1eeb594f3b9407bb61e2be2bb18fb41b805e474ecd967d7744"
+}

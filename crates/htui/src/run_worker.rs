@@ -2427,7 +2427,7 @@ pub(crate) mod tests {
     use htui_agent::event::{DoneEvent, DriverEnvelope, DriverEvent, StopReason};
     use htui_agent::fake::FakeDriver;
     use htui_agent::registry::{DriverFactory, TransportBuilder};
-    use htui_core::fixtures::{demo_at, ids};
+    use htui_core::fixtures::{demo_at, edit_agent, ids};
     use htui_core::model::{
         Agent, AgentBox, AgentId, Billing, DocumentId, Item, ItemId, NewDocument, NewRepo, NewRun,
         RepoId, Resolution, Run, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId,
@@ -2496,11 +2496,11 @@ pub(crate) mod tests {
         for summary in store.agents().await.expect("the fixture's agents") {
             let mut row = summary.agent;
             row.enabled = false;
-            store.upsert_agent(&row).await.expect("the row is disabled");
+            edit_agent(&store, &row).await.expect("the row is disabled");
         }
         let agent = AgentId::new();
         store
-            .upsert_agent(&scripted_row(agent))
+            .upsert_agent(&scripted_row(agent), None)
             .await
             .expect("the scripted row lands");
         store
@@ -3456,8 +3456,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// A run of `item` another process claimed an hour ago and never renewed: `running`, its
-    /// lease expired, its owner not this one. No step was created.
+    /// A run of `item` another process claimed an hour ago (`started_at`) under a lease that
+    /// lapsed at once: `running`, its lease expired, its owner not this one. No step was created.
     async fn stranded(fixture: &Fixture, item: ItemId) -> RunId {
         let backend = Backend::memory(fixture.store.clone());
         let row = fixture.item(item).await;
@@ -3492,13 +3492,7 @@ pub(crate) mod tests {
             .expect("the run lands");
         let claim = fixture
             .store
-            .claim_run(
-                run,
-                ids::BOX,
-                Uuid::now_v7(),
-                past,
-                past + TimeDelta::minutes(1),
-            )
+            .claim_run(run, ids::BOX, Uuid::now_v7(), past, TimeDelta::zero())
             .await
             .expect("the claim answers");
         assert!(claim.is_admitted(), "{claim}");

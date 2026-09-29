@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE box SET last_seen_at = clock_timestamp() WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6f2adf5dfc8f8c3c2e665680d23bf942b62a25cacb484041c7851915f64d672a"
+}

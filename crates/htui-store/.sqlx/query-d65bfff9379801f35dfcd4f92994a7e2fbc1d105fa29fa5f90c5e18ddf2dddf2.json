@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run_step SET exit_code        = $2, usage            = COALESCE($3, usage), trim_record      = COALESCE($4, trim_record), verify_outcome   = $5, verify_exit_code = $6, finished_at      = $7 WHERE id = $1 AND EXISTS (SELECT 1 FROM run r WHERE r.id = run_step.run_id AND r.lease_owner IS NOT DISTINCT FROM $8 FOR SHARE)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Jsonb",
+        "Jsonb",
+        "Text",
+        "Int4",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d65bfff9379801f35dfcd4f92994a7e2fbc1d105fa29fa5f90c5e18ddf2dddf2"
+}

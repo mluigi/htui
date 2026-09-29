@@ -34,7 +34,10 @@ pub use connect::{Applied, ConnEvent, ConnectContext, StartOptions, Started};
 pub use dsn::{Dsn, DsnError};
 pub use error::map_sqlx;
 pub use identity::{Fingerprint, Identity};
-pub use pg::{Connected, HTUI_VERSION, MigrationState, PgStore, Registration};
+pub use pg::{
+    Connected, HTUI_VERSION, HeadlessError, MigrationState, PgStore, Registration,
+    TARGET_VERSION_KEY,
+};
 pub use writer::{DATABASE_UNREACHABLE, PROMPT_ON_SERVER_ONLY, REGISTRY_ON_SERVER_ONLY, Writer};
 
 /// The hop ceiling of the amended §7.3 upstream walk, re-exported from where the trait it belongs

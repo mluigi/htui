@@ -367,7 +367,7 @@ impl Rig {
 
         let store = MemStore::demo();
         store
-            .upsert_agent(&install_row(AgentId::new()))
+            .upsert_agent(&install_row(AgentId::new()), None)
             .await
             .expect("the row lands");
 

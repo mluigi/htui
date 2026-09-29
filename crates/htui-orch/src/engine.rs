@@ -41,7 +41,7 @@ use htui_core::prompt::{
     TemplateRef, TemplateRole, TokenEstimator, TrimStrategy, VerifyFailure, assemble, settings,
 };
 use htui_core::scrub::Scrubber;
-use htui_core::store::{StoreError, WriteStore};
+use htui_core::store::{StepFence, StoreError, WriteStore};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -684,7 +684,7 @@ where
     /// [`EngineError`] the walk raises.
     pub async fn claim(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
         let now = self.now();
-        let lease = now + self.lease_times().ttl;
+        let ttl = self.lease_times().ttl;
         // Anything but `Admitted` is a refusal. `MissingTags` is `R-ORCH-10`'s: `claim_run`
         // already failed the run and blocked its item, and the engine adds the note (D78). The
         // three verdicts named in the last arm are ANA-2 §4.7's admission, not claimable, box full
@@ -692,7 +692,7 @@ where
         let claim = self
             .parts
             .store
-            .claim_run(run, self.parts.box_id, self.parts.owner, now, lease)
+            .claim_run(run, self.parts.box_id, self.parts.owner, now, ttl)
             .await?;
         match claim {
             Claim::Admitted => {}
@@ -715,7 +715,11 @@ where
             }
         }
 
-        let rest = self.walk_leased(run, lease, self.run_to_rest(run)).await?;
+        // `now` was read before the claim was sent, so `now + ttl` is a fence the store's expiry
+        // cannot precede (MOD-40 plan OQ-2, blueprint F-38).
+        let rest = self
+            .walk_leased(run, now + ttl, self.run_to_rest(run))
+            .await?;
         Ok(CommandOutcome::Started { run, rest })
     }
 
@@ -1401,6 +1405,7 @@ where
             self.parts
                 .store
                 .finish_step(
+                    StepFence::Lease(self.parts.owner),
                     row.id,
                     StepOutcome {
                         exit_code: None,
@@ -1647,9 +1652,10 @@ where
 
     /// Plan D86/D107: `walk` raced against [`crate::recover::heartbeat`] in this task.
     ///
-    /// `until` is the `lease_expires_at` the caller's lease take wrote (`claim_run`, `take_lease`
-    /// or the sweep's renewal). The heartbeat's first fence is that `until` less one refresh (plan
-    /// D143), not a lease the heartbeat assumes from its own start.
+    /// `until` is the local instant the caller's lease take (`claim_run`, `take_lease` or the
+    /// sweep's renewal) lapses by at the earliest: the instant it was sent plus the TTL (MOD-40
+    /// plan D10, OQ-2). The heartbeat's first fence is that `until` less one refresh (plan D143),
+    /// not a lease the heartbeat assumes from its own start.
     ///
     /// On the walk's answer, the lease is released when the run rests anywhere but `running`
     /// (D87), and also when the re-read that decides it fails (D129: warned, and the walk's `Ok`
@@ -1661,8 +1667,11 @@ where
     /// walk is dropped where it stands, **before** anything else. An expired run then enters
     /// [`DeadWalks`] (plan D140), so the next sweep gives its lease back. Then
     /// `Isolator::release` drops this process's guards for the run (D99), and the caller gets
-    /// [`EngineError::LeaseLost`]. Generic over the walk's output, so one wrapper serves every
-    /// command's post-unpark tail (blueprint F-M).
+    /// [`EngineError::LeaseLost`]. A walk's own `Err` that is the store's `Fenced` (MOD-40 plan
+    /// D2: another process adopted the run before the heartbeat saw it) is an abandon too: the
+    /// guards are released, no lease is given back, and the caller gets `LeaseLost`. Generic
+    /// over the walk's output, so one wrapper serves every command's post-unpark tail
+    /// (blueprint F-M).
     ///
     /// **A runtime with a time driver is required** (blueprint H-3): the heartbeat sleeps on
     /// `tokio::time::sleep`, so every engine entry that walks — [`Self::dispatch`],
@@ -1693,11 +1702,11 @@ where
     }
 
     /// [`Self::walk_leased`]'s race of `walk` against the heartbeat, without its releases: the
-    /// outer `Err` is the heartbeat's [`EngineError::LeaseLost`], with the walk already dropped,
-    /// [`DeadWalks`] and the guards handled as `walk_leased` documents; the inner `Result` is the
-    /// walk's own answer, which the caller settles. `AcceptArtifact`'s window uses it directly
-    /// (plan D86): its run is parked, so a walk's release on `Ok` would give back the lease its
-    /// `AnswerGate(Approved)` tail is about to renew.
+    /// outer `Err` is [`EngineError::LeaseLost`], the heartbeat's or a fenced walk's, with the
+    /// walk already dropped, [`DeadWalks`] and the guards handled as `walk_leased` documents; the
+    /// inner `Result` is the walk's own answer, which the caller settles. `AcceptArtifact`'s
+    /// window uses it directly (plan D86): its run is parked, so a walk's release on `Ok` would
+    /// give back the lease its `AnswerGate(Approved)` tail is about to renew.
     async fn heartbeaten<T, F>(
         &self,
         run: RunId,
@@ -1710,7 +1719,7 @@ where
         let times = self.lease_times();
         let (store, owner) = (self.parts.store, self.parts.owner);
         let beat = recover::heartbeat(
-            |until| store.refresh_lease(run, owner, until),
+            |ttl| store.refresh_lease(run, owner, ttl),
             until,
             self.parts.clock,
             times,
@@ -1718,6 +1727,19 @@ where
         // Both boxed: `select` needs `Unpin`, and dropping `select`'s output does not drop a
         // stack-pinned walk (blueprint H-11). A boxed one goes when its box does.
         match futures::future::select(Box::pin(walk), Box::pin(beat)).await {
+            // MOD-40 review: a walk the store fenced (`Fenced`, from its recorder or its settle)
+            // wrote under a lease another process adopted before this heartbeat noticed. It is
+            // the abandon below, reached by the walk rather than the beat: the guards go, and
+            // the lease is a stranger's, so nothing gives it back.
+            Either::Left((Err(err), beat)) if is_fenced(&err) => {
+                drop(beat);
+                self.release_guards(
+                    run,
+                    "releasing the run's guards after a fenced write failed",
+                )
+                .await;
+                Err(EngineError::LeaseLost { run })
+            }
             Either::Left((out, beat)) => {
                 drop(beat);
                 Ok(out)
@@ -1755,16 +1777,16 @@ where
         }
     }
 
-    /// Plan D87/D108: `take_lease(run, box, owner, now, now + ttl)`, after a command's pure guard
-    /// and before its first write.
-    /// Answers the `until` it wrote, which the command's [`Self::walk_leased`] fences from (plan
-    /// D143).
+    /// Plan D87/D108: `take_lease(run, box, owner, ttl)`, after a command's pure guard and before
+    /// its first write.
+    /// Answers the local instant its lease lapses by at the earliest (the send instant plus the
+    /// TTL), which the command's [`Self::walk_leased`] fences from (plan D143).
     ///
     /// Plan D130: a zero-row answer re-reads the run to say why. Not `running` or
-    /// `awaiting_approval` → [`EngineError::RunStatus`] naming the status; a live lease (never
-    /// this process's, which the take would have renewed) → [`EngineError::LeaseHeld`]; neither
-    /// (the run executes on another box with its lease lapsed) → [`EngineError::RunStatus`] saying
-    /// so.
+    /// `awaiting_approval` → [`EngineError::RunStatus`] naming the status; a run on this box →
+    /// [`EngineError::LeaseHeld`] (the store's only remaining refusal is a live foreign lease;
+    /// never this process's, which the take would have renewed); a run on another box →
+    /// [`EngineError::RunStatus`] saying so, whatever its lease (MOD-40 blueprint B26).
     async fn take_lease(&self, run: RunId) -> Result<DateTime<Utc>, EngineError> {
         if let Some(until) = self.renew_lease(run).await? {
             return Ok(until);
@@ -1777,7 +1799,11 @@ where
                 expected: "running | awaiting_approval",
             });
         }
-        if row.lease_expires_at.is_some_and(|until| until > self.now()) {
+        // MOD-40 blueprint B26: no clock is read. A take on a `running` or parked run is refused
+        // for one of two reasons only: the run executes on another box, or another owner's lease
+        // had not lapsed by the store's clock. The expiry is the store's, and comparing it with
+        // this process's clock would reintroduce the skew D10 removed.
+        if row.executing_box_id == Some(self.parts.box_id) {
             return Err(EngineError::LeaseHeld { run });
         }
         Err(EngineError::RunStatus {
@@ -1787,9 +1813,10 @@ where
         })
     }
 
-    /// The store's `take_lease(run, box, owner, now, now + ttl)` and its bare answer: the `until`
-    /// written when the lease was taken (plan D143), `None` for "not takeable here", which
-    /// [`Self::take_lease`] words and the sweep skips (plan D126).
+    /// The store's `take_lease(run, box, owner, ttl)` and its bare answer: the local instant the
+    /// lease lapses by at the earliest, `now + ttl` with `now` read before the take (plan D143),
+    /// `None` for "not takeable here", which [`Self::take_lease`] words and the sweep skips (plan
+    /// D126).
     ///
     /// Plan D140: a run taken here is about to be walked, so it leaves [`DeadWalks`]. The sweep
     /// must not give back the lease of a live walk.
@@ -1800,17 +1827,17 @@ where
     /// live in this process and the guards are a dead walk's.
     async fn renew_lease(&self, run: RunId) -> Result<Option<DateTime<Utc>>, EngineError> {
         let now = self.now();
-        let until = now + self.lease_times().ttl;
+        let ttl = self.lease_times().ttl;
         let taken = self
             .parts
             .store
-            .take_lease(run, self.parts.box_id, self.parts.owner, now, until)
+            .take_lease(run, self.parts.box_id, self.parts.owner, ttl)
             .await?;
         if taken && self.parts.dead_walks.remove(run) {
             self.release_guards(run, "releasing a dead walk's guards at a lease take failed")
                 .await;
         }
-        Ok(taken.then_some(until))
+        Ok(taken.then_some(now + ttl))
     }
 
     /// `Isolator::release(run)`, best-effort: a failure is a `warn` saying `what`, and nothing
@@ -1864,23 +1891,18 @@ where
         self.release_lease(run).await;
     }
 
-    /// Plan D87/D139: the store's `release_lease(run, owner, now)`. The lease reads as expired at
-    /// once and has no owner, so every process's sweep may adopt the run, this one's included
-    /// (plan D88 skips only a row this process still owns). A heartbeat refresh that hung and
-    /// commits after the release matches no row, so it cannot take the lease back. A zero-row
-    /// answer is ignored and an error is warned; neither is raised.
+    /// Plan D87/D139: the store's `release_lease(run, owner)`. The lease reads as expired at once,
+    /// by the store's clock, and has no owner, so every process's sweep may adopt the run, this
+    /// one's included (plan D88 skips only a row this process still owns). A heartbeat refresh
+    /// that hung and commits after the release matches no row, so it cannot take the lease back.
+    /// A zero-row answer is ignored and an error is warned; neither is raised.
     ///
     /// Plan D140: a release that fails puts the run in [`DeadWalks`], and the next
     /// [`Self::sweep`] tries again. Any answer from the store takes the run out. Plan D151:
     /// `NotFound { entity: "run" }` is such an answer: the row is gone, so no lease is left to
     /// give back, and the run leaves the set with a `warn`.
     async fn release_lease(&self, run: RunId) {
-        match self
-            .parts
-            .store
-            .release_lease(run, self.parts.owner, self.now())
-            .await
-        {
+        match self.parts.store.release_lease(run, self.parts.owner).await {
             // `false`: the lease is no longer ours, so there is nothing of ours to give back.
             Ok(_) => {
                 self.parts.dead_walks.remove(run);
@@ -1958,12 +1980,11 @@ where
                 .await;
             self.release_lease(run).await;
         }
-        let now = self.now();
         let times = self.lease_times();
         let adopted = self
             .parts
             .store
-            .adopt_runs(self.parts.box_id, self.parts.owner, now, now + times.ttl)
+            .adopt_runs(self.parts.box_id, self.parts.owner, times.ttl)
             .await?;
         let mut swept = Vec::with_capacity(adopted.len());
         for run in adopted {
@@ -2280,6 +2301,7 @@ where
         self.parts
             .store
             .finish_step(
+                StepFence::Lease(self.parts.owner),
                 step.id,
                 StepOutcome {
                     exit_code: None,
@@ -3201,6 +3223,7 @@ where
         self.parts
             .store
             .finish_step(
+                StepFence::Lease(self.parts.owner),
                 step.id,
                 StepOutcome {
                     exit_code: None,
@@ -3803,6 +3826,7 @@ where
         self.parts
             .store
             .finish_step(
+                StepFence::Lease(self.parts.owner),
                 step.id,
                 StepOutcome {
                     exit_code: None,
@@ -4244,6 +4268,7 @@ where
         self.parts
             .store
             .finish_step(
+                StepFence::Lease(self.parts.owner),
                 judge.id,
                 StepOutcome {
                     exit_code: None,
@@ -5294,7 +5319,10 @@ where
             step.id,
             settings.keep_raw_events,
             None,
-        );
+        )
+        // MOD-40 plan D2: the walk's lease rides every row, usage and digest write, so a walk
+        // that sleeps through its lease writes nothing once another process has adopted it.
+        .with_fence(StepFence::Lease(self.parts.owner));
         if let Some(micros) = settings.per_token_cap_run {
             recorder = recorder.with_run_cap(RunCap {
                 micros,
@@ -5697,6 +5725,20 @@ struct JudgePrompts {
     reversed: AssembledPrompt,
     /// The `judge` row the prompts rendered, as the judge phase's template.
     template: SnapshotTemplate,
+}
+
+/// MOD-40 review: whether `err` is the store's [`StoreError::Fenced`], however the walk carried
+/// it: a settle write's own, or the recorder's through [`htui_agent::RecordError`] or
+/// [`htui_agent::error::DriverError`].
+const fn is_fenced(err: &EngineError) -> bool {
+    matches!(
+        err,
+        EngineError::Store(StoreError::Fenced { .. })
+            | EngineError::Record(htui_agent::RecordError::Store(StoreError::Fenced { .. }))
+            | EngineError::Driver(htui_agent::error::DriverError::Store(
+                StoreError::Fenced { .. }
+            ))
+    )
 }
 
 /// The `fanout_index` of a candidate the judge prompt's trimmer dropped outright (plan D53).
@@ -7842,7 +7884,7 @@ mod tests {
             harness
                 .orch
                 .store
-                .claim_run(run, ids::BOX, harness.orch.owner(), now, now + ttl)
+                .claim_run(run, ids::BOX, harness.orch.owner(), now, ttl)
                 .await
                 .expect("MemStore claims"),
             htui_core::model::Claim::Admitted,
@@ -8091,7 +8133,7 @@ mod tests {
             harness
                 .orch
                 .store
-                .take_lease(run, ids::BOX, harness.orch.owner(), now, now + ttl)
+                .take_lease(run, ids::BOX, harness.orch.owner(), ttl)
                 .await
                 .expect("MemStore takes the lease")
         );
@@ -8161,7 +8203,7 @@ mod tests {
             harness
                 .orch
                 .store
-                .take_lease(run, ids::BOX, harness.orch.owner(), now, now + ttl)
+                .take_lease(run, ids::BOX, harness.orch.owner(), ttl)
                 .await
                 .expect("MemStore takes the lease")
         );
@@ -8217,7 +8259,7 @@ mod tests {
             harness
                 .orch
                 .store
-                .take_lease(run, ids::BOX, harness.orch.owner(), now, now + ttl)
+                .take_lease(run, ids::BOX, harness.orch.owner(), ttl)
                 .await
                 .expect("MemStore takes the lease"),
             "the released lease is this harness's to take back"
@@ -8241,14 +8283,16 @@ mod tests {
         };
         let stranger = uuid::Uuid::now_v7();
         let steal = async {
+            // The stranger's clock is past the lease; the walk's heartbeat still reads the
+            // harness clock, which has not moved (MOD-40 blueprint F-33, B24).
             let adopted = harness
                 .orch
                 .store
+                .handle_at(now + ttl + TimeDelta::seconds(1))
                 .adopt_runs(
                     ids::BOX,
                     stranger,
-                    now + ttl + TimeDelta::seconds(1),
-                    now + ttl + TimeDelta::days(1),
+                    TimeDelta::days(1) - TimeDelta::seconds(1),
                 )
                 .await
                 .expect("MemStore adopts");
@@ -8290,6 +8334,180 @@ mod tests {
             !harness.orch.dead_walks.contains(run),
             "plan D140: an abandoned walk's lease is the stranger's, so it is never a dead walk"
         );
+    }
+
+    /// MOD-40 review: a walk whose run another process adopted **mid-session** is refused by the
+    /// store's fence at its next recorder or settle write, not by its heartbeat. That refusal is
+    /// a taken lease all the same: the isolator releases the run's guards once and the caller
+    /// reads `LeaseLost`, so no `shared_serialized` guard outlives the walk. The adopter's lease
+    /// stands.
+    #[tokio::test]
+    async fn a_walk_fenced_mid_session_releases_its_guards() {
+        use std::sync::Arc;
+
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        let stalled = Arc::new(tokio::sync::Notify::new());
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let graphs = harness.orch.graphs();
+        let driver = |_candidate: &SnapshotCandidate,
+                      key: &SessionKey<'_>|
+         -> Box<dyn htui_agent::driver::AgentDriver> {
+            Box::new(SuspendingDriver {
+                inner: harness.orch.driver_for_key(key),
+                stalled: Arc::clone(&stalled),
+                wake: Arc::clone(&wake),
+            })
+        };
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let engine = super::Engine::new(
+            super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
+                .await
+                .expect("the harness has a box"),
+        );
+
+        let mut walk = Box::pin(engine.dispatch(Command::StartRun {
+            item: ids::HTUI_FEAT_3,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        }));
+        if let futures::future::Either::Left(_) =
+            futures::future::select(walk.as_mut(), Box::pin(stalled.notified())).await
+        {
+            panic!("the walk finished instead of suspending mid-session");
+        }
+        let run = harness
+            .orch
+            .store
+            .runs(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|run| run.status == RunStatus::Running)
+            .expect("the suspended walk left the run `running`")
+            .id;
+        let other = harness.orch.restarted();
+        assert_eq!(
+            super::sweep_fake(&other)
+                .await
+                .expect("the sweep adopts")
+                .iter()
+                .map(|adopted| adopted.run)
+                .collect::<Vec<_>>(),
+            [run],
+            "the second process adopts the run mid-session"
+        );
+
+        wake.notify_one();
+        let refused = walk
+            .await
+            .expect_err("the woken session's writes are fenced");
+        assert!(
+            matches!(refused, EngineError::LeaseLost { run: lost } if lost == run),
+            "{refused}"
+        );
+        assert_eq!(
+            harness.orch.isolator.releases(),
+            1,
+            "the fenced walk's guards are released, once"
+        );
+        assert!(
+            other
+                .store
+                .refresh_lease(run, other.owner(), TimeDelta::minutes(1))
+                .await
+                .expect("MemStore refreshes"),
+            "the adopter still holds the lease"
+        );
+    }
+
+    /// An [`AgentDriver`](htui_agent::driver::AgentDriver) whose session signals `stalled` at its
+    /// first pull and waits for `wake` before playing `inner`'s: a walk suspended mid-session.
+    #[derive(Debug)]
+    struct SuspendingDriver {
+        inner: Box<dyn htui_agent::driver::AgentDriver>,
+        stalled: std::sync::Arc<tokio::sync::Notify>,
+        wake: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl htui_agent::driver::AgentDriver for SuspendingDriver {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn caps(&self) -> DriverCaps {
+            self.inner.caps()
+        }
+
+        fn start<'a>(
+            &'a self,
+            spec: htui_agent::driver::SessionSpec,
+            prompt: String,
+        ) -> htui_agent::driver::DriverFuture<'a, Box<dyn htui_agent::driver::AgentSession>>
+        {
+            Box::pin(async move {
+                let inner = self.inner.start(spec, prompt).await?;
+                Ok(Box::new(SuspendingSession {
+                    inner,
+                    suspend: Some((
+                        std::sync::Arc::clone(&self.stalled),
+                        std::sync::Arc::clone(&self.wake),
+                    )),
+                })
+                    as Box<dyn htui_agent::driver::AgentSession>)
+            })
+        }
+    }
+
+    /// [`SuspendingDriver`]'s session: `suspend` is taken by the first pull.
+    #[derive(Debug)]
+    struct SuspendingSession {
+        inner: Box<dyn htui_agent::driver::AgentSession>,
+        suspend: Option<(
+            std::sync::Arc<tokio::sync::Notify>,
+            std::sync::Arc<tokio::sync::Notify>,
+        )>,
+    }
+
+    impl htui_agent::driver::AgentSession for SuspendingSession {
+        fn session_ref(&self) -> Option<&htui_agent::driver::AgentSessionRef> {
+            self.inner.session_ref()
+        }
+
+        fn next_event<'a>(
+            &'a mut self,
+        ) -> htui_agent::driver::DriverFuture<'a, Option<htui_agent::event::DriverEnvelope>>
+        {
+            Box::pin(async move {
+                if let Some((stalled, wake)) = self.suspend.take() {
+                    stalled.notify_one();
+                    wake.notified().await;
+                }
+                self.inner.next_event().await
+            })
+        }
+
+        fn send_follow_up<'a>(
+            &'a mut self,
+            text: String,
+        ) -> htui_agent::driver::DriverFuture<'a, ()> {
+            self.inner.send_follow_up(text)
+        }
+
+        fn answer_permission<'a>(
+            &'a mut self,
+            request_id: htui_agent::driver::PermissionRequestId,
+            answer: htui_agent::driver::PermissionAnswer,
+        ) -> htui_agent::driver::DriverFuture<'a, ()> {
+            self.inner.answer_permission(request_id, answer)
+        }
+
+        fn cancel<'a>(
+            &'a mut self,
+            grace: std::time::Duration,
+        ) -> htui_agent::driver::DriverFuture<'a, ()> {
+            self.inner.cancel(grace)
+        }
     }
 
     /// Plan D122 (review H1): a walk whose every refresh fails stops itself one `refresh` before
@@ -9090,7 +9308,8 @@ mod tests {
                     other
                         .orch
                         .store
-                        .take_lease(run, ids::BOX, stranger, later, until)
+                        .handle_at(later)
+                        .take_lease(run, ids::BOX, stranger, TimeDelta::days(1))
                         .await
                         .expect("MemStore takes the lease"),
                     "the stranger's clock is past this sweep's lease"
@@ -10058,7 +10277,7 @@ mod tests {
         let adopted = harness
             .orch
             .store
-            .adopt_runs(ids::BOX, uuid::Uuid::now_v7(), now, now)
+            .adopt_runs(ids::BOX, uuid::Uuid::now_v7(), TimeDelta::zero())
             .await
             .expect("MemStore adopts");
         assert_eq!(
@@ -10096,6 +10315,44 @@ mod tests {
         assert_eq!(harness.orch.steps(run).await, before, "nothing was walked");
     }
 
+    /// MOD-40 blueprint B26: a live lease another process holds is `LeaseHeld` whatever this
+    /// process's clock says. The engine's clock is two days ahead of the store's, so the old
+    /// check (`lease_expires_at > self.now()`) read the stranger's one-day lease as lapsed and
+    /// answered `RunStatus`; the store refused the take, and the run executes here, so the
+    /// lease is held.
+    #[tokio::test]
+    async fn a_skewed_engine_still_names_a_live_lease_held() {
+        let harness = Harness::new().await;
+        let (run, _) = started(&harness).await;
+        let other = a_live_stranger(&harness, run).await;
+        let before = other.orch.run(run).await;
+        let skewed = crate::fake::TestClock::at(other.orch.clock.now() + TimeDelta::days(2));
+
+        let graphs = other.orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| other.orch.driver_for_key(key);
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let mut parts = super::fake_parts(&other.orch, &graphs, &driver, &scrubber)
+            .await
+            .expect("the harness has a box");
+        parts.clock = &skewed;
+        let engine = super::Engine::new(parts);
+
+        let refused = engine
+            .take_lease(run)
+            .await
+            .expect_err("the first process's lease is live by the store's clock");
+        assert!(
+            matches!(refused, EngineError::LeaseHeld { run: named } if named == run),
+            "{refused}"
+        );
+        assert_eq!(
+            other.orch.run(run).await,
+            before,
+            "the refused take wrote nothing"
+        );
+    }
+
     /// Blueprint A-1: `resume` takes the lease before it resolves or walks, so a run a live
     /// stranger holds is refused and nothing is advanced.
     #[tokio::test]
@@ -10114,12 +10371,7 @@ mod tests {
         let adopted = harness
             .orch
             .store
-            .adopt_runs(
-                ids::BOX,
-                uuid::Uuid::now_v7(),
-                now,
-                now + TimeDelta::days(1),
-            )
+            .adopt_runs(ids::BOX, uuid::Uuid::now_v7(), TimeDelta::days(1))
             .await
             .expect("MemStore adopts");
         assert_eq!(adopted.len(), 1, "the released lease is adoptable at once");
@@ -10210,13 +10462,7 @@ mod tests {
             harness
                 .orch
                 .store
-                .take_lease(
-                    run,
-                    ids::BOX,
-                    harness.orch.owner(),
-                    harness.orch.clock.now(),
-                    harness.orch.clock.now() + TimeDelta::days(1)
-                )
+                .take_lease(run, ids::BOX, harness.orch.owner(), TimeDelta::days(1))
                 .await
                 .expect("MemStore takes the lease"),
             "the first process takes its released lease back, for a day"
@@ -11177,17 +11423,10 @@ mod tests {
                 Box::pin(async move {
                     let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
                     self.orch.clock.advance(ttl + TimeDelta::seconds(1));
-                    let now = self.orch.clock.now();
                     assert!(
                         self.orch
                             .store
-                            .take_lease(
-                                self.run,
-                                ids::BOX,
-                                self.stranger,
-                                now,
-                                now + TimeDelta::days(1)
-                            )
+                            .take_lease(self.run, ids::BOX, self.stranger, TimeDelta::days(1))
                             .await
                             .expect("MemStore takes the lease"),
                         "the accept's lease lapsed, so another process takes it"

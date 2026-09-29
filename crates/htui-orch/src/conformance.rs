@@ -28,7 +28,7 @@ use htui_core::model::{
     BoxEdit, Claim, NewItem, OverlapRule, Quota, QuotaSource, RunKind, Scope, Spend, WorkspaceId,
 };
 use htui_core::prompt::DiffBlock;
-use htui_core::store::{CasOutcome, MemStore, ReadStore as _, WriteStore as _};
+use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -36,7 +36,9 @@ use crate::command::{
     Command, CommandOutcome, EngineError, GateAnswer, OpeningPath, Rest, UnblockCase,
 };
 use crate::engine::{Adopted, Next, Resume};
-use crate::fake::{FakeIsolator, FakeOrchestrator, FakeVerifier, ScriptedStep, TestClock};
+use crate::fake::{
+    FakeIsolator, FakeOrchestrator, FakeVerifier, RESTART_GAP, ScriptedStep, TestClock,
+};
 use crate::isolate::Clock as _;
 use crate::status::RunFailure;
 
@@ -162,6 +164,17 @@ pub trait Orchestrate {
         write_output: bool,
     ) -> Arc<Notify>;
 
+    /// MOD-40 T2: [`stall_after_done`](Self::stall_after_done) with no document, as a
+    /// **suspend** rather than a death — the session signals the first [`Notify`], then awaits
+    /// the second and returns `Ok(None)`, and the walk settles on. A laptop lid, not a kill.
+    #[must_use]
+    fn suspend_after_done(
+        &self,
+        phase: &str,
+        attempt: i32,
+        slot: Option<(i32, u32)>,
+    ) -> (Arc<Notify>, Arc<Notify>);
+
     /// Make stage 3 refuse `phase`'s own prompt (MOD-4 plan D162): its pinned template names a
     /// placeholder no role has, which is ANA-5 criterion 3's literal case.
     fn refuse_prompt(&self, phase: &str);
@@ -253,6 +266,15 @@ impl Orchestrate for FakeOrchestrator {
         Self::stall_after_done(self, phase, attempt, slot, write_output)
     }
 
+    fn suspend_after_done(
+        &self,
+        phase: &str,
+        attempt: i32,
+        slot: Option<(i32, u32)>,
+    ) -> (Arc<Notify>, Arc<Notify>) {
+        Self::suspend_after_done(self, phase, attempt, slot)
+    }
+
     fn refuse_prompt(&self, phase: &str) {
         Self::refuse_prompt(self, phase);
     }
@@ -285,11 +307,11 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Seventy-two, and the count is pinned in two places on purpose — here by
+/// Seventy-three, and the count is pinned in two places on purpose — here by
 /// `cases_are_unique_and_counted` and out of crate by `tests/fake_conformance.rs` —
 /// because a binding that silently ran one fewer of them would still be green.
 ///
-/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18 + 2.
+/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18 + 2 + 1.
 ///
 /// **Eighteen before milestone 4.** Six are `docs/ANA-2.md` §12's validation criteria (1, 2, 3,
 /// 5, 6 and 7); four are contract lines §12 does not number but §4.2 states outright; one is the
@@ -336,6 +358,9 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// **Two for MOD-7 milestone 3** (plan D86, D87): criterion 14's capability half, a refusal at
 /// `StartRun` that writes no run and that `Unblock` reopens, and ANA-2 §4.10's claim-time half, a
 /// run failed by name when its tag was withdrawn after enqueue.
+///
+/// **One for MOD-40 milestone 1** (plan D1, D2): a suspended walk, woken after another process
+/// adopted its run, writes nothing to the step.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -502,6 +527,9 @@ pub const CASES: &[&str] = &[
     "close_out_writes_one_summary_and_closes_the_item",
     // Criterion 20: close-out is refused while a run of the item is live, and writes nothing.
     "close_out_is_refused_while_a_run_is_live",
+    // MOD-40 plan D1, D2: a walk that wakes after another process adopted its run writes nothing
+    // to the step.
+    "a_suspended_walk_cannot_write_after_adoption",
 ];
 
 /// Run one case by name.
@@ -517,7 +545,7 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
 ///
 /// A plain function rather than a `match` inside [`run_case`]'s own body, and that is about the
 /// stack, not style: an unoptimised build gives every arm's case future its own stack slot, so a
-/// seventy-two-arm `match` in an `async fn` puts all seventy-two in the one frame every case is
+/// seventy-three-arm `match` in an `async fn` puts all seventy-three in the one frame every case is
 /// then polled beneath, and the recovery cases' walks overflowed a test thread's 2 MiB. Here the
 /// slots are gone before the first poll.
 ///
@@ -712,6 +740,9 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         }
         "close_out_is_refused_while_a_run_is_live" => {
             Box::pin(close_out_is_refused_while_a_run_is_live(harness))
+        }
+        "a_suspended_walk_cannot_write_after_adoption" => {
+            Box::pin(a_suspended_walk_cannot_write_after_adoption(harness))
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -3981,7 +4012,6 @@ async fn a_parked_run_releases_its_lease_and_an_answer_takes_it<H: CaseHarness>(
         "the second process walked `plan` and parked at its gate"
     );
 
-    let later = other.clock().now() + TimeDelta::minutes(1);
     assert_eq!(
         run_of(&orch, run).await.lease_expires_at,
         Some(other.clock().now()),
@@ -3990,7 +4020,7 @@ async fn a_parked_run_releases_its_lease_and_an_answer_takes_it<H: CaseHarness>(
     assert!(
         !orch
             .store()
-            .refresh_lease(run, orch.owner(), later)
+            .refresh_lease(run, orch.owner(), TimeDelta::minutes(1))
             .await
             .expect("MemStore refreshes"),
         "and no longer the first's"
@@ -4010,8 +4040,7 @@ async fn a_live_lease_blocks_an_answer_from_another_process<H: CaseHarness>(harn
                 run,
                 ids::BOX,
                 orch.owner(),
-                orch.clock().now(),
-                other.clock().now() + TimeDelta::days(1)
+                TimeDelta::days(1) + RESTART_GAP
             )
             .await
             .expect("MemStore takes the lease"),
@@ -4043,6 +4072,110 @@ async fn a_live_lease_blocks_an_answer_from_another_process<H: CaseHarness>(harn
     assert_eq!(step.status, StepStatus::AwaitingApproval);
     assert_eq!(step.gate_outcome, None, "plan D108: nothing written");
     assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
+}
+
+/// MOD-40 plan D1, D2 (ANA-16 C1): a walk suspended between its session and its settle, whose run
+/// another process adopted meanwhile, wakes and writes nothing to the step. Its `finish_step` is
+/// fenced by the owner it walked under, and so is a recorder built the way the engine builds one.
+/// The adopter's row and log stand. The fence reads as a taken lease: the caller gets `LeaseLost`
+/// and the isolator releases the run's guards once, as a heartbeat's abandon would.
+async fn a_suspended_walk_cannot_write_after_adoption<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    let (stalled, wake) = orch.suspend_after_done("prd", 1, None);
+    let mut walk = Box::pin(orch.dispatch(Command::StartRun {
+        item: ids::HTUI_FEAT_3,
+        mode: RunMode::Manual,
+        repo_scope: None,
+    }));
+    if let Either::Left(_) =
+        futures::future::select(walk.as_mut(), Box::pin(stalled.notified())).await
+    {
+        panic!("the walk finished instead of suspending");
+    }
+    let run = orch
+        .store()
+        .runs(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .find(|run| run.status == RunStatus::Running)
+        .expect("the suspended walk left the run `running`")
+        .id;
+    let prd = step_at(&orch, run, 0, 1).await;
+
+    let other = orch.restarted();
+    assert_eq!(
+        other.sweep().await.expect("the sweep adopts"),
+        [Adopted {
+            run,
+            next: Next::Walk
+        }]
+    );
+    let adopted = step_at(&other, run, 0, 1).await;
+    assert_eq!(
+        (adopted.status, adopted.gate_note.as_deref()),
+        (StepStatus::Failed, Some("interrupted")),
+        "the adopter settled `prd` as interrupted (plan D89)"
+    );
+    let log = orch
+        .store()
+        .step_events(prd.id)
+        .await
+        .expect("MemStore never fails a read");
+
+    wake.notify_one();
+    let woke = walk.await;
+    assert!(
+        matches!(&woke, Err(EngineError::LeaseLost { run: lost }) if *lost == run),
+        "{woke:?}"
+    );
+    assert_eq!(
+        orch.isolator().releases(),
+        1,
+        "the fenced walk's guards are released, once"
+    );
+    assert_eq!(
+        step_at(&other, run, 0, 1).await,
+        adopted,
+        "the woken settle wrote nothing"
+    );
+    assert_eq!(
+        orch.store()
+            .step_events(prd.id)
+            .await
+            .expect("MemStore never fails a read"),
+        log
+    );
+
+    let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+    let mut recorder =
+        htui_agent::record::Recorder::new(orch.store(), &scrubber, prd.id, false, None)
+            .with_fence(StepFence::Lease(orch.owner()));
+    let refused = recorder
+        .record_prompt("woken", serde_json::json!([]), orch.clock().now())
+        .await;
+    assert!(
+        matches!(&refused, Err(htui_agent::record::RecordError::Store(
+            htui_core::store::StoreError::Fenced { step })) if *step == prd.id),
+        "{refused:?}"
+    );
+    assert_eq!(
+        orch.store()
+            .step_events(prd.id)
+            .await
+            .expect("MemStore never fails a read"),
+        log
+    );
+    assert!(
+        other
+            .store()
+            .refresh_lease(run, other.owner(), TimeDelta::minutes(1))
+            .await
+            .expect("MemStore refreshes"),
+        "the adopter still holds the lease"
+    );
 }
 
 // -- MOD-4 milestone 5: the recovery sweep (plan D89-D98, blueprint A-2, A-3) -----------------------
@@ -4642,7 +4775,7 @@ async fn the_sweep_never_touches_a_parked_run_or_a_live_lease<H: CaseHarness>(ha
     let other = orch.restarted();
     assert!(
         orch.store()
-            .refresh_lease(live, orch.owner(), other.clock().now() + TimeDelta::days(1))
+            .refresh_lease(live, orch.owner(), TimeDelta::days(1) + RESTART_GAP)
             .await
             .expect("MemStore refreshes"),
         "the first process's heartbeat is still beating"
@@ -4867,8 +5000,7 @@ async fn cancel_meets_a_live_lease_and_writes_nothing<H: CaseHarness>(harness: &
                 run,
                 ids::BOX,
                 orch.owner(),
-                orch.clock().now(),
-                other.clock().now() + TimeDelta::days(1)
+                TimeDelta::days(1) + RESTART_GAP
             )
             .await
             .expect("MemStore takes the lease"),
@@ -5755,8 +5887,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            72,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            73,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -5776,7 +5908,8 @@ mod tests {
              criterion 3's running run parked on a topology mismatch, a cancel meeting a live \
              lease, four promotions, five accepts, `Unblock`'s three cases, and criterion \
              20's close-out and its refusal), and MOD-7 milestone 3's two (criterion 14's \
-             capability half and §4.10's claim-time half)"
+             capability half and §4.10's claim-time half), and MOD-40 milestone 1's one (a \
+             suspended walk fenced after adoption)"
         );
     }
 

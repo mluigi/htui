@@ -6,12 +6,8 @@
 //! conformance suite can drive a walk that touches no filesystem at all. The four `R-ORCH-8`
 //! isolation modes are milestone 3's; nothing here knows what a worktree is.
 //!
-//! `Clock` is here rather than in `engine.rs` for a build-order reason worth stating: `fake.rs`'s
-//! `TestClock` implements it and `engine.rs` is still a stub, so the trait has to exist in a module
-//! T3 owns. `isolate.rs` is the one it belongs in — these are the crate's two *injected*
-//! non-store seams, both `Send + Sync`, both held by the engine as a `&'a` borrow, and both
-//! doubled by `fake.rs`. T4's `engine.rs` uses them from here; the blueprint's §5.1 placement is
-//! recorded as moved rather than silently ignored.
+//! `Clock` and `SystemClock` live in `htui_core::clock` since MOD-40 plan D11 and are re-exported
+//! here, so every path that named them still does.
 
 use core::fmt;
 use std::collections::BTreeMap;
@@ -19,16 +15,14 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use chrono::{DateTime, SubsecRound as _, Utc};
-use htui_core::model::{
-    Isolation, RepoId, RunId, RunStepCommit, RunStepTree, StepId, TIMESTAMPTZ_DIGITS,
-};
+use htui_core::model::{Isolation, RepoId, RunId, RunStepCommit, RunStepTree, StepId};
 use htui_core::prompt::DiffBlock;
 
 pub mod copy;
 pub mod git;
 pub mod real;
 
+pub use htui_core::clock::{Clock, SystemClock};
 pub use real::{GixIsolator, IsolatorConfig, RepoCheckout};
 
 /// The boxed future every [`Isolator`] method returns.
@@ -241,51 +235,4 @@ pub trait Isolator: Send + Sync + fmt::Debug {
     /// [`cleanup`](Isolator::cleanup) also releases them, but it removes trees, which would
     /// destroy what the process that adopts the run has to read.
     fn release<'a>(&'a self, run: RunId) -> IsolatorFuture<'a, ()>;
-}
-
-/// The one place an instant enters the walk (plan D8).
-///
-/// Every seam writer milestone 1 shipped takes its `at` from the caller, so the engine owns the
-/// clock; and `docs/ANA-2.md:1766-1768` requires the harness's settle snapshots to be sleep-free,
-/// so the engine must be able to be handed a clock a test moves. `fake::TestClock` is that clock
-/// (both are behind `test-support`, so neither is linked from here: a doc link into a gated module
-/// is `broken_intra_doc_links` in a plain `cargo doc`).
-pub trait Clock: Send + Sync {
-    /// Now, already truncated to the column's resolution.
-    ///
-    /// The truncation is the contract, not an implementation detail: `TIMESTAMPTZ` keeps
-    /// microseconds and `chrono` keeps nanoseconds, so an untruncated instant round-trips
-    /// differently through Postgres than through `MemStore` and the two backends disagree about a
-    /// column neither changed (`crates/htui-core/src/model/run.rs:272`).
-    fn now(&self) -> DateTime<Utc>;
-}
-
-/// The production [`Clock`]: `Utc::now()`, truncated.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now(&self) -> DateTime<Utc> {
-        Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use chrono::{SubsecRound as _, Utc};
-    use htui_core::model::TIMESTAMPTZ_DIGITS;
-
-    use super::{Clock as _, SystemClock};
-
-    /// Plan D8's whole point: a stamp that survives a Postgres round trip unchanged.
-    #[test]
-    fn system_clock_is_microsecond_truncated() {
-        let now = SystemClock.now();
-        assert_eq!(now, now.trunc_subsecs(TIMESTAMPTZ_DIGITS));
-        assert_eq!(now.timestamp_subsec_nanos() % 1_000, 0);
-        assert!(
-            (Utc::now() - now).num_seconds().abs() < 5,
-            "the production clock is the wall clock"
-        );
-    }
 }

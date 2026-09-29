@@ -165,7 +165,10 @@ async fn an_agent_no_fixture_contains_appears_from_its_row_alone() {
     extra.id = AgentId::new();
     extra.name = "kappa".to_owned();
     extra.default_model = Some("k1".to_owned());
-    store.upsert_agent(&extra).await.expect("the row saves");
+    store
+        .upsert_agent(&extra, None)
+        .await
+        .expect("the row saves");
 
     let mut harness = settings_over(store).await;
     let frame = harness.render();

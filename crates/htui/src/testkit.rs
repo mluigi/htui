@@ -261,6 +261,7 @@ impl Harness {
                         StoreReply::StoreState {
                             label: label.clone(),
                             migrations_pending: *migrations_pending,
+                            below_target: None,
                         }
                     }
                     (
@@ -492,6 +493,7 @@ impl Harness {
                         StoreReply::StoreState {
                             label: label.clone(),
                             migrations_pending: *migrations_pending,
+                            below_target: None,
                         }
                     }
                     (request, _) => store_worker::serve(&self.backend, request).await,

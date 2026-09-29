@@ -96,9 +96,9 @@ use htui_agent::conformance::{Script, ScriptEvent};
 use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk};
 use htui_agent::fake::FakeAdapter;
 use htui_agent::registry::{DriverFactory, caps_for};
-use htui_core::fixtures::ids;
+use htui_core::fixtures::{edit_agent, ids};
 use htui_core::model::{Agent, EventKind, SessionEvent, Transport, UsageTotals};
-use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+use htui_core::store::{MemStore, ReadStore as _};
 use htui_store::Backend;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -196,7 +196,7 @@ async fn the_seeded_cli_row_banners_its_three_missing_capabilities() {
         if summary.agent.id != agent.id {
             let mut row = summary.agent;
             row.enabled = false;
-            store.upsert_agent(&row).await.expect("the row is disabled");
+            edit_agent(&store, &row).await.expect("the row is disabled");
         }
     }
 

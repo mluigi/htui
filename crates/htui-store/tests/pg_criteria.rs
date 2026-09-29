@@ -18,16 +18,18 @@ use chrono::{DateTime, SubsecRound as _, TimeDelta, Utc};
 use futures::future::join_all;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, Claim, CommandRunId, CommandRunStatus, GraphSnapshot,
-    Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, NewCommandRun, NewItem,
-    NewProject, NewRepo, NewRequirement, NewRun, NewWorkspace, Priority, ProjectId, RepoId,
-    RequirementId, RunId, RunMode, RunStatus, RunStepTree, SnapshotGraph, SnapshotSettings, Status,
-    StepId, TIMESTAMPTZ_DIGITS, Transport, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    Agent, AgentBox, AgentId, Billing, BoxId, Claim, CommandRunId, CommandRunStatus, EventKind,
+    EventRole, GraphSnapshot, Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch,
+    NewCommandRun, NewItem, NewProject, NewRepo, NewRequirement, NewRun, NewWorkspace, Priority,
+    ProjectId, RepoId, RequirementId, RunId, RunMode, RunStatus, RunStepTree, SessionEvent,
+    SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome, TIMESTAMPTZ_DIGITS, Transport,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
+use htui_core::store::conformance::assert_leased_for;
 use htui_core::store::{
-    CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, SettingRung, UpdateOutcome,
+    CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, SettingRung, StepFence, UpdateOutcome,
     WriteStore as _,
 };
 use htui_store::PgStore;
@@ -677,11 +679,11 @@ async fn admission_is_serialised_by_the_box_row_lock() {
         .expect("second pool")
         .store;
     let at = Utc::now();
-    let until = at + TimeDelta::minutes(5);
+    let ttl = TimeDelta::minutes(5);
     let (one, two) = tokio::join!(
         db.store
-            .claim_run(first, ids::BOX, uuid::Uuid::now_v7(), at, until),
-        other.claim_run(second, ids::BOX, uuid::Uuid::now_v7(), at, until),
+            .claim_run(first, ids::BOX, uuid::Uuid::now_v7(), at, ttl),
+        other.claim_run(second, ids::BOX, uuid::Uuid::now_v7(), at, ttl),
     );
     let one = one.expect("the first claim must not fail");
     let two = two.expect("the second claim must not fail");
@@ -756,11 +758,11 @@ async fn two_sweeps_adopt_each_expired_run_once() {
             .id;
         assert_eq!(
             db.store
-                .claim_run(run, ids::BOX, crashed, at, at - TimeDelta::minutes(1))
+                .claim_run(run, ids::BOX, crashed, at, TimeDelta::zero())
                 .await
                 .expect("the claim must not fail"),
             Claim::Admitted,
-            "both runs fit the fixture box's two slots, under a lease already expired"
+            "both runs fit the fixture box's two slots, under a lease that lapses at once"
         );
         expired.push(run);
     }
@@ -769,11 +771,10 @@ async fn two_sweeps_adopt_each_expired_run_once() {
         .await
         .expect("second pool")
         .store;
-    let until = at + TimeDelta::minutes(5);
     let (a, b) = tokio::join!(
         db.store
-            .adopt_runs(ids::BOX, uuid::Uuid::now_v7(), at, until),
-        other.adopt_runs(ids::BOX, uuid::Uuid::now_v7(), at, until),
+            .adopt_runs(ids::BOX, uuid::Uuid::now_v7(), TimeDelta::minutes(5)),
+        other.adopt_runs(ids::BOX, uuid::Uuid::now_v7(), TimeDelta::minutes(5)),
     );
     let a: Vec<RunId> = a
         .expect("the first sweep must not fail")
@@ -828,7 +829,7 @@ async fn two_takes_of_one_released_lease_admit_one() {
         .id;
     assert_eq!(
         db.store
-            .claim_run(run, ids::BOX, first_owner, at, at + TimeDelta::minutes(5))
+            .claim_run(run, ids::BOX, first_owner, at, TimeDelta::minutes(5))
             .await
             .expect("the claim must not fail"),
         Claim::Admitted,
@@ -843,7 +844,7 @@ async fn two_takes_of_one_released_lease_admit_one() {
     );
     assert!(
         db.store
-            .release_lease(run, first_owner, at)
+            .release_lease(run, first_owner)
             .await
             .expect("the release must not fail"),
         "the walk that parked it releases its lease (owner cleared, lease_expires_at = now: plan D139)"
@@ -853,11 +854,11 @@ async fn two_takes_of_one_released_lease_admit_one() {
         .await
         .expect("second pool")
         .store;
-    let (one_until, two_until) = (at + TimeDelta::minutes(10), at + TimeDelta::minutes(20));
+    let (one_ttl, two_ttl) = (TimeDelta::minutes(10), TimeDelta::minutes(20));
     let (one, two) = tokio::join!(
         db.store
-            .take_lease(run, ids::BOX, uuid::Uuid::now_v7(), at, one_until),
-        other.take_lease(run, ids::BOX, uuid::Uuid::now_v7(), at, two_until),
+            .take_lease(run, ids::BOX, uuid::Uuid::now_v7(), one_ttl),
+        other.take_lease(run, ids::BOX, uuid::Uuid::now_v7(), two_ttl),
     );
     let one = one.expect("the first take must not fail");
     let two = two.expect("the second take must not fail");
@@ -867,16 +868,191 @@ async fn two_takes_of_one_released_lease_admit_one() {
         1,
         "exactly one take may win a released lease, got ({one}, {two})"
     );
-    let winner = if one { one_until } else { two_until };
-    assert_eq!(
-        db.store
+    // The two TTLs are ten minutes apart, so the helper's one-second window tells them apart.
+    let winner = if one { one_ttl } else { two_ttl };
+    assert_leased_for(
+        "two_takes_of_one_released_lease_admit_one",
+        &db.store
             .run(run)
             .await
             .expect("read must not fail")
+            .expect("the run exists"),
+        winner,
+        "the stored expiry is the winner's",
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-40 plan D10 (C2): every lease a lease method writes, and every expiry one compares, is
+/// the database's `clock_timestamp()`. The caller's clock is a day slow and enters nothing but
+/// `started_at` (blueprint B25). Each expiry lies between two `clock_timestamp()` reads taken
+/// around its write, plus the TTL.
+#[tokio::test(flavor = "multi_thread")]
+async fn lease_times_are_the_databases() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (a, b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let slow = (Utc::now() - TimeDelta::days(1)).trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let (pool, store) = (&db.pool, &db.store);
+    let db_now = || async move {
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT clock_timestamp()")
+            .fetch_one(pool)
+            .await
+            .expect("read the database's clock")
+    };
+    let row = || async move {
+        store
+            .run(ids::RUN_2)
+            .await
+            .expect("read must not fail")
             .expect("the run exists")
-            .lease_expires_at,
-        Some(winner),
-        "the stored expiry is the winner's"
+    };
+    let bracketed = |lease: Option<DateTime<Utc>>,
+                     from: DateTime<Utc>,
+                     to: DateTime<Utc>,
+                     ttl: TimeDelta,
+                     what: &str| {
+        let lease = lease.unwrap_or_else(|| panic!("{what}: no lease"));
+        assert!(
+            from + ttl <= lease && lease <= to + ttl,
+            "{what}: {lease} is not the database's clock plus {ttl} (read {from} .. {to})"
+        );
+    };
+
+    let from = db_now().await;
+    assert_eq!(
+        store
+            .claim_run(ids::RUN_2, ids::BOX, a, slow, TimeDelta::minutes(5))
+            .await
+            .expect("the claim must not fail"),
+        Claim::Admitted,
+        "A claims the queued fixture run"
+    );
+    let to = db_now().await;
+    let claimed = row().await;
+    assert_eq!(
+        claimed.started_at,
+        Some(slow),
+        "started_at is the caller's clock (B25)"
+    );
+    bracketed(
+        claimed.lease_expires_at,
+        from,
+        to,
+        TimeDelta::minutes(5),
+        "the claim",
+    );
+
+    let from = db_now().await;
+    assert!(
+        store
+            .refresh_lease(ids::RUN_2, a, TimeDelta::minutes(10))
+            .await
+            .expect("the refresh must not fail"),
+        "A refreshes its own lease"
+    );
+    let to = db_now().await;
+    bracketed(
+        row().await.lease_expires_at,
+        from,
+        to,
+        TimeDelta::minutes(10),
+        "the refresh",
+    );
+
+    let from = db_now().await;
+    assert!(
+        store
+            .take_lease(ids::RUN_2, ids::BOX, a, TimeDelta::minutes(15))
+            .await
+            .expect("the take must not fail"),
+        "A renews its own lease"
+    );
+    let to = db_now().await;
+    bracketed(
+        row().await.lease_expires_at,
+        from,
+        to,
+        TimeDelta::minutes(15),
+        "the renewal",
+    );
+
+    let from = db_now().await;
+    assert!(
+        store
+            .release_lease(ids::RUN_2, a)
+            .await
+            .expect("the release must not fail"),
+        "A gives its lease back"
+    );
+    let to = db_now().await;
+    bracketed(
+        row().await.lease_expires_at,
+        from,
+        to,
+        TimeDelta::zero(),
+        "the release",
+    );
+
+    let from = db_now().await;
+    let adopted = store
+        .adopt_runs(ids::BOX, b, TimeDelta::minutes(7))
+        .await
+        .expect("the sweep must not fail");
+    let to = db_now().await;
+    assert_eq!(
+        adopted.iter().map(|run| run.id).collect::<Vec<_>>(),
+        [ids::RUN_2],
+        "B's sweep adopts the released run"
+    );
+    bracketed(
+        row().await.lease_expires_at,
+        from,
+        to,
+        TimeDelta::minutes(7),
+        "the adoption",
+    );
+
+    // Expiry is compared on the database's clock too: a lease planted 1 s in the past is a
+    // stranger's to take, one planted an hour ahead is not, whatever the caller's clock says.
+    let plant = |seconds: i64, owner: uuid::Uuid| async move {
+        sqlx::query(
+            "UPDATE run SET lease_owner = $1, \
+                            lease_expires_at = clock_timestamp() + $2 * interval '1 second' \
+              WHERE id = $3",
+        )
+        .bind(owner)
+        .bind(seconds)
+        .bind(ids::RUN_2.as_uuid())
+        .execute(pool)
+        .await
+        .expect("plant a lease");
+    };
+    plant(-1, b).await;
+    assert!(
+        store
+            .take_lease(ids::RUN_2, ids::BOX, a, TimeDelta::minutes(5))
+            .await
+            .expect("the take must not fail"),
+        "a lease lapsed by the database's clock is taken"
+    );
+    plant(60 * 60, b).await;
+    assert!(
+        !store
+            .take_lease(ids::RUN_2, ids::BOX, a, TimeDelta::minutes(5))
+            .await
+            .expect("the take must not fail"),
+        "a lease live by the database's clock is refused"
+    );
+    assert!(
+        store
+            .adopt_runs(ids::BOX, a, TimeDelta::minutes(5))
+            .await
+            .expect("the sweep must not fail")
+            .is_empty(),
+        "and not swept"
     );
 
     db.drop_db().await;
@@ -1013,6 +1189,7 @@ async fn set_step_usage_keeps_the_digest_a_none_call_does_not_supply() {
 
     db.store
         .set_step_usage(
+            StepFence::Unleased,
             step,
             serde_json::json!({ "input_tokens": 11 }),
             Some("d1ge57".to_owned()),
@@ -1030,6 +1207,7 @@ async fn set_step_usage_keeps_the_digest_a_none_call_does_not_supply() {
 
     db.store
         .set_step_usage(
+            StepFence::Unleased,
             step,
             serde_json::json!({ "input_tokens": 30, "output_tokens": 40 }),
             None,
@@ -1047,7 +1225,12 @@ async fn set_step_usage_keeps_the_digest_a_none_call_does_not_supply() {
     );
 
     db.store
-        .set_step_usage(step, serde_json::json!({}), Some("f00d".to_owned()))
+        .set_step_usage(
+            StepFence::Unleased,
+            step,
+            serde_json::json!({}),
+            Some("f00d".to_owned()),
+        )
         .await
         .expect("a second digest write must land");
     assert_eq!(
@@ -1094,7 +1277,12 @@ async fn set_step_prompt_writes_only_the_digest_and_the_record() {
 
     // Something in every column the write must not disturb, so "unchanged" is a real claim.
     db.store
-        .set_step_usage(step, serde_json::json!({ "input_tokens": 7 }), None)
+        .set_step_usage(
+            StepFence::Unleased,
+            step,
+            serde_json::json!({ "input_tokens": 7 }),
+            None,
+        )
         .await
         .expect("the usage write lands");
     db.store
@@ -1160,12 +1348,11 @@ async fn set_step_prompt_writes_only_the_digest_and_the_record() {
 
 /// `PgStore::upsert_agent` read back through the inherent `agents()` (MOD-2 plan D3): a second
 /// write of the same `agent.id` updates the row **in place** - one row, the new column values - and
-/// `created_at` survives it, because the insert supplies it and the `DO UPDATE SET` list does not
+/// `created_at` survives it, because the insert supplies it and the edit's `SET` list does not
 /// (§5.7). `updated_at` is the migration's `BEFORE UPDATE` trigger's, not the caller's.
 ///
-/// `store::conformance`'s `upsert_agent_by_id_name_unique` can only assert that the second write is
-/// *accepted*: `upsert_agent` is a [`htui_core::store::WriteStore`] method while the registry read
-/// is inherent, so no conformance case can read the row back. This is that read-back.
+/// `store::conformance`'s `upsert_agent_by_id_name_unique` reads the row back from the outcome
+/// (MOD-40 plan D5); this is the registry read-back, a second reader of the same row.
 #[tokio::test(flavor = "multi_thread")]
 async fn upsert_agent_updates_in_place_and_keeps_created_at() {
     let Some(db) = common::demo_db().await else {
@@ -1188,10 +1375,18 @@ async fn upsert_agent_updates_in_place_and_keeps_created_at() {
         created_at: created,
         updated_at: created,
     };
-    db.store
-        .upsert_agent(&inserted)
+    match db
+        .store
+        .upsert_agent(&inserted, None)
         .await
-        .expect("the insert must land");
+        .expect("the insert must land")
+    {
+        CasOutcome::Applied(row) => assert_eq!(
+            row, inserted,
+            "the create answers the row as stored, which is the row given: the literal is µs"
+        ),
+        stale @ CasOutcome::Stale(_) => panic!("a fresh id cannot be Stale, got {stale:?}"),
+    }
     assert_eq!(
         agent_row(&db.store, id).await,
         inserted,
@@ -1221,16 +1416,21 @@ async fn upsert_agent_updates_in_place_and_keeps_created_at() {
         updated_at: far_future,
         ..inserted.clone()
     };
-    db.store
-        .upsert_agent(&updated)
+    let edited = db
+        .store
+        .upsert_agent(&updated, Some(inserted.updated_at))
         .await
         .expect("the update must land");
+    assert!(
+        matches!(edited, CasOutcome::Applied(_)),
+        "the insert's own stamp is the current token, got {edited:?}"
+    );
 
     let registry = db.store.agents().await.expect("agents must not fail");
     assert_eq!(
         registry.iter().filter(|row| row.agent.id == id).count(),
         1,
-        "the second write updated the row in place: `ON CONFLICT (id)`, no second row"
+        "the second write updated the row in place: an `UPDATE` by id, no second row"
     );
     assert_eq!(
         registry.len(),
@@ -1253,8 +1453,8 @@ async fn upsert_agent_updates_in_place_and_keeps_created_at() {
             updated_at: after.agent.updated_at,
             ..updated.clone()
         },
-        "every column in the `DO UPDATE SET` list took the second write's value, and `created_at` \
-         is still the insert's"
+        "every column in the edit's `SET` list took the second write's value, and `created_at` is \
+         still the insert's"
     );
     assert_ne!(
         after.agent.created_at, far_future,
@@ -1591,15 +1791,18 @@ async fn set_agent_box_quota_leaves_probe_byte_identical() {
     let quota_at: DateTime<Utc> = "2026-09-10T09:00:00.000456Z"
         .parse()
         .expect("a microsecond-precision literal");
-    db.store
-        .set_agent_box_quota(
-            ids::AGENT_CLAUDE,
-            db.store.this_box(),
-            quota.clone(),
-            quota_at,
-        )
-        .await
-        .expect("the latch lands on the probed row");
+    assert!(
+        db.store
+            .set_agent_box_quota(
+                ids::AGENT_CLAUDE,
+                db.store.this_box(),
+                quota.clone(),
+                quota_at,
+            )
+            .await
+            .expect("the latch lands on the probed row"),
+        "a first latch writes"
+    );
 
     let row = sqlx::query(
         "SELECT probe, quota, quota_at, updated_at, enabled, version, path, probed_at \
@@ -1661,7 +1864,7 @@ async fn set_agent_box_quota_leaves_probe_byte_identical() {
                 ..
             })
         ),
-        "`rows_affected() == 0` is the `NotFound`; there is no insert path, got {missing:?}"
+        "a key no row has is the `NotFound`; there is no insert path, got {missing:?}"
     );
 
     db.drop_db().await;
@@ -1790,6 +1993,152 @@ async fn an_upsert_can_neither_set_nor_clear_the_quota_columns() {
         "clearing a latch is `set_agent_box_quota`'s too; an upsert has no way to do it"
     );
     assert_eq!(quota_at, Some(latched_at));
+
+    db.drop_db().await;
+}
+
+/// MOD-40 plan D4: a latch older than the stored `quota_at` writes **nothing** — the whole row,
+/// read as `jsonb`, is byte-identical across it, `updated_at` included: a guarded `UPDATE` that
+/// matched no row fires no `BEFORE UPDATE` trigger. The conformance case
+/// `an_older_quota_is_a_no_op` pins the order through the seam; this is the SQL-level read-back.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_quota_leaves_the_row_byte_identical() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    // Microsecond literals, `timestamptz`'s resolution, as the latch case above.
+    let probed_at: DateTime<Utc> = "2026-09-10T06:00:00.000123Z"
+        .parse()
+        .expect("a microsecond-precision literal");
+    let t2: DateTime<Utc> = "2026-09-10T09:00:00.000456Z"
+        .parse()
+        .expect("a microsecond-precision literal");
+    let t1 = t2 - TimeDelta::minutes(1);
+    let box_id = db.store.this_box();
+    db.store
+        .upsert_agent_box(&AgentBox {
+            agent_id: ids::AGENT_CLAUDE,
+            box_id,
+            enabled: true,
+            version: Some("0.7.1".to_owned()),
+            path: Some("/usr/bin/node".to_owned()),
+            probed_at: Some(probed_at),
+            quota: None,
+            quota_at: None,
+            updated_at: probed_at,
+            probe: Some(serde_json::json!({ "status": "ready", "source": "probe" })),
+        })
+        .await
+        .expect("the probe row lands");
+    assert!(
+        db.store
+            .set_agent_box_quota(ids::AGENT_CLAUDE, box_id, serde_json::json!({ "v": 2 }), t2)
+            .await
+            .expect("the newer latch finds its row"),
+        "the first latch writes"
+    );
+    let row = || async {
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT to_jsonb(ab) FROM agent_box ab WHERE agent_id = $1 AND box_id = $2",
+        )
+        .bind(ids::AGENT_CLAUDE.as_uuid())
+        .bind(box_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the latched row")
+    };
+    let before = row().await;
+
+    assert!(
+        !db.store
+            .set_agent_box_quota(ids::AGENT_CLAUDE, box_id, serde_json::json!({ "v": 1 }), t1)
+            .await
+            .expect("the older latch finds its row"),
+        "an older latch is refused"
+    );
+    assert_eq!(
+        row().await,
+        before,
+        "a refused latch leaves the whole row byte-identical, `updated_at` included"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-40 plan D7 (C4): the box heartbeat stamps `last_seen_at` with the server's clock and
+/// touches nothing else. The rest of the row is read as `jsonb` minus the two columns the beat
+/// and its trigger move, and compared whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn touch_box_advances_last_seen_at() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let id = db.store.this_box();
+    let row = || async {
+        let row = sqlx::query(
+            "SELECT last_seen_at, to_jsonb(b) - 'last_seen_at' - 'updated_at' AS rest \
+             FROM box b WHERE id = $1",
+        )
+        .bind(id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the registered box row");
+        (
+            row.get::<DateTime<Utc>, _>("last_seen_at"),
+            row.get::<serde_json::Value, _>("rest"),
+        )
+    };
+    let (seen0, rest0) = row().await;
+    let server: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the server clock");
+
+    assert!(
+        db.store
+            .touch_box(id)
+            .await
+            .expect("the heartbeat reaches the server"),
+        "the registered box has a row to touch"
+    );
+    let (seen1, rest1) = row().await;
+    assert!(
+        seen1 > seen0,
+        "the beat moved `last_seen_at`: {seen0} -> {seen1}"
+    );
+    assert!(
+        seen1 >= server,
+        "the stamp is the server's, taken after the read: {seen1} < {server}"
+    );
+    assert_eq!(
+        rest1, rest0,
+        "a heartbeat writes `last_seen_at` and nothing a person, the probe or registration owns; \
+         `edit_version` included"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-40 plan D7: a heartbeat for an id with no row answers `false` and inserts nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn touch_box_on_an_unknown_box_is_false() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let before = common::count(&db.pool, "box").await;
+
+    assert!(
+        !db.store
+            .touch_box(BoxId::new())
+            .await
+            .expect("a heartbeat for an unknown id is not an error"),
+        "an unknown id has no row to touch"
+    );
+    assert_eq!(
+        common::count(&db.pool, "box").await,
+        before,
+        "no insert path: an unknown id is `false`, never a row"
+    );
 
     db.drop_db().await;
 }
@@ -3559,7 +3908,6 @@ async fn finish_run_holds_the_item_while_another_run_is_live() {
     };
     let owner = uuid::Uuid::now_v7();
     let at = Utc::now();
-    let until = at + TimeDelta::minutes(5);
 
     let closed_at = async |item: ItemId| {
         sqlx::query_scalar!(
@@ -3593,7 +3941,7 @@ async fn finish_run_holds_the_item_while_another_run_is_live() {
     for run in [left, right] {
         assert_eq!(
             db.store
-                .claim_run(run, ids::BOX, owner, at, until)
+                .claim_run(run, ids::BOX, owner, at, TimeDelta::minutes(5))
                 .await
                 .expect("the claim must not fail"),
             Claim::Admitted,
@@ -3734,10 +4082,9 @@ async fn a_missing_tags_run_aimed_at_another_box_is_not_claimable() {
 
     let at = Utc::now();
     let owner = uuid::Uuid::now_v7();
-    let until = at + TimeDelta::minutes(5);
     assert_eq!(
         db.store
-            .claim_run(run.id, ids::BOX, owner, at, until)
+            .claim_run(run.id, ids::BOX, owner, at, TimeDelta::minutes(5))
             .await
             .expect("the claim is answered"),
         Claim::NotClaimable,
@@ -3753,7 +4100,7 @@ async fn a_missing_tags_run_aimed_at_another_box_is_not_claimable() {
     // through, which is `Ok(false)` when no lease owner matches.
     assert!(
         !db.store
-            .refresh_lease(run.id, owner, until)
+            .refresh_lease(run.id, owner, TimeDelta::minutes(5))
             .await
             .expect("the lease refresh is answered"),
         "the refusal took no lease"
@@ -3816,13 +4163,9 @@ async fn a_run_with_no_item_is_never_refused_for_tags() {
     .expect("plant a queued run with no item");
 
     let owner = uuid::Uuid::now_v7();
-    // `timestamptz` is microsecond-resolution, so the lease comes back truncated from the
-    // nanoseconds it was handed. `MemStore` keeps every digit, which is why the same assertion
-    // needs no truncation there; `ChatRunSpec::mint` truncates for the same reason.
-    let until = (at + TimeDelta::minutes(5)).trunc_subsecs(TIMESTAMPTZ_DIGITS);
     assert_eq!(
         db.store
-            .claim_run(id, ids::BOX, owner, at, until)
+            .claim_run(id, ids::BOX, owner, at, TimeDelta::minutes(5))
             .await
             .expect("the claim is answered"),
         Claim::Admitted,
@@ -3836,10 +4179,11 @@ async fn a_run_with_no_item_is_never_refused_for_tags() {
         .expect("it exists");
     assert_eq!(claimed.status, RunStatus::Running);
     assert_eq!(claimed.executing_box_id, Some(ids::BOX));
-    assert_eq!(
-        claimed.lease_expires_at,
-        Some(until),
-        "the admitted claim wrote the lease it was handed"
+    assert_leased_for(
+        "a_run_with_no_item_is_never_refused_for_tags",
+        &claimed,
+        TimeDelta::minutes(5),
+        "the admitted claim wrote the lease its TTL asked for",
     );
 
     db.drop_db().await;
@@ -4099,6 +4443,166 @@ async fn upsert_step_tree_writes_the_primary_isolation_path() {
         column().await.0.as_deref(),
         Some("/srv/trees/prd/docs"),
         "an empty batch names no tree, so it leaves the column alone"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-40 blueprint B2: `a` claims the queued fixture run, then `b`'s take of its lease is written
+/// in a transaction left open, standing in for a `take_lease` or `adopt_runs` whose commit has not
+/// landed yet. The caller commits it once its racing write is seen waiting.
+async fn an_uncommitted_take(
+    db: &common::TestDb,
+    a: uuid::Uuid,
+    b: uuid::Uuid,
+    now: DateTime<Utc>,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    assert_eq!(
+        db.store
+            .claim_run(ids::RUN_2, ids::BOX, a, now, TimeDelta::minutes(5))
+            .await
+            .expect("the claim must not fail"),
+        Claim::Admitted,
+        "A claims the queued fixture run"
+    );
+    let mut tx = db.pool.begin().await.expect("begin");
+    sqlx::query("UPDATE run SET lease_owner = $1 WHERE id = $2")
+        .bind(b)
+        .bind(ids::RUN_2.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("B's take, uncommitted");
+    tx
+}
+
+/// Waits until a backend of this database waits on a lock, bounded, then checks `write` has not
+/// answered: the proof that it is blocked on the take's row lock (`FOR SHARE`) and not merely
+/// slow.
+async fn wait_for_the_take<T>(db: &common::TestDb, write: &mut tokio::task::JoinHandle<T>) {
+    let started = std::time::Instant::now();
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the write never waited on the take's row lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut *write)
+            .await
+            .is_err(),
+        "the write answered while the take was uncommitted"
+    );
+}
+
+/// MOD-40 blueprint B2: a step write racing an uncommitted lease take waits for it, then answers
+/// `Fenced`, and writes nothing.
+///
+/// Under `READ COMMITTED` a join reads `run` and does not lock it, so without the `FOR SHARE` in
+/// the append's `lease` CTE the write would see the pre-take row and commit after the take. The
+/// write must still be waiting on its row lock when checked, and must re-read the committed owner
+/// once the take commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_take_committed_mid_write_fences_it() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (a, b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let now = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let tx = an_uncommitted_take(&db, a, b, now).await;
+
+    let store = db.store.clone();
+    let row = SessionEvent {
+        run_step_id: ids::STEP_R2_PRD,
+        seq: 0,
+        turn: 0,
+        kind: EventKind::AssistantText,
+        role: EventRole::Agent,
+        tool_call_id: None,
+        payload: serde_json::json!({ "text": "A, asleep through its lease" }),
+        raw: None,
+        at: now,
+    };
+    let mut handle =
+        tokio::spawn(async move { store.append_events(StepFence::Lease(a), &[row]).await });
+    wait_for_the_take(&db, &mut handle).await;
+
+    tx.commit().await.expect("B's take commits");
+    let answer = handle.await.expect("the write task must not panic");
+    assert!(
+        matches!(answer, Err(htui_core::store::StoreError::Fenced { step }) if step == ids::STEP_R2_PRD),
+        "the write re-reads the committed owner and is fenced, got {answer:?}"
+    );
+    assert!(
+        db.store
+            .step_events(ids::STEP_R2_PRD)
+            .await
+            .expect("read must not fail")
+            .is_none(),
+        "the fenced write left no row"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-40 blueprint B2, the settle's shape: `finish_step`'s fence is an `EXISTS … FOR SHARE`
+/// sub-select rather than the append's CTE, and a take committed while it waits fences it the
+/// same way. The step's settle columns are left as they were.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_take_committed_mid_settle_fences_it() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (a, b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+    let now = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let settle_columns = || async {
+        sqlx::query_as::<_, (Option<DateTime<Utc>>, Option<i32>)>(
+            "SELECT finished_at, verify_exit_code FROM run_step WHERE id = $1",
+        )
+        .bind(ids::STEP_R2_PRD.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read the step's settle columns")
+    };
+    let before = settle_columns().await;
+    let tx = an_uncommitted_take(&db, a, b, now).await;
+
+    let store = db.store.clone();
+    let outcome = StepOutcome {
+        exit_code: None,
+        usage: None,
+        trim_record: None,
+        verify_outcome: None,
+        verify_exit_code: Some(0),
+        finished_at: now,
+    };
+    let mut handle = tokio::spawn(async move {
+        store
+            .finish_step(StepFence::Lease(a), ids::STEP_R2_PRD, outcome)
+            .await
+    });
+    wait_for_the_take(&db, &mut handle).await;
+
+    tx.commit().await.expect("B's take commits");
+    let answer = handle.await.expect("the settle task must not panic");
+    assert!(
+        matches!(answer, Err(htui_core::store::StoreError::Fenced { step }) if step == ids::STEP_R2_PRD),
+        "the settle re-reads the committed owner and is fenced, got {answer:?}"
+    );
+    assert_eq!(
+        settle_columns().await,
+        before,
+        "the fenced settle wrote nothing"
     );
 
     db.drop_db().await;

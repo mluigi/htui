@@ -1,6 +1,6 @@
 //! The one error type every store returns.
 
-use crate::model::ParseEnumError;
+use crate::model::{ParseEnumError, StepId};
 
 /// The `Result` the `docs/ANA-9.md` §6.1 signatures refer to.
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -20,6 +20,15 @@ pub enum StoreError {
     /// attempted delete.
     #[error("constraint violated: {0}")]
     Constraint(String),
+    /// A step write named a lease its run does not carry (MOD-40 plan D1): another process
+    /// adopted the run, or the fence names a lease on a run that has none, or none on a run that
+    /// has one. Nothing was written, and a retry under the same fence answers the same: the writer
+    /// has lost the step.
+    #[error("run_step {step} is not writable under this lease")]
+    Fenced {
+        /// The step the write named; for a batch, the lowest-ordered fenced one.
+        step: StepId,
+    },
     /// The backend cannot write; the offline backend of MOD-6 is the only one that returns this.
     #[error("this backend is read-only ({0})")]
     ReadOnly(&'static str),
