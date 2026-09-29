@@ -66,7 +66,8 @@ async fn open() -> anyhow::Result<(PgStore, QdrantStore<FastEmbedder>)> {
             bail!("{n} schema migration(s) are pending; start `htui` once to apply them")
         }
         Err(HeadlessError::Store(err)) => {
-            return Err(anyhow::Error::new(err).context("cannot reach Postgres"));
+            let context = store_context(&err);
+            return Err(anyhow::Error::new(err).context(context));
         }
         Err(below @ HeadlessError::BelowTarget { .. }) => return Err(below.into()),
     };
@@ -75,6 +76,16 @@ async fn open() -> anyhow::Result<(PgStore, QdrantStore<FastEmbedder>)> {
         .await
         .context("cannot reach Qdrant")?;
     Ok((pg, store))
+}
+
+/// The line above a headless connect's store error: only an unreachable server is "cannot
+/// reach"; a newer or drifted schema, a partial version or a malformed target was reached and
+/// refused this build (MOD-40 plan D8).
+fn store_context(err: &htui_core::store::StoreError) -> &'static str {
+    match err {
+        htui_core::store::StoreError::Unreachable(_) => "cannot reach Postgres",
+        _ => "Postgres refused this htui",
+    }
 }
 
 /// Every workspace's projects as scopes, narrowed to one project slug when given.
@@ -191,6 +202,19 @@ mod tests {
         assert_eq!(s.url, "http://localhost:6334");
         assert!(s.api_key.is_some());
         assert!(settings_from(Some("localhost:6334".into()), None).is_err());
+    }
+
+    #[test]
+    fn only_an_unreachable_server_is_cannot_reach() {
+        use htui_core::store::StoreError;
+        assert_eq!(
+            store_context(&StoreError::Unreachable("refused".into())),
+            "cannot reach Postgres"
+        );
+        assert_eq!(
+            store_context(&StoreError::Backend("the schema is newer".into())),
+            "Postgres refused this htui"
+        );
     }
 
     #[test]
