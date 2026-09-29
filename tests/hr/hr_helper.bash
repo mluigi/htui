@@ -71,11 +71,43 @@ hr_fake_home() {
 # received to $HR_TEST_DOCKER_LOG.env. Knobs: HR_TEST_DOCKER_IMAGE=missing|mismatch,
 # HR_TEST_DOCKER_RUNNING="hr-mod-5 ..." (projects whose `ps` is non-empty),
 # HR_TEST_DOCKER_FAIL_UP=1 (`compose ... up` exits 1).
+# `docker run` (hr's throwaway status-check container) is emulated on the host by default: the
+# -v SRC:DST mount becomes a path swap (an argument equal to DST, and -w, map to SRC), then the
+# entrypoint runs here. Only for benign fixture clones — HR_TEST_DOCKER_RUN=clean answers "clean"
+# (exit 0) without running anything, =dirty prints a canned finding (exit 1), =fail exits 125.
 hr_stub_docker() {
     mkdir -p "$(dirname "$HR_DOCKER")"
     cat >"$HR_DOCKER" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$HR_TEST_DOCKER_LOG"
+if [[ "$1" == run ]]; then
+    shift
+    src='' dst='' wd='' ep=''
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --rm) shift ;;
+            --pull | --name | --network | --cap-drop | --security-opt | -u) shift 2 ;;
+            -v) IFS=: read -r src dst _ <<<"$2"; shift 2 ;;
+            -w) wd="$2"; shift 2 ;;
+            --entrypoint) ep="$2"; shift 2 ;;
+            -*) echo "stub docker run: unexpected option $1" >&2; exit 125 ;;
+            *) break ;;
+        esac
+    done
+    shift # the image
+    case "${HR_TEST_DOCKER_RUN:-emulate}" in
+        clean) exit 0 ;;
+        dirty) echo "uncommitted changes in $dst:"; echo "   M canned.txt"; exit 1 ;;
+        fail) echo "stub: docker run failed" >&2; exit 125 ;;
+    esac
+    args=()
+    for a in "$@"; do
+        [[ "$a" == "$dst" ]] && a="$src"
+        args+=("$a")
+    done
+    cd "$src${wd#"$dst"}" || exit 125
+    exec "$ep" "${args[@]}"
+fi
 case "$1 ${2:-}" in
     "image inspect")
         case "${HR_TEST_DOCKER_IMAGE:-ok}" in

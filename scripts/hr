@@ -170,11 +170,91 @@ host_repo() {
     git -C "$HOST" rev-parse --git-dir >/dev/null 2>&1 || die 2 "host repo $HOST is not a git repository"
 }
 
-# Every host-side git call inside a clone goes through here: the clone's .git/config is writable
-# from the sandbox, so nothing it names may execute on the host (F14).
+# clone_ok — the run's clone has a real .git directory (not a symlink a sandbox planted, not a
+# gitdir file pointing elsewhere).
+clone_ok() {
+    [[ -d "$SRC/.git" && ! -L "$SRC/.git" ]]
+}
+
+# Every host-side git call on a clone goes through here, and only ref/object plumbing is allowed:
+# the clone's .git (config, info/attributes, hooks, modules/) is writable from the sandbox, and
+# anything that reads its worktree (status, diff, checkout...) runs the filters, fsmonitor and
+# hooks it names. Those run in a throwaway container instead (clone_status_check; F14, review H3).
+# --git-dir (no worktree), fsmonitor/hooks/untracked cache off as a second fence.
 src_git() {
-    git --no-pager -C "$SRC" -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+    case "${1:-}" in
+        rev-parse | for-each-ref | cat-file | merge-base | rev-list) ;;
+        worktree) [[ "${2:-}" == list ]] || die 3 "internal: git worktree ${2:-} on a clone is not allowed on the host" ;;
+        *) die 3 "internal: git ${1:-} on a clone is not allowed on the host (it may run the sandbox's filters)" ;;
+    esac
+    clone_ok || { warn "$SRC/.git is missing or not a directory"; return 1; }
+    git --no-pager --git-dir="$SRC/.git" -c core.fsmonitor=false -c core.hooksPath=/dev/null \
         -c core.untrackedCache=false "$@"
+}
+
+# clone_git ARGS — `up` only: git on the clone this process has just created, before any
+# container has seen it (its config and hooks are still git clone's own).
+clone_git() {
+    git --no-pager -C "$SRC" "$@"
+}
+
+# Runs inside the throwaway container of clone_status_check: git status in every worktree of the
+# clone (main + in-run linked ones), with the clone mounted at its in-sandbox path ($1), so the
+# worktree paths recorded inside the sandbox are valid. Untracked non-ignored files count
+# (-unormal); linked worktrees are checked on their own and excluded from the main one's status.
+# Exit 0 clean, 1 dirty or not checkable; findings on stdout.
+# shellcheck disable=SC2016
+CHECK_SCRIPT='root=$1 rc=0 wt="" out=""
+err=$(mktemp) || exit 2
+list=$(git worktree list --porcelain) || { echo "cannot list the clone'"'"'s worktrees"; exit 2; }
+excl=()
+while IFS= read -r line; do
+    case $line in "worktree $root"/*) excl+=(":(exclude,literal)${line#"worktree $root"/}") ;; esac
+done <<<"$list"
+while IFS= read -r line; do
+    case $line in "worktree "*) wt=${line#worktree } ;; *) continue ;; esac
+    spec=()
+    case $wt in
+        "$root") spec=(-- . "${excl[@]}") ;;
+        "$root"/*) ;;
+        *) echo "worktree $wt is outside the clone: it cannot be checked"; rc=1; continue ;;
+    esac
+    if [ ! -d "$wt" ]; then
+        echo "worktree $wt is missing (git worktree prune inside the sandbox)"; rc=1; continue
+    fi
+    if ! out=$(cd "$wt" && timeout 240 git --no-optional-locks status --porcelain -unormal --ignore-submodules=all "${spec[@]}" 2>"$err"); then
+        echo "git status failed in $wt:"; sed "s/^/  /" "$err"; rc=1; continue
+    fi
+    if [ -n "$out" ]; then
+        echo "uncommitted changes in $wt:"; printf "%s\n" "$out" | sed "s/^/  /"; rc=1
+    fi
+done <<<"$list"
+exit $rc'
+
+# clone_status_check — git status of the clone's worktrees, never on the host: a throwaway
+# container of the toolchain image (no network, no capabilities, clone read-only, host uid), so
+# whatever the sandbox's config makes git execute stays in there (review H3). Prints findings;
+# 0 clean, 1 dirty or unverifiable (any failure fails closed). After load_run.
+clone_status_check() {
+    local name="hr-check-${PROJECT#hr-}-$$" out rc
+    out="$(timeout 300 "$DOCKER" run --rm --pull never --name "$name" --network none --cap-drop ALL \
+        --security-opt no-new-privileges -u "$(id -u):$(id -g)" -v "$SRC:$HOST:ro" -w "$HOST" \
+        --entrypoint bash "$IMAGE" -c "$CHECK_SCRIPT" hr-check "$HOST" 2>&1)"
+    rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        1) printf '%s\n' "$out" ;;
+        124) "$DOCKER" rm -f "$name" >/dev/null 2>&1
+             printf 'the status check timed out after 300 s\n' ;;
+        *) printf 'the status check failed (docker run exit %s):\n%s\n' "$rc" "$out" ;;
+    esac
+    return 1
+}
+
+# no_ctl — stdin to stdout without control characters (newlines kept): text a sandbox or a
+# HANDOFF line wrote must not reach the terminal as escape sequences.
+no_ctl() {
+    LC_ALL=C sed 's/[[:cntrl:]]//g'
 }
 
 # open_items SHA — "ID<TAB>title" for every open checklist line of HANDOFF.md at SHA.
@@ -437,7 +517,7 @@ dev_running() {
 # load_run. A run with no commits passes (its tip is the base).
 is_collected() {
     local item="$1" tip
-    [[ -d "$SRC/.git" ]] || return 1
+    clone_ok || return 1
     tip="$(src_git rev-parse --verify -q "refs/heads/hr/$item^{commit}")" || return 1
     git -C "$HOST" cat-file -e "$tip^{commit}" 2>/dev/null || return 1
     git -C "$HOST" merge-base --is-ancestor "$tip" "refs/heads/hr/$item" 2>/dev/null && return 0
@@ -602,10 +682,10 @@ cmd_up() {
     SRC="$run_dir/src"
     spin "Cloning $HOST" git clone -q --no-hardlinks --no-checkout "$HOST" "$SRC" \
         || up_abort 3 "git clone of $HOST failed"
-    src_git switch -q -c "hr/$item" "$sha" || up_abort 3 "cannot check out hr/$item at ${sha:0:12}"
+    clone_git switch -q -c "hr/$item" "$sha" || up_abort 3 "cannot check out hr/$item at ${sha:0:12}"
     # Inside the container the host repo is /host/htui (read-only); the host path is the clone.
-    src_git remote set-url origin /host/htui || up_abort 3 "cannot set origin"
-    src_git config remote.origin.pushurl no-push-from-sandbox || up_abort 3 "cannot set pushurl"
+    clone_git remote set-url origin /host/htui || up_abort 3 "cannot set origin"
+    clone_git config remote.origin.pushurl no-push-from-sandbox || up_abort 3 "cannot set pushurl"
     local exclude="$SRC/.git/info/exclude" gi
     gi="$(global_ignore_file)"
     mkdir -p "${exclude%/*}"
@@ -698,7 +778,7 @@ ls_rows() {
         fi
         is_collected "$item" && state+=+collected
         ahead='?'
-        if [[ -d "$SRC/.git" ]]; then
+        if clone_ok; then
             if [[ -n "$main" ]] && src_git cat-file -e "$main^{commit}" 2>/dev/null; then
                 ahead="$(src_git rev-list --count "$main..refs/heads/hr/$item" 2>/dev/null || echo '?')"
             else
@@ -774,7 +854,7 @@ cmd_collect() {
     item="$(norm_item "$item")"
     load_run "$item" 0
     local branch="refs/heads/hr/$item"
-    [[ -d "$SRC/.git" ]] || die 1 "clone missing at $SRC"
+    clone_ok || die 1 "clone missing at $SRC (or its .git is not a directory)"
     local tip
     tip="$(src_git rev-parse --verify -q "$branch^{commit}")" || die 1 "the clone has no branch hr/$item"
 
@@ -801,8 +881,10 @@ cmd_collect() {
             || die 1 "hr/$item was rewritten in the sandbox (host has ${old:0:12}, sandbox ${tip:0:12}); --force overwrites the host branch"
     fi
     [[ "$force" -eq 1 ]] && spec="+$spec"
-    git -C "$HOST" -c core.hooksPath=/dev/null fetch -q --no-tags --no-write-fetch-head \
-        --no-recurse-submodules "$SRC" "$spec" || die 3 "git fetch from $SRC failed"
+    # Local fetch: upload-pack runs on the clone but ignores its repo-level packObjectsHook; every
+    # object the sandbox made is fsck'd on the way in.
+    git -C "$HOST" -c core.hooksPath=/dev/null -c transfer.fsckObjects=true fetch -q --no-tags \
+        --no-write-fetch-head --no-recurse-submodules "$SRC" "$spec" || die 3 "git fetch from $SRC failed"
     set_reg "$item" "collected_sha=$tip" "collected_at=$(now_utc)"
     echo "hr: collected hr/$item at ${tip:0:12} — commits not on main:"
     git -C "$HOST" --no-pager log --oneline "refs/heads/main..$branch" 2>/dev/null \
@@ -847,21 +929,44 @@ cmd_collect() {
 }
 
 # purge_blockers ITEM — why a run may not be purged; empty (and 0) when it may. After load_run.
+# Any check that cannot run counts as a blocker (fail closed). The worktrees are read only in a
+# throwaway container (clone_status_check); everything here on the host is ref/object plumbing.
 purge_blockers() {
-    local item="$1" out='' dirty missing='' sha name
-    if [[ ! -d "$SRC/.git" ]]; then
-        printf '  clone missing at %s\n' "$SRC"
+    local item="$1" out='' st refs wl missing='' detached='' sha name k v wt='' head=''
+    if ! clone_ok; then
+        printf '  clone missing at %s (or its .git is not a directory)\n' "$SRC"
         return 1
     fi
     is_collected "$item" || out+="  hr/$item is not collected (scripts/hr collect $item)"$'\n'
-    dirty="$(src_git status --porcelain --untracked-files=no 2>/dev/null)"
-    [[ -n "$dirty" ]] && out+="  the clone has uncommitted tracked changes:"$'\n'"$(sed 's/^/    /' <<<"$dirty")"$'\n'
-    while read -r sha name; do
-        [[ -z "$sha" || "$name" == "hr/$item" ]] && continue
-        git -C "$HOST" cat-file -e "$sha^{commit}" 2>/dev/null || missing+="    $name (${sha:0:12})"$'\n'
-    done < <(src_git for-each-ref --format='%(objectname) %(refname:short)' refs/heads 2>/dev/null)
-    [[ -n "$missing" ]] && out+="  clone branches whose tips the host does not have:"$'\n'"$missing"
-    printf '%s' "$out"
+    st="$(clone_status_check)" \
+        || out+="  the clone has uncommitted work (checked in a throwaway container):"$'\n'"$(sed 's/^/    /' <<<"$st")"$'\n'
+    src_git rev-parse -q --verify refs/stash >/dev/null \
+        && out+="  the clone has stashed changes (refs/stash) — apply and commit them, or drop them"$'\n'
+    if refs="$(src_git for-each-ref --format='%(objectname) %(refname:short)' refs/heads)"; then
+        while read -r sha name; do
+            [[ -z "$sha" || "$name" == "hr/$item" ]] && continue
+            git -C "$HOST" cat-file -e "$sha^{commit}" 2>/dev/null || missing+="    $name (${sha:0:12})"$'\n'
+        done <<<"$refs"
+        [[ -n "$missing" ]] && out+="  clone branches whose tips the host does not have:"$'\n'"$missing"
+    else
+        out+="  cannot list the clone's branches"$'\n'
+    fi
+    if wl="$(src_git worktree list --porcelain)"; then
+        while read -r k v; do
+            case "$k" in
+                worktree) wt="$v"; head='' ;;
+                HEAD) head="$v" ;;
+                detached)
+                    [[ -n "$head" ]] && git -C "$HOST" cat-file -e "$head^{commit}" 2>/dev/null \
+                        || detached+="    $wt (${head:0:12})"$'\n'
+                    ;;
+            esac
+        done <<<"$wl"
+        [[ -n "$detached" ]] && out+="  detached worktree HEADs the host does not have:"$'\n'"$detached"
+    else
+        out+="  cannot list the clone's worktrees"$'\n'
+    fi
+    printf '%s' "$out" | no_ctl
     [[ -z "$out" ]]
 }
 
@@ -910,9 +1015,12 @@ cmd_down() {
     check_leases
     local blockers forced_uncollected=0
     if [[ "$force" -eq 0 ]]; then
+        # Stopped first, so nothing in the sandbox changes the clone between the checks and the
+        # purge (review M1). A refused purge leaves the run stopped; attach restarts it.
+        spin "Stopping $PROJECT" "${COMPOSE[@]}" stop || die 3 "docker compose stop failed for $PROJECT"
         if ! blockers="$(purge_blockers "$item")"; then
             printf '%s' "$blockers" >&2
-            die 1 "refusing to purge $item (above); --force overrides"
+            die 1 "refusing to purge $item (above; the run is now stopped, attach restarts it); --force overrides"
         fi
     else
         is_collected "$item" || forced_uncollected=1

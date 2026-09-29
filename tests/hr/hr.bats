@@ -679,6 +679,218 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
 }
 
 # ---------------------------------------------------------------------------------------------
+# purge checks (review H3, M1, M2)
+
+# purge_state ITEM — "clean" when the run passes every purge check (gc lists it as purgeable),
+# else the blocker text (stderr of a refused down --purge). Never purges: no --yes.
+purge_state() {
+    run --separate-stderr "$HR" gc
+    if [[ "$output" == *"  $1"* ]]; then
+        echo clean
+        return 0
+    fi
+    run --separate-stderr "$HR" down "$1" --purge
+    [[ $status -eq 1 && "$stderr" == *'refusing to purge'* ]] || { echo "unexpected: $status $stderr" >&2; return 1; }
+    printf '%s\n' "$stderr"
+}
+
+@test "29. the purge status check runs in a throwaway container (no network, no caps, clone ro); failure blocks" {
+    mk_run MOD-5
+    "$HR" collect MOD-5 >/dev/null 2>&1
+    : >"$HR_TEST_DOCKER_LOG"
+    [[ "$(purge_state MOD-5)" == clean ]]
+    local line
+    line="$(grep '^run ' "$HR_TEST_DOCKER_LOG" | head -n 1)"
+    [[ "$line" == 'run --rm --pull never --name hr-check-mod-5-'* ]]
+    [[ "$line" == *' --network none --cap-drop ALL --security-opt no-new-privileges '* ]]
+    [[ "$line" == *" -u $(id -u):$(id -g) -v $(src_of MOD-5):$HR_HOST_REPO:ro -w $HR_HOST_REPO --entrypoint bash htui-hr-dev -c "* ]]
+
+    # Fail closed: a check that cannot run, or reports anything, blocks.
+    local out
+    out="$(HR_TEST_DOCKER_RUN=fail purge_state MOD-5)"
+    [[ "$out" == *'status check failed'* ]]
+    out="$(HR_TEST_DOCKER_RUN=dirty purge_state MOD-5)"
+    [[ "$out" == *'canned.txt'* ]]
+    HR_TEST_DOCKER_RUN=fail run --separate-stderr "$HR" gc --yes
+    [[ $status -eq 0 && -d "$(src_of MOD-5)/.git" && -f "$(reg_of MOD-5)" ]]
+    HR_TEST_DOCKER_RUN=fail run --separate-stderr "$HR" down MOD-5 --purge --yes
+    [[ $status -eq 1 && -d "$(src_of MOD-5)/.git" ]]
+}
+
+@test "30. purge blockers: untracked files, linked worktrees, stash, detached HEADs; ignored files do not block" {
+    mk_run MOD-5
+    "$HR" collect MOD-5 >/dev/null 2>&1
+    local src out
+    src="$(src_of MOD-5)"
+    gs() { git -C "$src" -c user.name=s -c user.email=s@x.invalid "$@"; }
+
+    # Ignored (target/) is fine; untracked non-ignored is not.
+    printf '/target/\n' >>"$src/.git/info/exclude"
+    mkdir -p "$src/target" && : >"$src/target/big"
+    [[ "$(purge_state MOD-5)" == clean ]]
+    : >"$src/stray.txt"
+    [[ "$(purge_state MOD-5)" == *'stray.txt'* ]]
+    rm "$src/stray.txt"
+
+    # An in-run linked worktree: checked on its own, not reported by the main one.
+    gs worktree add -q "$src/.claude/worktrees/w1" -b w1
+    [[ "$(purge_state MOD-5)" == clean ]]
+    printf 'wip\n' >>"$src/.claude/worktrees/w1/HANDOFF.md"
+    out="$(purge_state MOD-5)"
+    [[ "$out" == *".claude/worktrees/w1"*'HANDOFF.md'* ]]
+    gs -C "$src/.claude/worktrees/w1" checkout -q -- HANDOFF.md
+    : >"$src/.claude/worktrees/w1/new.txt"
+    [[ "$(purge_state MOD-5)" == *'new.txt'* ]]
+    rm "$src/.claude/worktrees/w1/new.txt"
+    [[ "$(purge_state MOD-5)" == clean ]]
+
+    # A detached worktree HEAD with a commit the host never saw.
+    gs worktree add -q --detach "$src/.claude/worktrees/w2"
+    printf 'x\n' >"$src/.claude/worktrees/w2/det.txt"
+    gs -C "$src/.claude/worktrees/w2" add det.txt
+    gs -C "$src/.claude/worktrees/w2" commit -q -m detached
+    [[ "$(purge_state MOD-5)" == *'detached worktree HEADs'*'w2'* ]]
+    gs worktree remove --force "$src/.claude/worktrees/w2"
+    [[ "$(purge_state MOD-5)" == clean ]]
+
+    # A missing worktree dir, and one outside the clone, cannot be checked.
+    gs worktree add -q --detach "$src/.claude/worktrees/w3"
+    rm -rf "$src/.claude/worktrees/w3"
+    [[ "$(purge_state MOD-5)" == *'w3 is missing'* ]]
+    gs worktree prune
+    gs worktree add -q --detach "$BATS_TEST_TMPDIR/outside"
+    [[ "$(purge_state MOD-5)" == *'outside the clone'* ]]
+    gs worktree remove --force "$BATS_TEST_TMPDIR/outside"
+
+    # A stash.
+    printf 'stash me\n' >>"$src/HANDOFF.md"
+    gs stash -q
+    [[ "$(purge_state MOD-5)" == *'refs/stash'* ]]
+    gs stash drop -q
+    [[ "$(purge_state MOD-5)" == clean ]]
+}
+
+@test "31. down --purge stops the project before the checks; a refused purge leaves it stopped, never down -v" {
+    mk_run MOD-4
+    : >"$HR_TEST_DOCKER_LOG"
+    run --separate-stderr "$HR" down MOD-4 --purge --yes
+    [[ $status -eq 1 ]]
+    [[ "$stderr" == *'not collected'* && "$stderr" == *'now stopped'* ]]
+    grep -qxF "compose -p hr-mod-4 -f $HR_COMPOSE_FILE stop" "$HR_TEST_DOCKER_LOG"
+    ! grep -q -- 'down' "$HR_TEST_DOCKER_LOG" || false
+
+    mk_run MOD-5
+    "$HR" collect MOD-5 >/dev/null 2>&1
+    : >"$HR_TEST_DOCKER_LOG"
+    run --separate-stderr "$HR" down MOD-5 --purge --yes
+    [[ $status -eq 0 ]]
+    local stop check down
+    stop="$(grep -n ' stop$' "$HR_TEST_DOCKER_LOG" | cut -d: -f1)"
+    check="$(grep -n '^run ' "$HR_TEST_DOCKER_LOG" | cut -d: -f1)"
+    down="$(grep -n ' down -v$' "$HR_TEST_DOCKER_LOG" | cut -d: -f1)"
+    [[ -n "$stop" && -n "$check" && -n "$down" && "$stop" -lt "$check" && "$check" -lt "$down" ]]
+}
+
+@test "32. a hostile clone (filters, fsmonitor, hooks, pager, submodule config) never executes on the host" {
+    mk_run MOD-4
+    mk_run MOD-5
+    local sub="$BATS_TEST_TMPDIR/subsrc" m="$BATS_TEST_TMPDIR/pwned" evil="$BATS_TEST_TMPDIR/evil"
+    git init -q -b main "$sub"
+    git -C "$sub" -c user.name=s -c user.email=s@x.invalid commit -q --allow-empty -m sub
+    local s4 s5
+    s4="$(src_of MOD-4)"
+    s5="$(src_of MOD-5)"
+    git -C "$s5" -c protocol.file.allow=always submodule add -q "$sub" sub
+    git -C "$s5" -c user.name=s -c user.email=s@x.invalid commit -q -m 'add sub'
+    "$HR" collect MOD-4 >/dev/null 2>&1
+    "$HR" collect MOD-5 >/dev/null 2>&1
+    src_commit MOD-5 notes/late.txt 'late' 'late sandbox work'   # fetched below, from the hostile clone
+
+    # Everything a sandbox can write into a clone's .git that makes git execute something.
+    printf '#!/bin/sh\ntouch "%s"\ncat\n' "$m" >"$evil"
+    chmod +x "$evil"
+    mkdir -p "$BATS_TEST_TMPDIR/hooks"
+    local h gd
+    for h in reference-transaction post-checkout post-merge pre-commit post-index-change pre-auto-gc \
+        post-rewrite fsmonitor-watchman push-to-checkout; do
+        ln -sf "$evil" "$BATS_TEST_TMPDIR/hooks/$h"
+    done
+    for gd in "$s4/.git" "$s5/.git" "$s5/.git/modules/sub"; do
+        git config -f "$gd/config" filter.x.clean "$evil"
+        git config -f "$gd/config" filter.x.smudge "$evil"
+        git config -f "$gd/config" filter.x.required true
+        git config -f "$gd/config" core.fsmonitor "$evil"
+        git config -f "$gd/config" core.hooksPath "$BATS_TEST_TMPDIR/hooks"
+        git config -f "$gd/config" core.pager "$evil"
+        git config -f "$gd/config" pager.status "$evil"
+        git config -f "$gd/config" diff.external "$evil"
+        git config -f "$gd/config" uploadpack.packObjectsHook "$evil"
+        git config -f "$gd/config" core.alternateRefsCommand "$evil"
+        git config -f "$gd/config" core.sshCommand "$evil"
+        git config -f "$gd/config" core.editor "$evil"
+        git config -f "$gd/config" credential.helper "!$evil"
+        git config -f "$gd/config" gpg.program "$evil"
+        git config -f "$gd/config" status.showUntrackedFiles all
+        mkdir -p "$gd/info"
+        printf '* filter=x\n' >>"$gd/info/attributes"
+    done
+    # Stat-dirty tracked files: a status would have to run the clean filter to compare them.
+    touch "$s4/HANDOFF.md" "$s5/HANDOFF.md"
+
+    # Log every git the host runs.
+    local real
+    real="$(command -v git)"
+    mkdir -p "$BATS_TEST_TMPDIR/gitshim"
+    printf '#!/bin/bash\nprintf "%%s\\t%%s\\n" "$PWD" "$*" >>"%s"\nexec "%s" "$@"\n' \
+        "$BATS_TEST_TMPDIR/git.log" "$real" >"$BATS_TEST_TMPDIR/gitshim/git"
+    chmod +x "$BATS_TEST_TMPDIR/gitshim/git"
+    : >"$BATS_TEST_TMPDIR/git.log"
+    : >"$HR_TEST_DOCKER_LOG"
+
+    local -a env=(PATH="$BATS_TEST_TMPDIR/gitshim:$PATH" HR_TEST_DOCKER_RUN=clean)
+    run --separate-stderr env "${env[@]}" "$HR" ls
+    [[ $status -eq 0 ]]
+    run --separate-stderr env "${env[@]}" "$HR" collect MOD-5
+    [[ $status -eq 0 && "$output" == *'late sandbox work'* ]]
+    run --separate-stderr env "${env[@]}" "$HR" gc
+    [[ $status -eq 1 && "$output" == *MOD-4* && "$output" == *MOD-5* ]]
+    run --separate-stderr env "${env[@]}" "$HR" down MOD-5 --purge --yes
+    [[ $status -eq 0 && ! -e "$s5" ]]
+    run --separate-stderr env "${env[@]}" "$HR" gc --yes
+    [[ $status -eq 0 && ! -e "$s4" ]]
+
+    # Nothing ran on the host...
+    [[ ! -e "$m" ]]
+    # ... the worktree checks went to the container (gc x2 + down) ...
+    [[ "$(grep -c '^run ' "$HR_TEST_DOCKER_LOG")" -ge 4 ]]
+    # ... and every host git touching a clone was ref/object plumbing, or the host's own fetch.
+    local cwd argv sub_cmd n=0 fetches=0 prev
+    local -a a
+    while IFS=$'\t' read -r cwd argv; do
+        [[ "$cwd/" != "$HR_ROOT"/* ]] || { echo "git ran inside a clone: $cwd $argv" >&2; return 1; }
+        [[ "$argv" == *"$HR_ROOT/"* ]] || continue
+        read -ra a <<<"$argv"
+        sub_cmd='' prev=''
+        for h in "${a[@]}"; do
+            if [[ "$prev" == -C || "$prev" == -c ]]; then prev=''; continue; fi
+            case "$h" in
+                -C | -c) prev="$h" ;;
+                --no-pager | --git-dir=*) ;;
+                *) sub_cmd="$h"; break ;;
+            esac
+        done
+        case "$sub_cmd" in
+            rev-parse | for-each-ref | cat-file | merge-base | rev-list) n=$((n + 1)) ;;
+            worktree) [[ "$argv" == *' worktree list '* ]] || { echo "host git: $argv" >&2; return 1; } ;;
+            fetch) [[ "$argv" == "-C $HR_HOST_REPO "* ]] || { echo "host git: $argv" >&2; return 1; }
+                   fetches=$((fetches + 1)) ;;
+            *) echo "host git on a clone: $argv" >&2; return 1 ;;
+        esac
+    done <"$BATS_TEST_TMPDIR/git.log"
+    [[ $n -gt 0 && $fetches -eq 1 ]]
+}
+
+# ---------------------------------------------------------------------------------------------
 # Docker (real image and daemon; fixture host repo; run once: bats --filter-tags docker tests/hr/hr.bats)
 
 # bats test_tags=docker
@@ -793,4 +1005,32 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     [[ -z "$(docker ps -aq --filter label=com.docker.compose.project=hr-tool-9001)" ]]
     docker volume inspect htui-hr-cargo >/dev/null
     [[ ! -e "$HR_ROOT/TOOL-9001" && ! -e "$(reg_of TOOL-9001)" ]]
+}
+
+# bats test_tags=docker
+@test "D5. hostile clone: the sandbox's clean filter runs in the throwaway check container, never on the host" {
+    hr_docker_setup TOOL-9001
+    run --separate-stderr "$HR" up TOOL-9001
+    [[ $status -eq 0 ]]
+    local src m="$BATS_TEST_TMPDIR/pwned"
+    src="$(src_of TOOL-9001)"
+    git -C "$src" -c user.name=s -c user.email=s@x.invalid commit -q --allow-empty -m 'sandbox work'
+    run --separate-stderr "$HR" collect TOOL-9001
+    [[ $status -eq 0 ]]
+    # A filter that leaves a marker where it runs and changes what it cleans: if it runs in the
+    # container, status there reports HANDOFF.md modified; if it ran here, the marker would exist.
+    git config -f "$src/.git/config" filter.x.clean "sh -c 'mkdir -p $BATS_TEST_TMPDIR && touch $m; cat; echo tampered'"
+    git config -f "$src/.git/config" filter.x.required true
+    printf '* filter=x\n' >>"$src/.git/info/attributes"
+    touch "$src/HANDOFF.md"
+    run --separate-stderr "$HR" down TOOL-9001 --purge --yes
+    echo "$stderr"
+    [[ $status -eq 1 ]]
+    [[ "$stderr" == *'uncommitted work'*'HANDOFF.md'* ]]
+    [[ ! -e "$m" && -d "$src/.git" ]]
+    # Without the filter the same tree is clean, and the purge goes through.
+    : >"$src/.git/info/attributes"
+    run --separate-stderr "$HR" down TOOL-9001 --purge --yes
+    echo "$stderr"
+    [[ $status -eq 0 && ! -e "$HR_ROOT/TOOL-9001" && ! -e "$m" ]]
 }
