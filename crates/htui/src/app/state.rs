@@ -187,6 +187,11 @@ pub struct App {
     /// `StoreState` is re-read every fourth tick, so without this an answered `n` would re-open
     /// the prompt a second later, forever (blueprint D.5).
     pub(super) migration_prompt_shown: bool,
+    /// Whether the below-the-target notice has been shown this session (MOD-40 plan D9).
+    ///
+    /// `StoreState` is re-read every fourth tick; without this a notice the next key cleared
+    /// would come back a second later, `migration_prompt_shown`'s reason.
+    pub(super) below_target_shown: bool,
     /// Whether the no-DSN redirect has already fired this session (MOD-15 M6 D6).
     ///
     /// `ConnectionInfo` is re-issued whenever the shell asks again, so without this a box with an
@@ -234,6 +239,7 @@ impl App {
             migration_overlay: None,
             replay_tab: None,
             migration_prompt_shown: false,
+            below_target_shown: false,
             connection_redirect_done: false,
             pending_edit: None,
         }

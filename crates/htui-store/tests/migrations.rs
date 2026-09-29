@@ -11,8 +11,15 @@ use std::collections::BTreeSet;
 
 use htui_core::model::{BoxId, OsFamily};
 use htui_core::store::StoreError;
-use htui_store::{MIGRATOR, MigrationState, PgStore, Registration, identity};
+use htui_store::{
+    HTUI_VERSION, HeadlessError, MIGRATOR, MigrationState, PgStore, Registration,
+    TARGET_VERSION_KEY, identity,
+};
+use serde_json::json;
 use sqlx::Row as _;
+
+/// The `connect_timeout` every headless connect here passes.
+const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The 39 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
 /// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5).
@@ -930,6 +937,329 @@ async fn a_checksum_mismatch_is_refused() {
         ),
         other => panic!("expected StoreError::Backend, got {other:?}"),
     }
+
+    db.drop_db().await;
+}
+
+/// The stored `htui_target_version` document, if any (MOD-40 plan D9).
+async fn target(pool: &sqlx::PgPool) -> Option<serde_json::Value> {
+    sqlx::query_scalar("SELECT value FROM app_setting WHERE key = $1")
+        .bind(TARGET_VERSION_KEY)
+        .fetch_optional(pool)
+        .await
+        .expect("read the target version")
+}
+
+/// Plants `value` as the target, over whatever is stored: another box's newer build, or a hand
+/// edit.
+async fn plant_target(pool: &sqlx::PgPool, value: serde_json::Value) {
+    sqlx::query(
+        "INSERT INTO app_setting (key, value) VALUES ($1, $2) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(TARGET_VERSION_KEY)
+    .bind(value)
+    .execute(pool)
+    .await
+    .expect("plant a target version");
+}
+
+/// How many tables the `public` schema holds.
+async fn public_tables(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")
+        .fetch_one(pool)
+        .await
+        .expect("count the public tables")
+}
+
+/// MOD-40 plan D8, `R-STO-5` as amended: a headless connect over a pending schema refuses with
+/// the count and applies nothing, and over a database with no migrations table it does not even
+/// create one (blueprint F-22: a role without `CREATE` could not).
+#[tokio::test]
+async fn a_headless_connect_never_migrates() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    assert_eq!(db.migrations_at_connect, MigrationState::Pending(7));
+
+    let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT)
+        .await
+        .expect_err("a pending schema is refused");
+    assert_eq!(refused, HeadlessError::MigrationsPending(7));
+    assert_eq!(
+        common::count(&db.pool, "_sqlx_migrations").await,
+        0,
+        "a headless connect applies nothing"
+    );
+    assert_eq!(
+        public_tables(&db.pool).await,
+        1,
+        "a headless connect applies nothing: the bookkeeping table the TUI's connect made is all"
+    );
+
+    sqlx::query("DROP TABLE _sqlx_migrations")
+        .execute(&db.pool)
+        .await
+        .expect("drop the bookkeeping table");
+    let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT)
+        .await
+        .expect_err("no migrations table is every migration pending");
+    assert_eq!(refused, HeadlessError::MigrationsPending(7));
+    let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
+        .fetch_one(&db.pool)
+        .await
+        .expect("ask for the bookkeeping table");
+    assert!(
+        absent,
+        "it does not even create the bookkeeping table (blueprint F-22)"
+    );
+    assert_eq!(
+        public_tables(&db.pool).await,
+        0,
+        "the schema is still empty"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-40 plan D8: a headless connect refuses what `PgStore::connect` refuses, a newer, dirty or
+/// drifted schema, and refuses it before the bootstrap writes anything (blueprint B19).
+#[tokio::test]
+async fn a_headless_connect_refuses_a_newer_schema() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let boxes = common::count(&db.pool, "box").await;
+    let stranger = identity::Identity {
+        box_id: BoxId::new(),
+        hostname: format!("HTUI-TEST-{}", uuid::Uuid::now_v7().simple()),
+    };
+    let refusal = |why: &'static str| {
+        let (url, stranger) = (db.url.clone(), stranger.clone());
+        async move {
+            match PgStore::connect_headless(&url, &stranger, HEADLESS_WAIT).await {
+                Err(HeadlessError::Store(StoreError::Backend(text))) => text,
+                other => panic!("expected a store refusal ({why}), got {other:?}"),
+            }
+        }
+    };
+
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (9999, 'from a newer htui', true, '\\x00'::bytea, 0)",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("plant a newer applied migration");
+    let text = refusal("newer").await;
+    assert!(text.contains("schema is newer"), "got {text}");
+    assert_eq!(
+        common::count(&db.pool, "box").await,
+        boxes,
+        "refused before the bootstrap"
+    );
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 9999")
+        .execute(&db.pool)
+        .await
+        .expect("remove the newer migration");
+
+    sqlx::query("UPDATE _sqlx_migrations SET success = false WHERE version = 7")
+        .execute(&db.pool)
+        .await
+        .expect("mark the last migration dirty");
+    let text = refusal("dirty").await;
+    assert!(text.contains("partially applied"), "got {text}");
+    assert_eq!(
+        common::count(&db.pool, "box").await,
+        boxes,
+        "refused before the bootstrap"
+    );
+    sqlx::query("UPDATE _sqlx_migrations SET success = true WHERE version = 7")
+        .execute(&db.pool)
+        .await
+        .expect("mark it clean again");
+
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = '\\xdeadbeef'::bytea WHERE version = 1")
+        .execute(&db.pool)
+        .await
+        .expect("corrupt the recorded checksum");
+    let text = refusal("drifted").await;
+    assert!(text.contains("checksum"), "got {text}");
+    assert_eq!(
+        common::count(&db.pool, "box").await,
+        boxes,
+        "refused before the bootstrap"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-40 plan D9, blueprint B17, B18: every `apply_migrations` raises the target to this build
+/// and never lowers it; a malformed or deleted target is written afresh.
+#[tokio::test]
+async fn applying_migrations_raises_the_target_and_never_lowers_it() {
+    let Some(mut db) = common::bare_db().await else {
+        return;
+    };
+
+    db.store
+        .apply_migrations()
+        .await
+        .expect("apply the embedded migrations");
+    assert_eq!(
+        target(&db.pool).await,
+        Some(json!(HTUI_VERSION)),
+        "the first migrator writes its version"
+    );
+    assert_eq!(db.store.below_target(), None);
+
+    plant_target(&db.pool, json!("0.0.1")).await;
+    db.store.apply_migrations().await.expect("apply again");
+    assert_eq!(target(&db.pool).await, Some(json!(HTUI_VERSION)), "raised");
+    assert_eq!(db.store.below_target(), None);
+
+    plant_target(&db.pool, json!("99.0.0")).await;
+    db.store.apply_migrations().await.expect("apply again");
+    assert_eq!(
+        target(&db.pool).await,
+        Some(json!("99.0.0")),
+        "never lowered"
+    );
+    assert_eq!(
+        db.store.below_target(),
+        Some("99.0.0"),
+        "a migrator below the target knows it"
+    );
+
+    plant_target(&db.pool, json!(42)).await;
+    db.store.apply_migrations().await.expect("apply again");
+    assert_eq!(
+        target(&db.pool).await,
+        Some(json!(HTUI_VERSION)),
+        "a malformed target is replaced (blueprint B18)"
+    );
+    assert_eq!(db.store.below_target(), None);
+
+    sqlx::query("DELETE FROM app_setting WHERE key = $1")
+        .bind(TARGET_VERSION_KEY)
+        .execute(&db.pool)
+        .await
+        .expect("delete the target by hand");
+    db.store.apply_migrations().await.expect("apply again");
+    assert_eq!(
+        target(&db.pool).await,
+        Some(json!(HTUI_VERSION)),
+        "re-inserted"
+    );
+
+    assert_eq!(
+        common::count(&db.pool, "_sqlx_migrations").await,
+        7,
+        "the later applies migrate nothing"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-40 plan D9, PRD D3: a headless process below the target refuses before it registers, and
+/// refuses a target that is not a version; at or above it, it connects as `connect` does.
+#[tokio::test]
+async fn a_headless_connect_below_the_target_refuses() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let stranger = identity::Identity {
+        box_id: BoxId::new(),
+        hostname: format!("HTUI-TEST-{}", uuid::Uuid::now_v7().simple()),
+    };
+    let registered = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM box WHERE id = $1")
+            .bind(stranger.box_id.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("count the stranger's box rows")
+    };
+
+    plant_target(&db.pool, json!("99.0.0")).await;
+    let refused = PgStore::connect_headless(&db.url, &stranger, HEADLESS_WAIT)
+        .await
+        .expect_err("a build below the target is refused");
+    assert_eq!(
+        refused,
+        HeadlessError::BelowTarget {
+            ours: HTUI_VERSION.into(),
+            target: "99.0.0".into(),
+        }
+    );
+    assert_eq!(
+        registered().await,
+        0,
+        "refused before the bootstrap: nothing registered"
+    );
+
+    plant_target(&db.pool, json!("banana")).await;
+    match PgStore::connect_headless(&db.url, &stranger, HEADLESS_WAIT).await {
+        Err(HeadlessError::Store(StoreError::Backend(text))) => assert!(
+            text.contains("htui_target_version") && text.contains("not a version"),
+            "the refusal names the key and the reason, got {text}"
+        ),
+        other => panic!("a headless process never guesses a malformed target, got {other:?}"),
+    }
+    assert_eq!(registered().await, 0, "refused before the bootstrap");
+
+    plant_target(&db.pool, json!(HTUI_VERSION)).await;
+    let store = PgStore::connect_headless(&db.url, &stranger, HEADLESS_WAIT)
+        .await
+        .expect("at the target a headless process connects");
+    assert_eq!(
+        store.this_box(),
+        stranger.box_id,
+        "at the target it connects and registers as `connect` does"
+    );
+    assert_eq!(store.below_target(), None);
+
+    plant_target(&db.pool, json!("0.0.1")).await;
+    PgStore::connect_headless(&db.url, &stranger, HEADLESS_WAIT)
+        .await
+        .expect("above the target a headless process connects");
+
+    db.drop_db().await;
+}
+
+/// MOD-40 plan D9, PRD D3: a TUI below the target connects, runs and records the target; at it,
+/// or over a malformed one, there is nothing to say (blueprint B18).
+#[tokio::test]
+async fn a_tui_connect_below_the_target_reports_it() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+
+    plant_target(&db.pool, json!("99.0.0")).await;
+    let connected = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("a TUI below the target connects");
+    assert_eq!(connected.migrations, MigrationState::UpToDate);
+    assert_eq!(
+        connected.store.below_target(),
+        Some("99.0.0"),
+        "a TUI runs below the target and knows it (PRD D3)"
+    );
+
+    plant_target(&db.pool, json!(HTUI_VERSION)).await;
+    let connected = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("a TUI at the target connects");
+    assert_eq!(connected.store.below_target(), None);
+
+    plant_target(&db.pool, json!(42)).await;
+    let connected = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("a TUI over a malformed target connects");
+    assert_eq!(
+        connected.store.below_target(),
+        None,
+        "a TUI ignores a malformed target (blueprint B18)"
+    );
 
     db.drop_db().await;
 }

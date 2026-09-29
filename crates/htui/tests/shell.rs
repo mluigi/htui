@@ -22,6 +22,7 @@ fn store_state(label: &str, migrations_pending: Option<usize>) -> Action {
         reply: StoreReply::StoreState {
             label: label.to_owned(),
             migrations_pending,
+            below_target: None,
         },
     })
 }

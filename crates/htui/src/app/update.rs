@@ -253,10 +253,14 @@ impl App {
             StoreReply::StoreState {
                 label,
                 migrations_pending,
+                below_target,
             } => {
                 self.top_bar.store = label.clone();
                 if migrations_pending.is_some_and(|n| n > 0) {
                     self.offer_migration_prompt();
+                }
+                if let Some(target) = below_target {
+                    self.note_below_target(target);
                 }
             }
             StoreReply::MigrationsApplied { applied } => {
@@ -287,6 +291,16 @@ impl App {
         }
         self.migration_prompt_shown = true;
         self.update(Action::Overlay(OverlayAction::Open(id)));
+    }
+
+    /// Says once per session that this build is below the database's target version (MOD-40
+    /// plan D9, PRD D3): a TUI warns and runs, where a headless process refuses.
+    fn note_below_target(&mut self, target: &str) {
+        if self.below_target_shown {
+            return;
+        }
+        self.below_target_shown = true;
+        self.status = Some(below_target_notice(target));
     }
 
     /// Whether a workspace has been entered yet.
@@ -347,6 +361,14 @@ impl App {
             )));
         }
     }
+}
+
+/// The status line's below-the-target sentence (MOD-40 plan D9).
+fn below_target_notice(target: &str) -> String {
+    format!(
+        "htui {} is older than {target}, which last migrated this database; upgrade this box",
+        htui_store::HTUI_VERSION
+    )
 }
 
 #[cfg(test)]
@@ -625,6 +647,20 @@ mod tests {
             reply: StoreReply::StoreState {
                 label: label.to_owned(),
                 migrations_pending,
+                below_target: None,
+            },
+        }
+    }
+
+    /// A `StoreState` reply from a store whose database was last migrated by `target`.
+    fn store_state_below(label: &str, target: &str) -> ReplyEnvelope {
+        ReplyEnvelope {
+            seq: 0,
+            origin: Origin::App,
+            reply: StoreReply::StoreState {
+                label: label.to_owned(),
+                migrations_pending: None,
+                below_target: Some(target.to_owned()),
             },
         }
     }
@@ -653,6 +689,40 @@ mod tests {
         assert!(
             app.overlays.is_empty(),
             "an answered prompt is not re-asked every fourth tick"
+        );
+    }
+
+    /// MOD-40 plan D9, PRD D3: a TUI below the database's target version says so on the status
+    /// line, once per session: the next key clears it and the fourth-tick re-read does not bring
+    /// it back.
+    #[test]
+    fn a_store_state_below_the_target_says_so_once() {
+        let (mut app, _rx, _seen) = shell();
+
+        app.update(Action::Reply(store_state("online", None)));
+        assert_eq!(app.status, None, "no target above this build, no notice");
+
+        app.update(Action::Reply(store_state_below("online", "99.0.0")));
+        assert_eq!(app.top_bar.store, "online");
+        assert_eq!(app.status, Some(below_target_notice("99.0.0")));
+        assert!(
+            app.status.as_deref().is_some_and(
+                |line| line.contains("99.0.0") && line.contains(htui_store::HTUI_VERSION)
+            ),
+            "the notice names both versions: {:?}",
+            app.status
+        );
+
+        app.on_key(KeyEvent::from(KeyCode::Char('x')));
+        assert_eq!(
+            app.status, None,
+            "the next key clears it, as every status line"
+        );
+
+        app.update(Action::Reply(store_state_below("online", "99.0.0")));
+        assert_eq!(
+            app.status, None,
+            "said once per session, not every fourth tick"
         );
     }
 

@@ -53,6 +53,15 @@ const SEEDED_SETTINGS: [(&str, i32); 2] = [
 /// the probe writer, compared by `BoxRecord::needs_probe`.
 pub const HTUI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The `app_setting` key holding the **target version** (MOD-40 plan D9, PRD D3): the highest
+/// [`HTUI_VERSION`] that has applied migrations to this database, as a JSON string.
+///
+/// Raised by [`PgStore::apply_migrations`] and never lowered. A TUI below it runs and says so
+/// ([`PgStore::below_target`]); a headless process below it refuses
+/// ([`HeadlessError::BelowTarget`]). Snake case like every other key; no reader iterates
+/// `app_setting`, so the row is invisible to the settings resolvers and the Settings tab.
+pub const TARGET_VERSION_KEY: &str = "htui_target_version";
+
 /// What [`PgStore::register_box`] found (plan D2, D3, blueprint D19).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Registration {
@@ -101,6 +110,33 @@ pub struct Connected {
     pub store: PgStore,
     /// Whether the embedded set is fully applied.
     pub migrations: MigrationState,
+}
+
+/// Why [`PgStore::connect_headless`] refused (MOD-40 plan D8, `R-STO-5` as amended 2026-09-26: a
+/// headless process never migrates; it refuses and reports).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HeadlessError {
+    /// The store refused as [`PgStore::connect`] would: unreachable, a newer schema, checksum
+    /// drift, a partially applied version, or a target that is not a version.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// This many embedded migrations are not applied. A TUI asks; a headless process refuses.
+    #[error(
+        "{0} schema migration(s) are pending, and a headless process never migrates; start \
+         `htui` once to apply them"
+    )]
+    MigrationsPending(usize),
+    /// This build is below the database's target version ([`TARGET_VERSION_KEY`]).
+    #[error(
+        "this htui is {ours}, below {target}, the version that last migrated this database; \
+         upgrade htui on this box"
+    )]
+    BelowTarget {
+        /// [`HTUI_VERSION`].
+        ours: String,
+        /// The stored target, as `semver` prints it.
+        target: String,
+    },
 }
 
 /// The schema check of ANA-9 §5.0 / `R-STO-5`.
@@ -190,6 +226,27 @@ impl PgStore {
             store.bootstrap().await?;
         }
         Ok(Connected { store, migrations })
+    }
+
+    /// Connects for a process with no one to ask (MOD-40 plan D8): refuses rather than migrates.
+    ///
+    /// Not written yet: delegates to [`PgStore::connect_with`] and refuses a pending schema
+    /// (MOD-40 T6, red).
+    ///
+    /// # Errors
+    ///
+    /// [`HeadlessError::Store`] for everything [`PgStore::connect`] refuses;
+    /// [`HeadlessError::MigrationsPending`].
+    pub async fn connect_headless(
+        dsn: &str,
+        identity: &Identity,
+        connect_timeout: Duration,
+    ) -> core::result::Result<Self, HeadlessError> {
+        let connected = Self::connect_with(dsn, identity, connect_timeout).await?;
+        if let MigrationState::Pending(n) = connected.migrations {
+            return Err(HeadlessError::MigrationsPending(n));
+        }
+        Ok(connected.store)
     }
 
     /// A store over a pool that has **never** connected, for tests that need an `Online`
@@ -549,6 +606,13 @@ impl PgStore {
     #[must_use]
     pub const fn registration(&self) -> Option<&Registration> {
         self.registration.as_ref()
+    }
+
+    /// The database's target version when this build's [`HTUI_VERSION`] is below it (MOD-40
+    /// plan D9). Not read yet: always `None` (MOD-40 T6, red).
+    #[must_use]
+    pub const fn below_target(&self) -> Option<&str> {
+        None
     }
 
     /// Seeds, reads this machine's fingerprint and registers this box (plan D5, MOD-7 D1-D3).

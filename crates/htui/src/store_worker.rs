@@ -824,6 +824,10 @@ pub enum StoreReply {
         /// How many migrations are pending; `None` when the question does not apply — a memory
         /// backend, an offline one, or a connected one whose schema is up to date.
         migrations_pending: Option<usize>,
+        /// The database's target version when this build is below it (MOD-40 plan D9, PRD D3):
+        /// `PgStore::below_target` of an `Online` backend, `None` for every other. The shell
+        /// says it once on the status line; the session runs regardless.
+        below_target: Option<String>,
     },
     /// Answer to [`StoreRequest::ApplyMigrations`].
     MigrationsApplied {
@@ -1226,6 +1230,10 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::StoreState => StoreReply::StoreState {
             label: backend.label(),
             migrations_pending: None,
+            below_target: backend
+                .writable()
+                .and_then(PgStore::below_target)
+                .map(str::to_owned),
         },
         StoreRequest::ApplyMigrations => StoreReply::MigrationsApplied { applied: 0 },
         StoreRequest::QdrantInfo
@@ -1455,6 +1463,10 @@ pub fn spawn_with_runtimes(
                         StoreRequest::StoreState => StoreReply::StoreState {
                             label: backend.label(),
                             migrations_pending: pending,
+                            below_target: backend
+                                .writable()
+                                .and_then(PgStore::below_target)
+                                .map(str::to_owned),
                         },
                         StoreRequest::ApplyMigrations if held.is_some() => {
                             // `if held.is_some()` above, so this cannot be the `None` arm; the
@@ -2356,6 +2368,7 @@ mod tests {
         let StoreReply::StoreState {
             label,
             migrations_pending,
+            below_target,
         } = round_trip(&tx, &mut rx, StoreRequest::StoreState).await
         else {
             panic!("wrong reply variant")
@@ -2365,6 +2378,7 @@ mod tests {
             migrations_pending, None,
             "a memory backend has no schema to migrate"
         );
+        assert_eq!(below_target, None, "a memory backend has no target");
         drop(tx);
         worker.await.expect("the worker stops with its channel");
     }
@@ -2553,6 +2567,61 @@ mod tests {
         drop(req_tx);
         worker.await.expect("the worker stops with its channel");
         cache.close().await;
+    }
+
+    /// MOD-40 plan D9, blueprint B16: the target a connect read travels inside the `PgStore`, and
+    /// the worker copies it into every `StoreState` it answers over that store.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_state_carries_below_target_from_an_online_store() {
+        let Some(db) = htui_store::testkit::fresh_db().await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO app_setting (key, value) VALUES ($1, $2) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(htui_store::TARGET_VERSION_KEY)
+        .bind(serde_json::json!("99.0.0"))
+        .execute(&db.pool)
+        .await
+        .expect("plant another box's newer target");
+        let pg = PgStore::connect(&db.url, &db.identity)
+            .await
+            .expect("a TUI connects below the target")
+            .store;
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "below-target", 1)
+            .await
+            .expect("open a throwaway mirror");
+
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let mut started = Started::detached(Backend::Online {
+            pg,
+            cache: cache.clone(),
+        });
+        started.reconnect = None;
+        let worker = spawn(started, req_rx, rep_tx);
+
+        let StoreReply::StoreState {
+            label,
+            below_target,
+            ..
+        } = round_trip(&req_tx, &mut rep_rx, StoreRequest::StoreState).await
+        else {
+            panic!("wrong reply variant")
+        };
+        assert_eq!(label, "online");
+        assert_eq!(
+            below_target.as_deref(),
+            Some("99.0.0"),
+            "the store's target reaches the shell on the reply it re-reads"
+        );
+
+        drop(req_tx);
+        worker.await.expect("the worker stops with its channel");
+        cache.close().await;
+        db.drop_db().await;
     }
 
     /// MOD-40 plan D7 (C4): an `Online` worker stamps its box's `last_seen_at` every

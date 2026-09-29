@@ -92,6 +92,45 @@ async fn start_opens_the_mirror_offline_and_reports_online_over_a_migrated_datab
     db.drop_db().await;
 }
 
+/// MOD-40 blueprint B16: the target version travels inside the `PgStore` that
+/// `ConnEvent::Online` carries, so the worker learns it without a new event shape.
+#[tokio::test]
+async fn start_hands_over_a_store_that_knows_it_is_below_the_target() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO app_setting (key, value) VALUES ($1, $2) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(htui_store::TARGET_VERSION_KEY)
+    .bind(serde_json::json!("99.0.0"))
+    .execute(&db.pool)
+    .await
+    .expect("plant another box's newer target");
+    let root = tempfile::tempdir().expect("temp root");
+
+    let mut started = start(StartOptions {
+        dsn: Some(db.url.clone()),
+        offline: false,
+        ..StartOptions::new(root.path().to_owned())
+    })
+    .await
+    .expect("start");
+
+    match next_event(&mut started, "a database migrated by a newer build").await {
+        ConnEvent::Online(pg) => assert_eq!(
+            pg.below_target(),
+            Some("99.0.0"),
+            "the fact rides the store the worker receives"
+        ),
+        other => panic!("expected Online, got {other:?}"),
+    }
+
+    close(&started).await;
+    db.drop_db().await;
+}
+
 #[tokio::test]
 async fn start_reports_the_pending_count_over_a_bare_database() {
     let Some(db) = common::bare_db().await else {
