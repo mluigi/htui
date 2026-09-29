@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-28):** **MOD-56 was done** (`docs/decisions/mod/mod-56.md`): `terminal::init`
+**Current status (2026-09-28):** **MOD-31 was done** (`docs/decisions/mod/mod-31.md`):
+`AgentRuntime.background` is now tagged by what each task writes, and the install guard consults
+only the writing half. A running prompt preview — which writes nothing (MOD-2 D102) — no longer
+refuses an install, a login, a `ProbeBox` or the `Online` swap's registration probe, and the
+refusal now names a re-probe as well as a probe. One guard line repaired all five callers;
+`ProbeAgents` never shared the claim and still does not (recorded, not changed).
+Before it, **MOD-56 was done** (`docs/decisions/mod/mod-56.md`): `terminal::init`
 builds the terminal itself instead of calling `ratatui::init`, so htui's panic hook is the outermost
 one and `restores_the_terminal()` is consulted before anything restores — a provider panic that
 `run_providers` contains (H-20) no longer tears the terminal down mid-session. `tests/panic_hook.rs`
@@ -272,17 +278,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   is maintainer-only. Its write-up should carry the ANA-5 sections it touches.
   **Relates to ANA-16** (`docs/ANA-16.md` §5.3, §8): a container child box has its own hostname,
   distinct from its parent's (MOD-44), so the switch and the digest split also cover child boxes.
-- [ ] **MOD-31 - A running prompt preview makes an adapter install refuse** (from MOD-2, finding
-  F-121). `R-AGT-10`, `R-TUI-8`, `R-NF-3`. `AgentRuntime::serve` pushes the deferred preview task
-  into `self.background` (`agent_worker.rs:824`), and the install guard refuses whenever
-  `!self.background.is_empty()` with *"a probe is already running on this box; install once it has
-  finished"* (`agent_worker.rs:1116`). Selecting a Backlog row therefore blocks `i` in Settings for
-  the life of a preview, with a message about a probe that is not running. The guard's reason is real
-  — a probe and an install's re-probe race on the same `agent_box` row — but it keys on the wrong
-  set: `background` mixes tasks that **write** `agent_box` (the probe, the re-probe) with tasks that
-  only **read** (the preview, plan D102's "the preview writes nothing"). Split `background` by what a
-  task writes, and let the install guard consult the writing half only. `background_len` is read by
-  tests, so the split has to keep an answer for them. Found at MOD-2 close-out, 2026-09-15.
 - [ ] **MOD-32 - `trim_record`'s own strings reach the store unscrubbed** (from MOD-2, finding
   F-80). `R-SEC-3`, `R-PRM-3`. MOD-2's assembler scrubs every **digested** byte at the input layer
   (D100 as corrected by the milestone-9 CRITICAL, `f48b82b`), so nothing unmasked reaches the model
@@ -784,6 +779,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 41 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-59 write replies name themselves, MOD-55 agent help in the editor, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 40 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-59 write replies name themselves, MOD-55 agent help in the editor, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 0 |
