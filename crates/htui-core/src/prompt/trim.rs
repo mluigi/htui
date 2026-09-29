@@ -53,9 +53,10 @@ const DOCUMENT_FLOOR_PERCENT: usize = 25;
 const VERIFY_FLOOR_LINES: usize = 200;
 /// §4.6c's floor for a handoff `step_summary`.
 const STEP_SUMMARY_FLOOR_LINES: usize = 20;
-/// `trim_record.v`: version 2 since MOD-9 D42 added `skill_choices`; first, so a reader can branch
+/// `trim_record.v`: version 3 since MOD-9 D118 added `matched`, `no_match` and
+/// `skill_choices[].path`; 2 since MOD-9 D42 added `skill_choices`; first, so a reader can branch
 /// (§5.1).
-const RECORD_VERSION: u8 = 2;
+const RECORD_VERSION: u8 = 3;
 
 /// How a section lost content. Closed vocabulary (§5.1 `:1545`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -239,8 +240,8 @@ impl TrimRecord {
     ///
     /// Masking is idempotent (`scrub.rs:52`, the `[REDACTED]` step-over at `:124-129`), so a
     /// caller that scrubs twice records the same bytes both times. That matters on the paths that
-    /// do hold a populated list, where `excerpts.files[].repo`/`.path` and `skill_choices[].name`
-    /// arrive already masked by `scrubbed_inputs`.
+    /// do hold a populated list, where `excerpts.files[].repo`/`.path`, `skill_choices[].name`
+    /// and `skill_choices[].path` arrive already masked by `scrubbed_inputs`.
     ///
     /// # Errors
     ///

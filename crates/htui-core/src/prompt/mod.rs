@@ -22,8 +22,10 @@
 //! [`excerpt`]'s five-tier ranker, its [`ExcerptProvider`](excerpt::ExcerptProvider) seam and
 //! [`excerpt::select`], whose filesystem half is `htui_agent::excerpt`. MOD-7 milestone 4 adds
 //! [`excerpt_residual`] (D118), [`drop_unmaskable_excerpts`] (D129) and
-//! [`withhold_unmaskable_notes`] (P-2), which `htui_agent::excerpt::excerpts_for` uses. It is the one pass both the engine's phase prompt and
-//! the Backlog preview run, and a caller with no readable root gets the empty audit from it.
+//! [`withhold_unmaskable_notes`] (P-2), and MOD-9 milestone 5 adds [`drop_unmaskable_files`]
+//! (D116), which the shared pass in `htui_agent::excerpt` uses. It is the one pass both the
+//! engine's phase prompt and the Backlog preview run, and a caller with no readable root gets the
+//! empty audit from it.
 
 pub mod defaults;
 pub mod digest;
@@ -525,8 +527,9 @@ pub fn assemble(
 }
 
 /// ANA-5 §4.4 step 6's residual (MOD-7 milestone 4, D118): the tokens left under the target once
-/// everything but the excerpts is assembled. `spec` is assembled with an empty [`ExcerptSet`] and
-/// the answer is `(trim.target - trim.estimated_after).max(0)`, the budget §4.5's selection may
+/// everything but the excerpts is assembled — the spec's `step_files` included, so an active
+/// matched skill is paid for first (MOD-9 D120). `spec` is assembled with an empty [`ExcerptSet`]
+/// and the answer is `(trim.target - trim.estimated_after).max(0)`, the budget §4.5's selection may
 /// spend. The excerpt section's framing is not in it; an overshoot is §4.4's to trim, and excerpt
 /// files are what it drops first.
 ///
@@ -863,11 +866,17 @@ fn scrubbed_inputs(
     // MOD-9 D43: collapse the candidates, then decide them. Only the active ones render, are
     // estimated and meet the cap; every candidate is recorded.
     let placed = parsed.used.contains(&Placeholder::Skills);
-    let (skills, skill_choices) = select(
+    let (skills, mut skill_choices) = select(
         BoundSkill::collapse(spec.skills.clone()),
         placed,
-        &StepFiles::default(),
+        &spec.step_files,
     );
+    // MOD-9 D117: the matched path is recorded, never rendered; masked as the names are.
+    for choice in &mut skill_choices {
+        if let Some(path) = &mut choice.path {
+            mask(scrubber, path, &skills_name)?;
+        }
+    }
     let candidates = judge_candidates(&spec);
     Ok(ScrubbedInputs {
         spec,
@@ -974,8 +983,16 @@ pub fn drop_unmaskable_excerpts(set: &mut ExcerptSet, scrubber: &dyn Scrubber) {
 /// path, stricter than `drop_unmaskable_excerpts`. `None` when nothing was withheld.
 #[must_use]
 pub fn drop_unmaskable_files(files: &mut StepFiles, scrubber: &dyn Scrubber) -> Option<String> {
-    let _ = (files, scrubber);
-    todo!()
+    let mut withheld = 0usize;
+    files.retain(|repo, path| {
+        let refused =
+            refused_rule(scrubber, repo).is_some() || refused_rule(scrubber, path).is_some();
+        withheld += usize::from(refused);
+        !refused
+    });
+    (withheld > 0).then(|| {
+        format!("skills: {withheld} path(s) withheld from glob matching; the scrubber refused them")
+    })
 }
 
 /// What [`withhold_unmaskable_notes`] puts in place of a note it withholds.

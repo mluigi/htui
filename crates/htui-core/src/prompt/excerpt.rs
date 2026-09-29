@@ -1335,8 +1335,27 @@ pub fn select_listed(
 /// repo-relative, past [`skip_by_path`] — is added, reaching its repo even with no root.
 #[must_use]
 pub fn step_files(listing: &Listing, touched: &[PathPrefix], changed: &[RepoPath]) -> StepFiles {
-    let _ = (listing, touched, changed);
-    todo!()
+    let mut files = StepFiles::default();
+    for repo in &listing.listed {
+        files.reach(repo);
+    }
+    for file in &listing.files {
+        if touched.is_empty()
+            || touched
+                .iter()
+                .any(|prefix| prefix.matches(&file.repo, &file.path))
+        {
+            files.insert(&file.repo, &file.path);
+        }
+    }
+    // MOD-9 D115: the walk's own path rules, so a denied or escaping path is match evidence
+    // nowhere and reaches nothing.
+    for change in changed {
+        if is_repo_relative(&change.path) && skip_by_path(&change.path).is_none() {
+            files.insert(&change.repo, &change.path);
+        }
+    }
+    files
 }
 
 /// §4.5 steps 1–10 over a reader and a candidate list already merged from every provider.
