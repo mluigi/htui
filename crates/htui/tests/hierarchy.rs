@@ -1253,6 +1253,24 @@ async fn q_quits_from_browse() {
     );
 }
 
+/// MOD-52: inside a half-typed field `q` is a letter, and `ctrl-c` still quits, because the field
+/// and the section pass `CONTROL` chords on to the global table.
+#[tokio::test]
+async fn ctrl_c_quits_from_a_half_typed_field() {
+    let mut harness = hierarchy_over(MemStore::demo()).await;
+    harness.key("j");
+    harness.key("n");
+    harness.settle().await;
+    type_into(&mut harness, "vulk");
+    harness.key("q");
+    harness.settle().await;
+    assert!(!harness.app().should_quit, "`q` is a letter here");
+
+    harness.key("ctrl-c");
+    harness.settle().await;
+    assert!(harness.app().should_quit, "`ctrl-c` quits from the field");
+}
+
 /// Types one key per char, as a user would: the field is the only thing that sees them.
 fn type_into(harness: &mut Harness, text: &str) {
     for c in text.chars() {

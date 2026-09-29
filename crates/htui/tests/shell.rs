@@ -280,3 +280,17 @@ async fn esc_answers_the_prompt_like_n() {
         "`Esc` falls through to the wildcard overlay binding"
     );
 }
+
+/// MOD-52: the switcher is modal and swallows `q`, but `ctrl-c` quits through the overlay
+/// wildcard binding.
+#[tokio::test]
+async fn ctrl_c_quits_from_the_modal_switcher() {
+    let mut harness = open_over_demo().await;
+    harness.key("q");
+    assert!(
+        !harness.app().should_quit,
+        "the modal overlay still swallows `q`"
+    );
+    harness.key("ctrl-c");
+    assert!(harness.app().should_quit, "`ctrl-c` quits from it");
+}
