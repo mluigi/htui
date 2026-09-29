@@ -155,12 +155,17 @@ host_snapshot() {
 
 # ---- Docker-tagged cases ----
 
-# hr_docker_setup ITEM... — real docker + real HOME; fixture host repo with the given open items
-# (TOOL-9xxx so no real run's project name can collide); HR_ROOT/HR_STATE under the tmpdir.
+# hr_docker_setup [--no-image] ITEM... — real docker + real HOME; fixture host repo with the given
+# open items (TOOL-9xxx so no real run's project name can collide); HR_ROOT/HR_STATE under the
+# tmpdir. Skips unless the image is built (--no-image: the case builds it itself).
 hr_docker_setup() {
     hr_base_setup || return 1
+    local need_image=1
+    [[ "${1:-}" == --no-image ]] && { need_image=0; shift; }
     docker info >/dev/null 2>&1 || skip "docker daemon not reachable"
-    docker image inspect "${HR_IMAGE:-htui-hr-dev}" >/dev/null 2>&1 || skip "image htui-hr-dev not built"
+    if [[ $need_image -eq 1 ]]; then
+        docker image inspect "${HR_IMAGE:-htui-hr-dev}" >/dev/null 2>&1 || skip "image htui-hr-dev not built (scripts/hr build)"
+    fi
     local item proj
     for item in "$@"; do
         proj="hr-${item,,}"

@@ -531,7 +531,7 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
 
 # bats test_tags=docker
 @test "D1. hr build: image labels match the host identity" {
-    hr_docker_setup TOOL-9001
+    hr_docker_setup --no-image TOOL-9001
     run --separate-stderr "$HR" build
     [[ $status -eq 0 ]]
     run docker image inspect -f '{{index .Config.Labels "hr.uid"}} {{index .Config.Labels "hr.gid"}} {{index .Config.Labels "hr.home"}}' htui-hr-dev
