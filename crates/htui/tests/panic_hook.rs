@@ -2,7 +2,10 @@
 //!
 //! Its own test binary, and one `#[test]` in it, because [`std::panic::set_hook`] is **process**
 //! state: a second case running in parallel in this binary would see this one's hook, and this one
-//! would see its panics.
+//! would see its panics. Several of them are *expected*, and the second half of the test forwards
+//! them to the default hook rather than swallowing them — libtest captures what the hook prints, so
+//! they stay invisible unless the test fails or `--nocapture` is passed, and the price paid for
+//! that visibility is that a failing `assert_eq!` in here still reports its message and location.
 //!
 //! Review finding M1. `catch_unwind` does not stop the panic hook, so a provider panic that
 //! `htui_agent::excerpt::run_providers` catches, drops and records (hazard H-20) still ran
@@ -10,6 +13,7 @@
 //! no raw mode while the event loop carried on drawing into it. The wedged-UI shape, from a defect
 //! the assembler had already decided to survive.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use htui_agent::excerpt::{PROVIDER_THREAD_PREFIX, run_providers};
@@ -126,4 +130,47 @@ fn a_contained_provider_panic_leaves_the_terminal_alone() {
         "a panic the process does not survive still gives the terminal back — that is the whole \
          reason the hook exists"
     );
+
+    // The second half of MOD-56, and the half that was missing: everything above pins the
+    // *decision*, and the decision was right while the terminal was still torn down underneath the
+    // event loop, because the hook that asked it was ratatui's inner one and ratatui's outer one
+    // restored regardless of the answer. So this drives the real chain, with a counting restore
+    // standing where `ratatui::restore` stands in production.
+    let restored = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&restored);
+    // The chain's `previous` is the default hook, forwarded rather than replaced. Rust renders a
+    // panic's message, location and left/right *in* the hook, so a no-op base would leave every
+    // failing `assert_eq!` below reporting as a bare `thread panicked at` with nothing to act on —
+    // a swallowed assertion is a worse failure than a noisy one. The price is that the two
+    // expected panics below now print; libtest captures it, so it costs nothing unless this
+    // binary is run with `--nocapture` or one of those asserts actually fails.
+    let inner = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| inner(info)));
+    htui::terminal::install_panic_hook_restoring(move || {
+        counter.fetch_add(1, Ordering::Relaxed);
+    });
+
+    // A contained panic, inline, on this thread — the case that `catch_unwind` swallows without
+    // stopping the hook, and the one H-20 exists for.
+    let (_, set) = run_providers(&inline, &owned.as_request());
+    assert_eq!(set, vec!["boom@0.1:panic".to_owned()]);
+    assert_eq!(
+        restored.load(Ordering::Relaxed),
+        0,
+        "a `false` from the predicate has to reach the restore, or the terminal goes down under a \
+         running event loop (MOD-56)"
+    );
+
+    // And then the panic the process does not survive, on this same thread.
+    let _ = std::panic::catch_unwind(|| panic!("the shell itself"));
+    assert_eq!(
+        restored.load(Ordering::Relaxed),
+        1,
+        "an uncontained panic still gives the terminal back — that is the whole reason the hook \
+         exists"
+    );
+
+    // Nothing of this test's own is left installed: the counting chain is dropped, and the binary
+    // ends on the default hook rather than on a closure that outlives the test that owns it.
+    let _ = std::panic::take_hook();
 }

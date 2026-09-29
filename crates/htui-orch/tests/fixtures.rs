@@ -56,6 +56,7 @@ async fn feature_with_verify_snapshot_matches() {
             project_id: item.project_id,
             name: "feature-with-verify".to_owned(),
             description: "intermediate verify phase".to_owned(),
+            is_override: false,
         })
         .await
         .unwrap();

@@ -14,29 +14,30 @@ use uuid::Uuid;
 
 use crate::fixtures::ids;
 use crate::model::{
-    Agent, AgentBox, AgentId, Billing, BoxEdit, BoxId, BoxProbe, BoxRow, ChatRunSpec, CitationKind,
-    Claim, CommandQueue, CommandRun, CommandRunId, CommandRunStatus, CoverageRow,
-    DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EventKind, EventRole, Gate, GateOutcome,
-    GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKindId, ItemKindPatch,
-    ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
-    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-    NewStepGraph, NewWorkspace, NoteId, OverlapRule, PhaseId, PhasePatch, Priority, ProbedTool,
-    ProjectId, ProjectPatch, PromptScope, PromptTemplate, PromptTemplateId, RepoBoxPath, RepoId,
-    RepoPatch, RepoScope, Requirement, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementState, RequirementUpdate, Resolution, Run,
-    RunId, RunKind, RunMode, RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope,
-    SessionEvent, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry,
-    UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    canonical_declared_tags, missing_tags_failure,
+    Activation, Agent, AgentBox, AgentId, Attachment, Billing, BindingChange, BoxEdit, BoxId,
+    BoxProbe, BoxRow, ChatRunSpec, CitationKind, Claim, CommandQueue, CommandRun, CommandRunId,
+    CommandRunStatus, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EventKind, EventRole,
+    Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId,
+    ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument,
+    NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
+    NoteId, OverlapRule, PhaseId, PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch,
+    PromptScope, PromptTemplate, PromptTemplateId, RepoBoxPath, RepoId, RepoPatch, RepoScope,
+    Requirement, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementState, RequirementUpdate, Resolution, Run, RunId, RunKind,
+    RunMode, RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, Skill,
+    SkillBindingKey, SkillId, SkillPatch, SkillVersion, SnapshotGraph, SnapshotSettings, Status,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
+    TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::store::error::StoreError;
 use crate::store::traits::{
     CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, UpdateOutcome, WriteStore,
-    citation_key, illegal_move, invalid_area_code, requirement_withdrawn, resolution_not_closable,
-    withdrawn_requirement_cited,
+    already_exists, citation_key, illegal_move, invalid_area_code, requirement_withdrawn,
+    resolution_not_closable, withdrawn_requirement_cited,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -118,6 +119,12 @@ pub const CASES: &[&str] = &[
     "claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks",
     "claim_run_checks_tags_after_claimability_and_before_the_slot",
     "infer_repo_box_path_inserts_only_where_absent",
+    "skill_create_reads_back_with_version_one",
+    "skill_update_is_a_compare_and_set_and_refuses_a_taken_name",
+    "skill_version_append_is_a_compare_and_set_on_the_head",
+    "skill_binding_attach_change_detach_are_compare_and_set",
+    "skill_binding_refuses_by_rule",
+    "skill_binding_stores_expanded_globs_and_languages_as_typed",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -263,6 +270,22 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "infer_repo_box_path_inserts_only_where_absent" => {
             infer_repo_box_path_inserts_only_where_absent(store).await;
+        }
+        "skill_create_reads_back_with_version_one" => {
+            skill_create_reads_back_with_version_one(store).await;
+        }
+        "skill_update_is_a_compare_and_set_and_refuses_a_taken_name" => {
+            skill_update_is_a_compare_and_set_and_refuses_a_taken_name(store).await;
+        }
+        "skill_version_append_is_a_compare_and_set_on_the_head" => {
+            skill_version_append_is_a_compare_and_set_on_the_head(store).await;
+        }
+        "skill_binding_attach_change_detach_are_compare_and_set" => {
+            skill_binding_attach_change_detach_are_compare_and_set(store).await;
+        }
+        "skill_binding_refuses_by_rule" => skill_binding_refuses_by_rule(store).await,
+        "skill_binding_stores_expanded_globs_and_languages_as_typed" => {
+            skill_binding_stores_expanded_globs_and_languages_as_typed(store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -3256,6 +3279,7 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
             project_id: ids::PROJECT_HTUI,
             name: "release".to_owned(),
             description: "Cut a release".to_owned(),
+            is_override: false,
         })
         .await
         .expect(CASE);
@@ -3266,6 +3290,7 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
             project_id: ids::PROJECT_HTUI,
             name: "analysis".to_owned(),
             description: String::new(),
+            is_override: false,
         })
         .await;
     assert!(
@@ -3492,6 +3517,28 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
             })
         ),
         "{CASE}: an unknown id is NotFound, got {unknown:?}"
+    );
+
+    // MOD-9 D80, D95: `is_override` is written at create and read back; last, so the name list
+    // above is the graphs a non-override create leaves.
+    let marked = store
+        .create_step_graph(NewStepGraph {
+            id: StepGraphId::new(),
+            project_id: ids::PROJECT_HTUI,
+            name: "release-override".to_owned(),
+            description: String::new(),
+            is_override: true,
+        })
+        .await
+        .expect(CASE);
+    assert!(marked.is_override, "{CASE}: create writes is_override");
+    assert!(!graph.is_override, "{CASE}: and false stays false");
+    let listed = store.step_graphs(ids::PROJECT_HTUI).await.expect(CASE);
+    assert!(
+        listed
+            .iter()
+            .any(|row| row.id == marked.id && row.is_override),
+        "{CASE}: is_override reads back"
     );
 }
 
@@ -5975,6 +6022,811 @@ async fn prompt_template_refuses_what_parse_refuses<S: WriteStore>(store: &S) {
             .expect(CASE),
     );
     assert_eq!(head.version, 2, "{CASE}: the unknown author wrote nothing");
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-9 milestone 3: the skill writers (plan D75-D79)
+// ------------------------------------------------------------------------------------------------
+//
+// Every writer is a compare-and-set whose token is checked first (D75). The refusal sentences are
+// the pure helpers of `store::traits` (blueprint D88), so each refusal below is asserted by a
+// needle out of that sentence, the same on both stores. The two-session races (two appends at one
+// head, two attaches of one key) need two sessions, so they are not cases here: they are the
+// two-session tests in `htui-store`'s `tests/`.
+
+/// A skill to create with a fresh id, an empty description and a `{}` source, authored by the
+/// fixture user.
+fn new_skill(name: &str, body: &str) -> NewSkill {
+    NewSkill {
+        id: SkillId::new(),
+        name: name.to_owned(),
+        description: String::new(),
+        body: body.to_owned(),
+        source: json!({}),
+        created_by: ids::USER,
+    }
+}
+
+/// A version to append with a `{}` source, authored by the fixture user.
+fn version(body: &str) -> NewSkillVersion {
+    NewSkillVersion {
+        body: body.to_owned(),
+        source: json!({}),
+        created_by: ids::USER,
+    }
+}
+
+/// An attachment with no pin, no globs and no languages.
+fn attachment(activation: Activation, position: i32) -> Attachment {
+    Attachment {
+        pinned_version: None,
+        position,
+        activation,
+        globs: Vec::new(),
+        languages: Vec::new(),
+    }
+}
+
+/// The natural key of one attachment.
+fn key(skill: SkillId, project: Option<ProjectId>, phase: Option<PhaseId>) -> SkillBindingKey {
+    SkillBindingKey {
+        skill,
+        project,
+        phase,
+    }
+}
+
+/// A `Constraint` whose sentence carries `needle`, or a panic naming the case and what was tried.
+fn constraint_with<T: core::fmt::Debug>(
+    case: &str,
+    outcome: Result<T, StoreError>,
+    needle: &str,
+    what: &str,
+) {
+    match outcome {
+        Err(StoreError::Constraint(message)) => assert!(
+            message.contains(needle),
+            "{case}: {what}: the refusal names `{needle}`, got {message:?}"
+        ),
+        other => panic!("{case}: {what} is Constraint, got {other:?}"),
+    }
+}
+
+/// A `NotFound` on `entity`, or a panic naming the case and what was tried.
+fn not_found_on<T: core::fmt::Debug>(
+    case: &str,
+    outcome: Result<T, StoreError>,
+    entity: &str,
+    what: &str,
+) {
+    match outcome {
+        Err(StoreError::NotFound { entity: found, .. }) if found == entity => {}
+        other => panic!("{case}: {what} is NotFound on `{entity}`, got {other:?}"),
+    }
+}
+
+/// MOD-9 plan D75, D77: a skill is created with its version 1 in one write, and reads back
+/// through the three readers in their orders (D91). A bad name, a taken name, a blank body and an
+/// unknown author are each refused and write nothing.
+async fn skill_create_reads_back_with_version_one<S: WriteStore>(store: &S) {
+    const CASE: &str = "skill_create_reads_back_with_version_one";
+    const BODY: &str = "Write in the active voice.";
+
+    let (skill, v1) = store
+        .create_skill(new_skill("docs-style", BODY))
+        .await
+        .expect(CASE);
+    assert_eq!(skill.name, "docs-style", "{CASE}: the name as given");
+    assert_eq!(skill.description, "", "{CASE}: the description as given");
+    assert_eq!(
+        skill.created_by,
+        ids::USER,
+        "{CASE}: authored by the caller"
+    );
+    assert_eq!(
+        skill.created_at, skill.updated_at,
+        "{CASE}: a new row has not been edited"
+    );
+    assert_eq!(
+        v1,
+        SkillVersion {
+            skill_id: skill.id,
+            version: 1,
+            body: BODY.to_owned(),
+            source: json!({}),
+            created_by: ids::USER,
+            created_at: v1.created_at,
+        },
+        "{CASE}: version 1 carries the body, the source and the author"
+    );
+
+    let names = |skills: Vec<Skill>| skills.into_iter().map(|row| row.name).collect::<Vec<_>>();
+    assert_eq!(
+        names(store.skills().await.expect(CASE)),
+        ["docs-style", "rust-style", "tests"],
+        "{CASE}: the library in name byte order"
+    );
+    assert_eq!(
+        store.skill_versions(skill.id).await.expect(CASE),
+        [v1],
+        "{CASE}: the new skill has exactly its version 1"
+    );
+    assert_eq!(
+        store
+            .skill_versions(ids::SKILL_RUST_STYLE)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|row| row.version)
+            .collect::<Vec<_>>(),
+        [1, 2],
+        "{CASE}: a fixture skill's versions ascend"
+    );
+    assert!(
+        store
+            .skill_versions(SkillId::new())
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: an unknown skill has no version"
+    );
+
+    constraint_with(
+        CASE,
+        store.create_skill(new_skill("Docs", BODY)).await,
+        "skill.name",
+        "an upper-case name",
+    );
+    constraint_with(
+        CASE,
+        store.create_skill(new_skill("tests", BODY)).await,
+        "`tests` already exists",
+        "a taken name",
+    );
+    constraint_with(
+        CASE,
+        store.create_skill(new_skill("blank", "  \n")).await,
+        "a skill needs text",
+        "a blank body",
+    );
+    let mut stranger = new_skill("stranger", BODY);
+    stranger.created_by = UserId::new();
+    let unknown = store.create_skill(stranger).await;
+    assert!(
+        matches!(unknown, Err(StoreError::Constraint(_))),
+        "{CASE}: a created_by that names no app_user is Constraint, got {unknown:?}"
+    );
+    // The author is looked at before the name: a stranger taking a taken name is refused for the
+    // author, on both stores.
+    let mut stranger = new_skill("tests", BODY);
+    stranger.created_by = UserId::new();
+    constraint_with(
+        CASE,
+        store.create_skill(stranger).await,
+        "references no app_user",
+        "an unknown author with a taken name",
+    );
+    let mut twin = new_skill("docs-twin", BODY);
+    twin.id = skill.id;
+    constraint_with(
+        CASE,
+        store.create_skill(twin).await,
+        &already_exists("skill", skill.id),
+        "a taken id",
+    );
+    assert_eq!(
+        store.skills().await.expect(CASE).len(),
+        3,
+        "{CASE}: the refusals wrote nothing"
+    );
+}
+
+/// MOD-9 plan D76 (OQ-17): a rename is a compare-and-set on `updated_at`. A spent token is
+/// `Stale` even for a name that would be refused; a fresh one into a taken or invalid name is
+/// `Constraint`; an unknown id is `NotFound`. Versions do not move.
+async fn skill_update_is_a_compare_and_set_and_refuses_a_taken_name<S: WriteStore>(store: &S) {
+    const CASE: &str = "skill_update_is_a_compare_and_set_and_refuses_a_taken_name";
+    let rename = |name: &str| SkillPatch {
+        name: Some(name.to_owned()),
+        description: None,
+    };
+
+    let row = store
+        .skills()
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|row| row.name == "rust-style")
+        .expect("the fixture holds rust-style");
+
+    let renamed = applied(
+        CASE,
+        store
+            .update_skill(row.id, row.updated_at, rename("rust-house"))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(renamed.name, "rust-house", "{CASE}: the name changed");
+    assert_eq!(
+        renamed.description, row.description,
+        "{CASE}: a `None` description is left alone"
+    );
+    assert!(
+        renamed.updated_at > row.updated_at,
+        "{CASE}: the edit moved the token"
+    );
+
+    let now = stale(
+        CASE,
+        store
+            .update_skill(
+                row.id,
+                row.updated_at,
+                SkillPatch {
+                    name: None,
+                    description: Some("x".to_owned()),
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(now, renamed, "{CASE}: a spent token finds the renamed row");
+
+    constraint_with(
+        CASE,
+        store
+            .update_skill(row.id, renamed.updated_at, rename("tests"))
+            .await,
+        "`tests` already exists",
+        "a rename into a taken name",
+    );
+    let spent = store
+        .update_skill(row.id, row.updated_at, rename("A B"))
+        .await
+        .expect(CASE);
+    assert!(
+        matches!(spent, CasOutcome::Stale(_)),
+        "{CASE}: a spent token is Stale before the name is judged, got {spent:?}"
+    );
+    constraint_with(
+        CASE,
+        store
+            .update_skill(row.id, renamed.updated_at, rename("a--b"))
+            .await,
+        "skill.name",
+        "a doubled hyphen",
+    );
+    not_found_on(
+        CASE,
+        store
+            .update_skill(SkillId::new(), row.updated_at, rename("x"))
+            .await,
+        "skill",
+        "an unknown id",
+    );
+    assert_eq!(
+        store
+            .skill_versions(row.id)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|row| row.version)
+            .collect::<Vec<_>>(),
+        [1, 2],
+        "{CASE}: a rename writes no version"
+    );
+}
+
+/// MOD-9 plan D75, D77, blueprint D89: the head version is the token of an append. A spent head
+/// is `Stale` with the head as it is, even for a blank body; a blank body at the head and an
+/// unknown author are `Constraint`; an unknown skill is `NotFound`. (A skill with no version at
+/// all needs a hand-written row, so that arm is `a_skill_with_no_version_takes_version_one_at_zero`
+/// in `mem.rs`.)
+async fn skill_version_append_is_a_compare_and_set_on_the_head<S: WriteStore>(store: &S) {
+    const CASE: &str = "skill_version_append_is_a_compare_and_set_on_the_head";
+
+    let v3 = applied(
+        CASE,
+        store
+            .add_skill_version(ids::SKILL_RUST_STYLE, 2, version("v3 body"))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (v3.skill_id, v3.version, v3.body.as_str()),
+        (ids::SKILL_RUST_STYLE, 3, "v3 body"),
+        "{CASE}: an append at head v2 writes v3"
+    );
+    assert_eq!(v3.source, json!({}), "{CASE}: the source as given");
+    assert_eq!(v3.created_by, ids::USER, "{CASE}: authored by the caller");
+
+    let head = stale(
+        CASE,
+        store
+            .add_skill_version(ids::SKILL_RUST_STYLE, 2, version("other"))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (head.version, head.body.as_str()),
+        (3, "v3 body"),
+        "{CASE}: a spent head finds v3"
+    );
+    let spent = store
+        .add_skill_version(ids::SKILL_RUST_STYLE, 2, version(" "))
+        .await
+        .expect(CASE);
+    assert!(
+        matches!(spent, CasOutcome::Stale(_)),
+        "{CASE}: a spent head is Stale before the body is judged, got {spent:?}"
+    );
+    constraint_with(
+        CASE,
+        store
+            .add_skill_version(ids::SKILL_RUST_STYLE, 3, version("\t\n"))
+            .await,
+        "a skill needs text",
+        "a blank body at the head",
+    );
+    let mut stranger = version("v4 body");
+    stranger.created_by = UserId::new();
+    let unknown = store
+        .add_skill_version(ids::SKILL_RUST_STYLE, 3, stranger)
+        .await;
+    assert!(
+        matches!(unknown, Err(StoreError::Constraint(_))),
+        "{CASE}: a created_by that names no app_user is Constraint, got {unknown:?}"
+    );
+    not_found_on(
+        CASE,
+        store
+            .add_skill_version(SkillId::new(), 0, version("body"))
+            .await,
+        "skill",
+        "an unknown skill",
+    );
+    assert_eq!(
+        store
+            .skill_versions(ids::SKILL_RUST_STYLE)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|row| row.version)
+            .collect::<Vec<_>>(),
+        [1, 2, 3],
+        "{CASE}: one append landed, the refusals wrote nothing"
+    );
+}
+
+/// MOD-9 plan D75, D78, blueprint D90: attach, change and detach at one natural key, each a
+/// compare-and-set on the row's `updated_at`, with `None` meaning "I expect no row". A spent
+/// token is `Stale` with the row as it is (or `None` when it is gone); a change keeps the id.
+async fn skill_binding_attach_change_detach_are_compare_and_set<S: WriteStore>(store: &S) {
+    const CASE: &str = "skill_binding_attach_change_detach_are_compare_and_set";
+    let global = key(ids::SKILL_TESTS, None, None);
+
+    let row = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                global,
+                None,
+                BindingChange::Attach(attachment(Activation::Always, 3)),
+            )
+            .await
+            .expect(CASE),
+    )
+    .expect("an attach carries its row");
+    assert_eq!(
+        (row.skill_id, row.project_id, row.phase_id),
+        (ids::SKILL_TESTS, None, None),
+        "{CASE}: a global row"
+    );
+    assert_eq!(
+        (row.position, row.activation, row.pinned_version),
+        (3, Activation::Always, None),
+        "{CASE}: the attachment as given"
+    );
+    assert_eq!(
+        store.skill_bindings(None).await.expect(CASE),
+        std::slice::from_ref(&row),
+        "{CASE}: the global rows"
+    );
+
+    let again = stale(
+        CASE,
+        store
+            .set_skill_binding(
+                global,
+                None,
+                BindingChange::Attach(attachment(Activation::Always, 5)),
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(again.as_ref(), Some(&row), "{CASE}: `None` finds the row");
+
+    let row2 = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                global,
+                Some(row.updated_at),
+                BindingChange::Attach(attachment(Activation::Off, 4)),
+            )
+            .await
+            .expect(CASE),
+    )
+    .expect("a change carries its row");
+    assert_eq!(row2.id, row.id, "{CASE}: a change keeps the row's id");
+    assert_eq!(
+        (row2.position, row2.activation),
+        (4, Activation::Off),
+        "{CASE}: the change landed"
+    );
+    assert!(
+        row2.updated_at > row.updated_at,
+        "{CASE}: the change moved the token"
+    );
+
+    for change in [
+        BindingChange::Attach(attachment(Activation::Always, 9)),
+        BindingChange::Detach,
+    ] {
+        let now = stale(
+            CASE,
+            store
+                .set_skill_binding(global, Some(row.updated_at), change.clone())
+                .await
+                .expect(CASE),
+        );
+        assert_eq!(
+            now.as_ref(),
+            Some(&row2),
+            "{CASE}: a spent token finds the changed row ({change:?})"
+        );
+    }
+
+    let gone = applied(
+        CASE,
+        store
+            .set_skill_binding(global, Some(row2.updated_at), BindingChange::Detach)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(gone, None, "{CASE}: a detach carries no row");
+    assert!(
+        store.skill_bindings(None).await.expect(CASE).is_empty(),
+        "{CASE}: the global row is gone"
+    );
+    let none = stale(
+        CASE,
+        store
+            .set_skill_binding(global, Some(row2.updated_at), BindingChange::Detach)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        none, None,
+        "{CASE}: a token on a key with no row is Stale(None)"
+    );
+    let nothing = applied(
+        CASE,
+        store
+            .set_skill_binding(global, None, BindingChange::Detach)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        nothing, None,
+        "{CASE}: detaching nothing under `None` applies"
+    );
+
+    let phase = key(
+        ids::SKILL_RUST_STYLE,
+        Some(ids::PROJECT_HTUI),
+        Some(ids::PHASE_HTUI_IMPLEMENT),
+    );
+    let demo = stale(
+        CASE,
+        store
+            .set_skill_binding(
+                phase,
+                None,
+                BindingChange::Attach(attachment(Activation::Always, 0)),
+            )
+            .await
+            .expect(CASE),
+    )
+    .expect("the fixture's phase row");
+    assert_eq!(
+        demo.id,
+        ids::BINDING_HTUI_IMPLEMENT_RUST_STYLE,
+        "{CASE}: `None` on the fixture's phase key finds its row"
+    );
+    let token = store
+        .skill_bindings(Some(ids::PROJECT_HTUI))
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|row| row.id == ids::BINDING_HTUI_IMPLEMENT_RUST_STYLE)
+        .expect("the fixture's phase row reads back")
+        .updated_at;
+    let pinned = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                phase,
+                Some(token),
+                BindingChange::Attach(Attachment {
+                    pinned_version: Some(2),
+                    ..Attachment::of(&demo)
+                }),
+            )
+            .await
+            .expect(CASE),
+    )
+    .expect("a change carries its row");
+    assert_eq!(pinned.pinned_version, Some(2), "{CASE}: re-pinned to v2");
+    assert_eq!(
+        store
+            .skill_bindings(Some(ids::PROJECT_HTUI))
+            .await
+            .expect(CASE)
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        [
+            ids::BINDING_HTUI_RUST_STYLE,
+            ids::BINDING_HTUI_IMPLEMENT_RUST_STYLE,
+            ids::BINDING_HTUI_TESTS,
+        ],
+        "{CASE}: a project's rows by skill id, then phase id with the project row first (D91)"
+    );
+}
+
+/// MOD-9 plan D78, D79: every rule of the attachment writer refuses with its sentence and writes
+/// nothing; an unknown skill, project or phase is `NotFound`; a spent token is `Stale` before the
+/// input is judged; and a qualified glob naming a repo of the project lands.
+async fn skill_binding_refuses_by_rule<S: WriteStore>(store: &S) {
+    const CASE: &str = "skill_binding_refuses_by_rule";
+    store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE);
+    let read_all = || async {
+        (
+            store.skill_bindings(None).await.expect(CASE),
+            store
+                .skill_bindings(Some(ids::PROJECT_HTUI))
+                .await
+                .expect(CASE),
+            store
+                .skill_bindings(Some(ids::PROJECT_AGY))
+                .await
+                .expect(CASE),
+        )
+    };
+    let before = read_all().await;
+
+    let agy = key(ids::SKILL_TESTS, Some(ids::PROJECT_AGY), None);
+    let with = |edit: fn(&mut Attachment)| {
+        let mut change = attachment(Activation::Always, 0);
+        edit(&mut change);
+        BindingChange::Attach(change)
+    };
+    let refusals: [(SkillBindingKey, BindingChange, &str, &str); 9] = [
+        (
+            key(
+                ids::SKILL_TESTS,
+                Some(ids::PROJECT_AGY),
+                Some(ids::PHASE_HTUI_IMPLEMENT),
+            ),
+            with(|_| {}),
+            "is not in project",
+            "a phase of another project",
+        ),
+        (
+            key(ids::SKILL_TESTS, None, Some(ids::PHASE_HTUI_IMPLEMENT)),
+            with(|_| {}),
+            "needs its project",
+            "a phase without its project",
+        ),
+        (
+            agy,
+            with(|a| a.pinned_version = Some(9)),
+            "pinned_version",
+            "a pin to a missing version",
+        ),
+        (
+            agy,
+            with(|a| a.languages = vec!["klingon".to_owned()]),
+            "klingon",
+            "an unknown language",
+        ),
+        (
+            agy,
+            with(|a| a.globs = vec!["src/[a".to_owned()]),
+            "src/[a",
+            "a glob that does not compile",
+        ),
+        (
+            key(ids::SKILL_TESTS, None, None),
+            with(|a| a.globs = vec!["core:**/*.rs".to_owned()]),
+            "global attachment",
+            "a qualified glob on a global row",
+        ),
+        (
+            agy,
+            with(|a| a.globs = vec!["nosuchrepo:**/*.rs".to_owned()]),
+            "nosuchrepo",
+            "a qualifier naming no repo of the project",
+        ),
+        (
+            agy,
+            with(|a| a.activation = Activation::Glob),
+            "needs at least one glob",
+            "activation glob without a glob",
+        ),
+        (
+            agy,
+            with(|a| a.position = -1),
+            "0 or more",
+            "a negative position",
+        ),
+    ];
+    for (at, change, needle, what) in refusals {
+        constraint_with(
+            CASE,
+            store.set_skill_binding(at, None, change).await,
+            needle,
+            what,
+        );
+    }
+
+    let fine = || BindingChange::Attach(attachment(Activation::Always, 0));
+    not_found_on(
+        CASE,
+        store
+            .set_skill_binding(key(SkillId::new(), None, None), None, fine())
+            .await,
+        "skill",
+        "an unknown skill",
+    );
+    not_found_on(
+        CASE,
+        store
+            .set_skill_binding(
+                key(ids::SKILL_TESTS, Some(ProjectId::new()), None),
+                None,
+                fine(),
+            )
+            .await,
+        "project",
+        "an unknown project",
+    );
+    not_found_on(
+        CASE,
+        store
+            .set_skill_binding(
+                key(
+                    ids::SKILL_TESTS,
+                    Some(ids::PROJECT_HTUI),
+                    Some(PhaseId::new()),
+                ),
+                None,
+                fine(),
+            )
+            .await,
+        "step_graph_phase",
+        "an unknown phase",
+    );
+    let spent = store
+        .set_skill_binding(
+            key(ids::SKILL_TESTS, Some(ids::PROJECT_HTUI), None),
+            None,
+            with(|a| a.globs = vec!["src/[a".to_owned()]),
+        )
+        .await
+        .expect(CASE);
+    assert!(
+        matches!(spent, CasOutcome::Stale(Some(_))),
+        "{CASE}: `None` on the fixture's project row is Stale before the glob is judged, got \
+         {spent:?}"
+    );
+
+    assert_eq!(
+        read_all().await,
+        before,
+        "{CASE}: the refusals wrote nothing"
+    );
+
+    let landed = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                key(
+                    ids::SKILL_TESTS,
+                    Some(ids::PROJECT_HTUI),
+                    Some(ids::PHASE_HTUI_IMPLEMENT),
+                ),
+                None,
+                with(|a| {
+                    a.activation = Activation::Glob;
+                    a.globs = vec!["core:**/*.rs".to_owned()];
+                }),
+            )
+            .await
+            .expect(CASE),
+    )
+    .expect("an attach carries its row");
+    assert_eq!(
+        landed.globs,
+        ["core:**/*.rs"],
+        "{CASE}: a qualifier naming a repo of the project lands"
+    );
+}
+
+/// MOD-9 plan D73, D74, D78: the writer stores the canonical globs (typed, trimmed, empties
+/// dropped, then the languages' globs, first of each kept) and the languages trimmed, lowercased
+/// and deduplicated. Re-saving a stored row as typed (the clone's shape, D80) changes neither.
+async fn skill_binding_stores_expanded_globs_and_languages_as_typed<S: WriteStore>(store: &S) {
+    const CASE: &str = "skill_binding_stores_expanded_globs_and_languages_as_typed";
+    store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE);
+    let at = key(
+        ids::SKILL_TESTS,
+        Some(ids::PROJECT_HTUI),
+        Some(ids::PHASE_HTUI_IMPLEMENT),
+    );
+    let typed = |list: &[&str]| list.iter().map(|&s| s.to_owned()).collect::<Vec<_>>();
+
+    let row = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                at,
+                None,
+                BindingChange::Attach(Attachment {
+                    globs: typed(&[" core:src/** ", "", "**/*.rs"]),
+                    languages: typed(&[" Rust ", "rust", "toml"]),
+                    ..attachment(Activation::Glob, 0)
+                }),
+            )
+            .await
+            .expect(CASE),
+    )
+    .expect("an attach carries its row");
+    assert_eq!(
+        row.globs,
+        ["core:src/**", "**/*.rs", "**/Cargo.toml", "**/*.toml"],
+        "{CASE}: typed globs first, then the languages' globs, each once"
+    );
+    assert_eq!(
+        row.languages,
+        ["rust", "toml"],
+        "{CASE}: languages trimmed, lowercased, each once"
+    );
+
+    let again = applied(
+        CASE,
+        store
+            .set_skill_binding(
+                at,
+                Some(row.updated_at),
+                BindingChange::Attach(Attachment::of(&row)),
+            )
+            .await
+            .expect(CASE),
+    )
+    .expect("a change carries its row");
+    assert_eq!(
+        (&again.globs, &again.languages),
+        (&row.globs, &row.languages),
+        "{CASE}: a stored row re-saved as typed is the same attachment"
+    );
 }
 
 /// A [`BoxEdit`] that writes `declared_tags` and leaves `quirks` alone.
