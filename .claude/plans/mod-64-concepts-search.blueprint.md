@@ -1,6 +1,6 @@
 # Blueprint: MOD-64, concepts search in the TUI
 
-**Status**: proposed (2026-09-29). Findings F1–F13 (§0) and decisions D241–D262 (§11) are proposed
+**Status**: accepted (2026-09-29); F1 resolved by the maintainer as `find` (D236, D257 amended). Findings F1–F13 (§0) and decisions D241–D262 (§11) are proposed
 here. **Blocker** means the plan, read literally, fails its own acceptance or its own named test, or
 leaves the gate red. The Fix column is what the implementer builds.
 
@@ -36,7 +36,7 @@ a citation into a file a task edits moves after that task's first commit. `df -h
 
 | # | Severity | Plan says | Tree at `9a1cf27` | Fix |
 |---|---|---|---|---|
-| **F1** | Major (gate: 27 snapshots move) | D236: global `Ctrl+F`, help text `search concepts`, "bound in `register_all` like `w`". Nothing about snapshots. | `App::render` draws `keymap.help_line(&KeyScope::Global)` on the status row whenever `status` is `None` (`app/state.rs` `render`). Today that line is 85 cells: `q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces`. Appending ` · Ctrl+f search concepts` (`KeyChord::label` prints `Ctrl+f`, `keymap.rs:88-100`) makes it 110; the Harness is 100 wide (`testkit.rs:34`), so every registered-shell snapshot's last row changes and ends `· Ctrl+f search c`. 27 files carry that row: 26 under `crates/htui/tests/snapshots/` (list in §5.9) and `crates/htui/src/snapshots/htui__testkit__tests__shell_empty.snap`. No test asserts the whole line (`keymap.rs:491` pins `default_global` only; `tests/integration.rs:58` checks `contains("w workspaces")`, still true). | D257: T4 re-blesses exactly those 27 in the commit that adds the binding, and checks that only their **last line** changed (§5.9 gate). The help text stays `search concepts` (D236 is settled). If the maintainer would rather the row fit at 100 columns, `find` (` · Ctrl+f find`, 99 cells) is the only short text that does; that is a D236 amendment for the maintainer, not an implementer's call. |
+| **F1** | Major (gate: 27 snapshots move) | D236: global `Ctrl+F`, help text `search concepts`, "bound in `register_all` like `w`". Nothing about snapshots. | `App::render` draws `keymap.help_line(&KeyScope::Global)` on the status row whenever `status` is `None` (`app/state.rs` `render`). Today that line is 85 cells: `q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces`. Appending ` · Ctrl+f search concepts` (`KeyChord::label` prints `Ctrl+f`, `keymap.rs:88-100`) makes it 110; the Harness is 100 wide (`testkit.rs:34`), so every registered-shell snapshot's last row changes and ends `· Ctrl+f search c`. 27 files carry that row: 26 under `crates/htui/tests/snapshots/` (list in §5.9) and `crates/htui/src/snapshots/htui__testkit__tests__shell_empty.snap`. No test asserts the whole line (`keymap.rs:491` pins `default_global` only; `tests/integration.rs:58` checks `contains("w workspaces")`, still true). | **Resolved by the maintainer 2026-09-29: `find`.** D257: T4 re-blesses exactly those 27 in the commit that adds the binding, and checks that only their **last line** changed (§5.9 gate). The help text stays `search concepts` (D236 is settled). If the maintainer would rather the row fit at 100 columns, `find` (` · Ctrl+f find`, 99 cells) is the only short text that does; that is a D236 amendment for the maintainer, not an implementer's call. |
 | **F2** | Blocker (the overlay cannot read an error) | D231: no-runtime answer `Concepts { outcome: Err(..) }`. D232: `StoreReply::Concepts(ConceptsReply)`, `ConceptsReply::{Hits { hits, query }, Indexed(SyncReport)}` "wrapped in `Result<_, String>`". | The two shapes disagree. Either way, an `Err(String)` does not say which request failed, and both requests come from the same `Origin::Overlay(id)`. `App::latest` keys freshness by `(Origin, Discriminant<StoreRequest>)` (`state.rs:170`), so a search reply and an index reply are both fresh at once, and the overlay would not know whether to put an error on the search line or the index line. | D242: the error lives **inside** each kind: `StoreReply::Concepts(Box<ConceptsReply>)`, `ConceptsReply::Hits { query: SearchQuery, outcome: Result<Vec<Hit>, String> }` and `ConceptsReply::Indexed(Result<SyncReport, String>)`. D232's intent (one variant, error inside, never `Failed`, the query echoed) is kept. |
 | **F3** | Major (harness is scheduling-dependent) | D231: "`Harness::with_concepts_runtime` mirrors `with_agent_runtime`; `drive`/`settle` route the two requests to it." | `drive` only delivers what reached `replies.1` by the time it looks (`testkit.rs:364-367`); a `tokio::spawn`ed search may not have run yet. The run runtime solves this by awaiting its tasks every round (`RunRuntime::settle`, `run_worker.rs:1632-1655`, called at `testkit.rs:344-351`). Neither precedent routes through `settle`: the agent runtime is `drive`-only (`testkit.rs:276-306`) and `with_run_runtime`'s doc says "`Harness::settle` stays runtime-free" (`testkit.rs:156-158`); `settle` never reads `replies.1` (`testkit.rs:484-516`), so a spawned task's reply could never be delivered by it. | D243/D244: `ConceptsRuntime::settle(limit) -> usize` (harness-only, the `RunRuntime::settle` shape) and `drive` calls it every round. `settle` stays runtime-free and answers both requests through `store_worker::serve`, i.e. the no-runtime `NOT_AVAILABLE` reply. Concepts tests use `drive`/`drive_to_end`. |
 | **F4** | Major (a named test cannot pass) | D235: `RevealTarget::{Item(ItemId), Requirement(RequirementId)}`; "an item absent from the reply says `<KEY> is not in this workspace's backlog`". T3 test "an unknown id → the notice". | When the item is absent, the Backlog has no row to read the key from. | D248: each target carries its key: `RevealTarget::Item { id, key }`, `RevealTarget::Requirement { id, key }`. The overlay takes it from `Hit::key` (`vector.rs:328`), which is the owner item's key on a document hit. |
@@ -949,7 +949,7 @@ Starts from T2 and T3 merged.
       scope: KeyScope::Global,
       key: KeyChord::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
       action: Action::Overlay(OverlayAction::Open(ConceptsSearch::ID)),
-      help: "search concepts",
+      help: "find",
   });
   ```
   Import `ConceptsSearch` in `:12`; the doc list gains `7. …Ctrl+F opens the concepts search
@@ -1183,7 +1183,7 @@ Snapshots (`insta::assert_snapshot!("<name>", h.render())` → `concepts_search_
 ### 5.9 The 27 moved snapshots (F1, D257)
 
 The status row of each becomes `q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ?
-help · w workspaces · Ctrl+f search c` (clipped at 100). They are exactly the files whose last line
+help · w workspaces · Ctrl+f find` (99 cells, not clipped; D257 as amended). They are exactly the files whose last line
 ends `w workspaces` at `9a1cf27`:
 
 - `crates/htui/src/snapshots/htui__testkit__tests__shell_empty.snap`;
@@ -1318,7 +1318,7 @@ Then the plan's live check, unchanged (`htui` against the compose Qdrant after `
 | D254 | Overlay layout and texts per §5.5; "the first search" is per overlay instance (F10); `ui::cells`-based `clip`, local to the overlay. |
 | D255 | `Enter` searches iff `concepts::query(current state) != sent`; sending clears the hits; a failed search clears `sent` so `Enter` retries; otherwise `Enter` opens the highlighted hit. |
 | D256 | `ChatTab::on_key` passes `CONTROL`/`ALT` chords before the composer (F7). |
-| D257 | D236's help text stands; the 27 status-row snapshots are re-blessed in T4's binding commit, and only their last line may change (F1). `find` is the maintainer's alternative if the row must fit 100 columns. |
+| D257 | **Amended by the maintainer 2026-09-29 (F1):** the help text is `find` (` · Ctrl+f find`, 99 cells, fits the 100-column harness). The 27 status-row snapshots are re-blessed in T4's binding commit, and only their last line may change. |
 | D258 | `FastEmbedder: Clone` is asserted at compile time in `htui`'s `concepts.rs` tests (F11). |
 | D259 | Every `htui` gate command carries `--all-features` (F12). |
 | D260 | `IndexConcepts` with no projects answers `Indexed(Ok(SyncReport::default()))` at once; the overlay never sends one (it says `NO_PROJECTS`). |

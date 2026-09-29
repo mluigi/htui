@@ -137,7 +137,7 @@ format or `htui-store`'s public API beyond `FastEmbedder: Clone`.
   A document hit reveals its owner item (the Docs sub-pane is not focused; out of scope).
   The overlay emits `Overlay(Close)` then `Reveal`.
 - **D236 — `Ctrl+F` opens the overlay** (OQ-3 default), bound in `register_all` like `w`, help
-  text `search concepts`.
+  text `find` (amended by the maintainer 2026-09-29, blueprint F1: `search concepts` truncates the status row at 100 columns).
 - **D237 — Re-index key** (OQ-1 default). `Ctrl+R` sends `IndexConcepts { scope }` for the
   overlay's current projects; the reply prints the `SyncReport` line `htui --index-items` prints,
   factored into `concepts::report_line`. While it runs, searches still work. Closing the overlay
