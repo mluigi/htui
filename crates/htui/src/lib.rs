@@ -15,6 +15,7 @@ pub mod box_settings;
 pub mod catalogue;
 pub mod cli;
 pub mod concepts;
+pub mod concepts_worker;
 pub mod connection;
 pub mod editor;
 pub mod event_loop;

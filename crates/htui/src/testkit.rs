@@ -23,6 +23,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use crate::agent_worker::{AgentRuntime, ChatTask, Served};
 use crate::app::{Action, App, Ctx, Emit, Handled, TopBarState};
+use crate::concepts_worker::{ConceptsRuntime, ConceptsServed};
 use crate::keymap::{KeyChord, Keymap};
 use crate::run_worker::{RunRuntime, RunServed};
 use crate::store_worker::{self, Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest};
@@ -65,6 +66,9 @@ pub struct Harness {
     runs: Option<RunRuntime>,
     /// The run runtime's event receiver, taken when it was installed (D181).
     run_events: Option<UnboundedReceiver<RunServed>>,
+    /// The concepts runtime, when a test installed one (MOD-64 D231). Without it both requests
+    /// answer `concepts_worker::NOT_AVAILABLE`.
+    concepts: Option<ConceptsRuntime>,
     /// The reply channel a chat writes its frames into.
     replies: (
         mpsc::UnboundedSender<ReplyEnvelope>,
@@ -134,6 +138,7 @@ impl Harness {
             chats: Vec::new(),
             runs: None,
             run_events: None,
+            concepts: None,
             replies: (reply_tx, reply_rx),
             store_state: None,
             term: terminal(width, height),
@@ -160,6 +165,16 @@ impl Harness {
     pub fn with_run_runtime(mut self, mut runtime: RunRuntime) -> Self {
         self.run_events = Some(runtime.take_events());
         self.runs = Some(runtime);
+        self
+    }
+
+    /// Installs the runtime the concepts search and index requests are served by (MOD-64 D231), as
+    /// [`Harness::with_agent_runtime`] installs the chat one. [`Harness::drive`] then awaits its
+    /// tasks every round, so a render never photographs a search in flight by accident.
+    /// [`Harness::settle`] stays runtime-free: it answers both requests `NOT_AVAILABLE`.
+    #[must_use]
+    pub fn with_concepts_runtime(mut self, runtime: ConceptsRuntime) -> Self {
+        self.concepts = Some(runtime);
         self
     }
 
@@ -330,6 +345,20 @@ impl Harness {
                             }
                         }
                     }
+                    // MOD-64 D231: through the concepts runtime when a test installed one; without
+                    // one `store_worker::serve` answers them `NOT_AVAILABLE` (D244).
+                    (StoreRequest::SearchConcepts(_) | StoreRequest::IndexConcepts { .. }, _) => {
+                        match self.concepts.as_mut() {
+                            Some(concepts) => {
+                                match concepts.serve(&self.backend, &self.replies.0, &envelope) {
+                                    ConceptsServed::Reply(reply) => reply,
+                                    // The runtime's task answers this request itself.
+                                    ConceptsServed::Deferred => continue,
+                                }
+                            }
+                            None => store_worker::serve(&self.backend, &envelope.request).await,
+                        }
+                    }
                     (request, _) => store_worker::serve(&self.backend, request).await,
                 };
                 self.app.update(Action::Reply(ReplyEnvelope {
@@ -337,6 +366,16 @@ impl Harness {
                     origin: envelope.origin,
                     reply,
                 }));
+            }
+
+            // MOD-64 D243: every search and index task this round spawned has answered before the
+            // replies below are read.
+            if let Some(concepts) = self.concepts.as_mut() {
+                let stuck = concepts.settle(CHAT_END).await;
+                assert_eq!(
+                    stuck, 0,
+                    "{stuck} concepts task(s) did not end within {CHAT_END:?}"
+                );
             }
 
             // H-5: every walk task this round started is awaited to its rest, so the frame this

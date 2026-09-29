@@ -19,8 +19,10 @@ path = "src/main.rs"
 [features]
 default = []
 # Compiles `testkit::Harness` into the library so integration tests under `tests/` (T4, T5) can
-# build an `App`, feed keys and render to a `TestBackend`.
-testkit = []
+# build an `App`, feed keys and render to a `TestBackend`. MOD-64 D230: and htui-store's
+# `test-support`, so `concepts_worker::MemIndex` (over `MemVectorStore`) compiles whenever `testkit`
+# does.
+testkit = ["htui-store/test-support"]
 
 [dependencies]
 htui-agent         = { workspace = true }

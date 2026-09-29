@@ -31,6 +31,7 @@ use htui_core::store::{
     DeleteReach, DeleteTarget, ReadStore, Result as StoreResult, SettingRung, StoreError,
 };
 use htui_store::cache::refresh::{RefreshSettings, Refresher};
+use htui_store::vector::SearchQuery;
 use htui_store::{Backend, ConnEvent, Dsn, PgStore, Started, connect};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -39,6 +40,7 @@ use tokio::time::MissedTickBehavior;
 use crate::agent_worker::{AgentRuntime, Served};
 use crate::box_settings::{self, BoxesSnapshot};
 use crate::catalogue::{self, CatalogueSnapshot};
+use crate::concepts_worker::{self, ConceptsReply, ConceptsRuntime, ConceptsServed};
 use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, InferReport, MirrorAfterDelete};
 use crate::prompt_settings::{self, SettingsSnapshot};
@@ -640,6 +642,15 @@ pub enum StoreRequest {
     SetQdrantApiKey(zeroize::Zeroizing<String>),
     /// Request to clear the Qdrant connection string.
     ClearQdrantSettings,
+    /// MOD-64 D231: a concepts search, served by `concepts_worker::ConceptsRuntime` on a task of its
+    /// own (`R-NF-3`). Answered with [`StoreReply::Concepts`], never `Failed` (D232).
+    SearchConcepts(SearchQuery),
+    /// MOD-64 D237: `Indexer::sync` over `scope`'s projects, on the runtime's task. Answered with
+    /// [`StoreReply::Concepts`].
+    IndexConcepts {
+        /// The workspace and the projects to index.
+        scope: Scope,
+    },
     /// Plan D154: one orchestrator command or read, served by `run_worker::RunRuntime` on its own
     /// task (`R-NF-3`). Answered once at this `seq`, possibly hours later (R-41).
     Orch(crate::run_worker::OrchRequest),
@@ -830,6 +841,9 @@ impl StoreRequest {
             Self::SetQdrantUrl(_) => "set_qdrant_url",
             Self::SetQdrantApiKey(_) => "set_qdrant_api_key",
             Self::ClearQdrantSettings => "clear_qdrant_settings",
+            // The two of `concepts_worker::REQUEST_NAMES`, in that order (MOD-64 D241).
+            Self::SearchConcepts(_) => "search_concepts",
+            Self::IndexConcepts { .. } => "index_concepts",
             // Blueprint D209: one name per verb, `run_worker::ORCH_NAMES`.
             Self::Orch(request) => request.name(),
             Self::RunStream { .. } => "run_stream",
@@ -1031,6 +1045,10 @@ pub enum StoreReply {
     Connection(ConnectionSnapshot),
     /// Reply to QdrantInfo, SetQdrantDsn, ClearQdrantSettings requests.
     Qdrant(crate::qdrant_settings_info::QdrantSnapshot),
+    /// Answer to [`StoreRequest::SearchConcepts`] and [`StoreRequest::IndexConcepts`] (MOD-64 D232):
+    /// the outcome carries its own error, so a Qdrant failure stays in the search overlay and never
+    /// reaches the status line the way a [`StoreReply::Failed`] does.
+    Concepts(Box<ConceptsReply>),
     /// Answer to [`StoreRequest::Orch`], once, at its `seq`.
     Orch(crate::run_worker::OrchReply),
     /// One frame of a [`StoreRequest::RunStream`] subscription, at the subscribing `seq`.
@@ -1388,6 +1406,16 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             request: request.name(),
             message: "handled in worker loop".to_owned(),
         },
+        // MOD-64 D231: the loop serves both through the concepts runtime; one that reaches here
+        // belongs to a caller with none (the harness default), and is answered in the overlay's
+        // own reply (D232).
+        StoreRequest::SearchConcepts(query) => StoreReply::Concepts(Box::new(ConceptsReply::Hits {
+            query: query.clone(),
+            outcome: Err(concepts_worker::NOT_AVAILABLE.to_owned()),
+        })),
+        StoreRequest::IndexConcepts { .. } => StoreReply::Concepts(Box::new(
+            ConceptsReply::Indexed(Err(concepts_worker::NOT_AVAILABLE.to_owned())),
+        )),
         // Blueprint D183 (F-C, F-P): the three orchestrator reads need no runtime. A shell with
         // none — the test harness — gets a subscription acknowledgement, the verdicts with no live
         // chat, and the document, so no view renders a status-line error for asking.
@@ -1574,6 +1602,8 @@ pub fn spawn_with_runtimes(
         // D181, D190: the run runtime's events and its sweep ticker are loop locals, like the two
         // above, so a handler may borrow `runs` (H-4).
         let mut run_events = runs.take_events();
+        // MOD-64 D231: the concepts runtime, built here so no caller's signature moves.
+        let mut concepts = ConceptsRuntime::production();
         let mut sweep_every = runs.sweep_every();
         let mut sweeper = sweep_ticker(sweep_every);
         if backend.writer().is_some() {
@@ -1894,6 +1924,15 @@ pub fn spawn_with_runtimes(
                                 }
                             }
                         }
+                        // MOD-64 D231: a search loads a model and calls Qdrant, an index run reads
+                        // every item: both are tasks of the concepts runtime, and
+                        // `Deferred => continue` is the whole of `R-NF-3`.
+                        StoreRequest::SearchConcepts(_) | StoreRequest::IndexConcepts { .. } => {
+                            match concepts.serve(&backend, &tx, &envelope) {
+                                ConceptsServed::Reply(reply) => reply,
+                                ConceptsServed::Deferred => continue,
+                            }
+                        }
                         other => match try_serve(&backend, other).await {
                             Ok(reply) => reply,
                             Err(err) => {
@@ -2016,6 +2055,7 @@ pub fn spawn_with_runtimes(
             runs.shutdown(crate::agent_worker::CANCEL_GRACE),
             runtime.shutdown(crate::agent_worker::CANCEL_GRACE),
         );
+        concepts.shutdown();
 
         if let Some(refresher) = refresher {
             refresher.abort();
@@ -2257,6 +2297,53 @@ mod tests {
             .find(|w| w.slug == "platform")
             .expect("the demo fixture holds the `platform` workspace");
         Scope::from_workspace(platform)
+    }
+
+    /// MOD-64 D231, D232: the loop hands a search to the concepts runtime and answers the next
+    /// request meanwhile; the search's error comes back in its own reply, never `Failed`. The
+    /// production index reads the (fake, empty) keyring first, so no model loads and no network is
+    /// touched. The keyring fake is one process-wide slot: run under `--test-threads=1`.
+    #[tokio::test]
+    async fn the_loop_serves_a_search_off_the_loop_and_never_as_failed() {
+        let _keyring = htui_store::testkit::mock_keyring().await;
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+        let (tx, mut rx, _worker) = detached(backend);
+        let query = crate::concepts::query("anything", scope.project_ids, false, 10);
+        for (seq, request) in [
+            (1, StoreRequest::SearchConcepts(query.clone())),
+            (2, StoreRequest::BoxInfo),
+        ] {
+            tx.send(RequestEnvelope {
+                seq,
+                origin: Origin::App,
+                request,
+            })
+            .expect("the worker is alive");
+        }
+
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            replies.push(rx.recv().await.expect("the worker answers"));
+        }
+        replies.sort_by_key(|reply| reply.seq);
+        assert!(
+            matches!(replies[1].reply, StoreReply::BoxInfo(_)),
+            "{:?}",
+            replies[1].reply
+        );
+        let StoreReply::Concepts(concepts) = &replies[0].reply else {
+            panic!("the search is answered in its own variant: {:?}", replies[0].reply)
+        };
+        let ConceptsReply::Hits {
+            query: echoed,
+            outcome: Err(error),
+        } = concepts.as_ref()
+        else {
+            panic!("a search with no stored URL fails: {concepts:?}")
+        };
+        assert_eq!(echoed, &query);
+        assert!(error.contains("Settings > Qdrant"), "{error}");
     }
 
     #[tokio::test]
