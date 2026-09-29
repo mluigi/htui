@@ -192,6 +192,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                     project_id: *project,
                     name: name.clone(),
                     description: description.clone(),
+                    is_override: false,
                 })
                 .await?;
             reread(&writer, scope).await

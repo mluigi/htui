@@ -55,6 +55,10 @@ tempfile = "3"
 # MOD-9 D12: the Templates view's line diff; 3.2.0 is already compiled for htui-agent.
 similar            = { workspace = true }
 
+# MOD-54 D1: display-cell width and grapheme boundaries for the text widgets.
+unicode-width         = { workspace = true }
+unicode-segmentation   = { workspace = true }
+
 [dev-dependencies]
 # The chat tab's snapshots drive the fake transport through the same registry the ACP one uses.
 htui-agent = { workspace = true, features = ["test-support"] }

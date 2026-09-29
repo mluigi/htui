@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/skills.rs
+expression: frame
+---
+Graphics · DESKTOP-HTUI · memory · 0 runs
+ 1 Backlog  2 Skills  3 Settings  4 Chat
+ Skills │ Templates
+┌ Skills ──────────────────────┐┌ diff v1 → v2 ────────────────────────────────────────────────────┐
+│  rust-style             v2   ││--- rust-style v1                                                 │
+│  tests                  v1   ││+++ rust-style v2                                                 │
+│                              ││@@ -1 +1 @@                                                       │
+│                              ││-Prefer `expect` with a reason.                                   │
+│                              ││\ No newline at end of file                                       │
+│                              ││+Prefer `expect` with a reason. One error enum per crate.         │
+│                              ││\ No newline at end of file                                       │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+│                              ││                                                                  │
+└──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
+
+ j/k  ,/. version  b base  d diff  e edit  E $EDITOR  n new  i info  a attach  r reload  h/l view
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces

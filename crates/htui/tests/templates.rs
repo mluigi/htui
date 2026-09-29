@@ -8,7 +8,9 @@
 //! request that was sent is served by `settle` and would have written a row.
 //!
 //! The editor's cursor is observable only through the hint row's `L{line}:C{col}` (blueprint D20):
-//! a frame is symbols, not styles.
+//! a frame is symbols, not styles. `C` is a **grapheme** column (MOD-54 D13), so it steps by the
+//! character a person sees rather than by code point -- unchanged for ASCII, which is all of the
+//! fixtures here.
 #![cfg(feature = "testkit")]
 
 use htui::app::register_all;
