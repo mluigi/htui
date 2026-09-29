@@ -43,6 +43,7 @@ use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, InferReport, MirrorAfterDelete};
 use crate::prompt_settings::{self, SettingsSnapshot};
 use crate::run_worker::{LiveChats, RunRuntime, RunServed};
+use crate::skill_import::SkillImports;
 use crate::skills::{self, SkillsSnapshot, StaleWhat};
 use crate::templates::{self, TemplateBody, TemplatesSnapshot};
 use crate::ui::overlay::OverlayId;
@@ -604,6 +605,17 @@ pub enum StoreRequest {
         /// Attach or detach.
         change: BindingChange,
     },
+    /// Imports `SKILL.md` and rules files from the paths named, each a file or a directory (MOD-9
+    /// milestone 4, D97). The **worker** reads the filesystem: `R-NF-3` keeps the walk off the UI
+    /// task, and the view types a path and nothing else. Writes `skill` and `skill_version` rows
+    /// only, never an attachment. Answered with [`StoreReply::SkillImports`].
+    ImportSkills {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The paths as the maintainer typed them, in that order. A path is never split: one line
+        /// of the import form is one path, so a path containing a space is one path.
+        paths: Vec<String>,
+    },
     /// The connection as the Settings > Connection section shows it (MOD-15 M6, D4): backend
     /// label, whether a DSN is stored (never the DSN), the mirror's `cache_meta`, the last dial.
     ConnectionInfo,
@@ -708,12 +720,13 @@ impl StoreRequest {
             // The two of `templates::REQUEST_NAMES`, in that order (MOD-9 D5).
             Self::Templates(..) => "templates",
             Self::SaveTemplate { .. } => "save_template",
-            // The five of `skills::REQUEST_NAMES`, in that order (MOD-9 D81).
+            // The six of `skills::REQUEST_NAMES`, in that order (MOD-9 D81, milestone 4 D97).
             Self::Skills(..) => "skills",
             Self::CreateSkill { .. } => "create_skill",
             Self::EditSkill { .. } => "edit_skill",
             Self::SaveSkillVersion { .. } => "save_skill_version",
             Self::SetSkillBinding { .. } => "set_skill_binding",
+            Self::ImportSkills { .. } => "import_skills",
             // The four of `connection::REQUEST_NAMES`, in that order (MOD-15 M6 D4).
             Self::ConnectionInfo => "connection_info",
             Self::SetDsn(_) => "set_dsn",
@@ -902,6 +915,11 @@ pub enum StoreReply {
         /// Which write went stale.
         what: StaleWhat,
     },
+    /// The library after an import, and what happened to every file it touched
+    /// ([`StoreRequest::ImportSkills`], MOD-9 milestone 4 D97). One variant and not two: a file
+    /// that lost its token is a row of `report` while the rest of the batch lands, so there is no
+    /// `SkillsStale` shape to answer.
+    SkillImports(Box<SkillImports>),
     /// `ConnectionInfo`, and every connection writer's success (D4): the section re-renders from
     /// it and never patches a field of its own into what it already had.
     Connection(ConnectionSnapshot),
@@ -1201,13 +1219,14 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::Templates(..) | StoreRequest::SaveTemplate { .. } => {
             templates::serve(backend, request).await?
         }
-        // The five skill requests, or-ed for the reason the arms above are: a guard does not count
-        // towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-9 D81).
+        // The six skill requests, or-ed for the reason the arms above are: a guard does not count
+        // towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-9 D81, D97).
         StoreRequest::Skills(..)
         | StoreRequest::CreateSkill { .. }
         | StoreRequest::EditSkill { .. }
         | StoreRequest::SaveSkillVersion { .. }
-        | StoreRequest::SetSkillBinding { .. } => skills::serve(backend, request).await?,
+        | StoreRequest::SetSkillBinding { .. }
+        | StoreRequest::ImportSkills { .. } => skills::serve(backend, request).await?,
         // The four connection requests, or-ed for the same reason the twenty-five above are: a
         // guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would
         // be an E0004 here (MOD-15 M3 plan F-12, M6 plan D9). Only the read is answered: the three
