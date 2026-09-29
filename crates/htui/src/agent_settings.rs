@@ -177,7 +177,7 @@ pub fn parse_command(text: &str) -> Result<String, Refusal> {
     }
 }
 
-/// `args` (plan D236): POSIX shell words. The inverse of [`format_args`].
+/// `args` (plan D236): POSIX shell words. The inverse of [`format_args()`].
 ///
 /// # Errors
 ///
