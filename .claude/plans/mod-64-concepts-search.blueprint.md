@@ -1292,7 +1292,7 @@ Then the plan's live check, unchanged (`htui` against the compose Qdrant after `
 
 | # | Risk | Likelihood | Mitigation |
 |---|---|---|---|
-| K5 | A search in flight when the store worker exits is aborted by `shutdown`; a model load in its detached init task is not (it cannot be) and runs to the end of `spawn_blocking` inside the runtime's shutdown window. | Low | `lib.rs`'s `SHUTDOWN` (5 s) bounds the quit; the load holds no lock or row. |
+| K5 | A search in flight when the store worker exits is aborted by `shutdown`; a model load in its detached init task is not (it cannot be) and runs to the end of `spawn_blocking` inside the runtime's shutdown window. | Low | `lib.rs`'s `SHUTDOWN` (5 s) bounds the quit; the load holds no lock or row. *Amended at review (MOD-64 review 1): `SHUTDOWN` bounded only the worker join — `#[tokio::main]`'s runtime drop waited unbounded for the blocking pool, so `main` now builds the runtime and calls `shutdown_timeout(SHUTDOWN)`.* |
 | K6 | `Ctrl+F` is taken by a capturing Backlog detail sub-pane that swallows chords (not audited here beyond `TextField`, which passes them). | Low | The from-every-tab test covers each tab in its resting state; a sub-pane that swallows `Ctrl+C` would already break MOD-52. |
 | K7 | Hits name an item whose project was folded **and** then removed from the workspace. | Very low | `Items` omits it; the reveal says `not in this workspace's backlog` (the unknown-id path). |
 

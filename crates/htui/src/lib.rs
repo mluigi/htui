@@ -40,8 +40,9 @@ pub mod testkit;
 /// How long the shell waits for the store worker to end every live chat before giving up.
 ///
 /// Long enough for a cancel's grace window plus a process-tree kill, short enough that a wedged
-/// agent cannot hold the terminal hostage after `q`.
-const SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+/// agent cannot hold the terminal hostage after `q`. `main` bounds the runtime's own shutdown by
+/// it too: a blocking task (a first model download) must not hold the process (MOD-64 review 1).
+pub const SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(5);
 
 use std::io::BufRead as _;
 use std::path::Path;
