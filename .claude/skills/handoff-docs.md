@@ -39,9 +39,10 @@ in this surface runs unattended.
 Turns one line of description into a well-formed item: picks the prefix (`ANA`/`MOD`/`NEXT`/`VAL`/
 `TOOL`/`CLEAN`), mints the next ID by running
 `.claude/skills/handoff-run/scripts/next-item-id.sh --prefix <PREFIX>` (macOS/Linux) or
-`next-item-id.ps1 -Prefix <PREFIX>` (Windows) — or, while `scripts/hr` sandbox runs exist
-(`scripts/hr-mint --leasing` exits 0), `scripts/hr-mint --prefix <PREFIX> --title "<title>"`, which
-leases the ID so parallel runs never mint the same one (owned-ID method; IDs are per-repo and never
+`next-item-id.ps1 -Prefix <PREFIX>` (Windows) — or, when `scripts/hr-mint --leasing` exits 0 (always
+in a `scripts/hr` sandbox; on the host once `scripts/hr up` has been used),
+`scripts/hr-mint --prefix <PREFIX> --title "<title>"`, which leases the ID so parallel runs never
+mint the same one (owned-ID method; IDs are per-repo and never
 reused), files it under the right section, adds origin / blocked-on cross-links,
 recounts the summary table, and leaves the validator green. It shows a verdict and waits before
 writing.

@@ -8,12 +8,13 @@ rule wins.
 
 1. Mint the ID — run the script, do not derive it by eye:
 
-   **When sandbox runs exist, lease the ID.** On Linux, if `scripts/hr-mint --leasing` exits 0
-   (always true inside a sandbox; true on the host once `scripts/hr up` has been used on this
-   box), mint with `scripts/hr-mint --prefix <PREFIX> --title "<one-line title>"` instead of the
+   **When leasing is on, lease the ID.** On Linux, if `scripts/hr-mint --leasing` exits 0
+   (always inside a sandbox; on the host once `scripts/hr up` has been used — nothing turns it
+   off again), mint with `scripts/hr-mint --prefix <PREFIX> --title "<one-line title>"` instead of the
    commands below. It runs the same `next-item-id.sh` over this tree and returns the higher of
    that and the highest ID of the prefix already leased + 1, so parallel runs never share an ID;
-   the owned-ID rule below still decides the floor and a lease can only raise it. Stdout is the
+   the owned-ID rule below still decides the floor and a lease can only raise it (law:
+   `workflow-docs.md`, "Lease raise"). Stdout is the
    bare ID. Stderr says how it was reached —
    `hr-mint: leased MOD-6 for hr/MOD-65 (tree next MOD-6, lease floor none)` — and, under
    `hr-mint: other MOD leases in the last 7 days - ask the maintainer before filing if one is the same problem:`,

@@ -19,7 +19,8 @@ One command to mint a HANDOFF item correctly. The verdict gate below stays inter
 - `../handoff-run/references/lifecycle.md` — P0 open-item procedure (ID mint, placement, recount, cross-links)
 - `../handoff-run/scripts/next-item-id.sh` / `.ps1` — the owned-ID mint, run at step 3 (never mint by eye)
 - `scripts/hr-mint` (repo root, Linux) — the leased mint over `next-item-id.sh`, used at step 3 instead whenever
-  `scripts/hr-mint --leasing` exits 0 (`scripts/hr` sandbox runs exist; user guide `docs/hr-sandbox.md`)
+  `scripts/hr-mint --leasing` exits 0 (always in a sandbox; on the host once `scripts/hr up` has been used; user
+  guide `docs/hr-sandbox.md`)
 - `../handoff-run/scripts/validate-workflow-docs.sh` / `.ps1` — structural validator, run after writing
 - Law: `.claude/rules/workflow-docs.md` (prefix table, section table, lifecycle rules). This skill is an operational
   checklist over the law; it does not restate it — on any conflict, the rule wins.
@@ -64,7 +65,8 @@ pwsh .claude/skills/handoff-run/scripts/next-item-id.ps1 -Prefix <PREFIX>   # Wi
 Its `max open` / `max archived` / `next` feed the verdict line below verbatim. **Non-zero exit blocks the mint** — the
 ID space is untrustworthy until the reported finding is fixed; report it and stop rather than minting over it.
 
-With sandbox runs live (Linux: `scripts/hr-mint --leasing` exits 0), mint with
+When leasing is on (Linux: `scripts/hr-mint --leasing` exits 0 — always in a sandbox, and on the host once
+`scripts/hr up` has been used), mint with
 `scripts/hr-mint --prefix <PREFIX> --title "<title>"` instead — except under `--dry-run`, which runs only the read-only
 report above and notes that the real mint is leased and may be higher. `hr-mint`'s stderr line
 (`hr-mint: leased <ID> for <owner> (tree next <ID>, lease floor <ID>|none)`) replaces `max open / archived` in the

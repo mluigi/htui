@@ -34,8 +34,11 @@ Linux only. The design, and why it is built this way, is in
   non-interactive shells work without it.
 - **The host tools under `~/.local`**, installed through mise as usual: `claude`, `gortex`,
   `graphify`, `headroom`, `uv`/`uvx`. They are mounted read-only into every run, so a sandbox always
-  uses exactly the versions you have on the host. Gortex also needs `~/.gortex/config.yaml`,
-  `~/.gortex/instructions/` and `~/.gortex/models/`.
+  uses exactly the versions you have on the host. `up` looks for `claude` and `uv` under
+  `~/.local/share/mise/installs/<tool>/latest` (set `HR_MISE_PATH` to override). It also needs
+  `~/.claude.json`, `~/.gortex/config.yaml`, `~/.gortex/instructions/` and `~/.gortex/models/`.
+- **A git identity** (`git config user.name` and `user.email`) in this repo: the run commits as
+  you.
 - **`bats`** (through mise) if you want to run the tests.
 - **Disk.** A run's clone and `target/` take 10–40 GB. Runs live on `/media` by default; see
   [Where the data lives](#where-the-data-lives).
@@ -53,8 +56,10 @@ scripts/hr down MOD-65 --purge
 
 Run `scripts/hr` on its own for a menu of the verbs. Exit codes: `0` ok, `1` refused (duplicate
 run, item not open, dirty tree, rewritten history, not collected, conflict, no confirmation), `2`
-usage or a missing dependency, `3` Docker or git failed. Without a terminal, a missing choice is a
-usage error and every confirmation needs `--yes`.
+usage or a missing dependency, `3` Docker, git or file I/O failed. `attach`, `collect` and `down`
+take `ITEM` optionally: in a terminal they let you pick from the registered runs. Without a
+terminal, a missing choice is a usage error and a confirmation (`down --purge`, `gc`) is refused
+unless you pass `--yes`.
 
 `scripts/hr` is a host tool. Inside a sandbox it refuses to run.
 
@@ -66,8 +71,8 @@ scripts/hr build
 
 Builds `htui-hr-dev` for your user id, group id and home directory, and creates the shared
 `htui-hr-cargo` volume. The image records those three values as labels; `scripts/hr up` refuses to
-start a run when they no longer match you (`rebuild`), and offers to build when the image is
-missing. Rebuild whenever `docker/hr/Dockerfile` changes. It pins Rust, `sqlx-cli` and
+start a run when they no longer match you (`rebuild`). When the image is missing, `up` offers to
+build it in a terminal and otherwise exits `2` naming `scripts/hr build`. Rebuild whenever `docker/hr/Dockerfile` changes. It pins Rust, `sqlx-cli` and
 `cargo-insta` to match `rust-toolchain.toml` and `Cargo.lock`, so bump it together with them.
 
 ## Starting a run
@@ -80,8 +85,10 @@ scripts/hr up [ITEM] [--ssd] [--from REF] [--cpus N] [--yes]
   run are left out. An item that is not an open checklist line is refused, and so is a second run
   for the same item.
 - `--from REF` branches from `REF` instead of `main`. The clone takes the **committed** `REF` only:
-  if `.claude/`, `HANDOFF.md` or `DECISIONS.md` have uncommitted changes on the host, `up` lists them
-  and asks before going on. Commit first if the run needs them.
+  if `.claude/`, `HANDOFF.md` or `DECISIONS.md` have uncommitted or untracked changes on the host
+  (your `.claude/settings.local.json` excepted), `up` lists them. In a terminal it then asks whether
+  to go on with the committed `REF`; `--yes` skips the question, and without a terminal it warns and
+  continues. Commit first if the run needs them.
 - `--ssd` puts the run on the SSD (`~/htui-hr`) instead of `/media`.
 - `--cpus N` limits the run's `dev` container (default 4).
 
@@ -90,7 +97,10 @@ Gortex and headroom hooks), a private copy of `~/.claude.json`, and your global 
 (added to the clone's `.git/info/exclude`). The clone's `origin` is the host repo, mounted
 read-only, and pushing is disabled.
 
-When `up` fails half-way, clean up with `scripts/hr down ITEM --purge --force` and try again.
+If `up` fails before the containers start (clone, copies), it removes the half-made run directory
+itself; just fix the cause and run it again. Only when `docker compose up` fails is the run already
+registered — `up` then says so, and you clean up with `scripts/hr down ITEM --purge --force` before
+retrying.
 
 ## Working in a run
 
@@ -98,8 +108,10 @@ When `up` fails half-way, clean up with `scripts/hr down ITEM --purge --force` a
 scripts/hr attach [ITEM] [--shell]
 ```
 
-Starts the run if it is stopped, then opens `claude --dangerously-skip-permissions` in the clone,
-or a login shell with `--shell`. Detaching is just quitting `claude`; the containers keep running.
+Starts the run's containers if `dev` is not running (after `down`, or a reboot), then opens
+`claude --dangerously-skip-permissions` in the clone, or a login shell with `--shell`. Detaching is
+just quitting `claude`; the containers keep running, and you can attach again, or from several
+terminals at once.
 Inside, start the lifecycle as usual:
 
 ```
@@ -163,9 +175,10 @@ visible read-only at `/host/htui`; nothing in a run can change it.
 
 ## New item IDs across runs
 
-Two runs that each open a new item would both mint the same next ID from their own trees. So while
-sandbox runs exist, every mint — in a run, and in `/handoff-add` or `/handoff-run` on the host — goes
-through `scripts/hr-mint`, which the skills do for you:
+Two runs that each open a new item would both mint the same next ID from their own trees. So when
+`scripts/hr-mint --leasing` exits 0 — always in a sandbox, and on the host once `scripts/hr up` has
+been used — every mint, in a run and in `/handoff-add` or `/handoff-run` on the host, goes through
+`scripts/hr-mint`, which the skills do for you:
 
 ```
 scripts/hr-mint --prefix MOD --title "Ctrl-c leaves the terminal raw"
@@ -186,7 +199,9 @@ run's ID instead. A leased ID that ends up unused is a harmless gap — IDs are 
 are allowed.
 
 - `scripts/hr-mint --leasing` exits 0 when leasing is on, which is the skills' switch.
-  `scripts/hr up` turns it on (`scripts/hr-mint --init`); it stays on for the host from then on.
+  `scripts/hr up` turns it on (`scripts/hr-mint --init` creates the lease file) and nothing turns it
+  off again: `down` and `gc` prune leases, never the file. The owned-ID rule allows this raise
+  (`.claude/rules/workflow-docs.md`, "Lease raise").
 - Without the lease file, or without the state directory, `hr-mint` is the plain tree mint and says
   so: `hr-mint: leasing off (no state dir at …) - MOD-6 is the tree mint only`, or
   `(no lease file at …; run scripts/hr-mint --init)`.
@@ -194,8 +209,9 @@ are allowed.
   unparseable line), `2` usage, `3` lock timeout or the state directory is not writable. Non-zero
   means no ID: fix the cause, do not fall back to `next-item-id.sh`.
 - The lease file (`id-leases.tsv` in the state directory) belongs to `hr-mint`; never edit it by
-  hand. `scripts/hr gc` prunes leases whose ID has reached `main`, but always keeps the highest lease
-  of each prefix so an older clone cannot mint below it.
+  hand. `scripts/hr gc` prunes leases whose ID has reached `main`, and a forced purge of an
+  uncollected run drops that run's leases; both always keep the highest lease of each prefix, so an
+  older clone cannot mint below it.
 
 ## Bringing work home
 
@@ -211,8 +227,10 @@ is safe at any time and can be repeated as the run makes more commits. It refuse
 - `hr/ITEM` is checked out in one of your host worktrees.
 
 `--merge` then merges `hr/ITEM` into your **current** branch (`--no-ff`) and runs
-`validate-workflow-docs.sh`. It refuses on uncommitted changes to tracked files, a merge already in
-progress or a detached `HEAD`. It never pushes.
+`validate-workflow-docs.sh`; a red validator after a clean merge exits `1` (`merged … but the
+validator is red — fix before pushing`). It refuses on uncommitted changes to tracked files, a merge
+already in progress or a detached `HEAD`. Those checks run before anything is fetched, so a refused
+`--merge` leaves the host exactly as it was. It never pushes.
 
 ### Merge conflicts
 
@@ -225,10 +243,10 @@ The resolution is always the same:
 4. run `bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh` — non-zero means not
    done.
 
-When those files (and `docs/decisions/**`) are the only conflicts, `collect --merge` offers to open
-a host `claude` session primed with this recipe; you stay in it and approve as usual. Conflicts in
-code are left to you (`git merge --abort` backs out). Either way the command exits `1` with the
-merge in progress.
+When those files (and `docs/decisions/**`) are the only conflicts, `collect --merge` prints the
+recipe and, in a terminal, offers to open a host `claude` session primed with it (`--yes` opens it
+without asking); you stay in it and approve as usual. Conflicts in code are left to you
+(`git merge --abort` backs out). Either way the command exits `1` with the merge in progress.
 
 ### After merging
 
@@ -246,15 +264,25 @@ scripts/hr gc [--yes]
 
 - **`ls`** shows each run's state (`running`, `stopped`, `down`, plus `+collected`), branch, commits
   ahead of your `main` (a `*` means counted from the run's starting point, because your `main` has
-  moved past anything the clone knows), disk use and whether it is on the HDD or the SSD.
+  moved past anything the clone knows; `?` means the clone is missing), disk use and whether it is
+  on the HDD or the SSD (`hdd`/`ssd`).
 - **`down`** stops and removes the run's containers. The clone, the databases and the Gortex index
   stay; `attach` brings it back.
 - **`down --purge`** also deletes the run's databases, Gortex store and run directory. It refuses
-  unless the branch was collected, the clone has no uncommitted tracked changes and no clone branch
-  is missing from the host. `--force` skips those checks, and then also drops the run's ID leases.
-  It always asks (or needs `--yes`). The shared `htui-hr-cargo` volume is never removed.
-- **`gc`** offers to purge every stopped, collected, clean run, then prunes ID leases that have
-  reached `main`.
+  (and lists why) unless:
+  - `hr/ITEM` is collected — its tip is in the host's `hr/ITEM` or `main`;
+  - the clone has no uncommitted changes to tracked files;
+  - every other branch in the clone has its tip on the host. Branches made inside the run, such as
+    implementer worktree branches, count: bring them home with
+    `git fetch <run directory>/src <branch>:<branch>` on the host, or delete them in the run, or
+    use `--force`.
+
+  `--force` skips these checks. When the run was not collected, a forced purge also drops its ID
+  leases, except the highest lease of each prefix, which always stays as the floor. Purging always
+  asks (or needs `--yes`). The shared `htui-hr-cargo` volume is never removed.
+- **`gc`** finds every run whose `dev` container is not running and that passes the same three
+  checks, offers them for purging (`--yes` purges them all; without a terminal and without `--yes`
+  it only lists them and exits `1`), then prunes ID leases that have reached `main`.
 
 ## Where the data lives
 
@@ -268,7 +296,7 @@ scripts/hr gc [--yes]
 
 These are environment variables read by `scripts/hr`. Set them the same way for every call, not
 only `up`: the registry lives in `HR_STATE`, and `--purge` only deletes run directories under
-`HR_ROOT` or `HR_SSD_ROOT`.
+`HR_ROOT` or `HR_SSD_ROOT`. `HR_IMAGE` renames the image (default `htui-hr-dev`).
 
 The run directories are the big part. Watch both disks while runs are building:
 
@@ -319,6 +347,10 @@ left over from a crash: check it for work you want, then delete it by hand.
 
 **`gum not found`.** Install it (`apt install gum`) or pass the arguments the menu would ask for.
 
+**`up` stops on `missing …`, `git user.name / user.email not set` or `claude not found`.** `up`
+checks everything the run mounts before it clones. Create the missing file, set your git identity,
+or install the tool with mise (or point `HR_MISE_PATH` at it).
+
 **Gortex is missing or says `daemon already running`.** The `dev` container clears Gortex's stale
 daemon files every time it starts, so `scripts/hr down ITEM` followed by `scripts/hr attach ITEM`
 fixes a stuck daemon. Give a fresh run 20 seconds to index before judging. If Gortex still will not
@@ -354,9 +386,17 @@ live under `/var/lib/docker`.
 ## Tests
 
 ```
-bats --filter-tags '!docker' tests/hr   # seconds; fixture repos only, no Docker
-bats tests/hr                           # also builds the image and starts real runs
+bats --filter-tags '!docker' tests/hr              # 51 cases in seconds; stub docker, fixture repos
+bats --filter-tags docker tests/hr/hr.bats         # ~30 s; real image and containers
 ```
 
-The tests never touch your real repo or your real state directory: every case clones from a fixture
-repo and keeps its state under a temporary directory.
+The fast cases stub `docker`, use a fake home directory and never need a terminal. The Docker cases
+use your real `$HOME` mounts and a real Docker daemon, but still clone from a fixture repo whose
+items are `TOOL-9001` and `TOOL-9002` (compose projects `hr-tool-9001`/`hr-tool-9002`; a case skips
+if one already exists); D1 builds the image. Neither kind touches your real repo or state directory:
+state, run directories and the fixture live under a temporary directory.
+
+Knobs that help when driving `scripts/hr` from a script or a test: `HR_INTERACTIVE=0|1` forces
+non-interactive or interactive behaviour (default: interactive when stdin and stdout are
+terminals), `HR_NO_GUM=1` behaves as if `gum` were not installed, and `scripts/hr ls --tsv` prints
+the table as tab-separated text.

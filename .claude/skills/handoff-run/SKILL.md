@@ -26,7 +26,7 @@ One command per HANDOFF item lifecycle. Auto-chain with the maintainer present �
 - `references/ecosystem-survey.md` — wrap-vs-fork record (build-time, not needed at run time)
 - `scripts/next-item-id.sh` / `.ps1` — the owned-ID mint, run whenever a path spawns a new item (lifecycle P0)
 - `scripts/hr-mint` (repo root, Linux) — the leased mint; P0 mints through it whenever `scripts/hr-mint --leasing`
-  exits 0 (sandbox runs exist). User guide: `docs/hr-sandbox.md`
+  exits 0 (always in a sandbox; on the host once `scripts/hr up` has been used). User guide: `docs/hr-sandbox.md`
 - `scripts/validate-workflow-docs.sh` / `.ps1` — structural validator, run at close-out
 - Law: `.claude/rules/workflow-docs.md` (auto-loads when workflow docs are touched)
 
