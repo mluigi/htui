@@ -1107,7 +1107,15 @@ cmd_collect() {
             ask=1
         fi
         if fancy && { [[ "$yes" -eq 1 && "$ask" -eq 0 ]] || gum confirm "$prompt"; }; then
+            # A Ctrl-C (or TERM) meant for claude reaches hr too, and must not end it: the hint
+            # below has to print. The `exit` traps go for the session; a plain reset (`trap -`) is
+            # not enough, because bash then kills itself too when claude dies of the SIGINT. A
+            # no-op trap keeps hr alive whatever claude does, while claude itself starts with the
+            # default dispositions (a trapped signal is reset in a child). The EXIT trap stays.
+            trap : INT TERM
             (cd "$HOST" && claude "$(recipe_prompt "$item" "$(tr '\n' ' ' <<<"$conflicted")")")
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
         fi
         die 1 "merge in progress in $HOST — finish it (recipe above) or back out with git merge --abort"
     fi

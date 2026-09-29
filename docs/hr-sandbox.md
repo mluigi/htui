@@ -293,7 +293,8 @@ Without `--merge`, `collect` only fetches the run's `hr/ITEM` branch into the ho
 `git log --oneline main..hr/ITEM` (subjects without control characters). The fetch runs no hooks
 and checks every object it brings in (`transfer.fsckObjects`). It lands in a temporary ref
 (`refs/hr-collect/ITEM`); `hr/ITEM` and the registry move only after the checks below pass on what
-actually arrived, and the temporary ref is deleted on every way out. The registry records the
+actually arrived, and the temporary ref is deleted on every way out but a `SIGKILL` (see
+[Troubleshooting](#troubleshooting)). The registry records the
 host's `hr/ITEM` as it is after the fetch. Your working tree and checked-out branch are not touched,
 so it is safe at any time and can be repeated as the run makes more commits. It refuses when:
 
@@ -339,7 +340,8 @@ recipe and, in a terminal, offers to open a host `claude` session primed with it
 approve as usual. That session starts in the half-merged tree, so it loads the run's `.claude/`. If
 the run changed any of those tool-config paths, `collect` prints that `git diff --stat` again and
 asks again, `--yes` or not; otherwise `--yes` opens the session without asking. Conflicts in code are left to you (`git merge --abort` backs out). Either way the command
-exits `1` with the merge in progress.
+exits `1` with the merge in progress, and says so — also when you leave the `claude` session with
+Ctrl-C.
 
 ### After merging
 
@@ -553,6 +555,11 @@ Nothing is read from it; delete it by hand.
 **`collect --merge` says `needs confirmation`** (exit `1`). The run changes tool configuration
 (the diffstat above the message). Read it, then pass `--yes`, or run it in a terminal.
 
+**A `refs/hr-collect/<ITEM>` ref is left over.** `collect` fetches into that temporary ref and
+deletes it on every way out it can catch; a `SIGKILL` (or a crash) in the middle leaves it behind.
+It shows up in `git for-each-ref`, and `git push --mirror` would push it. The next `collect` of that
+item overwrites it; to remove it, run `git update-ref -d refs/hr-collect/<ITEM>`.
+
 **`HR_RUNS … must not be inside HR_STATE`** (exit `2`). Every sandbox mounts `HR_STATE`
 read-write; point `HR_RUNS` somewhere else.
 
@@ -603,7 +610,7 @@ live under `/var/lib/docker`.
 ## Tests
 
 ```
-bats --filter-tags '!docker' tests/hr              # 84 cases (55 hr, 29 hr-mint); stub docker, fixture repos
+bats --filter-tags '!docker' tests/hr              # 85 cases (56 hr, 29 hr-mint); stub docker, fixture repos
 bats --filter-tags docker tests/hr/hr.bats         # D1–D5; real image and containers
 ```
 

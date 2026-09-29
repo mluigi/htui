@@ -1392,6 +1392,39 @@ EOF
     # (A forced purge of an uncollected run would prune its leases: refused — test 27.)
 }
 
+@test "49. Ctrl-C in the recipe claude session: hr still prints the merge-in-progress hint and cleans up" {
+    mk_run MOD-4
+    local s4
+    s4="$(src_of MOD-4)"
+    sed -i 's/^- \[ \] \*\*MOD-4 - Thing\.\*\* body$/- [ ] **MOD-4 - Thing.** sandbox body/' "$s4/HANDOFF.md"
+    git -C "$s4" -c user.name=s -c user.email=s@x.invalid commit -q -am 'sandbox edits MOD-4'
+    sed -i 's/^- \[ \] \*\*MOD-4 - Thing\.\*\* body$/- [ ] **MOD-4 - Thing.** host body/' "$HR_HOST_REPO/HANDOFF.md"
+    git -C "$HR_HOST_REPO" commit -q -am 'host edits MOD-4'
+
+    # A Ctrl-C in a terminal reaches the whole foreground process group: hr, its subshell and
+    # claude. hr runs in a session of its own here (setsid), so `kill -INT 0` in the fake claude
+    # hits exactly that group, never bats. The fake dies of it, or catches it and exits 130.
+    local fb="$BATS_TEST_TMPDIR/fakebin" tmp="$BATS_TEST_TMPDIR/tmp" mode
+    mkdir -p "$fb" "$tmp"
+    printf '#!/bin/sh\nexit 0\n' >"$fb/gum"
+    printf '#!/bin/sh\ntouch "%s/claude-launched"\n[ "$FAKE_CLAUDE" = catch ] && trap "exit 130" INT\nkill -INT 0\nsleep 2\n' \
+        "$BATS_TEST_TMPDIR" >"$fb/claude"
+    chmod +x "$fb/claude" "$fb/gum"
+    for mode in die catch; do
+        rm -f "$BATS_TEST_TMPDIR/claude-launched"
+        run --separate-stderr env PATH="$fb:$PATH" HR_INTERACTIVE=1 TMPDIR="$tmp" FAKE_CLAUDE="$mode" \
+            setsid -w "$HR" collect MOD-4 --merge --yes
+        echo "$mode: $status $stderr"
+        [[ -e "$BATS_TEST_TMPDIR/claude-launched" ]]
+        [[ $status -eq 1 && "$stderr" == *'merge in progress'*'git merge --abort'* ]]
+        git -C "$HR_HOST_REPO" rev-parse -q --verify MERGE_HEAD
+        # The EXIT cleanup ran: no temporary ref, no validator copy.
+        [[ -z "$(git -C "$HR_HOST_REPO" for-each-ref refs/hr-collect)" ]]
+        [[ -z "$(ls -A "$tmp")" ]]
+        git -C "$HR_HOST_REPO" merge --abort
+    done
+}
+
 # ---------------------------------------------------------------------------------------------
 # Docker (real image and daemon; fixture host repo; run once: bats --filter-tags docker tests/hr/hr.bats)
 
