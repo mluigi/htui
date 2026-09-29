@@ -2712,8 +2712,27 @@ mod tests {
 
     /// MOD-40 blueprint B14: a heartbeat against a server that is not there is logged and nothing
     /// else. The refresher owns the swap to `Offline`; a beat never makes it.
+    ///
+    /// The "server" is a listener that hangs up on every connection, so each beat's `touch_box`
+    /// fails at once and is counted. Beats keep coming, one period after the last ended, and the
+    /// backend is still `online` after all of them.
     #[tokio::test]
     async fn a_failed_box_heartbeat_leaves_the_backend_online() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a throwaway port");
+        let port = listener.local_addr().expect("a bound port").port();
+        let dialled = Arc::new(AtomicU64::new(0));
+        let hangups = tokio::spawn({
+            let dialled = Arc::clone(&dialled);
+            async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    dialled.fetch_add(1, Ordering::SeqCst);
+                    drop(socket);
+                }
+            }
+        });
+
         let root = tempfile::tempdir().expect("temp root");
         let cache = CacheStore::open(root.path(), "heartbeat-fails", 1)
             .await
@@ -2723,7 +2742,7 @@ mod tests {
             hostname: "HTUI-TEST".to_owned(),
         };
         let pg = PgStore::lazy(
-            "postgres://nobody:nothing@127.0.0.1:1/none",
+            &format!("postgres://nobody:nothing@127.0.0.1:{port}/none"),
             &identity,
             std::time::Duration::from_millis(250),
         )
@@ -2739,8 +2758,17 @@ mod tests {
         started.box_heartbeat = std::time::Duration::from_millis(20);
         let worker = spawn(started, req_rx, rep_tx);
 
-        // Several periods, so several beats fail; at most one is ever in flight.
+        // The start-up sweep dials too, once; after it, only beats do (the sweeper's period is
+        // the lease's, far past this test). No request is sent meanwhile, so nothing but the
+        // beats' own ends wakes the loop to beat again.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let settled = dialled.load(Ordering::SeqCst);
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let beaten = dialled.load(Ordering::SeqCst);
+        assert!(
+            beaten >= settled + 3,
+            "several failed beats in 300 ms of a 20 ms period: {settled} -> {beaten} dials"
+        );
         let StoreReply::StoreState { label, .. } =
             round_trip(&req_tx, &mut rep_rx, StoreRequest::StoreState).await
         else {
@@ -2753,6 +2781,7 @@ mod tests {
 
         drop(req_tx);
         worker.await.expect("the worker stops with its channel");
+        hangups.abort();
         cache.close().await;
     }
 
