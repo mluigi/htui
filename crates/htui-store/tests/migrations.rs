@@ -85,11 +85,12 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2, 3, 4, 5, 6, 7],
+        vec![1, 2, 3, 4, 5, 6, 7, 8],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
-         MOD-7 milestone 1's 0005_box_identity.sql, MOD-38's 0006_requirements.sql and MOD-9 \
-         milestone 2's 0007_skill_attachments.sql, in ordinal order"
+         MOD-7 milestone 1's 0005_box_identity.sql, MOD-38's 0006_requirements.sql, MOD-9 \
+         milestone 2's 0007_skill_attachments.sql and MOD-9 milestone 5's \
+         0008_trim_record_v3.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -178,8 +179,8 @@ async fn agent_box_gains_a_jsonb_probe_column() {
 /// `agent.name` is ANA-4 §9 as amended by plan D43 (its `COMMENT ... IS NULL` would have cleared a
 /// comment `0001_init.sql` never wrote); the next five are ANA-5 §9 copied from
 /// `docs/ANA-5.md:2153-2181`; the last nineteen are ANA-2 §9 (`docs/ANA-2.md:1862-1999`).
-/// `run_step.trim_record` is the text `0007_skill_attachments.sql` restates (MOD-9 D42), which
-/// replaces `0002`'s. They live here as literals on purpose: this test is the guard against a
+/// `run_step.trim_record` is the text `0008_trim_record_v3.sql` restates (MOD-9 D118), which
+/// replaces `0007`'s, which replaced `0002`'s. They live here as literals on purpose: this test is the guard against a
 /// paraphrase drifting into a forward-only migration that cannot be edited afterwards.
 const ANA_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     (
@@ -214,13 +215,16 @@ const ANA_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     (
         "run_step",
         "trim_record",
-        "ANA-5 5.1 as amended by MOD-9 D42: {v, template, budget, budget_source, reserve, target, \
-         estimator, estimated_before, estimated_after, sections[], skill_choices[], excerpts, \
-         notes}, v 2. skill_choices[] is every candidate skill, ordered by position then name, \
-         each {skill, name, version, level, activation, active, reason} with reason always, off, \
-         no_path, missing_version or not_placed (ANA-22 6 item 8). A v 1 record, written before \
-         0007, has no skill_choices. Canonical; the prompt payload sections[] array is its \
-         abridged projection. Written at stage 3 by set_step_prompt, before the session starts.",
+        "ANA-5 5.1 as amended by MOD-9 D42 and D118: {v, template, budget, budget_source, \
+         reserve, target, estimator, estimated_before, estimated_after, sections[], \
+         skill_choices[], excerpts, notes}, v 3. skill_choices[] is every candidate skill, \
+         ordered by position then name, each {skill, name, version, level, activation, active, \
+         reason} with reason always, matched, no_match, off, no_path, missing_version or \
+         not_placed (ANA-22 6 item 8); a matched choice adds path, <repo>:<path>, the first \
+         matching file in repo then path byte order. A v 2 record, written before 0008, has no \
+         matched or no_match; a v 1 record, written before 0007, has no skill_choices. \
+         Canonical; the prompt payload sections[] array is its abridged projection. Written at \
+         stage 3 by set_step_prompt, before the session starts.",
     ),
     (
         "step_graph_phase",
@@ -881,8 +885,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(7),
-        "seven embedded migrations, none applied"
+        MigrationState::Pending(8),
+        "eight embedded migrations, none applied"
     );
 
     db.drop_db().await;
@@ -980,12 +984,12 @@ async fn a_headless_connect_never_migrates() {
     let Some(db) = common::bare_db().await else {
         return;
     };
-    assert_eq!(db.migrations_at_connect, MigrationState::Pending(7));
+    assert_eq!(db.migrations_at_connect, MigrationState::Pending(8));
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT)
         .await
         .expect_err("a pending schema is refused");
-    assert_eq!(refused, HeadlessError::MigrationsPending(7));
+    assert_eq!(refused, HeadlessError::MigrationsPending(8));
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
         0,
@@ -1004,7 +1008,7 @@ async fn a_headless_connect_never_migrates() {
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT)
         .await
         .expect_err("no migrations table is every migration pending");
-    assert_eq!(refused, HeadlessError::MigrationsPending(7));
+    assert_eq!(refused, HeadlessError::MigrationsPending(8));
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
         .await
