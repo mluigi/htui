@@ -690,11 +690,16 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     [[ $status -eq 0 ]]
 }
 
-@test "28. up warns once that a non-default HR_STATE must be exported for host mints" {
+@test "28. up warns once per up that a non-default HR_STATE must be exported for host mints" {
     run --separate-stderr "$HR" up MOD-5
     [[ $status -eq 0 ]]
+    # One line per `up`, not one per step that touches the state dir; other verbs never warn.
     [[ "$(grep -c 'HR_STATE is non-default' <<<"$stderr")" -eq 1 ]]
     [[ "$stderr" == *"export HR_STATE=$HR_STATE"* ]]
+    run --separate-stderr "$HR" up MOD-4
+    [[ $status -eq 0 && "$(grep -c 'HR_STATE is non-default' <<<"$stderr")" -eq 1 ]]
+    run --separate-stderr "$HR" ls
+    [[ "$stderr" != *'HR_STATE is non-default'* ]]
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1350,6 +1355,41 @@ EOF
     ! git -C "$HR_HOST_REPO" rev-parse -q --verify refs/heads/hr/MOD-5 || false
     [[ -z "$(git -C "$HR_HOST_REPO" for-each-ref refs/hr-collect)" ]]
     [[ "$(cat "$(reg_of MOD-5)")" == "$reg" && "$(host_snapshot)" == "$before" ]]
+}
+
+@test "47. up excludes tool-owned dirs in the clone; their untracked files never block a purge" {
+    mk_run MOD-5
+    "$HR" collect MOD-5 >/dev/null 2>&1
+    local src d
+    src="$(src_of MOD-5)"
+    for d in /.serena/ /.claude/skills/generated/ /.kiro/ /graphify-out/; do
+        grep -qxF "$d" "$src/.git/info/exclude" || { echo "no $d in exclude" >&2; return 1; }
+    done
+    mkdir -p "$src/.serena/memories" "$src/.claude/skills/generated/x" "$src/.kiro/steering" "$src/graphify-out"
+    : >"$src/.serena/memories/note.md"
+    : >"$src/.claude/skills/generated/x/SKILL.md"
+    : >"$src/.kiro/steering/a.md"
+    : >"$src/graphify-out/graph.json"
+    [[ -z "$(git -C "$src" status --porcelain)" ]]
+    [[ "$(purge_state MOD-5)" == clean ]]
+    # Anything else untracked still blocks.
+    : >"$src/.claude/skills/new.md"
+    [[ "$(purge_state MOD-5)" == *'.claude/skills/new.md'* ]]
+}
+
+@test "48. a vanished lease file blocks only the purge that prunes leases (forced, uncollected)" {
+    mk_run MOD-4
+    mk_run MOD-5
+    "$HR" collect MOD-5 >/dev/null 2>&1
+    rm -f "$(lease_file)" "$HR_STATE/id-leases.lock"
+    # A checked purge, and a forced purge of a collected run, prune nothing: they go through.
+    run --separate-stderr "$HR" down MOD-5 --purge --yes
+    [[ $status -eq 0 && ! -e "$HR_ROOT/MOD-5" ]]
+    "$HR" collect MOD-4 >/dev/null 2>&1
+    run --separate-stderr "$HR" down MOD-4 --purge --force --yes
+    [[ $status -eq 0 && ! -e "$HR_ROOT/MOD-4" ]]
+    [[ ! -e "$(lease_file)" ]]
+    # (A forced purge of an uncollected run would prune its leases: refused — test 27.)
 }
 
 # ---------------------------------------------------------------------------------------------

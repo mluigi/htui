@@ -32,8 +32,9 @@
 # docker/hr/compose.hr.yaml (blueprint §T1).
 #
 # Exit codes: 0 ok, 1 refused (duplicate run, item not open, dirty tree, non-fast-forward,
-#             uncollected, conflict, no confirmation), 2 usage / missing dependency,
-#             3 external failure (docker, git clone/fetch, IO).
+#             uncollected, conflict, vanished lease file, no confirmation), 2 usage / missing
+#             dependency (a malformed ITEM included), 3 external failure (docker, git clone/fetch,
+#             IO), an invalid registry entry, or a tampered cargo-volume mount point.
 #
 # Run registry $HR_RUNS/<ITEM> (owned by this script; key=value, written tmp+mv under flock
 # $HR_RUNS/.lock, parsed and validated, never sourced). HR_RUNS is host-only: the registry names
@@ -670,6 +671,9 @@ check_image() {
 
 # ---- up ----
 
+# Tool-owned directories `up` adds to the clone's .git/info/exclude.
+TOOL_EXCLUDES=(/.serena/ /.claude/skills/generated/ /.kiro/ /graphify-out/)
+
 UP_RUN_DIR=''
 UP_CREATED=0
 up_abort() { # $1=rc, rest=message — undo a half-made run dir (before the registry exists)
@@ -796,6 +800,11 @@ cmd_up() {
             printf '\n'
         fi
         printf '# copied in by scripts/hr up, untracked\n/.claude/settings.local.json\n'
+        # Tool-owned output the host keeps untracked (serena memories, generated skills, Kiro,
+        # graphify): in a run it would block `down --purge` and `gc` (re-review L5). Excluded here
+        # only, so it is dropped with the run; anything worth keeping belongs in a commit.
+        printf '# tool-owned, untracked on the host too (scripts/hr up)\n'
+        printf '%s\n' "${TOOL_EXCLUDES[@]}"
     } >>"$exclude" || up_abort 3 "cannot write $exclude"
     if [[ -f "$HOST/.claude/settings.local.json" ]]; then
         mkdir -p "$SRC/.claude" && cp -p "$HOST/.claude/settings.local.json" "$SRC/.claude/" \
@@ -1196,7 +1205,6 @@ cmd_down() {
         return 0
     fi
 
-    check_leases
     local blockers forced_uncollected=0
     if [[ "$force" -eq 0 ]]; then
         # Stopped first, so nothing in the sandbox changes the clone between the checks and the
@@ -1208,6 +1216,10 @@ cmd_down() {
         fi
     else
         is_collected "$item" || forced_uncollected=1
+        # Only this purge prunes leases (the run's own, never the floor). With the lease file
+        # gone hr-mint would refuse that prune after the run is already deleted, so refuse
+        # first (re-review L8a). Every other purge leaves the leases alone and goes ahead.
+        [[ "$forced_uncollected" -eq 1 ]] && check_leases
     fi
     confirm "$yes" "Purge $item: containers, volumes and ${RUN[run_dir]}?" || die 1 "cancelled"
     purge_run "$item"
