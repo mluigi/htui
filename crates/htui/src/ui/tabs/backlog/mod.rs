@@ -14,7 +14,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use crate::app::{Ctx, Handled};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::backlog::detail::{
-    BodyTab, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, RunsTab,
+    BodyTab, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab, RunsTab,
 };
 use crate::ui::tabs::backlog::list::{ListView, Selection};
 use crate::ui::tabs::registry::{Tab, TabId};
@@ -44,7 +44,7 @@ pub struct BacklogTab {
     folded: Vec<ProjectId>,
     /// The cursor, or `None` before the first reply.
     selected: Option<Selection>,
-    /// Body, Runs, Graph, Documents, Notes, Prompt, in that order.
+    /// Body, Runs, Graph, Docs, Notes, Prompt, Reqs, in that order.
     detail: DetailRegistry,
 }
 
@@ -58,7 +58,8 @@ impl BacklogTab {
     /// Identity of the Backlog tab.
     pub const ID: TabId = TabId("backlog");
 
-    /// A Backlog tab with the six detail sub-tabs registered, in blueprint order.
+    /// A Backlog tab with the seven detail sub-tabs registered, in blueprint order; Reqs is
+    /// MOD-39 plan P12's, after Prompt.
     #[must_use]
     pub fn new() -> Self {
         let mut detail = DetailRegistry::new();
@@ -68,6 +69,7 @@ impl BacklogTab {
         detail.register(Box::new(DocumentsTab::new()));
         detail.register(Box::new(NotesTab::new()));
         detail.register(Box::new(PromptTab::new()));
+        detail.register(Box::new(ReqsTab::new()));
         Self {
             items: Vec::new(),
             folded: Vec::new(),
@@ -95,14 +97,16 @@ impl BacklogTab {
 
     /// Moves the cursor to a row and, when that is a different item, re-reads its detail.
     ///
-    /// The six reads go out together rather than per sub-tab, so switching sub-tabs costs
-    /// nothing and no sub-tab has to know when it became visible. They are six distinct request
+    /// The seven reads go out together rather than per sub-tab, so switching sub-tabs costs
+    /// nothing and no sub-tab has to know when it became visible. They are seven distinct request
     /// kinds, so the shell's staleness index keeps them apart and a reply to the previous
     /// selection is dropped rather than shown under the new one (blueprint C.2).
     ///
-    /// The sixth is MOD-2 milestone 9's preview (plan D102). It goes out with the other five even
+    /// The sixth is MOD-2 milestone 9's preview (plan D102). It goes out with the others even
     /// though it is the expensive one, for the same reason they do: the pane must be populated
     /// before it is looked at, and the work happens on a task of its own either way (`R-NF-3`).
+    ///
+    /// The seventh is MOD-39 plan P12's: the item's requirement citations for the Reqs sub-tab.
     fn go(&mut self, next: Option<Selection>, ctx: &Ctx<'_>) {
         if next == self.selected {
             return;
@@ -124,6 +128,7 @@ impl BacklogTab {
             template_name: None,
             scope: ctx.scope.clone(),
         });
+        ctx.request(StoreRequest::ItemRequirements(id));
     }
 
     /// Moves the cursor `delta` rows, clamped to the ends of the list.
