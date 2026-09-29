@@ -36,8 +36,8 @@ use tracing::warn;
 use htui_core::model::{BoxId, Repo, RepoBoxPath, RepoId, RunStepTree};
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, BuiltinRanker, ExcerptAudit, ExcerptCandidate, ExcerptCaps, ExcerptProvider,
-    ExcerptRequest, ExcerptSet, OwnedExcerptRequest, PathPrefix, ProviderError, RepoReader,
-    RepoRoot, RootRecord, RootSource, select, skip_by_path,
+    ExcerptRequest, ExcerptSet, Listing, OwnedExcerptRequest, PathPrefix, ProviderError, RepoPath,
+    RepoReader, RepoRoot, RootRecord, RootSource, list, select_listed, skip_by_path,
 };
 use htui_core::prompt::settings::resolve_excerpt_caps;
 use htui_core::prompt::{
@@ -54,7 +54,7 @@ pub const BINARY_PROBE_BYTES: usize = 8_192;
 ///
 /// Re-exported from `htui-core` rather than spelled again here. The ceiling is a property of
 /// [`ExcerptCandidate`], which that crate owns, and
-/// [`select`] clamps to it as well — two independent `100`s
+/// [`select`](htui_core::prompt::excerpt::select) clamps to it as well — two independent `100`s
 /// were how finding F-100 arrived, with the invariant enforced only by the impure crate.
 pub use htui_core::prompt::excerpt::MAX_PROVIDER_WEIGHT;
 
@@ -952,19 +952,36 @@ pub struct PassInput {
     /// The caller's own notes about the roots, which go first: a scope repo with no row, or
     /// D108's "no `run_step_tree` row yet".
     pub notes: Vec<String>,
+    /// MOD-9 D121: the previous attempt's changed paths, repo-qualified by name; empty on
+    /// attempt 1 and in the preview. Excerpt tier 2 and the `glob` file set both read it.
+    pub changed_paths: Vec<RepoPath>,
 }
 
-/// §4.5 over the filesystem (plan D119): the built-in provider, then `select` over an
-/// `FsRepoReader` built from the request's own caps (F-101). **Blocking**: `excerpts_for` calls it
-/// under `spawn_blocking` whenever a root is readable.
+/// MOD-9 D114: §4.5 steps 1-2 over the filesystem — every root resolved and listed once through
+/// an `FsRepoReader` built from the request's own caps. **Blocking**: it walks every readable
+/// root.
 #[must_use]
-pub fn excerpt_pass(req: &OwnedExcerptRequest, est: TokenEstimator) -> ExcerptSet {
+pub fn walk_pass(req: &OwnedExcerptRequest) -> Listing {
+    list(&FsRepoReader::new(req.caps), &req.as_request())
+}
+
+/// §4.5 steps 3-10 over the filesystem (plan D119, MOD-9 D114): the built-in provider, then
+/// `select_listed` over a [`walk_pass`] listing already taken and an `FsRepoReader` built from the
+/// request's own caps (F-101). **Blocking** (reads files): `excerpts_for` calls it under
+/// `spawn_blocking` whenever a root is readable.
+#[must_use]
+pub fn excerpt_pass(
+    req: &OwnedExcerptRequest,
+    listing: &Listing,
+    est: TokenEstimator,
+) -> ExcerptSet {
     let providers: Vec<Arc<dyn ExcerptProvider>> = vec![Arc::new(BuiltinRanker)];
     let request = req.as_request();
     let (merged, provider_set) = run_providers(&providers, &request);
-    select(
+    select_listed(
         &FsRepoReader::new(req.caps),
         &request,
+        listing,
         merged,
         provider_set,
         est,
@@ -995,8 +1012,8 @@ pub fn excerpt_pass(req: &OwnedExcerptRequest, est: TokenEstimator) -> ExcerptSe
 /// 7. `set.notes` = `input.notes`, then the pass's notes, then the drop notes.
 ///
 /// The request is `item_key`, `item_body`, `phase` and the input documents' bodies from `spec`,
-/// `input.touched_prefixes`, no `changed_paths` (D122), `input.roots`, the budget, and the caps,
-/// `scan_cap` and `deadline` of step 1. `est` is `spec.estimator`.
+/// `input.touched_prefixes`, `input.changed_paths` (MOD-9 D121), `input.roots`, the budget, and
+/// the caps, `scan_cap` and `deadline` of step 1. `est` is `spec.estimator`.
 pub async fn excerpts_for(
     spec: &PromptSpec,
     input: PassInput,
@@ -1008,6 +1025,7 @@ pub async fn excerpts_for(
         roots,
         touched_prefixes,
         notes,
+        changed_paths,
     } = input;
 
     let places = parse(spec.role, &spec.body)
@@ -1041,8 +1059,8 @@ pub async fn excerpts_for(
             .map(|document| document.body.clone())
             .collect(),
         touched_prefixes,
-        // D122: the previous attempt's diff carries no repo-qualified path list.
-        changed_paths: Vec::new(),
+        // MOD-9 D121: tier 2 reads the previous attempt's changed paths.
+        changed_paths,
         roots,
         budget_tokens,
         caps,
@@ -1053,7 +1071,10 @@ pub async fn excerpts_for(
 
     let mut set = if readable {
         let roots = request.roots.clone();
-        match tokio::task::spawn_blocking(move || excerpt_pass(&request, est)).await {
+        // MOD-9 D114: one hop walks then selects over the same listing.
+        match tokio::task::spawn_blocking(move || excerpt_pass(&request, &walk_pass(&request), est))
+            .await
+        {
             Ok(set) => set,
             Err(error) => {
                 let mut notes = notes;
@@ -1072,7 +1093,7 @@ pub async fn excerpts_for(
     } else {
         // No readable root: `select` lists nothing and reads nothing, and the one provider runs
         // on this thread, so there is no I/O to move off the runtime (H-9).
-        excerpt_pass(&request, est)
+        excerpt_pass(&request, &walk_pass(&request), est)
     };
     // The pass's own notes name `repo:path` as the reader returned it, so they are checked
     // before `drop_unmaskable_excerpts` appends its own, which are built safe (P-2).

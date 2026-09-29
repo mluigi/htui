@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use htui_agent::excerpt::{
     FsRepoReader, GITIGNORE_MAX_BYTES, PassInput, SkipRule, excerpt_pass, excerpt_roots,
-    excerpts_for, run_providers, touched_prefixes,
+    excerpts_for, run_providers, touched_prefixes, walk_pass,
 };
 use htui_core::model::{
     BoxId, Isolation, ProjectId, Repo, RepoBoxPath, RepoId, RunStepTree, StepId,
@@ -1103,6 +1103,7 @@ fn readable_input(dir: &std::path::Path) -> PassInput {
         roots: vec![fs_root(dir)],
         touched_prefixes: vec![PathPrefix::parse("src/lib.rs", "htui")],
         notes: vec!["excerpt: a caller's own note".to_owned()],
+        changed_paths: Vec::new(),
     }
 }
 
@@ -1111,10 +1112,8 @@ fn excerpt_pass_selects_a_touched_file_from_a_real_tree() {
     let dir = tempfile::tempdir().expect("a throwaway root");
     write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
 
-    let set = excerpt_pass(
-        &base_request(&["src/lib.rs"], vec![fs_root(dir.path())]),
-        TokenEstimator::DEFAULT,
-    );
+    let req = base_request(&["src/lib.rs"], vec![fs_root(dir.path())]);
+    let set = excerpt_pass(&req, &walk_pass(&req), TokenEstimator::DEFAULT);
 
     assert!(
         set.files
@@ -1141,10 +1140,8 @@ fn excerpt_pass_records_a_no_path_root_and_scans_nothing() {
         root: std::path::PathBuf::new(),
         source: RootSource::NoPath,
     };
-    let set = excerpt_pass(
-        &base_request(&["src/lib.rs"], vec![root]),
-        TokenEstimator::DEFAULT,
-    );
+    let req = base_request(&["src/lib.rs"], vec![root]);
+    let set = excerpt_pass(&req, &walk_pass(&req), TokenEstimator::DEFAULT);
 
     assert!(set.files.is_empty());
     assert_eq!(set.audit.considered, 0);
@@ -1379,6 +1376,7 @@ async fn excerpts_for_never_persists_a_note_naming_a_masked_path() {
         roots: vec![fs_root(dir.path())],
         touched_prefixes: vec![PathPrefix::parse(&format!("{secret}/bad.rs"), "htui")],
         notes: Vec::new(),
+        changed_paths: Vec::new(),
     };
 
     let set = excerpts_for(

@@ -147,7 +147,7 @@ pub use event::{
 // run, and `plan_install`/`resolve_tools` set the precedent.
 pub use excerpt::{
     FsRepoReader, GitignoreSubset, PassInput, SkipRule, excerpt_pass, excerpt_roots, excerpts_for,
-    run_providers, touched_prefixes,
+    run_providers, touched_prefixes, walk_pass,
 };
 // `plan_install`, not `plan`: at the crate root the bare name says nothing about what is being
 // planned, and `resolve_tools` set the precedent.

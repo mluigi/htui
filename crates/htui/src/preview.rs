@@ -271,6 +271,7 @@ pub async fn build(
         roots: excerpt_roots(&repo_scope, &[], &paths, box_id),
         touched_prefixes: touched_prefixes(&row.touched_paths, &repos),
         notes: Vec::new(),
+        changed_paths: Vec::new(),
     };
 
     let mut spec = PromptSpec {

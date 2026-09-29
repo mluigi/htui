@@ -5012,6 +5012,7 @@ where
             roots,
             touched_prefixes: touched_prefixes(&row.touched_paths, &repos),
             notes,
+            changed_paths: Vec::new(),
         };
         let excerpts = excerpts_for(spec, input, &self.parts.app, self.parts.scrubber).await;
         spec.excerpts = excerpts;
