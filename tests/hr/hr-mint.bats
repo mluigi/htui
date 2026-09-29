@@ -6,6 +6,9 @@ load test_helper
 
 setup() {
     hr_base_setup
+    # Host behaviour unless a case opts in; the host tree override never points at a real path.
+    unset HR_SANDBOX
+    export HR_HOST_TREE="$BATS_TEST_TMPDIR/no-host-tree"
     FIX="$BATS_TEST_TMPDIR/repo"
     make_fixture "$FIX"
 }
@@ -403,4 +406,93 @@ TS_ROW_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
     [[ $status -eq 0 ]]
     [[ "$stderr" == *'leasing off'* ]]
     [[ ! -e "$HR_STATE" ]]
+}
+
+@test "21. sandbox: no state dir or no lease file blocks (exit 1), never a tree-only mint" {
+    HR_SANDBOX=1 run --separate-stderr mint --prefix MOD --title 'A thing'
+    [[ $status -eq 1 ]]
+    [[ -z "$output" ]]
+    [[ "$stderr" == *'sandbox'*'no state dir'* ]]
+    [[ "$stderr" != *'leasing off'* ]]
+    [[ ! -e "$HR_STATE" ]]
+
+    mkdir -p "$HR_STATE"
+    HR_SANDBOX=1 run --separate-stderr mint --prefix MOD --title 'A thing'
+    [[ $status -eq 1 ]]
+    [[ -z "$output" ]]
+    [[ "$stderr" == *'sandbox'*'no lease file'* ]]
+    [[ "$stderr" != *'leasing off'* ]]
+    HR_SANDBOX=1 run --separate-stderr "$HR_MINT" --prune --repo-root "$FIX"
+    [[ $status -eq 1 ]]
+    [[ -z "$(ls -A "$HR_STATE")" ]]
+
+    # Leasing is always on in a sandbox, so the skills reach the blocked mint rather than
+    # falling back to next-item-id.sh.
+    HR_SANDBOX=1 run --separate-stderr "$HR_MINT" --leasing
+    [[ $status -eq 0 ]]
+    # The lease file is the host's to create or restore: a sandbox never recreates it.
+    HR_SANDBOX=1 run --separate-stderr "$HR_MINT" --init
+    [[ $status -eq 1 ]]
+    [[ "$stderr" == *'host'* ]]
+    HR_SANDBOX=1 run --separate-stderr "$HR_MINT" --init --force
+    [[ $status -eq 1 ]]
+    [[ -z "$(ls -A "$HR_STATE")" ]]
+
+    # With the lease file in place a sandbox mints as usual.
+    init_leases
+    HR_SANDBOX=1 HR_ITEM=MOD-65 run --separate-stderr mint --prefix MOD --title 'A thing'
+    [[ $status -eq 0 ]]
+    [[ "$output" == 'MOD-6' ]]
+    [[ "$(lease_rows | cut -f1,2 | tr '\t' ' ')" == 'MOD-6 hr/MOD-65' ]]
+}
+
+@test "22. host: --init creates the lock; a vanished lease file blocks --init, mint and prune; --init --force restores it" {
+    run --separate-stderr "$HR_MINT" --init
+    [[ $status -eq 0 ]]
+    [[ -f "$HR_STATE/id-leases.lock" ]]
+    seed_lease MOD-9 hr/A "$(ts_ago '1 day ago')" 'the lost floor'
+    rm "$(lease_file)"
+
+    run --separate-stderr "$HR_MINT" --init
+    [[ $status -eq 1 ]]
+    [[ "$stderr" == *'lease file vanished'*'scripts/hr-mint --init --force'* ]]
+    [[ ! -e "$(lease_file)" ]]
+
+    # Nothing turns leasing off, so the skills reach the blocked mint instead of the plain one.
+    run --separate-stderr "$HR_MINT" --leasing
+    [[ $status -eq 0 ]]
+    run --separate-stderr mint --prefix MOD --title 'x'
+    [[ $status -eq 1 ]]
+    [[ -z "$output" ]]
+    [[ "$stderr" == *'lease file vanished'* ]]
+    [[ "$stderr" != *'leasing off'* ]]
+    run --separate-stderr "$HR_MINT" --prune --repo-root "$FIX"
+    [[ $status -eq 1 ]]
+    [[ "$stderr" == *'lease file vanished'* ]]
+    [[ ! -e "$(lease_file)" ]]
+
+    run --separate-stderr "$HR_MINT" --init --force
+    [[ $status -eq 0 ]]
+    [[ "$stderr" == *"created $(lease_file)"* ]]
+    [[ "$(wc -l <"$(lease_file)")" -eq 2 ]]
+    run --separate-stderr mint --prefix MOD --title 'x'
+    [[ $status -eq 0 ]]
+    [[ "$output" == 'MOD-6' ]]
+}
+
+@test "23. --force only goes with --init; on an existing lease file --init --force changes nothing" {
+    run --separate-stderr "$HR_MINT" --force
+    [[ $status -eq 2 ]]
+    run --separate-stderr mint --prefix MOD --title x --force
+    [[ $status -eq 2 ]]
+    run --separate-stderr "$HR_MINT" --prune --force --repo-root "$FIX"
+    [[ $status -eq 2 ]]
+    [[ ! -e "$HR_STATE" ]]
+
+    init_leases
+    seed_lease MOD-9 hr/A "$(ts_ago '1 day ago')" 'keep me'
+    cp "$(lease_file)" "$BATS_TEST_TMPDIR/before"
+    run --separate-stderr "$HR_MINT" --init --force
+    [[ $status -eq 0 ]]
+    cmp "$(lease_file)" "$BATS_TEST_TMPDIR/before"
 }

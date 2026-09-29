@@ -7,21 +7,34 @@
 #
 # Usage:
 #   scripts/hr-mint --prefix P --title "one line" [--repo-root R] [--branch B]
-#   scripts/hr-mint --leasing          # exit 0 iff the lease file exists (the skill docs' switch)
-#   scripts/hr-mint --init             # create state dir + lease file; idempotent
+#   scripts/hr-mint --leasing          # exit 0 iff leasing is on (the skill docs' switch)
+#   scripts/hr-mint --init [--force]   # host only: create state dir + lock + lease file
 #   scripts/hr-mint --prune [--ref main] [--repo-root R] [--purged-owner B]...
 #
 # Mint prints the ID on stdout and nothing else; provenance, the "leasing off" notice and the
-# recent same-prefix leases of other runs ("ask before filing" list) go to stderr. Without the
-# state dir or the lease file it is exactly `next-item-id.sh --prefix P --id-only`.
+# recent same-prefix leases of other runs ("ask before filing" list) go to stderr.
+#
+# Leasing is on when the lease file exists, when the lock is stamped (an earlier --init created
+# the lease file), or always in a sandbox (HR_SANDBOX=1). It fails closed whenever it is on but
+# the lease file is missing - a tree-only mint then would drop the F1 floor without a word:
+#   - HR_SANDBOX=1, no state dir or no lease file: mint and prune exit 1; --init exits 1 (the
+#     lease file is created and restored on the host, never in a sandbox).
+#   - host, stamped lock but no lease file ("lease file vanished"): mint, prune and --init exit 1.
+#     `--init --force` recreates an empty lease file; check first that no live run holds leases
+#     that are not on main yet, because their floor is lost.
+# Only a host that never ran --init (no lease file, no stamped lock) is "leasing off": mint is
+# then exactly `next-item-id.sh --prefix P --id-only`, prune a no-op, both with a stderr notice.
+# --init on a fresh state dir creates the lease file and stamps the lock (one line written into
+# id-leases.lock under the flock), idempotently; the stamp, not the lock's mere existence, is the
+# "lease file existed" signal, so two first --init racing each other never read as a vanish.
 # --prune drops a lease once its ID is on REF (open checklist line in HANDOFF.md or index line
 # in DECISIONS.md) or its owner is a --purged-owner — but never the highest lease of a prefix:
 # that row is the floor that keeps a clone taken before the merge from re-minting (F1).
 #
 # Owner: --branch B, else hr/$HR_ITEM when set (inside a sandbox), else "host".
 # State: $HR_STATE, else /media/projects/htui-hr/.state. Lease file id-leases.tsv; lock
-# id-leases.lock (separate, so prune's tmp+mv never swaps the locked inode). Lock wait:
-# $HR_MINT_LOCK_TIMEOUT seconds (default 30).
+# id-leases.lock (separate, so prune's tmp+mv never swaps the locked inode; never removed).
+# Lock wait: $HR_MINT_LOCK_TIMEOUT seconds (default 30).
 # R (default: this script's repo) only selects the HANDOFF/DECISIONS data; next-item-id.sh and
 # workflow-patterns.sh always come from this script's own repo.
 #
@@ -31,8 +44,10 @@
 #   MOD-71<TAB>hr/MOD-65<TAB>2026-09-29T10:02:11Z<TAB>Ctrl-c leaves the terminal raw
 # `#` lines are comments, empty lines are ignored, anything else fails closed (exit 1).
 #
-# Exit codes: 0 ok, 1 blocked (next-item-id findings, unparseable lease file, --leasing off),
-#           2 usage (bad argument, out-of-set prefix, empty title, unusable repo root or ref),
+# Exit codes: 0 ok, 1 blocked (next-item-id findings, unparseable lease file, lease file missing
+#           while leasing is on, --init in a sandbox, --leasing off),
+#           2 usage (bad argument, out-of-set prefix, empty title, unusable repo root or ref,
+#           --force without --init),
 #           3 lock timeout / state dir or lease file unwritable.
 #
 # The law is .claude/rules/workflow-docs.md; this script implements it, it does not restate it.
@@ -73,7 +88,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/hr-mint --prefix P --title "one line" [--repo-root R] [--branch B]
        scripts/hr-mint --leasing
-       scripts/hr-mint --init
+       scripts/hr-mint --init [--force]
        scripts/hr-mint --prune [--ref main] [--repo-root R] [--purged-owner B]...
 EOF
 }
@@ -146,26 +161,69 @@ take_lock() {
 
 release_lock() { exec 9>&-; }
 
+in_sandbox() { [[ "${HR_SANDBOX:-}" == 1 ]]; }
+
+# The lock carries one stamp line once --init has created the lease file (it is otherwise empty
+# and never removed). Written under the flock, so it is a race-free "the lease file existed".
+stamp_lock() { # needs fd 9
+    [[ -s "$LOCK" ]] && return 0
+    printf 'hr-mint: --init created %s at %s - lock stamp, keep this file\n' \
+        "$LEASES" "$(date -u +%FT%TZ)" >&9 2>/dev/null \
+        || die 3 "cannot stamp $LOCK"
+}
+
+vanished_msg() {
+    printf '%s' "lease file vanished: $LEASES is gone but $LOCK shows --init created it - nothing done. Restore it, or run \`scripts/hr-mint --init --force\` after checking that no live run holds leases that are not on main yet (their floor is lost)"
+}
+
+# 0 = leasing on (the lease path exists), 1 = leasing off (a host that never ran --init).
+# Dies 1 when leasing is on but the lease file is missing: in a sandbox (leasing is mandatory
+# there), or on a host whose stamped lock shows --init created the file. A lease path that is
+# there but unreadable is "on", so read_leases fails it closed (exit 3).
+leasing_or_die() {
+    [[ -e "$LEASES" ]] && return 0
+    if in_sandbox; then
+        [[ -d "$STATE" ]] \
+            || die 1 "in a sandbox (HR_SANDBOX=1) leasing is required, but there is no state dir at $STATE - nothing done; check the /hr-state mount on the host"
+        die 1 "in a sandbox (HR_SANDBOX=1) leasing is required, but there is no lease file at $LEASES - nothing done; the maintainer restores it on the host"
+    fi
+    [[ -s "$LOCK" ]] && die 1 "$(vanished_msg)"
+    return 1
+}
+
 # ---- modes ----
 
-# Leasing is on as soon as the path exists: a lease file that is there but unreadable must fail
-# the mint closed (exit 3), never fall back to a tree-only mint.
+# The skills' switch. On when the lease path exists, when the lock is stamped (the file vanished:
+# the mint then blocks instead of the skill falling back to next-item-id.sh), and always in a
+# sandbox.
 do_leasing() {
-    [[ -e "$LEASES" ]]
+    [[ -e "$LEASES" || -s "$LOCK" ]] || in_sandbox
 }
 
 do_init() {
+    in_sandbox && die 1 "--init is host-only: the lease file is created and restored on the host, never in a sandbox (HR_SANDBOX=1)"
     mkdir -p "$STATE" 2>/dev/null || die 3 "cannot create state dir $STATE"
     take_lock
     if [[ ! -e "$LEASES" ]]; then
+        local again=0
+        if [[ -s "$LOCK" ]]; then
+            [[ $FORCE -eq 1 ]] || die 1 "$(vanished_msg)"
+            again=1
+        fi
         local tmp="$LEASES.tmp.$$"
         if ! printf '%s\n%s\n' "$LEASE_HEADER_1" "$LEASE_HEADER_2" 2>/dev/null >"$tmp" \
             || ! mv -f "$tmp" "$LEASES"; then
             rm -f "$tmp"
             die 3 "cannot write $LEASES"
         fi
-        echo "hr-mint: created $LEASES" >&2
+        if [[ $again -eq 1 ]]; then
+            echo "hr-mint: re-created $LEASES empty (--force) - the lease floor restarts from the trees" >&2
+        else
+            echo "hr-mint: created $LEASES" >&2
+        fi
     fi
+    # Also stamps a lock left empty by an --init that predates the stamp.
+    stamp_lock
     release_lock
 }
 
@@ -188,16 +246,14 @@ tree_mint() {
 }
 
 do_mint() {
-    if [[ ! -d "$STATE" ]]; then
+    if ! leasing_or_die; then
         tree_mint
         printf '%s\n' "$TREE_ID"
-        echo "hr-mint: leasing off (no state dir at $STATE) - $TREE_ID is the tree mint only" >&2
-        return 0
-    fi
-    if ! do_leasing; then
-        tree_mint
-        printf '%s\n' "$TREE_ID"
-        echo "hr-mint: leasing off (no lease file at $LEASES; run scripts/hr-mint --init) - $TREE_ID is the tree mint only" >&2
+        if [[ ! -d "$STATE" ]]; then
+            echo "hr-mint: leasing off (no state dir at $STATE) - $TREE_ID is the tree mint only" >&2
+        else
+            echo "hr-mint: leasing off (no lease file at $LEASES; run scripts/hr-mint --init) - $TREE_ID is the tree mint only" >&2
+        fi
         return 0
     fi
 
@@ -246,7 +302,7 @@ do_prune() {
         || die 2 "ref '$REF' has no HANDOFF.md in $REPO_ROOT"
     arch="$(git -C "$REPO_ROOT" show "$REF:DECISIONS.md" 2>/dev/null)" || arch=''
 
-    if ! do_leasing; then
+    if ! leasing_or_die; then
         echo "hr-mint: leasing off (no lease file at $LEASES) - nothing to prune" >&2
         return 0
     fi
@@ -324,7 +380,7 @@ need_value() { # $1=flag $2=remaining arg count
 }
 
 PREFIX=''; TITLE=''; HAVE_TITLE=0; REPO_ROOT=''; BRANCH=''; HAVE_BRANCH=0; REF=''; HAVE_REF=0
-PURGED=()
+PURGED=(); FORCE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --prefix) need_value "$1" $#; set_mode mint; PREFIX="$2"; shift 2 ;;
@@ -333,6 +389,7 @@ while [[ $# -gt 0 ]]; do
         --repo-root) need_value "$1" $#; REPO_ROOT="$2"; shift 2 ;;
         --leasing) set_mode leasing; shift ;;
         --init) set_mode init; shift ;;
+        --force) FORCE=1; shift ;;
         --prune) set_mode prune; shift ;;
         --ref) need_value "$1" $#; set_mode prune; REF="$2"; HAVE_REF=1; shift 2 ;;
         --purged-owner) need_value "$1" $#; set_mode prune; PURGED+=("$2"); shift 2 ;;
@@ -341,6 +398,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 [[ -n "$MODE" ]] || { usage >&2; exit 2; }
+[[ $FORCE -eq 0 || "$MODE" == init ]] || { echo "hr-mint: --force only goes with --init" >&2; usage >&2; exit 2; }
 
 STATE="${HR_STATE:-/media/projects/htui-hr/.state}"
 LEASES="$STATE/id-leases.tsv"
