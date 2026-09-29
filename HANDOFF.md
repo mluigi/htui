@@ -14,7 +14,11 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-29):** **MOD-39 was done** (`docs/decisions/mod/mod-39.md`): the
+**Current status (2026-09-29):** **TOOL-7 shipped** (`docs/decisions/tool/tool-7.md`): `scripts/hr` runs
+3–4 `/handoff-run` lifecycles side by side, each in its own container set (fresh clone on
+`hr/<ITEM>`, private Postgres/Qdrant, no git credentials), with cross-run ID leases through
+`scripts/hr-mint`; guide `docs/hr-sandbox.md`.
+Before it, **MOD-39 was done** (`docs/decisions/mod/mod-39.md`): the
 Requirements tab is in (tab 3, so Settings is now 4 and Chat 5), with the project → area →
 requirement tree, coverage with suspect markers, the revision trail with each deciding item, and
 maintainer-only create, amend and withdraw (the maintainer is the project's requirement-spec owner).
@@ -28,12 +32,6 @@ process that wakes after its run was adopted writes nothing to its old step. Lea
 stamped by Postgres, quota writes keep the newest, agent edits are a compare-and-set, the store
 worker beats `box.last_seen_at`, and a headless connect never migrates and refuses a build below
 `htui_target_version` (`R-STO-5` amended). No migration. **MOD-41** is no longer blocked.
-Before it, **MOD-50 was done** (`docs/decisions/mod/mod-50.md`): the
-concepts index now holds requirement rows as `type = requirement` points (withdrawn ones kept), item
-and document points carry `item.resolution`, and `htui --search-items --decisions` keeps items
-closed as done, concluded or rejected (maintainer). The collection is now `htui_concepts_v2`, so the
-first `--index-items` after upgrading rebuilds everything; `R-STO-8` was amended in place. It
-minted **MOD-64** (concepts search in the TUI).
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -58,7 +56,7 @@ greyed and every production judge fails until MOD-11**, because no agent can wri
 `output_kind` document yet, so production fan-outs go to the human (`s` in the Runs pane).
 Adapters install under `HTUI_AGENTS_ROOT`, default
 `dirs::data_local_dir()/htui/agents`; `HTUI_TOOL_<NAME>` still overrides everything. Dev Postgres
-via `compose.yaml` (port 5439); tests need
+via `compose.yaml` (port 5439, loopback only since TOOL-7); tests need
 `HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres` and the
 `USERNAME=htui-ci` prefix of TOOL-2 (`docs/decisions/mod/mod-6.md`). Under load the dev Postgres
 goes into recovery (`57P03`) and a failure seen then is re-run alone before it is believed;
@@ -803,15 +801,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 
 ### Tooling findings
 
-- [ ] **TOOL-7 - Containerized handoff-run sandboxes.** Run 3–4 `/handoff-run` lifecycles
-  concurrently without interference: one compose project per run (`hr-<item>`) with a dev
-  toolchain image plus a private Postgres 16 / Qdrant v1.19.1 sharing one network namespace (same
-  `localhost:5439`/`6333`/`6334` as the host, nothing published); a fresh clone of the read-only
-  host repo on branch `hr/<ITEM>`; no git credentials inside — the host runs
-  `scripts/hr collect [--merge]`; gum-driven `scripts/hr` (build/up/attach/ls/collect/down/gc);
-  cross-run ID leases via `scripts/hr-mint`; a `handoff-run` sandbox mode (`HR_SANDBOX=1`).
-  Design: `.claude/plans/tool-7-hr-sandbox.plan.md`.
-
 ## Summary
 
 | Area    | Open                                                                                     |
@@ -819,4 +808,4 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | ANA-N   | 4 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-26 configurable hotkeys) |
 | MOD-N   | 35 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-7 offline-buffer leftovers)            |
-| TOOL-N  | 1 (TOOL-7 handoff-run sandboxes) |
+| TOOL-N  | 0 |

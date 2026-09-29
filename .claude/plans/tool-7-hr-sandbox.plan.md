@@ -450,3 +450,23 @@ Residuals (after the re-review fixes, 2026-09-29):
 - a clone's `.git/commondir` can redirect host ref reads, but only to make its own run look collected;
 - deleting both `id-leases.tsv` and `id-leases.lock` no longer makes host mints tree-only: host
   `hr-mint` reads `$HR_RUNS/.leases-initialized` too (L3), provided it sees the same `HR_RUNS`.
+
+## T6 acceptance results (2026-09-29)
+
+Three real runs brought up with `scripts/hr up --yes` (≈6 s each): CLEAN-4 and CLEAN-6 on `/media`
+(HDD), MOD-59 with `--ssd`; each ran `cargo test --workspace --all-features -- --test-threads=1`
+from a cold `target/` **simultaneously** (4-CPU quota each).
+
+| run | root | result | tests passed | Postgres/Qdrant skips | `57P03` | wall | run dir |
+|---|---|---|---|---|---|---|---|
+| CLEAN-4 | hdd | ✔ rc 0 | 2453 | 0 / 0 | 0 | 411 s | 15 GB |
+| CLEAN-6 | hdd | ✔ rc 0 | 2453 | 0 / 0 | 0 | 419 s | 15 GB |
+| MOD-59 | ssd | ✔ rc 0 | 2453 | 0 / 0 | 0 | 388 s | 15 GB |
+
+Host checks: repo HEAD/`main`/status/diff/every branch byte-identical before vs after; host
+`htui-postgres`/`htui-qdrant` same `StartedAt`, 0 restarts, no recovery lines in the log.
+**Default `HR_ROOT` stays `/media/projects/htui-hr`:** the HDD costs ~7% wall time on a cold full
+run, while 15 GB per run on the SSD (89 GB free after this test) would crowd the host's own
+`target/`. `--ssd` remains the opt-in. Claim #4 (concurrent OAuth refresh) was not exercised: the
+runs made no Claude calls; it stays an argued pass with the documented `claude setup-token`
+fallback.
