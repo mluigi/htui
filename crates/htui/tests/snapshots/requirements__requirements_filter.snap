@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/requirements.rs
+expression: frame
+---
+Platform · DESKTOP-HTUI · memory · 1 run
+ 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+┌ Requirements (1) · /STO ──────────────────┐┌ R-STO-1 ────────────────────────────────────────────┐
+│▾ htui (1)                                 ││Postgres is the source of truth; the cache is a      │
+│  ▾ STO Storage (1)                        ││read-only mirror.                                    │
+│    R-STO-1  must   Postgres is the source…││                                                     │
+│                                           ││must · active · v1                                   │
+│                                           ││                                                     │
+│                                           ││Coverage                                             │
+│                                           ││FEAT-1  addresses v1  in_progress  —                 │
+│                                           ││FIX-1   addresses v1  closed       done              │
+│                                           ││                                                     │
+│                                           ││Revisions                                            │
+│                                           ││v1   created                09-03 12:00              │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+└───────────────────────────────────────────┘└─────────────────────────────────────────────────────┘
+
+ j/k move  Enter fold  / filter  a area  n new  e amend  W withdraw  r reload
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces

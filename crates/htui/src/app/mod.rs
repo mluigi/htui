@@ -15,7 +15,7 @@ use crate::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection, PromptSection,
     QdrantSection,
 };
-use crate::ui::tabs::{BacklogTab, ChatTab, SettingsTab, SkillsTab};
+use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsTab};
 
 /// Registers every tab and every overlay factory, and names the workspace switcher as the
 /// startup overlay.
@@ -25,8 +25,9 @@ use crate::ui::tabs::{BacklogTab, ChatTab, SettingsTab, SkillsTab};
 ///
 /// Three things happen, in this order:
 ///
-/// 1. Backlog, Skills and Settings are registered. Registration order is tab-strip order and
-///    `1`..`9` order, so Backlog first is what makes it the tab a user lands on.
+/// 1. Backlog, Skills, Requirements and Settings are registered. Registration order is tab-strip
+///    order and `1`..`9` order, so Backlog first is what makes it the tab a user lands on.
+///    Requirements sits before Settings, `R-TUI-1`'s order (MOD-39 PRD D2).
 /// 2. The switcher's factory goes in under its own [`OverlayId`](crate::ui::overlay::OverlayId)
 ///    and global `w` is bound to opening it. The binding is added here rather than in
 ///    [`Keymap::default_global`](crate::keymap::Keymap::default_global) because it names an
@@ -47,6 +48,7 @@ use crate::ui::tabs::{BacklogTab, ChatTab, SettingsTab, SkillsTab};
 pub fn register_all(app: &mut App) {
     app.register_tab(Box::new(BacklogTab::new()));
     app.register_tab(Box::new(SkillsTab::new()));
+    app.register_tab(Box::new(RequirementsTab::new()));
     app.register_tab(Box::new(SettingsTab::with_sections(vec![
         Box::new(AgentsSection::new()),
         Box::new(HierarchySection::new()),
