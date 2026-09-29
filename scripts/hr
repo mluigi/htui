@@ -941,6 +941,25 @@ recipe_prompt() {
         "Then git add the resolved files, git commit --no-edit, and rerun the validator. Do not push."
 }
 
+# Files that configure or run tools on the host once merged (collect --merge shows and confirms them).
+CONFIG_PATHS=(.claude scripts docker CLAUDE.md AGENTS.md .mcp.json .cargo rust-toolchain.toml)
+
+# collect's temporaries. Globals, not locals: the EXIT trap runs after cmd_collect has returned,
+# when its locals are gone (re-review L4).
+COLLECT_TMPREF=''
+COLLECT_VDIR=''
+collect_cleanup() {
+    if [[ -n "$COLLECT_TMPREF" ]]; then
+        git -C "$HOST" -c core.hooksPath=/dev/null update-ref -d "$COLLECT_TMPREF" 2>/dev/null
+        COLLECT_TMPREF=''
+    fi
+    if [[ -n "$COLLECT_VDIR" ]]; then
+        rm -rf -- "$COLLECT_VDIR"
+        COLLECT_VDIR=''
+    fi
+    return 0
+}
+
 cmd_collect() {
     local item='' merge=0 force=0 yes=0
     while [[ $# -gt 0 ]]; do
@@ -962,10 +981,17 @@ cmd_collect() {
     clone_ok || die 1 "clone missing at $SRC (or its .git is not a directory)"
     local tip
     tip="$(src_git rev-parse --verify -q "$branch^{commit}")" || die 1 "the clone has no branch hr/$item"
+    # Every way out (return, die, Ctrl-C) drops the temporary ref and the validator copy.
+    trap collect_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 
-    # --merge preconditions first: a refused merge leaves the host exactly as it was.
+    # --merge preconditions first: a refused merge leaves the host exactly as it was. That covers
+    # the validator too: it is taken from the pre-merge HEAD (review H6) before anything is fetched
+    # (re-review L2).
+    local current=''
     if [[ "$merge" -eq 1 ]]; then
-        local dirty
+        local dirty f
         dirty="$(git -C "$HOST" status --porcelain --untracked-files=no)"
         if [[ -n "$dirty" ]]; then
             sed 's/^/  /' <<<"$dirty" >&2
@@ -973,26 +999,62 @@ cmd_collect() {
         fi
         git -C "$HOST" rev-parse -q --verify MERGE_HEAD >/dev/null \
             && die 1 "a merge is already in progress in $HOST"
-        git -C "$HOST" symbolic-ref -q HEAD >/dev/null \
+        current="$(git -C "$HOST" symbolic-ref -q --short HEAD)" \
             || die 1 "HEAD is detached in $HOST — check out the branch to merge into"
+        COLLECT_VDIR="$(mktemp -d)" || die 3 "cannot create a temp dir"
+        for f in validate-workflow-docs.sh workflow-patterns.sh; do
+            git -C "$HOST" cat-file blob "HEAD:.claude/skills/handoff-run/scripts/$f" >"$COLLECT_VDIR/$f" 2>/dev/null \
+                || die 2 "cannot read .claude/skills/handoff-run/scripts/$f at HEAD of $HOST (the merge is validated with it) — nothing fetched"
+        done
     fi
 
     git -C "$HOST" worktree list --porcelain | grep -qxF "branch $branch" \
         && die 1 "hr/$item is checked out in a host worktree — collect cannot move it (switch that worktree away first)"
-    local old spec="$branch:$branch"
+    local old
     old="$(git -C "$HOST" rev-parse --verify -q "$branch")"
     if [[ -n "$old" && "$old" != "$tip" ]] && ! src_git merge-base --is-ancestor "$old" "$tip" 2>/dev/null; then
         [[ "$force" -eq 1 ]] \
             || die 1 "hr/$item was rewritten in the sandbox (host has ${old:0:12}, sandbox ${tip:0:12}); --force overwrites the host branch"
     fi
-    [[ "$force" -eq 1 ]] && spec="+$spec"
-    # Local fetch: upload-pack runs on the clone but ignores its repo-level packObjectsHook; every
-    # object the sandbox made is fsck'd on the way in.
+    # Local fetch into a temporary ref: upload-pack runs on the clone but ignores its repo-level
+    # packObjectsHook; every object the sandbox made is fsck'd on the way in. hr/ITEM, and the
+    # registry, move only once every check below has passed; a refusal drops the temporary ref
+    # (collect_cleanup), so the host's refs are exactly as they were (re-review L1).
+    COLLECT_TMPREF="refs/hr-collect/$item"
     git -C "$HOST" -c core.hooksPath=/dev/null -c transfer.fsckObjects=true fetch -q --no-tags \
-        --no-write-fetch-head --no-recurse-submodules "$SRC" "$spec" || die 3 "git fetch from $SRC failed"
-    # What the host now has (the sandbox may have committed since `tip` was read).
+        --no-write-fetch-head --no-recurse-submodules "$SRC" "+$branch:$COLLECT_TMPREF" \
+        || die 3 "git fetch from $SRC failed"
+    # What arrived (the sandbox may have committed, or rewritten, since `tip` was read).
     local got
-    got="$(git -C "$HOST" rev-parse --verify -q "$branch^{commit}")" || die 3 "hr/$item missing on the host after the fetch"
+    got="$(git -C "$HOST" rev-parse --verify -q "$COLLECT_TMPREF^{commit}")" || die 3 "nothing fetched for hr/$item"
+    if [[ -n "$old" && "$old" != "$got" && "$force" -eq 0 ]] \
+        && ! git -C "$HOST" merge-base --is-ancestor "$old" "$got" 2>/dev/null; then
+        die 1 "hr/$item was rewritten in the sandbox (host has ${old:0:12}, sandbox ${got:0:12}); --force overwrites the host branch"
+    fi
+
+    # What the run changes in files that configure or run tools on the host: after the merge, the
+    # next claude session, scripts/hr call or image build uses them. Always shown before a merge,
+    # and confirmed — in a terminal always (--yes does not answer it), without one only by --yes.
+    local sensitive=''
+    if [[ "$merge" -eq 1 ]]; then
+        sensitive="$(git -C "$HOST" --no-pager diff --stat "HEAD...$COLLECT_TMPREF" -- "${CONFIG_PATHS[@]}" 2>/dev/null)"
+        if [[ -n "$sensitive" ]]; then
+            echo "hr: hr/$item changes files that configure or run tools on this host (${CONFIG_PATHS[*]}):"
+            no_ctl <<<"$sensitive" | sed 's/^/  /'
+            if interactive; then
+                need_gum
+                gum confirm "Merge hr/$item, with the tool-config changes above, into $current?" \
+                    || die 1 "cancelled — nothing collected or merged; review: git diff HEAD...hr/$item after a plain collect"
+            elif [[ "$yes" -ne 1 ]]; then
+                die 1 "needs confirmation: pass --yes (or run it in a terminal) — hr/$item changes tool config (above); nothing collected or merged"
+            fi
+        fi
+    fi
+
+    git -C "$HOST" -c core.hooksPath=/dev/null update-ref -m "scripts/hr collect $item" "$branch" "$got" "$old" \
+        || die 3 "cannot move hr/$item on the host to ${got:0:12}"
+    git -C "$HOST" -c core.hooksPath=/dev/null update-ref -d "$COLLECT_TMPREF" 2>/dev/null
+    COLLECT_TMPREF=''
     set_reg "$item" "collected_sha=$got" "collected_at=$(now_utc)"
     echo "hr: collected hr/$item at ${got:0:12} — commits not on main:"
     { git -C "$HOST" --no-pager log --oneline "refs/heads/main..$branch" 2>/dev/null \
@@ -1000,20 +1062,8 @@ cmd_collect() {
 
     [[ "$merge" -eq 1 ]] || return 0
 
-    # Pre-merge, from the host's HEAD: the validator (and what it sources) that judges the merge,
-    # and what the run changes in files that drive tools or a claude session on the host. After
-    # the merge, both would be the run's own versions (review H6).
-    local current vdir f sensitive
-    current="$(git -C "$HOST" symbolic-ref --short HEAD)"
-    vdir="$(mktemp -d)" || die 3 "cannot create a temp dir"
-    trap 'rm -rf -- "$vdir"' EXIT
-    for f in validate-workflow-docs.sh workflow-patterns.sh; do
-        git -C "$HOST" cat-file blob "HEAD:.claude/skills/handoff-run/scripts/$f" >"$vdir/$f" 2>/dev/null \
-            || die 2 "cannot read .claude/skills/handoff-run/scripts/$f at HEAD of $HOST (the merge is validated with it)"
-    done
-    sensitive="$(git -C "$HOST" --no-pager diff --stat "HEAD...$branch" -- .claude scripts docker 2>/dev/null)"
     if git -C "$HOST" merge --no-ff --no-edit -m "Merge hr/$item (sandbox run)" "$branch"; then
-        if ! bash "$vdir/validate-workflow-docs.sh" --repo-root "$HOST"; then
+        if ! bash "$COLLECT_VDIR/validate-workflow-docs.sh" --repo-root "$HOST"; then
             die 1 "merged hr/$item into $current, but the validator is red — fix before pushing"
         fi
         echo "hr: merged hr/$item into $current. Nothing was pushed."

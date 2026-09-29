@@ -364,8 +364,15 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     host_commit other.txt 'host moved on'
     local head
     head="$(git -C "$HR_HOST_REPO" rev-parse HEAD)"
+    # L4: the pre-merge validator's temp dir is gone afterwards, and the exit is clean.
+    export TMPDIR="$BATS_TEST_TMPDIR/tmpdir"
+    mkdir -p "$TMPDIR"
     run --separate-stderr "$HR" collect MOD-5 --merge
     [[ $status -eq 0 ]]
+    [[ "$stderr" != *unbound* && -z "$(ls -A "$TMPDIR")" ]]
+    # Nothing under .claude/scripts/docker/...: no confirmation needed without a terminal.
+    [[ "$output$stderr" != *'needs confirmation'* ]]
+    [[ -z "$(git -C "$HR_HOST_REPO" for-each-ref refs/hr-collect)" ]]
     [[ "$(git -C "$HR_HOST_REPO" rev-list --parents -n 1 HEAD | wc -w)" -eq 3 ]]
     [[ "$(git -C "$HR_HOST_REPO" rev-parse HEAD^1)" == "$head" ]]
     [[ "$(git -C "$HR_HOST_REPO" rev-parse HEAD^2)" == "$(git -C "$HR_HOST_REPO" rev-parse hr/MOD-5)" ]]
@@ -966,9 +973,13 @@ hr_selfhost() {
     sed -i "2i touch '$BATS_TEST_TMPDIR/validator-ran'" "$src/$wf/validate-workflow-docs.sh"
     sed -i "1i touch '$BATS_TEST_TMPDIR/patterns-ran'" "$src/$wf/workflow-patterns.sh"
     git -C "$src" -c user.name=s -c user.email=s@x.invalid commit -q -am 'sandbox rewrites the validator'
-    run --separate-stderr "$hrx" collect MOD-5 --merge
+    export TMPDIR="$BATS_TEST_TMPDIR/tmpdir"
+    mkdir -p "$TMPDIR"
+    # The run changes .claude/: without a terminal that needs --yes (re-review L1).
+    run --separate-stderr "$hrx" collect MOD-5 --merge --yes
     echo "$output$stderr"
     [[ $status -eq 0 ]]
+    [[ "$stderr" != *unbound* && -z "$(ls -A "$TMPDIR")" ]]
     [[ "$output$stderr" == *'0 error(s)'* ]]
     # The merge landed (the hostile files are in the host tree now) but never ran.
     grep -q 'validator-ran' "$HR_HOST_REPO/$wf/validate-workflow-docs.sh"
@@ -993,7 +1004,8 @@ hr_selfhost() {
     local fb="$BATS_TEST_TMPDIR/fakebin"
     mkdir -p "$fb"
     printf '#!/bin/sh\ntouch "%s/claude-launched"\n' "$BATS_TEST_TMPDIR" >"$fb/claude"
-    printf '#!/bin/sh\necho "$*" >>"%s/gum.log"\n[ "$1" = confirm ] && exit "${FAKE_GUM_CONFIRM:-1}"\nexit 0\n' \
+    # Yes to collect's tool-config question (test 45 covers it); FAKE_GUM_CONFIRM for the session one.
+    printf '#!/bin/sh\necho "$*" >>"%s/gum.log"\ncase "$1 $2" in "confirm Merge hr/"*) exit 0 ;; confirm*) exit "${FAKE_GUM_CONFIRM:-1}" ;; esac\nexit 0\n' \
         "$BATS_TEST_TMPDIR" >"$fb/gum"
     chmod +x "$fb/claude" "$fb/gum"
     local -a env=(PATH="$fb:$PATH" HR_INTERACTIVE=1)
@@ -1002,7 +1014,7 @@ hr_selfhost() {
     run --separate-stderr env "${env[@]}" "$HR" collect MOD-5 --merge --yes
     [[ $status -eq 1 ]]
     [[ "$output" == *'.claude/settings.json'* ]]
-    grep -q '^confirm ' "$BATS_TEST_TMPDIR/gum.log"
+    grep -q '^confirm Open a host claude session' "$BATS_TEST_TMPDIR/gum.log"
     [[ ! -e "$BATS_TEST_TMPDIR/claude-launched" ]]
     git -C "$HR_HOST_REPO" merge --abort
 
@@ -1050,6 +1062,24 @@ EOF
     PATH="$BATS_TEST_TMPDIR/gitshim:$PATH" run --separate-stderr "$HR" collect MOD-5
     [[ $status -eq 0 && -e "$BATS_TEST_TMPDIR/raced" ]]
     [[ "$(reg_get MOD-5 collected_sha)" == "$(git -C "$HR_HOST_REPO" rev-parse refs/heads/hr/MOD-5)" ]]
+
+    # A rewrite that lands between the check and the fetch is caught on what arrived: refused, the
+    # host ref and the registry as they were, the temporary ref gone.
+    local old reg
+    old="$(git -C "$HR_HOST_REPO" rev-parse refs/heads/hr/MOD-5)"
+    reg="$(cat "$(reg_of MOD-5)")"
+    cat >"$BATS_TEST_TMPDIR/gitshim/git" <<EOF
+#!/bin/bash
+if [[ " \$* " == *" fetch "* && ! -e "$BATS_TEST_TMPDIR/amended" ]]; then
+    : >"$BATS_TEST_TMPDIR/amended"
+    "$real" -C "$src" -c user.name=s -c user.email=s@x.invalid commit -q --amend -m amended
+fi
+exec "$real" "\$@"
+EOF
+    PATH="$BATS_TEST_TMPDIR/gitshim:$PATH" run --separate-stderr "$HR" collect MOD-5
+    [[ $status -eq 1 && "$stderr" == *'rewritten'* && -e "$BATS_TEST_TMPDIR/amended" ]]
+    [[ "$(git -C "$HR_HOST_REPO" rev-parse refs/heads/hr/MOD-5)" == "$old" && "$(cat "$(reg_of MOD-5)")" == "$reg" ]]
+    [[ -z "$(git -C "$HR_HOST_REPO" for-each-ref refs/hr-collect)" ]]
 }
 
 @test "38. Ctrl-C (INT) or TERM during up's clone removes the half-made run dir; no registry" {
@@ -1255,6 +1285,71 @@ EOF
     rm "$HR_STATE/runs"
     run --separate-stderr "$HR" ls
     [[ $status -eq 0 && "$stderr" != *"$HR_STATE/runs"* ]]
+}
+
+@test "45. collect --merge shows what the run changes in tool config and asks first; a refusal leaves the host as it was" {
+    mk_run MOD-5
+    local src p
+    src="$(src_of MOD-5)"
+    local -a paths=(.claude/settings.json scripts/tool.sh docker/x/Dockerfile CLAUDE.md AGENTS.md .mcp.json
+        .cargo/config.toml rust-toolchain.toml)
+    for p in "${paths[@]}"; do
+        mkdir -p "$src/$(dirname "$p")"
+        printf 'from the run\n' >"$src/$p"
+        git -C "$src" add -f -- "$p"
+    done
+    git -C "$src" -c user.name=s -c user.email=s@x.invalid commit -q -m 'run changes tool config'
+    local before reg
+    before="$(host_snapshot)"
+    reg="$(cat "$(reg_of MOD-5)")"
+    host_unchanged() {
+        [[ "$(host_snapshot)" == "$before" && "$(cat "$(reg_of MOD-5)")" == "$reg" ]] || return 1
+        [[ -z "$(git -C "$HR_HOST_REPO" for-each-ref refs/hr-collect refs/heads/hr)" ]] || return 1
+        ! git -C "$HR_HOST_REPO" rev-parse -q --verify MERGE_HEAD >/dev/null
+    }
+
+    # No terminal, no --yes: the stat names every path, then a refusal before anything moves.
+    run --separate-stderr "$HR" collect MOD-5 --merge
+    [[ $status -eq 1 && "$stderr" == *'needs confirmation'*'--yes'* ]]
+    for p in "${paths[@]}"; do [[ "$output$stderr" == *"$p"* ]] || { echo "stat lacks $p" >&2; return 1; }; done
+    host_unchanged
+
+    # In a terminal it always asks, --yes or not; declined -> the same refusal.
+    local fb="$BATS_TEST_TMPDIR/fakebin"
+    mkdir -p "$fb"
+    printf '#!/bin/sh\necho "$*" >>"%s/gum.log"\n[ "$1" = confirm ] && exit "${FAKE_GUM_CONFIRM:-1}"\nexit 0\n' \
+        "$BATS_TEST_TMPDIR" >"$fb/gum"
+    chmod +x "$fb/gum"
+    PATH="$fb:$PATH" HR_INTERACTIVE=1 run --separate-stderr "$HR" collect MOD-5 --merge --yes
+    [[ $status -eq 1 ]]
+    grep -q '^confirm .*hr/MOD-5' "$BATS_TEST_TMPDIR/gum.log"
+    [[ "$output$stderr" == *'.claude/settings.json'* ]]
+    host_unchanged
+
+    # Accepted in a terminal, or --yes without one: collected and merged.
+    PATH="$fb:$PATH" HR_INTERACTIVE=1 FAKE_GUM_CONFIRM=0 run --separate-stderr "$HR" collect MOD-5 --merge
+    [[ $status -eq 0 && "$(git -C "$HR_HOST_REPO" log -1 --format=%s)" == 'Merge hr/MOD-5 (sandbox run)' ]]
+    [[ "$(reg_get MOD-5 collected_sha)" == "$(git -C "$HR_HOST_REPO" rev-parse hr/MOD-5)" ]]
+    [[ -z "$(git -C "$HR_HOST_REPO" for-each-ref refs/hr-collect)" ]]
+    git -C "$HR_HOST_REPO" reset -q --hard HEAD^
+    src_commit MOD-5 .claude/more.txt 'more config'
+    run --separate-stderr "$HR" collect MOD-5 --merge --yes
+    [[ $status -eq 0 && "$output$stderr" == *'.claude/more.txt'* ]]
+    [[ "$(git -C "$HR_HOST_REPO" log -1 --format=%s)" == 'Merge hr/MOD-5 (sandbox run)' ]]
+}
+
+@test "46. collect --merge without a validator at HEAD -> 2 before the fetch: no hr/ITEM, registry unchanged" {
+    mk_run MOD-5
+    git -C "$HR_HOST_REPO" rm -q .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
+    git -C "$HR_HOST_REPO" commit -q -m 'no validator'
+    local reg before
+    reg="$(cat "$(reg_of MOD-5)")"
+    before="$(host_snapshot)"
+    run --separate-stderr "$HR" collect MOD-5 --merge --yes
+    [[ $status -eq 2 && "$stderr" == *'validate-workflow-docs.sh'* ]]
+    ! git -C "$HR_HOST_REPO" rev-parse -q --verify refs/heads/hr/MOD-5 || false
+    [[ -z "$(git -C "$HR_HOST_REPO" for-each-ref refs/hr-collect)" ]]
+    [[ "$(cat "$(reg_of MOD-5)")" == "$reg" && "$(host_snapshot)" == "$before" ]]
 }
 
 # ---------------------------------------------------------------------------------------------
