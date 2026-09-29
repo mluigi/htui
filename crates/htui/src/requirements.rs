@@ -292,9 +292,14 @@ pub fn requirement_of_another_project(key: &str, project: &str) -> String {
 /// # Errors
 /// Whatever the backend reports.
 pub async fn snapshot(backend: &Backend, scope: &Scope) -> Result<RequirementsSnapshot> {
-    // `ok()` and not `?`: a mirror that never synced this OS user answers `NotFound`, and that
-    // must not cost the whole offline read (blueprint F-10). Such a user owns no spec.
-    let me = backend.this_user().await.ok();
+    // A mirror that never synced this OS user answers `NotFound`, and that must not cost the
+    // whole offline read (blueprint F-10): such a user owns no spec. Any other failure is the
+    // read's, so a broken lookup never passes for "read-only" (MOD-39 review).
+    let me = match backend.this_user().await {
+        Ok(user) => Some(user),
+        Err(StoreError::NotFound { .. }) => None,
+        Err(other) => return Err(other),
+    };
     let mut projects = Vec::with_capacity(scope.project_ids.len());
     for &project_id in &scope.project_ids {
         let spec = backend.requirement_spec(project_id).await?;
