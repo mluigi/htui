@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-28):** **TOOL-3 was decided** (`docs/decisions/tool/tool-3.md`): the maintainer accepted that `cargo clippy --target x86_64-pc-windows-msvc` cannot run here — it dies in `ring`'s build script with `cc-rs: failed to find tool "lib.exe"` — so **MOD-16 is the only Windows check** and no C toolchain is installed to replace it. Re-verified unchanged 2026-09-28, and green for **neither** crate: `ring` reaches `-p htui` through sqlx on a path that predates MOD-20, and MOD-20's reqwest/rustls extended the same failure to `-p htui-agent`. MOD-20's plan D21 and its Validation block are amended so nothing still asserts a gate that never went green, and the README section says up front that its command does not run here. MOD-20's Windows code was reviewed by eye, never linted.
+**Current status (2026-09-28):** **MOD-56 was done** (`docs/decisions/mod/mod-56.md`): `terminal::init`
+builds the terminal itself instead of calling `ratatui::init`, so htui's panic hook is the outermost
+one and `restores_the_terminal()` is consulted before anything restores — a provider panic that
+`run_providers` contains (H-20) no longer tears the terminal down mid-session. `tests/panic_hook.rs`
+drives the real chain; `tests/panic_hook_order.rs` is a source guard that fails if a ratatui init
+comes back. Closes MOD-9 milestone-1 blueprint finding F-U.
+Before it, **TOOL-3 was decided** (`docs/decisions/tool/tool-3.md`): the maintainer accepted that `cargo clippy --target x86_64-pc-windows-msvc` cannot run here — it dies in `ring`'s build script with `cc-rs: failed to find tool "lib.exe"` — so **MOD-16 is the only Windows check** and no C toolchain is installed to replace it. Re-verified unchanged 2026-09-28, and green for **neither** crate: `ring` reaches `-p htui` through sqlx on a path that predates MOD-20, and MOD-20's reqwest/rustls extended the same failure to `-p htui-agent`. MOD-20's plan D21 and its Validation block are amended so nothing still asserts a gate that never went green, and the README section says up front that its command does not run here. MOD-20's Windows code was reviewed by eye, never linted.
 Before it, **CLEAN-5 was done** (`docs/decisions/clean/clean-5.md`): the MOD-4
 merge-hook test no longer waits a fixed 3 s for a merge whose future it dropped; it polls every
 100 ms for the landed state with a 30 s deadline that reports what it saw, so a hung merge is
@@ -738,18 +744,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   which agent and model answer (the chat driver or a one-shot CLI call), whether the exchange is
   recorded, and how secrets in a body are scrubbed before they leave. Blocked on MOD-9 milestone 1.
 
-- [ ] **MOD-56 - htui's panic hook is wrapped by ratatui's, so a contained panic still restores the
-  terminal** (from MOD-9, milestone-1 blueprint finding F-U; maintainer-decided 2026-09-26).
-  `R-ID-1`, `R-TUI-1`. `terminal::init` (`crates/htui/src/terminal.rs:26-43`) installs htui's
-  **conditional** hook and then calls `ratatui::init()`, whose `try_init` wraps whatever hook is
-  current in ratatui's **unconditional** `restore()` (`ratatui-0.30.2/src/init.rs:397-403`,
-  `:566-572`). So a panic that `htui_agent::excerpt::run_providers` contains (MOD-2 review M1,
-  H-20) still drops the terminal out of raw mode and the alternate screen mid-session, and
-  `restores_the_terminal()` is never consulted first; `tests/panic_hook.rs` tests only the
-  predicate. Fix shape: initialise without ratatui's hook (build the terminal the way `enter`
-  already does, `terminal.rs:88`) or install htui's hook after `ratatui::init` with `take_hook`
-  dropping ratatui's, plus a test that runs the real hook chain. Not blocked.
-
 - [ ] **MOD-57 - Run the external editor inside the TUI pane** (from MOD-9, merge of MOD-7
   milestone 2, maintainer-decided 2026-09-26). `R-TUI-1`, `R-TUI-7`, `R-NF-1`. Today `E`/`Ctrl+E`
   in the Templates editor (and any later user of the shared `ui::TextArea`) suspends the whole TUI
@@ -790,6 +784,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 42 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-59 write replies name themselves, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 41 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-59 write replies name themselves, MOD-55 agent help in the editor, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 0 |
