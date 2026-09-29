@@ -85,11 +85,12 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2, 3, 4, 5, 6, 7],
+        vec![1, 2, 3, 4, 5, 6, 7, 8],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
-         MOD-7 milestone 1's 0005_box_identity.sql, MOD-38's 0006_requirements.sql and MOD-9 \
-         milestone 2's 0007_skill_attachments.sql, in ordinal order"
+         MOD-7 milestone 1's 0005_box_identity.sql, MOD-38's 0006_requirements.sql, MOD-9 \
+         milestone 2's 0007_skill_attachments.sql and MOD-23's 0008_agent_box_user_off.sql, in \
+         ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -411,6 +412,16 @@ const MOD9_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The one `COMMENT ON COLUMN` text of `0008_agent_box_user_off.sql` (MOD-23 plan D242), verbatim,
+/// for [`ANA_COLUMN_COMMENTS`]'s reason.
+const MOD23_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[(
+    "agent_box",
+    "user_off",
+    "MOD-23 D242: the per-box switch, written only by set_agent_box_enabled. true keeps enabled \
+     false through every probe: upsert_agent_box writes enabled = EXCLUDED.enabled AND NOT \
+     user_off on conflict. Switching on re-derives enabled from the stored probe status.",
+)];
+
 /// The one `COMMENT ON TABLE` of `0003_orchestration.sql` (ANA-2 §9), verbatim. Kept beside
 /// [`ANA_COLUMN_COMMENTS`] rather than in it: `col_description` cannot read it, because a table
 /// comment is `objsubid = 0`.
@@ -430,6 +441,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .iter()
         .chain(MOD7_COLUMN_COMMENTS)
         .chain(MOD9_COLUMN_COMMENTS)
+        .chain(MOD23_COLUMN_COMMENTS)
     {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.col_description(c.oid, a.attnum) \
@@ -446,7 +458,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         assert_eq!(
             actual.as_deref(),
             Some(*expected),
-            "{table}.{column}'s comment is the ANA (or MOD-7, or MOD-9) text byte for byte"
+            "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9 or MOD-23) text byte for byte"
         );
     }
 
@@ -468,8 +480,8 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
     );
 
     // And nothing else in those tables carries one, so a reader of `\d+` sees exactly the
-    // thirty-four contracts the three ANAs, MOD-7 and ANA-22 wrote and no half-finished
-    // thirty-fifth.
+    // thirty-five contracts the three ANAs, MOD-7, ANA-22 and MOD-23 wrote and no half-finished
+    // thirty-sixth.
     let commented: Vec<(String, String)> = sqlx::query_as(
         "SELECT c.relname::text, a.attname::text FROM pg_class c \
          JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -483,6 +495,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             .iter()
             .chain(MOD7_COLUMN_COMMENTS)
             .chain(MOD9_COLUMN_COMMENTS)
+            .chain(MOD23_COLUMN_COMMENTS)
             .map(|(table, _, _)| (*table).to_owned())
             .collect::<BTreeSet<String>>()
             .into_iter()
@@ -496,12 +509,13 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .iter()
         .chain(MOD7_COLUMN_COMMENTS)
         .chain(MOD9_COLUMN_COMMENTS)
+        .chain(MOD23_COLUMN_COMMENTS)
         .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
         .collect();
     expected.sort();
     assert_eq!(
         commented, expected,
-        "exactly the thirty-four commented columns, and no others"
+        "exactly the thirty-five commented columns, and no others"
     );
 
     db.drop_db().await;
@@ -881,8 +895,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(7),
-        "seven embedded migrations, none applied"
+        MigrationState::Pending(8),
+        "eight embedded migrations, none applied"
     );
 
     db.drop_db().await;
@@ -980,12 +994,12 @@ async fn a_headless_connect_never_migrates() {
     let Some(db) = common::bare_db().await else {
         return;
     };
-    assert_eq!(db.migrations_at_connect, MigrationState::Pending(7));
+    assert_eq!(db.migrations_at_connect, MigrationState::Pending(8));
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT)
         .await
         .expect_err("a pending schema is refused");
-    assert_eq!(refused, HeadlessError::MigrationsPending(7));
+    assert_eq!(refused, HeadlessError::MigrationsPending(8));
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
         0,
@@ -1004,7 +1018,7 @@ async fn a_headless_connect_never_migrates() {
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT)
         .await
         .expect_err("no migrations table is every migration pending");
-    assert_eq!(refused, HeadlessError::MigrationsPending(7));
+    assert_eq!(refused, HeadlessError::MigrationsPending(8));
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
         .await

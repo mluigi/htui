@@ -1277,6 +1277,22 @@ impl WriteStore for PgStore {
         Ok(verdict.written)
     }
 
+    /// The per-box switch (MOD-23 D242, blueprint D249): one statement, keyed on the composite
+    /// primary key. `user_off` and `enabled` and nothing else; `updated_at` is the `BEFORE UPDATE`
+    /// trigger's on the conflict arm and the column default on the insert.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] when the agent or the box does not exist (`23503`).
+    async fn set_agent_box_enabled(
+        &self,
+        agent_id: AgentId,
+        box_id: BoxId,
+        enabled: bool,
+    ) -> Result<()> {
+        todo!("MOD-23 T0: the per-box switch ({agent_id}, {box_id}, {enabled})")
+    }
+
     /// One box probe in one transaction (MOD-7 D10): the nine probe columns of the row, then the
     /// whole `box_tool` set deleted and re-inserted.
     ///

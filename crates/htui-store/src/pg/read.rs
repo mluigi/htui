@@ -1346,7 +1346,11 @@ impl PgStore {
                     }),
                     _ => None,
                 };
-                AgentSummary { agent, on_box }
+                AgentSummary {
+                    agent,
+                    on_box,
+                    user_off: false,
+                }
             })
             .collect())
     }

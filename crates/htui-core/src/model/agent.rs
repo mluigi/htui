@@ -190,8 +190,14 @@ struct AgentSeed {
 pub struct AgentSummary {
     /// The `agent` row.
     pub agent: Agent,
-    /// This box's `agent_box` row; `Some` when a probe has run on this box, `None` otherwise.
+    /// This box's `agent_box` row; `Some` when a probe or the per-box switch wrote one, `None`
+    /// otherwise.
     pub on_box: Option<AgentBox>,
+    /// `agent_box.user_off` of this box's row (MOD-23 D242): the human switched this agent off on
+    /// this box, so no probe turns `on_box.enabled` back on. `false` when there is no row, and
+    /// always `false` from the offline mirror, which does not hold `agent_box`.
+    #[serde(default)]
+    pub user_off: bool,
 }
 
 #[cfg(test)]

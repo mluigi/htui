@@ -256,6 +256,7 @@ fn probed_row(
             updated_at: htui_core::fixtures::demo_at(0, 0),
         },
         on_box: None,
+        user_off: false,
     };
     summary.on_box = Some(AgentBox {
         agent_id: summary.agent.id,

@@ -422,6 +422,35 @@ pub trait WriteStore: ReadStore {
         quota_at: DateTime<Utc>,
     ) -> Result<bool>;
 
+    /// Switches this agent on or off **on one box** (MOD-23 D242): writes `agent_box.user_off` and
+    /// re-derives `agent_box.enabled`, and nothing else. It never writes `probe`, `version`,
+    /// `path`, `probed_at`, `quota` or `quota_at`.
+    ///
+    /// The probe proposes `enabled` and the human vetoes it. `false` sets `user_off` and
+    /// `enabled = false`, and while `user_off` holds,
+    /// [`upsert_agent_box`](WriteStore::upsert_agent_box) cannot turn `enabled` back on. `true`
+    /// clears `user_off` and sets `enabled` to the stored probe's verdict: `true` when the row
+    /// holds no probe document, else whether its `status` is `ready` (a document without a
+    /// `status` is not ready).
+    ///
+    /// An absent row is inserted bare: `enabled` as switched, every probe column `NULL`, so a
+    /// reader treats it as never probed. No compare-and-set: the switch is an absolute set, and a
+    /// token on `agent_box.updated_at` would be spent by every probe. The last of two concurrent
+    /// switches wins, and both see it on their re-read.
+    ///
+    /// The only writer of `user_off` (MOD-2 D74's single-writer shape).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the agent or the box
+    /// does not exist; nothing is written.
+    async fn set_agent_box_enabled(
+        &self,
+        agent_id: AgentId,
+        box_id: BoxId,
+        enabled: bool,
+    ) -> Result<()>;
+
     /// Writes one box probe (MOD-7 D10): the hardware columns, `probed_tags`, `htui_version`,
     /// `last_probed_at` and `probe_spec_digest`, and replaces this box's `box_tool` set, in one
     /// transaction. A narrow machine writer (MOD-2 D74): never `hostname`, `declared_tags`, `quirks`,

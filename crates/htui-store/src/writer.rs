@@ -393,6 +393,18 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn set_agent_box_enabled(
+        &self,
+        agent_id: AgentId,
+        box_id: BoxId,
+        enabled: bool,
+    ) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.set_agent_box_enabled(agent_id, box_id, enabled).await,
+            Self::Online(pg) => pg.set_agent_box_enabled(agent_id, box_id, enabled).await,
+        }
+    }
+
     async fn record_box_probe(&self, probe: &BoxProbe) -> Result<()> {
         match self {
             Self::Memory(store) => store.record_box_probe(probe).await,
