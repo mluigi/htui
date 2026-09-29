@@ -409,3 +409,35 @@ in its volume and die at purge; durable decisions belong in the repo docs anyway
 Accepted limitation: remember's save lock records a PID, and container PIDs are meaningless on the
 host (and vice versa), so a host save and a sandbox save racing each other can break each other's
 lock; worst case an interleaved `now.md` entry. Documented in `docs/hr-sandbox.md`, not engineered.
+
+## Threat model (after the review gate, 2026-09-29)
+
+Goals 1 and 2 hold against **accidental** interference only. A sandbox is not a boundary against a
+prompt-injected agent running with `--dangerously-skip-permissions`; the user-facing version is
+`docs/hr-sandbox.md`, "Threat model".
+
+Shared read-write channels, and what a hostile run can do through each:
+
+| channel | allows |
+|---|---|
+| `~/.claude` (by design, goal 6) | hooks or settings that execute in the host's next Claude session |
+| `~/.cache/uv` | packages that `uvx` runs on the host |
+| `~/.headroom`, `~/.serena` | state and config the host's headroom and serena read |
+| shared `.remember/` (M6) | e.g. `now.md` replaced by a symlink to a host-checkout file; the host remember plugin then writes into the checkout |
+| `/hr-state` | delete the lease file or hold its lock; bounded by the fail-closed rules (`scripts/hr-mint` header, `scripts/hr` `check_leases`) |
+| `htui-hr-cargo` | shared crate sources in `registry/src`; `bin/` is off `PATH`, config/credentials files are empty read-only binds |
+
+Protected: host repo read-only; no git credentials; host Postgres/Qdrant published on `127.0.0.1`
+only (`compose.yaml`, H2); per-run databases and volumes; host-side git never reads a clone's
+worktree outside a throwaway `--network none` container (H3); run registry host-only
+(`HR_RUNS`) and validated (H4); `~/.local` narrowed to four read-only tool dirs (C1). Advice: review
+`git diff main...hr/ITEM -- .claude scripts docker` before `collect --merge` (which shows that stat
+itself only before offering the doc-conflict session, H6); after a distrusted run, inspect
+`~/.claude/settings.json` and hooks.
+
+Residuals R1 could not fix:
+
+- shared crate sources in `htui-hr-cargo` (one run's edits compile in another);
+- lease-lock DoS, bounded by the 30 s `HR_MINT_LOCK_TIMEOUT` (mints exit 3);
+- a clone's `.git/commondir` can redirect host ref reads, but only to make its own run look collected;
+- deleting both `id-leases.tsv` and `id-leases.lock` makes host mints tree-only (`leasing off`) until the next `hr up`/`gc`/`down --purge`, which refuse via `$HR_RUNS/.leases-initialized`.
