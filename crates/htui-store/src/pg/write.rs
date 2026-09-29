@@ -1194,6 +1194,12 @@ impl WriteStore for PgStore {
     /// by construction. `COALESCE(EXCLUDED.quota, agent_box.quota)` was considered and rejected:
     /// it would still let an upsert *set* the column, and would make clearing it impossible.
     ///
+    /// Since MOD-23 (plan D242) the conflict arm writes `enabled = EXCLUDED.enabled AND NOT
+    /// agent_box.user_off`: a row the human switched off on this box stays off whatever the probe
+    /// proposes, while every other column the probe owns is still written. The insert is
+    /// unchanged, since a fresh row takes `user_off`'s default `false`.
+    /// [`WriteStore::set_agent_box_enabled`] is the only writer of `user_off`.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Constraint`] when the agent or the box does not exist (`23503`).
@@ -1203,7 +1209,7 @@ impl WriteStore for PgStore {
                                     updated_at, probe) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (agent_id, box_id) DO UPDATE SET \
-                 enabled   = EXCLUDED.enabled, \
+                 enabled   = EXCLUDED.enabled AND NOT agent_box.user_off, \
                  version   = EXCLUDED.version, \
                  path      = EXCLUDED.path, \
                  probed_at = EXCLUDED.probed_at, \
@@ -1281,6 +1287,10 @@ impl WriteStore for PgStore {
     /// primary key. `user_off` and `enabled` and nothing else; `updated_at` is the `BEFORE UPDATE`
     /// trigger's on the conflict arm and the column default on the insert.
     ///
+    /// Switching on re-derives `enabled` from the stored probe. The `COALESCE` is load-bearing: a
+    /// probe document without `status` makes `->>'status'` `NULL`, and `true AND NULL` would
+    /// violate `enabled NOT NULL` (blueprint F-1).
+    ///
     /// # Errors
     ///
     /// [`StoreError::Constraint`] when the agent or the box does not exist (`23503`).
@@ -1290,7 +1300,21 @@ impl WriteStore for PgStore {
         box_id: BoxId,
         enabled: bool,
     ) -> Result<()> {
-        todo!("MOD-23 T0: the per-box switch ({agent_id}, {box_id}, {enabled})")
+        sqlx::query!(
+            "INSERT INTO agent_box (agent_id, box_id, enabled, user_off) \
+             VALUES ($1, $2, $3, NOT $3) \
+             ON CONFLICT (agent_id, box_id) DO UPDATE SET \
+                 user_off = NOT $3, \
+                 enabled  = $3 AND (agent_box.probe IS NULL \
+                                    OR COALESCE(agent_box.probe->>'status' = 'ready', false))",
+            agent_id.as_uuid(),
+            box_id.as_uuid(),
+            enabled,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
     }
 
     /// One box probe in one transaction (MOD-7 D10): the nine probe columns of the row, then the

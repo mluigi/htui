@@ -1277,7 +1277,8 @@ impl PgStore {
     ///
     /// One statement with a `LEFT JOIN` narrowed to `this_box` in the join condition rather than
     /// in the `WHERE`, so an agent that has never been probed here still gets a row with
-    /// `on_box: None` - which is what the Settings tab renders as "not probed".
+    /// `on_box: None` - which is what the Settings tab renders as "not probed". `user_off` is the
+    /// joined row's per-box switch (MOD-23 plan D242), `false` when there is no row.
     ///
     /// # Errors
     ///
@@ -1304,7 +1305,8 @@ impl PgStore {
                    ab.quota        AS "box_quota?",
                    ab.quota_at     AS "box_quota_at?",
                    ab.updated_at   AS "box_updated_at?",
-                   ab.probe        AS "box_probe?"
+                   ab.probe        AS "box_probe?",
+                   ab.user_off     AS "box_user_off?"
               FROM agent a
               LEFT JOIN agent_box ab ON ab.agent_id = a.id AND ab.box_id = $1
              ORDER BY a.name
@@ -1349,7 +1351,7 @@ impl PgStore {
                 AgentSummary {
                     agent,
                     on_box,
-                    user_off: false,
+                    user_off: row.box_user_off.unwrap_or(false),
                 }
             })
             .collect())

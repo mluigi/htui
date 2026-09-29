@@ -1168,8 +1168,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        7,
-        "the later applies migrate nothing"
+        8,
+        "the later applies migrate nothing: the eight embedded migrations (MOD-23 added \
+         0008_agent_box_user_off.sql) are applied once"
     );
 
     db.drop_db().await;
