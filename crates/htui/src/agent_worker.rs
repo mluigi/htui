@@ -2141,9 +2141,10 @@ async fn run_probe(args: ProbeArgs) {
 /// [`run_probe`]'s loop, shared with the box probe (MOD-7 D11): every enabled row of `agents`
 /// probed on `box_id` through `env`, one at a time, each fresh row written through `writer`.
 ///
-/// The rows come back as this probe left them: `on_box` replaced by what was written, and left
-/// as read for a disabled row or a hand-written one the probe kept (plan D51). The first write
-/// that fails ends the walk with its error.
+/// The rows come back as this probe left them: `on_box` replaced by what was written, with
+/// `enabled` as the store kept it under the per-box switch (MOD-23 D243), and left as read for a
+/// disabled row or a hand-written one the probe kept (plan D51). The first write that fails ends
+/// the walk with its error.
 async fn probe_agents_on(
     writer: &Writer,
     box_id: BoxId,
@@ -2169,8 +2170,10 @@ async fn probe_agents_on(
         )
         .await
         {
-            ProbeOutcome::Row(row) => {
+            ProbeOutcome::Row(mut row) => {
                 writer.upsert_agent_box(&row).await?;
+                // MOD-23 D243: the store kept `enabled AND NOT user_off`; the reply says the same.
+                row.enabled &= !summary.user_off;
                 summary.on_box = Some(row);
             }
             // Plan D51: a hand-written row the probe could not confirm is left exactly as it is,
