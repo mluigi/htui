@@ -42,8 +42,9 @@ async fn the_demo_shell_starts_inside_the_first_workspace_on_the_backlog_tab() {
     );
     assert_eq!(
         harness.app().tabs.len(),
-        4,
-        "Backlog, Skills, Settings and Chat, in that order (MOD-2 milestone 3 registered the last)"
+        5,
+        "Backlog, Skills, Requirements, Settings and Chat, in that order (MOD-2 milestone 3 \
+         registered Chat, MOD-39 plan T3 put Requirements third)"
     );
     assert!(
         harness.app().overlays.is_empty(),
@@ -55,7 +56,7 @@ async fn the_demo_shell_starts_inside_the_first_workspace_on_the_backlog_tab() {
         "the top bar reads the startup scope"
     );
     assert!(
-        frame.contains(" 1 Backlog  2 Skills  3 Settings"),
+        frame.contains(" 1 Backlog  2 Skills  3 Requirements  4 Settings"),
         "the tab strip is in registration order: {frame}"
     );
     assert!(

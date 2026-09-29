@@ -3,7 +3,7 @@ source: crates/htui/tests/skills.rs
 expression: frame
 ---
 Graphics · DESKTOP-HTUI · memory · 0 runs
- 1 Backlog  2 Skills  3 Settings  4 Chat
+ 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
  Skills │ Templates
 ┌ rust-style · editing from v2, saves v4 · ~42 tokens ─────────────────────────────────────────────┐
 │XPrefer `expect` with a reason. One error enum per crate.                                         │

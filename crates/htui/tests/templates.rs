@@ -889,8 +889,8 @@ async fn tab_and_digits_while_editing() {
     harness.key("tab");
     assert_eq!(
         harness.app().tabs.active_id().map(|id| id.0),
-        Some("settings"),
-        "`Tab` passes to the shell"
+        Some("requirements"),
+        "`Tab` passes to the shell, and Requirements follows Skills"
     );
     harness.key("2");
     harness.settle().await;
@@ -908,7 +908,7 @@ async fn the_strip_text_is_unchanged() {
     let mut harness = open().await;
     let frame = harness.render();
     assert!(
-        frame.contains(" 1 Backlog  2 Skills  3 Settings  4 Chat"),
+        frame.contains(" 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat"),
         "{frame}"
     );
 }

@@ -2052,7 +2052,8 @@ async fn the_product_registers_connection_after_prompt() {
     let mut harness = Harness::demo();
     htui::app::register_all(harness.app());
     harness.settle().await;
-    harness.key("3");
+    // Settings is the fourth tab since the Requirements tab took `3` (MOD-39 plan T5).
+    harness.key("4");
     harness.settle().await;
 
     let frame = harness.render();

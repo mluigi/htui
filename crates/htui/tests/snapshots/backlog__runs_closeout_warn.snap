@@ -5,7 +5,7 @@ expression: warn
 Platform · DESKTOP-HTUI · memory · 1 run
  1 Backlog
 ┌ Backlog (11) ───────────────────────────────────────┐┌ ANA-1 ────────────────────────────────────┐
-│▾ htui (8)                                           ││ Body Runs Graph Documents Notes Prompt    │
+│▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
 │  ANA-1    done               Data model, box regist…││kind   status    box          started      │
 │  ANA-2    open               Orchestrator step grap…││mode                          finished     │
 │  CLEAN-1  failed             Drop the legacy markdo…││graph  done      DESKTOP-HTUI 09-02 14:00  │
@@ -29,6 +29,6 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │                                                     ││                                           │
 │                                                     ││close ANA-1 as done · 1 runs · 0 commit    │
 │                                                     ││rows · summary v2                          │
-│                                                     ││y continue · n cancel                      │
+│                                                     ││←/→ resolution · y continue · n cancel     │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help
