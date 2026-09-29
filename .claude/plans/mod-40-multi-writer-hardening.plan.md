@@ -34,7 +34,10 @@ to `crates/`).
   `finish_step` (`:3707`, `:3790`), so a stale holder that wakes mid-session meets a fenced
   recorder flush first and its walk stops there. `interrupt_step` is the sweep's own write
   (`engine.rs:9280`) and must not be fenced. The rest go into a note on MOD-41. Alternative: fence
-  `set_step_prompt` and `upsert_step_tree` too (two more signatures).
+  `set_step_prompt` and `upsert_step_tree` too (two more signatures). The MOD-41 note also names
+  `record_commits` and the sink's output write: unfenced step writes on the settle tail, which a
+  holder that wakes **after** `done` makes before it reaches its fenced `finish_step` (blueprint
+  F-7).
 - **OQ-2 — The heartbeat fences on local elapsed time, not on the returned stamp.** PRD D2 says
   Postgres "returns what it wrote". Recommended refinement: the lease methods take a TTL, Postgres
   stamps `clock_timestamp() + ttl`, and the heartbeat's self-fence is `send time + ttl - margin` on
@@ -237,7 +240,7 @@ in `migrations.rs`/`connect.rs` against a real Postgres 16.
 
 | # | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|---|
-| R-1 | A chat continuing a promoted step meets a lease taken by accept | Low | Medium | Accept refuses while a chat is live (`engine.rs:1366`, `command.rs:1136`); `an_unleased_fence_is_refused_on_a_leased_run` pins the refusal if it ever happens |
+| R-1 | A chat continuing a promoted step meets a lease taken by accept | Low | Medium | Accept refuses while a chat is live (`engine.rs:1366`, `command.rs:1136`); `an_unleased_fence_is_refused_on_a_leased_run` pins the refusal if it ever happens. Also: a park whose best-effort `release_lease` failed (`engine.rs:1877-1890`, warned) leaves `lease_owner` set, and a chat on that promoted step is `Fenced` until the owner's sweep gives the lease back (D140); loud, never silent (blueprint F-11) |
 | R-2 | T8 rewrites many lease tests and a meaning drifts | Medium | High | Each rewritten case keeps its name and asserts the same outcome; the reviewer diffs old and new assertions per case |
 | R-3 | `ttl = 0` expiry on Postgres is racy against `clock_timestamp()` resolution | Low | Low | `<=` comparisons (`write.rs:3733`, `:3800`); a zero-TTL lease is expired at the next statement |
 | R-4 | `.sqlx` churn across four tasks | Certain | Low | `cargo sqlx prepare --check` at every task's gate |
