@@ -1,9 +1,9 @@
 # Design: TOOL-7 — containerized handoff-run sandboxes
 
-> **Status: design approved in conversation 2026-09-29; awaiting written-spec review.** Not yet
-> fact-checked — "Claims to verify" below lists every tree/host fact the design leans on, for the
-> `/handoff-run TOOL-7` plan fact-check (step 3.5). No task breakdown yet: that is the `plan`
-> step's output, from this document.
+> **Status: CONFIRMED 2026-09-29 (`/handoff-run TOOL-7`, routed as plan by maintainer override of
+> a threshold PRD verdict); fact-checked; implementation in progress.** Task breakdown and the
+> verified-claims table are at the end of this document. Claims #2–#4 can only be settled by the
+> T2 spike, which gates every Docker-dependent task.
 
 **Source**: HANDOFF.md TOOL-7. Maintainer request: "when running the handoff-run skill I'd like to
 run it in a dev container, with all the necessary tools, so that I can run multiple without
@@ -78,7 +78,8 @@ The host repo is mounted **read-only** at `/host/htui` and is the clone's `origi
 - Base `ubuntu:24.04` — the host's release, so host binaries mounted from `~/.local` run unmodified.
 - User `mluigi` with host uid/gid (build args), `HOME=/home/mluigi`.
 - rustup with the `rust-toolchain.toml` pin (**1.98.1**) + `rustfmt`, `clippy`, **`rust-analyzer`**
-  (serena's Rust LSP).
+  (serena's Rust LSP). The pin's `components` list omits `rust-analyzer`, so the image adds it
+  explicitly (`rustup component add rust-analyzer --toolchain 1.98.1`).
 - `sqlx-cli` (`--no-default-features --features postgres,rustls`, version = `sqlx` in `Cargo.lock`),
   `cargo-insta`, `postgresql-client-16` (PGDG apt), `build-essential`, `pkg-config`, `git`, `jq`,
   `ripgrep`, `curl`, `ca-certificates`.
@@ -110,9 +111,12 @@ carries the Gortex hooks (8 events) and headroom's `SessionStart` self-heal, whi
 ### Environment in `dev`
 
 `USERNAME=htui-ci`, `HTUI_TEST_DATABASE_URL=postgres://postgres@localhost:5439/postgres`,
-`HR_ITEM=<ITEM>`, `HR_SANDBOX=1`, `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_NAME`/
+`HTUI_TEST_QDRANT_URL=http://localhost:6334` (gates `crates/htui-store/tests/qdrant_live.rs`),
+`HR_ITEM=<ITEM>`, `HR_SANDBOX=1`, `HR_STATE=/hr-state`, `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_NAME`/
 `GIT_COMMITTER_EMAIL` from host `git config user.*`, `PATH` including the mise install dirs for
-`claude`, `uv`, `ripgrep`, and `TERM`/`COLORTERM` passthrough. `SQLX_OFFLINE` stays as
+`claude`, `uv`, `ripgrep` **ahead of `~/.local/bin`** (which holds a stale uv/uvx 0.8.22 that
+would otherwise shadow mise's 0.12.x — serena's MCP entry runs `uvx`; the Gortex MCP entry runs
+bare `gortex`, so `~/.local/bin` must still be on `PATH`), and `TERM`/`COLORTERM` passthrough. `SQLX_OFFLINE` stays as
 `.cargo/config.toml` sets it. No D-Bus, no keyring: suites use `mock_keyring()`, a real keyring read
 fails fast.
 
@@ -155,11 +159,14 @@ parallel would both mint the same ID. `scripts/hr-mint --prefix <P> --title "<on
 3. Result = `max(tree mint, highest leased <P> + 1)`; append `<ID>\t<hr branch or "host">\t<ISO time>\t<title>`.
 4. Print the ID, plus other runs' leases for `<P>` from the last 7 days with titles.
 
-`next-item-id.sh` / `.ps1` stay **untouched** (twin parity unaffected). `handoff-run`
-(`references/lifecycle.md` P0) and `handoff-add` step 3 mint through `hr-mint` **whenever the lease
-file exists** — on the host too, so a host `/handoff-add` cannot reuse a sandbox's leased ID. A
+`next-item-id.sh` / `.ps1` stay **untouched** (twin parity unaffected). The three mint call sites —
+`handoff-run` (`references/lifecycle.md` P0), `handoff-add` step 3 and the overview
+`.claude/skills/handoff-docs.md` — mint through `hr-mint` **whenever the lease file exists** — on the host too, so a host `/handoff-add` cannot reuse a sandbox's leased ID. A
 leased-then-abandoned ID is a harmless gap (owned-ID method takes the max). `hr gc` prunes a lease
-once its ID is on host `main` (open line or archive index) or its run was purged uncollected.
+once its ID is on host `main` (open line or archive index) or its run was purged uncollected; the
+pruning itself is `hr-mint --prune` so the lease-file format has exactly one owner. State dir
+resolution: `$HR_STATE`, else `/media/projects/htui-hr/.state`; no state dir → `hr-mint` behaves as
+`next-item-id.sh --id-only` and says leasing is off.
 
 **Same problem, different IDs.** Step 4's listing exists for this: the skill tells the agent to
 **ask the maintainer** before minting when a sibling lease's title looks like the same issue. On
@@ -225,8 +232,9 @@ A new SKILL.md section overriding:
 - `docker/hr/Dockerfile`, `docker/hr/compose.hr.yaml`
 - `scripts/hr`, `scripts/hr-mint`
 - `tests/hr/*.bats`
-- `.claude/skills/handoff-run/SKILL.md` sandbox-mode section; `references/lifecycle.md` P0 and
-  `.claude/skills/handoff-add/SKILL.md` step 3 mint via `hr-mint` when the lease file exists
+- `.claude/skills/handoff-run/SKILL.md` sandbox-mode section; `references/lifecycle.md` P0,
+  `.claude/skills/handoff-add/SKILL.md` step 3 and `.claude/skills/handoff-docs.md` mint via
+  `hr-mint` when the lease file exists
 - `docs/hr-sandbox.md` + README pointer
 - Memory updates: sqlx-prepare (`docker exec` recipe sandbox variant), worktree-implementers
   (in-sandbox fan-out)
@@ -251,3 +259,131 @@ dependency builds dominate); resource quotas beyond `cpus`.
 10. `lifecycle.md` P0 and `handoff-add` step 3 are the only mint call sites.
 11. `.remember/` is untracked in the repo (so it is not in the clone).
 12. gum v2.0.2 supports `choose`, `filter`, `table`, `spin`, `confirm` with the flags used.
+
+## Tasks
+
+Ordering: **wave 1** T1 → T2 (spike) on the Docker side, with T3 in parallel (no Docker);
+**wave 2** T4 ∥ T5 after T2 passes; **wave 3** T6. Every implementer commits incrementally with
+explicit paths (no `git add -A`, `git stash`, `--amend` while another agent shares the tree).
+TDD where there is a test surface: the bats cases land before the script they cover.
+
+### T1 — Toolchain image and run compose file
+
+Files: `docker/hr/Dockerfile`, `docker/hr/compose.hr.yaml`, `docker/hr/.dockerignore`.
+
+- Dockerfile per "Toolchain image": `ubuntu:24.04`, build args `UID`/`GID`/`USER=mluigi`,
+  rustup 1.98.1 + `rustfmt` `clippy` `rust-analyzer`, `cargo install sqlx-cli --version 0.9.0
+  --locked --no-default-features --features postgres,rustls`, `cargo-insta`, PGDG
+  `postgresql-client-16`, apt basics. Cargo registry/git under a path the shared `htui-hr-cargo`
+  volume mounts over.
+- compose file per "One run = one compose project", every host path and per-run value from env
+  (`HR_SRC`, `HR_ITEM`, `HR_CPUS`, `HR_STATE_HOST`, `HR_CLAUDE_JSON`, git identity, …) so
+  `scripts/hr` is the only thing that knows the defaults; no `ports:` anywhere; `.remember`,
+  `~/.claude`, `~/.local` etc. mounts exactly per the mounts table; `~/.gitconfig`, `~/.ssh`,
+  `~/.git-credentials` absent.
+- Done when: `docker build` succeeds; `docker compose -p hr-t1 … up -d --wait` on a throwaway clone
+  gives a `dev` where `cargo --version` is 1.98.1, `cargo sqlx --version` is 0.9.0,
+  `psql postgres://postgres@localhost:5439/postgres -c 'select 1'` works, `claude --version` and
+  `gortex version` run, `git config --global credential.helper` is empty; then `down -v`.
+
+### T2 — T0 spike (gate; main thread + maintainer)
+
+Files: this plan (spike results section); fixes to T1 files if a check fails.
+
+Checks, with a throwaway run brought up by hand from the T1 compose file:
+1. `claude mcp list` inside lists gortex, headroom, serena connected.
+2. An attached interactive `claude` shows the Gortex `SessionStart` banner and the Gortex daemon
+   indexes the clone under the per-run store (claim #2), and the untracked
+   `settings.local.json` hooks fire (claim #3) — **maintainer attaches**.
+3. The remember plugin appends to the shared host `.remember/`.
+4. Three sandboxes + the host run `claude -p` concurrently and repeatedly across an OAuth token
+   refresh without logging anyone out (claim #4). If a refresh can't be forced within the spike,
+   record that and keep the `claude setup-token` fallback ready.
+
+Fallbacks per "Verification" §1. **Any fallback taken amends this plan before wave 2.**
+
+### T3 — `scripts/hr-mint` (parallel with T1/T2)
+
+Files: `scripts/hr-mint`, `tests/hr/test_helper.bash`, `tests/hr/hr-mint.bats`.
+
+- Tests first: a fixture repo (minimal `HANDOFF.md`) plus `HR_STATE` in a tmpdir; cases for
+  20 parallel mints → 20 unique IDs; `max(tree, lease+1)` both ways; a non-zero exit from
+  `next-item-id.sh` blocks; the sibling listing (other branches, last 7 days, with titles);
+  `--prune` drops leases whose ID is on the given ref (open line or archive index) or whose run
+  is listed as purged; no state dir → plain tree mint + "leasing off" notice.
+- Interface: `hr-mint --prefix P --title T [--repo-root R] [--branch B]` (prints the ID on stdout,
+  siblings on stderr); `hr-mint --prune [--ref main] [--repo-root R]`; `hr-mint --leasing`
+  (exit 0 iff the lease file exists — the skill docs' switch).
+
+### T4 — `scripts/hr` (after T2)
+
+Files: `scripts/hr`, `tests/hr/hr_helper.bash`, `tests/hr/hr.bats`.
+
+- Every verb in the `scripts/hr` table; gum for interaction, plain args for everything; `hr gc`
+  calls `hr-mint --prune`, never edits the lease file itself.
+- Tests first (non-Docker cases run in seconds, Docker cases tagged `docker`): `collect`
+  fetch-only leaves the host tree and HEAD untouched; refuses non-fast-forward without `--force`;
+  `--merge` refuses on dirty tracked files; `up` warns on uncommitted `.claude/`, `HANDOFF.md`,
+  `DECISIONS.md` and refuses an item with a registered run; `down --purge` refuses an uncollected
+  branch. Git-side cases run against fixture repos, never the real host repo.
+
+### T5 — Skill sandbox mode and docs (after T2; parallel with T4)
+
+Files: `.claude/skills/handoff-run/SKILL.md`, `.claude/skills/handoff-run/references/lifecycle.md`,
+`.claude/skills/handoff-add/SKILL.md`, `.claude/skills/handoff-docs.md`, `docs/hr-sandbox.md`,
+`README.md`.
+
+- SKILL.md "Sandbox mode (`HR_SANDBOX=1`)" section per the design; P0 / step 3 / overview mint via
+  `scripts/hr-mint` when `scripts/hr-mint --leasing` succeeds, with the ask-on-similar-title rule.
+- `docs/hr-sandbox.md`: user guide (build, up, attach, collect, merge recipe, gc, storage, what is
+  and is not in the sandbox). README pointer.
+- `validate-workflow-docs.sh` green.
+
+### T6 — Acceptance and close-out (main thread)
+
+Files: this plan (results), memories outside the repo (sqlx-prepare sandbox variant,
+worktree-implementers in-sandbox fan-out), HANDOFF/DECISIONS bookkeeping.
+
+- Non-interference acceptance per "Verification" §3 (3 runs, `--test-threads=1` workspace suite
+  each, host `htui-postgres` uptime and host tree/`main` unchanged); record per-run disk and wall
+  time on `/media` vs `--ssd` and set the default `HR_ROOT` from them.
+
+### Independence (file-set intersection)
+
+| pair | intersection | verdict |
+|---|---|---|
+| T1 ∩ T3 | ∅ | parallel |
+| T3 ∩ T4 | ∅ (`test_helper.bash` vs `hr_helper.bash`; `hr` reaches leases only through `hr-mint --prune`) | parallel-safe; T4 still waits for T2 |
+| T4 ∩ T5 | ∅ | parallel |
+| T3 ∩ T5 | ∅ (T5 documents the T3 interface fixed above) | parallel-safe |
+| T1 ∩ T4 | ∅ files, but `hr` consumes the compose file's env names | serial by dependency |
+
+### Risk noted
+
+`.claude/skills/handoff-run/**`, `handoff-add/**` and `handoff-docs.md` are a *synced workflow
+surface* distributed from a workspace source by `sync-workflow-surface.sh` (default targets
+`engine ../engine-template?`, not htui). htui's copy is already edited in place (85448c8), and T5
+extends that divergence. **Accepted by the maintainer at CONFIRM (2026-09-29):** these skills are
+what htui was started for and the workflow is migrating to htui, so htui's copy is allowed to lead;
+no sync back into htui is planned.
+
+## Verified claims
+
+| # | claim | verdict | evidence |
+|---|---|---|---|
+| 1 | Host is Ubuntu 24.04; `~/.local` binaries run in `ubuntu:24.04` | ✓ | `/etc/os-release` 24.04, glibc 2.39; probe container: `claude` 2.1.284, `gortex` v0.64.5, `headroom` 0.38.0, `uvx`, `graphify` all exit 0 |
+| 1a | PATH inside mirrors host tool versions | ✗ → amended | `~/.local/bin/uv{,x}` is 0.8.22 (2025) vs mise 0.12.20; mise dirs must precede `~/.local/bin` |
+| 2 | Gortex daemon runs in a container with a fresh store | open → T2 | needs the spike |
+| 3 | Untracked `.claude/settings.local.json` in the clone is honoured | partly ✓ → T2 | file is untracked (ignored by the user's global `~/.config/git/ignore`), carries 8 hook events; firing needs the spike |
+| 4 | Concurrent OAuth refresh on a shared `.credentials.json` is safe | open → T2 | needs the spike |
+| 5 | `~/.claude.json` is rewritten by rename | ✓ | inode 2149922 → 2149837 across one minute of this session |
+| 6 | Postgres `-p 5439` + `network_mode: service:postgres` peers reach it on `localhost`; Qdrant binds 6333/6334 in the shared namespace; nothing published | ✓ | probe compose: `psql …@localhost:5439` → PG 16.15, `fsync=off`; `GET :6333` → 200; `:6334` open; `docker compose ps` shows no publishers |
+| 7 | `sqlx` in `Cargo.lock` has a matching `sqlx-cli` with the named features | ✓ | lock 0.9.0; crates.io `sqlx-cli` 0.9.0 has `postgres`, `rustls`; MSRV 1.94 ≤ 1.98.1 |
+| 8 | Store suites need only a `CREATEDB` maintenance DSN; trust auth is fine | ✓ | `crates/htui-store/src/testkit.rs:5` (maintenance DSN with `CREATEDB`); no role DDL in any crate's `src`/`tests` |
+| 8a | Postgres is the only live test backend | ✗ → amended | `qdrant_live.rs` gates on `HTUI_TEST_QDRANT_URL`; added to the env list |
+| 9 | `next-item-id.sh --id-only` prints only the ID | ✓ | prints `TOOL-8`, exit 0 |
+| 10 | `lifecycle.md` P0 and `handoff-add` step 3 are the only mint call sites | ✗ → amended | third: `.claude/skills/handoff-docs.md:41`; added to T5 |
+| 10a | Toolchain pin brings `rust-analyzer` | ✗ → amended | `rust-toolchain.toml` components are `rustfmt`, `clippy` only; image adds it |
+| 11 | `.remember/` is untracked (not in the clone) | ✓ | `.remember/.gitignore` is `*`; `git ls-files .remember` empty |
+| 12 | gum v2.0.2 has `choose`/`filter`/`table`/`spin`/`confirm` with the flags used | ✓ | all five `--help` exit 0; `table -c/-s/-p/-f`, `filter --header/--placeholder` present |
+| — | Task independence | ✓ | intersection table above; every task lists its files |
