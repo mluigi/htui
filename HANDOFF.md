@@ -14,7 +14,12 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-28):** **MOD-32 was done** (`docs/decisions/mod/mod-32.md`): the
+**Current status (2026-09-29):** **MOD-62 was decided** (`docs/decisions/mod/mod-62.md`): a
+verify command keeps htui's process environment unchanged (plan D30), and PR #20's allowlist was
+closed unmerged. The agent it checks already runs with that same environment, so an allowlist on the
+verifier alone hid nothing and broke real verifiers. The rule that remains sits on **MOD-10**:
+resolved secrets in the agent's `SessionSpec.env` must never be handed to the verifier.
+Before it, **MOD-32 was done** (`docs/decisions/mod/mod-32.md`): the
 `run_step.trim_record` write is now scrubbed whole — `TrimRecord::to_value` takes a `&dyn Scrubber`,
 returns `Result<Value, Unmasked>`, and all three engine call sites go through it, so a
 credential-shaped record string fails the step before any session starts. The guarantee is
@@ -325,19 +330,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   side reintroduces the superseded-seq bug `16079aa` fixed, so the fix belongs in the runtime:
   catch the panic (or notice a panicked `JoinHandle` in `sweep_finished`) and send the task's
   terminal reply with a failure. Found 2026-09-26.
-- [ ] **MOD-62 - A verify command's environment: minus the secrets, plus a named passthrough**
-  (from PR #20 review, held by the maintainer 2026-09-29). `R-SEC-2`, `R-ORCH-11`. `verify.rs`
-  hands the child the whole process environment (plan D30), so a verify command sees host secrets
-  that ANA-2 `:493` says it should not ("the agent's environment minus the secrets"). CodeRabbit's
-  PR #20 swapped that for a fixed allowlist (`PATH`, `HOME`, temp dirs, `CARGO_HOME`,
-  `RUSTUP_HOME`, a few Windows roots) with no escape hatch, which drops what real verifiers need:
-  `HTUI_TEST_DATABASE_URL` (the Postgres suites then print "skipped" and a `cargo test` verify
-  passes without running them), proxy and CA variables, locale, `RUSTUP_TOOLCHAIN`,
-  `CARGO_TARGET_DIR`, and on Windows `APPDATA`/`PATHEXT`/`ComSpec`. Decide the shape: remove only
-  the ANA-7-resolved secret names, a per-phase or `app_setting` `verify_env` passthrough list, or
-  both; keep the agent's own environment consistent with it (`htui-agent/src/launch.rs` passes the
-  host environment through too). PR #20 stays open as a reference until this lands. Found
-  2026-09-29.
 - [ ] **MOD-60 - Display width in every hand-laid-out row** (from MOD-54, plan D18). `R-TUI-1`,
   `R-NF-1`. MOD-54 made `TextField` and `TextArea` count cells instead of code points through
   `crate::ui::cells`; every other place that lays text out in `char`s has the identical class of
@@ -483,6 +475,10 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   `SessionSpec` with an empty `env`, and its comment names this item as the one that fills it.
   **Relates to ANA-16** (`docs/ANA-16.md` §8, §9): open question on where secrets resolve, on the
   worker or on the server; MOD-48 owns it, with `R-SEC-2` amended only if the server resolves them.
+  **Verifier boundary (MOD-62, 2026-09-29):** once this item fills the agent's `SessionSpec.env`
+  with resolved secrets, that map must never reach `htui-orch/src/verify.rs`. The verifier keeps
+  htui's own process environment (plan D30) and scrubs its output. A test pinning that the verify
+  child does not see a resolved secret belongs to this item.
 - [ ] **MOD-11 - htui MCP server.** `R-MCP-1..4`. Tools `item_link`, `item_status`,
   `document_write`, `note_add`, `box_profile`, `command_run`; per-step scoping; command queue with
   per-box class limits; per-phase exposure. Per ANA-2 (`docs/ANA-2.md` §4.2, §8, risk 11):
@@ -831,6 +827,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 40 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-62 verify env passthrough, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-61 run scrubber masks nothing; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 39 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-61 run scrubber masks nothing; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 0 |
