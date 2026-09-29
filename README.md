@@ -444,22 +444,33 @@ terminal layer is `crossterm` and the drawing layer is `ratatui`.
 
 `htui-agent` is the only crate with `#[cfg(windows)]` code — the job object, `CREATE_NO_WINDOW`
 and the `PATHEXT`-aware command lookup of `launch.rs`. On a Linux box that code is never
-compiled by an ordinary build, so it is checked against the Windows target instead:
+compiled by an ordinary build, so the intended check is the Windows target:
 
 ```bash
 rustup target add x86_64-pc-windows-msvc
 cargo clippy --target x86_64-pc-windows-msvc -p htui-agent --all-targets --all-features -- -D warnings
 ```
 
-No linker is involved, so this needs nothing but the target's standard library. It compiles and
-lints every Windows branch, and it has already caught two things a Linux build cannot see (an
-enum whose variants are lopsided only on Windows, and a binding used only under `cfg(unix)`).
+**This command does not run on a Linux box without an MSVC-capable C compiler, and this project
+does not require one.** `htui-agent` reaches `ring` (through `reqwest`/`rustls`) and `ring`'s build
+script cross-compiles C, so the line dies in `cc-rs` with `failed to find tool "lib.exe"` after
+warning `GNU compiler is not supported for this target`. The same failure is pre-existing for
+`-p htui`, whose `ring` path runs `ring <- rustls <- sqlx-core <- sqlx <- htui-core <- htui-store`.
+The line was green for `htui-agent` before `ring` entered its graph; it is not green now on either
+crate.
 
-**It proves the code builds, not that it behaves.** The job object's kill-on-close guarantee, the
+The maintainer accepted that loss on 2026-09-28 (`TOOL-3`), so **Windows code is not lint-checked
+from Linux, and this section describes a check you cannot run here.** It previously caught two
+things a Linux build cannot see (an enum whose variants are lopsided only on Windows, and a
+binding used only under `cfg(unix)`); nothing replaces that. `MOD-16` is the only Windows check.
+If you want the lint line back, it needs a C toolchain that can target MSVC without root
+(`cargo install cargo-zigbuild` plus `pip install ziglang`); `cargo-xwin` needs `clang`.
+
+**The cross-target lint proves the code builds, not that it behaves.** The job object's kill-on-close guarantee, the
 `.cmd` shim that `CreateProcess` refuses, and `CREATE_NO_WINDOW` are runtime facts about Windows
 and are verified by running the suite there — `cargo test -p htui-agent` plus the `#[ignore]` live
-tests. The rest of the workspace does not cross-check from Linux: `sqlx`'s `ring` dependency
-builds C code and wants an MSVC-compatible compiler.
+tests. That is now the only Windows check there is. The rest of the workspace does not cross-check
+from Linux either, for the same `ring` reason.
 
 The terminal is restored on every exit path, panics included: a panic hook runs `ratatui::restore()`
 before the default hook prints, and the terminal guard restores again on drop.

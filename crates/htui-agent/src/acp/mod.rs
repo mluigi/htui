@@ -1069,6 +1069,14 @@ async fn session_main(
     child: &Mutex<ChildGuard>,
 ) {
     let mut state = TaskState::new(options.stamp, spec.retain_raw);
+    let filesystem = match fs::SessionFs::new(&spec.cwd, &spec.extra_dirs).await {
+        Ok(filesystem) => filesystem,
+        Err(err) => {
+            answer(ready, Err(DriverError::Transport(err.to_string())));
+            kill(child).await;
+            return;
+        }
+    };
 
     // 1. initialize. ANA-4 risk 11: `block_task` only here, never in a dispatch handler.
     let initialize = InitializeRequest::new(ProtocolVersion::V1)
@@ -1254,7 +1262,7 @@ async fn session_main(
                 break;
             }
             Step::Inbound(Some(request)) => {
-                if !on_inbound(&mut state, &events, &spec, request).await {
+                if !on_inbound(&mut state, &events, &filesystem, request).await {
                     break;
                 }
             }
@@ -1445,7 +1453,7 @@ async fn answer_permission(
 async fn on_inbound(
     state: &mut TaskState,
     events: &mpsc::Sender<DriverEnvelope>,
-    spec: &SessionSpec,
+    filesystem: &fs::SessionFs,
     request: Inbound,
 ) -> bool {
     match request {
@@ -1472,37 +1480,35 @@ async fn on_inbound(
             )
             .await
         }
-        Inbound::ReadFile(request, responder) => {
-            match fs::guard(&request.path, &spec.cwd, &spec.extra_dirs) {
-                Ok(path) => match fs::read_current(&path).await {
-                    Ok(text) => {
-                        let window = fs::slice_lines(&text, request.line, request.limit);
-                        let _ = responder.respond(ReadTextFileResponse::new(window));
-                        true
-                    }
-                    Err(err) => {
-                        let _ = responder
-                            .respond_with_error(agent_client_protocol::Error::internal_error());
-                        let event = DriverEvent::Error(ErrorEvent {
-                            code: "read_failed".to_owned(),
-                            message: err.to_string(),
-                        });
-                        emit(state, events, event, None).await
-                    }
-                },
-                Err(outside) => {
-                    let _ = responder
-                        .respond_with_error(agent_client_protocol::Error::invalid_params());
-                    refused(state, events, &outside).await
+        Inbound::ReadFile(request, responder) => match filesystem.guard(&request.path) {
+            Ok(path) => match fs::read_current(&path).await {
+                Ok(text) => {
+                    let window = fs::slice_lines(&text, request.line, request.limit);
+                    let _ = responder.respond(ReadTextFileResponse::new(window));
+                    true
                 }
+                Err(err) => {
+                    let _ = responder
+                        .respond_with_error(agent_client_protocol::Error::internal_error());
+                    let event = DriverEvent::Error(ErrorEvent {
+                        code: "read_failed".to_owned(),
+                        message: err.to_string(),
+                    });
+                    emit(state, events, event, None).await
+                }
+            },
+            Err(outside) => {
+                let _ =
+                    responder.respond_with_error(agent_client_protocol::Error::invalid_params());
+                refused(state, events, &outside).await
             }
-        }
+        },
         Inbound::WriteFile(request, responder) => {
-            match fs::guard(&request.path, &spec.cwd, &spec.extra_dirs) {
+            match filesystem.guard(&request.path) {
                 Ok(path) => {
                     // §4.3's adopted option: read, synthesize the diff, record it, then write.
                     let old = fs::read_current(&path).await.unwrap_or_default();
-                    let display = path.to_string_lossy().into_owned();
+                    let display = path.display_path().to_string_lossy().into_owned();
                     let event = DriverEvent::EditProposal(EditProposalEvent {
                         // This write arrives outside any tool call the client can see, so the
                         // recorder's dedup key for it is `(None, path)` (§4.3).
