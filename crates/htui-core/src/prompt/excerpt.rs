@@ -1048,93 +1048,13 @@ pub struct Listing {
 /// that is not repo-relative, and a count per skip rule.
 #[must_use]
 pub fn list(reader: &dyn RepoReader, req: &ExcerptRequest<'_>) -> Listing {
-    let _ = (reader, req);
-    todo!()
-}
-
-/// MOD-9 D114: §4.5 steps 3 to 10 over a [`list`]ing the caller already holds, so the reader is
-/// never asked to list again. The notes start with the F-101 caps note, then `listing.notes`, then
-/// the selection's own — [`select`]'s order before the split.
-#[must_use]
-pub fn select_listed(
-    reader: &dyn RepoReader,
-    req: &ExcerptRequest<'_>,
-    listing: &Listing,
-    merged: Vec<ExcerptCandidate>,
-    providers: Vec<String>,
-    est: crate::prompt::TokenEstimator,
-) -> ExcerptSet {
-    let _ = (reader, req, listing, merged, providers, est);
-    todo!()
-}
-
-/// MOD-9 D115: the F2 set. Every repo of `listing.listed` is reached; a listed file is kept when
-/// `touched` is empty or some prefix covers it (the narrowing is global: a repo no prefix names
-/// keeps its reach and loses its files); then every changed path the listing's rules would keep —
-/// repo-relative, past [`skip_by_path`] — is added, reaching its repo even with no root.
-#[must_use]
-pub fn step_files(listing: &Listing, touched: &[PathPrefix], changed: &[RepoPath]) -> StepFiles {
-    let _ = (listing, touched, changed);
-    todo!()
-}
-
-/// §4.5 steps 1–10 over a reader and a candidate list already merged from every provider.
-///
-/// Pure over `reader`: with an in-memory double no filesystem is touched, which is what makes the
-/// tier, denylist and windowing cases unit tests rather than integration tests (hazard H-22).
-///
-/// `providers` is the `provider_set` `htui_agent::excerpt::run_providers` produced, in P-11's
-/// grammar; [`BUILTIN_ID`] is forced to the front if the caller left it out, because §4.5 `:1201`
-/// makes the built-in un-removable and a record that omitted it would claim a prompt no code path
-/// can produce.
-///
-/// Every failure here is a **note**, never an error (§4.5 step 1's fail-open): an unresolved root,
-/// an unlistable repo, a denied file, an unreadable candidate and an exhausted budget all leave a
-/// valid prompt with a smaller excerpt section and a record that says why.
-///
-/// `caps.max_file_bytes` is **reconciled against the reader's own** before anything is listed, and
-/// the reconciled value is both the one enforced at step 8 and the one `audit.caps` records (review
-/// finding F-101). A reader that refuses large files itself — every filesystem reader must, since a
-/// file has to be refused before it is allocated — binds earlier than this function can see, in its
-/// walk. Recording the configured number when the reader's was lower made the audit name a cap that
-/// had stopped nothing.
-#[must_use]
-pub fn select(
-    reader: &dyn RepoReader,
-    req: &ExcerptRequest<'_>,
-    merged: Vec<ExcerptCandidate>,
-    providers: Vec<String>,
-    est: crate::prompt::TokenEstimator,
-) -> ExcerptSet {
     let mut notes = Vec::new();
-    let mut provider_set = providers;
-    if !provider_set.iter().any(|entry| entry == BUILTIN_ID) {
-        provider_set.insert(0, BUILTIN_ID.to_owned());
-    }
-
-    // The one `max_file_bytes` this pass runs under, reconciled before the first listing (review
-    // finding F-101). A reader that enforces a limit of its own enforces it *earlier* than anything
-    // here can — in the walk, so the file is never listed, and again in `read`, before the bytes are
-    // allocated — so the smaller of the two is the only number that can bind. Recording the caps'
-    // number when the reader's was lower made `audit.caps` a claim about a pass that did not
-    // happen; recording the minimum makes it the record §4.5 `:1127` asks for.
-    let caps = ExcerptCaps {
-        max_file_bytes: req.caps.max_file_bytes.min(reader.max_file_bytes()),
-        ..req.caps
-    };
-    if caps.max_file_bytes < req.caps.max_file_bytes {
-        notes.push(format!(
-            "excerpt: the reader's max_file_bytes ({}) is below the configured \
-             excerpt_max_file_bytes ({}); the reader's is the cap that bound and the one recorded",
-            caps.max_file_bytes, req.caps.max_file_bytes
-        ));
-    }
-
     // -- steps 1 and 2: resolve a root per repo, list under it, apply the path-only skip rules --
     let mut roots: Vec<&RepoRoot> = req.roots.iter().collect();
     roots.sort_by(|a, b| a.repo.as_bytes().cmp(b.repo.as_bytes()));
     let mut root_records = Vec::new();
-    let mut listing: Vec<Listed> = Vec::new();
+    let mut files: Vec<RepoPath> = Vec::new();
+    let mut listed = Vec::new();
     let mut skipped: std::collections::BTreeMap<&'static str, u32> =
         std::collections::BTreeMap::new();
     let mut denied_notes = Vec::new();
@@ -1166,6 +1086,7 @@ pub fn select(
                 continue;
             }
         };
+        listed.push(root.repo.clone());
         root_records.push(RootRecord {
             repo: root.repo.clone(),
             source: root.source,
@@ -1206,10 +1127,9 @@ pub fn select(
                 ));
                 continue;
             }
-            listing.push(Listed {
+            files.push(RepoPath {
                 repo: root.repo.clone(),
                 path,
-                head: String::new(),
             });
         }
     }
@@ -1217,6 +1137,65 @@ pub fn select(
     for (rule, count) in &skipped {
         notes.push(format!("excerpt: {count} path(s) skipped by rule `{rule}`"));
     }
+    Listing {
+        roots: root_records,
+        files,
+        listed,
+        notes,
+    }
+}
+
+/// MOD-9 D114: §4.5 steps 3 to 10 over a [`list`]ing the caller already holds, so the reader is
+/// never asked to list again. The notes start with the F-101 caps note, then `listing.notes`, then
+/// the selection's own — [`select`]'s order before the split.
+#[must_use]
+pub fn select_listed(
+    reader: &dyn RepoReader,
+    req: &ExcerptRequest<'_>,
+    listing: &Listing,
+    merged: Vec<ExcerptCandidate>,
+    providers: Vec<String>,
+    est: crate::prompt::TokenEstimator,
+) -> ExcerptSet {
+    let mut notes = Vec::new();
+    let mut provider_set = providers;
+    if !provider_set.iter().any(|entry| entry == BUILTIN_ID) {
+        provider_set.insert(0, BUILTIN_ID.to_owned());
+    }
+
+    // The one `max_file_bytes` this pass runs under, reconciled before the first read (review
+    // finding F-101). A reader that enforces a limit of its own enforces it *earlier* than anything
+    // here can — in the walk, so the file is never listed, and again in `read`, before the bytes are
+    // allocated — so the smaller of the two is the only number that can bind. Recording the caps'
+    // number when the reader's was lower made `audit.caps` a claim about a pass that did not
+    // happen; recording the minimum makes it the record §4.5 `:1127` asks for.
+    let caps = ExcerptCaps {
+        max_file_bytes: req.caps.max_file_bytes.min(reader.max_file_bytes()),
+        ..req.caps
+    };
+    if caps.max_file_bytes < req.caps.max_file_bytes {
+        notes.push(format!(
+            "excerpt: the reader's max_file_bytes ({}) is below the configured \
+             excerpt_max_file_bytes ({}); the reader's is the cap that bound and the one recorded",
+            caps.max_file_bytes, req.caps.max_file_bytes
+        ));
+    }
+
+    // MOD-9 D114: steps 1 and 2 ran in `list`; their notes follow the F-101 note, as they did.
+    notes.extend(listing.notes.iter().cloned());
+    // Sorted as `list` sorted them: the read loop looks a candidate's root up by repo.
+    let mut roots: Vec<&RepoRoot> = req.roots.iter().collect();
+    roots.sort_by(|a, b| a.repo.as_bytes().cmp(b.repo.as_bytes()));
+    let root_records = listing.roots.clone();
+    let mut listing: Vec<Listed> = listing
+        .files
+        .iter()
+        .map(|file| Listed {
+            repo: file.repo.clone(),
+            path: file.path.clone(),
+            head: String::new(),
+        })
+        .collect();
     let considered = u32::try_from(listing.len()).unwrap_or(u32::MAX);
 
     // Every provider candidate is vetted against the listing **here**, while the listing is still
@@ -1348,6 +1327,50 @@ pub fn select(
         audit,
         notes,
     }
+}
+
+/// MOD-9 D115: the F2 set. Every repo of `listing.listed` is reached; a listed file is kept when
+/// `touched` is empty or some prefix covers it (the narrowing is global: a repo no prefix names
+/// keeps its reach and loses its files); then every changed path the listing's rules would keep —
+/// repo-relative, past [`skip_by_path`] — is added, reaching its repo even with no root.
+#[must_use]
+pub fn step_files(listing: &Listing, touched: &[PathPrefix], changed: &[RepoPath]) -> StepFiles {
+    let _ = (listing, touched, changed);
+    todo!()
+}
+
+/// §4.5 steps 1–10 over a reader and a candidate list already merged from every provider.
+///
+/// Pure over `reader`: with an in-memory double no filesystem is touched, which is what makes the
+/// tier, denylist and windowing cases unit tests rather than integration tests (hazard H-22).
+///
+/// `providers` is the `provider_set` `htui_agent::excerpt::run_providers` produced, in P-11's
+/// grammar; [`BUILTIN_ID`] is forced to the front if the caller left it out, because §4.5 `:1201`
+/// makes the built-in un-removable and a record that omitted it would claim a prompt no code path
+/// can produce.
+///
+/// Every failure here is a **note**, never an error (§4.5 step 1's fail-open): an unresolved root,
+/// an unlistable repo, a denied file, an unreadable candidate and an exhausted budget all leave a
+/// valid prompt with a smaller excerpt section and a record that says why.
+///
+/// `caps.max_file_bytes` is **reconciled against the reader's own** before anything is read, and
+/// the reconciled value is both the one enforced at step 8 and the one `audit.caps` records (review
+/// finding F-101). A reader that refuses large files itself — every filesystem reader must, since a
+/// file has to be refused before it is allocated — binds earlier than this function can see, in its
+/// walk. Recording the configured number when the reader's was lower made the audit name a cap that
+/// had stopped nothing.
+///
+/// MOD-9 D114: [`list`] then [`select_listed`], so a caller that also needs the listing — the
+/// `glob` file set, [`step_files`] — walks once and calls the two halves itself.
+#[must_use]
+pub fn select(
+    reader: &dyn RepoReader,
+    req: &ExcerptRequest<'_>,
+    merged: Vec<ExcerptCandidate>,
+    providers: Vec<String>,
+    est: crate::prompt::TokenEstimator,
+) -> ExcerptSet {
+    select_listed(reader, req, &list(reader, req), merged, providers, est)
 }
 
 /// The provider candidates [`select`] will consider, in the order they arrived: repo-relative, past
