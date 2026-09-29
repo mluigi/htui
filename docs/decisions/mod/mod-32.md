@@ -89,7 +89,7 @@ an unscrubbed record, and the SQLite cache mirror only ever carries what Postgre
 | `5377a8f` | the implementation blueprint |
 | `8c1e92f` | the review gate: a pin that could not fail, and docs that claimed more than the code |
 | `921654e` | the refusal's real cost, and the status narrative stripped |
-| `b01e90f` | the close-out, and MOD-59 opened |
+| `b01e90f` | the close-out, and MOD-61 opened |
 | `d9836b7` | the vacuous workspace walk, and two reverts nothing caught |
 
 Branch `mod-32`, branched off `mod-58`'s `8cc3fda`. Plan:
@@ -131,7 +131,7 @@ run engine builds its `MinimalScrubber` with an **empty** secret list (`run_work
 `:935`) and `mask` returns its input unchanged when the list is empty (`scrub.rs:119-121`), so
 only the prefix rules and the PEM marker fire. The fail-closed half — what `R-SEC-3` requires and
 what the item asks for — is live and works. The chat path's populated scrubber
-(`agent_worker.rs:3059`) never reaches `set_step_prompt`. That is **MOD-59**, opened at the gate.
+(`agent_worker.rs:3059`) never reaches `set_step_prompt`. That is **MOD-61**, opened at the gate.
 
 The gate also closed a gap the signature change cannot: `TrimRecord` is `pub` and still derives
 `Serialize`, so `serde_json::to_value(&trim)` — the literal line this item deleted — remains

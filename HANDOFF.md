@@ -20,7 +20,7 @@ returns `Result<Value, Unmasked>`, and all three engine call sites go through it
 credential-shaped record string fails the step before any session starts. The guarantee is
 field-agnostic because the defect *was* an enumeration; `template.name`, `PromptSpec.notes` and the
 `excerpts` audit's `roots[].repo` / `provider_set[]` were all unmasked. The masking half is still
-inert on the run path (the engine's secret list is empty) — that is **MOD-59**, opened at the
+inert on the run path (the engine's secret list is empty) — that is **MOD-61**, opened at the
 review gate. The store is still not the enforcement point: it will accept an unscrubbed
 `trim_record` from any non-engine caller.
 Before it, **MOD-58 was done** (`docs/decisions/mod/mod-58.md`): the two
@@ -243,7 +243,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   only **read** (the preview, plan D102's "the preview writes nothing"). Split `background` by what a
   task writes, and let the install guard consult the writing half only. `background_len` is read by
   tests, so the split has to keep an answer for them. Found at MOD-2 close-out, 2026-09-15.
-- [ ] **MOD-59 - The run engine's scrubber masks nothing** (from the MOD-32 review gate).
+- [ ] **MOD-61 - The run engine's scrubber masks nothing** (from the MOD-32 review gate).
   `R-SEC-3`. MOD-32 made `TrimRecord::to_value` scrub the whole record before the write, and
   `scrub` does two things: mask the resolved secrets, then fail closed on residue. Only the second
   is live on the run path. The run engine builds its `MinimalScrubber` with an **empty** secret
@@ -748,6 +748,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-21 per-model weights)                                                                  |
-| MOD-N   | 40 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor, MOD-59 run scrubber masks nothing; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 40 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor, MOD-61 run scrubber masks nothing; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-5 merge-hook test flake)                |
 | TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |

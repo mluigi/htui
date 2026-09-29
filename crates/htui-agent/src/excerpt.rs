@@ -921,13 +921,11 @@ pub fn excerpt_pass(req: &OwnedExcerptRequest, est: TokenEstimator) -> ExcerptSe
 ///    `excerpt: the pass panicked; no excerpts`, or `excerpt: the pass was cancelled; no excerpts`
 ///    when the task never ran (§4.5 fail-open).
 /// 5. `withhold_unmaskable_notes(&mut set.notes, scrubber)`: a pass note names `repo:path` as the
-///    reader returned it, so a note the scrubber would **mask** is replaced by a fixed line that
-///    names nothing. The record-wide pass ([`TrimRecord::to_value`], MOD-32) is what makes the
+///    reader returned it, so a note the scrubber would **mask or refuse** is replaced by a fixed
+///    line that names nothing. The record-wide pass ([`TrimRecord::to_value`], MOD-32) is what makes the
 ///    record safe, and it is now the first line of defence; this function is the second, kept
 ///    because a withheld note reads as a withheld note, where a masked one would read "a file in
 ///    repo `[REDACTED]` dropped", which names a value no reader can resolve (P-2).
-///    A note the scrubber would **refuse** is a different case and is not handled here: the
-///    record-wide pass stops the write, so the replacement line is never persisted at all.
 /// 6. `drop_unmaskable_excerpts(&mut set, scrubber)`, whose notes are built safe.
 /// 7. `set.notes` = `input.notes`, then the pass's notes, then the drop notes.
 ///
