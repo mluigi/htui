@@ -21,6 +21,7 @@ use serde_json::{Map, Value as Json, json};
 
 use crate::model::frontmatter::{self, Issue, Value, split};
 use crate::model::skill::{Activation, validate_name};
+use crate::model::skill_glob::split_list;
 use crate::store::traits::invalid_skill_name;
 
 /// The file name §7.3's `name` fallback treats as a skill: its parent directory names the skill.
@@ -234,12 +235,8 @@ fn prefill_of(frontmatter: &Map<String, Json>) -> ImportPrefill {
                 .filter(|item| !item.is_empty())
                 .map(str::to_owned)
                 .collect(),
-            Some(Json::String(text)) => text
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(str::to_owned)
-                .collect(),
+            // The form's own splitter, so `src/**/*.{ts,tsx}` is not cut at its brace comma.
+            Some(Json::String(text)) => split_list(text),
             _ => Vec::new(),
         }
     };
@@ -253,13 +250,7 @@ fn prefill_of(frontmatter: &Map<String, Json>) -> ImportPrefill {
     if let Some(apply_to) = frontmatter.get("applyTo").and_then(Json::as_str) {
         let apply_to = apply_to.trim();
         if apply_to != "**" {
-            globs.extend(
-                apply_to
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|item| !item.is_empty())
-                    .map(str::to_owned),
-            );
+            globs.extend(split_list(apply_to));
         }
     }
     globs.dedup();

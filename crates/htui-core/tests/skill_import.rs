@@ -500,6 +500,21 @@ fn the_glob_keys_prefill_glob_activation() {
         parsed.prefill.globs,
         vec!["src/**".to_owned(), "lib/**".to_owned()]
     );
+
+    // The split is the form's own: a comma inside `{…}` is part of the glob, for `globs` and for
+    // `applyTo` alike.
+    for line in [
+        "globs: src/**/*.{ts,tsx}, docs/**",
+        "applyTo: \"src/**/*.{ts,tsx}, docs/**\"",
+    ] {
+        let text = format!("---\nname: a\ndescription: d\n{line}\n---\nB\n");
+        let parsed = parse("/x/SKILL.md", "SKILL.md", &text, at()).expect("parses");
+        assert_eq!(
+            parsed.prefill.globs,
+            vec!["src/**/*.{ts,tsx}".to_owned(), "docs/**".to_owned()],
+            "{line}"
+        );
+    }
 }
 
 /// §7.3's second prefill row: the four always-sources, including `applyTo: "**"`, which the table

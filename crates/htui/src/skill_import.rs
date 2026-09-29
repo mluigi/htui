@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use htui_core::model::skill_import::{ParsedSkill, SKILL_FILE, parse};
 use htui_core::model::{NewSkill, NewSkillVersion, SkillId, SkillPatch, UserId};
-use htui_core::store::{CasOutcome, Result, StoreError, WriteStore};
+use htui_core::store::{CasOutcome, Result, StoreError, WriteStore, skill_body_refusal};
 use htui_store::{Backend, DATABASE_UNREACHABLE};
 
 use crate::skills::{SkillEntry, SkillsSnapshot};
@@ -295,7 +295,13 @@ impl<W: WriteStore> Batch<'_, W> {
         };
 
         let skill = existing.skill.id;
-        if existing.skill.description != description {
+        // Refuse a body the version append would refuse before anything is written, so a refused
+        // file never leaves a moved description behind it.
+        if let Some(refusal) = skill_body_refusal(&body) {
+            return refused(refusal);
+        }
+        let described = existing.skill.description != description;
+        if described {
             let patch = SkillPatch {
                 name: None,
                 description: Some(description),
@@ -336,10 +342,17 @@ impl<W: WriteStore> Batch<'_, W> {
                 path: label.to_owned(),
                 version: version.version,
             },
-            Ok(CasOutcome::Stale(_)) | Err(StoreError::NotFound { .. }) => refused(format!(
-                "`{name}` gained a version while this import was running; its description was \
-                 updated and no version was appended, so re-running the import finishes it"
-            )),
+            Ok(CasOutcome::Stale(_)) | Err(StoreError::NotFound { .. }) => {
+                let description = if described {
+                    "its description was updated and "
+                } else {
+                    ""
+                };
+                refused(format!(
+                    "`{name}` gained a version while this import was running; {description}no \
+                     version was appended, so re-running the import finishes it"
+                ))
+            }
             Err(error) => refused(sentence(error)),
         }
     }
@@ -963,6 +976,38 @@ mod tests {
             }]
         );
         assert!(entry(&backend, "empty-skill").await.is_none());
+    }
+
+    /// A re-import whose body the append would refuse writes nothing at all, not even the new
+    /// description it carries: the refusal is asked before `update_skill`, so a `Refused` row
+    /// really means the file was not imported.
+    #[tokio::test]
+    async fn a_refused_body_on_re_import_leaves_the_description_alone() {
+        let backend = demo();
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = skill_file(dir.path(), "house-rules", "# Rules\n");
+        let label = path.display().to_string();
+        run(&backend, std::slice::from_ref(&label)).await;
+        let before = entry(&backend, "house-rules").await.expect("present");
+
+        fs::write(
+            &path,
+            "---\nname: house-rules\ndescription: A new description.\n---\n\n",
+        )
+        .expect("write");
+        let report = run(&backend, &[label.clone()]).await;
+
+        assert_eq!(
+            report,
+            [ImportOutcome::Refused {
+                path: label,
+                message: htui_core::store::BLANK_SKILL_BODY.to_owned(),
+            }]
+        );
+        let after = entry(&backend, "house-rules").await.expect("present");
+        assert_eq!(after.skill.description, before.skill.description);
+        assert_eq!(after.skill.updated_at, before.skill.updated_at);
+        assert_eq!(after.versions.len(), 1);
     }
 
     /// A path that is not there is a reported refusal, not an error: the other paths still import.
