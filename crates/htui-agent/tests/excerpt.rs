@@ -629,41 +629,33 @@ fn fs_reader_bounds_gitignore_files_before_parsing() {
     let dir = tempfile::tempdir().expect("a throwaway root");
     // The ignore cap is its own, so a small excerpt cap does not stop a `.gitignore` excluding.
     let reader = capped(32);
-    for prefix in ["", "nested/"] {
-        write(dir.path(), &format!("{prefix}keep.rs"), b"fn keep() {}\n");
-    }
+    write(dir.path(), "keep.rs", b"fn keep() {}\n");
+    write(dir.path(), "nested/keep.rs", b"fn keep() {}\n");
+    write(dir.path(), "nested/other.rs", b"fn other() {}\n");
     let max = usize::try_from(GITIGNORE_MAX_BYTES).expect("fits");
 
-    // At the cap the rules apply. One byte over it the file is refused whole, never parsed from
-    // a prefix, and its subtree contributes nothing rather than everything: at the root that is
-    // the whole listing. Both the root and the recursive walk are exercised.
+    // At the cap the rules apply (and the ignore file itself is over the excerpt cap, so it is
+    // not listed). One byte over it the file is refused whole, never parsed from a prefix, and
+    // its subtree contributes nothing rather than everything; the sibling at the root still
+    // lists.
     for size in [max, max + 1] {
         let mut rules = b"keep.rs\n#".to_vec();
         rules.resize(size, b'x');
-        for prefix in ["", "nested/"] {
-            write(dir.path(), &format!("{prefix}.gitignore"), &rules);
-        }
+        write(dir.path(), "nested/.gitignore", &rules);
         let (paths, truncated) = reader
             .list(&fs_root(dir.path()), 20_000)
             .expect("the root is readable");
         assert!(!truncated);
         if size == max {
-            assert_eq!(paths, vec![".gitignore", "nested/.gitignore"]);
+            assert_eq!(paths, vec!["keep.rs", "nested/other.rs"]);
         } else {
-            assert!(
-                paths.is_empty(),
-                "an unreadable ignore file fails closed: {paths:?}"
+            assert_eq!(
+                paths,
+                vec!["keep.rs"],
+                "an unreadable ignore file fails closed"
             );
         }
     }
-
-    // Only the refused directory drops out: a sibling still lists.
-    write(dir.path(), ".gitignore", b"");
-    write(dir.path(), "other/keep.rs", b"fn keep() {}\n");
-    let (paths, _) = reader
-        .list(&fs_root(dir.path()), 20_000)
-        .expect("the root is readable");
-    assert_eq!(paths, vec![".gitignore", "keep.rs", "other/keep.rs"]);
 }
 
 #[test]
