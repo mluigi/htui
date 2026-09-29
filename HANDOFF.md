@@ -281,6 +281,15 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   **Relates to ANA-16** (`docs/ANA-16.md` §6.2, §8): personas should be registry rows rather than a
   per-box directory, so they are distributed like the rest of the config (MOD-48).
 - [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`); the MCP half needs MOD-11.
+- [ ] **MOD-65 - A panic on a blocking thread a runtime task starts leaves the terminal alone**
+  (from MOD-53). `R-NF-3`, `R-TUI-8`. MOD-53 made every task the agent runtime spawns answer its
+  request on a panic and polls it inside `htui_agent::excerpt::contain`, so the panic hook leaves the
+  terminal alone. A panic on a `spawn_blocking` thread such a task starts is outside that window:
+  the install's unpack (`htui-agent` install pipeline) and `SystemHardware::read`'s `system_facts`
+  (`htui-agent/src/box_probe/hardware.rs`). The task still answers, because tokio hands the panic
+  back as a `JoinError`, but the hook on the blocking thread is not vouched for and still calls
+  `ratatui::restore()` under the running UI. Open the same window on those threads (a closure
+  wrapped in `contain`, or a small `spawn_blocking` helper that does it). Found 2026-09-29.
 - [ ] **MOD-60 - Display width in every hand-laid-out row** (from MOD-54, plan D18). `R-TUI-1`,
   `R-NF-1`. MOD-54 made `TextField` and `TextArea` count cells instead of code points through
   `crate::ui::cells`; every other place that lays text out in `char`s has the identical class of
@@ -787,6 +796,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 4 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-26 configurable hotkeys) |
-| MOD-N   | 36 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 37 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-6 Runs pane approve doc)                |
 | TOOL-N  | 0 |
