@@ -15,7 +15,7 @@
 //!
 //! | Key | On | Sends |
 //! |---|---|---|
-//! | `a` / `x` | step | approve / reject with a typed note (`AnswerGate`) |
+//! | `a` / `x` | step | approve (`AnswerGate`) / reject with a typed note |
 //! | `r` | step | `RetryStep` |
 //! | `p` | step | promote to chat (`Action::Promote`, served for the Chat tab) |
 //! | `s` | step | `SelectFanout` with the step as the winner |
@@ -24,12 +24,16 @@
 //! | `c` | run | `CancelRun`, after a `y` |
 //! | `T` | run | a retry of the run's cleanup |
 //! | `u` / `R` | item | `Unblock` / `StartRun` |
-//! | `C` | item | close-out: the counts, a `y`, then the item key typed back (D167) |
+//! | `C` | item | close-out: the counts, a picked resolution, a `y`, the key typed back (D167) |
+//!
+//! At the close-out's counts `←`/`→` (and `h`/`l`) pick the resolution among the legal ones for
+//! the item's status (`Resolution::closes_from`), starting on `Resolution::default_for` (MOD-39
+//! plan P13).
 
 use core::cell::Cell;
 use htui_core::model::{
-    Document, DocumentId, ItemId, RunId, RunMode, RunStatus, RunStepSummary, RunSummary, StepId,
-    StepStatus, UsageTotals,
+    Document, DocumentId, ItemId, Resolution, RunId, RunMode, RunStatus, RunStepSummary,
+    RunSummary, Status, StepId, StepStatus, UsageTotals,
 };
 use htui_orch::closeout::Preview;
 use htui_orch::{Command, CommandOutcome, GateAnswer};
@@ -218,7 +222,8 @@ enum Mode {
 enum CloseOutStage {
     /// `CloseOutPreview` is on its way.
     Counting,
-    /// The counts are shown; `y` goes on to the typed stage.
+    /// The counts are shown; `←`/`→` pick the resolution in `Preview::resolution` (MOD-39 plan
+    /// P13) and `y` goes on to the typed stage, which sends it.
     Warn(Preview),
     /// The item key has to be typed back.
     Typed {
@@ -693,10 +698,37 @@ fn reject_key(
     }
 }
 
+/// ANA-11 §4.2 through `Resolution::closes_from`: `Resolution::ALL` in declaration order,
+/// filtered (MOD-39 plan P13). The store stays the authority.
+fn resolutions(status: Status) -> Vec<Resolution> {
+    Resolution::ALL
+        .iter()
+        .copied()
+        .filter(|resolution| resolution.closes_from(status))
+        .collect()
+}
+
+/// The next (`forward`) or previous legal resolution after `current`, wrapping; the first legal
+/// one when `current` is not legal. `current` itself when nothing closes `status`, which the
+/// preview's guard has already refused.
+fn cycle(status: Status, current: Resolution, forward: bool) -> Resolution {
+    let legal = resolutions(status);
+    let Some(at) = legal.iter().position(|&resolution| resolution == current) else {
+        return legal.first().copied().unwrap_or(current);
+    };
+    let next = if forward {
+        (at + 1) % legal.len()
+    } else {
+        (at + legal.len() - 1) % legal.len()
+    };
+    legal[next]
+}
+
 /// A key in [`Mode::CloseOut`], stage by stage (D167): the mode it leaves the pane in.
 ///
-/// Counting and warning leave on `n`/`Esc`; the typed stage leaves on `Esc` only, because `n` is a
-/// letter there; in flight, every key waits for the answer.
+/// Counting and warning leave on `n`/`Esc`; the warning's `←`/`→` (and `h`/`l`) pick the
+/// resolution (MOD-39 plan P13); the typed stage leaves on `Esc` only, because `n` is a letter
+/// there; in flight, every key waits for the answer.
 fn close_out_key(item: ItemId, stage: CloseOutStage, key: KeyEvent, ctx: &Ctx<'_>) -> Mode {
     let stage = match stage {
         CloseOutStage::Counting => match key.code {
@@ -709,6 +741,16 @@ fn close_out_key(item: ItemId, stage: CloseOutStage, key: KeyEvent, ctx: &Ctx<'_
                 field: TextField::new(),
             },
             KeyCode::Char('n') | KeyCode::Esc => return Mode::Browse,
+            KeyCode::Right | KeyCode::Char('l') => {
+                let mut preview = preview;
+                preview.resolution = cycle(preview.status, preview.resolution, true);
+                CloseOutStage::Warn(preview)
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                let mut preview = preview;
+                preview.resolution = cycle(preview.status, preview.resolution, false);
+                CloseOutStage::Warn(preview)
+            }
             _ => CloseOutStage::Warn(preview),
         },
         CloseOutStage::Typed { preview, mut field } => match field.on_key(key) {
@@ -1272,7 +1314,7 @@ impl RunsTab {
                     ),
                     theme.title,
                 ),
-                hint("y continue · n cancel"),
+                hint("←/→ resolution · y continue · n cancel"),
             ],
             Mode::CloseOut(CloseOutStage::Typed { preview, field }) => {
                 let prompt = format!("type {} to close it: ", preview.key);
@@ -2500,8 +2542,8 @@ mod tests {
         Preview {
             key: "FEAT-1".to_owned(),
             title: "TUI scaffold".to_owned(),
-            status: htui_core::model::Status::Done,
-            resolution: htui_core::model::Resolution::Done,
+            status: Status::Done,
+            resolution: Resolution::Done,
             runs: 1,
             rows: 3,
             version: 2,
@@ -2548,7 +2590,7 @@ mod tests {
             footer(&pane),
             [
                 "close FEAT-1 as done · 1 runs · 3 commit rows · summary v2",
-                "y continue · n cancel"
+                "←/→ resolution · y continue · n cancel"
             ]
         );
         pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
@@ -2590,8 +2632,8 @@ mod tests {
     async fn the_close_out_warn_names_the_resolution() {
         let shell = Shell::new();
         let failed = Preview {
-            status: htui_core::model::Status::Failed,
-            resolution: htui_core::model::Resolution::Withdrawn,
+            status: Status::Failed,
+            resolution: Resolution::Withdrawn,
             ..preview()
         };
         let mut pane = warned_with(&shell, failed).await;
@@ -2608,8 +2650,180 @@ mod tests {
             emitted.iter().filter_map(sent_command).collect::<Vec<_>>(),
             [&Command::CloseOut {
                 item: ids::HTUI_FEAT_1,
-                resolution: htui_core::model::Resolution::Withdrawn,
+                resolution: Resolution::Withdrawn,
             }]
+        );
+    }
+
+    /// The resolution the warning stage has picked.
+    fn picked(pane: &RunsTab) -> Resolution {
+        match &pane.mode {
+            Mode::CloseOut(CloseOutStage::Warn(preview)) => preview.resolution,
+            other => panic!("not at the warning: {other:?}"),
+        }
+    }
+
+    /// `presses` of `code` at the warning, each consumed: the resolutions picked, in order.
+    fn walk(pane: &mut RunsTab, shell: &Shell, code: KeyCode, presses: usize) -> Vec<Resolution> {
+        (0..presses)
+            .map(|_| {
+                assert_eq!(pane.on_key(key(code), &mut shell.ctx()), Handled::Consumed);
+                picked(pane)
+            })
+            .collect()
+    }
+
+    /// MOD-39 plan P13: `→` on a `done` item walks every resolution in declaration order and
+    /// wraps; nothing is sent while picking.
+    #[tokio::test]
+    async fn right_on_a_done_preview_walks_all_six_resolutions() {
+        let shell = Shell::new();
+        let mut pane = warned(&shell).await;
+        assert_eq!(picked(&pane), Resolution::Done);
+        assert_eq!(
+            walk(&mut pane, &shell, KeyCode::Right, 6),
+            [
+                Resolution::Concluded,
+                Resolution::Rejected,
+                Resolution::Withdrawn,
+                Resolution::Superseded,
+                Resolution::Duplicate,
+                Resolution::Done,
+            ]
+        );
+        assert!(shell.emit.is_empty(), "picking sends nothing");
+        assert!(pane.captures_input(), "and stays at the warning");
+    }
+
+    /// MOD-39 plan P13: `←` and `h` walk back, wrapping from the first resolution to the last.
+    #[tokio::test]
+    async fn left_walks_back_and_wraps() {
+        let shell = Shell::new();
+        let mut pane = warned(&shell).await;
+        assert_eq!(
+            walk(&mut pane, &shell, KeyCode::Left, 1),
+            [Resolution::Duplicate]
+        );
+        assert_eq!(
+            walk(&mut pane, &shell, KeyCode::Char('h'), 1),
+            [Resolution::Superseded]
+        );
+        assert_eq!(
+            walk(&mut pane, &shell, KeyCode::Char('l'), 2),
+            [Resolution::Duplicate, Resolution::Done]
+        );
+    }
+
+    /// ANA-11 §4.2: a `blocked` item cannot close as `done` or `concluded`, so the picker offers
+    /// the four others, starting on `withdrawn`.
+    #[tokio::test]
+    async fn a_blocked_preview_offers_the_four_non_success_resolutions() {
+        let shell = Shell::new();
+        let blocked = Preview {
+            status: Status::Blocked,
+            resolution: Resolution::Withdrawn,
+            ..preview()
+        };
+        let mut pane = warned_with(&shell, blocked).await;
+        assert_eq!(
+            walk(&mut pane, &shell, KeyCode::Char('l'), 4),
+            [
+                Resolution::Superseded,
+                Resolution::Duplicate,
+                Resolution::Rejected,
+                Resolution::Withdrawn,
+            ]
+        );
+        assert_eq!(
+            resolutions(Status::Blocked),
+            [
+                Resolution::Rejected,
+                Resolution::Withdrawn,
+                Resolution::Superseded,
+                Resolution::Duplicate,
+            ]
+        );
+    }
+
+    /// MOD-39 plan P13: an `open` item is closable now; its picker starts on `withdrawn` and
+    /// offers the same four as `blocked`. A resolution that is not legal steps to the first legal
+    /// one.
+    #[tokio::test]
+    async fn an_open_preview_starts_on_withdrawn() {
+        assert_eq!(
+            Resolution::default_for(Status::Open),
+            Some(Resolution::Withdrawn)
+        );
+        assert_eq!(resolutions(Status::Open), resolutions(Status::Blocked));
+        assert!(resolutions(Status::Queued).is_empty());
+        assert_eq!(
+            cycle(Status::Open, Resolution::Done, true),
+            Resolution::Rejected
+        );
+        assert_eq!(
+            cycle(Status::Open, Resolution::Done, false),
+            Resolution::Rejected
+        );
+
+        let shell = Shell::new();
+        let open = Preview {
+            status: Status::Open,
+            resolution: Resolution::Withdrawn,
+            ..preview()
+        };
+        let mut pane = warned_with(&shell, open).await;
+        assert_eq!(picked(&pane), Resolution::Withdrawn);
+        assert_eq!(
+            walk(&mut pane, &shell, KeyCode::Left, 4),
+            [
+                Resolution::Rejected,
+                Resolution::Duplicate,
+                Resolution::Superseded,
+                Resolution::Withdrawn,
+            ]
+        );
+    }
+
+    /// MOD-39 plan P13: the typed key sends the resolution picked, not the one the preview
+    /// started on.
+    #[tokio::test]
+    async fn the_chosen_resolution_is_what_close_out_sends() {
+        let shell = Shell::new();
+        let mut pane = warned(&shell).await;
+        walk(&mut pane, &shell, KeyCode::Char('l'), 2);
+        assert_eq!(picked(&pane), Resolution::Rejected);
+
+        pane.on_key(key(KeyCode::Char('y')), &mut shell.ctx());
+        type_text(&mut pane, &shell, "FEAT-1");
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert_eq!(
+            emitted.iter().filter_map(sent_command).collect::<Vec<_>>(),
+            [&Command::CloseOut {
+                item: ids::HTUI_FEAT_1,
+                resolution: Resolution::Rejected,
+            }]
+        );
+    }
+
+    /// MOD-39 plan P13: the warning names the picker in its hint and the picked resolution in its
+    /// title line.
+    #[tokio::test]
+    async fn the_warn_footer_names_the_picker() {
+        let shell = Shell::new();
+        let mut pane = warned(&shell).await;
+        assert!(
+            footer(&pane)[1].contains("←/→ resolution"),
+            "{:?}",
+            footer(&pane)
+        );
+        walk(&mut pane, &shell, KeyCode::Right, 2);
+        assert_eq!(
+            footer(&pane),
+            [
+                "close FEAT-1 as rejected · 1 runs · 3 commit rows · summary v2",
+                "←/→ resolution · y continue · n cancel"
+            ]
         );
     }
 
@@ -2651,7 +2865,7 @@ mod tests {
             emitted.iter().filter_map(sent_command).collect::<Vec<_>>(),
             [&Command::CloseOut {
                 item: ids::HTUI_FEAT_1,
-                resolution: htui_core::model::Resolution::Done,
+                resolution: Resolution::Done,
             }]
         );
         for swallowed in [KeyCode::Esc, KeyCode::Char('y'), KeyCode::Enter] {

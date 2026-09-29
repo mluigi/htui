@@ -3,7 +3,7 @@ source: crates/htui/tests/skills.rs
 expression: frame
 ---
 Graphics · DESKTOP-HTUI · memory · 0 runs
- 1 Backlog  2 Skills  3 Settings  4 Chat
+ 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
  Skills │ Templates
 ┌ Skills ──────────────────────┐┌ rust-style v2 (head v2) · ~42 tokens ────────────────────────────┐
 │  rust-style             v2   ││House Rust conventions: no `unwrap` off the test path, one error  │

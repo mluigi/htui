@@ -2,29 +2,19 @@
 //! milestone 4 T21).
 //!
 //! **What this file proves now.** `htui` is online-only. A chat started on a box whose Postgres is
-//! unreachable is **refused** with the one sentence `htui_store::DATABASE_UNREACHABLE` carries, no
-//! step is minted, and nothing is written to `<cache_dir>/pending/`. That is
-//! `an_offline_chat_is_refused_with_the_unreachable_warning`, driven against the production pieces
-//! and nothing else — a `Backend::Offline` over a real mirror, the production `AgentRuntime`
-//! driving a scripted transport through the same registry the ACP one uses. Its online negative,
-//! `an_online_chat_header_says_nothing_about_a_buffer`, still runs: a chat over a store the
-//! maintainer can read back says nothing about a buffer. The only thing the tests supply is the
-//! mirror's contents (`testkit::seed_mirror`), because an offline box is by definition one that
-//! has already synced.
+//! unreachable is **refused** with the one sentence `htui_store::DATABASE_UNREACHABLE` carries, and
+//! no step is minted. That is `an_offline_chat_is_refused_with_the_unreachable_warning`, driven
+//! against the production pieces and nothing else — a `Backend::Offline` over a real mirror, the
+//! production `AgentRuntime` driving a scripted transport through the same registry the ACP one
+//! uses. Its online negative, `an_online_chat_header_says_nothing_about_a_buffer`, still runs: a
+//! chat over a store the maintainer can read back says nothing about a buffer. The only thing the
+//! tests supply is the mirror's contents (`testkit::seed_mirror`), because an offline box is by
+//! definition one that has already synced.
 //!
-//! **What this file keeps, ignored.** Criterion 12 read: a chat started with the store unreachable
-//! records its rows to `<cache_dir>/pending/`, and the next connection uploads them. It is
-//! withdrawn with the mode it proved — see `docs/decisions/mod/mod-2.md`, "Known, accepted, and
-//! handed on". The four cases that proved that mode are `#[ignore]`d rather than deleted, bodies
-//! byte-for-byte: the two buffer-writing cases, the `HTUI_TEST_DATABASE_URL`-gated end-to-end
-//! criterion-12 proof (`a_buffered_chat_lands_in_postgres_on_the_next_connection`, which prints
-//! `testkit::SKIP` without a server, plan D13), and D33's `app_user` refusal, now unreachable from
-//! the shell because `start()` refuses at the writer before it asks the mirror who this user is.
-//! They still compile and are expected to fail if run with `--ignored`; that is what "disabled"
-//! means. They are the evidence the reversal would need, and a later CLEAN item removes them.
-//!
-//! Only the **write** side is disabled. `upload_pending` still runs on every refresh pass, so a
-//! buffer left by an earlier build still lands on the next connection.
+//! Criterion 12 used to read: a chat started with the store unreachable records its rows to
+//! `<cache_dir>/pending/`, and the next connection uploads them. It is withdrawn with the mode it
+//! proved — see `docs/decisions/mod/mod-2.md`, "Known, accepted, and handed on" — and the buffer,
+//! its upload and the cases that proved them have since been removed.
 #![cfg(feature = "testkit")]
 
 use std::sync::Arc;
@@ -98,8 +88,8 @@ fn compose(harness: &mut Harness, text: &str) {
 /// A mirror holding the demo world, this OS user, and one registry row the fake can build.
 ///
 /// The user's **name** is the one thing rewritten: `CacheStore::this_user` resolves the OS user
-/// against the mirror by name (D33), which is what makes the run this test uploads carry the same
-/// author an online one would. The `TempDir` is returned because dropping it deletes the mirror.
+/// against the mirror by name (D33), so the seeded rows carry this OS user's name. The `TempDir` is
+/// returned because dropping it deletes the mirror.
 async fn offline_mirror(agent_id: AgentId) -> (tempfile::TempDir, CacheStore) {
     let root = tempfile::tempdir().expect("a throwaway config root");
     let cache = CacheStore::open(root.path(), "offline-chat", PgStore::schema_version())
@@ -120,11 +110,6 @@ async fn offline_mirror(agent_id: AgentId) -> (tempfile::TempDir, CacheStore) {
 }
 
 /// The shell over an offline backend, with the Chat tab and a scripted transport behind it.
-///
-/// The frame is 140 columns wide rather than the harness default of 100: the D42 suffix is 43
-/// characters on top of a header that already carries an agent, a model, a project name and a
-/// 41-character session id, and a truncated header would hide the very words the snapshot exists
-/// to pin.
 ///
 /// The [`testkit::KeyringGuard`] comes back with the harness rather than being taken by each case:
 /// since MOD-15 M6 `App::start` issues a `ConnectionInfo`, and over a non-`Memory` backend that
@@ -152,7 +137,7 @@ async fn offline_harness(cache: &CacheStore, script: Script) -> (testkit::Keyrin
 }
 
 /// The turn every case plays: a thought, some text, a tool call and its result, a usage report and
-/// the end of the turn — one row of every shape the buffer has to carry.
+/// the end of the turn — one row of every shape the recorder writes.
 fn one_turn() -> Script {
     Script::one_turn(vec![
         ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
@@ -189,17 +174,13 @@ fn one_turn() -> Script {
     ])
 }
 
-/// MOD-25, from the shell: a box whose Postgres is unreachable **refuses** the chat instead of
-/// buffering it. The refusal is the one sentence `htui_store::DATABASE_UNREACHABLE` carries, and
-/// the proof that the buffer is disabled is negative on both sides — no step was minted, and
-/// `<cache_dir>/pending/` is still empty, with neither an `.open` file nor a sealed one.
+/// MOD-25, from the shell: a box whose Postgres is unreachable **refuses** the chat. The refusal
+/// is the one sentence `htui_store::DATABASE_UNREACHABLE` carries, and no step was minted.
 ///
 /// `Backend::writer()` answers `None` offline, so `AgentRuntime::start` refuses at the writer,
-/// before it ever asks the mirror who this user is. That is why this case, not the D33 one below,
-/// is what an offline chat does now.
+/// before it ever asks the mirror who this user is.
 ///
-/// Plain asserts and no snapshot: the sentence and the empty directory are the whole contract, and
-/// a snapshot would only be one more file for the CLEAN item to delete.
+/// Plain asserts and no snapshot: the sentence and the missing step are the whole contract.
 #[tokio::test]
 async fn an_offline_chat_is_refused_with_the_unreachable_warning() {
     let agent_id = AgentId::new();
@@ -225,8 +206,8 @@ async fn an_offline_chat_is_refused_with_the_unreachable_warning() {
     cache.close().await;
 }
 
-/// The negative of the header case: a chat that records into a store the maintainer can read back
-/// says nothing about a buffer, so none of the eight `chat__*` snapshots moves.
+/// The online negative: a chat that records into a store the maintainer can read back says
+/// nothing about a buffer, so none of the eight `chat__*` snapshots moves.
 #[tokio::test]
 async fn an_online_chat_header_says_nothing_about_a_buffer() {
     let store = MemStore::demo();

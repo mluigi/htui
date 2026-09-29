@@ -275,28 +275,13 @@ pub const TIMESTAMPTZ_DIGITS: u16 = 6;
 /// (`kind = 'chat'`, `item_id NULL`) and one `run_step` (`phase_name = 'chat'`, position 0)
 /// (MOD-2 plan D4).
 ///
-/// The ids are minted client-side, so both paths address the *same* two rows: written straight to
-/// Postgres by [`WriteStore::start_chat_run`](crate::store::WriteStore::start_chat_run), or — for
-/// a chat a build before MOD-25 started offline — buffered to
-/// `<cache_dir>/pending/<project_id>.<run_id>.jsonl` and uploaded later (`docs/ANA-9.md` §4.3);
-/// that upload path is still live, though nothing writes a new buffer. Both inserts are `ON CONFLICT (id) DO NOTHING`, so however the two
-/// interleave the database ends up with one `run` and one `run_step` for the chat, never a second
-/// pair and never a duplicate-key error.
-///
-/// What converges is the row **count**, not every column. `DO NOTHING` means the path that lands
-/// first owns the values, and the two paths do not write the same ones. `start_chat_run` writes
-/// this spec's `agent_id` and `model`, `status = 'running'` on both rows (closed later by
-/// `finish_chat_run`) and [`ChatRunSpec::started_at`] as every stamp. The upload
-/// (`crates/htui-store/src/cache/pending.rs`) writes `agent_id` and `model` NULL - the pending line
-/// format carries neither - `status = 'done'`, and stamps taken from the buffered events' `at`.
-///
-/// So an online-first chat keeps the spec's agent and model when the upload replays over it, while
-/// an **offline-first** chat keeps a NULL `agent_id` even after a later online start. Carrying
-/// `agent_id` and `model` in the pending format belongs to the offline session path, MOD-2
-/// milestone 4 (plan D16); until it lands, that asymmetry is the guarantee. Both directions are
-/// pinned in `crates/htui-store/tests/pg_criteria.rs`, by
-/// `chat_run_rows_converge_with_the_offline_mint` and
-/// `an_offline_first_chat_keeps_the_uploaded_columns`.
+/// The ids are minted client-side and both inserts of
+/// [`WriteStore::start_chat_run`](crate::store::WriteStore::start_chat_run) are
+/// `ON CONFLICT (id) DO NOTHING`, so a start retried after an answer that never arrived lands on
+/// the pair the first attempt wrote: one `run` and one `run_step` for the chat, never a second pair
+/// and never a duplicate-key error (`docs/ANA-9.md` §4.3). Before MOD-25 the same ids also named
+/// the rows of a chat buffered offline under `<cache_dir>/pending/` and uploaded later; that path
+/// has since been removed, and `start_chat_run` is the only writer of the pair.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatRunSpec {
     /// `run.id`.

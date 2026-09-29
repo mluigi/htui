@@ -1547,8 +1547,8 @@ where
     /// `closed` as `resolution`, in one transaction. No run lease is involved: the store re-checks
     /// a live run, the item's status and `Resolution::closes_from` inside that transaction, so a
     /// run started since is refused there with nothing written. The commit rows already exist, so
-    /// none are passed. Until MOD-39 the guard still refuses an `open` item, whatever the
-    /// resolution (MOD-38 plan D6).
+    /// none are passed. The guard admits an `open` item too (`Resolution::default_for(Open)` is
+    /// `withdrawn`, MOD-39 plan P13); `resolution` is the one the Runs pane's picker sent.
     async fn close_out(
         &self,
         item: ItemId,
@@ -2068,7 +2068,8 @@ where
 
     /// MOD-4 plan D167's first confirmation, read-only: [`crate::command::close_out_enabled`],
     /// then [`closeout::preview`] over exactly the rows `CloseOut` would write the summary from,
-    /// carrying the resolution the guard answers (MOD-38 plan D6).
+    /// carrying the resolution the guard answers, which the Runs pane's picker starts on (MOD-38
+    /// plan D6, MOD-39 plan P13).
     ///
     /// # Errors
     /// [`EngineError::RunStatus`] or [`EngineError::NotClosable`], and the store's own.

@@ -1016,9 +1016,8 @@ impl Drop for ChildGuard {
 /// **Async, and the `which` lookup runs on a blocking thread.** Resolving a command walks `PATH`
 /// with a `stat` per candidate — and on Windows a `PATHEXT` product per candidate — which is
 /// filesystem I/O, not arithmetic. Milestone 3 calls this from inside `AgentDriver::start`, so it
-/// would sit on a runtime worker; `crates/htui-store/src/cache/pending.rs` already sets this
-/// crate family's precedent of pushing blocking file I/O through `spawn_blocking`, and doing it
-/// *inside* this function makes the type system enforce it rather than the caller's memory.
+/// would sit on a runtime worker; pushing it through `spawn_blocking` *inside* this function makes
+/// the type system enforce that rather than the caller's memory.
 ///
 /// The rest of the work stays on the caller's thread on purpose: `tokio::process::Command::spawn`
 /// is non-blocking, and the stderr reader is a `tokio::spawn`ed task, so this function must be

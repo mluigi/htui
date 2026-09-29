@@ -20,11 +20,11 @@ use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, Permissi
 use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
-    AgentId, AgentSummary, BindingChange, BoxEdit, BoxId, BoxInfo, Document, DocumentHead,
-    DocumentId, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemSummary, LinkGraph, Note,
-    PhaseId, PhasePatch, ProjectId, ProjectPatch, RepoId, RepoPatch, RunSummary, Scope,
-    SessionEvent, SkillBindingKey, SkillId, SkillPatch, StepGraphId, StepGraphPatch, StepId,
-    WorkspaceId, WorkspacePatch, WorkspaceSummary,
+    AgentId, AgentSummary, BindingChange, BoxEdit, BoxId, BoxInfo, CitationKind, Document,
+    DocumentHead, DocumentId, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemSummary,
+    LinkGraph, Note, PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, RepoId, RepoPatch,
+    RequirementAreaId, RequirementId, RunSummary, Scope, SessionEvent, SkillBindingKey, SkillId,
+    SkillPatch, StepGraphId, StepGraphPatch, StepId, WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::store::{
@@ -42,6 +42,9 @@ use crate::catalogue::{self, CatalogueSnapshot};
 use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, InferReport, MirrorAfterDelete};
 use crate::prompt_settings::{self, SettingsSnapshot};
+use crate::requirements::{
+    self, ItemCitations, RequirementDetail, RequirementText, RequirementsSnapshot,
+};
 use crate::run_worker::{LiveChats, RunRuntime, RunServed};
 use crate::skill_import::SkillImports;
 use crate::skills::{self, SkillsSnapshot, StaleWhat};
@@ -650,6 +653,97 @@ pub enum StoreRequest {
     Document(DocumentId),
     /// Blueprint D182: every action's enabling verdict for the item, from the engine's own guards.
     RunActions(ItemId),
+    /// MOD-39 plan P2: the scope's specs, areas and requirements, answered with
+    /// [`StoreReply::Requirements`].
+    Requirements(Scope),
+    /// One requirement with its coverage and revisions (plan P7).
+    RequirementDetail(RequirementId),
+    /// One item's citations and what it could cite (plan P8), answered with
+    /// [`StoreReply::ItemCitations`].
+    ItemRequirements(ItemId),
+    /// `create_requirement_area`, gated (PRD D1). The worker picks `position` (last + 1).
+    CreateRequirementArea {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The project the area belongs to.
+        project: ProjectId,
+        /// The area code as typed; the worker trims it.
+        code: String,
+        /// The title as typed; the worker trims it.
+        title: String,
+    },
+    /// `mint_requirement`, gated. The worker mints the id and fills `created_by` and `box_id`.
+    MintRequirement {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The area's project: the one the gate checks (MOD-39 blueprint F-7).
+        project: ProjectId,
+        /// The area the requirement is minted in; must be one of `project`'s.
+        area: RequirementAreaId,
+        /// The body.
+        body: RequirementText,
+        /// The rationale.
+        rationale: RequirementText,
+        /// The priority.
+        priority: Priority,
+    },
+    /// `amend_requirement` at `expected_version`, gated; `deciding` is the typed item key (plan
+    /// P6). [`StoreReply::RequirementsStale`] on `Diverged`.
+    AmendRequirement {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The requirement amended.
+        id: RequirementId,
+        /// The version the form opened on: the compare-and-set token.
+        expected_version: i32,
+        /// The new body.
+        body: RequirementText,
+        /// The new rationale.
+        rationale: RequirementText,
+        /// The new priority.
+        priority: Priority,
+        /// The deciding item's key, as typed.
+        deciding: String,
+    },
+    /// `withdraw_requirement` at `expected_version`, gated; `deciding` as above.
+    WithdrawRequirement {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// The requirement withdrawn.
+        id: RequirementId,
+        /// The version the form opened on: the compare-and-set token.
+        expected_version: i32,
+        /// The deciding item's key, as typed.
+        deciding: String,
+    },
+    /// `cite(item, requirement, kind, None)`: a human citation. Not gated (plan P5); `addresses`
+    /// or `reserves` of a requirement of the item's project only (PRD D4).
+    CiteRequirement {
+        /// The citing item.
+        item: ItemId,
+        /// The cited requirement.
+        requirement: RequirementId,
+        /// The citation kind.
+        kind: CitationKind,
+    },
+    /// `uncite`; `amends`/`withdraws` refused (plan P9).
+    UnciteRequirement {
+        /// The citing item.
+        item: ItemId,
+        /// The cited requirement.
+        requirement: RequirementId,
+        /// The citation kind.
+        kind: CitationKind,
+    },
+    /// `reconfirm`: re-stamp at the current version.
+    ReconfirmCitation {
+        /// The citing item.
+        item: ItemId,
+        /// The cited requirement.
+        requirement: RequirementId,
+        /// The citation kind.
+        kind: CitationKind,
+    },
 }
 
 impl StoreRequest {
@@ -741,6 +835,17 @@ impl StoreRequest {
             Self::RunStream { .. } => "run_stream",
             Self::Document(_) => "document",
             Self::RunActions(_) => "run_actions",
+            // The ten of `requirements::REQUEST_NAMES`, in that order (MOD-39 plan P2).
+            Self::Requirements(..) => "requirements",
+            Self::RequirementDetail(..) => "requirement_detail",
+            Self::ItemRequirements(..) => "item_requirements",
+            Self::CreateRequirementArea { .. } => "create_requirement_area",
+            Self::MintRequirement { .. } => "mint_requirement",
+            Self::AmendRequirement { .. } => "amend_requirement",
+            Self::WithdrawRequirement { .. } => "withdraw_requirement",
+            Self::CiteRequirement { .. } => "cite_requirement",
+            Self::UnciteRequirement { .. } => "uncite_requirement",
+            Self::ReconfirmCitation { .. } => "reconfirm_citation",
         }
     }
 }
@@ -820,14 +925,11 @@ pub enum StoreReply {
         session_ref: Option<AgentSessionRef>,
         /// What this transport can do, for the tab's capability banner.
         caps: DriverCaps,
-        /// `Writer::label()` of the store this chat records into: `memory` or `online` (MOD-2 D42;
-        /// `buffered` is the third label, which no accepted chat has carried since MOD-25 made an
-        /// offline one refuse).
+        /// `Writer::label()` of the store this chat records into: `memory` or `online` (MOD-2 D42).
         ///
-        /// It travels on the acceptance because the tab must be able to say that a conversation is
-        /// only on this disk, and it cannot ask: `R-NF-3` keeps every store handle on the worker's
-        /// side, and inferring "offline therefore buffered" from the top bar would be a guess about
-        /// a backend the tab does not hold.
+        /// It was carried so the tab could say that a conversation was only on this disk (the
+        /// `buffered` label, gone since MOD-25 made an offline chat refuse); the tab ignores it
+        /// now.
         writer_label: &'static str,
     },
     /// Answer to [`StoreRequest::StoreState`].
@@ -946,6 +1048,16 @@ pub enum StoreReply {
     /// A box edit missed its token, or its box is gone (D46, D48): the boxes as they are now, for
     /// the editor to reload against. The editor keeps its typed text and retries only on save.
     BoxesStale(Box<BoxesSnapshot>),
+    /// The scope's requirements, freshly read: the answer to [`StoreRequest::Requirements`] and to
+    /// every tab write that applied (MOD-39 plan P3).
+    Requirements(Box<RequirementsSnapshot>),
+    /// An amend or withdraw missed its version (plan P3): the snapshot as it is now. The form keeps
+    /// its text and retries only by hand.
+    RequirementsStale(Box<RequirementsSnapshot>),
+    /// Answer to [`StoreRequest::RequirementDetail`].
+    RequirementDetail(Box<RequirementDetail>),
+    /// Answer to [`StoreRequest::ItemRequirements`] and to every citation write that applied.
+    ItemCitations(Box<ItemCitations>),
     /// The store failed. `request` is [`StoreRequest::name`].
     Failed {
         /// Which request failed.
@@ -1247,6 +1359,19 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::Boxes | StoreRequest::EditBox { .. } => {
             box_settings::serve(backend, request).await?
         }
+        // The ten requirement requests, or-ed for the reason the arms above are: a guard does not
+        // count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-39 plan
+        // P1).
+        StoreRequest::Requirements(..)
+        | StoreRequest::RequirementDetail(..)
+        | StoreRequest::ItemRequirements(..)
+        | StoreRequest::CreateRequirementArea { .. }
+        | StoreRequest::MintRequirement { .. }
+        | StoreRequest::AmendRequirement { .. }
+        | StoreRequest::WithdrawRequirement { .. }
+        | StoreRequest::CiteRequirement { .. }
+        | StoreRequest::UnciteRequirement { .. }
+        | StoreRequest::ReconfirmCitation { .. } => requirements::serve(backend, request).await?,
         StoreRequest::StoreState => StoreReply::StoreState {
             label: backend.label(),
             migrations_pending: None,

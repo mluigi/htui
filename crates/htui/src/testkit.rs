@@ -116,8 +116,8 @@ impl Harness {
     /// Builds a harness over any [`Backend`], not only a memory one.
     ///
     /// The offline chat case needs a `Backend::Offline` over a seeded mirror: what it is testing is
-    /// that the *backend* the store worker holds decides where a chat's rows go, so handing the
-    /// harness a `MemStore` and pretending would test nothing (MOD-2 milestone 4, T21).
+    /// that the *backend* the store worker holds decides whether a chat starts at all (MOD-25), so
+    /// handing the harness a `MemStore` and pretending would test nothing (MOD-2 milestone 4, T21).
     #[must_use]
     pub fn over_backend(backend: Backend) -> Self {
         let (request_tx, rx) = mpsc::unbounded_channel();
@@ -242,10 +242,7 @@ impl Harness {
     /// which would await the flow for `CHAT_END` first (blueprint P-2).
     ///
     /// That reading holds for a chat whose writer never leaves the task — `MemStore`'s
-    /// `append_events` is a lock and a `Vec` push, and `PgStore`'s is served inline here too. It
-    /// does **not** hold for `Writer::Buffered`, which appends to a file through `spawn_blocking`:
-    /// such a chat is `Pending` for as long as a blocking thread takes, and polling it once more
-    /// would be a race rather than a test. [`Harness::drive_to_end`] is that case's answer.
+    /// `append_events` is a lock and a `Vec` push, and `PgStore`'s is served inline here too.
     ///
     /// # Panics
     ///

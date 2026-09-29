@@ -3,7 +3,7 @@ source: crates/htui/tests/skills.rs
 expression: frame
 ---
 Graphics · DESKTOP-HTUI · memory · 0 runs
- 1 Backlog  2 Skills  3 Settings  4 Chat
+ 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
  Skills │ Templates
 ┌ Skills ──────────────────────┐┌ diff v1 → v2 ────────────────────────────────────────────────────┐
 │  rust-style             v2   ││--- rust-style v1                                                 │

@@ -14,7 +14,15 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-29):** **MOD-40 was done** (`docs/decisions/mod/mod-40.md`): step
+**Current status (2026-09-29):** **MOD-39 was done** (`docs/decisions/mod/mod-39.md`): the
+Requirements tab is in (tab 3, so Settings is now 4 and Chat 5), with the project → area →
+requirement tree, coverage with suspect markers, the revision trail with each deciding item, and
+maintainer-only create, amend and withdraw (the maintainer is the project's requirement-spec owner).
+Item detail gained a **Reqs** sub-tab ("Documents" is now "Docs") to re-confirm, cite and uncite,
+and the Runs pane's close-out picks the resolution, so an `open` item can now close as withdrawn,
+rejected, superseded or duplicate. CLEAN-6 was folded in, and the stale `Engine::close_out` doc comments were fixed once
+MOD-40 released `engine.rs`. No migration and no store change.
+Before it, **MOD-40 was done** (`docs/decisions/mod/mod-40.md`): step
 writes (`append_events`, `set_step_usage`, `finish_step`) are fenced by the run's lease owner, so a
 process that wakes after its run was adopted writes nothing to its old step. Lease times are
 stamped by Postgres, quota writes keep the newest, agent edits are a compare-and-set, the store
@@ -26,20 +34,16 @@ and document points carry `item.resolution`, and `htui --search-items --decision
 closed as done, concluded or rejected (maintainer). The collection is now `htui_concepts_v2`, so the
 first `--index-items` after upgrading rebuilds everything; `R-STO-8` was amended in place. It
 minted **MOD-64** (concepts search in the TUI).
-Before it, **MOD-53 was done** (`docs/decisions/mod/mod-53.md`): every task
-the agent runtime spawns now goes through one wrapper that catches a panic and sends that task's own
-terminal failure, so `probing`, a running install or login, or a chat's pending start can no longer
-stay set forever. The same window tells the panic hook the panic is survived, so it no longer gives
-the terminal back under the running UI.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
 (MOD-38) and `0007_skill_attachments` (MOD-9 milestone 2; cache: `0001`..`0004`), so **the next
 migration is `0008`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
-(done, all four milestones), MOD-38, MOD-9 milestones 1 to 4 and MOD-40 (re-counted 2026-09-29):
-store conformance `CASES` 96, `READ_CASES` 14, `htui-orch` `CASES` 73, `GraphSource` 7 methods, `StoreRequest` 75, `StoreReply`
-43, `hierarchy::REQUEST_NAMES` 13, 288 `.sqlx` files, 96 `crates/htui/tests/snapshots`,
+(done, all four milestones), MOD-38, MOD-9 milestones 1 to 4, MOD-40 and MOD-39 (re-counted
+2026-09-29): store conformance `CASES` 96, `READ_CASES` 14, `htui-orch` `CASES` 73, `GraphSource` 7
+methods, `StoreRequest` 85, `StoreReply` 47, `hierarchy::REQUEST_NAMES` 13, 288 `.sqlx` files, 107
+`crates/htui/tests/snapshots`,
 `MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 34 pinned commented
 columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 2` with `skill_choices`.
 Excerpts reach phase prompts since MOD-7 milestone 4, so a phase-prompt digest recorded before
@@ -160,13 +164,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   Deliver a verdict and the `MOD-N` that implements it.
 
 ### Next features
-- [ ] **MOD-39 - Requirements tab and item traceability** (from ANA-11; MOD-38 done,
-  `docs/decisions/mod/mod-38.md`: the seam, `item.resolution` and `Resolution::default_for` exist).
-  `R-TUI-1`, `R-TUI-9`, `R-ENT-14..15`. Requirements tab (areas, requirements, coverage by
-  citing item with status and resolution, withdrawn rows dimmed, revision trail with the deciding
-  item); cited requirements with suspect markers and a re-confirm action in item detail; a
-  resolution picker in MOD-4's Runs-pane close-out confirmation; maintainer-only
-  create/amend/withdraw, where amend names the deciding item (`docs/ANA-11.md` §6).
 - [ ] **MOD-37 - Orchestrator hardening follow-ups** (from MOD-4). `R-ORCH-3`, `R-ORCH-5`,
   `R-ORCH-8`, `R-ORCH-9`, `R-TUI-4`, `R-HIS-1`, `R-NF-3`. MOD-4 closed with these risks carried and
   no other item owns them. Each is small, known and recorded; none blocks a manual run today. Pick
@@ -300,7 +297,10 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   `crates/htui/src/ui/tabs/backlog/detail/`. `ui::cells::cell_width` is the shared measurement to
   build on. Note the chat transcript is the one to be careful with, because a snapshot there would
   move. Also out of scope there: soft wrap, bidi, and terminals that report a CJK char as one cell.
-  Not blocked; MOD-54 is done (`docs/decisions/mod/mod-54.md`).
+  Not blocked; MOD-54 is done (`docs/decisions/mod/mod-54.md`). MOD-39 added two more `char`
+  counters: the Requirements tab's `tree::pad`/`clip` (on a narrow pane `pad` cuts the
+  ` · read-only` marker before the project name) and the Reqs sub-tab's `cut`
+  (`docs/decisions/mod/mod-39.md`, "Carried").
 - [ ] **MOD-59 - A write's reply names itself, so a form never stays "in flight"** (from MOD-9
   milestone 3 review, finding 3). `R-TUI-7`, `R-NF-3`. The Skills and Templates views decide that a
   save landed by finding what they sent in the re-read snapshot (`ui/tabs/skills/library.rs` `land`,
@@ -310,7 +310,9 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   form refuses `Esc` and `Ctrl+S` until the workspace changes. Make a write's reply identify itself
   (e.g. `StoreReply::SkillsWritten { snapshot, what }` and a templates twin) so landing no longer
   depends on content, or release the form on any reply to the write's request name. Found
-  2026-09-26.
+  2026-09-26. MOD-39's Requirements tab lands the same way (`ui/tabs/requirements/mod.rs` `land`),
+  and re-reads after a refused mint because the worker answers `Failed` when only its re-read
+  failed; a reply that names its write would retire both (`docs/decisions/mod/mod-39.md`).
 - [ ] **MOD-49 - Interactive path picker for repo and workspace roots** (from MOD-7). `R-BOX-4`,
   `R-TUI-8`. MOD-7 D5 infers each repo's path on a box and falls back to a typed path in a text box
   when inference fails; as built, the typed fallback is Settings > Hierarchy's `b` (MOD-7 milestone
@@ -758,14 +760,13 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   `htui --search-items [--decisions]`, `crates/htui/src/concepts.rs`); inside the TUI, Qdrant is
   only a Settings section. Add a search overlay: free text, scoped to the selected project or all,
   a decisions toggle, and hits listed as `concepts::format_hit` prints them. Enter on an item or
-  document hit selects that item in the Backlog; a requirement hit opens it in MOD-39's
-  Requirements tab once that exists. Embedding the query loads the model synchronously
+  document hit selects that item in the Backlog; a requirement hit opens it in the
+  Requirements tab (MOD-39, done: `docs/decisions/mod/mod-39.md`). Embedding the query loads the model synchronously
   (`FastEmbedder::new`, MOD-34 review), so the search runs off the UI thread, and a missing or
   unreachable Qdrant is an inline error that affects nothing else (`R-STO-8`). Whether the TUI also
   offers a re-index action, or leaves that to MOD-41's background sync, is this item's call. MOD-50
   is done (`docs/decisions/mod/mod-50.md`): hits carry an `Owner` (item or requirement), the
   resolution and the requirement state, and `concepts::DECISION_RESOLUTIONS` is the decisions set.
-  Best after MOD-39.
 
 ### Deferred backlog
 
@@ -777,11 +778,18 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   in a change that first pins which stop reason each shipped loop case reaches, because the fix can
   change that. Source: `.claude/plans/mod-4-orch-fanout.blueprint.md` F-B and §11, carried unchanged
   through milestones 5 and 6 (`docs/decisions/mod/mod-4.md`, "Carried").
-- [ ] **CLEAN-6 - Runs pane doc says approve takes a typed note** (from the README rewrite,
-  2026-09-29). `R-TUI-4`. The module doc's key table (`crates/htui/src/ui/tabs/backlog/detail/runs.rs:19`)
-  reads "`a` / `x` approve / reject with a typed note", but only reject opens a note field; `a`
-  sends `AnswerGate(Approved)` at once (`:504-517`). The code matches `R-TUI-4` ("approve, reject
-  with note"), so only the comment changes.
+- [ ] **CLEAN-7 - Leftovers of the removed offline chat buffer** (from MOD-39, 2026-09-29).
+  `R-NF-3`. MOD-25 refused offline chats and the buffer machinery was deleted later; MOD-39 fixed
+  the comments (`docs/decisions/mod/mod-39.md`), which left code and text: the Settings rebuild
+  confirm still says "the pending/ buffer" survives (`ui/tabs/settings/connection.rs` ~140 and
+  ~996, asserted in `tests/connection.rs` and the `connection__confirm` snapshot);
+  `RefreshSettings::this_user` (`htui-store/src/cache/refresh.rs`) is set and never read;
+  `agent_worker.rs` `quota_latch_for` always answers `Some` and it and `project_caps_for` take an
+  unused `_writer`; `writer_label` still rides `StoreReply::ChatAccepted` and `ChatArgs` though the
+  Chat tab ignores it; and test names and messages still say upload or buffered
+  (`mem.rs` `a_chat_run_mints_the_two_rows_the_offline_upload_would`, `recorder.rs` ~1531,
+  `agent_worker.rs` ~5828/5976/7170, `chat_offline.rs`, `tests/cache.rs` `pending_event`).
+  No behaviour change.
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
@@ -800,6 +808,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 4 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-26 configurable hotkeys) |
-| MOD-N   | 36 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-6 Runs pane approve doc)                |
+| MOD-N   | 35 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-7 offline-buffer leftovers)            |
 | TOOL-N  | 0 |

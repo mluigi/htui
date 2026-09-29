@@ -1466,12 +1466,11 @@ async fn usage_deltas_sum_into_step_usage() {
 
 /// A `usage` row masking made unreadable is **still summed**, because it is still persisted.
 ///
-/// `run_step.usage` has two writers: this recorder, online, and `upload_pending`, for a chat that
-/// happened offline. The uploader sums every persisted `usage` row through
-/// `UsageTotals::from_rows`, so a row the recorder persisted but skipped would make an online step
-/// and the same step uploaded from a buffer disagree - for exactly one row shape, which is the kind
-/// of divergence nobody finds twice (MOD-2 plan D36). The last assertion is that property stated
-/// directly: the recorder's document and the uploader's document over the very same rows.
+/// `UsageTotals::from_rows` re-derives `run_step.usage` from every persisted `usage` row (a
+/// continued step's starting total, MOD-4 plan D164), so a row the recorder persisted but skipped
+/// would make the recorder's document and the log's disagree - for exactly one row shape, which is
+/// the kind of divergence nobody finds twice (MOD-2 plan D36). The last assertion is that property
+/// stated directly: the recorder's document and `from_rows`' over the very same rows.
 #[tokio::test]
 async fn an_unreadable_usage_row_is_still_summed_into_step_usage() {
     let chat = chat_spec();

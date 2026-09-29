@@ -10,6 +10,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use htui::agent_worker::AgentRuntime;
 use htui::app::Action;
+use htui::requirements::decision_citation_stays;
 use htui::run_worker::{self, LiveChats, RunRuntime, StepAuthor};
 use htui::testkit::Harness;
 use htui::ui::tabs::backlog::BacklogTab;
@@ -19,10 +20,10 @@ use htui_agent::fake::FakeAdapter;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::{demo_at, edit_agent, ids};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, DocumentId, ItemId, NewDocument, RunStep, SnapshotPhase,
-    Transport, WorkspaceSummary,
+    Agent, AgentBox, AgentId, Billing, CitationKind, DocumentId, ItemId, NewDocument, Resolution,
+    RunStep, SnapshotPhase, Status, Transport, WorkspaceSummary,
 };
-use htui_core::store::{MemStore, WriteStore as _};
+use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 use htui_orch::Clock;
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
 use htui_store::Backend;
@@ -226,9 +227,15 @@ async fn h_and_l_cycle_the_sub_tabs_both_ways() {
     down(&mut harness, TO_FEAT_1).await;
     harness.key("h");
     assert!(
-        harness.render().contains("digest"),
-        "h from Body wraps around to Prompt, the sixth since MOD-2 milestone 9"
+        harness.render().contains("R-STO-1 addresses v1"),
+        "h from Body wraps around to Reqs, the seventh since MOD-39 (blueprint F-5)"
     );
+    harness.key("h");
+    assert!(
+        harness.render().contains("digest"),
+        "a second h lands on Prompt, the sixth since MOD-2 milestone 9"
+    );
+    harness.key("l");
     harness.key("]");
     assert!(
         harness
@@ -245,6 +252,174 @@ async fn h_and_l_cycle_the_sub_tabs_both_ways() {
             .contains("Stand up the terminal application"),
         "[ goes back to Body"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Reqs sub-tab (MOD-39 PRD D3, D4; plan P12; blueprint §5).
+// ---------------------------------------------------------------------------------------------
+
+/// Steps right of Body to the Reqs sub-tab, registered after Prompt.
+const TO_REQS: usize = 6;
+
+/// Rows down to htui `CLEAN-1`, the item that cites no requirement.
+const TO_CLEAN_1: usize = 2;
+
+/// On htui `FEAT-1`'s Reqs sub-tab, `c` opens the picker over htui's active requirements but
+/// `R-STO-1`, which `FEAT-1` already addresses, and `j` puts its cursor on `R-ENT-2`, the second:
+/// the harness and the frame at the Pick stage.
+async fn picking_r_ent_2() -> (Harness, String) {
+    let mut harness = backlog().await;
+    down(&mut harness, TO_FEAT_1).await;
+    sub_tab(&mut harness, TO_REQS);
+    harness.key("c");
+    harness.drive_to_end().await;
+    harness.key("j");
+    let frame = harness.render();
+    (harness, frame)
+}
+
+/// [`picking_r_ent_2`], then `Enter` picks it and `a` cites it as `addresses`.
+async fn cited_r_ent_2() -> Harness {
+    let (mut harness, _) = picking_r_ent_2().await;
+    harness.key("enter");
+    harness.key("a");
+    harness.drive_to_end().await;
+    harness
+}
+
+/// PRD D3: the arrival row `ANA-1` cites `R-ENT-1` at v1, and `ANA-2` amended it to v2 since, so
+/// the citation is the demo's one suspect citation.
+#[tokio::test]
+async fn the_reqs_sub_tab_shows_ana_1_s_suspect_citation() {
+    let mut harness = backlog().await;
+    sub_tab(&mut harness, TO_REQS);
+    let frame = harness.render();
+    assert!(frame.contains("┌ ANA-1"), "the arrival row:\n{frame}");
+    assert!(
+        frame.contains("R-ENT-1 addresses v1 ! suspect"),
+        "the citation, its stamp and the marker:\n{frame}"
+    );
+    assert!(
+        frame.contains("Every item has a stable key"),
+        "the requirement's first line under it:\n{frame}"
+    );
+    insta::assert_snapshot!("detail_reqs", frame);
+}
+
+/// Plan P9: `r` re-stamps the suspect citation at the requirement's current version.
+#[tokio::test]
+async fn r_reconfirms_the_suspect_citation() {
+    let mut harness = backlog().await;
+    sub_tab(&mut harness, TO_REQS);
+    harness.key("r");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert_eq!(harness.app().status, None, "the re-confirm applied");
+    assert!(
+        frame.contains("R-ENT-1 addresses v2"),
+        "stamped at v2:\n{frame}"
+    );
+    assert!(
+        !frame.contains("! suspect"),
+        "and no longer suspect:\n{frame}"
+    );
+    insta::assert_snapshot!("detail_reqs_reconfirmed", frame);
+}
+
+/// PRD D4: `c` offers the active requirements of the item's own project that it does not cite
+/// yet, `Enter` picks one and `a` cites it as `addresses`; the list cursor never moves while the
+/// picker captures, and lands on the new citation once it is made.
+#[tokio::test]
+async fn c_cites_a_requirement_of_the_item_s_project() {
+    let (mut harness, picker) = picking_r_ent_2().await;
+    assert!(
+        picker.contains("┌ FEAT-1"),
+        "the list cursor stayed:\n{picker}"
+    );
+    assert!(
+        picker.contains("▸ R-ENT-2 later An item may carry"),
+        "the picker's cursor is on R-ENT-2:\n{picker}"
+    );
+    assert!(
+        !picker.contains("R-STO-1 must"),
+        "R-STO-1, already cited, is not offered:\n{picker}"
+    );
+    insta::assert_snapshot!("detail_reqs_cite_picker", picker);
+
+    harness.key("enter");
+    harness.key("a");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert_eq!(harness.app().status, None, "the cite applied");
+    assert!(
+        frame.contains("▸ R-ENT-2 addresses v1"),
+        "the new citation, under the cursor:\n{frame}"
+    );
+    assert!(
+        frame.contains("R-STO-1 addresses v1"),
+        "next to the one FEAT-1 already had:\n{frame}"
+    );
+}
+
+/// Plan P9: `u` asks, `y` uncites; the row is gone.
+#[tokio::test]
+async fn u_then_y_uncites() {
+    let mut harness = cited_r_ent_2().await;
+    assert!(
+        harness.render().contains("▸ R-ENT-2 addresses v1"),
+        "the new citation is under the cursor"
+    );
+    harness.key("u");
+    let asking = harness.render();
+    assert!(
+        asking.contains("uncite R-ENT-2 (addresses)?"),
+        "`u` asks first:\n{asking}"
+    );
+    harness.key("y");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert_eq!(harness.app().status, None, "the uncite applied");
+    assert!(!frame.contains("R-ENT-2"), "the citation is gone:\n{frame}");
+    assert!(
+        frame.contains("R-STO-1 addresses v1"),
+        "and the other one stays:\n{frame}"
+    );
+}
+
+/// Plan P9: `ANA-2`'s `amends` citation records a decision, so `u` answers the status line and
+/// asks nothing.
+#[tokio::test]
+async fn u_on_an_amends_citation_is_answered_on_the_status_line() {
+    let mut harness = backlog().await;
+    down(&mut harness, TO_ANA_2).await;
+    sub_tab(&mut harness, TO_REQS);
+    harness.key("u");
+    harness.drive_to_end().await;
+    assert_eq!(
+        harness.app().status,
+        Some(decision_citation_stays(CitationKind::Amends))
+    );
+    let frame = harness.render();
+    assert!(
+        frame.contains("R-ENT-1 amends v2"),
+        "the citation stays:\n{frame}"
+    );
+    assert!(!frame.contains("uncite R-"), "and nothing asks:\n{frame}");
+}
+
+/// Plan D11: `CLEAN-1` cites nothing, and the pane says so rather than going blank.
+#[tokio::test]
+async fn the_reqs_sub_tab_says_so_when_it_has_nothing() {
+    let mut harness = backlog().await;
+    down(&mut harness, TO_CLEAN_1).await;
+    sub_tab(&mut harness, TO_REQS);
+    let frame = harness.render();
+    assert!(frame.contains("┌ CLEAN-1"), "the empty case:\n{frame}");
+    assert!(
+        frame.contains("No requirements cited."),
+        "a message, never a blank pane:\n{frame}"
+    );
+    insta::assert_snapshot!("empty_reqs", frame);
 }
 
 #[tokio::test]
@@ -486,6 +661,60 @@ async fn the_close_out_counts_then_asks_for_the_key() {
     );
     insta::assert_snapshot!("runs_closeout_typed", typed);
     assert_eq!(harness.app().status, None);
+}
+
+/// MOD-39 plan P13 through the whole tab: the engine's preview starts an `open` item's picker on
+/// `withdrawn`; `l`/`→` and `h`/`←`, which cycle the sub-tabs elsewhere, reach the Runs pane's
+/// picker while it captures input; and the key typed back closes the item with the resolution
+/// picked, not the default.
+#[tokio::test]
+async fn the_close_out_picker_takes_h_and_l_and_lands_the_pick() {
+    let adapter = FakeAdapter::new();
+    let store = MemStore::demo();
+    let mut harness = driving(store.clone(), &adapter).await;
+    for _ in 0..TO_ANA_2 {
+        harness.key("j");
+        harness.drive().await;
+    }
+    sub_tab(&mut harness, 1);
+    harness.key("C");
+    harness.drive().await;
+    let warn = harness.render();
+    assert!(
+        warn.contains("close ANA-2 as withdrawn"),
+        "an `open` item's picker starts on `withdrawn`:\n{warn}"
+    );
+
+    for (key, picked) in [
+        ("l", "superseded"),
+        ("right", "duplicate"),
+        ("h", "superseded"),
+        ("left", "withdrawn"),
+        ("left", "rejected"),
+    ] {
+        harness.key(key);
+        harness.drive().await;
+        let frame = harness.render();
+        assert!(
+            frame.contains(&format!("close ANA-2 as {picked}")),
+            "`{key}` picks `{picked}` and stays on the Runs pane:\n{frame}"
+        );
+    }
+
+    harness.key("y");
+    type_text(&mut harness, "ANA-2");
+    harness.key("enter");
+    harness.drive().await;
+    assert_eq!(harness.app().status, None, "the close-out was accepted");
+    let closed = store
+        .item(ids::HTUI_ANA_2)
+        .await
+        .expect("the memory store never fails")
+        .expect("the item exists");
+    assert_eq!(
+        (closed.status, closed.resolution),
+        (Status::Closed, Some(Resolution::Rejected))
+    );
 }
 
 /// D168, D182: a refused key shows the engine guard's own sentence and sends nothing: with no run

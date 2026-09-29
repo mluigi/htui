@@ -179,7 +179,7 @@ fn usage_is_one_row_per_turn_with_every_figure_a_delta_of_the_cumulative_report(
          rows, so the deltas must reconstruct the cumulative figure exactly"
     );
 
-    // And the same sum through the type the uploader actually uses.
+    // And the same sum through the type the recorder actually uses.
     let mut totals = UsageTotals::default();
     for usage in &usage {
         totals.add_payload(&serde_json::to_value(usage).expect("a usage payload serialises"));

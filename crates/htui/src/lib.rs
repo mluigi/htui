@@ -24,6 +24,7 @@ pub mod preview;
 pub mod prompt_settings;
 /// State and summary of the Qdrant connection string.
 pub mod qdrant_settings_info;
+pub mod requirements;
 pub mod run_worker;
 pub mod skill_import;
 pub mod skills;

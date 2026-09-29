@@ -473,10 +473,10 @@ pub trait WriteStore: ReadStore {
     /// Mints the `run` / `run_step` pair of a free-standing chat, both `ON CONFLICT (id) DO
     /// NOTHING` (MOD-2 plan D4).
     ///
-    /// The rows are the ones `htui-store`'s pending-buffer upload writes for the same chat, with
-    /// `status = 'running'` and `finished_at NULL` in place of the upload's terminal values, so an
-    /// online start followed by a replayed upload - or the reverse - converges on one pair of rows
-    /// rather than two.
+    /// Both rows are written `status = 'running'` with `finished_at NULL`, which
+    /// [`finish_chat_run`](WriteStore::finish_chat_run) closes. The ids are the spec's, minted
+    /// client-side, so a start retried after an answer that never arrived converges on one pair of
+    /// rows rather than two.
     ///
     /// # Errors
     ///
@@ -1973,10 +1973,10 @@ pub fn run_is_terminal(run: RunId, status: RunStatus) -> String {
 /// sentences could before they were named. `to` is the run's terminal status and `item` the item's
 /// *current* one; the caller has already established that no other run of the item is active.
 ///
-/// `None` is "leave it alone", which is plan D17 rather than an omission: MOD-2's chat path and the
-/// offline upload path insert `run` and `item` rows outside §4.3, so an item at a status this table
-/// does not list has not necessarily passed through [`Status::can_move_to`] and must not be forced
-/// through the law on its way out.
+/// `None` is "leave it alone", which is plan D17 rather than an omission: MOD-2's chat path, and
+/// before MOD-25 the offline upload path, insert `run` and `item` rows outside §4.3, so an item at
+/// a status this table does not list has not necessarily passed through [`Status::can_move_to`]
+/// and must not be forced through the law on its way out.
 #[must_use]
 pub const fn finish_run_item_mirror(to: RunStatus, item: Status) -> Option<Status> {
     match (to, item) {

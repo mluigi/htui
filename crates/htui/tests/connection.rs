@@ -576,9 +576,8 @@ async fn rebuild_cache_empties_the_mirrored_tables_and_keeps_the_meta() {
         .await
         .expect("the mirror is seeded");
     let before = cache.meta().await.expect("a seeded mirror has meta");
-    // `project`, not `item`: `seed_mirror` writes the six unscoped tables an offline *write* path
-    // needs, and the cursor-driven ones are not among them. It is one of `MIRRORED_TABLES` either
-    // way.
+    // `project`, not `item`: `seed_mirror` writes six unscoped tables, and the cursor-driven ones
+    // are not among them. It is one of `MIRRORED_TABLES` either way.
     let projects: i64 = sqlx::query_scalar("SELECT count(*) FROM project")
         .fetch_one(cache.pool())
         .await
@@ -2052,7 +2051,8 @@ async fn the_product_registers_connection_after_prompt() {
     let mut harness = Harness::demo();
     htui::app::register_all(harness.app());
     harness.settle().await;
-    harness.key("3");
+    // Settings is the fourth tab since the Requirements tab took `3` (MOD-39 plan T5).
+    harness.key("4");
     harness.settle().await;
 
     let frame = harness.render();

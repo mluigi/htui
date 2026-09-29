@@ -23,7 +23,8 @@ pub struct Preview {
     pub title: String,
     /// `item.status` now.
     pub status: Status,
-    /// What the close-out closes as: `Resolution::default_for(status)` until MOD-39.
+    /// The resolution the confirmation starts on: `close_out_enabled`'s answer. The Runs pane
+    /// may send another that `closes_from(status)` (MOD-39 plan P13).
     pub resolution: Resolution,
     /// Runs of the item the summary lists.
     pub runs: usize,

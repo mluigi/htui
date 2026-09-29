@@ -14,11 +14,9 @@
 //! frames the whole time and is exactly where it was when `Esc` closes the replay.
 //!
 //! Milestone 4 also let a chat start with the store unreachable, in which case its rows went to the
-//! offline buffer instead of to Postgres. The header said so (D42), from the `writer_label` the
-//! acceptance carried — never from a guess about which backend the worker is holding, which is a
-//! thing this tab is not allowed to know (`R-NF-3`). Since MOD-25 no backend hands out the
-//! (`BUFFERED_LABEL` / `BUFFERED_NOTE`, and the comparison that uses them) is kept compiling
-//! for the reversal and is never taken; a later CLEAN item removes it.
+//! offline buffer instead of to Postgres, and the header said so (D42) from the `writer_label` the
+//! acceptance carried. Since MOD-25 an offline chat is refused before it starts, the buffer has
+//! been removed, and the tab ignores `writer_label`.
 //!
 //! Since MOD-4 milestone 6 the tab also drives a **promoted graph step** (plan D165): the Runs
 //! pane's `p` asks the shell to promote on this tab's behalf, the `Orch(Promoted)` reply names
@@ -67,17 +65,6 @@ const REPLAY_HINT: &str = "Esc leave replay · t thoughts · j/k scroll";
 /// the shell asked for it on the tab's behalf.
 const PROMOTE_STEP: &str = crate::run_worker::ORCH_NAMES[5];
 
-/// [`crate::store_worker::StoreReply::ChatAccepted::writer_label`] of the offline sink.
-///
-/// Compared rather than matched on a backend: the tab is told where its rows went and does not
-/// deduce it (`R-NF-3`).
-///
-/// What the header adds when the conversation is only on this disk (D42).
-///
-/// An offline chat is in no `run` table until it is uploaded, so `active_runs` does not count it
-/// and the Runs pane cannot list it: this line is the only place it is visible, and the maintainer
-/// has to be able to tell it apart from a conversation the server already holds.
-///
 /// The live chat, once one has been accepted.
 #[derive(Debug, Clone)]
 pub struct ChatSessionState {
@@ -87,7 +74,6 @@ pub struct ChatSessionState {
     pub session_ref: Option<AgentSessionRef>,
     /// What this transport can do.
     pub caps: DriverCaps,
-    /// The chat records into the offline buffer, not into a store anyone else can read (D42).
     /// How the session ended, once it has.
     pub ended: Option<htui_agent::event::StopReason>,
 }

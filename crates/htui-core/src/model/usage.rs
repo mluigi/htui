@@ -5,11 +5,11 @@
 //! the five keys this type carries. A key no row ever reported stays `null`, so "the agent reports
 //! no token counts" and "the agent reported zero" stay distinguishable.
 //!
-//! The rule lives here rather than in the recorder because two writers need it and neither may
-//! depend on the other: `htui-agent`'s recorder sums the deltas as they arrive, and `htui-store`'s
-//! `upload_pending` sums the same rows again when a chat that happened offline is uploaded. A
-//! second, hand-written sum would drift from the first, and a step uploaded later must be
-//! indistinguishable from one recorded online.
+//! The rule lives here so that every sum of a step's rows is one sum: `htui-agent`'s recorder adds
+//! the deltas as they arrive, and [`UsageTotals::from_rows`] sums the same rows again from the log
+//! (a continued step's starting total, MOD-4 plan D164). Before MOD-25 `htui-store`'s upload of an
+//! offline chat was a second writer through the same rule. A second, hand-written sum would drift
+//! from the first.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -42,9 +42,9 @@ impl UsageTotals {
     /// adds nothing and leaves its total as it was.
     ///
     /// Takes the JSON document rather than a typed event because the typed event lives in
-    /// `htui-agent` and the uploader in `htui-store`, and the payload is the one thing both hold —
-    /// the recorder passes the scrubbed document it is about to persist, so both sides sum exactly
-    /// the bytes the row carries.
+    /// `htui-agent` and the payload is what the persisted row holds — the recorder passes the
+    /// scrubbed document it is about to persist, so a live sum and [`UsageTotals::from_rows`] add
+    /// exactly the bytes the row carries.
     pub fn add_payload(&mut self, payload: &Value) {
         add_delta(&mut self.input_tokens, payload, "input_tokens");
         add_delta(&mut self.output_tokens, payload, "output_tokens");
@@ -56,8 +56,8 @@ impl UsageTotals {
     /// [`UsageTotals::add_payload`] over every row whose kind is [`EventKind::Usage`], in slice
     /// order; rows of any other kind contribute nothing.
     ///
-    /// The uploader's entry point: it holds the step's persisted rows and nothing else, and this
-    /// is what turns them back into the document the online recorder would have written.
+    /// The entry point for a caller that holds the step's persisted rows and nothing else: this is
+    /// what turns them back into the document the recorder writes.
     #[must_use]
     pub fn from_rows(rows: &[SessionEvent]) -> Self {
         let mut totals = Self::default();
@@ -67,8 +67,7 @@ impl UsageTotals {
         totals
     }
 
-    /// The `run_step.usage` document: the five keys, each nullable, that `set_step_usage` and the
-    /// uploader's `run_step` insert write.
+    /// The `run_step.usage` document: the five keys, each nullable, that `set_step_usage` writes.
     ///
     /// Built by hand rather than through `serde_json::to_value`, whose signature is fallible while
     /// five nullable integers cannot fail to serialize; `to_value_matches_the_serde_form` pins the
@@ -124,7 +123,7 @@ mod tests {
     }
 
     /// The recorder's `usage_deltas_sum_into_step_usage` case, reached from the persisted rows
-    /// instead of from the live events: the uploader must land on the same document.
+    /// instead of from the live events: a sum over the rows must land on the same document.
     #[test]
     fn from_rows_sums_the_deltas() {
         let step = StepId::new();
@@ -160,7 +159,7 @@ mod tests {
 
     /// `cost_micros_total` is the agent's cumulative figure and `cost_micros` the delta derived
     /// from it (ANA-4 §7). Summing the deltas is the rule; the cumulative key is not one of the
-    /// five and must not leak into the document, or an uploaded step would double-count.
+    /// five and must not leak into the document, or the document would double-count.
     #[test]
     fn the_cumulative_key_is_not_summed_and_never_reaches_the_document() {
         let step = StepId::new();

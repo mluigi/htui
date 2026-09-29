@@ -1441,9 +1441,9 @@ impl CacheStore {
     /// (MOD-2 plan D70).
     ///
     /// The offline arm of the per-run cap, and it needs no new mirrored column: `project.settings`
-    /// has been mirrored since `cache_migrations/0001_mirror.sql:57-61`. An offline chat therefore
-    /// enforces the same cap as an online one, off the same document — which is the reason D70
-    /// chose this column over an env knob or a new table.
+    /// has been mirrored since `cache_migrations/0001_mirror.sql:57-61`. Before MOD-25 an offline
+    /// chat therefore enforced the same cap as an online one, off the same document — which is the
+    /// reason D70 chose this column over an env knob or a new table.
     ///
     /// A runtime query rather than a macro, like every statement in this file: the mirror has no
     /// compile-time schema for `sqlx` to check against.
@@ -1466,9 +1466,8 @@ impl CacheStore {
     ///
     /// [`user_named`](CacheStore::user_named) under
     /// [`identity::os_user_name`](crate::identity::os_user_name) - the *same* name
-    /// [`PgStore::seed_if_empty`](crate::PgStore::seed_if_empty) stamped the database with, which
-    /// is what makes a run recorded offline and uploaded later indistinguishable from one recorded
-    /// online.
+    /// [`PgStore::seed_if_empty`](crate::PgStore::seed_if_empty) stamped the database with, so the
+    /// mirror answers the same author the server does.
     ///
     /// # Errors
     ///
@@ -1485,7 +1484,7 @@ impl CacheStore {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] when no mirrored row carries that name. Refusing is the point: an
-    /// invented `UserId` would make the uploader insert a stranger as the run's author.
+    /// invented `UserId` would name an author the server does not have.
     pub async fn user_named(&self, name: &str) -> Result<UserId> {
         let row =
             sqlx::query("SELECT id FROM app_user WHERE name = ? ORDER BY created_at, id LIMIT 1")

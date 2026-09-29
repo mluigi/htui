@@ -69,8 +69,7 @@ impl Writer {
 }
 
 /// D35's refusal for the registry writes, and MOD-2 D52's for a probe that has no server to
-/// write its snapshot to: the same sentence in both places, on purpose. It is also what an
-/// offline chat logs when it declines to latch a quota (MOD-2 plan D68).
+/// write its snapshot to: the same sentence in both places, on purpose.
 /// A probe costs process spawns, so the caller checks this **before** it spawns anything rather
 /// than discovering the refusal on the write. Writing a probe result somewhere local is the
 /// local-only store's job (MOD-17), not this seam's.
@@ -81,8 +80,8 @@ pub const REGISTRY_ON_SERVER_ONLY: &str = "the agent registry is written on the 
 /// It names **two** facts because they are the same fact from either end. Reading: four of the
 /// assembler's inputs — `prompt_template`, `skill`, `skill_version`, `skill_binding`, `box_tool` —
 /// have no cache mirror, so a preview cannot be assembled offline at all. Writing:
-/// `run_step.trim_record` has nowhere to go in the pending buffer, whose line format is
-/// `session_event` columns only, and unlike `run_step.usage` nothing can recompute it at upload.
+/// `run_step.trim_record` has nowhere to go offline — since MOD-25 there is no offline write path
+/// at all, and the pending buffer before it carried `session_event` columns only.
 /// One constant, so a user who meets the refusal from the preview and from a step's audit row
 /// reads the same sentence and does not have to decide whether they are two problems.
 pub const PROMPT_ON_SERVER_ONLY: &str = "the prompt path needs the server: templates, skills and box tools are not mirrored, and a \

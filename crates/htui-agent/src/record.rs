@@ -420,8 +420,8 @@ pub struct Recorder<'a, S: WriteStore> {
     digest_pending: Option<String>,
     usage: UsageTotals,
     usage_dirty: bool,
-    /// Plan D66-D68: `None` records no quota — a test, an offline chat, or a backend that refused
-    /// the latch once and will not be asked again this session.
+    /// Plan D66-D68: `None` records no quota — a test, or a backend that refused the latch once
+    /// and will not be asked again this session.
     quota_latch: Option<QuotaLatch>,
     /// The last vendor blob a `usage` row of this session carried, as scrubbed and persisted.
     ///
@@ -553,9 +553,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// Records `agent_box.quota` for one row as well as the step's log (plan D66-D68).
     ///
     /// A builder rather than a sixth parameter to [`Recorder::new`] because most recorders have no
-    /// latch: every conformance case that is not about quota, every buffered chat a build before
-    /// MOD-25 started (a buffered writer refuses registry writes, so the worker answers `None`
-    /// before the first row rather than discovering it on one), and every test of the other twelve
+    /// latch: every conformance case that is not about quota, and every test of the other twelve
     /// rules.
     #[must_use]
     pub fn with_quota_latch(mut self, latch: QuotaLatch) -> Self {
@@ -797,8 +795,8 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// **The return value is the cap verdict** (plan D69-D70): `Some` on the one `usage` row whose
     /// running spend reached [`RunCap::micros`], and `None` on every other row of every session,
     /// including every later row of a session that already breached. A caller that holds the
-    /// session answers it with [`enforce_breach`]; a caller that does not — a replay, an uploader,
-    /// a test asserting on rows — may ignore it, which is why it is not `#[must_use]`.
+    /// session answers it with [`enforce_breach`]; a caller that does not — a replay, a test
+    /// asserting on rows — may ignore it, which is why it is not `#[must_use]`.
     ///
     /// # Errors
     /// [`RecordError::Store`] when a flush fails, [`RecordError::Encode`] when the event cannot
@@ -915,9 +913,9 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
                 }
                 if matches!(event, DriverEvent::Usage(_)) {
                     // The scrubbed document that is about to be persisted, not the typed event:
-                    // the uploader (`htui-store`) has only these bytes, and summing them on both
-                    // sides is what makes an uploaded step's `run_step.usage` indistinguishable
-                    // from an online one (plan D36).
+                    // `UsageTotals::from_rows` has only these bytes when it re-derives
+                    // `run_step.usage` from the log, and summing them here too keeps the two one
+                    // document (plan D36).
                     self.usage.add_payload(&payload);
                     self.usage_dirty = true;
                     self.latch_quota(&payload, scrubbed.at).await;

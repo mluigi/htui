@@ -1,16 +1,18 @@
-//! The detail pane: the [`DetailTab`] contract, the registry that holds the six sub-tabs, and
+//! The detail pane: the [`DetailTab`] contract, the registry that holds the seven sub-tabs, and
 //! the scroll state they share.
 //!
 //! Sub-tabs are a registry for the same reason tabs are (plan D5): MOD-4's approve/reject and
 //! MOD-2's "promote to chat" are `DetailTab::on_key` bodies inside their own file plus one
 //! `register` line, never a `match` arm in the Backlog tab. In MOD-1 every sub-tab is read-only
-//! and answers to nothing but scrolling (plan D11).
+//! and answers to nothing but scrolling (plan D11). MOD-39 plan P12 adds the seventh, [`ReqsTab`],
+//! and shortens "Documents" to "Docs" so the strip keeps its 40 columns.
 
 pub mod body;
 pub mod documents;
 pub mod graph;
 pub mod notes;
 pub mod prompt;
+pub mod requirements;
 pub mod runs;
 
 use htui_core::model::ItemId;
@@ -30,6 +32,7 @@ pub use documents::DocumentsTab;
 pub use graph::GraphTab;
 pub use notes::NotesTab;
 pub use prompt::PromptTab;
+pub use requirements::ReqsTab;
 pub use runs::RunsTab;
 
 /// How many rows `PageDown` / `PageUp` move.
@@ -51,7 +54,7 @@ impl core::fmt::Display for DetailId {
 
 /// One view of the selected item.
 ///
-/// A sub-tab holds no store handle either (`R-NF-3`): the Backlog tab issues the six reads when
+/// A sub-tab holds no store handle either (`R-NF-3`): the Backlog tab issues the seven reads when
 /// the selection changes and hands every reply to every sub-tab, which keeps each one to "here is
 /// my variant, here is how it draws". MOD-2 milestone 9's [`PromptTab`] is the worked example of
 /// how far that goes: its reply is assembled by a task the store worker spawned, and the sub-tab
@@ -181,7 +184,7 @@ impl DetailRegistry {
         }
     }
 
-    /// Hands a reply to every sub-tab: the six reads are issued together, so a sub-tab is
+    /// Hands a reply to every sub-tab: the seven reads are issued together, so a sub-tab is
     /// populated before it is ever looked at.
     pub fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         for tab in &mut self.tabs {

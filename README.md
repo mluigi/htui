@@ -5,8 +5,8 @@ It keeps your work items, their documents, the runs agents performed and full ch
 one Postgres database, and lets you browse and drive all of it from the terminal, across several
 projects, repositories and machines.
 
-- **One place for everything.** Items, documents, notes, runs, skills and prompt templates live in
-  Postgres. Credentials live in your OS keyring, never in a config file.
+- **One place for everything.** Items, documents, notes, runs, requirements, skills and prompt
+  templates live in Postgres. Credentials live in your OS keyring, never in a config file.
 - **Works offline.** A local copy of what you browse is kept on each machine, so `htui` opens
   instantly and stays readable when the server is out of reach.
 - **Talks to real agents.** Chat with Claude Code or Google's Antigravity (`agy`) from inside the
@@ -153,14 +153,15 @@ and says why on the status line; update `htui` to connect.
 Everything happens in a **workspace**. Press `w` to switch workspaces. If the database has none
 yet, create one in **Settings › Hierarchy** with `N`.
 
-`htui` has four tabs. Switch with `Tab` / `Shift+Tab` or the number keys `1` to `4`.
+`htui` has five tabs. Switch with `Tab` / `Shift+Tab` or the number keys `1` to `5`.
 
 | Tab | What it is for |
 |---|---|
 | **1 Backlog** | The workspace's items, grouped by project, with details on the right. This is also where you drive runs. |
 | **2 Skills** | Your skill library and prompt templates: browse versions, compare them, edit, import, and attach skills to projects and repositories. |
-| **3 Settings** | Agents, workspaces and projects, item kinds, prompt settings, the database connection, the search server and this machine's profile. |
-| **4 Chat** | A live conversation with an agent, and replays of recorded ones. |
+| **3 Requirements** | Each project's requirements, grouped by area: what each one says, which items cite it and how it changed over time. The project's owner adds, amends and withdraws them here. |
+| **4 Settings** | Agents, workspaces and projects, item kinds, prompt settings, the database connection, the search server and this machine's profile. |
+| **5 Chat** | A live conversation with an agent, and replays of recorded ones. |
 
 **Press `?` on any screen for its full list of keys.** The ones below are the essentials.
 
@@ -170,7 +171,7 @@ yet, create one in **Settings › Hierarchy** with `N`.
 |---|---|
 | `q` | Quit |
 | `Tab` / `Shift+Tab` | Next / previous tab |
-| `1` … `4` | Go to a tab |
+| `1` … `5` | Go to a tab |
 | `w` | Switch workspace |
 | `?` | Show or hide the key help |
 | `Esc` | Close the open pop-up |
@@ -180,8 +181,9 @@ between sub-tabs or sections.
 
 ### Backlog
 
-Select an item on the left to see it on the right. The detail pane has six sub-tabs: **Body**,
-**Runs**, **Graph** (linked items), **Documents**, **Notes** and **Prompt**.
+Select an item on the left to see it on the right. The detail pane has seven sub-tabs: **Body**,
+**Runs**, **Graph** (linked items), **Docs**, **Notes**, **Prompt** and **Reqs** (the requirements
+the item cites).
 
 | Key | Action |
 |---|---|
@@ -206,7 +208,12 @@ If an action isn't allowed right now, the status line says why and nothing happe
 | `c` | Cancel the run |
 | `T` | Retry the run's cleanup |
 | `u` | Unblock the item |
-| `C` | Close out the item (asks you to type the item's key to confirm) |
+| `C` | Close out the item: pick how it ends with `←` / `→`, press `y`, then type the item's key to confirm |
+
+When you close out an item, the picker offers only the endings that fit its status. A `done` item
+starts on `done` and can end as done, concluded, rejected, withdrawn, superseded or duplicate. An
+open, blocked or failed item starts on `withdrawn` and can also end as rejected, superseded or
+duplicate.
 
 Runs need a connection to the database.
 
@@ -214,6 +221,47 @@ Runs need a connection to the database.
 assembled text, its token budget, what was trimmed to fit, and which files were picked as
 context. `n` / `p` switch between the project's templates. Looking at a prompt changes nothing and
 starts nothing.
+
+**Reqs.** The Reqs sub-tab lists the requirements the item cites, and how: it *addresses* a
+requirement, *reserves* it for later, or is the item that *amends* or *withdraws* it. A citation is
+marked `! suspect` when the requirement has changed since the item cited it.
+
+| Key | Action |
+|---|---|
+| `J` / `K` | Move between citations |
+| `r` | Re-confirm a suspect citation against the requirement as it reads now |
+| `c` | Cite another requirement of the item's project (`Enter` picks it, then `a` addresses or `v` reserves) |
+| `u` | Remove the citation (asks you to confirm with `y`) |
+
+A citation made by amending or withdrawing a requirement is part of that decision and stays.
+Citing needs a connection to the database.
+
+### Requirements
+
+The left pane lists the workspace's projects, their areas and each area's requirements, with
+their priority (`must` or `later`). Select a requirement to see its full text and rationale, which
+items cite it (a `! suspect` marker means the item cited an older version) and its revision
+history. Withdrawn requirements stay in the list, dimmed and marked `✕`.
+
+| Key | Action |
+|---|---|
+| `j` / `k`, `g` / `G` | Move, jump to the first / last row |
+| `Enter` on a project or area | Fold or unfold it |
+| `J` / `K`, `PageUp` / `PageDown` | Scroll the detail pane |
+| `/` | Filter the list as you type (`Enter` keeps the filter, `Esc` clears it) |
+| `a` | Add an area to the project |
+| `n` | Write a new requirement in the selected area |
+| `e` | Amend the requirement |
+| `W` | Withdraw the requirement (asks you to type its key to confirm) |
+| `r` | Read the requirements again |
+
+In the forms, `Tab` moves between fields and `Ctrl+S` saves. An amend or a withdraw names the
+item that decided it, and that item then cites the requirement.
+
+A project's requirements belong to whoever first added an area or a requirement to it. Anyone
+can read them, but only the owner can add, amend or withdraw; for everyone else, and while offline,
+the write keys are greyed out and the status line says why. If someone else changed a requirement
+while you were amending it, your text is kept and `Ctrl+S` saves over the new version.
 
 ### Chat
 

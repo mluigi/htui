@@ -37,9 +37,9 @@ const TRANSCRIPT_STEPS_KEY: &str = "cached_transcript_steps";
 /// Cursor-pass tuning, read from `app_setting` at connect (§4.4, §6.2).
 ///
 /// `this_box` and `this_user` are not tuning; they are here because §6.2 step 2 mirrors the *own*
-/// `box` row and step 5 uploads the offline chat buffer under this box and this user, and because
-/// both [`Refresher::spawn`] and [`run_pass`] would otherwise need two more arguments each
-/// (deviation from blueprint C.13, same components).
+/// `box` row, and because both [`Refresher::spawn`] and [`run_pass`] would otherwise need two more
+/// arguments each (deviation from blueprint C.13, same components). `this_user` was for the upload
+/// of the offline chat buffer, which is gone (MOD-25); the pass no longer reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefreshSettings {
     /// `app_setting.cache_refresh_seconds`, default 30 s.
@@ -48,9 +48,10 @@ pub struct RefreshSettings {
     pub overlap: Duration,
     /// `project.settings.cached_transcript_steps`, default 20; the per-project value wins.
     pub transcript_steps: i64,
-    /// [`crate::PgStore::this_box`]: whose `box` row is mirrored and who owns an uploaded run.
+    /// [`crate::PgStore::this_box`]: whose `box` row is mirrored.
     pub this_box: BoxId,
-    /// [`crate::PgStore::this_user`]: `run.started_by` of an uploaded offline chat.
+    /// [`crate::PgStore::this_user`]: was `run.started_by` of an uploaded offline chat; unread
+    /// since that upload was removed.
     pub this_user: UserId,
 }
 
