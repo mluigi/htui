@@ -1,7 +1,7 @@
 # Plan: MOD-23 — agent registry editing in the Settings agents section
 
 > **Status: fact-checked 2026-09-29 (53 claims: 44 TRUE, 6 line drifts fixed, 1 PARTIAL and 2 FALSE
-> amended — see "Verified claims"); awaiting the maintainer's CONFIRM and answers to OQ-1…OQ-5.**
+> amended — see "Verified claims"); **CONFIRMED by the maintainer 2026-09-29**, every OQ on its recommended answer.**
 
 **Source**: `HANDOFF.md` MOD-23 (the checklist line at `:601-632`, from MOD-2). Create a manual
 agent row and edit an existing one — transport (`acp` | `cli`), launch command and args, model
@@ -46,12 +46,12 @@ file reads and `grep`. The fact-check pass re-reads each at its line.
 
 ---
 
-## Open questions for the maintainer
+## Open questions for the maintainer (all answered 2026-09-29: recommended answer taken on each)
 
 Each has a recommended answer the plan adopts, so implementation is not blocked once it is
 confirmed.
 
-- [ ] **OQ-1 — How a per-box "off" survives a re-probe.** Today the probe owns
+- [x] **OQ-1 — How a per-box "off" survives a re-probe.** Today the probe owns
       `agent_box.enabled`: `agent_box_row` sets `enabled: snapshot.status == ProbeStatus::Ready`
       (`crates/htui-agent/src/probe.rs:1530`), and `PgStore::upsert_agent_box` rewrites it on every
       conflict (`enabled = EXCLUDED.enabled`, `crates/htui-store/src/pg/write.rs:1206`). A switch the
@@ -72,7 +72,7 @@ confirmed.
       reads only `row.enabled`) and about fifteen test assertions (`htui-agent/tests/probe.rs`,
       `probe_live.rs`, `agy_live.rs`, `crates/htui/src/agent_worker.rs`, `crates/htui/tests/chat.rs`).
       **Alternative (C):** drop the per-box switch from MOD-23 and open a follow-up item.
-- [ ] **OQ-2 — How `args` is typed in one line.** `agent.launch.args` is a `Vec<String>`
+- [x] **OQ-2 — How `args` is typed in one line.** `agent.launch.args` is a `Vec<String>`
       (`crates/htui-agent/src/launch.rs:80`), and an argument may hold a space or a quote.
       **Recommended (D236):** POSIX shell words through the `shell-words` crate — `join` prefills the
       field, `split` parses it, an unclosed quote is refused by name — promoted to a declared
@@ -81,7 +81,7 @@ confirmed.
       listed by that package at `:195`), so nothing new is downloaded. Cost: a Windows path with
       backslashes has to be quoted or written with `/` (R-5). **Alternative:** a JSON array
       (`["--uid=", "${x}"]`) through `serde_json`, lossless and dependency-free but clumsy to type.
-- [ ] **OQ-3 — Is the ANA-4 §4.6 per-box "manual entry" part of MOD-23?** ANA-4 describes it as
+- [x] **OQ-3 — Is the ANA-4 §4.6 per-box "manual entry" part of MOD-23?** ANA-4 describes it as
       "writing `agent_box.path` and `probe.resolved` by hand in the Settings tab and setting
       `probe.status = "ready"`" (`docs/ANA-4.md:796-798`), protected by MOD-2 D45/D51's
       `source: manual`. In the tree that recording would not reach a spawn:
@@ -92,12 +92,12 @@ confirmed.
       (`crates/htui-core/src/model/agent.rs:41-42`), so MOD-23's create form already gives "manual
       entries allowed" for the common case. **Alternative:** build the per-box entry here (a second
       form writing `probe.tools`, `source: manual`), roughly doubling T3.
-- [ ] **OQ-4 — ANA-21's `settings.weights`.** `docs/ANA-21.md:552` says "MOD-23's editor surfaces
+- [x] **OQ-4 — ANA-21's `settings.weights`.** `docs/ANA-21.md:552` says "MOD-23's editor surfaces
       `settings.weights` alongside the model list and default model". MOD-36, which consumes the
       weights, is open. **Recommended (D248):** not in MOD-23; `settings` is carried through every
       edit untouched (D239), and MOD-36 adds a weights field to this form, which D231's field list
       makes a one-entry change. **Alternative:** a read-only weights line in the edit pane now.
-- [ ] **OQ-5 — What a new row's `settings` document holds.** A `cli` row reaches an adapter only
+- [x] **OQ-5 — What a new row's `settings` document holds.** A `cli` row reaches an adapter only
       through `settings.cli.stream` (`adapter_id_from`, `crates/htui-agent/src/registry.rs:137-144`;
       a missing block yields the bare id `cli`, which no build registers). A new row with
       `settings = {}` is therefore a `cli` row that can never chat, and the form cannot edit
