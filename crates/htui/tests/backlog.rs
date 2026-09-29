@@ -264,8 +264,9 @@ const TO_REQS: usize = 6;
 /// Rows down to htui `CLEAN-1`, the item that cites no requirement.
 const TO_CLEAN_1: usize = 2;
 
-/// On htui `FEAT-1`'s Reqs sub-tab, `c` opens the picker over htui's three active requirements and
-/// `j` puts its cursor on `R-ENT-2`, the second: the harness and the frame at the Pick stage.
+/// On htui `FEAT-1`'s Reqs sub-tab, `c` opens the picker over htui's active requirements but
+/// `R-STO-1`, which `FEAT-1` already addresses, and `j` puts its cursor on `R-ENT-2`, the second:
+/// the harness and the frame at the Pick stage.
 async fn picking_r_ent_2() -> (Harness, String) {
     let mut harness = backlog().await;
     down(&mut harness, TO_FEAT_1).await;
@@ -325,8 +326,9 @@ async fn r_reconfirms_the_suspect_citation() {
     insta::assert_snapshot!("detail_reqs_reconfirmed", frame);
 }
 
-/// PRD D4: `c` offers the active requirements of the item's own project, `Enter` picks one and
-/// `a` cites it as `addresses`; the list cursor never moves while the picker captures.
+/// PRD D4: `c` offers the active requirements of the item's own project that it does not cite
+/// yet, `Enter` picks one and `a` cites it as `addresses`; the list cursor never moves while the
+/// picker captures, and lands on the new citation once it is made.
 #[tokio::test]
 async fn c_cites_a_requirement_of_the_item_s_project() {
     let (mut harness, picker) = picking_r_ent_2().await;
@@ -338,6 +340,10 @@ async fn c_cites_a_requirement_of_the_item_s_project() {
         picker.contains("▸ R-ENT-2 later An item may carry"),
         "the picker's cursor is on R-ENT-2:\n{picker}"
     );
+    assert!(
+        !picker.contains("R-STO-1 must"),
+        "R-STO-1, already cited, is not offered:\n{picker}"
+    );
     insta::assert_snapshot!("detail_reqs_cite_picker", picker);
 
     harness.key("enter");
@@ -346,8 +352,8 @@ async fn c_cites_a_requirement_of_the_item_s_project() {
     let frame = harness.render();
     assert_eq!(harness.app().status, None, "the cite applied");
     assert!(
-        frame.contains("R-ENT-2 addresses v1"),
-        "the new citation:\n{frame}"
+        frame.contains("▸ R-ENT-2 addresses v1"),
+        "the new citation, under the cursor:\n{frame}"
     );
     assert!(
         frame.contains("R-STO-1 addresses v1"),
@@ -361,7 +367,7 @@ async fn u_then_y_uncites() {
     let mut harness = cited_r_ent_2().await;
     assert!(
         harness.render().contains("▸ R-ENT-2 addresses v1"),
-        "R-ENT-2 sorts first, under the cursor"
+        "the new citation is under the cursor"
     );
     harness.key("u");
     let asking = harness.render();

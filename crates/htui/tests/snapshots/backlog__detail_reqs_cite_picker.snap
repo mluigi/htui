@@ -26,9 +26,9 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
+│                                                     ││                                           │
 │                                                     ││  R-ENT-1 must Every item has a stable key…│
 │                                                     ││▸ R-ENT-2 later An item may carry a free-f…│
-│                                                     ││  R-STO-1 must Postgres is the source of t…│
 │                                                     ││j/k move · Enter pick · Esc back           │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help
