@@ -373,9 +373,9 @@ no sync back into htui is planned.
 |---|---|---|---|
 | 1 | Host is Ubuntu 24.04; `~/.local` binaries run in `ubuntu:24.04` | ✓ | `/etc/os-release` 24.04, glibc 2.39; probe container: `claude` 2.1.284, `gortex` v0.64.5, `headroom` 0.38.0, `uvx`, `graphify` all exit 0 |
 | 1a | PATH inside mirrors host tool versions | ✗ → amended | `~/.local/bin/uv{,x}` is 0.8.22 (2025) vs mise 0.12.20; mise dirs must precede `~/.local/bin` |
-| 2 | Gortex daemon runs in a container with a fresh store | open → T2 | needs the spike |
-| 3 | Untracked `.claude/settings.local.json` in the clone is honoured | partly ✓ → T2 | file is untracked (ignored by the user's global `~/.config/git/ignore`), carries 8 hook events; firing needs the spike |
-| 4 | Concurrent OAuth refresh on a shared `.credentials.json` is safe | open → T2 | needs the spike |
+| 2 | Gortex daemon runs in a container with a fresh store | ✓ (T2) | sandbox `claude -p`: SessionStart banner "cwd `/home/mluigi/projects/htui` is tracked … 27795 nodes", daemon indexed the clone in ~17 s. Needed fix `f27c440`: stale `daemon.pid` in the per-run volume blocked respawn after a container restart; `dev` start command clears the runtime files |
+| 3 | Untracked `.claude/settings.local.json` in the clone is honoured | ✓ (T2) | all 4 SessionStart hooks (Gortex, superpowers, remember, headroom) `hook_response` exit 0 in the sandbox stream-json |
+| 4 | Concurrent OAuth refresh on a shared `.credentials.json` is safe | argued ✓, observe in T6 (maintainer 2026-09-29) | `~/.claude` is a bind-mounted directory on the same filesystem, so atomic renames and lock dirs behave as for the parallel host sessions already in use; forced refresh not run (it would edit the live auth file). Watch for logouts if T6 crosses the token expiry; fallback `claude setup-token` |
 | 5 | `~/.claude.json` is rewritten by rename | ✓ | inode 2149922 → 2149837 across one minute of this session |
 | 6 | Postgres `-p 5439` + `network_mode: service:postgres` peers reach it on `localhost`; Qdrant binds 6333/6334 in the shared namespace; nothing published | ✓ | probe compose: `psql …@localhost:5439` → PG 16.15, `fsync=off`; `GET :6333` → 200; `:6334` open; `docker compose ps` shows no publishers |
 | 7 | `sqlx` in `Cargo.lock` has a matching `sqlx-cli` with the named features | ✓ | lock 0.9.0; crates.io `sqlx-cli` 0.9.0 has `postgres`, `rustls`; MSRV 1.94 ≤ 1.98.1 |
@@ -387,3 +387,25 @@ no sync back into htui is planned.
 | 11 | `.remember/` is untracked (not in the clone) | ✓ | `.remember/.gitignore` is `*`; `git ls-files .remember` empty |
 | 12 | gum v2.0.2 has `choose`/`filter`/`table`/`spin`/`confirm` with the flags used | ✓ | all five `--help` exit 0; `table -c/-s/-p/-f`, `filter --header/--placeholder` present |
 | — | Task independence | ✓ | intersection table above; every task lists its files |
+
+## T2 spike results (2026-09-29)
+
+One sandbox brought up by hand from `docker/hr/compose.hr.yaml`; headless `claude -p` inside
+(maintainer: headless is enough, no interactive attach).
+
+| check | result |
+|---|---|
+| `claude mcp list` | gortex ✔, headroom ✔, serena ✔ (after fix); host-disabled servers disabled |
+| auth + model inside | ✔ `claude-opus-5-5[1m]`, answered `hr/SPIKE` from the clone |
+| plugins | ✔ remember, superpowers (+ agents-md) |
+| hooks | ✔ Gortex / superpowers / remember / headroom SessionStart exit 0 |
+| remember → shared `.remember/` | ✔ writes land in host `.remember/tmp` |
+
+Fixes (`f27c440`): `UV_TOOL_DIR=/tmp/uv-tools` (uvx writes temp files into its tool dir even for
+ephemeral tools; `~/.local` is ro); `dev` start command clears Gortex `daemon.{pid,sock,spawn.lock,spawn.fail}`.
+No fallback taken. F9 (share Gortex `memories/`): **not shared** — each run's Gortex memories live
+in its volume and die at purge; durable decisions belong in the repo docs anyway.
+
+Accepted limitation: remember's save lock records a PID, and container PIDs are meaningless on the
+host (and vice versa), so a host save and a sandbox save racing each other can break each other's
+lock; worst case an interleaved `now.md` entry. Documented in `docs/hr-sandbox.md`, not engineered.
