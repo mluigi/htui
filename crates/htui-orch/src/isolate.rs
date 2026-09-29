@@ -121,8 +121,20 @@ pub struct ResetReport {
     pub refused: Vec<(RepoId, String)>,
 }
 
-/// ANA-2 §4.6's four verbs plus milestone 4's two reads and milestone 5's two recovery verbs; the
-/// four are named there verbatim (`docs/ANA-2.md:1769`), and all eight sit behind plan D6's seam.
+/// MOD-9 D119: the paths a step's committed ranges touched, for the next attempt's `glob` file
+/// set and excerpt tier 2. `(repo, path)` repo-relative and `/`-separated, sorted by `(repo id,
+/// path bytes)`, deduplicated; a rename appears under both names (`--no-renames`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChangedPaths {
+    /// The paths.
+    pub paths: Vec<(RepoId, String)>,
+    /// Some repo's list was cut at [`git::DIFF_CAP`]; its partial last entry was dropped.
+    pub truncated: bool,
+}
+
+/// ANA-2 §4.6's four verbs plus three reads (milestone 4's two, and `changed_paths`, MOD-9 D119)
+/// and milestone 5's two recovery verbs; the four are named there verbatim (`docs/ANA-2.md:1769`),
+/// and all nine sit behind plan D6's seam.
 ///
 /// **An isolator touches no store.** The engine persists what these return —
 /// `upsert_step_tree` after [`prepare`](Isolator::prepare), `record_commits` after
@@ -188,6 +200,14 @@ pub trait Isolator: Send + Sync + fmt::Debug {
         trees: &'a [RunStepTree],
         commits: &'a [RunStepCommit],
     ) -> IsolatorFuture<'a, Option<DiffBlock>>;
+
+    /// MOD-9 D119: the paths [`diff`](Isolator::diff)'s ranges changed, over the same rows and the
+    /// same range choice. No usable `git` is `Ok(ChangedPaths::default())`, as `diff` is `Ok(None)`.
+    fn changed_paths<'a>(
+        &'a self,
+        trees: &'a [RunStepTree],
+        commits: &'a [RunStepCommit],
+    ) -> IsolatorFuture<'a, ChangedPaths>;
 
     /// §4.6 step 4: the winning candidate's branch merged into the primary tree, one commit row
     /// per repo.

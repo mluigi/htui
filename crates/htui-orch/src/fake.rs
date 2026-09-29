@@ -40,7 +40,8 @@ use crate::command::{Command, CommandOutcome, EngineError};
 use crate::engine::{DeadWalks, SessionKey};
 use crate::graph::GraphSource;
 use crate::isolate::{
-    Clock, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree, ResetReport,
+    ChangedPaths, Clock, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared,
+    PreparedTree, ResetReport,
 };
 use crate::verify::{Verifier, VerifierFuture, VerifyReport, VerifyRequest};
 
@@ -92,6 +93,13 @@ pub struct FakeIsolator {
     /// The `run_step_id`s of the tree and commit rows each [`diff`](Isolator::diff) call was
     /// handed, in call order — so a case can tell *whose* rows plan D67 diffed.
     diff_requests: Mutex<Vec<DiffRequest>>,
+    /// Scripted [`changed_paths`](Isolator::changed_paths) answers, FIFO, one consumed per call;
+    /// unscripted is `ChangedPaths::default()` (MOD-9 D119); `Err` is a scripted
+    /// [`fail_changed_paths`](Self::fail_changed_paths).
+    changed: Mutex<VecDeque<std::result::Result<ChangedPaths, IsolateError>>>,
+    /// The rows each [`changed_paths`](Isolator::changed_paths) call was handed, in call order, in
+    /// [`DiffRequest`]'s shape (MOD-9 D135), so a case can tell *whose* rows a retry read.
+    changed_path_requests: Mutex<Vec<DiffRequest>>,
     /// Every [`reconcile`](Isolator::reconcile) call, as `(winner, siblings)`, in call order — so a
     /// case can tell which siblings plan D54(d) handed the isolator.
     reconciles: Mutex<Vec<(StepId, Vec<StepId>)>>,
@@ -235,6 +243,34 @@ impl FakeIsolator {
     #[must_use]
     pub fn diff_requests(&self) -> Vec<DiffRequest> {
         self.diff_requests
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .clone()
+    }
+
+    /// MOD-9 D119: queue the answer of the next [`changed_paths`](Isolator::changed_paths). An
+    /// unscripted call answers `ChangedPaths::default()`, the shape of a box with no `git`.
+    pub fn script_changed_paths(&self, paths: ChangedPaths) {
+        self.changed
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(Ok(paths));
+    }
+
+    /// MOD-9 D119: make the next [`changed_paths`](Isolator::changed_paths) fail with a `git`
+    /// error, which the engine degrades to a prompt note (MOD-9 D122).
+    pub fn fail_changed_paths(&self, reason: &str) {
+        self.changed
+            .lock()
+            .expect("no panic holds the fake isolator's lock")
+            .push_back(Err(IsolateError::Git(reason.to_owned())));
+    }
+
+    /// MOD-9 D135: every [`changed_paths`](Isolator::changed_paths) call so far, as the rows it
+    /// was handed.
+    #[must_use]
+    pub fn changed_path_requests(&self) -> Vec<DiffRequest> {
+        self.changed_path_requests
             .lock()
             .expect("no panic holds the fake isolator's lock")
             .clone()
@@ -592,6 +628,21 @@ impl Isolator for FakeIsolator {
                 .expect("no panic holds the fake isolator's lock")
                 .pop_front()
                 .unwrap_or(Ok(None))
+        })
+    }
+
+    /// The next [`script_changed_paths`](FakeIsolator::script_changed_paths) or
+    /// [`fail_changed_paths`](FakeIsolator::fail_changed_paths) answer, or the empty set
+    /// unscripted; the rows are recorded for
+    /// [`changed_path_requests`](FakeIsolator::changed_path_requests) either way (MOD-9 D135).
+    fn changed_paths<'a>(
+        &'a self,
+        trees: &'a [RunStepTree],
+        commits: &'a [RunStepCommit],
+    ) -> IsolatorFuture<'a, ChangedPaths> {
+        Box::pin(async move {
+            let _ = (trees, commits);
+            todo!("MOD-9 D119")
         })
     }
 
@@ -1787,7 +1838,9 @@ mod tests {
     use super::{FakeGraphSource, FakeIsolator, FakeOrchestrator, GraphSource, ScriptedStep};
     use crate::engine::SessionKey;
     use crate::graph::{ResolveError, Resolved, resolve};
-    use crate::isolate::{Clock as _, FanoutSlot, Isolator as _, ResetReport};
+    use crate::isolate::{
+        ChangedPaths, Clock as _, FanoutSlot, IsolateError, Isolator as _, ResetReport,
+    };
 
     /// `graph::resolve` of `HTUI_FEAT-1`, manual, no `app_setting`, no requested scope.
     async fn resolve_feat<G: GraphSource>(
@@ -2024,6 +2077,71 @@ mod tests {
         );
         assert_eq!(isolator.diff(&[], &[]).await.expect("scripted"), None);
         assert_eq!(isolator.diff(&[], &[]).await.expect("unscripted"), None);
+    }
+
+    /// MOD-9 D119/D135: the fake's `changed_paths` answers what a case queued, FIFO, the empty
+    /// set unscripted, and records each call's rows.
+    #[tokio::test]
+    async fn scripted_changed_paths_round_trip() {
+        let isolator = FakeIsolator::new();
+        let step = StepId::new();
+        let scope = repos();
+        let trees: Vec<_> = isolator
+            .prepare(ids::RUN_2, step, &scope, Isolation::Worktree, None)
+            .await
+            .expect("the fake never refuses")
+            .trees
+            .into_iter()
+            .map(|prepared| prepared.tree)
+            .collect();
+        let commits = isolator
+            .capture(step, &trees)
+            .await
+            .expect("the fake never refuses");
+
+        assert_eq!(
+            isolator
+                .changed_paths(&trees, &commits)
+                .await
+                .expect("unscripted"),
+            ChangedPaths::default()
+        );
+        let scripted = ChangedPaths {
+            paths: vec![(scope[0], "src/lib.rs".to_owned())],
+            truncated: true,
+        };
+        isolator.script_changed_paths(scripted.clone());
+        assert_eq!(
+            isolator
+                .changed_paths(&trees, &commits)
+                .await
+                .expect("scripted"),
+            scripted
+        );
+        assert_eq!(
+            isolator
+                .changed_paths(&trees, &commits)
+                .await
+                .expect("consumed once"),
+            ChangedPaths::default()
+        );
+        isolator.fail_changed_paths("x");
+        match isolator.changed_paths(&[], &[]).await {
+            Err(IsolateError::Git(reason)) => assert_eq!(reason, "x"),
+            other => panic!("expected a git error, got {other:?}"),
+        }
+
+        let requests = isolator.changed_path_requests();
+        assert_eq!(
+            requests.len(),
+            4,
+            "every call is recorded, the failed one included"
+        );
+        for request in &requests[..3] {
+            assert_eq!(request.trees, vec![step; scope.len()]);
+            assert_eq!(request.commits, vec![step; scope.len()]);
+        }
+        assert!(requests[3].trees.is_empty() && requests[3].commits.is_empty());
     }
 
     /// D92/D99: the fake's `reset` is empty unless scripted, a scripted refusal is consumed once

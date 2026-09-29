@@ -44,8 +44,8 @@ use htui_orch::isolate::git::testkit::{
 };
 use htui_orch::isolate::real::{dirty_tree_not_reset, local_moved};
 use htui_orch::isolate::{
-    FanoutSlot, GixIsolator, Isolator, IsolatorConfig, IsolatorFuture, Prepared, RepoCheckout,
-    ResetReport,
+    ChangedPaths, FanoutSlot, GixIsolator, Isolator, IsolatorConfig, IsolatorFuture, Prepared,
+    RepoCheckout, ResetReport,
 };
 use htui_orch::skip_without_git;
 use htui_orch::status::RunFailure;
@@ -2016,6 +2016,17 @@ impl Isolator for StallAfterReconcile<'_> {
         self.inner.diff(trees, commits)
     }
 
+    fn changed_paths<'a>(
+        &'a self,
+        trees: &'a [RunStepTree],
+        commits: &'a [RunStepCommit],
+    ) -> IsolatorFuture<'a, ChangedPaths> {
+        Box::pin(async move {
+            let _ = (trees, commits);
+            todo!("MOD-9 D119")
+        })
+    }
+
     fn reconcile<'a>(
         &'a self,
         winner: StepId,
@@ -2827,6 +2838,96 @@ async fn a_merge_onto_a_moved_primary_diffs_only_its_own_paths() {
         !diff.stat.contains("a.txt") && !diff.diff.contains("a.txt"),
         "never the other run's path: {}",
         diff.diff
+    );
+}
+
+/// MOD-9 D119: a worktree step's committed paths, one row per file, keyed by the repo.
+#[tokio::test]
+async fn changed_paths_of_a_worktree_step_names_its_committed_paths() {
+    let Some(_git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let step = StepId::new();
+    let prepared = fix
+        .isolator
+        .prepare(
+            RunId::new(),
+            step,
+            &[fix.core.id],
+            Isolation::Worktree,
+            None,
+        )
+        .await
+        .expect("the worktree mode prepares");
+    let rows: Vec<RunStepTree> = prepared
+        .trees
+        .iter()
+        .map(|tree| tree.tree.clone())
+        .collect();
+    commit_file(
+        Path::new(&rows[0].path),
+        "a.txt",
+        "a\n",
+        "the step commits a",
+    );
+    commit_file(
+        Path::new(&rows[0].path),
+        "b.txt",
+        "b\n",
+        "the step commits b",
+    );
+    let commits = fix
+        .isolator
+        .capture(step, &rows)
+        .await
+        .expect("the step captures");
+
+    assert_eq!(
+        fix.isolator
+            .changed_paths(&rows, &commits)
+            .await
+            .expect("the changed paths read"),
+        ChangedPaths {
+            paths: vec![
+                (fix.core.id, "a.txt".to_owned()),
+                (fix.core.id, "b.txt".to_owned()),
+            ],
+            truncated: false,
+        }
+    );
+}
+
+/// MOD-9 D119 over plan D141: a reconcile merge onto a moved primary names only its own paths,
+/// read from the merge's first parent exactly as `diff` reads it.
+#[tokio::test]
+async fn changed_paths_of_a_reconcile_merge_uses_the_first_parent() {
+    let Some(_git) = skip_without_git!() else {
+        return;
+    };
+    let fix = Fixture::new(Isolation::Worktree, None).await;
+    let (a, _, a_rows) = committed_worktree_step(&fix, "a.txt", "run a\n").await;
+    let (b, _, b_rows) = committed_worktree_step(&fix, "b.txt", "run b\n").await;
+    fix.isolator
+        .reconcile(a, &a_rows, &[])
+        .await
+        .expect("the first run reconciles");
+    let second = fix
+        .isolator
+        .reconcile(b, &b_rows, &[])
+        .await
+        .expect("the second run reconciles on top of the first one's merge");
+
+    assert_eq!(
+        fix.isolator
+            .changed_paths(&b_rows, &second)
+            .await
+            .expect("the changed paths read"),
+        ChangedPaths {
+            paths: vec![(fix.core.id, "b.txt".to_owned())],
+            truncated: false,
+        },
+        "the merge's own path, never the other run's `a.txt`"
     );
 }
 

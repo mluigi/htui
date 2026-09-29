@@ -21,7 +21,8 @@ use tokio::sync::OwnedMutexGuard;
 use super::copy;
 use super::git::{self, Cli, blocking};
 use super::{
-    FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree, ResetReport,
+    ChangedPaths, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree,
+    ResetReport,
 };
 
 // One named free function per refusal sentence, the house style of `htui_core`'s store refusals
@@ -1489,6 +1490,17 @@ impl Isolator for GixIsolator {
                     ),
                 }),
             })
+        })
+    }
+
+    fn changed_paths<'a>(
+        &'a self,
+        trees: &'a [RunStepTree],
+        commits: &'a [RunStepCommit],
+    ) -> IsolatorFuture<'a, ChangedPaths> {
+        Box::pin(async move {
+            let _ = (trees, commits);
+            todo!("MOD-9 D119")
         })
     }
 

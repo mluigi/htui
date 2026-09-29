@@ -839,6 +839,44 @@ impl Cli {
         }
         Ok(exited.stdout)
     }
+
+    /// MOD-9 D119/D130: `git diff --no-color --name-only -z --no-renames --no-ext-diff
+    /// --no-textconv <before> <after> --` in `repo`, stdout head-capped at [`DIFF_CAP`] as bytes.
+    ///
+    /// The flags are [`diff`](Cli::diff)'s discipline plus `-z`, which removes git's path quoting,
+    /// and `--no-renames`, which lists a rename under its old and its new name. The bytes are never
+    /// decoded as a whole ([`parse_name_only`]): a lossy decode would turn a non-UTF-8 name into a
+    /// plausible path. Not retried: a read (M3 D39).
+    ///
+    /// # Errors
+    /// [`IsolateError::Git`] for a spawn or budget failure, or for a non-zero exit (a revision the
+    /// repository does not hold, among them), named `git diff` as [`diff`](Cli::diff)'s are.
+    pub async fn name_only(
+        &self,
+        repo: &Path,
+        before: &str,
+        after: &str,
+    ) -> Result<NameOnly, IsolateError> {
+        let _ = (repo, before, after);
+        todo!("MOD-9 D119")
+    }
+}
+
+/// MOD-9 D119: one range's changed names, in git's order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NameOnly {
+    /// Repo-relative, `/`-separated names; a non-UTF-8 or empty one was dropped.
+    pub paths: Vec<String>,
+    /// The output overflowed [`DIFF_CAP`]; the partial last entry was dropped.
+    pub truncated: bool,
+}
+
+/// MOD-9 D130: NUL-split; the final segment is always dropped (empty when git finished its last
+/// entry, partial when the cap cut it); a non-UTF-8 or empty entry is dropped; `truncated =
+/// overflowed`.
+fn parse_name_only(bytes: &[u8], overflowed: bool) -> NameOnly {
+    let _ = (bytes, overflowed);
+    todo!("MOD-9 D130")
 }
 
 /// The sleeps between retries (plan D39): 200, 400 and 800 ms, so four attempts in all.
@@ -1106,6 +1144,12 @@ impl HeadBuffer {
             self.overflowed = true;
         }
         self.kept.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+
+    /// MOD-9 D130: the kept bytes and whether anything was dropped after them.
+    #[must_use]
+    pub fn into_bytes(self) -> (Vec<u8>, bool) {
+        todo!("MOD-9 D130")
     }
 
     /// The buffer as text, lossily, with `\n[diff truncated at 64 KiB]` appended when it
@@ -2158,8 +2202,8 @@ mod tests {
         commit_file, commit_removal, empty_repo, has_object, repo_with_one_commit,
     };
     use super::{
-        CAPTURE_TAIL, Cli, DIFF_CAP, Exited, HeadBuffer, MIN_GIT, SCRUBBED_ENV, TailBuffer,
-        ancestor_walk, is_lock_error, merge_walk,
+        CAPTURE_TAIL, Cli, DIFF_CAP, Exited, HeadBuffer, MIN_GIT, NameOnly, SCRUBBED_ENV,
+        TailBuffer, ancestor_walk, is_lock_error, merge_walk, parse_name_only,
     };
     use crate::isolate::IsolateError;
 
@@ -3617,6 +3661,200 @@ mod tests {
             "abcd",
             "exactly the cap is not an overflow"
         );
+    }
+
+    /// MOD-9 D119 test support: one `git` verb in `repo`, with the child environment scrubbed as
+    /// [`Cli`]'s own is and a fixed identity, for the renames and removals `testkit::commit_file`
+    /// cannot make.
+    fn git_in(git: &Cli, repo: &std::path::Path, args: &[&OsStr]) {
+        let mut command = std::process::Command::new(git.binary());
+        command.current_dir(repo);
+        for key in SCRUBBED_ENV {
+            command.env_remove(key);
+        }
+        let status = command
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .status()
+            .expect("git runs");
+        assert!(
+            status.success(),
+            "git {args:?} failed in {}",
+            repo.display()
+        );
+    }
+
+    /// `git add -A` then `git commit -m <message>`; returns the new `HEAD`.
+    fn commit_all(git: &Cli, repo: &std::path::Path, message: &str) -> String {
+        git_in(git, repo, &[OsStr::new("add"), OsStr::new("-A")]);
+        git_in(
+            git,
+            repo,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-q"),
+                OsStr::new("-m"),
+                OsStr::new(message),
+            ],
+        );
+        super::head(repo).expect("HEAD reads")
+    }
+
+    /// MOD-9 D119: every changed name, a rename under both of its names (`--no-renames`), a space
+    /// and a newline kept verbatim (`-z`, no quoting).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn name_only_lists_every_changed_path_with_renames_split() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path();
+        empty_repo(repo);
+        for (name, body) in [
+            ("f", "first\n"),
+            ("old.rs", "fn old() {}\n"),
+            ("gone.rs", "x\n"),
+        ] {
+            std::fs::write(repo.join(name), body).expect("the file is written");
+        }
+        let before = commit_all(&git, repo, "base");
+
+        std::fs::write(repo.join("f"), "second\n").expect("f is modified");
+        git_in(
+            &git,
+            repo,
+            &[
+                OsStr::new("mv"),
+                OsStr::new("old.rs"),
+                OsStr::new("moved.rs"),
+            ],
+        );
+        git_in(
+            &git,
+            repo,
+            &[OsStr::new("rm"), OsStr::new("-q"), OsStr::new("gone.rs")],
+        );
+        std::fs::write(repo.join("a b.rs"), "a\n").expect("a spaced name is written");
+        std::fs::write(repo.join("new\nline.rs"), "n\n").expect("a newline name is written");
+        let after = commit_all(&git, repo, "after");
+
+        let mut listed = git
+            .name_only(repo, &before, &after)
+            .await
+            .expect("the names read");
+        listed.paths.sort();
+        assert_eq!(
+            listed,
+            NameOnly {
+                paths: [
+                    "a b.rs",
+                    "f",
+                    "gone.rs",
+                    "moved.rs",
+                    "new\nline.rs",
+                    "old.rs"
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+                truncated: false,
+            }
+        );
+    }
+
+    /// MOD-9 D119: a name that is not UTF-8 is dropped, never decoded into a plausible path.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn name_only_drops_a_non_utf8_name() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path();
+        let before = repo_with_one_commit(repo);
+        std::fs::write(repo.join(OsStr::from_bytes(b"\xff\xfe.rs")), "x\n")
+            .expect("a non-UTF-8 name is written");
+        std::fs::write(repo.join("ok.rs"), "ok\n").expect("ok.rs is written");
+        let after = commit_all(&git, repo, "names");
+
+        assert_eq!(
+            git.name_only(repo, &before, &after)
+                .await
+                .expect("the names read"),
+            NameOnly {
+                paths: vec!["ok.rs".to_owned()],
+                truncated: false,
+            }
+        );
+    }
+
+    /// MOD-9 D119: an empty range names nothing and is not an error.
+    #[tokio::test]
+    async fn name_only_of_an_empty_range_is_empty() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let head = repo_with_one_commit(dir.path());
+        assert_eq!(
+            git.name_only(dir.path(), &head, &head)
+                .await
+                .expect("the empty range reads"),
+            NameOnly::default()
+        );
+    }
+
+    /// MOD-9 D130: the byte capture hands back what it kept and whether it dropped anything.
+    #[test]
+    fn head_bytes_capture_reports_overflow() {
+        let mut over = HeadBuffer::new(8);
+        over.push(b"abcdefghij");
+        assert_eq!(over.into_bytes(), (b"abcdefgh".to_vec(), true));
+
+        let mut exact = HeadBuffer::new(8);
+        exact.push(b"abcd");
+        exact.push(b"efgh");
+        assert_eq!(
+            exact.into_bytes(),
+            (b"abcdefgh".to_vec(), false),
+            "exactly the cap is not an overflow"
+        );
+    }
+
+    /// MOD-9 D130: the final NUL-split segment is always dropped — partial when the cap cut it,
+    /// empty when git finished its last entry — and never a second one.
+    #[test]
+    fn name_only_drops_a_partial_last_entry_when_capped() {
+        let names = |paths: &[&str], truncated: bool| NameOnly {
+            paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+            truncated,
+        };
+        assert_eq!(
+            parse_name_only(b"a.rs\0b.rs\0c.r", true),
+            names(&["a.rs", "b.rs"], true),
+            "the cut entry goes"
+        );
+        assert_eq!(
+            parse_name_only(b"a.rs\0b.rs\0", true),
+            names(&["a.rs", "b.rs"], true),
+            "cut exactly on a NUL: both entries are whole"
+        );
+        assert_eq!(
+            parse_name_only(b"a.rs\0b.rs\0", false),
+            names(&["a.rs", "b.rs"], false)
+        );
+        assert_eq!(parse_name_only(b"", false), NameOnly::default());
     }
 
     /// A-3's read: whether an object database holds a commit, with no subprocess.
