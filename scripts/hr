@@ -70,6 +70,9 @@ STATE="$(realpath -ms "${HR_STATE:-$DEFAULT_STATE}")"
 RUNS="$(realpath -ms "${HR_RUNS:-/media/projects/htui-hr/.runs}")"
 RUNS_LOCK="$RUNS/.lock"
 LEASE_MARK="$RUNS/.leases-initialized"
+# How LEASE_MARK names a state dir: symlinks resolved, so any spelling of the same dir matches
+# (hr-mint compares the same way).
+STATE_KEY="$(realpath -m -- "$STATE")"
 MIGRATED_MARK="$RUNS/.migrated"
 OLD_RUNS="$STATE/runs"
 ROOT_HDD="$(realpath -ms "${HR_ROOT:-/media/projects/htui-hr}")"
@@ -427,8 +430,18 @@ mark_migrated() {
 
 # ID leases: hr-mint --init creates the lease file on the host; the host-only marker then remembers
 # it existed, because a sandbox can delete both the lease file and its lock (review M3).
+# lease_marked — LEASE_MARK names this state dir; each line and STATE compared with symlinks
+# resolved (realpath -m), as hr-mint compares them.
+lease_marked() {
+    local line
+    [[ -f "$LEASE_MARK" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" && "$(realpath -m -- "$line")" == "$STATE_KEY" ]] && return 0
+    done <"$LEASE_MARK"
+    return 1
+}
 lease_file_vanished() {
-    [[ -f "$LEASE_MARK" ]] && grep -qxF -- "$STATE" "$LEASE_MARK" 2>/dev/null && [[ ! -e "$STATE/id-leases.tsv" ]]
+    lease_marked && [[ ! -e "$STATE/id-leases.tsv" ]]
 }
 check_leases() {
     lease_file_vanished || return 0
@@ -437,8 +450,8 @@ check_leases() {
 init_leases() {
     check_leases
     HR_STATE="$STATE" HR_RUNS="$RUNS" "$HR_MINT_BIN" --init || die 3 "scripts/hr-mint --init failed"
-    grep -qxF -- "$STATE" "$LEASE_MARK" 2>/dev/null && return 0
-    printf '%s\n' "$STATE" >>"$LEASE_MARK" || die 3 "cannot write $LEASE_MARK"
+    lease_marked && return 0
+    printf '%s\n' "$STATE_KEY" >>"$LEASE_MARK" || die 3 "cannot write $LEASE_MARK"
 }
 
 # set_reg ITEM k=v... — update registry fields under the lock.

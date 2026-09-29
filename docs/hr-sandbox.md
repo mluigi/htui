@@ -537,6 +537,7 @@ Known residuals:
 - A run that deletes both the lease file and its lock no longer makes host mints tree-only:
   `hr-mint` on the host reads `HR_RUNS/.leases-initialized` and reports the file vanished — as long
   as it sees the same `HR_RUNS` as `scripts/hr` (export it, like `HR_STATE`, if you change it).
+  The record names the state directory with symlinks resolved, so any spelling of it matches.
 - A clone's `.git/commondir` can redirect the host's ref reads; the most it achieves is making its
   own run look collected, so a purge then drops that run's uncollected work.
 

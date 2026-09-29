@@ -601,6 +601,17 @@ TS_ROW_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
     # The same state dir spelled differently still matches.
     HR_STATE="$HR_STATE/." run --separate-stderr mint --prefix MOD --title 'x'
     [[ $status -eq 1 && "$stderr" == *'lease file vanished'* ]]
+    # ... also through a symlink, whichever side (the record or HR_STATE) spells it that way.
+    ln -s "$HR_STATE" "$BATS_TEST_TMPDIR/state-link"
+    HR_STATE="$BATS_TEST_TMPDIR/state-link" run --separate-stderr mint --prefix MOD --title 'x'
+    [[ $status -eq 1 && "$stderr" == *'lease file vanished'* ]]
+    HR_STATE="$BATS_TEST_TMPDIR/state-link" run --separate-stderr "$HR_MINT" --leasing
+    [[ $status -eq 0 ]]
+    printf '%s\n' "$BATS_TEST_TMPDIR/state-link/" >"$HR_RUNS/.leases-initialized"
+    run --separate-stderr mint --prefix MOD --title 'x'
+    [[ $status -eq 1 && "$stderr" == *'lease file vanished'*'.leases-initialized'* ]]
+    run --separate-stderr "$HR_MINT" --init
+    [[ $status -eq 1 && "$stderr" == *'lease file vanished'* && ! -e "$(lease_file)" ]]
 
     # In a sandbox the marker is never read (HR_RUNS is host-only): the sandbox message.
     HR_SANDBOX=1 run --separate-stderr mint --prefix MOD --title 'x'

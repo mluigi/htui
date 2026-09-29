@@ -191,13 +191,14 @@ stamp_lock() { # needs fd 9
 
 # Host only: scripts/hr's host-only record ($HR_RUNS/.leases-initialized) names this state dir,
 # i.e. `scripts/hr up` turned leasing on for it. A sandbox can delete the lease file and the lock
-# (with its stamp), but never this file (re-review L3). Never read in a sandbox.
+# (with its stamp), but never this file (re-review L3). Never read in a sandbox. Each line and the
+# state dir are compared with symlinks resolved (realpath -m), so any spelling of it matches.
 marked_initialized() {
     in_sandbox && return 1
     [[ -f "$RUNS_MARK" ]] || return 1
     local line
     while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ -n "$line" && "$(realpath -ms -- "$line")" == "$STATE_NORM" ]] && return 0
+        [[ -n "$line" && "$(realpath -m -- "$line")" == "$STATE_NORM" ]] && return 0
     done <"$RUNS_MARK"
     return 1
 }
@@ -478,7 +479,8 @@ done
 STATE="${HR_STATE:-/media/projects/htui-hr/.state}"
 LEASES="$STATE/id-leases.tsv"
 LOCK="$STATE/id-leases.lock"
-STATE_NORM="$(realpath -ms -- "$STATE")"
+# The state dir as scripts/hr's record names it: symlinks resolved (both sides compared so).
+STATE_NORM="$(realpath -m -- "$STATE")"
 RUNS_MARK="${HR_RUNS:-/media/projects/htui-hr/.runs}/.leases-initialized"
 
 if [[ ! "${HR_MINT_LOCK_TIMEOUT:-30}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then

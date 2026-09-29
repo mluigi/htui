@@ -673,7 +673,7 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
 
 @test "27. the lease file vanished after hr-mint --init -> up, gc, down --purge refuse (1); never recreated" {
     mk_run MOD-5
-    grep -qxF "$HR_STATE" "$HR_RUNS/.leases-initialized"
+    grep -qxF "$(realpath -m "$HR_STATE")" "$HR_RUNS/.leases-initialized"
     rm -f "$(lease_file)" "$HR_STATE/id-leases.lock"
     run --separate-stderr "$HR" up MOD-4
     [[ $status -eq 1 ]]
@@ -685,9 +685,23 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     [[ $status -eq 1 && "$stderr" == *'vanished'* ]]
     [[ -d "$(src_of MOD-5)/.git" && ! -e "$(lease_file)" ]]
     ! grep -q -- 'down -v' "$HR_TEST_DOCKER_LOG" || false
-    # A different state dir has its own record: the guard is per HR_STATE.
-    HR_STATE="$BATS_TEST_TMPDIR/state2" run --separate-stderr "$HR" up MOD-4
+    # A different state dir has its own record: the guard is per HR_STATE. This one is spelled
+    # through a symlink; the record holds it with symlinks resolved, and is matched that way.
+    mkdir -p "$BATS_TEST_TMPDIR/state2"
+    ln -s "$BATS_TEST_TMPDIR/state2" "$BATS_TEST_TMPDIR/state-link"
+    HR_STATE="$BATS_TEST_TMPDIR/state-link" run --separate-stderr "$HR" up MOD-4
     [[ $status -eq 0 ]]
+    grep -qxF "$(realpath -m "$BATS_TEST_TMPDIR/state2")" "$HR_RUNS/.leases-initialized"
+    ! grep -qF 'state-link' "$HR_RUNS/.leases-initialized" || false
+    rm -f "$BATS_TEST_TMPDIR/state2/id-leases.tsv" "$BATS_TEST_TMPDIR/state2/id-leases.lock"
+    # Either spelling is guarded, by scripts/hr and by hr-mint.
+    HR_STATE="$BATS_TEST_TMPDIR/state2" run --separate-stderr "$HR" gc --yes
+    [[ $status -eq 1 && "$stderr" == *'vanished'* ]]
+    HR_STATE="$BATS_TEST_TMPDIR/state-link" run --separate-stderr "$HR" gc --yes
+    [[ $status -eq 1 && "$stderr" == *'vanished'* ]]
+    HR_STATE="$BATS_TEST_TMPDIR/state-link" run --separate-stderr "$HR_MINT" --prefix MOD --title x \
+        --repo-root "$HR_HOST_REPO"
+    [[ $status -eq 1 && "$stderr" == *'lease file vanished'* ]]
 }
 
 @test "28. up warns once per up that a non-default HR_STATE must be exported for host mints" {
