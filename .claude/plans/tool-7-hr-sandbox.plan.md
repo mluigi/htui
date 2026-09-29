@@ -420,24 +420,33 @@ Shared read-write channels, and what a hostile run can do through each:
 
 | channel | allows |
 |---|---|
-| `~/.claude` (by design, goal 6) | hooks or settings that execute in the host's next Claude session |
+| `~/.claude` (by design, goal 6): login, settings, plugins, skills, agents, commands | hooks or settings that execute in the host's next Claude session; the shared login |
+| `~/.claude/projects/-home-mluigi-projects-htui` (re-review M-C) | this project's host transcripts; its auto-memory, loaded by the next host session |
 | `~/.cache/uv` | packages that `uvx` runs on the host |
 | `~/.headroom`, `~/.serena` | state and config the host's headroom and serena read |
 | shared `.remember/` (M6) | e.g. `now.md` replaced by a symlink to a host-checkout file; the host remember plugin then writes into the checkout |
 | `/hr-state` | delete the lease file or hold its lock; bounded by the fail-closed rules (`scripts/hr-mint` header, `scripts/hr` `check_leases`) |
-| `htui-hr-cargo` | shared crate sources in `registry/src`; `bin/` is off `PATH`, config/credentials files are empty read-only binds |
+| `htui-hr-cargo` | the shared download cache and index (`registry/cache`, `registry/index`); `registry/src` is a per-run volume, `bin/` an empty read-only tmpfs (cargo searches it for subcommands ahead of `PATH`, M-A), config/credentials empty read-only binds, and `up`/`attach` refuse a mount point of the wrong kind (L8b) |
 
 Protected: host repo read-only; no git credentials; host Postgres/Qdrant published on `127.0.0.1`
 only (`compose.yaml`, H2); per-run databases and volumes; host-side git never reads a clone's
 worktree outside a throwaway `--network none` container (H3); run registry host-only
-(`HR_RUNS`) and validated (H4); `~/.local` narrowed to four read-only tool dirs (C1). Advice: review
-`git diff main...hr/ITEM -- .claude scripts docker` before `collect --merge` (which shows that stat
-itself only before offering the doc-conflict session, H6); after a distrusted run, inspect
-`~/.claude/settings.json` and hooks.
+(`HR_RUNS`) and validated (H4), an old `$HR_STATE/runs` imported once only (M-B); `~/.local`
+narrowed to four read-only tool dirs (C1); in `~/.claude`, everything that holds other projects' or
+the host's own session data is masked per run (M-C): tmpfs over `projects` (the htui project dir
+bound back rw), `file-history`, `paste-cache`, `shell-snapshots`, `session-env`, `session-data`,
+`sessions`, `daemon`, `jobs`, `backups`, `metrics`, `.remember`; per-run empty files over
+`history.jsonl`, `bash-commands.log`, `cost-tracker.log`. `collect --merge` prints the diffstat of
+`.claude scripts docker CLAUDE.md AGENTS.md .mcp.json .cargo rust-toolchain.toml` and requires a
+confirmation before every merge that changes them, fetching into a temporary ref so a refusal
+leaves the host's refs as they were (L1). Advice: read that diff before confirming; after a
+distrusted run, inspect `~/.claude/settings.json`, hooks and the htui auto-memory.
 
-Residuals R1 could not fix:
+Residuals (after the re-review fixes, 2026-09-29):
 
-- shared crate sources in `htui-hr-cargo` (one run's edits compile in another);
+- the shared cargo download cache and index: a run that rewrites a cached `.crate` and its index
+  entry can still reach a later extraction in another run (`registry/src` itself is per run now);
 - lease-lock DoS, bounded by the 30 s `HR_MINT_LOCK_TIMEOUT` (mints exit 3);
 - a clone's `.git/commondir` can redirect host ref reads, but only to make its own run look collected;
-- deleting both `id-leases.tsv` and `id-leases.lock` makes host mints tree-only (`leasing off`) until the next `hr up`/`gc`/`down --purge`, which refuse via `$HR_RUNS/.leases-initialized`.
+- deleting both `id-leases.tsv` and `id-leases.lock` no longer makes host mints tree-only: host
+  `hr-mint` reads `$HR_RUNS/.leases-initialized` too (L3), provided it sees the same `HR_RUNS`.

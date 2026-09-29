@@ -511,8 +511,9 @@ lint-checked from Linux without a C toolchain that targets MSVC, so check it by 
 `scripts/hr` gives each run its own container set: a fresh clone on branch `hr/<ITEM>`, a private
 Postgres and Qdrant, and the full toolchain, so three or four runs can work side by side without
 getting in each other's way. That guards against accidents, not against a hostile agent: every run
-shares `~/.claude` and a few other directories with the host read-write (see the threat model in the
-guide). Linux only; needs Docker. `gum` is needed only for the menus: every verb takes plain
+shares your Claude login, settings, plugins and skills, this project's Claude memory and a few other
+directories with the host read-write; other projects' transcripts and your prompt history are masked
+(see the threat model in the guide). Linux only; needs Docker. `gum` is needed only for the menus: every verb takes plain
 arguments. See [`docs/hr-sandbox.md`](docs/hr-sandbox.md).
 
 ## Further reading
