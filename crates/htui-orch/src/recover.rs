@@ -1,7 +1,7 @@
 //! ANA-2 §4.9's lease heartbeat and the sweep's pure half (plan D85, D86, D90, D91, D97).
 //!
 //! Nothing here reads or writes a store. The heartbeat takes its refresh as a closure (plan D106),
-//! so the engine hands it `|until| store.refresh_lease(run, owner, until)` and a test hands it a
+//! so the engine hands it `|ttl| store.refresh_lease(run, owner, ttl)` and a test hands it a
 //! script; everything else is a function of rows the caller already read.
 
 use std::collections::BTreeMap;
@@ -35,13 +35,15 @@ pub const DEFAULT_LEASE_TTL_SECONDS: i64 = 120;
 pub const DEFAULT_LEASE_REFRESH_SECONDS: i64 = 60;
 
 /// The longest TTL [`LeaseTimes::from_app`] reads as set: one year, so `now + ttl` never
-/// overflows a `DateTime<Utc>`.
-const MAX_LEASE_TTL_SECONDS: i64 = 365 * 24 * 60 * 60;
+/// overflows a `DateTime<Utc>`, and the store's own bound (MOD-40 blueprint B27).
+const MAX_LEASE_TTL_SECONDS: i64 = htui_core::store::MAX_LEASE_TTL.num_seconds();
 
 /// How long a lease lives and how often it is renewed (plan D85).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaseTimes {
-    /// Added to the clock's instant for every `lease_expires_at` this process writes.
+    /// The TTL this process hands every lease write. The store adds it to its own clock (MOD-40
+    /// plan D10); the heartbeat adds it to the local instant it sent the write at, which is where
+    /// its self-fence is measured from.
     pub ttl: TimeDelta,
     /// How long the heartbeat sleeps between two refreshes; at most a third of `ttl` (D124).
     pub refresh: Duration,
@@ -94,15 +96,20 @@ pub enum Heartbeat {
 /// Plan D123's floor on the sooner retry after a failed refresh.
 const MIN_RETRY: Duration = Duration::from_secs(1);
 
-/// Sleep, then `refresh(clock.now() + times.ttl)`: `Ok(true)` → the lease runs to that `until`,
-/// sleep `times.refresh`, loop; `Ok(false)` → `Abandoned`; `Err(e)` → `tracing::warn!`, sleep
-/// `times.refresh / 4` (at least 1 s, D123) and loop (D86, D103). Never returns otherwise.
+/// Sleep, then `refresh(times.ttl)`: `Ok(true)` → the lease runs at least to `clock.now() +
+/// times.ttl` as read **before** the refresh was sent, sleep `times.refresh`, loop; `Ok(false)` →
+/// `Abandoned`; `Err(e)` → `tracing::warn!`, sleep `times.refresh / 4` (at least 1 s, D123) and
+/// loop (D86, D103). Never returns otherwise.
 ///
-/// **The self-fence (plan D122).** The heartbeat tracks the last `until` it wrote successfully,
-/// starting from `written`: the `until` its caller's `claim_run`, `take_lease` or the sweep's
-/// `renew_lease` actually wrote (plan D143), which may lie before `clock.now() + times.ttl` at
-/// this call when the caller wrote other rows in between. Once refreshes have failed until
-/// `clock.now() >= last_until - times.refresh`, it returns `Expired`: the walk cannot prove its
+/// **The self-fence (plan D122; MOD-40 plan OQ-2).** The store stamps a lease with its own clock
+/// and does not say what it wrote (plan D10). The heartbeat instead tracks, on its **own** clock,
+/// the instant by which the last lease it wrote successfully lapses at the earliest: the instant
+/// it sent that write plus the TTL. The store read its clock after that send, so its expiry is no
+/// earlier, and a span measured on one clock does not care how far apart two hosts' clocks are.
+/// It starts from `written`, the same instant for the caller's `claim_run`, `take_lease` or the
+/// sweep's `renew_lease` (plan D143), which may lie before `clock.now() + times.ttl` at this call
+/// when the caller wrote other rows in between. Once refreshes have failed until
+/// `clock.now() >= last - times.refresh`, it returns `Expired`: the walk cannot prove its
 /// lease, and one `refresh` before it lapses is where it stops, so no other box's sweep adopts a
 /// run this walk still writes to. Neither the first beat nor a retry sleeps past that fence, and
 /// a refresh still pending at the fence (a stuck connection) is dropped there and read as
@@ -111,6 +118,9 @@ const MIN_RETRY: Duration = Duration::from_secs(1);
 /// A single store error is not a taken lease: offline, the lease is left to expire and the
 /// reconnect sweep adjudicates (`docs/ANA-2.md:1325-1336`). Needs a runtime with the time driver
 /// (H-3).
+///
+/// The clock is the wall clock in production, so a wall-clock step while a lease is held moves
+/// the fence with it (MOD-40 blueprint F-38); a monotonic clock is MOD-41's.
 pub async fn heartbeat<F, Fut, C>(
     mut refresh: F,
     written: DateTime<Utc>,
@@ -118,7 +128,7 @@ pub async fn heartbeat<F, Fut, C>(
     times: LeaseTimes,
 ) -> Heartbeat
 where
-    F: FnMut(DateTime<Utc>) -> Fut,
+    F: FnMut(TimeDelta) -> Fut,
     Fut: Future<Output = Result<bool, StoreError>>,
     C: Clock + ?Sized,
 {
@@ -136,7 +146,7 @@ where
         let until = now + times.ttl;
         // Plan D122: a refresh that hangs is given up at the fence, not waited on past it.
         let left = (fence - now).to_std().unwrap_or(Duration::ZERO);
-        let Ok(answer) = tokio::time::timeout(left, refresh(until)).await else {
+        let Ok(answer) = tokio::time::timeout(left, refresh(times.ttl)).await else {
             tracing::warn!("lease refresh still pending at the fence; the walk stops");
             return Heartbeat::Expired;
         };
@@ -519,20 +529,20 @@ mod tests {
     }
 
     /// A refresh closure answering `script` in order (then `Ok(true)` for ever), recording each
-    /// `until` beside the clock's instant at the call.
+    /// TTL beside the clock's instant at the call.
     #[allow(clippy::type_complexity)]
     fn scripted(
         clock: &PausedClock,
         script: Vec<Result<bool, StoreError>>,
     ) -> (
-        Arc<Mutex<Vec<(DateTime<Utc>, DateTime<Utc>)>>>,
-        impl FnMut(DateTime<Utc>) -> std::future::Ready<Result<bool, StoreError>> + '_,
+        Arc<Mutex<Vec<(DateTime<Utc>, TimeDelta)>>>,
+        impl FnMut(TimeDelta) -> std::future::Ready<Result<bool, StoreError>> + '_,
     ) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&calls);
         let mut script = script.into_iter();
-        let refresh = move |until| {
-            seen.lock().unwrap().push((clock.now(), until));
+        let refresh = move |ttl| {
+            seen.lock().unwrap().push((clock.now(), ttl));
             std::future::ready(script.next().unwrap_or(Ok(true)))
         };
         (calls, refresh)
@@ -546,10 +556,7 @@ mod tests {
     }
 
     /// The seconds after the clock's origin of every recorded call.
-    fn beats(
-        calls: &Mutex<Vec<(DateTime<Utc>, DateTime<Utc>)>>,
-        origin: DateTime<Utc>,
-    ) -> Vec<i64> {
+    fn beats(calls: &Mutex<Vec<(DateTime<Utc>, TimeDelta)>>, origin: DateTime<Utc>) -> Vec<i64> {
         calls
             .lock()
             .unwrap()
@@ -574,9 +581,12 @@ mod tests {
         );
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 3, "a beat at 40 s, 80 s and 120 s");
-        for (beat, (now, until)) in (1..).zip(calls.iter()) {
+        for (beat, (now, ttl)) in (1..).zip(calls.iter()) {
             assert_eq!(*now, clock.origin + TimeDelta::seconds(40 * beat));
-            assert_eq!(*until, *now + times.ttl, "beat {beat}");
+            assert_eq!(
+                *ttl, times.ttl,
+                "beat {beat}: every refresh asks for the configured TTL"
+            );
         }
     }
 
@@ -700,7 +710,7 @@ mod tests {
         let clock = PausedClock::new();
         let times = default_times();
         let calls = Mutex::new(0_u32);
-        let refresh = |_until| {
+        let refresh = |_ttl| {
             *calls.lock().unwrap() += 1;
             std::future::pending::<Result<bool, StoreError>>()
         };

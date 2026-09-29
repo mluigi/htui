@@ -6,19 +6,19 @@
 //! `READ COMMITTED` the loser of a compare-and-set race blocks on the row lock, re-evaluates
 //! `version = $2` against the committed value and matches nothing (ANA-9 §11.3). The exceptions are
 //! MOD-2's chat-run pair, which writes one `run` and one `run_step` and therefore takes an explicit
-//! transaction, exactly as the pending-buffer upload does (`crate::cache::pending`), and MOD-15's
-//! two deletes, which count and delete in one transaction **at `REPEATABLE READ`** so that the two
-//! statements share a snapshot as well (review M1; see [`begin_repeatable_read`]). MOD-7's
-//! `record_box_probe` is one more: it updates the `box` row and replaces its `box_tool` set, so it
-//! takes a transaction too (plan D10). MOD-38's amend, withdraw and `cite` also take one, because
-//! each decides a refusal on a row it has locked before it writes (see [`revise_requirement`]).
+//! transaction, and MOD-15's two deletes, which count and delete in one transaction **at
+//! `REPEATABLE READ`** so that the two statements share a snapshot as well (review M1; see
+//! [`begin_repeatable_read`]). MOD-7's `record_box_probe` is one more: it updates the `box` row and
+//! replaces its `box_tool` set, so it takes a transaction too (plan D10). MOD-38's amend, withdraw
+//! and `cite` also take one, because each decides a refusal on a row it has locked before it writes
+//! (see [`revise_requirement`]).
 //!
 //! There is **no `DELETE FROM item`** in this file and none may be added: §4.1's "keys are never
 //! reused" is enforced by the absence of the path, and the conformance case `no_delete_path` is
 //! what pins it. Nor does any statement write `updated_at` on an update path - the `BEFORE UPDATE`
 //! trigger of the migration owns it, and `RETURNING` sees the trigger-modified row.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord,
     BoxRow, BoxSettings, BoxTool, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId,
@@ -41,15 +41,15 @@ use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::seed;
 use htui_core::store::{
     BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung,
-    StoreError, StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, already_exists,
+    StepFence, StoreError, StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, already_exists,
     chat_step_status, check_attachment, citation_key, close_out_needs_a_summary, expected_on_row,
     failure_disagrees_with_status, finish_run_item_mirror, finish_run_needs_a_terminal_status,
     graph_not_in_project, illegal_move, invalid_area_code, invalid_prefix, item_has_a_live_run,
-    item_kind_is_held, item_not_in_project, legal_move, new_skill_refusal, not_a_fanout_candidate,
-    not_a_terminal_status, prompt_template_key, prompt_template_refusal, references_no_row,
-    requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_step,
-    run_is_terminal, skill_body_refusal, skill_patch_refusal, skill_version_key,
-    step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
+    item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move, new_skill_refusal,
+    not_a_fanout_candidate, not_a_terminal_status, prompt_template_key, prompt_template_refusal,
+    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
+    row_names_another_step, run_is_terminal, skill_body_refusal, skill_patch_refusal,
+    skill_version_key, step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
     withdrawn_requirement_cited,
 };
 use serde_json::Value;
@@ -175,6 +175,24 @@ async fn step_exists(conn: &mut PgConnection, step: StepId) -> Result<()> {
             id: step.to_string(),
         })?;
     Ok(())
+}
+
+/// MOD-40 plan D1: why a fenced `UPDATE` of `step` matched no row. [`StoreError::NotFound`] when
+/// the step does not exist, else [`StoreError::Fenced`]: `step_exists`' follow-up read on a miss,
+/// `interrupt_step`'s shape.
+///
+/// Its callers box it: it is the rare branch, and inline it would add an acquire and a query to
+/// every settle's future, which the engine nests deep enough that a debug build's worker stack
+/// overflows (`htui/tests/runs_pg.rs`).
+async fn fenced_or_missing(pool: &sqlx::PgPool, step: StepId) -> StoreError {
+    let exists = async {
+        let mut conn = pool.acquire().await.map_err(map_sqlx)?;
+        step_exists(&mut conn, step).await
+    };
+    match exists.await {
+        Ok(()) => StoreError::Fenced { step },
+        Err(err) => err,
+    }
 }
 
 /// The `document` insert [`WriteStore::write_document`] and [`WriteStore::close_out`] share, on
@@ -925,25 +943,33 @@ impl WriteStore for PgStore {
         }
     }
 
-    /// Appends session events in one `INSERT`, skipping the `(run_step_id, seq)` pairs already
-    /// stored (ANA-9 §4.3, plan D3).
+    /// Appends session events in one statement under `fence`, skipping the `(run_step_id, seq)`
+    /// pairs already stored (ANA-9 §4.3, plan D3; MOD-40 plan D1).
     ///
     /// The batch is carried as **one** `jsonb` parameter and expanded by `jsonb_to_recordset`,
     /// rather than as nine parallel arrays: `SessionEvent`'s serde form already *is* the row -
-    /// field names are the column names verbatim - which is the same fact the pending buffer's
-    /// line format rests on (`crate::cache::pending`), and nullable `text[]` / `jsonb[]` parameters
+    /// field names are the column names verbatim - and nullable `text[]` / `jsonb[]` parameters
     /// are avoided entirely.
     ///
-    /// `rows_affected()` counts inserts only, because `ON CONFLICT ... DO NOTHING` reports the
-    /// skipped rows as unaffected: that is the "how many landed" answer §4.1 asks for, and it is
-    /// what makes a replayed offline buffer distinguishable from a fresh one.
+    /// The fence is decided **inside** the statement (MOD-40 blueprint B1, B2). `lease` reads the
+    /// named steps' runs and share-locks them, so a `take_lease` or `adopt_runs` either waits for
+    /// this write or is seen by it; `fenced` is the lowest step whose run's `lease_owner` is not
+    /// `$2`. The insert runs only when nothing is fenced, **or** when a named step does not exist
+    /// at all, so that such a row still reaches the foreign key and refuses the batch (`23503`)
+    /// ahead of the fence. The statement answers both facts, so no second read is needed and none
+    /// can race.
+    ///
+    /// `inserted` counts inserts only, because `ON CONFLICT ... DO NOTHING` skips a stored row: that
+    /// is the "how many landed" answer §4.1 asks for, and what tells a recorder's replay (short is
+    /// fine) from a fresh batch (short is a second writer).
     ///
     /// # Errors
     ///
     /// [`StoreError::Constraint`] when an event names a `run_step` that does not exist (`23503`)
-    /// or a `kind` / `role` outside the §4.3 `CHECK` lists (`23514`). One statement, so a refused
-    /// batch writes none of its rows.
-    async fn append_events(&self, events: &[SessionEvent]) -> Result<usize> {
+    /// or a `kind` / `role` outside the §4.3 `CHECK` lists (`23514`); [`StoreError::Fenced`] when a
+    /// named step's run does not carry `fence`'s lease. One statement, so a refused batch writes
+    /// none of its rows.
+    async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> Result<usize> {
         if events.is_empty() {
             return Ok(0);
         }
@@ -951,25 +977,57 @@ impl WriteStore for PgStore {
             StoreError::Backend(format!("session_event does not serialise: {err}"))
         })?;
 
-        let inserted = sqlx::query!(
+        let answer = sqlx::query!(
             r#"
-            INSERT INTO session_event (run_step_id, seq, turn, kind, role, tool_call_id,
-                                       payload, raw, at)
-            SELECT e.run_step_id, e.seq, e.turn, e.kind, e.role, e.tool_call_id, e.payload,
-                   e.raw, e.at
-              FROM jsonb_to_recordset($1::jsonb)
-                   AS e(run_step_id uuid, seq int, turn int, kind text, role text,
-                        tool_call_id text, payload jsonb, raw jsonb, at timestamptz)
-            ON CONFLICT (run_step_id, seq) DO NOTHING
+            WITH e AS (
+                SELECT *
+                  FROM jsonb_to_recordset($1::jsonb)
+                       AS e(run_step_id uuid, seq int, turn int, kind text, role text,
+                            tool_call_id text, payload jsonb, raw jsonb, at timestamptz)
+            ),
+            lease AS (
+                SELECT s.id AS run_step_id, r.lease_owner
+                  FROM run_step s
+                  JOIN run r ON r.id = s.run_id
+                 WHERE s.id IN (SELECT run_step_id FROM e)
+                   FOR SHARE OF r
+            ),
+            fenced AS (
+                SELECT run_step_id
+                  FROM lease
+                 WHERE lease_owner IS DISTINCT FROM $2
+                 ORDER BY run_step_id
+                 LIMIT 1
+            ),
+            ins AS (
+                INSERT INTO session_event (run_step_id, seq, turn, kind, role, tool_call_id,
+                                           payload, raw, at)
+                SELECT e.run_step_id, e.seq, e.turn, e.kind, e.role, e.tool_call_id, e.payload,
+                       e.raw, e.at
+                  FROM e
+                 WHERE NOT EXISTS (SELECT 1 FROM fenced)
+                    OR EXISTS (SELECT 1 FROM e AS m
+                                WHERE NOT EXISTS (SELECT 1 FROM lease l
+                                                   WHERE l.run_step_id = m.run_step_id))
+                ON CONFLICT (run_step_id, seq) DO NOTHING
+                RETURNING 1
+            )
+            SELECT (SELECT count(*) FROM ins) AS "inserted!",
+                   (SELECT run_step_id FROM fenced) AS "fenced_step?"
             "#,
             rows,
+            fence.owner(),
         )
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
-        .map_err(map_sqlx)?
-        .rows_affected();
+        .map_err(map_sqlx)?;
 
-        Ok(usize::try_from(inserted).unwrap_or(0))
+        if let Some(step) = answer.fenced_step {
+            return Err(StoreError::Fenced {
+                step: StepId::from_uuid(step),
+            });
+        }
+        Ok(usize::try_from(answer.inserted).unwrap_or(0))
     }
 
     /// `run_step.usage` on every call, `run_step.prompt_digest` only when one is supplied
@@ -980,10 +1038,13 @@ impl WriteStore for PgStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] when the step does not exist - zero rows updated is the only thing
-    /// this statement can mean.
+    /// [`StoreError::NotFound`] when the step does not exist and [`StoreError::Fenced`] when it
+    /// does and its run does not carry `fence`'s lease, told apart by `step_exists`' follow-up read
+    /// on a miss (`interrupt_step`'s shape). `FOR SHARE` on the run for `append_events`' reason
+    /// (MOD-40 blueprint B2).
     async fn set_step_usage(
         &self,
+        fence: StepFence,
         step: StepId,
         usage: Value,
         prompt_digest: Option<String>,
@@ -991,65 +1052,130 @@ impl WriteStore for PgStore {
         let updated = sqlx::query!(
             "UPDATE run_step \
                 SET usage = $2, prompt_digest = COALESCE($3, prompt_digest) \
-              WHERE id = $1",
+              WHERE id = $1 \
+                AND EXISTS (SELECT 1 FROM run r \
+                             WHERE r.id = run_step.run_id \
+                               AND r.lease_owner IS NOT DISTINCT FROM $4 \
+                               FOR SHARE)",
             step.as_uuid(),
             usage,
             prompt_digest.as_deref(),
+            fence.owner(),
         )
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?
         .rows_affected();
 
-        if updated == 0 {
-            return Err(StoreError::NotFound {
-                entity: "run_step",
-                id: step.to_string(),
-            });
+        if updated == 1 {
+            return Ok(());
         }
-        Ok(())
+        Err(Box::pin(fenced_or_missing(&self.pool, step)).await)
     }
 
-    /// Inserts or updates one `agent` row, keyed by `agent.id` (`docs/ANA-4.md` §4.1, ANA-9 §5.7).
+    /// Creates or edits one `agent` row as a compare-and-set on `updated_at` (`docs/ANA-4.md`
+    /// §4.1, ANA-9 §5.7; MOD-40 plan D5).
     ///
-    /// `created_at` and `updated_at` are supplied on the insert and neither is in the `DO UPDATE`
-    /// `SET` list: the row keeps the creation stamp it was first written with, and the migration's
-    /// `BEFORE UPDATE` trigger owns `updated_at` on every later write.
+    /// Two statements, one per branch, `set_setting`'s `App` rung's shape: `expected: None` is
+    /// `INSERT … ON CONFLICT (id) DO NOTHING`, so a stored id is a miss and never an overwrite —
+    /// and the `id` arbiter is checked before the name's unique index, so a stored id is `Stale`
+    /// even under a held name; `Some(t)` is `UPDATE … WHERE id = $1 AND updated_at = $t`, whose
+    /// `SET` list names neither stamp: `created_at` stays the insert's and the `BEFORE UPDATE`
+    /// trigger writes `updated_at`, which `RETURNING` sees. A spent token matches no row, so no
+    /// unique check runs and a stale rename is `Stale`, not `Constraint` (blueprint P-7). A miss
+    /// reads the row once ([`cas_miss`]): present is `Stale`, absent is `NotFound`.
+    ///
+    /// The insert keeps the caller's stamps at the column's resolution, microseconds; `Applied`
+    /// carries them as stored, which is the token the next edit passes.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Constraint`] when another id already holds the name (`23505` on
-    /// `agent_name_key`).
-    async fn upsert_agent(&self, agent: &Agent) -> Result<()> {
-        sqlx::query!(
-            "INSERT INTO agent (id, name, transport, launch, models, default_model, billing, \
-                                enabled, settings, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-             ON CONFLICT (id) DO UPDATE SET \
-                 name          = EXCLUDED.name, \
-                 transport     = EXCLUDED.transport, \
-                 launch        = EXCLUDED.launch, \
-                 models        = EXCLUDED.models, \
-                 default_model = EXCLUDED.default_model, \
-                 billing       = EXCLUDED.billing, \
-                 enabled       = EXCLUDED.enabled, \
-                 settings      = EXCLUDED.settings",
-            agent.id.as_uuid(),
-            agent.name,
-            agent.transport.as_str(),
-            &agent.launch,
-            &agent.models[..],
-            agent.default_model.as_deref(),
-            agent.billing.as_str(),
-            agent.enabled,
-            &agent.settings,
-            agent.created_at,
-            agent.updated_at,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
-        Ok(())
+    /// [`StoreError::NotFound`] for `Some(_)` on an id no row has; [`StoreError::Constraint`]
+    /// when another id holds the name (`23505` on `agent_name_key`).
+    async fn upsert_agent(
+        &self,
+        agent: &Agent,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Agent>> {
+        let landed = match expected {
+            None => sqlx::query_as!(
+                Agent,
+                r#"
+                INSERT INTO agent (id, name, transport, launch, models, default_model, billing,
+                                   enabled, settings, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id            AS "id: AgentId",
+                          name,
+                          transport     AS "transport: htui_core::model::Transport",
+                          launch,
+                          models,
+                          default_model,
+                          billing       AS "billing: htui_core::model::Billing",
+                          enabled,
+                          settings,
+                          created_at,
+                          updated_at
+                "#,
+                agent.id.as_uuid(),
+                agent.name,
+                agent.transport.as_str(),
+                &agent.launch,
+                &agent.models[..],
+                agent.default_model.as_deref(),
+                agent.billing.as_str(),
+                agent.enabled,
+                &agent.settings,
+                agent.created_at,
+                agent.updated_at,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?,
+            Some(token) => sqlx::query_as!(
+                Agent,
+                r#"
+                UPDATE agent
+                   SET name          = $2,
+                       transport     = $3,
+                       launch        = $4,
+                       models        = $5,
+                       default_model = $6,
+                       billing       = $7,
+                       enabled       = $8,
+                       settings      = $9
+                 WHERE id = $1 AND updated_at = $10
+                RETURNING id            AS "id: AgentId",
+                          name,
+                          transport     AS "transport: htui_core::model::Transport",
+                          launch,
+                          models,
+                          default_model,
+                          billing       AS "billing: htui_core::model::Billing",
+                          enabled,
+                          settings,
+                          created_at,
+                          updated_at
+                "#,
+                agent.id.as_uuid(),
+                agent.name,
+                agent.transport.as_str(),
+                &agent.launch,
+                &agent.models[..],
+                agent.default_model.as_deref(),
+                agent.billing.as_str(),
+                agent.enabled,
+                &agent.settings,
+                token,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?,
+        };
+        match landed {
+            Some(row) => Ok(CasOutcome::Applied(row)),
+            None => cas_miss(self.stored_agent(agent.id).await?, "agent", agent.id),
+        }
     }
 
     /// Inserts or updates one `agent_box` row on its composite primary key (`docs/ANA-4.md` §4.1,
@@ -1098,14 +1224,18 @@ impl WriteStore for PgStore {
     }
 
     /// The two-column quota latch of `docs/ANA-4.md` §7 (MOD-2 plan D67), keyed on the composite
-    /// primary key.
+    /// primary key, newest `quota_at` winning (MOD-40 plan D4).
     ///
     /// Two columns and no more: `probe` and the four discovery columns belong to the probe, which
     /// may be re-running beside this write. `updated_at` is the migration's `BEFORE UPDATE`
     /// trigger's - `agent_box` is in the `0001_init.sql:577` loop, and "no write path may set
-    /// `updated_at` by hand" is that loop's own rule. `rows_affected() == 0` is the `NotFound`:
-    /// there is no insert path, because a row that has never been probed has no columns to latch
-    /// into.
+    /// `updated_at` by hand" is that loop's own rule.
+    ///
+    /// One statement answers both facts the trait tells apart (MOD-40 blueprint B11): `written`
+    /// from the guarded `UPDATE`, and `present` from the same statement's snapshot, so "absent"
+    /// and "a newer quota is stored" can never be confused by a row that appears between two
+    /// reads. Under `READ COMMITTED` the `UPDATE` re-checks its `WHERE` on the newest version of
+    /// a row a concurrent latch just committed, so of two racing latches the older one loses.
     ///
     /// # Errors
     ///
@@ -1116,25 +1246,35 @@ impl WriteStore for PgStore {
         box_id: BoxId,
         quota: Value,
         quota_at: DateTime<Utc>,
-    ) -> Result<()> {
-        let updated = sqlx::query!(
-            "UPDATE agent_box SET quota = $3, quota_at = $4 WHERE agent_id = $1 AND box_id = $2",
+    ) -> Result<bool> {
+        let verdict = sqlx::query!(
+            r#"
+            WITH latched AS (
+                UPDATE agent_box
+                   SET quota = $3, quota_at = $4
+                 WHERE agent_id = $1 AND box_id = $2
+                   AND (quota_at IS NULL OR quota_at <= $4)
+                RETURNING 1
+            )
+            SELECT EXISTS (SELECT 1 FROM latched) AS "written!",
+                   EXISTS (SELECT 1 FROM agent_box
+                            WHERE agent_id = $1 AND box_id = $2) AS "present!"
+            "#,
             agent_id.as_uuid(),
             box_id.as_uuid(),
             &quota,
             quota_at,
         )
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
-        .map_err(map_sqlx)?
-        .rows_affected();
-        if updated == 0 {
+        .map_err(map_sqlx)?;
+        if !verdict.present {
             return Err(StoreError::NotFound {
                 entity: "agent_box",
                 id: format!("{agent_id}/{box_id}"),
             });
         }
-        Ok(())
+        Ok(verdict.written)
     }
 
     /// One box probe in one transaction (MOD-7 D10): the nine probe columns of the row, then the
@@ -1382,25 +1522,14 @@ impl WriteStore for PgStore {
     /// The `run` / `run_step` pair of a free-standing chat, in one transaction, both
     /// `ON CONFLICT (id) DO NOTHING` (plan D4).
     ///
-    /// The pair has the shape `crate::cache::pending`'s upload gives the same chat - `kind 'chat'`,
-    /// `mode 'manual'`, `item_id NULL`, `phase_name 'chat'`, `position 0`, `attempt 1`,
-    /// `fanout_index 0`, `executing_box_id` = the target box - and, because the ids are minted
-    /// client-side and both paths insert `ON CONFLICT (id) DO NOTHING`, an online start followed by
-    /// a replayed upload (or the reverse) converges on **one** such pair rather than colliding
-    /// (ANA-9 §4.3).
-    ///
-    /// It is the row count that converges, not every column: `DO NOTHING` hands the values to
-    /// whichever path lands first, and this one differs from the upload in four groups. `status` is
-    /// `running` rather than the upload's terminal `done` and `finished_at` is NULL, which
-    /// [`WriteStore::finish_chat_run`] closes; `agent_id` and `model` come from the spec, where the
-    /// upload leaves both NULL because the pending line format carries neither; and every stamp is
-    /// `chat.started_at`, where the upload derives them from the buffered events' `at`. An
-    /// offline-first chat therefore keeps a NULL `agent_id` after a later online start - see
-    /// [`ChatRunSpec`] for the whole asymmetry, and `tests/pg_criteria.rs`
-    /// (`chat_run_rows_converge_with_the_offline_mint`,
-    /// `an_offline_first_chat_keeps_the_uploaded_columns`) for both directions in SQL. Carrying
-    /// `agent_id` / `model` in the pending format is the offline session path's, MOD-2 milestone 4
-    /// (plan D16).
+    /// The pair is `kind 'chat'`, `mode 'manual'`, `item_id NULL`, `phase_name 'chat'`,
+    /// `position 0`, `attempt 1`, `fanout_index 0`, `executing_box_id` = the target box, both rows
+    /// `running` with `finished_at` NULL (which [`WriteStore::finish_chat_run`] closes), `agent_id`
+    /// and `model` from the spec, and every stamp `chat.started_at`. The ids are minted
+    /// client-side, so a start retried after an answer that never arrived lands on the pair the
+    /// first attempt wrote rather than colliding (ANA-9 §4.3). Nothing else inserts the pair: the
+    /// offline buffer that once uploaded the same chat is gone (MOD-25, MOD-40), and a step write
+    /// the store refuses is re-offered by the recorder itself.
     ///
     /// # Errors
     ///
@@ -3434,6 +3563,12 @@ impl WriteStore for PgStore {
 
     /// ANA-2 §4.7's admission, one transaction with the box row locked for its whole length.
     ///
+    /// The lease's expiry is `clock_timestamp()` plus the TTL, in the statement that admits the
+    /// run, so no process's clock enters a lease (MOD-40 plan D10); `started_at` and a
+    /// `MissingTags` `finished_at` are the caller's `at` (blueprint B25). The product
+    /// `$5 * interval '1 microsecond'` keeps the span in the interval's time field, so the sum is
+    /// absolute in any session `TimeZone` (P-13).
+    ///
     /// `SELECT ... FOR UPDATE` on `box` is the critical section (§4.7, `docs/ANA-2.md:1094`): the
     /// slot count and the overlap check are read-then-write decisions, and without the lock two
     /// claimers can both read "one slot free" and both take it. The Postgres-only pin is
@@ -3454,8 +3589,9 @@ impl WriteStore for PgStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] `{ entity: "run" }` or `{ entity: "box" }`, the run looked up
-    /// first. Every refusal that is not an error is an `Ok` [`Claim`] other than
+    /// [`StoreError::Constraint`] for a TTL outside [`lease_ttl_micros`]'s range, before the
+    /// transaction opens. [`StoreError::NotFound`] `{ entity: "run" }` or `{ entity: "box" }`, the
+    /// run looked up first. Every refusal that is not an error is an `Ok` [`Claim`] other than
     /// [`Claim::Admitted`], with nothing written, except [`Claim::MissingTags`]: the run is failed
     /// and its item blocked in this same transaction, which is then committed (MOD-7 milestone 3,
     /// D80). The run row and the box row are both locked `FOR UPDATE` before the tag read, so a
@@ -3473,8 +3609,9 @@ impl WriteStore for PgStore {
         box_id: BoxId,
         owner: Uuid,
         at: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> Result<Claim> {
+        let ttl = lease_ttl_micros(ttl)?;
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
         let claimed = sqlx::query!(
@@ -3632,13 +3769,13 @@ impl WriteStore for PgStore {
                     started_at       = COALESCE(started_at, $4), \
                     lease_box_id     = $2, \
                     lease_owner      = $3, \
-                    lease_expires_at = $5 \
+                    lease_expires_at = clock_timestamp() + $5::bigint * interval '1 microsecond' \
               WHERE id = $1 AND status = 'queued'",
             run.as_uuid(),
             box_id.as_uuid(),
             owner,
             at,
-            lease_until,
+            ttl,
         )
         .execute(&mut *tx)
         .await
@@ -3663,18 +3800,23 @@ impl WriteStore for PgStore {
     ///
     /// Zero rows is the abandon signal, and it is `Ok(false)` rather than an error — the caller is
     /// meant to stop working, not to crash. `lease_owner` is not a [`Run`] field (blueprint F-S),
-    /// so this answer is the only way ownership is observable.
+    /// so this answer is the only way ownership is observable. The new expiry is
+    /// `clock_timestamp()` plus the TTL (MOD-40 plan D10).
     ///
     /// # Errors
     ///
+    /// [`StoreError::Constraint`] for a TTL out of range, before anything is read.
     /// [`StoreError::NotFound`] `{ entity: "run" }` when there is no such run at all, told apart
     /// from "not ours" by the one follow-up read [`WriteStore::transition`] has always used.
-    async fn refresh_lease(&self, run: RunId, owner: Uuid, until: DateTime<Utc>) -> Result<bool> {
+    async fn refresh_lease(&self, run: RunId, owner: Uuid, ttl: TimeDelta) -> Result<bool> {
+        let ttl = lease_ttl_micros(ttl)?;
         let moved = sqlx::query!(
-            "UPDATE run SET lease_expires_at = $3 WHERE id = $1 AND lease_owner = $2",
+            "UPDATE run \
+                SET lease_expires_at = clock_timestamp() + $3::bigint * interval '1 microsecond' \
+              WHERE id = $1 AND lease_owner = $2",
             run.as_uuid(),
             owner,
-            until,
+            ttl,
         )
         .execute(&self.pool)
         .await
@@ -3701,8 +3843,9 @@ impl WriteStore for PgStore {
         }
     }
 
-    /// ANA-2 §4.9's sweep: every `running` run on the box whose lease is `NULL` or expired at
-    /// `now`, and is not already `owner`'s (plan D88), becomes `owner`'s, in one statement.
+    /// ANA-2 §4.9's sweep: every `running` run on the box whose lease is `NULL` or expired by
+    /// `clock_timestamp()`, and is not already `owner`'s (plan D88), becomes `owner`'s, in one
+    /// statement, its lease `clock_timestamp()` plus the TTL (MOD-40 plan D10).
     ///
     /// The candidates are locked in `(queued_at, id)` order with `FOR UPDATE SKIP LOCKED`
     /// (blueprint A-5): two concurrent sweeps never wait on each other's row locks and cannot
@@ -3714,14 +3857,10 @@ impl WriteStore for PgStore {
     ///
     /// # Errors
     ///
-    /// The backend's own failures only.
-    async fn adopt_runs(
-        &self,
-        box_id: BoxId,
-        owner: Uuid,
-        now: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
-    ) -> Result<Vec<Run>> {
+    /// [`StoreError::Constraint`] for a TTL out of range, before anything is read; otherwise the
+    /// backend's own failures only.
+    async fn adopt_runs(&self, box_id: BoxId, owner: Uuid, ttl: TimeDelta) -> Result<Vec<Run>> {
+        let ttl = lease_ttl_micros(ttl)?;
         sqlx::query_as!(
             Run,
             r#"
@@ -3730,7 +3869,7 @@ impl WriteStore for PgStore {
                   FROM run
                  WHERE executing_box_id = $1
                    AND status = 'running'
-                   AND (lease_expires_at IS NULL OR lease_expires_at <= $3)
+                   AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())
                    AND lease_owner IS DISTINCT FROM $2
                  ORDER BY queued_at, id
                    FOR UPDATE SKIP LOCKED
@@ -3739,7 +3878,7 @@ impl WriteStore for PgStore {
                 UPDATE run r
                    SET lease_owner      = $2,
                        lease_box_id     = $1,
-                       lease_expires_at = $4
+                       lease_expires_at = clock_timestamp() + $3::bigint * interval '1 microsecond'
                   FROM candidates c
                  WHERE r.id = c.id
              RETURNING r.*
@@ -3767,8 +3906,7 @@ impl WriteStore for PgStore {
             "#,
             box_id.as_uuid(),
             owner,
-            now,
-            lease_until,
+            ttl,
         )
         .fetch_all(&self.pool)
         .await
@@ -3777,8 +3915,14 @@ impl WriteStore for PgStore {
 
     /// Plan D87: the lease of a run that is ours or free, in one compare-and-set `UPDATE`.
     ///
+    /// Expiry is judged, and the new one stamped, by `clock_timestamp()` (MOD-40 plan D10). Under
+    /// READ COMMITTED a take that waits on another's row lock re-evaluates its `WHERE` against the
+    /// committed row, and `clock_timestamp()` is volatile, so the re-check reads the clock after
+    /// the wait (`pg_criteria.rs::two_takes_of_one_released_lease_admit_one`).
+    ///
     /// # Errors
     ///
+    /// [`StoreError::Constraint`] for a TTL out of range, before anything is read.
     /// [`StoreError::NotFound`] `{ entity: "run" }` when there is no such run at all, told apart
     /// from "not takeable" by the follow-up read [`WriteStore::refresh_lease`] uses.
     async fn take_lease(
@@ -3786,24 +3930,23 @@ impl WriteStore for PgStore {
         run: RunId,
         box_id: BoxId,
         owner: Uuid,
-        now: DateTime<Utc>,
-        until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> Result<bool> {
+        let ttl = lease_ttl_micros(ttl)?;
         let moved = sqlx::query!(
             "UPDATE run \
                 SET lease_owner      = $3, \
                     lease_box_id     = $2, \
-                    lease_expires_at = $5 \
+                    lease_expires_at = clock_timestamp() + $4::bigint * interval '1 microsecond' \
               WHERE id = $1 \
                 AND status IN ('running','awaiting_approval') \
                 AND executing_box_id = $2 \
                 AND (lease_owner = $3 OR lease_owner IS NULL \
-                     OR lease_expires_at IS NULL OR lease_expires_at <= $4)",
+                     OR lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())",
             run.as_uuid(),
             box_id.as_uuid(),
             owner,
-            now,
-            until,
+            ttl,
         )
         .execute(&self.pool)
         .await
@@ -3834,19 +3977,19 @@ impl WriteStore for PgStore {
     ///
     /// Clearing `lease_owner` is what lets this process's own sweep adopt the run (plan D88 skips
     /// only a row whose owner is the sweeper). A heartbeat `UPDATE` that commits after this one
-    /// filters on `lease_owner = $2` and so matches no row.
+    /// filters on `lease_owner = $2` and so matches no row. The expiry is `clock_timestamp()`, so
+    /// the lease reads as lapsed at once by every process's comparison (MOD-40 plan D10).
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] `{ entity: "run" }` when there is no such run at all, told apart
     /// from "not ours" by the follow-up read [`WriteStore::refresh_lease`] uses.
-    async fn release_lease(&self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
+    async fn release_lease(&self, run: RunId, owner: Uuid) -> Result<bool> {
         let moved = sqlx::query!(
-            "UPDATE run SET lease_owner = NULL, lease_expires_at = $3 \
+            "UPDATE run SET lease_owner = NULL, lease_expires_at = clock_timestamp() \
               WHERE id = $1 AND lease_owner = $2",
             run.as_uuid(),
             owner,
-            now,
         )
         .execute(&self.pool)
         .await
@@ -4067,9 +4210,16 @@ impl WriteStore for PgStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] `{ entity: "run_step" }` - zero rows updated is the only thing this
-    /// statement can mean.
-    async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> Result<()> {
+    /// [`StoreError::NotFound`] `{ entity: "run_step" }` when the step does not exist and
+    /// [`StoreError::Fenced`] when it does and its run does not carry `fence`'s lease, told apart
+    /// by `step_exists`' follow-up read on a miss (`interrupt_step`'s shape). `FOR SHARE` on the
+    /// run for `append_events`' reason (MOD-40 blueprint B2).
+    async fn finish_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        outcome: StepOutcome,
+    ) -> Result<()> {
         let updated = sqlx::query!(
             "UPDATE run_step \
                 SET exit_code        = $2, \
@@ -4078,7 +4228,11 @@ impl WriteStore for PgStore {
                     verify_outcome   = $5, \
                     verify_exit_code = $6, \
                     finished_at      = $7 \
-              WHERE id = $1",
+              WHERE id = $1 \
+                AND EXISTS (SELECT 1 FROM run r \
+                             WHERE r.id = run_step.run_id \
+                               AND r.lease_owner IS NOT DISTINCT FROM $8 \
+                               FOR SHARE)",
             step.as_uuid(),
             outcome.exit_code,
             outcome.usage,
@@ -4086,19 +4240,17 @@ impl WriteStore for PgStore {
             outcome.verify_outcome.map(VerifyOutcome::as_str),
             outcome.verify_exit_code,
             outcome.finished_at,
+            fence.owner(),
         )
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?
         .rows_affected();
 
-        if updated == 0 {
-            return Err(StoreError::NotFound {
-                entity: "run_step",
-                id: step.to_string(),
-            });
+        if updated == 1 {
+            return Ok(());
         }
-        Ok(())
+        Err(Box::pin(fenced_or_missing(&self.pool, step)).await)
     }
 
     /// Plan D89: one compare-and-set `UPDATE`, `running -> failed` with the note.
@@ -5696,6 +5848,35 @@ fn concurrent_write(entity: &str, id: impl core::fmt::Display, what: &str) -> St
 }
 
 impl PgStore {
+    /// One `agent` row by id, for [`WriteStore::upsert_agent`]'s miss (MOD-40 blueprint B12).
+    ///
+    /// `agents()` is the registry joined to this box and answers every row; the compare-and-set
+    /// needs exactly the one it missed, as stored now.
+    async fn stored_agent(&self, id: AgentId) -> Result<Option<Agent>> {
+        sqlx::query_as!(
+            Agent,
+            r#"
+            SELECT id            AS "id: AgentId",
+                   name,
+                   transport     AS "transport: htui_core::model::Transport",
+                   launch,
+                   models,
+                   default_model,
+                   billing       AS "billing: htui_core::model::Billing",
+                   enabled,
+                   settings,
+                   created_at,
+                   updated_at
+              FROM agent
+             WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
     /// One attempt of [`WriteStore::delete_workspace`]'s count-and-delete; `Ok(None)` is the
     /// `40001` the caller retries (review M1).
     async fn delete_workspace_once(&self, id: WorkspaceId) -> Result<Option<DeleteReach>> {

@@ -4,6 +4,7 @@
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
 - **[MOD-39](docs/decisions/mod/mod-39.md)** - Requirements tab and item traceability (done, 2026-09-29)
 - **[CLEAN-6](docs/decisions/clean/clean-6.md)** - Runs pane doc says approve takes a typed note (done, 2026-09-29)
+- **[MOD-40](docs/decisions/mod/mod-40.md)** - Multi-writer store hardening (done, 2026-09-29)
 - **[MOD-50](docs/decisions/mod/mod-50.md)** - Requirements and resolution in the concepts index (done, 2026-09-29)
 - **[MOD-53](docs/decisions/mod/mod-53.md)** - Runtime tasks always send a terminal reply (done, 2026-09-29)
 - **[MOD-52](docs/decisions/mod/mod-52.md)** - `ctrl-c` does not quit `htui` (done, 2026-09-29)

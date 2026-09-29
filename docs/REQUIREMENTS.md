@@ -17,6 +17,9 @@ R-TUI-1 amended in place; the optional R-MCP-2 `requirement_cite` amendment defe
 amended 2026-09-26 by maintainer decision on ANA-22 (`docs/ANA-22.md` §6,
 `docs/decisions/ana/ana-22.md`) during MOD-9 milestone 2 — R-SKL-2 amended in place (global level,
 most-specific-wins, activation on the attachment);
+amended 2026-09-26 by maintainer decision on ANA-16 (`docs/ANA-16.md` §6.1 C5,
+`docs/decisions/ana/ana-16.md`) during MOD-40 — R-STO-5 amended in place (a headless process never
+migrates; it refuses and reports);
 amended 2026-09-29 by maintainer decision on MOD-50 (`docs/decisions/mod/mod-50.md`) — R-STO-8
 amended in place (requirement rows indexed; the decisions filter keyed on resolution).
 **Governed by:** `.claude/rules/workflow-docs.md`
@@ -147,7 +150,9 @@ conflict. Their verdicts survive only where restated here.
   read-only mode from the cache: browse items, graph, documents and cached transcripts. No item
   creation, no runs.
 - **R-STO-5 (must).** Schema migrations are versioned, forward-only in version one, applied by
-  `htui` on connect after confirmation. The per-box SQLite schemas for the read-only cache (R-STO-3)
+  `htui` on connect after confirmation. A headless process (one with no one to confirm, such as a
+  worker) never migrates: when the schema is behind or ahead of the one it was built for, it refuses
+  to start and reports why. The per-box SQLite schemas for the read-only cache (R-STO-3)
   are versioned and forward-only, but answer a version mismatch by rebuilding.
 - **R-STO-6 (must).** Startup with a warm cache and reachable Postgres is under one second on the
   reference workstation. Cache refresh runs in the background and never blocks input. The budget is

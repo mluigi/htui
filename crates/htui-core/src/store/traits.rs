@@ -29,7 +29,7 @@
 //! **MOD-9 milestone 3** adds the skill readers to `WriteStore` beside their writers (plan D75),
 //! as MOD-15 did; the bound-skill read the prompt uses stays inherent.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -255,13 +255,10 @@ pub trait ReadStore: Send + Sync {
 
 /// Everything a write path needs.
 ///
-/// It used to be implemented only by a store that can reach Postgres. Since MOD-2 milestone 4
-/// (plan D34) `htui-store`'s offline sink implements it too, writing the `session_event` rows to
-/// a JSON-lines buffer and answering
-/// [`StoreError::Unreachable`](crate::store::StoreError::Unreachable) for everything the buffer
-/// cannot hold — so "an offline write is a compile error" is now narrower and still true where it
-/// counts: nothing reaches **Postgres** except through a store that has a connection, and the
-/// read-only mirror still does not implement this trait at all.
+/// Implemented by the stores that write where they read — `PgStore`, which needs a connection,
+/// and `MemStore` — and by `htui-store`'s `Writer`, which holds one of the two. The read-only
+/// mirror does not implement it, so an offline write is a compile error. (Between MOD-2 milestone
+/// 4 and MOD-25 an offline sink implemented it too; MOD-25 removed it.)
 #[allow(async_fn_in_trait)] // D2 / plan V3, as above.
 pub trait WriteStore: ReadStore {
     /// Mints an item: counter upsert, key assembly and revision 1 in one transaction (§7.1, §4.1).
@@ -282,18 +279,26 @@ pub trait WriteStore: ReadStore {
     /// (MOD-38 PRD D1); use [`close_out`](WriteStore::close_out).
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool>;
 
-    /// Appends session events, skipping any `(run_step_id, seq)` already stored, and answers how
-    /// many rows were actually inserted (`docs/ANA-4.md` §4.1, `docs/ANA-9.md` §4.3).
+    /// Appends session events under `fence`, skipping any `(run_step_id, seq)` already stored, and
+    /// answers how many rows were actually inserted (`docs/ANA-4.md` §4.1, `docs/ANA-9.md` §4.3,
+    /// MOD-40 plan D1).
     ///
-    /// One statement: either every new row lands or none does, so a batch holding an event for a
-    /// step that does not exist writes nothing at all. Idempotence is the primary key's, which is
-    /// what makes replaying an offline buffer safe.
+    /// One statement: either every new row lands or none does, so a batch naming a step that does
+    /// not exist, or a step whose run does not carry `fence`'s lease, writes nothing at all.
+    /// Idempotence is the primary key's: a row already stored is skipped and not counted. That is
+    /// what makes the recorder's re-offer of a batch whose answer it never got safe, and why such a
+    /// replay may answer less than it offered; a **fresh** batch that answers less has met a second
+    /// writer, which the recorder reports (MOD-40 plan D3).
     ///
     /// # Errors
     ///
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when an event names a
-    /// `run_step` that does not exist or a `kind` / `role` outside the §4.3 `CHECK` lists.
-    async fn append_events(&self, events: &[SessionEvent]) -> Result<usize>;
+    /// In this order: [`StoreError::Constraint`](crate::store::StoreError::Constraint) when an
+    /// event names a `run_step` that does not exist;
+    /// [`StoreError::Fenced`](crate::store::StoreError::Fenced) when a named step's run has a
+    /// `lease_owner` other than `fence`'s, even if every row is already stored;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a `kind` / `role`
+    /// outside the §4.3 `CHECK` lists.
+    async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> Result<usize>;
 
     /// Writes `run_step.usage`, and `run_step.prompt_digest` when `prompt_digest` is `Some`
     /// (`docs/ANA-4.md` §4.1; the digest parameter survives to milestone 9, plan D15(b)).
@@ -301,26 +306,53 @@ pub trait WriteStore: ReadStore {
     /// `None` leaves the stored digest as it is rather than clearing it: the recorder computes the
     /// digest once, at the prompt, and every later usage write for the same step passes `None`.
     ///
+    /// Written only while the step's run carries `fence`'s lease (MOD-40 plan D1).
+    ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) when the step does not exist.
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) when the step does not exist;
+    /// [`StoreError::Fenced`](crate::store::StoreError::Fenced) when it does and its run's
+    /// `lease_owner` is not `fence`'s.
     async fn set_step_usage(
         &self,
+        fence: StepFence,
         step: StepId,
         usage: Value,
         prompt_digest: Option<String>,
     ) -> Result<()>;
 
-    /// Inserts or updates one `agent` row, keyed by `agent.id` (`docs/ANA-4.md` §4.1, §5.7).
+    /// Creates or edits one `agent` row, keyed by `agent.id` (`docs/ANA-4.md` §4.1, §5.7), as a
+    /// compare-and-set on `agent.updated_at` (MOD-40 plan D5, `docs/ANA-16.md` C6) — the
+    /// [`set_setting`](WriteStore::set_setting) `App` rung's shape.
     ///
-    /// `agent.created_at` is written on the insert and never rewritten; `updated_at` belongs to
-    /// the migration's `BEFORE UPDATE` trigger.
+    /// `expected: None` is "I expect no row": every column is inserted as given, `created_at` and
+    /// `updated_at` included (the migration's trigger is `BEFORE UPDATE` only). An id that is
+    /// already stored is [`CasOutcome::Stale`] with the stored row, and nothing is written — so
+    /// an agent seeded or created by another process is never overwritten by a create.
+    ///
+    /// `Some(t)` is the `updated_at` of the row the caller read and edited. Every column but the
+    /// two stamps is written where the stored `updated_at` is still `t`; `created_at` is never
+    /// rewritten and `updated_at` becomes the store's clock. A token that no longer matches is
+    /// `Stale` with the row as it is now, and nothing is written.
+    ///
+    /// `Applied` carries the row as stored; its `updated_at` is the next token. Take tokens from
+    /// a row the store answered (this outcome, or a registry read), never from a struct the caller
+    /// built: Postgres keeps microseconds (MOD-40 blueprint F-17).
+    ///
+    /// Order, the same on every store: the id and the token first (`Stale`, `NotFound`), then the
+    /// name, then the write. A stale edit is `Stale` even when it would also take another agent's
+    /// name.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when another id already
-    /// holds the name (`agent.name` is `UNIQUE`).
-    async fn upsert_agent(&self, agent: &Agent) -> Result<()>;
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) with `entity: "agent"` for
+    /// `Some(_)` on an id no row has; [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// when the write would give this id a name another id holds (`agent.name` is `UNIQUE`).
+    async fn upsert_agent(
+        &self,
+        agent: &Agent,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Agent>>;
 
     /// Inserts or updates one `agent_box` row, keyed by `(agent_id, box_id)` (`docs/ANA-4.md`
     /// §4.1, §5.7).
@@ -365,17 +397,30 @@ pub trait WriteStore: ReadStore {
     /// implementations and `store::conformance`. Widening them before there is a caller would be
     /// six signatures changed to express a case no code can reach.
     ///
+    /// # Newest wins (MOD-40 plan D4)
+    ///
+    /// The write lands only when `quota_at` is at least the stored one: `quota_at IS NULL OR
+    /// quota_at <= $quota_at`. Two chats on one box latch the same row from two processes, and a
+    /// report that arrives late must not overwrite a newer allowance with an older one. `<=`, not
+    /// `<`: a second latch of the same instant rewrites the document, which is how one session
+    /// refreshes the spend under an unchanged `observed_at`. Callers pass microseconds, as the
+    /// recorder does (`stamp`), so the comparison means the same on every store.
+    ///
+    /// Answers `true` when the pair was written and `false` when an equal-or-newer `quota_at`
+    /// was already stored and nothing was written. `false` is not an error: the latch is
+    /// best-effort, and "somebody newer got there first" is the ordering working.
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) with `entity: "agent_box"` and
-    /// id `"<agent_id>/<box_id>"` when no row has that key.
+    /// id `"<agent_id>/<box_id>"` when no row has that key, whatever `quota_at` is.
     async fn set_agent_box_quota(
         &self,
         agent_id: AgentId,
         box_id: BoxId,
         quota: Value,
         quota_at: DateTime<Utc>,
-    ) -> Result<()>;
+    ) -> Result<bool>;
 
     /// Writes one box probe (MOD-7 D10): the hardware columns, `probed_tags`, `htui_version`,
     /// `last_probed_at` and `probe_spec_digest`, and replaces this box's `box_tool` set, in one
@@ -405,6 +450,12 @@ pub trait WriteStore: ReadStore {
     /// `hostname`, the probe columns, `htui_version`, `settings`, `machine_fingerprint`,
     /// `probe_spec_digest`, `last_seen_at` or `box_tool`. Registration and the probe never write
     /// `edit_version`, so neither can stale an open editor.
+    ///
+    /// **Every human writer of `box` is this compare-and-set** (MOD-40 plan D6, `docs/ANA-16.md`
+    /// C7). `box.settings`, which admission reads under `claim_run`'s row lock, has **no** writer
+    /// at all today: registration, the probe and this editor all leave it at its default. The first
+    /// one extends [`BoxEdit`] and rides this statement's `edit_version` guard; a second, unguarded
+    /// `UPDATE box SET settings` would let two editors overwrite each other silently.
     ///
     /// Answers [`CasOutcome::Applied`] with the row as written, or [`CasOutcome::Stale`] with the
     /// row as it is now when `expected` is spent (nothing is written).
@@ -941,19 +992,24 @@ pub trait WriteStore: ReadStore {
     /// [`OverlapRule::NotIsolated`](crate::model::OverlapRule::NotIsolated).
     ///
     /// On [`Claim::Admitted`] the run moves `queued -> running` with `executing_box_id = box_id`,
-    /// `started_at = at`, `lease_box_id = box_id`, `lease_owner = owner`,
-    /// `lease_expires_at = lease_until`, and the item `queued -> in_progress`. On
-    /// [`Claim::MissingTags`] the run moves `queued -> failed` with `failure` =
-    /// [`missing_tags_failure`](crate::model::missing_tags_failure) of the list and
-    /// `finished_at = at`, and its item `queued -> blocked`, in the same transaction;
+    /// `started_at = at`, `lease_box_id = box_id`, `lease_owner = owner`, and `lease_expires_at`
+    /// the **store's** clock plus `ttl` (MOD-40 plan D10: Postgres's `clock_timestamp()`), and the
+    /// item `queued -> in_progress`. On [`Claim::MissingTags`] the run moves `queued -> failed`
+    /// with `failure` = [`missing_tags_failure`](crate::model::missing_tags_failure) of the list
+    /// and `finished_at = at`, and its item `queued -> blocked`, in the same transaction;
     /// `executing_box_id`, `started_at` and the lease stay unset, so no slot is taken. Every other
     /// answer writes nothing.
+    ///
+    /// `at` is the caller's clock, like every other stamp of the run's timeline; only the lease is
+    /// the store's, because only the lease is compared by another process (MOD-40 blueprint B25).
     ///
     /// The two predicates range over two different sets, and `awaiting_approval` is where they
     /// part: a parked run consumes no compute and so holds no slot, but it still owns its trees
     /// and its unmerged branch and so still refuses an overlapping scope (§4.7, invariant 6).
     ///
     /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a `ttl` outside
+    /// [`lease_ttl_micros`]'s range, before anything is read;
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown run (`"run"`)
     /// or box (`"box"`), the run looked up first.
     async fn claim_run(
@@ -962,45 +1018,45 @@ pub trait WriteStore: ReadStore {
         box_id: BoxId,
         owner: Uuid,
         at: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> Result<Claim>;
 
-    /// ANA-2 §4.9's heartbeat: `UPDATE run SET lease_expires_at = until WHERE id = run AND
-    /// lease_owner = owner`. `Ok(false)` = zero rows = abandon; the run exists but is not ours.
+    /// ANA-2 §4.9's heartbeat: `UPDATE run SET lease_expires_at = <store now> + ttl WHERE id = run
+    /// AND lease_owner = owner`. `Ok(false)` = zero rows = abandon; the run exists but is not
+    /// ours. The expiry is the store's clock (MOD-40 plan D10) and is not returned: the caller
+    /// fences on its own clock, from the instant it sent the refresh (plan OQ-2).
     ///
     /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a `ttl` out of range;
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`.
-    async fn refresh_lease(&self, run: RunId, owner: Uuid, until: DateTime<Utc>) -> Result<bool>;
+    async fn refresh_lease(&self, run: RunId, owner: Uuid, ttl: TimeDelta) -> Result<bool>;
 
     /// ANA-2 §4.9's sweep: every `running` run whose `executing_box_id` is `box_id` and whose
-    /// lease is `NULL` or expired at `now` becomes ours (`lease_owner = owner`,
-    /// `lease_expires_at = lease_until`). Returns the adopted rows in `queued_at` order, ties
-    /// broken by `id` so the order is total and the same on every backend; empty when nothing was
-    /// abandoned. A box that does not exist adopts nothing (`Ok(vec![])`).
+    /// lease is `NULL` or expired **by the store's clock** becomes ours (`lease_owner = owner`,
+    /// `lease_expires_at` = the store's clock plus `ttl`). Returns the adopted rows in `queued_at`
+    /// order, ties broken by `id` so the order is total and the same on every backend; empty when
+    /// nothing was abandoned. A box that does not exist adopts nothing (`Ok(vec![])`).
     ///
     /// **Never** a run whose `lease_owner` is `owner` (plan D88): a process whose heartbeat
     /// stalled past its TTL must not adopt its own live walk and run it twice under one owner.
     ///
     /// # Errors
-    /// The backend's own failures only.
-    async fn adopt_runs(
-        &self,
-        box_id: BoxId,
-        owner: Uuid,
-        now: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
-    ) -> Result<Vec<Run>>;
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a `ttl` out of range;
+    /// the backend's own failures.
+    async fn adopt_runs(&self, box_id: BoxId, owner: Uuid, ttl: TimeDelta) -> Result<Vec<Run>>;
 
     /// Plan D87: the lease of a run that is ours or free, taken before a command's first write on
     /// a parked or running run. `UPDATE run SET lease_owner = owner, lease_box_id = box_id,
-    /// lease_expires_at = until WHERE id = run AND status IN ('running','awaiting_approval') AND
-    /// executing_box_id = box_id AND (lease_owner = owner OR lease_owner IS NULL OR
-    /// lease_expires_at IS NULL OR lease_expires_at <= now)`.
+    /// lease_expires_at = <store now> + ttl WHERE id = run AND status IN
+    /// ('running','awaiting_approval') AND executing_box_id = box_id AND (lease_owner = owner OR
+    /// lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= <store now>)`.
     ///
-    /// `Ok(false)` = zero rows: another owner holds a live lease, or the run is not takeable here
-    /// (not `running`/`awaiting_approval`, or executing on another box). Nothing is written then.
+    /// `Ok(false)` = zero rows: another owner holds a lease live by the store's clock, or the run
+    /// is not takeable here (not `running`/`awaiting_approval`, or executing on another box).
+    /// Nothing is written then.
     ///
     /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a `ttl` out of range;
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`, told
     /// apart from "not takeable" by one follow-up read.
     async fn take_lease(
@@ -1008,13 +1064,12 @@ pub trait WriteStore: ReadStore {
         run: RunId,
         box_id: BoxId,
         owner: Uuid,
-        now: DateTime<Utc>,
-        until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> Result<bool>;
 
-    /// Plan D139: gives a lease back. `UPDATE run SET lease_owner = NULL, lease_expires_at = now
-    /// WHERE id = run AND lease_owner = owner`. `Ok(false)` = zero rows = not ours, and nothing
-    /// is written.
+    /// Plan D139: gives a lease back. `UPDATE run SET lease_owner = NULL, lease_expires_at =
+    /// <store now> WHERE id = run AND lease_owner = owner`. `Ok(false)` = zero rows = not ours,
+    /// and nothing is written.
     ///
     /// The owner is cleared, not only the expiry. Plan D88 keeps [`adopt_runs`] off a run whose
     /// `lease_owner` is the sweeper, so a lease released with [`refresh_lease`] stayed out of its
@@ -1034,7 +1089,7 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`, told
     /// apart from "not ours" by one follow-up read.
-    async fn release_lease(&self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool>;
+    async fn release_lease(&self, run: RunId, owner: Uuid) -> Result<bool>;
 
     /// Inserts a step at `pending`. `fanout_index = -1` is the judge and is accepted.
     ///
@@ -1075,11 +1130,15 @@ pub trait WriteStore: ReadStore {
         at: DateTime<Utc>,
     ) -> Result<bool>;
 
-    /// Writes the settle columns of [`StepOutcome`]; never `status`.
+    /// Writes the settle columns of [`StepOutcome`]; never `status`. Only while the step's run
+    /// carries `fence`'s lease (MOD-40 plan D1).
     ///
     /// # Errors
-    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`.
-    async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> Result<()>;
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
+    /// [`StoreError::Fenced`](crate::store::StoreError::Fenced) when the step exists and its run's
+    /// `lease_owner` is not `fence`'s.
+    async fn finish_step(&self, fence: StepFence, step: StepId, outcome: StepOutcome)
+    -> Result<()>;
 
     /// Plan D89, ANA-2 §4.9's interrupted step: a compare-and-set `running -> failed` with
     /// `gate_note = note` and `finished_at = COALESCE(finished_at, at)`, `gate_outcome` left
@@ -1783,6 +1842,31 @@ pub fn item_kind_is_held(prefix: &str, items: u64) -> String {
 // `references_no_row`, which is the sentence `MemStore` already gave `run.project_id` and
 // `session_event.run_step_id` before this milestone gave it a name.
 
+/// The longest lease TTL a store accepts: 365 days, the bound `htui-orch`'s `LeaseTimes::from_app`
+/// already clamps `lease_ttl_seconds` to, so `now + ttl` never overflows an instant and the µs
+/// count Postgres multiplies stays below 2^53, where a `float8` product is exact (MOD-40 blueprint
+/// P-13, B27).
+pub const MAX_LEASE_TTL: TimeDelta = TimeDelta::seconds(365 * 24 * 60 * 60);
+
+/// MOD-40 plan D10 (blueprint B27): a lease TTL as the whole microseconds both stores add to their
+/// own clock, or the one refusal both give.
+///
+/// Sub-microsecond parts are dropped (`TIMESTAMPTZ` has none), so Postgres, which binds the
+/// count, and `MemStore`, which adds `TimeDelta::microseconds(count)`, add the same span.
+///
+/// # Errors
+/// [`StoreError::Constraint`](crate::store::StoreError::Constraint) naming the TTL when it is
+/// negative or longer than [`MAX_LEASE_TTL`]. Checked before any row is read, so an out-of-range
+/// TTL on an unknown run is this refusal, not `NotFound`.
+pub fn lease_ttl_micros(ttl: TimeDelta) -> Result<i64> {
+    match ttl.num_microseconds() {
+        Some(micros) if ttl >= TimeDelta::zero() && ttl <= MAX_LEASE_TTL => Ok(micros),
+        _ => Err(crate::store::StoreError::Constraint(format!(
+            "lease ttl {ttl} is outside 0 ..= {MAX_LEASE_TTL}"
+        ))),
+    }
+}
+
 /// A foreign key that names no row, in the sentence both stores give it.
 #[must_use]
 pub fn references_no_row(column: &str, id: impl std::fmt::Display, table: &str) -> String {
@@ -1984,6 +2068,37 @@ impl<T> CasOutcome<T> {
     pub fn into_inner(self) -> T {
         match self {
             Self::Applied(row) | Self::Stale(row) => row,
+        }
+    }
+}
+
+/// Which lease a step write is made under (MOD-40 plan D1, PRD D1).
+///
+/// [`WriteStore::append_events`], [`WriteStore::set_step_usage`] and [`WriteStore::finish_step`]
+/// take one and write only while the step's run carries exactly that lease:
+/// `run.lease_owner IS NOT DISTINCT FROM` [`StepFence::owner`]. A process whose run another process
+/// adopted ([`WriteStore::adopt_runs`], [`WriteStore::take_lease`]) still holds its old `Lease`,
+/// and the store answers it with [`StoreError::Fenced`](crate::store::StoreError::Fenced) and
+/// writes nothing.
+///
+/// No `Default`: every caller says which one it means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepFence {
+    /// The walk's own lease: the `owner` it passed to `claim_run`, `take_lease` or `adopt_runs`
+    /// (the engine's `parts.owner`). Writes only while `run.lease_owner = owner`.
+    Lease(Uuid),
+    /// No lease: a chat run, whose `lease_owner` is `NULL`, or a promoted step continued by a chat
+    /// after its park released the lease. Refused on a run whose lease names an owner.
+    Unleased,
+}
+
+impl StepFence {
+    /// The `run.lease_owner` this fence writes under: the owner, or `None` for `NULL`.
+    #[must_use]
+    pub const fn owner(self) -> Option<Uuid> {
+        match self {
+            Self::Lease(owner) => Some(owner),
+            Self::Unleased => None,
         }
     }
 }

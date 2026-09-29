@@ -13,7 +13,7 @@ impl CaseHarness for Demo {
 
 #[test]
 fn cases_len_is_pinned() {
-    assert_eq!(CASES.len(), 72);
+    assert_eq!(CASES.len(), 73);
 }
 
 #[test]

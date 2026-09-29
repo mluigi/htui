@@ -54,8 +54,12 @@ use serde_json::json;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-/// An `Engine` over `$fix`'s store, graphs, driver and verifier with `$isolator`, `$clock`, `$owner`
-/// and `$sink` swapped in, bound to `$engine` while `$body` is evaluated.
+/// An `Engine` over `$fix`'s graphs, driver and verifier with `$store`, `$isolator`, `$clock`,
+/// `$owner` and `$sink` swapped in, bound to `$engine` while `$body` is evaluated.
+///
+/// `$store` is the process's own handle on the fixture's rows: `&fix.orch.store` for the
+/// fixture's process, the fourth item of [`Fixture::second_process`] for a second one, whose
+/// handle reads that process's clock (MOD-40 blueprint B23).
 ///
 /// A macro because the parts it borrows — the graph source, the driver closure, the scrubber —
 /// are built here and must outlive the `Engine`, and the driver is a closure whose type no helper
@@ -65,7 +69,7 @@ use uuid::Uuid;
 /// Each engine gets an empty [`DeadWalks`] of its own (plan D140). No case here needs a dead walk
 /// to outlive the engine that saw it die.
 macro_rules! engine_as {
-    ($fix:expr, $isolator:expr, $clock:expr, $owner:expr, $sink:expr, |$engine:ident| $body:expr) => {{
+    ($fix:expr, $store:expr, $isolator:expr, $clock:expr, $owner:expr, $sink:expr, |$engine:ident| $body:expr) => {{
         let fix: &Fixture = $fix;
         let graphs = fix.orch.graphs();
         let driver =
@@ -86,7 +90,7 @@ macro_rules! engine_as {
             .expect("MemStore never fails a read")
             .expect("the demo fixture seeds this box");
         let $engine = Engine::new(EngineParts {
-            store: &fix.orch.store,
+            store: $store,
             graphs: &graphs,
             isolator: $isolator,
             verifier: &fix.verifier,
@@ -222,6 +226,7 @@ impl Fixture {
     ) -> Result<CommandOutcome, EngineError> {
         engine_as!(
             self,
+            &self.orch.store,
             &self.isolator,
             &self.orch.clock,
             self.orch.owner(),
@@ -2056,12 +2061,14 @@ impl Fixture {
     /// The process started after the one that crashed (plan D118's shape over real git): a new
     /// [`GixIsolator`] over the same repositories — with its own D43 guard table, so nothing the
     /// dead process held is waited on (blueprint H-12) — a new `owner`, which makes the dead
-    /// process's lease a stranger's, and a clock [`RESTART_GAP`] later, past every TTL.
-    fn second_process(&self) -> (GixIsolator, Uuid, TestClock) {
+    /// process's lease a stranger's, a clock [`RESTART_GAP`] later, past every TTL, and a store
+    /// handle that reads that clock.
+    fn second_process(&self) -> (GixIsolator, Uuid, TestClock, MemStore) {
         let isolator =
             GixIsolator::new(self.config.clone()).expect("the first process's config was accepted");
         let clock = TestClock::at(self.orch.clock.now() + RESTART_GAP);
-        (isolator, Uuid::now_v7(), clock)
+        let store = self.orch.store.clone().with_clock(Arc::new(clock.clone()));
+        (isolator, Uuid::now_v7(), clock, store)
     }
 
     /// The crash (blueprint A-2): `dispatched` is driven until `stalled` fires and then dropped,
@@ -2179,10 +2186,16 @@ async fn criterion_12_the_sweep_parks_a_dirty_local_step_without_resetting() {
     assert_eq!(prd.status, StepStatus::Running, "the crash left `prd` live");
     let listed = fix.trees_text(prd.id, &[]).await;
 
-    let (isolator, owner, clock) = fix.second_process();
-    let adopted = engine_as!(&fix, &isolator, &clock, owner, &fix.orch, |engine| engine
-        .sweep()
-        .await)
+    let (isolator, owner, clock, store) = fix.second_process();
+    let adopted = engine_as!(
+        &fix,
+        &store,
+        &isolator,
+        &clock,
+        owner,
+        &fix.orch,
+        |engine| engine.sweep().await
+    )
     .expect("the sweep adopts");
     assert_eq!(adopted, parked_not_reset(run));
 
@@ -2260,15 +2273,21 @@ async fn criterion_18_an_unfinished_worktree_step_is_retried_from_the_same_base(
         "the dead agent committed on its branch"
     );
 
-    let (isolator, owner, clock) = fix.second_process();
+    let (isolator, owner, clock, store) = fix.second_process();
     let committing = CommittingSink {
         orch: &fix.orch,
         repos: &["core"],
         phases: &[],
     };
-    let adopted = engine_as!(&fix, &isolator, &clock, owner, &committing, |engine| engine
-        .sweep()
-        .await)
+    let adopted = engine_as!(
+        &fix,
+        &store,
+        &isolator,
+        &clock,
+        owner,
+        &committing,
+        |engine| engine.sweep().await
+    )
     .expect("the sweep adopts");
     assert_eq!(
         adopted,
@@ -2283,9 +2302,15 @@ async fn criterion_18_an_unfinished_worktree_step_is_retried_from_the_same_base(
         (StepStatus::Failed, Some("interrupted"))
     );
 
-    let resumed = engine_as!(&fix, &isolator, &clock, owner, &committing, |engine| engine
-        .resume(run)
-        .await)
+    let resumed = engine_as!(
+        &fix,
+        &store,
+        &isolator,
+        &clock,
+        owner,
+        &committing,
+        |engine| engine.resume(run).await
+    )
     .expect("the adopter walks it");
     assert!(
         matches!(
@@ -2325,9 +2350,15 @@ async fn criterion_18_an_unfinished_worktree_step_is_retried_from_the_same_base(
         );
     }
 
-    let outcome = engine_as!(&fix, &isolator, &clock, owner, &committing, |engine| engine
-        .dispatch(Command::CancelRun { run })
-        .await)
+    let outcome = engine_as!(
+        &fix,
+        &store,
+        &isolator,
+        &clock,
+        owner,
+        &committing,
+        |engine| engine.dispatch(Command::CancelRun { run }).await
+    )
     .expect("a parked run is cancellable");
     assert!(
         matches!(outcome, CommandOutcome::Cancelled { .. }),
@@ -2365,7 +2396,7 @@ async fn criterion_18_a_finished_worktree_step_is_adopted_and_merged() {
     let prd = fix.step_at(run, 0, 1).await;
     assert_eq!(prd.status, StepStatus::Running, "the crash left `prd` live");
 
-    let (isolator, owner, clock) = fix.second_process();
+    let (isolator, owner, clock, store) = fix.second_process();
     // "Capture landed, settle lost": stage 5's first two writes, by hand.
     let trees = fix
         .orch
@@ -2396,9 +2427,15 @@ async fn criterion_18_a_finished_worktree_step_is_adopted_and_merged() {
     assert!(merges(&git, &fix.docs.path).await.is_empty());
 
     let counting = StallAfterReconcile::counting(&isolator);
-    let adopted = engine_as!(&fix, &counting, &clock, owner, &fix.orch, |engine| engine
-        .sweep()
-        .await)
+    let adopted = engine_as!(
+        &fix,
+        &store,
+        &counting,
+        &clock,
+        owner,
+        &fix.orch,
+        |engine| engine.sweep().await
+    )
     .expect("the sweep adopts");
     assert_eq!(
         counting.reconciles(),
@@ -2472,10 +2509,16 @@ async fn a_clean_shared_checkout_is_labelled_then_reset_and_retried() {
             "the dead agent committed on the checkout"
         );
 
-        let (isolator, owner, clock) = fix.second_process();
-        let adopted = engine_as!(&fix, &isolator, &clock, owner, &fix.orch, |engine| engine
-            .sweep()
-            .await)
+        let (isolator, owner, clock, store) = fix.second_process();
+        let adopted = engine_as!(
+            &fix,
+            &store,
+            &isolator,
+            &clock,
+            owner,
+            &fix.orch,
+            |engine| engine.sweep().await
+        )
         .expect("the sweep adopts");
         let first_now = fix.step_at(run, 0, 1).await;
 
@@ -2543,9 +2586,15 @@ async fn a_clean_shared_checkout_is_labelled_then_reset_and_retried() {
         );
         assert_eq!(fix.step_at(run, 0, 2).await.status, StepStatus::Pending);
 
-        let resumed = engine_as!(&fix, &isolator, &clock, owner, &fix.orch, |engine| engine
-            .resume(run)
-            .await)
+        let resumed = engine_as!(
+            &fix,
+            &store,
+            &isolator,
+            &clock,
+            owner,
+            &fix.orch,
+            |engine| engine.resume(run).await
+        )
         .expect("the adopter walks it");
         assert!(
             matches!(
@@ -2588,6 +2637,7 @@ async fn a_lost_merge_is_recognised_not_repeated() {
     let dispatched = async {
         engine_as!(
             &fix,
+            &fix.orch.store,
             &stalling,
             &fix.orch.clock,
             fix.orch.owner(),
@@ -2615,11 +2665,17 @@ async fn a_lost_merge_is_recognised_not_repeated() {
         "the merge was lost: `after_hash` is still capture's"
     );
 
-    let (isolator, owner, clock) = fix.second_process();
+    let (isolator, owner, clock, store) = fix.second_process();
     let counting = StallAfterReconcile::counting(&isolator);
-    let adopted = engine_as!(&fix, &counting, &clock, owner, &fix.orch, |engine| engine
-        .sweep()
-        .await)
+    let adopted = engine_as!(
+        &fix,
+        &store,
+        &counting,
+        &clock,
+        owner,
+        &fix.orch,
+        |engine| engine.sweep().await
+    )
     .expect("the sweep adopts");
     assert_eq!(
         adopted,
@@ -3130,7 +3186,7 @@ async fn a_merge_that_landed_on_another_process_merge_is_recognised_later() {
         "run b's merge landed on a's"
     );
 
-    let (isolator, _, _) = fix.second_process();
+    let (isolator, _, _, _) = fix.second_process();
     let again = isolator
         .reconcile(b, &b_rows, &[])
         .await

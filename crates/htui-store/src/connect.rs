@@ -33,6 +33,10 @@ use crate::secret;
 /// How often an offline worker retries (plan D10).
 pub const RECONNECT: Duration = Duration::from_secs(30);
 
+/// How often the store worker stamps this box's `last_seen_at` while it is online (MOD-40 plan
+/// D7): [`PgStore::touch_box`] on its own task, first one period after the loop starts.
+pub const BOX_HEARTBEAT: Duration = Duration::from_secs(60);
+
 /// The cache directory name used when there is no DSN to fingerprint.
 ///
 /// A box that has never run `htui --set-dsn` still gets a mirror, so `--offline` and a first
@@ -243,6 +247,10 @@ pub struct Started {
     /// overlap are filled in from the connected server by [`refresh_settings`]; what survives from
     /// here is `transcript_steps` and the fallbacks.
     pub settings: RefreshSettings,
+    /// The box heartbeat's period, [`BOX_HEARTBEAT`] from both constructors. A field rather
+    /// than the constant in the loop so a test can beat in milliseconds against a real server,
+    /// where a paused clock would also expire the pool's acquire timeout (MOD-40 blueprint F-20).
+    pub box_heartbeat: Duration,
     /// One reconnect attempt, or `None` with `--offline`, with `--demo` and when no DSN is stored.
     pub reconnect: Option<Reconnect>,
     /// What [`apply_dsn`] needs (D20). `None` from [`Started::detached`] and therefore under
@@ -255,6 +263,7 @@ impl core::fmt::Debug for Started {
         f.debug_struct("Started")
             .field("backend", &self.backend)
             .field("settings", &self.settings)
+            .field("box_heartbeat", &self.box_heartbeat)
             .field("reconnect", &self.reconnect.is_some())
             .field("connect", &self.connect)
             .finish_non_exhaustive()
@@ -277,6 +286,7 @@ impl Started {
             events_tx,
             projects,
             settings: RefreshSettings::default(),
+            box_heartbeat: BOX_HEARTBEAT,
             reconnect: None,
             connect: None,
         }
@@ -390,6 +400,7 @@ pub async fn start(opts: StartOptions) -> Result<Started> {
         events_tx,
         projects,
         settings: RefreshSettings::default(),
+        box_heartbeat: BOX_HEARTBEAT,
         reconnect,
         connect: Some(ConnectContext {
             config_root: opts.config_root,

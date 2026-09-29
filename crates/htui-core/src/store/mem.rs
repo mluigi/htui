@@ -11,13 +11,16 @@
 //! `(project, prefix)` key counter and the absent delete path of §4.1, and the compare-and-set on
 //! `version` with its `Diverged { head, ancestor }` answer of §4.2.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 
 use serde_json::Value;
 
+use crate::clock::Clock;
+#[cfg(feature = "test-support")]
+use crate::clock::TestClock;
 use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AppUser, BindingChange, BoundSkill, BoxEdit, BoxId,
     BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec,
@@ -45,12 +48,12 @@ use crate::prompt::template::TemplateRole;
 use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
-    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StoredSetting,
-    UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment, citation_key,
-    close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
+    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StepFence,
+    StoredSetting, UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment,
+    citation_key, close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
     finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project,
     invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
-    legal_move, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
+    lease_ttl_micros, legal_move, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
     prompt_template_key, prompt_template_refusal, references_no_row, requirement_withdrawn,
     reserved_phase_name, resolution_not_closable, row_names_another_step, run_is_terminal,
     skill_body_refusal, skill_patch_refusal, skill_version_key, step_is_not_promotable,
@@ -58,6 +61,31 @@ use crate::store::traits::{
     withdrawn_requirement_cited,
 };
 use uuid::Uuid;
+
+/// Where one [`MemStore`] handle reads "now" (MOD-40 plan D11, blueprint B21, B23).
+///
+/// `None` is the wall clock **untruncated**, exactly the stamps every `MemStore` wrote before
+/// MOD-40: two back-to-back compare-and-sets share one microsecond about half the time (blueprint
+/// P-11), and a truncated default would let a spent `updated_at` token read as current.
+#[derive(Clone, Default)]
+struct MemClock(Option<Arc<dyn Clock>>);
+
+impl std::fmt::Debug for MemClock {
+    /// Hand written: [`Clock`] carries no `Debug` supertrait.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "MemClock(injected)"
+        } else {
+            "MemClock(wall)"
+        })
+    }
+}
+
+impl MemClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.0.as_ref().map_or_else(Utc::now, |clock| clock.now())
+    }
+}
 
 /// The store the TUI runs against in MOD-1: every row in process memory, cloned out under a lock
 /// that is never held across an `.await` (plan D6).
@@ -67,6 +95,11 @@ pub struct MemStore {
     /// The writes [`MemStore::set_fault`] switched on, shared through clones as `state` is.
     #[cfg(feature = "test-support")]
     faults: Arc<RwLock<HashSet<MemFault>>>,
+    /// This handle's clock (MOD-40 plan D11). **Not** shared through clones the way `state` is:
+    /// a clone copies it, and [`MemStore::with_clock`] replaces it on one handle, so two handles
+    /// on one set of rows can read two clocks, as two processes on one database do (blueprint
+    /// B23).
+    clock: MemClock,
 }
 
 /// MOD-4 plan D152: a write [`MemStore::set_fault`] can make fail, so a test can tell "the store
@@ -301,6 +334,7 @@ impl MemStore {
             state: Arc::new(RwLock::new(state)),
             #[cfg(feature = "test-support")]
             faults: Arc::default(),
+            clock: MemClock::default(),
         }
     }
 
@@ -512,7 +546,7 @@ impl MemStore {
     /// worth testing: the resolvers' fall-through rule only fires on a stored value the validator
     /// would never have accepted, and there has to be a way to plant one.
     pub fn set_app_setting(&self, key: &str, value: Value) {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.app_settings.insert(key.to_owned(), (value, now)));
     }
 
@@ -523,7 +557,7 @@ impl MemStore {
     ///
     /// A project that is not there is left alone, as a no-op.
     pub fn set_project_settings(&self, project: ProjectId, settings: Value) {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| {
             if let Some(row) = state.projects.get_mut(&project) {
                 row.settings = settings;
@@ -764,6 +798,33 @@ impl MemStore {
         } else {
             faults.remove(&fault);
         }
+    }
+
+    /// This handle, reading `clock` for every stamp and every lease comparison it makes (MOD-40
+    /// plan D10, D11). The rows and the fault switches stay shared with every clone; the clock is
+    /// this handle's alone.
+    ///
+    /// A frozen clock stamps every write with one instant, so a compare-and-set on `updated_at`
+    /// cannot tell two edits made at it apart: a case that checks a spent token moves the clock
+    /// between the two edits (blueprint F-42).
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = MemClock(Some(clock));
+        self
+    }
+
+    /// A handle on the same rows whose clock is a `TestClock` frozen at `now`: a second
+    /// process's view, for a case that stages a stranger at another instant than its own clock
+    /// (MOD-40 blueprint B24).
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn handle_at(&self, now: DateTime<Utc>) -> Self {
+        self.clone().with_clock(Arc::new(TestClock::at(now)))
+    }
+
+    /// This handle's "now": its injected clock, else `Utc::now()` untruncated (blueprint B21).
+    fn now(&self) -> DateTime<Utc> {
+        self.clock.now()
     }
 
     /// `Err(Unreachable)` when `fault` is switched on (plan D152), `Ok(())` otherwise.
@@ -1427,18 +1488,44 @@ impl State {
             .collect()
     }
 
+    /// MOD-40 plan D1: whether `row`'s run carries `fence`'s lease. `lease_owners` holds a run only
+    /// while its lease names an owner ([`WriteStore::release_lease`] removes it), which is
+    /// Postgres's `lease_owner IS NOT DISTINCT FROM $fence`. A function of the map rather than of
+    /// `self`, so a caller can hold `steps` mutably while it asks.
+    fn fence_holds(
+        lease_owners: &HashMap<RunId, Uuid>,
+        row: &RunStep,
+        fence: StepFence,
+    ) -> Result<()> {
+        if lease_owners.get(&row.run_id).copied() == fence.owner() {
+            Ok(())
+        } else {
+            Err(StoreError::Fenced { step: row.id })
+        }
+    }
+
     /// Appends events, skipping every `(run_step_id, seq)` already stored, and answers how many
     /// rows landed (§4.3).
     ///
     /// Every event is validated **before** the first insert, because Postgres does the whole batch
     /// in one statement: a batch naming a step that does not exist must write none of its rows.
-    fn append_events(&mut self, events: &[SessionEvent]) -> Result<usize> {
+    /// Existence first, then the fence (MOD-40 plan D1), lowest step first, both before the first
+    /// insert.
+    fn append_events(&mut self, fence: StepFence, events: &[SessionEvent]) -> Result<usize> {
         for event in events {
             if !self.steps.contains_key(&event.run_step_id) {
                 return Err(StoreError::Constraint(format!(
                     "session_event.run_step_id `{}` references no run_step",
                     event.run_step_id
                 )));
+            }
+        }
+        // Then the fence, before any row is written; the lowest step first, which is the one
+        // Postgres's `fenced` CTE names (MOD-40 blueprint B6).
+        let named: BTreeSet<StepId> = events.iter().map(|event| event.run_step_id).collect();
+        for step in named {
+            if let Some(row) = self.steps.get(&step) {
+                Self::fence_holds(&self.lease_owners, row, fence)?;
             }
         }
 
@@ -1461,6 +1548,7 @@ impl State {
     /// `run_step.usage`, plus `prompt_digest` when one is supplied (`docs/ANA-4.md` §4.1).
     fn set_step_usage(
         &mut self,
+        fence: StepFence,
         step: StepId,
         usage: Value,
         prompt_digest: Option<String>,
@@ -1473,6 +1561,7 @@ impl State {
                 entity: "run_step",
                 id: step.to_string(),
             })?;
+        Self::fence_holds(&self.lease_owners, row, fence)?;
         row.usage = Some(usage);
         if let Some(digest) = prompt_digest {
             row.prompt_digest = Some(digest);
@@ -1508,11 +1597,32 @@ impl State {
         Ok(())
     }
 
-    /// Insert-or-update on `agent.id`, with `agent.name` unique across every other id (§5.7).
+    /// Creates or edits one agent under compare-and-set on `updated_at` (MOD-40 plan D5), in
+    /// Postgres's order (blueprint F-18): the id and the token, then the name, then the write.
     ///
-    /// `created_at` is the stored row's on an update, never the caller's, and `updated_at` is the
-    /// clock: that is what Postgres's `BEFORE UPDATE` trigger does, written out.
-    fn upsert_agent(&mut self, agent: &Agent, now: DateTime<Utc>) -> Result<()> {
+    /// `None` inserts the row as given, stamps included, and is `Stale` on a stored id. `Some(t)`
+    /// writes every column but the stamps where the stored `updated_at` is `t`: `created_at` is
+    /// the stored row's and `updated_at` is the clock, which is what Postgres's `BEFORE UPDATE`
+    /// trigger does, written out.
+    fn upsert_agent(
+        &mut self,
+        agent: &Agent,
+        expected: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Agent>> {
+        match (self.agents.get(&agent.id), expected) {
+            (Some(stored), None) => return Ok(CasOutcome::Stale(stored.clone())),
+            (Some(stored), Some(token)) if stored.updated_at != token => {
+                return Ok(CasOutcome::Stale(stored.clone()));
+            }
+            (None, Some(_)) => {
+                return Err(StoreError::NotFound {
+                    entity: "agent",
+                    id: agent.id.to_string(),
+                });
+            }
+            (None, None) | (Some(_), Some(_)) => {}
+        }
         if self
             .agents
             .values()
@@ -1523,18 +1633,16 @@ impl State {
                 agent.name
             )));
         }
-        match self.agents.get_mut(&agent.id) {
-            Some(stored) => {
-                let created_at = stored.created_at;
-                *stored = agent.clone();
-                stored.created_at = created_at;
-                stored.updated_at = now;
-            }
-            None => {
-                self.agents.insert(agent.id, agent.clone());
-            }
-        }
-        Ok(())
+        let row = match self.agents.get(&agent.id) {
+            Some(stored) => Agent {
+                created_at: stored.created_at,
+                updated_at: now,
+                ..agent.clone()
+            },
+            None => agent.clone(),
+        };
+        self.agents.insert(agent.id, row.clone());
+        Ok(CasOutcome::Applied(row))
     }
 
     /// Insert-or-update on the composite primary key `(agent_id, box_id)`, both referents required
@@ -1583,7 +1691,8 @@ impl State {
 
     /// The two-column quota latch of `docs/ANA-4.md` §7 (plan D67): an existing row only, with
     /// `updated_at` bumped as `set_step_usage` bumps it and Postgres's `BEFORE UPDATE` trigger
-    /// does it there.
+    /// does it there, and newest `quota_at` wins (MOD-40 plan D4): an older one is `Ok(false)` and
+    /// writes nothing, not even `updated_at`.
     fn set_agent_box_quota(
         &mut self,
         agent_id: AgentId,
@@ -1591,7 +1700,7 @@ impl State {
         quota: Value,
         quota_at: DateTime<Utc>,
         now: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let row = self
             .agent_boxes
             .get_mut(&(agent_id, box_id))
@@ -1599,10 +1708,13 @@ impl State {
                 entity: "agent_box",
                 id: format!("{agent_id}/{box_id}"),
             })?;
+        if row.quota_at.is_some_and(|stored| stored > quota_at) {
+            return Ok(false);
+        }
         row.quota = Some(quota);
         row.quota_at = Some(quota_at);
         row.updated_at = now;
-        Ok(())
+        Ok(true)
     }
 
     /// One box probe (MOD-7 D10): the nine probe columns, the whole `box_tool` set and the spec
@@ -3868,7 +3980,7 @@ impl State {
         box_id: BoxId,
         owner: Uuid,
         at: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
         now: DateTime<Utc>,
     ) -> Result<Claim> {
         let claimed = self.require_run(run)?.clone();
@@ -3965,7 +4077,7 @@ impl State {
             row.executing_box_id = Some(box_id);
             row.started_at = row.started_at.or(Some(at));
             row.lease_box_id = Some(box_id);
-            row.lease_expires_at = Some(lease_until);
+            row.lease_expires_at = Some(now + ttl);
             row.updated_at = now;
         }
         self.lease_owners.insert(run, owner);
@@ -3986,7 +4098,7 @@ impl State {
         &mut self,
         run: RunId,
         owner: Uuid,
-        until: DateTime<Utc>,
+        ttl: TimeDelta,
         now: DateTime<Utc>,
     ) -> Result<bool> {
         self.require_run(run)?;
@@ -3994,20 +4106,19 @@ impl State {
             return Ok(false);
         }
         if let Some(row) = self.runs.get_mut(&run) {
-            row.lease_expires_at = Some(until);
+            row.lease_expires_at = Some(now + ttl);
             row.updated_at = now;
         }
         Ok(true)
     }
 
     /// ANA-2 §4.9's sweep: every abandoned lease on the box that is not already `owner`'s becomes
-    /// `owner`'s (plan D88).
+    /// `owner`'s (plan D88). Expiry is judged by this handle's clock (MOD-40 plan D10).
     fn adopt_runs(
         &mut self,
         box_id: BoxId,
         owner: Uuid,
-        at: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
         now: DateTime<Utc>,
     ) -> Vec<Run> {
         let mut abandoned: Vec<(DateTime<Utc>, RunId)> = self
@@ -4016,7 +4127,7 @@ impl State {
             .filter(|row| {
                 row.status == RunStatus::Running
                     && row.executing_box_id == Some(box_id)
-                    && row.lease_expires_at.is_none_or(|until| until <= at)
+                    && row.lease_expires_at.is_none_or(|until| until <= now)
                     // Plan D88: never this process's own lease, even an expired one.
                     && self.lease_owners.get(&row.id) != Some(&owner)
             })
@@ -4029,7 +4140,7 @@ impl State {
             self.lease_owners.insert(id, owner);
             if let Some(row) = self.runs.get_mut(&id) {
                 row.lease_box_id = Some(box_id);
-                row.lease_expires_at = Some(lease_until);
+                row.lease_expires_at = Some(now + ttl);
                 row.updated_at = now;
                 adopted.push(row.clone());
             }
@@ -4043,8 +4154,7 @@ impl State {
         run: RunId,
         box_id: BoxId,
         owner: Uuid,
-        at: DateTime<Utc>,
-        until: DateTime<Utc>,
+        ttl: TimeDelta,
         now: DateTime<Utc>,
     ) -> Result<bool> {
         self.require_run(run)?;
@@ -4057,32 +4167,26 @@ impl State {
         };
         let takeable = matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval)
             && row.executing_box_id == Some(box_id)
-            && (ours_or_free || row.lease_expires_at.is_none_or(|expiry| expiry <= at));
+            && (ours_or_free || row.lease_expires_at.is_none_or(|expiry| expiry <= now));
         if !takeable {
             return Ok(false);
         }
         row.lease_box_id = Some(box_id);
-        row.lease_expires_at = Some(until);
+        row.lease_expires_at = Some(now + ttl);
         row.updated_at = now;
         self.lease_owners.insert(run, owner);
         Ok(true)
     }
 
     /// Plan D139: a compare-and-set on `lease_owner` that clears it; `false` writes nothing.
-    fn release_lease(
-        &mut self,
-        run: RunId,
-        owner: Uuid,
-        at: DateTime<Utc>,
-        now: DateTime<Utc>,
-    ) -> Result<bool> {
+    fn release_lease(&mut self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
         self.require_run(run)?;
         if self.lease_owners.get(&run) != Some(&owner) {
             return Ok(false);
         }
         self.lease_owners.remove(&run);
         if let Some(row) = self.runs.get_mut(&run) {
-            row.lease_expires_at = Some(at);
+            row.lease_expires_at = Some(now);
             row.updated_at = now;
         }
         Ok(true)
@@ -4217,6 +4321,7 @@ impl State {
     /// The settle columns of [`StepOutcome`] and never `status`.
     fn finish_step(
         &mut self,
+        fence: StepFence,
         step: StepId,
         outcome: StepOutcome,
         now: DateTime<Utc>,
@@ -4228,6 +4333,7 @@ impl State {
                 entity: "run_step",
                 id: step.to_string(),
             })?;
+        Self::fence_holds(&self.lease_owners, row, fence)?;
         row.exit_code = outcome.exit_code;
         // The two the assembler and the usage summer own: `None` leaves the column.
         if outcome.usage.is_some() {
@@ -5559,7 +5665,7 @@ impl ReadStore for MemStore {
 
 impl WriteStore for MemStore {
     async fn mint_item(&self, new: NewItem) -> Result<Item> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.mint(new, now))
     }
 
@@ -5569,38 +5675,43 @@ impl WriteStore for MemStore {
         expected_version: i32,
         patch: ItemPatch,
     ) -> Result<UpdateOutcome> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.update(id, expected_version, patch, now))
     }
 
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
         #[cfg(feature = "test-support")]
         self.check_fault(MemFault::ItemTransition)?;
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.transition(id, from, to, now))
     }
 
-    async fn append_events(&self, events: &[SessionEvent]) -> Result<usize> {
-        self.write(|state| state.append_events(events))
+    async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> Result<usize> {
+        self.write(|state| state.append_events(fence, events))
     }
 
     async fn set_step_usage(
         &self,
+        fence: StepFence,
         step: StepId,
         usage: Value,
         prompt_digest: Option<String>,
     ) -> Result<()> {
-        let now = Utc::now();
-        self.write(|state| state.set_step_usage(step, usage, prompt_digest, now))
+        let now = self.now();
+        self.write(|state| state.set_step_usage(fence, step, usage, prompt_digest, now))
     }
 
-    async fn upsert_agent(&self, agent: &Agent) -> Result<()> {
-        let now = Utc::now();
-        self.write(|state| state.upsert_agent(agent, now))
+    async fn upsert_agent(
+        &self,
+        agent: &Agent,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Agent>> {
+        let now = self.now();
+        self.write(|state| state.upsert_agent(agent, expected, now))
     }
 
     async fn upsert_agent_box(&self, row: &AgentBox) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.upsert_agent_box(row, now))
     }
 
@@ -5610,13 +5721,13 @@ impl WriteStore for MemStore {
         box_id: BoxId,
         quota: Value,
         quota_at: DateTime<Utc>,
-    ) -> Result<()> {
-        let now = Utc::now();
+    ) -> Result<bool> {
+        let now = self.now();
         self.write(|state| state.set_agent_box_quota(agent_id, box_id, quota, quota_at, now))
     }
 
     async fn record_box_probe(&self, probe: &BoxProbe) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.record_box_probe(probe, now))
     }
 
@@ -5633,7 +5744,7 @@ impl WriteStore for MemStore {
     ) -> Result<CasOutcome<BoxRow>> {
         // Both before the write lock: `this_user` takes the read lock (blueprint F-K).
         let user = self.this_user();
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.edit_box(user, id, expected, edit, now))
     }
 
@@ -5648,12 +5759,12 @@ impl WriteStore for MemStore {
         status: RunStatus,
         finished_at: DateTime<Utc>,
     ) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.finish_chat_run(run, step, status, finished_at, now))
     }
 
     async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.set_step_prompt(step, digest, trim, now))
     }
 
@@ -5662,7 +5773,7 @@ impl WriteStore for MemStore {
     // about what is legal, only about how it is stored.
 
     async fn create_workspace(&self, new: NewWorkspace) -> Result<Workspace> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_workspace(new, now))
     }
 
@@ -5672,7 +5783,7 @@ impl WriteStore for MemStore {
         expected: DateTime<Utc>,
         patch: WorkspacePatch,
     ) -> Result<CasOutcome<Workspace>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.update_workspace(id, expected, patch, now))
     }
 
@@ -5697,7 +5808,7 @@ impl WriteStore for MemStore {
     }
 
     async fn upsert_workspace_box_path(&self, path: &WorkspaceBoxPath) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.upsert_workspace_box_path(path, now))
     }
 
@@ -5706,7 +5817,7 @@ impl WriteStore for MemStore {
     }
 
     async fn create_project(&self, new: NewProject) -> Result<Project> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_project(new, now))
     }
 
@@ -5716,12 +5827,12 @@ impl WriteStore for MemStore {
         expected: DateTime<Utc>,
         patch: ProjectPatch,
     ) -> Result<CasOutcome<Project>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.update_project(id, expected, patch, now))
     }
 
     async fn create_repo(&self, new: NewRepo) -> Result<Repo> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_repo(new, now))
     }
 
@@ -5731,7 +5842,7 @@ impl WriteStore for MemStore {
         expected: DateTime<Utc>,
         patch: RepoPatch,
     ) -> Result<CasOutcome<Repo>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.update_repo(id, expected, patch, now))
     }
 
@@ -5740,12 +5851,12 @@ impl WriteStore for MemStore {
     }
 
     async fn upsert_repo_box_path(&self, path: &RepoBoxPath) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.upsert_repo_box_path(path, now))
     }
 
     async fn infer_repo_box_path(&self, path: &RepoBoxPath) -> Result<bool> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.infer_repo_box_path(path, now))
     }
 
@@ -5754,7 +5865,7 @@ impl WriteStore for MemStore {
     }
 
     async fn create_item_kind(&self, new: NewItemKind) -> Result<ItemKind> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_item_kind(new, now))
     }
 
@@ -5764,7 +5875,7 @@ impl WriteStore for MemStore {
         expected: DateTime<Utc>,
         patch: ItemKindPatch,
     ) -> Result<CasOutcome<ItemKind>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.update_item_kind(id, expected, patch, now))
     }
 
@@ -5777,7 +5888,7 @@ impl WriteStore for MemStore {
     }
 
     async fn create_step_graph(&self, new: NewStepGraph) -> Result<StepGraph> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_step_graph(new, now))
     }
 
@@ -5787,7 +5898,7 @@ impl WriteStore for MemStore {
         expected: DateTime<Utc>,
         patch: StepGraphPatch,
     ) -> Result<CasOutcome<StepGraph>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.update_step_graph(id, expected, patch, now))
     }
 
@@ -5796,7 +5907,7 @@ impl WriteStore for MemStore {
     }
 
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_phase(phase, now))
     }
 
@@ -5806,7 +5917,7 @@ impl WriteStore for MemStore {
         expected: DateTime<Utc>,
         patch: PhasePatch,
     ) -> Result<CasOutcome<StepGraphPhase>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.update_phase(id, expected, patch, now))
     }
 
@@ -5819,7 +5930,7 @@ impl WriteStore for MemStore {
         new: NewPromptTemplate,
         expected: Option<i32>,
     ) -> Result<CasOutcome<PromptTemplate>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.append_prompt_template(new, expected, now))
     }
 
@@ -5836,7 +5947,7 @@ impl WriteStore for MemStore {
     }
 
     async fn create_skill(&self, new: NewSkill) -> Result<(Skill, SkillVersion)> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_skill(new, now))
     }
 
@@ -5846,7 +5957,7 @@ impl WriteStore for MemStore {
         expected: DateTime<Utc>,
         patch: SkillPatch,
     ) -> Result<CasOutcome<Skill>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.update_skill(id, expected, patch, now))
     }
 
@@ -5856,7 +5967,7 @@ impl WriteStore for MemStore {
         expected: i32,
         new: NewSkillVersion,
     ) -> Result<CasOutcome<SkillVersion>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.add_skill_version(skill, expected, new, now))
     }
 
@@ -5866,7 +5977,7 @@ impl WriteStore for MemStore {
         expected: Option<DateTime<Utc>>,
         change: BindingChange,
     ) -> Result<CasOutcome<Option<SkillBinding>>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.set_skill_binding(key, expected, change, now))
     }
 
@@ -5877,7 +5988,7 @@ impl WriteStore for MemStore {
         value: Value,
         expected: Option<DateTime<Utc>>,
     ) -> Result<CasOutcome<StoredSetting>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.set_setting(rung, key, value, expected, now))
     }
 
@@ -5887,7 +5998,7 @@ impl WriteStore for MemStore {
         key: SettingKey,
         expected: DateTime<Utc>,
     ) -> Result<CasOutcome<StoredSetting>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.clear_setting(rung, key, expected, now))
     }
 
@@ -5910,7 +6021,7 @@ impl WriteStore for MemStore {
     }
 
     async fn delete_project(&self, id: ProjectId) -> Result<DeleteReach> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.delete_project(id, now))
     }
 
@@ -5920,7 +6031,7 @@ impl WriteStore for MemStore {
     // not by discipline.
 
     async fn create_run(&self, new: NewRun) -> Result<Run> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_run(new, now))
     }
 
@@ -5930,28 +6041,25 @@ impl WriteStore for MemStore {
         box_id: BoxId,
         owner: Uuid,
         at: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> Result<Claim> {
-        let now = Utc::now();
-        self.write(|state| state.claim_run(run, box_id, owner, at, lease_until, now))
+        let ttl = TimeDelta::microseconds(lease_ttl_micros(ttl)?);
+        let now = self.now();
+        self.write(|state| state.claim_run(run, box_id, owner, at, ttl, now))
     }
 
-    async fn refresh_lease(&self, run: RunId, owner: Uuid, until: DateTime<Utc>) -> Result<bool> {
+    async fn refresh_lease(&self, run: RunId, owner: Uuid, ttl: TimeDelta) -> Result<bool> {
         #[cfg(feature = "test-support")]
         self.check_fault(MemFault::RefreshLease)?;
-        let now = Utc::now();
-        self.write(|state| state.refresh_lease(run, owner, until, now))
+        let ttl = TimeDelta::microseconds(lease_ttl_micros(ttl)?);
+        let now = self.now();
+        self.write(|state| state.refresh_lease(run, owner, ttl, now))
     }
 
-    async fn adopt_runs(
-        &self,
-        box_id: BoxId,
-        owner: Uuid,
-        at: DateTime<Utc>,
-        lease_until: DateTime<Utc>,
-    ) -> Result<Vec<Run>> {
-        let now = Utc::now();
-        Ok(self.write(|state| state.adopt_runs(box_id, owner, at, lease_until, now)))
+    async fn adopt_runs(&self, box_id: BoxId, owner: Uuid, ttl: TimeDelta) -> Result<Vec<Run>> {
+        let ttl = TimeDelta::microseconds(lease_ttl_micros(ttl)?);
+        let now = self.now();
+        Ok(self.write(|state| state.adopt_runs(box_id, owner, ttl, now)))
     }
 
     async fn take_lease(
@@ -5959,22 +6067,22 @@ impl WriteStore for MemStore {
         run: RunId,
         box_id: BoxId,
         owner: Uuid,
-        now: DateTime<Utc>,
-        until: DateTime<Utc>,
+        ttl: TimeDelta,
     ) -> Result<bool> {
-        let stamp = Utc::now();
-        self.write(|state| state.take_lease(run, box_id, owner, now, until, stamp))
+        let ttl = TimeDelta::microseconds(lease_ttl_micros(ttl)?);
+        let now = self.now();
+        self.write(|state| state.take_lease(run, box_id, owner, ttl, now))
     }
 
-    async fn release_lease(&self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
+    async fn release_lease(&self, run: RunId, owner: Uuid) -> Result<bool> {
         #[cfg(feature = "test-support")]
         self.check_fault(MemFault::ReleaseLease)?;
-        let stamp = Utc::now();
-        self.write(|state| state.release_lease(run, owner, now, stamp))
+        let now = self.now();
+        self.write(|state| state.release_lease(run, owner, now))
     }
 
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_step(new, now))
     }
 
@@ -5985,7 +6093,7 @@ impl WriteStore for MemStore {
         to: RunStatus,
         at: DateTime<Utc>,
     ) -> Result<bool> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.transition_run(run, from, to, at, now))
     }
 
@@ -5996,17 +6104,22 @@ impl WriteStore for MemStore {
         to: StepStatus,
         at: DateTime<Utc>,
     ) -> Result<bool> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.transition_step(step, from, to, at, now))
     }
 
-    async fn finish_step(&self, step: StepId, outcome: StepOutcome) -> Result<()> {
-        let now = Utc::now();
-        self.write(|state| state.finish_step(step, outcome, now))
+    async fn finish_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        outcome: StepOutcome,
+    ) -> Result<()> {
+        let now = self.now();
+        self.write(|state| state.finish_step(fence, step, outcome, now))
     }
 
     async fn interrupt_step(&self, step: StepId, note: &str, at: DateTime<Utc>) -> Result<bool> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.interrupt_step(step, note, at, now))
     }
 
@@ -6017,7 +6130,7 @@ impl WriteStore for MemStore {
         note: Option<String>,
         at: DateTime<Utc>,
     ) -> Result<bool> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.answer_gate(step, outcome, note, at, now))
     }
 
@@ -6029,17 +6142,17 @@ impl WriteStore for MemStore {
         winner: StepId,
         reason: Option<String>,
     ) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.select_fanout(run, position, attempt, winner, reason, now))
     }
 
     async fn supersede_step(&self, step: StepId) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.supersede_step(step, now))
     }
 
     async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.upsert_step_tree(step, trees, now))
     }
 
@@ -6060,12 +6173,12 @@ impl WriteStore for MemStore {
     }
 
     async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.promote_step(step, at, now))
     }
 
     async fn fail_run(&self, run: RunId, failure: &str, at: DateTime<Utc>) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.fail_run(run, failure, at, now))
     }
 
@@ -6076,7 +6189,7 @@ impl WriteStore for MemStore {
         failure: Option<&str>,
         at: DateTime<Utc>,
     ) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.finish_run(run, to, failure, at, now))
     }
 
@@ -6087,7 +6200,7 @@ impl WriteStore for MemStore {
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.close_out(item, resolution, summary, commits, now))
     }
 
@@ -6104,14 +6217,14 @@ impl WriteStore for MemStore {
         owner_id: UserId,
         preamble: String,
     ) -> Result<CasOutcome<RequirementSpec>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| {
             state.set_requirement_spec(project, expected_version, owner_id, preamble, now)
         })
     }
 
     async fn create_requirement_area(&self, new: NewRequirementArea) -> Result<RequirementArea> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_requirement_area(new, now))
     }
 
@@ -6120,7 +6233,7 @@ impl WriteStore for MemStore {
         area: RequirementAreaId,
         new: NewRequirement,
     ) -> Result<Requirement> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.mint_requirement(area, new, now))
     }
 
@@ -6131,7 +6244,7 @@ impl WriteStore for MemStore {
         patch: RequirementPatch,
         amended_by: ItemId,
     ) -> Result<RequirementUpdate> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| {
             state.revise_requirement(
                 id,
@@ -6151,7 +6264,7 @@ impl WriteStore for MemStore {
         author_id: UserId,
         box_id: Option<BoxId>,
     ) -> Result<RequirementUpdate> {
-        let now = Utc::now();
+        let now = self.now();
         let patch = RequirementPatch {
             author_id,
             box_id,
@@ -6176,7 +6289,7 @@ impl WriteStore for MemStore {
         kind: CitationKind,
         proposed_by: Option<StepId>,
     ) -> Result<ItemRequirement> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.cite(item, requirement, kind, proposed_by, now))
     }
 
@@ -6186,7 +6299,7 @@ impl WriteStore for MemStore {
         requirement: RequirementId,
         kind: CitationKind,
     ) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.uncite(item, requirement, kind, now))
     }
 
@@ -6196,31 +6309,107 @@ impl WriteStore for MemStore {
         requirement: RequirementId,
         kind: CitationKind,
     ) -> Result<ItemRequirement> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.reconfirm(item, requirement, kind, now))
     }
 }
 
 #[cfg(all(test, feature = "test-support"))]
 mod tests {
+    use std::sync::Arc;
+
     use super::MemStore;
+    use crate::clock::{Clock as _, TestClock};
     use crate::fixtures::ids;
     use crate::model::{
         AgentBox, AgentId, BoxId, BoxProbe, ChatRunSpec, CitationKind, Claim, DocumentId,
         GateOutcome, GraphSnapshot, Isolation, ItemId, ItemKindPatch, NewDocument, NewItem,
         NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-        NoteId, OverlapRule, Priority, ProbedTool, ProjectId, RepoId, RequirementAreaId,
-        RequirementId, RequirementPatch, RequirementUpdate, Resolution, RunId, RunKind, RunMode,
-        RunStatus, RunStepCommit, RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status,
-        StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
+        NoteId, OverlapRule, Priority, ProbedTool, ProjectId, ProjectPatch, RepoId,
+        RequirementAreaId, RequirementId, RequirementPatch, RequirementUpdate, Resolution, RunId,
+        RunKind, RunMode, RunStatus, RunStepCommit, RunStepTree, Scope, SnapshotGraph,
+        SnapshotSettings, Status, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
     use crate::store::error::StoreError;
-    use crate::store::{CasOutcome, DeleteTarget, ReadStore as _, SettingRung, WriteStore as _};
+    use crate::store::{
+        CasOutcome, DeleteTarget, ReadStore as _, SettingRung, StepFence, WriteStore as _,
+    };
     use chrono::{TimeDelta, Utc};
     use serde_json::{Value, json};
     use uuid::Uuid;
+
+    /// MOD-40 plan D11 (T7): a `MemStore` stamps with the clock its handle was given, and a
+    /// clone given another clock stamps with that one. Without a clock it stamps the wall clock,
+    /// untruncated (blueprint B21).
+    #[tokio::test]
+    async fn a_mem_store_reads_its_clock() {
+        let edit = |description: &str| ProjectPatch {
+            description: Some(description.to_owned()),
+            ..ProjectPatch::default()
+        };
+        let clock = TestClock::at(Utc::now() - TimeDelta::days(3));
+        let store = MemStore::demo().with_clock(Arc::new(clock.clone()));
+        clock.advance(TimeDelta::minutes(7));
+        let project = store
+            .project(ids::PROJECT_HTUI)
+            .await
+            .expect("read")
+            .expect("fixture");
+        let CasOutcome::Applied(edited) = store
+            .update_project(project.id, project.updated_at, edit("first"))
+            .await
+            .expect("the edit must not fail")
+        else {
+            panic!("the token was read from the store");
+        };
+        assert_eq!(
+            edited.updated_at,
+            clock.now(),
+            "the write is stamped by the handle's clock"
+        );
+
+        let later = store.handle_at(clock.now() + TimeDelta::hours(1));
+        let CasOutcome::Applied(again) = later
+            .update_project(project.id, edited.updated_at, edit("second"))
+            .await
+            .expect("the edit must not fail")
+        else {
+            panic!("the token is the first edit's");
+        };
+        assert_eq!(
+            again.updated_at,
+            clock.now() + TimeDelta::hours(1),
+            "a handle's clock is its own; the rows are shared"
+        );
+        assert_eq!(
+            store
+                .project(ids::PROJECT_HTUI)
+                .await
+                .expect("read")
+                .expect("fixture")
+                .updated_at,
+            again.updated_at,
+            "both handles read one set of rows"
+        );
+
+        let wall = MemStore::demo();
+        let before = Utc::now();
+        let unclocked = wall
+            .project(ids::PROJECT_HTUI)
+            .await
+            .expect("read")
+            .expect("fixture");
+        let CasOutcome::Applied(stamped) = wall
+            .update_project(unclocked.id, unclocked.updated_at, edit("third"))
+            .await
+            .expect("the edit must not fail")
+        else {
+            panic!("the token was read from the store");
+        };
+        assert!(stamped.updated_at >= before, "no clock: the wall clock");
+    }
 
     /// MOD-4 plan D152: a switched-on fault answers `Unreachable` on every clone, before the
     /// write looks at a row, and the write answers as before once it is switched off.
@@ -6229,19 +6418,20 @@ mod tests {
         let store = MemStore::demo();
         let clone = store.clone();
         let ghost = RunId::new();
-        let now = Utc::now();
 
         store.set_fault(super::MemFault::ReleaseLease, true);
         assert!(
             matches!(
-                clone.release_lease(ghost, Uuid::now_v7(), now).await,
+                clone.release_lease(ghost, Uuid::now_v7()).await,
                 Err(StoreError::Unreachable(_))
             ),
             "the clone shares the switch, and the missing row is never looked up"
         );
         assert!(
             matches!(
-                clone.refresh_lease(ghost, Uuid::now_v7(), now).await,
+                clone
+                    .refresh_lease(ghost, Uuid::now_v7(), TimeDelta::zero())
+                    .await,
                 Err(StoreError::NotFound { .. })
             ),
             "only the named write fails"
@@ -6250,7 +6440,7 @@ mod tests {
         store.set_fault(super::MemFault::ReleaseLease, false);
         assert!(
             matches!(
-                clone.release_lease(ghost, Uuid::now_v7(), now).await,
+                clone.release_lease(ghost, Uuid::now_v7()).await,
                 Err(StoreError::NotFound { .. })
             ),
             "switched off, the write answers as it did"
@@ -6300,6 +6490,7 @@ mod tests {
         let store = MemStore::demo();
         store
             .set_step_usage(
+                StepFence::Unleased,
                 ids::STEP_IMPL,
                 json!({ "input_tokens": 7 }),
                 Some("abc".to_owned()),
@@ -6307,7 +6498,12 @@ mod tests {
             .await
             .expect("the first write lands");
         store
-            .set_step_usage(ids::STEP_IMPL, json!({ "input_tokens": 9 }), None)
+            .set_step_usage(
+                StepFence::Unleased,
+                ids::STEP_IMPL,
+                json!({ "input_tokens": 9 }),
+                None,
+            )
             .await
             .expect("the second write lands");
 
@@ -6342,7 +6538,12 @@ mod tests {
     async fn set_step_prompt_writes_both_columns() {
         let store = MemStore::demo();
         store
-            .set_step_usage(ids::STEP_IMPL, json!({ "input_tokens": 7 }), None)
+            .set_step_usage(
+                StepFence::Unleased,
+                ids::STEP_IMPL,
+                json!({ "input_tokens": 7 }),
+                None,
+            )
             .await
             .expect("the usage write lands");
         store
@@ -6854,10 +7055,13 @@ mod tests {
             "spend": { "session_micros": 351, "currency": "USD" },
         });
         let quota_at = Utc::now();
-        store
-            .set_agent_box_quota(ids::AGENT_CLAUDE, ids::BOX, quota.clone(), quota_at)
-            .await
-            .expect("the latch lands on the probed row");
+        assert!(
+            store
+                .set_agent_box_quota(ids::AGENT_CLAUDE, ids::BOX, quota.clone(), quota_at)
+                .await
+                .expect("the latch lands on the probed row"),
+            "a first latch writes"
+        );
 
         let after = store
             .agents()
@@ -6904,6 +7108,75 @@ mod tests {
                 })
             ),
             "a row that has never been probed has no columns to latch into, got {missing:?}"
+        );
+    }
+
+    /// MOD-40 plan D4: a latch older than the stored `quota_at` is `Ok(false)` and writes
+    /// nothing — not the document, not the instant, and not `updated_at` either, which Postgres's
+    /// `BEFORE UPDATE` trigger would not move for a guarded `UPDATE` that matched no row. The
+    /// conformance case `an_older_quota_is_a_no_op` pins the order through the seam; this reads
+    /// the stored pair back.
+    #[tokio::test]
+    async fn an_older_quota_leaves_the_stored_pair_alone() {
+        let store = MemStore::demo();
+        let probed_at = Utc::now() - TimeDelta::hours(3);
+        store
+            .upsert_agent_box(&AgentBox {
+                agent_id: ids::AGENT_CLAUDE,
+                box_id: ids::BOX,
+                enabled: true,
+                version: Some("1.2.3".to_owned()),
+                path: Some("claude".to_owned()),
+                probed_at: Some(probed_at),
+                quota: None,
+                quota_at: None,
+                updated_at: probed_at,
+                probe: Some(serde_json::json!({ "status": "ready", "source": "probe" })),
+            })
+            .await
+            .expect("the probe row lands");
+        let t2 = Utc::now();
+        let t1 = t2 - TimeDelta::minutes(1);
+        assert!(
+            store
+                .set_agent_box_quota(
+                    ids::AGENT_CLAUDE,
+                    ids::BOX,
+                    serde_json::json!({ "v": 2 }),
+                    t2
+                )
+                .await
+                .expect("the newer latch finds its row"),
+            "the first latch writes"
+        );
+        let stored = || {
+            store
+                .read(|state| {
+                    state
+                        .agent_boxes
+                        .get(&(ids::AGENT_CLAUDE, ids::BOX))
+                        .cloned()
+                })
+                .expect("the row is stored")
+        };
+        let before = stored();
+
+        assert!(
+            !store
+                .set_agent_box_quota(
+                    ids::AGENT_CLAUDE,
+                    ids::BOX,
+                    serde_json::json!({ "v": 1 }),
+                    t1
+                )
+                .await
+                .expect("the older latch finds its row"),
+            "an older latch is refused"
+        );
+        assert_eq!(
+            stored(),
+            before,
+            "a refused latch writes nothing, not even the trigger's stamp"
         );
     }
 
@@ -8084,11 +8357,15 @@ mod tests {
     /// slot count is `box.settings.max_concurrent_items`.
     #[tokio::test]
     async fn claim_run_refuses_an_overlapping_scope_and_a_full_box() {
-        let store = MemStore::demo();
+        // MOD-40 plan D10: the lease is this handle's clock plus the TTL, so the case clocks its
+        // handle and reads `at` from it (truncated, as every clock is).
+        let clock = TestClock::at(Utc::now());
+        let at = clock.now();
+        let store = MemStore::demo().with_clock(Arc::new(clock.clone()));
         let repo = a_repo(&store, "core").await;
         let owner = Uuid::now_v7();
-        let at = Utc::now();
-        let until = at + TimeDelta::minutes(5);
+        let ttl = TimeDelta::minutes(5);
+        let until = at + ttl;
 
         let queue = |item, project, scope: Vec<RepoId>| {
             let store = &store;
@@ -8107,7 +8384,7 @@ mod tests {
 
         assert_eq!(
             store
-                .claim_run(first, ids::BOX, owner, at, until)
+                .claim_run(first, ids::BOX, owner, at, ttl)
                 .await
                 .expect("the claim is answered"),
             Claim::Admitted,
@@ -8136,7 +8413,7 @@ mod tests {
 
         assert_eq!(
             store
-                .claim_run(second, ids::BOX, owner, at, until)
+                .claim_run(second, ids::BOX, owner, at, ttl)
                 .await
                 .expect("the claim is answered"),
             Claim::Overlaps {
@@ -8158,7 +8435,7 @@ mod tests {
 
         assert_eq!(
             store
-                .claim_run(third, ids::BOX, owner, at, until)
+                .claim_run(third, ids::BOX, owner, at, ttl)
                 .await
                 .expect("the claim is answered"),
             Claim::Admitted,
@@ -8166,7 +8443,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .claim_run(fourth, ids::BOX, owner, at, until)
+                .claim_run(fourth, ids::BOX, owner, at, ttl)
                 .await
                 .expect("the claim is answered"),
             Claim::SlotFull {
@@ -8177,7 +8454,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .claim_run(first, ids::BOX, owner, at, until)
+                .claim_run(first, ids::BOX, owner, at, ttl)
                 .await
                 .expect("the claim is answered"),
             Claim::NotClaimable,
@@ -8186,9 +8463,7 @@ mod tests {
 
         assert!(
             matches!(
-                store
-                    .claim_run(second, BoxId::new(), owner, at, until)
-                    .await,
+                store.claim_run(second, BoxId::new(), owner, at, ttl).await,
                 Err(StoreError::NotFound { entity: "box", .. })
             ),
             "the box is looked up after the run"
@@ -8196,7 +8471,7 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .claim_run(RunId::new(), BoxId::new(), owner, at, until)
+                    .claim_run(RunId::new(), BoxId::new(), owner, at, ttl)
                     .await,
                 Err(StoreError::NotFound { entity: "run", .. })
             ),
@@ -8275,10 +8550,9 @@ mod tests {
 
         let at = Utc::now();
         let owner = Uuid::now_v7();
-        let until = at + TimeDelta::minutes(5);
         assert_eq!(
             store
-                .claim_run(run.id, ids::BOX, owner, at, until)
+                .claim_run(run.id, ids::BOX, owner, at, TimeDelta::minutes(5))
                 .await
                 .expect("the claim is answered"),
             Claim::NotClaimable,
@@ -8293,7 +8567,7 @@ mod tests {
         // see it: the refused branch has to be pinned through the CAS it would have gone through.
         assert!(
             !store
-                .refresh_lease(run.id, owner, until)
+                .refresh_lease(run.id, owner, TimeDelta::minutes(5))
                 .await
                 .expect("the lease refresh is answered"),
             "the refusal took no lease"
@@ -8326,9 +8600,12 @@ mod tests {
     /// `running` on `ids::BOX` when the second claims, so only the second slot admits it.
     #[tokio::test]
     async fn a_run_with_no_item_is_never_refused_for_tags() {
-        let store = MemStore::demo();
-        let at = Utc::now();
-        let until = at + TimeDelta::minutes(5);
+        // MOD-40 plan D10: the lease is this handle's clock plus the TTL.
+        let clock = TestClock::at(Utc::now());
+        let at = clock.now();
+        let store = MemStore::demo().with_clock(Arc::new(clock.clone()));
+        let ttl = TimeDelta::minutes(5);
+        let until = at + ttl;
 
         let run = store
             .create_run(graph_run(ids::HTUI_ANA_2, ids::PROJECT_HTUI, Vec::new()))
@@ -8340,7 +8617,7 @@ mod tests {
         });
         assert_eq!(
             store
-                .claim_run(run, ids::BOX, Uuid::now_v7(), at, until)
+                .claim_run(run, ids::BOX, Uuid::now_v7(), at, ttl)
                 .await
                 .expect("the claim is answered"),
             Claim::Admitted,
@@ -8356,7 +8633,7 @@ mod tests {
         assert_eq!(
             claimed.lease_expires_at,
             Some(until),
-            "the admitted claim wrote the lease it was handed"
+            "the admitted claim wrote the lease its TTL asked for"
         );
 
         // A second item of its own, so the two arms share no state.
@@ -8387,7 +8664,7 @@ mod tests {
         });
         assert_eq!(
             store
-                .claim_run(orphaned, ids::BOX, Uuid::now_v7(), at, until)
+                .claim_run(orphaned, ids::BOX, Uuid::now_v7(), at, ttl)
                 .await
                 .expect("the claim is answered"),
             Claim::Admitted,
@@ -8406,10 +8683,14 @@ mod tests {
     /// expired lease from whoever held it.
     #[tokio::test]
     async fn a_lease_refresh_is_a_cas_on_its_owner_and_the_sweep_adopts_it() {
-        let store = MemStore::demo();
+        // MOD-40 plan D10: a lease is this handle's clock plus a TTL, so the case moves the
+        // clock where it used to pass an instant, and asks for the TTL that lands on the old
+        // expiry; every expiry below is the exact instant it was.
+        let clock = TestClock::at(Utc::now());
+        let at = clock.now();
+        let store = MemStore::demo().with_clock(Arc::new(clock.clone()));
         let first_owner = Uuid::now_v7();
         let second_owner = Uuid::now_v7();
-        let at = Utc::now();
         let until = at + TimeDelta::minutes(5);
 
         let run = store
@@ -8419,7 +8700,7 @@ mod tests {
             .id;
         assert_eq!(
             store
-                .claim_run(run, ids::BOX, first_owner, at, until)
+                .claim_run(run, ids::BOX, first_owner, at, until - at)
                 .await
                 .expect("the claim is answered"),
             Claim::Admitted
@@ -8428,7 +8709,7 @@ mod tests {
         let extended = until + TimeDelta::minutes(5);
         assert!(
             store
-                .refresh_lease(run, first_owner, extended)
+                .refresh_lease(run, first_owner, extended - clock.now())
                 .await
                 .expect("the refresh is answered"),
             "the owner extends its own lease"
@@ -8444,7 +8725,11 @@ mod tests {
         );
         assert!(
             !store
-                .refresh_lease(run, second_owner, extended + TimeDelta::minutes(5))
+                .refresh_lease(
+                    run,
+                    second_owner,
+                    extended + TimeDelta::minutes(5) - clock.now()
+                )
                 .await
                 .expect("the refresh is answered"),
             "a stranger's heartbeat is zero rows, which means abandon"
@@ -8452,7 +8737,7 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .refresh_lease(RunId::new(), first_owner, extended)
+                    .refresh_lease(RunId::new(), first_owner, extended - clock.now())
                     .await,
                 Err(StoreError::NotFound { entity: "run", .. })
             ),
@@ -8460,26 +8745,18 @@ mod tests {
         );
 
         let swept = extended + TimeDelta::minutes(5);
+        clock.set(extended - TimeDelta::seconds(1));
         assert!(
             store
-                .adopt_runs(
-                    ids::BOX,
-                    second_owner,
-                    extended - TimeDelta::seconds(1),
-                    swept
-                )
+                .adopt_runs(ids::BOX, second_owner, swept - clock.now())
                 .await
                 .expect("the sweep is answered")
                 .is_empty(),
             "a live lease is not abandoned"
         );
+        clock.set(extended + TimeDelta::seconds(1));
         let adopted = store
-            .adopt_runs(
-                ids::BOX,
-                second_owner,
-                extended + TimeDelta::seconds(1),
-                swept,
-            )
+            .adopt_runs(ids::BOX, second_owner, swept - clock.now())
             .await
             .expect("the sweep is answered");
         assert_eq!(
@@ -8490,22 +8767,23 @@ mod tests {
         assert_eq!(adopted[0].lease_expires_at, Some(swept));
         assert!(
             !store
-                .refresh_lease(run, first_owner, swept)
+                .refresh_lease(run, first_owner, swept - clock.now())
                 .await
                 .expect("the refresh is answered"),
             "the old owner has lost it"
         );
         assert!(
             store
-                .refresh_lease(run, second_owner, swept)
+                .refresh_lease(run, second_owner, swept - clock.now())
                 .await
                 .expect("the refresh is answered"),
             "the new owner holds it"
         );
         let later = swept + TimeDelta::minutes(5);
+        clock.set(swept + TimeDelta::seconds(1));
         assert!(
             store
-                .adopt_runs(ids::BOX, second_owner, swept + TimeDelta::seconds(1), later)
+                .adopt_runs(ids::BOX, second_owner, later - clock.now())
                 .await
                 .expect("the sweep is answered")
                 .is_empty(),
@@ -8513,7 +8791,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .adopt_runs(ids::BOX, first_owner, swept + TimeDelta::seconds(1), later)
+                .adopt_runs(ids::BOX, first_owner, later - clock.now())
                 .await
                 .expect("the sweep is answered")
                 .iter()
@@ -8524,7 +8802,7 @@ mod tests {
         );
         assert!(
             store
-                .adopt_runs(BoxId::new(), second_owner, swept, swept)
+                .adopt_runs(BoxId::new(), second_owner, TimeDelta::zero())
                 .await
                 .expect("the sweep is answered")
                 .is_empty(),
@@ -8745,6 +9023,7 @@ mod tests {
         let finished = Utc::now();
         store
             .finish_step(
+                StepFence::Unleased,
                 ids::STEP_R2_PRD,
                 StepOutcome {
                     exit_code: Some(0),
@@ -8759,6 +9038,7 @@ mod tests {
             .expect("the settle lands");
         store
             .finish_step(
+                StepFence::Unleased,
                 ids::STEP_R2_PRD,
                 StepOutcome {
                     exit_code: Some(1),
@@ -8798,7 +9078,7 @@ mod tests {
         );
         assert!(matches!(
             store
-                .finish_step(StepId::new(), StepOutcome::default())
+                .finish_step(StepFence::Unleased, StepId::new(), StepOutcome::default())
                 .await,
             Err(StoreError::NotFound {
                 entity: "run_step",
@@ -9580,13 +9860,7 @@ mod tests {
         let at = Utc::now();
         assert_eq!(
             store
-                .claim_run(
-                    run,
-                    ids::BOX,
-                    Uuid::now_v7(),
-                    at,
-                    at + TimeDelta::minutes(5),
-                )
+                .claim_run(run, ids::BOX, Uuid::now_v7(), at, TimeDelta::minutes(5),)
                 .await
                 .expect("the claim is answered"),
             Claim::Admitted

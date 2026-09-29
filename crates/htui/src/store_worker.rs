@@ -942,6 +942,10 @@ pub enum StoreReply {
         /// How many migrations are pending; `None` when the question does not apply — a memory
         /// backend, an offline one, or a connected one whose schema is up to date.
         migrations_pending: Option<usize>,
+        /// The database's target version when this build is below it (MOD-40 plan D9, PRD D3):
+        /// `PgStore::below_target` of an `Online` backend, `None` for every other. The shell
+        /// says it once on the status line; the session runs regardless.
+        below_target: Option<String>,
     },
     /// Answer to [`StoreRequest::ApplyMigrations`].
     MigrationsApplied {
@@ -1374,6 +1378,10 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::StoreState => StoreReply::StoreState {
             label: backend.label(),
             migrations_pending: None,
+            below_target: backend
+                .writable()
+                .and_then(PgStore::below_target)
+                .map(str::to_owned),
         },
         StoreRequest::ApplyMigrations => StoreReply::MigrationsApplied { applied: 0 },
         StoreRequest::QdrantInfo
@@ -1435,6 +1443,9 @@ fn failed(request: &'static str, err: &StoreError) -> StoreReply {
 ///   behaviour is `Delay`, not the default `Burst`: a dial that overran its slot - a ten-second
 ///   acquire timeout inside a thirty-second interval, or a laptop that was suspended - must not
 ///   be followed by a queue of catch-up dials fired back to back.
+/// - A **box heartbeat** every `Started::box_heartbeat` ([`connect::BOX_HEARTBEAT`]) while the
+///   backend is `Online`: `PgStore::touch_box` on a spawned task, one at a time, its failure only
+///   logged (MOD-40 plan D7).
 ///
 /// `started` is the bundle [`connect::start`] hands back; `Started::detached` is the `--demo` and
 /// test form, whose event channel is never written and whose ticker is disarmed, so the worker
@@ -1528,6 +1539,7 @@ pub fn spawn_with_runtimes(
         events_tx,
         projects,
         settings,
+        box_heartbeat,
         // `mut` since MOD-15 M6: a `SetDsn` replaces the closure so every later tick dials the
         // **new** server, and a `ClearDsn` drops it so none dials a credential the user just
         // deleted (D11 step 7, D13).
@@ -1570,6 +1582,12 @@ pub fn spawn_with_runtimes(
         if backend.writer().is_some() {
             runs.sweep(&backend, &tx);
         }
+        // MOD-40 plan D7 (C4): the box heartbeat's ticker, first beat one period out and `Delay`
+        // on a missed one like the two above, and the beat in flight, if any (blueprint B14).
+        let mut box_beat =
+            tokio::time::interval_at(tokio::time::Instant::now() + box_heartbeat, box_heartbeat);
+        box_beat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut beat: Option<tokio::task::JoinHandle<()>> = None;
 
         loop {
             // The first sweep reads `lease_ttl_seconds`; the ticker follows it.
@@ -1593,6 +1611,10 @@ pub fn spawn_with_runtimes(
                         StoreRequest::StoreState => StoreReply::StoreState {
                             label: backend.label(),
                             migrations_pending: pending,
+                            below_target: backend
+                                .writable()
+                                .and_then(PgStore::below_target)
+                                .map(str::to_owned),
                         },
                         StoreRequest::ApplyMigrations if held.is_some() => {
                             // `if held.is_some()` above, so this cannot be the `None` arm; the
@@ -1957,6 +1979,22 @@ pub fn spawn_with_runtimes(
                     runs.sweep(&backend, &tx);
                 }
 
+                // D7: only a backend with a server to beat against, and never a second beat
+                // while one is in flight: a touch that waits on a registration's or an editor's
+                // row lock is not joined by another every period. Spawned, so the loop never
+                // waits on the server (`R-NF-3`).
+                _ = box_beat.tick(), if backend.writable().is_some() && beat.is_none() => {
+                    if let Some(pg) = backend.writable().cloned() {
+                        beat = Some(tokio::spawn(beat_once(pg)));
+                    }
+                }
+
+                // The beat in flight ends, and the ticker's arm is live again at once: a tick
+                // missed while it ran fires now (`Delay`) rather than at the next event.
+                _ = in_flight(&mut beat), if beat.is_some() => {
+                    beat = None;
+                }
+
                 err = lost_the_server(health.clone()) => {
                     // The refresher passes every `interval`, so it usually notices first.
                     go_offline(&mut backend, &mut refresher, &mut health, &err);
@@ -1985,6 +2023,9 @@ pub fn spawn_with_runtimes(
         if let Some(refresher) = refresher {
             refresher.abort();
         }
+        if let Some(beat) = beat {
+            beat.abort();
+        }
     })
 }
 
@@ -1993,6 +2034,31 @@ fn sweep_ticker(every: std::time::Duration) -> tokio::time::Interval {
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticker
+}
+
+/// The box heartbeat in flight, to its end: pending when there is none, so the loop's arm over it
+/// is inert until a beat is spawned. A beat that panicked or was aborted ends it all the same.
+async fn in_flight(beat: &mut Option<tokio::task::JoinHandle<()>>) {
+    match beat {
+        Some(handle) => drop(handle.await),
+        None => std::future::pending().await,
+    }
+}
+
+/// One box heartbeat (MOD-40 plan D7), on its own task.
+///
+/// A failure is logged and nothing else. A lost server is the refresher's to report
+/// ([`lost_the_server`]); a heartbeat that swapped the backend itself would be a second path to
+/// [`go_offline`] racing the first, from a task that does not own the backend (blueprint B14).
+async fn beat_once(pg: PgStore) {
+    let id = pg.this_box();
+    match pg.touch_box(id).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(box_id = %id, "the box heartbeat found no box row to touch"),
+        Err(err) => {
+            tracing::debug!(%err, "the box heartbeat failed; the refresher reports a lost server");
+        }
+    }
 }
 
 /// Runs one dial on its own task and reports it under the generation it was spawned in.
@@ -2462,6 +2528,7 @@ mod tests {
         let StoreReply::StoreState {
             label,
             migrations_pending,
+            below_target,
         } = round_trip(&tx, &mut rx, StoreRequest::StoreState).await
         else {
             panic!("wrong reply variant")
@@ -2471,6 +2538,7 @@ mod tests {
             migrations_pending, None,
             "a memory backend has no schema to migrate"
         );
+        assert_eq!(below_target, None, "a memory backend has no target");
         drop(tx);
         worker.await.expect("the worker stops with its channel");
     }
@@ -2658,6 +2726,190 @@ mod tests {
 
         drop(req_tx);
         worker.await.expect("the worker stops with its channel");
+        cache.close().await;
+    }
+
+    /// MOD-40 plan D9, blueprint B16: the target a connect read travels inside the `PgStore`, and
+    /// the worker copies it into every `StoreState` it answers over that store.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn store_state_carries_below_target_from_an_online_store() {
+        let Some(db) = htui_store::testkit::fresh_db().await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO app_setting (key, value) VALUES ($1, $2) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(htui_store::TARGET_VERSION_KEY)
+        .bind(serde_json::json!("99.0.0"))
+        .execute(&db.pool)
+        .await
+        .expect("plant another box's newer target");
+        let pg = PgStore::connect(&db.url, &db.identity)
+            .await
+            .expect("a TUI connects below the target")
+            .store;
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "below-target", 1)
+            .await
+            .expect("open a throwaway mirror");
+
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let mut started = Started::detached(Backend::Online {
+            pg,
+            cache: cache.clone(),
+        });
+        started.reconnect = None;
+        let worker = spawn(started, req_rx, rep_tx);
+
+        let StoreReply::StoreState {
+            label,
+            below_target,
+            ..
+        } = round_trip(&req_tx, &mut rep_rx, StoreRequest::StoreState).await
+        else {
+            panic!("wrong reply variant")
+        };
+        assert_eq!(label, "online");
+        assert_eq!(
+            below_target.as_deref(),
+            Some("99.0.0"),
+            "the store's target reaches the shell on the reply it re-reads"
+        );
+
+        drop(req_tx);
+        worker.await.expect("the worker stops with its channel");
+        cache.close().await;
+        db.drop_db().await;
+    }
+
+    /// MOD-40 plan D7 (C4): an `Online` worker stamps its box's `last_seen_at` every
+    /// `Started::box_heartbeat`, against a real server, and moves no editor's token doing it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_box_heartbeat_stamps_last_seen_at_while_online() {
+        let Some(db) = htui_store::testkit::fresh_db().await else {
+            return;
+        };
+        let id = db.store.this_box();
+        let seen = || async {
+            sqlx::query_scalar::<_, DateTime<Utc>>("SELECT last_seen_at FROM box WHERE id = $1")
+                .bind(id.as_uuid())
+                .fetch_one(&db.pool)
+                .await
+                .expect("read the registered box row")
+        };
+        let before = seen().await;
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "heartbeat", 1)
+            .await
+            .expect("open a throwaway mirror");
+
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, _rep_rx) = mpsc::unbounded_channel();
+        let mut started = Started::detached(Backend::Online {
+            pg: db.store.clone(),
+            cache: cache.clone(),
+        });
+        started.reconnect = None;
+        started.box_heartbeat = std::time::Duration::from_millis(50);
+        let worker = spawn(started, req_rx, rep_tx);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut stamped = seen().await;
+        while stamped <= before && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            stamped = seen().await;
+        }
+        assert!(
+            stamped > before,
+            "a beat stamped the box while online: {before} -> {stamped}"
+        );
+        let edit_version: i32 = sqlx::query_scalar("SELECT edit_version FROM box WHERE id = $1")
+            .bind(id.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the box's editor token");
+        assert_eq!(edit_version, 0, "no editor token moved");
+
+        drop(req_tx);
+        worker.await.expect("the worker stops with its channel");
+        cache.close().await;
+        db.drop_db().await;
+    }
+
+    /// MOD-40 blueprint B14: a heartbeat against a server that is not there is logged and nothing
+    /// else. The refresher owns the swap to `Offline`; a beat never makes it.
+    ///
+    /// The "server" is a listener that hangs up on every connection, so each beat's `touch_box`
+    /// fails at once and is counted. Beats keep coming, one period after the last ended, and the
+    /// backend is still `online` after all of them.
+    #[tokio::test]
+    async fn a_failed_box_heartbeat_leaves_the_backend_online() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a throwaway port");
+        let port = listener.local_addr().expect("a bound port").port();
+        let dialled = Arc::new(AtomicU64::new(0));
+        let hangups = tokio::spawn({
+            let dialled = Arc::clone(&dialled);
+            async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    dialled.fetch_add(1, Ordering::SeqCst);
+                    drop(socket);
+                }
+            }
+        });
+
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "heartbeat-fails", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let identity = Identity {
+            box_id: BoxId::new(),
+            hostname: "HTUI-TEST".to_owned(),
+        };
+        let pg = PgStore::lazy(
+            &format!("postgres://nobody:nothing@127.0.0.1:{port}/none"),
+            &identity,
+            std::time::Duration::from_millis(250),
+        )
+        .expect("a lazy pool opens no socket");
+
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let mut started = Started::detached(Backend::Online {
+            pg,
+            cache: cache.clone(),
+        });
+        started.reconnect = None;
+        started.box_heartbeat = std::time::Duration::from_millis(20);
+        let worker = spawn(started, req_rx, rep_tx);
+
+        // The start-up sweep dials too, once; after it, only beats do (the sweeper's period is
+        // the lease's, far past this test). No request is sent meanwhile, so nothing but the
+        // beats' own ends wakes the loop to beat again.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let settled = dialled.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let beaten = dialled.load(Ordering::SeqCst);
+        assert!(
+            beaten >= settled + 3,
+            "several failed beats in 300 ms of a 20 ms period: {settled} -> {beaten} dials"
+        );
+        let StoreReply::StoreState { label, .. } =
+            round_trip(&req_tx, &mut rep_rx, StoreRequest::StoreState).await
+        else {
+            panic!("wrong reply variant")
+        };
+        assert_eq!(
+            label, "online",
+            "a failed heartbeat is logged, never a backend swap: the refresher owns that"
+        );
+
+        drop(req_tx);
+        worker.await.expect("the worker stops with its channel");
+        hangups.abort();
         cache.close().await;
     }
 
@@ -2965,7 +3217,7 @@ mod tests {
         let store = MemStore::demo();
         let agent_id = AgentId::new();
         let agent = crate::agent_worker::tests::install_row(agent_id, "demo", true);
-        htui_core::store::WriteStore::upsert_agent(&store, &agent)
+        htui_core::store::WriteStore::upsert_agent(&store, &agent, None)
             .await
             .expect("the row lands");
         let tmp = tempfile::tempdir().expect("a temporary install root");

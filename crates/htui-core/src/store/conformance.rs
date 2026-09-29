@@ -35,9 +35,9 @@ use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::store::error::StoreError;
 use crate::store::traits::{
-    CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, UpdateOutcome, WriteStore,
-    already_exists, citation_key, illegal_move, invalid_area_code, requirement_withdrawn,
-    resolution_not_closable, withdrawn_requirement_cited,
+    CasOutcome, DeleteReach, DeleteTarget, MAX_LEASE_TTL, ReadStore, SettingRung, StepFence,
+    UpdateOutcome, WriteStore, already_exists, citation_key, illegal_move, invalid_area_code,
+    requirement_withdrawn, resolution_not_closable, withdrawn_requirement_cited,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -125,6 +125,19 @@ pub const CASES: &[&str] = &[
     "skill_binding_attach_change_detach_are_compare_and_set",
     "skill_binding_refuses_by_rule",
     "skill_binding_stores_expanded_globs_and_languages_as_typed",
+    "a_stale_owner_writes_nothing_to_the_step",
+    "the_new_owner_writes_the_step",
+    "an_unleased_fence_writes_a_chat_step",
+    "an_unleased_fence_is_refused_on_a_leased_run",
+    "a_replayed_batch_under_the_right_fence_is_ok_zero",
+    "a_missing_step_keeps_its_old_error_not_fenced",
+    "an_older_quota_is_a_no_op",
+    "an_equal_quota_at_rewrites_idempotently",
+    "a_missing_agent_box_is_not_found",
+    "upsert_agent_with_none_inserts_and_is_stale_when_present",
+    "upsert_agent_with_a_spent_token_is_stale_and_writes_nothing",
+    "upsert_agent_with_the_current_token_applies",
+    "a_lease_ttl_out_of_range_is_refused",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -287,6 +300,35 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "skill_binding_stores_expanded_globs_and_languages_as_typed" => {
             skill_binding_stores_expanded_globs_and_languages_as_typed(store).await;
         }
+        "a_stale_owner_writes_nothing_to_the_step" => {
+            a_stale_owner_writes_nothing_to_the_step(store).await
+        }
+        "the_new_owner_writes_the_step" => the_new_owner_writes_the_step(store).await,
+        "an_unleased_fence_writes_a_chat_step" => an_unleased_fence_writes_a_chat_step(store).await,
+        "an_unleased_fence_is_refused_on_a_leased_run" => {
+            an_unleased_fence_is_refused_on_a_leased_run(store).await
+        }
+        "a_replayed_batch_under_the_right_fence_is_ok_zero" => {
+            a_replayed_batch_under_the_right_fence_is_ok_zero(store).await
+        }
+        "a_missing_step_keeps_its_old_error_not_fenced" => {
+            a_missing_step_keeps_its_old_error_not_fenced(store).await
+        }
+        "an_older_quota_is_a_no_op" => an_older_quota_is_a_no_op(store).await,
+        "an_equal_quota_at_rewrites_idempotently" => {
+            an_equal_quota_at_rewrites_idempotently(store).await
+        }
+        "a_missing_agent_box_is_not_found" => a_missing_agent_box_is_not_found(store).await,
+        "upsert_agent_with_none_inserts_and_is_stale_when_present" => {
+            upsert_agent_with_none_inserts_and_is_stale_when_present(store).await
+        }
+        "upsert_agent_with_a_spent_token_is_stale_and_writes_nothing" => {
+            upsert_agent_with_a_spent_token_is_stale_and_writes_nothing(store).await
+        }
+        "upsert_agent_with_the_current_token_applies" => {
+            upsert_agent_with_the_current_token_applies(store).await
+        }
+        "a_lease_ttl_out_of_range_is_refused" => a_lease_ttl_out_of_range_is_refused(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -1316,7 +1358,7 @@ async fn append_events_idempotent_and_ordered<S: WriteStore>(store: &S) {
     let first: Vec<SessionEvent> = (0..5).map(|seq| chat_event(step, seq)).collect();
     assert_eq!(
         store
-            .append_events(&first)
+            .append_events(StepFence::Unleased, &first)
             .await
             .expect("append_events_idempotent_and_ordered: the first append must land"),
         5,
@@ -1329,7 +1371,7 @@ async fn append_events_idempotent_and_ordered<S: WriteStore>(store: &S) {
     again.push(chat_event(step, 6));
     assert_eq!(
         store
-            .append_events(&again)
+            .append_events(StepFence::Unleased, &again)
             .await
             .expect("append_events_idempotent_and_ordered: the replay must not fail"),
         2,
@@ -1356,7 +1398,7 @@ async fn append_events_idempotent_and_ordered<S: WriteStore>(store: &S) {
     // statement is one `INSERT`, so a bad row cannot leave the good ones behind (§5.8 FK).
     let orphan = StepId::new();
     let mixed = vec![chat_event(step, 7), chat_event(orphan, 0)];
-    let refused = store.append_events(&mixed).await;
+    let refused = store.append_events(StepFence::Unleased, &mixed).await;
     assert!(
         matches!(refused, Err(StoreError::Constraint(_))),
         "append_events_idempotent_and_ordered: an unknown run_step_id is refused, got {refused:?}"
@@ -1374,7 +1416,7 @@ async fn append_events_idempotent_and_ordered<S: WriteStore>(store: &S) {
 
     assert_eq!(
         store
-            .append_events(&[])
+            .append_events(StepFence::Unleased, &[])
             .await
             .expect("append_events_idempotent_and_ordered: an empty batch must not fail"),
         0,
@@ -1394,6 +1436,7 @@ async fn set_step_usage_writes_usage_and_digest<S: WriteStore>(store: &S) {
     let step = ids::STEP_IMPL;
     store
         .set_step_usage(
+            StepFence::Unleased,
             step,
             json!({ "input_tokens": 10, "output_tokens": 20 }),
             Some("9f8e7d".to_owned()),
@@ -1401,11 +1444,18 @@ async fn set_step_usage_writes_usage_and_digest<S: WriteStore>(store: &S) {
         .await
         .expect("set_step_usage_writes_usage_and_digest: the first write must land");
     store
-        .set_step_usage(step, json!({ "input_tokens": 30 }), None)
+        .set_step_usage(
+            StepFence::Unleased,
+            step,
+            json!({ "input_tokens": 30 }),
+            None,
+        )
         .await
         .expect("set_step_usage_writes_usage_and_digest: a digest-free write must land");
 
-    let unknown = store.set_step_usage(StepId::new(), json!({}), None).await;
+    let unknown = store
+        .set_step_usage(StepFence::Unleased, StepId::new(), json!({}), None)
+        .await;
     assert!(
         matches!(
             unknown,
@@ -1440,7 +1490,9 @@ async fn start_chat_run_mints_chat_rows<S: WriteStore>(store: &S) {
     );
 
     // Nothing to record into yet: the step row is what the event FK points at.
-    let early = store.append_events(&[chat_event(chat.step_id, 0)]).await;
+    let early = store
+        .append_events(StepFence::Unleased, &[chat_event(chat.step_id, 0)])
+        .await;
     assert!(
         matches!(early, Err(StoreError::Constraint(_))),
         "start_chat_run_mints_chat_rows: no step exists before the mint, got {early:?}"
@@ -1453,7 +1505,7 @@ async fn start_chat_run_mints_chat_rows<S: WriteStore>(store: &S) {
     let rows: Vec<SessionEvent> = (0..3).map(|seq| chat_event(chat.step_id, seq)).collect();
     assert_eq!(
         store
-            .append_events(&rows)
+            .append_events(StepFence::Unleased, &rows)
             .await
             .expect("start_chat_run_mints_chat_rows: the chat's events must land"),
         3,
@@ -1514,25 +1566,40 @@ async fn start_chat_run_mints_chat_rows<S: WriteStore>(store: &S) {
 /// `upsert_agent` keys on `agent.id` and keeps `agent.name` unique (§5.7 `name TEXT NOT NULL
 /// UNIQUE`): a second write of the same id is an update, a second id under a taken name is refused.
 ///
-/// The registry read is inherent, not a [`WriteStore`] or `ReadStore` method (MOD-2 plan D3), so
-/// this case can assert only that the second write is *accepted*. That the row was updated **in
-/// place** and kept its `created_at` is read back per backend, by
-/// `pg_criteria.rs::upsert_agent_updates_in_place_and_keeps_created_at`.
+/// Since MOD-40 plan D5 the write answers the row it stored, so the update-in-place and the kept
+/// `created_at` are asserted here; `pg_criteria.rs::upsert_agent_updates_in_place_and_keeps_created_at`
+/// keeps the registry read-back as a second reader.
 async fn upsert_agent_by_id_name_unique<S: WriteStore>(store: &S) {
+    const CASE: &str = "upsert_agent_by_id_name_unique";
     let id = AgentId::new();
-    store
-        .upsert_agent(&test_agent(id, "tester", "small"))
-        .await
-        .expect("upsert_agent_by_id_name_unique: the insert must land");
+    let first = applied(
+        CASE,
+        store
+            .upsert_agent(&test_agent(id, "tester", "small"), None)
+            .await
+            .expect("upsert_agent_by_id_name_unique: the insert must land"),
+    );
 
     // Same id, different columns: an update in place, not a duplicate-key refusal.
-    store
-        .upsert_agent(&test_agent(id, "tester", "large"))
-        .await
-        .expect("upsert_agent_by_id_name_unique: the update must land");
+    let second = applied(
+        CASE,
+        store
+            .upsert_agent(&test_agent(id, "tester", "large"), Some(first.updated_at))
+            .await
+            .expect("upsert_agent_by_id_name_unique: the update must land"),
+    );
+    assert_eq!(
+        second.models,
+        ["large"],
+        "{CASE}: the second write updated the row in place"
+    );
+    assert_eq!(
+        second.created_at, first.created_at,
+        "{CASE}: and kept the creation stamp the insert wrote"
+    );
 
     let stolen = store
-        .upsert_agent(&test_agent(AgentId::new(), "tester", "small"))
+        .upsert_agent(&test_agent(AgentId::new(), "tester", "small"), None)
         .await;
     assert!(
         matches!(stolen, Err(StoreError::Constraint(_))),
@@ -1540,7 +1607,7 @@ async fn upsert_agent_by_id_name_unique<S: WriteStore>(store: &S) {
     );
 
     let seeded = store
-        .upsert_agent(&test_agent(AgentId::new(), "claude", "small"))
+        .upsert_agent(&test_agent(AgentId::new(), "claude", "small"), None)
         .await;
     assert!(
         matches!(seeded, Err(StoreError::Constraint(_))),
@@ -1548,10 +1615,16 @@ async fn upsert_agent_by_id_name_unique<S: WriteStore>(store: &S) {
     );
 
     // The refused writes left the row that did land alone: it still answers to its own id.
-    store
-        .upsert_agent(&test_agent(id, "tester", "largest"))
-        .await
-        .expect("upsert_agent_by_id_name_unique: the row is still updatable by its id");
+    applied(
+        CASE,
+        store
+            .upsert_agent(
+                &test_agent(id, "tester", "largest"),
+                Some(second.updated_at),
+            )
+            .await
+            .expect("upsert_agent_by_id_name_unique: the row is still updatable by its id"),
+    );
 }
 
 /// `upsert_agent_box` keys on the composite primary key `(agent_id, box_id)` and needs both
@@ -1638,15 +1711,20 @@ async fn set_agent_box_quota_updates_two_columns_or_not_found<S: WriteStore>(sto
         .await
         .expect("set_agent_box_quota_updates_two_columns_or_not_found: the probed row must land");
 
-    store
-        .set_agent_box_quota(
-            ids::AGENT_CLAUDE,
-            ids::BOX,
-            json!({ "source": "none", "spend": { "session_micros": 7, "currency": "USD" } }),
-            Utc::now(),
-        )
-        .await
-        .expect("set_agent_box_quota_updates_two_columns_or_not_found: the latch lands on a row");
+    assert!(
+        store
+            .set_agent_box_quota(
+                ids::AGENT_CLAUDE,
+                ids::BOX,
+                json!({ "source": "none", "spend": { "session_micros": 7, "currency": "USD" } }),
+                Utc::now(),
+            )
+            .await
+            .expect(
+                "set_agent_box_quota_updates_two_columns_or_not_found: the latch lands on a row"
+            ),
+        "set_agent_box_quota_updates_two_columns_or_not_found: a first latch writes"
+    );
 
     let missing = store
         .set_agent_box_quota(
@@ -4015,17 +4093,21 @@ async fn settings_phase_rung_writes_token_budget_only<S: WriteStore>(store: &S) 
 /// The caller's clock at `timestamptz`'s own resolution, which is what every §8 writer's stamp has
 /// to be.
 ///
-/// Blueprint F-S puts the clock in the caller's hands for `started_at`, `finished_at`,
-/// `lease_expires_at` and `promoted_at`, and the cases below read those columns back and compare
-/// them with the value they passed. A raw [`Utc::now`] is nanoseconds on Linux; Postgres keeps
-/// [`TIMESTAMPTZ_DIGITS`] of them and `MemStore` keeps all of them, so an untruncated reading makes
-/// the two backends disagree about a column neither of them changed. [`ChatRunSpec::mint`] has
-/// truncated for the same reason since MOD-2; this is the §8 writers' half of it, and `PgStore`
-/// cannot fix it on its own — a store that truncated on the way in would still hand back something
-/// the caller's own variable no longer equals.
+/// Blueprint F-S puts the clock in the caller's hands for `started_at`, `finished_at` and
+/// `promoted_at`, and the cases below read those columns back and compare them with the value they
+/// passed. `lease_expires_at` was in that list until MOD-40 plan D10 made it the store's clock
+/// plus a TTL; [`assert_leased_for`] reads it. A raw [`Utc::now`] is nanoseconds on Linux;
+/// Postgres keeps [`TIMESTAMPTZ_DIGITS`] of them and `MemStore` keeps all of them, so an
+/// untruncated reading makes the two backends disagree about a column neither of them changed.
+/// [`ChatRunSpec::mint`] has truncated for the same reason since MOD-2; this is the §8 writers'
+/// half of it, and `PgStore` cannot fix it on its own — a store that truncated on the way in would
+/// still hand back something the caller's own variable no longer equals.
 fn seam_clock() -> DateTime<Utc> {
     Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS)
 }
+
+/// The TTL the lease cases claim with: live for the whole case on any store (MOD-40 plan D10).
+const LEASE: TimeDelta = TimeDelta::minutes(5);
 
 /// The smallest `R-ORCH-11` snapshot [`WriteStore::create_run`] accepts: the `htui` FEAT graph,
 /// no phases, and the settings the seed rungs resolve to.
@@ -4148,6 +4230,28 @@ async fn run_row<S: ReadStore>(case: &str, store: &S, run: RunId) -> Run {
         .await
         .expect(case)
         .unwrap_or_else(|| panic!("{case}: run {run} exists"))
+}
+
+/// MOD-40 blueprint B29: `run`'s lease was written for `ttl` by the write that last stamped the
+/// row. A lease is the store's clock plus a TTL (plan D10), and a generic case cannot read that
+/// clock, so the expiry is read against the row's own `updated_at`, which the same write stamped
+/// on the same clock: `MemStore` stamps both from one read (the span is exactly `ttl`); Postgres
+/// stamps `updated_at` in its `BEFORE UPDATE` trigger, a few µs after the `SET` read
+/// `clock_timestamp()` (the span is `ttl` less that gap). A released lease is `ttl = 0`.
+///
+/// Holds only while the lease write is the row's last write; read the row right after it.
+///
+/// # Panics
+/// When the run holds no lease or the span is outside `(ttl - 1 s, ttl]`.
+pub fn assert_leased_for(case: &str, run: &Run, ttl: TimeDelta, what: &str) {
+    let Some(expiry) = run.lease_expires_at else {
+        panic!("{case}: {what}: the run holds no lease");
+    };
+    let span = expiry - run.updated_at;
+    assert!(
+        span <= ttl && span > ttl - TimeDelta::seconds(1),
+        "{case}: {what}: the lease runs {span} past the write that stamped it, not {ttl}"
+    );
 }
 
 /// The item row, or a panic naming the case.
@@ -4371,11 +4475,10 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
 
     let owner = Uuid::now_v7();
     let at = seam_clock();
-    let until = at + TimeDelta::minutes(5);
 
     assert_eq!(
         store
-            .claim_run(first, ids::BOX, owner, at, until)
+            .claim_run(first, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -4402,10 +4505,11 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
         Some(ids::BOX),
         "{CASE}: the lease names the box"
     );
-    assert_eq!(
-        claimed.lease_expires_at,
-        Some(until),
-        "{CASE}: the lease expires when the caller said"
+    assert_leased_for(
+        CASE,
+        &claimed,
+        LEASE,
+        "the lease runs its TTL from the store's clock",
     );
     assert_eq!(
         item_row(CASE, store, ids::HTUI_ANA_2).await.status,
@@ -4415,7 +4519,7 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
 
     assert_eq!(
         store
-            .claim_run(second, ids::BOX, owner, at, until)
+            .claim_run(second, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Overlaps {
@@ -4437,7 +4541,7 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
 
     assert_eq!(
         store
-            .claim_run(third, ids::BOX, owner, at, until)
+            .claim_run(third, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -4449,7 +4553,7 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
     );
     assert_eq!(
         store
-            .claim_run(fourth, ids::BOX, owner, at, until)
+            .claim_run(fourth, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::SlotFull {
@@ -4472,7 +4576,7 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
     );
     assert_eq!(
         store
-            .claim_run(second, ids::BOX, owner, at, until)
+            .claim_run(second, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Overlaps {
@@ -4483,7 +4587,7 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
     );
     assert_eq!(
         store
-            .claim_run(fourth, ids::BOX, owner, at, until)
+            .claim_run(fourth, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -4492,7 +4596,7 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
 
     assert_eq!(
         store
-            .claim_run(first, ids::BOX, owner, at, until)
+            .claim_run(first, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::NotClaimable,
@@ -4500,14 +4604,14 @@ async fn claim_run_admits_one_and_refuses_the_second<S: WriteStore>(store: &S) {
     );
 
     let no_box = store
-        .claim_run(second, BoxId::new(), owner, at, until)
+        .claim_run(second, BoxId::new(), owner, at, LEASE)
         .await;
     assert!(
         matches!(no_box, Err(StoreError::NotFound { entity: "box", .. })),
         "{CASE}: an unknown box is NotFound, got {no_box:?}"
     );
     let no_run = store
-        .claim_run(RunId::new(), BoxId::new(), owner, at, until)
+        .claim_run(RunId::new(), BoxId::new(), owner, at, LEASE)
         .await;
     assert!(
         matches!(no_run, Err(StoreError::NotFound { entity: "run", .. })),
@@ -4616,8 +4720,7 @@ async fn claim_run_applies_the_isolation_and_path_rules<S: WriteStore>(store: &S
 
     let owner = Uuid::now_v7();
     let claimed_at = at + TimeDelta::minutes(1);
-    let until = claimed_at + TimeDelta::minutes(5);
-    let claim = |run: RunId| store.claim_run(run, ids::BOX, owner, claimed_at, until);
+    let claim = |run: RunId| store.claim_run(run, ids::BOX, owner, claimed_at, LEASE);
 
     assert_eq!(
         claim(a).await.expect(CASE),
@@ -4764,7 +4867,6 @@ async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStor
     const CASE: &str = "claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks";
     let owner = Uuid::now_v7();
     let at = seam_clock();
-    let until = at + TimeDelta::minutes(5);
 
     let ana = store
         .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
@@ -4773,7 +4875,7 @@ async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStor
         .id;
     assert_eq!(
         store
-            .claim_run(ana, ids::BOX, owner, at, until)
+            .claim_run(ana, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -4803,7 +4905,7 @@ async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStor
     let missing = tags(&["docker", "vulkan"]);
     assert_eq!(
         store
-            .claim_run(run, ids::BOX, owner, at, until)
+            .claim_run(run, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::MissingTags {
@@ -4850,7 +4952,7 @@ async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStor
 
     assert_eq!(
         store
-            .claim_run(run, ids::BOX, owner, at, until)
+            .claim_run(run, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::NotClaimable,
@@ -4869,7 +4971,7 @@ async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStor
         .id;
     assert_eq!(
         store
-            .claim_run(clean, ids::BOX, owner, at, until)
+            .claim_run(clean, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -4912,7 +5014,7 @@ async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStor
         .id;
     assert_eq!(
         store
-            .claim_run(rerun, ids::BOX, owner, at, until)
+            .claim_run(rerun, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -4933,7 +5035,6 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
     const CASE: &str = "claim_run_checks_tags_after_claimability_and_before_the_slot";
     let owner = Uuid::now_v7();
     let at = seam_clock();
-    let until = at + TimeDelta::minutes(5);
 
     // Claimability first: a cancelled run is not claimable, and nothing is written.
     let cancelled_item = mint_tagged(CASE, store, "Cancelled", &["vulkan"]).await;
@@ -4948,7 +5049,7 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
         .expect(CASE);
     assert_eq!(
         store
-            .claim_run(cancelled, ids::BOX, owner, at, until)
+            .claim_run(cancelled, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::NotClaimable,
@@ -4980,7 +5081,7 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
         .id;
     assert_eq!(
         store
-            .claim_run(ana, ids::BOX, owner, at, until)
+            .claim_run(ana, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -4994,7 +5095,7 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
         .id;
     assert_eq!(
         store
-            .claim_run(overlapping, ids::BOX, owner, at, until)
+            .claim_run(overlapping, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::MissingTags {
@@ -5018,7 +5119,7 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
         .id;
     assert_eq!(
         store
-            .claim_run(overlap_control, ids::BOX, owner, at, until)
+            .claim_run(overlap_control, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Overlaps {
@@ -5036,7 +5137,7 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
         .id;
     assert_eq!(
         store
-            .claim_run(clean, ids::BOX, owner, at, until)
+            .claim_run(clean, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -5050,7 +5151,7 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
         .id;
     assert_eq!(
         store
-            .claim_run(full, ids::BOX, owner, at, until)
+            .claim_run(full, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::MissingTags {
@@ -5068,7 +5169,7 @@ async fn claim_run_checks_tags_after_claimability_and_before_the_slot<S: WriteSt
         .id;
     assert_eq!(
         store
-            .claim_run(control, ids::BOX, owner, at, until)
+            .claim_run(control, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::SlotFull {
@@ -5090,7 +5191,6 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
     let first_owner = Uuid::now_v7();
     let second_owner = Uuid::now_v7();
     let at = seam_clock();
-    let until = at + TimeDelta::minutes(5);
     let run = store
         .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
         .await
@@ -5098,14 +5198,14 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
         .id;
     assert_eq!(
         store
-            .claim_run(run, ids::BOX, first_owner, at, until)
+            .claim_run(run, ids::BOX, first_owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
         "{CASE}: the run is admitted"
     );
 
-    let extended = until + TimeDelta::minutes(5);
+    let extended = TimeDelta::minutes(10);
     assert!(
         store
             .refresh_lease(run, first_owner, extended)
@@ -5113,22 +5213,23 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
             .expect(CASE),
         "{CASE}: the owner extends its own lease"
     );
-    assert_eq!(
-        run_row(CASE, store, run).await.lease_expires_at,
-        Some(extended),
-        "{CASE}: the new expiry is stored"
+    assert_leased_for(
+        CASE,
+        &run_row(CASE, store, run).await,
+        extended,
+        "the new expiry is stored",
     );
-    let stranger = extended + TimeDelta::minutes(5);
+    let before = run_row(CASE, store, run).await;
     assert!(
         !store
-            .refresh_lease(run, second_owner, stranger)
+            .refresh_lease(run, second_owner, TimeDelta::minutes(15))
             .await
             .expect(CASE),
         "{CASE}: a stranger's heartbeat is zero rows, which means abandon"
     );
     assert_eq!(
-        run_row(CASE, store, run).await.lease_expires_at,
-        Some(extended),
+        run_row(CASE, store, run).await,
+        before,
         "{CASE}: a refused heartbeat writes nothing"
     );
     let unknown = store
@@ -5139,27 +5240,24 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
         "{CASE}: an unknown run is NotFound, got {unknown:?}"
     );
 
-    let swept = extended + TimeDelta::minutes(10);
+    let swept = TimeDelta::minutes(15);
     assert!(
         store
-            .adopt_runs(
-                ids::BOX,
-                second_owner,
-                extended - TimeDelta::seconds(1),
-                swept,
-            )
+            .adopt_runs(ids::BOX, second_owner, swept)
             .await
             .expect(CASE)
             .is_empty(),
         "{CASE}: a live lease is not abandoned"
     );
+    assert!(
+        store
+            .refresh_lease(run, first_owner, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: the first owner's lease lapses (MOD-40: a zero TTL)"
+    );
     let adopted = store
-        .adopt_runs(
-            ids::BOX,
-            second_owner,
-            extended + TimeDelta::seconds(1),
-            swept,
-        )
+        .adopt_runs(ids::BOX, second_owner, swept)
         .await
         .expect(CASE);
     assert_eq!(
@@ -5167,10 +5265,11 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
         vec![run],
         "{CASE}: the expired lease is adopted"
     );
-    assert_eq!(
-        adopted.first().and_then(|row| row.lease_expires_at),
-        Some(swept),
-        "{CASE}: the adopted row carries the sweeper's expiry"
+    assert_leased_for(
+        CASE,
+        &adopted[0],
+        swept,
+        "the adopted row carries the sweeper's expiry",
     );
     assert!(
         !store
@@ -5188,12 +5287,14 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
     );
     assert!(
         store
-            .adopt_runs(
-                ids::BOX,
-                second_owner,
-                swept + TimeDelta::seconds(1),
-                swept + TimeDelta::minutes(5),
-            )
+            .refresh_lease(run, second_owner, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: the sweeper's lease lapses (MOD-40: a zero TTL)"
+    );
+    assert!(
+        store
+            .adopt_runs(ids::BOX, second_owner, TimeDelta::minutes(5))
             .await
             .expect(CASE)
             .is_empty(),
@@ -5201,12 +5302,7 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
     );
     assert_eq!(
         store
-            .adopt_runs(
-                ids::BOX,
-                first_owner,
-                swept + TimeDelta::seconds(1),
-                swept + TimeDelta::minutes(5),
-            )
+            .adopt_runs(ids::BOX, first_owner, TimeDelta::minutes(5))
             .await
             .expect(CASE)
             .iter()
@@ -5217,7 +5313,7 @@ async fn lease_refresh_is_a_cas_on_owner<S: WriteStore>(store: &S) {
     );
     assert!(
         store
-            .adopt_runs(BoxId::new(), second_owner, swept, swept)
+            .adopt_runs(BoxId::new(), second_owner, TimeDelta::zero())
             .await
             .expect(CASE)
             .is_empty(),
@@ -5234,7 +5330,7 @@ async fn take_lease_moves_only_our_own_or_an_expired_lease<S: WriteStore>(store:
     const CASE: &str = "take_lease_moves_only_our_own_or_an_expired_lease";
     let (x, y, z) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
     let at = seam_clock();
-    let minutes = |n: i64| at + TimeDelta::minutes(n);
+    let minutes = TimeDelta::minutes;
     let run = store
         .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
         .await
@@ -5246,46 +5342,55 @@ async fn take_lease_moves_only_our_own_or_an_expired_lease<S: WriteStore>(store:
             .await
             .expect(CASE),
         Claim::Admitted,
-        "{CASE}: X claims the run until at + 5 min"
+        "{CASE}: X claims the run for five minutes"
     );
 
+    let before = run_row(CASE, store, run).await;
     assert!(
         !store
-            .take_lease(run, ids::BOX, y, at, minutes(10))
+            .take_lease(run, ids::BOX, y, minutes(10))
             .await
             .expect(CASE),
         "{CASE}: X's lease is live, so Y cannot take it"
     );
     assert_eq!(
-        run_row(CASE, store, run).await.lease_expires_at,
-        Some(minutes(5)),
+        run_row(CASE, store, run).await,
+        before,
         "{CASE}: a refused take writes nothing"
     );
     assert!(
         store
-            .take_lease(run, ids::BOX, x, at, minutes(10))
+            .take_lease(run, ids::BOX, x, minutes(10))
             .await
             .expect(CASE),
         "{CASE}: X renews its own live lease"
     );
-    assert_eq!(
-        run_row(CASE, store, run).await.lease_expires_at,
-        Some(minutes(10)),
-        "{CASE}: the renewal stores the new expiry"
+    assert_leased_for(
+        CASE,
+        &run_row(CASE, store, run).await,
+        minutes(10),
+        "the renewal stores the new expiry",
     );
     assert!(
         store
-            .take_lease(run, ids::BOX, y, minutes(11), minutes(20))
+            .refresh_lease(run, x, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: X's lease lapses (MOD-40: a zero TTL)"
+    );
+    assert!(
+        store
+            .take_lease(run, ids::BOX, y, minutes(9))
             .await
             .expect(CASE),
         "{CASE}: once X's lease has expired, Y takes it"
     );
     assert!(
-        !store.refresh_lease(run, x, minutes(20)).await.expect(CASE),
+        !store.refresh_lease(run, x, minutes(9)).await.expect(CASE),
         "{CASE}: X has lost it"
     );
     assert!(
-        store.refresh_lease(run, y, minutes(20)).await.expect(CASE),
+        store.refresh_lease(run, y, minutes(9)).await.expect(CASE),
         "{CASE}: Y holds it"
     );
 
@@ -5295,32 +5400,41 @@ async fn take_lease_moves_only_our_own_or_an_expired_lease<S: WriteStore>(store:
                 run,
                 RunStatus::Running,
                 RunStatus::AwaitingApproval,
-                minutes(11)
+                at + minutes(11)
             )
             .await
             .expect(CASE),
         "{CASE}: the run parks at a gate"
     );
     assert!(
-        store.refresh_lease(run, y, minutes(11)).await.expect(CASE),
+        store
+            .refresh_lease(run, y, TimeDelta::zero())
+            .await
+            .expect(CASE),
         "{CASE}: Y releases the lease at the park (lease_expires_at = now)"
     );
     assert!(
         store
-            .take_lease(run, ids::BOX, z, minutes(11), minutes(30))
+            .take_lease(run, ids::BOX, z, minutes(19))
             .await
             .expect(CASE),
         "{CASE}: a released lease on a parked run is Z's to take"
     );
     let taken = run_row(CASE, store, run).await;
     assert_eq!(
-        (taken.lease_box_id, taken.lease_expires_at),
-        (Some(ids::BOX), Some(minutes(30))),
-        "{CASE}: the take writes the box and the expiry"
+        taken.lease_box_id,
+        Some(ids::BOX),
+        "{CASE}: the take writes the box"
+    );
+    assert_leased_for(
+        CASE,
+        &taken,
+        minutes(19),
+        "the take writes the box and the expiry",
     );
     assert!(
         !store
-            .take_lease(run, BoxId::new(), z, minutes(40), minutes(50))
+            .take_lease(run, BoxId::new(), z, minutes(10))
             .await
             .expect(CASE),
         "{CASE}: a run executing on another box is not takeable"
@@ -5338,7 +5452,7 @@ async fn take_lease_moves_only_our_own_or_an_expired_lease<S: WriteStore>(store:
         .id;
     assert!(
         !store
-            .take_lease(queued, ids::BOX, z, at, minutes(5))
+            .take_lease(queued, ids::BOX, z, minutes(5))
             .await
             .expect(CASE),
         "{CASE}: an unclaimed queued run has no lease to take"
@@ -5356,26 +5470,26 @@ async fn take_lease_moves_only_our_own_or_an_expired_lease<S: WriteStore>(store:
         .id;
     assert_eq!(
         store
-            .claim_run(finished, ids::BOX, x, at, minutes(5))
+            .claim_run(finished, ids::BOX, x, at, TimeDelta::zero())
             .await
             .expect(CASE),
         Claim::Admitted,
-        "{CASE}: the second run is admitted"
+        "{CASE}: the second run is admitted, its lease lapsed at once"
     );
     store
-        .finish_run(finished, RunStatus::Done, None, minutes(1))
+        .finish_run(finished, RunStatus::Done, None, at + minutes(1))
         .await
         .expect(CASE);
     assert!(
         !store
-            .take_lease(finished, ids::BOX, x, minutes(10), minutes(20))
+            .take_lease(finished, ids::BOX, x, minutes(10))
             .await
             .expect(CASE),
         "{CASE}: a terminal run is not takeable, even by its own expired owner"
     );
 
     let unknown = store
-        .take_lease(RunId::new(), ids::BOX, x, at, minutes(5))
+        .take_lease(RunId::new(), ids::BOX, x, minutes(5))
         .await;
     assert!(
         matches!(unknown, Err(StoreError::NotFound { entity: "run", .. })),
@@ -5393,7 +5507,7 @@ async fn release_lease_frees_the_run_for_its_own_sweep<S: WriteStore>(store: &S)
     const CASE: &str = "release_lease_frees_the_run_for_its_own_sweep";
     let (x, y) = (Uuid::now_v7(), Uuid::now_v7());
     let at = seam_clock();
-    let minutes = |n: i64| at + TimeDelta::minutes(n);
+    let minutes = TimeDelta::minutes;
     let run = store
         .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
         .await
@@ -5405,16 +5519,17 @@ async fn release_lease_frees_the_run_for_its_own_sweep<S: WriteStore>(store: &S)
             .await
             .expect(CASE),
         Claim::Admitted,
-        "{CASE}: X claims the run until at + 5 min"
+        "{CASE}: X claims the run for five minutes"
     );
 
+    let before = run_row(CASE, store, run).await;
     assert!(
-        !store.release_lease(run, y, minutes(1)).await.expect(CASE),
+        !store.release_lease(run, y).await.expect(CASE),
         "{CASE}: Y does not hold the lease, so Y's release is zero rows"
     );
     assert_eq!(
-        run_row(CASE, store, run).await.lease_expires_at,
-        Some(minutes(5)),
+        run_row(CASE, store, run).await,
+        before,
         "{CASE}: a refused release writes nothing"
     );
     assert!(
@@ -5423,26 +5538,32 @@ async fn release_lease_frees_the_run_for_its_own_sweep<S: WriteStore>(store: &S)
     );
 
     assert!(
-        store.release_lease(run, x, minutes(1)).await.expect(CASE),
+        store.release_lease(run, x).await.expect(CASE),
         "{CASE}: X gives its own lease back"
     );
     let released = run_row(CASE, store, run).await;
     assert_eq!(
-        (released.lease_box_id, released.lease_expires_at),
-        (Some(ids::BOX), Some(minutes(1))),
-        "{CASE}: the expiry reads `now`; the box that held the lease is kept"
+        released.lease_box_id,
+        Some(ids::BOX),
+        "{CASE}: the box that held the lease is kept"
+    );
+    assert_leased_for(
+        CASE,
+        &released,
+        TimeDelta::zero(),
+        "the expiry reads the store's now; the box that held the lease is kept",
     );
     assert!(
         !store.refresh_lease(run, x, minutes(10)).await.expect(CASE),
         "{CASE}: the owner is cleared, so X's late heartbeat matches no row"
     );
     assert!(
-        !store.release_lease(run, x, minutes(1)).await.expect(CASE),
+        !store.release_lease(run, x).await.expect(CASE),
         "{CASE}: a second release finds nothing of X's"
     );
 
     let adopted = store
-        .adopt_runs(ids::BOX, x, minutes(1), minutes(10))
+        .adopt_runs(ids::BOX, x, minutes(10))
         .await
         .expect(CASE);
     assert_eq!(
@@ -5455,10 +5576,973 @@ async fn release_lease_frees_the_run_for_its_own_sweep<S: WriteStore>(store: &S)
         "{CASE}: the adoption made the lease X's again"
     );
 
-    let unknown = store.release_lease(RunId::new(), x, minutes(1)).await;
+    let unknown = store.release_lease(RunId::new(), x).await;
     assert!(
         matches!(unknown, Err(StoreError::NotFound { entity: "run", .. })),
         "{CASE}: an unknown run is NotFound, got {unknown:?}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// MOD-40 milestone 1 (plan D1, blueprint B1-B7): the step fence. `append_events`,
+// `set_step_usage` and `finish_step` write only while the step's run carries the fence's lease;
+// a writer whose run another process took is answered `Fenced` and writes nothing.
+// ------------------------------------------------------------------------------------------
+
+/// MOD-40 D1: a fresh run claimed by `a` for [`LEASE`], with one step. The fence cases start
+/// here; the run is `HTUI_ANA_2`'s, as the lease cases' are.
+async fn leased_step<S: WriteStore>(
+    case: &str,
+    store: &S,
+    a: Uuid,
+    at: DateTime<Utc>,
+) -> (RunId, StepId) {
+    let run = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(case)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, a, at, LEASE)
+            .await
+            .expect(case),
+        Claim::Admitted,
+        "{case}: A claims the run for five minutes"
+    );
+    let step = store
+        .create_step(new_run_step(run, 0, 1, 0))
+        .await
+        .expect(case)
+        .id;
+    (run, step)
+}
+
+/// B takes the run's lapsed lease, as a sweep's `adopt_runs` does to a suspended holder. A's
+/// lapse is a zero-TTL refresh (MOD-40 plan D10).
+async fn taken_by<S: WriteStore>(case: &str, store: &S, run: RunId, a: Uuid, b: Uuid) {
+    assert!(
+        store
+            .refresh_lease(run, a, TimeDelta::zero())
+            .await
+            .expect(case),
+        "{case}: A's lease lapses, as a suspended holder's does"
+    );
+    assert!(
+        store
+            .take_lease(run, ids::BOX, b, TimeDelta::minutes(14))
+            .await
+            .expect(case),
+        "{case}: B takes A's lapsed lease"
+    );
+}
+
+/// The step's log, empty when nothing is cached (`step_events` answers `None` then).
+async fn log_of<S: ReadStore>(case: &str, store: &S, step: StepId) -> Vec<SessionEvent> {
+    store
+        .step_events(step)
+        .await
+        .expect(case)
+        .unwrap_or_default()
+}
+
+/// The three fenced writes under `fence` each answer `Fenced { step }`: an append at `seq`, a
+/// usage write, a settle at `at`.
+async fn assert_fenced<S: WriteStore>(
+    case: &str,
+    store: &S,
+    fence: StepFence,
+    step: StepId,
+    seq: i32,
+    at: DateTime<Utc>,
+) {
+    let append = store.append_events(fence, &[chat_event(step, seq)]).await;
+    assert!(
+        matches!(append, Err(StoreError::Fenced { step: s }) if s == step),
+        "{case}: an append under {fence:?} is fenced, got {append:?}"
+    );
+    let usage = store
+        .set_step_usage(
+            fence,
+            step,
+            json!({ "input_tokens": 99 }),
+            Some("stale".to_owned()),
+        )
+        .await;
+    assert!(
+        matches!(usage, Err(StoreError::Fenced { step: s }) if s == step),
+        "{case}: a usage write under {fence:?} is fenced, got {usage:?}"
+    );
+    let settle = store
+        .finish_step(
+            fence,
+            step,
+            StepOutcome {
+                exit_code: Some(1),
+                finished_at: at,
+                ..StepOutcome::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(settle, Err(StoreError::Fenced { step: s }) if s == step),
+        "{case}: a settle under {fence:?} is fenced, got {settle:?}"
+    );
+}
+
+/// MOD-40 plan D1 (ANA-16 C1): once B has taken A's lapsed lease, every step write A makes under
+/// its old lease is `Fenced` and writes nothing, a replay of rows already stored included
+/// (blueprint B7).
+async fn a_stale_owner_writes_nothing_to_the_step<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_stale_owner_writes_nothing_to_the_step";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let (run, step) = leased_step(CASE, store, a, at).await;
+    let rows: Vec<SessionEvent> = (0..2).map(|seq| chat_event(step, seq)).collect();
+    assert_eq!(
+        store
+            .append_events(StepFence::Lease(a), &rows)
+            .await
+            .expect(CASE),
+        2,
+        "{CASE}: A writes its step while it holds the lease"
+    );
+    store
+        .set_step_usage(
+            StepFence::Lease(a),
+            step,
+            json!({ "input_tokens": 1 }),
+            Some("d0".to_owned()),
+        )
+        .await
+        .expect(CASE);
+    taken_by(CASE, store, run, a, b).await;
+    let row = step_row(CASE, store, run, step).await;
+    let log = log_of(CASE, store, step).await;
+
+    assert_fenced(
+        CASE,
+        store,
+        StepFence::Lease(a),
+        step,
+        2,
+        at + TimeDelta::minutes(7),
+    )
+    .await;
+    let replay = store.append_events(StepFence::Lease(a), &rows).await;
+    assert!(
+        matches!(replay, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: A's replay of stored rows is fenced too, never Ok(0) (blueprint B7), got {replay:?}"
+    );
+    assert_eq!(
+        step_row(CASE, store, run, step).await,
+        row,
+        "{CASE}: the refused writes left the settle and usage columns alone"
+    );
+    assert_eq!(
+        log_of(CASE, store, step).await,
+        log,
+        "{CASE}: the refused writes appended nothing"
+    );
+    assert_eq!(log.len(), 2, "{CASE}: A's two rows stand");
+}
+
+/// MOD-40 plan D1: the process that took the lease writes the step under its own.
+async fn the_new_owner_writes_the_step<S: WriteStore>(store: &S) {
+    const CASE: &str = "the_new_owner_writes_the_step";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let (run, step) = leased_step(CASE, store, a, at).await;
+    let rows: Vec<SessionEvent> = (0..2).map(|seq| chat_event(step, seq)).collect();
+    assert_eq!(
+        store
+            .append_events(StepFence::Lease(a), &rows)
+            .await
+            .expect(CASE),
+        2,
+        "{CASE}: A writes its step while it holds the lease"
+    );
+    taken_by(CASE, store, run, a, b).await;
+
+    let more: Vec<SessionEvent> = (2..4).map(|seq| chat_event(step, seq)).collect();
+    assert_eq!(
+        store
+            .append_events(StepFence::Lease(b), &more)
+            .await
+            .expect(CASE),
+        2,
+        "{CASE}: B appends under its lease"
+    );
+    store
+        .set_step_usage(
+            StepFence::Lease(b),
+            step,
+            json!({ "input_tokens": 5 }),
+            None,
+        )
+        .await
+        .expect(CASE);
+    store
+        .finish_step(
+            StepFence::Lease(b),
+            step,
+            StepOutcome {
+                exit_code: Some(0),
+                finished_at: at + TimeDelta::minutes(7),
+                ..StepOutcome::default()
+            },
+        )
+        .await
+        .expect(CASE);
+
+    let row = step_row(CASE, store, run, step).await;
+    assert_eq!(
+        (row.exit_code, row.finished_at, row.usage),
+        (
+            Some(0),
+            Some(at + TimeDelta::minutes(7)),
+            Some(json!({ "input_tokens": 5 }))
+        ),
+        "{CASE}: B's usage and settle landed"
+    );
+    assert_eq!(
+        log_of(CASE, store, step)
+            .await
+            .iter()
+            .map(|event| event.seq)
+            .collect::<Vec<i32>>(),
+        (0..4).collect::<Vec<i32>>(),
+        "{CASE}: A's rows and B's, in order"
+    );
+}
+
+/// MOD-40 plan D1: a chat run holds no lease, so `Unleased` writes its step, and a fence naming
+/// any owner is refused there.
+async fn an_unleased_fence_writes_a_chat_step<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_unleased_fence_writes_a_chat_step";
+    let at = seam_clock();
+    let chat = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        ids::BOX,
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        Some("sonnet".to_owned()),
+    );
+    store.start_chat_run(&chat).await.expect(CASE);
+    let rows: Vec<SessionEvent> = (0..3).map(|seq| chat_event(chat.step_id, seq)).collect();
+    assert_eq!(
+        store
+            .append_events(StepFence::Unleased, &rows)
+            .await
+            .expect(CASE),
+        3,
+        "{CASE}: a chat's rows land unleased"
+    );
+    store
+        .set_step_usage(
+            StepFence::Unleased,
+            chat.step_id,
+            json!({ "input_tokens": 3 }),
+            Some("c0".to_owned()),
+        )
+        .await
+        .expect(CASE);
+    store
+        .finish_step(
+            StepFence::Unleased,
+            chat.step_id,
+            StepOutcome {
+                exit_code: Some(0),
+                finished_at: at,
+                ..StepOutcome::default()
+            },
+        )
+        .await
+        .expect(CASE);
+    let row = step_row(CASE, store, chat.run_id, chat.step_id).await;
+    let log = log_of(CASE, store, chat.step_id).await;
+
+    assert_fenced(
+        CASE,
+        store,
+        StepFence::Lease(Uuid::now_v7()),
+        chat.step_id,
+        3,
+        at + TimeDelta::minutes(1),
+    )
+    .await;
+    assert_eq!(
+        step_row(CASE, store, chat.run_id, chat.step_id).await,
+        row,
+        "{CASE}: the refused writes left the chat step alone"
+    );
+    assert_eq!(
+        log_of(CASE, store, chat.step_id).await,
+        log,
+        "{CASE}: the refused append wrote nothing"
+    );
+}
+
+/// MOD-40 plan D1, plan R-1: `Unleased` is refused on a run whose lease names an owner; once the
+/// owner gives the lease back (a park, plan D139) the step is a chat's to continue, and the old
+/// owner's fence is refused instead.
+async fn an_unleased_fence_is_refused_on_a_leased_run<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_unleased_fence_is_refused_on_a_leased_run";
+    let a = Uuid::now_v7();
+    let at = seam_clock();
+    let (run, step) = leased_step(CASE, store, a, at).await;
+
+    assert_fenced(
+        CASE,
+        store,
+        StepFence::Unleased,
+        step,
+        0,
+        at + TimeDelta::minutes(1),
+    )
+    .await;
+    assert!(
+        log_of(CASE, store, step).await.is_empty(),
+        "{CASE}: the refused append wrote nothing"
+    );
+    assert_eq!(
+        step_row(CASE, store, run, step).await.finished_at,
+        None,
+        "{CASE}: the refused settle wrote nothing"
+    );
+
+    assert!(
+        store.release_lease(run, a).await.expect(CASE),
+        "{CASE}: A gives its lease back, as a park does"
+    );
+    assert_eq!(
+        store
+            .append_events(StepFence::Unleased, &[chat_event(step, 0)])
+            .await
+            .expect(CASE),
+        1,
+        "{CASE}: a released run's step takes an unleased row"
+    );
+    assert_fenced(
+        CASE,
+        store,
+        StepFence::Lease(a),
+        step,
+        1,
+        at + TimeDelta::minutes(2),
+    )
+    .await;
+}
+
+/// MOD-40 plan D1, D3: under the right fence a replay is `Ok(0)` and a partial replay counts only
+/// its new rows; the same replay under the wrong fence is `Fenced` (blueprint B7).
+async fn a_replayed_batch_under_the_right_fence_is_ok_zero<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_replayed_batch_under_the_right_fence_is_ok_zero";
+    let a = Uuid::now_v7();
+    let at = seam_clock();
+    let (_, step) = leased_step(CASE, store, a, at).await;
+    let rows: Vec<SessionEvent> = (0..3).map(|seq| chat_event(step, seq)).collect();
+
+    assert_eq!(
+        store
+            .append_events(StepFence::Lease(a), &rows)
+            .await
+            .expect(CASE),
+        3,
+        "{CASE}: three new rows"
+    );
+    assert_eq!(
+        store
+            .append_events(StepFence::Lease(a), &rows)
+            .await
+            .expect(CASE),
+        0,
+        "{CASE}: a whole replay under the right fence lands nothing and is not an error"
+    );
+    let wider: Vec<SessionEvent> = (0..4).map(|seq| chat_event(step, seq)).collect();
+    assert_eq!(
+        store
+            .append_events(StepFence::Lease(a), &wider)
+            .await
+            .expect(CASE),
+        1,
+        "{CASE}: a replay with one new row counts the one"
+    );
+    assert_eq!(
+        log_of(CASE, store, step)
+            .await
+            .iter()
+            .map(|event| event.seq)
+            .collect::<Vec<i32>>(),
+        (0..4).collect::<Vec<i32>>(),
+        "{CASE}: seq 0..4, no duplicate"
+    );
+
+    let wrong = store.append_events(StepFence::Unleased, &rows).await;
+    assert!(
+        matches!(wrong, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: the same replay under the wrong fence is fenced (blueprint B7), got {wrong:?}"
+    );
+}
+
+/// MOD-40 blueprint B6: a step that does not exist keeps today's answer under any fence —
+/// `Constraint` for the append, `NotFound` for the two updates — and a batch naming one refuses
+/// whole with `Constraint`, ahead of the fence, even when its other step is fenced.
+async fn a_missing_step_keeps_its_old_error_not_fenced<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_missing_step_keeps_its_old_error_not_fenced";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let orphan = StepId::new();
+    let (run, step) = leased_step(CASE, store, a, at).await;
+    taken_by(CASE, store, run, a, b).await;
+
+    for fence in [StepFence::Unleased, StepFence::Lease(Uuid::now_v7())] {
+        let append = store.append_events(fence, &[chat_event(orphan, 0)]).await;
+        assert!(
+            matches!(append, Err(StoreError::Constraint(_))),
+            "{CASE}: an append on a missing step under {fence:?} is Constraint, got {append:?}"
+        );
+        let usage = store.set_step_usage(fence, orphan, json!({}), None).await;
+        assert!(
+            matches!(
+                usage,
+                Err(StoreError::NotFound {
+                    entity: "run_step",
+                    ..
+                })
+            ),
+            "{CASE}: a usage write on a missing step under {fence:?} is NotFound, got {usage:?}"
+        );
+        let settle = store
+            .finish_step(fence, orphan, StepOutcome::default())
+            .await;
+        assert!(
+            matches!(
+                settle,
+                Err(StoreError::NotFound {
+                    entity: "run_step",
+                    ..
+                })
+            ),
+            "{CASE}: a settle on a missing step under {fence:?} is NotFound, got {settle:?}"
+        );
+    }
+
+    let mixed = store
+        .append_events(
+            StepFence::Lease(a),
+            &[chat_event(step, 0), chat_event(orphan, 0)],
+        )
+        .await;
+    assert!(
+        matches!(mixed, Err(StoreError::Constraint(_))),
+        "{CASE}: a batch naming a missing step and a fenced one is Constraint (B6), got {mixed:?}"
+    );
+    assert!(
+        log_of(CASE, store, step).await.is_empty(),
+        "{CASE}: the refused batch wrote none of its rows"
+    );
+}
+
+/// MOD-40 D4: `AGENT_CLAUDE`'s probed `agent_box` row on the fixture box, with no quota yet, as
+/// `set_agent_box_quota_updates_two_columns_or_not_found` plants it.
+async fn quota_row<S: WriteStore>(case: &str, store: &S, t0: DateTime<Utc>) {
+    store
+        .upsert_agent_box(&AgentBox {
+            agent_id: ids::AGENT_CLAUDE,
+            box_id: ids::BOX,
+            enabled: true,
+            version: Some("1.2.3".to_owned()),
+            path: Some("/usr/bin/claude".to_owned()),
+            probed_at: Some(t0),
+            quota: None,
+            quota_at: None,
+            updated_at: t0,
+            probe: Some(json!({ "status": "ready", "source": "probe" })),
+        })
+        .await
+        .unwrap_or_else(|err| panic!("{case}: the probed row must land: {err:?}"));
+}
+
+/// One quota latch on `AGENT_CLAUDE`'s fixture-box row: whether it was written, or a panic naming
+/// the case and the error.
+async fn latch<S: WriteStore>(case: &str, store: &S, quota: Value, at: DateTime<Utc>) -> bool {
+    store
+        .set_agent_box_quota(ids::AGENT_CLAUDE, ids::BOX, quota, at)
+        .await
+        .unwrap_or_else(|err| panic!("{case}: the latch at {at} finds its row: {err:?}"))
+}
+
+/// MOD-40 plan D4: newest `quota_at` wins. A latch older than the stored one is `Ok(false)` and
+/// writes nothing — not `NotFound`, and not an overwrite — while a newer one still lands.
+///
+/// That the refused latch left the stored pair **byte for byte** is asserted where the row can be
+/// read back (`mem.rs::an_older_quota_leaves_the_stored_pair_alone` and
+/// `pg_criteria.rs::an_older_quota_leaves_the_row_byte_identical`); here the order itself shows
+/// it: had the older latch landed, the one between it and the stored instant would land too.
+async fn an_older_quota_is_a_no_op<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_older_quota_is_a_no_op";
+    let t0 = seam_clock();
+    quota_row(CASE, store, t0).await;
+    let (t1, t2) = (t0 + TimeDelta::minutes(1), t0 + TimeDelta::minutes(2));
+    let mid = t0 + TimeDelta::seconds(90);
+
+    assert!(
+        latch(CASE, store, json!({ "v": 2 }), t2).await,
+        "{CASE}: the first latch lands on a row with no quota"
+    );
+    assert!(
+        !latch(CASE, store, json!({ "v": 1 }), t1).await,
+        "{CASE}: an older quota is a no-op, not NotFound"
+    );
+    assert!(
+        !latch(CASE, store, json!({ "v": 15 }), mid).await,
+        "{CASE}: t2 is still the stored instant: had t1 overwritten it, t1.5 would have landed"
+    );
+    assert!(
+        latch(CASE, store, json!({ "v": 3 }), t0 + TimeDelta::minutes(3)).await,
+        "{CASE}: a newer one still lands"
+    );
+}
+
+/// MOD-40 plan D4: the guard is `<=`, so a latch of the stored instant rewrites the document —
+/// how one session refreshes its spend under an unchanged `observed_at` — and does so
+/// idempotently, while one microsecond older is older.
+async fn an_equal_quota_at_rewrites_idempotently<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_equal_quota_at_rewrites_idempotently";
+    let t0 = seam_clock();
+    quota_row(CASE, store, t0).await;
+    let t = t0 + TimeDelta::minutes(1);
+
+    assert!(
+        latch(CASE, store, json!({ "v": 1 }), t).await,
+        "{CASE}: the first latch lands"
+    );
+    assert!(
+        latch(CASE, store, json!({ "v": 2 }), t).await,
+        "{CASE}: `<=`: the same instant rewrites, which is how one session refreshes its spend"
+    );
+    assert!(
+        latch(CASE, store, json!({ "v": 2 }), t).await,
+        "{CASE}: the same latch again is written again, idempotently"
+    );
+    assert!(
+        !latch(
+            CASE,
+            store,
+            json!({ "v": 0 }),
+            t - TimeDelta::microseconds(1)
+        )
+        .await,
+        "{CASE}: one microsecond older is older"
+    );
+}
+
+/// MOD-40 plan D4: a key with no `agent_box` row is `NotFound`, however old the latch — absence
+/// is never mistaken for "a newer quota is stored" — and a row with a `NULL` `quota_at` accepts
+/// any instant at all.
+async fn a_missing_agent_box_is_not_found<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_missing_agent_box_is_not_found";
+    let t0 = seam_clock();
+    let ancient = t0 - TimeDelta::days(3650);
+
+    for (agent_id, box_id) in [
+        (AgentId::new(), ids::BOX),
+        (ids::AGENT_CLAUDE, BoxId::new()),
+        (ids::AGENT_CLAUDE, ids::BOX),
+    ] {
+        let missing = store
+            .set_agent_box_quota(agent_id, box_id, json!({ "v": 0 }), ancient)
+            .await;
+        match missing {
+            Err(StoreError::NotFound {
+                entity: "agent_box",
+                id,
+            }) => assert_eq!(
+                id,
+                format!("{agent_id}/{box_id}"),
+                "{CASE}: the refusal names the key"
+            ),
+            other => panic!(
+                "{CASE}: absence is never mistaken for an older quota; {agent_id}/{box_id} is \
+                 NotFound on agent_box, got {other:?}"
+            ),
+        }
+    }
+
+    quota_row(CASE, store, t0).await;
+    assert!(
+        latch(CASE, store, json!({ "v": 0 }), ancient).await,
+        "{CASE}: a `NULL` quota_at accepts anything, however old"
+    );
+}
+
+/// MOD-40 D5: `test_agent` stamped at `at`, a microsecond instant, so the row a store answers is
+/// the row given, on every store.
+fn stamped_agent(id: AgentId, name: &str, model: &str, at: DateTime<Utc>) -> Agent {
+    Agent {
+        created_at: at,
+        updated_at: at,
+        ..test_agent(id, name, model)
+    }
+}
+
+/// MOD-40 plan D5: `upsert_agent(_, None)` is a create. It stores the row as given, stamps
+/// included, and on an id that is already stored — one it created, or a fixture agent — it is
+/// `Stale` with the stored row and writes nothing, even when the name is also held (the id is
+/// decided before the name, blueprint P-7).
+async fn upsert_agent_with_none_inserts_and_is_stale_when_present<S: WriteStore>(store: &S) {
+    const CASE: &str = "upsert_agent_with_none_inserts_and_is_stale_when_present";
+    let at = seam_clock();
+    let a = stamped_agent(AgentId::new(), "m40-none", "small", at);
+
+    let stored = applied(
+        CASE,
+        store
+            .upsert_agent(&a, None)
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: the create lands: {err:?}")),
+    );
+    assert_eq!(
+        stored, a,
+        "{CASE}: the insert stores the row as given, both stamps included"
+    );
+
+    let again = store
+        .upsert_agent(
+            &Agent {
+                models: vec!["large".to_owned()],
+                default_model: Some("large".to_owned()),
+                ..a.clone()
+            },
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{CASE}: a second create is an outcome: {err:?}"));
+    assert_eq!(
+        stale(CASE, again),
+        a,
+        "{CASE}: a create on a stored id is Stale with the stored row and writes nothing"
+    );
+
+    let held = store
+        .upsert_agent(
+            &Agent {
+                name: "claude".to_owned(),
+                ..a.clone()
+            },
+            None,
+        )
+        .await;
+    assert!(
+        matches!(held, Ok(CasOutcome::Stale(_))),
+        "{CASE}: the id is decided before the name: a create on a stored id under a held name \
+         is Stale, not Constraint, got {held:?}"
+    );
+
+    let seed = store
+        .upsert_agent(
+            &Agent {
+                id: ids::AGENT_CLAUDE,
+                name: "m40-seed".to_owned(),
+                ..a.clone()
+            },
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{CASE}: a create over a fixture id is an outcome: {err:?}"));
+    let seed = stale(CASE, seed);
+    assert_eq!(
+        (seed.id, seed.name.as_str()),
+        (ids::AGENT_CLAUDE, "claude"),
+        "{CASE}: a fixture agent is present too: every edit of one passes its token"
+    );
+
+    applied(
+        CASE,
+        store
+            .upsert_agent(&a, Some(a.updated_at))
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: the edit with the stored token: {err:?}")),
+    );
+}
+
+/// MOD-40 plan D5: an edit whose token another write has spent is `Stale` with the row as it is
+/// now and writes nothing — also when it would take a held name — while the write that spent it
+/// moved `updated_at` and kept `created_at`.
+async fn upsert_agent_with_a_spent_token_is_stale_and_writes_nothing<S: WriteStore>(store: &S) {
+    const CASE: &str = "upsert_agent_with_a_spent_token_is_stale_and_writes_nothing";
+    let at = seam_clock();
+    let r0 = applied(
+        CASE,
+        store
+            .upsert_agent(
+                &stamped_agent(AgentId::new(), "m40-spent", "small", at),
+                None,
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: the create lands: {err:?}")),
+    );
+    let r1 = applied(
+        CASE,
+        store
+            .upsert_agent(
+                &Agent {
+                    models: vec!["large".to_owned()],
+                    ..r0.clone()
+                },
+                Some(r0.updated_at),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: the first edit lands: {err:?}")),
+    );
+    // `!=`, not `>`: on Postgres the two stamps come from two clocks, the caller's and the
+    // trigger's.
+    assert_ne!(
+        r1.updated_at, r0.updated_at,
+        "{CASE}: the edit spent the token"
+    );
+    assert_eq!(
+        r1.created_at, r0.created_at,
+        "{CASE}: an edit never rewrites created_at"
+    );
+
+    let late = store
+        .upsert_agent(
+            &Agent {
+                models: vec!["largest".to_owned()],
+                ..r0.clone()
+            },
+            Some(r0.updated_at),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{CASE}: a stale edit is an outcome: {err:?}"));
+    assert_eq!(
+        stale(CASE, late),
+        r1,
+        "{CASE}: Stale carries the row as it is now"
+    );
+
+    let late_rename = store
+        .upsert_agent(
+            &Agent {
+                name: "claude".to_owned(),
+                ..r0.clone()
+            },
+            Some(r0.updated_at),
+        )
+        .await;
+    assert!(
+        matches!(late_rename, Ok(CasOutcome::Stale(_))),
+        "{CASE}: a spent token under a held name is Stale, not Constraint (P-7), got \
+         {late_rename:?}"
+    );
+
+    let current = applied(
+        CASE,
+        store
+            .upsert_agent(&r1, Some(r1.updated_at))
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: the current token applies: {err:?}")),
+    );
+    assert_eq!(
+        current.models,
+        ["large"],
+        "{CASE}: the stale writes wrote nothing: r1's token was still current"
+    );
+}
+
+/// MOD-40 plan D5: an edit under the current token writes every column but the two stamps —
+/// `created_at` stays the insert's and `updated_at` is the store's, never the caller's. The same
+/// token under a held name is the name's `Constraint` and writes nothing, and a token for an id
+/// no row has is `NotFound`.
+async fn upsert_agent_with_the_current_token_applies<S: WriteStore>(store: &S) {
+    const CASE: &str = "upsert_agent_with_the_current_token_applies";
+    let at = seam_clock();
+    let r0 = applied(
+        CASE,
+        store
+            .upsert_agent(
+                &stamped_agent(AgentId::new(), "m40-apply", "small", at),
+                None,
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: the create lands: {err:?}")),
+    );
+    let far = at + TimeDelta::days(3650);
+    let edited = Agent {
+        name: "m40-renamed".to_owned(),
+        transport: Transport::Acp,
+        launch: json!({ "command": "renamed", "args": ["--acp"], "env": {} }),
+        models: vec!["small".to_owned(), "large".to_owned()],
+        default_model: Some("large".to_owned()),
+        billing: Billing::Subscription,
+        enabled: false,
+        settings: json!({ "acp": {} }),
+        created_at: far,
+        updated_at: far,
+        ..r0.clone()
+    };
+
+    let r1 = applied(
+        CASE,
+        store
+            .upsert_agent(&edited, Some(r0.updated_at))
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: the edit lands: {err:?}")),
+    );
+    assert_eq!(
+        r1,
+        Agent {
+            created_at: r0.created_at,
+            updated_at: r1.updated_at,
+            ..edited.clone()
+        },
+        "{CASE}: every column but the stamps took the edit"
+    );
+    assert_ne!(
+        r1.updated_at, far,
+        "{CASE}: updated_at is the store's, never the caller's"
+    );
+
+    let taken = store
+        .upsert_agent(
+            &Agent {
+                name: "claude".to_owned(),
+                ..r1.clone()
+            },
+            Some(r1.updated_at),
+        )
+        .await;
+    assert!(
+        matches!(taken, Err(StoreError::Constraint(_))),
+        "{CASE}: a current token under a held name is the name's refusal, got {taken:?}"
+    );
+    applied(
+        CASE,
+        store
+            .upsert_agent(&r1, Some(r1.updated_at))
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: the refused rename wrote nothing: {err:?}")),
+    );
+
+    let ghost = store
+        .upsert_agent(
+            &stamped_agent(AgentId::new(), "m40-ghost", "small", at),
+            Some(at),
+        )
+        .await;
+    assert!(
+        matches!(
+            ghost,
+            Err(StoreError::NotFound {
+                entity: "agent",
+                ..
+            })
+        ),
+        "{CASE}: a token for an id no row has is NotFound, got {ghost:?}"
+    );
+}
+
+/// MOD-40 blueprint B27: a lease TTL below zero or past [`MAX_LEASE_TTL`] is `Constraint` from
+/// every method that takes one, checked before any row is read (an unknown run is the same
+/// refusal, not `NotFound`), and writes nothing. Both bounds are accepted.
+async fn a_lease_ttl_out_of_range_is_refused<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_lease_ttl_out_of_range_is_refused";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+    let out_of_range = [
+        TimeDelta::microseconds(-1),
+        MAX_LEASE_TTL + TimeDelta::microseconds(1),
+    ];
+    let refused = |answer: Result<(), StoreError>, what: &str| {
+        assert!(
+            matches!(answer, Err(StoreError::Constraint(_))),
+            "{CASE}: {what} is Constraint, got {answer:?}"
+        );
+    };
+    let run = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    let queued = run_row(CASE, store, run).await;
+    for ttl in out_of_range {
+        refused(
+            store
+                .claim_run(run, ids::BOX, owner, at, ttl)
+                .await
+                .map(|_| ()),
+            "a claim",
+        );
+        refused(
+            store
+                .claim_run(RunId::new(), ids::BOX, owner, at, ttl)
+                .await
+                .map(|_| ()),
+            "a claim of an unknown run",
+        );
+    }
+    assert_eq!(
+        run_row(CASE, store, run).await,
+        queued,
+        "{CASE}: a refused claim writes nothing"
+    );
+
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, MAX_LEASE_TTL)
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: the longest TTL is admitted"
+    );
+    let claimed = run_row(CASE, store, run).await;
+    assert_leased_for(CASE, &claimed, MAX_LEASE_TTL, "the longest lease");
+    for ttl in out_of_range {
+        refused(
+            store.refresh_lease(run, owner, ttl).await.map(|_| ()),
+            "a refresh",
+        );
+        refused(
+            store
+                .refresh_lease(RunId::new(), owner, ttl)
+                .await
+                .map(|_| ()),
+            "a refresh of an unknown run",
+        );
+        refused(
+            store
+                .take_lease(run, ids::BOX, owner, ttl)
+                .await
+                .map(|_| ()),
+            "a take",
+        );
+        refused(
+            store
+                .adopt_runs(ids::BOX, Uuid::now_v7(), ttl)
+                .await
+                .map(|_| ()),
+            "a sweep",
+        );
+    }
+    assert_eq!(
+        run_row(CASE, store, run).await,
+        claimed,
+        "{CASE}: the refusals wrote nothing"
+    );
+    assert!(
+        store
+            .refresh_lease(run, owner, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: a zero TTL is accepted"
+    );
+    assert_leased_for(
+        CASE,
+        &run_row(CASE, store, run).await,
+        TimeDelta::zero(),
+        "a zero lease",
     );
 }
 
@@ -7202,6 +8286,7 @@ async fn interrupt_step_is_a_cas_on_running<S: WriteStore>(store: &S) {
     let settled = running(1).await;
     store
         .finish_step(
+            StepFence::Unleased,
             settled,
             StepOutcome {
                 exit_code: Some(0),
@@ -7470,6 +8555,7 @@ async fn finish_step_records_the_settle<S: WriteStore>(store: &S) {
     let finished = seam_clock();
     store
         .finish_step(
+            StepFence::Unleased,
             ids::STEP_R2_PRD,
             StepOutcome {
                 exit_code: Some(0),
@@ -7507,6 +8593,7 @@ async fn finish_step_records_the_settle<S: WriteStore>(store: &S) {
 
     store
         .finish_step(
+            StepFence::Unleased,
             ids::STEP_R2_PRD,
             StepOutcome {
                 exit_code: Some(1),
@@ -7534,7 +8621,7 @@ async fn finish_step_records_the_settle<S: WriteStore>(store: &S) {
     );
 
     let unknown = store
-        .finish_step(StepId::new(), StepOutcome::default())
+        .finish_step(StepFence::Unleased, StepId::new(), StepOutcome::default())
         .await;
     assert!(
         matches!(
@@ -10198,7 +11285,6 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
     const CASE: &str = "finish_run_moves_run_and_item_together";
     let owner = Uuid::now_v7();
     let at = seam_clock();
-    let until = at + TimeDelta::minutes(5);
 
     // Leg 1: `done` reaches the item, and the finish stamps the caller's instant.
     let before = item_row(CASE, store, ids::HTUI_ANA_2).await;
@@ -10209,7 +11295,7 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
         .id;
     assert_eq!(
         store
-            .claim_run(first, ids::BOX, owner, at, until)
+            .claim_run(first, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,
@@ -10267,7 +11353,7 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
     for run in [left, right] {
         assert_eq!(
             store
-                .claim_run(run, ids::BOX, owner, at, until)
+                .claim_run(run, ids::BOX, owner, at, LEASE)
                 .await
                 .expect(CASE),
             Claim::Admitted,
@@ -10306,7 +11392,7 @@ async fn finish_run_moves_run_and_item_together<S: WriteStore>(store: &S) {
         .id;
     assert_eq!(
         store
-            .claim_run(failing, ids::BOX, owner, at, until)
+            .claim_run(failing, ids::BOX, owner, at, LEASE)
             .await
             .expect(CASE),
         Claim::Admitted,

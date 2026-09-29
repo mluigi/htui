@@ -18,7 +18,8 @@ use htui::testkit::Harness;
 use htui_agent::box_probe::hardware::{FixedHardware, Hardware};
 use htui_agent::probe::{ProbeEnv, platform_key};
 use htui_agent::registry::DriverFactory;
-use htui_core::store::{MemStore, WriteStore};
+use htui_core::fixtures::edit_agent;
+use htui_core::store::MemStore;
 use serde_json::json;
 
 /// The demo registry with every row's launch rewritten to resolve nowhere (H-7).
@@ -37,7 +38,7 @@ async fn unresolvable_registry() -> MemStore {
                 "handshake": true
             }
         });
-        store.upsert_agent(&agent).await.expect("the row updates");
+        edit_agent(&store, &agent).await.expect("the row updates");
     }
     store
 }

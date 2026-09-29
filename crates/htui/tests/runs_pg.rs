@@ -44,14 +44,14 @@ use htui_agent::driver::{AgentDriver, DriverCaps};
 use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk, UsageEvent};
 use htui_agent::fake::{FakeAdapter, FakeDriver};
 use htui_agent::registry::{DriverFactory, TransportBuilder};
-use htui_core::fixtures::ids;
+use htui_core::fixtures::{edit_agent, ids};
 use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, BoxEdit, DocumentHead, DocumentId, EventKind, EventRole,
     Item, ItemId, ItemPatch, NewDocument, NewRepo, RepoId, Resolution, Run, RunId, RunMode,
     RunStatus, RunStep, RunStepCommit, SessionEvent, SnapshotPhase, Status, StepId, StepStatus,
     Transport, UsageTotals,
 };
-use htui_core::store::{CasOutcome, ReadStore as _, StoreError, WriteStore as _};
+use htui_core::store::{CasOutcome, ReadStore as _, StepFence, StoreError, WriteStore as _};
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
 use htui_orch::{Command, GateAnswer};
 use htui_store::{Backend, CacheStore, PgStore, testkit};
@@ -175,24 +175,27 @@ async fn seed(store: &PgStore) {
     for summary in store.agents().await.expect("the fixture's agents") {
         let mut row = summary.agent;
         row.enabled = false;
-        store.upsert_agent(&row).await.expect("the row is disabled");
+        edit_agent(store, &row).await.expect("the row is disabled");
     }
     let agent_id = AgentId::new();
     let at = Utc::now();
     store
-        .upsert_agent(&Agent {
-            id: agent_id,
-            name: "scripted".to_owned(),
-            transport: Transport::Acp,
-            billing: Billing::Subscription,
-            models: Vec::new(),
-            default_model: Some("sonnet".to_owned()),
-            launch: json!({ "command": "unused", "args": [] }),
-            settings: json!({}),
-            enabled: true,
-            created_at: at,
-            updated_at: at,
-        })
+        .upsert_agent(
+            &Agent {
+                id: agent_id,
+                name: "scripted".to_owned(),
+                transport: Transport::Acp,
+                billing: Billing::Subscription,
+                models: Vec::new(),
+                default_model: Some("sonnet".to_owned()),
+                launch: json!({ "command": "unused", "args": [] }),
+                settings: json!({}),
+                enabled: true,
+                created_at: at,
+                updated_at: at,
+            },
+            None,
+        )
         .await
         .expect("the scripted row lands");
     store
@@ -644,7 +647,7 @@ async fn a_promoted_step_continues_its_own_log_on_postgres() {
         stack
             .db
             .store
-            .append_events(&second_turn)
+            .append_events(StepFence::Unleased, &second_turn)
             .await
             .expect("the second turn lands"),
         2

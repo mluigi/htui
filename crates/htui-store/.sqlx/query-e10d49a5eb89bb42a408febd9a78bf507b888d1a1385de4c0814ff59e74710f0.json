@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run SET lease_expires_at = clock_timestamp() + $3::bigint * interval '1 microsecond' WHERE id = $1 AND lease_owner = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e10d49a5eb89bb42a408febd9a78bf507b888d1a1385de4c0814ff59e74710f0"
+}

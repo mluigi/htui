@@ -63,7 +63,7 @@ refusal frees only the write in flight; an amend over a head withdrawn elsewhere
 
 ## Carried
 
-- **CLEAN-7**: the `Engine::close_out` doc comment in `crates/htui-orch/src/engine.rs` (~1545)
+- **CLEAN-7**: the `Engine::close_out` doc comment in `crates/htui-orch/src/engine.rs` (~1550)
   still says "Until MOD-39 the guard still refuses an `open` item"; `engine.rs` was MOD-40's while
   this ran.
 - **MOD-60**: the tab's `tree::pad`/`clip` and the Reqs pane's `cut` count `char`s, and on a narrow

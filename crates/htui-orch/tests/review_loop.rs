@@ -85,7 +85,7 @@ async fn claimed_with(store: &MemStore, snapshot: GraphSnapshot) -> Run {
             ids::BOX,
             uuid::Uuid::now_v7(),
             now,
-            now + chrono::TimeDelta::hours(1),
+            chrono::TimeDelta::hours(1),
         )
         .await
         .expect("MemStore never fails a claim");

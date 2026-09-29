@@ -18,7 +18,7 @@ use htui_agent::conformance::{Script, ScriptEvent};
 use htui_agent::event::{DoneEvent, DriverEvent, StopReason};
 use htui_agent::fake::FakeAdapter;
 use htui_agent::registry::DriverFactory;
-use htui_core::fixtures::{demo_at, ids};
+use htui_core::fixtures::{demo_at, edit_agent, ids};
 use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, CitationKind, DocumentId, ItemId, NewDocument, Resolution,
     RunStep, SnapshotPhase, Status, Transport, WorkspaceSummary,
@@ -484,23 +484,26 @@ async fn seeded_store() -> MemStore {
     for summary in store.agents().await.expect("the fixture's agents") {
         let mut row = summary.agent;
         row.enabled = false;
-        store.upsert_agent(&row).await.expect("the row is disabled");
+        edit_agent(&store, &row).await.expect("the row is disabled");
     }
     let agent = AgentId::new();
     store
-        .upsert_agent(&Agent {
-            id: agent,
-            name: "scripted".to_owned(),
-            transport: Transport::Acp,
-            billing: Billing::Subscription,
-            models: Vec::new(),
-            default_model: Some("sonnet".to_owned()),
-            launch: json!({ "command": "unused", "args": [] }),
-            settings: json!({}),
-            enabled: true,
-            created_at: demo_at(0, 0),
-            updated_at: demo_at(0, 0),
-        })
+        .upsert_agent(
+            &Agent {
+                id: agent,
+                name: "scripted".to_owned(),
+                transport: Transport::Acp,
+                billing: Billing::Subscription,
+                models: Vec::new(),
+                default_model: Some("sonnet".to_owned()),
+                launch: json!({ "command": "unused", "args": [] }),
+                settings: json!({}),
+                enabled: true,
+                created_at: demo_at(0, 0),
+                updated_at: demo_at(0, 0),
+            },
+            None,
+        )
         .await
         .expect("the scripted row lands");
     store
