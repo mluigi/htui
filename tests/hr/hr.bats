@@ -551,6 +551,134 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
 }
 
 # ---------------------------------------------------------------------------------------------
+# registry (review H4) and lease guard
+
+@test "24. the registry lives in the host-only HR_RUNS; HR_RUNS inside HR_STATE -> 2" {
+    run --separate-stderr "$HR" up MOD-5
+    [[ $status -eq 0 ]]
+    [[ -f "$HR_RUNS/MOD-5" && -f "$HR_RUNS/.lock" ]]
+    # Nothing of the registry in the state dir every sandbox mounts rw.
+    [[ ! -e "$HR_STATE/runs" && ! -e "$HR_STATE/runs.lock" ]]
+    ! grep -v '^HR_RUNS=' "$HR_TEST_DOCKER_LOG.env" | grep -qF "$HR_RUNS" || false
+
+    HR_RUNS="$HR_STATE/runs" run --separate-stderr "$HR" ls
+    [[ $status -eq 2 ]]
+    [[ "$stderr" == *'HR_RUNS'*'HR_STATE'* ]]
+    HR_RUNS="$HR_STATE" run --separate-stderr "$HR" ls
+    [[ $status -eq 2 ]]
+}
+
+@test "25. a tampered registry -> 3 for every verb; nothing started, fetched, stopped or deleted" {
+    mk_run MOD-5
+    "$HR" collect MOD-5 >/dev/null 2>&1
+    local reg good="$BATS_TEST_TMPDIR/reg.good" canary="$BATS_TEST_TMPDIR/canary"
+    reg="$(reg_of MOD-5)"
+    cp "$reg" "$good"
+    mkdir -p "$canary"
+    : >"$canary/keep"
+    local -a cases=(
+        "item|MOD-4" "project|hr-mod-4" "project|htui" "branch|main" "branch|hr/MOD-4"
+        "run_dir|$HR_HOST_REPO" "run_dir|$HR_ROOT/MOD-4" "run_dir|$canary" "run_dir|$HR_ROOT/x/../../MOD-5"
+        "run_dir|$HR_SSD_ROOT/MOD-5" "run_dir|" "root_kind|ssd" "root_kind|nvme" "root_kind|"
+        "cpus|4;touch x" "cpus|" "cpus|0" "base_sha|abc" "base_sha|$(printf 'g%.0s' {1..40})"
+        "base_ref|" "created_at|yesterday" "collected_sha|zzz" "collected_at|now"
+    )
+    local c verb
+    local -a verbs=("attach MOD-5" "down MOD-5 --purge --force --yes" "down MOD-5" "collect MOD-5" "ls" "gc --yes")
+    check_refused() { # $1=case label
+        local v
+        for v in "${verbs[@]}"; do
+            : >"$HR_TEST_DOCKER_LOG"
+            # shellcheck disable=SC2086
+            run --separate-stderr "$HR" $v </dev/null
+            [[ $status -eq 3 && "$stderr" == *"registry $reg is invalid"* ]] \
+                || { echo "case '$1', hr $v: status $status: $stderr" >&2; return 1; }
+            ! grep -q . "$HR_TEST_DOCKER_LOG" || { echo "case '$1', hr $v called docker" >&2; return 1; }
+        done
+        [[ -d "$(src_of MOD-5)/.git" && -f "$canary/keep" && -d "$HR_HOST_REPO/.git" && -f "$reg" ]]
+    }
+    for c in "${cases[@]}"; do
+        cp "$good" "$reg"
+        reg_set MOD-5 "${c%%|*}" "${c#*|}"
+        check_refused "$c"
+    done
+    # Structure: missing / duplicate / unknown key, control characters, no header, a symlink.
+    cp "$good" "$reg"; sed -i '/^cpus=/d' "$reg";                      check_refused 'missing cpus'
+    cp "$good" "$reg"; printf 'cpus=8\n' >>"$reg";                     check_refused 'duplicate cpus'
+    cp "$good" "$reg"; printf 'mount=/\n' >>"$reg";                    check_refused 'unknown key'
+    cp "$good" "$reg"; reg_set MOD-5 base_ref $'main\e]0;x\a';         check_refused 'control characters'
+    cp "$good" "$reg"; sed -i 1d "$reg";                               check_refused 'no header'
+    cp "$good" "$BATS_TEST_TMPDIR/reg.link"; rm "$reg"; ln -s "$BATS_TEST_TMPDIR/reg.link" "$reg"
+    check_refused 'symlink'
+
+    # The untampered file still works.
+    rm "$reg"; cp "$good" "$reg"
+    run --separate-stderr "$HR" ls
+    [[ $status -eq 0 && "$output" == *MOD-5* ]]
+}
+
+@test "26. a registry in the old place (\$HR_STATE/runs) moves to HR_RUNS on first use, then is validated" {
+    mk_run MOD-5
+    mkdir -p "$HR_STATE/runs"
+    mv "$(reg_of MOD-5)" "$HR_STATE/runs/MOD-5"
+    : >"$HR_STATE/runs.lock"
+    run --separate-stderr "$HR" ls
+    [[ $status -eq 0 ]]
+    [[ "$stderr" == *"moved 1 registry entries from $HR_STATE/runs"* ]]
+    [[ "$output" == *MOD-5* ]]
+    [[ -f "$(reg_of MOD-5)" && ! -e "$HR_STATE/runs" && ! -e "$HR_STATE/runs.lock" ]]
+
+    # A sandbox-edited entry is moved, then refused like any other.
+    mkdir -p "$HR_STATE/runs"
+    mv "$(reg_of MOD-5)" "$HR_STATE/runs/MOD-5"
+    sed -i 's/^project=.*/project=htui/' "$HR_STATE/runs/MOD-5"
+    : >"$HR_TEST_DOCKER_LOG"
+    run --separate-stderr "$HR" down MOD-5 --purge --force --yes
+    [[ $status -eq 3 ]]
+    [[ "$stderr" == *'project'* ]]
+    [[ -d "$(src_of MOD-5)/.git" ]]
+    ! grep -q '^compose' "$HR_TEST_DOCKER_LOG" || false
+
+    # In both places -> refused, neither touched; the old dir as a symlink -> refused.
+    cp "$(reg_of MOD-5)" "$BATS_TEST_TMPDIR/both"
+    mkdir -p "$HR_STATE/runs"
+    cp "$BATS_TEST_TMPDIR/both" "$HR_STATE/runs/MOD-5"
+    run --separate-stderr "$HR" ls
+    [[ $status -eq 3 && "$stderr" == *'both'* ]]
+    [[ -f "$HR_STATE/runs/MOD-5" && -f "$(reg_of MOD-5)" ]]
+    rm -rf "$HR_STATE/runs"
+    ln -s "$HR_RUNS" "$HR_STATE/runs"
+    run --separate-stderr "$HR" ls
+    [[ $status -eq 3 && "$stderr" == *'not a directory'* ]]
+}
+
+@test "27. the lease file vanished after hr-mint --init -> up, gc, down --purge refuse (1); never recreated" {
+    mk_run MOD-5
+    grep -qxF "$HR_STATE" "$HR_RUNS/.leases-initialized"
+    rm -f "$(lease_file)" "$HR_STATE/id-leases.lock"
+    run --separate-stderr "$HR" up MOD-4
+    [[ $status -eq 1 ]]
+    [[ "$stderr" == *'vanished'*'hr-mint --init --force'* ]]
+    [[ ! -e "$HR_ROOT/MOD-4" && ! -e "$(reg_of MOD-4)" && ! -e "$(lease_file)" ]]
+    run --separate-stderr "$HR" gc --yes
+    [[ $status -eq 1 && "$stderr" == *'vanished'* ]]
+    run --separate-stderr "$HR" down MOD-5 --purge --force --yes
+    [[ $status -eq 1 && "$stderr" == *'vanished'* ]]
+    [[ -d "$(src_of MOD-5)/.git" && ! -e "$(lease_file)" ]]
+    ! grep -q -- 'down -v' "$HR_TEST_DOCKER_LOG" || false
+    # A different state dir has its own record: the guard is per HR_STATE.
+    HR_STATE="$BATS_TEST_TMPDIR/state2" run --separate-stderr "$HR" up MOD-4
+    [[ $status -eq 0 ]]
+}
+
+@test "28. up warns once that a non-default HR_STATE must be exported for host mints" {
+    run --separate-stderr "$HR" up MOD-5
+    [[ $status -eq 0 ]]
+    [[ "$(grep -c 'HR_STATE is non-default' <<<"$stderr")" -eq 1 ]]
+    [[ "$stderr" == *"export HR_STATE=$HR_STATE"* ]]
+}
+
+# ---------------------------------------------------------------------------------------------
 # Docker (real image and daemon; fixture host repo; run once: bats --filter-tags docker tests/hr/hr.bats)
 
 # bats test_tags=docker
@@ -664,5 +792,5 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     [[ -z "$(docker volume ls -q --filter label=com.docker.compose.project=hr-tool-9001)" ]]
     [[ -z "$(docker ps -aq --filter label=com.docker.compose.project=hr-tool-9001)" ]]
     docker volume inspect htui-hr-cargo >/dev/null
-    [[ ! -e "$HR_ROOT/TOOL-9001" && ! -e "$HR_STATE/runs/TOOL-9001" ]]
+    [[ ! -e "$HR_ROOT/TOOL-9001" && ! -e "$(reg_of TOOL-9001)" ]]
 }

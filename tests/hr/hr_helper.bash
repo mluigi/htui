@@ -19,7 +19,7 @@ HR_COMPOSE_FILE="$HR_TEST_REPO_ROOT/docker/hr/compose.hr.yaml"
 hr_clear_env() {
     unset HR_SANDBOX HR_ITEM HR_SRC HR_CLAUDE_JSON HR_CPUS HR_IMAGE HR_NO_GUM HR_GIT_NAME \
         HR_GIT_EMAIL HR_HOME HR_UID HR_GID HR_STATE_HOST HR_MISE_PATH HR_INTERACTIVE HR_DOCKER \
-        HR_ROOT HR_SSD_ROOT HR_HOST_REPO XDG_CONFIG_HOME GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
+        HR_ROOT HR_SSD_ROOT HR_RUNS HR_HOST_REPO XDG_CONFIG_HOME GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \
         GIT_CONFIG_GLOBAL HR_TEST_DOCKER_IMAGE HR_TEST_DOCKER_RUNNING HR_TEST_DOCKER_FAIL_UP
 }
 
@@ -31,10 +31,11 @@ hr_setup() {
     export HR_HOST_REPO="$BATS_TEST_TMPDIR/host"
     export HR_ROOT="$BATS_TEST_TMPDIR/hdd"
     export HR_SSD_ROOT="$BATS_TEST_TMPDIR/ssd"
+    export HR_RUNS="$BATS_TEST_TMPDIR/runs"
     export HR_DOCKER="$BATS_TEST_TMPDIR/bin/docker"
     export HR_TEST_DOCKER_LOG="$BATS_TEST_TMPDIR/docker.log"
     local p
-    for p in "$HOME" "$HR_HOST_REPO" "$HR_ROOT" "$HR_SSD_ROOT" "$HR_STATE" "$HR_DOCKER" \
+    for p in "$HOME" "$HR_HOST_REPO" "$HR_ROOT" "$HR_SSD_ROOT" "$HR_RUNS" "$HR_STATE" "$HR_DOCKER" \
         "$HR_TEST_DOCKER_LOG"; do
         hr_assert_tmp_path "$p" || return 1
     done
@@ -111,8 +112,17 @@ docker_log() { cat "$HR_TEST_DOCKER_LOG"; }
 # src_of ITEM [ROOT] — the run's clone.
 src_of() { printf '%s/%s/src' "${2:-$HR_ROOT}" "$1"; }
 
-# reg_of ITEM — the run's registry file.
-reg_of() { printf '%s/runs/%s' "$HR_STATE" "$1"; }
+# reg_of ITEM — the run's registry file (host-only HR_RUNS, never under the mounted HR_STATE).
+reg_of() { printf '%s/%s' "$HR_RUNS" "$1"; }
+
+# reg_set ITEM KEY VALUE — overwrite one registry line in place (a tampered registry).
+reg_set() {
+    local f
+    f="$(reg_of "$1")"
+    hr_assert_tmp_path "$f" || return 1
+    KEY="$2" VAL="$3" awk -F= 'BEGIN { k = ENVIRON["KEY"]; v = ENVIRON["VAL"] }
+        $1 == k { print k "=" v; next } { print }' "$f" >"$f.new" && mv "$f.new" "$f"
+}
 
 # reg_get ITEM KEY — one registry value.
 reg_get() { sed -n "s/^$2=//p" "$(reg_of "$1")"; }
@@ -178,9 +188,10 @@ hr_docker_setup() {
     export HR_HOST_REPO="$BATS_TEST_TMPDIR/host"
     export HR_ROOT="$BATS_TEST_TMPDIR/hdd"
     export HR_SSD_ROOT="$BATS_TEST_TMPDIR/ssd"
+    export HR_RUNS="$BATS_TEST_TMPDIR/runs"
     export HR_INTERACTIVE=0
     local p
-    for p in "$HR_HOST_REPO" "$HR_ROOT" "$HR_SSD_ROOT" "$HR_STATE"; do
+    for p in "$HR_HOST_REPO" "$HR_ROOT" "$HR_SSD_ROOT" "$HR_RUNS" "$HR_STATE"; do
         hr_assert_tmp_path "$p" || return 1
     done
     make_fixture "$HR_HOST_REPO" || return 1

@@ -20,7 +20,8 @@
 # Environment (all optional):
 #   HR_ROOT       run dirs on the HDD        (default /media/projects/htui-hr)
 #   HR_SSD_ROOT   run dirs with `up --ssd`   (default ~/htui-hr)
-#   HR_STATE      run registry + ID leases   (default /media/projects/htui-hr/.state)
+#   HR_STATE      ID leases, shared rw with every sandbox (default /media/projects/htui-hr/.state)
+#   HR_RUNS       run registry, host-only    (default /media/projects/htui-hr/.runs; never mounted)
 #   HR_HOST_REPO  host repo main worktree    (default: the main worktree of this script's repo)
 #   HR_IMAGE      toolchain image tag        (default htui-hr-dev)
 #   HR_MISE_PATH  PATH dirs for claude/uv/rg inside the sandbox (default: resolved from mise)
@@ -34,8 +35,12 @@
 #             uncollected, conflict, no confirmation), 2 usage / missing dependency,
 #             3 external failure (docker, git clone/fetch, IO).
 #
-# Run registry $HR_STATE/runs/<ITEM> (owned by this script; key=value, written tmp+mv under
-# flock $HR_STATE/runs.lock, parsed, never sourced). ID leases belong to scripts/hr-mint alone.
+# Run registry $HR_RUNS/<ITEM> (owned by this script; key=value, written tmp+mv under flock
+# $HR_RUNS/.lock, parsed and validated, never sourced). HR_RUNS is host-only: the registry names
+# what gets mounted rw and what `down -v` removes, so no sandbox may write it (review H4); a
+# registry left in the old place, $HR_STATE/runs, is moved there on first use. ID leases belong to
+# scripts/hr-mint alone; $HR_RUNS/.leases-initialized records (host-only) that a state dir had
+# leasing on, so a lease file a sandbox deleted is refused rather than silently recreated.
 # Design: .claude/plans/tool-7-hr-sandbox.plan.md, blueprint §T4. Linux only.
 
 set -u
@@ -56,8 +61,12 @@ source "$WF_DIR/workflow-patterns.sh"
 
 DOCKER="${HR_DOCKER:-docker}"
 IMAGE="${HR_IMAGE:-htui-hr-dev}"
-STATE="$(realpath -ms "${HR_STATE:-/media/projects/htui-hr/.state}")"
-RUNS="$STATE/runs"
+DEFAULT_STATE=/media/projects/htui-hr/.state
+STATE="$(realpath -ms "${HR_STATE:-$DEFAULT_STATE}")"
+RUNS="$(realpath -ms "${HR_RUNS:-/media/projects/htui-hr/.runs}")"
+RUNS_LOCK="$RUNS/.lock"
+LEASE_MARK="$RUNS/.leases-initialized"
+OLD_RUNS="$STATE/runs"
 ROOT_HDD="$(realpath -ms "${HR_ROOT:-/media/projects/htui-hr}")"
 ROOT_SSD="$(realpath -ms "${HR_SSD_ROOT:-$HOME/htui-hr}")"
 CARGO_VOLUME=htui-hr-cargo
@@ -187,24 +196,62 @@ registered_items() {
     local f
     [[ -d "$RUNS" ]] || return 0
     for f in "$RUNS"/*; do
-        [[ -f "$f" ]] || continue
+        [[ -e "$f" || -L "$f" ]] || continue
         f="${f##*/}"
         [[ "$f" =~ $ITEM_RE ]] && printf '%s\n' "$f"
     done
 }
 
-# read_reg ITEM — fill RUN[] from the registry file; 1 if there is none.
+# read_reg ITEM — fill RUN[] from the registry file and validate every field; 1 if there is none,
+# exit 3 on anything this script would not have written (review H4). RUN[run_dir] comes back
+# normalised to exactly $HR_ROOT/ITEM or $HR_SSD_ROOT/ITEM.
 read_reg() {
-    local file="$RUNS/$1" k v
-    [[ -f "$file" ]] || return 1
+    local item="$1" file="$RUNS/$1" k v first=1
+    [[ -e "$file" || -L "$file" ]] || return 1
+    reg_bad() { die 3 "registry $file is invalid: $* — fix or remove it by hand (scripts/hr never writes that)"; }
+    [[ -f "$file" && ! -L "$file" ]] || reg_bad "not a regular file"
     RUN=()
-    while IFS='=' read -r k v || [[ -n "$k" ]]; do
-        [[ -z "$k" || "$k" == '#'* ]] && continue
+    while IFS= read -r k || [[ -n "$k" ]]; do
+        if [[ "$first" -eq 1 ]]; then
+            [[ "$k" == "$REG_HEADER" ]] || reg_bad "missing header line"
+            first=0
+            continue
+        fi
+        [[ -z "$k" ]] && continue
+        [[ "$k" == *[[:cntrl:]]* ]] && reg_bad "control characters"
+        [[ "$k" == '#'* ]] && continue
+        [[ "$k" == *=* ]] || reg_bad "line without '='"
+        v="${k#*=}"
+        k="${k%%=*}"
         case " ${REG_KEYS[*]} " in
-            *" $k "*) RUN[$k]="$v" ;;
+            *" $k "*) [[ -z "${RUN[$k]+x}" ]] || reg_bad "duplicate key $k"; RUN[$k]="$v" ;;
+            *) reg_bad "unknown key '$k'" ;;
         esac
     done <"$file"
-    [[ "${RUN[item]:-}" == "$1" ]] || die 3 "registry $file is corrupt (item=${RUN[item]:-})"
+    [[ "$first" -eq 0 ]] || reg_bad "empty"
+    for k in "${REG_KEYS[@]}"; do
+        [[ -n "${RUN[$k]+x}" ]] || reg_bad "missing key $k"
+    done
+    local sha_re='^[0-9a-f]{40}([0-9a-f]{24})?$' ts_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+    [[ "${RUN[item]}" == "$item" && "$item" =~ $ITEM_RE ]] || reg_bad "item '${RUN[item]}' is not $item"
+    [[ "${RUN[project]}" == "hr-${item,,}" ]] || reg_bad "project '${RUN[project]}' is not hr-${item,,}"
+    [[ "${RUN[branch]}" == "hr/$item" ]] || reg_bad "branch '${RUN[branch]}' is not hr/$item"
+    local root
+    case "${RUN[root_kind]}" in
+        hdd) root="$ROOT_HDD" ;;
+        ssd) root="$ROOT_SSD" ;;
+        *) reg_bad "root_kind '${RUN[root_kind]}' is not hdd or ssd" ;;
+    esac
+    [[ -n "${RUN[run_dir]}" && "$(realpath -ms -- "${RUN[run_dir]}")" == "$root/$item" ]] \
+        || reg_bad "run_dir '${RUN[run_dir]}' is not $root/$item (${RUN[root_kind]} root; HR_ROOT / HR_SSD_ROOT changed?)"
+    RUN[run_dir]="$root/$item"
+    [[ "${RUN[cpus]}" =~ ^[0-9]+(\.[0-9]+)?$ && ! "${RUN[cpus]}" =~ ^0+(\.0+)?$ ]] || reg_bad "cpus '${RUN[cpus]}' is not a positive number"
+    [[ "${RUN[base_sha]}" =~ $sha_re ]] || reg_bad "base_sha '${RUN[base_sha]}' is not a commit id"
+    [[ -n "${RUN[base_ref]}" ]] || reg_bad "empty base_ref"
+    [[ "${RUN[created_at]}" =~ $ts_re ]] || reg_bad "created_at '${RUN[created_at]}' is not a UTC timestamp"
+    [[ -z "${RUN[collected_sha]}" || "${RUN[collected_sha]}" =~ $sha_re ]] || reg_bad "collected_sha '${RUN[collected_sha]}' is not a commit id"
+    [[ -z "${RUN[collected_at]}" || "${RUN[collected_at]}" =~ $ts_re ]] || reg_bad "collected_at '${RUN[collected_at]}' is not a UTC timestamp"
+    return 0
 }
 
 # write_reg ITEM — RUN[] to the registry file, tmp + mv. Caller holds the runs lock.
@@ -222,13 +269,67 @@ write_reg() {
 
 RUNS_FD=''
 lock_runs() {
+    [[ -n "$RUNS_FD" ]] && return 0
     mkdir -p "$RUNS" 2>/dev/null || die 3 "cannot create $RUNS"
-    exec {RUNS_FD}>>"$STATE/runs.lock" || die 3 "cannot open $STATE/runs.lock"
-    flock -w 30 "$RUNS_FD" || die 3 "timed out waiting for $STATE/runs.lock"
+    exec {RUNS_FD}>>"$RUNS_LOCK" || die 3 "cannot open $RUNS_LOCK"
+    flock -w 30 "$RUNS_FD" || die 3 "timed out waiting for $RUNS_LOCK"
 }
 unlock_runs() {
     [[ -n "$RUNS_FD" ]] && exec {RUNS_FD}>&-
     RUNS_FD=''
+}
+
+# check_runs_dir — HR_RUNS must stay out of everything a sandbox mounts rw.
+check_runs_dir() {
+    case "$RUNS/" in
+        "$STATE"/*) die 2 "HR_RUNS ($RUNS) must not be inside HR_STATE ($STATE): every sandbox mounts HR_STATE rw" ;;
+    esac
+}
+
+# migrate_registry — a registry from before review H4 lived in $HR_STATE/runs, which every sandbox
+# can write: move its entries to the host-only HR_RUNS (read_reg validates them like any other).
+migrate_registry() {
+    [[ -e "$OLD_RUNS" || -L "$OLD_RUNS" ]] || return 0
+    [[ -d "$OLD_RUNS" && ! -L "$OLD_RUNS" ]] \
+        || die 3 "$OLD_RUNS is not a directory (a sandbox?) — the registry lives in $RUNS now; inspect and remove it by hand"
+    lock_runs
+    local f name n=0 left=0
+    for f in "$OLD_RUNS"/* "$OLD_RUNS"/.[!.]*; do
+        [[ -e "$f" || -L "$f" ]] || continue
+        name="${f##*/}"
+        if [[ "$name" =~ $ITEM_RE && -f "$f" && ! -L "$f" ]]; then
+            [[ -e "$RUNS/$name" || -L "$RUNS/$name" ]] \
+                && die 3 "registry entry $name is in both $OLD_RUNS and $RUNS — keep one by hand"
+            mv -- "$f" "$RUNS/$name" || die 3 "cannot move $f to $RUNS"
+            n=$((n + 1))
+        else
+            left=$((left + 1))
+        fi
+    done
+    rm -f -- "$STATE/runs.lock"
+    if [[ "$left" -eq 0 ]]; then
+        rmdir -- "$OLD_RUNS" 2>/dev/null || true
+    else
+        warn "left $OLD_RUNS in place: $left entries that are not registry files — inspect and remove it by hand"
+    fi
+    [[ "$n" -gt 0 ]] && warn "moved $n registry entries from $OLD_RUNS to the host-only $RUNS"
+    unlock_runs
+}
+
+# ID leases: hr-mint --init creates the lease file on the host; the host-only marker then remembers
+# it existed, because a sandbox can delete both the lease file and its lock (review M3).
+lease_file_vanished() {
+    [[ -f "$LEASE_MARK" ]] && grep -qxF -- "$STATE" "$LEASE_MARK" 2>/dev/null && [[ ! -e "$STATE/id-leases.tsv" ]]
+}
+check_leases() {
+    lease_file_vanished || return 0
+    die 1 "lease file $STATE/id-leases.tsv vanished (a sandbox or a stray rm?) — restore it, or run scripts/hr-mint --init --force after checking"
+}
+init_leases() {
+    check_leases
+    HR_STATE="$STATE" "$HR_MINT_BIN" --init || die 3 "scripts/hr-mint --init failed"
+    grep -qxF -- "$STATE" "$LEASE_MARK" 2>/dev/null && return 0
+    printf '%s\n' "$STATE" >>"$LEASE_MARK" || die 3 "cannot write $LEASE_MARK"
 }
 
 # set_reg ITEM k=v... — update registry fields under the lock.
@@ -422,7 +523,7 @@ cmd_up() {
         esac
     done
     [[ "$cpus" =~ ^[0-9]+(\.[0-9]+)?$ && "$cpus" != 0 ]] || usage_die "--cpus needs a positive number, got '$cpus'"
-    [[ -n "$ref" && "$ref" != -* ]] || usage_die "--from needs a ref, got '$ref'"
+    [[ -n "$ref" && "$ref" != -* && "$ref" != *[[:cntrl:]]* ]] || usage_die "--from needs a ref, got '$ref'"
     [[ -z "$item" ]] || item="$(norm_item "$item")"
     host_repo
 
@@ -487,7 +588,9 @@ cmd_up() {
     host_env 1
     mkdir -p "$HOME/.headroom" "$HOME/.serena" "$HOME/.cache/uv" "$HOST/.remember" "$RUNS" \
         || die 3 "cannot create the host-side mount sources"
-    HR_STATE="$STATE" "$HR_MINT_BIN" --init || die 3 "scripts/hr-mint --init failed"
+    [[ "$STATE" == "$DEFAULT_STATE" ]] \
+        || warn "HR_STATE is non-default: export HR_STATE=$STATE in your shell profile, or host skill mints will not see the leases"
+    init_leases
 
     # 7. clone, under the runs lock
     lock_runs
@@ -627,7 +730,9 @@ cmd_ls() {
         rows="$(gum spin --show-stdout --title "Measuring runs" -- "$SELF" ls --tsv)" || die 3 "ls failed"
         tail -n +2 <<<"$rows" | gum table -p -s "$TAB" -c ITEM,STATE,BRANCH,AHEAD,DISK,ROOT
     else
-        ls_rows | column -t -s "$TAB"
+        local rows
+        rows="$(ls_rows)" || exit $?
+        column -t -s "$TAB" <<<"$rows"
     fi
 }
 
@@ -802,6 +907,7 @@ cmd_down() {
         return 0
     fi
 
+    check_leases
     local blockers forced_uncollected=0
     if [[ "$force" -eq 0 ]]; then
         if ! blockers="$(purge_blockers "$item")"; then
@@ -829,6 +935,7 @@ cmd_gc() {
         esac
     done
     host_repo
+    check_leases
     local item
     local -a cands=() chosen=()
     while IFS= read -r item; do
@@ -873,6 +980,12 @@ main() {
         need_gum
         verb="$(gum choose --header "scripts/hr — /handoff-run sandboxes" "${VERBS[@]}")" || exit 1
     fi
+    case "$verb" in
+        up | attach | ls | collect | down | gc)
+            check_runs_dir
+            migrate_registry
+            ;;
+    esac
     case "$verb" in
         build) cmd_build "$@" ;;
         up) cmd_up "$@" ;;
