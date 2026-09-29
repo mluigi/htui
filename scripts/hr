@@ -244,6 +244,18 @@ set_reg() {
 
 # ---- compose env (the contract in docker/hr/compose.hr.yaml) ----
 
+# The only parts of ~/.local a sandbox sees (read-only); the rest holds secrets (review C1).
+LOCAL_MOUNTS=("$HOME/.local/bin" "$HOME/.local/share/mise/installs" "$HOME/.local/share/uv/python"
+    "$HOME/.local/share/uv/tools")
+
+# make_cargo_empty RUN_DIR — the empty read-only file compose binds over the shared cargo volume's
+# config/credentials files (review M5). Outside src/, so the sandbox cannot write it.
+make_cargo_empty() {
+    local f="$1/cargo-empty"
+    [[ -f "$f" && ! -L "$f" && ! -s "$f" ]] && return 0
+    rm -f -- "$f" && : >"$f" && chmod 444 "$f"
+}
+
 # resolve_mise_path STRICT — HR_MISE_PATH unless preset: claude and uv (required; before the stale
 # uv in ~/.local/bin), ripgrep (optional). Colon-joined, no trailing slashes. Never mise shims.
 resolve_mise_path() {
@@ -309,6 +321,7 @@ load_run() {
     export HR_ITEM="$item"
     export HR_SRC="${RUN[run_dir]}/src"
     export HR_CLAUDE_JSON="${RUN[run_dir]}/claude.json"
+    export HR_CARGO_EMPTY="${RUN[run_dir]}/cargo-empty"
     export HR_CPUS="${RUN[cpus]:-4}"
     SRC="$HR_SRC"
     set_compose "${RUN[project]:-hr-${item,,}}"
@@ -467,7 +480,7 @@ cmd_up() {
 
     # 6. preflight: every host source the compose file mounts, the state dir, leasing on
     local p
-    for p in "$HOME/.local" "$HOME/.claude" "$HOME/.claude.json" "$HOME/.gortex/config.yaml" \
+    for p in "${LOCAL_MOUNTS[@]}" "$HOME/.claude" "$HOME/.claude.json" "$HOME/.gortex/config.yaml" \
         "$HOME/.gortex/instructions" "$HOME/.gortex/models"; do
         [[ -e "$p" ]] || die 2 "missing $p (the sandbox mounts or copies it)"
     done
@@ -508,6 +521,7 @@ cmd_up() {
     # Mount point of the shared .remember; Docker would create it root-owned.
     mkdir -p "$SRC/.remember" || up_abort 3 "cannot create $SRC/.remember"
     install -m 600 "$HOME/.claude.json" "$run_dir/claude.json" || up_abort 3 "cannot snapshot ~/.claude.json"
+    make_cargo_empty "$run_dir" || up_abort 3 "cannot create $run_dir/cargo-empty"
 
     # 8. registry before compose, so `down --purge --force` can clean a failed up
     RUN=([item]="$item" [project]="hr-${item,,}" [branch]="hr/$item" [run_dir]="$run_dir"
@@ -519,6 +533,7 @@ cmd_up() {
 
     # 9. containers
     export HR_ITEM="$item" HR_SRC="$SRC" HR_CLAUDE_JSON="$run_dir/claude.json" HR_CPUS="$cpus"
+    export HR_CARGO_EMPTY="$run_dir/cargo-empty"
     set_compose "hr-${item,,}"
     "$DOCKER" volume create "$CARGO_VOLUME" >/dev/null || die 3 "cannot create volume $CARGO_VOLUME"
     spin "Starting $PROJECT" "${COMPOSE[@]}" up -d --wait \
@@ -547,6 +562,10 @@ cmd_attach() {
     item="$(norm_item "$item")"
     load_run "$item" 1
     if ! dev_running; then
+        # Runs made before the cargo-empty file existed; and `docker volume prune --all` may have
+        # dropped the external cargo volume (both idempotent).
+        make_cargo_empty "${RUN[run_dir]}" || die 3 "cannot create ${RUN[run_dir]}/cargo-empty"
+        "$DOCKER" volume create "$CARGO_VOLUME" >/dev/null || die 3 "cannot create volume $CARGO_VOLUME"
         spin "Starting $PROJECT" "${COMPOSE[@]}" up -d --wait || die 3 "docker compose up failed for $PROJECT"
     fi
     local -a tty=()

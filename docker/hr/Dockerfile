@@ -3,8 +3,9 @@
 #   docker build -t htui-hr-dev -f docker/hr/Dockerfile \
 #     --build-arg HR_USER=$(id -un) --build-arg HR_UID=$(id -u) --build-arg HR_GID=$(id -g) \
 #     --build-arg HR_HOME=$HOME docker/hr
-# Host tools (claude, gortex, graphify, headroom, uv/uvx, serena) are NOT baked in: ~/.local is
-# mounted read-only so a sandbox never drifts from the host. Design: .claude/plans/tool-7-hr-sandbox.plan.md
+# Host tools (claude, gortex, graphify, headroom, uv/uvx, serena) are NOT baked in: their ~/.local
+# dirs (bin, share/mise/installs, share/uv/{python,tools}) are mounted read-only so a sandbox never
+# drifts from the host; the rest of ~/.local is never mounted (it holds secrets). Design: .claude/plans/tool-7-hr-sandbox.plan.md
 FROM ubuntu:24.04 AS base
 ARG HR_USER=mluigi
 ARG HR_UID=1000
@@ -33,6 +34,9 @@ RUN (userdel -r ubuntu 2>/dev/null || true) \
  && chown "$HR_UID:$HR_GID" "$HR_HOME/.profile" \
  && install -d -o "$HR_UID" -g "$HR_GID" /opt/rust \
       "$HR_HOME/.cache" "$HR_HOME/.config" "$HR_HOME/.gortex" "$HR_HOME/.cargo" "$HR_HOME/projects" \
+      "$HR_HOME/.local" "$HR_HOME/.local/share" "$HR_HOME/.local/share/mise" "$HR_HOME/.local/share/uv" \
+      "$HR_HOME/.local/bin" "$HR_HOME/.local/share/mise/installs" "$HR_HOME/.local/share/uv/python" \
+      "$HR_HOME/.local/share/uv/tools" "$HR_HOME/.local/state" \
  && install -d /host /hr-state /hr-seed
 
 FROM base AS dev

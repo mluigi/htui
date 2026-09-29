@@ -59,15 +59,19 @@ services:
       HR_ITEM: ${HR_ITEM:?}
       HR_SANDBOX: "1"
       HR_STATE: /hr-state
-      # ~/.local is read-only, and uvx (serena's MCP entry) writes temp files into its tool dir even
-      # for ephemeral tools; a per-container tool dir keeps the host's uv tools untouched (TOOL-7 T2).
+      # ~/.local/share/uv/tools is read-only, and uvx (serena's MCP entry) writes temp files into its
+      # tool dir even for ephemeral tools; a per-container tool dir keeps the host's uv tools untouched (TOOL-7 T2).
       UV_TOOL_DIR: /tmp/uv-tools
+      # `cargo install` lands per container, never in the shared cargo volume (review M5); its bin
+      # dir is last on PATH, so nothing a run installs can shadow the toolchain.
+      CARGO_INSTALL_ROOT: /tmp/cargo-install
       GIT_AUTHOR_NAME: ${HR_GIT_NAME:?}
       GIT_AUTHOR_EMAIL: ${HR_GIT_EMAIL:?}
       GIT_COMMITTER_NAME: ${HR_GIT_NAME:?}
       GIT_COMMITTER_EMAIL: ${HR_GIT_EMAIL:?}
-      # mise dirs first: ~/.local/bin holds a stale uv/uvx that would shadow mise's.
-      PATH: ${HR_MISE_PATH:?}:/opt/rust/cargo/bin:${HR_HOME:?}/.cargo/bin:${HR_HOME:?}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      # mise dirs first: ~/.local/bin holds a stale uv/uvx that would shadow mise's. No
+      # ~/.cargo/bin: that dir is in the shared cargo volume, writable by every run (review M5).
+      PATH: ${HR_MISE_PATH:?}:/opt/rust/cargo/bin:${HR_HOME:?}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/tmp/cargo-install/bin
       TERM: ${TERM:-xterm-256color}
       COLORTERM: ${COLORTERM:-truecolor}
     volumes:
@@ -76,7 +80,14 @@ services:
       - {type: bind, source: "${HR_HOST_REPO:?}/.remember",  target: "${HR_HOST_REPO:?}/.remember",         bind: {create_host_path: false}}
       - {type: bind, source: "${HR_STATE_HOST:?}",           target: /hr-state,                             bind: {create_host_path: false}}
       - {type: bind, source: "${HR_CLAUDE_JSON:?}",          target: /hr-seed/claude.json, read_only: true, bind: {create_host_path: false}}
-      - {type: bind, source: "${HR_HOME:?}/.local",          target: "${HR_HOME:?}/.local", read_only: true, bind: {create_host_path: false}}
+      # Only the tool dirs of ~/.local, read-only (review C1): the rest of it holds secrets (nvim undo
+      # histories of credential files, keyrings, uv/gh credentials). claude = mise installs; gortex,
+      # uv/uvx (stale, shadowed) = ~/.local/bin; python3 -> uv/python; graphify, headroom -> uv/tools
+      # venvs whose interpreter is uv/python. Parents are pre-created user-owned in the image (F13).
+      - {type: bind, source: "${HR_HOME:?}/.local/bin",                  target: "${HR_HOME:?}/.local/bin",                  read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_HOME:?}/.local/share/mise/installs",  target: "${HR_HOME:?}/.local/share/mise/installs",  read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_HOME:?}/.local/share/uv/python",      target: "${HR_HOME:?}/.local/share/uv/python",      read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_HOME:?}/.local/share/uv/tools",       target: "${HR_HOME:?}/.local/share/uv/tools",       read_only: true, bind: {create_host_path: false}}
       - {type: bind, source: "${HR_HOME:?}/.claude",         target: "${HR_HOME:?}/.claude",                bind: {create_host_path: false}}
       - {type: volume, source: gortex,                       target: "${HR_HOME:?}/.gortex"}
       - {type: bind, source: "${HR_HOME:?}/.gortex/config.yaml",  target: "${HR_HOME:?}/.gortex/config.yaml",  read_only: true, bind: {create_host_path: false}}
@@ -86,6 +97,13 @@ services:
       - {type: bind, source: "${HR_HOME:?}/.serena",         target: "${HR_HOME:?}/.serena",                bind: {create_host_path: false}}
       - {type: bind, source: "${HR_HOME:?}/.cache/uv",       target: "${HR_HOME:?}/.cache/uv",              bind: {create_host_path: false}}
       - {type: volume, source: cargo,                        target: "${HR_HOME:?}/.cargo"}
+      # The cargo volume is shared by every run: one run must not reconfigure the others' builds
+      # (review M5). Cargo reads config[.toml] and credentials[.toml] from CARGO_HOME; one empty
+      # read-only host file over all four (same inode, so cargo does not warn that both exist).
+      - {type: bind, source: "${HR_CARGO_EMPTY:?}", target: "${HR_HOME:?}/.cargo/config",           read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_CARGO_EMPTY:?}", target: "${HR_HOME:?}/.cargo/config.toml",      read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_CARGO_EMPTY:?}", target: "${HR_HOME:?}/.cargo/credentials",      read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_CARGO_EMPTY:?}", target: "${HR_HOME:?}/.cargo/credentials.toml", read_only: true, bind: {create_host_path: false}}
 
 volumes:
   pgdata:

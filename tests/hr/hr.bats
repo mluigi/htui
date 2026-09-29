@@ -119,6 +119,10 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     grep -qx "HR_GIT_NAME=hr fixture" "$env"
     grep -qx "HR_GIT_EMAIL=hr-fixture@example.invalid" "$env"
     grep -qx "HR_CPUS=6" "$env"
+    grep -qx "HR_CARGO_EMPTY=$HR_ROOT/MOD-5/cargo-empty" "$env"
+    # The file bound over the shared cargo volume's config/credentials: empty, read-only.
+    [[ -f "$HR_ROOT/MOD-5/cargo-empty" && ! -s "$HR_ROOT/MOD-5/cargo-empty" ]]
+    [[ "$(stat -c %a "$HR_ROOT/MOD-5/cargo-empty")" == 444 ]]
     grep -qx "HR_MISE_PATH=/usr/bin" "$env"
     [[ "$(reg_get MOD-5 cpus)" == 6 ]]
 }
@@ -144,6 +148,24 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     [[ $status -eq 0 ]]
     grep -qx "HR_MISE_PATH=$m/claude/latest:$m/uv/latest/.mise-bins:$m/ripgrep/latest/ripgrep-15.2.0-x86_64-unknown-linux-musl" \
         "$HR_TEST_DOCKER_LOG.env"
+}
+
+@test "3d. up preflights the ~/.local tool dirs it mounts (never ~/.local itself)" {
+    local d
+    for d in .local/bin .local/share/mise/installs .local/share/uv/python .local/share/uv/tools; do
+        mv "$HOME/$d" "$HOME/$d.away"
+        run --separate-stderr "$HR" up MOD-5
+        mv "$HOME/$d.away" "$HOME/$d"
+        [[ $status -eq 2 ]]
+        [[ "$stderr" == *"missing $HOME/$d"* ]]
+        [[ ! -e "$(reg_of MOD-5)" && ! -e "$HR_ROOT/MOD-5" ]]
+    done
+    # The compose file mounts exactly those four, read-only, and nothing else under ~/.local.
+    run grep -cE 'source: "\$\{HR_HOME:\?\}/\.local' "$HR_COMPOSE_FILE"
+    [[ "$output" == 4 ]]
+    run grep -E 'source: "\$\{HR_HOME:\?\}/\.local' "$HR_COMPOSE_FILE"
+    local line
+    for line in "${lines[@]}"; do [[ "$line" == *'read_only: true'* ]]; done
 }
 
 @test "4. up warns on uncommitted workflow files; the clone takes the committed ref" {
@@ -247,6 +269,8 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     run --separate-stderr "$HR" attach MOD-5 </dev/null
     [[ $status -eq 0 ]]
     grep -qxF "compose -p hr-mod-5 -f $HR_COMPOSE_FILE up -d --wait" "$HR_TEST_DOCKER_LOG"
+    # The shared cargo volume is (re)created first: `docker volume prune --all` may have dropped it.
+    [[ "$(grep -v ' ps ' "$HR_TEST_DOCKER_LOG" | head -n 1)" == 'volume create htui-hr-cargo' ]]
     grep -qE -- "^compose -p hr-mod-5 -f .* exec (-T )?-e TERM -e COLORTERM dev claude --dangerously-skip-permissions$" \
         "$HR_TEST_DOCKER_LOG"
 
@@ -568,6 +592,50 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     [[ "$(wc -l <<<"$ports")" -eq 3 ]]
     [[ "$ports" != *'->'* ]]
     [[ "$(stat -c %U "$HR_HOST_REPO/.remember")" == "$(id -un)" ]]
+
+    # C1: of ~/.local only the tool dirs are visible, read-only; nothing that holds secrets.
+    [[ "$(dexec TOOL-9001 bash -c 'ls -A ~/.local | tr "\n" " "')" == 'bin share state ' ]]
+    [[ "$(dexec TOOL-9001 bash -c 'ls -A ~/.local/share | tr "\n" " "')" == 'mise uv ' ]]
+    [[ "$(dexec TOOL-9001 bash -c 'ls -A ~/.local/share/uv | tr "\n" " "')" == 'python tools ' ]]
+    [[ -z "$(dexec TOOL-9001 bash -c 'ls -A ~/.local/state')" ]]
+    [[ -z "$(dexec TOOL-9001 bash -c 'for p in ~/.local/share/keyrings ~/.local/share/uv/credentials \
+        ~/.local/state/nvim ~/.local/share/gh ~/.local/share/pipx; do [ -e "$p" ] && echo "$p"; done; true')" ]]
+    run ! dexec TOOL-9001 touch "$HOME/.local/bin/hr-x"
+    run ! dexec TOOL-9001 touch "$HOME/.local/share/uv/tools/hr-x"
+    # ... and every host tool still runs from them.
+    dexec TOOL-9001 claude --version
+    dexec TOOL-9001 gortex version
+    dexec TOOL-9001 headroom --version
+    [[ "$(dexec TOOL-9001 uvx --version)" == 'uvx 0.12.'* ]]
+    [[ "$(dexec TOOL-9001 "$HOME/.local/bin/python3" --version)" == 'Python 3.'* ]]
+    dexec TOOL-9001 graphify --help >/dev/null
+
+    # H2: the host's dev Postgres/Qdrant are published on loopback only, so the bridge gateway
+    # (the host, seen from the run's network) refuses 5439 and 6333.
+    local probe='h=$(awk '"'"'$2 == "00000000" { print $3; exit }'"'"' /proc/net/route)
+        gw=$(printf "%d.%d.%d.%d" 0x${h:6:2} 0x${h:4:2} 0x${h:2:2} 0x${h:0:2})
+        echo "$gw"; timeout 3 bash -c "</dev/tcp/$gw/$1" 2>/dev/null'
+    run dexec TOOL-9001 bash -c "$probe" _ 5439
+    echo "gateway $output"
+    [[ $status -ne 0 && "$output" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+    run dexec TOOL-9001 bash -c "$probe" _ 6333
+    [[ $status -ne 0 && "$output" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+    # M5: the shared cargo volume cannot reconfigure other runs' builds or shadow their tools.
+    local path
+    path="$(dexec TOOL-9001 printenv PATH)"
+    [[ "$path" != *'.cargo/bin'* && "$path" == *':/tmp/cargo-install/bin' ]]
+    [[ "$(dexec TOOL-9001 printenv CARGO_INSTALL_ROOT)" == /tmp/cargo-install ]]
+    local f
+    for f in config config.toml credentials credentials.toml; do
+        [[ -z "$(dexec TOOL-9001 cat "$HOME/.cargo/$f")" ]]
+        run ! dexec TOOL-9001 bash -c "echo '[build]' >>\"\$HOME/.cargo/$f\""
+    done
+    # One file behind all four names: cargo does not warn that config and config.toml both exist.
+    run --separate-stderr dexec TOOL-9001 bash -c 'cd /tmp && cargo new -q --vcs none hr-probe && cd hr-probe && cargo metadata -q --no-deps --offline --format-version 1 >/dev/null'
+    [[ $status -eq 0 ]]
+    [[ "$stderr" != *warning* ]]
+
     run --separate-stderr "$HR" ls
     [[ "$output" == *'TOOL-9001'*'running'* ]]
 }

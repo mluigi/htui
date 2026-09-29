@@ -58,8 +58,8 @@ hr_setup() {
 hr_fake_home() {
     local h="$1"
     hr_assert_tmp_path "$h" || return 1
-    mkdir -p "$h/.claude" "$h/.local/bin" "$h/.gortex/instructions" "$h/.gortex/models" \
-        "$h/.config/git"
+    mkdir -p "$h/.claude" "$h/.local/bin" "$h/.local/share/mise/installs" "$h/.local/share/uv/python" \
+        "$h/.local/share/uv/tools" "$h/.gortex/instructions" "$h/.gortex/models" "$h/.config/git"
     printf '{"fake": "claude.json"}\n' >"$h/.claude.json"
     chmod 644 "$h/.claude.json"
     printf 'fake: gortex\n' >"$h/.gortex/config.yaml"
