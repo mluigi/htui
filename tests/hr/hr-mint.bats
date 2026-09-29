@@ -9,6 +9,8 @@ setup() {
     # Host behaviour unless a case opts in; the host tree override never points at a real path.
     unset HR_SANDBOX
     export HR_HOST_TREE="$BATS_TEST_TMPDIR/no-host-tree"
+    # scripts/hr's host-only marker dir: never the real /media/projects/htui-hr/.runs.
+    export HR_RUNS="$BATS_TEST_TMPDIR/runs"
     FIX="$BATS_TEST_TMPDIR/repo"
     make_fixture "$FIX"
 }
@@ -580,4 +582,41 @@ TS_ROW_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
     [[ "$stderr" == *'duplicate-id'* ]]
     [[ "$stderr" == *'warning: host tree mint failed'*'exit 1'* ]]
     [[ "$stderr" == *'host next unavailable'* ]]
+}
+
+@test "27. host: scripts/hr's marker naming this state dir, lease file gone -> vanished even without a lock stamp" {
+    mkdir -p "$HR_RUNS" "$HR_STATE"
+    # scripts/hr records the state dir it turned leasing on for; a sandbox then deleted both the
+    # lease file and the lock (or they never survived): the marker still says leasing is on.
+    printf '%s\n' "$BATS_TEST_TMPDIR/other-state" "$HR_STATE" >"$HR_RUNS/.leases-initialized"
+    run --separate-stderr "$HR_MINT" --leasing
+    [[ $status -eq 0 ]]
+    run --separate-stderr mint --prefix MOD --title 'x'
+    [[ $status -eq 1 && -z "$output" && "$stderr" == *'lease file vanished'*'.leases-initialized'* ]]
+    run --separate-stderr "$HR_MINT" --prune --repo-root "$FIX"
+    [[ $status -eq 1 && "$stderr" == *'lease file vanished'* ]]
+    run --separate-stderr "$HR_MINT" --init
+    [[ $status -eq 1 && "$stderr" == *'lease file vanished'* ]]
+    [[ ! -e "$(lease_file)" ]]
+    # The same state dir spelled differently still matches.
+    HR_STATE="$HR_STATE/." run --separate-stderr mint --prefix MOD --title 'x'
+    [[ $status -eq 1 && "$stderr" == *'lease file vanished'* ]]
+
+    # In a sandbox the marker is never read (HR_RUNS is host-only): the sandbox message.
+    HR_SANDBOX=1 run --separate-stderr mint --prefix MOD --title 'x'
+    [[ $status -eq 1 && "$stderr" == *'sandbox'*'no lease file'* && "$stderr" != *'.leases-initialized'* ]]
+
+    # A marker for another state dir only: leasing off, the plain tree mint.
+    printf '%s\n' "$BATS_TEST_TMPDIR/other-state" >"$HR_RUNS/.leases-initialized"
+    run --separate-stderr "$HR_MINT" --leasing
+    [[ $status -eq 1 ]]
+    run --separate-stderr mint --prefix MOD --title 'x'
+    [[ $status -eq 0 && "$output" == MOD-6 && "$stderr" == *'leasing off'* ]]
+
+    # --init --force restores it.
+    printf '%s\n' "$HR_STATE" >"$HR_RUNS/.leases-initialized"
+    run --separate-stderr "$HR_MINT" --init --force
+    [[ $status -eq 0 && -f "$(lease_file)" ]]
+    run --separate-stderr mint --prefix MOD --title 'x'
+    [[ $status -eq 0 && "$output" == MOD-6 ]]
 }

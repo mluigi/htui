@@ -24,15 +24,20 @@
 # them (sibling list, prune lines, unparseable-line errors): a sandbox's row reaches the host tty.
 #
 # Leasing is on when the lease file exists, when the lock is stamped (an earlier --init created
-# the lease file), or always in a sandbox (HR_SANDBOX=1). It fails closed whenever it is on but
+# the lease file), on the host when scripts/hr's record names the state dir, or always in a
+# sandbox (HR_SANDBOX=1). It fails closed whenever it is on but
 # the lease file is missing - a tree-only mint then would drop the F1 floor without a word:
 #   - HR_SANDBOX=1, no state dir or no lease file: mint and prune exit 1; --init exits 1 (the
 #     lease file is created and restored on the host, never in a sandbox).
-#   - host, stamped lock but no lease file ("lease file vanished"): mint, prune and --init exit 1.
-#     `--init --force` recreates an empty lease file; check first that no live run holds leases
-#     that are not on main yet, because their floor is lost.
-# Only a host that never ran --init (no lease file, no stamped lock) is "leasing off": mint is
-# then exactly `next-item-id.sh --prefix P --id-only`, prune a no-op, both with a stderr notice.
+#   - host, no lease file but a stamped lock, or scripts/hr's host-only record
+#     ${HR_RUNS:-/media/projects/htui-hr/.runs}/.leases-initialized naming this state dir
+#     ("lease file vanished"): mint, prune and --init exit 1, --leasing exits 0. The record
+#     matters because a sandbox can delete the lock (and its stamp) too; it is never read with
+#     HR_SANDBOX=1. `--init --force` recreates an empty lease file; check first that no live run
+#     holds leases that are not on main yet, because their floor is lost.
+# Only a host that never ran --init (no lease file, no stamped lock, no record) is "leasing off":
+# mint is then exactly `next-item-id.sh --prefix P --id-only`, prune a no-op, both with a stderr
+# notice.
 # --init on a fresh state dir creates the lease file and stamps the lock (one line written into
 # id-leases.lock under the flock), idempotently; the stamp, not the lock's mere existence, is the
 # "lease file existed" signal, so two first --init racing each other never read as a vanish.
@@ -41,7 +46,8 @@
 # that row is the floor that keeps a clone taken before the merge from re-minting (F1).
 #
 # Owner: --branch B, else hr/$HR_ITEM when set (inside a sandbox), else "host".
-# State: $HR_STATE, else /media/projects/htui-hr/.state. Lease file id-leases.tsv; lock
+# State: $HR_STATE, else /media/projects/htui-hr/.state. scripts/hr's record: $HR_RUNS, else
+# /media/projects/htui-hr/.runs (host only; read, never written here). Lease file id-leases.tsv; lock
 # id-leases.lock (separate, so prune's tmp+mv never swaps the locked inode; never removed).
 # Lock wait: $HR_MINT_LOCK_TIMEOUT seconds (default 30).
 # R (default: this script's repo) only selects the HANDOFF/DECISIONS data; next-item-id.sh and
@@ -183,8 +189,32 @@ stamp_lock() { # needs fd 9
         || die 3 "cannot stamp $LOCK"
 }
 
+# Host only: scripts/hr's host-only record ($HR_RUNS/.leases-initialized) names this state dir,
+# i.e. `scripts/hr up` turned leasing on for it. A sandbox can delete the lease file and the lock
+# (with its stamp), but never this file (re-review L3). Never read in a sandbox.
+marked_initialized() {
+    in_sandbox && return 1
+    [[ -f "$RUNS_MARK" ]] || return 1
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" && "$(realpath -ms -- "$line")" == "$STATE_NORM" ]] && return 0
+    done <"$RUNS_MARK"
+    return 1
+}
+
+# The evidence that --init created the lease file: the lock stamp, or scripts/hr's record.
+init_evidence() {
+    if [[ -s "$LOCK" ]]; then
+        printf '%s shows --init created it' "$LOCK"
+    elif marked_initialized; then
+        printf '%s names this state dir (scripts/hr up turned leasing on)' "$RUNS_MARK"
+    else
+        return 1
+    fi
+}
+
 vanished_msg() {
-    printf '%s' "lease file vanished: $LEASES is gone but $LOCK shows --init created it - nothing done. Restore it, or run \`scripts/hr-mint --init --force\` after checking that no live run holds leases that are not on main yet (their floor is lost)"
+    printf '%s' "lease file vanished: $LEASES is gone but $1 - nothing done. Restore it, or run \`scripts/hr-mint --init --force\` after checking that no live run holds leases that are not on main yet (their floor is lost)"
 }
 
 # 0 = leasing on (the lease path exists), 1 = leasing off (a host that never ran --init).
@@ -198,17 +228,18 @@ leasing_or_die() {
             || die 1 "in a sandbox (HR_SANDBOX=1) leasing is required, but there is no state dir at $STATE - nothing done; check the /hr-state mount on the host"
         die 1 "in a sandbox (HR_SANDBOX=1) leasing is required, but there is no lease file at $LEASES - nothing done; the maintainer restores it on the host"
     fi
-    [[ -s "$LOCK" ]] && die 1 "$(vanished_msg)"
+    local ev
+    ev="$(init_evidence)" && die 1 "$(vanished_msg "$ev")"
     return 1
 }
 
 # ---- modes ----
 
-# The skills' switch. On when the lease path exists, when the lock is stamped (the file vanished:
-# the mint then blocks instead of the skill falling back to next-item-id.sh), and always in a
-# sandbox.
+# The skills' switch. On when the lease path exists, when the lock is stamped or scripts/hr's
+# host-only record names this state dir (the file vanished: the mint then blocks instead of the
+# skill falling back to next-item-id.sh), and always in a sandbox.
 do_leasing() {
-    [[ -e "$LEASES" || -s "$LOCK" ]] || in_sandbox
+    [[ -e "$LEASES" || -s "$LOCK" ]] || in_sandbox || marked_initialized
 }
 
 do_init() {
@@ -216,9 +247,9 @@ do_init() {
     mkdir -p "$STATE" 2>/dev/null || die 3 "cannot create state dir $STATE"
     take_lock
     if [[ ! -e "$LEASES" ]]; then
-        local again=0
-        if [[ -s "$LOCK" ]]; then
-            [[ $FORCE -eq 1 ]] || die 1 "$(vanished_msg)"
+        local again=0 ev
+        if ev="$(init_evidence)"; then
+            [[ $FORCE -eq 1 ]] || die 1 "$(vanished_msg "$ev")"
             again=1
         fi
         local tmp="$LEASES.tmp.$$"
@@ -447,6 +478,8 @@ done
 STATE="${HR_STATE:-/media/projects/htui-hr/.state}"
 LEASES="$STATE/id-leases.tsv"
 LOCK="$STATE/id-leases.lock"
+STATE_NORM="$(realpath -ms -- "$STATE")"
+RUNS_MARK="${HR_RUNS:-/media/projects/htui-hr/.runs}/.leases-initialized"
 
 if [[ ! "${HR_MINT_LOCK_TIMEOUT:-30}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     die 2 "HR_MINT_LOCK_TIMEOUT must be a number of seconds, got '${HR_MINT_LOCK_TIMEOUT}'"

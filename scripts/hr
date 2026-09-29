@@ -435,7 +435,7 @@ check_leases() {
 }
 init_leases() {
     check_leases
-    HR_STATE="$STATE" "$HR_MINT_BIN" --init || die 3 "scripts/hr-mint --init failed"
+    HR_STATE="$STATE" HR_RUNS="$RUNS" "$HR_MINT_BIN" --init || die 3 "scripts/hr-mint --init failed"
     grep -qxF -- "$STATE" "$LEASE_MARK" 2>/dev/null && return 0
     printf '%s\n' "$STATE" >>"$LEASE_MARK" || die 3 "cannot write $LEASE_MARK"
 }
@@ -1212,7 +1212,7 @@ cmd_down() {
     confirm "$yes" "Purge $item: containers, volumes and ${RUN[run_dir]}?" || die 1 "cancelled"
     purge_run "$item"
     if [[ "$forced_uncollected" -eq 1 ]]; then
-        HR_STATE="$STATE" "$HR_MINT_BIN" --prune --repo-root "$HOST" --purged-owner "hr/$item" \
+        HR_STATE="$STATE" HR_RUNS="$RUNS" "$HR_MINT_BIN" --prune --repo-root "$HOST" --purged-owner "hr/$item" \
             || { warn "scripts/hr-mint --prune failed; leases of hr/$item stay until the next gc"; exit 3; }
     fi
 }
@@ -1255,7 +1255,7 @@ cmd_gc() {
         load_run "$item" 0
         purge_run "$item"
     done
-    HR_STATE="$STATE" "$HR_MINT_BIN" --prune --ref main --repo-root "$HOST" \
+    HR_STATE="$STATE" HR_RUNS="$RUNS" "$HR_MINT_BIN" --prune --ref main --repo-root "$HOST" \
         || { warn "scripts/hr-mint --prune failed"; exit 3; }
 }
 
