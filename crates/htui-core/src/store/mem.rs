@@ -546,7 +546,7 @@ impl MemStore {
     /// worth testing: the resolvers' fall-through rule only fires on a stored value the validator
     /// would never have accepted, and there has to be a way to plant one.
     pub fn set_app_setting(&self, key: &str, value: Value) {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.app_settings.insert(key.to_owned(), (value, now)));
     }
 
@@ -557,7 +557,7 @@ impl MemStore {
     ///
     /// A project that is not there is left alone, as a no-op.
     pub fn set_project_settings(&self, project: ProjectId, settings: Value) {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| {
             if let Some(row) = state.projects.get_mut(&project) {
                 row.settings = settings;
@@ -5673,7 +5673,7 @@ impl ReadStore for MemStore {
 
 impl WriteStore for MemStore {
     async fn mint_item(&self, new: NewItem) -> Result<Item> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.mint(new, now))
     }
 
@@ -5683,14 +5683,14 @@ impl WriteStore for MemStore {
         expected_version: i32,
         patch: ItemPatch,
     ) -> Result<UpdateOutcome> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.update(id, expected_version, patch, now))
     }
 
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
         #[cfg(feature = "test-support")]
         self.check_fault(MemFault::ItemTransition)?;
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.transition(id, from, to, now))
     }
 
@@ -5705,7 +5705,7 @@ impl WriteStore for MemStore {
         usage: Value,
         prompt_digest: Option<String>,
     ) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.set_step_usage(fence, step, usage, prompt_digest, now))
     }
 
@@ -5714,12 +5714,12 @@ impl WriteStore for MemStore {
         agent: &Agent,
         expected: Option<DateTime<Utc>>,
     ) -> Result<CasOutcome<Agent>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.upsert_agent(agent, expected, now))
     }
 
     async fn upsert_agent_box(&self, row: &AgentBox) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.upsert_agent_box(row, now))
     }
 
@@ -5730,12 +5730,12 @@ impl WriteStore for MemStore {
         quota: Value,
         quota_at: DateTime<Utc>,
     ) -> Result<bool> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.set_agent_box_quota(agent_id, box_id, quota, quota_at, now))
     }
 
     async fn record_box_probe(&self, probe: &BoxProbe) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.record_box_probe(probe, now))
     }
 
@@ -5752,7 +5752,7 @@ impl WriteStore for MemStore {
     ) -> Result<CasOutcome<BoxRow>> {
         // Both before the write lock: `this_user` takes the read lock (blueprint F-K).
         let user = self.this_user();
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.edit_box(user, id, expected, edit, now))
     }
 
@@ -5767,12 +5767,12 @@ impl WriteStore for MemStore {
         status: RunStatus,
         finished_at: DateTime<Utc>,
     ) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.finish_chat_run(run, step, status, finished_at, now))
     }
 
     async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.set_step_prompt(step, digest, trim, now))
     }
 
@@ -5781,7 +5781,7 @@ impl WriteStore for MemStore {
     // about what is legal, only about how it is stored.
 
     async fn create_workspace(&self, new: NewWorkspace) -> Result<Workspace> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_workspace(new, now))
     }
 
@@ -5791,7 +5791,7 @@ impl WriteStore for MemStore {
         expected: DateTime<Utc>,
         patch: WorkspacePatch,
     ) -> Result<CasOutcome<Workspace>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.update_workspace(id, expected, patch, now))
     }
 
@@ -5816,7 +5816,7 @@ impl WriteStore for MemStore {
     }
 
     async fn upsert_workspace_box_path(&self, path: &WorkspaceBoxPath) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.upsert_workspace_box_path(path, now))
     }
 
@@ -5825,7 +5825,7 @@ impl WriteStore for MemStore {
     }
 
     async fn create_project(&self, new: NewProject) -> Result<Project> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_project(new, now))
     }
 
@@ -5835,12 +5835,12 @@ impl WriteStore for MemStore {
         expected: DateTime<Utc>,
         patch: ProjectPatch,
     ) -> Result<CasOutcome<Project>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.update_project(id, expected, patch, now))
     }
 
     async fn create_repo(&self, new: NewRepo) -> Result<Repo> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_repo(new, now))
     }
 
@@ -5850,7 +5850,7 @@ impl WriteStore for MemStore {
         expected: DateTime<Utc>,
         patch: RepoPatch,
     ) -> Result<CasOutcome<Repo>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.update_repo(id, expected, patch, now))
     }
 
@@ -5859,12 +5859,12 @@ impl WriteStore for MemStore {
     }
 
     async fn upsert_repo_box_path(&self, path: &RepoBoxPath) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.upsert_repo_box_path(path, now))
     }
 
     async fn infer_repo_box_path(&self, path: &RepoBoxPath) -> Result<bool> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.infer_repo_box_path(path, now))
     }
 
@@ -5873,7 +5873,7 @@ impl WriteStore for MemStore {
     }
 
     async fn create_item_kind(&self, new: NewItemKind) -> Result<ItemKind> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_item_kind(new, now))
     }
 
@@ -5883,7 +5883,7 @@ impl WriteStore for MemStore {
         expected: DateTime<Utc>,
         patch: ItemKindPatch,
     ) -> Result<CasOutcome<ItemKind>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.update_item_kind(id, expected, patch, now))
     }
 
@@ -5896,7 +5896,7 @@ impl WriteStore for MemStore {
     }
 
     async fn create_step_graph(&self, new: NewStepGraph) -> Result<StepGraph> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_step_graph(new, now))
     }
 
@@ -5906,7 +5906,7 @@ impl WriteStore for MemStore {
         expected: DateTime<Utc>,
         patch: StepGraphPatch,
     ) -> Result<CasOutcome<StepGraph>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.update_step_graph(id, expected, patch, now))
     }
 
@@ -5915,7 +5915,7 @@ impl WriteStore for MemStore {
     }
 
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_phase(phase, now))
     }
 
@@ -5925,7 +5925,7 @@ impl WriteStore for MemStore {
         expected: DateTime<Utc>,
         patch: PhasePatch,
     ) -> Result<CasOutcome<StepGraphPhase>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.update_phase(id, expected, patch, now))
     }
 
@@ -5938,7 +5938,7 @@ impl WriteStore for MemStore {
         new: NewPromptTemplate,
         expected: Option<i32>,
     ) -> Result<CasOutcome<PromptTemplate>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.append_prompt_template(new, expected, now))
     }
 
@@ -5955,7 +5955,7 @@ impl WriteStore for MemStore {
     }
 
     async fn create_skill(&self, new: NewSkill) -> Result<(Skill, SkillVersion)> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_skill(new, now))
     }
 
@@ -5965,7 +5965,7 @@ impl WriteStore for MemStore {
         expected: DateTime<Utc>,
         patch: SkillPatch,
     ) -> Result<CasOutcome<Skill>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.update_skill(id, expected, patch, now))
     }
 
@@ -5975,7 +5975,7 @@ impl WriteStore for MemStore {
         expected: i32,
         new: NewSkillVersion,
     ) -> Result<CasOutcome<SkillVersion>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.add_skill_version(skill, expected, new, now))
     }
 
@@ -5985,7 +5985,7 @@ impl WriteStore for MemStore {
         expected: Option<DateTime<Utc>>,
         change: BindingChange,
     ) -> Result<CasOutcome<Option<SkillBinding>>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.set_skill_binding(key, expected, change, now))
     }
 
@@ -5996,7 +5996,7 @@ impl WriteStore for MemStore {
         value: Value,
         expected: Option<DateTime<Utc>>,
     ) -> Result<CasOutcome<StoredSetting>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.set_setting(rung, key, value, expected, now))
     }
 
@@ -6006,7 +6006,7 @@ impl WriteStore for MemStore {
         key: SettingKey,
         expected: DateTime<Utc>,
     ) -> Result<CasOutcome<StoredSetting>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.clear_setting(rung, key, expected, now))
     }
 
@@ -6029,7 +6029,7 @@ impl WriteStore for MemStore {
     }
 
     async fn delete_project(&self, id: ProjectId) -> Result<DeleteReach> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.delete_project(id, now))
     }
 
@@ -6039,7 +6039,7 @@ impl WriteStore for MemStore {
     // not by discipline.
 
     async fn create_run(&self, new: NewRun) -> Result<Run> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_run(new, now))
     }
 
@@ -6051,14 +6051,14 @@ impl WriteStore for MemStore {
         at: DateTime<Utc>,
         lease_until: DateTime<Utc>,
     ) -> Result<Claim> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.claim_run(run, box_id, owner, at, lease_until, now))
     }
 
     async fn refresh_lease(&self, run: RunId, owner: Uuid, until: DateTime<Utc>) -> Result<bool> {
         #[cfg(feature = "test-support")]
         self.check_fault(MemFault::RefreshLease)?;
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.refresh_lease(run, owner, until, now))
     }
 
@@ -6069,7 +6069,7 @@ impl WriteStore for MemStore {
         at: DateTime<Utc>,
         lease_until: DateTime<Utc>,
     ) -> Result<Vec<Run>> {
-        let now = Utc::now();
+        let now = self.now();
         Ok(self.write(|state| state.adopt_runs(box_id, owner, at, lease_until, now)))
     }
 
@@ -6081,19 +6081,19 @@ impl WriteStore for MemStore {
         now: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> Result<bool> {
-        let stamp = Utc::now();
+        let stamp = self.now();
         self.write(|state| state.take_lease(run, box_id, owner, now, until, stamp))
     }
 
     async fn release_lease(&self, run: RunId, owner: Uuid, now: DateTime<Utc>) -> Result<bool> {
         #[cfg(feature = "test-support")]
         self.check_fault(MemFault::ReleaseLease)?;
-        let stamp = Utc::now();
+        let stamp = self.now();
         self.write(|state| state.release_lease(run, owner, now, stamp))
     }
 
     async fn create_step(&self, new: NewRunStep) -> Result<RunStep> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_step(new, now))
     }
 
@@ -6104,7 +6104,7 @@ impl WriteStore for MemStore {
         to: RunStatus,
         at: DateTime<Utc>,
     ) -> Result<bool> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.transition_run(run, from, to, at, now))
     }
 
@@ -6115,7 +6115,7 @@ impl WriteStore for MemStore {
         to: StepStatus,
         at: DateTime<Utc>,
     ) -> Result<bool> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.transition_step(step, from, to, at, now))
     }
 
@@ -6125,12 +6125,12 @@ impl WriteStore for MemStore {
         step: StepId,
         outcome: StepOutcome,
     ) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.finish_step(fence, step, outcome, now))
     }
 
     async fn interrupt_step(&self, step: StepId, note: &str, at: DateTime<Utc>) -> Result<bool> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.interrupt_step(step, note, at, now))
     }
 
@@ -6141,7 +6141,7 @@ impl WriteStore for MemStore {
         note: Option<String>,
         at: DateTime<Utc>,
     ) -> Result<bool> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.answer_gate(step, outcome, note, at, now))
     }
 
@@ -6153,17 +6153,17 @@ impl WriteStore for MemStore {
         winner: StepId,
         reason: Option<String>,
     ) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.select_fanout(run, position, attempt, winner, reason, now))
     }
 
     async fn supersede_step(&self, step: StepId) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.supersede_step(step, now))
     }
 
     async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.upsert_step_tree(step, trees, now))
     }
 
@@ -6184,12 +6184,12 @@ impl WriteStore for MemStore {
     }
 
     async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.promote_step(step, at, now))
     }
 
     async fn fail_run(&self, run: RunId, failure: &str, at: DateTime<Utc>) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.fail_run(run, failure, at, now))
     }
 
@@ -6200,7 +6200,7 @@ impl WriteStore for MemStore {
         failure: Option<&str>,
         at: DateTime<Utc>,
     ) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.finish_run(run, to, failure, at, now))
     }
 
@@ -6211,7 +6211,7 @@ impl WriteStore for MemStore {
         summary: NewDocument,
         commits: &[RunStepCommit],
     ) -> Result<Document> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.close_out(item, resolution, summary, commits, now))
     }
 
@@ -6228,14 +6228,14 @@ impl WriteStore for MemStore {
         owner_id: UserId,
         preamble: String,
     ) -> Result<CasOutcome<RequirementSpec>> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| {
             state.set_requirement_spec(project, expected_version, owner_id, preamble, now)
         })
     }
 
     async fn create_requirement_area(&self, new: NewRequirementArea) -> Result<RequirementArea> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.create_requirement_area(new, now))
     }
 
@@ -6244,7 +6244,7 @@ impl WriteStore for MemStore {
         area: RequirementAreaId,
         new: NewRequirement,
     ) -> Result<Requirement> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.mint_requirement(area, new, now))
     }
 
@@ -6255,7 +6255,7 @@ impl WriteStore for MemStore {
         patch: RequirementPatch,
         amended_by: ItemId,
     ) -> Result<RequirementUpdate> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| {
             state.revise_requirement(
                 id,
@@ -6275,7 +6275,7 @@ impl WriteStore for MemStore {
         author_id: UserId,
         box_id: Option<BoxId>,
     ) -> Result<RequirementUpdate> {
-        let now = Utc::now();
+        let now = self.now();
         let patch = RequirementPatch {
             author_id,
             box_id,
@@ -6300,7 +6300,7 @@ impl WriteStore for MemStore {
         kind: CitationKind,
         proposed_by: Option<StepId>,
     ) -> Result<ItemRequirement> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.cite(item, requirement, kind, proposed_by, now))
     }
 
@@ -6310,7 +6310,7 @@ impl WriteStore for MemStore {
         requirement: RequirementId,
         kind: CitationKind,
     ) -> Result<()> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.uncite(item, requirement, kind, now))
     }
 
@@ -6320,7 +6320,7 @@ impl WriteStore for MemStore {
         requirement: RequirementId,
         kind: CitationKind,
     ) -> Result<ItemRequirement> {
-        let now = Utc::now();
+        let now = self.now();
         self.write(|state| state.reconfirm(item, requirement, kind, now))
     }
 }
