@@ -1,10 +1,14 @@
 //! The Skills tab (MOD-9 PRD D1): a `Skills | Templates` switch.
 //!
-//! The Templates view (`templates`) is MOD-9 milestone 1: the scope's prompt templates, their
-//! versions, a line diff, and an editor that saves through `parse`. The Skills view is milestone
-//! 3's and says so. The tab reads the templates on activation whichever view is shown (blueprint
-//! D34), so switching views needs no request.
+//! The Skills view (`library`, with its attachments pane in `attach`) is MOD-9 milestone 3: the
+//! skill library, any version's body, a line diff between two versions, an editor with a token
+//! estimate, and one skill's global, project and phase attachments (plan D82-D84). The Templates
+//! view (`templates`) is milestone 1: the scope's prompt templates, their versions, a line diff,
+//! and an editor that saves through `parse`. The tab reads both on activation whichever view is
+//! shown (blueprint D34, plan D84), so switching views needs no request.
 
+mod attach;
+mod library;
 mod templates;
 
 use htui_core::model::Scope;
@@ -19,25 +23,24 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::registry::{Tab, TabId};
 use crossterm::event::{KeyCode, KeyEvent};
 
+use library::LibraryView;
 use templates::TemplatesView;
 
-/// What the Skills view says until milestone 3 fills it (plan D14; the stub's MOD-12 attribution
-/// was wrong, PRD "Record corrections").
-const SKILLS_LATER: &str = "Skills are edited here from MOD-9 milestone 3.";
-
-/// The Skills tab (MOD-9 PRD D1): `Skills | Templates`. The Skills view is milestone 3's.
+/// The Skills tab (MOD-9 PRD D1): `Skills | Templates`.
 #[derive(Debug, Default)]
 pub struct SkillsTab {
     /// Which of the two views is shown.
     view: View,
     /// The Templates view, alive whichever view is shown: its replies land either way.
     templates: TemplatesView,
+    /// The Skills view (milestone 3), alive whichever view is shown, for the same reason.
+    library: LibraryView,
 }
 
 /// The two views of the switch line.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum View {
-    /// Milestone 3's; one line until then. The tab opens here (D34).
+    /// The skill library and its attachments (milestone 3). The tab opens here (D34).
     #[default]
     Skills,
     /// The prompt templates (milestone 1).
@@ -73,35 +76,49 @@ impl Tab for SkillsTab {
     }
 
     fn wants_requests(&self, scope: &Scope) -> Vec<StoreRequest> {
-        vec![StoreRequest::Templates(scope.clone())]
+        vec![
+            StoreRequest::Templates(scope.clone()),
+            StoreRequest::Skills(scope.clone()),
+        ]
     }
 
     fn on_scope_change(&mut self, _scope: &Scope) {
         self.templates.on_scope_change();
+        self.library.on_scope_change();
     }
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        // An open editor or name prompt owns every key it uses: `l` is a letter there, not a view
-        // switch (the chat composer's and the Settings sections' rule).
-        if self.view == View::Templates && self.templates.captures_input() {
-            return self.templates.on_key(key, ctx);
+        // An open editor, form or name prompt owns every key it uses: `l` is a letter there, not
+        // a view switch (the chat composer's and the Settings sections' rule).
+        let captured = match self.view {
+            View::Skills => self.library.captures_input(),
+            View::Templates => self.templates.captures_input(),
+        };
+        if !captured
+            && matches!(
+                key.code,
+                KeyCode::Char('h' | 'l' | '[' | ']') | KeyCode::Left | KeyCode::Right
+            )
+        {
+            self.toggle();
+            return Handled::Consumed;
         }
-        match key.code {
-            KeyCode::Char('h' | 'l' | '[' | ']') | KeyCode::Left | KeyCode::Right => {
-                self.toggle();
-                Handled::Consumed
-            }
-            _ if self.view == View::Templates => self.templates.on_key(key, ctx),
-            _ => Handled::Pass,
+        match self.view {
+            View::Skills => self.library.on_key(key, ctx),
+            View::Templates => self.templates.on_key(key, ctx),
         }
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         self.templates.on_reply(reply, ctx);
+        self.library.on_reply(reply, ctx);
     }
 
+    /// Both views may have handed off to `$EDITOR`; each ignores an outcome it did not ask for
+    /// (blueprint D100, F-N).
     fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
-        self.templates.on_external_edit(outcome, ctx);
+        self.templates.on_external_edit(outcome.clone(), ctx);
+        self.library.on_external_edit(outcome, ctx);
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
@@ -123,10 +140,7 @@ impl Tab for SkillsTab {
             switch,
         );
         match self.view {
-            View::Skills => frame.render_widget(
-                Paragraph::new(Line::styled(format!(" {SKILLS_LATER}"), ctx.theme.dim)),
-                body,
-            ),
+            View::Skills => self.library.render(frame, body, ctx),
             View::Templates => self.templates.render(frame, body, ctx),
         }
     }

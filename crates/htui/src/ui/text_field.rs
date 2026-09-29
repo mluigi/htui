@@ -177,6 +177,13 @@ impl TextField {
         }
     }
 
+    /// What was typed before the cursor, or `None` while the field is masked: what a key would
+    /// insert after.
+    #[must_use]
+    pub fn before_cursor(&self) -> Option<&str> {
+        self.text().map(|text| &text[..self.byte_of(self.cursor)])
+    }
+
     /// Moves the buffer out, leaving the field empty. The only read of a masked field.
     ///
     /// The allocation **moves**: nothing is copied, so a masked caller that wraps the result in
@@ -340,6 +347,25 @@ mod tests {
         wide.on_key(key(KeyCode::Home));
         wide.on_key(key(KeyCode::Char('a')));
         assert_eq!(wide.text(), Some("aé"));
+    }
+
+    /// The text before the cursor, sliced at a char boundary; nothing of a masked field.
+    #[test]
+    fn before_cursor_is_the_text_up_to_the_cursor() {
+        let mut field = TextField::with_text("aéc");
+        assert_eq!(
+            field.before_cursor(),
+            Some("aéc"),
+            "the cursor starts at the end"
+        );
+        field.on_key(key(KeyCode::Left));
+        assert_eq!(field.before_cursor(), Some("aé"));
+        field.on_key(key(KeyCode::Home));
+        assert_eq!(field.before_cursor(), Some(""));
+
+        let mut masked = TextField::masked();
+        masked.on_key(key(KeyCode::Char('s')));
+        assert_eq!(masked.before_cursor(), None, "a masked field is never read");
     }
 
     #[test]
