@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-29):** **MOD-62 was decided** (`docs/decisions/mod/mod-62.md`): a
+**Current status (2026-09-29):** **MOD-50 was done** (`docs/decisions/mod/mod-50.md`): the
+concepts index now holds requirement rows as `type = requirement` points (withdrawn ones kept), item
+and document points carry `item.resolution`, and `htui --search-items --decisions` keeps items
+closed as done, concluded or rejected (maintainer). The collection is now `htui_concepts_v2`, so the
+first `--index-items` after upgrading rebuilds everything; `R-STO-8` was amended in place. It
+minted **MOD-64** (concepts search in the TUI).
+Before it, **MOD-62 was decided** (`docs/decisions/mod/mod-62.md`): a
 verify command keeps htui's process environment unchanged (plan D30), and PR #20's allowlist was
 closed unmerged. The agent it checks already runs with that same environment, so an allowlist on the
 verifier alone hid nothing and broke real verifiers. The rule that remains sits on **MOD-10**:
@@ -31,11 +37,6 @@ field-agnostic because the defect *was* an enumeration; `template.name`, `Prompt
 inert on the run path (the engine's secret list is empty) — that is **MOD-61**, opened at the
 review gate. The store is still not the enforcement point: it will accept an unscrubbed
 `trim_record` from any non-engine caller.
-Before it, **MOD-58 was done** (`docs/decisions/mod/mod-58.md`): the two
-claim-time tag rules are now pinned per store — `NotClaimable` outranks `MissingTags` for a run aimed
-at another box, and blueprint D94's no-item case is never refused. Four tests, no production
-behaviour change, no shared trait method, no migration, and no count pin moved. The gate's Postgres
-DSN is now password-free via `~/.pgpass`.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -152,12 +153,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   item); cited requirements with suspect markers and a re-confirm action in item detail; a
   resolution picker in MOD-4's Runs-pane close-out confirmation; maintainer-only
   create/amend/withdraw, where amend names the deciding item (`docs/ANA-11.md` §6).
-- [ ] **MOD-50 - Requirements and resolution in the concepts index** (from MOD-34 and MOD-38;
-  `docs/decisions/mod/mod-34.md`, `docs/decisions/mod/mod-38.md`). `R-STO-8`, `R-ENT-8`, `R-ENT-14`.
-  Index `requirement` rows into the concepts collection as `type = requirement` points (the type
-  MOD-34 reserved), and add `item.resolution` to the item point payload so
-  `htui --search-items --decisions` filters on resolution instead of meaning "done or closed".
-  The TUI side of the search is **MOD-64**.
 - [ ] **MOD-37 - Orchestrator hardening follow-ups** (from MOD-4). `R-ORCH-3`, `R-ORCH-5`,
   `R-ORCH-8`, `R-ORCH-9`, `R-TUI-4`, `R-HIS-1`, `R-NF-3`. MOD-4 closed with these risks carried and
   no other item owns them. Each is small, known and recorded; none blocks a manual run today. Pick
@@ -779,8 +774,10 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   Requirements tab once that exists. Embedding the query loads the model synchronously
   (`FastEmbedder::new`, MOD-34 review), so the search runs off the UI thread, and a missing or
   unreachable Qdrant is an inline error that affects nothing else (`R-STO-8`). Whether the TUI also
-  offers a re-index action, or leaves that to MOD-41's background sync, is this item's call. Best
-  after MOD-50 (requirement points and the resolution filter) and MOD-39.
+  offers a re-index action, or leaves that to MOD-41's background sync, is this item's call. MOD-50
+  is done (`docs/decisions/mod/mod-50.md`): hits carry an `Owner` (item or requirement), the
+  resolution and the requirement state, and `concepts::DECISION_RESOLUTIONS` is the decisions set.
+  Best after MOD-39.
 
 ### Deferred backlog
 
@@ -815,6 +812,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 41 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-61 run scrubber masks nothing, MOD-63 Qdrant `r` reload, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 40 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-61 run scrubber masks nothing, MOD-63 Qdrant `r` reload, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-6 Runs pane approve doc)                |
 | TOOL-N  | 0 |

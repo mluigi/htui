@@ -1,7 +1,11 @@
 # Plan: MOD-50 — requirements and resolution in the concepts index
 
-> **Status: confirmed** (2026-09-29), with the R-STO-8 amendment (D229) added by the maintainer. Fact-check: 16 claims, 16 verified, 0 falsified;
-> verdicts in "Verified claims" below.
+> **Status: done** (2026-09-29). Confirmed by the maintainer with the R-STO-8 amendment (D229),
+> implemented in `9c381db`, review fixes `5417e78`, closed out in
+> [`docs/decisions/mod/mod-50.md`](../../docs/decisions/mod/mod-50.md). Fact-check: 16 claims, 16
+> verified, 0 falsified; verdicts in "Verified claims" below. Two deviations are recorded in the
+> write-up: `point_type` is derived rather than stored (D225), and the live exact-key case asserts
+> membership rather than first rank (T4).
 
 **Source**: `HANDOFF.md` MOD-50 (from MOD-34 and MOD-38; `docs/decisions/mod/mod-34.md` "Left to
 other items", `docs/decisions/mod/mod-38.md`). MOD-34 built the concepts index over items and their
