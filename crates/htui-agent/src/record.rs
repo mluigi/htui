@@ -1487,9 +1487,9 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     /// It is **not** exempt from `run_step.usage`. A persisted `usage` row is summed from its
     /// document, not from its typed event ([`UsageTotals::add_payload`]), so masking costs it only
     /// the keys masking made unreadable. Skipping it here would be a real divergence rather than a
-    /// tidiness: `upload_pending` sums *every* persisted `usage` row of a chat that happened
-    /// offline (MOD-2 plan D36), so an online step and the same step uploaded from a buffer would
-    /// disagree for exactly this one row shape.
+    /// tidiness: `run_step.usage` is the sum of *every* persisted `usage` row of the step (MOD-2
+    /// plan D36's one rule), so the column and the log it summarizes would disagree for exactly
+    /// this one row shape.
     ///
     /// **A breach outlives a refused flush.** The sum and [`Recorder::check_cap`] run before the
     /// trailing flush, so by the time that flush can fail the verdict is already spent: `spent` is

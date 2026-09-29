@@ -450,8 +450,8 @@ impl WriteStore for Writer {
     // ---- MOD-15 milestone 1: the hierarchy (plan D2) ---------------------------------------
     //
     // Delegation, as every arm above: a `Writer` decides *which* store, never *what* a write
-    // means. The three stores disagree about all 31 of these — `MemStore` keeps maps, `PgStore`
-    // keeps rows, `BufferedWriter` refuses — and that disagreement stays in the stores.
+    // means. The two stores disagree about how all 31 of these are kept — `MemStore` keeps maps,
+    // `PgStore` keeps rows — and that disagreement stays in the stores.
 
     async fn create_workspace(&self, new: NewWorkspace) -> Result<Workspace> {
         match self {

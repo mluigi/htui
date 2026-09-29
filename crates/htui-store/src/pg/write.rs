@@ -1522,25 +1522,14 @@ impl WriteStore for PgStore {
     /// The `run` / `run_step` pair of a free-standing chat, in one transaction, both
     /// `ON CONFLICT (id) DO NOTHING` (plan D4).
     ///
-    /// The pair has the shape `crate::cache::pending`'s upload gives the same chat - `kind 'chat'`,
-    /// `mode 'manual'`, `item_id NULL`, `phase_name 'chat'`, `position 0`, `attempt 1`,
-    /// `fanout_index 0`, `executing_box_id` = the target box - and, because the ids are minted
-    /// client-side and both paths insert `ON CONFLICT (id) DO NOTHING`, an online start followed by
-    /// a replayed upload (or the reverse) converges on **one** such pair rather than colliding
-    /// (ANA-9 §4.3).
-    ///
-    /// It is the row count that converges, not every column: `DO NOTHING` hands the values to
-    /// whichever path lands first, and this one differs from the upload in four groups. `status` is
-    /// `running` rather than the upload's terminal `done` and `finished_at` is NULL, which
-    /// [`WriteStore::finish_chat_run`] closes; `agent_id` and `model` come from the spec, where the
-    /// upload leaves both NULL because the pending line format carries neither; and every stamp is
-    /// `chat.started_at`, where the upload derives them from the buffered events' `at`. An
-    /// offline-first chat therefore keeps a NULL `agent_id` after a later online start - see
-    /// [`ChatRunSpec`] for the whole asymmetry, and `tests/pg_criteria.rs`
-    /// (`chat_run_rows_converge_with_the_offline_mint`,
-    /// `an_offline_first_chat_keeps_the_uploaded_columns`) for both directions in SQL. Carrying
-    /// `agent_id` / `model` in the pending format is the offline session path's, MOD-2 milestone 4
-    /// (plan D16).
+    /// The pair is `kind 'chat'`, `mode 'manual'`, `item_id NULL`, `phase_name 'chat'`,
+    /// `position 0`, `attempt 1`, `fanout_index 0`, `executing_box_id` = the target box, both rows
+    /// `running` with `finished_at` NULL (which [`WriteStore::finish_chat_run`] closes), `agent_id`
+    /// and `model` from the spec, and every stamp `chat.started_at`. The ids are minted
+    /// client-side, so a start retried after an answer that never arrived lands on the pair the
+    /// first attempt wrote rather than colliding (ANA-9 §4.3). Nothing else inserts the pair: the
+    /// offline buffer that once uploaded the same chat is gone (MOD-25, MOD-40), and a step write
+    /// the store refuses is re-offered by the recorder itself.
     ///
     /// # Errors
     ///
