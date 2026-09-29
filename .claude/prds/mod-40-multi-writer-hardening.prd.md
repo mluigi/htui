@@ -175,8 +175,8 @@ touching the store.
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Step fence | C1 and C8: a stale lease holder writes nothing to its old step, chats still write, and a short fresh insert is loud. | in-progress | [plan](../plans/mod-40-multi-writer-hardening.plan.md) |
-| 2 | Ordered writes | C3 quota ordering, C6 agent CAS, C7 pinned. | pending | [plan](../plans/mod-40-multi-writer-hardening.plan.md) |
+| 1 | Step fence | C1 and C8: a stale lease holder writes nothing to its old step, chats still write, and a short fresh insert is loud. | complete | [plan](../plans/mod-40-multi-writer-hardening.plan.md) |
+| 2 | Ordered writes | C3 quota ordering, C6 agent CAS, C7 pinned. | in-progress | [plan](../plans/mod-40-multi-writer-hardening.plan.md) |
 | 3 | Box and schema | C4 heartbeat and C5 headless connect with the target version. | pending | [plan](../plans/mod-40-multi-writer-hardening.plan.md) |
 | 4 | Database time | C2: lease times stamped by Postgres, heartbeat fence on the returned expiry, MemStore clock. | pending | [plan](../plans/mod-40-multi-writer-hardening.plan.md) |
 
@@ -197,7 +197,7 @@ proposals: the plan implements them.
   `clock_timestamp()` and returns what it wrote, and MemStore takes a clock; the `Clock` trait moves
   from `htui-orch` to `htui-core` so tests share one `TestClock`.
 - **D3 — Below the target version, a TUI warns and a headless process refuses.** A TUI that applies
-  migrations raises `app_setting` `htui.target_version` to its own version and never lowers it.
+  migrations raises `app_setting` `htui_target_version` (spelled like the other `app_setting` keys; blueprint F-25) to its own version and never lowers it.
 
 ## Risks
 
