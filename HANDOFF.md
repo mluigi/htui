@@ -325,6 +325,19 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   side reintroduces the superseded-seq bug `16079aa` fixed, so the fix belongs in the runtime:
   catch the panic (or notice a panicked `JoinHandle` in `sweep_finished`) and send the task's
   terminal reply with a failure. Found 2026-09-26.
+- [ ] **MOD-62 - A verify command's environment: minus the secrets, plus a named passthrough**
+  (from PR #20 review, held by the maintainer 2026-09-29). `R-SEC-2`, `R-ORCH-11`. `verify.rs`
+  hands the child the whole process environment (plan D30), so a verify command sees host secrets
+  that ANA-2 `:493` says it should not ("the agent's environment minus the secrets"). CodeRabbit's
+  PR #20 swapped that for a fixed allowlist (`PATH`, `HOME`, temp dirs, `CARGO_HOME`,
+  `RUSTUP_HOME`, a few Windows roots) with no escape hatch, which drops what real verifiers need:
+  `HTUI_TEST_DATABASE_URL` (the Postgres suites then print "skipped" and a `cargo test` verify
+  passes without running them), proxy and CA variables, locale, `RUSTUP_TOOLCHAIN`,
+  `CARGO_TARGET_DIR`, and on Windows `APPDATA`/`PATHEXT`/`ComSpec`. Decide the shape: remove only
+  the ANA-7-resolved secret names, a per-phase or `app_setting` `verify_env` passthrough list, or
+  both; keep the agent's own environment consistent with it (`htui-agent/src/launch.rs` passes the
+  host environment through too). PR #20 stays open as a reference until this lands. Found
+  2026-09-29.
 - [ ] **MOD-60 - Display width in every hand-laid-out row** (from MOD-54, plan D18). `R-TUI-1`,
   `R-NF-1`. MOD-54 made `TextField` and `TextArea` count cells instead of code points through
   `crate::ui::cells`; every other place that lays text out in `char`s has the identical class of
@@ -436,9 +449,29 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   first, then refused). Review `rust-reviewer` APPROVE WITH FIXES: findings 1, 2, 4, 5, 7 and the
   acceptance gap (a phase `off` over a global `always`, end to end) applied (`22822ca`..`e5db119`);
   finding 3 opened as MOD-59; finding 8 accepted (documented residue in `crates/htui/src/skills.rs`).
-  **Milestone 4 (import of skill files) is next.** Carry into it: the Skills view cannot open an editor
-  on a skill with no version (review finding 6, `library.rs` `on_skill_key`), which import is the
-  first writer able to produce; and a `glob` attachment still records `no_path` until row 5.
+  **Phase 4 landed (`09fd007`..`6af3f53`, 2026-09-29):** milestone 4, SKILL.md import, ported
+  from PR #10 (`4abb49a`..`bbac75c`) onto the milestone 3 above; #10's own milestone 3 was not taken.
+  A hand-written frontmatter reader (`model::frontmatter`, no YAML dependency, per-key issues with
+  byte and line, block scalars accepted) and ANA-22 §7.3's mapping (`model::skill_import`,
+  `prefill_from_source`); `StoreRequest::ImportSkills` / `StoreReply::SkillImports`
+  (`skills::REQUEST_NAMES` 5 → 6) walking a file or directory on the store worker
+  (`crate::skill_import`: any SKILL.md to depth 4, a rules directory's `*.md`/`*.mdc`, a hidden tool
+  root's rules child only, bundled `scripts/`/`references/`/`assets/` skipped and listed, 64-file
+  and 256 KiB caps asked before the read) and writing through `create_skill`, or through
+  `update_skill` for a moved description and `add_skill_version` for a changed body when the name
+  exists — never an attachment; the Skills
+  view's `I` path form and per-file report; the attachments pane prefilling a new attachment from
+  the head's `source`. Three review findings fixed in the port: a hidden tool root collected its own
+  markdown and skipped its rules files, a `<name>.instructions.md` or snake-case stem was refused,
+  and a name repeated in one import answered a spurious stale refusal. No migration, no
+  `WriteStore` method, no `.sqlx` file, no dependency. Plan
+  `.claude/plans/mod-9-skill-import.plan.md`, blueprint
+  `.claude/plans/mod-9-skill-import.blueprint.md`, each headed by the port's departures.
+  **Row 5 (glob attachments fire) is next, and is the last open part of MOD-9.** Carry into it: a
+  `glob` attachment still records `no_path`, and an imported file's globs prefill the form but
+  match nothing until row 5. Still open from milestone 3: the Skills view cannot open an editor on
+  a skill with no version (review finding 6, `library.rs` `on_skill_key`); import cannot produce
+  one (`create_skill` writes v1 with the row), so only a hand-written row can.
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
   pattern masks, fail-closed persistence gate, Settings tab secret provider section. **No longer
@@ -798,6 +831,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 39 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-61 run scrubber masks nothing; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 40 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-62 verify env passthrough, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-61 run scrubber masks nothing; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 0 |

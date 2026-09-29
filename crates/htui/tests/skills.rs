@@ -939,3 +939,468 @@ async fn the_strip_text_is_unchanged() {
         "{frame}"
     );
 }
+
+// --- the import surface (MOD-9 milestone 4, import plan D102) ----------------------------------
+
+/// A `SKILL.md` under `dir/<name>`, declaring `name`, returning its path.
+fn skill_file(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    let nested = dir.join(name);
+    std::fs::create_dir_all(&nested).expect("mkdir");
+    let path = nested.join("SKILL.md");
+    std::fs::write(
+        &path,
+        format!("---\nname: {name}\ndescription: The {name} skill.\n---\n{body}"),
+    )
+    .expect("write");
+    path
+}
+
+/// The head of the skill named `name`, straight from the store.
+async fn head(store: &MemStore, name: &str) -> Option<SkillVersion> {
+    versions(store, name).await.pop()
+}
+
+/// The skill named `name`, straight from the store.
+async fn skill_row(store: &MemStore, name: &str) -> Option<htui_core::model::Skill> {
+    store
+        .skills()
+        .await
+        .expect("the library read")
+        .into_iter()
+        .find(|skill| skill.name == name)
+}
+
+/// The path, `Enter`, and the reply, for a form a test has already opened. The form returns to
+/// Browse at once, so the library is on screen while the worker walks.
+async fn submit_path(harness: &mut Harness, path: &std::path::Path) {
+    type_text(harness, &path.display().to_string());
+    harness.key("enter");
+    harness.settle().await;
+}
+
+/// `I`, then the path and the reply. A report left open by an earlier import is closed first:
+/// `Esc` closes it and is a no-op in Browse, so the `I` reaches the browse map.
+async fn import(harness: &mut Harness, path: &std::path::Path) {
+    harness.key("esc");
+    harness.settle().await;
+    harness.key("I");
+    harness.settle().await;
+    submit_path(harness, path).await;
+}
+
+#[tokio::test]
+async fn capital_i_opens_a_path_form_and_enter_imports_the_path() {
+    let store = MemStore::demo();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = skill_file(dir.path(), "imported-skill", "# Imported\n");
+    let mut harness = open_over(store.clone()).await;
+    assert!(
+        hint(&harness.render()).contains("I import"),
+        "Browse names the key: {}",
+        hint(&harness.render())
+    );
+
+    harness.key("I");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains(" import skills "), "the form:\n{frame}");
+    assert_eq!(hint(&frame).trim(), "Enter import  Esc cancel");
+
+    submit_path(&mut harness, &path).await;
+
+    let head = head(&store, "imported-skill")
+        .await
+        .unwrap_or_else(|| panic!("the skill is in the library:\n{}", harness.render()));
+    assert_eq!(head.version, 1, "a new name starts at v1");
+    assert_eq!(head.body, "# Imported\n");
+    assert_eq!(
+        head.source["format"],
+        serde_json::json!("skill-md"),
+        "the import wrote its provenance: {}",
+        head.source
+    );
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("imported 1, updated 0, unchanged 0"),
+        "a clean import says its counts: {}",
+        notice(&frame)
+    );
+    assert!(
+        frame.contains("imported-skill"),
+        "and the library shows it:\n{frame}"
+    );
+}
+
+#[tokio::test]
+async fn esc_leaves_the_path_form_and_sends_nothing() {
+    let store = MemStore::demo();
+    let before = store.skills().await.expect("readable").len();
+    let mut harness = open_over(store.clone()).await;
+
+    harness.key("I");
+    type_text(&mut harness, "/nowhere/at/all");
+    harness.key("esc");
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(!frame.contains(" import skills "), "closed:\n{frame}");
+    assert!(hint(&frame).contains("I import"), "browsing: {frame}");
+    assert_eq!(
+        store.skills().await.expect("readable").len(),
+        before,
+        "`Esc` sent nothing"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_path_is_refused_before_anything_is_sent() {
+    let store = MemStore::demo();
+    let before = store.skills().await.expect("readable").len();
+    let mut harness = open_over(store.clone()).await;
+
+    harness.key("I");
+    harness.key("enter");
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(notice(&frame).contains("type a path"), "{}", notice(&frame));
+    assert!(frame.contains(" import skills "), "the form stays open");
+    assert_eq!(store.skills().await.expect("readable").len(), before);
+}
+
+#[tokio::test]
+async fn a_second_import_of_the_same_body_adds_no_version() {
+    let store = MemStore::demo();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = skill_file(dir.path(), "twice-skill", "# Same\n");
+    let mut harness = open_over(store.clone()).await;
+
+    import(&mut harness, &path).await;
+    import(&mut harness, &path).await;
+
+    assert_eq!(
+        versions(&store, "twice-skill").await.len(),
+        1,
+        "ANA-22 §6 item 12: an identical body appends nothing"
+    );
+    assert!(
+        notice(&harness.render()).contains("unchanged 1"),
+        "{}",
+        notice(&harness.render())
+    );
+}
+
+#[tokio::test]
+async fn a_changed_body_gets_a_new_version_and_the_description_moves() {
+    let store = MemStore::demo();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = skill_file(dir.path(), "revised-skill", "# One\n");
+    let mut harness = open_over(store.clone()).await;
+    import(&mut harness, &path).await;
+
+    std::fs::write(
+        &path,
+        "---\nname: revised-skill\ndescription: Revised.\n---\n# Two\n",
+    )
+    .expect("write");
+    import(&mut harness, &path).await;
+
+    let head = head(&store, "revised-skill").await.expect("present");
+    assert_eq!((head.version, head.body.as_str()), (2, "# Two\n"));
+    assert_eq!(
+        skill_row(&store, "revised-skill")
+            .await
+            .expect("present")
+            .description,
+        "Revised."
+    );
+    assert!(
+        notice(&harness.render()).contains("updated 1"),
+        "{}",
+        notice(&harness.render())
+    );
+}
+
+#[tokio::test]
+async fn a_refused_file_opens_the_report_and_the_rest_still_imports() {
+    let store = MemStore::demo();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    skill_file(dir.path(), "good-skill", "# Good\n");
+    let bad = dir.path().join("rules");
+    std::fs::create_dir_all(&bad).expect("mkdir");
+    std::fs::write(
+        bad.join("Bad Name.md"),
+        "---\nname: Bad Name\ndescription: d\n---\nB\n",
+    )
+    .expect("write");
+    let mut harness = open_over(store.clone()).await;
+
+    // The directory holds one good skill; its `rules/` child is not the root, so the bad file is
+    // not a candidate — importing the rules directory itself is what reaches it.
+    import(&mut harness, dir.path()).await;
+    assert!(head(&store, "good-skill").await.is_some(), "the good file");
+    import(&mut harness, &bad).await;
+
+    let frame = harness.render();
+    assert!(
+        hint(&frame).contains("Esc back"),
+        "a refusal opens the report: {frame}"
+    );
+    assert!(
+        frame.contains('!') && frame.contains("1-64 of a-z"),
+        "the writer's own sentence is in the report:\n{frame}"
+    );
+    harness.key("esc");
+    assert!(
+        hint(&harness.render()).contains("I import"),
+        "`Esc` goes back to Browse"
+    );
+}
+
+#[tokio::test]
+async fn a_missing_path_is_refused_in_one_sentence() {
+    let store = MemStore::demo();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut harness = open_over(store).await;
+
+    import(&mut harness, &dir.path().join("nope")).await;
+
+    let frame = harness.render();
+    assert!(hint(&frame).contains("Esc back"), "the report: {frame}");
+    assert!(
+        frame.contains("could not read"),
+        "in one sentence:\n{frame}"
+    );
+}
+
+/// A hidden tool root imports its rules child's files and none of its own markdown — the review
+/// finding against PR #10, end to end through the view.
+#[tokio::test]
+async fn a_tool_root_import_takes_the_rules_files_and_not_the_roots_markdown() {
+    let store = MemStore::demo();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let cursor = dir.path().join(".cursor");
+    std::fs::create_dir_all(cursor.join("rules")).expect("mkdir");
+    std::fs::write(
+        cursor.join("rules/api_style.mdc"),
+        "---\ndescription: API style\nglobs: src/api/**\nalwaysApply: false\n---\nKeep it REST.\n",
+    )
+    .expect("write");
+    std::fs::write(
+        cursor.join("stray.md"),
+        "---\ndescription: x\n---\nStray.\n",
+    )
+    .expect("write");
+    let mut harness = open_over(store.clone()).await;
+
+    import(&mut harness, &cursor).await;
+
+    assert!(
+        head(&store, "api-style").await.is_some(),
+        "`.cursor/rules/api_style.mdc` imported under its stem:\n{}",
+        harness.render()
+    );
+    assert!(
+        skill_row(&store, "stray").await.is_none(),
+        "`.cursor/stray.md` is not a rules file"
+    );
+    assert!(
+        notice(&harness.render()).contains("imported 1"),
+        "{}",
+        notice(&harness.render())
+    );
+}
+
+/// The report is the per-file record §9 asks for. The path is a fixed one that cannot exist, so
+/// the snapshot is stable: a temporary directory would put a random name in every run.
+#[tokio::test]
+async fn the_import_report_lists_every_outcome() {
+    let mut harness = open().await;
+
+    import(
+        &mut harness,
+        std::path::Path::new("/nonexistent/htui-import-report"),
+    )
+    .await;
+
+    let frame = harness.render();
+    assert!(frame.contains(" import report "), "{frame}");
+    assert!(frame.contains(">! "), "the refused file leads: {frame}");
+    assert_eq!(hint(&frame).trim(), "j/k move  r reload  Esc back");
+    insta::assert_snapshot!("import_report", frame);
+}
+
+// --- the prefill (import plan D96) -------------------------------------------------------------
+
+/// A `source` as the import writes it: the whole frontmatter, verbatim, under the same keys.
+fn imported_source(frontmatter: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "format": "skill-md",
+        "path": "/x/skills/rust-style/SKILL.md",
+        "imported_at": "2026-09-28T12:00:00+00:00",
+        "frontmatter": frontmatter,
+        "issues": [],
+    })
+}
+
+/// Appends `rust-style` v3 carrying `source`, straight into the store, as an import would.
+async fn import_rust_style_v3(store: &MemStore, frontmatter: serde_json::Value) {
+    let outcome = store
+        .add_skill_version(
+            ids::SKILL_RUST_STYLE,
+            2,
+            NewSkillVersion {
+                body: "# v3\n".to_owned(),
+                source: imported_source(frontmatter),
+                created_by: ids::USER,
+            },
+        )
+        .await
+        .expect("the direct write");
+    assert!(matches!(outcome, CasOutcome::Applied(ref row) if row.version == 3));
+}
+
+/// `rust-style` has no global attachment, so the pane's first row opens a new one.
+#[tokio::test]
+async fn a_new_attachment_is_prefilled_from_the_imported_source() {
+    let store = MemStore::demo();
+    import_rust_style_v3(
+        &store,
+        serde_json::json!({
+            "name": "rust-style",
+            "description": "House style.",
+            "globs": ["**/*.rs", "src/**/*.toml"],
+        }),
+    )
+    .await;
+    let mut harness = open_platform_over(store).await;
+    select(&mut harness, "rust-style");
+    harness.key("a");
+    harness.key("enter");
+
+    let frame = harness.render();
+    assert!(
+        frame.contains("attach rust-style \u{b7} global"),
+        "a new attachment: {frame}"
+    );
+    assert!(
+        frame.contains("activation  glob"),
+        "the file's activation: {frame}"
+    );
+    assert!(
+        frame.contains("globs       **/*.rs, src/**/*.toml"),
+        "both of the file's globs: {frame}"
+    );
+}
+
+/// Import plan D96: an existing attachment is never re-seeded. `htui`'s stored `always` row stays
+/// `always` with no globs, though the skill's head says `glob`.
+#[tokio::test]
+async fn an_existing_attachment_is_never_reseeded_from_a_source() {
+    let store = MemStore::demo();
+    import_rust_style_v3(
+        &store,
+        serde_json::json!({ "name": "rust-style", "globs": ["**/*.rs"] }),
+    )
+    .await;
+    let mut harness = open_platform_over(store).await;
+    select(&mut harness, "rust-style");
+    harness.key("a");
+    harness.key("j");
+    harness.key("enter");
+
+    let frame = harness.render();
+    assert!(
+        frame.contains("edit rust-style \u{b7} htui"),
+        "the stored row: {frame}"
+    );
+    assert!(frame.contains("activation  always"), "{frame}");
+    assert!(
+        line_with(&frame, "globs       ") == "globs",
+        "no glob seeded into a stored row: {frame}"
+    );
+}
+
+/// A skill typed in the TUI carries `source = {}` and prefills nothing, with no hint.
+#[tokio::test]
+async fn a_skill_with_no_source_prefills_nothing() {
+    let mut harness = open_platform_over(MemStore::demo()).await;
+    select(&mut harness, "tests");
+    harness.key("a");
+    harness.key("enter");
+
+    let frame = harness.render();
+    assert!(frame.contains("attach tests \u{b7} global"), "{frame}");
+    assert!(frame.contains("activation  always"), "{frame}");
+    assert!(line_with(&frame, "globs       ") == "globs", "{frame}");
+    assert!(
+        !notice(&frame).contains("prefills"),
+        "no hint: {}",
+        notice(&frame)
+    );
+}
+
+/// §7.3's last row: a file with a description and no activation rule prefills `always`, and the
+/// form says why beside it.
+#[tokio::test]
+async fn a_file_with_no_activation_rule_prefills_always_and_says_so() {
+    let store = MemStore::demo();
+    import_rust_style_v3(
+        &store,
+        serde_json::json!({ "name": "rust-style", "description": "House style." }),
+    )
+    .await;
+    let mut harness = open_platform_over(store).await;
+    select(&mut harness, "rust-style");
+    harness.key("a");
+    harness.key("enter");
+
+    let frame = harness.render();
+    assert!(frame.contains("activation  always"), "{frame}");
+    assert!(
+        notice(&frame).contains("names no activation rule; htui prefills `always`"),
+        "{}",
+        notice(&frame)
+    );
+}
+
+/// The prefill seeds the *fields*; what the save writes is still built from them, so the stored
+/// globs are the effective ones, the language's expansion included, and nothing else is written.
+#[tokio::test]
+async fn the_prefilled_fields_are_what_the_save_writes() {
+    let store = MemStore::demo();
+    import_rust_style_v3(
+        &store,
+        serde_json::json!({
+            "name": "rust-style",
+            "globs": "custom/**/*.rs",
+            "languages": ["rust"],
+        }),
+    )
+    .await;
+    let mut harness = open_platform_over(store.clone()).await;
+    select(&mut harness, "rust-style");
+    harness.key("a");
+    harness.key("enter");
+    harness.key("ctrl-s");
+    harness.settle().await;
+
+    let row = store
+        .skill_bindings(None)
+        .await
+        .expect("the global read")
+        .into_iter()
+        .find(|row| row.skill_id == ids::SKILL_RUST_STYLE)
+        .unwrap_or_else(|| panic!("the global row landed:\n{}", harness.render()));
+    assert_eq!(row.activation, Activation::Glob);
+    assert_eq!(row.languages, vec!["rust".to_owned()]);
+    assert_eq!(
+        row.globs,
+        vec![
+            "custom/**/*.rs".to_owned(),
+            "**/*.rs".to_owned(),
+            "**/Cargo.toml".to_owned()
+        ],
+        "typed first, then the language's globs"
+    );
+}
