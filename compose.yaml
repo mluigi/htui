@@ -20,8 +20,10 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: htui
       POSTGRES_DB: htui
+    # Loopback only (TOOL-7 review H2): published on 0.0.0.0, the dev database was reachable from
+    # every TOOL-7 sandbox through its bridge gateway, with the password in this very file.
     ports:
-      - "5439:5432"
+      - "127.0.0.1:5439:5432"
     # TOOL-5. Docker's default `/dev/shm` is 64 MiB, and Postgres puts parallel-query segments
     # there. The store suites mint a throwaway `htui_test_*` database each, so two overlapping
     # `cargo test --workspace` runs are easily 17 live databases with workers apiece — at which
@@ -54,8 +56,8 @@ services:
     container_name: htui-qdrant
     restart: unless-stopped
     ports:
-      - "6334:6334"
-      - "6333:6333"
+      - "127.0.0.1:6334:6334"
+      - "127.0.0.1:6333:6333"
     volumes:
       - htui-qdrant-data:/qdrant/storage
 
