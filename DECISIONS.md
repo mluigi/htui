@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-62](docs/decisions/mod/mod-62.md)** - A verify command keeps the process environment; no allowlist (decided, 2026-09-29)
 - **[MOD-32](docs/decisions/mod/mod-32.md)** - `trim_record`'s own strings reach the store unscrubbed (done, 2026-09-28)
 - **[MOD-58](docs/decisions/mod/mod-58.md)** - Two claim-time test gaps (done, 2026-09-28)
 - **[MOD-54](docs/decisions/mod/mod-54.md)** - Wide characters and graphemes in the text widgets (done, 2026-09-28)
