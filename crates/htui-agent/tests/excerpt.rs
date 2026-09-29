@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use htui_agent::excerpt::{
-    FsRepoReader, PassInput, SkipRule, excerpt_pass, excerpt_roots, excerpts_for, run_providers,
-    touched_prefixes,
+    FsRepoReader, GITIGNORE_MAX_BYTES, PassInput, SkipRule, excerpt_pass, excerpt_roots,
+    excerpts_for, run_providers, touched_prefixes,
 };
 use htui_core::model::{
     BoxId, Isolation, ProjectId, Repo, RepoBoxPath, RepoId, RunStepTree, StepId,
@@ -627,14 +627,17 @@ fn fs_reader_ignores_symlinked_gitignore_files() {
 #[test]
 fn fs_reader_bounds_gitignore_files_before_parsing() {
     let dir = tempfile::tempdir().expect("a throwaway root");
+    // The ignore cap is its own, so a small excerpt cap does not stop a `.gitignore` excluding.
     let reader = capped(32);
     for prefix in ["", "nested/"] {
         write(dir.path(), &format!("{prefix}keep.rs"), b"fn keep() {}\n");
     }
+    let max = usize::try_from(GITIGNORE_MAX_BYTES).expect("fits");
 
-    // At the cap the rules still apply; one byte over it rejects the entire file, including
-    // the complete rule at its beginning. Exercise both the root and recursive walk.
-    for size in [32, 33] {
+    // At the cap the rules apply. One byte over it the file is refused whole, never parsed from
+    // a prefix, and its subtree contributes nothing rather than everything: at the root that is
+    // the whole listing. Both the root and the recursive walk are exercised.
+    for size in [max, max + 1] {
         let mut rules = b"keep.rs\n#".to_vec();
         rules.resize(size, b'x');
         for prefix in ["", "nested/"] {
@@ -644,12 +647,35 @@ fn fs_reader_bounds_gitignore_files_before_parsing() {
             .list(&fs_root(dir.path()), 20_000)
             .expect("the root is readable");
         assert!(!truncated);
-        if size == 32 {
+        if size == max {
             assert_eq!(paths, vec![".gitignore", "nested/.gitignore"]);
         } else {
-            assert_eq!(paths, vec!["keep.rs", "nested/keep.rs"]);
+            assert!(
+                paths.is_empty(),
+                "an unreadable ignore file fails closed: {paths:?}"
+            );
         }
     }
+
+    // Only the refused directory drops out: a sibling still lists.
+    write(dir.path(), ".gitignore", b"");
+    write(dir.path(), "other/keep.rs", b"fn keep() {}\n");
+    let (paths, _) = reader
+        .list(&fs_root(dir.path()), 20_000)
+        .expect("the root is readable");
+    assert_eq!(paths, vec![".gitignore", "keep.rs", "other/keep.rs"]);
+}
+
+#[test]
+fn fs_reader_keeps_the_rules_of_a_gitignore_that_is_not_utf8() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "keep.rs", b"fn keep() {}\n");
+    write(dir.path(), "drop.rs", b"fn drop() {}\n");
+    write(dir.path(), ".gitignore", b"# caf\xe9\ndrop.rs\n");
+    let (paths, _) = FsRepoReader::default()
+        .list(&fs_root(dir.path()), 20_000)
+        .expect("the root is readable");
+    assert_eq!(paths, vec![".gitignore", "keep.rs"]);
 }
 
 #[cfg(unix)]

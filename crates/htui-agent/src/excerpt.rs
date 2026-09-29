@@ -255,8 +255,8 @@ impl FsRepoReader {
         names.sort_by(|a, b| a.as_encoded_bytes().cmp(b.as_encoded_bytes()));
 
         // The directory's own `.gitignore`, read once and scoped to this subtree.
-        let pushed = match read_gitignore(&dir.join(".gitignore"), self.caps.max_file_bytes) {
-            Some(text) => {
+        let pushed = match read_gitignore(&dir.join(".gitignore")) {
+            IgnoreFile::Rules(text) => {
                 let rules = GitignoreSubset::parse(&text);
                 let empty = rules.is_empty();
                 if !empty {
@@ -264,7 +264,10 @@ impl FsRepoReader {
                 }
                 !empty
             }
-            None => false,
+            IgnoreFile::Absent => false,
+            // Rules exist here but could not be read whole. Walking on without them would make
+            // everything they exclude eligible for a prompt, so the subtree contributes nothing.
+            IgnoreFile::Refused => return Ok(false),
         };
 
         let mut truncated = false;
@@ -477,21 +480,53 @@ fn open_regular(path: &Path) -> Option<(std::fs::File, std::fs::Metadata)> {
     Some((file, after))
 }
 
-/// Ignore files obey the same regular-file and byte limits as excerpt sources. Unreadable,
-/// invalid UTF-8 and oversized files contribute no rules; never parse a truncated prefix.
-fn read_gitignore(path: &Path, max_bytes: u64) -> Option<String> {
+/// The most a `.gitignore` is read up to. It is its own cap rather than
+/// [`ExcerptCaps::max_file_bytes`]: that one is a user setting about what is worth excerpting, and
+/// an ignore file over it must not silently stop excluding anything.
+pub const GITIGNORE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// What [`read_gitignore`] found at a directory's `.gitignore`.
+enum IgnoreFile {
+    /// No regular file there, or a symlink: no rules. Git itself does not follow a symlinked
+    /// `.gitignore` in the working tree, so neither does the walk.
+    Absent,
+    /// The whole file, lossily decoded so one bad byte does not drop every rule.
+    Rules(String),
+    /// A file is there but is not a regular file, is over [`GITIGNORE_MAX_BYTES`], or failed to
+    /// read. The walk fails closed on it.
+    Refused,
+}
+
+/// Reads a directory's `.gitignore` through [`open_regular`], bounded so a huge file or one
+/// that grows during the read is never parsed from a truncated prefix.
+fn read_gitignore(path: &Path) -> IgnoreFile {
     use std::io::Read as _;
 
-    let (file, meta) = open_regular(path)?;
-    if meta.len() > max_bytes {
-        return None;
+    let before = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return IgnoreFile::Absent,
+        Err(_) => return IgnoreFile::Refused,
+    };
+    if before.is_symlink() {
+        return IgnoreFile::Absent;
     }
-    let mut text = String::new();
+    let Some((file, meta)) = open_regular(path) else {
+        return IgnoreFile::Refused;
+    };
+    if meta.len() > GITIGNORE_MAX_BYTES {
+        return IgnoreFile::Refused;
+    }
+    let mut bytes = Vec::new();
     // Metadata can become stale while a file grows, so bound the read itself as well.
-    file.take(max_bytes.saturating_add(1))
-        .read_to_string(&mut text)
-        .ok()?;
-    (text.len() as u64 <= max_bytes).then_some(text)
+    if file
+        .take(GITIGNORE_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > GITIGNORE_MAX_BYTES
+    {
+        return IgnoreFile::Refused;
+    }
+    IgnoreFile::Rules(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Whether two [`std::fs::Metadata`] describe the same file, for [`open_regular`]'s re-check.
