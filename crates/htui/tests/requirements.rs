@@ -30,7 +30,11 @@ const STAMP_FILTER: (&str, &str) = (r"\d{2}-\d{2} \d{2}:\d{2}", "MM-DD hh:mm");
 
 /// The shell over `store` in the Platform workspace (`htui`, `agy`), on the Requirements tab.
 async fn open_platform_over(store: MemStore) -> Harness {
-    let mut harness = Harness::over(store);
+    open_platform_in(Harness::over(store)).await
+}
+
+/// `harness` moved to the Platform workspace, on the Requirements tab.
+async fn open_platform_in(mut harness: Harness) -> Harness {
     register_all(harness.app());
     harness.settle().await;
     harness.key("w");
@@ -145,6 +149,19 @@ async fn the_tab_shows_the_tree_and_r_ent_1_detail() {
         "v2 was amended by ANA-2: {frame}"
     );
     insta::assert_snapshot!("requirements_tree", frame);
+}
+
+/// The PRD metric "ANA-1's citation shows a suspect marker" on a standard 80x24 terminal: the
+/// detail pane is 42 columns there and draws without wrapping, so the marker must not be last.
+#[tokio::test]
+async fn the_suspect_marker_fits_an_80_column_terminal() {
+    let mut harness = open_platform_in(Harness::over(MemStore::demo()).size(80, 24)).await;
+    let frame = harness.render();
+    let row = frame
+        .lines()
+        .find(|line| line.contains("ANA-1  addresses"))
+        .unwrap_or_else(|| panic!("ANA-1's citation is drawn:\n{frame}"));
+    assert!(row.contains("! suspect"), "{frame}");
 }
 
 #[tokio::test]

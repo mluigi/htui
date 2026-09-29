@@ -32,8 +32,8 @@ const UNCLAIMED: &str = "no spec yet: the first write claims it";
 /// The widest citation kind (`addresses`, `withdraws`).
 const KIND_WIDTH: usize = 9;
 
-/// The widest resolution (`superseded`), and the `—` of none.
-const RESOLUTION_WIDTH: usize = 10;
+/// A citation stamped at a version the requirement has since moved past.
+const SUSPECT: &str = "! suspect";
 
 /// The widest revision reason the store writes (`withdrawn`).
 const REASON_WIDTH: usize = 9;
@@ -102,7 +102,12 @@ pub(super) fn lines(detail: &RequirementDetail, width: u16, theme: &Theme) -> Ve
     out
 }
 
-/// `ANA-1  addresses v1  done  —          ! suspect`, one line per citing item.
+/// `ANA-1  addresses v1  ! suspect  done  —`, one line per citing item.
+///
+/// The suspect marker comes straight after the stamp it judges (as the item's Reqs sub-tab puts
+/// it), not at the end of the row: the pane does not wrap, and at 80 columns it is 42 wide, so a
+/// last column would be cut first. Its column is there only when some row is suspect, and the
+/// resolution, last, is not padded.
 fn coverage(rows: &[CoverageRow], theme: &Theme) -> Vec<Line<'static>> {
     let key_width = rows
         .iter()
@@ -114,6 +119,7 @@ fn coverage(rows: &[CoverageRow], theme: &Theme) -> Vec<Line<'static>> {
         .map(|row| row.item.status.as_str().len())
         .max()
         .unwrap_or(0);
+    let any_suspect = rows.iter().any(|row| row.suspect);
     rows.iter()
         .map(|row| {
             let resolution = row.resolution.map_or_else(
@@ -130,17 +136,19 @@ fn coverage(rows: &[CoverageRow], theme: &Theme) -> Vec<Line<'static>> {
                     theme.base,
                 ),
                 Span::raw(" "),
-                Span::styled(
-                    padded(row.item.status.as_str(), status_width),
-                    theme.status_style(row.item.status),
-                ),
-                Span::raw("  "),
-                Span::styled(padded(&resolution, RESOLUTION_WIDTH), theme.dim),
             ];
             if row.suspect {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled("! suspect", theme.error));
+                spans.push(Span::styled(SUSPECT, theme.error));
+                spans.push(Span::raw("  "));
+            } else if any_suspect {
+                spans.push(Span::raw(padded("", SUSPECT.len() + 2)));
             }
+            spans.push(Span::styled(
+                padded(row.item.status.as_str(), status_width),
+                theme.status_style(row.item.status),
+            ));
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(resolution, theme.dim));
             Line::from(spans)
         })
         .collect()
@@ -254,8 +262,7 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("ANA-1"))
             .expect("ANA-1 cites R-ENT-1");
-        assert!(suspect.contains("addresses v1"), "{suspect}");
-        assert!(suspect.ends_with("! suspect"), "{suspect}");
+        assert!(suspect.contains("addresses v1  ! suspect"), "{suspect}");
         let amends = drawn
             .lines()
             .find(|line| line.starts_with("ANA-2"))
@@ -263,6 +270,38 @@ mod tests {
         assert!(!amends.contains("suspect"), "{amends}");
         assert!(drawn.contains("by ANA-2"), "{drawn}");
         assert!(!drawn.contains(REVISIONS_NEED_THE_DATABASE), "{drawn}");
+    }
+
+    /// The pane draws without wrapping, so a row is cut at its right edge. At 80x24 the detail
+    /// pane is 42 columns inside its border: the suspect marker must fit in them, whatever the
+    /// citing item's status (`awaiting_approval` is the widest).
+    #[tokio::test]
+    async fn the_suspect_marker_survives_an_80_column_terminal() {
+        use htui_core::model::Status;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::{Paragraph, Widget as _};
+
+        let theme = Theme::default();
+        let mut detail = r_ent_1().await;
+        for row in &mut detail.coverage {
+            row.item.status = Status::AwaitingApproval;
+        }
+        let area = Rect::new(0, 0, 42, 40);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(lines(&detail, area.width, &theme)).render(area, &mut buffer);
+        let drawn: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let suspect = drawn
+            .iter()
+            .find(|line| line.starts_with("ANA-1"))
+            .unwrap_or_else(|| panic!("ANA-1 is drawn: {drawn:#?}"));
+        assert!(suspect.contains("! suspect"), "{suspect}");
     }
 
     /// Blueprint F-14: the mirror holds no revisions, and the pane says so.

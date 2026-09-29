@@ -8,7 +8,7 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │▾ htui (3)                                 ││An item may carry a free-form priority.              │
 │  ▾ ENT Entity model (2)                   ││                                                     │
 │    R-ENT-1  must   Every item has a stabl…││later · withdrawn · v2                               │
-│    R-ENT-2  later  An item may carry a fr…││                                                     │
+│  ✕ R-ENT-2  later  An item may carry a fr…││                                                     │
 │  ▾ STO Storage (1)                        ││Coverage                                             │
 │    R-STO-1  must   Postgres is the source…││ANA-2  withdraws v2  open  —                         │
 │▾ agy (0)                                  ││                                                     │

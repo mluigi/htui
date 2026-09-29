@@ -11,8 +11,8 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │    R-ENT-2  later  An item may carry a fr…││must · active · v2                                   │
 │  ▾ STO Storage (1)                        ││                                                     │
 │    R-STO-1  must   Postgres is the source…││Coverage                                             │
-│▾ agy (0)                                  ││ANA-1  addresses v1  done  —          ! suspect      │
-│  no areas                                 ││ANA-2  amends    v2  open  —                         │
+│▾ agy (0)                                  ││ANA-1  addresses v1  ! suspect  done  —              │
+│  no areas                                 ││ANA-2  amends    v2             open  —              │
 │                                           ││                                                     │
 │                                           ││Revisions                                            │
 │                                           ││v1   created                09-03 10:00              │

@@ -12,8 +12,8 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │  ▾ STO Storage (1)                        ││must · active · v3                                   │
 │    R-STO-1  must   Postgres is the source…││                                                     │
 │▾ agy (0)                                  ││Coverage                                             │
-│  no areas                                 ││ANA-1  addresses v1  done  —          ! suspect      │
-│                                           ││ANA-2  amends    v3  open  —                         │
+│  no areas                                 ││ANA-1  addresses v1  ! suspect  done  —              │
+│                                           ││ANA-2  amends    v3             open  —              │
 │                                           ││                                                     │
 │                                           ││Revisions                                            │
 │                                           ││v1   created                MM-DD hh:mm              │

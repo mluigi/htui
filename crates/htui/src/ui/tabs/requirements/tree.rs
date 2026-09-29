@@ -26,6 +26,11 @@ const AREA_INDENT: usize = 2;
 /// How far a requirement row is indented under its area.
 const ROW_INDENT: usize = 4;
 
+/// Drawn in a withdrawn requirement's indent, under its area's fold marker: the state in a glyph,
+/// so a theme without colour still tells it from an active one (PRD scope: key, priority, state,
+/// first line of body). Costs no column.
+const WITHDRAWN_MARK: char = '\u{2715}';
+
 /// The priority column: `later` is the longer of the two.
 const PRIORITY_WIDTH: usize = 5;
 
@@ -248,7 +253,7 @@ pub(super) fn lines(
 }
 
 /// `    R-ENT-1  must   <first line of body>`: the key accented, the rest in
-/// [`requirement_style`]; every span dim when the requirement is withdrawn.
+/// [`requirement_style`]; a withdrawn requirement is `  ✕ R-ENT-2  …`, every span dim.
 fn requirement_line(
     requirement: &Requirement,
     key_width: usize,
@@ -256,13 +261,15 @@ fn requirement_line(
     theme: &Theme,
 ) -> Line<'static> {
     let style = requirement_style(requirement, theme);
-    let key_style = if requirement.state == RequirementState::Withdrawn {
-        theme.dim
+    let withdrawn = requirement.state == RequirementState::Withdrawn;
+    let key_style = if withdrawn { theme.dim } else { theme.accent };
+    let indent = if withdrawn {
+        format!("{}{WITHDRAWN_MARK} ", " ".repeat(AREA_INDENT))
     } else {
-        theme.accent
+        " ".repeat(ROW_INDENT)
     };
     Line::from(vec![
-        Span::styled(" ".repeat(ROW_INDENT), style),
+        Span::styled(indent, style),
         Span::styled(padded(&requirement.key, key_width), key_style),
         Span::styled(" ".repeat(GAP), style),
         Span::styled(padded(requirement.priority.as_str(), PRIORITY_WIDTH), style),
@@ -393,6 +400,11 @@ mod tests {
             .iter()
             .find(|line| text(line).contains("R-ENT-2"))
             .expect("a withdrawn requirement stays listed");
+        assert!(
+            text(withdrawn).starts_with("  \u{2715} R-ENT-2"),
+            "the state is marked without colour too: {}",
+            text(withdrawn)
+        );
         for span in withdrawn
             .spans
             .iter()
@@ -415,6 +427,11 @@ mod tests {
                 .filter(|span| !span.content.trim().is_empty())
                 .all(|span| span.style != theme.dim),
             "and nothing of an active row is dim"
+        );
+        assert!(
+            text(active).starts_with("    R-ENT-1"),
+            "nor marked: {}",
+            text(active)
         );
     }
 }

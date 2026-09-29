@@ -29,7 +29,7 @@ mod tree;
 use core::cell::Cell;
 
 use htui_core::model::{
-    ProjectId, RequirementArea, RequirementAreaId, RequirementId, RequirementState, Scope,
+    Priority, ProjectId, RequirementArea, RequirementAreaId, RequirementId, RequirementState, Scope,
 };
 use htui_core::store::{invalid_area_code, requirement_withdrawn};
 use htui_store::DATABASE_UNREACHABLE;
@@ -132,7 +132,8 @@ fn requirement_changed_elsewhere(head: i32) -> String {
 pub struct RequirementsTab {
     /// The last read, or `None` before the first reply.
     snapshot: Option<RequirementsSnapshot>,
-    /// `Some(message)` after a refused `READ_NAME`.
+    /// `Some(message)` after a refused `READ_NAME`, until the next good read. With no snapshot
+    /// the tree pane draws it; over a snapshot it is the notice and the tree stays drawn.
     unavailable: Option<String>,
     /// Folded headers.
     folded: Vec<Fold>,
@@ -199,12 +200,20 @@ enum Sent {
         /// The project's requirements when the mint went out.
         known: Vec<RequirementId>,
     },
-    /// `AmendRequirement`: the version moved past the token.
+    /// `AmendRequirement`: the version moved past the token and the row reads as sent. The
+    /// content, not the version alone: another session's amend moves the version too, and taken
+    /// for this one it would close the form over text that was never written.
     Amend {
         /// The requirement.
         id: RequirementId,
         /// The token sent.
         expected_version: i32,
+        /// The body sent.
+        body: String,
+        /// The rationale sent.
+        rationale: String,
+        /// The priority sent.
+        priority: Priority,
     },
     /// `WithdrawRequirement`: the requirement is withdrawn.
     Withdraw {
@@ -236,10 +245,16 @@ impl core::fmt::Debug for Sent {
             Self::Amend {
                 id,
                 expected_version,
+                body,
+                rationale,
+                priority,
             } => f
                 .debug_struct("Amend")
                 .field("id", id)
                 .field("expected_version", expected_version)
+                .field("body_len", &body.len())
+                .field("rationale_len", &rationale.len())
+                .field("priority", priority)
                 .finish(),
             Self::Withdraw { id } => f.debug_struct("Withdraw").field("id", id).finish(),
         }
@@ -626,14 +641,17 @@ impl RequirementsTab {
                                 scope,
                                 id: *id,
                                 expected_version: *expected_version,
-                                body: RequirementText::new(body),
-                                rationale,
+                                body: RequirementText::new(body.clone()),
+                                rationale: rationale.clone(),
                                 priority,
                                 deciding,
                             },
                             Sent::Amend {
                                 id: *id,
                                 expected_version: *expected_version,
+                                body,
+                                rationale: rationale.as_str().to_owned(),
+                                priority,
                             },
                         )
                     }
@@ -721,9 +739,17 @@ impl RequirementsTab {
             Sent::Amend {
                 id,
                 expected_version,
+                body,
+                rationale,
+                priority,
             } => snapshot
                 .requirement(*id)
-                .filter(|row| row.version > *expected_version)
+                .filter(|row| {
+                    row.version > *expected_version
+                        && row.body == *body
+                        && row.rationale == *rationale
+                        && row.priority == *priority
+                })
                 .map(|row| {
                     (
                         format!("amended {} to v{}", row.key, row.version),
@@ -775,8 +801,19 @@ impl RequirementsTab {
         }
     }
 
+    /// A good read after a refused one: the refusal goes, and so does its notice if nothing has
+    /// replaced it.
+    fn recovered(&mut self) {
+        if let Some(error) = self.unavailable.take()
+            && self.notice == Some(Notice::Error(error))
+        {
+            self.notice = None;
+        }
+    }
+
     /// A `RequirementsStale` over the write in flight: the form stays with its text, its token
-    /// moves to the head, and the notice says so.
+    /// moves to the head, and the notice says so. A head withdrawn elsewhere takes no retry, and
+    /// the notice says that instead.
     fn stale(&mut self) {
         if self.busy.take().is_none() {
             return;
@@ -790,14 +827,23 @@ impl RequirementsTab {
             Mode::Withdraw(form) => form.id(),
             _ => return,
         };
-        let Some(head) = self
+        let Some((head, state, key)) = self
             .snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.requirement(id))
-            .map(|row| row.version)
+            .map(|row| (row.version, row.state, row.key.clone()))
         else {
             return;
         };
+        if state == RequirementState::Withdrawn {
+            // Withdrawn elsewhere: no retry can land, so the form does not offer one. An amend
+            // keeps its text on screen until `Esc`; a withdraw has nothing left to do.
+            if matches!(self.mode, Mode::Withdraw(_)) {
+                self.mode = Mode::Browse;
+            }
+            self.notice = Some(Notice::Error(requirement_withdrawn(&key)));
+            return;
+        }
         match &mut self.mode {
             Mode::Requirement(RequirementForm {
                 target:
@@ -830,12 +876,14 @@ impl RequirementsTab {
         let message = |text: &str, style: Style| {
             Paragraph::new(Line::styled(text.to_owned(), style)).wrap(Wrap { trim: true })
         };
-        if let Some(error) = &self.unavailable {
-            frame.render_widget(message(error, ctx.theme.error), inner);
-            return;
-        }
         let Some(snapshot) = &self.snapshot else {
-            frame.render_widget(message(NOT_READ, ctx.theme.dim), inner);
+            let (text, style) = self
+                .unavailable
+                .as_ref()
+                .map_or((NOT_READ, ctx.theme.dim), |error| {
+                    (error.as_str(), ctx.theme.error)
+                });
+            frame.render_widget(message(text, style), inner);
             return;
         };
         let view = TreeView {
@@ -1026,7 +1074,7 @@ impl Tab for RequirementsTab {
                     return;
                 }
                 self.snapshot = Some((**snapshot).clone());
-                self.unavailable = None;
+                self.recovered();
                 if self.busy.is_some() && self.land(ctx) {
                     return;
                 }
@@ -1037,7 +1085,7 @@ impl Tab for RequirementsTab {
                     return;
                 }
                 self.snapshot = Some((**snapshot).clone());
-                self.unavailable = None;
+                self.recovered();
                 self.stale();
                 self.reselect(ctx);
             }
@@ -1048,6 +1096,10 @@ impl Tab for RequirementsTab {
                 }
             }
             StoreReply::Failed { request, message } if *request == READ_NAME => {
+                // A snapshot already held stays drawn, and the refusal is the notice.
+                if self.snapshot.is_some() {
+                    self.notice = Some(Notice::Error(message.clone()));
+                }
                 self.unavailable = Some(message.clone());
             }
             StoreReply::Failed { request, message } if *request == DETAIL_NAME => {
@@ -1100,18 +1152,20 @@ impl Tab for RequirementsTab {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, RequirementsTab, Row};
+    use super::{HINT_WRITES, Mode, Notice, RequirementsTab, Row};
     use crate::app::{Action, Ctx, Emit, Handled, TopBarState};
     use crate::keymap::Keymap;
-    use crate::requirements::{self, RequirementsSnapshot, not_the_maintainer};
-    use crate::store_worker::{Origin, StoreRequest};
+    use crate::requirements::{self, READ_NAME, RequirementsSnapshot, not_the_maintainer};
+    use crate::store_worker::{Origin, StoreReply, StoreRequest};
     use crate::ui::Theme;
     use crate::ui::tabs::registry::Tab as _;
     use crossterm::event::{KeyCode, KeyEvent};
     use htui_core::fixtures::ids;
-    use htui_core::model::{ProjectRef, Scope};
+    use htui_core::model::{ProjectRef, RequirementState, Scope};
     use htui_core::store::MemStore;
+    use htui_core::store::requirement_withdrawn;
     use htui_store::{Backend, DATABASE_UNREACHABLE};
+    use ratatui::style::Style;
 
     /// The demo's Platform snapshot, its projects (`htui`, `agy`) and its scope.
     pub(in crate::ui::tabs::requirements) async fn platform()
@@ -1163,8 +1217,8 @@ mod tests {
             }
         }
 
-        fn key(&self, tab: &mut RequirementsTab, code: KeyCode) -> Handled {
-            let mut ctx = Ctx::new(
+        fn ctx(&self) -> Ctx<'_> {
+            Ctx::new(
                 &self.scope,
                 &self.projects,
                 &self.top_bar,
@@ -1172,8 +1226,15 @@ mod tests {
                 &self.theme,
                 Origin::Tab(RequirementsTab::ID),
                 &self.emit,
-            );
-            tab.on_key(KeyEvent::from(code), &mut ctx)
+            )
+        }
+
+        fn key(&self, tab: &mut RequirementsTab, code: KeyCode) -> Handled {
+            tab.on_key(KeyEvent::from(code), &mut self.ctx())
+        }
+
+        fn reply(&self, tab: &mut RequirementsTab, reply: &StoreReply) {
+            tab.on_reply(reply, &mut self.ctx());
         }
 
         fn typed(&self, tab: &mut RequirementsTab, text: &str) {
@@ -1288,5 +1349,166 @@ mod tests {
         bench.key(&mut tab, KeyCode::Esc);
         assert!(!tab.captures_input(), "Esc closes the form");
         assert!(bench.emit.take().is_empty(), "and nothing was sent");
+    }
+
+    /// The style the Browse hint draws the four write words in.
+    fn write_words_style(tab: &RequirementsTab, theme: &Theme) -> Style {
+        tab.hint(theme)
+            .spans
+            .iter()
+            .find(|span| span.content == HINT_WRITES)
+            .expect("the hint names the write keys")
+            .style
+    }
+
+    /// PRD D1 "mirrored in the view as greyed keys": the write words are dim offline and on a
+    /// project this user does not own, and in the base style where a write would be sent.
+    #[tokio::test]
+    async fn the_hint_dims_the_write_words_where_a_write_is_refused() {
+        let (snapshot, _, _) = platform().await;
+        let theme = Theme::default();
+
+        let tab = tab_on(snapshot.clone());
+        assert_eq!(
+            write_words_style(&tab, &theme),
+            theme.base,
+            "the maintainer"
+        );
+
+        let mut offline = snapshot.clone();
+        offline.writable = false;
+        assert_eq!(
+            write_words_style(&tab_on(offline), &theme),
+            theme.dim,
+            "offline"
+        );
+
+        let mut stranger = snapshot;
+        for entry in &mut stranger.projects {
+            entry.maintainer = false;
+        }
+        assert_eq!(
+            write_words_style(&tab_on(stranger), &theme),
+            theme.dim,
+            "not the maintainer"
+        );
+    }
+
+    /// A refused re-read over a snapshot keeps the tree and says why in the notice; the next good
+    /// read takes the notice away.
+    #[tokio::test]
+    async fn a_refused_reread_keeps_the_tree() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot.clone());
+        let refused = StoreReply::Failed {
+            request: READ_NAME,
+            message: DATABASE_UNREACHABLE.to_owned(),
+        };
+        bench.reply(&mut tab, &refused);
+        assert!(tab.snapshot.is_some(), "the tree stays");
+        assert_eq!(
+            tab.notice,
+            Some(Notice::Error(DATABASE_UNREACHABLE.to_owned()))
+        );
+
+        bench.reply(&mut tab, &StoreReply::Requirements(Box::new(snapshot)));
+        assert_eq!(tab.notice, None, "a good read clears it");
+        assert_eq!(tab.unavailable, None);
+    }
+
+    /// Blueprint F-16 by content: a read showing another session's amend (the version moved, the
+    /// text is theirs) is not this amend landing. The form stays, and the stale answer that
+    /// follows moves its token.
+    #[tokio::test]
+    async fn another_sessions_amend_does_not_land_this_one() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot.clone());
+        bench.key(&mut tab, KeyCode::Char('e'));
+        bench.key(&mut tab, KeyCode::End);
+        bench.typed(&mut tab, " Mine.");
+        for _ in 0..3 {
+            bench.key(&mut tab, KeyCode::Tab);
+        }
+        bench.typed(&mut tab, "ANA-2");
+        bench.key(&mut tab, KeyCode::Enter);
+        assert!(tab.busy.is_some(), "the amend went out");
+        let sent = bench.emit.take();
+        assert!(
+            matches!(
+                requests(&sent).as_slice(),
+                [StoreRequest::AmendRequirement { .. }]
+            ),
+            "{sent:?}"
+        );
+
+        let mut theirs = snapshot;
+        for entry in &mut theirs.projects {
+            for row in &mut entry.requirements {
+                if row.id == ids::REQ_ENT_1 {
+                    row.version = 3;
+                    "Theirs.".clone_into(&mut row.body);
+                }
+            }
+        }
+        bench.reply(
+            &mut tab,
+            &StoreReply::Requirements(Box::new(theirs.clone())),
+        );
+        assert!(tab.busy.is_some(), "still in flight");
+        assert!(matches!(tab.mode, Mode::Requirement(_)), "the form stays");
+
+        bench.reply(&mut tab, &StoreReply::RequirementsStale(Box::new(theirs)));
+        assert!(tab.busy.is_none());
+        assert!(matches!(tab.mode, Mode::Requirement(_)), "with its text");
+        assert!(
+            matches!(&tab.notice, Some(Notice::Error(text)) if text.contains("now v3")),
+            "{:?}",
+            tab.notice
+        );
+    }
+
+    /// A stale answer whose head was withdrawn elsewhere offers no retry: it says the requirement
+    /// is withdrawn, and a withdraw form closes.
+    #[tokio::test]
+    async fn a_stale_answer_over_a_withdrawn_head_says_so() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot.clone());
+        bench.key(&mut tab, KeyCode::Char('W'));
+        bench.typed(&mut tab, "ANA-2");
+        bench.key(&mut tab, KeyCode::Enter);
+        bench.typed(&mut tab, "R-ENT-1");
+        bench.key(&mut tab, KeyCode::Enter);
+        assert!(tab.busy.is_some(), "the withdraw went out");
+        let sent = bench.emit.take();
+        assert!(
+            matches!(
+                requests(&sent).as_slice(),
+                [StoreRequest::WithdrawRequirement { .. }]
+            ),
+            "{sent:?}"
+        );
+
+        let mut withdrawn = snapshot;
+        for entry in &mut withdrawn.projects {
+            for row in &mut entry.requirements {
+                if row.id == ids::REQ_ENT_1 {
+                    row.version = 3;
+                    row.state = RequirementState::Withdrawn;
+                }
+            }
+        }
+        bench.reply(
+            &mut tab,
+            &StoreReply::RequirementsStale(Box::new(withdrawn)),
+        );
+        assert!(tab.busy.is_none());
+        assert!(matches!(tab.mode, Mode::Browse), "nothing left to retry");
+        assert_eq!(
+            tab.notice,
+            Some(Notice::Error(requirement_withdrawn("R-ENT-1")))
+        );
     }
 }

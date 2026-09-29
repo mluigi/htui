@@ -491,18 +491,18 @@ impl WithdrawForm {
     }
 
     /// Draws the form into the pane's inner `area`; `body` is the requirement's, as the snapshot
-    /// shows it.
+    /// shows it, one hard line at a time (a `Line` drops the `\n` of a `TextArea` body).
     pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, body: &str, theme: &Theme) {
         let width = area.width;
-        let mut lines = vec![
-            Line::styled(body.to_owned(), theme.base),
+        let mut lines = body_lines(body, theme);
+        lines.extend([
             Line::default(),
             Line::styled(
                 "A withdrawn requirement stays listed, dimmed, and takes no new citation.",
                 theme.dim,
             ),
             Line::default(),
-        ];
+        ]);
         match self {
             Self::Deciding { field, .. } => {
                 lines.push(field_line("deciding item", field, width, true, theme));
@@ -527,6 +527,13 @@ impl WithdrawForm {
         }
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
+}
+
+/// `body` as lines, one per hard line; the paragraph around them wraps each.
+fn body_lines(body: &str, theme: &Theme) -> Vec<Line<'static>> {
+    body.lines()
+        .map(|line| Line::styled(line.to_owned(), theme.base))
+        .collect()
 }
 
 /// `theme.accent` on the field with the keys, `theme.dim` otherwise.
@@ -559,4 +566,19 @@ fn padded(text: &str, width: usize) -> String {
         width.saturating_sub(text.chars().count()),
     ));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::body_lines;
+    use crate::ui::Theme;
+
+    /// A `TextArea` body keeps its line breaks on the withdraw form: `Line` would drop the `\n`
+    /// and run the lines together.
+    #[test]
+    fn a_multi_line_body_stays_on_its_lines() {
+        let lines = body_lines("First line.\nSecond line.", &Theme::default());
+        let text: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(text, vec!["First line.", "Second line."]);
+    }
 }
