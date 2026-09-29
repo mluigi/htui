@@ -1,8 +1,8 @@
 # Plan: MOD-9 milestone 5 — glob attachments fire
 
-**Status: DRAFTED and FACT-CHECKED 2026-09-29, awaiting the maintainer's confirmation of
-OQ-27..OQ-29.** Every decision below is written at the OQ's recommended default, so implementation is
-not blocked on a yes. Two independent verifiers (one over `htui-core`/`htui-store`, one over
+**Status: DRAFTED, FACT-CHECKED and CONFIRMED by the maintainer 2026-09-29, OQ-27..OQ-29 at their
+defaults** (OQ-27: `0008` comment migration, mirror refill accepted; OQ-28: finding 6 fixed here as
+T7; OQ-29: changed paths feed excerpt tier 2). Two independent verifiers (one over `htui-core`/`htui-store`, one over
 `htui-orch`/`htui-agent`/`htui` plus task independence) re-checked every claim against `7fa06e7`; their
 verdicts are in "Verified claims — fact-check" at the end. **Falsified as first drafted and corrected
 in place:** OQ-27's precedent (no earlier migration is comment-only) and its cost (any new migration
@@ -59,7 +59,7 @@ evidence.
 
 ## Open questions for the maintainer (read these first)
 
-- [ ] **OQ-27 — Record version and a comment migration.** Adding two reasons and a `path` key makes
+- [x] **OQ-27 — Record version and a comment migration.** Adding two reasons and a `path` key makes
       the column comment on `run_step.trim_record` false: `0007_skill_attachments.sql:43-50` states
       "`v 2` … reason always, off, no_path, missing_version or not_placed", and
       `crates/htui-store/tests/migrations.rs:214-223` pins that text verbatim as the contract.
@@ -77,14 +77,14 @@ evidence.
       **Alternative:** bump the record to `v: 3` in code but add no migration; the pinned column
       comment stays at `v 2`'s text until the next real migration restates it (T3 dropped, the
       migration pins unchanged, no mirror refill).
-- [ ] **OQ-28 — Milestone 3's review finding 6 (the Skills view cannot open an editor on a skill
+- [x] **OQ-28 — Milestone 3's review finding 6 (the Skills view cannot open an editor on a skill
       with no version).** MOD-9 closes with this row, so the finding either lands here or becomes a
       new item. The fix is UI-only: `WriteStore::add_skill_version` already takes `expected = 0` as
       "no version yet" (`crates/htui-core/src/store/traits.rs:852`), and only a hand-written row can
       reach the state (`create_skill` writes v1 with the row). **Default (D127): take it, as the
       independent task T7** (`library.rs` plus one Postgres test). **Alternative:** leave it and
       open a small MOD item at close-out with `/handoff-add`.
-- [ ] **OQ-29 — Feed the same changed paths to excerpt tier 2.** The list row 5 builds for skills is
+- [x] **OQ-29 — Feed the same changed paths to excerpt tier 2.** The list row 5 builds for skills is
       exactly ANA-5 §4.5's tier-2 input, which MOD-7 milestone 4 left empty only because no list
       existed (MOD-7 plan D122; `crates/htui-agent/src/excerpt.rs:1044-1045`, "the previous
       attempt's diff carries no repo-qualified path list"). **Default (D121): yes**, `PassInput`
