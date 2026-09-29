@@ -19,10 +19,10 @@ use htui_agent::fake::FakeAdapter;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::{demo_at, ids};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, DocumentId, ItemId, NewDocument, RunStep, SnapshotPhase,
-    Transport, WorkspaceSummary,
+    Agent, AgentBox, AgentId, Billing, DocumentId, ItemId, NewDocument, Resolution, RunStep,
+    SnapshotPhase, Status, Transport, WorkspaceSummary,
 };
-use htui_core::store::{MemStore, WriteStore as _};
+use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 use htui_orch::Clock;
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
 use htui_store::Backend;
@@ -483,6 +483,60 @@ async fn the_close_out_counts_then_asks_for_the_key() {
     );
     insta::assert_snapshot!("runs_closeout_typed", typed);
     assert_eq!(harness.app().status, None);
+}
+
+/// MOD-39 plan P13 through the whole tab: the engine's preview starts an `open` item's picker on
+/// `withdrawn`; `l`/`→` and `h`/`←`, which cycle the sub-tabs elsewhere, reach the Runs pane's
+/// picker while it captures input; and the key typed back closes the item with the resolution
+/// picked, not the default.
+#[tokio::test]
+async fn the_close_out_picker_takes_h_and_l_and_lands_the_pick() {
+    let adapter = FakeAdapter::new();
+    let store = MemStore::demo();
+    let mut harness = driving(store.clone(), &adapter).await;
+    for _ in 0..TO_ANA_2 {
+        harness.key("j");
+        harness.drive().await;
+    }
+    sub_tab(&mut harness, 1);
+    harness.key("C");
+    harness.drive().await;
+    let warn = harness.render();
+    assert!(
+        warn.contains("close ANA-2 as withdrawn"),
+        "an `open` item's picker starts on `withdrawn`:\n{warn}"
+    );
+
+    for (key, picked) in [
+        ("l", "superseded"),
+        ("right", "duplicate"),
+        ("h", "superseded"),
+        ("left", "withdrawn"),
+        ("left", "rejected"),
+    ] {
+        harness.key(key);
+        harness.drive().await;
+        let frame = harness.render();
+        assert!(
+            frame.contains(&format!("close ANA-2 as {picked}")),
+            "`{key}` picks `{picked}` and stays on the Runs pane:\n{frame}"
+        );
+    }
+
+    harness.key("y");
+    type_text(&mut harness, "ANA-2");
+    harness.key("enter");
+    harness.drive().await;
+    assert_eq!(harness.app().status, None, "the close-out was accepted");
+    let closed = store
+        .item(ids::HTUI_ANA_2)
+        .await
+        .expect("the memory store never fails")
+        .expect("the item exists");
+    assert_eq!(
+        (closed.status, closed.resolution),
+        (Status::Closed, Some(Resolution::Rejected))
+    );
 }
 
 /// D168, D182: a refused key shows the engine guard's own sentence and sends nothing: with no run
