@@ -1,6 +1,6 @@
 # Plan: MOD-64 — concepts search in the TUI
 
-**Status: DRAFT, awaiting CONFIRM.**
+**Status: CONFIRMED by the maintainer 2026-09-29 with OQ-1..OQ-4 defaults as written.**
 
 **Source**: `HANDOFF.md` MOD-64 (from MOD-50, 2026-09-29): a search overlay over the concepts index
 — free text, scoped to the selected project or all, a decisions toggle, hits listed as
@@ -30,14 +30,14 @@ listed in *Verified claims*.
 
 Each has a default this plan adopts, so implementation is not blocked.
 
-- [ ] **OQ-1 — Re-index from the TUI, or leave it to MOD-41?** (the item's own question).
+- [x] **OQ-1 — Re-index from the TUI, or leave it to MOD-41?** (the item's own question).
       **Default (D237): yes, `Ctrl+R` in the overlay** re-indexes the overlay's current project
       scope with `Indexer::sync` (the same call `htui --index-items` makes), off the UI thread,
       and reports the `SyncReport` counts inline. Reason: MOD-41 (headless worker) is not started,
       so without it a TUI-only user meets an empty index and a pointer to the command line.
       MOD-41 later makes the key mostly unnecessary but not wrong. **Alternative:** no key; the
       empty-result line says `run htui --index-items`.
-- [ ] **OQ-2 — What "all" and "the selected project" mean.** The shell has no selected project —
+- [x] **OQ-2 — What "all" and "the selected project" mean.** The shell has no selected project —
       only the workspace scope (`Scope` = one workspace + its projects, `model/scope.rs:10-15`) —
       and a `Hit` carries no project id, so a hit in another workspace could not be selected
       without switching the whole scope. **Default (D233):** "all" = every project of the current
@@ -45,12 +45,12 @@ Each has a default this plan adopts, so implementation is not blocked.
       the overlay's header line. The overlay opens on "all". **Alternative:** "all" spans every
       workspace, and `Enter` on a hit elsewhere switches the scope first (needs a `Hit` →
       workspace lookup the index does not carry).
-- [ ] **OQ-3 — Key that opens the overlay.** **Default (D236): global `Ctrl+F`.** It is unbound
+- [x] **OQ-3 — Key that opens the overlay.** **Default (D236): global `Ctrl+F`.** It is unbound
       everywhere in `crates/htui/src` today; `/` is the Requirements tab's own filter and `s` is
       the Runs pane's "select candidate", and a tab sees a key before the global table, so either
       of those would open search from some tabs and not others. **Alternative:** `/` globally,
       accepting that the Requirements tab keeps its filter on `/`.
-- [ ] **OQ-4 — Search on `Enter` or as you type.** **Default (D234): `Enter` searches** when the
+- [x] **OQ-4 — Search on `Enter` or as you type.** **Default (D234): `Enter` searches** when the
       query or a toggle changed since the last search; otherwise `Enter` opens the highlighted
       hit. The first search loads the embedding model (seconds; a first-ever run downloads it), so
       typing never triggers work by itself. **Alternative:** live search, debounced on the 250 ms
