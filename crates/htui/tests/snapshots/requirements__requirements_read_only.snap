@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/requirements.rs
+expression: frame
+---
+Platform · DESKTOP-HTUI · memory · 1 run
+ 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+┌ Requirements (3) ─────────────────────────┐┌ R-ENT-1 ────────────────────────────────────────────┐
+│▾ htui (3) · read-only                     ││Every item has a stable key of the form PREFIX-N.    │
+│  ▾ ENT Entity model (2)                   ││                                                     │
+│    R-ENT-1  must   Every item has a stabl…││rationale: Keys are what people type.                │
+│    R-ENT-2  later  An item may carry a fr…││must · active · v2                                   │
+│  ▾ STO Storage (1)                        ││                                                     │
+│    R-STO-1  must   Postgres is the source…││Coverage                                             │
+│▾ agy (0)                                  ││ANA-1  addresses v1  done  —          ! suspect      │
+│  no areas                                 ││ANA-2  amends    v2  open  —                         │
+│                                           ││                                                     │
+│                                           ││Revisions                                            │
+│                                           ││v1   created                09-03 10:00              │
+│                                           ││v2   amended   by ANA-2     09-05 10:00              │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+└───────────────────────────────────────────┘└─────────────────────────────────────────────────────┘
+
+ j/k move  Enter fold  / filter  a area  n new  e amend  W withdraw  r reload
+only the owner of htui's requirements can add areas or create, amend or withdraw requirements

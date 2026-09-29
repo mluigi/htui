@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/requirements.rs
+expression: frame
+---
+Platform · DESKTOP-HTUI · memory · 1 run
+ 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+┌ Requirements (3) ─────────────────────────┐┌ R-ENT-2 ────────────────────────────────────────────┐
+│▾ htui (3)                                 ││An item may carry a free-form priority.              │
+│  ▾ ENT Entity model (2)                   ││                                                     │
+│    R-ENT-1  must   Every item has a stabl…││later · withdrawn · v2                               │
+│    R-ENT-2  later  An item may carry a fr…││                                                     │
+│  ▾ STO Storage (1)                        ││Coverage                                             │
+│    R-STO-1  must   Postgres is the source…││ANA-2  withdraws v2  open  —                         │
+│▾ agy (0)                                  ││                                                     │
+│  no areas                                 ││Revisions                                            │
+│                                           ││v1   created                MM-DD hh:mm              │
+│                                           ││v2   withdrawn by ANA-2     MM-DD hh:mm              │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+│                                           ││                                                     │
+└───────────────────────────────────────────┘└─────────────────────────────────────────────────────┘
+ withdrew R-ENT-2
+ j/k move  Enter fold  / filter  a area  n new  e amend  W withdraw  r reload
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces
