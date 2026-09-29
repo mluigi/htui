@@ -1,6 +1,6 @@
 # Plan: MOD-50 — requirements and resolution in the concepts index
 
-> **Status: awaiting CONFIRM** (2026-09-29). Fact-check: 16 claims, 16 verified, 0 falsified;
+> **Status: confirmed** (2026-09-29), with the R-STO-8 amendment (D229) added by the maintainer. Fact-check: 16 claims, 16 verified, 0 falsified;
 > verdicts in "Verified claims" below.
 
 **Source**: `HANDOFF.md` MOD-50 (from MOD-34 and MOD-38; `docs/decisions/mod/mod-34.md` "Left to
@@ -80,6 +80,10 @@ lack the new field and the indexer's freshness check cannot tell.
 - **D228: `resolution` gets a keyword payload index,** added to `ensure_collection`'s loop, which
   re-runs on every connect and is idempotent (`vector.rs:387-411`).
 
+- **D229 (maintainer, 2026-09-29): `R-STO-8` is amended in place** to name requirement rows and
+  the decisions filter. The maintainer typed the ok ("yes include amend to r sto 8"). The status
+  header of `docs/REQUIREMENTS.md` gains the matching amendment line.
+
 ## Patterns to Mirror
 
 - `document_point_id` (`vector.rs:130-139`): the SHA-256 → v8 UUID derivation and its golden test.
@@ -99,6 +103,7 @@ lack the new field and the indexer's freshness check cannot tell.
 | `crates/htui/src/cli.rs` | `--decisions` help text (line 47) |
 | `crates/htui-store/tests/qdrant_live.rs` | live cases: the decisions filter, a requirement found by its exact key, a withdrawn requirement re-indexed |
 | `README.md` | the `--decisions` row (line 84) and the Search section: requirements are indexed |
+| `docs/REQUIREMENTS.md` | `R-STO-8` amended in place, plus the status header line (D229) |
 
 Close-out (after review): `HANDOFF.md` MOD-50 closed, `DECISIONS.md` index line,
 `docs/decisions/mod/mod-50.md`.

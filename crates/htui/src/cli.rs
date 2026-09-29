@@ -44,7 +44,8 @@ pub struct Args {
     #[arg(long, value_name = "SLUG", requires = "concepts")]
     pub project: Option<String>,
 
-    /// With `--search-items`: decisions only (done and closed items and their documents).
+    /// With `--search-items`: decisions only (items closed as done, concluded or rejected, and
+    /// their documents).
     #[arg(long, requires = "search_items", conflicts_with = "index_items")]
     pub decisions: bool,
 
