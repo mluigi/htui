@@ -356,10 +356,14 @@ impl WriteStore for Writer {
         }
     }
 
-    async fn upsert_agent(&self, agent: &Agent) -> Result<()> {
+    async fn upsert_agent(
+        &self,
+        agent: &Agent,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Agent>> {
         match self {
-            Self::Memory(store) => store.upsert_agent(agent).await,
-            Self::Online(pg) => pg.upsert_agent(agent).await,
+            Self::Memory(store) => store.upsert_agent(agent, expected).await,
+            Self::Online(pg) => pg.upsert_agent(agent, expected).await,
         }
     }
 

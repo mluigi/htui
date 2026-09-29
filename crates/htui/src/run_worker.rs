@@ -2427,7 +2427,7 @@ pub(crate) mod tests {
     use htui_agent::event::{DoneEvent, DriverEnvelope, DriverEvent, StopReason};
     use htui_agent::fake::FakeDriver;
     use htui_agent::registry::{DriverFactory, TransportBuilder};
-    use htui_core::fixtures::{demo_at, ids};
+    use htui_core::fixtures::{demo_at, edit_agent, ids};
     use htui_core::model::{
         Agent, AgentBox, AgentId, Billing, DocumentId, Item, ItemId, NewDocument, NewRepo, NewRun,
         RepoId, Resolution, Run, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId,
@@ -2496,11 +2496,11 @@ pub(crate) mod tests {
         for summary in store.agents().await.expect("the fixture's agents") {
             let mut row = summary.agent;
             row.enabled = false;
-            store.upsert_agent(&row).await.expect("the row is disabled");
+            edit_agent(&store, &row).await.expect("the row is disabled");
         }
         let agent = AgentId::new();
         store
-            .upsert_agent(&scripted_row(agent))
+            .upsert_agent(&scripted_row(agent), None)
             .await
             .expect("the scripted row lands");
         store

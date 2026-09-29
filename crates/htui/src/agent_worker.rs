@@ -3594,7 +3594,7 @@ pub(crate) mod tests {
         ToolKind,
     };
     use htui_agent::fake::FakeAdapter;
-    use htui_core::fixtures::ids;
+    use htui_core::fixtures::{edit_agent, ids};
     use htui_core::model::{Agent, AgentId, EventKind, EventRole, Scope, Transport};
     use htui_core::store::MemStore;
     use std::sync::Arc;
@@ -3969,7 +3969,7 @@ pub(crate) mod tests {
         let store = MemStore::from_demo(data);
         let agent_id = AgentId::new();
         store
-            .upsert_agent(&fake_row(agent_id))
+            .upsert_agent(&fake_row(agent_id), None)
             .await
             .expect("the fake row lands");
 
@@ -4979,7 +4979,7 @@ pub(crate) mod tests {
         let store = MemStore::demo();
         let agent_id = AgentId::new();
         store
-            .upsert_agent(&acp_fake_row(agent_id))
+            .upsert_agent(&acp_fake_row(agent_id), None)
             .await
             .expect("the acp row lands");
         let backend = Backend::memory(store.clone());
@@ -5040,7 +5040,7 @@ pub(crate) mod tests {
         let store = MemStore::demo();
         let agent_id = AgentId::new();
         store
-            .upsert_agent(&acp_fake_row(agent_id))
+            .upsert_agent(&acp_fake_row(agent_id), None)
             .await
             .expect("the acp row lands");
         let backend = Backend::memory(store.clone());
@@ -5086,7 +5086,7 @@ pub(crate) mod tests {
         let store = MemStore::demo();
         let agent_id = AgentId::new();
         store
-            .upsert_agent(&acp_fake_row(agent_id))
+            .upsert_agent(&acp_fake_row(agent_id), None)
             .await
             .expect("the acp row lands");
         let quota_at = Utc::now() - chrono::TimeDelta::hours(30);
@@ -5167,7 +5167,7 @@ pub(crate) mod tests {
         // reach the re-probe decision rather than be refused before it.
         let acp_agent = AgentId::new();
         store
-            .upsert_agent(&acp_fake_row(acp_agent))
+            .upsert_agent(&acp_fake_row(acp_agent), None)
             .await
             .expect("the acp row lands");
         store
@@ -5246,7 +5246,7 @@ pub(crate) mod tests {
         let store = MemStore::demo();
         let agent_id = AgentId::new();
         store
-            .upsert_agent(&unspawnable_row(agent_id))
+            .upsert_agent(&unspawnable_row(agent_id), None)
             .await
             .expect("the acp row lands");
         let fresh = probed_row(agent_id, Some(Utc::now()));
@@ -5359,7 +5359,10 @@ pub(crate) mod tests {
                 "handshake": true
             }
         });
-        store.upsert_agent(&agent).await.expect("the acp row lands");
+        store
+            .upsert_agent(&agent, None)
+            .await
+            .expect("the acp row lands");
         let fresh = probed_row(agent_id, Some(Utc::now()));
         store
             .upsert_agent_box(&fresh)
@@ -5419,7 +5422,7 @@ pub(crate) mod tests {
         let store = MemStore::demo();
         let agent_id = AgentId::new();
         store
-            .upsert_agent(&unspawnable_row(agent_id))
+            .upsert_agent(&unspawnable_row(agent_id), None)
             .await
             .expect("the acp row lands");
         store
@@ -5486,7 +5489,7 @@ pub(crate) mod tests {
                     "handshake": true
                 }
             });
-            store.upsert_agent(&agent).await.expect("the row updates");
+            edit_agent(store, &agent).await.expect("the row updates");
         }
     }
 
@@ -5694,7 +5697,7 @@ pub(crate) mod tests {
         let store = MemStore::demo();
         let agent_id = AgentId::new();
         store
-            .upsert_agent(&install_row(agent_id, "demo", true))
+            .upsert_agent(&install_row(agent_id, "demo", true), None)
             .await
             .expect("the row lands");
         let backend = Backend::memory(store);
@@ -5767,7 +5770,7 @@ pub(crate) mod tests {
         let store = unresolvable_registry().await;
         let agent_id = AgentId::new();
         store
-            .upsert_agent(&install_row(agent_id, "demo", true))
+            .upsert_agent(&install_row(agent_id, "demo", true), None)
             .await
             .expect("the row lands");
         let backend = Backend::memory(store);
@@ -5849,7 +5852,7 @@ pub(crate) mod tests {
         let store = MemStore::demo();
         let agent_id = AgentId::new();
         store
-            .upsert_agent(&install_row(agent_id, "undeclared", false))
+            .upsert_agent(&install_row(agent_id, "undeclared", false), None)
             .await
             .expect("the row lands");
         let backend = Backend::memory(store);
@@ -5897,7 +5900,7 @@ pub(crate) mod tests {
         let store = MemStore::demo();
         let agent_id = AgentId::new();
         store
-            .upsert_agent(&install_row(agent_id, "demo", true))
+            .upsert_agent(&install_row(agent_id, "demo", true), None)
             .await
             .expect("the row lands");
         let backend = Backend::memory(store.clone());
@@ -5994,7 +5997,7 @@ pub(crate) mod tests {
         let store = MemStore::demo();
         let agent_id = AgentId::new();
         store
-            .upsert_agent(&install_row(agent_id, "demo", true))
+            .upsert_agent(&install_row(agent_id, "demo", true), None)
             .await
             .expect("the row lands");
         let backend = Backend::memory(store.clone());
@@ -6088,7 +6091,7 @@ pub(crate) mod tests {
         let store = MemStore::demo();
         let agent_id = AgentId::new();
         store
-            .upsert_agent(&install_row(agent_id, "demo", true))
+            .upsert_agent(&install_row(agent_id, "demo", true), None)
             .await
             .expect("the row lands");
         let backend = Backend::memory(store);
@@ -6183,7 +6186,7 @@ pub(crate) mod tests {
                 "remembered": []
             }
         });
-        store.upsert_agent(&row).await.expect("the row lands");
+        store.upsert_agent(&row, None).await.expect("the row lands");
 
         let adapter = Arc::new(FakeAdapter::new());
         adapter.load(script);
@@ -6405,7 +6408,7 @@ done
             let store = MemStore::demo();
             let agent_id = AgentId::new();
             store
-                .upsert_agent(&login_row(agent_id, Transport::Acp, dir, extra))
+                .upsert_agent(&login_row(agent_id, Transport::Acp, dir, extra), None)
                 .await
                 .expect("the login row lands");
             store
@@ -6640,12 +6643,15 @@ done
             let store = MemStore::demo();
             let agent_id = AgentId::new();
             store
-                .upsert_agent(&login_row(
-                    agent_id,
-                    Transport::Cli,
-                    tmp.path(),
-                    &[("FIXTURE_KEY", "set")],
-                ))
+                .upsert_agent(
+                    &login_row(
+                        agent_id,
+                        Transport::Cli,
+                        tmp.path(),
+                        &[("FIXTURE_KEY", "set")],
+                    ),
+                    None,
+                )
                 .await
                 .expect("the row lands");
             store
@@ -6684,12 +6690,15 @@ done
             let store = MemStore::demo();
             let agent_id = AgentId::new();
             store
-                .upsert_agent(&login_row(
-                    agent_id,
-                    Transport::Acp,
-                    tmp.path(),
-                    &[("FIXTURE_KEY", "set")],
-                ))
+                .upsert_agent(
+                    &login_row(
+                        agent_id,
+                        Transport::Acp,
+                        tmp.path(),
+                        &[("FIXTURE_KEY", "set")],
+                    ),
+                    None,
+                )
                 .await
                 .expect("the row lands");
             store
@@ -6729,7 +6738,7 @@ done
             let (store, agent_id) = login_store(tmp.path(), &[("FIXTURE_KEY", "set")]).await;
             let install_id = AgentId::new();
             store
-                .upsert_agent(&install_row(install_id, "demo", true))
+                .upsert_agent(&install_row(install_id, "demo", true), None)
                 .await
                 .expect("the install row lands");
             let backend = Backend::memory(store);
@@ -6795,7 +6804,7 @@ done
                 login_store(tmp.path(), &[("FIXTURE_KEY", "set"), ("FIXTURE_HOLD", "1")]).await;
             let install_id = AgentId::new();
             store
-                .upsert_agent(&install_row(install_id, "demo", true))
+                .upsert_agent(&install_row(install_id, "demo", true), None)
                 .await
                 .expect("the install row lands");
             let backend = Backend::memory(store);
@@ -7979,7 +7988,10 @@ done
             settings: json!({}),
             ..fake_row(AgentId::new())
         };
-        store.upsert_agent(&agent).await.expect("the row lands");
+        store
+            .upsert_agent(&agent, None)
+            .await
+            .expect("the row lands");
         let backend = Backend::memory(store.clone());
         let mut runtime = box_runtime(tmp.path());
         let (tx, mut rx) = mpsc::unbounded_channel();

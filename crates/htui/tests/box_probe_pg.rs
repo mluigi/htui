@@ -43,8 +43,8 @@ use htui::store_worker::{Origin, ReplyEnvelope, StoreReply, StoreRequest, UNSOLI
 use htui_agent::box_probe::hardware::{FixedHardware, Hardware};
 use htui_agent::box_probe::spec::{SETTING_KEY, digest, seed};
 use htui_agent::probe::{ProbeEnv, ProbeSnapshot, ProbeStatus, platform_key};
+use htui_core::fixtures::edit_agent;
 use htui_core::model::{BoxEdit, BoxId, BoxRow, UserId};
-use htui_core::store::WriteStore as _;
 use htui_store::identity::Identity;
 use htui_store::{Backend, CacheStore, HTUI_VERSION, PgStore, Registration, testkit};
 use serde_json::{Value, json};
@@ -138,7 +138,7 @@ async fn make_unresolvable(store: &PgStore) {
                 "handshake": true
             }
         });
-        store.upsert_agent(&agent).await.expect("the row updates");
+        edit_agent(store, &agent).await.expect("the row updates");
     }
 }
 

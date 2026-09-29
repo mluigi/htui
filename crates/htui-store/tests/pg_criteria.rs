@@ -1173,12 +1173,11 @@ async fn set_step_prompt_writes_only_the_digest_and_the_record() {
 
 /// `PgStore::upsert_agent` read back through the inherent `agents()` (MOD-2 plan D3): a second
 /// write of the same `agent.id` updates the row **in place** - one row, the new column values - and
-/// `created_at` survives it, because the insert supplies it and the `DO UPDATE SET` list does not
+/// `created_at` survives it, because the insert supplies it and the edit's `SET` list does not
 /// (§5.7). `updated_at` is the migration's `BEFORE UPDATE` trigger's, not the caller's.
 ///
-/// `store::conformance`'s `upsert_agent_by_id_name_unique` can only assert that the second write is
-/// *accepted*: `upsert_agent` is a [`htui_core::store::WriteStore`] method while the registry read
-/// is inherent, so no conformance case can read the row back. This is that read-back.
+/// `store::conformance`'s `upsert_agent_by_id_name_unique` reads the row back from the outcome
+/// (MOD-40 plan D5); this is the registry read-back, a second reader of the same row.
 #[tokio::test(flavor = "multi_thread")]
 async fn upsert_agent_updates_in_place_and_keeps_created_at() {
     let Some(db) = common::demo_db().await else {
@@ -1201,10 +1200,18 @@ async fn upsert_agent_updates_in_place_and_keeps_created_at() {
         created_at: created,
         updated_at: created,
     };
-    db.store
-        .upsert_agent(&inserted)
+    match db
+        .store
+        .upsert_agent(&inserted, None)
         .await
-        .expect("the insert must land");
+        .expect("the insert must land")
+    {
+        CasOutcome::Applied(row) => assert_eq!(
+            row, inserted,
+            "the create answers the row as stored, which is the row given: the literal is µs"
+        ),
+        stale @ CasOutcome::Stale(_) => panic!("a fresh id cannot be Stale, got {stale:?}"),
+    }
     assert_eq!(
         agent_row(&db.store, id).await,
         inserted,
@@ -1234,16 +1241,21 @@ async fn upsert_agent_updates_in_place_and_keeps_created_at() {
         updated_at: far_future,
         ..inserted.clone()
     };
-    db.store
-        .upsert_agent(&updated)
+    let edited = db
+        .store
+        .upsert_agent(&updated, Some(inserted.updated_at))
         .await
         .expect("the update must land");
+    assert!(
+        matches!(edited, CasOutcome::Applied(_)),
+        "the insert's own stamp is the current token, got {edited:?}"
+    );
 
     let registry = db.store.agents().await.expect("agents must not fail");
     assert_eq!(
         registry.iter().filter(|row| row.agent.id == id).count(),
         1,
-        "the second write updated the row in place: `ON CONFLICT (id)`, no second row"
+        "the second write updated the row in place: an `UPDATE` by id, no second row"
     );
     assert_eq!(
         registry.len(),
@@ -1266,8 +1278,8 @@ async fn upsert_agent_updates_in_place_and_keeps_created_at() {
             updated_at: after.agent.updated_at,
             ..updated.clone()
         },
-        "every column in the `DO UPDATE SET` list took the second write's value, and `created_at` \
-         is still the insert's"
+        "every column in the edit's `SET` list took the second write's value, and `created_at` is \
+         still the insert's"
     );
     assert_ne!(
         after.agent.created_at, far_future,

@@ -1083,7 +1083,11 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::Constraint`] when another id already holds the name (`23505` on
     /// `agent_name_key`).
-    async fn upsert_agent(&self, agent: &Agent) -> Result<()> {
+    async fn upsert_agent(
+        &self,
+        agent: &Agent,
+        _expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Agent>> {
         sqlx::query!(
             "INSERT INTO agent (id, name, transport, launch, models, default_model, billing, \
                                 enabled, settings, created_at, updated_at) \
@@ -1112,7 +1116,8 @@ impl WriteStore for PgStore {
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?;
-        Ok(())
+        let stored = self.stored_agent(agent.id).await?;
+        cas_miss(stored, "agent", agent.id).map(|outcome| CasOutcome::Applied(outcome.into_inner()))
     }
 
     /// Inserts or updates one `agent_box` row on its composite primary key (`docs/ANA-4.md` §4.1,
@@ -5782,6 +5787,35 @@ fn concurrent_write(entity: &str, id: impl core::fmt::Display, what: &str) -> St
 }
 
 impl PgStore {
+    /// One `agent` row by id, for [`WriteStore::upsert_agent`]'s miss (MOD-40 blueprint B12).
+    ///
+    /// `agents()` is the registry joined to this box and answers every row; the compare-and-set
+    /// needs exactly the one it missed, as stored now.
+    async fn stored_agent(&self, id: AgentId) -> Result<Option<Agent>> {
+        sqlx::query_as!(
+            Agent,
+            r#"
+            SELECT id            AS "id: AgentId",
+                   name,
+                   transport     AS "transport: htui_core::model::Transport",
+                   launch,
+                   models,
+                   default_model,
+                   billing       AS "billing: htui_core::model::Billing",
+                   enabled,
+                   settings,
+                   created_at,
+                   updated_at
+              FROM agent
+             WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
     /// One attempt of [`WriteStore::delete_workspace`]'s count-and-delete; `Ok(None)` is the
     /// `40001` the caller retries (review M1).
     async fn delete_workspace_once(&self, id: WorkspaceId) -> Result<Option<DeleteReach>> {

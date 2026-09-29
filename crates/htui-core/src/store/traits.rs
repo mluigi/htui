@@ -321,16 +321,38 @@ pub trait WriteStore: ReadStore {
         prompt_digest: Option<String>,
     ) -> Result<()>;
 
-    /// Inserts or updates one `agent` row, keyed by `agent.id` (`docs/ANA-4.md` §4.1, §5.7).
+    /// Creates or edits one `agent` row, keyed by `agent.id` (`docs/ANA-4.md` §4.1, §5.7), as a
+    /// compare-and-set on `agent.updated_at` (MOD-40 plan D5, `docs/ANA-16.md` C6) — the
+    /// [`set_setting`](WriteStore::set_setting) `App` rung's shape.
     ///
-    /// `agent.created_at` is written on the insert and never rewritten; `updated_at` belongs to
-    /// the migration's `BEFORE UPDATE` trigger.
+    /// `expected: None` is "I expect no row": every column is inserted as given, `created_at` and
+    /// `updated_at` included (the migration's trigger is `BEFORE UPDATE` only). An id that is
+    /// already stored is [`CasOutcome::Stale`] with the stored row, and nothing is written — so
+    /// an agent seeded or created by another process is never overwritten by a create.
+    ///
+    /// `Some(t)` is the `updated_at` of the row the caller read and edited. Every column but the
+    /// two stamps is written where the stored `updated_at` is still `t`; `created_at` is never
+    /// rewritten and `updated_at` becomes the store's clock. A token that no longer matches is
+    /// `Stale` with the row as it is now, and nothing is written.
+    ///
+    /// `Applied` carries the row as stored; its `updated_at` is the next token. Take tokens from
+    /// a row the store answered (this outcome, or a registry read), never from a struct the caller
+    /// built: Postgres keeps microseconds (MOD-40 blueprint F-17).
+    ///
+    /// Order, the same on every store: the id and the token first (`Stale`, `NotFound`), then the
+    /// name, then the write. A stale edit is `Stale` even when it would also take another agent's
+    /// name.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when another id already
-    /// holds the name (`agent.name` is `UNIQUE`).
-    async fn upsert_agent(&self, agent: &Agent) -> Result<()>;
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) with `entity: "agent"` for
+    /// `Some(_)` on an id no row has; [`StoreError::Constraint`](crate::store::StoreError::Constraint)
+    /// when the write would give this id a name another id holds (`agent.name` is `UNIQUE`).
+    async fn upsert_agent(
+        &self,
+        agent: &Agent,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Agent>>;
 
     /// Inserts or updates one `agent_box` row, keyed by `(agent_id, box_id)` (`docs/ANA-4.md`
     /// §4.1, §5.7).

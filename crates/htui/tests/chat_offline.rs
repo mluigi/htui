@@ -42,6 +42,7 @@ use htui_agent::event::{
 };
 use htui_agent::fake::FakeAdapter;
 use htui_agent::registry::DriverFactory;
+use htui_core::fixtures::edit_agent;
 use htui_core::model::{Agent, AgentBox, AgentId, Billing, Transport};
 use htui_core::store::{MemStore, WriteStore as _};
 use htui_store::{Backend, CacheStore, PgStore, testkit};
@@ -233,10 +234,10 @@ async fn an_online_chat_header_says_nothing_about_a_buffer() {
     for summary in store.agents().await.expect("the fixture's agents") {
         let mut row = summary.agent;
         row.enabled = false;
-        store.upsert_agent(&row).await.expect("the row is disabled");
+        edit_agent(&store, &row).await.expect("the row is disabled");
     }
     store
-        .upsert_agent(&scripted_row(agent_id))
+        .upsert_agent(&scripted_row(agent_id), None)
         .await
         .expect("the scripted row lands");
 

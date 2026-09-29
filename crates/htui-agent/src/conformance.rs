@@ -747,8 +747,12 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
             });
         Ok(())
     }
-    async fn upsert_agent(&self, agent: &Agent) -> StoreResult<()> {
-        self.inner.upsert_agent(agent).await
+    async fn upsert_agent(
+        &self,
+        agent: &Agent,
+        expected: Option<DateTime<Utc>>,
+    ) -> StoreResult<CasOutcome<Agent>> {
+        self.inner.upsert_agent(agent, expected).await
     }
     async fn upsert_agent_box(&self, row: &AgentBox) -> StoreResult<()> {
         self.inner.upsert_agent_box(row).await

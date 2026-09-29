@@ -10,7 +10,8 @@
 use htui::agent_worker::AgentRuntime;
 use htui::testkit::Harness;
 use htui::ui::tabs::settings::{AgentsSection, SettingsTab};
-use htui_core::store::{MemStore, WriteStore};
+use htui_core::fixtures::edit_agent;
+use htui_core::store::MemStore;
 use serde_json::json;
 
 /// The demo registry with every row's launch rewritten to resolve nowhere (H-7).
@@ -29,7 +30,7 @@ async fn unresolvable_registry() -> MemStore {
                 "handshake": true
             }
         });
-        store.upsert_agent(&agent).await.expect("the row updates");
+        edit_agent(&store, &agent).await.expect("the row updates");
     }
     store
 }

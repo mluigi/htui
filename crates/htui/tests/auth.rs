@@ -261,7 +261,7 @@ impl Rig {
         let store = MemStore::demo();
         let agent_id = AgentId::new();
         store
-            .upsert_agent(&login_row(agent_id, tmp.path(), extra))
+            .upsert_agent(&login_row(agent_id, tmp.path(), extra), None)
             .await
             .expect("the login row lands");
         store

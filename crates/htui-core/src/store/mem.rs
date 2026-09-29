@@ -1540,7 +1540,12 @@ impl State {
     ///
     /// `created_at` is the stored row's on an update, never the caller's, and `updated_at` is the
     /// clock: that is what Postgres's `BEFORE UPDATE` trigger does, written out.
-    fn upsert_agent(&mut self, agent: &Agent, now: DateTime<Utc>) -> Result<()> {
+    fn upsert_agent(
+        &mut self,
+        agent: &Agent,
+        _expected: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Agent>> {
         if self
             .agents
             .values()
@@ -1562,7 +1567,7 @@ impl State {
                 self.agents.insert(agent.id, agent.clone());
             }
         }
-        Ok(())
+        Ok(CasOutcome::Applied(self.agents[&agent.id].clone()))
     }
 
     /// Insert-or-update on the composite primary key `(agent_id, box_id)`, both referents required
@@ -5628,9 +5633,13 @@ impl WriteStore for MemStore {
         self.write(|state| state.set_step_usage(fence, step, usage, prompt_digest, now))
     }
 
-    async fn upsert_agent(&self, agent: &Agent) -> Result<()> {
+    async fn upsert_agent(
+        &self,
+        agent: &Agent,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Agent>> {
         let now = Utc::now();
-        self.write(|state| state.upsert_agent(agent, now))
+        self.write(|state| state.upsert_agent(agent, expected, now))
     }
 
     async fn upsert_agent_box(&self, row: &AgentBox) -> Result<()> {

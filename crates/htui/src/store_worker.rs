@@ -2817,7 +2817,7 @@ mod tests {
         let store = MemStore::demo();
         let agent_id = AgentId::new();
         let agent = crate::agent_worker::tests::install_row(agent_id, "demo", true);
-        htui_core::store::WriteStore::upsert_agent(&store, &agent)
+        htui_core::store::WriteStore::upsert_agent(&store, &agent, None)
             .await
             .expect("the row lands");
         let tmp = tempfile::tempdir().expect("a temporary install root");

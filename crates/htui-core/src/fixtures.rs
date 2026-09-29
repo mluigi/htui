@@ -10,6 +10,9 @@
 //! projects and thirteen items covering all eight `Status` values. MOD-38 adds `htui`'s
 //! requirement set (ANA-11 §5): a spec header, two areas, three requirements and five citations,
 //! one of them suspect and one a tombstone.
+//!
+//! One async helper sits here too, [`edit_agent`], for tests that edit a fixture row (MOD-40 plan
+//! D5); it is the only item in this module that touches a store.
 
 use std::collections::HashMap;
 
@@ -29,6 +32,7 @@ use crate::model::{
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::seed;
+use crate::store::{CasOutcome, Result as StoreResult, WriteStore};
 
 /// Milliseconds of `2026-09-03T00:00:00Z`, the timestamp field of every [`demo_uuid`].
 pub const DEMO_EPOCH_MS: u64 = 1_788_393_600_000;
@@ -1995,6 +1999,33 @@ fn item_requirements() -> Vec<ItemRequirement> {
             }
         })
         .collect()
+}
+
+/// Writes `edited` over the stored `agent` row it was read from, passing the `updated_at` it was
+/// read with as the compare-and-set token (MOD-40 plan D5, blueprint B13), and answers the row
+/// as stored.
+///
+/// For tests that read a registry row (`agents()`), change some columns and write it back — the
+/// "disable every fixture agent" and "make every row unresolvable" set-ups. The token is the one
+/// the row carries, so `edited` must come from a store read, not be built by hand.
+///
+/// # Errors
+///
+/// Whatever [`WriteStore::upsert_agent`] refuses with: `NotFound` for an id with no row,
+/// `Constraint` for a name another id holds.
+///
+/// # Panics
+///
+/// When the token is spent (`Stale`): something wrote the row between the test's read and this
+/// write, which in a test is a bug in the test. The message names the row and what is stored.
+pub async fn edit_agent<S: WriteStore + ?Sized>(store: &S, edited: &Agent) -> StoreResult<Agent> {
+    match store.upsert_agent(edited, Some(edited.updated_at)).await? {
+        CasOutcome::Applied(row) => Ok(row),
+        CasOutcome::Stale(stored) => panic!(
+            "agent `{}` ({}) changed since it was read; stored now: {stored:?}",
+            edited.name, edited.id
+        ),
+    }
 }
 
 #[cfg(test)]

@@ -134,6 +134,9 @@ pub const CASES: &[&str] = &[
     "an_older_quota_is_a_no_op",
     "an_equal_quota_at_rewrites_idempotently",
     "a_missing_agent_box_is_not_found",
+    "upsert_agent_with_none_inserts_and_is_stale_when_present",
+    "upsert_agent_with_a_spent_token_is_stale_and_writes_nothing",
+    "upsert_agent_with_the_current_token_applies",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -315,6 +318,15 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
             an_equal_quota_at_rewrites_idempotently(store).await
         }
         "a_missing_agent_box_is_not_found" => a_missing_agent_box_is_not_found(store).await,
+        "upsert_agent_with_none_inserts_and_is_stale_when_present" => {
+            upsert_agent_with_none_inserts_and_is_stale_when_present(store).await
+        }
+        "upsert_agent_with_a_spent_token_is_stale_and_writes_nothing" => {
+            upsert_agent_with_a_spent_token_is_stale_and_writes_nothing(store).await
+        }
+        "upsert_agent_with_the_current_token_applies" => {
+            upsert_agent_with_the_current_token_applies(store).await
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -1552,25 +1564,40 @@ async fn start_chat_run_mints_chat_rows<S: WriteStore>(store: &S) {
 /// `upsert_agent` keys on `agent.id` and keeps `agent.name` unique (§5.7 `name TEXT NOT NULL
 /// UNIQUE`): a second write of the same id is an update, a second id under a taken name is refused.
 ///
-/// The registry read is inherent, not a [`WriteStore`] or `ReadStore` method (MOD-2 plan D3), so
-/// this case can assert only that the second write is *accepted*. That the row was updated **in
-/// place** and kept its `created_at` is read back per backend, by
-/// `pg_criteria.rs::upsert_agent_updates_in_place_and_keeps_created_at`.
+/// Since MOD-40 plan D5 the write answers the row it stored, so the update-in-place and the kept
+/// `created_at` are asserted here; `pg_criteria.rs::upsert_agent_updates_in_place_and_keeps_created_at`
+/// keeps the registry read-back as a second reader.
 async fn upsert_agent_by_id_name_unique<S: WriteStore>(store: &S) {
+    const CASE: &str = "upsert_agent_by_id_name_unique";
     let id = AgentId::new();
-    store
-        .upsert_agent(&test_agent(id, "tester", "small"))
-        .await
-        .expect("upsert_agent_by_id_name_unique: the insert must land");
+    let first = applied(
+        CASE,
+        store
+            .upsert_agent(&test_agent(id, "tester", "small"), None)
+            .await
+            .expect("upsert_agent_by_id_name_unique: the insert must land"),
+    );
 
     // Same id, different columns: an update in place, not a duplicate-key refusal.
-    store
-        .upsert_agent(&test_agent(id, "tester", "large"))
-        .await
-        .expect("upsert_agent_by_id_name_unique: the update must land");
+    let second = applied(
+        CASE,
+        store
+            .upsert_agent(&test_agent(id, "tester", "large"), Some(first.updated_at))
+            .await
+            .expect("upsert_agent_by_id_name_unique: the update must land"),
+    );
+    assert_eq!(
+        second.models,
+        ["large"],
+        "{CASE}: the second write updated the row in place"
+    );
+    assert_eq!(
+        second.created_at, first.created_at,
+        "{CASE}: and kept the creation stamp the insert wrote"
+    );
 
     let stolen = store
-        .upsert_agent(&test_agent(AgentId::new(), "tester", "small"))
+        .upsert_agent(&test_agent(AgentId::new(), "tester", "small"), None)
         .await;
     assert!(
         matches!(stolen, Err(StoreError::Constraint(_))),
@@ -1578,7 +1605,7 @@ async fn upsert_agent_by_id_name_unique<S: WriteStore>(store: &S) {
     );
 
     let seeded = store
-        .upsert_agent(&test_agent(AgentId::new(), "claude", "small"))
+        .upsert_agent(&test_agent(AgentId::new(), "claude", "small"), None)
         .await;
     assert!(
         matches!(seeded, Err(StoreError::Constraint(_))),
@@ -1586,10 +1613,16 @@ async fn upsert_agent_by_id_name_unique<S: WriteStore>(store: &S) {
     );
 
     // The refused writes left the row that did land alone: it still answers to its own id.
-    store
-        .upsert_agent(&test_agent(id, "tester", "largest"))
-        .await
-        .expect("upsert_agent_by_id_name_unique: the row is still updatable by its id");
+    applied(
+        CASE,
+        store
+            .upsert_agent(
+                &test_agent(id, "tester", "largest"),
+                Some(second.updated_at),
+            )
+            .await
+            .expect("upsert_agent_by_id_name_unique: the row is still updatable by its id"),
+    );
 }
 
 /// `upsert_agent_box` keys on the composite primary key `(agent_id, box_id)` and needs both
@@ -6097,6 +6130,273 @@ async fn a_missing_agent_box_is_not_found<S: WriteStore>(store: &S) {
     assert!(
         latch(CASE, store, json!({ "v": 0 }), ancient).await,
         "{CASE}: a `NULL` quota_at accepts anything, however old"
+    );
+}
+
+/// MOD-40 D5: `test_agent` stamped at `at`, a microsecond instant, so the row a store answers is
+/// the row given, on every store.
+fn stamped_agent(id: AgentId, name: &str, model: &str, at: DateTime<Utc>) -> Agent {
+    Agent {
+        created_at: at,
+        updated_at: at,
+        ..test_agent(id, name, model)
+    }
+}
+
+/// MOD-40 plan D5: `upsert_agent(_, None)` is a create. It stores the row as given, stamps
+/// included, and on an id that is already stored — one it created, or a fixture agent — it is
+/// `Stale` with the stored row and writes nothing, even when the name is also held (the id is
+/// decided before the name, blueprint P-7).
+async fn upsert_agent_with_none_inserts_and_is_stale_when_present<S: WriteStore>(store: &S) {
+    const CASE: &str = "upsert_agent_with_none_inserts_and_is_stale_when_present";
+    let at = seam_clock();
+    let a = stamped_agent(AgentId::new(), "m40-none", "small", at);
+
+    let stored = applied(
+        CASE,
+        store
+            .upsert_agent(&a, None)
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: the create lands: {err:?}")),
+    );
+    assert_eq!(
+        stored, a,
+        "{CASE}: the insert stores the row as given, both stamps included"
+    );
+
+    let again = store
+        .upsert_agent(
+            &Agent {
+                models: vec!["large".to_owned()],
+                default_model: Some("large".to_owned()),
+                ..a.clone()
+            },
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{CASE}: a second create is an outcome: {err:?}"));
+    assert_eq!(
+        stale(CASE, again),
+        a,
+        "{CASE}: a create on a stored id is Stale with the stored row and writes nothing"
+    );
+
+    let held = store
+        .upsert_agent(
+            &Agent {
+                name: "claude".to_owned(),
+                ..a.clone()
+            },
+            None,
+        )
+        .await;
+    assert!(
+        matches!(held, Ok(CasOutcome::Stale(_))),
+        "{CASE}: the id is decided before the name: a create on a stored id under a held name \
+         is Stale, not Constraint, got {held:?}"
+    );
+
+    let seed = store
+        .upsert_agent(
+            &Agent {
+                id: ids::AGENT_CLAUDE,
+                name: "m40-seed".to_owned(),
+                ..a.clone()
+            },
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{CASE}: a create over a fixture id is an outcome: {err:?}"));
+    let seed = stale(CASE, seed);
+    assert_eq!(
+        (seed.id, seed.name.as_str()),
+        (ids::AGENT_CLAUDE, "claude"),
+        "{CASE}: a fixture agent is present too: every edit of one passes its token"
+    );
+
+    applied(
+        CASE,
+        store
+            .upsert_agent(&a, Some(a.updated_at))
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: the edit with the stored token: {err:?}")),
+    );
+}
+
+/// MOD-40 plan D5: an edit whose token another write has spent is `Stale` with the row as it is
+/// now and writes nothing — also when it would take a held name — while the write that spent it
+/// moved `updated_at` and kept `created_at`.
+async fn upsert_agent_with_a_spent_token_is_stale_and_writes_nothing<S: WriteStore>(store: &S) {
+    const CASE: &str = "upsert_agent_with_a_spent_token_is_stale_and_writes_nothing";
+    let at = seam_clock();
+    let r0 = applied(
+        CASE,
+        store
+            .upsert_agent(
+                &stamped_agent(AgentId::new(), "m40-spent", "small", at),
+                None,
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: the create lands: {err:?}")),
+    );
+    let r1 = applied(
+        CASE,
+        store
+            .upsert_agent(
+                &Agent {
+                    models: vec!["large".to_owned()],
+                    ..r0.clone()
+                },
+                Some(r0.updated_at),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: the first edit lands: {err:?}")),
+    );
+    // `!=`, not `>`: on Postgres the two stamps come from two clocks, the caller's and the
+    // trigger's.
+    assert_ne!(
+        r1.updated_at, r0.updated_at,
+        "{CASE}: the edit spent the token"
+    );
+    assert_eq!(
+        r1.created_at, r0.created_at,
+        "{CASE}: an edit never rewrites created_at"
+    );
+
+    let late = store
+        .upsert_agent(
+            &Agent {
+                models: vec!["largest".to_owned()],
+                ..r0.clone()
+            },
+            Some(r0.updated_at),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{CASE}: a stale edit is an outcome: {err:?}"));
+    assert_eq!(
+        stale(CASE, late),
+        r1,
+        "{CASE}: Stale carries the row as it is now"
+    );
+
+    let late_rename = store
+        .upsert_agent(
+            &Agent {
+                name: "claude".to_owned(),
+                ..r0.clone()
+            },
+            Some(r0.updated_at),
+        )
+        .await;
+    assert!(
+        matches!(late_rename, Ok(CasOutcome::Stale(_))),
+        "{CASE}: a spent token under a held name is Stale, not Constraint (P-7), got \
+         {late_rename:?}"
+    );
+
+    let current = applied(
+        CASE,
+        store
+            .upsert_agent(&r1, Some(r1.updated_at))
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: the current token applies: {err:?}")),
+    );
+    assert_eq!(
+        current.models,
+        ["large"],
+        "{CASE}: the stale writes wrote nothing: r1's token was still current"
+    );
+}
+
+/// MOD-40 plan D5: an edit under the current token writes every column but the two stamps —
+/// `created_at` stays the insert's and `updated_at` is the store's, never the caller's. The same
+/// token under a held name is the name's `Constraint` and writes nothing, and a token for an id
+/// no row has is `NotFound`.
+async fn upsert_agent_with_the_current_token_applies<S: WriteStore>(store: &S) {
+    const CASE: &str = "upsert_agent_with_the_current_token_applies";
+    let at = seam_clock();
+    let r0 = applied(
+        CASE,
+        store
+            .upsert_agent(
+                &stamped_agent(AgentId::new(), "m40-apply", "small", at),
+                None,
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: the create lands: {err:?}")),
+    );
+    let far = at + TimeDelta::days(3650);
+    let edited = Agent {
+        name: "m40-renamed".to_owned(),
+        transport: Transport::Acp,
+        launch: json!({ "command": "renamed", "args": ["--acp"], "env": {} }),
+        models: vec!["small".to_owned(), "large".to_owned()],
+        default_model: Some("large".to_owned()),
+        billing: Billing::Subscription,
+        enabled: false,
+        settings: json!({ "acp": {} }),
+        created_at: far,
+        updated_at: far,
+        ..r0.clone()
+    };
+
+    let r1 = applied(
+        CASE,
+        store
+            .upsert_agent(&edited, Some(r0.updated_at))
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: the edit lands: {err:?}")),
+    );
+    assert_eq!(
+        r1,
+        Agent {
+            created_at: r0.created_at,
+            updated_at: r1.updated_at,
+            ..edited.clone()
+        },
+        "{CASE}: every column but the stamps took the edit"
+    );
+    assert_ne!(
+        r1.updated_at, far,
+        "{CASE}: updated_at is the store's, never the caller's"
+    );
+
+    let taken = store
+        .upsert_agent(
+            &Agent {
+                name: "claude".to_owned(),
+                ..r1.clone()
+            },
+            Some(r1.updated_at),
+        )
+        .await;
+    assert!(
+        matches!(taken, Err(StoreError::Constraint(_))),
+        "{CASE}: a current token under a held name is the name's refusal, got {taken:?}"
+    );
+    applied(
+        CASE,
+        store
+            .upsert_agent(&r1, Some(r1.updated_at))
+            .await
+            .unwrap_or_else(|err| panic!("{CASE}: the refused rename wrote nothing: {err:?}")),
+    );
+
+    let ghost = store
+        .upsert_agent(
+            &stamped_agent(AgentId::new(), "m40-ghost", "small", at),
+            Some(at),
+        )
+        .await;
+    assert!(
+        matches!(
+            ghost,
+            Err(StoreError::NotFound {
+                entity: "agent",
+                ..
+            })
+        ),
+        "{CASE}: a token for an id no row has is NotFound, got {ghost:?}"
     );
 }
 

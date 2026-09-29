@@ -133,7 +133,7 @@ fn the_codebase_has_never_heard_of_zeta() {
 async fn an_unknown_agent_reaches_a_driver_from_its_row_alone() {
     let store = MemStore::demo();
     store
-        .upsert_agent(&zeta_row())
+        .upsert_agent(&zeta_row(), None)
         .await
         .expect("the row saves");
 
@@ -427,7 +427,7 @@ impl CaseHarness for ZetaHarness {
 async fn the_unknown_agent_passes_every_conformance_case() {
     let store = MemStore::demo();
     store
-        .upsert_agent(&zeta_row())
+        .upsert_agent(&zeta_row(), None)
         .await
         .expect("the row saves");
     let row = store
@@ -462,7 +462,10 @@ async fn the_unknown_agent_passes_every_conformance_case() {
 async fn the_resolved_token_reaches_no_persisted_row() {
     let store = MemStore::demo();
     let zeta = zeta_row();
-    store.upsert_agent(&zeta).await.expect("the row saves");
+    store
+        .upsert_agent(&zeta, None)
+        .await
+        .expect("the row saves");
 
     // The env the session runs with is the *resolved* launch env, not a literal: this is the
     // value a probed box would really hand the child process.
