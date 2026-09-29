@@ -79,9 +79,9 @@ checkable is the one everybody actually builds with. Keep all three in step when
 | `--set-dsn` | Read a Postgres connection string from standard input, save it in the OS keyring and exit. |
 | `--clear-dsn` | Remove the saved connection string from the OS keyring and exit. |
 | `--index-items` | Update the search index from the database, then exit. See [Search](#search). |
-| `--search-items <QUERY>` | Search items and their documents, print the results and exit. |
+| `--search-items <QUERY>` | Search items, their documents and requirements, print the results and exit. |
 | `--project <SLUG>` | With `--index-items` or `--search-items`: only this project. |
-| `--decisions` | With `--search-items`: only done and closed items, and their documents. |
+| `--decisions` | With `--search-items`: only decisions, meaning items closed as done, concluded or rejected, and their documents. |
 | `--limit <N>` | With `--search-items`: how many results to print, from 1 to 1000 (default 10). |
 | `--log <PATH>` | Append logs to a file. Also read from `HTUI_LOG`; `HTUI_LOG_FILTER` changes the level (default `info`). Logs never go to the terminal, since the terminal is the app. |
 | `--help`, `--version` | Print usage or the version and exit. |
@@ -366,8 +366,9 @@ such as a subscription's usage window. It updates as you chat.
 
 ## Search
 
-`htui` can search your items and their documents by meaning and by exact words. This is optional
-and needs a [Qdrant](https://qdrant.tech/) server, which `docker compose up -d` also starts.
+`htui` can search your items, their documents and your requirements by meaning and by exact words.
+This is optional and needs a [Qdrant](https://qdrant.tech/) server, which `docker compose up -d`
+also starts.
 
 1. In **Settings › Qdrant**, press `e` and enter the server's gRPC address (with the included
    `compose.yaml`, that is `http://localhost:6334`), then an API key if your server needs one.
@@ -386,7 +387,15 @@ and needs a [Qdrant](https://qdrant.tech/) server, which `docker compose up -d` 
    htui --search-items "database choice" --decisions --project my-project --limit 5
    ```
 
-Run `--index-items` again to pick up changes.
+Each result says what matched: an item, one of its documents, or a requirement. A closed item also
+shows how it closed, for example `item (rejected)`, and a withdrawn requirement shows
+`requirement (withdrawn)`.
+
+Run `--index-items` again to pick up changes. After upgrading from a version that did not index
+requirements, the first `--index-items` rebuilds the whole index into a new collection,
+`htui_concepts_v2`. The old `htui_concepts_v1` collection is no longer read; you can drop it with
+`curl -X DELETE http://localhost:6333/collections/htui_concepts_v1` (Qdrant's HTTP port, not the
+gRPC one).
 
 ## Where htui keeps its files
 

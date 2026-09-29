@@ -191,7 +191,14 @@ impl Keymap {
         Self::default()
     }
 
-    /// The MOD-1 table: `q`, `Tab`, `Shift+Tab`, `1`..`9`, `?`, and `Esc` for every overlay.
+    /// The MOD-1 table: `q`, `Tab`, `Shift+Tab`, `1`..`9`, `?`, and `Esc` for every overlay, plus
+    /// `ctrl-c`, which quits from anywhere (MOD-52).
+    ///
+    /// Raw mode clears `ISIG`, so `ctrl-c` raises no `SIGINT` and arrives as a key like any other.
+    /// It is bound twice: globally, and on the overlay wildcard so a modal overlay (the startup
+    /// switcher, the migration prompt) does not swallow it. Every capturing section and text field
+    /// passes `CONTROL` chords on, so it quits from inside a half-typed field too, where `q` is a
+    /// letter.
     ///
     /// T6 adds global `w` (open the workspace switcher) once T5's overlay exists.
     #[must_use]
@@ -235,6 +242,14 @@ impl Keymap {
             action: Action::Overlay(OverlayAction::Close),
             help: "close",
         });
+        for scope in [KeyScope::Global, KeyScope::Overlay(OverlayId::ANY)] {
+            map.bind(Binding {
+                scope,
+                key: KeyChord::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                action: Action::Quit,
+                help: "quit",
+            });
+        }
         map
     }
 
@@ -384,6 +399,31 @@ mod tests {
             map.resolve(&KeyScope::Global, chord("?")),
             Some(Action::ToggleHelp)
         ));
+    }
+
+    /// MOD-52: `ctrl-c` quits globally and from every overlay, while `q` stays global only.
+    #[test]
+    fn ctrl_c_quits_globally_and_from_any_overlay() {
+        let map = Keymap::default_global();
+        assert!(matches!(
+            map.resolve(&KeyScope::Global, chord("ctrl-c")),
+            Some(Action::Quit)
+        ));
+        assert!(matches!(
+            map.resolve(
+                &KeyScope::Overlay(OverlayId("workspace_switcher")),
+                chord("ctrl-c")
+            ),
+            Some(Action::Quit)
+        ));
+        assert!(
+            map.resolve(
+                &KeyScope::Overlay(OverlayId("workspace_switcher")),
+                chord("q")
+            )
+            .is_none(),
+            "`q` is still not an overlay key"
+        );
     }
 
     #[test]

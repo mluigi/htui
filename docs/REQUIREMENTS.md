@@ -16,7 +16,9 @@ amended 2026-09-25 by maintainer decision on ANA-11 (`docs/ANA-11.md` §7,
 R-TUI-1 amended in place; the optional R-MCP-2 `requirement_cite` amendment deferred to MOD-11;
 amended 2026-09-26 by maintainer decision on ANA-22 (`docs/ANA-22.md` §6,
 `docs/decisions/ana/ana-22.md`) during MOD-9 milestone 2 — R-SKL-2 amended in place (global level,
-most-specific-wins, activation on the attachment).
+most-specific-wins, activation on the attachment);
+amended 2026-09-29 by maintainer decision on MOD-50 (`docs/decisions/mod/mod-50.md`) — R-STO-8
+amended in place (requirement rows indexed; the decisions filter keyed on resolution).
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -152,12 +154,15 @@ conflict. Their verdicts survive only where restated here.
   conditioned on a reachable server and binds no offline start (R-STO-4); that scope was decided,
   not overlooked (maintainer, 2026-09-08).
 - **R-STO-7 (withdrawn).** Local-only mode. Withdrawn by maintainer decision MOD-25, 2026-09-11.
-- **R-STO-8 (must).** Semantic search over items. `htui` indexes each item's key, title and body,
-  and its latest documents, into a Qdrant collection (local dense embeddings plus BM25 sparse
-  vectors, ranked together) and answers searches scoped to projects. The index is derived from
-  Postgres and rebuildable from it (R-STO-1); when Qdrant or the embedding model is unavailable,
-  search fails with a clear error and nothing else is affected. Added by maintainer decision on
-  MOD-34, 2026-09-25 (`docs/ANA-19.md`, `docs/ANA-20.md`).
+- **R-STO-8 (must).** Semantic search over items and requirements. `htui` indexes each item's key,
+  title and body, its latest documents, and each requirement's key, body and rationale (withdrawn
+  ones included), into a Qdrant collection (local dense embeddings plus BM25 sparse vectors, ranked
+  together) and answers searches scoped to projects. A search can be narrowed to decisions: items
+  closed as `done`, `concluded` or `rejected` (R-ENT-8), and their documents. The index is derived
+  from Postgres and rebuildable from it (R-STO-1); when Qdrant or the embedding model is
+  unavailable, search fails with a clear error and nothing else is affected. Added by maintainer
+  decision on MOD-34, 2026-09-25 (`docs/ANA-19.md`, `docs/ANA-20.md`); amended by maintainer
+  decision on MOD-50, 2026-09-29 (requirements indexed, decisions by resolution).
 
 ## 5. Agent driver (R-AGT)
 
