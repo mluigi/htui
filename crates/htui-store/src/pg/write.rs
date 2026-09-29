@@ -1073,51 +1073,109 @@ impl WriteStore for PgStore {
         Err(Box::pin(fenced_or_missing(&self.pool, step)).await)
     }
 
-    /// Inserts or updates one `agent` row, keyed by `agent.id` (`docs/ANA-4.md` §4.1, ANA-9 §5.7).
+    /// Creates or edits one `agent` row as a compare-and-set on `updated_at` (`docs/ANA-4.md`
+    /// §4.1, ANA-9 §5.7; MOD-40 plan D5).
     ///
-    /// `created_at` and `updated_at` are supplied on the insert and neither is in the `DO UPDATE`
-    /// `SET` list: the row keeps the creation stamp it was first written with, and the migration's
-    /// `BEFORE UPDATE` trigger owns `updated_at` on every later write.
+    /// Two statements, one per branch, `set_setting`'s `App` rung's shape: `expected: None` is
+    /// `INSERT … ON CONFLICT (id) DO NOTHING`, so a stored id is a miss and never an overwrite —
+    /// and the `id` arbiter is checked before the name's unique index, so a stored id is `Stale`
+    /// even under a held name; `Some(t)` is `UPDATE … WHERE id = $1 AND updated_at = $t`, whose
+    /// `SET` list names neither stamp: `created_at` stays the insert's and the `BEFORE UPDATE`
+    /// trigger writes `updated_at`, which `RETURNING` sees. A spent token matches no row, so no
+    /// unique check runs and a stale rename is `Stale`, not `Constraint` (blueprint P-7). A miss
+    /// reads the row once ([`cas_miss`]): present is `Stale`, absent is `NotFound`.
+    ///
+    /// The insert keeps the caller's stamps at the column's resolution, microseconds; `Applied`
+    /// carries them as stored, which is the token the next edit passes.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Constraint`] when another id already holds the name (`23505` on
-    /// `agent_name_key`).
+    /// [`StoreError::NotFound`] for `Some(_)` on an id no row has; [`StoreError::Constraint`]
+    /// when another id holds the name (`23505` on `agent_name_key`).
     async fn upsert_agent(
         &self,
         agent: &Agent,
-        _expected: Option<DateTime<Utc>>,
+        expected: Option<DateTime<Utc>>,
     ) -> Result<CasOutcome<Agent>> {
-        sqlx::query!(
-            "INSERT INTO agent (id, name, transport, launch, models, default_model, billing, \
-                                enabled, settings, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-             ON CONFLICT (id) DO UPDATE SET \
-                 name          = EXCLUDED.name, \
-                 transport     = EXCLUDED.transport, \
-                 launch        = EXCLUDED.launch, \
-                 models        = EXCLUDED.models, \
-                 default_model = EXCLUDED.default_model, \
-                 billing       = EXCLUDED.billing, \
-                 enabled       = EXCLUDED.enabled, \
-                 settings      = EXCLUDED.settings",
-            agent.id.as_uuid(),
-            agent.name,
-            agent.transport.as_str(),
-            &agent.launch,
-            &agent.models[..],
-            agent.default_model.as_deref(),
-            agent.billing.as_str(),
-            agent.enabled,
-            &agent.settings,
-            agent.created_at,
-            agent.updated_at,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
-        let stored = self.stored_agent(agent.id).await?;
-        cas_miss(stored, "agent", agent.id).map(|outcome| CasOutcome::Applied(outcome.into_inner()))
+        let landed = match expected {
+            None => sqlx::query_as!(
+                Agent,
+                r#"
+                INSERT INTO agent (id, name, transport, launch, models, default_model, billing,
+                                   enabled, settings, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id            AS "id: AgentId",
+                          name,
+                          transport     AS "transport: htui_core::model::Transport",
+                          launch,
+                          models,
+                          default_model,
+                          billing       AS "billing: htui_core::model::Billing",
+                          enabled,
+                          settings,
+                          created_at,
+                          updated_at
+                "#,
+                agent.id.as_uuid(),
+                agent.name,
+                agent.transport.as_str(),
+                &agent.launch,
+                &agent.models[..],
+                agent.default_model.as_deref(),
+                agent.billing.as_str(),
+                agent.enabled,
+                &agent.settings,
+                agent.created_at,
+                agent.updated_at,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?,
+            Some(token) => sqlx::query_as!(
+                Agent,
+                r#"
+                UPDATE agent
+                   SET name          = $2,
+                       transport     = $3,
+                       launch        = $4,
+                       models        = $5,
+                       default_model = $6,
+                       billing       = $7,
+                       enabled       = $8,
+                       settings      = $9
+                 WHERE id = $1 AND updated_at = $10
+                RETURNING id            AS "id: AgentId",
+                          name,
+                          transport     AS "transport: htui_core::model::Transport",
+                          launch,
+                          models,
+                          default_model,
+                          billing       AS "billing: htui_core::model::Billing",
+                          enabled,
+                          settings,
+                          created_at,
+                          updated_at
+                "#,
+                agent.id.as_uuid(),
+                agent.name,
+                agent.transport.as_str(),
+                &agent.launch,
+                &agent.models[..],
+                agent.default_model.as_deref(),
+                agent.billing.as_str(),
+                agent.enabled,
+                &agent.settings,
+                token,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?,
+        };
+        match landed {
+            Some(row) => Ok(CasOutcome::Applied(row)),
+            None => cas_miss(self.stored_agent(agent.id).await?, "agent", agent.id),
+        }
     }
 
     /// Inserts or updates one `agent_box` row on its composite primary key (`docs/ANA-4.md` §4.1,

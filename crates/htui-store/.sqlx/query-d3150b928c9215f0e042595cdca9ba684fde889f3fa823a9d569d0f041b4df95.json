@@ -1,0 +1,157 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE agent\n                   SET name          = $2,\n                       transport     = $3,\n                       launch        = $4,\n                       models        = $5,\n                       default_model = $6,\n                       billing       = $7,\n                       enabled       = $8,\n                       settings      = $9\n                 WHERE id = $1 AND updated_at = $10\n                RETURNING id            AS \"id: AgentId\",\n                          name,\n                          transport     AS \"transport: htui_core::model::Transport\",\n                          launch,\n                          models,\n                          default_model,\n                          billing       AS \"billing: htui_core::model::Billing\",\n                          enabled,\n                          settings,\n                          created_at,\n                          updated_at\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: AgentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "transport: htui_core::model::Transport",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "transport"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "launch",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "launch"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "models",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "models"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "default_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "default_model"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "billing: htui_core::model::Billing",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "billing"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "enabled",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "enabled"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "settings",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "settings"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Jsonb",
+        "TextArray",
+        "Text",
+        "Text",
+        "Bool",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d3150b928c9215f0e042595cdca9ba684fde889f3fa823a9d569d0f041b4df95"
+}

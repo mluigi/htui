@@ -1536,16 +1536,32 @@ impl State {
         Ok(())
     }
 
-    /// Insert-or-update on `agent.id`, with `agent.name` unique across every other id (§5.7).
+    /// Creates or edits one agent under compare-and-set on `updated_at` (MOD-40 plan D5), in
+    /// Postgres's order (blueprint F-18): the id and the token, then the name, then the write.
     ///
-    /// `created_at` is the stored row's on an update, never the caller's, and `updated_at` is the
-    /// clock: that is what Postgres's `BEFORE UPDATE` trigger does, written out.
+    /// `None` inserts the row as given, stamps included, and is `Stale` on a stored id. `Some(t)`
+    /// writes every column but the stamps where the stored `updated_at` is `t`: `created_at` is
+    /// the stored row's and `updated_at` is the clock, which is what Postgres's `BEFORE UPDATE`
+    /// trigger does, written out.
     fn upsert_agent(
         &mut self,
         agent: &Agent,
-        _expected: Option<DateTime<Utc>>,
+        expected: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> Result<CasOutcome<Agent>> {
+        match (self.agents.get(&agent.id), expected) {
+            (Some(stored), None) => return Ok(CasOutcome::Stale(stored.clone())),
+            (Some(stored), Some(token)) if stored.updated_at != token => {
+                return Ok(CasOutcome::Stale(stored.clone()));
+            }
+            (None, Some(_)) => {
+                return Err(StoreError::NotFound {
+                    entity: "agent",
+                    id: agent.id.to_string(),
+                });
+            }
+            (None, None) | (Some(_), Some(_)) => {}
+        }
         if self
             .agents
             .values()
@@ -1556,18 +1572,16 @@ impl State {
                 agent.name
             )));
         }
-        match self.agents.get_mut(&agent.id) {
-            Some(stored) => {
-                let created_at = stored.created_at;
-                *stored = agent.clone();
-                stored.created_at = created_at;
-                stored.updated_at = now;
-            }
-            None => {
-                self.agents.insert(agent.id, agent.clone());
-            }
-        }
-        Ok(CasOutcome::Applied(self.agents[&agent.id].clone()))
+        let row = match self.agents.get(&agent.id) {
+            Some(stored) => Agent {
+                created_at: stored.created_at,
+                updated_at: now,
+                ..agent.clone()
+            },
+            None => agent.clone(),
+        };
+        self.agents.insert(agent.id, row.clone());
+        Ok(CasOutcome::Applied(row))
     }
 
     /// Insert-or-update on the composite primary key `(agent_id, box_id)`, both referents required
