@@ -49,13 +49,6 @@ identical — the refusal is about which one this platform pays for, not which o
 
 ## Flow
 
-### 0. Response style
-
-Invoke the `caveman:caveman` skill at level **full** before anything else — every `/handoff-run` session runs
-caveman-full for its whole duration. Caveman boundaries apply as usual: code, commits, PRs, and generated artifacts
-(PRD/plan/ANA docs, HANDOFF entries, decision write-ups + index lines) are written normal; only chat
-output compresses.
-
 ### 1. Locate the item
 
 Read the **current repo's** root `HANDOFF.md` (the repo the session runs in; IDs are per-repo — never resolve an ID

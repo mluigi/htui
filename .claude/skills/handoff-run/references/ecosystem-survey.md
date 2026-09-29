@@ -94,5 +94,4 @@ Two corrections to the M1 table above, both found while doing this:
   **commands** (`commands/*.md`); Claude Code surfaces plugin commands in the skill
   listing, which is what the survey read.
 
-The environment prerequisite is now **caveman** (SKILL.md:54) and the `graphify` user skill
-— not ecc.
+The environment prerequisite is now the `graphify` user skill — not ecc.
