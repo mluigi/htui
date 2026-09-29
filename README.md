@@ -506,6 +506,13 @@ Only `htui-agent` has Windows-only code (process supervision and command lookup)
 lint-checked from Linux without a C toolchain that targets MSVC, so check it by running
 `cargo test -p htui-agent` on Windows, including the ignored live tests.
 
+### Running several `/handoff-run` sessions at once
+
+`scripts/hr` gives each run its own container set: a fresh clone on branch `hr/<ITEM>`, a private
+Postgres and Qdrant, and the full toolchain, so three or four runs can work side by side without
+touching each other or this checkout. Linux only; needs Docker and `gum`. See
+[`docs/hr-sandbox.md`](docs/hr-sandbox.md).
+
 ## Further reading
 
 - [`CONCEPTS.md`](CONCEPTS.md): what `htui` is, and the design decisions behind it.
