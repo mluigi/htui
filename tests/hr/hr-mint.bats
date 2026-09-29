@@ -14,6 +14,16 @@ mint() { "$HR_MINT" --repo-root "$FIX" "$@"; }
 
 TS_ROW_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
 
+@test "0. fixture is green under next-item-id.sh and validate-workflow-docs.sh; tree next MOD-6" {
+    run --separate-stderr bash "$HR_WF_SCRIPTS/next-item-id.sh" --prefix MOD --id-only --repo-root "$FIX"
+    [[ $status -eq 0 ]]
+    [[ "$output" == 'MOD-6' ]]
+    run --separate-stderr bash "$HR_WF_SCRIPTS/validate-workflow-docs.sh" --repo-root "$FIX"
+    [[ $status -eq 0 ]]
+    [[ "$output" == *'0 error(s), 0 warning(s)'* ]]
+    [[ -z "$(git -C "$FIX" status --porcelain)" ]]
+}
+
 @test "1. --leasing is 1 without a lease file, 0 after --init; --init is idempotent" {
     run "$HR_MINT" --leasing
     [[ $status -eq 1 ]]
@@ -107,12 +117,13 @@ TS_ROW_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
     [[ "$(lease_ids | sort -t- -k2,2n)" == "$want" ]]
     [[ "$(lease_rows | wc -l)" -eq 20 ]]
     # Every row well-formed: 4 tab fields, owner hr/P-N, ISO ts, its own title.
-    local id owner ts title
+    local id owner ts title k
     while IFS=$'\t' read -r id owner ts title; do
         [[ "$owner" =~ ^hr/P-([0-9]+)$ ]]
-        [[ "$title" == "parallel ${BASH_REMATCH[1]}" ]]
+        k="${BASH_REMATCH[1]}"
+        [[ "$title" == "parallel $k" ]]
         [[ "$ts" =~ $TS_ROW_RE ]]
-        [[ "$(cat "$out/${BASH_REMATCH[1]}.out")" == "$id" ]]
+        [[ "$(cat "$out/$k.out")" == "$id" ]]
     done < <(lease_rows)
 }
 
@@ -244,7 +255,7 @@ TS_ROW_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
     [[ "$(lease_ids)" == 'MOD-6' ]]
     run --separate-stderr mint --prefix MOD --title 'from a stale tree'
     [[ "$output" == 'MOD-7' ]]
-    [[ "$stderr" == *'(tree next MOD-6, lease floor MOD-6)'* ]]
+    [[ "$stderr" == *'(tree next MOD-5, lease floor MOD-6)'* ]]
 }
 
 @test "14. --purged-owner (repeatable) drops those owners' rows except the per-prefix max" {
@@ -295,6 +306,10 @@ TS_ROW_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
     [[ "$stderr" == *'no-such-ref'* ]]
     cmp "$(lease_file)" "$BATS_TEST_TMPDIR/before"
 
+    run --separate-stderr "$HR_MINT" --prune --ref --output=x --repo-root "$FIX"
+    [[ $status -eq 2 ]]
+    cmp "$(lease_file)" "$BATS_TEST_TMPDIR/before"
+
     # A ref without HANDOFF.md is just as unusable.
     git -C "$FIX" switch -q --orphan empty
     git -C "$FIX" commit -q --allow-empty -m empty
@@ -319,6 +334,27 @@ TS_ROW_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
     [[ $status -eq 1 ]]
     [[ "$stderr" == *'line 4 unparseable'* ]]
     cmp "$(lease_file)" "$BATS_TEST_TMPDIR/before"
+
+    # An unreadable lease file never reads as empty (that would drop the floor to 0) and never
+    # falls back to a tree-only mint.
+    rm "$(lease_file)"
+    mkdir "$(lease_file)"
+    run --separate-stderr "$HR_MINT" --leasing
+    [[ $status -eq 0 ]]
+    run --separate-stderr mint --prefix MOD --title 'x'
+    [[ $status -eq 3 ]]
+    [[ -z "$output" ]]
+    rmdir "$(lease_file)"
+    if [[ $(id -u) -ne 0 ]]; then
+        cp "$BATS_TEST_TMPDIR/before" "$(lease_file)"
+        chmod 000 "$(lease_file)"
+        run --separate-stderr mint --prefix MOD --title 'x'
+        [[ $status -eq 3 ]]
+        [[ -z "$output" ]]
+        run --separate-stderr "$HR_MINT" --prune --repo-root "$FIX"
+        [[ $status -eq 3 ]]
+        chmod 600 "$(lease_file)"
+    fi
 }
 
 @test "18. lock held elsewhere + HR_MINT_LOCK_TIMEOUT=1 -> exit 3, no row" {

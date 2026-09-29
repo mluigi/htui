@@ -1,0 +1,395 @@
+#!/usr/bin/env bash
+# hr-mint — cross-run item-ID leases for /handoff-run sandboxes (TOOL-7). Wraps the owned-ID mint
+# (`next-item-id.sh --id-only`) with a flock'd lease file shared by every sandbox and the host, so
+# two runs spawning items in parallel never mint the same ID: the result is
+# max(tree next, highest leased ID of that prefix + 1), recorded as a lease row before it is printed.
+# next-item-id.sh / .ps1 stay untouched; a leased-then-abandoned ID is a harmless gap.
+#
+# Usage:
+#   scripts/hr-mint --prefix P --title "one line" [--repo-root R] [--branch B]
+#   scripts/hr-mint --leasing          # exit 0 iff the lease file exists (the skill docs' switch)
+#   scripts/hr-mint --init             # create state dir + lease file; idempotent
+#   scripts/hr-mint --prune [--ref main] [--repo-root R] [--purged-owner B]...
+#
+# Mint prints the ID on stdout and nothing else; provenance, the "leasing off" notice and the
+# recent same-prefix leases of other runs ("ask before filing" list) go to stderr. Without the
+# state dir or the lease file it is exactly `next-item-id.sh --prefix P --id-only`.
+# --prune drops a lease once its ID is on REF (open checklist line in HANDOFF.md or index line
+# in DECISIONS.md) or its owner is a --purged-owner — but never the highest lease of a prefix:
+# that row is the floor that keeps a clone taken before the merge from re-minting (F1).
+#
+# Owner: --branch B, else hr/$HR_ITEM when set (inside a sandbox), else "host".
+# State: $HR_STATE, else /media/projects/htui-hr/.state. Lease file id-leases.tsv; lock
+# id-leases.lock (separate, so prune's tmp+mv never swaps the locked inode). Lock wait:
+# $HR_MINT_LOCK_TIMEOUT seconds (default 30).
+# R (default: this script's repo) only selects the HANDOFF/DECISIONS data; next-item-id.sh and
+# workflow-patterns.sh always come from this script's own repo.
+#
+# Lease file v1, owned by this script alone (never edit by hand):
+#   # hr-mint leases v1 - owner: scripts/hr-mint (never edit by hand)
+#   # id<TAB>owner<TAB>leased_at_utc<TAB>title
+#   MOD-71<TAB>hr/MOD-65<TAB>2026-09-29T10:02:11Z<TAB>Ctrl-c leaves the terminal raw
+# `#` lines are comments, empty lines are ignored, anything else fails closed (exit 1).
+#
+# Exit codes: 0 ok, 1 blocked (next-item-id findings, unparseable lease file, --leasing off),
+#           2 usage (bad argument, out-of-set prefix, empty title, unusable repo root or ref),
+#           3 lock timeout / state dir or lease file unwritable.
+#
+# The law is .claude/rules/workflow-docs.md; this script implements it, it does not restate it.
+# Design: .claude/plans/tool-7-hr-sandbox.plan.md (§ID leases), blueprint §T3.
+
+set -u
+
+# Linux-only (flock, GNU date); the handoff-run twins' Windows story does not apply here.
+case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW*|MSYS*|CYGWIN*|Windows_NT)
+        echo "hr-mint: Linux-only; on Windows mint with next-item-id.ps1" >&2
+        exit 2
+        ;;
+esac
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+WF_DIR="$SELF_ROOT/.claude/skills/handoff-run/scripts"
+NEXT_ID="$WF_DIR/next-item-id.sh"
+# shellcheck source=../.claude/skills/handoff-run/scripts/workflow-patterns.sh
+source "$WF_DIR/workflow-patterns.sh"
+
+LEASE_HEADER_1='# hr-mint leases v1 - owner: scripts/hr-mint (never edit by hand)'
+LEASE_HEADER_2=$'# id\towner\tleased_at_utc\ttitle'
+TAB=$'\t'
+# BASH_REMATCH: 1=id 2=owner 3=leased_at_utc 4=title
+LEASE_ROW_PATTERN="^(${ID_ALT})${TAB}([^${TAB}]+)${TAB}([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z)${TAB}(.*)\$"
+SIBLING_DAYS=7
+
+die() { # $1=exit code, rest=message
+    local rc="$1"
+    shift
+    echo "hr-mint: $*" >&2
+    exit "$rc"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/hr-mint --prefix P --title "one line" [--repo-root R] [--branch B]
+       scripts/hr-mint --leasing
+       scripts/hr-mint --init
+       scripts/hr-mint --prune [--ref main] [--repo-root R] [--purged-owner B]...
+EOF
+}
+
+contains() {
+    local needle="$1" x
+    shift
+    for x in "$@"; do [[ "$x" == "$needle" ]] && return 0; done
+    return 1
+}
+
+# One line, no field separators: tab/CR/LF -> space, then trim.
+one_line() {
+    local s="$1"
+    s="${s//$'\t'/ }"
+    s="${s//$'\r'/ }"
+    s="${s//$'\n'/ }"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# ---- lease file ----
+
+# Parse the lease file into LEASE_LINE[] (verbatim, for rewrite), LEASE_KIND[] (row|comment),
+# and per row LEASE_ID/LEASE_OWNER/LEASE_TS/LEASE_TITLE (indexed like LEASE_LINE). Fails closed.
+read_leases() {
+    LEASE_LINE=(); LEASE_KIND=(); LEASE_ID=(); LEASE_OWNER=(); LEASE_TS=(); LEASE_TITLE=()
+    local line n=0 i
+    # An unreadable file must not parse as an empty one: that would drop the floor to 0.
+    [[ -f "$LEASES" && -r "$LEASES" ]] || die 3 "cannot read $LEASES"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1))
+        line="${line%$'\r'}"
+        [[ -z "$line" ]] && continue
+        i=${#LEASE_LINE[@]}
+        LEASE_LINE[i]="$line"
+        if [[ "$line" == '#'* ]]; then
+            LEASE_KIND[i]=comment
+        elif [[ "$line" =~ $LEASE_ROW_PATTERN ]]; then
+            LEASE_KIND[i]=row
+            LEASE_ID[i]="${BASH_REMATCH[1]}"
+            LEASE_OWNER[i]="${BASH_REMATCH[2]}"
+            LEASE_TS[i]="${BASH_REMATCH[3]}"
+            LEASE_TITLE[i]="${BASH_REMATCH[4]}"
+        else
+            die 1 "lease file line $n unparseable - fix or remove it by hand ($LEASES): $line"
+        fi
+    done <"$LEASES"
+}
+
+# Highest leased N for prefix $1 (0 if none).
+lease_floor() {
+    local p="$1" max=0 i num
+    for i in "${!LEASE_LINE[@]}"; do
+        [[ "${LEASE_KIND[i]}" == row && "${LEASE_ID[i]%%-*}" == "$p" ]] || continue
+        num="${LEASE_ID[i]#*-}"
+        ((10#$num > max)) && max=$((10#$num))
+    done
+    printf '%s' "$max"
+}
+
+take_lock() {
+    local timeout="${HR_MINT_LOCK_TIMEOUT:-30}"
+    if ! { exec 9>>"$LOCK"; } 2>/dev/null; then
+        die 3 "cannot open lock $LOCK (state dir unwritable?)"
+    fi
+    flock -w "$timeout" 9 || die 3 "timed out after ${timeout}s waiting for $LOCK"
+}
+
+release_lock() { exec 9>&-; }
+
+# ---- modes ----
+
+# Leasing is on as soon as the path exists: a lease file that is there but unreadable must fail
+# the mint closed (exit 3), never fall back to a tree-only mint.
+do_leasing() {
+    [[ -e "$LEASES" ]]
+}
+
+do_init() {
+    mkdir -p "$STATE" 2>/dev/null || die 3 "cannot create state dir $STATE"
+    take_lock
+    if [[ ! -e "$LEASES" ]]; then
+        local tmp="$LEASES.tmp.$$"
+        if ! printf '%s\n%s\n' "$LEASE_HEADER_1" "$LEASE_HEADER_2" 2>/dev/null >"$tmp" \
+            || ! mv -f "$tmp" "$LEASES"; then
+            rm -f "$tmp"
+            die 3 "cannot write $LEASES"
+        fi
+        echo "hr-mint: created $LEASES" >&2
+    fi
+    release_lock
+}
+
+# Run the tree mint; on success sets TREE_ID. Never holds fd 9 in the child.
+tree_mint() {
+    local out rc
+    out="$(bash "$NEXT_ID" --prefix "$PREFIX" --id-only --repo-root "$REPO_ROOT" 9>&-)"
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        # next-item-id prints usage-type failures ("Unknown prefix", "RepoRoot not found") on
+        # stdout; our stdout carries the ID only.
+        [[ -n "$out" ]] && printf '%s\n' "$out" >&2
+        # 1 (findings) and 2 (usage) pass through; anything else (crash, missing script) blocks.
+        local ours=1
+        [[ $rc -eq 2 ]] && ours=2
+        die "$ours" "next-item-id.sh blocked the mint (exit $rc) - nothing leased"
+    fi
+    [[ "$out" =~ ^${PREFIX}-[0-9]+$ ]] || die 1 "unexpected next-item-id.sh output: $out"
+    TREE_ID="$out"
+}
+
+do_mint() {
+    if [[ ! -d "$STATE" ]]; then
+        tree_mint
+        printf '%s\n' "$TREE_ID"
+        echo "hr-mint: leasing off (no state dir at $STATE) - $TREE_ID is the tree mint only" >&2
+        return 0
+    fi
+    if ! do_leasing; then
+        tree_mint
+        printf '%s\n' "$TREE_ID"
+        echo "hr-mint: leasing off (no lease file at $LEASES; run scripts/hr-mint --init) - $TREE_ID is the tree mint only" >&2
+        return 0
+    fi
+
+    take_lock
+    read_leases
+    tree_mint
+    local floor tree_n n id now
+    floor="$(lease_floor "$PREFIX")"
+    tree_n="${TREE_ID#"$PREFIX"-}"
+    n=$((10#$tree_n > floor + 1 ? 10#$tree_n : floor + 1))
+    id="$PREFIX-$n"
+    now="$(date -u +%FT%TZ)"
+    # A last line without its newline (hand edit) would swallow our row: add one first.
+    local sep=''
+    [[ -s "$LEASES" && -n "$(tail -c 1 "$LEASES")" ]] && sep=$'\n'
+    if ! printf '%s%s\t%s\t%s\t%s\n' "$sep" "$id" "$OWNER" "$now" "$TITLE" 2>/dev/null >>"$LEASES"; then
+        die 3 "cannot append to $LEASES - nothing leased"
+    fi
+    release_lock
+
+    printf '%s\n' "$id"
+    local floor_s=none
+    [[ $floor -gt 0 ]] && floor_s="$PREFIX-$floor"
+    echo "hr-mint: leased $id for $OWNER (tree next $TREE_ID, lease floor $floor_s)" >&2
+
+    # Other leases of this prefix from the last N days - the row just written excluded.
+    local cutoff i header=0
+    cutoff="$(date -u -d "$SIBLING_DAYS days ago" +%FT%TZ)"
+    for i in "${!LEASE_LINE[@]}"; do
+        [[ "${LEASE_KIND[i]}" == row && "${LEASE_ID[i]%%-*}" == "$PREFIX" ]] || continue
+        [[ "${LEASE_TS[i]}" < "$cutoff" ]] && continue
+        if [[ $header -eq 0 ]]; then
+            echo "hr-mint: other $PREFIX leases in the last $SIBLING_DAYS days - ask the maintainer before filing if one is the same problem:" >&2
+            header=1
+        fi
+        printf '  %s  %s  %s  %s\n' "${LEASE_ID[i]}" "${LEASE_OWNER[i]}" "${LEASE_TS[i]}" "${LEASE_TITLE[i]}" >&2
+    done
+    return 0
+}
+
+do_prune() {
+    local open arch line
+    git -C "$REPO_ROOT" rev-parse --verify -q "$REF^{commit}" >/dev/null 2>&1 \
+        || die 2 "ref '$REF' is not a commit in $REPO_ROOT"
+    open="$(git -C "$REPO_ROOT" show "$REF:HANDOFF.md" 2>/dev/null)" \
+        || die 2 "ref '$REF' has no HANDOFF.md in $REPO_ROOT"
+    arch="$(git -C "$REPO_ROOT" show "$REF:DECISIONS.md" 2>/dev/null)" || arch=''
+
+    if ! do_leasing; then
+        echo "hr-mint: leasing off (no lease file at $LEASES) - nothing to prune" >&2
+        return 0
+    fi
+
+    local -A on_ref=()
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [[ "$line" =~ $CHECKLIST_LINE_PATTERN || "$line" =~ $CHECKLIST_LINE_LOOSE_PATTERN ]]; then
+            on_ref["${BASH_REMATCH[1]}"]=1
+        fi
+    done <<<"$open"
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [[ "$line" =~ $INDEX_LINE_PATTERN || "$line" =~ $INDEX_LINE_LOOSE_PATTERN ]]; then
+            on_ref["${BASH_REMATCH[1]}"]=1
+        fi
+    done <<<"$arch"
+
+    take_lock
+    read_leases
+
+    local -A max=()
+    local i p num
+    for i in "${!LEASE_LINE[@]}"; do
+        [[ "${LEASE_KIND[i]}" == row ]] || continue
+        p="${LEASE_ID[i]%%-*}"; num="${LEASE_ID[i]#*-}"
+        ((10#$num > ${max[$p]:-0})) && max[$p]=$((10#$num))
+    done
+
+    local -a keep=()
+    local pruned=0 kept=0 why
+    for i in "${!LEASE_LINE[@]}"; do
+        if [[ "${LEASE_KIND[i]}" != row ]]; then
+            keep+=("${LEASE_LINE[i]}")
+            continue
+        fi
+        p="${LEASE_ID[i]%%-*}"; num="${LEASE_ID[i]#*-}"
+        why=''
+        if ((10#$num != ${max[$p]})); then
+            if [[ -n "${on_ref[${LEASE_ID[i]}]:-}" ]]; then
+                why="on $REF"
+            elif contains "${LEASE_OWNER[i]}" "${PURGED[@]}"; then
+                why="owner ${LEASE_OWNER[i]} purged"
+            fi
+        fi
+        if [[ -n "$why" ]]; then
+            pruned=$((pruned + 1))
+            echo "hr-mint: prune ${LEASE_ID[i]} (${LEASE_OWNER[i]}): $why" >&2
+        else
+            kept=$((kept + 1))
+            keep+=("${LEASE_LINE[i]}")
+        fi
+    done
+
+    if [[ $pruned -gt 0 ]]; then
+        local tmp="$LEASES.tmp.$$"
+        if ! printf '%s\n' "${keep[@]}" 2>/dev/null >"$tmp" || ! mv -f "$tmp" "$LEASES"; then
+            rm -f "$tmp"
+            die 3 "cannot rewrite $LEASES - lease file unchanged"
+        fi
+    fi
+    release_lock
+    echo "hr-mint: pruned $pruned, kept $kept (ref $REF)" >&2
+}
+
+# ---- main ----
+
+MODE=''
+set_mode() {
+    [[ -z "$MODE" || "$MODE" == "$1" ]] || { echo "hr-mint: --$MODE and --$1 are exclusive" >&2; usage >&2; exit 2; }
+    MODE="$1"
+}
+need_value() { # $1=flag $2=remaining arg count
+    [[ "$2" -ge 2 ]] || { echo "hr-mint: $1 needs a value" >&2; usage >&2; exit 2; }
+}
+
+PREFIX=''; TITLE=''; HAVE_TITLE=0; REPO_ROOT=''; BRANCH=''; HAVE_BRANCH=0; REF=''; HAVE_REF=0
+PURGED=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --prefix) need_value "$1" $#; set_mode mint; PREFIX="$2"; shift 2 ;;
+        --title) need_value "$1" $#; set_mode mint; TITLE="$2"; HAVE_TITLE=1; shift 2 ;;
+        --branch) need_value "$1" $#; set_mode mint; BRANCH="$2"; HAVE_BRANCH=1; shift 2 ;;
+        --repo-root) need_value "$1" $#; REPO_ROOT="$2"; shift 2 ;;
+        --leasing) set_mode leasing; shift ;;
+        --init) set_mode init; shift ;;
+        --prune) set_mode prune; shift ;;
+        --ref) need_value "$1" $#; set_mode prune; REF="$2"; HAVE_REF=1; shift 2 ;;
+        --purged-owner) need_value "$1" $#; set_mode prune; PURGED+=("$2"); shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "hr-mint: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+[[ -n "$MODE" ]] || { usage >&2; exit 2; }
+
+STATE="${HR_STATE:-/media/projects/htui-hr/.state}"
+LEASES="$STATE/id-leases.tsv"
+LOCK="$STATE/id-leases.lock"
+
+if [[ ! "${HR_MINT_LOCK_TIMEOUT:-30}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    die 2 "HR_MINT_LOCK_TIMEOUT must be a number of seconds, got '${HR_MINT_LOCK_TIMEOUT}'"
+fi
+
+case "$MODE" in
+    leasing)
+        [[ -z "$REPO_ROOT" ]] || die 2 "--leasing takes no other argument"
+        do_leasing
+        exit $?
+        ;;
+    init)
+        [[ -z "$REPO_ROOT" ]] || die 2 "--init takes no other argument"
+        do_init
+        exit 0
+        ;;
+esac
+
+[[ -n "$REPO_ROOT" ]] || REPO_ROOT="$SELF_ROOT"
+[[ -d "$REPO_ROOT" ]] || die 2 "repo root not found: $REPO_ROOT"
+REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
+
+if [[ "$MODE" == prune ]]; then
+    [[ $HAVE_REF -eq 1 ]] || REF=main
+    [[ -n "$REF" && "$REF" != -* ]] || die 2 "--ref needs a ref name, got '$REF'"
+    for o in "${PURGED[@]}"; do [[ -n "$o" ]] || die 2 "--purged-owner needs a non-empty owner"; done
+    do_prune
+    exit 0
+fi
+
+# mint
+[[ -n "$PREFIX" ]] || die 2 "--prefix is required"
+PREFIX="$(printf '%s' "$PREFIX" | tr '[:lower:]' '[:upper:]')"
+contains "$PREFIX" "${PREFIXES[@]}" \
+    || die 2 "unknown prefix '$PREFIX'. The law defines exactly six: ${PREFIXES[*]}."
+[[ $HAVE_TITLE -eq 1 ]] || die 2 "--title is required"
+TITLE="$(one_line "$TITLE")"
+[[ -n "$TITLE" ]] || die 2 "--title is empty"
+if [[ $HAVE_BRANCH -eq 1 ]]; then
+    OWNER="$(one_line "$BRANCH")"
+    [[ -n "$OWNER" ]] || die 2 "--branch is empty"
+elif [[ -n "${HR_ITEM:-}" ]]; then
+    OWNER="hr/$(one_line "$HR_ITEM")"
+else
+    OWNER=host
+fi
+do_mint
+exit 0
