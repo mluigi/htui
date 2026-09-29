@@ -19,6 +19,25 @@ claim-time tag rules are now pinned per store — `NotClaimable` outranks `Missi
 at another box, and blueprint D94's no-item case is never refused. Four tests, no production
 behaviour change, no shared trait method, no migration, and no count pin moved. The gate's Postgres
 DSN is now password-free via `~/.pgpass`.
+Before it, **MOD-54 was done**
+(`docs/decisions/mod/mod-54.md`): `TextField` and `TextArea` measure display cells and step by
+grapheme through the new private `crates/htui/src/ui/cells.rs`, so a CJK or emoji line occupies
+the columns it is drawn in and `Backspace` cannot split a combining sequence. It declares
+`unicode-width` and `unicode-segmentation`, both already in the graph via `ratatui-core`; no
+snapshot moved. The rest of the display-width problem is **MOD-60**. `R-NF-1` is argued, not
+gated: a Windows cross-check of `-p htui` cannot run on this box, and MOD-16 carries it.
+Before it, **MOD-31 was done** (`docs/decisions/mod/mod-31.md`):
+`AgentRuntime.background` is now tagged by what each task writes, and the install guard consults
+only the writing half. A running prompt preview — which writes nothing (MOD-2 D102) — no longer
+refuses an install, a login, a `ProbeBox` or the `Online` swap's registration probe, and the
+refusal now names a re-probe as well as a probe. One guard line repaired all five callers;
+`ProbeAgents` never shared the claim and still does not (recorded, not changed).
+Before it, **MOD-56 was done** (`docs/decisions/mod/mod-56.md`): `terminal::init`
+builds the terminal itself instead of calling `ratatui::init`, so htui's panic hook is the outermost
+one and `restores_the_terminal()` is consulted before anything restores — a provider panic that
+`run_providers` contains (H-20) no longer tears the terminal down mid-session. `tests/panic_hook.rs`
+drives the real chain; `tests/panic_hook_order.rs` is a source guard that fails if a ratatui init
+comes back. Closes MOD-9 milestone-1 blueprint finding F-U.
 Before it, **TOOL-3 was decided** (`docs/decisions/tool/tool-3.md`): the maintainer accepted that `cargo clippy --target x86_64-pc-windows-msvc` cannot run here — it dies in `ring`'s build script with `cc-rs: failed to find tool "lib.exe"` — so **MOD-16 is the only Windows check** and no C toolchain is installed to replace it. Re-verified unchanged 2026-09-28, and green for **neither** crate: `ring` reaches `-p htui` through sqlx on a path that predates MOD-20, and MOD-20's reqwest/rustls extended the same failure to `-p htui-agent`. MOD-20's plan D21 and its Validation block are amended so nothing still asserts a gate that never went green, and the README section says up front that its command does not run here. MOD-20's Windows code was reviewed by eye, never linted.
 Before it, **CLEAN-5 was done** (`docs/decisions/clean/clean-5.md`): the MOD-4
 merge-hook test no longer waits a fixed 3 s for a merge whose future it dropped; it polls every
@@ -271,17 +290,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   is maintainer-only. Its write-up should carry the ANA-5 sections it touches.
   **Relates to ANA-16** (`docs/ANA-16.md` §5.3, §8): a container child box has its own hostname,
   distinct from its parent's (MOD-44), so the switch and the digest split also cover child boxes.
-- [ ] **MOD-31 - A running prompt preview makes an adapter install refuse** (from MOD-2, finding
-  F-121). `R-AGT-10`, `R-TUI-8`, `R-NF-3`. `AgentRuntime::serve` pushes the deferred preview task
-  into `self.background` (`agent_worker.rs:824`), and the install guard refuses whenever
-  `!self.background.is_empty()` with *"a probe is already running on this box; install once it has
-  finished"* (`agent_worker.rs:1116`). Selecting a Backlog row therefore blocks `i` in Settings for
-  the life of a preview, with a message about a probe that is not running. The guard's reason is real
-  — a probe and an install's re-probe race on the same `agent_box` row — but it keys on the wrong
-  set: `background` mixes tasks that **write** `agent_box` (the probe, the re-probe) with tasks that
-  only **read** (the preview, plan D102's "the preview writes nothing"). Split `background` by what a
-  task writes, and let the install guard consult the writing half only. `background_len` is read by
-  tests, so the split has to keep an answer for them. Found at MOD-2 close-out, 2026-09-15.
 - [ ] **MOD-32 - `trim_record`'s own strings reach the store unscrubbed** (from MOD-2, finding
   F-80). `R-SEC-3`, `R-PRM-3`. MOD-2's assembler scrubs every **digested** byte at the input layer
   (D100 as corrected by the milestone-9 CRITICAL, `f48b82b`), so nothing unmasked reaches the model
@@ -308,13 +316,17 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   side reintroduces the superseded-seq bug `16079aa` fixed, so the fix belongs in the runtime:
   catch the panic (or notice a panicked `JoinHandle` in `sweep_finished`) and send the task's
   terminal reply with a failure. Found 2026-09-26.
-- [ ] **MOD-54 - Wide characters and graphemes in the text widgets** (from MOD-7 milestone 2
-  review). `R-TUI-1`, `R-NF-1`. `TextField` and `TextArea` (`crates/htui/src/ui/`) count width in
-  `char`s and move the cursor by code point (plan D44 of MOD-7 milestone 2, `TextField`'s module
-  doc), so a CJK or emoji line overruns its column and the cursor cell can fall off-screen, and
-  `Left`/`Backspace` can split a combining sequence. Measure by display width (`unicode-width`) and
-  step by grapheme (`unicode-segmentation`) in both widgets together; declaring those crates is a
-  dependency decision. Found 2026-09-26.
+- [ ] **MOD-60 - Display width in every hand-laid-out row** (from MOD-54, plan D18). `R-TUI-1`,
+  `R-NF-1`. MOD-54 made `TextField` and `TextArea` count cells instead of code points through
+  `crate::ui::cells`; every other place that lays text out in `char`s has the identical class of
+  bug and is untouched on purpose. In order of severity: `crates/htui/src/ui/diff.rs` (the
+  Templates line diff -- a CJK hunk overrunning its pane), `crates/htui/src/ui/top_bar.rs` (the
+  tab bar and the clock), `crates/htui/src/ui/tabs/chat/transcript.rs` (wrap and clip), and
+  `settings::wrapped` plus every row renderer under `crates/htui/src/ui/tabs/settings/` and
+  `crates/htui/src/ui/tabs/backlog/detail/`. `ui::cells::cell_width` is the shared measurement to
+  build on. Note the chat transcript is the one to be careful with, because a snapshot there would
+  move. Also out of scope there: soft wrap, bidi, and terminals that report a CJK char as one cell.
+  Not blocked; MOD-54 is done (`docs/decisions/mod/mod-54.md`).
 - [ ] **MOD-59 - A write's reply names itself, so a form never stays "in flight"** (from MOD-9
   milestone 3 review, finding 3). `R-TUI-7`, `R-NF-3`. The Skills and Templates views decide that a
   save landed by finding what they sent in the re-read snapshot (`ui/tabs/skills/library.rs` `land`,
@@ -736,18 +748,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   which agent and model answer (the chat driver or a one-shot CLI call), whether the exchange is
   recorded, and how secrets in a body are scrubbed before they leave. Blocked on MOD-9 milestone 1.
 
-- [ ] **MOD-56 - htui's panic hook is wrapped by ratatui's, so a contained panic still restores the
-  terminal** (from MOD-9, milestone-1 blueprint finding F-U; maintainer-decided 2026-09-26).
-  `R-ID-1`, `R-TUI-1`. `terminal::init` (`crates/htui/src/terminal.rs:26-43`) installs htui's
-  **conditional** hook and then calls `ratatui::init()`, whose `try_init` wraps whatever hook is
-  current in ratatui's **unconditional** `restore()` (`ratatui-0.30.2/src/init.rs:397-403`,
-  `:566-572`). So a panic that `htui_agent::excerpt::run_providers` contains (MOD-2 review M1,
-  H-20) still drops the terminal out of raw mode and the alternate screen mid-session, and
-  `restores_the_terminal()` is never consulted first; `tests/panic_hook.rs` tests only the
-  predicate. Fix shape: initialise without ratatui's hook (build the terminal the way `enter`
-  already does, `terminal.rs:88`) or install htui's hook after `ratatui::init` with `take_hook`
-  dropping ratatui's, plus a test that runs the real hook chain. Not blocked.
-
 - [ ] **MOD-57 - Run the external editor inside the TUI pane** (from MOD-9, merge of MOD-7
   milestone 2, maintainer-decided 2026-09-26). `R-TUI-1`, `R-TUI-7`, `R-NF-1`. Today `E`/`Ctrl+E`
   in the Templates editor (and any later user of the shared `ui::TextArea`) suspends the whole TUI
@@ -758,7 +758,8 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   and the file read back through the same `parse` gate on exit. Works for any editor, nvim
   included. The alternative, nvim's `--embed` RPC UI (`nvim-rs`), is nvim-only and was not
   preferred. The three crates are not in `Cargo.lock`, so the plan owns that dependency decision.
-  Not blocked; pairs with MOD-54 (display width) for the in-app widget.
+  Not blocked. Its in-app widget draws through `ui::cells` (MOD-54, done:
+  `docs/decisions/mod/mod-54.md`); the rest of the display-width work is MOD-60.
 
 ### Deferred backlog
 
@@ -788,6 +789,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 41 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-59 write replies name themselves, MOD-55 agent help in the editor, MOD-56 panic hook order, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 39 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
 | TOOL-N  | 0 |
