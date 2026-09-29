@@ -14,7 +14,6 @@ use serde_json::Value;
 
 // F-15: the `y`/`n` convention is the Settings tab's, kept in one place, so this store-side module
 // borrows it from the UI module rather than owning a second copy.
-#[allow(unused_imports)]
 use crate::ui::tabs::settings::yes_or_no;
 
 /// The form's labels, in tab order (plan D231). `name` is the create form's only; the edit form
@@ -33,6 +32,18 @@ pub const FIELD_LABELS: [&str; 8] = [
 
 /// The field name of a refusal about the stored `launch` document rather than about a typed field.
 pub const LAUNCH_FIELD: &str = "launch";
+
+const NAME: &str = FIELD_LABELS[0];
+const TRANSPORT: &str = FIELD_LABELS[1];
+const COMMAND: &str = FIELD_LABELS[2];
+const ARGS: &str = FIELD_LABELS[3];
+const MODELS: &str = FIELD_LABELS[4];
+const DEFAULT_MODEL: &str = FIELD_LABELS[5];
+const BILLING: &str = FIELD_LABELS[6];
+const ENABLED: &str = FIELD_LABELS[7];
+
+/// The longest registry name (plan D234).
+const NAME_MAX: usize = 64;
 
 /// What the form edits of an `agent` row (plan D231): everything but `name`, `settings` and the
 /// keys of `launch` other than `command` and `args`.
@@ -111,7 +122,15 @@ pub struct DraftFields<'a> {
 /// from `[a-z0-9]`. No trimming: [`parse_name`] trims.
 #[must_use]
 pub fn valid_name(name: &str) -> bool {
-    todo!("{name}")
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let lower_or_digit = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    // Every accepted character is ASCII, so the byte length is the character count.
+    name.len() <= NAME_MAX
+        && lower_or_digit(first)
+        && chars.all(|c| lower_or_digit(c) || matches!(c, '.' | '_' | '-'))
 }
 
 /// The create form's `name` (plan D234), trimmed and checked with [`valid_name`].
@@ -120,7 +139,16 @@ pub fn valid_name(name: &str) -> bool {
 ///
 /// A [`Refusal`] on `name` when the rule does not hold.
 pub fn parse_name(text: &str) -> Result<String, Refusal> {
-    todo!("{text}")
+    let name = text.trim();
+    if valid_name(name) {
+        Ok(name.to_owned())
+    } else {
+        // The rule, never the text: a refused name may hold a control character.
+        Err(Refusal::new(
+            NAME,
+            "1-64 of a-z 0-9 . _ -, starting with a letter or digit",
+        ))
+    }
 }
 
 /// `transport` (plan D238): trimmed, ASCII-lowercased, then [`Transport`]'s `FromStr`.
@@ -129,7 +157,10 @@ pub fn parse_name(text: &str) -> Result<String, Refusal> {
 ///
 /// A [`Refusal`] on `transport` naming the accepted values.
 pub fn parse_transport(text: &str) -> Result<Transport, Refusal> {
-    todo!("{text}")
+    text.trim()
+        .to_ascii_lowercase()
+        .parse()
+        .map_err(|_| Refusal::new(TRANSPORT, format!("is {}", one_of(Transport::ALL))))
 }
 
 /// `command`: trimmed and non-empty.
@@ -138,7 +169,12 @@ pub fn parse_transport(text: &str) -> Result<Transport, Refusal> {
 ///
 /// A [`Refusal`] on `command` when nothing is left after trimming.
 pub fn parse_command(text: &str) -> Result<String, Refusal> {
-    todo!("{text}")
+    let command = text.trim();
+    if command.is_empty() {
+        Err(Refusal::new(COMMAND, "is required"))
+    } else {
+        Ok(command.to_owned())
+    }
 }
 
 /// `args` (plan D236): POSIX shell words. The inverse of [`format_args`].
@@ -147,14 +183,14 @@ pub fn parse_command(text: &str) -> Result<String, Refusal> {
 ///
 /// A [`Refusal`] on `args` carrying the parser's sentence (an unclosed quote).
 pub fn parse_args(text: &str) -> Result<Vec<String>, Refusal> {
-    todo!("{text}")
+    shell_words::split(text).map_err(|err| Refusal::new(ARGS, err.to_string()))
 }
 
 /// `args` as the form prefills it (plan D236): each argument quoted only where it has to be, so
 /// [`parse_args`] gives back exactly `args`.
 #[must_use]
 pub fn format_args(args: &[String]) -> String {
-    todo!("{args:?}")
+    shell_words::join(args)
 }
 
 /// `models` (plan D237): comma-separated, each trimmed, empties dropped, order kept.
@@ -163,13 +199,20 @@ pub fn format_args(args: &[String]) -> String {
 ///
 /// A [`Refusal`] on `models` naming the first model listed twice.
 pub fn parse_models(text: &str) -> Result<Vec<String>, Refusal> {
-    todo!("{text}")
+    let mut models: Vec<String> = Vec::new();
+    for model in text.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+        if models.iter().any(|kept| kept == model) {
+            return Err(Refusal::new(MODELS, format!("`{model}` is listed twice")));
+        }
+        models.push(model.to_owned());
+    }
+    Ok(models)
 }
 
 /// `models` as the form prefills it: joined with `", "`.
 #[must_use]
 pub fn format_models(models: &[String]) -> String {
-    todo!("{models:?}")
+    models.join(", ")
 }
 
 /// `default model` (plan D237): trimmed, empty for none. A non-empty `models` must list it; an
@@ -179,7 +222,17 @@ pub fn format_models(models: &[String]) -> String {
 ///
 /// A [`Refusal`] on `default model` when a non-empty `models` does not list it.
 pub fn parse_default(text: &str, models: &[String]) -> Result<Option<String>, Refusal> {
-    todo!("{text} {models:?}")
+    let default = text.trim();
+    if default.is_empty() {
+        return Ok(None);
+    }
+    if !models.is_empty() && !models.iter().any(|model| model == default) {
+        return Err(Refusal::new(
+            DEFAULT_MODEL,
+            format!("`{default}` is not one of the models"),
+        ));
+    }
+    Ok(Some(default.to_owned()))
 }
 
 /// `billing` (plan D238): trimmed, ASCII-lowercased, then [`Billing`]'s `FromStr`.
@@ -188,7 +241,10 @@ pub fn parse_default(text: &str, models: &[String]) -> Result<Option<String>, Re
 ///
 /// A [`Refusal`] on `billing` naming the accepted values.
 pub fn parse_billing(text: &str) -> Result<Billing, Refusal> {
-    todo!("{text}")
+    text.trim()
+        .to_ascii_lowercase()
+        .parse()
+        .map_err(|_| Refusal::new(BILLING, format!("is {}", one_of(Billing::ALL))))
 }
 
 /// `enabled (y/n)` (plan D238): the Settings tab's `yes_or_no` convention (blueprint F-15).
@@ -197,7 +253,7 @@ pub fn parse_billing(text: &str) -> Result<Billing, Refusal> {
 ///
 /// A [`Refusal`] on `enabled (y/n)` for anything but `y`, `yes`, `n` or `no`.
 pub fn parse_enabled(text: &str) -> Result<bool, Refusal> {
-    todo!("{text}")
+    yes_or_no(text).ok_or_else(|| Refusal::new(ENABLED, "is y or n"))
 }
 
 /// The whole form (plan D247): each parser in [`FIELD_LABELS`] order.
@@ -206,7 +262,22 @@ pub fn parse_enabled(text: &str) -> Result<bool, Refusal> {
 ///
 /// The first field's [`Refusal`], in tab order.
 pub fn draft_from_fields(fields: &DraftFields<'_>) -> Result<AgentDraft, Refusal> {
-    todo!("{fields:?}")
+    let transport = parse_transport(fields.transport)?;
+    let command = parse_command(fields.command)?;
+    let args = parse_args(fields.args)?;
+    let models = parse_models(fields.models)?;
+    let default_model = parse_default(fields.default_model, &models)?;
+    let billing = parse_billing(fields.billing)?;
+    let enabled = parse_enabled(fields.enabled)?;
+    Ok(AgentDraft {
+        transport,
+        command,
+        args,
+        models,
+        default_model,
+        billing,
+        enabled,
+    })
 }
 
 /// The worker's second pass over a draft it received (plan D247): the draft formatted back into
@@ -218,7 +289,17 @@ pub fn draft_from_fields(fields: &DraftFields<'_>) -> Result<AgentDraft, Refusal
 ///
 /// The [`Refusal`] the section would have shown for the same text.
 pub fn check_draft(draft: &AgentDraft) -> Result<AgentDraft, Refusal> {
-    todo!("{draft:?}")
+    let args = format_args(&draft.args);
+    let models = format_models(&draft.models);
+    draft_from_fields(&DraftFields {
+        transport: draft.transport.as_str(),
+        command: &draft.command,
+        args: &args,
+        models: &models,
+        default_model: draft.default_model.as_deref().unwrap_or(""),
+        billing: draft.billing.as_str(),
+        enabled: if draft.enabled { "y" } else { "n" },
+    })
 }
 
 /// Merges the form's `command` and `args` into a stored `agent.launch` (plan D235).
@@ -233,7 +314,17 @@ pub fn check_draft(draft: &AgentDraft) -> Result<AgentDraft, Refusal> {
 /// `AgentLaunch`. The sentence never quotes the document: serde's own message can quote a
 /// value, and `env` values are not for the screen (`R-SEC-2`).
 pub fn merge_launch(stored: &Value, command: &str, args: &[String]) -> Result<Value, Refusal> {
-    todo!("{stored} {command} {args:?}")
+    let Some(object) = stored.as_object() else {
+        return Err(Refusal::new(
+            LAUNCH_FIELD,
+            "the stored launch document is not a JSON object",
+        ));
+    };
+    let mut merged = object.clone();
+    merged.insert("command".to_owned(), Value::from(command));
+    merged.insert("args".to_owned(), Value::from(args.to_vec()));
+    let merged = Value::Object(merged);
+    checked_launch(merged)
 }
 
 /// An edit (plan D235, D239): `stored` with the draft applied.
@@ -247,7 +338,17 @@ pub fn merge_launch(stored: &Value, command: &str, args: &[String]) -> Result<Va
 ///
 /// The [`Refusal`] of [`check_draft`] or [`merge_launch`].
 pub fn apply_draft(stored: &Agent, draft: &AgentDraft) -> Result<Agent, Refusal> {
-    todo!("{stored:?} {draft:?}")
+    let draft = check_draft(draft)?;
+    let launch = merge_launch(&stored.launch, &draft.command, &draft.args)?;
+    Ok(Agent {
+        transport: draft.transport,
+        launch,
+        models: draft.models,
+        default_model: draft.default_model,
+        billing: draft.billing,
+        enabled: draft.enabled,
+        ..stored.clone()
+    })
 }
 
 /// A new row (plan D239): `launch` is `{command, args, env: {}}`, with no `discovery`, checked as
@@ -264,7 +365,26 @@ pub fn new_agent(
     settings: Value,
     now: DateTime<Utc>,
 ) -> Result<Agent, Refusal> {
-    todo!("{id} {name} {draft:?} {settings} {now}")
+    let name = parse_name(&name)?;
+    let draft = check_draft(draft)?;
+    let launch = checked_launch(serde_json::json!({
+        "command": draft.command,
+        "args": draft.args,
+        "env": {},
+    }))?;
+    Ok(Agent {
+        id,
+        name,
+        transport: draft.transport,
+        launch,
+        models: draft.models,
+        default_model: draft.default_model,
+        billing: draft.billing,
+        enabled: draft.enabled,
+        settings,
+        created_at: now,
+        updated_at: now,
+    })
 }
 
 /// The draft a stored row prefills the edit form with (blueprint F-16): `launch.command` if it is a
@@ -272,13 +392,62 @@ pub fn new_agent(
 /// `launch`.
 #[must_use]
 pub fn draft_of(agent: &Agent) -> AgentDraft {
-    todo!("{agent:?}")
+    let command = agent
+        .launch
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let args = agent
+        .launch
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|args| {
+            args.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    AgentDraft {
+        transport: agent.transport,
+        command,
+        args,
+        models: agent.models.clone(),
+        default_model: agent.default_model.clone(),
+        billing: agent.billing,
+        enabled: agent.enabled,
+    }
 }
 
 /// Whether the draft changes what a probe checked (plan D246): `transport`, `command` or `args`.
 #[must_use]
 pub fn launch_changed(stored: &Agent, draft: &AgentDraft) -> bool {
-    todo!("{stored:?} {draft:?}")
+    let before = draft_of(stored);
+    before.transport != draft.transport
+        || before.command != draft.command
+        || before.args != draft.args
+}
+
+/// `"a or b"` / `"a, b or c"`: the accepted values of a closed vocabulary, for a refusal.
+fn one_of<T: Copy + std::fmt::Display>(all: &[T]) -> String {
+    let words: Vec<String> = all.iter().map(ToString::to_string).collect();
+    match words.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+        _ => words.concat(),
+    }
+}
+
+/// `launch` checked as [`AgentLaunch`]. The refusal drops serde's sentence, which can quote a
+/// value (`invalid type: string "…"`), and an `env` value must not reach the screen (`R-SEC-2`).
+fn checked_launch(launch: Value) -> Result<Value, Refusal> {
+    match serde_json::from_value::<AgentLaunch>(launch.clone()) {
+        Ok(_) => Ok(launch),
+        Err(_) => Err(Refusal::new(
+            LAUNCH_FIELD,
+            "the merged launch document is not a valid AgentLaunch",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -370,7 +539,14 @@ mod tests {
             strings(&["--uid="]),
             strings(&["${claude_agent_acp}"]),
             strings(&["C:\\tools\\x.exe"]),
-            strings(&["-y", "", "two words", "#not-a-comment", "tab\there", "new\nline"]),
+            strings(&[
+                "-y",
+                "",
+                "two words",
+                "#not-a-comment",
+                "tab\there",
+                "new\nline",
+            ]),
             claude,
         ];
         for args in table {
@@ -396,7 +572,11 @@ mod tests {
     #[test]
     fn names_follow_the_d234_rule() {
         for seed in seed_rows(epoch()) {
-            assert!(valid_name(&seed.name), "the seed name {:?} passes", seed.name);
+            assert!(
+                valid_name(&seed.name),
+                "the seed name {:?} passes",
+                seed.name
+            );
         }
         for name in ["a", "0", "a.b_c-d", &"x".repeat(64)] {
             assert!(valid_name(name), "{name:?} passes");
@@ -610,8 +790,8 @@ mod tests {
     #[test]
     fn merge_launch_keeps_env_discovery_install_and_unknown_keys() {
         let stored = stored_launch();
-        let merged = merge_launch(&stored, "/opt/x", &strings(&["--a", "b c"]))
-            .expect("a valid merge");
+        let merged =
+            merge_launch(&stored, "/opt/x", &strings(&["--a", "b c"])).expect("a valid merge");
         assert_eq!(merged["command"], json!("/opt/x"));
         assert_eq!(merged["args"], json!(["--a", "b c"]));
         for key in ["env", "discovery", "x_future"] {
@@ -707,8 +887,14 @@ mod tests {
     fn new_agent_has_a_blank_launch_and_the_given_settings() {
         let id = AgentId::new();
         let settings = json!({ "cli": { "stream": "claude_stream_json" } });
-        let row = new_agent(id, "agent-x".to_owned(), &draft(), settings.clone(), epoch())
-            .expect("a valid row");
+        let row = new_agent(
+            id,
+            "agent-x".to_owned(),
+            &draft(),
+            settings.clone(),
+            epoch(),
+        )
+        .expect("a valid row");
         assert_eq!(row.id, id);
         assert_eq!(row.name, "agent-x");
         assert_eq!(
@@ -730,8 +916,14 @@ mod tests {
     #[test]
     fn new_agent_checks_the_name_and_the_draft_again() {
         assert_eq!(
-            new_agent(AgentId::new(), "Bad Name".to_owned(), &draft(), json!({}), epoch())
-                .map_err(|refusal| refusal.field),
+            new_agent(
+                AgentId::new(),
+                "Bad Name".to_owned(),
+                &draft(),
+                json!({}),
+                epoch()
+            )
+            .map_err(|refusal| refusal.field),
             Err("name")
         );
         let blank = AgentDraft {
