@@ -135,16 +135,19 @@ impl TextField {
             }
             KeyCode::Backspace => {
                 if self.cursor > 0 {
-                    let byte = self.byte_of(self.cursor - 1);
-                    self.text.remove(byte);
+                    // The whole cluster, not its first char: `String::remove` would leave a
+                    // stray combining mark or the rest of a ZWJ sequence behind. `replace_range`
+                    // shrinks in place, so a masked buffer is not reallocated.
+                    let (start, end) = (self.byte_of(self.cursor - 1), self.byte_of(self.cursor));
+                    self.text.replace_range(start..end, "");
                     self.cursor -= 1;
                 }
                 FieldOutcome::Consumed
             }
             KeyCode::Delete => {
                 if self.cursor < self.len() {
-                    let byte = self.byte_of(self.cursor);
-                    self.text.remove(byte);
+                    let (start, end) = (self.byte_of(self.cursor), self.byte_of(self.cursor + 1));
+                    self.text.replace_range(start..end, "");
                 }
                 FieldOutcome::Consumed
             }
@@ -286,6 +289,10 @@ impl TextField {
             // `head_width + at_width <= budget` is today's `cursor < budget`: the whole head plus
             // the cursor cell fit.
             (0, false)
+        } else if budget <= at_width {
+            // No cell is left for the ellipsis beside the cursor cell, so the cursor is all that
+            // is drawn (and `budget - at_width - 1` below would underflow).
+            (self.cursor.min(glyphs.len()), false)
         } else {
             // Otherwise show as much of the tail as fits: the smallest `start` whose shown tail
             // leaves room for the ellipsis and the cursor cell. The scan runs upward and sums the
@@ -779,6 +786,39 @@ mod tests {
             Some("a\u{301}"),
             "not a base and a stray mark"
         );
+    }
+
+    /// Backspace and Delete over a cluster of several chars take all of it: a base and its mark,
+    /// and a ZWJ family, leave nothing behind.
+    #[test]
+    fn backspace_and_delete_remove_a_multi_char_cluster() {
+        for cluster in ["a\u{301}", "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"] {
+            let mut field = TextField::with_text(cluster);
+            field.on_key(key(KeyCode::Backspace));
+            assert_eq!(field.text(), Some(""), "Backspace over {cluster:?}");
+            assert_eq!(field.cursor, 0);
+
+            let mut field = TextField::with_text(&format!("{cluster}x"));
+            field.on_key(key(KeyCode::Home));
+            field.on_key(key(KeyCode::Delete));
+            assert_eq!(field.text(), Some("x"), "Delete over {cluster:?}");
+        }
+    }
+
+    /// A field whose budget is no wider than the cursor cell, with text before the cursor, draws
+    /// only the cursor: there is no room for the ellipsis, and the tail scan must not underflow.
+    #[test]
+    fn a_budget_no_wider_than_the_cursor_draws_only_the_cursor() {
+        let mut field = TextField::with_text("a\u{4e00}");
+        field.on_key(key(KeyCode::Left));
+        assert_eq!(line_text(&field, 2, true), "\u{4e00}");
+
+        let mut masked = TextField::masked();
+        for _ in 0..12 {
+            masked.on_key(key(KeyCode::Char('x')));
+        }
+        // " (12)" takes five of the six cells, leaving one for the cursor at the end.
+        assert_eq!(line_text(&masked, 6, true), "  (12)");
     }
 
     /// D3's `insert`: a typed mark merges into the cluster before it, so the count does not grow
