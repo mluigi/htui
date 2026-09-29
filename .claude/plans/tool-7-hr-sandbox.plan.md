@@ -373,7 +373,7 @@ no sync back into htui is planned.
 |---|---|---|---|
 | 1 | Host is Ubuntu 24.04; `~/.local` binaries run in `ubuntu:24.04` | ✓ | `/etc/os-release` 24.04, glibc 2.39; probe container: `claude` 2.1.284, `gortex` v0.64.5, `headroom` 0.38.0, `uvx`, `graphify` all exit 0 |
 | 1a | PATH inside mirrors host tool versions | ✗ → amended | `~/.local/bin/uv{,x}` is 0.8.22 (2025) vs mise 0.12.20; mise dirs must precede `~/.local/bin` |
-| 2 | Gortex daemon runs in a container with a fresh store | ✓ (T2) | sandbox `claude -p`: SessionStart banner "cwd `/home/mluigi/projects/htui` is tracked … 27795 nodes", daemon indexed the clone in ~17 s. Needed fix `f27c440`: stale `daemon.pid` in the per-run volume blocked respawn after a container restart; `dev` start command clears the runtime files |
+| 2 | Gortex daemon runs in a container with a fresh store | ✓ (T2) | sandbox `claude -p`: SessionStart banner "cwd `/home/mluigi/projects/htui` is tracked … 27795 nodes", daemon indexed the clone in ~17 s. Needed fix `4459066`: stale `daemon.pid` in the per-run volume blocked respawn after a container restart; `dev` start command clears the runtime files |
 | 3 | Untracked `.claude/settings.local.json` in the clone is honoured | ✓ (T2) | all 4 SessionStart hooks (Gortex, superpowers, remember, headroom) `hook_response` exit 0 in the sandbox stream-json |
 | 4 | Concurrent OAuth refresh on a shared `.credentials.json` is safe | argued ✓, observe in T6 (maintainer 2026-09-29) | `~/.claude` is a bind-mounted directory on the same filesystem, so atomic renames and lock dirs behave as for the parallel host sessions already in use; forced refresh not run (it would edit the live auth file). Watch for logouts if T6 crosses the token expiry; fallback `claude setup-token` |
 | 5 | `~/.claude.json` is rewritten by rename | ✓ | inode 2149922 → 2149837 across one minute of this session |
@@ -401,7 +401,7 @@ One sandbox brought up by hand from `docker/hr/compose.hr.yaml`; headless `claud
 | hooks | ✔ Gortex / superpowers / remember / headroom SessionStart exit 0 |
 | remember → shared `.remember/` | ✔ writes land in host `.remember/tmp` |
 
-Fixes (`f27c440`): `UV_TOOL_DIR=/tmp/uv-tools` (uvx writes temp files into its tool dir even for
+Fixes (`4459066`): `UV_TOOL_DIR=/tmp/uv-tools` (uvx writes temp files into its tool dir even for
 ephemeral tools; `~/.local` is ro); `dev` start command clears Gortex `daemon.{pid,sock,spawn.lock,spawn.fail}`.
 No fallback taken. F9 (share Gortex `memories/`): **not shared** — each run's Gortex memories live
 in its volume and die at purge; durable decisions belong in the repo docs anyway.

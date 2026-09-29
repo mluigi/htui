@@ -58,9 +58,9 @@ paste-cache, shell snapshots, history, cost logs, …) is masked per run. Full t
 
 ## Commits
 
-`08f8fbc` plan · `0696688` blueprint · `f4efa04`, `e6bfd11` image and compose (T1) · `d177c48`,
-`3f66429` hr-mint (T3) · `f27c440`, `4813bee` spike fixes and results (T2) · `0084edd`, `fc88762`,
-`50aa884`, `9554a6b`, `2bdf2d6` hr (T4) · `a2027c7`, `676884c`, `fa23ed8`, `fd2a821` docs and
-sandbox mode (T5) · `82a6fc3` rule amendment · review fixes `d737c84`, `aa1f157`, `14ebd2b`,
-`f31d819`, `8504643`, `bb1466c`, `ce9b18e`, `e481134`, `5aae30f`, `e694c31`, `0bb7f04`, `4d87731`,
-`623ea8f`, `a1791a6`, `02185c1`, `93201c3`, `3d1f541`, `c270bf5`, `ddf7c30`, `951080e`, `213d901`.
+`1bb50a8` plan · `15f38fa` blueprint · `afe39b9`, `4f6d294` image and compose (T1) · `a861e8c`,
+`87484a0` hr-mint (T3) · `4459066`, `0ce36c6` spike fixes and results (T2) · `22e8394`, `d754075`,
+`f2d08e6`, `1713f3c`, `2d3ef05` hr (T4) · `735de43`, `844d2b2`, `0f2ffb8`, `b119b55` docs and
+sandbox mode (T5) · `1087702` rule amendment · review fixes `cd52855`, `2d362a5`, `ae635d1`,
+`d74342a`, `b8c3b0a`, `2fc09ce`, `479f6a8`, `d6a0083`, `68c8062`, `9a3aef7`, `5e353bd`, `736ee87`,
+`f346e52`, `12c4b65`, `980993f`, `06e5bb0`, `ff10519`, `2863649`, `1c54d4d`, `33ab5b2`, `720f169`.
