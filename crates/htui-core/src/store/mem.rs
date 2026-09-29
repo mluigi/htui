@@ -11,7 +11,7 @@
 //! `(project, prefix)` key counter and the absent delete path of §4.1, and the compare-and-set on
 //! `version` with its `Diverged { head, ancestor }` answer of §4.2.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use chrono::{DateTime, Utc};
@@ -1427,18 +1427,44 @@ impl State {
             .collect()
     }
 
+    /// MOD-40 plan D1: whether `row`'s run carries `fence`'s lease. `lease_owners` holds a run only
+    /// while its lease names an owner ([`WriteStore::release_lease`] removes it), which is
+    /// Postgres's `lease_owner IS NOT DISTINCT FROM $fence`. A function of the map rather than of
+    /// `self`, so a caller can hold `steps` mutably while it asks.
+    fn fence_holds(
+        lease_owners: &HashMap<RunId, Uuid>,
+        row: &RunStep,
+        fence: StepFence,
+    ) -> Result<()> {
+        if lease_owners.get(&row.run_id).copied() == fence.owner() {
+            Ok(())
+        } else {
+            Err(StoreError::Fenced { step: row.id })
+        }
+    }
+
     /// Appends events, skipping every `(run_step_id, seq)` already stored, and answers how many
     /// rows landed (§4.3).
     ///
     /// Every event is validated **before** the first insert, because Postgres does the whole batch
     /// in one statement: a batch naming a step that does not exist must write none of its rows.
-    fn append_events(&mut self, _fence: StepFence, events: &[SessionEvent]) -> Result<usize> {
+    /// Existence first, then the fence (MOD-40 plan D1), lowest step first, both before the first
+    /// insert.
+    fn append_events(&mut self, fence: StepFence, events: &[SessionEvent]) -> Result<usize> {
         for event in events {
             if !self.steps.contains_key(&event.run_step_id) {
                 return Err(StoreError::Constraint(format!(
                     "session_event.run_step_id `{}` references no run_step",
                     event.run_step_id
                 )));
+            }
+        }
+        // Then the fence, before any row is written; the lowest step first, which is the one
+        // Postgres's `fenced` CTE names (MOD-40 blueprint B6).
+        let named: BTreeSet<StepId> = events.iter().map(|event| event.run_step_id).collect();
+        for step in named {
+            if let Some(row) = self.steps.get(&step) {
+                Self::fence_holds(&self.lease_owners, row, fence)?;
             }
         }
 
@@ -1461,7 +1487,7 @@ impl State {
     /// `run_step.usage`, plus `prompt_digest` when one is supplied (`docs/ANA-4.md` §4.1).
     fn set_step_usage(
         &mut self,
-        _fence: StepFence,
+        fence: StepFence,
         step: StepId,
         usage: Value,
         prompt_digest: Option<String>,
@@ -1474,6 +1500,7 @@ impl State {
                 entity: "run_step",
                 id: step.to_string(),
             })?;
+        Self::fence_holds(&self.lease_owners, row, fence)?;
         row.usage = Some(usage);
         if let Some(digest) = prompt_digest {
             row.prompt_digest = Some(digest);
@@ -4217,7 +4244,7 @@ impl State {
     /// The settle columns of [`StepOutcome`] and never `status`.
     fn finish_step(
         &mut self,
-        _fence: StepFence,
+        fence: StepFence,
         step: StepId,
         outcome: StepOutcome,
         now: DateTime<Utc>,
@@ -4229,6 +4256,7 @@ impl State {
                 entity: "run_step",
                 id: step.to_string(),
             })?;
+        Self::fence_holds(&self.lease_owners, row, fence)?;
         row.exit_code = outcome.exit_code;
         // The two the assembler and the usage summer own: `None` leaves the column.
         if outcome.usage.is_some() {

@@ -6,12 +6,12 @@
 //! `READ COMMITTED` the loser of a compare-and-set race blocks on the row lock, re-evaluates
 //! `version = $2` against the committed value and matches nothing (ANA-9 §11.3). The exceptions are
 //! MOD-2's chat-run pair, which writes one `run` and one `run_step` and therefore takes an explicit
-//! transaction, exactly as the pending-buffer upload does (`crate::cache::pending`), and MOD-15's
-//! two deletes, which count and delete in one transaction **at `REPEATABLE READ`** so that the two
-//! statements share a snapshot as well (review M1; see [`begin_repeatable_read`]). MOD-7's
-//! `record_box_probe` is one more: it updates the `box` row and replaces its `box_tool` set, so it
-//! takes a transaction too (plan D10). MOD-38's amend, withdraw and `cite` also take one, because
-//! each decides a refusal on a row it has locked before it writes (see [`revise_requirement`]).
+//! transaction, and MOD-15's two deletes, which count and delete in one transaction **at
+//! `REPEATABLE READ`** so that the two statements share a snapshot as well (review M1; see
+//! [`begin_repeatable_read`]). MOD-7's `record_box_probe` is one more: it updates the `box` row and
+//! replaces its `box_tool` set, so it takes a transaction too (plan D10). MOD-38's amend, withdraw
+//! and `cite` also take one, because each decides a refusal on a row it has locked before it writes
+//! (see [`revise_requirement`]).
 //!
 //! There is **no `DELETE FROM item`** in this file and none may be added: §4.1's "keys are never
 //! reused" is enforced by the absence of the path, and the conformance case `no_delete_path` is
@@ -175,6 +175,24 @@ async fn step_exists(conn: &mut PgConnection, step: StepId) -> Result<()> {
             id: step.to_string(),
         })?;
     Ok(())
+}
+
+/// MOD-40 plan D1: why a fenced `UPDATE` of `step` matched no row. [`StoreError::NotFound`] when
+/// the step does not exist, else [`StoreError::Fenced`]: `step_exists`' follow-up read on a miss,
+/// `interrupt_step`'s shape.
+///
+/// Its callers box it: it is the rare branch, and inline it would add an acquire and a query to
+/// every settle's future, which the engine nests deep enough that a debug build's worker stack
+/// overflows (`htui/tests/runs_pg.rs`).
+async fn fenced_or_missing(pool: &sqlx::PgPool, step: StepId) -> StoreError {
+    let exists = async {
+        let mut conn = pool.acquire().await.map_err(map_sqlx)?;
+        step_exists(&mut conn, step).await
+    };
+    match exists.await {
+        Ok(()) => StoreError::Fenced { step },
+        Err(err) => err,
+    }
 }
 
 /// The `document` insert [`WriteStore::write_document`] and [`WriteStore::close_out`] share, on
@@ -925,25 +943,33 @@ impl WriteStore for PgStore {
         }
     }
 
-    /// Appends session events in one `INSERT`, skipping the `(run_step_id, seq)` pairs already
-    /// stored (ANA-9 §4.3, plan D3).
+    /// Appends session events in one statement under `fence`, skipping the `(run_step_id, seq)`
+    /// pairs already stored (ANA-9 §4.3, plan D3; MOD-40 plan D1).
     ///
     /// The batch is carried as **one** `jsonb` parameter and expanded by `jsonb_to_recordset`,
     /// rather than as nine parallel arrays: `SessionEvent`'s serde form already *is* the row -
-    /// field names are the column names verbatim - which is the same fact the pending buffer's
-    /// line format rests on (`crate::cache::pending`), and nullable `text[]` / `jsonb[]` parameters
+    /// field names are the column names verbatim - and nullable `text[]` / `jsonb[]` parameters
     /// are avoided entirely.
     ///
-    /// `rows_affected()` counts inserts only, because `ON CONFLICT ... DO NOTHING` reports the
-    /// skipped rows as unaffected: that is the "how many landed" answer §4.1 asks for, and it is
-    /// what makes a replayed offline buffer distinguishable from a fresh one.
+    /// The fence is decided **inside** the statement (MOD-40 blueprint B1, B2). `lease` reads the
+    /// named steps' runs and share-locks them, so a `take_lease` or `adopt_runs` either waits for
+    /// this write or is seen by it; `fenced` is the lowest step whose run's `lease_owner` is not
+    /// `$2`. The insert runs only when nothing is fenced, **or** when a named step does not exist
+    /// at all, so that such a row still reaches the foreign key and refuses the batch (`23503`)
+    /// ahead of the fence. The statement answers both facts, so no second read is needed and none
+    /// can race.
+    ///
+    /// `inserted` counts inserts only, because `ON CONFLICT ... DO NOTHING` skips a stored row: that
+    /// is the "how many landed" answer §4.1 asks for, and what tells a recorder's replay (short is
+    /// fine) from a fresh batch (short is a second writer).
     ///
     /// # Errors
     ///
     /// [`StoreError::Constraint`] when an event names a `run_step` that does not exist (`23503`)
-    /// or a `kind` / `role` outside the §4.3 `CHECK` lists (`23514`). One statement, so a refused
-    /// batch writes none of its rows.
-    async fn append_events(&self, _fence: StepFence, events: &[SessionEvent]) -> Result<usize> {
+    /// or a `kind` / `role` outside the §4.3 `CHECK` lists (`23514`); [`StoreError::Fenced`] when a
+    /// named step's run does not carry `fence`'s lease. One statement, so a refused batch writes
+    /// none of its rows.
+    async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> Result<usize> {
         if events.is_empty() {
             return Ok(0);
         }
@@ -951,25 +977,57 @@ impl WriteStore for PgStore {
             StoreError::Backend(format!("session_event does not serialise: {err}"))
         })?;
 
-        let inserted = sqlx::query!(
+        let answer = sqlx::query!(
             r#"
-            INSERT INTO session_event (run_step_id, seq, turn, kind, role, tool_call_id,
-                                       payload, raw, at)
-            SELECT e.run_step_id, e.seq, e.turn, e.kind, e.role, e.tool_call_id, e.payload,
-                   e.raw, e.at
-              FROM jsonb_to_recordset($1::jsonb)
-                   AS e(run_step_id uuid, seq int, turn int, kind text, role text,
-                        tool_call_id text, payload jsonb, raw jsonb, at timestamptz)
-            ON CONFLICT (run_step_id, seq) DO NOTHING
+            WITH e AS (
+                SELECT *
+                  FROM jsonb_to_recordset($1::jsonb)
+                       AS e(run_step_id uuid, seq int, turn int, kind text, role text,
+                            tool_call_id text, payload jsonb, raw jsonb, at timestamptz)
+            ),
+            lease AS (
+                SELECT s.id AS run_step_id, r.lease_owner
+                  FROM run_step s
+                  JOIN run r ON r.id = s.run_id
+                 WHERE s.id IN (SELECT run_step_id FROM e)
+                   FOR SHARE OF r
+            ),
+            fenced AS (
+                SELECT run_step_id
+                  FROM lease
+                 WHERE lease_owner IS DISTINCT FROM $2
+                 ORDER BY run_step_id
+                 LIMIT 1
+            ),
+            ins AS (
+                INSERT INTO session_event (run_step_id, seq, turn, kind, role, tool_call_id,
+                                           payload, raw, at)
+                SELECT e.run_step_id, e.seq, e.turn, e.kind, e.role, e.tool_call_id, e.payload,
+                       e.raw, e.at
+                  FROM e
+                 WHERE NOT EXISTS (SELECT 1 FROM fenced)
+                    OR EXISTS (SELECT 1 FROM e AS m
+                                WHERE NOT EXISTS (SELECT 1 FROM lease l
+                                                   WHERE l.run_step_id = m.run_step_id))
+                ON CONFLICT (run_step_id, seq) DO NOTHING
+                RETURNING 1
+            )
+            SELECT (SELECT count(*) FROM ins) AS "inserted!",
+                   (SELECT run_step_id FROM fenced) AS "fenced_step?"
             "#,
             rows,
+            fence.owner(),
         )
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
-        .map_err(map_sqlx)?
-        .rows_affected();
+        .map_err(map_sqlx)?;
 
-        Ok(usize::try_from(inserted).unwrap_or(0))
+        if let Some(step) = answer.fenced_step {
+            return Err(StoreError::Fenced {
+                step: StepId::from_uuid(step),
+            });
+        }
+        Ok(usize::try_from(answer.inserted).unwrap_or(0))
     }
 
     /// `run_step.usage` on every call, `run_step.prompt_digest` only when one is supplied
@@ -980,11 +1038,13 @@ impl WriteStore for PgStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] when the step does not exist - zero rows updated is the only thing
-    /// this statement can mean.
+    /// [`StoreError::NotFound`] when the step does not exist and [`StoreError::Fenced`] when it
+    /// does and its run does not carry `fence`'s lease, told apart by `step_exists`' follow-up read
+    /// on a miss (`interrupt_step`'s shape). `FOR SHARE` on the run for `append_events`' reason
+    /// (MOD-40 blueprint B2).
     async fn set_step_usage(
         &self,
-        _fence: StepFence,
+        fence: StepFence,
         step: StepId,
         usage: Value,
         prompt_digest: Option<String>,
@@ -992,23 +1052,25 @@ impl WriteStore for PgStore {
         let updated = sqlx::query!(
             "UPDATE run_step \
                 SET usage = $2, prompt_digest = COALESCE($3, prompt_digest) \
-              WHERE id = $1",
+              WHERE id = $1 \
+                AND EXISTS (SELECT 1 FROM run r \
+                             WHERE r.id = run_step.run_id \
+                               AND r.lease_owner IS NOT DISTINCT FROM $4 \
+                               FOR SHARE)",
             step.as_uuid(),
             usage,
             prompt_digest.as_deref(),
+            fence.owner(),
         )
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?
         .rows_affected();
 
-        if updated == 0 {
-            return Err(StoreError::NotFound {
-                entity: "run_step",
-                id: step.to_string(),
-            });
+        if updated == 1 {
+            return Ok(());
         }
-        Ok(())
+        Err(Box::pin(fenced_or_missing(&self.pool, step)).await)
     }
 
     /// Inserts or updates one `agent` row, keyed by `agent.id` (`docs/ANA-4.md` §4.1, ANA-9 §5.7).
@@ -4068,11 +4130,13 @@ impl WriteStore for PgStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] `{ entity: "run_step" }` - zero rows updated is the only thing this
-    /// statement can mean.
+    /// [`StoreError::NotFound`] `{ entity: "run_step" }` when the step does not exist and
+    /// [`StoreError::Fenced`] when it does and its run does not carry `fence`'s lease, told apart
+    /// by `step_exists`' follow-up read on a miss (`interrupt_step`'s shape). `FOR SHARE` on the
+    /// run for `append_events`' reason (MOD-40 blueprint B2).
     async fn finish_step(
         &self,
-        _fence: StepFence,
+        fence: StepFence,
         step: StepId,
         outcome: StepOutcome,
     ) -> Result<()> {
@@ -4084,7 +4148,11 @@ impl WriteStore for PgStore {
                     verify_outcome   = $5, \
                     verify_exit_code = $6, \
                     finished_at      = $7 \
-              WHERE id = $1",
+              WHERE id = $1 \
+                AND EXISTS (SELECT 1 FROM run r \
+                             WHERE r.id = run_step.run_id \
+                               AND r.lease_owner IS NOT DISTINCT FROM $8 \
+                               FOR SHARE)",
             step.as_uuid(),
             outcome.exit_code,
             outcome.usage,
@@ -4092,19 +4160,17 @@ impl WriteStore for PgStore {
             outcome.verify_outcome.map(VerifyOutcome::as_str),
             outcome.verify_exit_code,
             outcome.finished_at,
+            fence.owner(),
         )
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?
         .rows_affected();
 
-        if updated == 0 {
-            return Err(StoreError::NotFound {
-                entity: "run_step",
-                id: step.to_string(),
-            });
+        if updated == 1 {
+            return Ok(());
         }
-        Ok(())
+        Err(Box::pin(fenced_or_missing(&self.pool, step)).await)
     }
 
     /// Plan D89: one compare-and-set `UPDATE`, `running -> failed` with the note.

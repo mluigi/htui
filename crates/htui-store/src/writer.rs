@@ -5,27 +5,16 @@
 //! whole chat session, inside a task the store worker spawned, and it is generic over
 //! `S: WriteStore` — it needs something it can own.
 //!
-//! [`Writer`] is that something. Every arm is a cheap handle — `PgStore` is a pool handle,
-//! `MemStore` is an `Arc`, `BufferedWriter` is a `CacheStore` handle and a path — so a `Writer`
-//! is a clone of a handle, never a copy of a store.
+//! [`Writer`] is that something. Both arms are cheap handles — `PgStore` is a pool handle and
+//! `MemStore` is an `Arc` — so a `Writer` is a clone of a handle, never a copy of a store.
 //!
-//! There are **three** arms, but since MOD-25 only two of them are ever constructed. Between
-//! MOD-2 milestone 4 and MOD-25 [`Backend::writer`](crate::Backend::writer) answered `Some` on
-//! [`Backend::Offline`](crate::Backend::Offline) too (plan D34): an offline chat recorded the same
-//! rows to `<cache_dir>/pending/` as JSON lines, and the refresher uploaded them on the next
-//! connection. That was a different sink, not a different recorder — the recorder is generic over
-//! `S: WriteStore` and learns nothing about being offline, so every conformance case that passes
-//! online passed offline with the same rows.
-//!
-//! **MOD-25 made `htui` online-only**: `Backend::writer()` answers `None` off the server and a
-//! chat there is refused with [`DATABASE_UNREACHABLE`], so no backend hands out
-//! `Writer::Buffered` any more. The arm and `BufferedWriter` are kept, compiling and `pub`,
-//! for one release, so reversing MOD-25 is restoring one arm in `backend.rs`; the suites that
-//! prove them construct `BufferedWriter` directly, and `upload_pending` still runs on every
-//! refresh pass so buffers from earlier builds land. A later CLEAN item deletes all of it. What
-//! has **not** changed at any point is the invariant that matters: nothing writes to Postgres
-//! unless the backend is `Online`, and [`Backend::writable`](crate::Backend::writable) still
-//! answers `None` off the server.
+//! **Online only (MOD-25).** Between MOD-2 milestone 4 and MOD-25 a third arm buffered an offline
+//! chat's rows under `<cache_dir>/pending/` for a later upload (plan D34). MOD-25 removed that
+//! path: [`Backend::writer`](crate::Backend::writer) answers `None` off the server, where a chat is
+//! refused with [`DATABASE_UNREACHABLE`], and [`Backend::writable`](crate::Backend::writable)
+//! still answers `None` off the server, so nothing writes to Postgres unless the backend is
+//! `Online`. A step write the store refuses is re-offered by the recorder itself, at the same
+//! `seq` (`htui_agent::record`, MOD-40 plan D3); no buffer outlives the process.
 //!
 //! `MemStore` is reachable here and is not through `writable`, deliberately: `--demo` and every
 //! chat-tab snapshot run against it, and a seam only the production backend can exercise is a seam
@@ -79,38 +68,6 @@ impl Writer {
     }
 }
 
-/// The offline [`WriteStore`] (MOD-2 plan D34, D35): the rows an online chat sends to Postgres,
-/// appended to `<cache_dir>/pending/<project>.<run>.jsonl.open` as JSON lines instead.
-/// It writes what the buffer's line format can hold and refuses the rest. That format is
-/// `session_event` columns only (`crate::cache::pending`), so:
-/// - `append_events` is the whole point, and it needs the `(project, run)` pair the file name
-///   carries. `start_chat_run` is where that pair arrives, so it **registers** the chat's step
-///   rather than writing a row; a later event for a step nobody registered is a
-///   `StoreError::NotFound`, never a silent drop.
-/// - `set_step_usage` is a no-op: `run_step.usage` has nowhere to go in the buffer, and
-///   `upload_pending` recomputes it from the uploaded rows (plan D36) rather than losing it.
-/// - `set_step_prompt` is a **refusal**, and the contrast with the line above is the point: no
-///   upload can recompute `run_step.trim_record`, so a no-op would silently drop the audit row
-///   `R-PRM-3` requires to be "recorded on the step" (MOD-2 milestone 9, blueprint E-8).
-/// - `finish_chat_run` **seals** the buffer (risk `[H-1]`), which is a deliberate deviation from
-///   D35's "a no-op that logs at debug": without it, a chat that outlives a reconnect is uploaded
-///   mid-flight and its `run_step.usage` frozen at a partial sum.
-/// - item and registry writes answer `StoreError::Unreachable`: they genuinely need the server.
-///
-/// Two consequences worth stating, both of a buffered chat that a build before MOD-25 started.
-/// Such a chat is **not** in the mirror's `run` table until it is uploaded, so `active_runs` and
-/// the top bar do not count it — the D42 header is the one place it shows. And every construction
-/// of this writer yields a fresh, empty one, which was right because the runtime took exactly one
-/// per chat and moved it into that chat's session task, so its `start_chat_run` and its
-/// `append_events` shared one map. Since MOD-25 no [`Backend::writer`](crate::Backend::writer)
-/// call constructs it at all: the type is kept for one release for the reversal, and the upload
-/// side still lands whatever an earlier build buffered.
-///
-/// Plain delegation to the mirror: the recorder never reads, and the `WriteStore: ReadStore` bound
-/// wants these seven anyway.
-///
-/// D35's refusal for the three item writes: offline item editing is MOD-13's question.
-///
 /// D35's refusal for the registry writes, and MOD-2 D52's for a probe that has no server to
 /// write its snapshot to: the same sentence in both places, on purpose. It is also what an
 /// offline chat logs when it declines to latch a quota (MOD-2 plan D68).
