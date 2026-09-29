@@ -6,11 +6,12 @@
 use htui_core::model::{RunId, Scope, StepId, WorkspaceId, WorkspaceSummary};
 use htui_orch::Command;
 
-use crate::app::action::{Action, OverlayAction, TabAction};
+use crate::app::action::{Action, OverlayAction, RevealTarget, TabAction};
 use crate::app::state::{App, Ctx, EDITOR_NEEDS_A_TAB};
 use crate::connection::DsnState;
 use crate::run_worker::OrchRequest;
 use crate::store_worker::{Origin, ReplyEnvelope, StoreReply, StoreRequest};
+use crate::ui::overlay::{Overlay, OverlayId};
 use crate::ui::tabs::SettingsTab;
 use crate::ui::tabs::settings::ConnectionSection;
 
@@ -29,6 +30,7 @@ impl App {
             Action::SetScope { workspace } => self.set_scope(workspace),
             Action::Replay { step_id } => self.replay(step_id),
             Action::Promote { run, step } => self.promote(run, step),
+            Action::Reveal(target) => self.reveal(&target),
             // The unstamped path (`Origin::App`, or a keymap binding): only a tab can open the
             // editor, because only a tab can be handed the outcome (MOD-9 D10).
             Action::EditExternally(_) => self.status = Some(EDITOR_NEEDS_A_TAB.to_owned()),
@@ -83,8 +85,34 @@ impl App {
                     tracing::warn!(overlay = %id, "no factory registered");
                 }
             }
-            OverlayAction::Close => self.overlays.pop(),
-            OverlayAction::CloseAll => self.overlays.clear(),
+            OverlayAction::Close => self.close_top_overlay(),
+            OverlayAction::CloseAll => self.close_every_overlay(),
+        }
+    }
+
+    /// Pops the top overlay and forgets its requests (MOD-64 D240): `latest` is keyed by origin,
+    /// and a later overlay under the same id would otherwise take a reply to one of this one's.
+    fn close_top_overlay(&mut self) {
+        let Some(id) = self.overlays.top().map(Overlay::id) else {
+            return;
+        };
+        self.overlays.pop();
+        self.forget_overlay(id);
+    }
+
+    /// Closes every overlay and forgets their requests (D240): `CloseAll` and a scope change.
+    fn close_every_overlay(&mut self) {
+        let ids: Vec<OverlayId> = self.overlays.iter().map(Overlay::id).collect();
+        self.overlays.clear();
+        for id in ids {
+            self.forget_overlay(id);
+        }
+    }
+
+    /// [`App::forget`] for `Origin::Overlay(id)`, unless an overlay under that id is still open.
+    fn forget_overlay(&mut self, id: OverlayId) {
+        if !self.overlays.iter().any(|open| open.id() == id) {
+            self.forget(&Origin::Overlay(id));
         }
     }
 
@@ -119,7 +147,7 @@ impl App {
         for tab in self.tabs.iter_mut() {
             tab.on_scope_change(&scope);
         }
-        self.overlays.clear();
+        self.close_every_overlay();
         self.activate_tab();
         self.dispatch(Origin::App, StoreRequest::ActiveRuns { scope });
     }
@@ -160,6 +188,53 @@ impl App {
                 chat_open: false,
             })),
         );
+    }
+
+    /// Selects an entity in the tab registered for its kind (MOD-64 D235): focus that tab —
+    /// which re-sends its `wants_requests` if it was not the active one — then hand it the target
+    /// with a `Ctx` of its own, as `finish_external_edit` does, and drain what it emitted. A kind
+    /// nothing is registered for is a no-op, logged.
+    fn reveal(&mut self, target: &RevealTarget) {
+        let kind = target.kind();
+        let Some(tab) = self
+            .reveal_tabs
+            .iter()
+            .find(|(registered, _)| *registered == kind)
+            .map(|(_, tab)| *tab)
+        else {
+            tracing::debug!(?kind, "no tab reveals this kind");
+            return;
+        };
+        self.update_tab(TabAction::Focus(tab));
+        let origin = Origin::Tab(tab);
+        {
+            let Self {
+                scope,
+                projects,
+                top_bar,
+                keymap,
+                theme,
+                emit,
+                tabs,
+                ..
+            } = self;
+            let Some(view) = tabs.by_id_mut(tab) else {
+                return;
+            };
+            let mut ctx = Ctx::new(
+                scope,
+                projects,
+                top_bar,
+                keymap,
+                theme,
+                origin.clone(),
+                emit,
+            );
+            if !view.reveal(target, &mut ctx) {
+                tracing::debug!(%tab, "the tab does not reveal this target");
+            }
+        }
+        self.drain(&origin);
     }
 
     /// A reply came back: top bar first, then the staleness gate, then the addressee.
@@ -374,8 +449,8 @@ fn below_target_notice(target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Handled;
     use crate::app::state::EDITOR_NEEDS_A_TAB;
+    use crate::app::{Handled, RevealKind};
     use crate::editor::{ExternalEdit, ExternalEditOutcome};
     use crate::keymap::Keymap;
     use crate::store_worker::RequestEnvelope;
@@ -947,5 +1022,215 @@ mod tests {
         }));
         assert_eq!(app.status, Some(report.status_line()));
         assert!(seen.borrow().is_empty(), "no tab saw it");
+    }
+
+    /// What an [`Asking`] overlay was handed.
+    type Answers = Rc<RefCell<Vec<StoreReply>>>;
+
+    /// An overlay that asks for `Workspaces` on `s` and never on open, so a reopened one has no
+    /// request of its own to overwrite the staleness entry with (MOD-64 D240, blueprint F8).
+    struct Asking {
+        seen: Answers,
+    }
+
+    impl Asking {
+        const ID: OverlayId = OverlayId("asking");
+    }
+
+    impl Overlay for Asking {
+        fn id(&self) -> OverlayId {
+            Self::ID
+        }
+        fn title(&self) -> &str {
+            "Asking"
+        }
+        fn is_modal(&self) -> bool {
+            true
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+            if key.code == KeyCode::Char('s') {
+                ctx.request(StoreRequest::Workspaces);
+                return Handled::Consumed;
+            }
+            Handled::Pass
+        }
+        fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
+            self.seen.borrow_mut().push(reply.clone());
+        }
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+    }
+
+    /// A shell with [`Asking`] registered, and what every instance of it is handed.
+    fn asking_shell() -> (App, UnboundedReceiver<RequestEnvelope>, Answers) {
+        let (mut app, rx, _seen) = shell();
+        let answers = Answers::default();
+        let shared = Rc::clone(&answers);
+        app.overlay_factories.register(Asking::ID, move || {
+            Box::new(Asking {
+                seen: Rc::clone(&shared),
+            })
+        });
+        (app, rx, answers)
+    }
+
+    /// Opens [`Asking`], presses `s` and answers the `seq` of the `Workspaces` it sent.
+    fn open_and_ask(app: &mut App, rx: &mut UnboundedReceiver<RequestEnvelope>) -> u64 {
+        app.update(Action::Overlay(OverlayAction::Open(Asking::ID)));
+        app.on_key(KeyEvent::from(KeyCode::Char('s')));
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|envelope| {
+                envelope.origin == Origin::Overlay(Asking::ID)
+                    && matches!(envelope.request, StoreRequest::Workspaces)
+            })
+            .expect("the overlay asked")
+            .seq
+    }
+
+    /// The `Workspaces` answer to `seq`, addressed to [`Asking`].
+    fn answer(seq: u64) -> Action {
+        Action::Reply(ReplyEnvelope {
+            seq,
+            origin: Origin::Overlay(Asking::ID),
+            reply: StoreReply::Workspaces(Vec::new()),
+        })
+    }
+
+    /// MOD-64 D240: `latest` is keyed by origin, so without the fix a reopened overlay under the
+    /// same id takes the answer to a request its closed predecessor made.
+    #[test]
+    fn a_reply_to_a_closed_overlay_never_reaches_the_next_one() {
+        let (mut app, mut rx, answers) = asking_shell();
+        let seq = open_and_ask(&mut app, &mut rx);
+
+        app.update(Action::Overlay(OverlayAction::Close));
+        app.update(Action::Overlay(OverlayAction::Open(Asking::ID)));
+        app.update(answer(seq));
+        assert!(
+            answers.borrow().is_empty(),
+            "the reopened overlay never asked"
+        );
+    }
+
+    #[test]
+    fn close_all_and_a_scope_change_forget_an_overlays_requests_too() {
+        let (mut app, mut rx, answers) = asking_shell();
+
+        let seq = open_and_ask(&mut app, &mut rx);
+        app.update(Action::Overlay(OverlayAction::CloseAll));
+        app.update(Action::Overlay(OverlayAction::Open(Asking::ID)));
+        app.update(answer(seq));
+        assert!(answers.borrow().is_empty(), "CloseAll forgets");
+
+        app.update(Action::Overlay(OverlayAction::CloseAll));
+        let seq = open_and_ask(&mut app, &mut rx);
+        app.update(Action::SetScope {
+            workspace: workspace("Platform"),
+        });
+        app.update(Action::Overlay(OverlayAction::Open(Asking::ID)));
+        app.update(answer(seq));
+        assert!(answers.borrow().is_empty(), "a scope change forgets");
+    }
+
+    #[test]
+    fn closing_the_top_overlay_keeps_the_one_below_fresh() {
+        let (mut app, mut rx, answers) = asking_shell();
+        let seq = open_and_ask(&mut app, &mut rx);
+        app.push_overlay(Box::new(Popup));
+
+        app.update(Action::Overlay(OverlayAction::Close));
+        app.update(answer(seq));
+        let delivered = matches!(
+            answers.borrow().as_slice(),
+            [StoreReply::Workspaces(listed)] if listed.is_empty()
+        );
+        assert!(delivered, "the overlay below still waits for its answer");
+    }
+
+    /// What a [`Revealer`] was handed.
+    type Revealed = Rc<RefCell<Vec<RevealTarget>>>;
+
+    /// A tab that reveals items: it records the target and asks for `Items`, as the Backlog does
+    /// for an item it has not loaded (MOD-64 D235). It asks for nothing on activation, so the
+    /// `Items` on the wire is the reveal's.
+    struct Revealer {
+        revealed: Revealed,
+    }
+
+    impl Revealer {
+        const ID: TabId = TabId("revealer");
+    }
+
+    impl Tab for Revealer {
+        fn id(&self) -> TabId {
+            Self::ID
+        }
+        fn title(&self) -> &str {
+            "Revealer"
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_scope_change(&mut self, _scope: &Scope) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+        fn reveal(&mut self, target: &RevealTarget, ctx: &mut Ctx<'_>) -> bool {
+            self.revealed.borrow_mut().push(target.clone());
+            ctx.request(StoreRequest::Items {
+                scope: ctx.scope.clone(),
+                filter: ItemFilter::default(),
+            });
+            true
+        }
+    }
+
+    /// A shell whose recorder tab is active, with a [`Revealer`] registered after it and named as
+    /// the tab that reveals items.
+    fn revealing_shell() -> (App, UnboundedReceiver<RequestEnvelope>, Revealed) {
+        let (mut app, mut rx, _seen) = shell();
+        let revealed = Revealed::default();
+        app.register_tab(Box::new(Revealer {
+            revealed: Rc::clone(&revealed),
+        }));
+        app.reveal_tabs = vec![(RevealKind::Item, Revealer::ID)];
+        while rx.try_recv().is_ok() {}
+        assert_eq!(app.tabs.active_id(), Some(Recorder::ID));
+        (app, rx, revealed)
+    }
+
+    #[test]
+    fn reveal_focuses_the_registered_tab_and_hands_it_the_target() {
+        let (mut app, mut rx, revealed) = revealing_shell();
+        let target = RevealTarget::Item {
+            id: ItemId::new(),
+            key: "FEAT-1".to_owned(),
+        };
+
+        app.update(Action::Reveal(target.clone()));
+        assert_eq!(app.tabs.active_id(), Some(Revealer::ID));
+        assert_eq!(*revealed.borrow(), vec![target]);
+        let asked = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|envelope| matches!(envelope.request, StoreRequest::Items { .. }))
+            .expect("what the tab emitted was drained");
+        assert_eq!(asked.origin, Origin::Tab(Revealer::ID));
+    }
+
+    #[test]
+    fn a_reveal_kind_no_tab_is_registered_for_does_nothing() {
+        let (mut app, mut rx, revealed) = revealing_shell();
+
+        app.update(Action::Reveal(RevealTarget::Requirement {
+            id: htui_core::model::RequirementId::new(),
+            key: "R-STO-1".to_owned(),
+        }));
+        assert_eq!(app.tabs.active_id(), Some(Recorder::ID));
+        assert_eq!(app.status, None);
+        assert!(revealed.borrow().is_empty());
+        assert!(rx.try_recv().is_err(), "nothing is asked for");
     }
 }

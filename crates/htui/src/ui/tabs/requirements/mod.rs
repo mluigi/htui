@@ -39,7 +39,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::app::{Action, Ctx, Handled};
+use crate::app::{Action, Ctx, Handled, RevealTarget};
 use crate::requirements::{
     BLANK_AREA_TITLE, BLANK_BODY, DECIDING_KEY_NEEDED, DETAIL_NAME, READ_NAME, RequirementDetail,
     RequirementText, RequirementsSnapshot, is_tab_write, not_the_maintainer,
@@ -47,7 +47,7 @@ use crate::requirements::{
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::backlog::detail::Scroll;
 use crate::ui::tabs::backlog::list::window;
-use crate::ui::tabs::registry::{Tab, TabId};
+use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
 use crate::ui::tabs::settings::wrapped;
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -129,6 +129,13 @@ fn requirement_changed_elsewhere(head: i32) -> String {
     )
 }
 
+/// The Requirements tab's sentence for a reveal of a requirement this workspace does not hold
+/// (MOD-64 D235).
+#[must_use]
+pub fn not_in_these_requirements(key: &str) -> String {
+    format!("{key} is not in this workspace's requirements")
+}
+
 /// The Requirements tab (MOD-39 PRD D2, plan P10).
 #[derive(Debug, Default)]
 pub struct RequirementsTab {
@@ -164,6 +171,8 @@ pub struct RequirementsTab {
     verifying: Option<String>,
     /// The last outcome, one line above the hint.
     notice: Option<Notice>,
+    /// A reveal waiting for the next `Requirements` reply (MOD-64 D235).
+    pending_reveal: Option<(RequirementId, String)>,
 }
 
 /// What the keys are doing.
@@ -785,7 +794,15 @@ impl RequirementsTab {
         self.sent = None;
         self.mode = Mode::Browse;
         self.notice = Some(Notice::Info(message));
-        self.reveal(row, ctx);
+        self.select_row(row, ctx);
+        true
+    }
+
+    /// Makes `row` visible, puts the cursor on it and re-reads its detail: `land`'s tail, shared
+    /// with a reveal (MOD-64 D235). The detail is re-read even when `row` was already selected —
+    /// `land` needs that, the row having just been written.
+    fn select_row(&mut self, row: Row, ctx: &Ctx<'_>) {
+        self.unhide(row, ctx);
         if self.selected != Some(row) {
             self.detail = None;
             self.scroll.reset();
@@ -795,11 +812,17 @@ impl RequirementsTab {
         if let Row::Requirement(id) = row {
             ctx.request(StoreRequest::RequirementDetail(id));
         }
-        true
+    }
+
+    /// Whether the last read holds requirement `id` (MOD-64 D235).
+    fn holds(&self, id: RequirementId) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.requirement(id).is_some())
     }
 
     /// Makes `row` visible: unfolds what hides it, and drops a filter that would.
-    fn reveal(&mut self, row: Row, ctx: &Ctx<'_>) {
+    fn unhide(&mut self, row: Row, ctx: &Ctx<'_>) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -1103,6 +1126,14 @@ impl Tab for RequirementsTab {
                     self.sent = None;
                     self.notice = Some(Notice::Error(message));
                 }
+                // MOD-64 D251: a reveal of a requirement that was not read is decided by this one.
+                if let Some((id, key)) = self.pending_reveal.take() {
+                    if self.holds(id) {
+                        self.select_row(Row::Requirement(id), ctx);
+                    } else {
+                        self.notice = Some(Notice::Error(not_in_these_requirements(&key)));
+                    }
+                }
                 self.reselect(ctx);
             }
             StoreReply::RequirementsStale(snapshot) => {
@@ -1129,6 +1160,8 @@ impl Tab for RequirementsTab {
                 }
             }
             StoreReply::Failed { request, message } if *request == READ_NAME => {
+                // D251: a refused read must not leave a jump armed for a later one.
+                self.pending_reveal = None;
                 if let Some(refused) = self.verifying.take() {
                     // The check could not be made: report the mint's own refusal.
                     self.busy = None;
@@ -1200,6 +1233,31 @@ impl Tab for RequirementsTab {
             notice_row,
         );
         frame.render_widget(Paragraph::new(self.hint(ctx.theme)), hint_row);
+    }
+
+    fn reveal(&mut self, target: &RevealTarget, ctx: &mut Ctx<'_>) -> bool {
+        let RevealTarget::Requirement { id, key } = target else {
+            return false;
+        };
+        match self.mode {
+            Mode::Browse => {}
+            // The typed filter is kept as applied; `unhide` drops it if it hides the row.
+            Mode::Filter { .. } => self.mode = Mode::Browse,
+            // An open form keeps its text: the reveal says why it did not move (D252).
+            Mode::NewArea(_) | Mode::Requirement(_) | Mode::Withdraw(_) => {
+                self.notice = Some(Notice::Error(CLOSE_THE_FIELD_FIRST.to_owned()));
+                return true;
+            }
+        }
+        if self.holds(*id) {
+            self.pending_reveal = None;
+            self.select_row(Row::Requirement(*id), ctx);
+        } else {
+            // Not read yet, or minted since: re-read and decide on arrival (D251).
+            self.pending_reveal = Some((*id, key.clone()));
+            ctx.request(StoreRequest::Requirements(ctx.scope.clone()));
+        }
+        true
     }
 }
 

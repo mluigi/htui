@@ -4,7 +4,7 @@ pub mod action;
 pub mod state;
 pub mod update;
 
-pub use action::{Action, Handled, OverlayAction, TabAction};
+pub use action::{Action, Handled, OverlayAction, RevealKind, RevealTarget, TabAction};
 pub use state::{App, Ctx, EDITOR_NEEDS_A_TAB, Emit, TopBarState};
 
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -42,6 +42,8 @@ use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsT
 /// 5. The Chat tab is named as the replay tab and the Backlog tab's `Enter` is bound to the
 ///    refusal that says how to reach a replay (MOD-2 D39). Both name a concrete view, so both
 ///    belong here for the same reason the `w` binding does.
+/// 6. The Backlog and Requirements tabs are named as the tabs that reveal items and requirements
+///    (MOD-64 D235).
 ///
 /// Calling this twice would stack a second switcher; the shell calls it exactly once, between
 /// [`App::new`] and [`App::start`].
@@ -79,6 +81,12 @@ pub fn register_all(app: &mut App) {
     app.migration_overlay = Some(MigrationPrompt::ID);
 
     app.replay_tab = Some(ChatTab::ID);
+    // MOD-64 D235: which tab selects a revealed item or requirement. Ids, not views, for the reason
+    // `replay_tab` is one.
+    app.reveal_tabs = vec![
+        (RevealKind::Item, BacklogTab::ID),
+        (RevealKind::Requirement, RequirementsTab::ID),
+    ];
     // The Runs pane consumes `Enter` when it has a step under the cursor and emits
     // `Action::Replay` with it; the payload is the selection, which a static binding cannot
     // carry. This row is therefore the *miss*: it fires only when no pane took the key, and then

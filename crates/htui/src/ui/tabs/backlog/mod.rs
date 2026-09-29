@@ -11,13 +11,13 @@ use htui_core::model::{ItemFilter, ItemId, ItemSummary, ProjectId, Scope};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 
-use crate::app::{Ctx, Handled};
+use crate::app::{Action, Ctx, Handled, RevealTarget};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::backlog::detail::{
     BodyTab, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab, RunsTab,
 };
 use crate::ui::tabs::backlog::list::{ListView, Selection};
-use crate::ui::tabs::registry::{Tab, TabId};
+use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Width of the list pane, as a percentage of the body region.
@@ -46,6 +46,9 @@ pub struct BacklogTab {
     selected: Option<Selection>,
     /// Body, Runs, Graph, Docs, Notes, Prompt, Reqs, in that order.
     detail: DetailRegistry,
+    /// A reveal waiting for the next `Items` reply (MOD-64 D235), with the key its miss is
+    /// reported by.
+    pending_reveal: Option<(ItemId, String)>,
 }
 
 impl Default for BacklogTab {
@@ -75,6 +78,7 @@ impl BacklogTab {
             folded: Vec::new(),
             selected: None,
             detail,
+            pending_reveal: None,
         }
     }
 
@@ -180,6 +184,12 @@ impl BacklogTab {
             .or_else(|| rows.first());
         self.go(first_item.copied(), ctx);
     }
+
+    /// Unfolds `project` and moves the cursor to `id`, reading its detail (MOD-64 D235).
+    fn select_item(&mut self, id: ItemId, project: ProjectId, ctx: &Ctx<'_>) {
+        self.folded.retain(|folded| *folded != project);
+        self.go(Some(Selection::Item(id)), ctx);
+    }
 }
 
 impl Tab for BacklogTab {
@@ -203,6 +213,7 @@ impl Tab for BacklogTab {
         self.folded.clear();
         self.selected = None;
         self.detail.on_item_change(None);
+        self.pending_reveal = None;
     }
 
     /// A capturing sub-tab (a typed note, a typed-back key, a `y`/`n`) gets every key first: the
@@ -244,6 +255,13 @@ impl Tab for BacklogTab {
             self.items.clone_from(items);
             let live: Vec<ProjectId> = self.items.iter().map(|item| item.project_id).collect();
             self.folded.retain(|project| live.contains(project));
+            // MOD-64 D251: a reveal of an item that was not loaded is decided by this list.
+            if let Some((id, key)) = self.pending_reveal.take() {
+                match self.items.iter().find(|item| item.id == id) {
+                    Some(item) => self.select_item(id, item.project_id, ctx),
+                    None => ctx.emit(Action::Error(not_in_this_backlog(&key))),
+                }
+            }
             self.reselect(ctx);
             return;
         }
@@ -268,6 +286,33 @@ impl Tab for BacklogTab {
             ctx,
         );
     }
+
+    fn reveal(&mut self, target: &RevealTarget, ctx: &mut Ctx<'_>) -> bool {
+        let RevealTarget::Item { id, key } = target else {
+            return false;
+        };
+        // A half-typed note or reject reason would be lost by the move (`go` resets the sub-tabs).
+        if self.detail.captures_input() {
+            ctx.emit(Action::Error(CLOSE_THE_FIELD_FIRST.to_owned()));
+            return true;
+        }
+        match self.items.iter().find(|item| item.id == *id) {
+            Some(item) => {
+                let project = item.project_id;
+                self.pending_reveal = None;
+                self.select_item(*id, project, ctx);
+            }
+            // Not loaded, or not in the rows read so far: re-read and decide on arrival (D251).
+            None => {
+                self.pending_reveal = Some((*id, key.clone()));
+                ctx.request(StoreRequest::Items {
+                    scope: ctx.scope.clone(),
+                    filter: ItemFilter::default(),
+                });
+            }
+        }
+        true
+    }
 }
 
 /// Splits the body region into the list pane and the detail pane.
@@ -277,6 +322,12 @@ fn panes(area: Rect) -> [Rect; 2] {
         Constraint::Percentage(DETAIL_PERCENT),
     ])
     .areas(area)
+}
+
+/// The Backlog's sentence for a reveal of an item this workspace does not hold (MOD-64 D235, F5).
+#[must_use]
+pub fn not_in_this_backlog(key: &str) -> String {
+    format!("{key} is not in this workspace's backlog")
 }
 
 #[cfg(test)]
@@ -362,6 +413,7 @@ mod tests {
             folded: Vec::new(),
             selected: Some(first),
             detail,
+            pending_reveal: None,
         };
 
         let (top_bar, keymap, theme, emit) = (

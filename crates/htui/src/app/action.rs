@@ -3,7 +3,7 @@
 //! A view never mutates the shell: it emits an [`Action`] through
 //! [`Ctx::emit`](crate::app::Ctx::emit) and `App::update` is the single place that applies it.
 
-use htui_core::model::{RunId, StepId, WorkspaceSummary};
+use htui_core::model::{ItemId, RequirementId, RunId, StepId, WorkspaceSummary};
 
 use crate::editor::ExternalEdit;
 use crate::store_worker::{ReplyEnvelope, StoreRequest};
@@ -49,6 +49,10 @@ pub enum Action {
         /// The step to promote.
         step: StepId,
     },
+    /// Select an entity in the tab that shows it (MOD-64 D235). Emitted by the concepts search; the
+    /// shell focuses the tab registered for the target's kind (`App::reveal_tabs`) and hands it the
+    /// target through `Tab::reveal`, so the overlay never names a tab.
+    Reveal(RevealTarget),
     /// Hand text to `$VISUAL`/`$EDITOR` (MOD-9 D10). Stamped with the emitting tab in
     /// `App::drain`, which holds it for the event loop; any other origin is refused on the status
     /// line.
@@ -89,6 +93,54 @@ pub enum OverlayAction {
     Close,
     /// Close every overlay: what a scope change does.
     CloseAll,
+}
+
+/// What `Action::Reveal` selects (MOD-64 D235). The key rides along for the sentence a tab says
+/// when the row is not in this workspace (blueprint D248).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevealTarget {
+    /// An item; a document hit reveals its owner item.
+    Item {
+        /// The item.
+        id: ItemId,
+        /// Its key, e.g. `FEAT-1`.
+        key: String,
+    },
+    /// A requirement.
+    Requirement {
+        /// The requirement.
+        id: RequirementId,
+        /// Its key, e.g. `R-STO-8`.
+        key: String,
+    },
+}
+
+impl RevealTarget {
+    /// Which registration routes it.
+    #[must_use]
+    pub const fn kind(&self) -> RevealKind {
+        match self {
+            Self::Item { .. } => RevealKind::Item,
+            Self::Requirement { .. } => RevealKind::Requirement,
+        }
+    }
+
+    /// The target's key.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        match self {
+            Self::Item { key, .. } | Self::Requirement { key, .. } => key,
+        }
+    }
+}
+
+/// Which kind of entity a tab reveals: the key of `App::reveal_tabs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RevealKind {
+    /// Items (the Backlog).
+    Item,
+    /// Requirements (the Requirements tab).
+    Requirement,
 }
 
 /// Whether a view took the key.
