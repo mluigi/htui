@@ -1,0 +1,90 @@
+# One /handoff-run sandbox (TOOL-7). Instantiated only by scripts/hr:
+#   docker compose -p hr-<item> -f docker/hr/compose.hr.yaml up -d --wait
+# Every host path and per-run value comes from the environment scripts/hr exports; `:?` fails the
+# parse rather than mount the wrong thing. No `ports:` anywhere: all three services share postgres's
+# network namespace, so localhost:5439/6333/6334 inside mean what they mean on the host and nothing
+# collides with htui-postgres/htui-qdrant or another run. Deliberately NOT mounted (D7):
+# ~/.gitconfig, ~/.git-credentials, ~/.ssh.
+# Design: .claude/plans/tool-7-hr-sandbox.plan.md; env contract: .claude/plans/tool-7-hr-sandbox.blueprint.md §T1.
+services:
+  init:            # one-shot: named-volume roots are created root-owned
+    image: ${HR_IMAGE:-htui-hr-dev}
+    user: "0:0"
+    network_mode: none
+    command: ["chown", "${HR_UID:?}:${HR_GID:?}", "${HR_HOME:?}/.gortex", "${HR_HOME:?}/.cargo"]
+    volumes:
+      - {type: volume, source: gortex, target: "${HR_HOME:?}/.gortex"}
+      - {type: volume, source: cargo,  target: "${HR_HOME:?}/.cargo"}
+
+  postgres:
+    image: postgres:16
+    command: ["postgres", "-p", "5439", "-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"]
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    shm_size: 1gb
+    volumes:
+      - {type: volume, source: pgdata, target: /var/lib/postgresql/data}
+    healthcheck:   # -h localhost: the entrypoint's init-time temp server is socket-only, so this goes green only on the real server
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 5439 -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    network_mode: service:postgres
+    depends_on: [postgres]
+    volumes:
+      - {type: volume, source: qdrant, target: /qdrant/storage}
+
+  dev:
+    image: ${HR_IMAGE:-htui-hr-dev}
+    network_mode: service:postgres
+    init: true                      # reap claude/cargo children; sleep is PID 1 otherwise
+    cpus: ${HR_CPUS:-4}
+    working_dir: ${HR_HOST_REPO:?}
+    depends_on:
+      postgres: {condition: service_healthy}
+      qdrant:   {condition: service_started}
+      init:     {condition: service_completed_successfully}
+    # $$ = literal $ (compose would interpolate $HOME from the host otherwise)
+    command: ["bash", "-c", "test -e \"$$HOME/.claude.json\" || cp /hr-seed/claude.json \"$$HOME/.claude.json\"; exec sleep infinity"]
+    environment:
+      USERNAME: htui-ci
+      HTUI_TEST_DATABASE_URL: postgres://postgres@localhost:5439/postgres
+      HTUI_TEST_QDRANT_URL: http://localhost:6334
+      HR_ITEM: ${HR_ITEM:?}
+      HR_SANDBOX: "1"
+      HR_STATE: /hr-state
+      GIT_AUTHOR_NAME: ${HR_GIT_NAME:?}
+      GIT_AUTHOR_EMAIL: ${HR_GIT_EMAIL:?}
+      GIT_COMMITTER_NAME: ${HR_GIT_NAME:?}
+      GIT_COMMITTER_EMAIL: ${HR_GIT_EMAIL:?}
+      # mise dirs first: ~/.local/bin holds a stale uv/uvx that would shadow mise's.
+      PATH: ${HR_MISE_PATH:?}:/opt/rust/cargo/bin:${HR_HOME:?}/.cargo/bin:${HR_HOME:?}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      TERM: ${TERM:-xterm-256color}
+      COLORTERM: ${COLORTERM:-truecolor}
+    volumes:
+      - {type: bind, source: "${HR_SRC:?}",                  target: "${HR_HOST_REPO:?}",                   bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_HOST_REPO:?}",            target: /host/htui, read_only: true,           bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_HOST_REPO:?}/.remember",  target: "${HR_HOST_REPO:?}/.remember",         bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_STATE_HOST:?}",           target: /hr-state,                             bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_CLAUDE_JSON:?}",          target: /hr-seed/claude.json, read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_HOME:?}/.local",          target: "${HR_HOME:?}/.local", read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_HOME:?}/.claude",         target: "${HR_HOME:?}/.claude",                bind: {create_host_path: false}}
+      - {type: volume, source: gortex,                       target: "${HR_HOME:?}/.gortex"}
+      - {type: bind, source: "${HR_HOME:?}/.gortex/config.yaml",  target: "${HR_HOME:?}/.gortex/config.yaml",  read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_HOME:?}/.gortex/instructions", target: "${HR_HOME:?}/.gortex/instructions", read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_HOME:?}/.gortex/models",       target: "${HR_HOME:?}/.gortex/models",       read_only: true, bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_HOME:?}/.headroom",       target: "${HR_HOME:?}/.headroom",              bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_HOME:?}/.serena",         target: "${HR_HOME:?}/.serena",                bind: {create_host_path: false}}
+      - {type: bind, source: "${HR_HOME:?}/.cache/uv",       target: "${HR_HOME:?}/.cache/uv",              bind: {create_host_path: false}}
+      - {type: volume, source: cargo,                        target: "${HR_HOME:?}/.cargo"}
+
+volumes:
+  pgdata:
+  qdrant:
+  gortex:
+  cargo:
+    external: true
+    name: htui-hr-cargo
