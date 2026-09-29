@@ -1,6 +1,7 @@
 //! The skill library behind the Skills tab's library and attachment panes (MOD-9 milestone 3,
 //! D81): one snapshot read per scope and the four compare-and-set writes, the
-//! [`crate::templates`] shape.
+//! [`crate::templates`] shape; and, since milestone 4, the `SKILL.md` import, whose walk and
+//! writes are [`crate::skill_import`]'s.
 //!
 //! One read per event and never one per keystroke, one reply out. Every write re-reads the whole
 //! snapshot rather than handing the view the row its outcome carries: the view renders from the
@@ -23,6 +24,7 @@ use htui_core::model::{
 use htui_core::store::{CasOutcome, Result, StoreError, WriteStore as _};
 use htui_store::{Backend, DATABASE_UNREACHABLE, PROMPT_ON_SERVER_ONLY, Writer};
 
+use crate::skill_import::{self, SkillImports};
 use crate::store_worker::{StoreReply, StoreRequest};
 
 /// The whole Skills view in one read (D81): the library, the global attachments, and each scope
@@ -179,17 +181,18 @@ pub async fn snapshot(writer: &Writer, scope: &Scope) -> Result<SkillsSnapshot> 
     })
 }
 
-/// The five request names, in [`StoreRequest`] order.
+/// The six request names, in [`StoreRequest`] order.
 ///
-/// The view's `Failed` match reads from here. [`StoreRequest::name`]'s arms spell the same five as
+/// The view's `Failed` match reads from here. [`StoreRequest::name`]'s arms spell the same six as
 /// literals, and the `request_names_match_the_name_arms` test pins them to this list, so a name
 /// changed in one place and not the other fails there.
-pub const REQUEST_NAMES: [&str; 5] = [
+pub const REQUEST_NAMES: [&str; 6] = [
     "skills",
     "create_skill",
     "edit_skill",
     "save_skill_version",
     "set_skill_binding",
+    "import_skills",
 ];
 
 /// The **read**'s name: a refused read leaves the view with no library, where a refused write
@@ -208,8 +211,12 @@ pub const READ_NAME: &str = REQUEST_NAMES[0];
 /// # Errors
 /// Whatever the seam reports; offline, [`StoreError::Unreachable`] with `PROMPT_ON_SERVER_ONLY`
 /// for the read (skills are not mirrored, the Templates read's sentence) and
-/// `DATABASE_UNREACHABLE` for the four writes; [`StoreError::Backend`] for a request that is not
-/// one of this module's five.
+/// `DATABASE_UNREACHABLE` for the four writes and the import; [`StoreError::Backend`] for a
+/// request that is not one of this module's six.
+///
+/// The import answers [`StoreReply::SkillImports`]: the report of every file and a fresh snapshot.
+/// A file that lost its token is a row of the report while the rest of the batch lands, so an
+/// import never answers `SkillsStale`.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
     match request {
         StoreRequest::Skills(scope) => {
@@ -304,7 +311,18 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             };
             answer(&writer, scope, stale).await
         }
-        // `try_serve` routes exactly this module's five variants here, so the last arm is
+        StoreRequest::ImportSkills { scope, paths } => {
+            // The filesystem is read here and not in the view (`R-NF-3`): the walk is unbounded
+            // work and the UI task must not carry it. The reply re-reads the whole snapshot, so the
+            // report travels beside a library the view renders from rather than a row it patches.
+            let report = skill_import::import(backend, paths).await?;
+            let writer = write_access(backend)?;
+            Ok(StoreReply::SkillImports(Box::new(SkillImports {
+                snapshot: snapshot(&writer, scope).await?,
+                report,
+            })))
+        }
+        // `try_serve` routes exactly this module's six variants here, so the last arm is
         // unreachable from the shell; a caller that reached it anyway is better told which request
         // it sent than killed.
         other => Err(StoreError::Backend(format!(
@@ -401,6 +419,13 @@ mod tests {
             activation: Activation::Always,
             globs: Vec::new(),
             languages: Vec::new(),
+        }
+    }
+
+    fn import(scope: &Scope, path: &str) -> StoreRequest {
+        StoreRequest::ImportSkills {
+            scope: scope.clone(),
+            paths: vec![path.to_owned()],
         }
     }
 
@@ -797,8 +822,8 @@ mod tests {
         }
     }
 
-    /// Offline there is no writer, so each of the four writes is refused before anything is sent,
-    /// with the unreachable-database sentence, under its own name.
+    /// Offline there is no writer, so each of the four writes and the import is refused before
+    /// anything is sent, with the unreachable-database sentence, under its own name.
     #[tokio::test]
     async fn an_offline_write_is_refused_with_the_unreachable_sentence() {
         let (_root, backend) = offline().await;
@@ -813,7 +838,9 @@ mod tests {
                 Some(DateTime::UNIX_EPOCH),
                 BindingChange::Detach,
             ),
+            import(&scope, "/nowhere"),
         ];
+        assert_eq!(writes.len(), REQUEST_NAMES.len() - 1, "every write is here");
 
         for (write, name) in writes.iter().zip(&REQUEST_NAMES[1..]) {
             assert_eq!(
@@ -841,6 +868,7 @@ mod tests {
             edit(&scope, ids::SKILL_TESTS, DateTime::UNIX_EPOCH, ""),
             save(&scope, ids::SKILL_TESTS, 1, ""),
             bind(&scope, demo_phase_key(), None, BindingChange::Detach),
+            import(&scope, ""),
         ];
         let names: Vec<&str> = samples.iter().map(StoreRequest::name).collect();
         assert_eq!(names, REQUEST_NAMES);
@@ -861,7 +889,54 @@ mod tests {
         }
     }
 
-    /// A request that is not one of the five is refused by name rather than served.
+    /// `try_serve` routes the import here, and the reply is the report beside a fresh snapshot of
+    /// the request's own scope, so the view can tell a crossed scope change as it does for
+    /// `Skills`.
+    #[tokio::test]
+    async fn an_import_is_routed_here_and_answers_its_report_beside_a_snapshot() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let nested = dir.path().join("docs-style");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::write(
+            nested.join("SKILL.md"),
+            "---\nname: docs-style\ndescription: Docs.\n---\n# Docs\n",
+        )
+        .expect("write");
+
+        let reply =
+            store_worker::serve(&backend, &import(&scope, &dir.path().display().to_string())).await;
+
+        let StoreReply::SkillImports(imports) = reply else {
+            panic!("`import_skills` answers `SkillImports`, not {reply:?}")
+        };
+        assert!(
+            matches!(
+                &imports.report[..],
+                [crate::skill_import::ImportOutcome::Imported { name, version: 1, .. }]
+                    if name == "docs-style"
+            ),
+            "{:?}",
+            imports.report
+        );
+        assert!(
+            imports.snapshot.by_name("docs-style").is_some(),
+            "the snapshot is read after the writes"
+        );
+        assert_eq!(
+            imports
+                .snapshot
+                .projects
+                .iter()
+                .map(|entry| entry.project)
+                .collect::<Vec<_>>(),
+            scope.project_ids,
+            "and of the request's scope"
+        );
+    }
+
+    /// A request that is not one of the six is refused by name rather than served.
     #[tokio::test]
     async fn a_foreign_request_is_refused_by_name() {
         let backend = demo();

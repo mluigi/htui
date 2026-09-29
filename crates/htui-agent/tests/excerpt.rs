@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use htui_agent::excerpt::{
-    FsRepoReader, PassInput, SkipRule, excerpt_pass, excerpt_roots, excerpts_for, run_providers,
-    touched_prefixes,
+    FsRepoReader, GITIGNORE_MAX_BYTES, PassInput, SkipRule, excerpt_pass, excerpt_roots,
+    excerpts_for, run_providers, touched_prefixes,
 };
 use htui_core::model::{
     BoxId, Isolation, ProjectId, Repo, RepoBoxPath, RepoId, RunStepTree, StepId,
@@ -598,6 +598,76 @@ fn fs_reader_skips_git_gitignored_binary_large_and_lockfiles_in_order() {
     );
     // `!` is ignored rather than honoured (blueprint B.7), so a negation does not resurrect a file.
     assert!(!paths.iter().any(|path| path == "target/keep.rs"));
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_reader_ignores_symlinked_gitignore_files() {
+    use std::os::unix::fs::symlink;
+
+    let outside = tempfile::tempdir().expect("an outside directory");
+    write(outside.path(), "rules", b"keep.rs\n");
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    for prefix in ["", "nested/"] {
+        write(dir.path(), &format!("{prefix}keep.rs"), b"fn keep() {}\n");
+        symlink(
+            outside.path().join("rules"),
+            dir.path().join(format!("{prefix}.gitignore")),
+        )
+        .expect("symlink");
+    }
+
+    let (paths, truncated) = FsRepoReader::default()
+        .list(&fs_root(dir.path()), 20_000)
+        .expect("the root is readable");
+    assert!(!truncated);
+    assert_eq!(paths, vec!["keep.rs", "nested/keep.rs"]);
+}
+
+#[test]
+fn fs_reader_bounds_gitignore_files_before_parsing() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    // The ignore cap is its own, so a small excerpt cap does not stop a `.gitignore` excluding.
+    let reader = capped(32);
+    write(dir.path(), "keep.rs", b"fn keep() {}\n");
+    write(dir.path(), "nested/keep.rs", b"fn keep() {}\n");
+    write(dir.path(), "nested/other.rs", b"fn other() {}\n");
+    let max = usize::try_from(GITIGNORE_MAX_BYTES).expect("fits");
+
+    // At the cap the rules apply (and the ignore file itself is over the excerpt cap, so it is
+    // not listed). One byte over it the file is refused whole, never parsed from a prefix, and
+    // its subtree contributes nothing rather than everything; the sibling at the root still
+    // lists.
+    for size in [max, max + 1] {
+        let mut rules = b"keep.rs\n#".to_vec();
+        rules.resize(size, b'x');
+        write(dir.path(), "nested/.gitignore", &rules);
+        let (paths, truncated) = reader
+            .list(&fs_root(dir.path()), 20_000)
+            .expect("the root is readable");
+        assert!(!truncated);
+        if size == max {
+            assert_eq!(paths, vec!["keep.rs", "nested/other.rs"]);
+        } else {
+            assert_eq!(
+                paths,
+                vec!["keep.rs"],
+                "an unreadable ignore file fails closed"
+            );
+        }
+    }
+}
+
+#[test]
+fn fs_reader_keeps_the_rules_of_a_gitignore_that_is_not_utf8() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "keep.rs", b"fn keep() {}\n");
+    write(dir.path(), "drop.rs", b"fn drop() {}\n");
+    write(dir.path(), ".gitignore", b"# caf\xe9\ndrop.rs\n");
+    let (paths, _) = FsRepoReader::default()
+        .list(&fs_root(dir.path()), 20_000)
+        .expect("the root is readable");
+    assert_eq!(paths, vec![".gitignore", "keep.rs"]);
 }
 
 #[cfg(unix)]
@@ -1287,11 +1357,17 @@ async fn excerpts_for_drops_a_file_the_scrubber_refuses() {
 
 #[tokio::test]
 async fn excerpts_for_never_persists_a_note_naming_a_masked_path() {
-    // Review finding M-1. `select`'s own notes name `repo:path` as the reader listed it, and
-    // `trim_record.notes` is persisted unscrubbed. A file under a directory named after a known
-    // secret that the reader lists but cannot read — here, bytes that are not UTF-8 — would put
-    // the secret in the stored record. (An oversize file cannot reach this note through
-    // `FsRepoReader`: the walk's skip rule 5 never lists it, so it names nothing.)
+    // Review finding M-1. `select`'s own notes name `repo:path` as the reader listed it. A file
+    // under a directory named after a known secret that the reader lists but cannot read — here,
+    // bytes that are not UTF-8 — would have put the secret in the stored record.
+    //
+    // It no longer would: the record-wide pass ([`TrimRecord::to_value`], MOD-32) masks
+    // `trim_record.notes` before the write, and that is the first line of defence. This case is
+    // kept as the second, and for a narrower reason than safety — it pins the note's **wording**,
+    // that a withheld note reads as a withheld note rather than as "a file in repo
+    // `[REDACTED]` dropped", which names a value no reader can resolve. (An oversize file cannot
+    // reach this note through `FsRepoReader`: the walk's skip rule 5 never lists it, so it names
+    // nothing.)
     let secret = "hunter2hunter2";
     let dir = tempfile::tempdir().expect("a throwaway root");
     write(

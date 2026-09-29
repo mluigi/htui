@@ -2517,7 +2517,11 @@ mod tests {
             .expect("the demo run has an `implement` step");
         assert_eq!(
             step.trim_record.as_ref(),
-            Some(&crate::prompt::fixtures::demo_trim_record().to_value()),
+            Some(
+                &crate::prompt::fixtures::demo_trim_record()
+                    .to_value(&crate::scrub::MinimalScrubber::new([]))
+                    .expect("the demo record is plain data and carries nothing credential-shaped")
+            ),
             "the fixture literal and the assembler's own record must not drift"
         );
     }

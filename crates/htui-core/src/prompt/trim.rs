@@ -39,6 +39,7 @@ use crate::prompt::excerpt::{Excerpt, ExcerptAudit};
 use crate::prompt::render::{self, Rendered, UpstreamState};
 use crate::prompt::template::{Placeholder, TemplateRole};
 use crate::prompt::{AssembleError, JudgeCandidate, PromptSpec, SectionName, TemplateRef};
+use crate::scrub::{Scrubber, Unmasked};
 
 /// §4.4's floor for `item` and `judge_task`: half the body, and never fewer than this many lines.
 const ITEM_FLOOR_LINES: usize = 80;
@@ -211,10 +212,67 @@ pub struct TrimRecord {
 }
 
 impl TrimRecord {
-    /// The record as JSON, for `run_step.trim_record`.
-    #[must_use]
-    pub fn to_value(&self) -> Value {
-        serde_json::to_value(self).unwrap_or(Value::Null)
+    /// The record as JSON, for `run_step.trim_record` — **the only serialisation of a record, and
+    /// the only one that may be persisted.** A convention, not a compiler guarantee: `TrimRecord`
+    /// is `pub` and still derives `Serialize`, so `serde_json::to_value(&trim)` stays valid Rust
+    /// and nothing in the build fails if it comes back. `a_trim_record_is_never_serialised_outside_to_value`
+    /// (`tests/prompt_digest.rs`) is the grep that keeps it one convention.
+    ///
+    /// The `scrub` pass is whole-record and enumerates nothing: one call over the serialised
+    /// [`Value`], reaching every string leaf **and every object key** (`scrub.rs:142-166`). That is
+    /// what keeps the rule true when the next field is added — the defect this item fixes is a
+    /// guarantee that was an enumeration, and an enumeration goes stale the day someone forgets
+    /// to extend it. It is the same pass the assembler applies to the rendered bytes one layer up
+    /// (`prompt/mod.rs:472-483`), and it is the same call the recorder makes on every payload
+    /// (`record.rs`): scrub, then persist, or refuse and persist nothing.
+    ///
+    /// **What this guarantees today, and what it does not.** `scrub` masks, then fails closed on
+    /// residue. The residue half is live on every production path: the run engine hands in a
+    /// `MinimalScrubber` with an **empty** secret list (`run_worker.rs:1253`), so what fires there
+    /// is the prefix rules and the PEM marker, and a credential-shaped record string stops the
+    /// write. The **masking** half is inert on that path — `mask` returns its input unchanged when
+    /// the list is empty (`scrub.rs:119-121`) — so a record string that merely *equals* a resolved
+    /// secret is still stored verbatim. That is a property of how the run engine builds its
+    /// scrubber, not of this pass; the chat path, which does build one from resolved env
+    /// (`agent_worker.rs:3059`), never reaches this method. Recorded rather than papered over:
+    /// `R-SEC-3` requires the fail-closed half, and this delivers it.
+    ///
+    /// Masking is idempotent (`scrub.rs:52`, the `[REDACTED]` step-over at `:124-129`), so a
+    /// caller that scrubs twice records the same bytes both times. That matters on the paths that
+    /// do hold a populated list, where `excerpts.files[].repo`/`.path` and `skill_choices[].name`
+    /// arrive already masked by `scrubbed_inputs`.
+    ///
+    /// # Errors
+    ///
+    /// [`Unmasked`] when a string leaf still matches a credential rule after masking. `R-SEC-3`
+    /// is fail-closed, so the caller must **not** persist the value at all.
+    ///
+    /// **What that costs the caller, stated plainly.** The refusal is raised before the record is
+    /// written and before this step's own session starts, so nothing is persisted and this step
+    /// spends no token. It is not, however, a *step* failure in the sense the word usually means:
+    /// at the engine's three call sites the `?` propagates to `fail_hard` / `fail_candidate` /
+    /// `fail_judge`, each of which settles the run as `RunStatus::Failed` with the rendered
+    /// message as an **untyped** reason (`run.failure`, outside the closed `RunFailure` vocabulary)
+    /// and runs `cleanup_run`. It does **not** block the item the way the assembler's own
+    /// refusals do through `refuse_prompt`, so an item whose `template.name`, a caller note or a
+    /// repo slug trips a prefix rule is left actionable and will be re-run into the same abort.
+    /// That is the shape plan D8 chose over moving the scrub into `assemble`, and the trade is
+    /// recorded there rather than smoothed over here.
+    ///
+    /// The error names a rule and a JSON pointer and never the offending text — its `Display` and
+    /// `Debug` are part of the security contract (`scrub.rs:61-78`). At this call site the
+    /// rendered error reaches the run's failure reason and an item note, not a `session_event` row;
+    /// the recorder's own `residue_row` is what writes the `error` event `scrub.rs:63-65`
+    /// describes. The security point is the same either way: `path` is assembled from masked
+    /// keys, so no text leaks.
+    ///
+    /// An **encode** failure is deliberately not an error here: it becomes `Value::Null`, which
+    /// scrubs clean because it has no string leaf. See the note at the engine's call site for why
+    /// that is unreachable for this type.
+    pub fn to_value(&self, scrubber: &dyn Scrubber) -> Result<Value, Unmasked> {
+        let mut value = serde_json::to_value(self).unwrap_or(Value::Null);
+        scrubber.scrub(&mut value)?;
+        Ok(value)
     }
 
     /// **The** `sections[]` map (ANA-5 `:1551-1554`): `{name, tokens_after, trimmed}`, same order.

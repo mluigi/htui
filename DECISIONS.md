@@ -2,6 +2,15 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-62](docs/decisions/mod/mod-62.md)** - A verify command keeps the process environment; no allowlist (decided, 2026-09-29)
+- **[MOD-32](docs/decisions/mod/mod-32.md)** - `trim_record`'s own strings reach the store unscrubbed (done, 2026-09-28)
+- **[MOD-58](docs/decisions/mod/mod-58.md)** - Two claim-time test gaps (done, 2026-09-28)
+- **[MOD-54](docs/decisions/mod/mod-54.md)** - Wide characters and graphemes in the text widgets (done, 2026-09-28)
+- **[MOD-31](docs/decisions/mod/mod-31.md)** - A running prompt preview makes an adapter install refuse (done, 2026-09-28)
+- **[MOD-56](docs/decisions/mod/mod-56.md)** - htui's panic hook is the outermost one (done, 2026-09-28)
+- **[TOOL-3](docs/decisions/tool/tool-3.md)** - The Windows lint target cannot be built on this box, and MOD-20 made that bite (decided, 2026-09-28)
+- **[CLEAN-5](docs/decisions/clean/clean-5.md)** - `a_merge_dropped_mid_hook_still_lands_and_leaves_no_merge_head` flakes under load (done, 2026-09-28)
+- **[ANA-21](docs/decisions/ana/ana-21.md)** - Per-model weights for agent assignment, derived from public sources (concluded, 2026-09-28)
 - **[MOD-7](docs/decisions/mod/mod-7.md)** - Box registry + capabilities (done, 2026-09-26)
 - **[ANA-22](docs/decisions/ana/ana-22.md)** - How a skill is stored and when it activates (concluded, 2026-09-25)
 - **[MOD-38](docs/decisions/mod/mod-38.md)** - Requirements schema, seam and close-out resolution (done, 2026-09-25)
@@ -16,10 +25,8 @@
 - **[ANA-19](docs/decisions/ana/ana-19.md)** - Vector DB for related concepts search (done, 2026-09-19)
 - **[ANA-18](docs/decisions/ana/ana-18.md)** - Research Jev model implementability (done, 2026-09-19)
 - **[CLEAN-3](docs/decisions/clean/clean-3.md)** - `cargo doc --workspace --no-deps` has never been green (done, 2026-09-19)
-
 - **[CLEAN-2](docs/decisions/clean/clean-2.md)** - Delete the disabled offline buffered-write path (done, 2026-09-19)
 - **[MOD-29](docs/decisions/mod/mod-29.md)** - Bugsink integration via Sentry crate (done, 2026-09-19)
-
 - **[ANA-14](docs/decisions/ana/ana-14.md)** - Research whether using Redis could be beneficial (rejected, 2026-09-19)
 - **[MOD-15](docs/decisions/mod/mod-15.md)** - Workspace, project, repo and kind management: the write seam and the per-project seed, then the hierarchy, kinds, prompt-settings and connection sections — a DSN typed into the running app reaches the keyring, re-opens the mirror and connects without a restart (done, 2026-09-17)
 - **[MOD-25](docs/decisions/mod/mod-25.md)** - `htui` is online-only: the offline buffered-write path is disabled behind an unchanged seam, and MOD-17, MOD-18 and MOD-19 are withdrawn with ANA-10's verdict (done, 2026-09-16)

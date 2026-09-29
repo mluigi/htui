@@ -187,7 +187,9 @@ conflict. Their verdicts survive only where restated here.
   reset window as reported by the agent or its CLI, refreshed per run; for `per_token` agents, a
   configurable cap per run and per batch, enforced by cancelling the session when exceeded.
 - **R-AGT-8 (must).** When a phase lists several candidate agents, the orchestrator picks the first
-  in priority order whose quota is not exhausted and whose billing cap is not reached.
+  in priority order whose quota is not exhausted and whose billing cap is not reached. When the
+  phase fans out, the remaining candidate slots are apportioned across the other eligible
+  candidates by their per-model weight (ANA-21).
 - **R-AGT-9 (must).** An agent that reports itself installed but unauthenticated is authenticated
   **from the app**, through the agent's own protocol, without leaving `htui` for a vendor CLI. The
   method is chosen from the ones that agent advertises; logging out is offered where the agent

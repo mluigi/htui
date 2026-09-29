@@ -3934,9 +3934,10 @@ impl State {
         }
 
         // R-ORCH-10 at claim (MOD-7 milestone 3, D80, D81): after claimability, before the slot
-        // and the overlap, so a permanent refusal wins over a transient one. A run with no item
-        // (a chat run), or whose item row is gone, has no tags to check, as the Postgres join
-        // finds none (D94).
+        // and the overlap, so a permanent refusal wins over a transient one. A run whose item row
+        // is absent has no tags to check, as the Postgres join finds none (D94). A chat run is not
+        // such a run: `start_chat_run` inserts at `running`, so it is `NotClaimable` at the status
+        // half above and never reaches this check (MOD-58).
         let missing = claimed
             .item_id
             .and_then(|item| self.items.get(&item))
@@ -8357,6 +8358,196 @@ mod tests {
             2,
             "two runs hold the box"
         );
+    }
+
+    /// R-ORCH-10's claim-time check (MOD-7 milestone 3, D80, D81) and MOD-58 plan D3: a run aimed
+    /// at another box is `NotClaimable` even when its item needs a tag the claiming box lacks, and
+    /// the refusal writes nothing. Claimability is decided before the tag check, so an armed tag
+    /// rule never gets a turn.
+    #[tokio::test]
+    async fn a_missing_tags_run_aimed_at_another_box_is_not_claimable() {
+        let store = MemStore::demo();
+        // A real second box row, because `create_run` looks `target_box_id` up in `state.boxes`
+        // and refuses a run whose box is missing. A clone of the fixture's, so it carries the
+        // probed and declared tags a real registration leaves behind, and a hostname of its own.
+        // Neither of those is load-bearing: the rule reads the *claiming* box's tags, and that is
+        // `ids::BOX` either way.
+        let other = BoxId::new();
+        let mut elsewhere = store
+            .box_row(ids::BOX)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the fixture box");
+        elsewhere.id = other;
+        elsewhere.hostname = "elsewhere".to_owned();
+        store.write(|state| {
+            state.boxes.insert(other, elsewhere);
+        });
+
+        let item = store
+            .mint_item(NewItem {
+                id: ItemId::new(),
+                project_id: ids::PROJECT_HTUI,
+                kind_id: ids::KIND_HTUI_FEAT,
+                title: "needs a GPU toolchain".to_owned(),
+                body: String::new(),
+                required_tags: vec!["cuda".to_owned()],
+                touched_paths: Vec::new(),
+                priority: 0,
+                step_graph_id: None,
+                created_by: ids::USER,
+                box_id: Some(ids::BOX),
+            })
+            .await
+            .expect("the mint lands")
+            .id;
+        assert_eq!(
+            store
+                .missing_tags(item, ids::BOX)
+                .await
+                .expect("the tags read back"),
+            vec!["cuda".to_owned()],
+            "the tag rule is armed: the claiming box probes rust/msvc/cmake and declares gpu"
+        );
+        let run = store
+            .create_run(NewRun {
+                target_box_id: other,
+                ..graph_run(item, ids::PROJECT_HTUI, Vec::new())
+            })
+            .await
+            .expect("the run is queued");
+        assert_eq!(
+            run.target_box_id, other,
+            "the run is aimed at the second box, so this cannot pass by aiming at `ids::BOX`"
+        );
+
+        let at = Utc::now();
+        let owner = Uuid::now_v7();
+        let until = at + TimeDelta::minutes(5);
+        assert_eq!(
+            store
+                .claim_run(run.id, ids::BOX, owner, at, until)
+                .await
+                .expect("the claim is answered"),
+            Claim::NotClaimable,
+            "a run aimed at another box is not claimable, and that outranks the tag rule"
+        );
+        assert_eq!(
+            store.run(run.id).await.expect("the run reads back"),
+            Some(run.clone()),
+            "the refusal wrote nothing to the run: not even the `MissingTags` failure row"
+        );
+        // `lease_owner` is not a `Run` field on this store, so the row comparison above cannot
+        // see it: the refused branch has to be pinned through the CAS it would have gone through.
+        assert!(
+            !store
+                .refresh_lease(run.id, owner, until)
+                .await
+                .expect("the lease refresh is answered"),
+            "the refusal took no lease"
+        );
+        assert_eq!(
+            store
+                .item(item)
+                .await
+                .expect("the item reads back")
+                .expect("it exists")
+                .status,
+            Status::Queued,
+            "the refusal wrote nothing to the item either: it is not blocked"
+        );
+    }
+
+    /// Blueprint D94, both of its arms: a run with no item — `item_id` is `NULL`, or the row it
+    /// names is gone — has no tags to check, so the tag check is never reached and the claim is
+    /// admitted. `claim_run` asks `items.get`, not `require_item`, mirroring the Postgres join that
+    /// finds no row.
+    ///
+    /// Both arms are defensive pins on shapes the store cannot currently mint: `NewRun.item_id` is
+    /// a non-optional `ItemId` and there is no `delete_item` on the store, so no public call
+    /// reaches either one. A chat run is not a vehicle either — `start_chat_run` inserts at
+    /// `RunStatus::Running`, which is `NotClaimable` at the status half of the rule, so it never
+    /// reaches the tag query. What the case is for is a future writer that made `item_id`
+    /// nullable, or added a delete path.
+    ///
+    /// It leans on the fixture box's `max_concurrent_items: 2`: the first arm's run is still
+    /// `running` on `ids::BOX` when the second claims, so only the second slot admits it.
+    #[tokio::test]
+    async fn a_run_with_no_item_is_never_refused_for_tags() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        let until = at + TimeDelta::minutes(5);
+
+        let run = store
+            .create_run(graph_run(ids::HTUI_ANA_2, ids::PROJECT_HTUI, Vec::new()))
+            .await
+            .expect("the run is queued")
+            .id;
+        store.write(|state| {
+            state.runs.get_mut(&run).expect("the run exists").item_id = None;
+        });
+        assert_eq!(
+            store
+                .claim_run(run, ids::BOX, Uuid::now_v7(), at, until)
+                .await
+                .expect("the claim is answered"),
+            Claim::Admitted,
+            "no item, no tags, no refusal: the tag check is skipped"
+        );
+        let claimed = store
+            .run(run)
+            .await
+            .expect("the run reads back")
+            .expect("it exists");
+        assert_eq!(claimed.status, RunStatus::Running);
+        assert_eq!(claimed.executing_box_id, Some(ids::BOX));
+        assert_eq!(
+            claimed.lease_expires_at,
+            Some(until),
+            "the admitted claim wrote the lease it was handed"
+        );
+
+        // A second item of its own, so the two arms share no state.
+        let orphan = store
+            .mint_item(NewItem {
+                id: ItemId::new(),
+                project_id: ids::PROJECT_HTUI,
+                kind_id: ids::KIND_HTUI_FEAT,
+                title: "its item is gone".to_owned(),
+                body: String::new(),
+                required_tags: vec!["cuda".to_owned()],
+                touched_paths: Vec::new(),
+                priority: 0,
+                step_graph_id: None,
+                created_by: ids::USER,
+                box_id: Some(ids::BOX),
+            })
+            .await
+            .expect("the mint lands")
+            .id;
+        let orphaned = store
+            .create_run(graph_run(orphan, ids::PROJECT_HTUI, Vec::new()))
+            .await
+            .expect("the run is queued")
+            .id;
+        store.write(|state| {
+            state.items.remove(&orphan);
+        });
+        assert_eq!(
+            store
+                .claim_run(orphaned, ids::BOX, Uuid::now_v7(), at, until)
+                .await
+                .expect("the claim is answered"),
+            Claim::Admitted,
+            "an item that is gone leaves no tags to refuse on; `items.get` is not `require_item`"
+        );
+        let claimed = store
+            .run(orphaned)
+            .await
+            .expect("the run reads back")
+            .expect("it exists");
+        assert_eq!(claimed.status, RunStatus::Running);
+        assert_eq!(claimed.executing_box_id, Some(ids::BOX));
     }
 
     /// ANA-2 §4.9: the heartbeat is a compare-and-set on `lease_owner`, and the sweep takes an

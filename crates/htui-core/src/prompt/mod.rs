@@ -892,10 +892,14 @@ struct ScrubbedInputs {
 ///
 /// It checks the four strings [`assemble`] masks for an excerpt (`repo`, `path`, `content`, and
 /// `provider` when there is one), in that order, so every file kept here is one `assemble` will not
-/// refuse over. The note names the rule and never the content. Because `trim_record.notes` is
-/// persisted unscrubbed, a note names a repo or path only when the scrubber returns it unchanged —
-/// neither refused nor masked (a known secret inside a file name is masked, and naming it would
-/// leak it). `repo:path` is named only when both are unchanged, the repo alone when only it is:
+/// refuse over. The note names the rule and never the content. `trim_record.notes` is now scrubbed
+/// whole before the write ([`TrimRecord::to_value`], MOD-32), so a masked value can no longer leak
+/// through a note. The rule below is kept anyway, on the ground that survives: it is the
+/// **clearer** sentence, not the safer one. A note that named a masked repo would read ``a file in
+/// repo `[REDACTED]` dropped`` — an assertion about a value no reader can resolve — where the
+/// convention gives ``a file dropped; the scrubber refused it``. So a note here names a repo or
+/// path only when the scrubber returns it unchanged, neither refused nor masked.
+/// `repo:path` is named only when both are unchanged, the repo alone when only it is:
 /// - ``excerpt: `repo:path` dropped; the scrubber refused it (rule `…`)`` (content or provider,
 ///   repo and path unchanged);
 /// - ``excerpt: a file in repo `repo` dropped; the scrubber refused it (rule `…`)`` (content or
@@ -963,11 +967,14 @@ const WITHHELD_NOTE: &str =
 /// `repo:path` a pass's note names straight from the filesystem never reaches `trim_record.notes`
 /// in plain text (MOD-7 milestone 4, P-2, D129).
 ///
-/// `trim_record.notes` is persisted unscrubbed and the preview shows it, and
-/// [`excerpt::select`]'s own notes name a listed or read path as the reader returned it: one over
-/// `max_file_bytes`, one that could not be read, one declared but excluded, one not repo-relative.
-/// A path under a directory named after a known secret would otherwise be stored as it is. A note
-/// is kept only when the scrubber returns it unchanged, the same test
+/// The record-wide pass ([`TrimRecord::to_value`], MOD-32) now scrubs `trim_record.notes` whole
+/// before the write, and the preview shows it. So this function is no longer load-bearing for
+/// safety — it is kept as a second line of defence, and for the reason the sibling at
+/// [`drop_unmaskable_excerpts`] gives: a withheld note reads as a withheld note, where a masked
+/// one would read "a file in repo `[REDACTED]` dropped", which names a value no reader can
+/// resolve. [`excerpt::select`]'s own notes name a listed or read path as the reader returned it —
+/// one over `max_file_bytes`, one that could not be read, one declared but excluded, one not
+/// repo-relative — and a note is kept only when the scrubber returns it unchanged, the same test
 /// [`drop_unmaskable_excerpts`] applies before naming a repo or path; the replacement keeps the
 /// note's place and names nothing. A caller runs this on the pass's notes **before**
 /// [`drop_unmaskable_excerpts`] appends its own, which are already built to be safe.
