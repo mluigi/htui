@@ -1855,13 +1855,16 @@ pub fn spawn_with_runtimes(
                 // while one is in flight: a touch that waits on a registration's or an editor's
                 // row lock is not joined by another every period. Spawned, so the loop never
                 // waits on the server (`R-NF-3`).
-                _ = box_beat.tick(),
-                    if backend.writable().is_some()
-                        && beat.as_ref().is_none_or(tokio::task::JoinHandle::is_finished) =>
-                {
+                _ = box_beat.tick(), if backend.writable().is_some() && beat.is_none() => {
                     if let Some(pg) = backend.writable().cloned() {
                         beat = Some(tokio::spawn(beat_once(pg)));
                     }
+                }
+
+                // The beat in flight ends, and the ticker's arm is live again at once: a tick
+                // missed while it ran fires now (`Delay`) rather than at the next event.
+                _ = in_flight(&mut beat), if beat.is_some() => {
+                    beat = None;
                 }
 
                 err = lost_the_server(health.clone()) => {
@@ -1903,6 +1906,15 @@ fn sweep_ticker(every: std::time::Duration) -> tokio::time::Interval {
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticker
+}
+
+/// The box heartbeat in flight, to its end: pending when there is none, so the loop's arm over it
+/// is inert until a beat is spawned. A beat that panicked or was aborted ends it all the same.
+async fn in_flight(beat: &mut Option<tokio::task::JoinHandle<()>>) {
+    match beat {
+        Some(handle) => drop(handle.await),
+        None => std::future::pending().await,
+    }
 }
 
 /// One box heartbeat (MOD-40 plan D7), on its own task.
