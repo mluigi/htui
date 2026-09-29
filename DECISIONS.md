@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-52](docs/decisions/mod/mod-52.md)** - `ctrl-c` does not quit `htui` (done, 2026-09-29)
 - **[MOD-63](docs/decisions/mod/mod-63.md)** - Settings › Qdrant `r` does nothing (done, 2026-09-29)
 - **[MOD-61](docs/decisions/mod/mod-61.md)** - The run engine's scrubber masks nothing; folded into MOD-10 (decided, 2026-09-29)
 - **[MOD-62](docs/decisions/mod/mod-62.md)** - A verify command keeps the process environment; no allowlist (decided, 2026-09-29)

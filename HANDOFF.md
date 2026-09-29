@@ -14,7 +14,10 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-29):** **MOD-63 was done** (`docs/decisions/mod/mod-63.md`): `r` in
+**Current status (2026-09-29):** **MOD-52 was done** (`docs/decisions/mod/mod-52.md`): `ctrl-c`
+quits htui from anywhere, bound globally and on the overlay wildcard, so it works over the modal
+switcher and inside a half-typed field. Making the keys configurable is **ANA-26**.
+Before it, **MOD-63 was done** (`docs/decisions/mod/mod-63.md`): `r` in
 Settings › Qdrant re-reads the keyring, so the unavailable state recovers in place, and the section's
 writes now set `busy`, so their stored/cleared notices and in-flight hint finally show.
 Before it, **MOD-61 was folded into MOD-10** (`docs/decisions/mod/mod-61.md`):
@@ -22,14 +25,6 @@ there are no resolved secrets on any path yet (every production `SessionSpec.env
 engine's `engine.rs:5349` included), so a run-path scrubber built from them would carry an empty list.
 The run engine's scrubber is now MOD-10's to build, from the same map that fills the session env;
 the verifier's scrubber stays pattern-only. No code changed.
-Before it, **MOD-62 was decided** (`docs/decisions/mod/mod-62.md`): a
-verify command keeps htui's process environment unchanged (plan D30), and PR #20's allowlist was
-closed unmerged. The agent it checks already runs with that same environment, so an allowlist on the
-verifier alone hid nothing and broke real verifiers. The rule that remains sits on **MOD-10**:
-resolved secrets in the agent's `SessionSpec.env` must never be handed to the verifier.
-The same day, **MOD-9 milestone 4 landed** (SKILL.md import, PR #21; see MOD-9 below), and two
-security fixes merged without an item: PR #16 pins the ACP session's file access to its directory
-(path traversal), and PR #19 bounds `.gitignore` reads and skips non-regular files in the excerpt walk.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -137,6 +132,27 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   automatically. The fit is deterministic arithmetic over rows, so it is allowed under `R-ID-6`.
   Judge choice itself is out of scope: ANA-21 §2.2 established the judge is never asked of the
   selector, and MOD-36 owns the judge-identity hardening.
+- [ ] **ANA-26 - Configurable hotkeys** (maintainer-requested 2026-09-29, during MOD-52;
+  `docs/decisions/mod/mod-52.md`). `R-TUI-1`. The maintainer wants htui's hotkeys configurable.
+  Today only a thin table is data: `Keymap::default_global` (`crates/htui/src/keymap.rs`) holds the
+  global and overlay-wildcard bindings (`q`, `ctrl-c`, `Tab`, `1`..`9`, `?`, `Esc`, plus `w` from
+  `register_all`), and `KeyChord::parse` already reads spec strings such as `"ctrl-c"`. Every tab,
+  section and overlay key is a hard-coded `KeyCode` match in its own `on_key` (about 23 files under
+  `crates/htui/src/ui`), and the hint lines spell the keys as string constants (`HINT_*`, about 36),
+  so rebinding the table alone would leave those keys fixed and the hints wrong. Analyze and decide:
+  1. Scope: the global and overlay table only, or every tab and section key. The latter means
+     routing each `on_key` through named actions, and the shared letters (`e`, `c`, `r`, `j`/`k`
+     across the Settings sections) need one action name or several.
+  2. Where the bindings live and who owns them: a local file under the user's config dir, the
+     store's settings, or both with an override order. Per user, per box or per workspace, and how
+     R-TUI-1 and `docs/REQUIREMENTS.md` should say so (a requirement change needs the maintainer).
+  3. Validation at load: duplicate chords in one scope, a printable key bound where a text field
+     captures it, and whether `ctrl-c` quit may be unbound or is fixed (MOD-52 relies on every
+     capturing section passing `CONTROL` chords on).
+  4. How hints and the `?` help follow a rebinding, since both are generated from the table only
+     for the global scope today.
+  5. Prior art in other ratatui/crossterm TUIs (gitui, helix, yazi, lazygit's keybinding config).
+  Deliver a verdict and the `MOD-N` that implements it.
 
 ### Next features
 - [ ] **MOD-39 - Requirements tab and item traceability** (from ANA-11; MOD-38 done,
@@ -315,12 +331,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   `.claude/plans/mod-7-box-settings-section.plan.md`. Unblocked: MOD-7 is done
   (`docs/decisions/mod/mod-7.md`); its milestone 2 landed
   (the Boxes section, `crates/htui/src/ui/tabs/settings/boxes.rs`, and `crate::box_settings`).
-- [ ] **MOD-52 - `ctrl-c` does not quit `htui`** (from MOD-7 milestone 2 plan fact-check). `R-TUI-1`.
-  Crossterm's raw mode clears `ISIG`, so `ctrl-c` raises no `SIGINT`, and no `ctrl-` chord is bound:
-  `Keymap::default_global` (`crates/htui/src/keymap.rs:198-238`) binds `q`, `Tab`, `BackTab`,
-  `1`-`9`, `?` and the overlay `Esc`. Sections nevertheless pass `CONTROL` chords through "so `ctrl-c`
-  still quits", and several comments say it quits. Decide whether `ctrl-c` should quit (bind it
-  globally, respecting text-input capture) or not (correct the comments). Found 2026-09-26.
 - [ ] **MOD-9 - Skill library and templates.** `R-SKL-1..4`, `R-PRM-4`, `R-TUI-7`. Versioned skills,
   project and phase bindings, template rows, Skills tab editor with version diff, import of
   existing skill markdown files. Per ANA-5 (`docs/ANA-5.md` §4.1, §5.4): template save validation
@@ -784,7 +794,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 38 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 4 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-26 configurable hotkeys) |
+| MOD-N   | 37 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-53 terminal task replies, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-6 Runs pane approve doc)                |
 | TOOL-N  | 0 |

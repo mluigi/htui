@@ -915,8 +915,8 @@ async fn the_section_captures_input_only_while_an_editor_is_open() {
     assert!(section.captures_input(), "open until the reply");
 }
 
-/// OQ-16: a `CONTROL` chord passes through an open quirks editor. Nothing in the shell quits on
-/// `ctrl-c` today (MOD-52), so this pins the pass-through only.
+/// OQ-16: a `CONTROL` chord passes through an open quirks editor, so the global `ctrl-c` binding
+/// (MOD-52) quits from it. The quit itself is pinned in `tests/hierarchy.rs`.
 #[tokio::test]
 async fn ctrl_c_passes_through_an_open_quirks_editor() {
     let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
