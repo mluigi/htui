@@ -18,6 +18,8 @@ One command to mint a HANDOFF item correctly. The verdict gate below stays inter
 
 - `../handoff-run/references/lifecycle.md` — P0 open-item procedure (ID mint, placement, recount, cross-links)
 - `../handoff-run/scripts/next-item-id.sh` / `.ps1` — the owned-ID mint, run at step 3 (never mint by eye)
+- `scripts/hr-mint` (repo root, Linux) — the leased mint over `next-item-id.sh`, used at step 3 instead whenever
+  `scripts/hr-mint --leasing` exits 0 (`scripts/hr` sandbox runs exist; user guide `docs/hr-sandbox.md`)
 - `../handoff-run/scripts/validate-workflow-docs.sh` / `.ps1` — structural validator, run after writing
 - Law: `.claude/rules/workflow-docs.md` (prefix table, section table, lifecycle rules). This skill is an operational
   checklist over the law; it does not restate it — on any conflict, the rule wins.
@@ -62,6 +64,16 @@ pwsh .claude/skills/handoff-run/scripts/next-item-id.ps1 -Prefix <PREFIX>   # Wi
 Its `max open` / `max archived` / `next` feed the verdict line below verbatim. **Non-zero exit blocks the mint** — the
 ID space is untrustworthy until the reported finding is fixed; report it and stop rather than minting over it.
 
+With sandbox runs live (Linux: `scripts/hr-mint --leasing` exits 0), mint with
+`scripts/hr-mint --prefix <PREFIX> --title "<title>"` instead — except under `--dry-run`, which runs only the read-only
+report above and notes that the real mint is leased and may be higher. `hr-mint`'s stderr line
+(`hr-mint: leased <ID> for <owner> (tree next <ID>, lease floor <ID>|none)`) replaces `max open / archived` in the
+verdict's `ID mint:` field, and its sibling listing (`hr-mint: other <PREFIX> leases in the last 7 days - …`, one
+`<id>  <owner>  <ts>  <title>` row each) goes in the verdict too: a title that looks like the same problem is put to the
+maintainer before anything is written. A rejected verdict leaves the leased ID as a harmless gap. Non-zero exit blocks
+here as well (`1` findings / unparseable lease file, `2` usage, `3` lock or state-dir I/O) — never fall back to
+`next-item-id.sh` while leasing is on. Rules and lifecycle: `../handoff-run/references/lifecycle.md` P0.
+
 The rule it implements (owned-ID method, `../handoff-run/references/lifecycle.md` P0): max over open checklist lines
 (`^- \[ \] \*\*PREFIX-N`) in `HANDOFF.md` **plus** the archive — index lines (`^- \*\*\[PREFIX-N\]`) in
 `DECISIONS.md`, cross-checked against the `docs/decisions/<prefix>/` listing — then +1. Never
@@ -88,6 +100,7 @@ Print, before any write:
 Item:      <PREFIX-N> — <title>
 Prefix:    <chosen> (runner-up: <alt> — <one-line reason>, if ambiguous)
 ID mint:   max open <a> / archived <b> → <PREFIX-N>
+           (leasing on: leased <PREFIX-N> for <owner> (tree next …, lease floor …) + sibling rows, or none)
 Section:   <existing header matched | proposed new section from law table>
 Line:      <the drafted checklist line>
 Links:     <cross-link edits to make elsewhere, or none>

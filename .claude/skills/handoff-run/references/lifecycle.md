@@ -8,6 +8,22 @@ rule wins.
 
 1. Mint the ID — run the script, do not derive it by eye:
 
+   **When sandbox runs exist, lease the ID.** On Linux, if `scripts/hr-mint --leasing` exits 0
+   (always true inside a sandbox; true on the host once `scripts/hr up` has been used on this
+   box), mint with `scripts/hr-mint --prefix <PREFIX> --title "<one-line title>"` instead of the
+   commands below. It runs the same `next-item-id.sh` over this tree and returns the higher of
+   that and the highest ID of the prefix already leased + 1, so parallel runs never share an ID;
+   the owned-ID rule below still decides the floor and a lease can only raise it. Stdout is the
+   bare ID. Stderr says how it was reached —
+   `hr-mint: leased MOD-6 for hr/MOD-65 (tree next MOD-6, lease floor none)` — and, under
+   `hr-mint: other MOD leases in the last 7 days - ask the maintainer before filing if one is the same problem:`,
+   lists other leases for the prefix with their titles. If one looks like the same problem, ask
+   the maintainer before filing; on reuse, cite that ID instead (a leased-but-unused ID is a
+   harmless gap). **Non-zero exit blocks the mint** exactly as below — `1` findings or an
+   unparseable lease file, `2` usage, `3` lock timeout or state-dir I/O; never fall back to the
+   plain script while leasing is on, that is how two runs mint one ID. A `hr-mint: leasing off`
+   notice means the ID came from the tree alone. Otherwise:
+
    ```
    bash .claude/skills/handoff-run/scripts/next-item-id.sh --prefix <PREFIX>   # macOS/Linux
    pwsh .claude/skills/handoff-run/scripts/next-item-id.ps1 -Prefix <PREFIX>   # Windows
