@@ -158,12 +158,15 @@ pub struct NewStepGraph {
     pub name: String,
     /// `step_graph.description`.
     pub description: String,
+    /// `step_graph.is_override` (ANA-2 §4.1): `true` only for `override_graph`'s per-item clone
+    /// (MOD-9 D80); every other constructor passes `false`.
+    pub is_override: bool,
 }
 
 /// Edit passed to [`crate::store::WriteStore::update_step_graph`]; `None` leaves the column.
 ///
-/// `is_override` is not here: the column arrives with MOD-4's `0003` and seeded graphs take its
-/// default (PRD scope), so there is nothing for this milestone to write.
+/// `is_override` is not here: it is set once, at create ([`NewStepGraph::is_override`], MOD-9
+/// D80), and never edited.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StepGraphPatch {
     /// `step_graph.name`.

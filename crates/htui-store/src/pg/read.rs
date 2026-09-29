@@ -22,9 +22,10 @@ use htui_core::model::{
     RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementRevision,
     RequirementSpec, RequirementState, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase,
     Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree,
-    RunSummary, Scope, SessionEvent, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
-    StepGraphPhase, StepId, StepStatus, UpstreamEntry, UserId, VerifyOutcome, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
+    RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
+    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus,
+    UpstreamEntry, UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspaceProject, WorkspaceSummary,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -2360,6 +2361,157 @@ impl PgStore {
             graph.as_uuid(),
         )
         .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    // ---- MOD-9 milestone 3: the skill readers (plan D75, blueprint D91, D92) -----------------
+    //
+    // `query_as!` builds the model rows directly: `Skill`, `SkillVersion` and `SkillBinding` carry
+    // exactly their table's columns, in field order (`rows.rs` needs no struct for them).
+
+    /// Every skill, ordered by `name` bytes (D91).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn skill_rows(&self) -> Result<Vec<Skill>> {
+        sqlx::query_as!(
+            Skill,
+            r#"
+            SELECT id         AS "id: SkillId",
+                   name,
+                   description,
+                   created_by AS "created_by: UserId",
+                   created_at,
+                   updated_at
+              FROM skill
+             ORDER BY name COLLATE "C"
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// One skill by id, `None` when there is no such row.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn skill_row(&self, id: SkillId) -> Result<Option<Skill>> {
+        sqlx::query_as!(
+            Skill,
+            r#"
+            SELECT id         AS "id: SkillId",
+                   name,
+                   description,
+                   created_by AS "created_by: UserId",
+                   created_at,
+                   updated_at
+              FROM skill
+             WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// One skill's versions, ascending (D91); the head is the last.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn skill_version_rows(&self, skill: SkillId) -> Result<Vec<SkillVersion>> {
+        sqlx::query_as!(
+            SkillVersion,
+            r#"
+            SELECT skill_id   AS "skill_id: SkillId",
+                   version,
+                   body,
+                   source,
+                   created_by AS "created_by: UserId",
+                   created_at
+              FROM skill_version
+             WHERE skill_id = $1
+             ORDER BY version
+            "#,
+            skill.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// `None`: the global attachments; `Some(p)`: `p`'s project and phase attachments. Ordered by
+    /// `(skill_id, phase_id NULLS FIRST)` (D91).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn skill_binding_rows(
+        &self,
+        project: Option<ProjectId>,
+    ) -> Result<Vec<SkillBinding>> {
+        sqlx::query_as!(
+            SkillBinding,
+            r#"
+            SELECT id             AS "id: SkillBindingId",
+                   skill_id       AS "skill_id: SkillId",
+                   project_id     AS "project_id?: ProjectId",
+                   phase_id       AS "phase_id: PhaseId",
+                   pinned_version,
+                   position,
+                   activation     AS "activation: Activation",
+                   globs,
+                   languages,
+                   updated_at
+              FROM skill_binding
+             WHERE project_id IS NOT DISTINCT FROM $1
+             ORDER BY skill_id, phase_id NULLS FIRST
+            "#,
+            project.map(ProjectId::as_uuid),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// The row at one natural key (`UNIQUE NULLS NOT DISTINCT (skill_id, project_id, phase_id)`),
+    /// `None` when there is none.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn skill_binding_row(
+        &self,
+        key: SkillBindingKey,
+    ) -> Result<Option<SkillBinding>> {
+        sqlx::query_as!(
+            SkillBinding,
+            r#"
+            SELECT id             AS "id: SkillBindingId",
+                   skill_id       AS "skill_id: SkillId",
+                   project_id     AS "project_id?: ProjectId",
+                   phase_id       AS "phase_id: PhaseId",
+                   pinned_version,
+                   position,
+                   activation     AS "activation: Activation",
+                   globs,
+                   languages,
+                   updated_at
+              FROM skill_binding
+             WHERE skill_id = $1
+               AND project_id IS NOT DISTINCT FROM $2
+               AND phase_id IS NOT DISTINCT FROM $3
+            "#,
+            key.skill.as_uuid(),
+            key.project.map(ProjectId::as_uuid),
+            key.phase.map(PhaseId::as_uuid),
+        )
+        .fetch_optional(&self.pool)
         .await
         .map_err(map_sqlx)
     }

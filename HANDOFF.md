@@ -20,17 +20,32 @@ one and `restores_the_terminal()` is consulted before anything restores — a pr
 `run_providers` contains (H-20) no longer tears the terminal down mid-session. `tests/panic_hook.rs`
 drives the real chain; `tests/panic_hook_order.rs` is a source guard that fails if a ratatui init
 comes back. Closes MOD-9 milestone-1 blueprint finding F-U.
+Before it, **TOOL-3 was decided** (`docs/decisions/tool/tool-3.md`): the maintainer accepted that `cargo clippy --target x86_64-pc-windows-msvc` cannot run here — it dies in `ring`'s build script with `cc-rs: failed to find tool "lib.exe"` — so **MOD-16 is the only Windows check** and no C toolchain is installed to replace it. Re-verified unchanged 2026-09-28, and green for **neither** crate: `ring` reaches `-p htui` through sqlx on a path that predates MOD-20, and MOD-20's reqwest/rustls extended the same failure to `-p htui-agent`. MOD-20's plan D21 and its Validation block are amended so nothing still asserts a gate that never went green, and the README section says up front that its command does not run here. MOD-20's Windows code was reviewed by eye, never linted.
+Before it, **CLEAN-5 was done** (`docs/decisions/clean/clean-5.md`): the MOD-4
+merge-hook test no longer waits a fixed 3 s for a merge whose future it dropped; it polls every
+100 ms for the landed state with a 30 s deadline that reports what it saw, so a hung merge is
+diagnosed rather than timed out. The whole `gix_isolator` file passes (34), including under a
+12-way CPU load, which is the condition that produced the flake.
+Before it, **ANA-21 was concluded** (`docs/decisions/ana/ana-21.md`): a
+model weight is a coarse ordinal tier (S 95, A 80, B 65, C 45, D 25, 0 = never given a slot) keyed on
+the phase's `name` in `agent.settings.weights`, cost excluded because all three seeded agents are
+`subscription`; slot 0 stays `eligible[0]` so the priority order stands and only rival slots are
+apportioned, and `R-AGT-8` was amended to say so. Every figure was re-read from its primary source
+on 2026-09-28 (`docs/ANA-21-recheck-2026-09-28.md`); no model changed tier, but four draft figures
+did not reproduce — the draft's Sonnet 5 and Haiku 4.5 bases do not exist on Artificial Analysis at
+all, the SWE-ECI file is gone from the Epoch hub, and Opus 5.5 is absent from Epoch ECI. The
+refresh is a **source registry**, not a hardcoded fetcher: Epoch (CC BY 4.0) is the only source
+both fetchable and licensed for this use, so the analysis axis is fetched and the implement axis is
+maintained and dated, an undated entry resolving to 0 rather than to a stale number. Two follow-ups
+are spawned: **ANA-24** (find a licensed, effort-separated coding benchmark source) and **ANA-25**
+(learn weights from judge verdicts, behind its volume trigger). MOD-36 is unblocked.
 Before it, **MOD-7 was done** (`docs/decisions/mod/mod-7.md`), all four
 milestones: a box is keyed on its `box.toml` id and checked by a keyed machine fingerprint
 (migration `0005_box_identity`); a probe fills hardware, tools and tags; Settings > Boxes edits
 declared tags and quirks as a compare-and-set; `R-ORCH-10` refuses a missing tag at enqueue and at
 claim; and milestone 4 infers repo paths under the workspace root (Settings > Hierarchy `i`, manual
 fallback `b`) and puts excerpts read from those roots into phase prompts and the preview (the judge
-keeps none, D109). MOD-49 is unblocked; a MOD-4 test flake seen at its gate is CLEAN-5.
-Before it, **ANA-22 was concluded** (`docs/decisions/ana/ana-22.md`): a skill
-is pure library content attached at global, project or phase level, and the attachment carries the
-activation (`always`, `glob`, `off`; language compiled to globs); it unblocks MOD-9 milestones 3 and 4. MOD-9's
-PRD is up (`.claude/prds/mod-9-skill-library-templates.prd.md`); agent help while editing is MOD-55.
+keeps none, D109). MOD-49 is unblocked.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
 (MOD-38) and `0007_skill_attachments` (MOD-9 milestone 2; cache: `0001`..`0004`), so **the next
@@ -90,21 +105,52 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 ### Analyses
 
 
-- [ ] **ANA-21 - Per-model weights for agent assignment, derived from public sources** (from MOD-4
-  milestone 4, OQ-7; maintainer-requested 2026-09-23; MOD-4 is done, `docs/decisions/mod/mod-4.md`).
-  `R-AGT-8`, `R-ORCH-7`. Blocks MOD-36.
-  Research how to give each configured agent/model a weight (e.g. Gemini Flash 30, Claude Opus 5.5
-  60) that MOD-36 uses to choose which models run a phase's fan-out candidates. Survey public signals
-  (coding and reasoning benchmarks, leaderboards, published pricing and latency), decide whether
-  weights are per task kind (analysis, implement, review, judge) or global, and whether cost enters
-  the weight or stays a separate quota concern (ANA-4). Deliver: the weight table's schema and where
-  it lives (`agent` row, `app_setting`, or a new table), a refresh method (manual, scripted from
-  named sources, or learned from htui's own judge verdicts), and initial values for the seeded agents.
-  **Findings committed (2026-09-25):** draft verdict in `docs/ANA-21.md` (coarse tiers per phase
-  name in `agent.settings.weights`, cost kept out, deterministic slot rule, manual refresh, draft
-  initial values). Still open: the session's proxy blocked most benchmark and vendor pages, so the
-  figures in §3.3 and the initial values in §5.7 are second-hand and must be re-read from primary
-  sources, and the maintainer calls in §7 are undecided. No close-out yet.
+- [ ] **ANA-23 - Pure-Rust local embedder to replace `ort`/`fastembed`** (maintainer-requested
+  2026-09-26, during MOD-9 milestone 3). `htui-store`'s `local-embed` feature
+  (`embed::FastEmbedder`, BGE-small-en-v1.5, MOD-34, `docs/decisions/mod/mod-34.md`) pulls `ort`,
+  whose `ort-sys` build script downloads ONNX Runtime from `parcel.pyke.io` or needs
+  `ORT_LIB_LOCATION` pointing at a native `libonnxruntime`; sandboxes that block the host can only
+  build `htui-store` and `htui` with a hand-fetched library. The maintainer wants no native runtime
+  fetched at build time. Compare **`candle`** (with `tokenizers` on its `fancy-regex` feature, no
+  `onig`) and **`tract-onnx`** (runs the same ONNX file): offline build, binary size, embedding
+  speed on the demo corpus, how and when model weights are fetched at run time, and whether the
+  vectors equal the ones already stored in qdrant within a tolerance or force a re-embed. Deliver a
+  verdict and the `MOD-N` that implements it.
+- [ ] **ANA-24 - A licensed, effort-separated coding benchmark source for the weight map** (from
+  ANA-21; ANA-21 is done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`, `R-ORCH-7`.
+  ANA-21's refresh is a source registry, and exactly one entry in it can be fetched today: Epoch
+  (CC BY 4.0), which covers the **analysis** axis only. The implement axis has no
+  dynamically-permissible source at all, so its weights are the maintainer's, entered by hand and
+  dated, and an undated entry resolves to 0 rather than to a stale number. Research the gap:
+  1. Find a machine-readable, redistribution-licensed source of agentic **coding** benchmark
+     results. The prize is Harbor's tbench.ai: it is the official Terminal-Bench 4.0 board and the
+     only source found that publishes `reasoning_effort` per row, so it would close the
+     effort-separation gap that forced ANA-21 to flatten every `-medium`/`-low` string onto its
+     family's `-high` value. Its results sit behind an undocumented tRPC endpoint and carry no
+     licence grant; the harness repo is Apache-2.0. Establish whether the results are separately
+     licensed, and by what terms.
+  2. Establish whether any Terminal-Bench 4.0 results mirror exists with terms that permit fetching
+     them into a product that gives model-selection guidance. Artificial Analysis's API is
+     explicitly out of scope: it is internal-use only and bars exactly this use.
+  3. Re-probe the sources ANA-21 recorded as blocked, since licences and endpoints move: Vals, Scale
+     SEAL, Arena, SWE-bench/experiments, SWE-rebench, LiveBench, epoch-research/eci-public.
+  4. Deliver a verdict naming which sources are `dynamic: true` and which `redistributable: true`,
+     so ANA-21's `weights.sources` registry (§5.4) can be extended as a data edit. Blocked on
+     nothing; do it whenever.
+- [ ] **ANA-25 - Learn per-model weights from htui's own judge verdicts** (from ANA-21; ANA-21 is
+  done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`, `R-ORCH-7`, `R-ID-6`.
+  ANA-21 deferred learned weights behind a volume trigger but the maintainer asked for it to be
+  tracked rather than remembered. **Trigger: do not start until MOD-36 and MOD-11 are both done and
+  a project holds on the order of 100 judged cross-model groups.** The data is already recorded —
+  candidate `run_step` rows carry `agent_id`, `model`, `selected` and `verify_outcome`, and the
+  judge row (`fanout_index = -1`) carries its own `agent_id`/`model` — so no new logging is needed.
+  Fit a Bayesian Bradley-Terry model with a Plackett-Luce top-1 likelihood per verdict, taking
+  ANA-21's tier as the prior and a same-family-as-judge covariate, since the documented self- and
+  same-family preference (+10 to +25 points self, +3.4 to +8.4 same family) is as large as the
+  signal being measured. Show the fit read-only beside the manual weights before anything is applied
+  automatically. The fit is deterministic arithmetic over rows, so it is allowed under `R-ID-6`.
+  Judge choice itself is out of scope: ANA-21 §2.2 established the judge is never asked of the
+  selector, and MOD-36 owns the judge-identity hardening.
 
 ### Next features
 - [ ] **MOD-39 - Requirements tab and item traceability** (from ANA-11; MOD-38 done,
@@ -187,12 +233,14 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
     A promotion refused at the bind is already handed the stream (blueprint D185); the interval
     before the follow is served is not covered (T7 repair `9f7cc5c`, `agent_worker.rs` `Stream`).
 - [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
-  OQ-7; blocked on ANA-21 only, since MOD-4 is done, `docs/decisions/mod/mod-4.md`). `R-AGT-8`,
+  OQ-7; ANA-21 is done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`,
   `R-ORCH-7`. Milestone 4 runs every candidate of a group on the
   one agent the walk selects (rival sampling). This item spreads candidates across the eligible
   agents by weight: a weighted `AgentSelector` (the seam milestone 4 leaves per-candidate) picks each
   `fanout_index`'s agent from the walk's eligible list using ANA-21's weights, so the judge compares
-  different models on the same task. Open points to settle in the plan: the prompt is assembled once
+  different models on the same task. Slot 0 stays `eligible[0]` and only the rival slots are
+  apportioned, so the priority order stands (`docs/ANA-21.md` §5.5, §7.2). Open points to settle in
+  the plan: the prompt is assembled once
   per group, but token budgeting uses one agent's estimator (`TokenEstimator::for_agent`), so mixed
   families need either the tightest budget or per-candidate trimming, which breaks "identical prompt
   across siblings" (ANA-5 `:1870`); each candidate draws on its own agent's quota; the judge must not
@@ -275,6 +323,16 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   store conformance has no trait method to make a second box, so (a) wants a `pg_criteria` case
   that inserts a second `box` row plus a MemStore unit test in `mem.rs`; (b) fits either. Found
   2026-09-26.
+- [ ] **MOD-59 - A write's reply names itself, so a form never stays "in flight"** (from MOD-9
+  milestone 3 review, finding 3). `R-TUI-7`, `R-NF-3`. The Skills and Templates views decide that a
+  save landed by finding what they sent in the re-read snapshot (`ui/tabs/skills/library.rs` `land`,
+  milestone 1's D27 in `templates.rs`). If another session changes the same skill, binding or
+  template between the write and the worker's re-read, or `MemStore` stamps two writes with the same
+  instant, the predicate never holds: `busy` stays set and the editor, rename form or attachment
+  form refuses `Esc` and `Ctrl+S` until the workspace changes. Make a write's reply identify itself
+  (e.g. `StoreReply::SkillsWritten { snapshot, what }` and a templates twin) so landing no longer
+  depends on content, or release the form on any reply to the write's request name. Found
+  2026-09-26.
 - [ ] **MOD-49 - Interactive path picker for repo and workspace roots** (from MOD-7). `R-BOX-4`,
   `R-TUI-8`. MOD-7 D5 infers each repo's path on a box and falls back to a typed path in a text box
   when inference fails; as built, the typed fallback is Settings > Hierarchy's `b` (MOD-7 milestone
@@ -345,12 +403,29 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   uses the chosen template and the Prompt sub-tab lists the choices. `R-SKL-2` amended. Plan
   `.claude/plans/mod-9-skills-reach-the-run.plan.md`, blueprint
   `.claude/plans/mod-9-skills-reach-the-run.blueprint.md` (final review `rust-reviewer` APPROVE
-  WITH FIXES, findings applied). **Milestone 3 is next** (writers, Skills view and attachments
-  matrix with a global row, language map, glob matcher over ANA-22 F2, the `graph.rs` clone gap);
-  its plan continues at D70 and R-25. Carry into it: `override_graph` creates its clone without
-  `is_override` (`NewStepGraph` has no such field), so the engine's clone-gap note cannot fire
-  until the clone sets it (review finding 2); and reading bindings before versions is now the
-  race-safe order for the writers (review finding 5).
+  WITH FIXES, findings applied).
+  **Phase 3 landed (`df91c82`..`e5db119`, 2026-09-26):** milestone 3, skills editable and
+  attachable, **split by the maintainer** (glob *firing* is the PRD's new row 5, "Glob attachments
+  fire": the F2 file set, roots for fan-out groups, changed paths, `matched`/`no_match`; unblocked
+  now that MOD-7 milestone 4 runs the excerpt pass over `repo_box_path` roots). Shipped: skill names checked by the Agent Skills rule; `globset` (new
+  dependency) behind `model::skill_glob` (`<repo>:` qualifiers, brace-aware lists,
+  `canonical_globs`) and a seed language map (`model::skill_language`, fourteen languages); seven
+  `WriteStore` methods on every store (`skills`, `skill_versions`, `skill_bindings`, `create_skill`
+  with v1 in one transaction, `update_skill`, `add_skill_version`, `set_skill_binding`), each writer
+  a compare-and-set with one refusal chain (`check_attachment`), `CASES` 82; the clone gap closed
+  (`NewStepGraph.is_override` written, `override_graph` checks every copy before any write and
+  carries the source phases' attachments; the engine's clone-gap note is gone); `crate::skills` on
+  the store worker; the Skills view (library, versions, diff, `TextArea` and `$EDITOR`, token
+  estimate, rename; attachments pane with a global row, winner stars, a form showing the effective
+  globs and a repo picker). No migration; `.sqlx` 280. Plan
+  `.claude/plans/mod-9-skills-editable.plan.md`, blueprint
+  `.claude/plans/mod-9-skills-editable.blueprint.md` (F-H decided: an override clone is checked
+  first, then refused). Review `rust-reviewer` APPROVE WITH FIXES: findings 1, 2, 4, 5, 7 and the
+  acceptance gap (a phase `off` over a global `always`, end to end) applied (`22822ca`..`e5db119`);
+  finding 3 opened as MOD-59; finding 8 accepted (documented residue in `crates/htui/src/skills.rs`).
+  **Milestone 4 (import of skill files) is next.** Carry into it: the Skills view cannot open an editor
+  on a skill with no version (review finding 6, `library.rs` `on_skill_key`), which import is the
+  first writer able to produce; and a `glob` attachment still records `no_path` until row 5.
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
   pattern masks, fail-closed persistence gate, Settings tab secret provider section. **No longer
@@ -420,9 +495,15 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   edge, keyboard navigation that re-roots the Backlog selection; the `open graph` action of
   `R-TUI-2`. Not blocked (MOD-1 landed; replaces `ui/tabs/backlog/detail/graph.rs` only).
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
-  `R-NF-3`, `R-HIS-1`. Every Windows-only path MOD-2 compile- and lint-checked from Linux but
-  never ran. `cargo clippy --target x86_64-pc-windows-msvc -p htui-agent` is green and has already
-  caught two defects a Linux build cannot see (`c4d65ba`), but four facts are runtime facts:
+  `R-NF-3`, `R-HIS-1`. **This is now the only Windows check** (TOOL-3 decided 2026-09-28,
+  `docs/decisions/tool/tool-3.md`): the maintainer accepted that
+  `cargo clippy --target x86_64-pc-windows-msvc` cannot run on this box, so this item carries the
+  runtime half *and* the compile-level branch coverage that was lost. The line was green when
+  MOD-2 wrote this entry and had caught two defects a Linux build cannot see (`c4d65ba`); it is
+  green for neither crate now, `ring`'s build script being the blocker on a path that predates
+  MOD-20. Every Windows-only path MOD-2 and MOD-20 wrote was never ran. Beyond the four runtime
+  facts below, this item also inherits the branch coverage `ring` took away — see TOOL-3's "What
+  MOD-16 inherits". The four runtime facts are:
   the job object's kill-on-close guarantee leaves no `node`/`claude` process behind (`docs/ANA-4.md`
   §11 criterion 11's Windows half); `CreateProcess` refuses a `.cmd` shim, so `${claude}` resolving
   to one must fail with a message naming the shim rather than a bare `os error 193`;
@@ -685,16 +766,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   in a change that first pins which stop reason each shipped loop case reaches, because the fix can
   change that. Source: `.claude/plans/mod-4-orch-fanout.blueprint.md` F-B and §11, carried unchanged
   through milestones 5 and 6 (`docs/decisions/mod/mod-4.md`, "Carried").
-- [ ] **CLEAN-5 - `a_merge_dropped_mid_hook_still_lands_and_leaves_no_merge_head` flakes under
-  load** (from MOD-7 milestone 4 gate; the test is MOD-4's, `62777f4`). `R-ORCH-8`.
-  `crates/htui-orch/tests/gix_isolator.rs` drops a `merge_no_ff` future after 300 ms while the
-  primary's `pre-merge-commit` hook runs `sleep 2`, then waits a **fixed 3 s** before asserting
-  that the merge landed with parents `[before, after]`, no `index.lock` and no `MERGE_HEAD`. Under
-  load the detached `git merge` has not finished by then: `git log -1 --format=%P HEAD` is empty and
-  the case fails. It failed 1 of 3 runs alone at MOD-7 milestone 4's gate (2026-09-26) and is not
-  caused by MOD-7. Suggested fix, test-only: replace the fixed sleep with a poll (every 100 ms,
-  deadline about 30 s) until `%P` reads `before after` and neither `index.lock` nor `MERGE_HEAD`
-  exists, then run the existing assertions; the deadline keeps a real hang loud.
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
@@ -708,33 +779,11 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 
 ### Tooling findings
 
-- [ ] **TOOL-3 - The Windows lint target cannot be built on this box, and MOD-20 made that bite.**
-  `R-NF-3`, `R-AGT-1`. `cargo clippy --target x86_64-pc-windows-msvc` dies in `ring`'s build script
-  with `error occurred in cc-rs: failed to find tool "lib.exe"`: cross-compiling `ring`'s C needs an
-  MSVC-capable compiler, and this box has `gcc` only (`cc-rs` reports *"GNU compiler is not
-  supported for this target"*; `AR_x86_64_pc_windows_msvc=llvm-lib` gets one step further and dies
-  on *"not a COFF object"*). No `clang`, no `clang-cl`, no `cargo-xwin`, no `zig`, no `sudo`.
-  **Pre-existing for `-p htui`** — `ring` reaches it as `ring ← rustls ← sqlx-core ← sqlx ←
-  htui-core ← htui-store`, a path that predates MOD-20 — but MOD-20's `reqwest`/`rustls` brought it
-  into `htui-agent`'s graph too, which is the crate the README's own command names
-  (`README.md` "Checking the Windows-only code from Linux"). That command is the safety net MOD-2
-  milestone 3 credited with catching two defects a Linux build cannot see, and it is now green on
-  neither crate, so MOD-20's Windows-conditional code (`archive.rs`'s `cfg(unix)`/`cfg(not(unix))`
-  arms, `Layout::promote`'s retry, the `canonicalize` on both sides of the post-promote check) was
-  reviewed by eye rather than linted. Three ways out, none taken: install a C toolchain that can
-  target MSVC without `sudo` (`cargo install cargo-zigbuild` + `pip install ziglang` is the
-  sudo-free one; `cargo-xwin` needs `clang`); scope the lint line to a feature set that excludes
-  TLS, which lints most code but not `install/http.rs`; or accept the loss and let **MOD-16** be the
-  only Windows check. **This is a maintainer decision, and MOD-16 inherits the runtime half
-  either way.** MOD-20's plan D21 and its Validation block both name lint lines that currently
-  cannot run — whichever way this goes, they need amending. Found during MOD-20 T2 on 2026-09-09.
-  being reaped before the assertion reads `/proc/<pid>`.
-
 ## Summary
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 1 (ANA-21 per-model weights)                                                                  |
-| MOD-N   | 40 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-55 agent help in the editor, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-5 merge-hook test flake)                |
-| TOOL-N  | 1 (TOOL-3 Windows lint target unbuildable) |
+| ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
+| MOD-N   | 41 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-31 preview blocks install, MOD-32 unscrubbed trim record, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-52 `ctrl-c` quit, MOD-53 terminal task replies, MOD-54 wide characters, MOD-58 claim test gaps, MOD-59 write replies name themselves, MOD-55 agent help in the editor, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                               |
+| TOOL-N  | 0 |
