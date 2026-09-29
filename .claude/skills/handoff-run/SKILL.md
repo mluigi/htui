@@ -25,6 +25,8 @@ One command per HANDOFF item lifecycle. Auto-chain with the maintainer present �
 - `references/lifecycle.md` — bookkeeping procedures (open / phase note / close-out)
 - `references/ecosystem-survey.md` — wrap-vs-fork record (build-time, not needed at run time)
 - `scripts/next-item-id.sh` / `.ps1` — the owned-ID mint, run whenever a path spawns a new item (lifecycle P0)
+- `scripts/hr-mint` (repo root, Linux) — the leased mint; P0 mints through it whenever `scripts/hr-mint --leasing`
+  exits 0 (sandbox runs exist). User guide: `docs/hr-sandbox.md`
 - `scripts/validate-workflow-docs.sh` / `.ps1` — structural validator, run at close-out
 - Law: `.claude/rules/workflow-docs.md` (auto-loads when workflow docs are touched)
 
@@ -50,6 +52,8 @@ identical — the refusal is about which one this platform pays for, not which o
 ## Flow
 
 ### 1. Locate the item
+
+In a sandbox (`HR_SANDBOX=1` is set) read **Sandbox mode** below first — it overrides steps 1, 1.5 and 5.
 
 Read the **current repo's** root `HANDOFF.md` (the repo the session runs in; IDs are per-repo — never resolve an ID
 against another repo's HANDOFF). Item not found → list the open items with their IDs and stop.
@@ -156,6 +160,31 @@ routing trigger needed).
 4. Report: what shipped, commits, validator result. Push only when agreed (the repo's
    `CLAUDE.md` push policy; workspace-level where the repo is a submodule).
 
+## Sandbox mode (`HR_SANDBOX=1`)
+
+Set by `scripts/hr` (TOOL-7; user guide `docs/hr-sandbox.md`). The session runs in a private clone on
+branch `hr/$HR_ITEM`, with its own Postgres and Qdrant on the usual `localhost` ports, no Docker and no
+git credentials. These overrides apply; everything else in this file — every maintainer gate and the
+reviewer gate included — is unchanged.
+
+- **Steps 1 / 1.5 — the item is `$HR_ITEM`.** `next`, or a bare `/handoff-run`, resolves to it with no
+  selection subagent. A different ID is asked, never followed silently: the item was chosen on the host
+  by `scripts/hr up`, whose picker already hides items that have a run.
+- **New items (lifecycle P0) mint through `scripts/hr-mint`** — the lease file always exists in a
+  sandbox. Its sibling listing is how two runs avoid filing one problem under two IDs: when a listed
+  title looks like the same issue, ask the maintainer before filing; on reuse, cite the sibling's ID in
+  this run's phase note instead of creating the item.
+- **Database** — `psql -h localhost -p 5439 -U postgres` (trust auth, no password).
+  `HTUI_TEST_DATABASE_URL` and `HTUI_TEST_QDRANT_URL` are already set. There is no `docker` here: a
+  recipe that says `docker exec htui-postgres psql …` becomes the same `psql` command against
+  `localhost:5439` (the `sqlx prepare` variant is in `docs/hr-sandbox.md`).
+- **Durable notes** — this run's Gortex daemon and store, and every Gortex memory it writes, are private to
+  the run and are deleted when it is purged. Anything that must outlive the run goes in the repo (plan,
+  write-up) or the Claude auto-memory under `~/.claude`, which is shared with the host.
+- **Step 5, report — never push, never open a PR** (`origin` is the read-only host repo). The
+  done-report ends with exactly: `branch hr/<ITEM> ready — on host: scripts/hr collect <ITEM>`.
+  Merging back, and the real Postgres gate on the merged tree, happen on the host.
+
 ## Hard rules
 
 - Maintainer gates that never disappear: routing confirm (step 2), `plan` CONFIRM, PRD open questions, deliberate
@@ -170,4 +199,5 @@ routing trigger needed).
 - **Windows runs the `.ps1` variant of every script this skill names, and of every script git runs on
   its behalf** (see the References note). Never `bash …/*.sh` on this platform.
 - No done-report over a red validator.
+- In a sandbox (`HR_SANDBOX=1`) the item is `$HR_ITEM` and nothing is pushed — see Sandbox mode.
 - This skill orchestrates; it does not duplicate the law — `workflow-docs.md` wins on any bookkeeping conflict.
