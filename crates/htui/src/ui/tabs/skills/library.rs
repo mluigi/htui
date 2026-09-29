@@ -14,9 +14,10 @@
 //! The estimate is the skill's own block as the assembler renders it, without the section frame it
 //! shares with the other skills (D99, F-I): what adding this skill to a prompt costs.
 //!
-//! Milestone 4 adds the import (plan D102): `I` opens a one-line path form, `Enter` sends
-//! `ImportSkills` and returns to Browse while the worker walks, and the reply either says the
-//! counts in the notice or, when a file was refused or skipped, opens a per-file report.
+//! Milestone 4 adds the import (import plan D102, `.claude/plans/mod-9-skill-import.plan.md`): `I`
+//! opens a one-line path form, `Enter` sends `ImportSkills` and returns to Browse while the worker
+//! walks, and the reply either says the counts in the notice or, when a file was refused or
+//! skipped, opens a per-file report.
 
 use core::cell::Cell;
 
@@ -239,16 +240,16 @@ enum Mode {
     /// `e`, `n`'s step 3, or an `$EDITOR` return.
     Editing(Editor),
     /// `I`: the path to import. One field, because one line is one path — a path may contain a
-    /// space, and nothing here splits on one (OQ-24).
+    /// space, and nothing here splits on one (import plan OQ-24).
     ImportPath {
         /// The path, exactly as typed.
         field: TextField,
     },
     /// The answer to an import, one row per file in the order the files were named or found.
     ///
-    /// **Opened only when something was refused or skipped** (D102). A clean import says so in
-    /// the notice instead, because a report the reader must dismiss to learn that nothing went
-    /// wrong is a report most people learn to dismiss.
+    /// **Opened only when something was refused or skipped** (import plan D102). A clean import
+    /// says so in the notice instead, because a report the reader must dismiss to learn that
+    /// nothing went wrong is a report most people learn to dismiss.
     Report {
         /// Every outcome, in order.
         outcomes: Vec<ImportOutcome>,
@@ -811,8 +812,8 @@ impl LibraryView {
         }
     }
 
-    /// The import form (D102). `Enter` sends one path and returns to Browse, so the library is on
-    /// screen while the worker walks; `Esc` closes it and sends nothing.
+    /// The import form (import plan D102). `Enter` sends one path and returns to Browse, so the
+    /// library is on screen while the worker walks; `Esc` closes it and sends nothing.
     fn on_import_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let Mode::ImportPath { field } = &mut self.mode else {
             return Handled::Pass;
@@ -1235,9 +1236,9 @@ impl LibraryView {
         }
     }
 
-    /// An import came back (D102): the counts in the notice, or the report when a file was refused
-    /// or skipped. Only the import's own reply lands it — the reply is its own variant, so a
-    /// `Skills` read can never be mistaken for it.
+    /// An import came back (import plan D102): the counts in the notice, or the report when a file
+    /// was refused or skipped. Only the import's own reply lands it — the reply is its own variant,
+    /// so a `Skills` read can never be mistaken for it.
     ///
     /// The report opens only over Browse. Keys typed while the walk was in flight may have opened
     /// an editor or a form, and a report that replaced it would throw a draft away: there the

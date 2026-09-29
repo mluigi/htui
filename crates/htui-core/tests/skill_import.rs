@@ -612,7 +612,7 @@ fn the_source_keeps_the_whole_frontmatter_verbatim() {
     assert_eq!(
         keys,
         ["format", "frontmatter", "imported_at", "issues", "path"],
-        "the key set is a contract with the attachments matrix, which re-reads `frontmatter`"
+        "the key set is a contract with the attachments pane, which re-reads `frontmatter`"
     );
     assert_eq!(
         source["format"],
@@ -644,7 +644,7 @@ fn the_source_keeps_the_whole_frontmatter_verbatim() {
     assert_eq!(parsed.source["format"], serde_json::json!("markdown"));
 }
 
-/// The T1 ↔ T3 contract: the prefill the attachments matrix re-derives from a stored `source` is
+/// The T1 ↔ T3 contract: the prefill the attachments pane re-derives from a stored `source` is
 /// the same one the import used. If this drifts, an imported skill attaches with the wrong
 /// activation and nobody notices until a step does not fire.
 #[test]

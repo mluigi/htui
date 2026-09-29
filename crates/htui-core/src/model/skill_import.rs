@@ -2,10 +2,10 @@
 //! plus the prefill the attachment form will read back out of `skill_version.source`.
 //!
 //! **One definition, two callers.** [`prefill_from_source`] is the only place §7.3's prefill rules
-//! are written down. [`parse`] calls it with the frontmatter it just read, and the attachments
-//! matrix calls it with the frontmatter it read back out of a stored version — so a skill imported
-//! today and attached next week is prefilled by the same rules that prefilled it on import (plan
-//! D96, blueprint A-6).
+//! are written down. [`parse`] calls it with the frontmatter it just read, and the Skills view's
+//! attachments pane calls it with the frontmatter it read back out of a stored version — so a skill
+//! imported today and attached next week is prefilled by the same rules that prefilled it on import
+//! (import plan D96, blueprint A-6, in `.claude/plans/mod-9-skill-import.plan.md`).
 //!
 //! **What import writes.** A `skill` row and a `skill_version` row, and nothing else: ANA-22 §7.3
 //! is explicit that "nothing is attached by import". The activation keys are *prefill*, not state.
@@ -113,7 +113,7 @@ pub fn parse(
 /// Copilot's `<name>.instructions.md` names the rule `<name>`, and a snake-case stem such as
 /// `api_style.mdc` names it `api-style`, the only spelling the Agent Skills rule allows. Nothing
 /// else is rewritten — a declared `name` is taken as written, and a stem with a space or a capital
-/// is still refused (OQ-22: a name nobody wrote is not invented).
+/// is still refused (import plan OQ-22: a name nobody wrote is not invented).
 fn name_of(declared: Option<&str>, path: &str, file_name: &str) -> String {
     if let Some(name) = declared.map(str::trim).filter(|name| !name.is_empty()) {
         return name.to_owned();

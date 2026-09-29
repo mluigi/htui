@@ -606,9 +606,9 @@ pub enum StoreRequest {
         change: BindingChange,
     },
     /// Imports `SKILL.md` and rules files from the paths named, each a file or a directory (MOD-9
-    /// milestone 4, D97). The **worker** reads the filesystem: `R-NF-3` keeps the walk off the UI
-    /// task, and the view types a path and nothing else. Writes `skill` and `skill_version` rows
-    /// only, never an attachment. Answered with [`StoreReply::SkillImports`].
+    /// milestone 4, import plan D97). The **worker** reads the filesystem: `R-NF-3` keeps the walk
+    /// off the UI task, and the view types a path and nothing else. Writes `skill` and
+    /// `skill_version` rows only, never an attachment. Answered with [`StoreReply::SkillImports`].
     ImportSkills {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -720,7 +720,7 @@ impl StoreRequest {
             // The two of `templates::REQUEST_NAMES`, in that order (MOD-9 D5).
             Self::Templates(..) => "templates",
             Self::SaveTemplate { .. } => "save_template",
-            // The six of `skills::REQUEST_NAMES`, in that order (MOD-9 D81, milestone 4 D97).
+            // The six of `skills::REQUEST_NAMES`, in that order (MOD-9 D81, import plan D97).
             Self::Skills(..) => "skills",
             Self::CreateSkill { .. } => "create_skill",
             Self::EditSkill { .. } => "edit_skill",
@@ -916,7 +916,7 @@ pub enum StoreReply {
         what: StaleWhat,
     },
     /// The library after an import, and what happened to every file it touched
-    /// ([`StoreRequest::ImportSkills`], MOD-9 milestone 4 D97). One variant and not two: a file
+    /// ([`StoreRequest::ImportSkills`], MOD-9 import plan D97). One variant and not two: a file
     /// that lost its token is a row of `report` while the rest of the batch lands, so there is no
     /// `SkillsStale` shape to answer.
     SkillImports(Box<SkillImports>),
@@ -1220,7 +1220,8 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             templates::serve(backend, request).await?
         }
         // The six skill requests, or-ed for the reason the arms above are: a guard does not count
-        // towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-9 D81, D97).
+        // towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-9 D81, import
+        // plan D97).
         StoreRequest::Skills(..)
         | StoreRequest::CreateSkill { .. }
         | StoreRequest::EditSkill { .. }

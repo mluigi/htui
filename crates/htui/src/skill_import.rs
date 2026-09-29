@@ -1,12 +1,12 @@
 //! Reading skill files off the disk and writing them through milestone 3's skill writers (MOD-9
-//! milestone 4, D98–D100): `create_skill` for a new name, `update_skill` and `add_skill_version`
-//! for one the library already holds.
+//! milestone 4, import plan D98–D100): `create_skill` for a new name, `update_skill` and
+//! `add_skill_version` for one the library already holds.
 //!
 //! **Why the worker reads the files.** `R-NF-3` puts store-touching work off the UI task, and the
 //! PRD enforces it by ownership: reads and writes go through `StoreRequest` on the store worker.
 //! A directory walk is unbounded work by nature, so the view types a path and the worker does the
 //! rest. `std::fs` in an `async fn` is the [`crate::editor::run`] precedent, and the walk is capped
-//! ([`MAX_FILES`]) so it cannot hold the worker for long (R-42).
+//! ([`MAX_FILES`]) so it cannot hold the worker for long (import plan R-42).
 //!
 //! **One read for the tokens, one for the reply.** The library is read **once**, before the batch,
 //! and both compare-and-set tokens for every file come from that one read: `skill.updated_at` for
@@ -52,9 +52,9 @@ pub const SKIP_DIRS: [&str; 5] = ["scripts", "references", "assets", ".git", "no
 /// The directory names §8 means by "a rules directory": the folders the surveyed tools keep their
 /// rule files in (`.cursor/rules`, `.github/instructions`, `.kiro/steering`).
 ///
-/// This is the narrowing R-37 asked for. The alternative — every `*.md` at depth 1 of whatever
-/// directory was named — turns a project root into a skill sweep, and `README.md` is a skill with
-/// the stem `readme`.
+/// This is the narrowing import plan R-37 asked for. The alternative — every `*.md` at depth 1 of
+/// whatever directory was named — turns a project root into a skill sweep, and `README.md` is a
+/// skill with the stem `readme`.
 pub const RULES_DIR_NAMES: [&str; 3] = ["rules", "instructions", "steering"];
 
 /// What happened to one file the maintainer named, or one the walk found under it.
@@ -120,7 +120,7 @@ pub struct SkillImports {
 ///
 /// A path may name a file — imported whatever it is called — or a directory, which contributes a
 /// `SKILL.md` at any depth up to [`MAX_DEPTH`], and `*.md` / `*.mdc` from the rules directory its
-/// [`RootShape`] names (D99). One bad file never stops the batch.
+/// [`RootShape`] names (import plan D99). One bad file never stops the batch.
 ///
 /// # Errors
 /// Whatever the store reports for the library read or the user lookup, or
@@ -132,7 +132,7 @@ pub async fn import(backend: &Backend, paths: &[String]) -> Result<Vec<ImportOut
         .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
     let created_by = backend.this_user().await?;
 
-    // One read for the tokens (D100) and one clock for the provenance.
+    // One read for the tokens (import plan D100) and one clock for the provenance.
     let mut library = Vec::new();
     for skill in writer.skills().await? {
         let versions = writer.skill_versions(skill.id).await?;
@@ -257,7 +257,8 @@ impl<W: WriteStore> Batch<'_, W> {
         outcome
     }
 
-    /// The per-file write (D100), with both tokens from the read the batch took before it started.
+    /// The per-file write (import plan D100), with both tokens from the read the batch took before
+    /// it started.
     ///
     /// A new name is `create_skill`: the row and its version 1 together, so no skill exists without
     /// a body. A known name is `update_skill` when the description moved (§6 item 12), then
@@ -510,7 +511,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    /// A tree with the two shapes D99 collects and the five directories it prunes.
+    /// A tree with the two shapes import plan D99 collects and the five directories it prunes.
     fn tree() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("a temp dir");
         let root = dir.path();
@@ -569,7 +570,7 @@ mod tests {
             relative(dir.path()),
             ["one/SKILL.md", "two/nested/SKILL.md"],
             "`*/SKILL.md` at any depth, and nothing else: a project root is not a rules directory, \
-             so `README.md` and `rules.mdc` at its top level are not swept (R-37)"
+             so `README.md` and `rules.mdc` at its top level are not swept (import plan R-37)"
         );
         // The five bundled directories this fixture plants are pruned and listed, which
         // `the_bundled_directories_are_skipped_and_listed` pins exactly.
@@ -927,7 +928,7 @@ mod tests {
     }
 
     /// A name the writer would refuse is refused here too, in the writer's own words, and nothing
-    /// is written — which is OQ-22's default: refuse the file, slugify nothing.
+    /// is written — which is import plan OQ-22's default: refuse the file, slugify nothing.
     #[tokio::test]
     async fn a_refused_name_writes_nothing_and_says_the_writers_own_sentence() {
         let backend = demo();

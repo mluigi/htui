@@ -12,8 +12,8 @@
 //! A `glob` attachment is written and shown, but nothing matches it before PRD milestone 5 (D86,
 //! OQ-14): its row says so, as a run's record says `no_path`.
 //!
-//! A form over a row with **no** attachment is prefilled from the imported `source` of the
-//! skill's head (milestone 4, plan D96): ANA-22 §7.3's activation, globs and languages, read back
+//! A form over a row with **no** attachment is prefilled from the imported `source` of the skill's
+//! head (milestone 4, import plan D96): ANA-22 §7.3's activation, globs and languages, read back
 //! through [`prefill_from_source`], the one definition the import itself used. A stored row is
 //! never re-seeded, and the prefill feeds the fields, never the row: [`build`] over the fields is
 //! still the only source of what a save writes.
@@ -382,12 +382,12 @@ impl AttachPane {
     /// 0, nothing typed). The globs field holds the stored globs minus the stored languages'
     /// expansion (D102), so a re-save is the same attachment and the field shows what was typed.
     ///
-    /// A new one is prefilled from the imported `source` of the version it would put in force —
-    /// the head, since its pin starts at `latest` (D96) — and answers §7.3's hint beside it. The
-    /// source is re-read here rather than carried over from the import, so a skill imported last
-    /// week and attached today is prefilled too; a version typed in the TUI has `source = {}` and
-    /// prefills nothing. **A stored row is never re-seeded**: a maintainer who saved `off` over an
-    /// imported `always` finds it still `off`.
+    /// A new one is prefilled from the imported `source` of the version it would put in force — the
+    /// head, since its pin starts at `latest` (import plan D96) — and answers §7.3's hint beside
+    /// it. The source is re-read here rather than carried over from the import, so a skill imported
+    /// last week and attached today is prefilled too; a version typed in the TUI has `source = {}`
+    /// and prefills nothing. **A stored row is never re-seeded**: a maintainer who saved `off` over
+    /// an imported `always` finds it still `off`.
     fn open_form(
         &self,
         row: ARow,

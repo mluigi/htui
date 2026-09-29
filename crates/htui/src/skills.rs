@@ -890,7 +890,8 @@ mod tests {
     }
 
     /// `try_serve` routes the import here, and the reply is the report beside a fresh snapshot of
-    /// the request's own scope, so the view can tell a crossed scope change as it does for `Skills`.
+    /// the request's own scope, so the view can tell a crossed scope change as it does for
+    /// `Skills`.
     #[tokio::test]
     async fn an_import_is_routed_here_and_answers_its_report_beside_a_snapshot() {
         let backend = demo();

@@ -940,7 +940,7 @@ async fn the_strip_text_is_unchanged() {
     );
 }
 
-// --- the import surface (MOD-9 milestone 4, plan D102) -----------------------------------------
+// --- the import surface (MOD-9 milestone 4, import plan D102) ----------------------------------
 
 /// A `SKILL.md` under `dir/<name>`, declaring `name`, returning its path.
 fn skill_file(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
@@ -1230,7 +1230,7 @@ async fn the_import_report_lists_every_outcome() {
     insta::assert_snapshot!("import_report", frame);
 }
 
-// --- the prefill (plan D96) --------------------------------------------------------------------
+// --- the prefill (import plan D96) -------------------------------------------------------------
 
 /// A `source` as the import writes it: the whole frontmatter, verbatim, under the same keys.
 fn imported_source(frontmatter: serde_json::Value) -> serde_json::Value {
@@ -1293,8 +1293,8 @@ async fn a_new_attachment_is_prefilled_from_the_imported_source() {
     );
 }
 
-/// D96: an existing attachment is never re-seeded. `htui`'s stored `always` row stays `always`
-/// with no globs, though the skill's head says `glob`.
+/// Import plan D96: an existing attachment is never re-seeded. `htui`'s stored `always` row stays
+/// `always` with no globs, though the skill's head says `glob`.
 #[tokio::test]
 async fn an_existing_attachment_is_never_reseeded_from_a_source() {
     let store = MemStore::demo();
