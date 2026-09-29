@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-29):** **MOD-53 was done** (`docs/decisions/mod/mod-53.md`): every task
+**Current status (2026-09-29):** **MOD-50 was done** (`docs/decisions/mod/mod-50.md`): the
+concepts index now holds requirement rows as `type = requirement` points (withdrawn ones kept), item
+and document points carry `item.resolution`, and `htui --search-items --decisions` keeps items
+closed as done, concluded or rejected (maintainer). The collection is now `htui_concepts_v2`, so the
+first `--index-items` after upgrading rebuilds everything; `R-STO-8` was amended in place. It
+minted **MOD-64** (concepts search in the TUI).
+Before it, **MOD-53 was done** (`docs/decisions/mod/mod-53.md`): every task
 the agent runtime spawns now goes through one wrapper that catches a panic and sends that task's own
 terminal failure, so `probing`, a running install or login, or a chat's pending start can no longer
 stay set forever. The same window tells the panic hook the panic is survived, so it no longer gives
@@ -22,9 +28,6 @@ the terminal back under the running UI.
 Before it, **MOD-52 was done** (`docs/decisions/mod/mod-52.md`): `ctrl-c`
 quits htui from anywhere, bound globally and on the overlay wildcard, so it works over the modal
 switcher and inside a half-typed field. Making the keys configurable is **ANA-26**.
-Before it, **MOD-63 was done** (`docs/decisions/mod/mod-63.md`): `r` in
-Settings › Qdrant re-reads the keyring, so the unavailable state recovers in place, and the section's
-writes now set `busy`, so their stored/cleared notices and in-flight hint finally show.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -162,11 +165,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   item); cited requirements with suspect markers and a re-confirm action in item detail; a
   resolution picker in MOD-4's Runs-pane close-out confirmation; maintainer-only
   create/amend/withdraw, where amend names the deciding item (`docs/ANA-11.md` §6).
-- [ ] **MOD-50 - Requirements and resolution in the concepts index** (from MOD-34 and MOD-38;
-  `docs/decisions/mod/mod-34.md`, `docs/decisions/mod/mod-38.md`). `R-STO-8`, `R-ENT-8`, `R-ENT-14`.
-  Index `requirement` rows into the concepts collection as `type = requirement` points (the type
-  MOD-34 reserved), and add `item.resolution` to the item point payload so
-  `htui --search-items --decisions` filters on resolution instead of meaning "done or closed".
 - [ ] **MOD-37 - Orchestrator hardening follow-ups** (from MOD-4). `R-ORCH-3`, `R-ORCH-5`,
   `R-ORCH-8`, `R-ORCH-9`, `R-TUI-4`, `R-HIS-1`, `R-NF-3`. MOD-4 closed with these risks carried and
   no other item owns them. Each is small, known and recorded; none blocks a manual run today. Pick
@@ -762,6 +760,19 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   preferred. The three crates are not in `Cargo.lock`, so the plan owns that dependency decision.
   Not blocked. Its in-app widget draws through `ui::cells` (MOD-54, done:
   `docs/decisions/mod/mod-54.md`); the rest of the display-width work is MOD-60.
+- [ ] **MOD-64 - Concepts search in the TUI** (from MOD-50, 2026-09-29). `R-STO-8`, `R-TUI-2`.
+  The concepts index is reachable only from the command line today (`htui --index-items`,
+  `htui --search-items [--decisions]`, `crates/htui/src/concepts.rs`); inside the TUI, Qdrant is
+  only a Settings section. Add a search overlay: free text, scoped to the selected project or all,
+  a decisions toggle, and hits listed as `concepts::format_hit` prints them. Enter on an item or
+  document hit selects that item in the Backlog; a requirement hit opens it in MOD-39's
+  Requirements tab once that exists. Embedding the query loads the model synchronously
+  (`FastEmbedder::new`, MOD-34 review), so the search runs off the UI thread, and a missing or
+  unreachable Qdrant is an inline error that affects nothing else (`R-STO-8`). Whether the TUI also
+  offers a re-index action, or leaves that to MOD-41's background sync, is this item's call. MOD-50
+  is done (`docs/decisions/mod/mod-50.md`): hits carry an `Owner` (item or requirement), the
+  resolution and the requirement state, and `concepts::DECISION_RESOLUTIONS` is the decisions set.
+  Best after MOD-39.
 
 ### Deferred backlog
 
@@ -796,6 +807,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 4 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-26 configurable hotkeys) |
-| MOD-N   | 37 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-50 concepts index follow-ups, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 37 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-39 requirements tab, MOD-40 multi-writer hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-6 Runs pane approve doc)                |
 | TOOL-N  | 0 |
