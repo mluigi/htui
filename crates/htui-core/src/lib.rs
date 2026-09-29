@@ -8,6 +8,7 @@
 //! name a database driver (MOD-6 plan D1).
 #![warn(missing_docs)]
 
+pub mod clock;
 pub mod model;
 pub mod prompt;
 pub mod root_path;

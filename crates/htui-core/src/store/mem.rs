@@ -18,6 +18,9 @@ use chrono::{DateTime, Utc};
 
 use serde_json::Value;
 
+use crate::clock::Clock;
+#[cfg(feature = "test-support")]
+use crate::clock::TestClock;
 use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AppUser, BindingChange, BoundSkill, BoxEdit, BoxId,
     BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec,
@@ -59,6 +62,31 @@ use crate::store::traits::{
 };
 use uuid::Uuid;
 
+/// Where one [`MemStore`] handle reads "now" (MOD-40 plan D11, blueprint B21, B23).
+///
+/// `None` is the wall clock **untruncated**, exactly the stamps every `MemStore` wrote before
+/// MOD-40: two back-to-back compare-and-sets share one microsecond about half the time (blueprint
+/// P-11), and a truncated default would let a spent `updated_at` token read as current.
+#[derive(Clone, Default)]
+struct MemClock(Option<Arc<dyn Clock>>);
+
+impl std::fmt::Debug for MemClock {
+    /// Hand written: [`Clock`] carries no `Debug` supertrait.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "MemClock(injected)"
+        } else {
+            "MemClock(wall)"
+        })
+    }
+}
+
+impl MemClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.0.as_ref().map_or_else(Utc::now, |clock| clock.now())
+    }
+}
+
 /// The store the TUI runs against in MOD-1: every row in process memory, cloned out under a lock
 /// that is never held across an `.await` (plan D6).
 #[derive(Debug, Clone, Default)]
@@ -67,6 +95,11 @@ pub struct MemStore {
     /// The writes [`MemStore::set_fault`] switched on, shared through clones as `state` is.
     #[cfg(feature = "test-support")]
     faults: Arc<RwLock<HashSet<MemFault>>>,
+    /// This handle's clock (MOD-40 plan D11). **Not** shared through clones the way `state` is:
+    /// a clone copies it, and [`MemStore::with_clock`] replaces it on one handle, so two handles
+    /// on one set of rows can read two clocks, as two processes on one database do (blueprint
+    /// B23).
+    clock: MemClock,
 }
 
 /// MOD-4 plan D152: a write [`MemStore::set_fault`] can make fail, so a test can tell "the store
@@ -301,6 +334,7 @@ impl MemStore {
             state: Arc::new(RwLock::new(state)),
             #[cfg(feature = "test-support")]
             faults: Arc::default(),
+            clock: MemClock::default(),
         }
     }
 
@@ -764,6 +798,33 @@ impl MemStore {
         } else {
             faults.remove(&fault);
         }
+    }
+
+    /// This handle, reading `clock` for every stamp and every lease comparison it makes (MOD-40
+    /// plan D10, D11). The rows and the fault switches stay shared with every clone; the clock is
+    /// this handle's alone.
+    ///
+    /// A frozen clock stamps every write with one instant, so a compare-and-set on `updated_at`
+    /// cannot tell two edits made at it apart: a case that checks a spent token moves the clock
+    /// between the two edits (blueprint F-42).
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = MemClock(Some(clock));
+        self
+    }
+
+    /// A handle on the same rows whose clock is a `TestClock` frozen at `now`: a second
+    /// process's view, for a case that stages a stranger at another instant than its own clock
+    /// (MOD-40 blueprint B24).
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn handle_at(&self, now: DateTime<Utc>) -> Self {
+        self.clone().with_clock(Arc::new(TestClock::at(now)))
+    }
+
+    /// This handle's "now": its injected clock, else `Utc::now()` untruncated (blueprint B21).
+    fn now(&self) -> DateTime<Utc> {
+        self.clock.now()
     }
 
     /// `Err(Unreachable)` when `fault` is switched on (plan D152), `Ok(())` otherwise.
@@ -6266,16 +6327,19 @@ impl WriteStore for MemStore {
 
 #[cfg(all(test, feature = "test-support"))]
 mod tests {
+    use std::sync::Arc;
+
     use super::MemStore;
+    use crate::clock::{Clock as _, TestClock};
     use crate::fixtures::ids;
     use crate::model::{
         AgentBox, AgentId, BoxId, BoxProbe, ChatRunSpec, CitationKind, Claim, DocumentId,
         GateOutcome, GraphSnapshot, Isolation, ItemId, ItemKindPatch, NewDocument, NewItem,
         NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-        NoteId, OverlapRule, Priority, ProbedTool, ProjectId, RepoId, RequirementAreaId,
-        RequirementId, RequirementPatch, RequirementUpdate, Resolution, RunId, RunKind, RunMode,
-        RunStatus, RunStepCommit, RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status,
-        StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
+        NoteId, OverlapRule, Priority, ProbedTool, ProjectId, ProjectPatch, RepoId,
+        RequirementAreaId, RequirementId, RequirementPatch, RequirementUpdate, Resolution, RunId,
+        RunKind, RunMode, RunStatus, RunStepCommit, RunStepTree, Scope, SnapshotGraph,
+        SnapshotSettings, Status, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -6286,6 +6350,77 @@ mod tests {
     use chrono::{TimeDelta, Utc};
     use serde_json::{Value, json};
     use uuid::Uuid;
+
+    /// MOD-40 plan D11 (T7): a `MemStore` stamps with the clock its handle was given, and a
+    /// clone given another clock stamps with that one. Without a clock it stamps the wall clock,
+    /// untruncated (blueprint B21).
+    #[tokio::test]
+    async fn a_mem_store_reads_its_clock() {
+        let edit = |description: &str| ProjectPatch {
+            description: Some(description.to_owned()),
+            ..ProjectPatch::default()
+        };
+        let clock = TestClock::at(Utc::now() - TimeDelta::days(3));
+        let store = MemStore::demo().with_clock(Arc::new(clock.clone()));
+        clock.advance(TimeDelta::minutes(7));
+        let project = store
+            .project(ids::PROJECT_HTUI)
+            .await
+            .expect("read")
+            .expect("fixture");
+        let CasOutcome::Applied(edited) = store
+            .update_project(project.id, project.updated_at, edit("first"))
+            .await
+            .expect("the edit must not fail")
+        else {
+            panic!("the token was read from the store");
+        };
+        assert_eq!(
+            edited.updated_at,
+            clock.now(),
+            "the write is stamped by the handle's clock"
+        );
+
+        let later = store.handle_at(clock.now() + TimeDelta::hours(1));
+        let CasOutcome::Applied(again) = later
+            .update_project(project.id, edited.updated_at, edit("second"))
+            .await
+            .expect("the edit must not fail")
+        else {
+            panic!("the token is the first edit's");
+        };
+        assert_eq!(
+            again.updated_at,
+            clock.now() + TimeDelta::hours(1),
+            "a handle's clock is its own; the rows are shared"
+        );
+        assert_eq!(
+            store
+                .project(ids::PROJECT_HTUI)
+                .await
+                .expect("read")
+                .expect("fixture")
+                .updated_at,
+            again.updated_at,
+            "both handles read one set of rows"
+        );
+
+        let wall = MemStore::demo();
+        let before = Utc::now();
+        let unclocked = wall
+            .project(ids::PROJECT_HTUI)
+            .await
+            .expect("read")
+            .expect("fixture");
+        let CasOutcome::Applied(stamped) = wall
+            .update_project(unclocked.id, unclocked.updated_at, edit("third"))
+            .await
+            .expect("the edit must not fail")
+        else {
+            panic!("the token was read from the store");
+        };
+        assert!(stamped.updated_at >= before, "no clock: the wall clock");
+    }
 
     /// MOD-4 plan D152: a switched-on fault answers `Unreachable` on every clone, before the
     /// write looks at a row, and the write answers as before once it is switched off.

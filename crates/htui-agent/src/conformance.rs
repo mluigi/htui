@@ -277,10 +277,10 @@ const RESIDUE: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwx";
 ///
 /// # Panics
 ///
-/// Never: the constant is a valid instant.
+/// Never: `htui_core::clock::epoch` is a valid instant.
 #[must_use]
 pub fn epoch() -> DateTime<Utc> {
-    DateTime::from_timestamp_millis(1_788_393_600_000).expect("the suite epoch is a valid instant")
+    htui_core::clock::epoch()
 }
 
 /// The scrubber every case records through: `MinimalScrubber` over the session's one env value.

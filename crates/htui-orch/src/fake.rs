@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, SubsecRound as _, TimeDelta, Utc};
+use chrono::TimeDelta;
 use htui_agent::conformance::{Script, ScriptEvent, epoch};
 use htui_agent::driver::{AgentDriver, AgentSession, DriverCaps, DriverFuture, SessionSpec};
 use htui_agent::error::DriverError;
@@ -27,13 +27,14 @@ use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, BoundSkill, BoxId, Document, DocumentId, Isolation, Item, ItemId,
     NewDocument, PhaseAgent, PhaseId, ProjectId, PromptTemplate, RepoId, ResolvedGraph, Run, RunId,
-    RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, TIMESTAMPTZ_DIGITS, UserId,
-    VerifyOutcome,
+    RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, UserId, VerifyOutcome,
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::store::{MemStore, ReadStore, Result, WriteStore};
 use tokio::sync::Notify;
 use uuid::Uuid;
+
+pub use htui_core::clock::TestClock;
 
 use crate::command::{Command, CommandOutcome, EngineError};
 use crate::engine::{DeadWalks, SessionKey};
@@ -779,67 +780,6 @@ impl Verifier for FakeVerifier {
     }
 }
 
-/// A [`Clock`] a test moves, starting at the fake driver's own origin.
-///
-/// `htui_agent::conformance::epoch()` (`crates/htui-agent/src/conformance.rs:276`) is the instant
-/// every `FakeDriver` envelope is stamped from, so starting here means a step's store rows and its
-/// session rows share one origin and a snapshot of both reads as one timeline. [`advance`] is how a
-/// step-deadline case elapses time; no case ever sleeps.
-///
-/// [`advance`]: TestClock::advance
-#[derive(Debug)]
-pub struct TestClock {
-    now: Mutex<DateTime<Utc>>,
-}
-
-impl Default for TestClock {
-    fn default() -> Self {
-        Self::at(epoch())
-    }
-}
-
-impl TestClock {
-    /// A clock at `htui_agent::conformance::epoch()`.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// A clock at `now`, truncated like every other instant the walk hands a writer (plan D8).
-    #[must_use]
-    pub fn at(now: DateTime<Utc>) -> Self {
-        Self {
-            now: Mutex::new(now.trunc_subsecs(TIMESTAMPTZ_DIGITS)),
-        }
-    }
-
-    /// Move the clock forward (or back, for a test that wants to).
-    pub fn advance(&self, by: TimeDelta) {
-        let mut now = self
-            .now
-            .lock()
-            .expect("no panic holds the test clock's lock");
-        *now = (*now + by).trunc_subsecs(TIMESTAMPTZ_DIGITS);
-    }
-
-    /// Put the clock at an exact instant.
-    pub fn set(&self, to: DateTime<Utc>) {
-        *self
-            .now
-            .lock()
-            .expect("no panic holds the test clock's lock") = to.trunc_subsecs(TIMESTAMPTZ_DIGITS);
-    }
-}
-
-impl Clock for TestClock {
-    fn now(&self) -> DateTime<Utc> {
-        *self
-            .now
-            .lock()
-            .expect("no panic holds the test clock's lock")
-    }
-}
-
 /// The model the fake's stand-in candidate names (plan D20, blueprint A-1).
 ///
 /// `(AGENT_CLAUDE, "sonnet")` is the pair the fixture's own `RUN_1` steps carry
@@ -1253,6 +1193,9 @@ type Stall = (bool, Arc<Notify>, Option<Arc<Notify>>);
 /// `MemStore` + `FakeDriver` + [`FakeIsolator`] + [`TestClock`] + [`FakeGraphSource`], which is
 /// ANA-2's own description of the fake orchestrator (`docs/ANA-2.md:1764-1766`).
 ///
+/// The store handle reads [`clock`](Self::clock) (MOD-40 plan D11), so a lease the walk takes
+/// expires by the clock the case moves.
+///
 /// **`dispatch` is T4's.** Everything the walk needs from the harness is here and is public —
 /// [`graphs`](Self::graphs), [`driver_for`](Self::driver_for), [`after_done`](Self::after_done),
 /// [`box_id`](Self::box_id), [`user`](Self::user), [`owner`](Self::owner) — so T4 builds an
@@ -1303,7 +1246,8 @@ impl FakeOrchestrator {
     /// When the demo fixture seeds no `app_user`, which it always does.
     #[must_use]
     pub fn demo() -> Self {
-        let store = MemStore::demo();
+        let clock = TestClock::new();
+        let store = MemStore::demo().with_clock(Arc::new(clock.clone()));
         let user = store
             .this_user()
             .expect("the demo fixture seeds exactly one `app_user`");
@@ -1311,7 +1255,7 @@ impl FakeOrchestrator {
             store,
             isolator: FakeIsolator::new(),
             verifier: FakeVerifier::new(),
-            clock: TestClock::new(),
+            clock,
             dead_walks: DeadWalks::new(),
             scripts: Mutex::new(BTreeMap::new()),
             candidates: Mutex::new(BTreeMap::new()),
@@ -1337,6 +1281,10 @@ impl FakeOrchestrator {
     /// `advance_after_done` is not carried, and neither is a
     /// [`stall_after_done`](Self::stall_after_done): the crash was the first process's.
     ///
+    /// The store is a new handle on the same rows that reads the new clock, so this process judges
+    /// every lease by its own clock, as a process with its own database session would (MOD-40
+    /// blueprint B23).
+    ///
     /// # Panics
     /// When a lock is poisoned, which no case does.
     #[must_use]
@@ -1351,11 +1299,12 @@ impl FakeOrchestrator {
             .lock()
             .expect("no panic holds the fake orchestrator's lock")
             .clone();
+        let clock = TestClock::at(self.clock.now() + RESTART_GAP);
         Self {
-            store: self.store.clone(),
+            store: self.store.clone().with_clock(Arc::new(clock.clone())),
             isolator: FakeIsolator::new(),
             verifier: FakeVerifier::new(),
-            clock: TestClock::at(self.clock.now() + RESTART_GAP),
+            clock,
             dead_walks: DeadWalks::new(),
             scripts: Mutex::new(scripts),
             candidates: Mutex::new(candidates),
@@ -1835,9 +1784,7 @@ mod tests {
     use htui_core::prompt::DiffBlock;
     use htui_core::store::{MemStore, ReadStore as _};
 
-    use super::{
-        FakeGraphSource, FakeIsolator, FakeOrchestrator, GraphSource, ScriptedStep, TestClock,
-    };
+    use super::{FakeGraphSource, FakeIsolator, FakeOrchestrator, GraphSource, ScriptedStep};
     use crate::engine::SessionKey;
     use crate::graph::{ResolveError, Resolved, resolve};
     use crate::isolate::{Clock as _, FanoutSlot, Isolator as _, ResetReport};
@@ -2613,25 +2560,6 @@ mod tests {
                 (second, vec![third]),
                 (third, Vec::new())
             ]
-        );
-    }
-
-    /// Plan D8: the origin is the fake driver's, the resolution is the column's, and time moves
-    /// only when a test moves it.
-    #[test]
-    fn test_clock_starts_at_the_drivers_epoch_and_only_a_test_moves_it() {
-        let clock = TestClock::new();
-        assert_eq!(clock.now(), epoch());
-        assert_eq!(clock.now(), clock.now(), "no wall clock is read");
-
-        clock.advance(TimeDelta::seconds(2));
-        assert_eq!(clock.now(), epoch() + TimeDelta::seconds(2));
-
-        clock.set(epoch() + TimeDelta::nanoseconds(1_500));
-        assert_eq!(
-            clock.now(),
-            epoch() + TimeDelta::microseconds(1),
-            "every instant the walk hands a writer is microsecond-truncated"
         );
     }
 }
