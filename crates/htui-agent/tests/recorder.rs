@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use htui_agent::driver::{AgentSession, AgentSessionRef, DriverFuture, PermissionAnswer};
 use htui_agent::error::DriverError;
 use htui_agent::event::{
@@ -210,6 +210,11 @@ struct SpyStore {
     /// 9's `record_prompt` case is what reads it — the assembler and the recorder compute the same
     /// `Sha256` over the same text, and that is the claim.
     prompt_calls: Mutex<Vec<(StepId, String)>>,
+    /// Every `append_events` call that reached the inner store, as `(fence, seqs)`, in order.
+    appends: Mutex<Vec<(StepFence, Vec<i32>)>>,
+    /// Appends still to be let through and then answered `Unreachable`: a commit whose reply the
+    /// connection lost (MOD-40 plan D3).
+    lose_replies: Mutex<usize>,
 }
 
 impl SpyStore {
@@ -221,6 +226,8 @@ impl SpyStore {
             refuse_appends: Mutex::new(0),
             refuse_quota: Mutex::new(None),
             prompt_calls: Mutex::new(Vec::new()),
+            appends: Mutex::new(Vec::new()),
+            lose_replies: Mutex::new(0),
         }
     }
 
@@ -274,6 +281,36 @@ impl SpyStore {
     fn refuses_this_append(&self) -> bool {
         let mut left = self
             .refuse_appends
+            .lock()
+            .expect("the spy log is never poisoned");
+        if *left == 0 {
+            return false;
+        }
+        *left -= 1;
+        true
+    }
+
+    /// Every `append_events` call that reached the inner store so far, as `(fence, seqs)`.
+    fn appends(&self) -> Vec<(StepFence, Vec<i32>)> {
+        self.appends
+            .lock()
+            .expect("the spy log is never poisoned")
+            .clone()
+    }
+
+    /// Makes the next `count` `append_events` calls commit and then answer `Unreachable`, as a
+    /// connection that drops after the commit and before the reply does (MOD-40 plan D3).
+    fn lose_next_append_replies(&self, count: usize) {
+        *self
+            .lose_replies
+            .lock()
+            .expect("the spy log is never poisoned") = count;
+    }
+
+    /// Whether this append's reply is one of the lost ones, consuming it if so.
+    fn loses_this_reply(&self) -> bool {
+        let mut left = self
+            .lose_replies
             .lock()
             .expect("the spy log is never poisoned");
         if *left == 0 {
@@ -404,13 +441,23 @@ impl WriteStore for SpyStore {
         self.inner.transition(id, from, to).await
     }
     async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> StoreResult<usize> {
-        // The guard is dropped before the await: no lock is ever held across one.
+        // The guards are dropped before and taken after the await: none is held across one.
         if self.refuses_this_append() {
             return Err(StoreError::Unreachable(
                 "the spy store refused this append".to_owned(),
             ));
         }
-        self.inner.append_events(fence, events).await
+        let written = self.inner.append_events(fence, events).await?;
+        self.appends
+            .lock()
+            .expect("the spy log is never poisoned")
+            .push((fence, events.iter().map(|row| row.seq).collect()));
+        if self.loses_this_reply() {
+            return Err(StoreError::Unreachable(
+                "the spy store lost this append's reply".to_owned(),
+            ));
+        }
+        Ok(written)
     }
     async fn set_step_usage(
         &self,
@@ -2554,7 +2601,7 @@ async fn scrub_residue_refuses_the_write() {
 /// after it owns none of them.
 #[tokio::test]
 async fn edit_proposals_dedupe_per_call_and_path() {
-    let later = at() + chrono::TimeDelta::seconds(5);
+    let later = at() + TimeDelta::seconds(5);
     let proposal =
         |path: &str, diff: &str, accepted: Option<bool>, wire: &str, at| DriverEnvelope {
             event: DriverEvent::EditProposal(EditProposalEvent {
@@ -2659,7 +2706,7 @@ async fn edit_proposals_dedupe_per_call_and_path() {
 /// reads by `seq`, keep the true order of a row written late — and `seq` gapless over the whole log.
 #[tokio::test]
 async fn an_edit_proposal_reserves_its_seq_and_survives_a_flush() {
-    let later = at() + chrono::TimeDelta::seconds(5);
+    let later = at() + TimeDelta::seconds(5);
     let proposal = |diff: &str, accepted: Option<bool>, at| DriverEnvelope {
         event: DriverEvent::EditProposal(EditProposalEvent {
             tool_call_id: Some("call-1".to_owned()),
@@ -3265,6 +3312,261 @@ async fn a_refused_append_costs_a_retry_and_never_a_seq() {
         summary.rows,
         log.len(),
         "the summary counts the stored rows"
+    );
+}
+
+/// MOD-40 plan D3: a **fresh** batch the store answers short has met a second writer, because
+/// with one writer nobody else holds a `seq` the recorder numbered. That is an error, and its rows
+/// are **not** owed again: re-offering them would be a replay, and a replay may land short, which
+/// would hide the second writer. The collided `seq` stays spent.
+#[tokio::test]
+async fn a_fresh_batch_that_lands_short_is_an_error_and_not_requeued() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    // A second writer on the step takes seq 0 first, past the spy's log.
+    let theirs = SessionEvent {
+        run_step_id: chat.step_id,
+        seq: 0,
+        turn: 0,
+        kind: EventKind::AssistantText,
+        role: EventRole::Agent,
+        tool_call_id: None,
+        payload: json!({ "text": "the other writer" }),
+        raw: None,
+        at: at(),
+    };
+    assert_eq!(
+        store
+            .inner
+            .append_events(StepFence::Unleased, &[theirs])
+            .await
+            .expect("the other writer's row lands"),
+        1
+    );
+
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None);
+    let outcome = recorder
+        .record_prompt("summarise the backlog", json!([]), at())
+        .await;
+    match &outcome {
+        Err(RecordError::Store(StoreError::Constraint(message))) => {
+            assert!(
+                message.contains("already held")
+                    && message.contains("a second writer on this step"),
+                "the collision names what happened, got {message:?}"
+            );
+        }
+        other => panic!("a fresh batch that lands short is a collision, got {other:?}"),
+    }
+
+    recorder
+        .record(chunk("mine", "m1"))
+        .await
+        .expect("recording must land");
+    let summary = recorder
+        .finish()
+        .await
+        .expect("the next fresh batch lands whole");
+
+    assert_eq!(
+        store.appends(),
+        vec![
+            (StepFence::Unleased, vec![0]),
+            (StepFence::Unleased, vec![1])
+        ],
+        "seq 0 is never offered again: the collided row is not owed"
+    );
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        vec![0, 1],
+        "the other writer's row keeps seq 0 and ours takes the next"
+    );
+    assert_eq!(
+        log[0].payload,
+        json!({ "text": "the other writer" }),
+        "the collision overwrote nothing"
+    );
+    assert_eq!(summary.rows, 1, "only the row that landed is counted");
+    assert_eq!(summary.seq, 2, "the collided seq stays spent");
+}
+
+/// MOD-40 plan D3: a batch whose commit landed but whose reply was lost is re-offered **alone**,
+/// and there a short count is the replay finding its own rows, not a second writer. The fresh row
+/// buffered since goes out in its own call and lands whole.
+#[tokio::test]
+async fn a_replayed_batch_may_land_short() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None);
+
+    store.lose_next_append_replies(1);
+    let outcome = recorder
+        .record_prompt("summarise the backlog", json!([]), at())
+        .await;
+    assert!(
+        matches!(outcome, Err(RecordError::Store(StoreError::Unreachable(_)))),
+        "the reply was lost, got {outcome:?}"
+    );
+    assert_eq!(
+        rows(&store, chat.step_id)
+            .await
+            .iter()
+            .map(|row| row.seq)
+            .collect::<Vec<_>>(),
+        vec![0],
+        "the lost reply's batch committed"
+    );
+
+    recorder
+        .record(chunk("an answer", "m1"))
+        .await
+        .expect("recording must land");
+    let summary = recorder
+        .finish()
+        .await
+        .expect("a replay that lands short is not a collision");
+
+    assert_eq!(
+        store.appends(),
+        vec![
+            (StepFence::Unleased, vec![0]),
+            (StepFence::Unleased, vec![0]),
+            (StepFence::Unleased, vec![1])
+        ],
+        "the lost batch, its replay alone, then the fresh row alone"
+    );
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![EventKind::Prompt, EventKind::AssistantText]
+    );
+    assert_eq!(
+        log.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(
+        summary.rows, 1,
+        "the replayed row was already stored and is not counted twice"
+    );
+    assert_eq!(summary.seq, 2);
+}
+
+/// MOD-40 plan D2: the recorder's fence rides every row and the usage write. The default
+/// (`Unleased`) is refused on a leased run; the walk's own lease writes; and once another process
+/// takes the lease, the same fence writes nothing more.
+#[tokio::test]
+async fn the_fence_rides_every_write() {
+    let scrubber = scrubber();
+    let store = SpyStore::demo();
+    let (owner, stranger) = (Uuid::now_v7(), Uuid::now_v7());
+    let done = || {
+        env(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::EndTurn,
+        }))
+    };
+    assert_eq!(
+        store
+            .inner
+            .claim_run(
+                ids::RUN_2,
+                ids::BOX,
+                owner,
+                at(),
+                at() + TimeDelta::minutes(5)
+            )
+            .await
+            .expect("the claim must not fail"),
+        Claim::Admitted,
+        "the walk claims the queued fixture run"
+    );
+
+    // (1) The default fence on a leased run: refused at the first write.
+    let mut unfenced = Recorder::new(&store, &scrubber, ids::STEP_R2_PRD, false, None);
+    unfenced
+        .record(chunk("x", "m1"))
+        .await
+        .expect("a chunk is only buffered");
+    let refused = unfenced.record(done()).await;
+    assert!(
+        matches!(&refused, Err(RecordError::Store(StoreError::Fenced { step }))
+            if *step == ids::STEP_R2_PRD),
+        "a recorder that forgets the lease is refused loudly, got {refused:?}"
+    );
+    assert!(
+        store.appends().is_empty(),
+        "the refused flush wrote nothing"
+    );
+
+    // (2) The walk's own lease writes every row and the usage.
+    let mut fenced = Recorder::new(&store, &scrubber, ids::STEP_R2_PRD, false, None)
+        .with_fence(StepFence::Lease(owner));
+    fenced
+        .record(chunk("x", "m1"))
+        .await
+        .expect("recording must land");
+    fenced
+        .record(usage(Some(9), None))
+        .await
+        .expect("recording must land");
+    fenced.record(done()).await.expect("recording must land");
+    let summary = fenced.finish().await.expect("the leased recorder closes");
+    let appends = store.appends();
+    assert!(
+        !appends.is_empty()
+            && appends
+                .iter()
+                .all(|(fence, _)| *fence == StepFence::Lease(owner)),
+        "every append rode the walk's lease, got {appends:?}"
+    );
+    let step = store
+        .inner
+        .run_steps(ids::RUN_2)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .find(|row| row.id == ids::STEP_R2_PRD)
+        .expect("the fixture step exists");
+    assert_eq!(
+        step.usage,
+        Some(summary.usage),
+        "the usage write rode the fence: under `Unleased` it would be `Fenced`"
+    );
+
+    // (3) Another process takes the lapsed lease: the old owner writes nothing more.
+    assert!(
+        store
+            .inner
+            .take_lease(
+                ids::RUN_2,
+                ids::BOX,
+                stranger,
+                at() + TimeDelta::minutes(6),
+                at() + TimeDelta::minutes(20),
+            )
+            .await
+            .expect("the take must not fail"),
+        "the stranger takes the lapsed lease"
+    );
+    let tail = rows(&store, ids::STEP_R2_PRD).await;
+    let mut stale = Recorder::continuing(&store, &scrubber, ids::STEP_R2_PRD, false, None, &tail)
+        .with_fence(StepFence::Lease(owner));
+    stale
+        .record(chunk("y", "m2"))
+        .await
+        .expect("a chunk is only buffered");
+    let refused = stale.record(done()).await;
+    assert!(
+        matches!(&refused, Err(RecordError::Store(StoreError::Fenced { step }))
+            if *step == ids::STEP_R2_PRD),
+        "a recorder whose lease another process took is fenced, got {refused:?}"
+    );
+    assert_eq!(
+        rows(&store, ids::STEP_R2_PRD).await,
+        tail,
+        "the fenced flush wrote nothing"
     );
 }
 

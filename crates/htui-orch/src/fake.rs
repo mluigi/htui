@@ -1246,6 +1246,10 @@ pub const RESTART_GAP: TimeDelta = TimeDelta::minutes(10);
 /// `(fanout_index, call)` (plan D68).
 type ScriptKey = (String, i32, Option<(i32, u32)>);
 
+/// One session's stall (blueprint A-2; MOD-40 T2): whether the document is written first, the
+/// signal raised when the session stalls, and, for a suspend, the signal that wakes it.
+type Stall = (bool, Arc<Notify>, Option<Arc<Notify>>);
+
 /// `MemStore` + `FakeDriver` + [`FakeIsolator`] + [`TestClock`] + [`FakeGraphSource`], which is
 /// ANA-2's own description of the fake orchestrator (`docs/ANA-2.md:1764-1766`).
 ///
@@ -1274,9 +1278,10 @@ pub struct FakeOrchestrator {
     candidates: Mutex<BTreeMap<String, Vec<(AgentId, String)>>>,
     after_done_advance: Mutex<Option<TimeDelta>>,
     /// Blueprint A-2, F-O: the sessions whose `after_done` never returns, keyed like `scripts`,
-    /// each with whether the document is written first and the signal raised. Never carried by
-    /// [`restarted`](Self::restarted).
-    stalls: Mutex<BTreeMap<ScriptKey, (bool, Arc<Notify>)>>,
+    /// each with whether the document is written first and the signal raised, and, for a suspend
+    /// ([`suspend_after_done`](Self::suspend_after_done)), the signal that wakes it. Never carried
+    /// by [`restarted`](Self::restarted).
+    stalls: Mutex<BTreeMap<ScriptKey, Stall>>,
     /// MOD-4 plan D162: the phases whose pinned template stage 3 refuses. Carried by
     /// [`restarted`](Self::restarted): it is the graph's, not the process's.
     refused_prompts: Mutex<BTreeSet<String>>,
@@ -1472,13 +1477,38 @@ impl FakeOrchestrator {
             .expect("no panic holds the fake orchestrator's lock")
             .insert(
                 (phase.to_owned(), attempt, slot),
-                (write_output, Arc::clone(&notify)),
+                (write_output, Arc::clone(&notify), None),
             );
         notify
     }
 
+    /// MOD-40 T2: [`stall_after_done`](Self::stall_after_done) with no document, as a
+    /// **suspend** rather than a death — the session signals the first [`Notify`], then awaits
+    /// the second and returns `Ok(None)`, and the walk settles on. A laptop lid, not a kill.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn suspend_after_done(
+        &self,
+        phase: &str,
+        attempt: i32,
+        slot: Option<(i32, u32)>,
+    ) -> (Arc<Notify>, Arc<Notify>) {
+        let stalled = Arc::new(Notify::new());
+        let wake = Arc::new(Notify::new());
+        self.stalls
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .insert(
+                (phase.to_owned(), attempt, slot),
+                (false, Arc::clone(&stalled), Some(Arc::clone(&wake))),
+            );
+        (stalled, wake)
+    }
+
     /// The stall for one session, the exact key's before its `(phase, attempt)`'s, taken.
-    fn take_stall(&self, key: &SessionKey<'_>) -> Option<(bool, Arc<Notify>)> {
+    fn take_stall(&self, key: &SessionKey<'_>) -> Option<Stall> {
         let mut stalls = self
             .stalls
             .lock()
@@ -1586,7 +1616,8 @@ impl FakeOrchestrator {
     /// Elapses any [`advance_after_done`](Self::advance_after_done) first — that is what "after the
     /// session and before the settle" means for a deadline case — then writes the scripted output
     /// document, or none. T4's `impl SessionSink for FakeOrchestrator` forwards to this and adds
-    /// nothing. A [`stall_after_done`](Self::stall_after_done) of this session never returns.
+    /// nothing. A [`stall_after_done`](Self::stall_after_done) of this session never returns; a
+    /// [`suspend_after_done`](Self::suspend_after_done) returns `Ok(None)` once woken.
     ///
     /// # Errors
     /// The store's own refusals.
@@ -1604,12 +1635,16 @@ impl FakeOrchestrator {
         {
             self.clock.advance(by);
         }
-        if let Some((write_output, stalled)) = self.take_stall(key) {
+        if let Some((write_output, stalled, wake)) = self.take_stall(key) {
             if write_output {
                 self.write_output(item, step, phase, key).await?;
             }
             stalled.notify_one();
-            return std::future::pending().await;
+            let Some(wake) = wake else {
+                return std::future::pending().await;
+            };
+            wake.notified().await;
+            return Ok(None);
         }
         self.write_output(item, step, phase, key).await
     }
