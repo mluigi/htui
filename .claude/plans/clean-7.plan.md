@@ -3,6 +3,9 @@
 Routed as **plan** (CLEAN default; C1–C3 ✗, C4 borderline), ultracode not needed — maintainer
 accepted 2026-09-30. Sandbox run on `hr/CLEAN-7`.
 
+**Status: done 2026-09-30** (`docs/decisions/clean/clean-7.md`). Review renamed the `mem.rs` test
+further, to `a_chat_run_mints_both_rows_running_and_finish_closes_them` (`dd56355`).
+
 ## Goal
 
 Remove what the deleted offline chat buffer left behind (MOD-25 refused offline chats, MOD-39 fixed
