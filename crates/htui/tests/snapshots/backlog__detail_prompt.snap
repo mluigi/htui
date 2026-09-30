@@ -8,7 +8,7 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
 │  ANA-1    done               Data model, box regist…││template  prd v1                           │
 │  ANA-2    open               Orchestrator step grap…││picker    n / p · 8 template(s)            │
-│  CLEAN-1  failed             Drop the legacy markdo…││digest    b9fb821faa4926cf5bfad8cd773e6ba76│
+│  CLEAN-1  failed             Drop the legacy markdo…││digest    a3cad86a286f7e936fb4b1457f8c92b71│
 │  FEAT-1   in_progress        TUI scaffold           ││budget    120000 (project) · reserve 0.10 ·│
 │  FEAT-2   blocked            Agent driver and chat …││tokens    1067 → 1067 · chars-v2           │
 │  FEAT-3   queued             Postgres store and cac…││excerpts  builtin@1 · considered 0 · select│

@@ -14,9 +14,9 @@ app
   prompt_upstream_hops          unset | 2 (app_setting_default)   hops
   token_budget                  unset | 120000 (app_setting_default)   tokens
 project Vulkan Tutorials
+  box_hostname                  unset | on (default)   on/off
   prompt_upstream_hops          unset | 2 (app_setting_default)   hops
   token_budget                  120000 | 120000 (project)   tokens
-
 
 
 

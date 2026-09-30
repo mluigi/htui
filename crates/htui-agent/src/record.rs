@@ -20,8 +20,9 @@
 //!    numbers. Gaplessness is therefore a property of the log, not merely of the counter.
 //!    [`Recorder::continuing`] starts past a log's last row, at its last `turn`, so a promoted step
 //!    continued by a chat is still one gapless log with one writer at a time (MOD-4 plan D164).
-//! 3. **The prompt digest.** `sha256` over the assembled prompt text, computed once, written both
-//!    as the `digest` key of the `prompt` payload and through
+//! 3. **The prompt digest.** `sha256` over the text the assembler supplies for digesting (the
+//!    sent text itself unless a span is undigested, MOD-33), computed once, written both as the
+//!    `digest` key of the `prompt` payload and through
 //!    [`WriteStore::set_step_usage`]`(step, usage, Some(digest))`. Later usage writes for the same
 //!    step pass `None`, as that method's contract says. Passing `Some` rather than ANA-5 §4.4's
 //!    `None` is the plan's X8 ruling, and it stands until milestone 9. A continuing recorder owes
@@ -525,7 +526,8 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     ///   `run_step.usage` document from its own running total on every usage write, so a
     ///   continuation that started from zero would erase the step's pre-promotion spend.
     ///
-    /// Never call [`Recorder::record_prompt`] on it: that is what would rewrite the digest.
+    /// Never call [`Recorder::record_prompt`] or [`Recorder::record_prompt_digesting`] on it: either
+    /// is what would rewrite the digest.
     pub fn continuing(
         store: &'a S,
         scrubber: &'a dyn Scrubber,
@@ -627,11 +629,90 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         self.step
     }
 
+    /// Records the assembled initial prompt with the text the digest is over (MOD-33 D271):
+    /// `seq = 0`, `turn = 0`, role `htui` (ANA-9 §4.3).
+    ///
+    /// `text` is what was sent and is what the payload stores; `digest_text` is what ANA-5
+    /// supplies for digesting — the same canonical text with each undigested span's value replaced
+    /// by its stand-in. Both are scrubbed with the one scrubber, the payload first; a residue in
+    /// either refuses the prompt through the same `scrub_residue` row (a residue in `digest_text`
+    /// is reported at `/digest_text`). The recorder still computes the digest (ANA-4 §4 "the
+    /// driver computes the digest; ANA-5 owns what is digested"), so `run_step.prompt_digest`
+    /// equals the assembler's pre-flight digest (ANA-5 §12 criterion 11).
+    ///
+    /// The digest is `sha256` over the **scrubbed** digest text (ANA-5 §4.7's "scrub before
+    /// digest"), written as the payload's `digest` key and straight through to
+    /// `run_step.prompt_digest`. `digest_text` itself is never persisted. When the two arguments
+    /// are the same string the scrubbed payload text is hashed and no second scrub runs, which is
+    /// what keeps [`Recorder::record_prompt`] byte-identical.
+    ///
+    /// Call once, before any other row: it is what opens turn 0. `at` is as for
+    /// [`Recorder::record_prompt`].
+    ///
+    /// # Errors
+    /// [`RecordError::Store`] when the append or the digest write fails,
+    /// [`RecordError::Encode`] when `sections` cannot be scrubbed as JSON.
+    pub async fn record_prompt_digesting(
+        &mut self,
+        text: &str,
+        digest_text: &str,
+        sections: Value,
+        at: DateTime<Utc>,
+    ) -> Result<(), RecordError> {
+        let at = stamp(at);
+        self.turn = 0;
+        self.turns = 1;
+        let mut payload = json!({ "text": text, "sections": sections });
+        match self.scrubber.scrub(&mut payload) {
+            Ok(()) => {}
+            Err(unmasked) => return self.refuse(unmasked, at).await,
+        }
+        // The shortcut compares the arguments, before scrubbing: equal inputs scrub to equal
+        // outputs, so the payload's scrubbed text is already the scrubbed digest text.
+        let digest = if digest_text == text {
+            let scrubbed = payload
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            format!("{:x}", Sha256::digest(scrubbed.as_bytes()))
+        } else {
+            let mut value = Value::String(digest_text.to_owned());
+            if let Err(mut unmasked) = self.scrubber.scrub(&mut value) {
+                // A bare string reports `""`; prefix rather than replace, so a sub-path a future
+                // scrubber reports survives.
+                unmasked.path = format!("/digest_text{}", unmasked.path);
+                return self.refuse(unmasked, at).await;
+            }
+            let scrubbed = value.as_str().unwrap_or_default();
+            format!("{:x}", Sha256::digest(scrubbed.as_bytes()))
+        };
+        payload["digest"] = Value::String(digest.clone());
+        self.prompt_digest = Some(digest.clone());
+        self.digest_pending = Some(digest);
+
+        self.flush().await?;
+        self.push(PendingRow {
+            kind: EventKind::Prompt,
+            role: EventRole::Htui,
+            tool_call_id: None,
+            payload,
+            raw: Vec::new(),
+            at,
+        });
+        self.flush().await?;
+        self.sync_step().await
+    }
+
     /// Records the assembled initial prompt: `seq = 0`, `turn = 0`, role `htui` (ANA-9 §4.3).
     ///
-    /// The digest is `sha256` over the **scrubbed** text (ANA-5 §4.7's "scrub before digest"), so
-    /// two prompts that differ only in a masked secret share a digest, and it is written straight
-    /// through to `run_step.prompt_digest` as well as into the payload.
+    /// The digest is `sha256` over the **scrubbed** text (ANA-5 §4.7's "scrub before digest"):
+    /// this is [`Recorder::record_prompt_digesting`] with the sent text as the digest text too
+    /// (MOD-33 D271), for a prompt whose sent and digested texts are one string — a chat's user
+    /// text. Every assembled prompt, a judge's included (`judge_sessions` → `open_recorder`), goes
+    /// through [`Recorder::record_prompt_digesting`] with the two strings ANA-5 supplies, which for
+    /// a judge or a handoff are equal. Two prompts that differ only in a masked secret
+    /// share a digest, and it is written straight through to `run_step.prompt_digest` as well as
+    /// into the payload.
     ///
     /// Call once, before any other row: it is what opens turn 0.
     ///
@@ -649,34 +730,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
         sections: Value,
         at: DateTime<Utc>,
     ) -> Result<(), RecordError> {
-        let at = stamp(at);
-        self.turn = 0;
-        self.turns = 1;
-        let mut payload = json!({ "text": text, "sections": sections });
-        match self.scrubber.scrub(&mut payload) {
-            Ok(()) => {}
-            Err(unmasked) => return self.refuse(unmasked, at).await,
-        }
-        let scrubbed = payload
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let digest = format!("{:x}", Sha256::digest(scrubbed.as_bytes()));
-        payload["digest"] = Value::String(digest.clone());
-        self.prompt_digest = Some(digest.clone());
-        self.digest_pending = Some(digest);
-
-        self.flush().await?;
-        self.push(PendingRow {
-            kind: EventKind::Prompt,
-            role: EventRole::Htui,
-            tool_call_id: None,
-            payload,
-            raw: Vec::new(),
-            at,
-        });
-        self.flush().await?;
-        self.sync_step().await
+        self.record_prompt_digesting(text, text, sections, at).await
     }
 
     /// Records a user follow-up and opens the next turn (ANA-9 §4.3: role `user`, payload `text`).

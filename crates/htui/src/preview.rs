@@ -222,6 +222,8 @@ pub async fn build(
     let budget = settings::resolve_budget(None, Some(&project.settings), &app);
     let hops = settings::resolve_hops(Some(&project.settings), &app, &mut notes);
     let max_skill_tokens = settings::resolve_max_skill_tokens(&app);
+    // MOD-33 D267: the project's switch, as the engine's `phase_spec` resolves it.
+    let box_hostname = settings::resolve_box_hostname(Some(&project.settings));
 
     let documents = backend
         .documents_of_kinds(item, &[])
@@ -290,6 +292,7 @@ pub async fn build(
         documents,
         upstream,
         box_profile,
+        box_hostname,
         skills,
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),

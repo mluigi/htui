@@ -208,7 +208,8 @@ struct SpyStore {
     /// `RunStepSummary` carries the two derived figures and neither the digest nor the record, so
     /// the only way to assert *which digest* a caller wrote is to watch the call. MOD-2 milestone
     /// 9's `record_prompt` case is what reads it — the assembler and the recorder compute the same
-    /// `Sha256` over the same text, and that is the claim.
+    /// `Sha256` over the digest text ANA-5 supplies (MOD-33 D271), which for a prompt with nothing
+    /// undigested is the sent text itself, and that is the claim.
     prompt_calls: Mutex<Vec<(StepId, String)>>,
     /// Every `append_events` call that reached the inner store, as `(fence, seqs)`, in order.
     appends: Mutex<Vec<(StepFence, Vec<i32>)>>,
@@ -1278,6 +1279,235 @@ async fn seq_is_gapless_turns_count_and_digest_reaches_the_step() {
         carried.into_iter().flatten().next(),
         Some(expected),
         "run_step.prompt_digest is the payload digest (X8: Some until milestone 9)"
+    );
+}
+
+/// `sha256` of a string, as the lowercase hex the recorder writes.
+fn sha256_hex(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+/// `payload.digest` of a row.
+fn digest_of(row: &SessionEvent) -> &str {
+    row.payload
+        .get("digest")
+        .and_then(Value::as_str)
+        .expect("the prompt payload carries a digest")
+}
+
+/// MOD-33 D271: the payload stores the text that was sent, and the digest is over the text ANA-5
+/// supplies for digesting. The one digest is the payload's, the summary's and `run_step`'s.
+#[tokio::test]
+async fn a_split_prompt_stores_the_sent_text_and_digests_the_digest_text() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None);
+
+    recorder
+        .record_prompt_digesting("A x Z", "A [s] Z", json!([]), at())
+        .await
+        .expect("the prompt row must land");
+    let summary = recorder
+        .finish()
+        .await
+        .expect("the recorder must close cleanly");
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(log[0].seq, 0);
+    assert_eq!(log[0].kind, EventKind::Prompt);
+    assert_eq!(
+        text_of(&log[0]),
+        "A x Z",
+        "the payload stores the sent text"
+    );
+    let expected = sha256_hex("A [s] Z");
+    assert_eq!(
+        digest_of(&log[0]),
+        expected,
+        "the digest is over the digest text"
+    );
+    assert_ne!(
+        digest_of(&log[0]),
+        sha256_hex("A x Z"),
+        "the digest is not over the sent text"
+    );
+    assert!(
+        log[0].payload.get("digest_text").is_none(),
+        "the digest text is never persisted"
+    );
+    assert_eq!(
+        summary.prompt_digest.as_deref(),
+        Some(expected.as_str()),
+        "the summary reports the same digest"
+    );
+    let carried: Vec<String> = store
+        .usage_calls()
+        .into_iter()
+        .filter_map(|call| call.prompt_digest)
+        .collect();
+    assert_eq!(
+        carried,
+        vec![expected],
+        "run_step.prompt_digest is the digest-text digest, written once"
+    );
+}
+
+/// `record_prompt(t, …)` and `record_prompt_digesting(t, t, …)` write the same row and the same
+/// digest, and that digest is the fixed `sha256` over the **masked** text
+/// (`use [REDACTED] for the backlog`), so a prompt whose text the scrubber masks still digests as
+/// the chat path always did. What this pins is the observable output; that `record_prompt`
+/// *delegates* to `record_prompt_digesting` is structural (`record.rs`), and a copy with the same
+/// output would pass too.
+#[tokio::test]
+async fn record_prompt_is_the_split_with_one_string() {
+    let text = format!("use {SECRET} for the backlog");
+    let sections = json!([{"name": "task", "tokens": 4, "trimmed": false}]);
+    let scrubber = scrubber();
+
+    let plain_chat = chat_spec();
+    let plain_store = open_chat(&plain_chat).await;
+    let mut plain = Recorder::new(&plain_store, &scrubber, plain_chat.step_id, false, None);
+    plain
+        .record_prompt(&text, sections.clone(), at())
+        .await
+        .expect("the prompt row must land");
+    let plain_summary = plain.finish().await.expect("the recorder must close");
+
+    let split_chat = chat_spec();
+    let split_store = open_chat(&split_chat).await;
+    let mut split = Recorder::new(&split_store, &scrubber, split_chat.step_id, false, None);
+    split
+        .record_prompt_digesting(&text, &text, sections, at())
+        .await
+        .expect("the prompt row must land");
+    let split_summary = split.finish().await.expect("the recorder must close");
+
+    let plain_log = rows(&plain_store, plain_chat.step_id).await;
+    let split_log = rows(&split_store, split_chat.step_id).await;
+    assert_eq!(plain_log.len(), 1);
+    assert_eq!(split_log.len(), 1);
+    let (a, b) = (&plain_log[0], &split_log[0]);
+    assert_eq!(a.seq, b.seq);
+    assert_eq!(a.turn, b.turn);
+    assert_eq!(a.kind, b.kind);
+    assert_eq!(a.role, b.role);
+    assert_eq!(
+        a.payload, b.payload,
+        "same masked text, sections and digest"
+    );
+    assert_eq!(a.at, b.at);
+    assert_eq!(
+        text_of(a),
+        "use [REDACTED] for the backlog",
+        "the secret is masked in the stored text"
+    );
+    assert_eq!(
+        digest_of(a),
+        sha256_hex("use [REDACTED] for the backlog"),
+        "the digest is over the scrubbed text"
+    );
+    assert_eq!(plain_summary.prompt_digest, split_summary.prompt_digest);
+    assert_eq!(
+        plain_summary.prompt_digest.as_deref(),
+        Some(digest_of(a)),
+        "the summary carries the payload digest"
+    );
+}
+
+/// The digest text goes through the same scrubber before it is hashed (ANA-5 §4.7's "scrub before
+/// digest"), so a known secret in it never shapes the digest.
+#[tokio::test]
+async fn a_secret_in_the_digest_text_is_masked_before_the_hash() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None);
+
+    recorder
+        .record_prompt_digesting("A x Z", &format!("A {SECRET} Z"), json!([]), at())
+        .await
+        .expect("the prompt row must land");
+    let summary = recorder
+        .finish()
+        .await
+        .expect("the recorder must close cleanly");
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        text_of(&log[0]),
+        "A x Z",
+        "the payload stores the sent text"
+    );
+    let expected = sha256_hex("A [REDACTED] Z");
+    assert_eq!(
+        digest_of(&log[0]),
+        expected,
+        "the digest is over the masked digest text"
+    );
+    assert_eq!(summary.prompt_digest.as_deref(), Some(expected.as_str()));
+}
+
+/// A credential-shaped digest text refuses the prompt through the same `refuse` path a
+/// credential-shaped prompt payload takes: no prompt row, one `scrub_residue` row naming
+/// `/digest_text`, no digest anywhere. Unreachable in production (the stand-in is fixed); the case
+/// pins the path the refusal names.
+#[tokio::test]
+async fn residue_in_the_digest_text_refuses_the_prompt() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None);
+
+    recorder
+        .record_prompt_digesting(
+            "A x Z",
+            "A sk-ant-api03-abcdefghijklmnopqrstuvwx Z",
+            json!([]),
+            at(),
+        )
+        .await
+        .expect("a refused prompt is not a recording failure");
+    let outcome = recorder.finish().await;
+
+    assert!(
+        matches!(outcome, Err(RecordError::Unmasked(_))),
+        "finish reports the residue, got {outcome:?}"
+    );
+    let log = rows(&store, chat.step_id).await;
+    assert!(
+        log.iter().all(|row| row.kind != EventKind::Prompt),
+        "no prompt row is written"
+    );
+    assert_eq!(log.len(), 1, "exactly one row: the refusal");
+    assert_eq!(log[0].seq, 0);
+    assert_eq!(log[0].kind, EventKind::Error);
+    assert_eq!(
+        log[0].payload.get("code").and_then(Value::as_str),
+        Some("scrub_residue")
+    );
+    assert_eq!(
+        log[0].payload.get("message").and_then(Value::as_str),
+        Some("anthropic_api_key at /digest_text"),
+        "the refusal names the digest text"
+    );
+    assert_eq!(
+        step_digest(&store, &chat).await,
+        None,
+        "no digest reaches the step"
+    );
+    assert!(
+        store
+            .usage_calls()
+            .into_iter()
+            .all(|call| call.prompt_digest.is_none()),
+        "no usage write carries a digest"
+    );
+    assert!(
+        !serde_json::to_string(&log)
+            .expect("the log serialises")
+            .contains("sk-ant-"),
+        "the credential never reaches the store"
     );
 }
 

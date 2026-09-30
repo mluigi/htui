@@ -159,6 +159,69 @@ async fn the_preview_assembles_from_real_store_reads() {
     );
 }
 
+/// The demo data with `edit` applied, behind a memory backend.
+fn demo_backend(edit: impl FnOnce(&mut htui_core::fixtures::DemoData)) -> Backend {
+    let mut data = htui_core::fixtures::demo_data();
+    edit(&mut data);
+    Backend::memory(MemStore::from_demo(data))
+}
+
+/// FEAT-1's preview outcome over `backend`.
+async fn feat_1_prompt(backend: &Backend) -> htui_core::prompt::AssembledPrompt {
+    preview::build(
+        backend,
+        item_id("FEAT-1").await,
+        None,
+        &platform_scope().await,
+    )
+    .await
+    .expect("the demo store answers every prompt read")
+    .outcome
+    .expect("the demo item assembles")
+}
+
+/// MOD-33 D263: the preview on two boxes that differ only in hostname shows one digest, which is
+/// the comparison with a step's digest that the item exists to make possible.
+#[tokio::test]
+async fn two_boxes_that_differ_only_in_hostname_preview_one_digest() {
+    let here = feat_1_prompt(&demo_backend(|_| {})).await;
+    let there = feat_1_prompt(&demo_backend(|data| {
+        data.boxes
+            .iter_mut()
+            .find(|row| row.id == ids::BOX)
+            .expect("the demo box")
+            .hostname = "a-much-longer-build-host.example.internal".to_owned();
+    }))
+    .await;
+    assert_eq!(here.digest, there.digest);
+    assert_ne!(here.text, there.text);
+    assert!(here.text.contains("hostname: DESKTOP-HTUI\n"));
+    assert!(
+        there
+            .text
+            .contains("hostname: a-much-longer-build-host.example.internal\n")
+    );
+}
+
+/// MOD-33 D267, D269: `project.settings.box_hostname = false` previews no `hostname:` line, and
+/// with nothing undigested the text sent is the text digested.
+#[tokio::test]
+async fn a_project_that_turns_the_switch_off_previews_no_hostname() {
+    let off = feat_1_prompt(&demo_backend(|data| {
+        let project = data
+            .projects
+            .iter_mut()
+            .find(|project| project.id == ids::PROJECT_HTUI)
+            .expect("the demo htui project");
+        project.settings["box_hostname"] = serde_json::json!(false);
+    }))
+    .await;
+    assert!(!off.text.contains("hostname:"), "{}", off.text);
+    assert!(off.text.contains("<section name=\"box\">"));
+    assert_eq!(off.text, off.digest_text);
+    assert!(off.trim.undigested.is_empty());
+}
+
 /// Adds the repo `name` to the demo `htui` project, the primary one when `primary`.
 async fn add_repo(store: &MemStore, name: &str, primary: bool) -> RepoId {
     store

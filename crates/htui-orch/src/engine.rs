@@ -4437,6 +4437,10 @@ where
             documents: Vec::new(),
             upstream: Vec::new(),
             box_profile: self.parts.box_profile.clone(),
+            // MOD-33 D267, D272: the judge body cannot place `{{box}}`, so the switch decides
+            // nothing here — the hostname is neither rendered nor masked (it is masked only where
+            // `{{box}}` is placed); the replayed task keeps whatever the candidate saw.
+            box_hostname: settings::resolve_box_hostname(Some(&project.settings)),
             // MOD-9 D44, D48: the judged phase's candidates, the same list for both orders.
             skills: skills.clone(),
             // No pass for a judge (plan D109): its placeholder set cannot place `{{excerpts}}`
@@ -4570,8 +4574,10 @@ where
     /// The judge's two sessions under one recorder (plan D52), and the document each wrote.
     ///
     /// The judge runs in no tree: `prepare(…, &[], Local, None)` gives a scratch `cwd` and no row
-    /// (D51). The forward text is `record_prompt` at seq 0 — `prompt_digest` and `set_step_prompt`
-    /// are the forward prompt's — and the reversed text is a `follow_up` opening turn 1. The
+    /// (D51). The forward text is `record_prompt_digesting` at seq 0, through `open_recorder` —
+    /// `prompt_digest` and `set_step_prompt` are the forward prompt's, and a judge places no
+    /// `{{box}}`, so its sent and digest texts are one string (MOD-33 D271) — and the reversed
+    /// text is a `follow_up` opening turn 1. The
     /// recorder is finished on every path; a cap breach over the two is `judge_session_failed`.
     async fn judge_sessions(
         &self,
@@ -5142,6 +5148,8 @@ where
             documents,
             upstream,
             box_profile: self.parts.box_profile.clone(),
+            // MOD-33 D267: the project's switch, resolved here because `assemble` is pure.
+            box_hostname: settings::resolve_box_hostname(Some(&project.settings)),
             // MOD-9 D44: the global, project and phase attachments of this phase, most specific
             // winning (`model::skill::resolve`); the assembler's `select` decides which render and
             // records every candidate in `trim_record.skill_choices`.
@@ -5370,9 +5378,11 @@ where
 
     /// A step's [`Recorder`], with the run cap applied and `prompt` recorded as its seq-0 row.
     ///
-    /// `record_prompt` also writes `run_step.prompt_digest`, so every session a step opens — a
-    /// candidate's one, the judge's two (plan D52) — is recorded against the digest of the prompt
-    /// it was opened with.
+    /// `record_prompt_digesting` also writes `run_step.prompt_digest`, so every session a step
+    /// opens — a candidate's one, the judge's two (plan D52) — is recorded against the digest of
+    /// the prompt it was opened with. It is handed the sent text and the digest text (MOD-33
+    /// D271): the payload stores the first and the digest is over the second, so the recorder's
+    /// digest equals stage 3's pre-flight one (ANA-5 §12 criterion 11).
     async fn open_recorder(
         &self,
         run: &Run,
@@ -5400,7 +5410,12 @@ where
             });
         }
         recorder
-            .record_prompt(&prompt.text, prompt.payload_sections_value(), self.now())
+            .record_prompt_digesting(
+                &prompt.text,
+                &prompt.digest_text,
+                prompt.payload_sections_value(),
+                self.now(),
+            )
             .await?;
         Ok(recorder)
     }
@@ -6116,8 +6131,8 @@ pub async fn sweep_fake(orch: &crate::fake::FakeOrchestrator) -> Result<Vec<Adop
 /// The fifteen fields, filled from the harness.
 ///
 /// `app` is read here rather than cached because `MemStore::set_app_setting` (`mem.rs:430`) is the
-/// only writer a case can reach for `step_deadline_seconds` — `SettingKey` is a closed enum of ten
-/// that does not carry it, and `ProjectPatch` has no `settings` field — so a map captured at
+/// only writer a case can reach for `step_deadline_seconds` — `SettingKey` is a closed enum of
+/// eleven that does not carry it, and `ProjectPatch` has no `settings` field — so a map captured at
 /// construction would silently ignore the one knob the deadline case has.
 #[cfg(feature = "test-support")]
 pub(crate) async fn fake_parts<'a>(
@@ -13619,6 +13634,120 @@ mod tests {
             "a live phase of a live graph needs no note: {:?}",
             spec.notes
         );
+    }
+
+    /// The seq-0 `prompt` payload's `(text, digest)`, the step's `prompt_digest`, and the step's
+    /// prompt re-assembled along `assemble_prompt`'s path — stage 3's own, whose `digest` is what
+    /// `set_step_prompt` wrote before the session — for the one step `started` parks.
+    /// `MemStore` keeps no history of the column the recorder overwrites, so the pre-flight
+    /// digest is recomputed; the caller's text equality is what proves it is the same prompt.
+    async fn recorded_prompt(
+        harness: &Harness,
+    ) -> (
+        String,
+        String,
+        Option<String>,
+        htui_core::prompt::AssembledPrompt,
+    ) {
+        let (run, step) = started(harness).await;
+        let step_row = harness
+            .orch
+            .steps(run)
+            .await
+            .into_iter()
+            .find(|row| row.id == step)
+            .expect("the parked step");
+        let prompt_digest = step_row.prompt_digest.clone();
+        let row = harness.orch.run(run).await;
+        let snapshot = snapshot_of(harness, run).await;
+        let phase = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == step_row.phase_name)
+            .expect("the parked step's phase");
+        let item = row.item_id.expect("an item's run");
+        harness_engine!(harness.orch, engine);
+        // Stage 3's `assemble_prompt`, step by step, as it stood before the session: the step's
+        // own output document did not exist yet, so it is not an input of the pre-flight prompt.
+        let mut spec = engine
+            .phase_spec(&row, &snapshot, &step_row, phase, item, true)
+            .await
+            .expect("the spec is built")
+            .expect("the parked phase requires nothing missing");
+        spec.documents
+            .retain(|document| document.kind != phase.output_kind);
+        engine
+            .with_excerpts(&row, &step_row, item, &mut spec)
+            .await
+            .expect("the excerpt pass runs");
+        let preflight = htui_core::prompt::assemble(&spec, engine.parts.scrubber)
+            .expect("the demo phase prompt assembles");
+        let payload = harness
+            .orch
+            .store
+            .step_events(step)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the step has a log")
+            .into_iter()
+            .find(|event| event.seq == 0 && event.kind == htui_core::model::EventKind::Prompt)
+            .expect("the prompt opens the log")
+            .payload;
+        let field = |key: &str| {
+            payload[key]
+                .as_str()
+                .unwrap_or_else(|| panic!("the payload carries `{key}`"))
+                .to_owned()
+        };
+        (field("text"), field("digest"), prompt_digest, preflight)
+    }
+
+    /// MOD-33 D271, ANA-5 §12 criterion 11: a box-bearing phase step's `prompt_digest` — the
+    /// recorder's, over the digest text — is stage 3's pre-flight digest and the payload's
+    /// `digest`, and not the hash of the text sent; and a box whose hostname differs records the
+    /// same digest.
+    #[tokio::test]
+    async fn a_step_digest_is_the_payload_digest_and_not_the_sent_text_hash() {
+        let first = Harness::new().await;
+        let (text, digest, prompt_digest, preflight) = recorded_prompt(&first).await;
+        assert_eq!(
+            preflight.text, text,
+            "the re-assembly is the prompt the session was sent"
+        );
+        assert_eq!(
+            prompt_digest.as_deref(),
+            Some(preflight.digest.as_str()),
+            "criterion 11: the recorder's digest is stage 3's pre-flight one"
+        );
+        assert_eq!(digest, preflight.digest, "the payload carries it too");
+        assert_ne!(
+            digest,
+            htui_core::prompt::digest::sha256_hex(&text),
+            "the digest is over the digest text, not the sent text"
+        );
+        assert!(text.contains("hostname: DESKTOP-HTUI\n"), "{text}");
+
+        // Plan delta 4: the same demo world on a box with another hostname, no `fake.rs` edit.
+        let mut orch = FakeOrchestrator::demo();
+        let mut data = htui_core::fixtures::demo_data();
+        data.boxes
+            .iter_mut()
+            .find(|row| row.id == ids::BOX)
+            .expect("the demo box")
+            .hostname = "a-much-longer-build-host.example.internal".to_owned();
+        orch.store = MemStore::from_demo(data).with_clock(std::sync::Arc::new(orch.clock.clone()));
+        let second = Harness { orch };
+        let (other_text, other_digest, other_prompt_digest, other_preflight) =
+            recorded_prompt(&second).await;
+        assert_eq!(other_preflight.text, other_text);
+        assert_eq!(other_preflight.digest, preflight.digest);
+        assert!(
+            other_text.contains("hostname: a-much-longer-build-host.example.internal\n"),
+            "{other_text}"
+        );
+        assert_ne!(text, other_text);
+        assert_eq!(other_prompt_digest, prompt_digest);
+        assert_eq!(other_digest, digest);
     }
 
     /// MOD-9 D44: a phase with no phase-level attachment sees the project's, with no note.

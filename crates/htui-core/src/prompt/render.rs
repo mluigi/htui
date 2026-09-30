@@ -56,6 +56,28 @@ const ASSISTANT_TAIL_LINES: usize = 40;
 /// edit the code in the repo map" (<https://aider.chat/docs/faq.html>).
 const EXCERPT_PREAMBLE: &str = "Read-only context, selected by htui. These files may be truncated and may be out of date; the\nworking tree is authoritative. Do not treat an excerpt as the whole file, and open the file before\nediting it.";
 
+/// The fixed stand-in the digest sees in place of the box's hostname (MOD-33 D264).
+///
+/// A digest input for ever — changing these bytes changes every box-bearing digest — and never
+/// sent or persisted: the digest text is hashed and dropped (D271). Ten characters, the length of
+/// the fixture hostname `dev-win-01`, so the golden token figures do not move (D265).
+pub const HOSTNAME_STAND_IN: &str = "[hostname]";
+
+/// Which `hostname:` line [`box_profile`] renders (MOD-33 D263, D268, D269).
+///
+/// Policy about a prompt, not a fact about a box, so it is an argument and not a `BoxProfile`
+/// field: `BoxProfile` is also the MCP `box_profile` tool's payload (D277).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostnameLine {
+    /// The project's switch is off: no `hostname:` line; the section starts with `os:`.
+    Omitted,
+    /// The digest form, `hostname: [hostname]` — what the residue scan, the estimate, the trim
+    /// ladder and the record see.
+    StandIn,
+    /// The sent form: the (already masked) hostname, single-lined (D266).
+    Shown,
+}
+
 /// One rendered section before wrapping: what the trimmer mutates and what the estimator measures.
 ///
 /// `attrs` is in source order and its values are **already** attribute-escaped, so [`wrap`] is a
@@ -254,7 +276,9 @@ pub fn wrap(section: &Rendered) -> String {
 ///
 /// `assemble()` does **not** call this: it normalises and scrubs each span on its own and estimates
 /// over the concatenation, so the frame's estimate and the frame's substituted bytes are the same
-/// strings (review finding H-1). This remains the one-call answer to "what is the frame" for a
+/// strings (review finding H-1). The one byte range the estimate does not measure as sent is the box
+/// section's hostname value, which is estimated as [`HOSTNAME_STAND_IN`] (MOD-33 D265). This
+/// remains the one-call answer to "what is the frame" for a
 /// caller — MOD-9's editor — that has a [`ParsedTemplate`] and no scrubber.
 #[must_use]
 pub fn template_text(parsed: &ParsedTemplate) -> String {
@@ -370,10 +394,19 @@ impl UpstreamEntry {
 ///
 /// `cpu`, `ram`, `gpu`, `tools` and `quirks` are each omitted when the row has nothing to say, so
 /// the section never carries a line that means "unknown". `path` is not in the list, by type.
+///
+/// `hostname` picks the first line's form; every other line is identical in all three forms, which
+/// is what confines the sent/digest difference to one value (MOD-33 D263).
 #[must_use]
-pub fn box_profile(profile: &BoxProfile) -> Rendered {
+pub fn box_profile(profile: &BoxProfile, hostname: HostnameLine) -> Rendered {
     let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("hostname: {}", profile.hostname));
+    match hostname {
+        HostnameLine::Omitted => {}
+        HostnameLine::StandIn => lines.push(format!("hostname: {HOSTNAME_STAND_IN}")),
+        HostnameLine::Shown => {
+            lines.push(format!("hostname: {}", single_line(&profile.hostname)));
+        }
+    }
     lines.push(format!(
         "os: {} {} ({})",
         profile.os_family.as_str(),
@@ -423,6 +456,13 @@ pub fn box_profile(profile: &BoxProfile) -> Rendered {
         attrs: Vec::new(),
         content: lines.join("\n"),
     }
+}
+
+/// MOD-33 D266: each `\r\n` pair becomes one space, then any remaining `\r` or `\n` one space, so
+/// the sent hostname can never add or remove a line and `canonical()` commutes with the swap. Not
+/// [`attr`]'s collapse, which is per character and would make `\r\n` two spaces.
+fn single_line(value: &str) -> String {
+    value.replace("\r\n", " ").replace(['\r', '\n'], " ")
 }
 
 /// §4.2's skills section: one `<skill name="…" version="N">` block per binding (P-10).
@@ -1180,7 +1220,7 @@ mod tests {
             quirks: "MSVC toolchain only\nno WSL\n".to_owned(),
         };
         assert_eq!(
-            box_profile(&full).content,
+            box_profile(&full, HostnameLine::Shown).content,
             concat!(
                 "hostname: dev-win-01\n",
                 "os: windows 10.0.26200 (x86_64)\n",
@@ -1202,13 +1242,76 @@ mod tests {
             ..full
         };
         assert_eq!(
-            box_profile(&bare).content,
+            box_profile(&bare, HostnameLine::Shown).content,
             "hostname: dev-win-01\nos: windows 10.0.26200 (x86_64)\nhtui: 0.4.1"
         );
         assert!(
-            !box_profile(&bare).content.contains('/'),
+            !box_profile(&bare, HostnameLine::Shown)
+                .content
+                .contains('/'),
             "§4.2 rule 5: no path reaches the section, and BoxProfile has none to give"
         );
+    }
+
+    fn a_full_box() -> BoxProfile {
+        BoxProfile {
+            hostname: "dev-win-01".to_owned(),
+            os_family: OsFamily::Windows,
+            os_version: "10.0.26200".to_owned(),
+            arch: "x86_64".to_owned(),
+            cpu: "AMD Ryzen 9 7950X, 32 threads".to_owned(),
+            ram_mb: Some(65_536),
+            gpu_vendor: Some("nvidia".to_owned()),
+            htui_version: "0.4.1".to_owned(),
+            tools: vec![("cargo".to_owned(), "1.98.1".to_owned())],
+            more_tools: 0,
+            quirks: "no WSL".to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_hostname_line_has_three_forms() {
+        // MOD-33 D263: one body, one `match` on the first line, so the three forms differ in that
+        // line and nowhere else.
+        let full = a_full_box();
+        let shown = box_profile(&full, HostnameLine::Shown).content;
+        let (first, rest) = shown.split_once('\n').expect("more than one line");
+        assert_eq!(first, "hostname: dev-win-01");
+        assert_eq!(
+            box_profile(&full, HostnameLine::StandIn).content,
+            format!("hostname: {HOSTNAME_STAND_IN}\n{rest}")
+        );
+        assert_eq!(HOSTNAME_STAND_IN, "[hostname]");
+        let omitted = box_profile(&full, HostnameLine::Omitted).content;
+        assert_eq!(omitted, rest);
+        assert!(omitted.starts_with("os: "), "{omitted}");
+        assert!(!omitted.contains("hostname"), "{omitted}");
+    }
+
+    #[test]
+    fn a_shown_hostname_is_one_line() {
+        // MOD-33 D266: CRLF first, so `\r\n` is one space and not `attr`'s two.
+        for (hostname, line) in [
+            ("a\r\nb", "hostname: a b"),
+            ("a\rb\nc", "hostname: a b c"),
+            ("a\r\n\r\nb", "hostname: a  b"),
+        ] {
+            let profile = BoxProfile {
+                hostname: hostname.to_owned(),
+                ..a_full_box()
+            };
+            let content = box_profile(&profile, HostnameLine::Shown).content;
+            assert_eq!(content.lines().next(), Some(line), "{hostname:?}");
+            assert!(!content.contains('\r'), "{hostname:?}");
+            assert_eq!(
+                content.lines().count(),
+                box_profile(&a_full_box(), HostnameLine::Shown)
+                    .content
+                    .lines()
+                    .count(),
+                "{hostname:?} adds no line"
+            );
+        }
     }
 
     #[test]
