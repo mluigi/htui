@@ -3063,33 +3063,152 @@ mod role_gate {
         );
     }
 
-    /// MOD-41 review R-8: a sweep's prune drops a backoff entry whose due is past by more than
-    /// the grace (`max(BACKOFF_MAX, 2 x sweep period)`) and whose run no task works on; a fresh
-    /// entry, and a stale one whose run is live, stay.
-    #[tokio::test(start_paused = true)]
-    async fn prune_drops_a_stale_backoff_entry() {
-        let runtime = worker_runtime().with_sweep_every(Duration::from_secs(1));
-        let shared = &runtime.shared;
-        let (stale, live, fresh) = (RunId::new(), RunId::new(), RunId::new());
-        shared.step_backoff(stale);
-        shared.step_backoff(live);
-        let walk = shared.walks.child(live);
-        tokio::time::advance(BACKOFF_FIRST + BACKOFF_MAX + Duration::from_secs(1)).await;
-        shared.step_backoff(fresh);
+    /// The process's cached parts, read without re-reading the repo map.
+    async fn parts(
+        runtime: &RunRuntime<Backend, Timed>,
+        backend: &Backend,
+    ) -> (Arc<dyn Isolator>, Arc<dyn htui_orch::Verifier>) {
+        let writer = htui_core::store::WorkerHost::writer(backend).expect("the backend writes");
+        runtime
+            .shared
+            .singletons(backend, &writer, false)
+            .await
+            .expect("the parts are built")
+    }
 
-        shared.prune();
-        let kept: std::collections::BTreeSet<RunId> = shared
+    /// MOD-41 review R-1 (blueprint D202, R-39): while a walk of the worker is live, a sweep that
+    /// finds the repo map moved swaps nothing and claims nothing; the first sweep with no walk
+    /// live rebuilds the isolator and the verifier, and claims the run over the new checkout.
+    #[tokio::test]
+    async fn a_worker_sweep_under_a_live_walk_keeps_its_parts() {
+        if let Err(skip) = htui_orch::isolate::git::testkit::usable_git() {
+            println!("{skip}");
+            return;
+        }
+        let scratch = Scratch::new();
+        let store = seeded(MemStore::demo()).await;
+        set_executor(&store, Executor::Worker).await;
+        let alpha = checkout(&store, &scratch.0, "alpha").await;
+        let first = queued_over(
+            &store,
+            ids::HTUI_ANA_2,
+            Utc::now() - TimeDelta::minutes(2),
+            Some(&[alpha]),
+        )
+        .await;
+        let mut factory = DriverFactory::new();
+        factory.register("acp", Box::new(OneTurn));
+        let mut runtime: RunRuntime<Backend, Timed> = RunRuntime::new(factory)
+            .with_author(Arc::new(OutputAuthor))
+            .with_role(Role::Worker)
+            .with_scratch_root(scratch.0.join("trees"));
+        let backend = Backend::memory(store.clone());
+        let sink = Timed::new();
+        runtime.sweep_with(&backend, &sink);
+        rests_at(&store, first, RunStatus::AwaitingApproval).await;
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        store
+            .finish_run(first, RunStatus::Cancelled, None, Utc::now())
+            .await
+            .expect("the parked run is cancellable");
+        let (isolator, verifier) = parts(&runtime, &backend).await;
+
+        let beta = checkout(&store, &scratch.0, "beta").await;
+        let second = queued_over(&store, ids::HTUI_CLEAN_1, Utc::now(), Some(&[beta])).await;
+        let walk = runtime.shared.walks.child(RunId::new());
+        runtime.sweep_with(&backend, &sink);
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        assert_eq!(
+            status_of(&store, second).await,
+            RunStatus::Queued,
+            "no claim walks with the stale isolator"
+        );
+        assert_eq!(
+            runtime.isolator_builds(),
+            1,
+            "nothing is swapped under a live walk"
+        );
+        let (still, still_verifier) = parts(&runtime, &backend).await;
+        assert!(Arc::ptr_eq(&isolator, &still) && Arc::ptr_eq(&verifier, &still_verifier));
+
+        drop(walk);
+        runtime.sweep_with(&backend, &sink);
+        claimed(&store, second).await;
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        assert_eq!(
+            status_of(&store, second).await,
+            RunStatus::AwaitingApproval,
+            "the run over the new checkout walks once the walk rests"
+        );
+        assert_eq!(
+            runtime.isolator_builds(),
+            2,
+            "the rest's sweep rebuilt the isolator"
+        );
+        let (_, rebuilt) = parts(&runtime, &backend).await;
+        assert!(
+            !Arc::ptr_eq(&verifier, &rebuilt),
+            "the verifier is rebuilt with the isolator, so the limits are read afresh"
+        );
+    }
+
+    /// The runs `shared` keeps a backoff entry for.
+    fn backed_off(shared: &super::Shared<Timed>) -> std::collections::BTreeSet<RunId> {
+        shared
             .backoff
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .keys()
             .copied()
-            .collect();
+            .collect()
+    }
+
+    /// MOD-41 review R-8: a sweep's prune drops a backoff entry whose due is past by more than
+    /// the grace (`max(BACKOFF_MAX, 2 x sweep period)`) and whose run no task works on; a fresh
+    /// entry, one past its due by less than the grace, and a stale one whose run is live, stay.
+    #[tokio::test(start_paused = true)]
+    async fn prune_drops_a_stale_backoff_entry() {
+        let runtime = worker_runtime().with_sweep_every(Duration::from_secs(1));
+        let shared = &runtime.shared;
+        let (stale, within, live, fresh) = (RunId::new(), RunId::new(), RunId::new(), RunId::new());
+        shared.step_backoff(stale);
+        shared.step_backoff(live);
+        let walk = shared.walks.child(live);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        // Past its due by `BACKOFF_MAX - 1s` when the prune runs: inside the grace.
+        shared.step_backoff(within);
+        tokio::time::advance(BACKOFF_FIRST + BACKOFF_MAX - Duration::from_secs(1)).await;
+        shared.step_backoff(fresh);
+
+        shared.prune();
         assert_eq!(
-            kept,
-            [live, fresh].into_iter().collect(),
-            "the stale entry of a run no task works on is pruned"
+            backed_off(shared),
+            [within, live, fresh].into_iter().collect(),
+            "only the entry past its due by more than the grace, of a run no task works on, goes"
         );
         drop(walk);
+    }
+
+    /// MOD-41 review R-8: when twice the sweep period exceeds [`BACKOFF_MAX`], that is the grace,
+    /// so a run still failing keeps its delay across a slow sweep.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_sweep_widens_the_backoff_grace() {
+        let every = BACKOFF_MAX;
+        let runtime = worker_runtime().with_sweep_every(every);
+        let shared = &runtime.shared;
+        let (stale, within) = (RunId::new(), RunId::new());
+        shared.step_backoff(stale);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        shared.step_backoff(within);
+        // `stale` is past its due by `2 x every + 1s`, `within` by `2 x every - 1s`: both beyond
+        // `BACKOFF_MAX`.
+        tokio::time::advance(every * 2 + BACKOFF_FIRST - Duration::from_secs(1)).await;
+
+        shared.prune();
+        assert_eq!(
+            backed_off(shared),
+            [within].into_iter().collect(),
+            "the grace is twice the sweep period, not {BACKOFF_MAX:?}"
+        );
     }
 }
