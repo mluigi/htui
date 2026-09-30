@@ -9,14 +9,23 @@
 //!
 //! Both connect headless (`PgStore::connect_headless`, MOD-40 plan D8): a pending schema or a
 //! build below the database's target version is refused, never migrated.
+//!
+//! The worker's background sync (MOD-41 plan D19) lives here too: [`spawn_index_job`] reads the
+//! keyring once at `htui worker` start and, when it holds a Qdrant URL, spawns [`index_loop`],
+//! which re-syncs every project at start and then every [`sync_interval`].
+use std::collections::BTreeMap;
+use std::time::Duration;
+
 use anyhow::{Context as _, bail};
 use htui_core::model::{ProjectId, RequirementState, Resolution, Scope};
+use htui_core::store::{MemStore, ReadStore, StoreError};
 use htui_store::embed::FastEmbedder;
 use htui_store::pg::{CONNECT_TIMEOUT, PoolSize};
 use htui_store::qdrant_settings::QdrantSettings;
-use htui_store::vector::{Hit, PointType, QdrantStore, SearchQuery, VectorStore as _};
-use htui_store::vector_sync::Indexer;
+use htui_store::vector::{Hit, PointType, QdrantStore, SearchQuery, VectorStore};
+use htui_store::vector_sync::{Indexer, SyncReport};
 use htui_store::{HeadlessError, PgStore, identity, secret};
+use serde_json::Value;
 
 /// Options of `--search-items`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,9 +102,9 @@ pub fn headless_refusal(err: HeadlessError) -> anyhow::Error {
 /// The line above a headless connect's store error: only an unreachable server is "cannot
 /// reach"; a newer or drifted schema, a partial version or a malformed target was reached and
 /// refused this build (MOD-40 plan D8).
-fn store_context(err: &htui_core::store::StoreError) -> &'static str {
+fn store_context(err: &StoreError) -> &'static str {
     match err {
-        htui_core::store::StoreError::Unreachable(_) => "cannot reach Postgres",
+        StoreError::Unreachable(_) => "cannot reach Postgres",
         _ => "Postgres refused this htui",
     }
 }
@@ -133,10 +142,7 @@ async fn scopes(pg: &PgStore, project: Option<&str>) -> anyhow::Result<Vec<Scope
 /// Missing settings, an unreachable Postgres or Qdrant, a model that cannot load.
 pub async fn index_items(project: Option<&str>) -> anyhow::Result<()> {
     let (pg, store) = open().await?;
-    let mut report = htui_store::vector_sync::SyncReport::default();
-    for scope in scopes(&pg, project).await? {
-        report += Indexer::sync(&pg, &scope, &store).await?;
-    }
+    let report = sync_all(&pg, &scopes(&pg, project).await?, &store).await?;
     eprintln!(
         "indexed: {} item(s) rebuilt, {} unchanged; {} requirement(s) rebuilt, {} unchanged; \
          {} point(s) written, {} removed",
@@ -148,6 +154,102 @@ pub async fn index_items(project: Option<&str>) -> anyhow::Result<()> {
         report.points_deleted
     );
     Ok(())
+}
+
+/// The `app_setting` key of the worker's index interval (MOD-41 plan D19): a positive JSON
+/// integer of minutes.
+pub const SYNC_MINUTES_KEY: &str = "concepts_sync_minutes";
+
+/// The interval, in minutes, when [`SYNC_MINUTES_KEY`] is absent, non-positive or not an integer.
+pub const DEFAULT_SYNC_MINUTES: u64 = 15;
+
+/// `index_items`' loop over given scopes (MOD-41 plan D19, fact-check F-C4): every scope in
+/// order, the reports summed. Taking the scopes rather than a `PgStore` lets the worker job's
+/// tests run over `MemStore`.
+///
+/// # Errors
+///
+/// The first scope's store or index error; later scopes are not synced.
+pub async fn sync_all(
+    read: &impl ReadStore,
+    scopes: &[Scope],
+    vectors: &impl VectorStore,
+) -> Result<SyncReport, StoreError> {
+    let mut report = SyncReport::default();
+    for scope in scopes {
+        report += Indexer::sync(read, scope, vectors).await?;
+    }
+    Ok(report)
+}
+
+/// The worker's sleep between two syncs, from [`SYNC_MINUTES_KEY`] in `app`, re-read each cycle
+/// (the rule of `htui-orch`'s lease times): absent, `null`, a string, a bool, a fraction, zero
+/// and a negative all mean [`DEFAULT_SYNC_MINUTES`].
+#[must_use]
+pub fn sync_interval(app: &BTreeMap<String, Value>) -> Duration {
+    let _ = app;
+    Duration::from_secs(DEFAULT_SYNC_MINUTES * 60)
+}
+
+/// What the worker's index job reads besides [`ReadStore`]: both are inherent on the stores, not
+/// on a trait (MOD-41 plan D19).
+#[allow(async_fn_in_trait, reason = "no dyn IndexSource is formed")]
+pub trait IndexSource: ReadStore {
+    /// Every workspace's projects as scopes, a workspace without projects left out.
+    async fn index_scopes(&self) -> anyhow::Result<Vec<Scope>>;
+    /// The `app_setting` map, [`sync_interval`]'s input.
+    async fn index_settings(&self) -> Result<BTreeMap<String, Value>, StoreError>;
+}
+
+impl IndexSource for PgStore {
+    async fn index_scopes(&self) -> anyhow::Result<Vec<Scope>> {
+        scopes(self, None).await
+    }
+
+    async fn index_settings(&self) -> Result<BTreeMap<String, Value>, StoreError> {
+        self.app_settings().await
+    }
+}
+
+impl IndexSource for MemStore {
+    async fn index_scopes(&self) -> anyhow::Result<Vec<Scope>> {
+        Ok(self
+            .workspaces()
+            .await?
+            .iter()
+            .map(Scope::from_workspace)
+            .filter(|scope| !scope.project_ids.is_empty())
+            .collect())
+    }
+
+    async fn index_settings(&self) -> Result<BTreeMap<String, Value>, StoreError> {
+        self.app_settings().await
+    }
+}
+
+/// One cycle of the worker's index job: the scopes, [`sync_all`] over them, then the settings;
+/// answers how long to sleep before the next. A failure is a `warn` and never an `Err`: the next
+/// cycle is the retry (MOD-41 plan D19).
+pub async fn index_cycle(source: &impl IndexSource, vectors: &impl VectorStore) -> Duration {
+    let _ = (source, vectors);
+    sync_interval(&BTreeMap::new())
+}
+
+/// The worker's index job: [`index_cycle`] at start, then again after each interval, forever. It
+/// never touches the run runtime, and the worker aborts it on shutdown (MOD-41 plan D19).
+pub async fn index_loop(source: &impl IndexSource, vectors: &impl VectorStore) -> ! {
+    loop {
+        let pause = index_cycle(source, vectors).await;
+        tokio::time::sleep(pause).await;
+    }
+}
+
+/// The worker's index job over `pg`, when the keyring holds a Qdrant URL: read once, here, at
+/// `htui worker` start (MOD-41 PRD D6, plan D19). `None`, with an `info` line saying why, when it
+/// holds none or cannot be read, which on a keyring-less host is always.
+pub async fn spawn_index_job(pg: PgStore) -> Option<tokio::task::JoinHandle<()>> {
+    let _ = pg;
+    None
 }
 
 /// `--search-items`: prints the best hits, one per line.
@@ -317,5 +419,220 @@ mod tests {
                 Resolution::Rejected
             ]
         );
+    }
+
+    /// The worker's index job (MOD-41 plan D19, blueprint §16) over `MemStore` and
+    /// `MemVectorStore`, under paused time.
+    mod index_job {
+        use super::super::*;
+        use htui_core::fixtures::ids;
+        use htui_store::vector::{ConceptPoint, IndexedPoint, MemVectorStore};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use uuid::Uuid;
+
+        const MINUTE: Duration = Duration::from_secs(60);
+
+        /// `MemVectorStore`, counting the syncs that reach it (one `indexed` read of the htui
+        /// project per sync) and failing the first `fail` upserts.
+        #[derive(Debug, Default)]
+        struct Counting {
+            inner: MemVectorStore,
+            syncs: AtomicUsize,
+            fail: AtomicUsize,
+        }
+
+        impl Counting {
+            fn failing_once() -> Self {
+                Self {
+                    fail: AtomicUsize::new(1),
+                    ..Self::default()
+                }
+            }
+
+            fn syncs(&self) -> usize {
+                self.syncs.load(Ordering::SeqCst)
+            }
+        }
+
+        impl VectorStore for Counting {
+            async fn upsert(&self, points: Vec<ConceptPoint>) -> Result<(), StoreError> {
+                let failing = self
+                    .fail
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok();
+                if failing {
+                    return Err(StoreError::Backend(
+                        "qdrant: upsert: planted failure".into(),
+                    ));
+                }
+                self.inner.upsert(points).await
+            }
+
+            async fn delete(&self, ids: Vec<Uuid>) -> Result<(), StoreError> {
+                self.inner.delete(ids).await
+            }
+
+            async fn indexed(&self, project: ProjectId) -> Result<Vec<IndexedPoint>, StoreError> {
+                if project == ids::PROJECT_HTUI {
+                    self.syncs.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.indexed(project).await
+            }
+
+            async fn search(&self, query: &SearchQuery) -> Result<Vec<Hit>, StoreError> {
+                self.inner.search(query).await
+            }
+        }
+
+        /// Runs `checks` beside `index_loop(read, vectors)`; the loop never ends on its own, so
+        /// `checks` ending first is also the proof it was still alive.
+        async fn beside_the_loop(
+            read: &MemStore,
+            vectors: &Counting,
+            checks: impl Future<Output = ()>,
+        ) {
+            tokio::select! {
+                biased;
+                () = checks => {}
+                never = index_loop(read, vectors) => match never {},
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_index_job_syncs_at_start_and_every_interval() {
+            let read = MemStore::demo();
+            let vectors = Counting::default();
+            beside_the_loop(&read, &vectors, async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert_eq!(vectors.syncs(), 1, "one sync at start");
+                assert!(
+                    !vectors.inner.points().is_empty(),
+                    "the start sync indexed the demo items"
+                );
+                tokio::time::sleep(15 * MINUTE - Duration::from_secs(2)).await;
+                assert_eq!(vectors.syncs(), 1, "nothing before the default 15 minutes");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                assert_eq!(vectors.syncs(), 2, "the second sync after 15 minutes");
+                tokio::time::sleep(15 * MINUTE).await;
+                assert_eq!(vectors.syncs(), 3, "the third after 30");
+            })
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_failing_sync_is_logged_and_retried_next_cycle() {
+            let read = MemStore::demo();
+            let vectors = Counting::failing_once();
+            beside_the_loop(&read, &vectors, async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert_eq!(vectors.syncs(), 1, "the start sync ran");
+                assert!(
+                    vectors.inner.points().is_empty(),
+                    "and failed at its first upsert"
+                );
+                tokio::time::sleep(15 * MINUTE).await;
+                assert_eq!(vectors.syncs(), 2, "the loop outlived the failure");
+                assert!(
+                    !vectors.inner.points().is_empty(),
+                    "the next cycle indexed the demo items"
+                );
+            })
+            .await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_interval_reads_concepts_sync_minutes_with_a_15_minute_default() {
+            let default = DEFAULT_SYNC_MINUTES * MINUTE.as_secs();
+            assert_eq!(default, 15 * 60);
+            let with = |value: Value| BTreeMap::from([(SYNC_MINUTES_KEY.to_owned(), value)]);
+            assert_eq!(sync_interval(&BTreeMap::new()).as_secs(), default, "absent");
+            for value in [
+                json!(0),
+                json!(-3),
+                json!("5"),
+                json!(2.5),
+                json!(null),
+                json!(true),
+            ] {
+                assert_eq!(
+                    sync_interval(&with(value.clone())).as_secs(),
+                    default,
+                    "{value}"
+                );
+            }
+            assert_eq!(sync_interval(&with(json!(5))), 5 * MINUTE);
+            assert_eq!(
+                sync_interval(&with(json!(u64::MAX))),
+                Duration::from_secs(u64::MAX),
+                "a huge value saturates rather than overflowing"
+            );
+
+            let read = MemStore::demo();
+            let vectors = Counting::default();
+            beside_the_loop(&read, &vectors, async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert_eq!(vectors.syncs(), 1);
+                read.set_app_setting(SYNC_MINUTES_KEY, json!(1));
+                tokio::time::sleep(15 * MINUTE).await;
+                assert_eq!(
+                    vectors.syncs(),
+                    2,
+                    "the sleep in progress keeps its 15 minutes"
+                );
+                tokio::time::sleep(MINUTE).await;
+                assert_eq!(vectors.syncs(), 3, "the next sleep is the new minute");
+            })
+            .await;
+        }
+
+        /// A pool that has never connected: `spawn_index_job` must not query it when there is
+        /// no job to start.
+        fn unreachable_store() -> PgStore {
+            let identity = identity::Identity {
+                box_id: htui_core::model::BoxId::new(),
+                hostname: "HTUI-TEST".to_owned(),
+            };
+            PgStore::lazy(
+                "postgres://nobody:nothing@127.0.0.1:1/none",
+                &identity,
+                Duration::from_millis(250),
+            )
+            .expect("a lazy pool opens no socket")
+        }
+
+        #[tokio::test]
+        async fn no_qdrant_url_means_no_job() {
+            let _keyring = htui_store::testkit::mock_keyring().await;
+            assert!(
+                spawn_index_job(unreachable_store()).await.is_none(),
+                "an empty keyring starts no job"
+            );
+            secret::set_qdrant_api_key("a-key").expect("the fake keyring stores");
+            assert!(
+                spawn_index_job(unreachable_store()).await.is_none(),
+                "an API key without a URL starts no job"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unreadable_keyring_means_no_job() {
+            let _keyring = htui_store::testkit::mock_keyring_broken().await;
+            assert!(spawn_index_job(unreachable_store()).await.is_none());
+        }
+
+        #[tokio::test]
+        async fn a_stored_qdrant_url_starts_the_job() {
+            let _keyring = htui_store::testkit::mock_keyring().await;
+            // Nothing listens on port 1: the job starts, then warns every cycle, which is its
+            // contract (plan D19); the case aborts it at once, before the model loads.
+            secret::set_qdrant_url("http://127.0.0.1:1").expect("the fake keyring stores");
+            let job = spawn_index_job(unreachable_store())
+                .await
+                .expect("a stored URL starts the job");
+            assert!(!job.is_finished(), "the job runs until it is aborted");
+            job.abort();
+            assert!(job.await.expect_err("aborted").is_cancelled());
+        }
     }
 }
