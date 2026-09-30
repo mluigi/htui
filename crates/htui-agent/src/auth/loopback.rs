@@ -33,7 +33,11 @@
 //! - **Never echoed.** The pane's field is masked, is emptied on submit, on cancel and when the
 //!   flow ends, and nothing it draws afterwards names more than `127.0.0.1:<port>`.
 //! - **Sent to one place.** The loopback port the running flow advertised, over a plain socket no
-//!   proxy setting can reroute, following no redirect.
+//!   proxy setting can reroute, following no redirect. One caveat, a browser's own (review L-1):
+//!   for a `localhost` redirect `127.0.0.1` is tried before `[::1]`, so when the adapter bound
+//!   only `[::1]:<port>`, another local user who holds `127.0.0.1:<port>` receives the code.
+//!   PKCE bounds what that user can do with it: the code is worthless without the verifier the
+//!   adapter never sent.
 //!
 //! Outside the rule, and stated rather than hidden: `url::Url`'s parse buffer and the kernel's
 //! socket buffers are not wiped, a paste longer than [`PASTE_MAX`] may leave a reallocated prefix in
@@ -163,6 +167,11 @@ impl Advertised {
 
     /// D290: where to connect, from this host and never from a paste. `localhost` is
     /// `127.0.0.1` then `[::1]`; no name is ever resolved.
+    ///
+    /// The order is a browser's, and so is its one exposure (review L-1): a local user who binds
+    /// `127.0.0.1:<port>` while the adapter listens only on `[::1]:<port>` is connected to first
+    /// and receives the code. PKCE bounds it — the code cannot be redeemed without the adapter's
+    /// verifier — and the browser the redirect was meant for would have sent it to the same place.
     fn socket_addrs(&self) -> Vec<SocketAddr> {
         if self.host.eq_ignore_ascii_case("localhost") {
             return vec![
