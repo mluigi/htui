@@ -526,7 +526,8 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     ///   `run_step.usage` document from its own running total on every usage write, so a
     ///   continuation that started from zero would erase the step's pre-promotion spend.
     ///
-    /// Never call [`Recorder::record_prompt`] on it: that is what would rewrite the digest.
+    /// Never call [`Recorder::record_prompt`] or [`Recorder::record_prompt_digesting`] on it: either
+    /// is what would rewrite the digest.
     pub fn continuing(
         store: &'a S,
         scrubber: &'a dyn Scrubber,
@@ -704,10 +705,12 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
 
     /// Records the assembled initial prompt: `seq = 0`, `turn = 0`, role `htui` (ANA-9 §4.3).
     ///
-    /// The digest is `sha256` over the **scrubbed** text (ANA-5 §4.7's "scrub before digest")
-    /// **when the text sent is also the text digested** — a chat's user text, a judge's or a
-    /// handoff's prompt. An assembled phase prompt goes through
-    /// [`Recorder::record_prompt_digesting`]. Two prompts that differ only in a masked secret
+    /// The digest is `sha256` over the **scrubbed** text (ANA-5 §4.7's "scrub before digest"):
+    /// this is [`Recorder::record_prompt_digesting`] with the sent text as the digest text too
+    /// (MOD-33 D271), for a prompt whose sent and digested texts are one string — a chat's user
+    /// text. Every assembled prompt, a judge's included (`judge_sessions` → `open_recorder`), goes
+    /// through [`Recorder::record_prompt_digesting`] with the two strings ANA-5 supplies, which for
+    /// a judge or a handoff are equal. Two prompts that differ only in a masked secret
     /// share a digest, and it is written straight through to `run_step.prompt_digest` as well as
     /// into the payload.
     ///

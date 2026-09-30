@@ -546,9 +546,12 @@ pub trait WriteStore: ReadStore {
     /// (`docs/ANA-5.md` §4.4): the pre-flight audit of `R-PRM-3` / `R-ORCH-11`, written at stage 3
     /// before a session starts.
     ///
-    /// The same digest `htui_agent`'s `Recorder::record_prompt` will later recompute over the same
-    /// text and hand to [`set_step_usage`](WriteStore::set_step_usage), so the column's two
-    /// writers agree by construction rather than by ordering.
+    /// The same digest `htui_agent`'s `Recorder::record_prompt_digesting` will later recompute
+    /// over the digest text ANA-5 supplies (MOD-33 D271) and hand to
+    /// [`set_step_usage`](WriteStore::set_step_usage), so the column's two writers agree by
+    /// construction rather than by ordering. The digest text is the sent text with each undigested
+    /// span's value replaced by its stand-in; where there is none, as for a chat, it is the same
+    /// text.
     ///
     /// Not folded into `set_step_usage`: that one is the **chat** path's digest writer (plan D97),
     /// whose prompt has no template, no sections and no trim record to write.

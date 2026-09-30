@@ -4574,8 +4574,10 @@ where
     /// The judge's two sessions under one recorder (plan D52), and the document each wrote.
     ///
     /// The judge runs in no tree: `prepare(…, &[], Local, None)` gives a scratch `cwd` and no row
-    /// (D51). The forward text is `record_prompt` at seq 0 — `prompt_digest` and `set_step_prompt`
-    /// are the forward prompt's — and the reversed text is a `follow_up` opening turn 1. The
+    /// (D51). The forward text is `record_prompt_digesting` at seq 0, through `open_recorder` —
+    /// `prompt_digest` and `set_step_prompt` are the forward prompt's, and a judge places no
+    /// `{{box}}`, so its sent and digest texts are one string (MOD-33 D271) — and the reversed
+    /// text is a `follow_up` opening turn 1. The
     /// recorder is finished on every path; a cap breach over the two is `judge_session_failed`.
     async fn judge_sessions(
         &self,

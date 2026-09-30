@@ -208,7 +208,8 @@ struct SpyStore {
     /// `RunStepSummary` carries the two derived figures and neither the digest nor the record, so
     /// the only way to assert *which digest* a caller wrote is to watch the call. MOD-2 milestone
     /// 9's `record_prompt` case is what reads it — the assembler and the recorder compute the same
-    /// `Sha256` over the same text, and that is the claim.
+    /// `Sha256` over the digest text ANA-5 supplies (MOD-33 D271), which for a prompt with nothing
+    /// undigested is the sent text itself, and that is the claim.
     prompt_calls: Mutex<Vec<(StepId, String)>>,
     /// Every `append_events` call that reached the inner store, as `(fence, seqs)`, in order.
     appends: Mutex<Vec<(StepFence, Vec<i32>)>>,
