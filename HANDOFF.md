@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-30):** **MOD-33 done** (`docs/decisions/mod/mod-33.md`): the box
+**Current status (2026-09-30):** **ANA-26 concluded** (`docs/ANA-26.md`,
+`docs/decisions/ana/ana-26.md`): every key outside text entry becomes a named action in one
+compiled-in catalogue; a user overrides only what they change in a local `<config_root>/keys.toml`
+(never the store), an invalid file refuses to start with `path:line` errors, `ctrl-c` always quits
+(MOD-57's terminal pane excepted), and every hint and the `?` box are generated. New requirement
+`R-TUI-10`; `R-TUI-1` and `R-STO-1` amended. Implemented by **MOD-67**.
+Before it, **MOD-33 was done** (`docs/decisions/mod/mod-33.md`): the box
 hostname is rendered but not digested. `prompt_digest` is `sha256` of a digest text in which the box
 section's hostname value is the stand-in `[hostname]`; the model still sees the real value, the
 recorder hashes the digest text (`record_prompt_digesting`), and `trim_record` `v 4` lists
@@ -25,27 +31,6 @@ Before it, **MOD-65 was done** (`docs/decisions/mod/mod-65.md`): every
 thread and task `htui-agent` starts (12 blocking threads, 9 async tasks) now opens the panic-hook
 contain window through `htui_agent::contained`, so a panic tokio survives no longer gives the
 terminal back under the running UI; a crate-local `clippy.toml` lints every raw spawn.
-Before it, **MOD-23 was done** (`docs/decisions/mod/mod-23.md`): Settings > Agents
-edits the registry. `n` creates a row, `e` edits one (transport, command and shell-word args, models,
-default model, billing, enabled; `name` is create-only; a launch edit merges and never touches `env`),
-and `t` switches an agent off on this box. The switch is the new `agent_box.user_off` (migration
-`0009`), which no probe can undo and which refuses chat start, step promotion and an already-admitted pending step too (that last fails its
-run). Writes are
-MOD-40's compare-and-set, answered by one self-naming `AgentWritten` reply. Follow-up **MOD-66**
-(per-box manual tool path).
-Before it, **CLEAN-7 was done** (`docs/decisions/clean/clean-7.md`): the
-offline chat buffer's leftovers are gone — the rebuild confirmation no longer promises a `pending/`
-buffer survives, `writer_label` left `ChatAccepted`, `RefreshSettings::this_user` and the chat
-helpers' unused `_writer` went, every chat latches a plain `QuotaLatch`, and the upload/buffered
-test wording was renamed. No behaviour change beyond that one line of copy.
-Before it, **MOD-9 was done** (`docs/decisions/mod/mod-9.md`): templates and
-skills are edited, versioned and diffed in the Skills tab, skills are attached at global, project
-or phase level with `always`, `glob` or `off`, SKILL.md files import, and phase steps, judges and
-the preview carry the winners. Its fifth and last milestone makes a `glob` attachment fire over the
-step's file set (the excerpt walk's listing narrowed to `touched_paths`, plus the previous
-attempt's changed paths, which now feed excerpt tier 2 too), recorded as `matched <repo:path>` or
-`no_match` in `trim_record` `v 3` (migration `0008`, comment only). MOD-55, MOD-57 and MOD-59
-carry on from it.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -161,28 +146,6 @@ can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
   automatically. The fit is deterministic arithmetic over rows, so it is allowed under `R-ID-6`.
   Judge choice itself is out of scope: ANA-21 §2.2 established the judge is never asked of the
   selector, and MOD-36 owns the judge-identity hardening.
-- [ ] **ANA-26 - Configurable hotkeys** (maintainer-requested 2026-09-29, during MOD-52;
-  `docs/decisions/mod/mod-52.md`). `R-TUI-1`. The maintainer wants htui's hotkeys configurable.
-  Today only a thin table is data: `Keymap::default_global` (`crates/htui/src/keymap.rs`) holds the
-  global and overlay-wildcard bindings (`q`, `ctrl-c`, `Tab`, `1`..`9`, `?`, `Esc`, plus `w` from
-  `register_all`), and `KeyChord::parse` already reads spec strings such as `"ctrl-c"`. Every tab,
-  section and overlay key is a hard-coded `KeyCode` match in its own `on_key` (about 23 files under
-  `crates/htui/src/ui`), and the hint lines spell the keys as string constants (`HINT_*`, about 36),
-  so rebinding the table alone would leave those keys fixed and the hints wrong. Analyze and decide:
-  1. Scope: the global and overlay table only, or every tab and section key. The latter means
-     routing each `on_key` through named actions, and the shared letters (`e`, `c`, `r`, `j`/`k`
-     across the Settings sections) need one action name or several.
-  2. Where the bindings live and who owns them: a local file under the user's config dir, the
-     store's settings, or both with an override order. Per user, per box or per workspace, and how
-     R-TUI-1 and `docs/REQUIREMENTS.md` should say so (a requirement change needs the maintainer).
-  3. Validation at load: duplicate chords in one scope, a printable key bound where a text field
-     captures it, and whether `ctrl-c` quit may be unbound or is fixed (MOD-52 relies on every
-     capturing section passing `CONTROL` chords on).
-  4. How hints and the `?` help follow a rebinding, since both are generated from the table only
-     for the global scope today.
-  5. Prior art in other ratatui/crossterm TUIs (gitui, helix, yazi, lazygit's keybinding config).
-  Deliver a verdict and the `MOD-N` that implements it.
-
 ### Next features
 - [ ] **MOD-37 - Orchestrator hardening follow-ups** (from MOD-4). `R-ORCH-3`, `R-ORCH-5`,
   `R-ORCH-8`, `R-ORCH-9`, `R-TUI-4`, `R-HIS-1`, `R-NF-3`. MOD-4 closed with these risks carried and
@@ -639,6 +602,25 @@ can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
   preferred. The three crates are not in `Cargo.lock`, so the plan owns that dependency decision.
   Not blocked. Its in-app widget draws through `ui::cells` (MOD-54, done:
   `docs/decisions/mod/mod-54.md`); the rest of the display-width work is MOD-60.
+  **Keys (ANA-26, `R-TUI-10`):** the reserved leave chord is an action in MOD-67's catalogue, never a
+  hard-coded key, and this pane is the one place `ctrl-c` is forwarded instead of quitting; the
+  leave action must stay bound (`docs/ANA-26.md` §6.4).
+
+- [ ] **MOD-67 - Configurable hotkeys: named actions, `keys.toml`, generated hints** (from ANA-26,
+  `docs/ANA-26.md`, `docs/decisions/ana/ana-26.md`). `R-TUI-10`, `R-TUI-1`, `R-STO-1`, `R-NF-1`.
+  Every key outside text entry becomes a named action in one compiled-in catalogue (about 100
+  actions, named once per meaning: shared `list`/`pane`/`confirm`/`form`/`common` contexts, a
+  narrower context overriding one for a single view), dispatched through composed context stacks
+  whose resolver returns ordered candidates so a view can decline and fall through. A user
+  overrides only what they change in `<config_root>/keys.toml` (per OS user and machine, never the
+  store); an invalid file refuses to start with every error as `path:line`, exit status 2, kept out
+  of error capture; `--keys`, `--default-keys`, `--print-keys`. `ctrl-c` is checked first and
+  always quits (MOD-57's pane excepted). Every hint, key-naming message and the `?` box is
+  generated; `?`/`f1` open help from every screen. Fixes two routing defects found by ANA-26:
+  `ctrl-c` opens the clear confirm in Settings > Connection and Qdrant browse, and the Qdrant editor
+  passes `Tab` to the tab bar. Six milestones (ANA-26 §8): M1 catalogue and resolver, M2 the file,
+  M3 Settings and overlays, M4 Skills and Requirements, M5 Backlog and Chat, M6 close-out; M3-M5
+  are independent but share snapshots. Not blocked.
 
 ### Deferred backlog
 
@@ -667,7 +649,7 @@ can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 4 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-26 configurable hotkeys) |
-| MOD-N   | 31 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
+| MOD-N   | 32 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                              |
 | TOOL-N  | 0 |

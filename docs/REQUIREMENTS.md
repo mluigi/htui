@@ -21,7 +21,10 @@ amended 2026-09-26 by maintainer decision on ANA-16 (`docs/ANA-16.md` §6.1 C5,
 `docs/decisions/ana/ana-16.md`) during MOD-40 — R-STO-5 amended in place (a headless process never
 migrates; it refuses and reports);
 amended 2026-09-29 by maintainer decision on MOD-50 (`docs/decisions/mod/mod-50.md`) — R-STO-8
-amended in place (requirement rows indexed; the decisions filter keyed on resolution).
+amended in place (requirement rows indexed; the decisions filter keyed on resolution);
+amended 2026-09-30 by maintainer decision on ANA-26 (`docs/ANA-26.md` §9,
+`docs/decisions/ana/ana-26.md`) — R-TUI-10 added (configurable keys); R-TUI-1 and R-STO-1
+amended in place.
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -140,7 +143,9 @@ conflict. Their verdicts survive only where restated here.
 - **R-STO-1 (must).** Postgres is the only writable store. Connection
   string and provider identities live in the OS keyring (Windows Credential Manager, macOS Keychain,
   Linux secret service), never in a file — including when the connection string is typed into the
-  TUI rather than passed to `htui --set-dsn`.
+  TUI rather than passed to `htui --set-dsn`. Local files under the user's config directory that
+  hold no secret and no domain data (the box identity, the read-only cache, the key bindings of
+  R-TUI-10) are not a store.
 - **R-STO-2 (must).** TLS to Postgres is supported and optional.
 - **R-STO-3 (must).** Each box keeps a read-only cache of the projects it has opened under the
   user's config directory, refreshed on every successful connection. Contents: items, links,
@@ -309,7 +314,7 @@ conflict. Their verdicts survive only where restated here.
 
 ## 11. TUI (R-TUI)
 
-- **R-TUI-1 (must).** Keyboard driven, mouse optional. Top bar: workspace or project, box, store
+- **R-TUI-1 (must).** Keyboard driven, mouse optional; keys are configurable (R-TUI-10). Top bar: workspace or project, box, store
   state — distinguishing online, connecting, and offline since T
   — active run count. Tabs: Backlog, Chat (one per session), Skills, Requirements, Settings. Workspace switcher
   overlay. Queue overlay for auto mode with reorder and pause.
@@ -334,6 +339,18 @@ conflict. Their verdicts survive only where restated here.
   (R-STO-1); it is not echoed, not logged, and not written to any file.
 - **R-TUI-9 (must).** Close-out writes the final summary document, sets status, records commit
   hashes from the run. No markdown files are produced.
+- **R-TUI-10 (must).** Every key outside text entry is bound to a named action. The default
+  bindings ship in `htui`. A user overrides them in a local file, `keys.toml` under the user's
+  config directory, per OS user and per machine; the file lists only the actions it changes, may
+  unbind one, and is never read from or written to the store, so the keys in force are the same
+  offline. Printable characters, editing keys inside a text field, a field's Enter and Esc,
+  numbered choices, and a choice field's value keys are fixed. `htui` refuses to start on an
+  invalid file and names its path and line for every error, including a chord bound twice on one
+  screen and a printable chord bound where a text field is typing; `htui --default-keys` starts
+  with the defaults instead. `ctrl-c` always quits, from every htui screen and field, and cannot
+  be unbound or bound to anything else; a pane that runs another program in a terminal forwards
+  it to that program and always keeps a key that leaves the pane. Every hint line and the `?`
+  help show the keys in force, and the help opens from every screen.
 
 ## 12. Later tier (R-LATER)
 
