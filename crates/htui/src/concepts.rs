@@ -12,7 +12,7 @@
 use anyhow::{Context as _, bail};
 use htui_core::model::{ProjectId, RequirementState, Resolution, Scope};
 use htui_store::embed::FastEmbedder;
-use htui_store::pg::CONNECT_TIMEOUT;
+use htui_store::pg::{CONNECT_TIMEOUT, PoolSize};
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::vector::{Hit, PointType, QdrantStore, SearchQuery, VectorStore as _};
 use htui_store::vector_sync::Indexer;
@@ -65,23 +65,29 @@ async fn open() -> anyhow::Result<(PgStore, QdrantStore<FastEmbedder>)> {
         bail!("no Postgres DSN is stored; run `htui --set-dsn` first");
     };
     let identity = identity::load_or_mint(&identity::config_root()?)?;
-    let pg = match PgStore::connect_headless(&dsn, &identity, CONNECT_TIMEOUT).await {
-        Ok(pg) => pg,
-        // The bail text is today's, kept byte for byte (plan D8).
-        Err(HeadlessError::MigrationsPending(n)) => {
-            bail!("{n} schema migration(s) are pending; start `htui` once to apply them")
-        }
-        Err(HeadlessError::Store(err)) => {
-            let context = store_context(&err);
-            return Err(anyhow::Error::new(err).context(context));
-        }
-        Err(below @ HeadlessError::BelowTarget { .. }) => return Err(below.into()),
-    };
+    let pg = PgStore::connect_headless(&dsn, &identity, CONNECT_TIMEOUT, PoolSize::TUI)
+        .await
+        .map_err(headless_refusal)?;
     let embedder = FastEmbedder::new()?;
     let store = QdrantStore::connect(&settings, embedder)
         .await
         .context("cannot reach Qdrant")?;
     Ok((pg, store))
+}
+
+/// A headless connect's refusal as the line a user reads (MOD-40 plan D8's sentences, byte for
+/// byte). `--index-items` exits 1 with it, `htui worker` exits 2 (MOD-41 plan D14).
+pub fn headless_refusal(err: HeadlessError) -> anyhow::Error {
+    match err {
+        HeadlessError::MigrationsPending(n) => {
+            anyhow::anyhow!("{n} schema migration(s) are pending; start `htui` once to apply them")
+        }
+        HeadlessError::Store(err) => {
+            let context = store_context(&err);
+            anyhow::Error::new(err).context(context)
+        }
+        below @ HeadlessError::BelowTarget { .. } => below.into(),
+    }
 }
 
 /// The line above a headless connect's store error: only an unreachable server is "cannot
