@@ -1555,10 +1555,31 @@ async fn on_run_served(
 /// backend has one and after every `Online` swap.
 pub fn spawn_with_runtimes(
     started: Started,
+    rx: mpsc::UnboundedReceiver<RequestEnvelope>,
+    tx: mpsc::UnboundedSender<ReplyEnvelope>,
+    runtime: AgentRuntime,
+    runs: RunRuntime,
+) -> tokio::task::JoinHandle<()> {
+    // MOD-64 D231: the production concepts runtime, so no public signature moves.
+    spawn_with_concepts(
+        started,
+        rx,
+        tx,
+        runtime,
+        runs,
+        ConceptsRuntime::production(),
+    )
+}
+
+/// [`spawn_with_runtimes`] over a chosen [`ConceptsRuntime`] too: crate-private, for a test that
+/// needs the loop over a fake index (MOD-64 review 5).
+pub(crate) fn spawn_with_concepts(
+    started: Started,
     mut rx: mpsc::UnboundedReceiver<RequestEnvelope>,
     tx: mpsc::UnboundedSender<ReplyEnvelope>,
     mut runtime: AgentRuntime,
     mut runs: RunRuntime,
+    mut concepts: ConceptsRuntime,
 ) -> tokio::task::JoinHandle<()> {
     let Started {
         mut backend,
@@ -1604,8 +1625,6 @@ pub fn spawn_with_runtimes(
         // D181, D190: the run runtime's events and its sweep ticker are loop locals, like the two
         // above, so a handler may borrow `runs` (H-4).
         let mut run_events = runs.take_events();
-        // MOD-64 D231: the concepts runtime, built here so no caller's signature moves.
-        let mut concepts = ConceptsRuntime::production();
         let mut sweep_every = runs.sweep_every();
         let mut sweeper = sweep_ticker(sweep_every);
         if backend.writer().is_some() {
@@ -2301,16 +2320,29 @@ mod tests {
         Scope::from_workspace(platform)
     }
 
-    /// MOD-64 D231, D232: the loop hands a search to the concepts runtime and answers the next
-    /// request meanwhile; the search's error comes back in its own reply, never `Failed`. The
-    /// production index reads the (fake, empty) keyring first, so no model loads and no network is
-    /// touched. The keyring fake is one process-wide slot: run under `--test-threads=1`.
-    #[tokio::test]
+    /// MOD-64 D231, D232 (review 5): the loop hands a search to the concepts runtime and answers
+    /// the next request while the search is still running; the search's error comes back in its
+    /// own reply, never `Failed`. The fake index waits a (paused-clock) second first: had the loop
+    /// served it inline, that second would pass before `BoxInfo` was read, and the search would
+    /// answer first.
+    #[tokio::test(start_paused = true)]
     async fn the_loop_serves_a_search_off_the_loop_and_never_as_failed() {
-        let _keyring = htui_store::testkit::mock_keyring().await;
         let backend = demo();
         let scope = platform_scope(&backend).await;
-        let (tx, mut rx, _worker) = detached(backend);
+        let message = "qdrant: query: refused";
+        let index = concepts_worker::MemIndex::new()
+            .delayed(std::time::Duration::from_secs(1))
+            .failing(message);
+        let (tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rx) = mpsc::unbounded_channel();
+        let _worker = spawn_with_concepts(
+            Started::detached(backend),
+            req_rx,
+            rep_tx,
+            AgentRuntime::production(),
+            RunRuntime::production(),
+            ConceptsRuntime::new(Arc::new(index)),
+        );
         let query = crate::concepts::query("anything", scope.project_ids, false, 10);
         for (seq, request) in [
             (1, StoreRequest::SearchConcepts(query.clone())),
@@ -2324,20 +2356,19 @@ mod tests {
             .expect("the worker is alive");
         }
 
-        let mut replies = Vec::new();
-        for _ in 0..2 {
-            replies.push(rx.recv().await.expect("the worker answers"));
-        }
-        replies.sort_by_key(|reply| reply.seq);
+        let first = rx.recv().await.expect("the worker answers");
+        assert_eq!(first.seq, 2, "BoxInfo is answered while the search runs");
         assert!(
-            matches!(replies[1].reply, StoreReply::BoxInfo(_)),
+            matches!(first.reply, StoreReply::BoxInfo(_)),
             "{:?}",
-            replies[1].reply
+            first.reply
         );
-        let StoreReply::Concepts(concepts) = &replies[0].reply else {
+        let second = rx.recv().await.expect("the search answers");
+        assert_eq!(second.seq, 1);
+        let StoreReply::Concepts(concepts) = &second.reply else {
             panic!(
                 "the search is answered in its own variant: {:?}",
-                replies[0].reply
+                second.reply
             )
         };
         let ConceptsReply::Hits {
@@ -2345,10 +2376,10 @@ mod tests {
             outcome: Err(error),
         } = concepts.as_ref()
         else {
-            panic!("a search with no stored URL fails: {concepts:?}")
+            panic!("the failing index's search fails: {concepts:?}")
         };
         assert_eq!(echoed, &query);
-        assert!(error.contains("Settings > Qdrant"), "{error}");
+        assert_eq!(error, message);
     }
 
     #[tokio::test]
