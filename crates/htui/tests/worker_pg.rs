@@ -55,6 +55,17 @@ const CONFIG: WorkerConfig = WorkerConfig {
     grace: Duration::ZERO,
 };
 
+/// Case 1's: [`CONFIG`] with the production box beat, so its start beat can land within
+/// [`PATIENCE`] only if the first tick is at start (blueprint B-11), not one period out.
+const START_BEAT: WorkerConfig = WorkerConfig {
+    box_beat: htui_store::connect::BOX_HEARTBEAT,
+    ..CONFIG
+};
+const _: () = assert!(
+    START_BEAT.box_beat.as_secs() > PATIENCE.as_secs(),
+    "a first beat one period out cannot land within the patience window"
+);
+
 // ---------------------------------------------------------------------------------------------
 // The parts
 // ---------------------------------------------------------------------------------------------
@@ -293,14 +304,14 @@ impl Stack {
     }
 
     /// `htui worker`'s loop over this database, sharing the TUI's parts.
-    fn spawn_worker(&self) -> Running {
+    fn spawn_worker(&self, config: WorkerConfig) -> Running {
         let runtime: RunRuntime<PgStore, Unaddressed> =
             self.parts.runtime().with_role(Role::Worker);
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(worker::run(
             self.db.store.clone(),
             runtime,
-            CONFIG,
+            config,
             async move {
                 let _ = stopped.await;
             },
@@ -482,7 +493,7 @@ async fn a_headless_worker_drives_a_queued_run_to_rest() {
     );
     let seen = stack.last_seen(ids::BOX).await;
 
-    let worker = stack.spawn_worker();
+    let worker = stack.spawn_worker(START_BEAT);
     let deadline = Instant::now() + PATIENCE;
     while stack.last_seen(ids::BOX).await <= seen {
         assert!(
@@ -531,7 +542,7 @@ async fn a_tui_exit_does_not_interrupt_a_worker_run() {
         "the TUI wrote no lease"
     );
 
-    let worker = stack.spawn_worker();
+    let worker = stack.spawn_worker(CONFIG);
     stack.exit_tui().await;
     let row = stack.rested(run).await;
     assert_eq!(row.status, RunStatus::Done, "the worker settled the run");
@@ -625,7 +636,7 @@ async fn an_answer_handed_back_is_finished_by_the_worker() {
         "the lease was given back"
     );
 
-    let worker = stack.spawn_worker();
+    let worker = stack.spawn_worker(CONFIG);
     let row = stack.rested(run).await;
     let item: Status = stack
         .db
