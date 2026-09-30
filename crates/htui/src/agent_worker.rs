@@ -284,6 +284,14 @@ impl core::fmt::Debug for LiveInstall {
 /// side can reword without the other.
 pub const AUTH_ALREADY_CHOSEN: &str = "a method was already chosen";
 
+/// What a request into a login is told when no login is held at all (`auth_command`,
+/// `auth_cancel`).
+///
+/// Public for [`LOGIN_ENDED`]'s reason (review L-3): the settings section reads a refused
+/// `auth_deliver` carrying either as "the flow is gone", and a sentence the compiler links is not
+/// one either side can reword alone. The tests still pin the literal text.
+pub const NO_LOGIN_RUNNING: &str = "no login is running";
+
 /// What every request a finished login can no longer serve is told (MOD-22 D287): a command
 /// `auth_command` could not send, one still queued when the flow ended, and a delivery the flow's
 /// end overtook.
@@ -1674,7 +1682,7 @@ impl AgentRuntime {
         let Some(live) = self.auth.as_ref() else {
             return Served::Reply(StoreReply::Failed {
                 request,
-                message: "no login is running".to_owned(),
+                message: NO_LOGIN_RUNNING.to_owned(),
             });
         };
         if live.commands.send(command).is_err() {
@@ -1697,7 +1705,7 @@ impl AgentRuntime {
         let Some(live) = self.auth.as_ref() else {
             return Served::Reply(StoreReply::Failed {
                 request: "auth_cancel",
-                message: "no login is running".to_owned(),
+                message: NO_LOGIN_RUNNING.to_owned(),
             });
         };
         live.cancel.cancel();
