@@ -1399,7 +1399,10 @@ where
                 })
                 .await?;
             let after = self.parts.isolator.capture(row.id, &trees).await?;
-            self.parts.store.record_commits(row.id, &after).await?;
+            self.parts
+                .store
+                .record_commits(StepFence::Lease(self.parts.owner), row.id, &after)
+                .await?;
             let verify_outcome = verify.as_ref().map(|report| report.outcome);
             let verify_exit_code = verify.as_ref().and_then(|report| report.exit_code);
             self.parts
@@ -2556,6 +2559,10 @@ where
     /// reads than a cached walk would make and it is the point: there is no cursor to be stale, so
     /// a row another process moved is seen on the next pass rather than overwritten.
     ///
+    /// Call only under `walk_leased`: its step writes carry this process's lease
+    /// (`StepFence::Lease(parts.owner)`, MOD-41 plan D2), so a walk without that lease meets
+    /// [`StoreError::Fenced`] at its first prompt, tree or commit write.
+    ///
     /// # Errors
     /// Every [`EngineError`].
     pub async fn run_to_rest(&self, run: RunId) -> Result<Rest, EngineError> {
@@ -3126,7 +3133,10 @@ where
             .iter()
             .map(|tree| tree.tree.clone())
             .collect();
-        self.parts.store.upsert_step_tree(step.id, &trees).await?;
+        self.parts
+            .store
+            .upsert_step_tree(StepFence::Lease(self.parts.owner), step.id, &trees)
+            .await?;
         let before: Vec<RunStepCommit> = prepared
             .trees
             .iter()
@@ -3137,7 +3147,10 @@ where
                 after_hash: None,
             })
             .collect();
-        self.parts.store.record_commits(step.id, &before).await?;
+        self.parts
+            .store
+            .record_commits(StepFence::Lease(self.parts.owner), step.id, &before)
+            .await?;
 
         // -- stage 3: prompt ------------------------------------------------------------------
         let prompt = match self
@@ -3178,7 +3191,12 @@ where
             .map_err(htui_agent::RecordError::from)?;
         self.parts
             .store
-            .set_step_prompt(step.id, &prompt.digest, &trim)
+            .set_step_prompt(
+                StepFence::Lease(self.parts.owner),
+                step.id,
+                &prompt.digest,
+                &trim,
+            )
             .await?;
 
         // -- stage 4: session -----------------------------------------------------------------
@@ -3208,7 +3226,10 @@ where
 
         // -- stage 5: settle ------------------------------------------------------------------
         let after = self.parts.isolator.capture(step.id, &trees).await?;
-        self.parts.store.record_commits(step.id, &after).await?;
+        self.parts
+            .store
+            .record_commits(StepFence::Lease(self.parts.owner), step.id, &after)
+            .await?;
         let output = self.output_of(item, phase, step.id).await?;
         let now = self.now();
         let settled = gate::settle(&SettleInput {
@@ -3688,7 +3709,12 @@ where
     async fn release_trees(&self, step: &RunStep, trees: &[RunStepTree]) {
         match self.parts.isolator.capture(step.id, trees).await {
             Ok(after) => {
-                if let Err(err) = self.parts.store.record_commits(step.id, &after).await {
+                if let Err(err) = self
+                    .parts
+                    .store
+                    .record_commits(StepFence::Lease(self.parts.owner), step.id, &after)
+                    .await
+                {
                     tracing::warn!(step = %step.id, %err, "a failed candidate's commits were not recorded");
                 }
             }
@@ -3742,7 +3768,10 @@ where
             .map(|tree| tree.tree.clone())
             .collect();
         *trees = Some(rows.clone());
-        self.parts.store.upsert_step_tree(step.id, &rows).await?;
+        self.parts
+            .store
+            .upsert_step_tree(StepFence::Lease(self.parts.owner), step.id, &rows)
+            .await?;
         let before: Vec<RunStepCommit> = prepared
             .trees
             .iter()
@@ -3753,7 +3782,10 @@ where
                 after_hash: None,
             })
             .collect();
-        self.parts.store.record_commits(step.id, &before).await?;
+        self.parts
+            .store
+            .record_commits(StepFence::Lease(self.parts.owner), step.id, &before)
+            .await?;
 
         // -- stage 3: the group's one prompt (plan D58) ----------------------------------------
         let trim = prompt
@@ -3762,7 +3794,12 @@ where
             .map_err(htui_agent::RecordError::from)?;
         self.parts
             .store
-            .set_step_prompt(step.id, &prompt.digest, &trim)
+            .set_step_prompt(
+                StepFence::Lease(self.parts.owner),
+                step.id,
+                &prompt.digest,
+                &trim,
+            )
             .await?;
 
         // -- stage 4: this candidate's own session (plan D68) ---------------------------------
@@ -3809,7 +3846,10 @@ where
         // -- stage 5: settle on the candidate's own terms (plan D48) ---------------------------
         let after = self.parts.isolator.capture(step.id, &rows).await?;
         *captured = true;
-        self.parts.store.record_commits(step.id, &after).await?;
+        self.parts
+            .store
+            .record_commits(StepFence::Lease(self.parts.owner), step.id, &after)
+            .await?;
         let output = self.output_of(item, phase, step.id).await?;
         let now = self.now();
         // `verify_outcome: None`: a candidate's verify is the prefilter's to read (plan D49), not
@@ -4587,7 +4627,12 @@ where
             .map_err(htui_agent::RecordError::from)?;
         self.parts
             .store
-            .set_step_prompt(judge.id, &prompts.forward.digest, &trim)
+            .set_step_prompt(
+                StepFence::Lease(self.parts.owner),
+                judge.id,
+                &prompts.forward.digest,
+                &trim,
+            )
             .await?;
         let jp = judge_phase(phase, prompts.template.clone(), candidate);
 
@@ -4744,7 +4789,10 @@ where
         {
             Ok(after) => {
                 // ANA-2 `:987-988`: the winner's `after_hash` becomes the merge commit.
-                self.parts.store.record_commits(step.id, &after).await?;
+                self.parts
+                    .store
+                    .record_commits(StepFence::Lease(self.parts.owner), step.id, &after)
+                    .await?;
                 Ok(None)
             }
             Err(err) => {
@@ -6134,7 +6182,7 @@ mod tests {
         SnapshotPhase, Status, StepGraphId, StepGraphPhase, StepId, StepStatus,
     };
     use htui_core::store::mem::MemFault;
-    use htui_core::store::{CasOutcome, MemStore, ReadStore as _, WriteStore as _};
+    use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
 
     use super::{
         AgentSelector, FirstCandidate, JudgePrompts, NoSink, Resume, SessionKey, required_inputs,
@@ -6725,7 +6773,7 @@ mod tests {
         harness
             .orch
             .store
-            .record_commits(slot[1].id, &moved[..1])
+            .record_commits(StepFence::Unleased, slot[1].id, &moved[..1])
             .await
             .expect("the row is the step's own");
         let prepares = harness.orch.isolator.prepares();

@@ -29,7 +29,7 @@ use htui_core::model::{
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::scrub::MinimalScrubber;
-use htui_core::store::{MemStore, ReadStore as _, StoreError, WriteStore as _};
+use htui_core::store::{MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _};
 use htui_orch::command::{Command, CommandOutcome, EngineError, GateAnswer, Rest};
 use htui_orch::conformance::until_stalled;
 use htui_orch::engine::{
@@ -2410,7 +2410,7 @@ async fn criterion_18_a_finished_worktree_step_is_adopted_and_merged() {
         .expect("both trees are where the dead walk left them");
     fix.orch
         .store
-        .record_commits(prd.id, &captured)
+        .record_commits(StepFence::Lease(fix.orch.owner()), prd.id, &captured)
         .await
         .expect("MemStore records the capture");
     let after = fix

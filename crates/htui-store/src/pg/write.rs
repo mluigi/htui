@@ -1645,7 +1645,13 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::NotFound`] when the step does not exist - zero rows updated is the only thing
     /// this statement can mean.
-    async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> Result<()> {
+    async fn set_step_prompt(
+        &self,
+        _fence: StepFence,
+        step: StepId,
+        digest: &str,
+        trim: &Value,
+    ) -> Result<()> {
         let updated = sqlx::query!(
             "UPDATE run_step SET prompt_digest = $2, trim_record = $3 WHERE id = $1",
             step.as_uuid(),
@@ -4557,7 +4563,12 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Constraint`] when a row's
     /// `run_step_id` is not `step` or names an unknown repo.
-    async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> Result<()> {
+    async fn upsert_step_tree(
+        &self,
+        _fence: StepFence,
+        step: StepId,
+        trees: &[RunStepTree],
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         step_exists(&mut tx, step).await?;
 
@@ -4636,7 +4647,12 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Constraint`] when a row's
     /// `run_step_id` is not `step` or names an unknown repo.
-    async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> Result<()> {
+    async fn record_commits(
+        &self,
+        _fence: StepFence,
+        step: StepId,
+        commits: &[RunStepCommit],
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         step_exists(&mut tx, step).await?;
 

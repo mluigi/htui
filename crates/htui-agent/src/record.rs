@@ -2120,7 +2120,7 @@ mod tests {
         let (store, chat) = open_step().await;
         let scrubber = scrubber();
         store
-            .set_step_prompt(chat.step_id, "d0", &json!({}))
+            .set_step_prompt(StepFence::Unleased, chat.step_id, "d0", &json!({}))
             .await
             .expect("the original prompt's digest must land");
         let tail = seed(&store, chat.step_id, &earlier_log(chat.step_id)).await;

@@ -1026,7 +1026,7 @@ mod tests {
     use htui_core::model::{Document, GraphSnapshot, VerifyOutcome};
 
     use htui_core::model::{NewRepo, NewRunStep, RepoId, Run, RunStep, RunStepCommit, StepStatus};
-    use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+    use htui_core::store::{MemStore, ReadStore as _, StepFence, WriteStore as _};
 
     use super::{
         GateContext, LoopStop, Settle, SettleInput, StepFailure, Verdict, loop_target, no_progress,
@@ -1537,7 +1537,12 @@ mod tests {
                 after_hash: Some(after.to_owned()),
             }];
             let store = &store;
-            async move { store.record_commits(step, &rows).await.expect("recorded") }
+            async move {
+                store
+                    .record_commits(StepFence::Unleased, step, &rows)
+                    .await
+                    .expect("recorded")
+            }
         };
         let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
 

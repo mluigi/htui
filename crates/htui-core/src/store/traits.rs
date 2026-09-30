@@ -516,11 +516,21 @@ pub trait WriteStore: ReadStore {
     /// Not folded into `set_step_usage`: that one is the **chat** path's digest writer (plan D97),
     /// whose prompt has no template, no sections and no trim record to write.
     ///
+    /// Written only while the step's run carries `fence`'s lease (MOD-41 plan D1, as
+    /// [`set_step_usage`](WriteStore::set_step_usage) since MOD-40 plan D1).
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) with `entity: "run_step"` when
-    /// the step does not exist.
-    async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> Result<()>;
+    /// the step does not exist; [`StoreError::Fenced`](crate::store::StoreError::Fenced) when it
+    /// does and its run's `lease_owner` is not `fence`'s.
+    async fn set_step_prompt(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        digest: &str,
+        trim: &Value,
+    ) -> Result<()>;
 
     // ---- MOD-15 milestone 1: the hierarchy (plan D1-D12) -----------------------------------
     //
@@ -1212,20 +1222,37 @@ pub trait WriteStore: ReadStore {
     /// column is left as it was rather than cleared. One step has many trees and one
     /// `isolation_path`, and this is where that choice is made, so the two can never disagree.
     ///
+    /// Written only while the step's run carries `fence`'s lease (MOD-41 plan D1, as
+    /// [`set_step_usage`](WriteStore::set_step_usage) since MOD-40 plan D1).
+    ///
     /// # Errors
-    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
+    /// In this order: [`StoreError::NotFound`](crate::store::StoreError::NotFound)
+    /// `{ entity: "run_step" }`; [`StoreError::Fenced`](crate::store::StoreError::Fenced) when the
+    /// step's run has a `lease_owner` other than `fence`'s;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when a row's
     /// `run_step_id` is not `step` or names an unknown repo.
-    async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> Result<()>;
+    async fn upsert_step_tree(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        trees: &[RunStepTree],
+    ) -> Result<()>;
 
-    /// `R-ORCH-11`'s two hashes, upserted on `(run_step_id, repo_id)`; same refusals as
+    /// `R-ORCH-11`'s two hashes, upserted on `(run_step_id, repo_id)`; same fence and refusals as
     /// [`upsert_step_tree`](WriteStore::upsert_step_tree).
     ///
     /// # Errors
-    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
+    /// In this order: [`StoreError::NotFound`](crate::store::StoreError::NotFound)
+    /// `{ entity: "run_step" }`; [`StoreError::Fenced`](crate::store::StoreError::Fenced) when the
+    /// step's run has a `lease_owner` other than `fence`'s;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when a row's
     /// `run_step_id` is not `step` or names an unknown repo.
-    async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> Result<()>;
+    async fn record_commits(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        commits: &[RunStepCommit],
+    ) -> Result<()>;
 
     /// Records one `command_run` row (ANA-2 §4.2, `docs/ANA-2.md:501-506`; plan D31): this
     /// milestone's `verify_command` runs, later MOD-11's queue.
@@ -2074,8 +2101,9 @@ impl<T> CasOutcome<T> {
 
 /// Which lease a step write is made under (MOD-40 plan D1, PRD D1).
 ///
-/// [`WriteStore::append_events`], [`WriteStore::set_step_usage`] and [`WriteStore::finish_step`]
-/// take one and write only while the step's run carries exactly that lease:
+/// [`WriteStore::append_events`], [`WriteStore::set_step_usage`], [`WriteStore::finish_step`]
+/// (MOD-40), [`WriteStore::set_step_prompt`], [`WriteStore::upsert_step_tree`] and
+/// [`WriteStore::record_commits`] (MOD-41 plan D1) take one and write only while the step's run carries exactly that lease:
 /// `run.lease_owner IS NOT DISTINCT FROM` [`StepFence::owner`]. A process whose run another process
 /// adopted ([`WriteStore::adopt_runs`], [`WriteStore::take_lease`]) still holds its old `Lease`,
 /// and the store answers it with [`StoreError::Fenced`](crate::store::StoreError::Fenced) and

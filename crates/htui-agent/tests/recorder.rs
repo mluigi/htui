@@ -547,8 +547,16 @@ impl WriteStore for SpyStore {
             .finish_chat_run(run, step, status, finished_at)
             .await
     }
-    async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> StoreResult<()> {
-        self.inner.set_step_prompt(step, digest, trim).await?;
+    async fn set_step_prompt(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        digest: &str,
+        trim: &Value,
+    ) -> StoreResult<()> {
+        self.inner
+            .set_step_prompt(fence, step, digest, trim)
+            .await?;
         self.prompt_calls
             .lock()
             .expect("the spy log is never poisoned")
@@ -862,11 +870,21 @@ impl WriteStore for SpyStore {
     async fn supersede_step(&self, step: StepId) -> StoreResult<()> {
         self.inner.supersede_step(step).await
     }
-    async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> StoreResult<()> {
-        self.inner.upsert_step_tree(step, trees).await
+    async fn upsert_step_tree(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        trees: &[RunStepTree],
+    ) -> StoreResult<()> {
+        self.inner.upsert_step_tree(fence, step, trees).await
     }
-    async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> StoreResult<()> {
-        self.inner.record_commits(step, commits).await
+    async fn record_commits(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        commits: &[RunStepCommit],
+    ) -> StoreResult<()> {
+        self.inner.record_commits(fence, step, commits).await
     }
     async fn record_command_run(&self, new: NewCommandRun) -> StoreResult<CommandRun> {
         self.inner.record_command_run(new).await

@@ -1286,14 +1286,19 @@ async fn set_step_prompt_writes_only_the_digest_and_the_record() {
         .await
         .expect("the usage write lands");
     db.store
-        .set_step_prompt(step, "9f8e", &serde_json::json!({ "v": 1 }))
+        .set_step_prompt(
+            StepFence::Unleased,
+            step,
+            "9f8e",
+            &serde_json::json!({ "v": 1 }),
+        )
         .await
         .expect("the first prompt write lands");
 
     let before = row(&db.pool, step).await;
     let record = serde_json::json!({ "estimated_after": 34_000, "sections": [], "v": 1 });
     db.store
-        .set_step_prompt(step, "0a1b", &record)
+        .set_step_prompt(StepFence::Unleased, step, "0a1b", &record)
         .await
         .expect("the second prompt write lands");
     let after = row(&db.pool, step).await;
@@ -1330,7 +1335,12 @@ async fn set_step_prompt_writes_only_the_digest_and_the_record() {
 
     let unknown = db
         .store
-        .set_step_prompt(StepId::new(), "9f8e", &serde_json::json!({}))
+        .set_step_prompt(
+            StepFence::Unleased,
+            StepId::new(),
+            "9f8e",
+            &serde_json::json!({}),
+        )
         .await;
     assert!(
         matches!(
@@ -3290,6 +3300,7 @@ async fn step_tree_rows_cascade_with_their_step() {
         .id;
     db.store
         .upsert_step_tree(
+            StepFence::Unleased,
             ids::STEP_R2_PRD,
             &[RunStepTree {
                 run_step_id: ids::STEP_R2_PRD,
@@ -4404,6 +4415,7 @@ async fn upsert_step_tree_writes_the_primary_isolation_path() {
     // `docs` first, so batch order and the rule disagree.
     db.store
         .upsert_step_tree(
+            StepFence::Unleased,
             ids::STEP_R2_PRD,
             &[
                 tree(docs, "/srv/trees/prd/docs"),
@@ -4426,7 +4438,11 @@ async fn upsert_step_tree_writes_the_primary_isolation_path() {
 
     // A batch with no primary in it falls back to the lowest `repo_id`, which is a batch of one.
     db.store
-        .upsert_step_tree(ids::STEP_R2_PRD, &[tree(docs, "/srv/trees/prd/docs")])
+        .upsert_step_tree(
+            StepFence::Unleased,
+            ids::STEP_R2_PRD,
+            &[tree(docs, "/srv/trees/prd/docs")],
+        )
         .await
         .expect("the one-row batch lands");
     assert_eq!(
@@ -4436,7 +4452,7 @@ async fn upsert_step_tree_writes_the_primary_isolation_path() {
     );
 
     db.store
-        .upsert_step_tree(ids::STEP_R2_PRD, &[])
+        .upsert_step_tree(StepFence::Unleased, ids::STEP_R2_PRD, &[])
         .await
         .expect("the empty batch is a check, not a write");
     assert_eq!(

@@ -361,6 +361,9 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 ///
 /// **One for MOD-40 milestone 1** (plan D1, D2): a suspended walk, woken after another process
 /// adopted its run, writes nothing to the step.
+///
+/// **One for MOD-41 T1** (plan D1, D2): a walk woken after its session's `Done`, whose run
+/// another process adopted, records no commits.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -530,6 +533,9 @@ pub const CASES: &[&str] = &[
     // MOD-40 plan D1, D2: a walk that wakes after another process adopted its run writes nothing
     // to the step.
     "a_suspended_walk_cannot_write_after_adoption",
+    // MOD-41 plan D1, D2: a walk woken after its session's `Done`, whose run another process
+    // adopted, records no commits: its capture is fenced.
+    "a_walk_woken_after_done_records_no_commits",
 ];
 
 /// Run one case by name.
@@ -743,6 +749,9 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         }
         "a_suspended_walk_cannot_write_after_adoption" => {
             Box::pin(a_suspended_walk_cannot_write_after_adoption(harness))
+        }
+        "a_walk_woken_after_done_records_no_commits" => {
+            Box::pin(a_walk_woken_after_done_records_no_commits(harness))
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -4178,6 +4187,90 @@ async fn a_suspended_walk_cannot_write_after_adoption<H: CaseHarness>(harness: &
     );
 }
 
+/// MOD-41 plan D1, D2: a walk suspended after its session's `Done`, whose run another process
+/// adopted meanwhile, wakes into stage 5 and records no commits. Its capture's
+/// `record_commits(Lease(a))` is the first write after the wake, and the fence refuses it: the
+/// walk ends `LeaseLost` through `heartbeaten`'s `is_fenced` arm, its guards are released once,
+/// and the step's trees and commits are the ones the adopter found.
+async fn a_walk_woken_after_done_records_no_commits<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    let (stalled, wake) = orch.suspend_after_done("prd", 1, None);
+    let mut walk = Box::pin(orch.dispatch(Command::StartRun {
+        item: ids::HTUI_FEAT_3,
+        mode: RunMode::Manual,
+        repo_scope: None,
+    }));
+    if let Either::Left(_) =
+        futures::future::select(walk.as_mut(), Box::pin(stalled.notified())).await
+    {
+        panic!("the walk finished instead of suspending");
+    }
+    let run = orch
+        .store()
+        .runs(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .find(|run| run.status == RunStatus::Running)
+        .expect("the suspended walk left the run `running`")
+        .id;
+    let prd = step_at(&orch, run, 0, 1).await;
+    let rows_of_step = async |step: StepId| {
+        (
+            orch.store()
+                .step_trees(step)
+                .await
+                .expect("MemStore never fails a read"),
+            orch.store()
+                .step_commits(step)
+                .await
+                .expect("MemStore never fails a read"),
+        )
+    };
+    let (trees, commits) = rows_of_step(prd.id).await;
+    assert!(
+        !trees.is_empty() && commits.iter().all(|row| row.after_hash.is_none()),
+        "stage 2 recorded the tree and the base, and no capture yet: {trees:?} {commits:?}"
+    );
+
+    let other = orch.restarted();
+    assert_eq!(
+        other.sweep().await.expect("the sweep adopts"),
+        [Adopted {
+            run,
+            next: Next::Walk
+        }]
+    );
+    let adopted = rows_of_step(prd.id).await;
+
+    wake.notify_one();
+    let woke = walk.await;
+    assert!(
+        matches!(&woke, Err(EngineError::LeaseLost { run: lost }) if *lost == run),
+        "{woke:?}"
+    );
+    assert_eq!(
+        orch.isolator().releases(),
+        1,
+        "the fenced walk's guards are released, once"
+    );
+    assert_eq!(
+        rows_of_step(prd.id).await,
+        adopted,
+        "the woken capture recorded no commits and no trees (MOD-41 plan D1)"
+    );
+    assert!(
+        other
+            .store()
+            .refresh_lease(run, other.owner(), TimeDelta::minutes(1))
+            .await
+            .expect("MemStore refreshes"),
+        "the adopter still holds the lease: the woken walk released none"
+    );
+}
+
 // -- MOD-4 milestone 5: the recovery sweep (plan D89-D98, blueprint A-2, A-3) -----------------------
 
 /// A process killed mid-walk (plan D100, blueprint A-2): `StartRun` on `item` is polled until
@@ -4273,8 +4366,10 @@ async fn a_finished_step_is_adopted_through_its_gate<H: CaseHarness>(harness: &H
             .find(|row| row.repo_id == repo)
             .expect("stage 2 recorded the base")
             .before_hash;
+        // The crash left the run leased to `orch`: the capture lands under its lease.
         orch.store()
             .record_commits(
+                StepFence::Lease(orch.owner()),
                 prd.id,
                 &[htui_core::model::RunStepCommit {
                     run_step_id: prd.id,
@@ -4482,7 +4577,7 @@ async fn a_dirty_tree_is_never_reset<H: CaseHarness>(harness: &H) {
         tree.dirty = true;
     }
     orch.store()
-        .upsert_step_tree(prd.id, &trees)
+        .upsert_step_tree(StepFence::Lease(orch.owner()), prd.id, &trees)
         .await
         .expect("MemStore rewrites the rows");
     let listed = tree_text(&orch, prd.id).await;
@@ -5887,8 +5982,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            73,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            74,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -5909,7 +6004,8 @@ mod tests {
              lease, four promotions, five accepts, `Unblock`'s three cases, and criterion \
              20's close-out and its refusal), and MOD-7 milestone 3's two (criterion 14's \
              capability half and §4.10's claim-time half), and MOD-40 milestone 1's one (a \
-             suspended walk fenced after adoption)"
+             suspended walk fenced after adoption), and MOD-41 T1's fenced capture (a walk \
+             woken after `Done` records no commits, plan D1)"
         );
     }
 
@@ -5943,7 +6039,7 @@ mod fanout_paths {
     use htui_core::model::{
         Gate, Isolation, NewRunStep, RunStatus, RunStep, RunStepCommit, Status, StepId, StepStatus,
     };
-    use htui_core::store::{ReadStore as _, WriteStore as _};
+    use htui_core::store::{ReadStore as _, StepFence, WriteStore as _};
 
     use super::{
         FakeOrchestrator, Orchestrate, RunFailure, ScriptedStep, candidate, fan_research,
@@ -6461,8 +6557,10 @@ mod fanout_paths {
                 .await
                 .expect("MemStore takes the move");
         }
+        // The park released the lease: the hand-written slot is unleased.
         orch.store()
             .record_commits(
+                StepFence::Unleased,
                 zero,
                 &[RunStepCommit {
                     run_step_id: zero,
@@ -6700,7 +6798,7 @@ mod recovery_paths {
         CommandRunId, CommandRunStatus, Gate, Isolation, NewCommandRun, RunStatus, RunStepCommit,
         StepStatus, VerifyOutcome,
     };
-    use htui_core::store::{ReadStore as _, WriteStore as _};
+    use htui_core::store::{ReadStore as _, StepFence, WriteStore as _};
 
     use super::{
         Adopted, FakeOrchestrator, Next, Orchestrate, Rest, RunFailure, candidate, crash,
@@ -6804,6 +6902,7 @@ mod recovery_paths {
             .before_hash;
         orch.store()
             .record_commits(
+                StepFence::Lease(orch.owner()),
                 stuck.id,
                 &[RunStepCommit {
                     run_step_id: stuck.id,

@@ -21,7 +21,7 @@ use htui_core::model::{
     CitationKind, DocumentId, EventKind, EventRole, ItemFilter, LinkGraph, NewDocument, ProjectId,
     PromptScope, Resolution, RunId, Scope, SessionEvent, Status, StepId, UserId, WorkspaceSummary,
 };
-use htui_core::store::{MemStore, ReadStore as _, StoreError, WriteStore as _};
+use htui_core::store::{MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _};
 use htui_store::cache::refresh::{RefreshSettings, Refresher, run_pass};
 use htui_store::{Backend, CacheStore, identity};
 use serde_json::json;
@@ -514,7 +514,7 @@ async fn the_mirror_projects_a_malformed_trim_record_like_postgres() {
         (json!({}), (None, false)),
     ] {
         db.store
-            .set_step_prompt(ids::STEP_IMPL, "dead", &record)
+            .set_step_prompt(StepFence::Unleased, ids::STEP_IMPL, "dead", &record)
             .await
             .expect("the Postgres write lands");
         run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))

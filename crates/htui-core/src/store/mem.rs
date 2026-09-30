@@ -1579,6 +1579,7 @@ impl State {
     /// both values.
     fn set_step_prompt(
         &mut self,
+        _fence: StepFence,
         step: StepId,
         digest: &str,
         trim: &Value,
@@ -4507,13 +4508,22 @@ impl State {
 
     /// Every row of a tree or commit batch belongs to `step` and names a repo that exists; the
     /// whole batch is checked before the first insert, as [`State::append_events`] does.
+    ///
+    /// MOD-41 plan D1 (blueprint B-1): with `Some(fence)`, the step's run must carry that lease,
+    /// checked after the step's existence and before the rows. `close_out`'s per-commit check
+    /// passes `None`: close-out runs on a finished item with no lease, and Postgres's `close_out`
+    /// checks existence only.
     fn check_step_batch(
         &self,
         table: &str,
         step: StepId,
+        fence: Option<StepFence>,
         rows: impl IntoIterator<Item = (StepId, RepoId)>,
     ) -> Result<()> {
-        self.require_step(step)?;
+        let row = self.require_step(step)?;
+        if let Some(fence) = fence {
+            Self::fence_holds(&self.lease_owners, row, fence)?;
+        }
         for (run_step_id, repo_id) in rows {
             if run_step_id != step {
                 return Err(StoreError::Constraint(row_names_another_step(
@@ -4549,6 +4559,7 @@ impl State {
     /// would make it a write.
     fn upsert_step_tree(
         &mut self,
+        _fence: StepFence,
         step: StepId,
         trees: &[RunStepTree],
         now: DateTime<Utc>,
@@ -4556,6 +4567,7 @@ impl State {
         self.check_step_batch(
             "run_step_tree",
             step,
+            None,
             trees.iter().map(|row| (row.run_step_id, row.repo_id)),
         )?;
         let chosen = trees
@@ -4582,10 +4594,16 @@ impl State {
     }
 
     /// `run_step_commit` upserted on the same key (`R-ORCH-11`).
-    fn record_commits(&mut self, step: StepId, commits: &[RunStepCommit]) -> Result<()> {
+    fn record_commits(
+        &mut self,
+        _fence: StepFence,
+        step: StepId,
+        commits: &[RunStepCommit],
+    ) -> Result<()> {
         self.check_step_batch(
             "run_step_commit",
             step,
+            None,
             commits.iter().map(|row| (row.run_step_id, row.repo_id)),
         )?;
         for row in commits {
@@ -4850,6 +4868,7 @@ impl State {
             self.check_step_batch(
                 "run_step_commit",
                 row.run_step_id,
+                None,
                 std::iter::once((row.run_step_id, row.repo_id)),
             )?;
         }
@@ -5763,9 +5782,15 @@ impl WriteStore for MemStore {
         self.write(|state| state.finish_chat_run(run, step, status, finished_at, now))
     }
 
-    async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> Result<()> {
+    async fn set_step_prompt(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        digest: &str,
+        trim: &Value,
+    ) -> Result<()> {
         let now = self.now();
-        self.write(|state| state.set_step_prompt(step, digest, trim, now))
+        self.write(|state| state.set_step_prompt(fence, step, digest, trim, now))
     }
 
     // MOD-15 milestone 1. Each arm takes the lock and hands one `State` method the store's clock;
@@ -6151,13 +6176,23 @@ impl WriteStore for MemStore {
         self.write(|state| state.supersede_step(step, now))
     }
 
-    async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> Result<()> {
+    async fn upsert_step_tree(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        trees: &[RunStepTree],
+    ) -> Result<()> {
         let now = self.now();
-        self.write(|state| state.upsert_step_tree(step, trees, now))
+        self.write(|state| state.upsert_step_tree(fence, step, trees, now))
     }
 
-    async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> Result<()> {
-        self.write(|state| state.record_commits(step, commits))
+    async fn record_commits(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        commits: &[RunStepCommit],
+    ) -> Result<()> {
+        self.write(|state| state.record_commits(fence, step, commits))
     }
 
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
@@ -6548,6 +6583,7 @@ mod tests {
             .expect("the usage write lands");
         store
             .set_step_prompt(
+                StepFence::Unleased,
                 ids::STEP_IMPL,
                 "9f8e",
                 &json!({ "estimated_after": 34_000, "sections": [], "v": 1 }),
@@ -6579,7 +6615,7 @@ mod tests {
         );
 
         let unknown = store
-            .set_step_prompt(StepId::new(), "9f8e", &json!({}))
+            .set_step_prompt(StepFence::Unleased, StepId::new(), "9f8e", &json!({}))
             .await;
         assert!(
             matches!(
@@ -9276,7 +9312,11 @@ mod tests {
         };
 
         store
-            .upsert_step_tree(ids::STEP_R2_PRD, &[tree(second, false), tree(first, false)])
+            .upsert_step_tree(
+                StepFence::Unleased,
+                ids::STEP_R2_PRD,
+                &[tree(second, false), tree(first, false)],
+            )
             .await
             .expect("both rows land");
         let rows = store
@@ -9289,7 +9329,7 @@ mod tests {
             "repo_id order regardless of input order"
         );
         store
-            .upsert_step_tree(ids::STEP_R2_PRD, &[tree(first, true)])
+            .upsert_step_tree(StepFence::Unleased, ids::STEP_R2_PRD, &[tree(first, true)])
             .await
             .expect("the upsert replaces rather than inserts");
         let rows = store
@@ -9305,7 +9345,9 @@ mod tests {
         };
         assert!(
             matches!(
-                store.upsert_step_tree(ids::STEP_R2_PRD, &[stray]).await,
+                store
+                    .upsert_step_tree(StepFence::Unleased, ids::STEP_R2_PRD, &[stray])
+                    .await,
                 Err(StoreError::Constraint(_))
             ),
             "a row for another step is refused"
@@ -9313,21 +9355,27 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .upsert_step_tree(ids::STEP_R2_PRD, &[tree(RepoId::new(), false)])
+                    .upsert_step_tree(
+                        StepFence::Unleased,
+                        ids::STEP_R2_PRD,
+                        &[tree(RepoId::new(), false)]
+                    )
                     .await,
                 Err(StoreError::Constraint(_))
             ),
             "an unknown repo is a foreign key refusal"
         );
         assert!(matches!(
-            store.upsert_step_tree(StepId::new(), &[]).await,
+            store
+                .upsert_step_tree(StepFence::Unleased, StepId::new(), &[])
+                .await,
             Err(StoreError::NotFound {
                 entity: "run_step",
                 ..
             })
         ));
         store
-            .upsert_step_tree(ids::STEP_R2_PRD, &[])
+            .upsert_step_tree(StepFence::Unleased, ids::STEP_R2_PRD, &[])
             .await
             .expect("an empty slice checks the step and writes nothing");
 
@@ -9339,13 +9387,18 @@ mod tests {
         };
         store
             .record_commits(
+                StepFence::Unleased,
                 ids::STEP_R2_PRD,
                 &[commit(second, None), commit(first, None)],
             )
             .await
             .expect("both rows land");
         store
-            .record_commits(ids::STEP_R2_PRD, &[commit(first, Some("def"))])
+            .record_commits(
+                StepFence::Unleased,
+                ids::STEP_R2_PRD,
+                &[commit(first, Some("def"))],
+            )
             .await
             .expect("the upsert replaces");
         let commits = store
@@ -9358,7 +9411,9 @@ mod tests {
         );
         assert_eq!(commits[0].after_hash.as_deref(), Some("def"));
         assert!(matches!(
-            store.record_commits(StepId::new(), &[]).await,
+            store
+                .record_commits(StepFence::Unleased, StepId::new(), &[])
+                .await,
             Err(StoreError::NotFound {
                 entity: "run_step",
                 ..
@@ -9660,6 +9715,69 @@ mod tests {
                 .expect("the commits read back")
                 .len(),
             1
+        );
+    }
+
+    /// MOD-41 blueprint B-1: `close_out`'s per-commit check passes no fence. Close-out runs on a
+    /// finished item with no lease of its own, so its commits land even on a run whose lease
+    /// still names a dead owner, where a fenced `record_commits` under no lease is refused.
+    #[tokio::test]
+    async fn close_out_records_commits_without_a_fence() {
+        let store = MemStore::demo();
+        let repo = a_repo(&store, "core").await;
+        let run = store.read(|state| {
+            state
+                .steps
+                .get(&ids::STEP_IMPL)
+                .expect("the fixture step")
+                .run_id
+        });
+        assert!(
+            store.read(|state| !state.lease_owners.contains_key(&run)),
+            "the finished run's lease was released"
+        );
+        let dead = Uuid::now_v7();
+        store.write(|state| state.lease_owners.insert(run, dead));
+        let commit = RunStepCommit {
+            run_step_id: ids::STEP_IMPL,
+            repo_id: repo,
+            before_hash: "abc".to_owned(),
+            after_hash: Some("def".to_owned()),
+        };
+        assert!(
+            matches!(
+                store
+                    .record_commits(
+                        StepFence::Unleased,
+                        ids::STEP_IMPL,
+                        std::slice::from_ref(&commit)
+                    )
+                    .await,
+                Err(StoreError::Fenced { step }) if step == ids::STEP_IMPL
+            ),
+            "the fenced writer is refused on a run whose lease names an owner"
+        );
+
+        store
+            .transition(ids::HTUI_FEAT_1, Status::InProgress, Status::Done)
+            .await
+            .expect("the item finishes");
+        store
+            .close_out(
+                ids::HTUI_FEAT_1,
+                Resolution::Done,
+                a_document(ids::HTUI_FEAT_1, "summary", None),
+                std::slice::from_ref(&commit),
+            )
+            .await
+            .expect("close-out checks the step, not a fence");
+        assert_eq!(
+            store
+                .step_commits(ids::STEP_IMPL)
+                .await
+                .expect("the commits read back"),
+            vec![commit],
+            "the close-out's one commit row is stored"
         );
     }
 

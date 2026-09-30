@@ -138,6 +138,10 @@ pub const CASES: &[&str] = &[
     "upsert_agent_with_a_spent_token_is_stale_and_writes_nothing",
     "upsert_agent_with_the_current_token_applies",
     "a_lease_ttl_out_of_range_is_refused",
+    "a_stale_owner_writes_no_prompt_tree_or_commits",
+    "the_new_owner_writes_prompt_tree_and_commits",
+    "an_unleased_prompt_write_is_refused_on_a_leased_run",
+    "a_missing_step_is_not_found_before_the_fence",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -329,6 +333,18 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
             upsert_agent_with_the_current_token_applies(store).await
         }
         "a_lease_ttl_out_of_range_is_refused" => a_lease_ttl_out_of_range_is_refused(store).await,
+        "a_stale_owner_writes_no_prompt_tree_or_commits" => {
+            a_stale_owner_writes_no_prompt_tree_or_commits(store).await;
+        }
+        "the_new_owner_writes_prompt_tree_and_commits" => {
+            the_new_owner_writes_prompt_tree_and_commits(store).await;
+        }
+        "an_unleased_prompt_write_is_refused_on_a_leased_run" => {
+            an_unleased_prompt_write_is_refused_on_a_leased_run(store).await;
+        }
+        "a_missing_step_is_not_found_before_the_fence" => {
+            a_missing_step_is_not_found_before_the_fence(store).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -1853,6 +1869,7 @@ async fn set_step_prompt_writes_digest_and_trim<S: WriteStore>(store: &S) {
 
     store
         .set_step_prompt(
+            StepFence::Unleased,
             ids::STEP_IMPL,
             "9f8e",
             &json!({
@@ -1884,6 +1901,7 @@ async fn set_step_prompt_writes_digest_and_trim<S: WriteStore>(store: &S) {
 
     store
         .set_step_prompt(
+            StepFence::Unleased,
             ids::STEP_IMPL,
             "0a1b",
             &json!({ "estimated_after": 12, "sections": [], "v": 1 }),
@@ -1997,7 +2015,7 @@ async fn set_step_prompt_writes_digest_and_trim<S: WriteStore>(store: &S) {
         ("an empty record", json!({}), (None, false)),
     ] {
         store
-            .set_step_prompt(ids::STEP_IMPL, "dead", &record)
+            .set_step_prompt(StepFence::Unleased, ids::STEP_IMPL, "dead", &record)
             .await
             .unwrap_or_else(|error| {
                 panic!("set_step_prompt_writes_digest_and_trim: writing {label} must land: {error}")
@@ -2021,7 +2039,7 @@ async fn set_step_prompt_writes_digest_and_trim<S: WriteStore>(store: &S) {
     }
 
     let unknown = store
-        .set_step_prompt(StepId::new(), "9f8e", &json!({}))
+        .set_step_prompt(StepFence::Unleased, StepId::new(), "9f8e", &json!({}))
         .await;
     assert!(
         matches!(
@@ -6542,6 +6560,271 @@ async fn a_lease_ttl_out_of_range_is_refused<S: WriteStore>(store: &S) {
     );
 }
 
+// ------------------------------------------------------------------------------------------
+// MOD-41 T1 (plan D1, blueprint §3.6): the fence completed. `set_step_prompt`,
+// `upsert_step_tree` and `record_commits` write only while the step's run carries the fence's
+// lease, and answer a missing step `NotFound` before they answer `Fenced`.
+// ------------------------------------------------------------------------------------------
+
+/// MOD-41 plan D1: one tree row and one commit row for `step` in `repo`, both tagged with
+/// `label` so two writers' rows are told apart when they are read back.
+fn step_rows(step: StepId, repo: RepoId, label: &str) -> (RunStepTree, RunStepCommit) {
+    (
+        RunStepTree {
+            run_step_id: step,
+            repo_id: repo,
+            mode: Isolation::Worktree,
+            path: format!("/srv/trees/{label}/core"),
+            base_ref: "main".to_owned(),
+            dirty: false,
+        },
+        RunStepCommit {
+            run_step_id: step,
+            repo_id: repo,
+            before_hash: format!("{label}:before"),
+            after_hash: Some(format!("{label}:after")),
+        },
+    )
+}
+
+/// MOD-41 plan D1: what the three fenced writes can change on `step`: the step row
+/// (`prompt_digest`, `trim_record`, `isolation_path` and its stamp), its trees and its commits.
+async fn step_writes<S: WriteStore>(
+    case: &str,
+    store: &S,
+    run: RunId,
+    step: StepId,
+) -> (RunStep, Vec<RunStepTree>, Vec<RunStepCommit>) {
+    (
+        step_row(case, store, run, step).await,
+        store.step_trees(step).await.expect(case),
+        store.step_commits(step).await.expect(case),
+    )
+}
+
+/// MOD-41 plan D1: `set_step_prompt`, `upsert_step_tree` and `record_commits` under `fence`, each
+/// with `label`'s values, answered in that order.
+async fn prompt_tree_commits<S: WriteStore>(
+    store: &S,
+    fence: StepFence,
+    step: StepId,
+    repo: RepoId,
+    label: &str,
+) -> [Result<(), StoreError>; 3] {
+    let (tree, commit) = step_rows(step, repo, label);
+    [
+        store
+            .set_step_prompt(fence, step, label, &json!({ "v": 1, "by": label }))
+            .await,
+        store.upsert_step_tree(fence, step, &[tree]).await,
+        store.record_commits(fence, step, &[commit]).await,
+    ]
+}
+
+/// MOD-41 plan D1: each of the three writes answered `Fenced { step }`.
+fn assert_all_fenced(case: &str, what: &str, step: StepId, answers: [Result<(), StoreError>; 3]) {
+    for (write, answer) in ["the prompt", "the tree", "the commit"].iter().zip(answers) {
+        assert!(
+            matches!(answer, Err(StoreError::Fenced { step: s }) if s == step),
+            "{case}: {write} write under {what} is fenced, got {answer:?}"
+        );
+    }
+}
+
+/// MOD-41 plan D1 (ANA-16 C1): A writes its step while it holds the lease, gives the lease back,
+/// and B adopts the run. Every prompt, tree and commit write A makes under its old lease is then
+/// `Fenced`, and the digest, trim record, `isolation_path`, trees and commits A wrote stand.
+async fn a_stale_owner_writes_no_prompt_tree_or_commits<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_stale_owner_writes_no_prompt_tree_or_commits";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let (run, step) = leased_step(CASE, store, a, at).await;
+    let repo = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE)
+        .id;
+    for answer in prompt_tree_commits(store, StepFence::Lease(a), step, repo, "a").await {
+        answer.unwrap_or_else(|err| panic!("{CASE}: A writes while it holds the lease: {err:?}"));
+    }
+    assert!(
+        store.release_lease(run, a).await.expect(CASE),
+        "{CASE}: A gives its lease back"
+    );
+    let adopted = store.adopt_runs(ids::BOX, b, LEASE).await.expect(CASE);
+    assert!(
+        adopted.iter().any(|row| row.id == run),
+        "{CASE}: B adopts the released run"
+    );
+    let before = step_writes(CASE, store, run, step).await;
+
+    let stale = prompt_tree_commits(store, StepFence::Lease(a), step, repo, "stale").await;
+    assert_all_fenced(CASE, "A's old lease", step, stale);
+    assert_eq!(
+        step_writes(CASE, store, run, step).await,
+        before,
+        "{CASE}: the refused writes left the digest, trim record, isolation path, trees and \
+         commits alone"
+    );
+    assert_eq!(
+        before.0.prompt_digest.as_deref(),
+        Some("a"),
+        "{CASE}: A's digest stands"
+    );
+    assert_eq!(
+        before.0.isolation_path.as_deref(),
+        Some("/srv/trees/a/core"),
+        "{CASE}: A's tree stands"
+    );
+}
+
+/// MOD-41 plan D1: the process that adopted the run writes the step's prompt, tree and commits
+/// under its own lease, and each reads back as written.
+async fn the_new_owner_writes_prompt_tree_and_commits<S: WriteStore>(store: &S) {
+    const CASE: &str = "the_new_owner_writes_prompt_tree_and_commits";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let (run, step) = leased_step(CASE, store, a, at).await;
+    let repo = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE)
+        .id;
+    assert!(
+        store.release_lease(run, a).await.expect(CASE),
+        "{CASE}: A gives its lease back"
+    );
+    let adopted = store.adopt_runs(ids::BOX, b, LEASE).await.expect(CASE);
+    assert!(
+        adopted.iter().any(|row| row.id == run),
+        "{CASE}: B adopts the released run"
+    );
+
+    for answer in prompt_tree_commits(store, StepFence::Lease(b), step, repo, "b").await {
+        answer.unwrap_or_else(|err| panic!("{CASE}: B writes under its own lease: {err:?}"));
+    }
+    let (row, trees, commits) = step_writes(CASE, store, run, step).await;
+    let (tree, commit) = step_rows(step, repo, "b");
+    assert_eq!(
+        (
+            row.prompt_digest.as_deref(),
+            row.trim_record,
+            row.isolation_path.as_deref()
+        ),
+        (
+            Some("b"),
+            Some(json!({ "v": 1, "by": "b" })),
+            Some("/srv/trees/b/core")
+        ),
+        "{CASE}: B's digest, trim record and isolation path landed"
+    );
+    assert_eq!(trees, vec![tree], "{CASE}: B's one tree row");
+    assert_eq!(commits, vec![commit], "{CASE}: B's one commit row");
+}
+
+/// MOD-41 plan D1, MOD-40 plan R-1: `Unleased` is refused on a run whose lease names an owner,
+/// for the prompt, the tree and the commit alike, and writes nothing; a chat run holds no lease,
+/// so its prompt write lands unleased.
+async fn an_unleased_prompt_write_is_refused_on_a_leased_run<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_unleased_prompt_write_is_refused_on_a_leased_run";
+    let a = Uuid::now_v7();
+    let at = seam_clock();
+    let (run, step) = leased_step(CASE, store, a, at).await;
+    let repo = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE)
+        .id;
+    let before = step_writes(CASE, store, run, step).await;
+
+    let unleased = prompt_tree_commits(store, StepFence::Unleased, step, repo, "unleased").await;
+    assert_all_fenced(CASE, "no lease, on A's live one", step, unleased);
+    assert_eq!(
+        step_writes(CASE, store, run, step).await,
+        before,
+        "{CASE}: the refused writes wrote nothing"
+    );
+
+    let chat = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        ids::BOX,
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        Some("sonnet".to_owned()),
+    );
+    store.start_chat_run(&chat).await.expect(CASE);
+    store
+        .set_step_prompt(StepFence::Unleased, chat.step_id, "c0", &json!({ "v": 1 }))
+        .await
+        .unwrap_or_else(|err| panic!("{CASE}: a chat's prompt lands unleased: {err:?}"));
+    assert_eq!(
+        step_row(CASE, store, chat.run_id, chat.step_id)
+            .await
+            .prompt_digest
+            .as_deref(),
+        Some("c0"),
+        "{CASE}: the chat's digest landed"
+    );
+}
+
+/// MOD-41 plan D1: a step that does not exist is `NotFound { entity: "run_step" }` under any
+/// fence, for all three writes, never `Fenced`; on a step that exists and is fenced, a batch
+/// naming another step is `Fenced` rather than `Constraint`: existence, then the fence, then the
+/// batch.
+async fn a_missing_step_is_not_found_before_the_fence<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_missing_step_is_not_found_before_the_fence";
+    let a = Uuid::now_v7();
+    let at = seam_clock();
+    let orphan = StepId::new();
+    let (run, step) = leased_step(CASE, store, a, at).await;
+    let repo = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE)
+        .id;
+
+    for fence in [
+        StepFence::Unleased,
+        StepFence::Lease(a),
+        StepFence::Lease(Uuid::now_v7()),
+    ] {
+        let answers = prompt_tree_commits(store, fence, orphan, repo, "orphan").await;
+        for (write, answer) in ["the prompt", "the tree", "the commit"].iter().zip(answers) {
+            assert!(
+                matches!(
+                    answer,
+                    Err(StoreError::NotFound {
+                        entity: "run_step",
+                        ..
+                    })
+                ),
+                "{CASE}: {write} write on a missing step under {fence:?} is NotFound, got \
+                 {answer:?}"
+            );
+        }
+    }
+
+    let before = step_writes(CASE, store, run, step).await;
+    let (stray_tree, stray_commit) = step_rows(orphan, repo, "stray");
+    let fence = StepFence::Lease(Uuid::now_v7());
+    let tree = store.upsert_step_tree(fence, step, &[stray_tree]).await;
+    assert!(
+        matches!(tree, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: a tree batch naming another step, on a fenced step, is Fenced first, got {tree:?}"
+    );
+    let commit = store.record_commits(fence, step, &[stray_commit]).await;
+    assert!(
+        matches!(commit, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: a commit batch naming another step, on a fenced step, is Fenced first, got \
+         {commit:?}"
+    );
+    assert_eq!(
+        step_writes(CASE, store, run, step).await,
+        before,
+        "{CASE}: the refused batches wrote nothing"
+    );
+}
+
 /// The fixture's one `box` row, as `load_demo` and `MemStore::from_demo` both load it.
 fn fixture_box() -> BoxRow {
     crate::fixtures::demo_data()
@@ -9067,7 +9350,11 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
     );
 
     store
-        .upsert_step_tree(ids::STEP_R2_PRD, &[tree(second, false), tree(first, false)])
+        .upsert_step_tree(
+            StepFence::Unleased,
+            ids::STEP_R2_PRD,
+            &[tree(second, false), tree(first, false)],
+        )
         .await
         .expect(CASE);
     assert_eq!(
@@ -9088,7 +9375,7 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
     );
 
     store
-        .upsert_step_tree(ids::STEP_R2_PRD, &[tree(first, true)])
+        .upsert_step_tree(StepFence::Unleased, ids::STEP_R2_PRD, &[tree(first, true)])
         .await
         .expect(CASE);
     assert_eq!(
@@ -9111,13 +9398,19 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
         run_step_id: ids::STEP_PLAN,
         ..tree(first, false)
     };
-    let foreign = store.upsert_step_tree(ids::STEP_R2_PRD, &[stray]).await;
+    let foreign = store
+        .upsert_step_tree(StepFence::Unleased, ids::STEP_R2_PRD, &[stray])
+        .await;
     assert!(
         matches!(foreign, Err(StoreError::Constraint(_))),
         "{CASE}: a row naming another step is refused, got {foreign:?}"
     );
     let no_repo = store
-        .upsert_step_tree(ids::STEP_R2_PRD, &[tree(RepoId::new(), false)])
+        .upsert_step_tree(
+            StepFence::Unleased,
+            ids::STEP_R2_PRD,
+            &[tree(RepoId::new(), false)],
+        )
         .await;
     assert!(
         matches!(no_repo, Err(StoreError::Constraint(_))),
@@ -9128,7 +9421,9 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
         2,
         "{CASE}: neither refusal wrote a row"
     );
-    let no_step = store.upsert_step_tree(StepId::new(), &[]).await;
+    let no_step = store
+        .upsert_step_tree(StepFence::Unleased, StepId::new(), &[])
+        .await;
     assert!(
         matches!(
             no_step,
@@ -9144,6 +9439,7 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
     // and not the `Constraint` the row alone would earn.
     let stray_on_no_step = store
         .upsert_step_tree(
+            StepFence::Unleased,
             StepId::new(),
             &[RunStepTree {
                 run_step_id: ids::STEP_PLAN,
@@ -9162,7 +9458,7 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
         "{CASE}: D14 — the step is looked up before the batch is judged, got {stray_on_no_step:?}"
     );
     store
-        .upsert_step_tree(ids::STEP_R2_PRD, &[])
+        .upsert_step_tree(StepFence::Unleased, ids::STEP_R2_PRD, &[])
         .await
         .expect(CASE);
     assert_eq!(
@@ -9179,13 +9475,18 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
     };
     store
         .record_commits(
+            StepFence::Unleased,
             ids::STEP_R2_PRD,
             &[commit(second, None), commit(first, None)],
         )
         .await
         .expect(CASE);
     store
-        .record_commits(ids::STEP_R2_PRD, &[commit(first, Some("deadbeef"))])
+        .record_commits(
+            StepFence::Unleased,
+            ids::STEP_R2_PRD,
+            &[commit(first, Some("deadbeef"))],
+        )
         .await
         .expect(CASE);
     let commits = store.step_commits(ids::STEP_R2_PRD).await.expect(CASE);
@@ -9204,20 +9505,26 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
         ..commit(first, None)
     };
     let foreign_commit = store
-        .record_commits(ids::STEP_R2_PRD, &[stray_commit])
+        .record_commits(StepFence::Unleased, ids::STEP_R2_PRD, &[stray_commit])
         .await;
     assert!(
         matches!(foreign_commit, Err(StoreError::Constraint(_))),
         "{CASE}: a commit row naming another step is refused, got {foreign_commit:?}"
     );
     let no_commit_repo = store
-        .record_commits(ids::STEP_R2_PRD, &[commit(RepoId::new(), None)])
+        .record_commits(
+            StepFence::Unleased,
+            ids::STEP_R2_PRD,
+            &[commit(RepoId::new(), None)],
+        )
         .await;
     assert!(
         matches!(no_commit_repo, Err(StoreError::Constraint(_))),
         "{CASE}: an unknown repo is a foreign key refusal, got {no_commit_repo:?}"
     );
-    let no_commit_step = store.record_commits(StepId::new(), &[]).await;
+    let no_commit_step = store
+        .record_commits(StepFence::Unleased, StepId::new(), &[])
+        .await;
     assert!(
         matches!(
             no_commit_step,
@@ -9230,6 +9537,7 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
     );
     let stray_commit_on_no_step = store
         .record_commits(
+            StepFence::Unleased,
             StepId::new(),
             &[RunStepCommit {
                 run_step_id: ids::STEP_PLAN,
@@ -9248,7 +9556,7 @@ async fn trees_and_commits_round_trip<S: WriteStore>(store: &S) {
         "{CASE}: D14 holds for commits too, got {stray_commit_on_no_step:?}"
     );
     store
-        .record_commits(ids::STEP_R2_PRD, &[])
+        .record_commits(StepFence::Unleased, ids::STEP_R2_PRD, &[])
         .await
         .expect(CASE);
 
