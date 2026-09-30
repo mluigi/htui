@@ -70,6 +70,17 @@ pub(crate) enum Fake {
 #[cfg(feature = "test-support")]
 pub(crate) static FAKE: std::sync::Mutex<Option<Fake>> = std::sync::Mutex::new(None);
 
+/// How many times [`get_dsn`] has been answered by an installed [`Fake`].
+///
+/// Only an installed fake counts, and a fake is only installed under the `KEYRING` lock that
+/// `crate::testkit::mock_keyring` takes, so a case holding that guard sees no other case's reads.
+/// It is how a test proves the keyring was **not read** — `--dsn-stdin` must never open it, since
+/// on a headless host the real one may block on a secret-service prompt — rather than merely that
+/// its answer lost.
+#[cfg(feature = "test-support")]
+pub(crate) static FAKE_DSN_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// The fake slot, poison-tolerant: a test that panicked mid-assertion must not poison every later
 /// one.
 #[cfg(feature = "test-support")]
@@ -102,6 +113,7 @@ fn fake_failure(verb: &str, user: &str, why: &str) -> StoreError {
 pub fn get_dsn() -> Result<Option<String>> {
     #[cfg(feature = "test-support")]
     if let Some(fake) = &*fake() {
+        FAKE_DSN_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         return match fake {
             Fake::Slot(slots) => Ok(slots.pg.clone().filter(|dsn| !dsn.trim().is_empty())),
             Fake::Broken(why) => Err(fake_failure("read", USER, why)),
@@ -506,9 +518,17 @@ mod tests {
 /// keyring: never the developer's.
 #[cfg(test)]
 mod headless_dsn_tests {
-    use super::{CREDENTIAL_NAME, DsnSourceError, DsnSources, headless_dsn, set_dsn};
+    use super::{
+        CREDENTIAL_NAME, DsnSourceError, DsnSources, FAKE_DSN_READS, headless_dsn, set_dsn,
+    };
     use crate::testkit::{mock_keyring, mock_keyring_broken};
     use std::io::Cursor;
+    use std::sync::atomic::Ordering;
+
+    /// Keyring reads answered by the fake so far; stable while a `mock_keyring` guard is held.
+    fn keyring_reads() -> usize {
+        FAKE_DSN_READS.load(Ordering::SeqCst)
+    }
 
     /// A DSN nothing else in these cases spells, so an answer names its source.
     const KEYRING_DSN: &str = "postgres://keyring@h:5432/db";
@@ -530,6 +550,7 @@ mod headless_dsn_tests {
     async fn stdin_wins_and_the_keyring_is_not_read() {
         let guard = mock_keyring().await;
         set_dsn(KEYRING_DSN).expect("the fake keyring stores");
+        let reads = keyring_reads();
         let mut stdin = Cursor::new(format!("{STDIN_DSN}\n").into_bytes());
         let dsn = headless_dsn(DsnSources {
             stdin: Some(&mut stdin),
@@ -537,16 +558,27 @@ mod headless_dsn_tests {
         })
         .expect("stdin holds a DSN");
         assert_eq!(dsn.as_str(), STDIN_DSN, "--dsn-stdin is explicit and wins");
+        assert_eq!(
+            keyring_reads(),
+            reads,
+            "--dsn-stdin never reads the keyring"
+        );
         drop(guard);
 
         let _broken = mock_keyring_broken().await;
+        let reads = keyring_reads();
         let mut stdin = Cursor::new(format!("{STDIN_DSN}\n").into_bytes());
         let dsn = headless_dsn(DsnSources {
             stdin: Some(&mut stdin),
             credentials_dir: None,
         })
-        .expect("a keyring that cannot be opened is never opened under --dsn-stdin");
+        .expect("stdin wins even over a keyring that cannot be opened");
         assert_eq!(dsn.as_str(), STDIN_DSN);
+        assert_eq!(
+            keyring_reads(),
+            reads,
+            "a keyring that cannot be opened is never opened under --dsn-stdin"
+        );
     }
 
     #[cfg(target_os = "linux")]
