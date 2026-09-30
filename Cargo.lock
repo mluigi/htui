@@ -3169,6 +3169,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "htui-worker"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "htui-agent",
+ "htui-core",
+ "htui-orch",
+ "htui-store",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
