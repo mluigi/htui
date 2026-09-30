@@ -155,7 +155,7 @@ cargo test --workspace --all-features -- --test-threads=1   # full gate before c
 | `Backend::ready_items` refuses offline | ✓ | `crates/htui-store/src/backend.rs:540-545` → `orchestration_offline()`; this is why D2 does not call it |
 | `Backend::box_info` answers on Memory, Online **and Offline** | ✓, amended | `backend.rs:252-258`. It returns **`Option<BoxInfo>`**, so `None` means an unregistered box. D2 treats `None` as "no tags", which matches §7.4's `LEFT JOIN box … COALESCE(.., '{}')` (`pg/read.rs:1871-1911`) |
 | `BoxInfo` carries `probed_tags` and `declared_tags` | ✓ | `crates/htui-core/src/model/box_.rs:295-308` |
-| Demo data makes readiness parity non-trivial | ✓ | Demo box: probed `rust, msvc, cmake`, declared `gpu` (`fixtures.rs:475-476`). Items tagged `docker` and `gpu, vulkan` exist (`fixtures.rs:977, 1042`), so the capability half filters rows out |
+| Demo data makes readiness parity non-trivial | ✗ **struck** (blueprint E1) | The tagged items (`docker`, `gpu,vulkan`) are `awaiting_approval`/`in_progress`, so none passes `ready`; the capability half removes nothing in the demo. The tests mint an open `cuda`-tagged item (as `mem.rs:10540` does) |
 | `ready_items` is parity-checked Mem vs Pg | ✓ | `crates/htui-store/tests/pg_criteria.rs:3759-3890` |
 | Staleness is keyed by origin plus request name, and `Items` is one name | ✓ | `store_worker.rs:826-831` (`"items"`); `app/update.rs:93, 612-620` |
 | `StoreRequest::Items { .. }` construction sites | ✓, amended | 7 sites: `app/update.rs:529, 1220`; `store_worker.rs:2592, 2864`; `backlog/mod.rs:219, 357, 545`. `update.rs:574, 1254` are `{ .. }` patterns and need no edit. There is no `testkit.rs` site, so that row was dropped from the file list |
@@ -164,6 +164,8 @@ cargo test --workspace --all-features -- --test-threads=1   # full gate before c
 | `TextField` is exported from `crate::ui` | ✓ | `crates/htui/src/ui/mod.rs:15` |
 | An overlay factory cannot be seeded with state (D1 rationale) | ✓ | `ui/overlay/registry.rs`: `type Factory = Box<dyn Fn() -> Box<dyn Overlay>>` |
 | Tasks 1 and 2 are independent | ✗ struck | See the task order note. The shared compile surface is the `Items` field and the `mod.rs` module line |
+
+Blueprint: `.claude/plans/mod-13-filters.blueprint.md` (errata E1–E7 amend this plan; the blueprint wins on detail).
 
 ## Acceptance
 - [ ] All tasks complete
