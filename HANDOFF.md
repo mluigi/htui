@@ -18,7 +18,8 @@
 edits the registry. `n` creates a row, `e` edits one (transport, command and shell-word args, models,
 default model, billing, enabled; `name` is create-only; a launch edit merges and never touches `env`),
 and `t` switches an agent off on this box. The switch is the new `agent_box.user_off` (migration
-`0008`), which no probe can undo and which refuses chat start and step promotion too. Writes are
+`0008`), which no probe can undo and which refuses chat start, step promotion and an already-admitted pending step too (that last fails its
+run). Writes are
 MOD-40's compare-and-set, answered by one self-naming `AgentWritten` reply. Follow-up **MOD-66**
 (per-box manual tool path).
 Before it, **TOOL-7 shipped** (`docs/decisions/tool/tool-7.md`): `scripts/hr` runs

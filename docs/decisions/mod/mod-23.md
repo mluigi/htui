@@ -10,9 +10,10 @@ nothing added branches on an agent's name.
 `.claude/plans/mod-23-agent-registry-editing.blueprint.md` (D249-D262, findings F-1-F-24). Routed
 as **plan** (C4 borderline, 1 criterion fired). Run in a TOOL-7 sandbox (`hr/MOD-23`).
 **Decisions:** maintainer, 2026-09-29: route accepted; plan confirmed with OQ-1-OQ-5 on their
-recommended answers. 2026-09-30: review L-3 answered "gate chat start", then "gate promote too".
+recommended answers. 2026-09-30: review L-3 answered "gate chat start", then "gate promote too";
+re-review Low-1..Low-3 "fix all three now".
 **Commits:** `d2867f3`..`b0f9779` (plan, fact-check, blueprint), `acf0f6c`..`4afb7e9` (T0-T3),
-`601919e`..`6fa2d80` (review round). **Migration `0008_agent_box_user_off`**: the next one is `0009`.
+`601919e`..`6fa2d80` (review round), `731bfe4`..`df36258` (re-review round). **Migration `0008_agent_box_user_off`**: the next one is `0009`.
 
 ## What shipped
 
@@ -70,6 +71,23 @@ decline key of the consent and chooser modals. A plain `Agents` reply never clos
 - **L-5:** negative tests for the closed-form answers, a foreign `Failed`, a non-object `launch`
   (`935bbc1`); no bug found.
 
+## Re-review round (`rust-reviewer`: approve; three LOWs fixed by maintainer decision)
+
+- **Low-1:** a step already admitted before a switch-off (a pending fan-out member, or a step a
+  crashed walk left pending) still ran on the switched-off agent, because `Kit::driver` built its
+  driver without the switch. It now refuses before building anything, with the one shared sentence
+  (`agent_worker::switched_off`). **Consequence, by the existing refused-driver path:** the step goes
+  `failed` and the **run fails terminally** (`agent spawn failed: agent `<name>` is switched off on
+  this box; ...`); switching the agent back on does not revive it, a fresh `StartRun` on the item
+  does. Steps not yet created are unaffected: selection skips the agent and the run fails with
+  `no_candidate_agent` as before (`731bfe4`).
+- **Low-2:** the both-sides clash notice lists labels only while they fit 98 columns, then `+N more`
+  (`dd4a0bf`).
+- **Low-3:** `refuse_switched_off`'s doc now says a refused promotion leaves the step promoted
+  (`awaiting_approval`, `promoted_at` set) with no chat, as the `agent is disabled` refusal already
+  did; the test pins that state and that a second promote after switching on opens the chat
+  (`df36258`).
+
 ## Where the item text was stale
 
 The Settings tab already had a text-input widget (`TextField`, MOD-15) used by Boxes and Hierarchy.
@@ -89,6 +107,6 @@ not a ninth column) held.
 
 `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features -D warnings`, and
 `cargo test --workspace --all-features -- --test-threads=1` green on the final tree (91 binaries,
-2674 passed, 0 failed), Postgres suites run, not skipped; `cargo sqlx prepare --check` clean against a
+2677 passed, 0 failed), Postgres suites run, not skipped; `cargo sqlx prepare --check` clean against a
 scratch database migrated through `0008`. The Postgres gate on the merged host tree runs on the host
 after `scripts/hr collect MOD-23`.
