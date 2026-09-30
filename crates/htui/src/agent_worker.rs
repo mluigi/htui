@@ -287,7 +287,11 @@ pub const AUTH_ALREADY_CHOSEN: &str = "a method was already chosen";
 /// What every request a finished login can no longer serve is told (MOD-22 D287): a command
 /// `auth_command` could not send, one still queued when the flow ended, and a delivery the flow's
 /// end overtook.
-const LOGIN_ENDED: &str = "this login has ended";
+///
+/// Public for [`AUTH_ALREADY_CHOSEN`]'s reason: the settings section matches on this exact value
+/// (a refused `auth_deliver` carrying it means the flow is gone, not that one delivery was
+/// answered no), and a sentence the compiler links is not one either side can reword alone.
+pub const LOGIN_ENDED: &str = "this login has ended";
 
 /// What the worker asks a live login to do (MOD-21 D18).
 ///

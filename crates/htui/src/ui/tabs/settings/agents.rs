@@ -74,7 +74,7 @@ use std::path::Path;
 use crate::agent_settings::{
     self, AgentDraft, AgentWrite, DraftFields, FIELD_LABELS, REQUEST_NAMES, Refusal,
 };
-use crate::agent_worker::AUTH_ALREADY_CHOSEN;
+use crate::agent_worker::{AUTH_ALREADY_CHOSEN, LOGIN_ENDED};
 use crate::app::{Action, Ctx, Handled};
 use crate::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
 use crate::ui::tabs::settings::{
@@ -179,9 +179,9 @@ const PASTE_CANCELLING: &str = "this login is being cancelled; there is nothing 
 
 /// The two refusals of a request into a login that mean the flow is **gone** rather than that the
 /// one request was answered no: `agent_worker`'s `auth_command` answers the first when no login is
-/// held and the second when the flow's task has already closed its queue (MOD-22 D287). Spelled
-/// here because the worker's second constant is private to it; the section tests pin both.
-const LOGIN_GONE: [&str; 2] = ["no login is running", "this login has ended"];
+/// held and the second ([`LOGIN_ENDED`]) when the flow's task has already closed its queue (MOD-22
+/// D287). The section tests pin both as literal text.
+const LOGIN_GONE: [&str; 2] = ["no login is running", LOGIN_ENDED];
 
 /// What the `on this box` column reads between `a` and the flow's own method list.
 const STARTING: &str = "starting\u{2026}";
