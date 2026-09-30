@@ -303,8 +303,9 @@ mod tests {
         );
     }
 
+    /// MOD-59 D1, D2: an applied save answers its own variant, naming the row the store appended.
     #[tokio::test]
-    async fn a_save_at_the_head_answers_templates_with_the_new_version() {
+    async fn a_save_at_the_head_answers_template_saved_with_the_stored_version() {
         let backend = demo();
         let scope = platform_scope(&backend).await;
         let before = read(&backend, &scope).await;
@@ -320,9 +321,20 @@ mod tests {
         )
         .await;
 
-        let Ok(StoreReply::Templates(after)) = reply else {
-            panic!("an applied save answers `Templates`, got {reply:?}")
+        let Ok(StoreReply::TemplateSaved {
+            snapshot: Ok(after),
+            project,
+            name,
+            version,
+        }) = reply
+        else {
+            panic!("an applied save answers `TemplateSaved`, got {reply:?}")
         };
+        assert_eq!(
+            (project, name.as_str(), version),
+            (ids::PROJECT_HTUI, "implement", 2),
+            "the reply names the row the store appended"
+        );
         let head = after
             .head(ids::PROJECT_HTUI, "implement")
             .expect("the new head is in the fresh snapshot");
@@ -361,7 +373,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(first, Ok(StoreReply::Templates(_))),
+            matches!(first, Ok(StoreReply::TemplateSaved { version: 2, .. })),
             "the first save applies: {first:?}"
         );
         let before = read(&backend, &scope).await;
@@ -390,6 +402,39 @@ mod tests {
             .expect("the head is still there");
         assert_eq!(head.version, 2);
         assert_eq!(head.body, "first {{item_key}}\n");
+    }
+
+    /// MOD-59 D2: a name with no row saves as version 1, and the reply says so; the view has no
+    /// head to add one to.
+    #[tokio::test]
+    async fn a_new_name_saves_as_version_1() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+        let body = "Implement {{item}}\n";
+
+        let reply = serve(
+            &backend,
+            &save(&scope, ids::PROJECT_HTUI, "implement-2", body, None),
+        )
+        .await;
+
+        let Ok(StoreReply::TemplateSaved {
+            snapshot: Ok(after),
+            project,
+            name,
+            version,
+        }) = reply
+        else {
+            panic!("an applied save answers `TemplateSaved`, got {reply:?}")
+        };
+        assert_eq!(
+            (project, name.as_str(), version),
+            (ids::PROJECT_HTUI, "implement-2", 1)
+        );
+        let head = after
+            .head(ids::PROJECT_HTUI, "implement-2")
+            .expect("the new name is in the fresh snapshot");
+        assert_eq!((head.version, head.body.as_str()), (1, body));
     }
 
     #[tokio::test]

@@ -1078,6 +1078,21 @@ pub enum StoreReply {
     /// A template save missed its CAS token (PRD D5): the templates as they are now, for the editor
     /// to reload against. The editor keeps its typed text and retries only by hand.
     TemplatesStale(Box<TemplatesSnapshot>),
+    /// The answer to a [`StoreRequest::SaveTemplate`] that applied (MOD-59 D1): the templates
+    /// re-read after it and the row the store appended. Self-naming: the Templates view lands its
+    /// save on this variant alone, and a plain [`StoreReply::Templates`] never closes its editor or
+    /// moves its token.
+    TemplateSaved {
+        /// The templates as they are now; or, when only the re-read failed, its `StoreError`
+        /// rendered through `Display`. The version was appended either way (D5).
+        snapshot: Result<Box<TemplatesSnapshot>, String>,
+        /// The template's project, as stored.
+        project: ProjectId,
+        /// The template's name, as stored.
+        name: String,
+        /// The version the save appended.
+        version: i32,
+    },
     /// The Skills view's snapshot, freshly read: the answer to [`StoreRequest::Skills`] (MOD-9
     /// D81). A read answer only: a skill write that applied answers [`StoreReply::SkillWritten`]
     /// (MOD-59).

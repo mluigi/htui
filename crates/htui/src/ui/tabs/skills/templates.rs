@@ -1239,9 +1239,10 @@ mod tests {
         assert!(shown.contains("sent_len: Some(11)"), "{shown}");
     }
 
-    /// D27 (F-J): a `Templates` read served while a save is in flight — `Tab` away and back, `2`,
-    /// or `r` — must not be taken for the save's answer. `settle` serves in queue order, save
-    /// first, so only a direct drive can put a read's reply ahead of the save's.
+    /// MOD-59 D4: a `Templates` read served while a save is in flight — `Tab` away and back, `2`,
+    /// or `r` — is not the save's answer: a plain `Templates` never lands; the save's own
+    /// `TemplateSaved` does. `settle` serves in queue order, save first, so only a direct drive can
+    /// put a read's reply ahead of the save's.
     #[tokio::test]
     async fn a_read_reply_does_not_close_the_editor_mid_save() {
         let backend = Backend::memory(MemStore::demo());
@@ -1314,7 +1315,7 @@ mod tests {
             "the save is still in flight"
         );
 
-        // The save's own answer: the head is token + 1.
+        // The save's own answer, `TemplateSaved`: the version it appended is token + 1.
         let saved = serve(&backend, save.clone()).await;
         view.on_reply(&saved, &mut ctx);
         assert!(
@@ -1324,5 +1325,209 @@ mod tests {
         );
         assert_eq!(view.busy, None);
         assert_eq!(view.notice, Some(Notice::Info("saved v2".to_owned())));
+    }
+
+    /// What a `Ctx` borrows, held by the test: the Harness's startup scope and a fresh `Emit`.
+    struct Bench {
+        /// [`vulkan`].
+        scope: Scope,
+        /// The top bar.
+        top_bar: TopBarState,
+        /// The default keymap.
+        keymap: Keymap,
+        /// The default theme.
+        theme: Theme,
+        /// What the view emitted.
+        emit: Emit,
+    }
+
+    impl Bench {
+        fn new() -> Self {
+            Self {
+                scope: vulkan(),
+                top_bar: TopBarState::default(),
+                keymap: Keymap::default_global(),
+                theme: Theme::default(),
+                emit: Emit::default(),
+            }
+        }
+
+        fn ctx(&self) -> Ctx<'_> {
+            Ctx::new(
+                &self.scope,
+                &[],
+                &self.top_bar,
+                &self.keymap,
+                &self.theme,
+                Origin::Tab(SkillsTab::ID),
+                &self.emit,
+            )
+        }
+
+        /// The one request the view sent since the last drain, or a panic naming what it sent.
+        fn one(&self) -> StoreRequest {
+            let requests = sent(&self.emit);
+            let [request] = requests.as_slice() else {
+                panic!("exactly one request was sent: {requests:?}");
+            };
+            request.clone()
+        }
+    }
+
+    /// A plain key.
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    /// From a fresh read of the tree: `implement` opened (`[vulkan, fix, handoff, implement, …]`,
+    /// three `j`s), one `x` typed and `Ctrl+S`. The save it sent, at token 1.
+    fn save_implement(view: &mut TemplatesView, bench: &Bench, ctx: &mut Ctx<'_>) -> StoreRequest {
+        for _ in 0..3 {
+            view.on_key(key('j'), ctx);
+        }
+        view.on_key(key('e'), ctx);
+        view.on_key(key('x'), ctx);
+        view.on_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            ctx,
+        );
+        let save = bench.one();
+        assert!(
+            matches!(&save, StoreRequest::SaveTemplate { name, expected: Some(1), .. } if name == "implement"),
+            "{save:?}"
+        );
+        assert_eq!(view.busy, Some("save_template"));
+        save
+    }
+
+    /// MOD-59 D4: a read that already shows the saved version is still a read, and a read never
+    /// lands a save; only the save's own `TemplateSaved` does. Before MOD-59 the read landed it by
+    /// content, `token + 1` with the body sent.
+    #[tokio::test]
+    async fn a_read_that_shows_the_saved_version_does_not_land_the_save() {
+        let backend = Backend::memory(MemStore::demo());
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = TemplatesView::default();
+        let read = serve(&backend, StoreRequest::Templates(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+        let save = save_implement(&mut view, &bench, &mut ctx);
+
+        let saved = serve(&backend, save).await;
+        let shows = serve(&backend, StoreRequest::Templates(bench.scope.clone())).await;
+        let StoreReply::Templates(shown) = &shows else {
+            panic!("the read answers `Templates`: {shows:?}");
+        };
+        assert_eq!(
+            shown
+                .head(ids::PROJECT_VULKAN, "implement")
+                .map(|row| row.version),
+            Some(2),
+            "precondition: the read shows the saved version"
+        );
+
+        view.on_reply(&shows, &mut ctx);
+        assert!(
+            matches!(&view.mode, Mode::Editing(editor) if editor.name == "implement"),
+            "a read is not the save's answer: {:?}",
+            view.mode
+        );
+        assert_eq!(view.busy, Some("save_template"), "the save is in flight");
+
+        view.on_reply(&saved, &mut ctx);
+        assert!(matches!(view.mode, Mode::Browse), "{:?}", view.mode);
+        assert_eq!(view.busy, None);
+        assert_eq!(view.notice, Some(Notice::Info("saved v2".to_owned())));
+    }
+
+    /// MOD-59 D4: the save lands on its own reply, and the view does not look in the re-read for
+    /// the body it sent. Here the row at the saved version carries another body, as no store
+    /// would write it; the save lands all the same (DV-2: append-only rows cannot be raced).
+    #[tokio::test]
+    async fn a_save_lands_on_its_own_reply_whatever_body_the_reread_shows() {
+        let backend = Backend::memory(MemStore::demo());
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = TemplatesView::default();
+        let read = serve(&backend, StoreRequest::Templates(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+        let save = save_implement(&mut view, &bench, &mut ctx);
+
+        let reply = match serve(&backend, save).await {
+            StoreReply::TemplateSaved {
+                snapshot: Ok(mut snapshot),
+                project,
+                name,
+                version,
+            } => {
+                for row in snapshot
+                    .projects
+                    .iter_mut()
+                    .flat_map(|entry| entry.templates.iter_mut())
+                    .filter(|row| row.name == "implement" && row.version == version)
+                {
+                    "Theirs.\n".clone_into(&mut row.body);
+                }
+                StoreReply::TemplateSaved {
+                    snapshot: Ok(snapshot),
+                    project,
+                    name,
+                    version,
+                }
+            }
+            other => panic!("an applied save answers `TemplateSaved`, not {other:?}"),
+        };
+        view.on_reply(&reply, &mut ctx);
+
+        assert!(matches!(view.mode, Mode::Browse), "{:?}", view.mode);
+        assert_eq!(view.busy, None);
+        assert_eq!(view.notice, Some(Notice::Info("saved v2".to_owned())));
+    }
+
+    /// MOD-59 D5: a save whose re-read failed was appended all the same. It lands: the editor
+    /// closes and the notice says what was saved and that the tree drawn is the one held. A
+    /// `TemplateSaved` whose re-read failed while no save is in flight has no scope to check, so it
+    /// changes nothing.
+    #[tokio::test]
+    async fn a_save_whose_reread_failed_lands_and_keeps_the_tree_drawn() {
+        let backend = Backend::memory(MemStore::demo());
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = TemplatesView::default();
+        let read = serve(&backend, StoreRequest::Templates(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+        let before = view.snapshot.clone();
+        let unread = StoreReply::TemplateSaved {
+            snapshot: Err("store unreachable: gone".to_owned()),
+            project: ids::PROJECT_VULKAN,
+            name: "implement".to_owned(),
+            version: 2,
+        };
+
+        view.on_reply(&unread, &mut ctx);
+        assert_eq!(view.unavailable, None, "no save in flight owns it");
+        assert_eq!(view.notice, None);
+
+        save_implement(&mut view, &bench, &mut ctx);
+        view.on_reply(&unread, &mut ctx);
+
+        assert!(matches!(view.mode, Mode::Browse), "{:?}", view.mode);
+        assert_eq!(view.busy, None);
+        assert!(
+            matches!(
+                &view.notice,
+                Some(Notice::Error(text))
+                    if text.starts_with("saved v2 \u{2014} the re-read failed")
+                        && text.ends_with("store unreachable: gone")
+            ),
+            "{:?}",
+            view.notice
+        );
+        assert_eq!(view.snapshot, before, "the tree drawn is the one held");
+        assert_eq!(view.unavailable, None, "a tree is held, so it stays drawn");
+        assert_eq!(
+            view.selected_template(),
+            Some((ids::PROJECT_VULKAN, "implement".to_owned()))
+        );
     }
 }
