@@ -85,12 +85,13 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
          MOD-7 milestone 1's 0005_box_identity.sql, MOD-38's 0006_requirements.sql, MOD-9 \
-         milestone 2's 0007_skill_attachments.sql, MOD-9 milestone 5's 0008_trim_record_v3.sql \
-         and MOD-23's 0009_agent_box_user_off.sql, in ordinal order"
+         milestone 2's 0007_skill_attachments.sql, MOD-9 milestone 5's 0008_trim_record_v3.sql, \
+         MOD-23's 0009_agent_box_user_off.sql and MOD-33's 0010_prompt_digest_undigested.sql, \
+         in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -173,14 +174,15 @@ async fn agent_box_gains_a_jsonb_probe_column() {
     db.drop_db().await;
 }
 
-/// The twenty-five `COMMENT ON COLUMN` texts of `0002_agent_probe.sql` and
+/// The twenty-three `COMMENT ON COLUMN` texts of `0002_agent_probe.sql` and
 /// `0003_orchestration.sql`, verbatim.
 ///
 /// `agent.name` is ANA-4 §9 as amended by plan D43 (its `COMMENT ... IS NULL` would have cleared a
-/// comment `0001_init.sql` never wrote); the next five are ANA-5 §9 copied from
+/// comment `0001_init.sql` never wrote); the next three are ANA-5 §9 copied from
 /// `docs/ANA-5.md:2153-2181`; the last nineteen are ANA-2 §9 (`docs/ANA-2.md:1862-1999`).
-/// `run_step.trim_record` is the text `0008_trim_record_v3.sql` restates (MOD-9 D118), which
-/// replaces `0007`'s, which replaced `0002`'s. They live here as literals on purpose: this test is the guard against a
+/// `run_step.prompt_digest` and `run_step.trim_record` are restated by
+/// `0010_prompt_digest_undigested.sql` (MOD-33 D273) and are pinned in [`MOD33_COLUMN_COMMENTS`].
+/// They live here as literals on purpose: this test is the guard against a
 /// paraphrase drifting into a forward-only migration that cannot be edited afterwards.
 const ANA_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     (
@@ -204,27 +206,6 @@ const ANA_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
         "name",
         "phase name, or one of the reserved names judge and handoff (ANA-5 4.6); defaults are \
          copied into each new project by the ANA-9 5.10 seed as amended by ANA-5",
-    ),
-    (
-        "run_step",
-        "prompt_digest",
-        "ANA-5 4.7: sha256, lowercase hex, over the canonical assembled prompt TEXT as sent - LF \
-         normalised, BOM stripped, one trailing LF, scrubbed before hashing. Not over the payload \
-         and not over sections[]. An audit field, never a replay key (ANA-2 4.9).",
-    ),
-    (
-        "run_step",
-        "trim_record",
-        "ANA-5 5.1 as amended by MOD-9 D42 and D118: {v, template, budget, budget_source, \
-         reserve, target, estimator, estimated_before, estimated_after, sections[], \
-         skill_choices[], excerpts, notes}, v 3. skill_choices[] is every candidate skill, \
-         ordered by position then name, each {skill, name, version, level, activation, active, \
-         reason} with reason always, matched, no_match, off, no_path, missing_version or \
-         not_placed (ANA-22 6 item 8); a matched choice adds path, <repo>:<path>, the first \
-         matching file in repo then path byte order. A v 2 record, written before 0008, has no \
-         matched or no_match; a v 1 record, written before 0007, has no skill_choices. \
-         Canonical; the prompt payload sections[] array is its abridged projection. Written at \
-         stage 3 by set_step_prompt, before the session starts.",
     ),
     (
         "step_graph_phase",
@@ -425,6 +406,36 @@ const MOD23_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[(
      user_off on conflict. Switching on re-derives enabled from the stored probe status.",
 )];
 
+/// The two `COMMENT ON COLUMN` texts of `0010_prompt_digest_undigested.sql` (MOD-33 D273),
+/// verbatim, for [`ANA_COLUMN_COMMENTS`]'s reason.
+const MOD33_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "run_step",
+        "prompt_digest",
+        "ANA-5 4.7 as amended by MOD-33: sha256, lowercase hex, over the canonical assembled \
+         prompt TEXT as sent with each undigested span replaced by its fixed stand-in - today \
+         only the box section's hostname value, as [hostname] - LF normalised, BOM stripped, one \
+         trailing LF, scrubbed before hashing. trim_record.undigested lists the spans. Not over \
+         the payload and not over sections[]. An audit field, never a replay key (ANA-2 4.9).",
+    ),
+    (
+        "run_step",
+        "trim_record",
+        "ANA-5 5.1 as amended by MOD-9 D42 and D118 and MOD-33: {v, template, budget, \
+         budget_source, reserve, target, estimator, estimated_before, estimated_after, \
+         sections[], skill_choices[], undigested[], excerpts, notes}, v 4. undigested[] names \
+         every span rendered into the prompt but excluded from prompt_digest: box.hostname, or \
+         empty. skill_choices[] is every candidate skill, ordered by position then name, each \
+         {skill, name, version, level, activation, active, reason} with reason always, matched, \
+         no_match, off, no_path, missing_version or not_placed (ANA-22 6 item 8); a matched \
+         choice adds path, <repo>:<path>, the first matching file in repo then path byte order. \
+         A v 3 record, written before 0010, has no undigested and digested the hostname; a v 2 \
+         record, written before 0008, has no matched or no_match; a v 1 record, written before \
+         0007, has no skill_choices. Canonical; the prompt payload sections[] array is its \
+         abridged projection. Written at stage 3 by set_step_prompt, before the session starts.",
+    ),
+];
+
 /// The one `COMMENT ON TABLE` of `0003_orchestration.sql` (ANA-2 §9), verbatim. Kept beside
 /// [`ANA_COLUMN_COMMENTS`] rather than in it: `col_description` cannot read it, because a table
 /// comment is `objsubid = 0`.
@@ -445,6 +456,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD7_COLUMN_COMMENTS)
         .chain(MOD9_COLUMN_COMMENTS)
         .chain(MOD23_COLUMN_COMMENTS)
+        .chain(MOD33_COLUMN_COMMENTS)
     {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.col_description(c.oid, a.attnum) \
@@ -461,7 +473,8 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         assert_eq!(
             actual.as_deref(),
             Some(*expected),
-            "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9 or MOD-23) text byte for byte"
+            "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9, MOD-23 or MOD-33) text byte \
+             for byte"
         );
     }
 
@@ -483,8 +496,8 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
     );
 
     // And nothing else in those tables carries one, so a reader of `\d+` sees exactly the
-    // thirty-five contracts the three ANAs, MOD-7, ANA-22 and MOD-23 wrote and no half-finished
-    // thirty-sixth.
+    // thirty-five contracts the three ANAs, MOD-7, ANA-22, MOD-23 and MOD-33 wrote and no
+    // half-finished thirty-sixth.
     let commented: Vec<(String, String)> = sqlx::query_as(
         "SELECT c.relname::text, a.attname::text FROM pg_class c \
          JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -499,6 +512,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             .chain(MOD7_COLUMN_COMMENTS)
             .chain(MOD9_COLUMN_COMMENTS)
             .chain(MOD23_COLUMN_COMMENTS)
+            .chain(MOD33_COLUMN_COMMENTS)
             .map(|(table, _, _)| (*table).to_owned())
             .collect::<BTreeSet<String>>()
             .into_iter()
@@ -513,6 +527,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD7_COLUMN_COMMENTS)
         .chain(MOD9_COLUMN_COMMENTS)
         .chain(MOD23_COLUMN_COMMENTS)
+        .chain(MOD33_COLUMN_COMMENTS)
         .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
         .collect();
     expected.sort();
@@ -898,8 +913,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(9),
-        "nine embedded migrations, none applied"
+        MigrationState::Pending(10),
+        "ten embedded migrations, none applied"
     );
 
     db.drop_db().await;
@@ -997,12 +1012,12 @@ async fn a_headless_connect_never_migrates() {
     let Some(db) = common::bare_db().await else {
         return;
     };
-    assert_eq!(db.migrations_at_connect, MigrationState::Pending(9));
+    assert_eq!(db.migrations_at_connect, MigrationState::Pending(10));
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT)
         .await
         .expect_err("a pending schema is refused");
-    assert_eq!(refused, HeadlessError::MigrationsPending(9));
+    assert_eq!(refused, HeadlessError::MigrationsPending(10));
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
         0,
@@ -1021,7 +1036,7 @@ async fn a_headless_connect_never_migrates() {
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT)
         .await
         .expect_err("no migrations table is every migration pending");
-    assert_eq!(refused, HeadlessError::MigrationsPending(9));
+    assert_eq!(refused, HeadlessError::MigrationsPending(10));
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
         .await
@@ -1171,9 +1186,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        9,
-        "the later applies migrate nothing: the nine embedded migrations (through MOD-23's \
-         0009_agent_box_user_off.sql) are applied once"
+        10,
+        "the later applies migrate nothing: the ten embedded migrations (through MOD-33's \
+         0010_prompt_digest_undigested.sql) are applied once"
     );
 
     db.drop_db().await;
