@@ -32,6 +32,9 @@ const DETAIL_PERCENT: u16 = 45;
 /// How far the link traversal of the Graph sub-tab reaches (plan D11).
 const HOPS: u8 = 1;
 
+/// `StoreRequest::Items`' name: what a refused list read is answered `Failed` under.
+const ITEMS_READ: &str = "items";
+
 /// The Backlog screen.
 ///
 /// Holds no store handle and no channel (`R-NF-3`): rows arrive through [`Tab::on_reply`] and
@@ -265,6 +268,12 @@ impl Tab for BacklogTab {
             self.reselect(ctx);
             return;
         }
+        // D251, Requirements' rule: a refused read must not leave a reveal armed for a later list.
+        if let StoreReply::Failed { request, .. } = reply
+            && *request == ITEMS_READ
+        {
+            self.pending_reveal = None;
+        }
         self.detail.on_reply(reply, ctx);
     }
 
@@ -461,6 +470,73 @@ mod tests {
             "a sub-tab that stopped capturing gives `j` back to the list"
         );
         assert_eq!(seen.borrow().len(), keys.len(), "without offering it first");
+    }
+
+    /// MOD-64 review 6, Requirements' D251 rule: a refused `Items` read disarms a pending reveal,
+    /// so a later list neither jumps to nor reports an item the user has since moved on from.
+    #[tokio::test]
+    async fn a_refused_items_read_disarms_a_pending_reveal() {
+        let store = MemStore::demo();
+        let workspace = store
+            .workspaces()
+            .await
+            .expect("the memory store never fails")
+            .into_iter()
+            .find(|workspace| workspace.slug == "platform")
+            .expect("the demo holds `platform`");
+        let scope = Scope::from_workspace(&workspace);
+        let projects = store.projects(&scope).await.expect("the projects");
+        let (top_bar, keymap, theme, emit) = (
+            TopBarState::default(),
+            Keymap::new(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let mut ctx = Ctx::new(
+            &scope,
+            &projects,
+            &top_bar,
+            &keymap,
+            &theme,
+            Origin::Tab(BacklogTab::ID),
+            &emit,
+        );
+        let read = StoreRequest::Items {
+            scope: scope.clone(),
+            filter: ItemFilter::default(),
+        };
+        assert_eq!(ITEMS_READ, read.name());
+        let mut tab = BacklogTab::new();
+        let target = RevealTarget::Item {
+            id: ItemId::default(),
+            key: "GONE-1".to_owned(),
+        };
+        assert!(tab.reveal(&target, &mut ctx));
+        assert!(
+            tab.pending_reveal.is_some(),
+            "not loaded: the next list decides"
+        );
+        emit.take();
+
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: "items",
+                message: "the server went away".to_owned(),
+            },
+            &mut ctx,
+        );
+        assert!(tab.pending_reveal.is_none(), "the refusal disarms it");
+
+        tab.on_reply(&StoreReply::Items(Vec::new()), &mut ctx);
+        let errors: Vec<Action> = emit
+            .take()
+            .into_iter()
+            .filter(|action| matches!(action, Action::Error(_)))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "a later list reports nothing: {errors:?}"
+        );
     }
 
     /// The sub-tab strip fits inside the detail pane at the harness's pinned size, so a longer title, another sub-tab or a narrower pane fails here
