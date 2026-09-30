@@ -948,8 +948,8 @@ fn present_source(project_value: Option<&Value>, app_holds: bool) -> BudgetSourc
 /// What the reader would use for `key`, over the snapshot's own `app_map` and — on a project row —
 /// that project's blob (D6).
 ///
-/// **Exhaustive on purpose** (blueprint flag G, O-4): the four resolvers return four shapes, so an
-/// eleventh key cannot be resolved generically. Without a wildcard the compiler names the missing
+/// **Exhaustive on purpose** (blueprint flag G, O-4): the resolvers return different shapes, so a
+/// new key cannot be resolved generically. Without a wildcard the compiler names the missing
 /// arm; with one it would render a blank the user could not tell from a resolver that answered
 /// nothing.
 ///
@@ -1042,7 +1042,7 @@ fn effective(
 ///
 /// Computed rather than a constant: a longer key added tomorrow widens the column by itself.
 /// Computed **once**: [`SettingKey::ALL`] is compiled in and cannot change between frames, where
-/// calling this per row walked the ten keys thirteen times a frame.
+/// calling this per row walked every key once per row, every frame.
 static KEY_WIDTH: LazyLock<usize> = LazyLock::new(|| {
     SettingKey::ALL
         .iter()

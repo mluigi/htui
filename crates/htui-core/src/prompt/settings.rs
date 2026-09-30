@@ -172,7 +172,7 @@ pub enum SettingKey {
     ExcerptProviderDeadlineMs = 6,
     /// `max_skill_tokens`.
     MaxSkillTokens = 7,
-    /// `prompt_reserve_fraction`, the one [`SettingKind::Fraction`] of the ten.
+    /// `prompt_reserve_fraction`, the one [`SettingKind::Fraction`] of the App keys.
     PromptReserveFraction = 8,
     /// `prompt_upstream_hops` on the App rung, `upstream_hops` on a project (flag A).
     UpstreamHops = 9,
@@ -317,7 +317,7 @@ pub struct SettingSpec {
     /// `app_setting` row ever carries it.
     pub key: &'static str,
     /// The name under which `project.settings` holds it; `Some` exactly when `rungs` has
-    /// [`Rungs::PROJECT`]. Two of the ten spell it differently there (flag A), and writing the App
+    /// [`Rungs::PROJECT`]. Two keys spell it differently there (flag A), and writing the App
     /// spelling into a project would store a key `resolve_hops` never looks at.
     pub project_key: Option<&'static str>,
     /// How the JSON is read.
@@ -1082,7 +1082,8 @@ mod tests {
     }
 
     /// The discriminant is the index and the keys ascend as bytes, which is what makes
-    /// `SettingKey::ALL` reproduce `as_rows`'s order without a second list.
+    /// `SettingKey::app_keys` — `ALL` filtered, order kept — reproduce `as_rows`'s order without a
+    /// second list.
     #[test]
     fn specs_are_indexed_by_discriminant() {
         for key in SettingKey::ALL {

@@ -138,7 +138,7 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
     store: &S,
     scope: &Scope,
 ) -> Result<SettingsSnapshot> {
-    let mut app = Vec::with_capacity(SettingKey::ALL.len());
+    let mut app = Vec::with_capacity(SettingKey::app_keys().count());
     // `app_keys`, never `ALL`: a project-only key is a rung refusal on `App`, on both stores, and
     // would fail the whole read (MOD-33 D276).
     for key in SettingKey::app_keys() {
