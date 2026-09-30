@@ -420,8 +420,25 @@ pub enum DeliverError {
 ///
 /// The [`PasteError`] of the first rule the paste breaks.
 pub fn validate(url: &RedirectUrl, advertised: &Advertised) -> Result<Delivery, PasteError> {
+    let text = with_scheme(url.as_str())?;
+    // (3)
+    let parsed = Url::parse(&text).map_err(|_| PasteError::NotAUrl)?;
+    check_address(&parsed, advertised)?;
+    let query = parsed.query().unwrap_or_default();
+    let secrets = check_query(query, advertised)?;
+    Ok(Delivery {
+        targets: advertised.socket_addrs(),
+        host_header: advertised.target(),
+        request_target: Zeroizing::new(format!("{}?{query}", parsed.path())),
+        secrets,
+    })
+}
+
+/// D265 (1)–(2): the paste trimmed, bounded, and given `http://` when it names no scheme of its
+/// own, in a wiped buffer.
+fn with_scheme(pasted: &str) -> Result<Zeroizing<String>, PasteError> {
     // (1)
-    let text = url.as_str().trim();
+    let text = pasted.trim();
     if text.is_empty() {
         return Err(PasteError::Empty);
     }
@@ -430,13 +447,16 @@ pub fn validate(url: &RedirectUrl, advertised: &Advertised) -> Result<Delivery, 
     }
     // (2): `Url::parse("localhost:39879/?…")` succeeds with the scheme `localhost`. A scheme is
     // looked for at the start only: a `://` inside the query is not one (review L-6).
-    let text = if has_scheme(text) {
+    Ok(if has_scheme(text) {
         Zeroizing::new(text.to_owned())
     } else {
         Zeroizing::new(format!("http://{text}"))
-    };
-    // (3)–(8)
-    let parsed = Url::parse(&text).map_err(|_| PasteError::NotAUrl)?;
+    })
+}
+
+/// D265 (4)–(8): the scheme, the userinfo, the host, the port and the path are the advertised
+/// redirect's.
+fn check_address(parsed: &Url, advertised: &Advertised) -> Result<(), PasteError> {
     if parsed.scheme() != "http" {
         return Err(PasteError::NotHttp);
     }
@@ -460,21 +480,19 @@ pub fn validate(url: &RedirectUrl, advertised: &Advertised) -> Result<Delivery, 
             advertised: format!("{}{}", advertised.target(), advertised.path()),
         });
     }
-    // (9)–(12), over the raw query: only the `error`, `code` and `state` values are ever decoded,
-    // each into a wiped buffer, so an encoded code leaves no unwiped decoded copy behind.
-    let query = parsed.query().unwrap_or_default();
-    if let Some((_, raw)) = raw_pairs(query).find(|(key, _)| key.as_str() == "error") {
-        let error = form_decode(raw)
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-            .take(64)
-            .collect::<String>();
-        return Err(if error.is_empty() {
-            PasteError::BrowserErrorUnnamed
-        } else {
-            PasteError::BrowserError { error }
-        });
+    Ok(())
+}
+
+/// D265 (9)–(12), over the raw query: no `error`, one `code`, one `state` and the advertised one.
+/// Only the `error`, `code` and `state` values are ever decoded, each into a wiped buffer, so an
+/// encoded code leaves no unwiped decoded copy behind. What comes back is what an echo of them is
+/// blanked of.
+fn check_query(query: &str, advertised: &Advertised) -> Result<Vec<Zeroizing<String>>, PasteError> {
+    // (9)
+    if let Some(refusal) = browser_error(query) {
+        return Err(refusal);
     }
+    // (10)–(11)
     let (code, raw_code) = exactly_one(query, "code", PasteError::MissingCode)?;
     let no_state = if advertised.state.is_some() {
         PasteError::MissingState
@@ -482,28 +500,47 @@ pub fn validate(url: &RedirectUrl, advertised: &Advertised) -> Result<Delivery, 
         PasteError::UnverifiableWithoutState
     };
     let (state, raw_state) = exactly_one(query, "state", no_state)?;
+    // (12)
     if let Some(expected) = &advertised.state
         && state.as_str() != expected
     {
         return Err(PasteError::StaleState);
     }
+    Ok(secrets_of([
+        code.as_str(),
+        raw_code,
+        state.as_str(),
+        raw_state,
+    ]))
+}
 
-    // What an echo is blanked of: both values as decoded and as they travel, longest first so a
-    // secret that contains another is blanked whole.
-    let mut secrets: Vec<Zeroizing<String>> = Vec::with_capacity(4);
-    for value in [code.as_str(), raw_code, state.as_str(), raw_state] {
+/// D265 (9): the refusal of a redirect that came back with an OAuth `error`, its value filtered to
+/// `[A-Za-z0-9._-]` and cut to 64 characters.
+fn browser_error(query: &str) -> Option<PasteError> {
+    let (_, raw) = raw_pairs(query).find(|(key, _)| key.as_str() == "error")?;
+    let error = form_decode(raw)
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .take(64)
+        .collect::<String>();
+    Some(if error.is_empty() {
+        PasteError::BrowserErrorUnnamed
+    } else {
+        PasteError::BrowserError { error }
+    })
+}
+
+/// What an echo is blanked of: the values as decoded and as they travel, non-empty, deduplicated,
+/// longest first so a secret that contains another is blanked whole.
+fn secrets_of(values: [&str; 4]) -> Vec<Zeroizing<String>> {
+    let mut secrets: Vec<Zeroizing<String>> = Vec::with_capacity(values.len());
+    for value in values {
         if !value.is_empty() && !secrets.iter().any(|known| known.as_str() == value) {
             secrets.push(Zeroizing::new(value.to_owned()));
         }
     }
     secrets.sort_by_key(|secret| Reverse(secret.len()));
-
-    Ok(Delivery {
-        targets: advertised.socket_addrs(),
-        host_header: advertised.target(),
-        request_target: Zeroizing::new(format!("{}?{query}", parsed.path())),
-        secrets,
-    })
+    secrets
 }
 
 /// Whether `text` starts with an RFC 3986 scheme and `://`: a letter, then letters, digits, `+`,
@@ -589,12 +626,45 @@ pub async fn deliver(
     let target = delivery.target();
     let mut stream = connect(&delivery.targets, &target, limits.connect).await?;
     let deadline = Instant::now() + limits.response;
-    let timed_out = |target: String| DeliverError::Timeout {
-        target,
-        after: limits.response,
-    };
+    write_request(&mut stream, &delivery, deadline)
+        .await
+        .map_err(|failure| failure.into_error(&target, limits.response))?;
+    let answer = read_answer(stream, deadline)
+        .await
+        .map_err(|failure| failure.into_error(&target, limits.response))?;
+    classify(target, &answer, limits.response, &delivery.secrets)
+}
 
-    // The request, built in place with room to spare so it never reallocates, and wiped on drop.
+/// Why writing or reading stopped short, before it is given the target and the deadline that
+/// name it in a [`DeliverError`].
+enum Failure {
+    /// The response deadline elapsed.
+    Deadline,
+    /// The listener went away mid-write.
+    Closed,
+    /// Any other socket error.
+    Io(ErrorKind),
+}
+
+impl Failure {
+    fn into_error(self, target: &str, after: Duration) -> DeliverError {
+        let target = target.to_owned();
+        match self {
+            Self::Deadline => DeliverError::Timeout { target, after },
+            Self::Closed => DeliverError::ClosedWithoutAnswer { target },
+            Self::Io(kind) => DeliverError::Io { target, kind },
+        }
+    }
+}
+
+/// D267: the request line, `Host:` and three fixed headers, written by `deadline`.
+///
+/// Built in place with room to spare so it never reallocates, and wiped on drop.
+async fn write_request(
+    stream: &mut TcpStream,
+    delivery: &Delivery,
+    deadline: Instant,
+) -> Result<(), Failure> {
     let mut request = Zeroizing::new(Vec::with_capacity(
         delivery.request_target.len() + delivery.host_header.len() + 128,
     ));
@@ -608,21 +678,29 @@ pub async fn deliver(
         request.extend_from_slice(part.as_bytes());
     }
     match timeout_at(deadline, stream.write_all(&request)).await {
-        Err(_) => return Err(timed_out(target)),
-        Ok(Err(err)) if is_closed(err.kind()) => {
-            return Err(DeliverError::ClosedWithoutAnswer { target });
-        }
-        Ok(Err(err)) => {
-            return Err(DeliverError::Io {
-                target,
-                kind: err.kind(),
-            });
-        }
-        Ok(Ok(())) => {}
+        Err(_) => Err(Failure::Deadline),
+        Ok(Err(err)) if is_closed(err.kind()) => Err(Failure::Closed),
+        Ok(Err(err)) => Err(Failure::Io(err.kind())),
+        Ok(Ok(())) => Ok(()),
     }
-    drop(request);
+}
 
-    // D276: read until EOF, a reset, the cap, a complete framing, or the deadline.
+/// What came back, in a wiped buffer, and why the read stopped.
+struct Answer {
+    buffer: Zeroizing<Vec<u8>>,
+    len: usize,
+    ended: Ended,
+}
+
+impl Answer {
+    fn bytes(&self) -> &[u8] {
+        &self.buffer[..self.len]
+    }
+}
+
+/// D276: read until EOF, a reset, the cap, a complete framing, or the deadline. The stream is
+/// dropped on the way out, so the listener sees the close as soon as the answer is in.
+async fn read_answer(mut stream: TcpStream, deadline: Instant) -> Result<Answer, Failure> {
     let mut buffer = Zeroizing::new(vec![0u8; RESPONSE_CAP]);
     let mut len = 0;
     let ended = loop {
@@ -644,34 +722,38 @@ pub async fn deliver(
             {
                 break Ended::Reset;
             }
-            Ok(Err(err)) => {
-                return Err(DeliverError::Io {
-                    target,
-                    kind: err.kind(),
-                });
-            }
+            Ok(Err(err)) => return Err(Failure::Io(err.kind())),
         }
     };
-    drop(stream);
-    let answer = &buffer[..len];
+    Ok(Answer { buffer, len, ended })
+}
 
-    if answer.is_empty() {
-        return Err(match ended {
-            Ended::Deadline => timed_out(target),
+/// D276: what an answer amounts to — nothing, not HTTP, a timeout on a status line still coming,
+/// or a status line and what the listener said.
+fn classify(
+    target: String,
+    answer: &Answer,
+    after: Duration,
+    secrets: &[Zeroizing<String>],
+) -> Result<ListenerReply, DeliverError> {
+    let bytes = answer.bytes();
+    if bytes.is_empty() {
+        return Err(match answer.ended {
+            Ended::Deadline => DeliverError::Timeout { target, after },
             _ => DeliverError::ClosedWithoutAnswer { target },
         });
     }
-    let Some(line_end) = find(answer, b"\n") else {
-        let may_be_http = answer.starts_with(HTTP) || HTTP.starts_with(answer);
-        return Err(match ended {
-            Ended::Deadline if may_be_http => timed_out(target),
+    let Some(line_end) = find(bytes, b"\n") else {
+        let may_be_http = bytes.starts_with(HTTP) || HTTP.starts_with(bytes);
+        return Err(match answer.ended {
+            Ended::Deadline if may_be_http => DeliverError::Timeout { target, after },
             _ => DeliverError::NotHttp { target },
         });
     };
-    let Some((status, reason)) = status_line(&answer[..line_end]) else {
+    let Some((status, reason)) = status_line(&bytes[..line_end]) else {
         return Err(DeliverError::NotHttp { target });
     };
-    Ok(reply(target, status, reason, answer, &delivery.secrets))
+    Ok(reply(target, status, reason, bytes, secrets))
 }
 
 /// What every HTTP/1 status line starts with.

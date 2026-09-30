@@ -3002,26 +3002,13 @@ async fn run_auth(args: AuthArgs) {
                     frames.reply(&reply, answer);
                 }
                 Some(AuthCommand::Deliver { url, reply }) => {
-                    // A bool, not `&delivering` in the scrutinee: the arm below assigns the slot.
-                    let in_flight = delivering.is_some();
-                    let refusal = match (advertised.as_ref(), in_flight) {
-                        (None, _) => Some(NO_LOOPBACK_REDIRECT.to_owned()),
-                        (Some(_), true) => Some(DELIVERY_IN_FLIGHT.to_owned()),
-                        (Some(found), false) => match loopback::validate(&url, found) {
-                            Ok(delivery) => {
-                                // Not awaited here, as `Open` is: a response deadline of
-                                // seconds would stop the wire and `x` for all of them.
-                                delivering = Some(Delivering {
-                                    reply: reply.clone(),
-                                    answer: Box::pin(loopback::deliver(delivery, deliver_limits)),
-                                });
-                                None
-                            }
-                            Err(err) => Some(err.to_string()),
-                        },
-                    };
-                    // The pasted text ends here; the delivery holds only what its `GET` needs.
-                    drop(url);
+                    let refusal = accept_delivery(
+                        url,
+                        &reply,
+                        advertised.as_ref(),
+                        &mut delivering,
+                        deliver_limits,
+                    );
                     if let Some(message) = refusal {
                         frames.reply(
                             &reply,
@@ -3148,6 +3135,38 @@ async fn run_auth(args: AuthArgs) {
         },
     };
     frames.reply(&addr, StoreReply::Auth(frame));
+}
+
+/// One `AuthCommand::Deliver` inside the running login (MOD-22 D269): the paste checked against
+/// the newest advertised redirect and, when it passes and no delivery is in flight, its `GET` put
+/// in `slot`. `Some` is the refusal the request is owed; `None` means the slot's answer is.
+///
+/// The `GET` is not awaited here, as `Open` is: a response deadline of seconds would stop the wire
+/// and `x` for all of them. The pasted text ends in this function; the delivery holds only what
+/// its `GET` needs.
+fn accept_delivery(
+    url: RedirectUrl,
+    reply: &ReplyAddr,
+    advertised: Option<&Advertised>,
+    slot: &mut Option<Delivering>,
+    limits: DeliverLimits,
+) -> Option<String> {
+    let Some(found) = advertised else {
+        return Some(NO_LOOPBACK_REDIRECT.to_owned());
+    };
+    if slot.is_some() {
+        return Some(DELIVERY_IN_FLIGHT.to_owned());
+    }
+    match loopback::validate(&url, found) {
+        Ok(delivery) => {
+            *slot = Some(Delivering {
+                reply: reply.clone(),
+                answer: Box::pin(loopback::deliver(delivery, limits)),
+            });
+            None
+        }
+        Err(err) => Some(err.to_string()),
+    }
 }
 
 /// A delivery in flight (MOD-22 D269): who asked, and the one `GET`.
