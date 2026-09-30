@@ -45,6 +45,13 @@
 //! [`StoreReply::AgentWritten`] (D240): a plain [`StoreReply::Agents`] replaces the rows and never
 //! closes the form or moves its token. The form never shows `launch.env` (D235), and nothing here
 //! branches on an agent's name (`R-AGT-5`).
+//!
+//! Since MOD-22 a login can be **finished from another machine**. When the adapter's link advertises
+//! a loopback `redirect_uri`, the pane names it and `p` opens a masked field. The address the
+//! browser could not open is pasted there, checked here against that redirect, and sent as one
+//! [`StoreRequest::AuthDeliver`]. The login's own task relays it to the listener on this box and
+//! answers with what the listener said. The pasted address is a credential for the length of that
+//! request; the rule it is held to is `htui_agent::auth::loopback`'s (MOD-22 D273).
 
 use chrono::{DateTime, Utc};
 use htui_agent::auth::loopback::{
@@ -161,8 +168,11 @@ const HINT_MANUAL: &str = "Esc close";
 /// The hint line while the login chooser is waiting for a method (MOD-21 D20).
 const HINT_CHOOSING: &str = "j/k choose \u{b7} Enter select \u{b7} Esc cancel";
 
-/// The hint line while a login is spawning or running.
-const HINT_AUTH_RUNNING: &str = "o open link \u{b7} x cancel";
+/// The hint line while a login is spawning or running (MOD-22 D270: 41 of the 98 columns).
+const HINT_AUTH_RUNNING: &str = "o open link \u{b7} p paste redirect \u{b7} x cancel";
+
+/// The hint line while the paste field is open (MOD-22 D270).
+const HINT_PASTING: &str = "Enter sends \u{b7} Esc cancels";
 
 /// What `p` says while the login is being cancelled (MOD-22 D282).
 const PASTE_CANCELLING: &str = "this login is being cancelled; there is nothing to paste into";
@@ -922,7 +932,14 @@ impl AgentsSection {
     }
 
     /// The login half of the pane: the chooser, or the stream (MOD-21 D20).
-    fn auth_pane(&self, theme: &Theme) -> Vec<Line<'static>> {
+    ///
+    /// Under the stream's link, at most one line of MOD-22's (D270, D282), the first that applies:
+    /// the open paste field (a prompt, then `› ` and the masked field), a delivery in flight, or
+    /// the advertised redirect with the key that pastes for it. The prompt and the field replace
+    /// the redirect line rather than joining it, so the pane is at most six stderr lines, the link
+    /// and two more. Every one of them names [`Advertised::target`] and never a pasted byte. It
+    /// takes the width because the field draws a window of its dots.
+    fn auth_pane(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
         match &self.auth {
             AuthState::Choosing {
                 methods,
@@ -962,14 +979,48 @@ impl AgentsSection {
                 }
                 lines
             }
-            AuthState::Running { lines, url, .. } => lines
-                .iter()
-                .map(|line| Line::styled(line.clone(), theme.dim))
-                .chain(
-                    url.iter()
-                        .map(|url| Line::styled(format!("link: {url}"), theme.base)),
-                )
-                .collect(),
+            AuthState::Running {
+                lines,
+                url,
+                advertised,
+                paste,
+                delivering,
+                ..
+            } => {
+                let mut pane: Vec<Line<'static>> = lines
+                    .iter()
+                    .map(|line| Line::styled(line.clone(), theme.dim))
+                    .chain(
+                        url.iter()
+                            .map(|url| Line::styled(format!("link: {url}"), theme.base)),
+                    )
+                    .collect();
+                if let Some(target) = advertised.as_ref().map(Advertised::target) {
+                    if let Some(field) = paste {
+                        pane.push(Line::styled(
+                            format!("paste the address the browser could not open ({target}):"),
+                            theme.base,
+                        ));
+                        let mut spans = vec![Span::styled("\u{203a} ", theme.accent)];
+                        spans.extend(field.line(width.saturating_sub(2), true, theme).spans);
+                        pane.push(Line::from(spans));
+                    } else if *delivering {
+                        pane.push(Line::styled(
+                            format!("delivering to {target}\u{2026}"),
+                            theme.dim,
+                        ));
+                    } else {
+                        pane.push(Line::styled(
+                            format!(
+                                "redirect: {target} \u{b7} p pastes the address if the browser \
+                                 cannot reach it"
+                            ),
+                            theme.dim,
+                        ));
+                    }
+                }
+                pane
+            }
             AuthState::Idle | AuthState::Starting { .. } => Vec::new(),
         }
     }
@@ -1215,7 +1266,7 @@ impl AgentsSection {
                     )
                     .collect()
             }
-            _ => self.auth_pane(theme),
+            _ => self.auth_pane(width, theme),
         }
     }
 
@@ -1233,6 +1284,7 @@ impl AgentsSection {
             (Mode::Browse, InstallState::Idle) => match &self.auth {
                 AuthState::Idle => HINT_IDLE,
                 AuthState::Choosing { .. } => HINT_CHOOSING,
+                AuthState::Running { paste: Some(_), .. } => HINT_PASTING,
                 AuthState::Starting { .. } | AuthState::Running { .. } => HINT_AUTH_RUNNING,
             },
             // A pre-flight is one registry read and one `HEAD`, so this is usually gone before it
