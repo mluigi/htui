@@ -2801,10 +2801,12 @@ pub(crate) mod tests {
     }
 
     /// Plan D13 (`tui → worker`): a TUI walk in flight when the box flips keeps its lease and its
-    /// heartbeat and rests normally; a sweep meanwhile adopts nothing.
+    /// heartbeat and rests normally; a sweep meanwhile adopts nothing. A 6 s TTL beats every 2 s
+    /// (plan D124), so the heartbeat is seen moving the lease after the flip.
     #[tokio::test]
     async fn flipping_to_worker_keeps_the_tuis_live_walk() {
         let fixture = Fixture::new().await;
+        fixture.store.set_app_setting("lease_ttl_seconds", json!(6));
         let stall = Stall::default();
         fixture.sessions.push(Play::Stall(stall.clone()));
         let mut runtime = fixture.runtime();
@@ -2827,7 +2829,14 @@ pub(crate) mod tests {
         set_executor(&fixture, Executor::Worker).await;
 
         runtime.sweep(&backend, &replies);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let flipped = fixture.run(run).await.lease_expires_at;
+        assert!(flipped.is_some(), "leased when the box flips");
+        within("a heartbeat after the flip", async {
+            while fixture.run(run).await.lease_expires_at <= flipped {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
         let row = fixture.run(run).await;
         assert_eq!(row.status, RunStatus::Running, "the walk is still live");
         assert!(
@@ -2851,6 +2860,85 @@ pub(crate) mod tests {
             matches!(&started, Some(CommandOutcome::Started { rest, .. }) if rest.run == RunStatus::AwaitingApproval),
             "the start rested normally: {started:?}"
         );
+    }
+
+    /// Plan D13 (`worker → tui`): the worker's walk in flight when the box flips back keeps its
+    /// lease and its heartbeat and rests normally; the worker stops claiming at its next sweep
+    /// (OQ-2), so a row queued meanwhile stays `queued` for the TUI, even once nothing holds its
+    /// scope. A 6 s TTL beats every 2 s (plan D124).
+    #[tokio::test]
+    async fn flipping_to_tui_keeps_the_workers_live_walk() {
+        let fixture = Fixture::new().await;
+        fixture.store.set_app_setting("lease_ttl_seconds", json!(6));
+        set_executor(&fixture, Executor::Worker).await;
+        let stall = Stall::default();
+        fixture.sessions.push(Play::Stall(stall.clone()));
+        let mut runtime = fixture.runtime().with_role(Role::Worker);
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, mut answers) = mpsc::unbounded_channel();
+        runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq: 1,
+                    origin: Origin::App,
+                    request: start_run(ids::HTUI_ANA_2),
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        within("the session starting", stall.reached.notified()).await;
+        let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+        set_executor(&fixture, Executor::Tui).await;
+        let waiting = queued_by_another(&fixture, ids::HTUI_CLEAN_1).await;
+
+        runtime.sweep(&backend, &replies);
+        let flipped = fixture.run(run).await.lease_expires_at;
+        assert!(flipped.is_some(), "leased when the box flips");
+        within("a heartbeat after the flip", async {
+            while fixture.run(run).await.lease_expires_at <= flipped {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        let row = fixture.run(run).await;
+        assert_eq!(row.status, RunStatus::Running, "the walk is still live");
+        assert!(
+            row.lease_expires_at.is_some_and(|until| until > Utc::now()),
+            "and still leased: {:?}",
+            row.lease_expires_at
+        );
+        assert!(!stall.dropped.load(Ordering::SeqCst), "the session lives");
+
+        stall.release.notify_one();
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        assert_eq!(fixture.run(run).await.status, RunStatus::AwaitingApproval);
+        let mut started = None;
+        while let Ok(envelope) = answers.try_recv() {
+            if envelope.seq == 1 && !matches!(envelope.reply, StoreReply::RunStream(_)) {
+                started = Some(outcome(envelope.reply));
+            }
+        }
+        assert!(
+            matches!(&started, Some(CommandOutcome::Started { rest, .. }) if rest.run == RunStatus::AwaitingApproval),
+            "the start rested normally: {started:?}"
+        );
+
+        // Nothing holds the waiting row's scope any more, so only I-1 keeps the worker off it.
+        fixture
+            .store
+            .finish_run(run, RunStatus::Cancelled, None, Utc::now())
+            .await
+            .expect("the parked run is cancellable");
+        swept(&mut runtime, &fixture).await;
+        let row = fixture.run(waiting).await;
+        assert_eq!(
+            (row.status, row.lease_expires_at),
+            (RunStatus::Queued, None),
+            "I-1: a `tui` box's queued row is the TUI's to claim"
+        );
+        assert!(fixture.steps(waiting).await.is_empty(), "nothing walked");
     }
 
     /// Blueprint F-17, B-7: a claim this process's queue retries is I-1's too. After the flip to
