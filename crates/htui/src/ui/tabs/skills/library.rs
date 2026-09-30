@@ -617,7 +617,11 @@ impl LibraryView {
             StoreReply::Failed { request, message } if *request == READ_NAME => {
                 self.unavailable = Some(message.clone());
             }
-            StoreReply::Failed { request, message } if REQUEST_NAMES.contains(request) => {
+            // Only the write in flight: a refusal of one `on_scope_change` dropped must not free
+            // the next (the Requirements tab's guard; MOD-59 review L8).
+            StoreReply::Failed { request, message }
+                if REQUEST_NAMES.contains(request) && self.busy == Some(*request) =>
+            {
                 // A refused write leaves the draft, the form or the question's row as it was:
                 // nothing was written.
                 self.busy = None;
@@ -2566,6 +2570,52 @@ mod tests {
         assert_eq!(view.busy, Some("edit_skill"));
         assert_eq!(view.unavailable, None);
         assert_eq!(view.notice, Some(Notice::Info(SAVING.to_owned())));
+    }
+
+    /// MOD-59 review L8: a late refusal of another skill write (one a scope change dropped) frees
+    /// nothing; the refusal of the write in flight does, and the form keeps its text. The
+    /// Requirements tab's guard (MOD-39 review #3).
+    #[tokio::test]
+    async fn only_the_write_in_flight_is_freed_by_its_refusal() {
+        let backend = Backend::memory(MemStore::demo());
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        let read = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+
+        view.on_key(key(KeyCode::Char('i')), &mut ctx);
+        view.on_key(key(KeyCode::Tab), &mut ctx);
+        type_text(&mut view, "x", &mut ctx);
+        view.on_key(ctrl('s'), &mut ctx);
+        let _edit = bench.one();
+        assert_eq!(view.busy, Some("edit_skill"));
+
+        view.on_reply(
+            &StoreReply::Failed {
+                request: "save_skill_version",
+                message: "an older refusal".to_owned(),
+            },
+            &mut ctx,
+        );
+        assert_eq!(view.busy, Some("edit_skill"), "still in flight");
+        assert!(view.sent.is_some(), "with what it carries");
+        assert_eq!(view.notice, Some(Notice::Info(SAVING.to_owned())));
+
+        view.on_reply(
+            &StoreReply::Failed {
+                request: "edit_skill",
+                message: "refused".to_owned(),
+            },
+            &mut ctx,
+        );
+        assert_eq!(view.busy, None);
+        assert!(view.sent.is_none());
+        assert_eq!(view.notice, Some(Notice::Error("refused".to_owned())));
+        assert!(
+            matches!(view.mode, Mode::Info(_)),
+            "the form keeps its text"
+        );
     }
 
     /// MOD-9 D127, D134 (milestone 3's review finding 6): a skill with no version row — only a
