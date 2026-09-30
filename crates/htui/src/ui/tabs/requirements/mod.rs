@@ -42,7 +42,7 @@ use crate::app::{Action, Ctx, Handled, RevealTarget};
 use crate::requirements::{
     BLANK_AREA_TITLE, BLANK_BODY, DECIDING_KEY_NEEDED, DETAIL_NAME, MINT_NAME, READ_NAME,
     RequirementDetail, RequirementText, RequirementWrite, RequirementsSnapshot, is_tab_write,
-    not_the_maintainer,
+    mint_refused, not_the_maintainer,
 };
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::backlog::detail::Scroll;
@@ -213,6 +213,15 @@ enum Notice {
     Error(String),
 }
 
+/// A project's slug, or its id when the scope does not list it: the worker's `project_label`, so
+/// the gate's sentence is spelled the same on both sides.
+fn slug(ctx: &Ctx<'_>, project: ProjectId) -> String {
+    ctx.projects
+        .iter()
+        .find(|row| row.project_id == project)
+        .map_or_else(|| project.to_string(), |row| row.slug.clone())
+}
+
 /// A key with no modifier but `SHIFT`, which is how a terminal reports a capital.
 fn plain(key: &KeyEvent) -> bool {
     (key.modifiers - KeyModifiers::SHIFT).is_empty()
@@ -354,12 +363,7 @@ impl RequirementsTab {
             .project(project)
             .is_some_and(|entry| entry.maintainer)
         {
-            let slug = ctx
-                .projects
-                .iter()
-                .find(|row| row.project_id == project)
-                .map_or_else(|| project.to_string(), |row| row.slug.clone());
-            ctx.emit(Action::Error(not_the_maintainer(&slug)));
+            ctx.emit(Action::Error(not_the_maintainer(&slug(ctx, project))));
             return;
         }
         let mode = match (key, row) {
@@ -762,6 +766,20 @@ impl RequirementsTab {
         }
     }
 
+    /// Whether a mint's `Failed` is a refusal the worker gave before the insert, which wrote
+    /// nothing (MOD-59 re-review L2). With no mint form open there is nothing to name the project
+    /// and area by, and the answer is `false`: the hedge is the safe side.
+    fn mint_refused(&self, message: &str, ctx: &Ctx<'_>) -> bool {
+        let Mode::Requirement(RequirementForm {
+            target: FormTarget::Mint { project, area, .. },
+            ..
+        }) = &self.mode
+        else {
+            return false;
+        };
+        mint_refused(message, &slug(ctx, *project), *area)
+    }
+
     /// A `RequirementsStale` over the write in flight: the form stays with its text, its token
     /// moves to the head, and the notice says so. A head withdrawn elsewhere takes no retry, and
     /// the notice says that instead.
@@ -1116,9 +1134,10 @@ impl Tab for RequirementsTab {
                 // failed wrote nothing, or its retry is refused. A mint's `Failed` may be a COMMIT
                 // whose answer was lost, and its retry mints again, so its notice hedges (MOD-59
                 // review M1) and the tree is re-read for the user to check (re-review L1). That
-                // read is a plain `Requirements`, which lands nothing and closes no form (D4).
+                // read is a plain `Requirements`, which lands nothing and closes no form (D4). A
+                // mint the worker refused before its insert is a refusal like the others (L2).
                 self.busy = None;
-                if *request == MINT_NAME {
+                if *request == MINT_NAME && !self.mint_refused(message, ctx) {
                     self.notice = Some(Notice::Error(mint_failed(message)));
                     ctx.request(StoreRequest::Requirements(ctx.scope.clone()));
                 } else {
@@ -1203,8 +1222,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{ProjectRef, RequirementId, RequirementState, Scope};
-    use htui_core::store::MemStore;
-    use htui_core::store::requirement_withdrawn;
+    use htui_core::store::{MemStore, StoreError, requirement_withdrawn};
     use htui_store::{Backend, DATABASE_UNREACHABLE};
     use ratatui::style::Style;
 
@@ -1965,6 +1983,43 @@ mod tests {
         assert_eq!(draft(&tab), Some("Never written."), "a read closes no form");
         assert_eq!(tab.busy, None);
         assert_eq!(tab.notice, hedge, "the hedge stays up");
+    }
+
+    /// MOD-59 re-review L2: a mint refused before its insert (offline, a blank body, an area that
+    /// is not the project's, not the maintainer) wrote nothing, so its notice is the plain refusal:
+    /// no hedge, and no re-read.
+    #[tokio::test]
+    async fn a_mint_refused_before_its_insert_is_a_plain_refusal() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let refusals = [
+            StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()),
+            StoreError::Constraint(not_the_maintainer("htui")),
+            StoreError::Constraint(requirements::BLANK_BODY.to_owned()),
+            StoreError::NotFound {
+                entity: "requirement_area",
+                id: ids::AREA_ENT.to_string(),
+            },
+        ];
+        for refusal in refusals {
+            let message = refusal.to_string();
+            let mut tab = tab_on(snapshot.clone());
+            let name = mint(&bench, &mut tab, "Never written.");
+
+            bench.reply(
+                &mut tab,
+                &StoreReply::Failed {
+                    request: name,
+                    message: message.clone(),
+                },
+            );
+
+            assert_eq!(tab.busy, None);
+            assert_eq!(tab.notice, Some(Notice::Error(message.clone())));
+            assert_eq!(draft(&tab), Some("Never written."), "{message}");
+            let sent = bench.emit.take();
+            assert!(requests(&sent).is_empty(), "{message}: {sent:?}");
+        }
     }
 
     /// MOD-39 review #4: an amend form a stale answer kept open over a head withdrawn elsewhere

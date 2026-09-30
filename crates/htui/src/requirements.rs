@@ -38,8 +38,10 @@
 //! Known residue, the mint's (MOD-59 review M1): a mint whose COMMIT succeeded but whose answer
 //! the connection lost is the store's error, so the worker answers `Failed` for a requirement that
 //! exists. Every other tab write is a compare-and-set or a unique code, so its retry is refused;
-//! a mint's retry mints a second requirement, and a requirement is withdrawn, never deleted. The
-//! tab therefore does not call a mint's `Failed` a refusal: its notice says the requirement may
+//! a mint's retry mints a second requirement, and a requirement is withdrawn, never deleted. Only
+//! the insert's error is ambiguous: a refusal [`serve`] gives before it ([`mint_refused`]) is a
+//! plain refusal in the tab (re-review L2). The tab does not call any other mint `Failed` a
+//! refusal: its notice says the requirement may
 //! have been written, the form keeps its text, and the tab re-reads the tree, which is drawn beside
 //! the form, for the user to look for it before `Ctrl+S` retries (re-review L1). The check is
 //! still the user's: nothing matches the draft against the tree. A connection lost mid-COMMIT
@@ -247,7 +249,7 @@ pub const DETAIL_NAME: &str = REQUEST_NAMES[1];
 pub const CITATIONS_NAME: &str = REQUEST_NAMES[2];
 
 /// The tab's mint: the one tab write whose retry mints again rather than being refused, so its
-/// `Failed` is not known to be a refusal (MOD-59 review M1).
+/// `Failed` is not known to be a refusal (MOD-59 review M1) unless [`mint_refused`] says so.
 pub const MINT_NAME: &str = REQUEST_NAMES[4];
 
 /// Whether `name` is one of the tab's four writes.
@@ -278,6 +280,24 @@ pub fn not_the_maintainer(project: &str) -> String {
         "only the owner of {project}'s requirements can add areas or create, amend or withdraw \
          requirements"
     )
+}
+
+/// MOD-59 re-review L2: whether `message`, a mint's `Failed` as the worker renders it, is one of
+/// the refusals [`serve`] gives before the insert, so nothing was written: offline, a blank body,
+/// an area that is not the project's, or not the maintainer (`project` is the slug the gate
+/// names). Each is rendered from the error `serve` builds, so the two cannot drift apart. Anything
+/// else may follow a COMMIT whose answer was lost, and the tab keeps hedging it. That includes a
+/// read failed on the way to the insert, whose sentence is the insert's own.
+#[must_use]
+pub fn mint_refused(message: &str, project: &str, area: RequirementAreaId) -> bool {
+    [
+        offline(),
+        blank_body(),
+        area_not_found(area),
+        StoreError::Constraint(not_the_maintainer(project)),
+    ]
+    .iter()
+    .any(|refusal| refusal.to_string() == message)
 }
 
 /// Plan P6: no item of that key in the requirement's project.
@@ -536,10 +556,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 .iter()
                 .any(|row| row.id == *area)
             {
-                return Err(StoreError::NotFound {
-                    entity: "requirement_area",
-                    id: area.to_string(),
-                });
+                return Err(area_not_found(*area));
             }
             let me = backend.this_user().await?;
             let box_id = backend.box_info().await?.map(|row| row.box_id);
@@ -691,17 +708,33 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
 
 /// The writer, or the refusal every requirement write answers offline.
 fn write_access(backend: &Backend) -> Result<Writer> {
-    backend
-        .writer()
-        .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))
+    backend.writer().ok_or_else(offline)
+}
+
+/// The refusal of every requirement write offline, before anything is sent.
+fn offline() -> StoreError {
+    StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned())
 }
 
 /// [`BLANK_BODY`] for a body that is blank after `trim`.
 fn refuse_blank_body(body: &RequirementText) -> Result<()> {
     if body.as_str().trim().is_empty() {
-        Err(StoreError::Constraint(BLANK_BODY.to_owned()))
+        Err(blank_body())
     } else {
         Ok(())
+    }
+}
+
+/// A mint or amend refused for a blank body.
+fn blank_body() -> StoreError {
+    StoreError::Constraint(BLANK_BODY.to_owned())
+}
+
+/// A mint into an area that is not the project's (blueprint F-7).
+fn area_not_found(area: RequirementAreaId) -> StoreError {
+    StoreError::NotFound {
+        entity: "requirement_area",
+        id: area.to_string(),
     }
 }
 
@@ -872,7 +905,8 @@ mod tests {
         ItemCitations, READ_NAME, REQUEST_NAMES, RequirementDetail, RequirementText,
         RequirementWrite, RequirementsSnapshot, decision_citation_not_cited,
         decision_citation_stays, gate_after_read, is_citation_write, is_tab_write, matches_filter,
-        no_deciding_item, not_the_maintainer, requirement_of_another_project, serve, written,
+        mint_refused, no_deciding_item, not_the_maintainer, requirement_of_another_project, serve,
+        written,
     };
     use crate::store_worker::{self, StoreReply, StoreRequest};
     use chrono::TimeDelta;
@@ -1993,6 +2027,59 @@ mod tests {
                 other => panic!("an offline {} is refused, not {other:?}", write.name()),
             }
         }
+    }
+
+    /// MOD-59 re-review L2: the four refusals `serve` gives a mint before its insert, rendered by
+    /// the worker into `Failed` as the tab receives them, are what `mint_refused` recognises. The
+    /// insert's own error, and another project's gate, are not.
+    #[tokio::test]
+    async fn mint_refused_knows_the_refusals_before_the_insert() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+        let stranger = stranger_first();
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "requirements-mint-refused", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let offline = Backend::Offline { cache, since: None };
+        let refusals = [
+            ("offline", &offline, ids::PROJECT_HTUI, "Body."),
+            ("a blank body", &backend, ids::PROJECT_HTUI, "  "),
+            (
+                "another project's area",
+                &backend,
+                ids::PROJECT_AGY,
+                "Body.",
+            ),
+            ("not the maintainer", &stranger, ids::PROJECT_HTUI, "Body."),
+        ];
+        for (why, backend, project, body) in refusals {
+            let request = mint(&scope, project, ids::AREA_ENT, body);
+            let StoreReply::Failed { message, .. } = store_worker::serve(backend, &request).await
+            else {
+                panic!("{why}: the mint is refused")
+            };
+            let slug = if project == ids::PROJECT_HTUI {
+                "htui"
+            } else {
+                "agy"
+            };
+            assert!(
+                mint_refused(&message, slug, ids::AREA_ENT),
+                "{why}: {message}"
+            );
+        }
+
+        assert!(!mint_refused(
+            "store unreachable: connection reset",
+            "htui",
+            ids::AREA_ENT
+        ));
+        let theirs = StoreError::Constraint(not_the_maintainer("agy")).to_string();
+        assert!(
+            !mint_refused(&theirs, "htui", ids::AREA_ENT),
+            "another project's gate"
+        );
     }
 
     #[tokio::test]
