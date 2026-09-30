@@ -47,11 +47,11 @@ use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, InferReport, MirrorAfterDelete};
 use crate::prompt_settings::{self, SettingsSnapshot};
 use crate::requirements::{
-    self, ItemCitations, RequirementDetail, RequirementText, RequirementsSnapshot,
+    self, ItemCitations, RequirementDetail, RequirementText, RequirementWrite, RequirementsSnapshot,
 };
 use crate::run_worker::{LiveChats, RunRuntime, RunServed, TuiRuns as _};
 use crate::skill_import::SkillImports;
-use crate::skills::{self, SkillsSnapshot, StaleWhat};
+use crate::skills::{self, SkillWrite, SkillsSnapshot, StaleWhat};
 use crate::templates::{self, TemplateBody, TemplatesSnapshot};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
@@ -596,6 +596,8 @@ pub enum StoreRequest {
     Templates(Scope),
     /// Append version `expected + 1` of `(project, name)` iff `expected` is its head (`None`: a new
     /// name). The worker fills `created_by` (`this_user`); the view never holds a `UserId`.
+    /// Answered with [`StoreReply::TemplateSaved`] when it applied (MOD-59),
+    /// [`StoreReply::TemplatesStale`] when the token was spent.
     SaveTemplate {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -613,7 +615,8 @@ pub enum StoreRequest {
     /// graphs and repo names (MOD-9 D81). Answered with [`StoreReply::Skills`].
     Skills(Scope),
     /// `create_skill`: the row and its version 1 together (D75, D77). The worker mints the id and
-    /// fills `created_by`; the view never holds a `UserId`. A refusal (name, blank body, taken
+    /// fills `created_by`; the view never holds a `UserId`. Answered with
+    /// [`StoreReply::SkillWritten`] when it applied (MOD-59); a refusal (name, blank body, taken
     /// name) is [`StoreReply::Failed`].
     CreateSkill {
         /// The scope the reply re-reads.
@@ -625,9 +628,9 @@ pub enum StoreRequest {
         /// Version 1's body. Its `Debug` is its length.
         body: TemplateBody,
     },
-    /// `update_skill` under CAS on `skill.updated_at` (D76): answered with [`StoreReply::Skills`]
-    /// when it applied and [`StoreReply::SkillsStale`] when the token was spent or the skill is
-    /// gone.
+    /// `update_skill` under CAS on `skill.updated_at` (D76): answered with
+    /// [`StoreReply::SkillWritten`] when it applied (MOD-59) and [`StoreReply::SkillsStale`] when
+    /// the token was spent or the skill is gone.
     EditSkill {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -639,8 +642,8 @@ pub enum StoreRequest {
         patch: SkillPatch,
     },
     /// `add_skill_version`: append version `expected + 1` iff `expected` is the head (D75, D89).
-    /// The worker fills `created_by`. [`StoreReply::SkillsStale`] when the head moved or the skill
-    /// is gone.
+    /// The worker fills `created_by`. Answered with [`StoreReply::SkillWritten`] when it applied
+    /// (MOD-59), [`StoreReply::SkillsStale`] when the head moved or the skill is gone.
     SaveSkillVersion {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -651,9 +654,10 @@ pub enum StoreRequest {
         /// The new body. Its `Debug` is its length.
         body: TemplateBody,
     },
-    /// `set_skill_binding`: attach, change or detach the one row at `key` (D78, D90).
-    /// [`StoreReply::SkillsStale`] when the row at the key is not the one the form opened on, or
-    /// its skill, project or phase is gone.
+    /// `set_skill_binding`: attach, change or detach the one row at `key` (D78, D90). Answered
+    /// with [`StoreReply::SkillWritten`] when it applied (MOD-59), [`StoreReply::SkillsStale`]
+    /// when the row at the key is not the one the form opened on, or its skill, project or phase
+    /// is gone.
     SetSkillBinding {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -726,7 +730,8 @@ pub enum StoreRequest {
     /// One item's citations and what it could cite (plan P8), answered with
     /// [`StoreReply::ItemCitations`].
     ItemRequirements(ItemId),
-    /// `create_requirement_area`, gated (PRD D1). The worker picks `position` (last + 1).
+    /// `create_requirement_area`, gated (PRD D1). The worker picks `position` (last + 1). Answered
+    /// with [`StoreReply::RequirementWritten`] when it applied (MOD-59).
     CreateRequirementArea {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -738,6 +743,7 @@ pub enum StoreRequest {
         title: String,
     },
     /// `mint_requirement`, gated. The worker mints the id and fills `created_by` and `box_id`.
+    /// Answered with [`StoreReply::RequirementWritten`] when it applied (MOD-59).
     MintRequirement {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -753,7 +759,8 @@ pub enum StoreRequest {
         priority: Priority,
     },
     /// `amend_requirement` at `expected_version`, gated; `deciding` is the typed item key (plan
-    /// P6). [`StoreReply::RequirementsStale`] on `Diverged`.
+    /// P6). Answered with [`StoreReply::RequirementWritten`] when it applied (MOD-59),
+    /// [`StoreReply::RequirementsStale`] on `Diverged`.
     AmendRequirement {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -770,7 +777,9 @@ pub enum StoreRequest {
         /// The deciding item's key, as typed.
         deciding: String,
     },
-    /// `withdraw_requirement` at `expected_version`, gated; `deciding` as above.
+    /// `withdraw_requirement` at `expected_version`, gated; `deciding` as above. Answered with
+    /// [`StoreReply::RequirementWritten`] when it applied (MOD-59),
+    /// [`StoreReply::RequirementsStale`] on `Diverged`.
     WithdrawRequirement {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -1070,14 +1079,31 @@ pub enum StoreReply {
     /// A settings write missed its CAS token (M5 D14, PRD D8): the rungs as they are now, for the
     /// editor to reload against. The editor keeps its typed text and retries only on `Enter`.
     PromptSettingsStale(Box<SettingsSnapshot>),
-    /// The scope's prompt templates, freshly read: the answer to [`StoreRequest::Templates`] and to
-    /// a [`StoreRequest::SaveTemplate`] that applied (MOD-9 D5).
+    /// The scope's prompt templates, freshly read: the answer to [`StoreRequest::Templates`] (MOD-9
+    /// D5). A read answer only: a save that applied answers [`StoreReply::TemplateSaved`]
+    /// (MOD-59).
     Templates(Box<TemplatesSnapshot>),
     /// A template save missed its CAS token (PRD D5): the templates as they are now, for the editor
     /// to reload against. The editor keeps its typed text and retries only by hand.
     TemplatesStale(Box<TemplatesSnapshot>),
-    /// The Skills view's snapshot, freshly read: the answer to [`StoreRequest::Skills`] and to
-    /// every skill write that applied (MOD-9 D81).
+    /// The answer to a [`StoreRequest::SaveTemplate`] that applied (MOD-59 D1): the templates
+    /// re-read after it and the row the store appended. Self-naming: the Templates view lands its
+    /// save on this variant alone, and a plain [`StoreReply::Templates`] never closes its editor or
+    /// moves its token.
+    TemplateSaved {
+        /// The templates as they are now; or, when only the re-read failed, its `StoreError`
+        /// rendered through `Display`. The version was appended either way (D5).
+        snapshot: Result<Box<TemplatesSnapshot>, String>,
+        /// The template's project, as stored.
+        project: ProjectId,
+        /// The template's name, as stored.
+        name: String,
+        /// The version the save appended.
+        version: i32,
+    },
+    /// The Skills view's snapshot, freshly read: the answer to [`StoreRequest::Skills`] (MOD-9
+    /// D81). A read answer only: a skill write that applied answers [`StoreReply::SkillWritten`]
+    /// (MOD-59).
     Skills(Box<SkillsSnapshot>),
     /// A skill write missed its token, or its skill, project or phase is gone (D81, D97): the
     /// snapshot as it is now and which write it answers. The draft keeps its text and retries only
@@ -1087,6 +1113,16 @@ pub enum StoreReply {
         snapshot: Box<SkillsSnapshot>,
         /// Which write went stale.
         what: StaleWhat,
+    },
+    /// The answer to every skill write that applied (MOD-59 D1): the snapshot re-read after it,
+    /// and what the write did. Self-naming: the Skills view lands a write on this variant alone,
+    /// and a plain [`StoreReply::Skills`] never closes its editor, form or question.
+    SkillWritten {
+        /// The snapshot as it is now; or, when only the re-read failed, its `StoreError` rendered
+        /// through `Display`. The write landed either way (D5).
+        snapshot: Result<Box<SkillsSnapshot>, String>,
+        /// What the write did.
+        outcome: SkillWrite,
     },
     /// The library after an import, and what happened to every file it touched
     /// ([`StoreRequest::ImportSkills`], MOD-9 import plan D97). One variant and not two: a file
@@ -1129,12 +1165,23 @@ pub enum StoreReply {
         /// What the write did.
         outcome: AgentWrite,
     },
-    /// The scope's requirements, freshly read: the answer to [`StoreRequest::Requirements`] and to
-    /// every tab write that applied (MOD-39 plan P3).
+    /// The scope's requirements, freshly read: the answer to [`StoreRequest::Requirements`] (MOD-39
+    /// plan P3). A read answer only: a tab write that applied answers
+    /// [`StoreReply::RequirementWritten`] (MOD-59).
     Requirements(Box<RequirementsSnapshot>),
     /// An amend or withdraw missed its version (plan P3): the snapshot as it is now. The form keeps
     /// its text and retries only by hand.
     RequirementsStale(Box<RequirementsSnapshot>),
+    /// The answer to every tab write that applied (MOD-59 D1): the scope re-read after it, and
+    /// what the write did. Self-naming: the Requirements tab lands a write on this variant alone,
+    /// and a plain [`StoreReply::Requirements`] never closes its form.
+    RequirementWritten {
+        /// The requirements as they are now; or, when only the re-read failed, its `StoreError`
+        /// rendered through `Display`. The write landed either way (D5).
+        snapshot: Result<Box<RequirementsSnapshot>, String>,
+        /// What the write did.
+        outcome: RequirementWrite,
+    },
     /// Answer to [`StoreRequest::RequirementDetail`].
     RequirementDetail(Box<RequirementDetail>),
     /// Answer to [`StoreRequest::ItemRequirements`] and to every citation write that applied.
@@ -1146,6 +1193,43 @@ pub enum StoreReply {
         /// The `StoreError`, rendered through `Display`.
         message: String,
     },
+}
+
+/// What one self-naming write did, before the re-read that answers it (MOD-59 review L3): the
+/// skills, templates and requirements writers each hand their `answer` one of these. Only
+/// [`WriteOutcome::answer`] turns it into a reply, so the three keep one rule: an applied write
+/// answers its self-naming reply whatever the re-read came to (D5), and a stale one answers its
+/// stale reply, whose failed re-read stays an error (D3).
+///
+/// Not [`htui_core::store::CasOutcome`]: its `Stale` carries the row as it is now, of the applied
+/// row's own type, where a stale write here carries only which write missed and the re-read is
+/// the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteOutcome<T, S = ()> {
+    /// The write applied: what the store says it wrote.
+    Applied(T),
+    /// The write missed its token, or its row is gone: which write, when the reply says.
+    Stale(S),
+}
+
+impl<T, S> WriteOutcome<T, S> {
+    /// The reply, given the re-read after the write: `written` for an applied write, handed the
+    /// re-read whatever it came to; `stale` for a stale one, handed the snapshot, or the re-read's
+    /// error in its place.
+    ///
+    /// # Errors
+    /// The re-read's, after a stale write only.
+    pub fn answer<R>(
+        self,
+        reread: StoreResult<R>,
+        written: impl FnOnce(StoreResult<R>, T) -> StoreReply,
+        stale: impl FnOnce(R, S) -> StoreReply,
+    ) -> StoreResult<StoreReply> {
+        match self {
+            Self::Applied(outcome) => Ok(written(reread, outcome)),
+            Self::Stale(what) => Ok(stale(reread?, what)),
+        }
+    }
 }
 
 /// One frame of a chat stream.

@@ -28,19 +28,16 @@ reviews of the loop's last two turns (review rows answered `Rejected`, each read
 `documents_of_kinds`, which never held two. A loop whose two rejected reviews repeat each other now
 escalates at that attempt; the hash half is still asked first. `runs_pg`'s escalation case now stops
 on `no_progress_review`, and the stop is pinned in that test (MOD-4 R-9 closed).
+Before that, **MOD-59 done** (`docs/decisions/mod/mod-59.md`): an applied Skills,
+Templates or Requirements write answers its own reply (`SkillWritten`, `TemplateSaved`,
+`RequirementWritten`, as MOD-23's `AgentWritten`), so a form lands on its write and never stays "in
+flight" when another session changed the row or a read arrived first; a write whose re-read failed
+still lands, and a failed mint is hedged and re-reads the tree.
 Before it, **MOD-14 done** (`docs/decisions/mod/mod-14.md`): the Backlog's
 Graph sub-tab draws the selected item's link neighbourhood as a tree, 1-3 hops (`+`/`-`, default 2,
 fetched at 3), across projects, with link kind and status per row; `J`/`K` move, `Enter` re-roots the
 Backlog selection through MOD-64's reveal, a node outside the workspace refuses on the status line,
 and `m` opens the sub-tab (`R-TUI-2` `open graph`).
-Before that, **MOD-22 done** (`docs/decisions/mod/mod-22.md`): a login whose
-browser cannot reach the box completes from the TUI. While a login runs, `p` in Settings > Agents
-opens a masked field for the `http://127.0.0.1:<port>/?code=…&state=…` address the browser could
-not open; it is checked against the `redirect_uri` the login link advertised and sent as one raw
-loopback `GET` from the login's own task, the listener's answer is shown, and MOD-21's path finishes
-the login. The URL is a credential for one request (`R-AGT-9` amended). Bracketed paste is now on
-app-wide and reaches only a field that captures input. Live proof on the server-plus-laptop setup
-is the maintainer's (OQ-6).
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -266,18 +263,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   counters: the Requirements tab's `tree::pad`/`clip` (on a narrow pane `pad` cuts the
   ` · read-only` marker before the project name) and the Reqs sub-tab's `cut`
   (`docs/decisions/mod/mod-39.md`, "Carried").
-- [ ] **MOD-59 - A write's reply names itself, so a form never stays "in flight"** (from MOD-9
-  milestone 3 review, finding 3; `docs/decisions/mod/mod-9.md`). `R-TUI-7`, `R-NF-3`. The Skills and Templates views decide that a
-  save landed by finding what they sent in the re-read snapshot (`ui/tabs/skills/library.rs` `land`,
-  milestone 1's D27 in `templates.rs`). If another session changes the same skill, binding or
-  template between the write and the worker's re-read, or `MemStore` stamps two writes with the same
-  instant, the predicate never holds: `busy` stays set and the editor, rename form or attachment
-  form refuses `Esc` and `Ctrl+S` until the workspace changes. Make a write's reply identify itself
-  (e.g. `StoreReply::SkillsWritten { snapshot, what }` and a templates twin) so landing no longer
-  depends on content, or release the form on any reply to the write's request name. Found
-  2026-09-26. MOD-39's Requirements tab lands the same way (`ui/tabs/requirements/mod.rs` `land`),
-  and re-reads after a refused mint because the worker answers `Failed` when only its re-read
-  failed; a reply that names its write would retire both (`docs/decisions/mod/mod-39.md`).
 - [ ] **MOD-49 - Interactive path picker for repo and workspace roots** (from MOD-7). `R-BOX-4`,
   `R-TUI-8`. MOD-7 D5 infers each repo's path on a box and falls back to a typed path in a text box
   when inference fails; as built, the typed fallback is Settings > Hierarchy's `b` (MOD-7 milestone
@@ -601,6 +586,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 29 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 28 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

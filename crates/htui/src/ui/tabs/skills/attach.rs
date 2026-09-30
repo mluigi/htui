@@ -279,24 +279,29 @@ impl AttachPane {
 
     /// The write the form sent landed. Keys typed on the form while it was in flight still
     /// edited it: when the form no longer builds what was sent, it stays open on those edits with
-    /// the landed row's token, so the next `Ctrl+S` writes them over the row just saved (the
-    /// library editor's "later edits kept" rule), and this answers `true`. Otherwise (a detach,
-    /// or nothing typed since) the pane goes back to its rows.
+    /// `token`, so the next `Ctrl+S` writes them over the row just saved (the library editor's
+    /// "later edits kept" rule), and this answers `true`. Otherwise (a detach, or nothing typed
+    /// since) the pane goes back to its rows.
+    ///
+    /// `token` is the `updated_at` of the row this write landed, from the write's own outcome
+    /// (MOD-59 DV-1), not the re-read's row: another session may have written over that one
+    /// already, and a token taken from it would save over their row unchecked. `None` for a
+    /// detach.
     pub(super) fn on_landed(
         &mut self,
         key: SkillBindingKey,
         change: &BindingChange,
-        snapshot: &SkillsSnapshot,
+        token: Option<DateTime<Utc>>,
     ) -> bool {
         if let (
             AttachMode::Form(form) | AttachMode::Picker { form, .. },
             BindingChange::Attach(sent),
-        ) = (&mut self.mode, change)
+            Some(token),
+        ) = (&mut self.mode, change, token)
             && form.key == key
             && build(form).as_ref() != Ok(sent)
-            && let Some(row) = snapshot.binding(key)
         {
-            form.token = Some(row.updated_at);
+            form.token = Some(token);
             return true;
         }
         self.mode = AttachMode::Browse;
@@ -609,8 +614,6 @@ impl AttachPane {
                 change: BindingChange::Detach,
             }),
             sent: Box::new(Sent::Binding {
-                key: row,
-                token: Some(token),
                 change: BindingChange::Detach,
                 target,
             }),
@@ -638,12 +641,7 @@ impl AttachPane {
                 expected: token,
                 change: change.clone(),
             }),
-            sent: Box::new(Sent::Binding {
-                key,
-                token,
-                change,
-                target,
-            }),
+            sent: Box::new(Sent::Binding { change, target }),
         }
     }
 

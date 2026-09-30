@@ -3,10 +3,14 @@
 //! and the seven writes, the [`crate::templates`] shape.
 //!
 //! One read per event and never one per keystroke, one reply out. Every write re-reads rather than
-//! handing the view the row its outcome carries: a tab write answers a fresh
-//! [`RequirementsSnapshot`], a citation write a fresh [`ItemCitations`]. An amend or withdraw that
-//! missed its version answers [`StoreReply::RequirementsStale`] (plan P3); every other refusal
-//! stays an error, so [`crate::store_worker::serve`] answers `Failed` with the store's sentence.
+//! handing the view the row its outcome carries: a tab write that applied answers
+//! [`StoreReply::RequirementWritten`], a fresh [`RequirementsSnapshot`] beside what the store wrote
+//! (MOD-59), so the tab lands it on its own reply and never by searching the snapshot; a citation
+//! write answers a fresh [`ItemCitations`]. A re-read that fails after a tab write applied still
+//! answers `RequirementWritten`, carrying the failure, because the write has landed. An amend or
+//! withdraw that missed its version answers [`StoreReply::RequirementsStale`] (plan P3); every
+//! other refusal stays an error, so [`crate::store_worker::serve`] answers `Failed` with the
+//! store's sentence.
 //!
 //! **The maintainer gate** (PRD D1, plan P5): area create, mint, amend and withdraw are the
 //! project's requirements owner's (`requirement_spec.owner_id`). A project with no spec is
@@ -27,9 +31,22 @@
 //! text filter is a substring of key or title, so `ANA-1` would also find `ANA-10` (blueprint
 //! F-11). An unknown key is refused before any write.
 //!
-//! Known residue, the one [`crate::templates`] and [`crate::skills`] carry: a re-read that fails
-//! *after* an applied write answers `Failed`, so the view is told nothing happened when the write
-//! has in fact landed.
+//! Known residue, the citation writes' alone (MOD-59 D6): a re-read that fails *after* an applied
+//! cite, uncite or re-confirm answers `Failed`, so the Reqs sub-tab is told nothing happened when
+//! the write has in fact landed.
+//!
+//! Known residue, the mint's (MOD-59 review M1): a mint whose COMMIT succeeded but whose answer
+//! the connection lost is the store's error, so the worker answers `Failed` for a requirement that
+//! exists. Every other tab write is a compare-and-set or a unique code, so its retry is refused;
+//! a mint's retry mints a second requirement, and a requirement is withdrawn, never deleted. Only
+//! the insert's error is ambiguous: a refusal [`serve`] gives before it ([`mint_refused`]) is a
+//! plain refusal in the tab (re-review L2). The tab does not call any other mint `Failed` a
+//! refusal: its notice says the requirement may
+//! have been written, the form keeps its text, and the tab re-reads the tree, which is drawn beside
+//! the form, for the user to look for it before `Ctrl+S` retries (re-review L1). The check is
+//! still the user's: nothing matches the draft against the tree. A connection lost mid-COMMIT
+//! takes the worker offline, so that re-read is the mirror's, which may not hold the mint yet; a
+//! re-read refused outright puts its own refusal in the notice in place of the hedge.
 //!
 //! The worker fills the author and the box from [`Backend::this_user`] and [`Backend::box_info`];
 //! the render side never holds a `UserId` (`R-NF-3`). Nothing here reads the clock: the store
@@ -47,7 +64,7 @@ use htui_core::store::{
 };
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 
-use crate::store_worker::{StoreReply, StoreRequest};
+use crate::store_worker::{StoreReply, StoreRequest, WriteOutcome};
 
 /// A body or rationale on its way to the store. `StoreRequest` derives `Debug`, and this is user
 /// prose, so it prints its length only ([`crate::templates::TemplateBody`]'s rule).
@@ -231,6 +248,10 @@ pub const DETAIL_NAME: &str = REQUEST_NAMES[1];
 /// The sub-tab's read.
 pub const CITATIONS_NAME: &str = REQUEST_NAMES[2];
 
+/// The tab's mint: the one tab write whose retry mints again rather than being refused, so its
+/// `Failed` is not known to be a refusal (MOD-59 review M1) unless [`mint_refused`] says so.
+pub const MINT_NAME: &str = REQUEST_NAMES[4];
+
 /// Whether `name` is one of the tab's four writes.
 #[must_use]
 pub fn is_tab_write(name: &str) -> bool {
@@ -259,6 +280,24 @@ pub fn not_the_maintainer(project: &str) -> String {
         "only the owner of {project}'s requirements can add areas or create, amend or withdraw \
          requirements"
     )
+}
+
+/// MOD-59 re-review L2: whether `message`, a mint's `Failed` as the worker renders it, is one of
+/// the refusals [`serve`] gives before the insert, so nothing was written: offline, a blank body,
+/// an area that is not the project's, or not the maintainer (`project` is the slug the gate
+/// names). Each is rendered from the error `serve` builds, so the two cannot drift apart. Anything
+/// else may follow a COMMIT whose answer was lost, and the tab keeps hedging it. That includes a
+/// read failed on the way to the insert, whose sentence is the insert's own.
+#[must_use]
+pub fn mint_refused(message: &str, project: &str, area: RequirementAreaId) -> bool {
+    [
+        offline(),
+        blank_body(),
+        area_not_found(area),
+        StoreError::Constraint(not_the_maintainer(project)),
+    ]
+    .iter()
+    .any(|refusal| refusal.to_string() == message)
 }
 
 /// Plan P6: no item of that key in the requirement's project.
@@ -380,7 +419,62 @@ pub async fn citations(backend: &Backend, item: ItemId) -> Result<ItemCitations>
     })
 }
 
+/// What one tab write did (MOD-59 D2), carried by [`StoreReply::RequirementWritten`] beside the
+/// scope re-read. Ids, codes, keys and versions only: a body stays in the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequirementWrite {
+    /// [`StoreRequest::CreateRequirementArea`]: the area landed.
+    Area {
+        /// The area's id.
+        id: RequirementAreaId,
+        /// Its code, as stored (trimmed).
+        code: String,
+    },
+    /// [`StoreRequest::MintRequirement`]: the requirement landed at version 1.
+    Minted {
+        /// The id the worker minted.
+        id: RequirementId,
+        /// Its key, `R-<code>-<number>`.
+        key: String,
+    },
+    /// [`StoreRequest::AmendRequirement`] at the head: the new head.
+    Amended {
+        /// The requirement.
+        id: RequirementId,
+        /// Its key.
+        key: String,
+        /// The version written.
+        version: i32,
+    },
+    /// [`StoreRequest::WithdrawRequirement`] at the head.
+    Withdrawn {
+        /// The requirement.
+        id: RequirementId,
+        /// Its key.
+        key: String,
+    },
+}
+
+impl RequirementWrite {
+    /// The [`StoreRequest::name`] of the write this answers: what the tab's `busy` holds while it
+    /// is in flight, so only that write lands on it (MOD-59 D4).
+    #[must_use]
+    pub const fn request_name(&self) -> &'static str {
+        match self {
+            Self::Area { .. } => REQUEST_NAMES[3],
+            Self::Minted { .. } => REQUEST_NAMES[4],
+            Self::Amended { .. } => REQUEST_NAMES[5],
+            Self::Withdrawn { .. } => REQUEST_NAMES[6],
+        }
+    }
+}
+
 /// Serves one requirement request, off the UI task.
+///
+/// The tab's read answers [`StoreReply::Requirements`]. A tab write answers
+/// [`StoreReply::RequirementWritten`] when it applied, even when only the re-read after it failed
+/// (MOD-59 D1, D5), and an amend or withdraw that missed its version answers
+/// [`StoreReply::RequirementsStale`]; a refusal stays an error.
 ///
 /// # Errors
 /// Whatever the seam reports; offline, [`StoreError::Unreachable`] with `DATABASE_UNREACHABLE`
@@ -388,7 +482,9 @@ pub async fn citations(backend: &Backend, item: ItemId) -> Result<ItemCitations>
 /// maintainer; [`StoreError::Backend`] for a request that is not one of this module's ten.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
     match request {
-        StoreRequest::Requirements(scope) => answer(backend, scope, false).await,
+        StoreRequest::Requirements(scope) => Ok(StoreReply::Requirements(Box::new(
+            snapshot(backend, scope).await?,
+        ))),
         StoreRequest::RequirementDetail(id) => Ok(StoreReply::RequirementDetail(Box::new(
             detail(backend, *id).await?,
         ))),
@@ -426,7 +522,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 .map_or(0, |last| last + 1);
             let me = backend.this_user().await?;
             gate(backend, &writer, *project, me).await?;
-            writer
+            let area = writer
                 .create_requirement_area(NewRequirementArea {
                     id: RequirementAreaId::new(),
                     project_id: *project,
@@ -436,7 +532,11 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                     position,
                 })
                 .await?;
-            answer(backend, scope, false).await
+            let landed = RequirementWrite::Area {
+                id: area.id,
+                code: area.code,
+            };
+            answer(backend, scope, WriteOutcome::Applied(landed)).await
         }
         StoreRequest::MintRequirement {
             scope,
@@ -456,15 +556,12 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 .iter()
                 .any(|row| row.id == *area)
             {
-                return Err(StoreError::NotFound {
-                    entity: "requirement_area",
-                    id: area.to_string(),
-                });
+                return Err(area_not_found(*area));
             }
             let me = backend.this_user().await?;
             let box_id = backend.box_info().await?.map(|row| row.box_id);
             gate(backend, &writer, *project, me).await?;
-            writer
+            let row = writer
                 .mint_requirement(
                     *area,
                     NewRequirement {
@@ -477,7 +574,11 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                     },
                 )
                 .await?;
-            answer(backend, scope, false).await
+            let landed = RequirementWrite::Minted {
+                id: row.id,
+                key: row.key,
+            };
+            answer(backend, scope, WriteOutcome::Applied(landed)).await
         }
         StoreRequest::AmendRequirement {
             scope,
@@ -503,10 +604,20 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 box_id,
                 reason: "amended".to_owned(),
             };
-            let update = writer
+            let landed = match writer
                 .amend_requirement(*id, *expected_version, patch, deciding)
-                .await?;
-            answer(backend, scope, is_diverged(&update)).await
+                .await?
+            {
+                RequirementUpdate::Updated(row) => {
+                    WriteOutcome::Applied(RequirementWrite::Amended {
+                        id: row.id,
+                        key: row.key,
+                        version: row.version,
+                    })
+                }
+                RequirementUpdate::Diverged { .. } => WriteOutcome::Stale(()),
+            };
+            answer(backend, scope, landed).await
         }
         StoreRequest::WithdrawRequirement {
             scope,
@@ -520,10 +631,19 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             let me = backend.this_user().await?;
             let box_id = backend.box_info().await?.map(|row| row.box_id);
             gate(backend, &writer, project, me).await?;
-            let update = writer
+            let landed = match writer
                 .withdraw_requirement(*id, *expected_version, deciding, me, box_id)
-                .await?;
-            answer(backend, scope, is_diverged(&update)).await
+                .await?
+            {
+                RequirementUpdate::Updated(row) => {
+                    WriteOutcome::Applied(RequirementWrite::Withdrawn {
+                        id: row.id,
+                        key: row.key,
+                    })
+                }
+                RequirementUpdate::Diverged { .. } => WriteOutcome::Stale(()),
+            };
+            answer(backend, scope, landed).await
         }
         StoreRequest::CiteRequirement {
             item,
@@ -588,17 +708,33 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
 
 /// The writer, or the refusal every requirement write answers offline.
 fn write_access(backend: &Backend) -> Result<Writer> {
-    backend
-        .writer()
-        .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))
+    backend.writer().ok_or_else(offline)
+}
+
+/// The refusal of every requirement write offline, before anything is sent.
+fn offline() -> StoreError {
+    StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned())
 }
 
 /// [`BLANK_BODY`] for a body that is blank after `trim`.
 fn refuse_blank_body(body: &RequirementText) -> Result<()> {
     if body.as_str().trim().is_empty() {
-        Err(StoreError::Constraint(BLANK_BODY.to_owned()))
+        Err(blank_body())
     } else {
         Ok(())
+    }
+}
+
+/// A mint or amend refused for a blank body.
+fn blank_body() -> StoreError {
+    StoreError::Constraint(BLANK_BODY.to_owned())
+}
+
+/// A mint into an area that is not the project's (blueprint F-7).
+fn area_not_found(area: RequirementAreaId) -> StoreError {
+    StoreError::NotFound {
+        entity: "requirement_area",
+        id: area.to_string(),
     }
 }
 
@@ -726,21 +862,33 @@ async fn gate_after_read(
     }
 }
 
-/// Whether an amend or withdraw missed its version.
-const fn is_diverged(update: &RequirementUpdate) -> bool {
-    matches!(update, RequirementUpdate::Diverged { .. })
+/// The scope re-read after a tab write (MOD-59 D1, D5): `RequirementWritten` naming what `landed`
+/// wrote, or `RequirementsStale` when an amend or withdraw missed its version. The worker
+/// re-reads rather than handing the view the row the outcome carries: the view renders a tree, and
+/// a row patched in locally would be a second source of truth. A re-read that fails after an
+/// applied write still answers `RequirementWritten`, because the write landed; after a missed one
+/// it stays an error (D3).
+async fn answer(
+    backend: &Backend,
+    scope: &Scope,
+    landed: WriteOutcome<RequirementWrite>,
+) -> Result<StoreReply> {
+    let fresh = snapshot(backend, scope).await;
+    landed.answer(fresh, written, |snapshot, ()| {
+        StoreReply::RequirementsStale(Box::new(snapshot))
+    })
 }
 
-/// The scope re-read: [`StoreReply::Requirements`], or [`StoreReply::RequirementsStale`] after a
-/// missed version. The worker re-reads rather than handing the view the row the outcome carries:
-/// the view renders a tree, and a row patched in locally would be a second source of truth.
-async fn answer(backend: &Backend, scope: &Scope, stale: bool) -> Result<StoreReply> {
-    let fresh = Box::new(snapshot(backend, scope).await?);
-    Ok(if stale {
-        StoreReply::RequirementsStale(fresh)
-    } else {
-        StoreReply::Requirements(fresh)
-    })
+/// MOD-59 D5: the reply to a tab write that applied, whatever its re-read came to. A failed
+/// re-read travels as its `StoreError` rendered through `Display`, the sentence `Failed` would
+/// carry. An unreachable re-read is then no `Err` to the worker loop: it reaches neither its
+/// `go_offline` nor the status line, and the refresher's health pass takes the backend offline
+/// instead.
+fn written(reread: Result<RequirementsSnapshot>, outcome: RequirementWrite) -> StoreReply {
+    StoreReply::RequirementWritten {
+        snapshot: reread.map(Box::new).map_err(|err| err.to_string()),
+        outcome,
+    }
 }
 
 /// The item's citations re-read after a citation write.
@@ -755,9 +903,10 @@ mod tests {
     use super::{
         BLANK_AREA_TITLE, BLANK_BODY, CITATIONS_NAME, DECIDING_KEY_NEEDED, DETAIL_NAME,
         ItemCitations, READ_NAME, REQUEST_NAMES, RequirementDetail, RequirementText,
-        RequirementsSnapshot, decision_citation_not_cited, decision_citation_stays,
-        gate_after_read, is_citation_write, is_tab_write, matches_filter, no_deciding_item,
-        not_the_maintainer, requirement_of_another_project, serve,
+        RequirementWrite, RequirementsSnapshot, decision_citation_not_cited,
+        decision_citation_stays, gate_after_read, is_citation_write, is_tab_write, matches_filter,
+        mint_refused, no_deciding_item, not_the_maintainer, requirement_of_another_project, serve,
+        written,
     };
     use crate::store_worker::{self, StoreReply, StoreRequest};
     use chrono::TimeDelta;
@@ -982,6 +1131,8 @@ mod tests {
         assert_eq!(read(&backend, &scope).await, before, "nothing is written");
     }
 
+    /// MOD-59 D1, D2 too: an applied area create answers `RequirementWritten`, naming the area as
+    /// stored.
     #[tokio::test]
     async fn the_first_gated_write_claims_a_project_without_a_spec() {
         let backend = demo();
@@ -993,9 +1144,14 @@ mod tests {
         )
         .await;
 
-        let Ok(StoreReply::Requirements(after)) = reply else {
-            panic!("an applied area create answers `Requirements`, got {reply:?}")
+        let Ok(StoreReply::RequirementWritten {
+            snapshot: Ok(after),
+            outcome: RequirementWrite::Area { id, code },
+        }) = reply
+        else {
+            panic!("an applied area create answers `RequirementWritten`, got {reply:?}")
         };
+        assert_eq!(code, "API", "the code as stored, trimmed");
         let agy = after.project(ids::PROJECT_AGY).expect("agy");
         let spec = agy.spec.as_ref().expect("the write claimed a spec");
         assert_eq!(spec.owner_id, ids::USER, "owned by this user");
@@ -1009,15 +1165,21 @@ mod tests {
             ("API", "Interface")
         );
         assert_eq!(area.position, 0, "the first area of a project");
+        assert_eq!(area.id, id, "the outcome names the area written");
 
         let second = serve(
             &backend,
             &create_area(&scope, ids::PROJECT_HTUI, "UI", "Screens"),
         )
         .await;
-        let Ok(StoreReply::Requirements(after)) = second else {
+        let Ok(StoreReply::RequirementWritten {
+            snapshot: Ok(after),
+            outcome: RequirementWrite::Area { code, .. },
+        }) = second
+        else {
             panic!("a second area applies, got {second:?}")
         };
+        assert_eq!(code, "UI");
         let htui = after.project(ids::PROJECT_HTUI).expect("htui");
         let placed: Vec<(&str, i32)> = htui
             .areas
@@ -1068,8 +1230,10 @@ mod tests {
         );
     }
 
+    /// MOD-59 D1, D2: an applied mint answers `RequirementWritten`, naming the id the worker minted
+    /// and the key the store gave it.
     #[tokio::test]
-    async fn mint_answers_the_snapshot_with_the_next_key() {
+    async fn mint_answers_requirement_written_with_the_next_key() {
         let backend = demo();
         let scope = platform_scope(&backend).await;
 
@@ -1084,8 +1248,12 @@ mod tests {
         )
         .await;
 
-        let Ok(StoreReply::Requirements(after)) = reply else {
-            panic!("an applied mint answers `Requirements`, got {reply:?}")
+        let Ok(StoreReply::RequirementWritten {
+            snapshot: Ok(after),
+            outcome,
+        }) = reply
+        else {
+            panic!("an applied mint answers `RequirementWritten`, got {reply:?}")
         };
         let minted = after
             .project(ids::PROJECT_HTUI)
@@ -1100,6 +1268,13 @@ mod tests {
         assert_eq!(minted.priority, Priority::Must);
         assert_eq!(minted.state, RequirementState::Active);
         assert_eq!(minted.created_by, ids::USER, "the worker fills the author");
+        assert_eq!(
+            outcome,
+            RequirementWrite::Minted {
+                id: minted.id,
+                key: "R-ENT-3".to_owned(),
+            }
+        );
     }
 
     #[tokio::test]
@@ -1135,9 +1310,22 @@ mod tests {
 
         let reply = serve(&backend, &amend(&scope, ids::REQ_ENT_1, 2, " ana-2 ")).await;
 
-        let Ok(StoreReply::Requirements(after)) = reply else {
-            panic!("an applied amend answers `Requirements`, got {reply:?}")
+        let Ok(StoreReply::RequirementWritten {
+            snapshot: Ok(after),
+            outcome,
+        }) = reply
+        else {
+            panic!("an applied amend answers `RequirementWritten`, got {reply:?}")
         };
+        assert_eq!(
+            outcome,
+            RequirementWrite::Amended {
+                id: ids::REQ_ENT_1,
+                key: "R-ENT-1".to_owned(),
+                version: 3,
+            },
+            "the new head (MOD-59 D2)"
+        );
         let head = after.requirement(ids::REQ_ENT_1).expect("R-ENT-1");
         assert_eq!(head.version, 3);
         assert_eq!(
@@ -1219,9 +1407,21 @@ mod tests {
 
         let reply = serve(&backend, &withdraw(&scope, ids::REQ_STO_1, 1, "ANA-2")).await;
 
-        let Ok(StoreReply::Requirements(after)) = reply else {
-            panic!("an applied withdraw answers `Requirements`, got {reply:?}")
+        let Ok(StoreReply::RequirementWritten {
+            snapshot: Ok(after),
+            outcome,
+        }) = reply
+        else {
+            panic!("an applied withdraw answers `RequirementWritten`, got {reply:?}")
         };
+        assert_eq!(
+            outcome,
+            RequirementWrite::Withdrawn {
+                id: ids::REQ_STO_1,
+                key: "R-STO-1".to_owned(),
+            },
+            "MOD-59 D2"
+        );
         let row = after.requirement(ids::REQ_STO_1).expect("still listed");
         assert_eq!(row.state, RequirementState::Withdrawn);
         assert_eq!(row.version, 2);
@@ -1239,6 +1439,33 @@ mod tests {
             matches!(again, Ok(StoreReply::RequirementsStale(_))),
             "a second withdraw at the old version is stale: {again:?}"
         );
+    }
+
+    /// MOD-59 D5: a re-read that fails after a tab write applied still answers
+    /// `RequirementWritten`, the failure rendered as `Failed` would render it. `MemStore` cannot
+    /// fail a read inside one `serve`, so the mapping is pinned here.
+    #[test]
+    fn a_reread_that_fails_after_a_tab_write_still_answers_requirement_written() {
+        let outcome = RequirementWrite::Minted {
+            id: ids::REQ_ENT_2,
+            key: "R-ENT-2".to_owned(),
+        };
+
+        let reply = written(
+            Err(StoreError::Unreachable("gone".to_owned())),
+            outcome.clone(),
+        );
+
+        match reply {
+            StoreReply::RequirementWritten {
+                snapshot: Err(message),
+                outcome: landed,
+            } => {
+                assert_eq!(message, "store unreachable: gone");
+                assert_eq!(landed, outcome);
+            }
+            other => panic!("a landed write answers `RequirementWritten`, not {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1624,7 +1851,11 @@ mod tests {
 
         let reply = serve(&backend, &amend(&agy_only, ids::REQ_ENT_1, 2, "ANA-2")).await;
 
-        let Ok(StoreReply::Requirements(after)) = reply else {
+        let Ok(StoreReply::RequirementWritten {
+            snapshot: Ok(after),
+            ..
+        }) = reply
+        else {
             panic!("the amend applies, got {reply:?}")
         };
         assert!(after.is_for(&agy_only), "the answer is the request's scope");
@@ -1708,6 +1939,30 @@ mod tests {
             assert_eq!(is_citation_write(name), (7..10).contains(&index), "{name}");
         }
         assert!(!is_tab_write("templates") && !is_citation_write("templates"));
+
+        // MOD-59 D4: each outcome names the write it answers, the name the tab's `busy` holds.
+        let outcomes = [
+            RequirementWrite::Area {
+                id: ids::AREA_ENT,
+                code: "ENT".to_owned(),
+            },
+            RequirementWrite::Minted {
+                id: ids::REQ_ENT_1,
+                key: "R-ENT-1".to_owned(),
+            },
+            RequirementWrite::Amended {
+                id: ids::REQ_ENT_1,
+                key: "R-ENT-1".to_owned(),
+                version: 3,
+            },
+            RequirementWrite::Withdrawn {
+                id: ids::REQ_ENT_1,
+                key: "R-ENT-1".to_owned(),
+            },
+        ];
+        for (outcome, request) in outcomes.iter().zip(&samples[3..7]) {
+            assert_eq!(outcome.request_name(), request.name(), "{outcome:?}");
+        }
     }
 
     /// Offline there is no writer: the read answers from the mirror, which a fresh one holds no
@@ -1772,6 +2027,59 @@ mod tests {
                 other => panic!("an offline {} is refused, not {other:?}", write.name()),
             }
         }
+    }
+
+    /// MOD-59 re-review L2: the four refusals `serve` gives a mint before its insert, rendered by
+    /// the worker into `Failed` as the tab receives them, are what `mint_refused` recognises. The
+    /// insert's own error, and another project's gate, are not.
+    #[tokio::test]
+    async fn mint_refused_knows_the_refusals_before_the_insert() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+        let stranger = stranger_first();
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "requirements-mint-refused", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let offline = Backend::Offline { cache, since: None };
+        let refusals = [
+            ("offline", &offline, ids::PROJECT_HTUI, "Body."),
+            ("a blank body", &backend, ids::PROJECT_HTUI, "  "),
+            (
+                "another project's area",
+                &backend,
+                ids::PROJECT_AGY,
+                "Body.",
+            ),
+            ("not the maintainer", &stranger, ids::PROJECT_HTUI, "Body."),
+        ];
+        for (why, backend, project, body) in refusals {
+            let request = mint(&scope, project, ids::AREA_ENT, body);
+            let StoreReply::Failed { message, .. } = store_worker::serve(backend, &request).await
+            else {
+                panic!("{why}: the mint is refused")
+            };
+            let slug = if project == ids::PROJECT_HTUI {
+                "htui"
+            } else {
+                "agy"
+            };
+            assert!(
+                mint_refused(&message, slug, ids::AREA_ENT),
+                "{why}: {message}"
+            );
+        }
+
+        assert!(!mint_refused(
+            "store unreachable: connection reset",
+            "htui",
+            ids::AREA_ENT
+        ));
+        let theirs = StoreError::Constraint(not_the_maintainer("agy")).to_string();
+        assert!(
+            !mint_refused(&theirs, "htui", ids::AREA_ENT),
+            "another project's gate"
+        );
     }
 
     #[tokio::test]

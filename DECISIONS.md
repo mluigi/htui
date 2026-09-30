@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-59](docs/decisions/mod/mod-59.md)** - A write's reply names itself, so a form never stays "in flight" (done, 2026-09-30)
 - **[MOD-41](docs/decisions/mod/mod-41.md)** - Headless worker (`htui worker`) (done, 2026-09-30)
 - **[CLEAN-4](docs/decisions/clean/clean-4.md)** - `LoopStop::NoProgressReview` is unreachable (done, 2026-09-30)
 - **[MOD-14](docs/decisions/mod/mod-14.md)** - Graph tab (done, 2026-09-30)

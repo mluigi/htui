@@ -5,18 +5,19 @@
 //!
 //! One read per event and never one per keystroke, one reply out. Every write re-reads the whole
 //! snapshot rather than handing the view the row its outcome carries: the view renders from the
-//! snapshot and never patches a row into it. A write that missed its token, or whose skill,
-//! project or phase is gone, answers [`StoreReply::SkillsStale`] naming which write it was, so the
-//! view knows which draft keeps its text ([`crate::box_settings`]' rule for a vanished box).
-//!
-//! Known residue, the one [`crate::templates`] and [`crate::prompt_settings`] carry: a re-read
-//! that fails *after* an applied write answers `Failed`, so the view is told nothing happened
-//! when the write has in fact landed.
+//! snapshot and never patches a row into it. A write that applied answers
+//! [`StoreReply::SkillWritten`] naming what it wrote (MOD-59), so the view lands it on its own
+//! reply and never by searching the snapshot; a re-read that fails after it still answers
+//! `SkillWritten`, carrying the failure, because the write has landed. A write that missed its
+//! token, or whose skill, project or phase is gone, answers [`StoreReply::SkillsStale`] naming
+//! which write it was, so the view knows which draft keeps its text ([`crate::box_settings`]' rule
+//! for a vanished box).
 //!
 //! The worker fills `created_by` from [`Backend::this_user`] and mints the new skill's id; the
 //! render side never holds a `UserId` (`R-NF-3`). Nothing here reads the clock: the store stamps
 //! every instant.
 
+use chrono::{DateTime, Utc};
 use htui_core::model::{
     NewSkill, NewSkillVersion, ProjectId, RepoBoxPath, Scope, Skill, SkillBinding, SkillBindingKey,
     SkillId, SkillVersion, StepGraph, StepGraphPhase,
@@ -25,7 +26,7 @@ use htui_core::store::{CasOutcome, Result, StoreError, WriteStore as _};
 use htui_store::{Backend, DATABASE_UNREACHABLE, PROMPT_ON_SERVER_ONLY, Writer};
 
 use crate::skill_import::{self, SkillImports};
-use crate::store_worker::{StoreReply, StoreRequest};
+use crate::store_worker::{StoreReply, StoreRequest, WriteOutcome};
 
 /// The whole Skills view in one read (D81): the library, the global attachments, and each scope
 /// project's attachments, graphs and repo names.
@@ -214,14 +215,69 @@ pub const REQUEST_NAMES: [&str; 6] = [
 /// leaves the form or editor over its text.
 pub const READ_NAME: &str = REQUEST_NAMES[0];
 
+/// What one skill write did (MOD-59 D2), carried by [`StoreReply::SkillWritten`] beside the
+/// snapshot re-read. Ids, names, keys and tokens only: a body stays in the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillWrite {
+    /// [`StoreRequest::CreateSkill`]: the skill and its version 1 landed.
+    Created {
+        /// The id the worker minted.
+        skill: SkillId,
+        /// The name, as stored.
+        name: String,
+    },
+    /// [`StoreRequest::SaveSkillVersion`]: a version was appended.
+    Versioned {
+        /// Which skill.
+        skill: SkillId,
+        /// The version the store appended.
+        version: i32,
+    },
+    /// [`StoreRequest::EditSkill`]: the rename or re-describe applied.
+    Edited {
+        /// Which skill.
+        skill: SkillId,
+        /// The name, as stored.
+        name: String,
+    },
+    /// [`StoreRequest::SetSkillBinding`] with an attach: the row at `key` is the one sent.
+    Attached {
+        /// The attachment's key.
+        key: SkillBindingKey,
+        /// The landed row's `updated_at`: the token a kept edit saves over (MOD-59 DV-1), not the
+        /// re-read's row, which another session may already have written over.
+        updated_at: DateTime<Utc>,
+    },
+    /// [`StoreRequest::SetSkillBinding`] with a detach: no row at `key`.
+    Detached {
+        /// The attachment's key.
+        key: SkillBindingKey,
+    },
+}
+
+impl SkillWrite {
+    /// The [`StoreRequest::name`] of the write this answers: what the view's `busy` holds while
+    /// it is in flight, so only that write lands on it (MOD-59 D4).
+    #[must_use]
+    pub const fn request_name(&self) -> &'static str {
+        match self {
+            Self::Created { .. } => REQUEST_NAMES[1],
+            Self::Edited { .. } => REQUEST_NAMES[2],
+            Self::Versioned { .. } => REQUEST_NAMES[3],
+            Self::Attached { .. } | Self::Detached { .. } => REQUEST_NAMES[4],
+        }
+    }
+}
+
 /// Serves one skill request, off the UI task (D97).
 ///
-/// The read answers [`StoreReply::Skills`]. A write answers `Skills` when it applied and
-/// [`StoreReply::SkillsStale`] when its token was spent or the row it names is gone:
-/// `NotFound` of the skill for `EditSkill`; of the skill or `skill_version` for
-/// `SaveSkillVersion`; of the skill, project or `step_graph_phase` for `SetSkillBinding`.
-/// Every other refusal stays an error, so [`crate::store_worker::serve`] answers `Failed` with the
-/// store's sentence.
+/// The read answers [`StoreReply::Skills`]. A write answers [`StoreReply::SkillWritten`] when it
+/// applied, with the [`SkillWrite`] the store's own return names, even when only the re-read
+/// after it failed (MOD-59 D1, D5); and [`StoreReply::SkillsStale`] when its token was spent or
+/// the row it names is gone: `NotFound` of the skill for `EditSkill`; of the skill or
+/// `skill_version` for `SaveSkillVersion`; of the skill, project or `step_graph_phase` for
+/// `SetSkillBinding`. Every other refusal stays an error, so [`crate::store_worker::serve`]
+/// answers `Failed` with the store's sentence.
 ///
 /// # Errors
 /// Whatever the seam reports; offline, [`StoreError::Unreachable`] with `PROMPT_ON_SERVER_ONLY`
@@ -253,7 +309,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             let created_by = backend.this_user().await?;
             // A refusal (a bad name, a blank body, a taken name) stays an error: there is no token
             // to have spent, so it is `Failed` with the store's sentence, never `SkillsStale`.
-            writer
+            let (skill, _) = writer
                 .create_skill(NewSkill {
                     id: SkillId::new(),
                     name: name.clone(),
@@ -263,7 +319,11 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                     created_by,
                 })
                 .await?;
-            answer(backend, &writer, scope, None).await
+            let landed = WriteOutcome::Applied(SkillWrite::Created {
+                skill: skill.id,
+                name: skill.name,
+            });
+            answer(backend, &writer, scope, landed).await
         }
         StoreRequest::EditSkill {
             scope,
@@ -272,15 +332,18 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             patch,
         } => {
             let writer = write_access(backend)?;
-            let stale = match writer.update_skill(*skill, *expected, patch.clone()).await {
-                Ok(CasOutcome::Applied(_)) => None,
+            let landed = match writer.update_skill(*skill, *expected, patch.clone()).await {
+                Ok(CasOutcome::Applied(row)) => WriteOutcome::Applied(SkillWrite::Edited {
+                    skill: row.id,
+                    name: row.name,
+                }),
                 Ok(CasOutcome::Stale(_))
                 | Err(StoreError::NotFound {
                     entity: "skill", ..
-                }) => Some(StaleWhat::Skill(*skill)),
+                }) => WriteOutcome::Stale(StaleWhat::Skill(*skill)),
                 Err(other) => return Err(other),
             };
-            answer(backend, &writer, scope, stale).await
+            answer(backend, &writer, scope, landed).await
         }
         StoreRequest::SaveSkillVersion {
             scope,
@@ -295,16 +358,19 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 source: empty_source(),
                 created_by,
             };
-            let stale = match writer.add_skill_version(*skill, *expected, new).await {
-                Ok(CasOutcome::Applied(_)) => None,
+            let landed = match writer.add_skill_version(*skill, *expected, new).await {
+                Ok(CasOutcome::Applied(row)) => WriteOutcome::Applied(SkillWrite::Versioned {
+                    skill: *skill,
+                    version: row.version,
+                }),
                 Ok(CasOutcome::Stale(_))
                 | Err(StoreError::NotFound {
                     entity: "skill" | "skill_version",
                     ..
-                }) => Some(StaleWhat::Version(*skill)),
+                }) => WriteOutcome::Stale(StaleWhat::Version(*skill)),
                 Err(other) => return Err(other),
             };
-            answer(backend, &writer, scope, stale).await
+            answer(backend, &writer, scope, landed).await
         }
         StoreRequest::SetSkillBinding {
             scope,
@@ -313,19 +379,25 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             change,
         } => {
             let writer = write_access(backend)?;
-            let stale = match writer
+            let landed = match writer
                 .set_skill_binding(*key, *expected, change.clone())
                 .await
             {
-                Ok(CasOutcome::Applied(_)) => None,
+                Ok(CasOutcome::Applied(Some(row))) => WriteOutcome::Applied(SkillWrite::Attached {
+                    key: *key,
+                    updated_at: row.updated_at,
+                }),
+                Ok(CasOutcome::Applied(None)) => {
+                    WriteOutcome::Applied(SkillWrite::Detached { key: *key })
+                }
                 Ok(CasOutcome::Stale(_))
                 | Err(StoreError::NotFound {
                     entity: "skill" | "project" | "step_graph_phase",
                     ..
-                }) => Some(StaleWhat::Binding(*key)),
+                }) => WriteOutcome::Stale(StaleWhat::Binding(*key)),
                 Err(other) => return Err(other),
             };
-            answer(backend, &writer, scope, stale).await
+            answer(backend, &writer, scope, landed).await
         }
         StoreRequest::ImportSkills { scope, paths } => {
             // The filesystem is read here and not in the view (`R-NF-3`): the walk is unbounded
@@ -371,29 +443,43 @@ fn empty_source() -> serde_json::Value {
     serde_json::Value::Object(serde_json::Map::new())
 }
 
-/// The re-read every write answers with: `Skills` when `stale` is `None`, otherwise `SkillsStale`
-/// naming the write. Its callers are past `write_access`, so this box's paths are read here
-/// (MOD-9 D131).
+/// The re-read after a write (MOD-59 D1, D5): `SkillWritten` naming what `landed` wrote, or
+/// `SkillsStale` naming the write that missed. A re-read that fails after an applied write still
+/// answers `SkillWritten`, because the write landed; after a stale one it stays an error (D3).
 async fn answer(
     backend: &Backend,
     writer: &Writer,
     scope: &Scope,
-    stale: Option<StaleWhat>,
+    landed: WriteOutcome<SkillWrite, StaleWhat>,
 ) -> Result<StoreReply> {
-    let box_paths = this_box_paths(backend).await?;
-    let fresh = Box::new(snapshot(writer, scope, &box_paths).await?);
-    Ok(match stale {
-        None => StoreReply::Skills(fresh),
-        Some(what) => StoreReply::SkillsStale {
-            snapshot: fresh,
-            what,
-        },
+    let fresh = reread(backend, writer, scope).await;
+    landed.answer(fresh, written, |snapshot, what| StoreReply::SkillsStale {
+        snapshot: Box::new(snapshot),
+        what,
     })
+}
+
+/// The snapshot after a write. Its callers are past `write_access`, so this box's paths are read
+/// here (MOD-9 D131).
+async fn reread(backend: &Backend, writer: &Writer, scope: &Scope) -> Result<SkillsSnapshot> {
+    let box_paths = this_box_paths(backend).await?;
+    snapshot(writer, scope, &box_paths).await
+}
+
+/// MOD-59 D5: the reply to a write that applied, whatever its re-read came to. A failed re-read
+/// travels as its `StoreError` rendered through `Display`, the sentence `Failed` would carry.
+/// An unreachable re-read is then no `Err` to the worker loop: it reaches neither its `go_offline`
+/// nor the status line, and the refresher's health pass takes the backend offline instead.
+fn written(reread: Result<SkillsSnapshot>, outcome: SkillWrite) -> StoreReply {
+    StoreReply::SkillWritten {
+        snapshot: reread.map(Box::new).map_err(|err| err.to_string()),
+        outcome,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{READ_NAME, REQUEST_NAMES, SkillsSnapshot, StaleWhat, serve};
+    use super::{READ_NAME, REQUEST_NAMES, SkillWrite, SkillsSnapshot, StaleWhat, serve, written};
     use crate::store_worker::{self, StoreReply, StoreRequest};
     use crate::templates::TemplateBody;
     use chrono::{DateTime, Duration, Utc};
@@ -430,10 +516,14 @@ mod tests {
         }
     }
 
-    /// The snapshot of a `Skills` reply, or a panic naming what came back instead.
-    async fn applied(backend: &Backend, request: &StoreRequest) -> SkillsSnapshot {
+    /// The snapshot and outcome of a `SkillWritten` reply whose re-read succeeded, or a panic
+    /// naming what came back instead (MOD-59 D1).
+    async fn applied(backend: &Backend, request: &StoreRequest) -> (SkillsSnapshot, SkillWrite) {
         match serve(backend, request).await {
-            Ok(StoreReply::Skills(snapshot)) => *snapshot,
+            Ok(StoreReply::SkillWritten {
+                snapshot: Ok(snapshot),
+                outcome,
+            }) => (*snapshot, outcome),
             other => panic!("{} answered {other:?}", request.name()),
         }
     }
@@ -703,12 +793,14 @@ mod tests {
         assert!(agy.unrooted.is_empty(), "agy has no repo to be unrooted");
     }
 
+    /// MOD-59 D1, D2: every write that applied answers `SkillWritten`, naming what the store
+    /// stored, beside the snapshot re-read after it.
     #[tokio::test]
-    async fn each_write_answers_skills_when_it_applies() {
+    async fn each_write_answers_skill_written_with_what_the_store_stored() {
         let backend = demo();
         let scope = platform_scope(&backend).await;
 
-        let created = applied(
+        let (created, outcome) = applied(
             &backend,
             &create(&scope, "docs-style", "Write the doc first.\n"),
         )
@@ -717,6 +809,14 @@ mod tests {
             .by_name("docs-style")
             .expect("the created skill is in the fresh snapshot")
             .clone();
+        assert_eq!(
+            outcome,
+            SkillWrite::Created {
+                skill: entry.skill.id,
+                name: "docs-style".to_owned(),
+            },
+            "the id the worker minted"
+        );
         assert_eq!(
             entry
                 .versions
@@ -734,7 +834,7 @@ mod tests {
         assert_eq!(entry.versions[0].source, serde_json::json!({}));
         let id = entry.skill.id;
 
-        let edited = applied(
+        let (edited, outcome) = applied(
             &backend,
             &edit(&scope, id, entry.skill.updated_at, "Docs, then code."),
         )
@@ -743,8 +843,15 @@ mod tests {
             edited.entry(id).map(|e| e.skill.description.as_str()),
             Some("Docs, then code.")
         );
+        assert_eq!(
+            outcome,
+            SkillWrite::Edited {
+                skill: id,
+                name: "docs-style".to_owned(),
+            }
+        );
 
-        let saved = applied(
+        let (saved, outcome) = applied(
             &backend,
             &save(&scope, id, 1, "Write the doc first, always.\n"),
         )
@@ -753,13 +860,20 @@ mod tests {
         assert_eq!(head.version, 2);
         assert_eq!(head.body, "Write the doc first, always.\n");
         assert_eq!(head.created_by, ids::USER);
+        assert_eq!(
+            outcome,
+            SkillWrite::Versioned {
+                skill: id,
+                version: 2,
+            }
+        );
 
         let key = SkillBindingKey {
             skill: id,
             project: None,
             phase: None,
         };
-        let attached = applied(
+        let (attached, outcome) = applied(
             &backend,
             &bind(&scope, key, None, BindingChange::Attach(always())),
         )
@@ -769,13 +883,22 @@ mod tests {
             .expect("the global attachment is in the fresh snapshot")
             .clone();
         assert_eq!(attached.global, std::slice::from_ref(&row));
+        assert_eq!(
+            outcome,
+            SkillWrite::Attached {
+                key,
+                updated_at: row.updated_at,
+            },
+            "the landed row's token (MOD-59 DV-1)"
+        );
 
-        let detached = applied(
+        let (detached, outcome) = applied(
             &backend,
             &bind(&scope, key, Some(row.updated_at), BindingChange::Detach),
         )
         .await;
         assert!(detached.global.is_empty(), "the detach re-reads without it");
+        assert_eq!(outcome, SkillWrite::Detached { key });
     }
 
     #[tokio::test]
@@ -844,6 +967,31 @@ mod tests {
         .await;
         assert_eq!(what, StaleWhat::Binding(no_phase), "a phase gone is a miss");
         assert_eq!(fresh, before);
+    }
+
+    /// MOD-59 D5: a re-read that fails after a write applied still answers the write's own
+    /// variant, the failure rendered as `Failed` would render it. `MemStore` cannot fail a read
+    /// inside one `serve`, so the mapping is pinned here.
+    #[test]
+    fn a_reread_that_fails_after_an_applied_write_still_names_the_write() {
+        let outcome = SkillWrite::Versioned {
+            skill: ids::SKILL_TESTS,
+            version: 2,
+        };
+        let reply = written(
+            Err(StoreError::Unreachable("gone".to_owned())),
+            outcome.clone(),
+        );
+        match reply {
+            StoreReply::SkillWritten {
+                snapshot: Err(message),
+                outcome: named,
+            } => {
+                assert_eq!(message, "store unreachable: gone");
+                assert_eq!(named, outcome);
+            }
+            other => panic!("a landed write answers `SkillWritten`, not {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -950,6 +1098,43 @@ mod tests {
         ];
         let names: Vec<&str> = samples.iter().map(StoreRequest::name).collect();
         assert_eq!(names, REQUEST_NAMES);
+
+        // MOD-59 D4: each outcome names the write it answers, the name the view's `busy` holds.
+        let key = demo_phase_key();
+        let outcomes = [
+            (
+                SkillWrite::Created {
+                    skill: ids::SKILL_TESTS,
+                    name: "docs-style".to_owned(),
+                },
+                &samples[1],
+            ),
+            (
+                SkillWrite::Edited {
+                    skill: ids::SKILL_TESTS,
+                    name: "tests".to_owned(),
+                },
+                &samples[2],
+            ),
+            (
+                SkillWrite::Versioned {
+                    skill: ids::SKILL_TESTS,
+                    version: 2,
+                },
+                &samples[3],
+            ),
+            (
+                SkillWrite::Attached {
+                    key,
+                    updated_at: DateTime::UNIX_EPOCH,
+                },
+                &samples[4],
+            ),
+            (SkillWrite::Detached { key }, &samples[4]),
+        ];
+        for (outcome, request) in &outcomes {
+            assert_eq!(outcome.request_name(), request.name(), "{outcome:?}");
+        }
     }
 
     /// `StoreRequest` derives `Debug`; a skill body is user text, so a create and a save print
