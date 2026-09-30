@@ -385,7 +385,7 @@ pub enum Tails {
 
 /// Everything [`Engine::new`] borrows, as a struct literal rather than a builder.
 ///
-/// A builder would let a caller forget one of fifteen fields and find out at run time; a literal
+/// A builder would let a caller forget one of sixteen fields and find out at run time; a literal
 /// cannot compile until every one of them is named.
 pub struct EngineParts<'a, S, G, I, V, C, A, K>
 where
@@ -6185,7 +6185,7 @@ pub fn truncated(now: DateTime<Utc>) -> DateTime<Utc> {
 /// rather than in `fake.rs` for the reason the file itself gives: every part is already public on
 /// the orchestrator, and what was missing was `engine.rs`. Putting it beside the `Engine` keeps
 /// `fake.rs` exactly as T3 shipped it, and lets `conformance.rs`'s `impl Orchestrate for
-/// FakeOrchestrator` call one function instead of re-deciding fifteen fields per case.
+/// FakeOrchestrator` call one function instead of re-deciding sixteen fields per case.
 ///
 /// A fresh `Engine` per command is not a concession to the test: the engine holds nothing across a
 /// call (plan D16), so this is the shape milestone 6's Runs tab has too.
@@ -6250,7 +6250,7 @@ pub async fn sweep_fake(orch: &crate::fake::FakeOrchestrator) -> Result<Vec<Adop
     engine.sweep().await
 }
 
-/// The fifteen fields, filled from the harness.
+/// The sixteen fields, filled from the harness.
 ///
 /// `app` is read here rather than cached because `MemStore::set_app_setting` (`mem.rs:430`) is the
 /// only writer a case can reach for `step_deadline_seconds` — `SettingKey` is a closed enum of ten
