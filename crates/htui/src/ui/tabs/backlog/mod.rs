@@ -516,7 +516,7 @@ mod tests {
             tab.pending_reveal.is_some(),
             "not loaded: the next list decides"
         );
-        emit.take();
+        let _ = emit.take();
 
         tab.on_reply(
             &StoreReply::Failed {
