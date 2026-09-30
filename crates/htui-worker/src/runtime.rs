@@ -1846,7 +1846,7 @@ pub mod testing {
         let _ = ctx.tag.run.set(run);
     }
 
-    /// [`TaskCtx::unaddressed`]: a context for a task of the runtime's own.
+    /// `TaskCtx::unaddressed`: a context for a task of the runtime's own.
     #[must_use]
     pub fn unaddressed<H: htui_core::store::WorkerHost, P: ReplySink>(
         ctx: &TaskCtx<H, P>,
@@ -1855,7 +1855,7 @@ pub mod testing {
         ctx.unaddressed(name)
     }
 
-    /// [`super::spawn_supervised`]: `work` on a supervised, tracked task.
+    /// `spawn_supervised`: `work` on a supervised, tracked task.
     pub fn spawn_supervised<H: htui_core::store::WorkerHost, P: ReplySink>(
         ctx: TaskCtx<H, P>,
         work: impl Future<Output = ()> + Send + 'static,
@@ -1863,7 +1863,7 @@ pub mod testing {
         super::spawn_supervised(ctx, work);
     }
 
-    /// [`super::resumed`]: an adopted run's walk, resumed under its lock.
+    /// `resumed`: an adopted run's walk, resumed under its lock.
     pub async fn resumed<H: htui_core::store::WorkerHost, P: ReplySink>(
         ctx: TaskCtx<H, P>,
         run: RunId,
@@ -1871,12 +1871,12 @@ pub mod testing {
         super::resumed(ctx, run).await;
     }
 
-    /// [`super::retry_claims`]: the claim retry once `ctx`'s run rests.
+    /// `retry_claims`: the claim retry once `ctx`'s run rests.
     pub async fn retry_claims<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P>) {
         super::retry_claims(ctx).await;
     }
 
-    /// [`super::command_limits`]: the box row's `settings.command_limits`, else the default.
+    /// `command_limits`: the box row's `settings.command_limits`, else the default.
     ///
     /// # Errors
     /// The store's own read failure.
