@@ -1,6 +1,6 @@
 ---
 source: crates/htui/tests/backlog.rs
-expression: harness.render()
+expression: depth_3
 ---
 Platform · DESKTOP-HTUI · memory · 1 run
  1 Backlog
@@ -9,13 +9,13 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │  ANA-1    done               Data model, box regist…││▸ FEAT-1 in_progress TUI scaffold          │
 │  ANA-2    open               Orchestrator step grap…││  → origin     ANA-1 done Data model, box …│
 │  CLEAN-1  failed             Drop the legacy markdo…││    ← blocked_by agy:ANA-1 done Prompt ass…│
-│  FEAT-1   in_progress        TUI scaffold           ││    ← origin     FEAT-3 queued (*)         │
-│  FEAT-2   blocked            Agent driver and chat …││    ← blocked_by TOOL-1 awaiting_approval  │
-│  FEAT-3   queued             Postgres store and cac…││  ← blocked_by FEAT-2 blocked Agent driver…│
-│  FIX-1    closed             Terminal left raw afte…││    ← relates    agy:FEAT-1 open ACP trans…│
-│  TOOL-1   awaiting_approval  CI matrix for the thre…││  ← relates    FEAT-3 queued Postgres stor…│
-│▾ agy (3)                                            ││                                           │
-│  ANA-1    done               Prompt assembly survey ││                                           │
+│  FEAT-1   in_progress        TUI scaffold           ││      ← blocked_by agy:FIX-1 open Session …│
+│  FEAT-2   blocked            Agent driver and chat …││    ← origin     FEAT-3 queued (*)         │
+│  FEAT-3   queued             Postgres store and cac…││    ← blocked_by TOOL-1 awaiting_approval  │
+│  FIX-1    closed             Terminal left raw afte…││      ← origin     agy:FIX-1 open (*)      │
+│  TOOL-1   awaiting_approval  CI matrix for the thre…││  ← blocked_by FEAT-2 blocked Agent driver…│
+│▾ agy (3)                                            ││    ← relates    agy:FEAT-1 open ACP trans…│
+│  ANA-1    done               Prompt assembly survey ││  ← relates    FEAT-3 queued Postgres stor…│
 │  FEAT-1   open               ACP transport upgrade  ││                                           │
 │  FIX-1    open               Session leak on cancel ││                                           │
 │                                                     ││                                           │
@@ -29,6 +29,6 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│                                                     ││depth 2/3 · +/- depth · Enter re-root      │
+│                                                     ││depth 3/3 · +/- depth · Enter re-root      │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help

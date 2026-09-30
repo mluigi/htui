@@ -1,20 +1,20 @@
 ---
 source: crates/htui/tests/backlog.rs
-expression: harness.render()
+expression: frame
 ---
 Platform · DESKTOP-HTUI · memory · 1 run
  1 Backlog
-┌ Backlog (11) ───────────────────────────────────────┐┌ FEAT-1 ───────────────────────────────────┐
+┌ Backlog (11) ───────────────────────────────────────┐┌ ANA-1 ────────────────────────────────────┐
 │▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
-│  ANA-1    done               Data model, box regist…││▸ FEAT-1 in_progress TUI scaffold          │
-│  ANA-2    open               Orchestrator step grap…││  → origin     ANA-1 done Data model, box …│
-│  CLEAN-1  failed             Drop the legacy markdo…││    ← blocked_by agy:ANA-1 done Prompt ass…│
-│  FEAT-1   in_progress        TUI scaffold           ││    ← origin     FEAT-3 queued (*)         │
-│  FEAT-2   blocked            Agent driver and chat …││    ← blocked_by TOOL-1 awaiting_approval  │
-│  FEAT-3   queued             Postgres store and cac…││  ← blocked_by FEAT-2 blocked Agent driver…│
-│  FIX-1    closed             Terminal left raw afte…││    ← relates    agy:FEAT-1 open ACP trans…│
-│  TOOL-1   awaiting_approval  CI matrix for the thre…││  ← relates    FEAT-3 queued Postgres stor…│
-│▾ agy (3)                                            ││                                           │
+│  ANA-1    done               Data model, box regist…││▸ ANA-1 done Data model, box registry and …│
+│  ANA-2    open               Orchestrator step grap…││  ← blocked_by agy:ANA-1 done Prompt assem…│
+│  CLEAN-1  failed             Drop the legacy markdo…││    ← blocked_by agy:FIX-1 open Session le…│
+│  FEAT-1   in_progress        TUI scaffold           ││  ← origin     FEAT-1 in_progress TUI scaf…│
+│  FEAT-2   blocked            Agent driver and chat …││    ← blocked_by FEAT-2 blocked Agent driv…│
+│  FEAT-3   queued             Postgres store and cac…││    ← relates    FEAT-3 queued (*)         │
+│  FIX-1    closed             Terminal left raw afte…││  ← origin     FEAT-3 queued Postgres stor…│
+│  TOOL-1   awaiting_approval  CI matrix for the thre…││  ← blocked_by TOOL-1 awaiting_approval    │
+│▾ agy (3)                                            ││    ← origin     agy:FIX-1 open (*)        │
 │  ANA-1    done               Prompt assembly survey ││                                           │
 │  FEAT-1   open               ACP transport upgrade  ││                                           │
 │  FIX-1    open               Session leak on cancel ││                                           │

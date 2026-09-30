@@ -14,7 +14,12 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-30):** **MOD-22 done** (`docs/decisions/mod/mod-22.md`): a login whose
+**Current status (2026-09-30):** **MOD-14 done** (`docs/decisions/mod/mod-14.md`): the Backlog's
+Graph sub-tab draws the selected item's link neighbourhood as a tree, 1-3 hops (`+`/`-`, default 2,
+fetched at 3), across projects, with link kind and status per row; `J`/`K` move, `Enter` re-roots the
+Backlog selection through MOD-64's reveal, a node outside the workspace refuses on the status line,
+and `m` opens the sub-tab (`R-TUI-2` `open graph`).
+Before it, **MOD-22 done** (`docs/decisions/mod/mod-22.md`): a login whose
 browser cannot reach the box completes from the TUI. While a login runs, `p` in Settings > Agents
 opens a masked field for the `http://127.0.0.1:<port>/?code=…&state=…` address the browser could
 not open; it is checked against the `redirect_uri` the login link advertised and sent as one raw
@@ -22,7 +27,7 @@ loopback `GET` from the login's own task, the listener's answer is shown, and MO
 the login. The URL is a credential for one request (`R-AGT-9` amended). Bracketed paste is now on
 app-wide and reaches only a field that captures input. Live proof on the server-plus-laptop setup
 is the maintainer's (OQ-6).
-Before it, **ANA-26 concluded** (`docs/ANA-26.md`,
+Before that, **ANA-26 concluded** (`docs/ANA-26.md`,
 `docs/decisions/ana/ana-26.md`): every key outside text entry becomes a named action in one
 compiled-in catalogue; a user overrides only what they change in a local `<config_root>/keys.toml`
 (never the store), an invalid file refuses to start with `path:line` errors, `ctrl-c` always quits
@@ -93,8 +98,8 @@ ANA-5 (`docs/decisions/ana/ana-5.md`) — the prompt contract, no new crate, no 
 ANA-17 (`docs/decisions/ana/ana-17.md`) settling its block separator and keeping one frame for
 every model;
 ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set status tables,
-`htui-orch`, now built (MOD-4, `docs/decisions/mod/mod-4.md`). MOD-11, MOD-12, MOD-13 and MOD-14
-can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
+`htui-orch`, now built (MOD-4, `docs/decisions/mod/mod-4.md`). MOD-11, MOD-12 and MOD-13
+can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
 `docs/decisions/mod/mod-7.md`; MOD-9 is done, `docs/decisions/mod/mod-9.md`).
 
 ---
@@ -372,10 +377,6 @@ can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
   **The scope line "mint per §7.1" above means ANA-9 §7.1's Postgres statement**, which is now the
   only mint. MOD-4's close-out writes a generated `summary` document with no human prose (MOD-4 risk
   R-43, `docs/decisions/mod/mod-4.md`); an editable summary is this item's editor's.
-- [ ] **MOD-14 - Graph tab** (from MOD-1). `R-TUI-5`, `R-ENT-9`. Item neighbourhood one to N hops
-  across projects through `ReadStore::links` (`docs/ANA-9.md` §6.1), status and link kind per
-  edge, keyboard navigation that re-roots the Backlog selection; the `open graph` action of
-  `R-TUI-2`. Not blocked (MOD-1 landed; replaces `ui/tabs/backlog/detail/graph.rs` only).
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
   `R-NF-3`, `R-HIS-1`. **This is now the only Windows check** (TOOL-3 decided 2026-09-28,
   `docs/decisions/tool/tool-3.md`): the maintainer accepted that
@@ -623,6 +624,6 @@ can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 31 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 30 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                              |
 | TOOL-N  | 0 |

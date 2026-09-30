@@ -1,8 +1,9 @@
 //! The Backlog tab: the scope's items on the left, the selected item's detail on the right.
 //!
 //! MOD-1 is a skeleton (PRD scope): the tab reads, groups, folds and scrolls, and does not write
-//! anything. Filters and editing are MOD-13, run actions MOD-4, graph traversal MOD-14 — each of
-//! them lands as a [`DetailTab`](detail::DetailTab) body or a binding, not as a change here.
+//! anything. Filters and editing are MOD-13, run actions MOD-4, graph traversal MOD-14 (its hop
+//! count and the `m` key are the two lines it adds here) — each of them lands as a
+//! [`DetailTab`](detail::DetailTab) body or a binding, not as a change here.
 
 pub mod detail;
 pub mod list;
@@ -29,8 +30,10 @@ const LIST_PERCENT: u16 = 55;
 /// Width of the detail pane, as a percentage of the body region.
 const DETAIL_PERCENT: u16 = 45;
 
-/// How far the link traversal of the Graph sub-tab reaches (plan D11).
-const HOPS: u8 = 1;
+/// How far the link traversal behind the Graph sub-tab reaches: its deepest view (MOD-14 D2).
+/// Fetched once per selection and filtered by `+`/`-` locally, so a depth change costs no read and
+/// each of the seven reads stays one reply per selection (blueprint C.2).
+const HOPS: u8 = GraphTab::MAX_HOPS;
 
 /// `StoreRequest::Items`' name: what a refused list read is answered `Failed` under.
 const ITEMS_READ: &str = "items";
@@ -245,6 +248,11 @@ impl Tab for BacklogTab {
             KeyCode::Char('G') | KeyCode::End => self.jump(true, ctx),
             KeyCode::Char('l') | KeyCode::Char(']') | KeyCode::Right => self.detail.cycle_next(),
             KeyCode::Char('h') | KeyCode::Char('[') | KeyCode::Left => self.detail.cycle_prev(),
+            // MOD-14 D8, `open graph`. Below the capture guard, so an `m` typed into a note stays
+            // the note's.
+            KeyCode::Char('m') => {
+                self.detail.select_id(GraphTab::ID);
+            }
             // A project header folds; on an item row there is nothing to fold, and `Enter` is
             // the detail pane's — the Runs pane replays the step under its cursor with it
             // (MOD-2 D39). Without this the pane would never see the key at all.
@@ -543,6 +551,129 @@ mod tests {
             errors.is_empty(),
             "a later list reports nothing: {errors:?}"
         );
+    }
+
+    /// The Platform scope, its projects and its items, and the first item row (MOD-14 cases).
+    async fn platform() -> (
+        Scope,
+        Vec<htui_core::model::ProjectRef>,
+        Vec<ItemSummary>,
+        Selection,
+    ) {
+        let store = MemStore::demo();
+        let workspace = store
+            .workspaces()
+            .await
+            .expect("the memory store never fails")
+            .into_iter()
+            .find(|workspace| workspace.slug == "platform")
+            .expect("the demo holds `platform`");
+        let scope = Scope::from_workspace(&workspace);
+        let projects = store.projects(&scope).await.expect("the projects");
+        let items = store
+            .items(&scope, &ItemFilter::default())
+            .await
+            .expect("the items");
+        let first = list::rows(&items, &projects, &[])
+            .into_iter()
+            .find(|row| matches!(row, Selection::Item(_)))
+            .expect("the scope has an item");
+        (scope, projects, items, first)
+    }
+
+    /// MOD-14 D8: `select_id` activates a registered sub-tab by id and leaves an unknown id alone.
+    #[test]
+    fn select_id_finds_a_registered_sub_tab() {
+        let mut detail = BacklogTab::new().detail;
+        assert!(detail.select_id(GraphTab::ID));
+        assert_eq!(detail.active_id(), Some(GraphTab::ID));
+        assert!(!detail.select_id(DetailId("nope")));
+        assert_eq!(
+            detail.active_id(),
+            Some(GraphTab::ID),
+            "an unknown id changes nothing"
+        );
+    }
+
+    /// MOD-14 D8, `open graph`: `m` on the list selects the Graph sub-tab and nothing else.
+    #[tokio::test]
+    async fn m_on_the_list_opens_the_graph() {
+        let (scope, projects, items, first) = platform().await;
+        let mut tab = BacklogTab {
+            items,
+            folded: Vec::new(),
+            selected: Some(first),
+            detail: BacklogTab::new().detail,
+            pending_reveal: None,
+        };
+        let (top_bar, keymap, theme, emit) = (
+            TopBarState::default(),
+            Keymap::new(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let mut ctx = Ctx::new(
+            &scope,
+            &projects,
+            &top_bar,
+            &keymap,
+            &theme,
+            Origin::Tab(BacklogTab::ID),
+            &emit,
+        );
+        assert_ne!(tab.detail.active_id(), Some(GraphTab::ID));
+        assert_eq!(
+            tab.on_key(KeyEvent::from(KeyCode::Char('m')), &mut ctx),
+            Handled::Consumed
+        );
+        assert_eq!(tab.detail.active_id(), Some(GraphTab::ID));
+        assert_eq!(tab.selected, Some(first), "the list cursor did not move");
+        assert!(emit.is_empty(), "so no detail read went out");
+    }
+
+    /// MOD-14 D8: `m` is below the capture guard, so it is a capturing sub-tab's letter.
+    #[tokio::test]
+    async fn m_while_a_sub_tab_captures_is_the_sub_tab_s() {
+        let (scope, projects, items, first) = platform().await;
+        let capturing = Rc::new(Cell::new(true));
+        let seen: Rc<RefCell<Vec<KeyCode>>> = Rc::default();
+        let mut detail = DetailRegistry::new();
+        detail.register(Box::new(CapturingProbe {
+            capturing: Rc::clone(&capturing),
+            seen: Rc::clone(&seen),
+        }));
+        detail.register(Box::new(GraphTab::new()));
+        let mut tab = BacklogTab {
+            items,
+            folded: Vec::new(),
+            selected: Some(first),
+            detail,
+            pending_reveal: None,
+        };
+        let (top_bar, keymap, theme, emit) = (
+            TopBarState::default(),
+            Keymap::new(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let mut ctx = Ctx::new(
+            &scope,
+            &projects,
+            &top_bar,
+            &keymap,
+            &theme,
+            Origin::Tab(BacklogTab::ID),
+            &emit,
+        );
+        let m = KeyEvent::from(KeyCode::Char('m'));
+        assert_eq!(tab.on_key(m, &mut ctx), Handled::Consumed);
+        assert_eq!(*seen.borrow(), [KeyCode::Char('m')], "the probe got it");
+        assert_eq!(tab.detail.active_id(), Some(DetailId("probe")));
+
+        capturing.set(false);
+        assert_eq!(tab.on_key(m, &mut ctx), Handled::Consumed);
+        assert_eq!(tab.detail.active_id(), Some(GraphTab::ID));
+        assert_eq!(seen.borrow().len(), 1, "the probe saw nothing new");
     }
 
     /// The sub-tab strip fits inside the detail pane at the harness's pinned size, so a longer title, another sub-tab or a narrower pane fails here

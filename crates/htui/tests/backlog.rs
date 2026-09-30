@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use htui::agent_worker::AgentRuntime;
-use htui::app::Action;
+use htui::app::{Action, RevealKind};
+use htui::keymap::KeyScope;
 use htui::requirements::decision_citation_stays;
 use htui::run_worker::{self, LiveChats, RunRuntime, StepAuthor};
 use htui::testkit::Harness;
@@ -252,6 +253,20 @@ async fn h_and_l_cycle_the_sub_tabs_both_ways() {
             .contains("Stand up the terminal application"),
         "[ goes back to Body"
     );
+}
+
+/// MOD-14 D8: `m` opens the Graph from the Backlog's own arm; its binding is the help box's half,
+/// next to the `Enter` row it mirrors.
+#[tokio::test]
+async fn m_is_on_the_backlog_help_line() {
+    let mut harness = Harness::demo();
+    htui::app::register_all(harness.app());
+    let help = harness
+        .app()
+        .keymap
+        .help_line(&KeyScope::Tab(BacklogTab::ID));
+    assert!(help.contains("m open graph"), "{help}");
+    assert!(help.contains("Enter replay step"), "{help}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -740,4 +755,214 @@ async fn the_runs_pane_greys_a_key_with_the_guard_s_sentence() {
     harness.key("a");
     harness.drive().await;
     assert_eq!(harness.app().status.as_deref(), Some(sentence.as_str()));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Graph sub-tab (MOD-14 plan D2-D8, blueprint §3 T3).
+// ---------------------------------------------------------------------------------------------
+
+/// Steps right of Body to the Graph sub-tab.
+const TO_GRAPH: usize = 2;
+
+/// Rows down from the arrival row to htui `FEAT-2`.
+const TO_FEAT_2: usize = 4;
+
+/// `backlog()` with the Backlog named as the tab that reveals items, as `register_all` does: the
+/// Graph's `Enter` is an `Action::Reveal`, which reveals nothing without this (blueprint §6 D-1).
+async fn revealing_backlog() -> Harness {
+    let mut harness = backlog().await;
+    harness.app().reveal_tabs = vec![(RevealKind::Item, BacklogTab::ID)];
+    harness
+}
+
+/// D6: `Enter` on a graph node moves the list cursor to it; the Graph stays the active sub-tab
+/// and now shows the new item's neighbourhood.
+#[tokio::test]
+async fn enter_on_a_graph_node_re_roots_the_backlog() {
+    let mut harness = revealing_backlog().await;
+    down(&mut harness, TO_FEAT_1).await;
+    sub_tab(&mut harness, TO_GRAPH);
+    // One `J` from FEAT-1's root row is htui ANA-1 (blueprint §1.3).
+    harness.key("J");
+    harness.key("enter");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(frame.contains("┌ ANA-1"), "re-rooted on ANA-1:\n{frame}");
+    assert!(
+        frame.contains("agy:ANA-1"),
+        "only an htui root labels agy ANA-1 so:\n{frame}"
+    );
+    assert!(
+        frame.contains("depth 2/3"),
+        "the Graph is still active:\n{frame}"
+    );
+    assert_eq!(harness.app().status, None);
+    insta::assert_snapshot!("graph_re_rooted", frame);
+
+    harness.key("j");
+    harness.drive_to_end().await;
+    assert!(
+        harness.render().contains("┌ ANA-2"),
+        "the list cursor was on htui ANA-1, not agy ANA-1"
+    );
+}
+
+/// D6 through `BacklogTab::reveal`: a node of the workspace's other project is revealed, and its
+/// folded group unfolds.
+#[tokio::test]
+async fn enter_reveals_a_node_of_the_other_project_and_unfolds_its_group() {
+    let mut harness = revealing_backlog().await;
+    harness.key("G");
+    harness.drive_to_end().await;
+    for _ in 0..3 {
+        harness.key("k");
+        harness.drive_to_end().await;
+    }
+    harness.key("enter");
+    harness.drive_to_end().await;
+    assert!(
+        !harness.render().contains("ACP transport upgrade"),
+        "the agy group is folded"
+    );
+
+    harness.key("g");
+    harness.drive_to_end().await;
+    // From the htui header: one row to the arrival row, then on to FEAT-2.
+    down(&mut harness, 1 + TO_FEAT_2).await;
+    assert!(harness.render().contains("┌ FEAT-2"));
+    sub_tab(&mut harness, TO_GRAPH);
+    // One `J` from FEAT-2's root row is agy FEAT-1: `agy` < `htui` breaks the key tie.
+    harness.key("J");
+    harness.key("enter");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(frame.contains("┌ FEAT-1"), "re-rooted on FEAT-1:\n{frame}");
+    assert!(
+        frame.contains("htui:FEAT-2"),
+        "an agy root labels htui FEAT-2:\n{frame}"
+    );
+    assert!(frame.contains("▾ agy (3)"), "the group unfolded:\n{frame}");
+    assert!(
+        frame.contains("ACP transport upgrade"),
+        "and shows its rows:\n{frame}"
+    );
+
+    harness.key("j");
+    harness.drive_to_end().await;
+    assert!(
+        harness.render().contains("┌ FIX-1"),
+        "the list cursor was on agy FEAT-1"
+    );
+}
+
+/// D7: a node outside the workspace is refused on the status line, and the list stays put.
+#[tokio::test]
+async fn enter_on_a_node_outside_the_workspace_refuses_on_the_status_line() {
+    let mut harness = revealing_backlog().await;
+    harness.key("G");
+    harness.drive_to_end().await;
+    assert!(harness.render().contains("┌ FIX-1"), "agy FIX-1");
+    sub_tab(&mut harness, TO_GRAPH);
+    // Three `J` from agy FIX-1's root row is vulkan-tutorials FEAT-1 (blueprint §1.4).
+    for _ in 0..3 {
+        harness.key("J");
+    }
+    harness.key("enter");
+    harness.drive_to_end().await;
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("vulkan-tutorials:FEAT-1 is outside this workspace")
+    );
+    let frame = harness.render();
+    assert!(frame.contains("┌ FIX-1"), "the list did not move:\n{frame}");
+    insta::assert_snapshot!("graph_outside_workspace", frame);
+}
+
+/// Review L7: under the shell's real registration, whose Backlog `Enter` row is the `replay step`
+/// miss, `Enter` on the Graph's root row is consumed and nothing reaches the status line. On Body
+/// the same key does fall through to the miss, which is what gives the first half its meaning.
+#[tokio::test]
+async fn enter_on_the_graph_root_row_is_consumed_under_the_real_registration() {
+    let mut harness = Harness::demo().with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+    htui::app::register_all(harness.app());
+    harness.drive_to_end().await;
+    harness.app().update(Action::SetScope {
+        workspace: workspace("platform").await,
+    });
+    harness.drive_to_end().await;
+    down(&mut harness, TO_FEAT_1).await;
+    harness.key("m");
+    let frame = harness.render();
+    assert!(
+        frame.contains("┌ FEAT-1") && frame.contains("▸ FEAT-1 in_progress"),
+        "the Graph, its cursor on the root row:\n{frame}"
+    );
+    assert_eq!(harness.app().status, None);
+
+    harness.key("enter");
+    harness.drive_to_end().await;
+    assert_eq!(harness.app().status, None, "the Graph consumed `Enter`");
+
+    sub_tab_back(&mut harness, TO_GRAPH);
+    harness.key("enter");
+    harness.drive_to_end().await;
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("select a step in the Runs pane (J/K) to replay it"),
+        "from Body, the miss answers"
+    );
+}
+
+/// Cycles `n` sub-tabs to the left.
+fn sub_tab_back(harness: &mut Harness, n: usize) {
+    for _ in 0..n {
+        harness.key("h");
+    }
+}
+
+/// D8: `m` lands on the Graph from whichever sub-tab is showing.
+#[tokio::test]
+async fn m_opens_the_graph_from_any_sub_tab() {
+    let mut harness = backlog().await;
+    down(&mut harness, TO_FEAT_1).await;
+    assert!(!harness.render().contains("depth 2/3"), "Body is showing");
+    harness.key("m");
+    assert!(harness.render().contains("depth 2/3"), "from Body");
+
+    // Back one to Runs.
+    harness.key("h");
+    assert!(!harness.render().contains("depth 2/3"), "Runs is showing");
+    harness.key("m");
+    assert!(harness.render().contains("depth 2/3"), "from Runs");
+}
+
+/// D2: `+` / `-` change the view depth locally, clamp at 1 and 3, and the depth survives a new
+/// selection.
+#[tokio::test]
+async fn plus_and_minus_change_the_graph_depth() {
+    let mut harness = backlog().await;
+    down(&mut harness, TO_FEAT_1).await;
+    harness.key("m");
+    harness.key("-");
+    let depth_1 = harness.render();
+    assert!(depth_1.contains("depth 1/3"), "{depth_1}");
+    insta::assert_snapshot!("graph_depth_1", depth_1);
+
+    harness.key("+");
+    harness.key("+");
+    let depth_3 = harness.render();
+    assert!(depth_3.contains("depth 3/3"), "{depth_3}");
+    insta::assert_snapshot!("graph_depth_3", depth_3);
+
+    harness.key("+");
+    assert!(harness.render().contains("depth 3/3"), "`+` stops at 3");
+
+    harness.key("j");
+    harness.drive_to_end().await;
+    let feat_2 = harness.render();
+    assert!(feat_2.contains("┌ FEAT-2"), "{feat_2}");
+    assert!(
+        feat_2.contains("depth 3/3"),
+        "the depth is a preference, not per item:\n{feat_2}"
+    );
 }

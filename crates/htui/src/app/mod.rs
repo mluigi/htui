@@ -46,6 +46,8 @@ use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsT
 ///    (MOD-64 D235).
 /// 7. The concepts search's factory goes in and global `Ctrl+F` is bound to opening it (MOD-64
 ///    D236), a chord so no tab's letters and no text field's input can take it.
+/// 8. The Backlog tab's `m` is bound to its `open graph` help text (MOD-14 D8). The tab's own
+///    arm selects the Graph sub-tab; the binding only puts `m open graph` on the help line.
 ///
 /// Calling this twice would stack a second switcher; the shell calls it exactly once, between
 /// [`App::new`] and [`App::start`].
@@ -110,5 +112,14 @@ pub fn register_all(app: &mut App) {
         key: KeyChord::new(KeyCode::Enter, KeyModifiers::NONE),
         action: Action::Error("select a step in the Runs pane (J/K) to replay it".to_owned()),
         help: "replay step",
+    });
+    // MOD-14 D8: `m` opens the Graph sub-tab. The Backlog's own arm does it (no `Action` selects a
+    // sub-tab) and always consumes the key, so this row never fires: it is the help box's half, as
+    // the `Enter` row is. Its action is a no-op focus of the tab that is already active.
+    app.keymap.bind(Binding {
+        scope: KeyScope::Tab(BacklogTab::ID),
+        key: KeyChord::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        action: Action::Tab(TabAction::Focus(BacklogTab::ID)),
+        help: "open graph",
     });
 }

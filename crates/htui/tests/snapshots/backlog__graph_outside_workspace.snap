@@ -1,19 +1,19 @@
 ---
 source: crates/htui/tests/backlog.rs
-expression: harness.render()
+expression: frame
 ---
 Platform · DESKTOP-HTUI · memory · 1 run
  1 Backlog
-┌ Backlog (11) ───────────────────────────────────────┐┌ FEAT-1 ───────────────────────────────────┐
+┌ Backlog (11) ───────────────────────────────────────┐┌ FIX-1 ────────────────────────────────────┐
 │▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
-│  ANA-1    done               Data model, box regist…││▸ FEAT-1 in_progress TUI scaffold          │
-│  ANA-2    open               Orchestrator step grap…││  → origin     ANA-1 done Data model, box …│
-│  CLEAN-1  failed             Drop the legacy markdo…││    ← blocked_by agy:ANA-1 done Prompt ass…│
-│  FEAT-1   in_progress        TUI scaffold           ││    ← origin     FEAT-3 queued (*)         │
-│  FEAT-2   blocked            Agent driver and chat …││    ← blocked_by TOOL-1 awaiting_approval  │
-│  FEAT-3   queued             Postgres store and cac…││  ← blocked_by FEAT-2 blocked Agent driver…│
-│  FIX-1    closed             Terminal left raw afte…││    ← relates    agy:FEAT-1 open ACP trans…│
-│  TOOL-1   awaiting_approval  CI matrix for the thre…││  ← relates    FEAT-3 queued Postgres stor…│
+│  ANA-1    done               Data model, box regist…││  FIX-1 open Session leak on cancel        │
+│  ANA-2    open               Orchestrator step grap…││  → blocked_by ANA-1 done Prompt assembly …│
+│  CLEAN-1  failed             Drop the legacy markdo…││    → blocked_by htui:ANA-1 done Data mode…│
+│  FEAT-1   in_progress        TUI scaffold           ││▸ → origin vulkan-tutor…:FEAT-1 in_progress│
+│  FEAT-2   blocked            Agent driver and chat …││  → origin htui:TOOL-1 awaiting_approval   │
+│  FEAT-3   queued             Postgres store and cac…││    → blocked_by htui:ANA-1 done (*)       │
+│  FIX-1    closed             Terminal left raw afte…││                                           │
+│  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
 │▾ agy (3)                                            ││                                           │
 │  ANA-1    done               Prompt assembly survey ││                                           │
 │  FEAT-1   open               ACP transport upgrade  ││                                           │
@@ -31,4 +31,4 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │                                                     ││                                           │
 │                                                     ││depth 2/3 · +/- depth · Enter re-root      │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help
+vulkan-tutorials:FEAT-1 is outside this workspace
