@@ -301,18 +301,39 @@ impl<P: ReplySink> Shared<P> {
             .retain(|task| !task.handle.is_finished());
     }
 
-    /// D214 (review L5): one lazy pass per sweep tick — the finished task handles, the parent
-    /// tokens of runs no task works on, and the run locks nobody holds or waits for — so an idle
-    /// session keeps none of them for the life of the process.
+    /// D214 (review L5): one lazy pass per sweep tick — the finished task handles, the stale
+    /// backoff entries (MOD-41 review R-8), the parent tokens of runs no task works on, and the run
+    /// locks nobody holds or waits for — so an idle session keeps none of them for the life of the
+    /// process.
     fn prune(&self) {
         self.prune_tasks();
+        self.prune_backoff();
         self.walks.prune();
         self.locks.prune();
     }
 
-    /// The process's isolator and verifier (D156, D202). A `StartRun` re-reads the repo map and
-    /// rebuilds the production isolator when it moved and no walk of this process is live, and is
-    /// refused with [`REPOS_MOVED`] when one is (R-39).
+    /// MOD-41 review R-8: drops the backoff entry of every run no task of this process works on
+    /// whose due is past by more than `max(BACKOFF_MAX, 2 x sweep period)`: a run that left the box
+    /// (finished elsewhere, cancelled, its lease taken) is never resumed here again, so nothing
+    /// would ever clear its entry. A run still failing is adopted within that grace and keeps its
+    /// delay.
+    fn prune_backoff(&self) {
+        let every = Duration::from_millis(self.sweep_every.load(Ordering::SeqCst));
+        let grace = BACKOFF_MAX.max(every.saturating_mul(2));
+        let now = tokio::time::Instant::now();
+        self.backoff
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|run, entry| {
+                now.saturating_duration_since(entry.due) <= grace || self.walks.is_live(*run)
+            });
+    }
+
+    /// The process's isolator and verifier (D156, D202). A `StartRun`, and each sweep of the
+    /// worker (MOD-41 review R-1), re-reads the repo map and rebuilds the production isolator and
+    /// verifier when it moved and no walk of this process is live, and is refused with
+    /// [`REPOS_MOVED`] when one is (R-39). The rebuild reads `copy_max_total_bytes` and the box's
+    /// `command_limits` afresh.
     async fn singletons<H: htui_core::store::WorkerHost>(
         &self,
         host: &H,
@@ -376,6 +397,9 @@ impl<P: ReplySink> Shared<P> {
                 .map_err(|err| err.to_string())?;
             built.isolator = Some(Arc::new(isolator));
             built.repos = Some(repos);
+            // MOD-41 review R-1: the verifier is rebuilt at the same point, so the box's
+            // `command_limits` refresh with the repo map.
+            built.verifier = None;
             self.isolator_builds.fetch_add(1, Ordering::SeqCst);
         }
         if built.verifier.is_none() {
@@ -617,7 +641,8 @@ async fn repo_map<H: htui_core::store::WorkerHost>(
 ///
 /// D216 (review L7): a read that fails is not the default. `singletons` passes it up like the
 /// reads beside it, so no verifier is cached from it and the next command reads again. The limits
-/// are read once per process (per server): an edit to them reaches the next process (R-55).
+/// are read once per build of the parts (per server): an edit to them reaches the next process
+/// (R-55), or this one when its repo map next moves (MOD-41 review R-1).
 ///
 /// # Errors
 /// The store's own read failure.
@@ -688,7 +713,6 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
         let writer = host
             .writer()
             .ok_or_else(|| DATABASE_UNREACHABLE.to_owned())?;
-        let (isolator, verifier) = shared.singletons(host, &writer, start_run).await?;
         let sentence = |err: StoreError| err.to_string();
         let box_id = registered_box(host).await.map_err(sentence)?;
         // I-1 (plan D12): per command and per sweep, the executor key alone (plan D9).
@@ -699,6 +723,11 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             .map(|row| Executor::of(&row.settings))
             .ok_or_else(|| "this box has no row".to_owned())?;
         let tails = shared.role.tails(&executor);
+        // MOD-41 review R-6: a command whose tail is handed back walks nothing here, so it never
+        // rebuilds the isolator (nor is refused with `REPOS_MOVED`).
+        let (isolator, verifier) = shared
+            .singletons(host, &writer, start_run && tails == Tails::Walk)
+            .await?;
         let user = host.this_user().await.map_err(sentence)?;
         let app = host.app_settings().await.map_err(sentence)?;
         let box_profile = host
@@ -1382,6 +1411,11 @@ fn spawn_supervised<H: htui_core::store::WorkerHost, P: ReplySink>(
         {
             if let Some(run) = ctx.tag.run.get() {
                 ctx.shared.dead_walks.mark(*run);
+                // MOD-41 review R-2 (OQ-6): a panic is a failed resume too, so the resume the next
+                // sweep's adoption spawns waits out the run's backoff.
+                if ctx.shared.role == Role::Worker {
+                    ctx.shared.step_backoff(*run);
+                }
             }
             tracing::error!(run = ?ctx.tag.run.get(), "a run task panicked; the next sweep adopts its run");
             ctx.refuse(WALK_PANICKED.to_owned());
@@ -1507,7 +1541,11 @@ async fn reclaim<H: htui_core::store::WorkerHost, P: ReplySink>(
 }
 
 /// D158, D189: one sweep. I-1 (plan D12, D13): only the process whose role matches the box's
-/// executor adopts or claims, so the executor is read first, at every sweep. Then the adoption
+/// executor adopts or claims, so the executor is read first, at every sweep. The worker, which has
+/// no `StartRun` of its own, then re-reads its repo map (MOD-41 review R-1, blueprint D202): a
+/// repo or checkout change rebuilds the isolator and the verifier, with the limits read afresh,
+/// when no walk of this process is live, and while one is ([`REPOS_MOVED`]) the sweep still adopts
+/// but claims nothing this tick. Then the adoption
 /// (nothing is built when there is nothing to adopt: no dead walk of this process and no run
 /// holding a slot on this box), then the claim scan, always unless the runtime was built
 /// [`RunRuntime::without_claim_scan`] (blueprint B-8: `queued` rows hold no slot, so the
@@ -1536,12 +1574,31 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
     if !ctx.shared.role.executes(&executor) {
         return;
     }
+    // MOD-41 review R-1: the sweep task holds no `WalkToken`, so `any_live` reads real walks only.
+    // Never through `reclaim`: it mints its run's token first, so every claim would be refused.
+    let mut claims = ctx.shared.claim_scan;
+    if ctx.shared.role == Role::Worker
+        && let Some(writer) = host.writer()
+    {
+        match ctx.shared.singletons(host, &writer, true).await {
+            Ok(_) => {}
+            // D202 (R-39): the isolator is never swapped under a live walk; this tick's claims
+            // would walk with the stale one, so they wait for a sweep with no walk live.
+            Err(message) if message == REPOS_MOVED => {
+                tracing::debug!(%message, "the sweep claims nothing this tick");
+                claims = false;
+            }
+            Err(message) => {
+                tracing::debug!(%message, "the sweep could not refresh its parts");
+            }
+        }
+    }
     if !ctx.shared.dead_walks.runs().is_empty()
         || !matches!(host.active_runs_on_box(box_id).await, Ok(0))
     {
         adopt(&ctx).await;
     }
-    if ctx.shared.claim_scan {
+    if claims {
         claim_scan(&ctx, box_id).await;
     }
 }
