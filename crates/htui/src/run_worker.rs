@@ -550,6 +550,123 @@ pub const REPOS_MOVED: &str =
 /// The `copy_max_total_bytes` a box with no `app_setting` for it copies up to: 20 GiB.
 const DEFAULT_COPY_MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
+// ---------------------------------------------------------------------------------------------
+// Addressing (MOD-41 plan D7)
+// ---------------------------------------------------------------------------------------------
+
+/// Where the run runtime's answers and frames go (MOD-41 plan D7). The TUI's is [`TuiReplies`];
+/// the worker's is [`Unaddressed`].
+pub trait ReplySink: Clone + Send + Sync + 'static {
+    /// One request's address.
+    type Addr: Clone + Send + Sync + core::fmt::Debug + 'static;
+    /// Who a subscription belongs to: a later subscription of the same subscriber replaces it.
+    type Subscriber: Clone + Eq + core::hash::Hash + Send + Sync + core::fmt::Debug + 'static;
+    /// The subscriber `addr` belongs to.
+    fn subscriber(addr: &Self::Addr) -> Self::Subscriber;
+    /// One reply to `to`. Never fails: a gone receiver drops it, as a closed reply channel always
+    /// has.
+    fn send(&self, to: &Self::Addr, reply: RunReply);
+}
+
+/// One request the run runtime serves (MOD-41 plan D7): the payload of
+/// `StoreRequest::{Orch, RunStream, RunActions}`, without the TUI's envelope.
+#[derive(Debug, Clone)]
+pub enum RunRequest {
+    /// A command or an orchestrator read.
+    Orch(OrchRequest),
+    /// Follow an item's runs.
+    Stream {
+        /// The item.
+        item: ItemId,
+    },
+    /// Every verdict for an item.
+    Actions(ItemId),
+}
+
+impl RunRequest {
+    /// Exactly [`StoreRequest::name`]'s string for the same request: the [`ORCH_NAMES`] entry,
+    /// `run_stream` or `run_actions`.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Orch(request) => request.name(),
+            Self::Stream { .. } => "run_stream",
+            Self::Actions(_) => "run_actions",
+        }
+    }
+}
+
+/// One answer of the run runtime (MOD-41 plan D7), one-to-one with
+/// `StoreReply::{Orch, RunStream, RunActions, Failed}`.
+#[derive(Debug, Clone)]
+pub enum RunReply {
+    /// A command's or read's outcome.
+    Orch(OrchReply),
+    /// A frame of a subscribed item.
+    Frame(RunFrame),
+    /// Every verdict for an item.
+    Actions(Box<ItemActions>),
+    /// The request failed with the sentence.
+    Failed {
+        /// The request's name.
+        request: &'static str,
+        /// Why.
+        message: String,
+    },
+}
+
+impl From<RunReply> for StoreReply {
+    fn from(reply: RunReply) -> Self {
+        match reply {
+            RunReply::Orch(reply) => Self::Orch(reply),
+            RunReply::Frame(frame) => Self::RunStream(frame),
+            RunReply::Actions(actions) => Self::RunActions(actions),
+            RunReply::Failed { request, message } => Self::Failed { request, message },
+        }
+    }
+}
+
+/// The worker's sink: it serves no request, so nothing is addressed (MOD-41 plan D7). An
+/// `Attach` cannot be built for it, since its address type has no value.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Unaddressed;
+
+impl ReplySink for Unaddressed {
+    type Addr = core::convert::Infallible;
+    type Subscriber = core::convert::Infallible;
+
+    fn subscriber(addr: &Self::Addr) -> Self::Subscriber {
+        match *addr {}
+    }
+
+    fn send(&self, to: &Self::Addr, _reply: RunReply) {
+        match *to {}
+    }
+}
+
+/// The TUI's reply sink: the store loop's reply channel (MOD-41 plan D7). A reply goes out as a
+/// [`ReplyEnvelope`] at its address's `seq` and origin; a subscription is keyed on the origin, so
+/// a later `RunStream` from the same origin replaces the earlier one.
+#[derive(Debug, Clone)]
+pub struct TuiReplies(pub mpsc::UnboundedSender<ReplyEnvelope>);
+
+impl ReplySink for TuiReplies {
+    type Addr = ReplyAddr;
+    type Subscriber = Origin;
+
+    fn subscriber(addr: &ReplyAddr) -> Origin {
+        addr.origin.clone()
+    }
+
+    fn send(&self, to: &ReplyAddr, reply: RunReply) {
+        let _ = self.0.send(ReplyEnvelope {
+            seq: to.seq,
+            origin: to.origin.clone(),
+            reply: reply.into(),
+        });
+    }
+}
+
 /// What `RunRuntime::serve` (and the runtime's event channel) decided about one request.
 #[derive(Debug)]
 pub enum RunServed {
@@ -2445,7 +2562,8 @@ pub(crate) mod tests {
 
     use super::{
         BackendGraphs, FrameKind, LiveChats, ORCH_NAMES, OrchReply, OrchRequest, PREEMPTED,
-        RunRuntime, RunServed, StepAuthor, WALK_PANICKED,
+        ReplySink as _, RunReply, RunRequest, RunRuntime, RunServed, StepAuthor, TuiReplies,
+        WALK_PANICKED,
     };
     use crate::agent_worker::AgentRuntime;
     use crate::store_worker::{
@@ -4567,6 +4685,83 @@ pub(crate) mod tests {
         ] {
             assert!(!distinct.contains(other.name()), "{}", other.name());
         }
+    }
+
+    /// MOD-41 plan D7: a [`RunRequest`] is named exactly as the `StoreRequest` it was cut from, so
+    /// a `Failed` reply's `request` still matches the Runs pane's and the Chat tab's lists.
+    #[test]
+    fn run_request_names_match_store_request_names() {
+        let item = ids::HTUI_ANA_2;
+        let mut pairs: Vec<(RunRequest, StoreRequest)> = every_orch_request()
+            .into_iter()
+            .map(|request| {
+                (
+                    RunRequest::Orch(request.clone()),
+                    StoreRequest::Orch(request),
+                )
+            })
+            .collect();
+        pairs.push((
+            RunRequest::Stream { item },
+            StoreRequest::RunStream { item },
+        ));
+        pairs.push((RunRequest::Actions(item), StoreRequest::RunActions(item)));
+        assert_eq!(pairs.len(), ORCH_NAMES.len() + 2);
+        for (run, store) in pairs {
+            assert_eq!(run.name(), store.name(), "{run:?}");
+        }
+    }
+
+    /// MOD-41 plan D7: each [`RunReply`] reaches the loop as its one `StoreReply`, at the
+    /// address's own `seq` and origin.
+    #[test]
+    fn tui_replies_map_every_run_reply() {
+        let (replies, mut answers) = mpsc::unbounded_channel();
+        let sink = TuiReplies(replies);
+        let to = crate::agent_worker::ReplyAddr {
+            seq: 7,
+            origin: Origin::App,
+        };
+        let (item, run) = (ids::HTUI_ANA_2, RunId::new());
+        for reply in [
+            RunReply::Orch(OrchReply::CleanedUp { run }),
+            RunReply::Frame(super::RunFrame::subscribed(item)),
+            RunReply::Actions(Box::new(super::unreachable_actions(item, String::new()))),
+            RunReply::Failed {
+                request: "run_actions",
+                message: "gone".to_owned(),
+            },
+        ] {
+            sink.send(&to, reply);
+        }
+
+        let mut got = Vec::new();
+        while let Ok(envelope) = answers.try_recv() {
+            assert_eq!((envelope.seq, &envelope.origin), (7, &Origin::App));
+            got.push(envelope.reply);
+        }
+        assert_eq!(got.len(), 4, "one reply per send: {got:?}");
+        assert!(
+            matches!(&got[0], StoreReply::Orch(OrchReply::CleanedUp { run: of }) if *of == run),
+            "{:?}",
+            got[0]
+        );
+        assert!(
+            matches!(&got[1], StoreReply::RunStream(super::RunFrame { item: of, run: None, kind: FrameKind::Subscribed })
+                if *of == item),
+            "{:?}",
+            got[1]
+        );
+        assert!(
+            matches!(&got[2], StoreReply::RunActions(actions) if actions.item == item),
+            "{:?}",
+            got[2]
+        );
+        assert!(
+            matches!(&got[3], StoreReply::Failed { request: "run_actions", message } if message == "gone"),
+            "{:?}",
+            got[3]
+        );
     }
 
     /// Blueprint D183: with no runtime, the stream is acknowledged, the verdicts are read and the
