@@ -794,9 +794,11 @@ pub fn loop_target(snapshot: &GraphSnapshot, review_position: i32) -> Option<i32
 /// Both halves are computed from rows the step already wrote. The hash half compares the two
 /// implement attempts' `run_step_commit` rows per repo, with "both `None`" counting as identical —
 /// two attempts that committed nothing are exactly the failure mode ANA-2 `:735-739` names. The
-/// review half hashes the two latest review documents of this run through
-/// `prompt::digest::canonical`, the workspace's one normalisation, so a review re-emitted with
-/// different line endings does not read as progress.
+/// review half compares the two highest versions of the review phase's `output_kind` that this
+/// run's steps at `review_position` produced, read from every version the item holds rather
+/// than the latest per kind, and hashes them through `prompt::digest::canonical`, the workspace's
+/// one normalisation, so a review re-emitted with different line endings does not read as
+/// progress. The hash half is asked first, so a loop where both hold reports `no_progress_hash`.
 async fn no_progress<S: WriteStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     steps: &[RunStep],
@@ -861,7 +863,20 @@ async fn commits_are_identical<S: WriteStore, C: Clock + ?Sized>(
     }))
 }
 
-/// The two latest review documents of this run, byte-identical after canonicalisation.
+/// The two latest review documents this run's steps at `review_position` produced, byte-identical
+/// after canonicalisation.
+///
+/// Reads [`ReadStore::documents`](htui_core::store::ReadStore::documents): heads of every version
+/// of every kind, without bodies. `documents_of_kinds` answers only the latest version per kind,
+/// so it can never hold two reviews, and reading through it left `LoopStop::NoProgressReview`
+/// unreachable from MOD-4 milestone 2 until CLEAN-4. The heads are kept when their `kind` is the
+/// review phase's `output_kind` and their `produced_by_step_id` is one of this run's rows at
+/// `review_position`. The two highest versions win, and only those two bodies are read, through
+/// [`ReadStore::document`](htui_core::store::ReadStore::document).
+///
+/// Every "cannot tell" answers `false`, so the loop is not stopped: a chat run, a snapshot with
+/// no such position, fewer than two reviews, or a head whose body read answers `None` because the
+/// row went between the two reads.
 async fn reviews_are_identical<S: WriteStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     steps: &[RunStep],
@@ -875,28 +890,35 @@ async fn reviews_are_identical<S: WriteStore, C: Clock + ?Sized>(
         .phases
         .iter()
         .find(|phase| phase.position == review_position)
-        .map(|phase| phase.output_kind.clone())
+        .map(|phase| phase.output_kind.as_str())
     else {
         return Ok(false);
     };
-    let mine: Vec<_> = steps
+    let mine: Vec<StepId> = steps
         .iter()
         .filter(|step| step.position == review_position)
         .map(|step| step.id)
         .collect();
-    let mut documents: Vec<Document> = ctx
+    let mut heads: Vec<_> = ctx
         .store
-        .documents_of_kinds(item, &[kind])
+        .documents(item)
         .await?
         .into_iter()
-        .filter(|document| {
-            document
-                .produced_by_step_id
-                .is_some_and(|step| mine.contains(&step))
+        .filter(|head| {
+            head.kind == kind
+                && head
+                    .produced_by_step_id
+                    .is_some_and(|step| mine.contains(&step))
         })
         .collect();
-    documents.sort_by_key(|document| core::cmp::Reverse(document.version));
-    let [newest, previous, ..] = documents.as_slice() else {
+    heads.sort_by_key(|head| core::cmp::Reverse(head.version));
+    let [newest, previous, ..] = heads.as_slice() else {
+        return Ok(false);
+    };
+    let (Some(newest), Some(previous)) = (
+        ctx.store.document(newest.id).await?,
+        ctx.store.document(previous.id).await?,
+    ) else {
         return Ok(false);
     };
     Ok(sha256_hex(&canonical(&newest.body)) == sha256_hex(&canonical(&previous.body)))
