@@ -131,6 +131,12 @@ const GONE_CLOSED: &str = "deleted elsewhere; nothing was written";
 const NEEDS_CLI_BLOCK: &str =
     " \u{b7} a `cli` row needs a settings.cli block to chat (adapter id `cli` is not registered)";
 
+/// What a spent token says when fields the user changed were changed elsewhere too (review M-1),
+/// before their labels: shorter than [`CHANGED_ELSEWHERE`] so two labels still fit the bordered 98.
+/// Labels only, never a value. Opens like [`CHANGED_ELSEWHERE`], so [`is_error`] draws it the same.
+const CHANGED_ON_BOTH_SIDES: &str =
+    "changed elsewhere \u{2014} reloaded; Enter retries \u{b7} also changed elsewhere: ";
+
 /// What `Edited` adds when the save changed what a probe checked (plan D246): the stored verdict is
 /// now older than the row, so the next chat re-probes by itself.
 const REPROBES: &str = " \u{b7} the next chat re-probes; r probes now";
@@ -1308,24 +1314,19 @@ impl AgentsSection {
                         )
                     });
                 match current {
-                    // The text stays; the token and the "unchanged" baseline are the row's now.
+                    // Review M-1: the fields the user left alone take the re-read's values, the
+                    // ones they changed keep their text, and the token and the "unchanged"
+                    // baseline are the row's now.
                     Some((updated_at, draft)) => {
-                        if let Mode::Editing(Editor {
-                            target:
-                                Target::Edit {
-                                    expected,
-                                    opened,
-                                    relaunch,
-                                    ..
-                                },
-                            ..
-                        }) = &mut self.mode
-                        {
-                            *expected = updated_at;
-                            *opened = draft;
-                            *relaunch = false;
-                        }
-                        self.notice = Some(CHANGED_ELSEWHERE.to_owned());
+                        let clashes = match &mut self.mode {
+                            Mode::Editing(editor) => editor.rebase(updated_at, draft),
+                            Mode::Browse => Vec::new(),
+                        };
+                        self.notice = Some(if clashes.is_empty() {
+                            CHANGED_ELSEWHERE.to_owned()
+                        } else {
+                            format!("{CHANGED_ON_BOTH_SIDES}{}", clashes.join(", "))
+                        });
                     }
                     None => {
                         self.mode = Mode::Browse;
@@ -1502,15 +1503,7 @@ impl Editor {
     /// the worker does. `env` has no field (D235).
     fn edit(summary: &AgentSummary) -> Self {
         let opened = agent_settings::draft_of(&summary.agent);
-        let texts = [
-            opened.transport.as_str().to_owned(),
-            opened.command.clone(),
-            agent_settings::format_args(&opened.args),
-            agent_settings::format_models(&opened.models),
-            opened.default_model.clone().unwrap_or_default(),
-            opened.billing.as_str().to_owned(),
-            if opened.enabled { "y" } else { "n" }.to_owned(),
-        ];
+        let texts = prefill(&opened);
         Self {
             fields: FIELD_LABELS[1..]
                 .iter()
@@ -1526,6 +1519,42 @@ impl Editor {
             },
             focus: 0,
         }
+    }
+
+    /// A spent token under an open edit form (review M-1): rebase the form onto `current`, the row
+    /// as the re-read answered it, and answer the labels of the fields changed on both sides.
+    ///
+    /// A field whose text is still what the old baseline prefilled takes `current`'s text, so a
+    /// retry carries another writer's change instead of reverting it (`EditAgent` sends the whole
+    /// draft). A field the user changed keeps its text; it is a clash when `current` changed it
+    /// too, to something else. Then the token and the "unchanged" baseline are `current`'s.
+    fn rebase(&mut self, updated_at: DateTime<Utc>, current: AgentDraft) -> Vec<&'static str> {
+        let Target::Edit {
+            expected,
+            opened,
+            relaunch,
+            ..
+        } = &mut self.target
+        else {
+            return Vec::new();
+        };
+        let before = prefill(opened);
+        let after = prefill(&current);
+        let mut clashes = Vec::new();
+        // The edit form's fields are `FIELD_LABELS[1..]`, which is `prefill`'s order.
+        for ((field, old), new) in self.fields.iter_mut().zip(before).zip(after) {
+            if field.text() == old {
+                if new != old {
+                    field.input = TextField::with_text(&new);
+                }
+            } else if new != old && field.text() != new {
+                clashes.push(field.label);
+            }
+        }
+        *expected = updated_at;
+        *opened = current;
+        *relaunch = false;
+        clashes
     }
 
     /// The text of the field labelled `label`, or `""` when the form has none (the edit form's
@@ -1654,6 +1683,20 @@ impl Field {
     fn text(&self) -> &str {
         self.input.text().unwrap_or_default()
     }
+}
+
+/// The edit form's text for `draft`, in `FIELD_LABELS[1..]` order: what the form prefills, and
+/// what a `Stale` rebase compares against (review M-1).
+fn prefill(draft: &AgentDraft) -> [String; 7] {
+    [
+        draft.transport.as_str().to_owned(),
+        draft.command.clone(),
+        agent_settings::format_args(&draft.args),
+        agent_settings::format_models(&draft.models),
+        draft.default_model.clone().unwrap_or_default(),
+        draft.billing.as_str().to_owned(),
+        if draft.enabled { "y" } else { "n" }.to_owned(),
+    ]
 }
 
 /// The refusal of a key pressed while a registry write is in flight (blueprint F-20).

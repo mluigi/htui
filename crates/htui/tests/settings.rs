@@ -2678,6 +2678,9 @@ const CHANGED_ELSEWHERE: &str = "changed elsewhere since you opened it \u{2014} 
 /// `settings/mod.rs`'s `DELETED_ELSEWHERE`, for the same reason.
 const DELETED_ELSEWHERE: &str = "deleted elsewhere \u{2014} the editor was closed";
 
+/// Review M-1: a `Stale` whose re-read changed fields the user had changed too names them.
+const CHANGED_ON_BOTH_SIDES: &str = "changed elsewhere \u{2014} reloaded; Enter retries \u{b7} also changed elsewhere: command, models";
+
 /// A valid create form, in `FIELD_LABELS` order: name, transport, command, args, models, default
 /// model, billing, enabled.
 const VALID_CREATE: [&str; 8] = [
@@ -3187,6 +3190,114 @@ async fn agent_written_stale_keeps_the_text_and_takes_the_new_token() {
                 if *expected == htui_core::fixtures::demo_at(2, 0)
         ),
         "the retry carries the new token: {requests:?}"
+    );
+}
+
+/// Review M-1: a `Stale` reply rebases every field the user left alone onto the re-read row, so
+/// the retry carries another writer's change instead of silently reverting it; the fields the user
+/// changed keep their text.
+#[tokio::test]
+async fn agent_written_stale_rebases_untouched_fields() {
+    let bench = SectionBench::new().await;
+    let row = editable_row("alpha");
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row.clone()]);
+    bench.key(&mut section, "e");
+    pressed(&bench, &mut section, "tab", 3);
+    typed(&bench, &mut section, ", m9");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    let mut moved = row;
+    moved.agent.updated_at = htui_core::fixtures::demo_at(2, 0);
+    moved.agent.launch["command"] = json!("/opt/remote/bin/agent");
+    bench.reply(
+        &mut section,
+        &written(vec![moved], AgentWrite::Stale { id: agent_id }),
+    );
+    assert!(section.captures_input(), "the form stays open");
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        field_of(&rendered, "command").as_deref(),
+        Some("/opt/remote/bin/agent"),
+        "an untouched field takes the other writer's value:\n{rendered}"
+    );
+    assert_eq!(
+        field_of(&rendered, "models").as_deref(),
+        Some("m1, m2, m9"),
+        "the user's edit is kept"
+    );
+    assert_eq!(
+        note_line(&rendered),
+        CHANGED_ELSEWHERE,
+        "nothing clashed, so the plain sentence"
+    );
+
+    bench.key(&mut section, "enter");
+    let requests = requests_of(&bench);
+    match requests.as_slice() {
+        [
+            StoreRequest::EditAgent {
+                expected, draft, ..
+            },
+        ] => {
+            assert_eq!(*expected, htui_core::fixtures::demo_at(2, 0));
+            assert_eq!(
+                draft.command, "/opt/remote/bin/agent",
+                "the retry carries the other writer's command"
+            );
+            assert_eq!(draft.models, ["m1", "m2", "m9"], "and the user's models");
+            assert_eq!(draft.args, ["--flag", "a b"]);
+        }
+        other => panic!("expected one EditAgent, got {other:?}"),
+    }
+}
+
+/// Review M-1: a field changed on both sides keeps the user's text, and the notice names it (and
+/// only by label, never by value); a field only the other writer changed is rebased silently.
+#[tokio::test]
+async fn agent_written_stale_names_the_fields_changed_on_both_sides() {
+    let bench = SectionBench::new().await;
+    let row = editable_row("alpha");
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row.clone()]);
+    bench.key(&mut section, "e");
+    bench.key(&mut section, "tab");
+    filled(&bench, &mut section, &["/opt/mine/bin/agent"]);
+    pressed(&bench, &mut section, "tab", 2);
+    typed(&bench, &mut section, ", m9");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    let mut moved = row;
+    moved.agent.updated_at = htui_core::fixtures::demo_at(2, 0);
+    moved.agent.launch["command"] = json!("/opt/theirs/bin/agent");
+    moved.agent.launch["args"] = json!(["--theirs"]);
+    moved.agent.models = vec!["m1".to_owned(), "m7".to_owned()];
+    bench.reply(
+        &mut section,
+        &written(vec![moved], AgentWrite::Stale { id: agent_id }),
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        field_of(&rendered, "command").as_deref(),
+        Some("/opt/mine/bin/agent")
+    );
+    assert_eq!(field_of(&rendered, "models").as_deref(), Some("m1, m2, m9"));
+    assert_eq!(
+        field_of(&rendered, "args").as_deref(),
+        Some("--theirs"),
+        "a field only the other writer changed is rebased"
+    );
+    let note = note_line(&rendered);
+    assert_eq!(note, CHANGED_ON_BOTH_SIDES, "{rendered}");
+    assert!(
+        !note.contains("/opt/") && !note.contains("m7") && !note.contains("m9"),
+        "labels only, never a value: {note}"
+    );
+    assert!(
+        SECTION_BORDERED as usize >= CHANGED_ON_BOTH_SIDES.chars().count(),
+        "the notice fits the bordered pane"
     );
 }
 
