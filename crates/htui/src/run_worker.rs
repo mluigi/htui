@@ -144,12 +144,12 @@ pub(crate) mod tests {
     use htui_agent::registry::{DriverFactory, TransportBuilder};
     use htui_core::fixtures::{demo_at, edit_agent, ids};
     use htui_core::model::{
-        Agent, AgentBox, AgentId, Billing, DocumentId, Item, ItemId, NewDocument, NewRepo, NewRun,
-        RepoId, Resolution, Run, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId,
-        StepStatus, TIMESTAMPTZ_DIGITS, Transport,
+        Agent, AgentBox, AgentId, Billing, BoxEdit, DocumentId, Executor, Item, ItemId,
+        NewDocument, NewRepo, NewRun, RepoId, Resolution, Run, RunId, RunMode, RunStatus, RunStep,
+        SnapshotPhase, Status, StepId, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
     };
     use htui_core::store::mem::MemFault;
-    use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+    use htui_core::store::{CasOutcome, MemStore, ReadStore as _, WriteStore as _};
     use htui_orch::fake::{FakeIsolator, FakeVerifier};
     use htui_orch::{
         Clock, Command, CommandOutcome, EngineError, GateAnswer, GraphSource, Isolator,
@@ -158,7 +158,7 @@ pub(crate) mod tests {
     use serde_json::json;
     use tokio::sync::{Notify, mpsc};
 
-    use htui_worker::testing;
+    use htui_worker::{Role, testing, unknown_executor, worker_walks};
 
     use super::{
         FrameKind, HostGraphs, LiveChats, ORCH_NAMES, OrchReply, OrchRequest, PREEMPTED, ReplySink,
@@ -210,7 +210,12 @@ pub(crate) mod tests {
     /// Blueprint F-O: the demo with every fixture agent disabled, one scripted agent and its
     /// `agent_box` on the demo box, so rung 3 of the candidate chain names exactly it.
     async fn seeded_store() -> (MemStore, AgentId) {
-        let store = MemStore::demo();
+        seeded(MemStore::demo()).await
+    }
+
+    /// [`seeded_store`]'s seeding over `store` (MOD-41 T9: a demo whose box settings a case
+    /// edited).
+    async fn seeded(store: MemStore) -> (MemStore, AgentId) {
         for summary in store.agents().await.expect("the fixture's agents") {
             let mut row = summary.agent;
             row.enabled = false;
@@ -444,7 +449,13 @@ pub(crate) mod tests {
 
     impl Fixture {
         pub(crate) async fn new() -> Self {
-            let (store, _) = seeded_store().await;
+            Self::over(MemStore::demo()).await
+        }
+
+        /// The fixture over `store`, seeded as [`Self::new`]'s (MOD-41 T9: a demo whose box
+        /// settings a case edited).
+        async fn over(store: MemStore) -> Self {
+            let (store, _) = seeded(store).await;
             Self {
                 store,
                 sessions: Arc::default(),
@@ -1215,6 +1226,41 @@ pub(crate) mod tests {
             .await
             .expect("the claim answers");
         assert!(claim.is_admitted(), "{claim}");
+        run
+    }
+
+    /// A `queued` run of `item` another process enqueued five minutes ago and never claimed.
+    async fn queued_by_another(fixture: &Fixture, item: ItemId) -> RunId {
+        let backend = Backend::memory(fixture.store.clone());
+        let row = fixture.item(item).await;
+        let app = fixture.store.app_settings().await.expect("the settings");
+        let resolved = htui_orch::resolve(
+            &fixture.store,
+            &HostGraphs(backend),
+            &row,
+            RunMode::Manual,
+            &app,
+            None,
+            ids::BOX,
+        )
+        .await
+        .expect("the item resolves");
+        let run = RunId::new();
+        fixture
+            .store
+            .create_run(NewRun {
+                id: run,
+                project_id: row.project_id,
+                item_id: row.id,
+                mode: RunMode::Manual,
+                target_box_id: ids::BOX,
+                started_by: ids::USER,
+                graph_snapshot: resolved.snapshot,
+                repo_scope: resolved.repo_scope,
+                queued_at: Utc::now() - TimeDelta::minutes(5),
+            })
+            .await
+            .expect("the run lands");
         run
     }
 
@@ -2396,5 +2442,417 @@ pub(crate) mod tests {
                 "{reply:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-41 T9: the executor gate (I-1, plan D12, D13, OQ-4, OQ-5)
+    // -----------------------------------------------------------------------------------------
+
+    /// The box's executor set through its editor (MOD-41 plan D10).
+    async fn set_executor(fixture: &Fixture, executor: Executor) {
+        let row = fixture
+            .store
+            .box_row(ids::BOX)
+            .await
+            .expect("the read answers")
+            .expect("the demo box");
+        let edited = fixture
+            .store
+            .edit_box(
+                ids::BOX,
+                row.edit_version,
+                BoxEdit {
+                    executor: Some(executor),
+                    ..BoxEdit::default()
+                },
+            )
+            .await
+            .expect("the edit answers");
+        assert!(
+            matches!(edited, CasOutcome::Applied(_)),
+            "the executor was written: {edited:?}"
+        );
+    }
+
+    /// The fixture over a demo whose box settings are `settings` (plan D9: a value the editor
+    /// cannot write).
+    async fn fixture_with_box_settings(settings: serde_json::Value) -> Fixture {
+        let mut data = htui_core::fixtures::demo_data();
+        for row in &mut data.boxes {
+            row.settings = settings.clone();
+        }
+        Fixture::over(MemStore::from_demo(data)).await
+    }
+
+    /// One command served on `runtime` at `seq`, settled, and its answer.
+    async fn served(
+        runtime: &mut RunRuntime,
+        fixture: &Fixture,
+        seq: u64,
+        request: StoreRequest,
+    ) -> StoreReply {
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, mut answers) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq,
+                    origin: Origin::App,
+                    request,
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(matches!(served, RunServed::Deferred), "{served:?}");
+        assert!(runtime.settle(PATIENCE).await.is_empty(), "no task stuck");
+        drop(replies);
+        let mut reply = None;
+        while let Ok(envelope) = answers.try_recv() {
+            if envelope.seq == seq && !matches!(envelope.reply, StoreReply::RunStream(_)) {
+                reply = Some(envelope.reply);
+            }
+        }
+        reply.expect("the command was answered")
+    }
+
+    /// One sweep of `runtime`, settled.
+    async fn swept(runtime: &mut RunRuntime, fixture: &Fixture) {
+        let (replies, _answers) = mpsc::unbounded_channel();
+        runtime.sweep(&Backend::memory(fixture.store.clone()), &replies);
+        assert!(runtime.settle(PATIENCE).await.is_empty(), "no task stuck");
+    }
+
+    /// Plan D12 (`R` on a `worker` box): the run is only enqueued. The answer is `Started` at
+    /// `queued`; nothing claims or walks it, not even this runtime's next sweep.
+    #[tokio::test]
+    async fn on_a_worker_box_start_run_only_queues() {
+        let fixture = Fixture::new().await;
+        set_executor(&fixture, Executor::Worker).await;
+        let mut runtime = fixture.runtime();
+
+        let reply = served(&mut runtime, &fixture, 1, start_run(ids::HTUI_ANA_2)).await;
+        let CommandOutcome::Started { run, rest } = outcome(reply) else {
+            panic!("a start answers Started");
+        };
+        assert_eq!(
+            (rest.run, rest.position, rest.failure),
+            (RunStatus::Queued, None, None)
+        );
+        swept(&mut runtime, &fixture).await;
+        let row = fixture.run(run).await;
+        assert_eq!(
+            (row.status, row.lease_expires_at),
+            (RunStatus::Queued, None),
+            "the box's worker claims it, not the TUI"
+        );
+        assert!(fixture.steps(run).await.is_empty(), "nothing walked");
+    }
+
+    /// Plan D12 (`a` on a `worker` box): the answer is written under the lease, which is then
+    /// given back: the run is `running`, unleased, and no step past the gate exists.
+    #[tokio::test]
+    async fn on_a_worker_box_an_answer_hands_back() {
+        let fixture = Fixture::new().await;
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+        let (run, research) = parked(&fixture, &mut worker).await;
+        set_executor(&fixture, Executor::Worker).await;
+
+        let answer = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::AnswerGate {
+                run,
+                step: research.id,
+                answer: GateAnswer::Approved,
+            })),
+        );
+        let CommandOutcome::Answered { rest } = outcome(worker.reply(answer).await) else {
+            panic!("an answer answers Answered");
+        };
+        assert_eq!(rest.run, RunStatus::Running, "handed back, not walked");
+        let row = fixture.run(run).await;
+        assert_eq!(row.status, RunStatus::Running);
+        assert!(
+            row.lease_expires_at
+                .is_some_and(|until| until <= Utc::now()),
+            "the lease was released: {:?}",
+            row.lease_expires_at
+        );
+        let steps = fixture.steps(run).await;
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| (step.position, step.status))
+                .collect::<Vec<_>>(),
+            [(0, StepStatus::Done)],
+            "no step past the gate"
+        );
+    }
+
+    /// I-1, plan D13: on a `worker` box the TUI's sweep adopts nothing, even a lapsed lease.
+    #[tokio::test]
+    async fn on_a_worker_box_the_tui_never_sweeps() {
+        let fixture = Fixture::new().await;
+        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+        let before = fixture.run(run).await;
+        set_executor(&fixture, Executor::Worker).await;
+        let mut runtime = fixture.runtime();
+
+        swept(&mut runtime, &fixture).await;
+        let row = fixture.run(run).await;
+        assert_eq!(row.status, RunStatus::Running);
+        assert_eq!(
+            row.lease_expires_at, before.lease_expires_at,
+            "not adopted: the lease is still the lapsed stranger's"
+        );
+        assert!(fixture.steps(run).await.is_empty(), "nothing walked");
+    }
+
+    /// OQ-4: `c` on a run whose live lease is another process's is refused on a `worker` box with
+    /// the sentence naming the worker, and nothing is written.
+    #[tokio::test]
+    async fn on_a_worker_box_a_live_walk_refuses_cancel_naming_the_worker() {
+        let fixture = Fixture::new().await;
+        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+        assert!(
+            fixture
+                .store
+                .take_lease(run, ids::BOX, Uuid::now_v7(), TimeDelta::days(1))
+                .await
+                .expect("the take answers"),
+            "the box's worker walks it, for a day"
+        );
+        let before = fixture.run(run).await;
+        set_executor(&fixture, Executor::Worker).await;
+        let mut runtime = fixture.runtime();
+
+        let reply = served(
+            &mut runtime,
+            &fixture,
+            1,
+            StoreRequest::Orch(OrchRequest::Command(Command::CancelRun { run })),
+        )
+        .await;
+        assert!(
+            matches!(&reply, StoreReply::Failed { request: "cancel_run", message } if *message == worker_walks(run)),
+            "{reply:?}"
+        );
+        let row = fixture.run(run).await;
+        assert_eq!(
+            (row.status, row.lease_expires_at),
+            (RunStatus::Running, before.lease_expires_at),
+            "nothing written"
+        );
+        assert!(fixture.steps(run).await.is_empty());
+    }
+
+    /// Plan D9: an executor this build does not know fails closed. The TUI refuses `R` and the
+    /// walking commands with the sentence naming it, writing nothing; `c` still cancels.
+    #[tokio::test]
+    async fn an_unknown_executor_refuses_start_and_walking_commands() {
+        let fixture = fixture_with_box_settings(
+            json!({ "executor": "container", "max_concurrent_items": 2 }),
+        )
+        .await;
+        let refusal = unknown_executor(&Executor::Other("container".to_owned()));
+        // A run parked by a runtime of the other role, which serves commands whatever the box
+        // says: only the TUI's commands are gated by the executor (plan D9).
+        let mut other = fixture.runtime().with_role(Role::Worker);
+        let CommandOutcome::Started { run, rest } =
+            outcome(served(&mut other, &fixture, 1, start_run(ids::HTUI_ANA_2)).await)
+        else {
+            panic!("a start answers Started");
+        };
+        assert_eq!(rest.run, RunStatus::AwaitingApproval);
+        let research = step_at(&fixture, run, 0).await;
+        let mut runtime = fixture.runtime();
+
+        let reply = served(&mut runtime, &fixture, 1, start_run(ids::HTUI_CLEAN_1)).await;
+        assert!(
+            matches!(&reply, StoreReply::Failed { request: "start_run", message } if *message == refusal),
+            "{reply:?}"
+        );
+        assert!(
+            fixture
+                .store
+                .runs(ids::HTUI_CLEAN_1)
+                .await
+                .expect("the read answers")
+                .is_empty(),
+            "nothing was enqueued"
+        );
+        let reply = served(
+            &mut runtime,
+            &fixture,
+            2,
+            StoreRequest::Orch(OrchRequest::Command(Command::AnswerGate {
+                run,
+                step: research.id,
+                answer: GateAnswer::Approved,
+            })),
+        )
+        .await;
+        assert!(
+            matches!(&reply, StoreReply::Failed { request: "answer_gate", message } if *message == refusal),
+            "{reply:?}"
+        );
+        assert_eq!(
+            step_at(&fixture, run, 0).await.status,
+            StepStatus::AwaitingApproval,
+            "the gate is unanswered"
+        );
+
+        let reply = served(
+            &mut runtime,
+            &fixture,
+            3,
+            StoreRequest::Orch(OrchRequest::Command(Command::CancelRun { run })),
+        )
+        .await;
+        assert!(
+            matches!(outcome(reply), CommandOutcome::Cancelled { .. }),
+            "a cancel walks nothing, so it is not gated"
+        );
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
+    }
+
+    /// OQ-5: on a `tui` box the TUI's sweep claims a queued row another process left behind, and
+    /// walks it.
+    #[tokio::test]
+    async fn a_tui_box_claims_a_queued_row_it_did_not_queue() {
+        let fixture = Fixture::new().await;
+        fixture
+            .store
+            .finish_run(ids::RUN_2, RunStatus::Cancelled, None, Utc::now())
+            .await
+            .expect("the seeded queued run is cancellable");
+        // Left `queued` by a process that enqueued it and died before its claim.
+        let queued = queued_by_another(&fixture, ids::HTUI_ANA_2).await;
+        let mut runtime = fixture.runtime();
+
+        let (replies, _answers) = mpsc::unbounded_channel();
+        runtime.sweep(&Backend::memory(fixture.store.clone()), &replies);
+        rests_at(&fixture, queued, RunStatus::AwaitingApproval).await;
+        let row = fixture.run(queued).await;
+        assert_eq!(row.executing_box_id, Some(ids::BOX), "claimed on this box");
+        assert!(!fixture.steps(queued).await.is_empty(), "and walked");
+    }
+
+    /// Plan D13 (`tui → worker`): a TUI walk in flight when the box flips keeps its lease and its
+    /// heartbeat and rests normally; a sweep meanwhile adopts nothing.
+    #[tokio::test]
+    async fn flipping_to_worker_keeps_the_tuis_live_walk() {
+        let fixture = Fixture::new().await;
+        let stall = Stall::default();
+        fixture.sessions.push(Play::Stall(stall.clone()));
+        let mut runtime = fixture.runtime();
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, mut answers) = mpsc::unbounded_channel();
+        runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq: 1,
+                    origin: Origin::App,
+                    request: start_run(ids::HTUI_ANA_2),
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        within("the session starting", stall.reached.notified()).await;
+        let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+        set_executor(&fixture, Executor::Worker).await;
+
+        runtime.sweep(&backend, &replies);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let row = fixture.run(run).await;
+        assert_eq!(row.status, RunStatus::Running, "the walk is still live");
+        assert!(
+            row.lease_expires_at.is_some_and(|until| until > Utc::now()),
+            "and still leased: {:?}",
+            row.lease_expires_at
+        );
+        assert!(!stall.dropped.load(Ordering::SeqCst), "the session lives");
+
+        stall.release.notify_one();
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        assert_eq!(fixture.run(run).await.status, RunStatus::AwaitingApproval);
+        drop(replies);
+        let mut started = None;
+        while let Ok(envelope) = answers.try_recv() {
+            if envelope.seq == 1 && !matches!(envelope.reply, StoreReply::RunStream(_)) {
+                started = Some(outcome(envelope.reply));
+            }
+        }
+        assert!(
+            matches!(&started, Some(CommandOutcome::Started { rest, .. }) if rest.run == RunStatus::AwaitingApproval),
+            "the start rested normally: {started:?}"
+        );
+    }
+
+    /// Blueprint F-17, B-7: a claim this process's queue retries is I-1's too. After the flip to
+    /// `worker`, a walk that rests does not claim the waiting run: it leaves the queue and stays
+    /// `queued` for the box's worker.
+    #[tokio::test]
+    async fn flipping_to_worker_stops_the_in_memory_claim_retry() {
+        let fixture = Fixture::new().await;
+        let runtime = fixture.runtime();
+        let probe = testing::probe(&runtime);
+        let mut worker = Worker::spawn(&fixture.store, runtime);
+        let (first, _) = parked(&fixture, &mut worker).await;
+        let start = worker.send(Origin::App, start_run(ids::HTUI_CLEAN_1));
+        let StoreReply::Failed { message, .. } = worker.reply(start).await else {
+            panic!("the second claim is refused");
+        };
+        assert!(message.contains("overlaps run"), "{message}");
+        let second = only_run(&fixture.store, ids::HTUI_CLEAN_1).await;
+        assert!(
+            probe.queued().iter().any(|(_, run)| *run == second),
+            "the refused run waits in the queue"
+        );
+        set_executor(&fixture, Executor::Worker).await;
+
+        let cancel = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::CancelRun { run: first })),
+        );
+        outcome(worker.reply(cancel).await);
+        within("the waiting run leaving the queue", async {
+            while probe.queued().iter().any(|(_, run)| *run == second) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let row = fixture.run(second).await;
+        assert_eq!(
+            (row.status, row.lease_expires_at),
+            (RunStatus::Queued, None),
+            "I-1: the box's worker claims it, not the TUI"
+        );
+    }
+
+    /// Plan D9, fact-check F-M2: a malformed sibling key fails the whole-struct decode, but the
+    /// gate reads the `executor` key alone, so the box is still a `worker` box: `R` only queues.
+    #[tokio::test]
+    async fn a_worker_box_with_a_bad_sibling_setting_is_still_a_worker_box() {
+        let fixture =
+            fixture_with_box_settings(json!({ "executor": "worker", "max_concurrent_items": "2" }))
+                .await;
+        let mut runtime = fixture.runtime();
+
+        let reply = served(&mut runtime, &fixture, 1, start_run(ids::HTUI_ANA_2)).await;
+        let CommandOutcome::Started { run, rest } = outcome(reply) else {
+            panic!("a start answers Started");
+        };
+        assert_eq!(rest.run, RunStatus::Queued, "I-1 never fails open");
+        let row = fixture.run(run).await;
+        assert_eq!(
+            (row.status, row.lease_expires_at),
+            (RunStatus::Queued, None)
+        );
+        assert!(fixture.steps(run).await.is_empty());
     }
 }

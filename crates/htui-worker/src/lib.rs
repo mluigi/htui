@@ -42,7 +42,10 @@ pub use graphs::HostGraphs;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use runtime::testing;
-pub use runtime::{PREEMPTED, REPOS_MOVED, RunLocks, RunRuntime, UNBLOCK_MOVED, WALK_PANICKED};
+pub use runtime::{
+    PREEMPTED, REPOS_MOVED, Role, RunLocks, RunRuntime, UNBLOCK_MOVED, WALK_PANICKED,
+    unknown_executor, worker_walks,
+};
 pub use views::{
     Enabled, FrameKind, ItemActions, LiveChats, ORCH_NAMES, OrchReply, OrchRequest, ProgressSink,
     RunActions, RunFrame, StepActions, StepAuthor, Via, actions,

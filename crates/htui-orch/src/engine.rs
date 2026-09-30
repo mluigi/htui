@@ -373,6 +373,16 @@ impl RunFence for NoFence {
     }
 }
 
+/// Who walks a command's tail (MOD-41 plan D12, OQ-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tails {
+    /// This engine walks every tail: the TUI on a `tui` box, and `htui worker` always.
+    Walk,
+    /// The command's leased window is written, then the lease is released and the run's rest is
+    /// read: the box's worker adopts the run at its next poll (the TUI on a `worker` box).
+    HandBack,
+}
+
 /// Everything [`Engine::new`] borrows, as a struct literal rather than a builder.
 ///
 /// A builder would let a caller forget one of fifteen fields and find out at run time; a literal
@@ -1608,15 +1618,57 @@ where
     pub async fn cancel_run(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
         let row = self.run(run).await?;
         crate::command::cancel_enabled(&row)?;
-        let position = self.resting(&row).await?.position;
-
-        // MOD-4 plan D179 (R-28): a `running` or parked run's lease is taken after the guard and
-        // before the first write, so a live stranger's lease refuses the cancel with nothing
-        // written (`LeaseHeld`). A `queued` run was never claimed and has no lease to take.
-        let leased = matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval);
-        if leased {
-            self.take_lease(run).await?;
+        if row.status == RunStatus::Queued {
+            if let Some(outcome) = self.cancel_queued(&row).await? {
+                return Ok(outcome);
+            }
+            // OQ-4: a claim won between the read and the compare-and-set. The run is leased now,
+            // and the leased path refuses a live lease with `LeaseHeld`, writing nothing.
+            let row = self.run(run).await?;
+            crate::command::cancel_enabled(&row)?;
+            return self.cancel_leased(&row).await;
         }
+        self.cancel_leased(&row).await
+    }
+
+    /// OQ-4, B-6: a `queued` run's cancel. A `queued` run was never claimed and has no lease to
+    /// take. `None` when the run left `queued` first.
+    async fn cancel_queued(&self, row: &Run) -> Result<Option<CommandOutcome>, EngineError> {
+        let run = row.id;
+        let position = self.resting(row).await?.position;
+        let now = self.now();
+        let steps = self.parts.store.run_steps(run).await?;
+        for step in &steps {
+            if step.status.is_terminal() {
+                continue;
+            }
+            self.parts
+                .store
+                .transition_step(step.id, step.status, StepStatus::Cancelled, now)
+                .await?;
+        }
+        self.parts
+            .store
+            .finish_run(run, RunStatus::Cancelled, None, now)
+            .await?;
+        self.cleanup_run(run).await?;
+        Ok(Some(CommandOutcome::Cancelled {
+            rest: Rest {
+                run: RunStatus::Cancelled,
+                position,
+                failure: None,
+            },
+        }))
+    }
+
+    /// [`Self::cancel_run`] of a `running` or parked run (MOD-4 plan D179, R-28): its lease is
+    /// taken after the guard and before the first write, so a live stranger's lease refuses the
+    /// cancel with nothing written (`LeaseHeld`). Then every unsettled step moves to `cancelled`,
+    /// the run does, plan D36's cleanup runs, and the lease is given back.
+    async fn cancel_leased(&self, row: &Run) -> Result<CommandOutcome, EngineError> {
+        let run = row.id;
+        let position = self.resting(row).await?.position;
+        self.take_lease(run).await?;
         let window = async {
             let now = self.now();
             let steps = self.parts.store.run_steps(run).await?;
@@ -1638,12 +1690,8 @@ where
                 .await?;
             self.cleanup_run(run).await
         };
-        if leased {
-            self.leased_window(run, window).await?;
-            self.release_lease(run).await;
-        } else {
-            window.await?;
-        }
+        self.leased_window(run, window).await?;
+        self.release_lease(run).await;
         Ok(CommandOutcome::Cancelled {
             rest: Rest {
                 run: RunStatus::Cancelled,
@@ -13611,5 +13659,176 @@ mod tests {
         .snapshot
         .phases
         .remove(0)
+    }
+}
+
+/// MOD-41 T9 (OQ-4, blueprint B-6, F-21): the queued cancel, white-box over `cancel_queued`, whose
+/// race with another process's claim no conformance case can reach between the read and the write.
+#[cfg(test)]
+mod queued_cancel {
+    use chrono::TimeDelta;
+    use htui_core::fixtures::ids;
+    use htui_core::model::{RunMode, RunStatus, SnapshotCandidate, Status};
+    use htui_core::store::{ReadStore as _, WriteStore as _};
+
+    use super::SessionKey;
+    use crate::command::{Command, CommandOutcome, EngineError};
+    use crate::fake::FakeOrchestrator;
+    use crate::isolate::Clock as _;
+
+    /// The demo harness with `FEAT-3` freed of its seeded queued run.
+    async fn harness() -> FakeOrchestrator {
+        let orch = FakeOrchestrator::demo();
+        orch.store
+            .finish_run(ids::RUN_2, RunStatus::Cancelled, None, orch.clock.now())
+            .await
+            .expect("the seeded run is queued and cancellable");
+        orch
+    }
+
+    /// F-21: a claim lands between the cancel's read and its compare-and-set. `cancel_queued`
+    /// over the stale row answers `None` and writes nothing; the command then takes the leased
+    /// path, which the claimer's live lease refuses with `LeaseHeld`.
+    #[tokio::test]
+    async fn a_queued_cancel_loses_cleanly_to_a_concurrent_claim() {
+        let orch = harness().await;
+        let graphs = orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let engine = super::Engine::new(
+            super::fake_parts(&orch, &graphs, &driver, &scrubber)
+                .await
+                .expect("the harness has a box"),
+        );
+        let run = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .await
+            .expect("the item is open");
+        let stale = orch
+            .store
+            .run(run)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the run was enqueued");
+        assert_eq!(stale.status, RunStatus::Queued);
+
+        let claimer = uuid::Uuid::now_v7();
+        let claim = orch
+            .store
+            .claim_run(run, ids::BOX, claimer, orch.clock.now(), TimeDelta::days(1))
+            .await
+            .expect("the claim answers");
+        assert!(claim.is_admitted(), "{claim}");
+        let steps = orch
+            .store
+            .run_steps(run)
+            .await
+            .expect("MemStore never fails a read");
+
+        let cancelled = engine
+            .cancel_queued(&stale)
+            .await
+            .expect("the compare-and-set answers");
+        assert!(
+            cancelled.is_none(),
+            "OQ-4: the run left `queued` first, so the queued cancel writes nothing: {cancelled:?}"
+        );
+        let refused = engine
+            .dispatch(Command::CancelRun { run })
+            .await
+            .expect_err("a live lease elsewhere");
+        assert!(
+            matches!(refused, EngineError::LeaseHeld { run: held } if held == run),
+            "{refused}"
+        );
+
+        let row = orch
+            .store
+            .run(run)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the run is there");
+        assert_eq!(row.status, RunStatus::Running, "the claimer's walk stands");
+        assert!(
+            orch.store
+                .refresh_lease(run, claimer, TimeDelta::days(1))
+                .await
+                .expect("MemStore refreshes"),
+            "the lease is still the claimer's"
+        );
+        assert_eq!(
+            orch.store
+                .run_steps(run)
+                .await
+                .expect("MemStore never fails a read"),
+            steps,
+            "no step was cancelled"
+        );
+        assert_eq!(
+            orch.store
+                .item(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the item is there")
+                .status,
+            Status::InProgress
+        );
+    }
+
+    /// B-6: a queued cancel moves the run to `cancelled` and the item back to `open`, so a second
+    /// `StartRun` on the item is admitted.
+    #[tokio::test]
+    async fn a_queued_cancel_moves_the_item_back_to_open() {
+        let orch = harness().await;
+        let graphs = orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let engine = super::Engine::new(
+            super::fake_parts(&orch, &graphs, &driver, &scrubber)
+                .await
+                .expect("the harness has a box"),
+        );
+        let run = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .await
+            .expect("the item is open");
+
+        let outcome = engine
+            .dispatch(Command::CancelRun { run })
+            .await
+            .expect("a queued run is cancellable");
+        assert!(
+            matches!(outcome, CommandOutcome::Cancelled { ref rest } if rest.run == RunStatus::Cancelled),
+            "{outcome:?}"
+        );
+        let row = orch
+            .store
+            .run(run)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the run is there");
+        assert_eq!(row.status, RunStatus::Cancelled);
+        assert!(row.finished_at.is_some(), "a cancelled run is finished");
+        assert_eq!(
+            orch.store
+                .item(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the item is there")
+                .status,
+            Status::Open
+        );
+
+        let again = engine
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the item is free for a second run");
+        assert!(matches!(again, CommandOutcome::Started { .. }), "{again:?}");
     }
 }

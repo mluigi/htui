@@ -14,7 +14,7 @@ use htui_agent::driver::AgentDriver;
 use htui_agent::error::DriverError;
 use htui_agent::registry::DriverFactory;
 use htui_core::model::{
-    AgentId, AgentSummary, BoxId, BoxProfile, ItemId, RepoId, Run, RunId, RunStatus,
+    AgentId, AgentSummary, BoxId, BoxProfile, Executor, ItemId, RepoId, Run, RunId, RunStatus,
     SnapshotCandidate, UserId,
 };
 use htui_core::scrub::MinimalScrubber;
@@ -23,7 +23,7 @@ use htui_orch::{
     Adopted, Clock, Command, CommandOutcome, DeadWalks, DriverFor, Engine, EngineError,
     EngineParts, FirstCandidate, GixIsolator, Isolator, IsolatorConfig, LeaseTimes, Next,
     OpeningPath, RepoCheckout, Rest, Resume, RunFence, SessionKey, ShellVerifier, SystemClock,
-    UnblockCase, Verifier, cleanup_enabled,
+    Tails, UnblockCase, Verifier, cleanup_enabled,
 };
 use htui_store::{DATABASE_UNREACHABLE, identity};
 use serde_json::Value;
@@ -49,6 +49,56 @@ use crate::views::{
 /// is live, so the isolator cannot be rebuilt under it.
 pub const REPOS_MOVED: &str =
     "a repo was added or moved since the first run; wait for the live runs to rest (R-39)";
+
+/// Which process a runtime is (MOD-41 I-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Role {
+    /// The TUI's runtime.
+    #[default]
+    Tui,
+    /// `htui worker`'s.
+    Worker,
+}
+
+impl Role {
+    /// I-1: whether this role claims, adopts and sweeps on a box whose executor is `executor`.
+    /// [`Executor::Other`] is neither role's (fail closed, plan D9).
+    #[must_use]
+    pub const fn executes(self, executor: &Executor) -> bool {
+        matches!(
+            (self, executor),
+            (Self::Tui, Executor::Tui) | (Self::Worker, Executor::Worker)
+        )
+    }
+
+    /// Plan D12: the TUI hands a command's tail back on a `worker` box; everything else walks.
+    #[must_use]
+    pub const fn tails(self, executor: &Executor) -> Tails {
+        if matches!((self, executor), (Self::Tui, Executor::Worker)) {
+            Tails::HandBack
+        } else {
+            Tails::Walk
+        }
+    }
+}
+
+/// Plan D9: the refusal of `R` and the walking commands on a box whose executor this build does
+/// not know.
+#[must_use]
+pub fn unknown_executor(executor: &Executor) -> String {
+    format!(
+        "box executor `{executor}` is not known to htui {}",
+        htui_store::HTUI_VERSION
+    )
+}
+
+/// OQ-4: `c` on a run the box's worker is walking.
+#[must_use]
+pub fn worker_walks(run: RunId) -> String {
+    format!(
+        "the worker on this box is walking run {run}; cancelling a live run needs MOD-42's cancel command"
+    )
+}
 
 /// The `copy_max_total_bytes` a box with no `app_setting` for it copies up to: 20 GiB.
 const DEFAULT_COPY_MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024 * 1024;
@@ -93,6 +143,8 @@ struct Built {
 
 /// Everything the runtime's tasks share. `P` is where the runtime's answers go (MOD-41 plan D7).
 struct Shared<P: ReplySink> {
+    /// I-1: which process this runtime is.
+    role: Role,
     parts: Parts,
     drivers: Arc<DriverFactory>,
     clock: Arc<dyn Clock>,
@@ -706,6 +758,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
         let (events, receiver) = mpsc::unbounded_channel();
         Self {
             shared: Arc::new(Shared {
+                role: Role::Tui,
                 parts,
                 drivers: Arc::new(drivers),
                 clock: Arc::new(SystemClock),
@@ -797,6 +850,16 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
     /// request.
     fn configure(&mut self) -> &mut Shared<P> {
         Arc::get_mut(&mut self.shared).expect("a run runtime is configured before it serves")
+    }
+
+    /// MOD-41 I-1: a runtime that is `role`'s. A new runtime is [`Role::Tui`].
+    ///
+    /// # Panics
+    /// When called after the runtime has served.
+    #[must_use]
+    pub fn with_role(mut self, role: Role) -> Self {
+        self.configure().role = role;
+        self
     }
 
     /// A runtime whose engines read this clock; tests use a tokio-time one (H-2).
@@ -2036,5 +2099,458 @@ mod tests {
             [11],
             "at its later subscription's address"
         );
+    }
+}
+
+/// MOD-41 I-1, OQ-2, OQ-5, OQ-6: the role gate over `Backend::memory`, role [`Role::Worker`]. The
+/// runtime is reached through its generic API alone (blueprint F-33).
+#[cfg(test)]
+mod role_gate {
+    use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+    use std::time::Duration;
+
+    use chrono::{DateTime, SubsecRound as _, TimeDelta, Utc};
+    use htui_agent::conformance::{Script, ScriptEvent};
+    use htui_agent::driver::{AgentDriver, DriverCaps};
+    use htui_agent::error::DriverError;
+    use htui_agent::event::{DoneEvent, DriverEvent, StopReason};
+    use htui_agent::fake::FakeDriver;
+    use htui_agent::registry::{DriverFactory, TransportBuilder};
+    use htui_core::fixtures::{demo_at, demo_data, edit_agent, ids};
+    use htui_core::model::{
+        Agent, AgentBox, AgentId, Billing, BoxEdit, DocumentId, Executor, ItemId, NewDocument,
+        NewRepo, NewRun, RepoId, RunId, RunMode, RunStatus, RunStep, SnapshotPhase,
+        TIMESTAMPTZ_DIGITS, Transport,
+    };
+    use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+    use htui_orch::fake::{FakeIsolator, FakeVerifier};
+    use htui_orch::{Clock, Isolator};
+    use htui_store::Backend;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::{Role, RunRuntime};
+    use crate::graphs::HostGraphs;
+    use crate::{FrameKind, LiveChats, ReplySink, RunFrame, RunReply, RunRequest, StepAuthor};
+
+    /// How long a case waits for the runtime to do what it asserts.
+    const PATIENCE: Duration = Duration::from_secs(20);
+
+    /// A sink that records every frame with the tokio instant it arrived at.
+    #[derive(Debug, Clone)]
+    struct Timed {
+        start: tokio::time::Instant,
+        frames: Arc<StdMutex<Vec<(Duration, RunFrame)>>>,
+    }
+
+    impl Timed {
+        fn new() -> Self {
+            Self {
+                start: tokio::time::Instant::now(),
+                frames: Arc::default(),
+            }
+        }
+
+        /// When each `Error` frame of `item` arrived, from the sink's start.
+        fn errors_of(&self, item: ItemId) -> Vec<Duration> {
+            self.frames
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|(_, frame)| {
+                    frame.item == item && matches!(frame.kind, FrameKind::Error(_))
+                })
+                .map(|(at, _)| *at)
+                .collect()
+        }
+    }
+
+    impl ReplySink for Timed {
+        type Addr = u64;
+        type Subscriber = u64;
+
+        fn subscriber(addr: &u64) -> u64 {
+            *addr
+        }
+
+        fn send(&self, _to: &u64, reply: RunReply) {
+            if let RunReply::Frame(frame) = reply {
+                self.frames
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((self.start.elapsed(), frame));
+            }
+        }
+    }
+
+    /// `base + (tokio now - start)`: a paused case moves the rows' instants and the store's lease
+    /// comparisons with its own sleeps.
+    #[derive(Debug)]
+    struct TokioClock {
+        base: DateTime<Utc>,
+        start: tokio::time::Instant,
+    }
+
+    impl TokioClock {
+        fn new() -> Self {
+            Self {
+                base: Utc::now(),
+                start: tokio::time::Instant::now(),
+            }
+        }
+    }
+
+    impl Clock for TokioClock {
+        fn now(&self) -> DateTime<Utc> {
+            let elapsed = TimeDelta::from_std(self.start.elapsed()).expect("a case is short");
+            (self.base + elapsed).trunc_subsecs(TIMESTAMPTZ_DIGITS)
+        }
+    }
+
+    /// One turn, then `done`, for every session of the scripted row.
+    #[derive(Debug)]
+    struct OneTurn;
+
+    impl TransportBuilder for OneTurn {
+        fn build(
+            &self,
+            agent: &Agent,
+            _on_box: Option<&AgentBox>,
+            caps: DriverCaps,
+        ) -> Result<Box<dyn AgentDriver>, DriverError> {
+            let done = Script::one_turn(vec![ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                stop_reason: StopReason::EndTurn,
+            }))]);
+            Ok(Box::new(FakeDriver::new(agent.name.clone(), caps, done)))
+        }
+    }
+
+    /// One document of the phase's `output_kind` per step, so every step settles `done`.
+    #[derive(Debug)]
+    struct OutputAuthor;
+
+    impl StepAuthor for OutputAuthor {
+        fn document(
+            &self,
+            item: ItemId,
+            step: &RunStep,
+            phase: &SnapshotPhase,
+        ) -> Option<NewDocument> {
+            Some(NewDocument {
+                id: DocumentId::new(),
+                item_id: item,
+                kind: phase.output_kind.clone(),
+                title: format!("{} (attempt {})", phase.output_kind, step.attempt),
+                body: "authored".to_owned(),
+                produced_by_step_id: Some(step.id),
+                created_by: ids::USER,
+                created_at: Utc::now(),
+            })
+        }
+    }
+
+    /// The demo with every fixture agent disabled, one scripted `acp` agent ready on the box, a
+    /// primary repo every default scope resolves to, and the seeded queued `RUN_2` cancelled.
+    async fn seeded(store: MemStore) -> MemStore {
+        for summary in store.agents().await.expect("the fixture's agents") {
+            let mut row = summary.agent;
+            row.enabled = false;
+            edit_agent(&store, &row).await.expect("the row is disabled");
+        }
+        let agent = AgentId::new();
+        store
+            .upsert_agent(
+                &Agent {
+                    id: agent,
+                    name: "scripted".to_owned(),
+                    transport: Transport::Acp,
+                    billing: Billing::Subscription,
+                    models: Vec::new(),
+                    default_model: Some("sonnet".to_owned()),
+                    launch: json!({ "command": "unused", "args": [] }),
+                    settings: json!({}),
+                    enabled: true,
+                    created_at: demo_at(0, 0),
+                    updated_at: demo_at(0, 0),
+                },
+                None,
+            )
+            .await
+            .expect("the scripted row lands");
+        store
+            .upsert_agent_box(&AgentBox {
+                agent_id: agent,
+                box_id: ids::BOX,
+                enabled: true,
+                version: Some("0.0.0-fake".to_owned()),
+                path: None,
+                probed_at: Some(demo_at(0, 0)),
+                quota: None,
+                quota_at: None,
+                updated_at: demo_at(0, 0),
+                probe: Some(json!({ "status": "ready", "source": "probe" })),
+            })
+            .await
+            .expect("the agent_box row lands");
+        store
+            .create_repo(NewRepo {
+                id: RepoId::new(),
+                project_id: ids::PROJECT_HTUI,
+                name: "htui".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: true,
+            })
+            .await
+            .expect("the demo project has no repo yet");
+        store
+            .finish_run(ids::RUN_2, RunStatus::Cancelled, None, Utc::now())
+            .await
+            .expect("the seeded run is queued and cancellable");
+        store
+    }
+
+    /// The box's executor set through its editor (MOD-41 plan D10).
+    async fn set_executor(store: &MemStore, executor: Executor) {
+        let row = store
+            .box_row(ids::BOX)
+            .await
+            .expect("the read answers")
+            .expect("the demo box");
+        store
+            .edit_box(
+                ids::BOX,
+                row.edit_version,
+                BoxEdit {
+                    executor: Some(executor),
+                    ..BoxEdit::default()
+                },
+            )
+            .await
+            .expect("the edit answers");
+    }
+
+    /// A worker-role runtime over the fakes, the scripted row and the output author.
+    fn worker_runtime() -> RunRuntime<Backend, Timed> {
+        let mut factory = DriverFactory::new();
+        factory.register("acp", Box::new(OneTurn));
+        RunRuntime::with_parts(
+            Arc::new(FakeIsolator::new()) as Arc<dyn Isolator>,
+            Arc::new(FakeVerifier::new()),
+            factory,
+        )
+        .with_author(Arc::new(OutputAuthor))
+        .with_role(Role::Worker)
+    }
+
+    /// A `queued` run of `item`, created by another process at `queued_at`.
+    async fn queued(store: &MemStore, item: ItemId, queued_at: DateTime<Utc>) -> RunId {
+        let row = store
+            .item(item)
+            .await
+            .expect("the read answers")
+            .expect("the item");
+        let app = store.app_settings().await.expect("the settings");
+        let resolved = htui_orch::resolve(
+            store,
+            &HostGraphs(Backend::memory(store.clone())),
+            &row,
+            RunMode::Manual,
+            &app,
+            None,
+            ids::BOX,
+        )
+        .await
+        .expect("the item resolves");
+        let run = RunId::new();
+        store
+            .create_run(NewRun {
+                id: run,
+                project_id: row.project_id,
+                item_id: row.id,
+                mode: RunMode::Manual,
+                target_box_id: ids::BOX,
+                started_by: ids::USER,
+                graph_snapshot: resolved.snapshot,
+                repo_scope: resolved.repo_scope,
+                queued_at,
+            })
+            .await
+            .expect("the run lands");
+        run
+    }
+
+    /// A run of `item` another process claimed an hour ago under a lease that lapsed at once.
+    async fn stranded(store: &MemStore, item: ItemId) -> RunId {
+        let past = Utc::now() - TimeDelta::hours(1);
+        let run = queued(store, item, past).await;
+        let claim = store
+            .claim_run(run, ids::BOX, Uuid::now_v7(), past, TimeDelta::zero())
+            .await
+            .expect("the claim answers");
+        assert!(claim.is_admitted(), "{claim}");
+        run
+    }
+
+    async fn status_of(store: &MemStore, run: RunId) -> RunStatus {
+        store
+            .run(run)
+            .await
+            .expect("the read answers")
+            .expect("the run")
+            .status
+    }
+
+    /// Polls until `run` reaches `status`.
+    async fn rests_at(store: &MemStore, run: RunId, status: RunStatus) {
+        tokio::time::timeout(PATIENCE, async {
+            while status_of(store, run).await != status {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("run {run} did not reach `{status}` within {PATIENCE:?}"));
+    }
+
+    /// The idle assertions: the queued run is not claimed and the stranded one not adopted.
+    async fn idles(store: MemStore) {
+        let store = seeded(store).await;
+        let waiting = queued(&store, ids::HTUI_CLEAN_1, Utc::now()).await;
+        let lapsed = stranded(&store, ids::HTUI_ANA_2).await;
+        let before = store.run(lapsed).await.expect("the read").expect("the run");
+        let mut runtime = worker_runtime();
+        let backend = Backend::memory(store.clone());
+
+        runtime.sweep_with(&backend, &Timed::new());
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+
+        let row = store
+            .run(waiting)
+            .await
+            .expect("the read")
+            .expect("the run");
+        assert_eq!(
+            (row.status, row.lease_expires_at),
+            (RunStatus::Queued, None),
+            "I-1: not this role's box, so no claim"
+        );
+        let row = store.run(lapsed).await.expect("the read").expect("the run");
+        assert_eq!(
+            (row.status, row.lease_expires_at),
+            (RunStatus::Running, before.lease_expires_at),
+            "I-1: and no adoption"
+        );
+        assert!(
+            store.run_steps(lapsed).await.expect("the read").is_empty(),
+            "nothing walked"
+        );
+    }
+
+    /// OQ-2: `htui worker` on a box whose executor is the default `tui` idles: it claims no
+    /// queued row and adopts no lapsed lease.
+    #[tokio::test]
+    async fn a_worker_role_idles_on_a_tui_box() {
+        idles(MemStore::demo()).await;
+    }
+
+    /// Plan D9: an executor this build does not know fails closed; the worker idles there too.
+    #[tokio::test]
+    async fn an_unknown_executor_idles_the_worker() {
+        let mut data = demo_data();
+        for row in &mut data.boxes {
+            row.settings = json!({ "executor": "container", "max_concurrent_items": 2 });
+        }
+        idles(MemStore::from_demo(data)).await;
+    }
+
+    /// Plan D14, OQ-5: on a `worker` box the worker's sweep claims the box's queued rows in
+    /// `(queued_at, id)` order, whoever queued them. Two runs scope the primary repo, so the
+    /// earlier is claimed and walks to its gate, the later is refused on the overlap and waits,
+    /// and it is claimed once the earlier one is gone.
+    #[tokio::test]
+    async fn a_worker_role_claims_queued_rows_in_order() {
+        let store = seeded(MemStore::demo()).await;
+        set_executor(&store, Executor::Worker).await;
+        let now = Utc::now();
+        // Created later, queued earlier: the order is `queued_at`'s, not the insert's.
+        let later = queued(&store, ids::HTUI_CLEAN_1, now - TimeDelta::minutes(1)).await;
+        let earlier = queued(&store, ids::HTUI_ANA_2, now - TimeDelta::minutes(2)).await;
+        let mut runtime = worker_runtime();
+        let backend = Backend::memory(store.clone());
+        let sink = Timed::new();
+
+        runtime.sweep_with(&backend, &sink);
+        rests_at(&store, earlier, RunStatus::AwaitingApproval).await;
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        assert_eq!(
+            status_of(&store, later).await,
+            RunStatus::Queued,
+            "the parked earlier run still holds the overlapping scope"
+        );
+
+        store
+            .finish_run(earlier, RunStatus::Cancelled, None, Utc::now())
+            .await
+            .expect("the parked run is cancellable");
+        runtime.sweep_with(&backend, &sink);
+        rests_at(&store, later, RunStatus::AwaitingApproval).await;
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+    }
+
+    /// OQ-6, blueprint B-10: a stranded run whose live graph no longer resolves (`NoGraph`) fails
+    /// its resume at every adoption. Polled every second for a minute, the worker resumes it at
+    /// 0, 5, 15 and 35 s — the delay doubling from 5 s — not at every poll.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_whose_resume_keeps_failing_backs_off() {
+        let clock = Arc::new(TokioClock::new());
+        let mut data = demo_data();
+        data.graphs.retain(|graph| graph.id != ids::GRAPH_HTUI_FEAT);
+        let store = MemStore::from_demo(data).with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
+        set_executor(&store, Executor::Worker).await;
+        // `RUN_2` carries its snapshot from before the graph went: claimed an hour ago under a
+        // lease that lapsed at once.
+        let past = clock.now() - TimeDelta::hours(1);
+        let claim = store
+            .claim_run(
+                ids::RUN_2,
+                ids::BOX,
+                Uuid::now_v7(),
+                past,
+                TimeDelta::zero(),
+            )
+            .await
+            .expect("the claim answers");
+        assert!(claim.is_admitted(), "{claim}");
+        let mut runtime = RunRuntime::with_parts(
+            Arc::new(FakeIsolator::new()) as Arc<dyn Isolator>,
+            Arc::new(FakeVerifier::new()),
+            DriverFactory::new(),
+        )
+        .with_clock(clock)
+        .with_role(Role::Worker);
+        let backend = Backend::memory(store.clone());
+        let sink = Timed::new();
+        runtime
+            .serve_request(
+                &backend,
+                &sink,
+                1,
+                RunRequest::Stream {
+                    item: ids::HTUI_FEAT_3,
+                },
+                &LiveChats::default(),
+            )
+            .await;
+
+        for _ in 0..60 {
+            runtime.sweep_with(&backend, &sink);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let at: Vec<u64> = sink
+            .errors_of(ids::HTUI_FEAT_3)
+            .iter()
+            .map(Duration::as_secs)
+            .collect();
+        assert_eq!(at, [0, 5, 15, 35], "4 resumes, not 60");
     }
 }

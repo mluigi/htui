@@ -48,7 +48,7 @@ pub use command::{
 };
 pub use engine::{
     Adopted, AgentSelector, DeadWalks, DriverFor, Engine, EngineParts, FirstCandidate, Next,
-    NoSink, Resume, RunFence, SessionKey, SessionSink, live_step_at, required_inputs,
+    NoSink, Resume, RunFence, SessionKey, SessionSink, Tails, live_step_at, required_inputs,
 };
 #[cfg(feature = "test-support")]
 pub use engine::{claim_fake, dispatch_fake, resume_fake, sweep_fake};

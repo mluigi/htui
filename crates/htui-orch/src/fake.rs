@@ -37,7 +37,7 @@ use uuid::Uuid;
 pub use htui_core::clock::TestClock;
 
 use crate::command::{Command, CommandOutcome, EngineError};
-use crate::engine::{DeadWalks, SessionKey};
+use crate::engine::{DeadWalks, SessionKey, Tails};
 use crate::graph::GraphSource;
 use crate::isolate::{
     Clock, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree, ResetReport,
@@ -1229,6 +1229,9 @@ pub struct FakeOrchestrator {
     /// MOD-4 plan D162: the phases whose pinned template stage 3 refuses. Carried by
     /// [`restarted`](Self::restarted): it is the graph's, not the process's.
     refused_prompts: Mutex<BTreeSet<String>>,
+    /// MOD-41 plan D12: who walks a command's tail in the engines built over this harness.
+    /// [`Tails::Walk`] in [`demo`](Self::demo) and in [`restarted`](Self::restarted).
+    tails: Mutex<Tails>,
     default_script: ScriptedStep,
     caps: DriverCaps,
     box_id: BoxId,
@@ -1263,6 +1266,7 @@ impl FakeOrchestrator {
             after_done_advance: Mutex::new(None),
             stalls: Mutex::new(BTreeMap::new()),
             refused_prompts: Mutex::new(BTreeSet::new()),
+            tails: Mutex::new(Tails::Walk),
             default_script: ScriptedStep::done_with_output("scripted output"),
             caps: FakeDriver::full_caps(),
             box_id: ids::BOX,
@@ -1317,6 +1321,7 @@ impl FakeOrchestrator {
                     .expect("no panic holds the fake orchestrator's lock")
                     .clone(),
             ),
+            tails: Mutex::new(Tails::Walk),
             default_script: self.default_script.clone(),
             caps: self.caps,
             box_id: self.box_id,
@@ -1670,6 +1675,30 @@ impl FakeOrchestrator {
     #[must_use]
     pub const fn owner(&self) -> Uuid {
         self.owner
+    }
+
+    /// MOD-41 plan D12: who walks a command's tail in the engines built over this harness.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn tails(&self) -> Tails {
+        *self
+            .tails
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+    }
+
+    /// Sets [`tails`](Self::tails) for every engine built from now on: a TUI on a `worker` box is
+    /// [`Tails::HandBack`] (MOD-41 plan D12).
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    pub fn set_tails(&self, tails: Tails) {
+        *self
+            .tails
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock") = tails;
     }
 
     /// The driver capabilities every session is built with.

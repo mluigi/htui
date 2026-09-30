@@ -15,8 +15,9 @@ impl CaseHarness for Demo {
 fn cases_len_is_pinned() {
     assert_eq!(
         CASES.len(),
-        74,
-        "73 before MOD-41; T1's fenced capture (plan D1) makes it 74"
+        85,
+        "73 before MOD-41; T1's fenced capture (plan D1) makes it 74, and T9's eleven hand-back \
+         cases (plan D12, OQ-6) make it 85"
     );
 }
 
