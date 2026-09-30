@@ -1,6 +1,9 @@
 # Plan: MOD-9 milestone 5 — glob attachments fire
 
-**Status: DRAFTED, FACT-CHECKED and CONFIRMED by the maintainer 2026-09-29, OQ-27..OQ-29 at their
+**Status: IMPLEMENTED 2026-09-30, `f57fca4`..`d35098b`** (T1-T7; T8 close-out closes MOD-9,
+`docs/decisions/mod/mod-9.md`). Review `rust-reviewer` APPROVE WITH FIXES, no CRITICAL or HIGH;
+all five findings applied (`09aec1f`, `d8e15c2`, `3a30a67`, `ff18505`) plus the residue fix
+`d35098b`. Previously: **DRAFTED, FACT-CHECKED and CONFIRMED by the maintainer 2026-09-29, OQ-27..OQ-29 at their
 defaults** (OQ-27: `0008` comment migration, mirror refill accepted; OQ-28: finding 6 fixed here as
 T7; OQ-29: changed paths feed excerpt tier 2). Two independent verifiers (one over `htui-core`/`htui-store`, one over
 `htui-orch`/`htui-agent`/`htui` plus task independence) re-checked every claim against `7fa06e7`; their

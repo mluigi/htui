@@ -184,7 +184,7 @@ Answered by the maintainer on 2026-09-25, before planning.
 | 2 | Bound skills reach the run | Engine phase and judge steps and the preview resolve `bound_skills(project, Some(phase))`. Widened 2026-09-26 by the maintainer to ANA-22's storage and activation read side (migration `0007`, global level, `always`/`off` selection recorded per step). | complete (`7be0794`..`fd5161e`, 2026-09-26) | [plan](../plans/mod-9-skills-reach-the-run.plan.md), [blueprint](../plans/mod-9-skills-reach-the-run.blueprint.md) |
 | 3 | Skills are editable and bindable | Skill writers, `Skills` view with library, editor, diff, attachments pane (global, project, phase) and token estimate; the language map and glob matcher at save; the clone gap. Split 2026-09-26 by the maintainer: glob *firing* is row 5. | complete (`df91c82`..`e5db119`, 2026-09-26) | [plan](../plans/mod-9-skills-editable.plan.md), [blueprint](../plans/mod-9-skills-editable.blueprint.md) |
 | 4 | Existing skills come in | `SKILL.md` import from a file or directory, frontmatter mapped per ANA-22. | complete (`09fd007`..`6af3f53`, 2026-09-29; ported from PR #10) | [plan](../plans/mod-9-skill-import.plan.md), [blueprint](../plans/mod-9-skill-import.blueprint.md) |
-| 5 | Glob attachments fire | The F2 file set (the excerpt walk's listing under the step's roots, narrowed to `touched_paths`, plus the previous attempt's changed paths), roots for fan-out groups, `select` with `matched`/`no_match`, the preview's roots. Opened 2026-09-26 by the milestone 3 split. Unblocked by MOD-7 milestone 4 (landed 2026-09-26): phase steps and the preview now run the excerpt pass over `repo_box_path` roots, so row 5 feeds that listing to `select`. | pending | — |
+| 5 | Glob attachments fire | The F2 file set (the excerpt walk's listing under the step's roots, narrowed to `touched_paths`, plus the previous attempt's changed paths), roots for fan-out groups, `select` with `matched`/`no_match`, the preview's roots. Opened 2026-09-26 by the milestone 3 split. Unblocked by MOD-7 milestone 4 (landed 2026-09-26): phase steps and the preview now run the excerpt pass over `repo_box_path` roots, so row 5 feeds that listing to `select`. | complete (`f57fca4`..`d35098b`, 2026-09-30) | [plan](../plans/mod-9-glob-attachments-fire.plan.md), [blueprint](../plans/mod-9-glob-attachments-fire.blueprint.md) |
 
 Milestones 1 and 2 are independent of each other and of ANA-22. Milestone 4 needs milestone 3's
 writers; milestone 5 needs milestone 3's matcher and the step roots MOD-7 milestone 4 made real.
@@ -210,4 +210,5 @@ writers; milestone 5 needs milestone 3's matcher and the step roots MOD-7 milest
 | The multi-line widget grows into a general editor | Medium | Medium | Scope capped: insert, delete, newline, arrows, home/end, page; no undo stack beyond cancel |
 
 ---
-*Status: APPROVED at the PRD gate — milestones 1–2 ready for /plan; 3–4 follow ANA-22 (concluded).*
+*Status: COMPLETE — all five milestones landed (`e971418`..`d35098b`, 2026-09-30); write-up at
+`docs/decisions/mod/mod-9.md`. Approved at the PRD gate 2026-09-25.*
