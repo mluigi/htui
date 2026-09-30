@@ -1,6 +1,6 @@
 # Plan: MOD-65 - Every thread and task the agent runtime starts opens the contain window
 
-**Status: CONFIRMED by the maintainer 2026-09-30, as written.**
+**Status: CONFIRMED by the maintainer 2026-09-30; implemented and closed out 2026-09-30 (`docs/decisions/mod/mod-65.md`). Amendments after review at the end.**
 
 **Source**: `HANDOFF.md:288-295` (MOD-65, from MOD-53, found 2026-09-29). Requirements `R-NF-3`,
 `R-TUI-8`. Design authority: MOD-53 (`docs/decisions/mod/mod-53.md`, "Not done", bullet 2) and

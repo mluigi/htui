@@ -94,7 +94,7 @@ Accepted as stated below: 2 and 4.
 - A panic on a `spawn_blocking` thread a task starts (the install's unpack, the hardware read) is
   outside the window. The task still answers, because tokio hands it back as a `JoinError`, but the
   hook on that thread is not vouched for and still gives the terminal back. Provider threads are
-  contained by `run_providers` itself. Tracked as **MOD-65**.
+  contained by `run_providers` itself. Done in **MOD-65** (`docs/decisions/mod/mod-65.md`).
 - A task that panics **after** it already sent its terminal reply (a `BoxProbed`, an install's
   `Done`) sends a second one. Every handler just goes idle again, but the status line names a
   request that had succeeded.
