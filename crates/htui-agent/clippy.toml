@@ -12,4 +12,18 @@ disallowed-methods = [
     { path = "tokio::task::JoinSet::spawn_blocking", reason = "add a `crate::contained` helper first: a raw blocking thread panics outside the contain window (MOD-65)" },
     { path = "tokio::runtime::Handle::spawn", reason = "use `crate::contained::spawn`, or add a `crate::contained` helper that takes the handle: a raw task panics outside the contain window (MOD-65)" },
     { path = "tokio::runtime::Handle::spawn_blocking", reason = "use `crate::contained::spawn_blocking`, or add a `crate::contained` helper that takes the handle: a raw blocking thread panics outside the contain window (MOD-65)" },
+    { path = "tokio::runtime::Runtime::spawn", reason = "use `crate::contained::spawn`, or add a `crate::contained` helper that takes the runtime: a raw task panics outside the contain window (MOD-65)" },
+    { path = "tokio::runtime::Runtime::spawn_blocking", reason = "use `crate::contained::spawn_blocking`, or add a `crate::contained` helper that takes the runtime: a raw blocking thread panics outside the contain window (MOD-65)" },
+    { path = "tokio::task::JoinSet::spawn_on", reason = "use `crate::contained::spawn_in`, or add a `crate::contained` helper that takes the handle: a raw set task panics outside the contain window (MOD-65)" },
+    { path = "tokio::task::JoinSet::spawn_blocking_on", reason = "add a `crate::contained` helper first: a raw blocking thread panics outside the contain window (MOD-65)" },
+    { path = "tokio::task::spawn_local", reason = "add a `crate::contained` helper first: a raw local task panics outside the contain window (MOD-65)" },
+    { path = "tokio::task::LocalSet::spawn_local", reason = "add a `crate::contained` helper first: a raw local task panics outside the contain window (MOD-65)" },
+    { path = "tokio::task::JoinSet::spawn_local", reason = "add a `crate::contained` helper first: a raw local set task panics outside the contain window (MOD-65)" },
+    { path = "tokio::task::JoinSet::spawn_local_on", reason = "add a `crate::contained` helper first: a raw local set task panics outside the contain window (MOD-65)" },
+    # MOD-65 review (maintainer reversed plan D7): a raw OS thread is outside the window too. The
+    # excerpt provider thread is the one allowed site, because `propose_caught` opens the window.
+    { path = "std::thread::spawn", reason = "a raw OS thread panics outside the contain window: use `crate::contained::spawn_blocking`, or open the window in the thread as `excerpt`'s `propose_caught` does (MOD-65)" },
+    { path = "std::thread::Builder::spawn", reason = "a raw OS thread panics outside the contain window: use `crate::contained::spawn_blocking`, or open the window in the thread as `excerpt`'s `propose_caught` does (MOD-65)" },
+    { path = "std::thread::Builder::spawn_scoped", reason = "a raw scoped thread panics outside the contain window: open the window in the thread as `excerpt`'s `propose_caught` does (MOD-65)" },
+    { path = "std::thread::Scope::spawn", reason = "a raw scoped thread panics outside the contain window: open the window in the thread as `excerpt`'s `propose_caught` does (MOD-65)" },
 ]

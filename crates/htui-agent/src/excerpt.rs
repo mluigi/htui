@@ -804,6 +804,11 @@ pub fn run_providers(
             // Named so an unwind line says whose defect it is, and `Builder` rather than
             // `thread::spawn` so a refused spawn is this provider's `:error` rather than a panic
             // on the assembler's own thread.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the provider thread runs `propose_caught`, which opens the contain window \
+                          itself (MOD-65)"
+            )]
             let spawned = std::thread::Builder::new().name(name).spawn(move || {
                 // Detached on purpose: see H-20 above.
                 let outcome = propose_caught(provider.as_ref(), &request.as_request());
