@@ -913,12 +913,9 @@ impl AgentRuntime {
             .map_err(|err| StoreError::Backend(err.to_string()))?;
         let settings: AgentSettings =
             serde_json::from_value(summary.agent.settings.clone()).unwrap_or_default();
-        let project_caps = project_caps_for(
-            &writer,
-            project_id,
-            backend.project_settings(project_id).await?,
-        )?;
-        let quota_latch = quota_latch_for(&writer, &summary.agent, box_id, settings.quota.source);
+        let project_caps =
+            project_caps_for(project_id, backend.project_settings(project_id).await?)?;
+        let quota_latch = quota_latch_for(&summary.agent, box_id, settings.quota.source);
         let Some(tail) = writer.step_events(step_id).await? else {
             return Ok(Served::Reply(StoreReply::Failed {
                 request: PROMOTE_STEP,
@@ -1815,11 +1812,8 @@ impl AgentRuntime {
         // a cap an operator wrote and `htui` ignored is the risk table's "wrong by a factor of a
         // million" pointing the other way — a run that was supposed to be bounded and was not. An
         // absent *row* is [`project_caps_for`]'s question.
-        let project_caps = project_caps_for(
-            &writer,
-            project_id,
-            backend.project_settings(project_id).await?,
-        )?;
+        let project_caps =
+            project_caps_for(project_id, backend.project_settings(project_id).await?)?;
         if project_caps.batch_micros.is_some() {
             // Plan D71: read and reported, never compared. A batch spans runs MOD-4 does not yet
             // create, so enforcing it here would mean inventing the batch identity
@@ -1830,7 +1824,7 @@ impl AgentRuntime {
                 "a batch cap is set; a chat does not enforce it (ANA-4 §9: MOD-12 does)"
             );
         }
-        let quota_latch = quota_latch_for(&writer, &summary.agent, box_id, settings.quota.source);
+        let quota_latch = quota_latch_for(&summary.agent, box_id, settings.quota.source);
 
         let chat = ChatRunSpec::mint(project_id, box_id, user, Some(agent_id), model.clone());
         writer.start_chat_run(&chat).await?;
@@ -2019,8 +2013,9 @@ pub struct ChatArgs {
     /// struct would be one bug away from each other.
     project_caps: ProjectCaps,
     /// Plan D66-D68: the `agent_box` row this chat latches its allowance into
-    /// ([`quota_latch_for`]).
-    quota_latch: Option<QuotaLatch>,
+    /// ([`quota_latch_for`]). Always one, since a chat starts only online; `Recorder`'s own latch
+    /// stays an `Option` for the recorders that have none.
+    quota_latch: QuotaLatch,
 }
 
 impl core::fmt::Debug for ChatArgs {
@@ -2030,9 +2025,6 @@ impl core::fmt::Debug for ChatArgs {
             .field("step", &self.binding.step_id())
             .field("spec", &self.spec)
             .field("project_caps", &self.project_caps)
-            // Whether this chat latches, not which row it names: `Recorder`'s own `Debug` makes
-            // the same choice for the same reason.
-            .field("quota_latch", &self.quota_latch.is_some())
             .finish()
     }
 }
@@ -2047,7 +2039,6 @@ impl core::fmt::Debug for ChatArgs {
 ///
 /// A document that does not parse refuses too — that is `start_chat`'s own comment.
 fn project_caps_for(
-    _writer: &Writer,
     project_id: ProjectId,
     settings: Option<Value>,
 ) -> Result<ProjectCaps, StoreError> {
@@ -2066,24 +2057,19 @@ fn project_caps_for(
 /// The `agent_box` row a chat latches its allowance into (plan D66-D68).
 ///
 /// The decision is made **here**, at chat start, rather than discovered on the first `usage` row.
-/// Before MOD-25 a buffered offline chat got `None`, because the offline mirror has no `agent_box`
-/// table to latch into (plan D52); a chat now starts only online, so every chat gets a latch.
+/// Every chat gets one: a chat starts only online (MOD-25), and the `None` an offline chat once got
+/// (the mirror has no `agent_box` table, plan D52) left with the offline path (CLEAN-7).
 ///
 /// `source` is `agent.settings.quota.source` and `billing` is `agent.billing`, both read off the
 /// row. Nothing here looks at `agent.name` (`R-AGT-5`) — the name is logged, and a log line is not
 /// a dispatch.
-fn quota_latch_for(
-    _writer: &Writer,
-    agent: &Agent,
-    box_id: BoxId,
-    source: QuotaSource,
-) -> Option<QuotaLatch> {
-    Some(QuotaLatch {
+fn quota_latch_for(agent: &Agent, box_id: BoxId, source: QuotaSource) -> QuotaLatch {
+    QuotaLatch {
         agent_id: agent.id,
         box_id,
         source,
         billing: agent.billing,
-    })
+    }
 }
 
 /// Everything the probe task owns (MOD-2 D53).
@@ -3420,9 +3406,7 @@ pub async fn run_chat(args: ChatArgs) {
     // Two opt-in builders rather than two more `new` parameters, because most recorders in this
     // tree have neither (plan D66-D68, D70). The grace the cap's cancel takes is this runtime's
     // own `CANCEL_GRACE`, riding on `RunCap` so `htui_agent::record::pump` keeps its signature.
-    if let Some(latch) = quota_latch {
-        recorder = recorder.with_quota_latch(latch);
-    }
+    recorder = recorder.with_quota_latch(quota_latch);
     if let Some(micros) = project_caps.run_micros {
         recorder = recorder.with_run_cap(RunCap { micros, grace });
     }
