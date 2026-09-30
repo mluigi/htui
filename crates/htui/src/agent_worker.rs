@@ -2156,12 +2156,16 @@ async fn run_probe(args: ProbeArgs) {
 /// `user_off: false` and passes. Reads the switch, never the name (`R-AGT-5`).
 fn refuse_switched_off(summary: &htui_core::model::AgentSummary) -> Result<(), StoreError> {
     if summary.user_off {
-        return Err(StoreError::Constraint(format!(
-            "agent `{}` is switched off on this box; Settings > Agents, t switches it on",
-            summary.agent.name
-        )));
+        return Err(StoreError::Constraint(switched_off(&summary.agent.name)));
     }
     Ok(())
+}
+
+/// The one sentence for an agent switched off on this box (MOD-23 review L-3, re-review Low-1):
+/// [`refuse_switched_off`]'s, and `run_worker`'s `Kit::driver`'s for a step admitted before the
+/// switch. The name is only quoted, never branched on (`R-AGT-5`).
+pub(crate) fn switched_off(name: &str) -> String {
+    format!("agent `{name}` is switched off on this box; Settings > Agents, t switches it on")
 }
 
 /// [`run_probe`]'s loop, shared with the box probe (MOD-7 D11): every enabled row of `agents`

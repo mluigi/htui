@@ -1263,6 +1263,12 @@ impl Kit {
     }
 
     /// The driver for one candidate: the registry row's, else the refusal (D156).
+    ///
+    /// MOD-23 re-review Low-1: a row switched off on this box is refused here too. Selection
+    /// already skips it (its `agent_box.enabled` is false), but a step admitted before the switch —
+    /// a pending fan-out member, or one a dead walk admitted and the sweep adopted — is driven from
+    /// its own `agent_id`, so this is the one place every drive passes. The refusal fails the step
+    /// and the run like any driver that will not start. Offline there is no writer and no walk.
     fn driver(&self, candidate: &SnapshotCandidate) -> Box<dyn AgentDriver> {
         let Some(summary) = self.agents.get(&candidate.agent_id) else {
             return Box::new(RefusedDriver(DriverError::Transport(format!(
@@ -1270,6 +1276,11 @@ impl Kit {
                 candidate.agent_id
             ))));
         };
+        if summary.user_off {
+            return Box::new(RefusedDriver(DriverError::Spawn(
+                crate::agent_worker::switched_off(&summary.agent.name),
+            )));
+        }
         match self
             .drivers
             .driver_for(&summary.agent, summary.on_box.as_ref())
@@ -2430,8 +2441,8 @@ pub(crate) mod tests {
     use htui_core::fixtures::{demo_at, edit_agent, ids};
     use htui_core::model::{
         Agent, AgentBox, AgentId, Billing, DocumentId, Item, ItemId, NewDocument, NewRepo, NewRun,
-        RepoId, Resolution, Run, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId,
-        StepStatus, TIMESTAMPTZ_DIGITS, Transport,
+        NewRunStep, RepoId, Resolution, Run, RunId, RunMode, RunStatus, RunStep, SnapshotPhase,
+        Status, StepId, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
     };
     use htui_core::store::mem::MemFault;
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
@@ -3594,6 +3605,113 @@ pub(crate) mod tests {
         );
         let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
         rests_at(&fixture, run, RunStatus::AwaitingApproval).await;
+    }
+
+    /// The scripted agent's id in the fixture's registry.
+    async fn scripted_agent(fixture: &Fixture) -> AgentId {
+        fixture
+            .store
+            .agents()
+            .await
+            .expect("the memory store never fails")
+            .into_iter()
+            .find(|summary| summary.agent.enabled)
+            .expect("the fixture enables exactly the scripted row")
+            .agent
+            .id
+    }
+
+    /// MOD-23 re-review Low-1: a step admitted while its agent was on, still `pending` when the
+    /// agent is switched off on this box, is not driven on it: `Kit::driver` answers the switch's
+    /// refusal, so the step and the run fail as for any driver that refuses to start, with the
+    /// switch's sentence, and the agent is never built.
+    ///
+    /// The step is written by hand under a stranded run: a walk that admitted it and died before
+    /// driving it, which the startup sweep adopts and walks from the step's own `agent_id`.
+    #[tokio::test]
+    async fn a_pending_step_on_a_row_switched_off_since_admission_is_refused_unspawned() {
+        let fixture = Fixture::new().await;
+        let agent = scripted_agent(&fixture).await;
+        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+        let step = fixture
+            .store
+            .create_step(NewRunStep {
+                id: StepId::new(),
+                run_id: run,
+                position: 0,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "research".to_owned(),
+                agent_id: Some(agent),
+                model: Some("sonnet".to_owned()),
+            })
+            .await
+            .expect("the admitted step lands");
+        fixture
+            .store
+            .set_agent_box_enabled(agent, ids::BOX, false)
+            .await
+            .expect("the switch lands");
+        // A build pops this, so a queue still holding it is a driver never built.
+        fixture.sessions.push(Play::Done);
+
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+        rests_at(&fixture, run, RunStatus::Failed).await;
+
+        let sentence = "agent `scripted` is switched off on this box; Settings > Agents, t switches \
+                        it on";
+        assert_eq!(
+            fixture.run(run).await.failure,
+            Some(format!("agent spawn failed: {sentence}")),
+            "the run fails with the switch's sentence"
+        );
+        let steps = fixture.steps(run).await;
+        assert_eq!(steps.len(), 1, "nothing else was admitted: {steps:?}");
+        assert_eq!(steps[0].id, step.id);
+        assert_eq!(
+            steps[0].status,
+            StepStatus::Failed,
+            "the step is failed, not lost"
+        );
+        assert_eq!(
+            fixture.sessions.0.lock().expect("the queue").len(),
+            1,
+            "the switched-off agent was never built"
+        );
+
+        // A failed run is terminal: switching the agent back on does not resume it, and a retry of
+        // its step is refused. The item takes a fresh run.
+        fixture
+            .store
+            .set_agent_box_enabled(agent, ids::BOX, true)
+            .await
+            .expect("the switch lands");
+        let retry = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::RetryStep {
+                run,
+                step: step.id,
+            })),
+        );
+        assert!(
+            matches!(
+                worker.reply(retry).await,
+                StoreReply::Failed {
+                    request: "retry_step",
+                    ..
+                }
+            ),
+            "a terminal run takes no retry"
+        );
+        assert_eq!(fixture.run(run).await.status, RunStatus::Failed);
+        let start = worker.send(Origin::App, start_run(ids::HTUI_ANA_2));
+        assert!(
+            matches!(
+                outcome(worker.reply(start).await),
+                CommandOutcome::Started { .. }
+            ),
+            "the item starts a fresh run on the agent switched back on"
+        );
     }
 
     /// Blueprint §8.9: `settle` aborts a task that outlived its limit — the walk itself, not only
