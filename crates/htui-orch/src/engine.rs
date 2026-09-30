@@ -41,7 +41,7 @@ use htui_core::prompt::{
     TemplateRef, TemplateRole, TokenEstimator, TrimStrategy, VerifyFailure, assemble, settings,
 };
 use htui_core::scrub::Scrubber;
-use htui_core::store::{StepFence, StoreError, WriteStore};
+use htui_core::store::{StepFence, StoreError};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -379,7 +379,7 @@ impl RunFence for NoFence {
 /// cannot compile until every one of them is named.
 pub struct EngineParts<'a, S, G, I, V, C, A, K>
 where
-    S: WriteStore + htui_core::store::RecorderStore,
+    S: htui_core::store::WorkerStore,
     G: GraphSource,
     I: Isolator + ?Sized,
     V: Verifier + ?Sized,
@@ -428,7 +428,7 @@ where
 /// `SessionSpec` uses (`crates/htui-agent/src/driver.rs:281-298`), for the same reason.
 impl<S, G, I, V, C, A, K> core::fmt::Debug for EngineParts<'_, S, G, I, V, C, A, K>
 where
-    S: WriteStore + htui_core::store::RecorderStore,
+    S: htui_core::store::WorkerStore,
     G: GraphSource,
     I: Isolator + ?Sized,
     V: Verifier + ?Sized,
@@ -454,7 +454,7 @@ where
 #[derive(Debug)]
 pub struct Engine<'a, S, G, I, V, C, A, K>
 where
-    S: WriteStore + htui_core::store::RecorderStore,
+    S: htui_core::store::WorkerStore,
     G: GraphSource,
     I: Isolator + ?Sized,
     V: Verifier + ?Sized,
@@ -524,7 +524,7 @@ pub enum Next {
 
 impl<'a, S, G, I, V, C, A, K> Engine<'a, S, G, I, V, C, A, K>
 where
-    S: WriteStore + htui_core::store::RecorderStore,
+    S: htui_core::store::WorkerStore,
     G: GraphSource,
     I: Isolator + ?Sized,
     V: Verifier + ?Sized,
@@ -1548,7 +1548,7 @@ where
     ///
     /// The reads [`Self::close_out_preview`] counts over, the guard
     /// ([`crate::command::close_out_enabled`]), then one `summary` document built by
-    /// [`closeout::summary`] and written by `WriteStore::close_out` with the item's move to
+    /// [`closeout::summary`] and written by `WorkerStore::close_out` with the item's move to
     /// `closed` as `resolution`, in one transaction. No run lease is involved: the store re-checks
     /// a live run, the item's status and `Resolution::closes_from` inside that transaction, so a
     /// run started since is refused there with nothing written. The commit rows already exist, so

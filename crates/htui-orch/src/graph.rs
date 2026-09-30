@@ -21,8 +21,7 @@ use htui_core::model::{
     SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
 };
 use htui_core::store::{
-    BindingFacts, CasOutcome, ReadStore, Result, StoreError, UpdateOutcome, WriteStore,
-    check_attachment,
+    BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WriteStore, check_attachment,
 };
 use serde_json::Value;
 
@@ -56,7 +55,7 @@ const DEFAULT_MAX_AGENTS_PER_RUN: u32 = 8;
 /// `htui_core::prompt::settings::resolve_budget` already uses.
 ///
 /// Plain `async fn` with the targeted allow, mirroring `htui-core`'s own store seam
-/// (`crates/htui-core/src/store/traits.rs:62`): the engine is already generic over `S: WriteStore`
+/// (`crates/htui-core/src/store/traits.rs:62`): the engine is already generic over `S: WorkerStore`
 /// and takes `G` beside it, so no `dyn GraphSource` is ever formed and a boxed-future alias in the
 /// shape of `htui_agent::driver::DriverFuture` would buy an allocation per read and nothing else.
 #[allow(async_fn_in_trait)]
@@ -295,7 +294,7 @@ pub fn topology(phases: &[SnapshotPhase]) -> std::result::Result<String, Resolve
 ///
 /// # Errors
 /// Any [`ResolveError`]; a missing `project` row is [`StoreError::NotFound`].
-pub async fn resolve<S: ReadStore + WriteStore, G: GraphSource>(
+pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
     store: &S,
     source: &G,
     item: &Item,
@@ -861,12 +860,14 @@ mod tests {
         Activation, Gate, NewRepo, PromptTemplateId, RepoId, RepoScope, RunScope, SkillBinding,
         SkillBindingId,
     };
-    use htui_core::store::{MemStore, StoreError, glob_names_unknown_repo, negative_position};
+    use htui_core::store::{
+        MemStore, ReadStore, StoreError, glob_names_unknown_repo, negative_position,
+    };
     use serde_json::json;
 
     use super::{
         Agent, AgentBox, AgentId, BTreeMap, BoundSkill, BoxId, GraphSource, Isolation, Item,
-        ItemId, PhaseAgent, PhaseId, ProjectId, PromptTemplate, ReadStore, ResolveError, Resolved,
+        ItemId, PhaseAgent, PhaseId, ProjectId, PromptTemplate, ResolveError, Resolved,
         ResolvedGraph, Result, RunMode, SnapshotTemplate, StepGraphId, StepGraphPhase, Value,
         WriteStore, override_graph, resolve,
     };

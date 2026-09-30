@@ -16,7 +16,7 @@ use htui_core::model::{
     RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus, UserId, VerifyOutcome,
 };
 use htui_core::prompt::digest::{canonical, sha256_hex};
-use htui_core::store::{StoreError, WriteStore};
+use htui_core::store::StoreError;
 
 use crate::command::{EngineError, Rest, stale_run, stale_step};
 use crate::isolate::Clock;
@@ -298,7 +298,7 @@ fn deadline_elapsed(input: &SettleInput<'_>) -> bool {
 /// A borrowed bundle rather than seven arguments repeated across [`apply`] and [`review_loop`]:
 /// both need the same six things, and the engine builds it once per iteration.
 #[derive(Debug)]
-pub struct GateContext<'a, S: WriteStore, C: Clock + ?Sized> {
+pub struct GateContext<'a, S: htui_core::store::WorkerStore, C: Clock + ?Sized> {
     /// The store every write goes through.
     pub store: &'a S,
     /// Plan D8's clock: every instant below comes from here and from nowhere else.
@@ -313,7 +313,7 @@ pub struct GateContext<'a, S: WriteStore, C: Clock + ?Sized> {
     pub box_id: BoxId,
 }
 
-impl<S: WriteStore, C: Clock + ?Sized> GateContext<'_, S, C> {
+impl<S: htui_core::store::WorkerStore, C: Clock + ?Sized> GateContext<'_, S, C> {
     /// The run's item, or `None` for a chat run (which the walk never produces).
     const fn item(&self) -> Option<ItemId> {
         self.run.item_id
@@ -378,7 +378,7 @@ pub enum Landing {
 ///
 /// # Errors
 /// [`EngineError::StaleWrite`], and every [`EngineError`] the writes can raise.
-pub async fn apply<S: WriteStore, C: Clock + ?Sized>(
+pub async fn apply<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     step: &RunStep,
     phase: &SnapshotPhase,
@@ -458,7 +458,7 @@ fn gate_note(settle: &Settle) -> Option<String> {
 /// stays NULL until a human answers, and the composite park writer is carried with **R-5**.
 ///
 /// A settle with nothing to say writes nothing: the happy path adds no rows.
-async fn note_step<S: WriteStore, C: Clock + ?Sized>(
+async fn note_step<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     step: &RunStep,
     note: Option<&str>,
@@ -485,7 +485,7 @@ async fn note_step<S: WriteStore, C: Clock + ?Sized>(
 }
 
 /// The three compare-and-sets of a gate park, in step → run → item order (blueprint H-10).
-async fn park<S: WriteStore, C: Clock + ?Sized>(
+async fn park<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     step: &RunStep,
     phase: &SnapshotPhase,
@@ -515,7 +515,7 @@ async fn park<S: WriteStore, C: Clock + ?Sized>(
 /// **not** created here — the walk's cursor creates it at `next_attempt`, which is the one place
 /// that reads `max(attempt) + 1` from rows and therefore the one place that cannot trip
 /// `UNIQUE (run_id, position, attempt, fanout_index)` (blueprint H-4).
-async fn retry_or_fail<S: WriteStore, C: Clock + ?Sized>(
+async fn retry_or_fail<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     step: &RunStep,
     phase: &SnapshotPhase,
@@ -550,7 +550,7 @@ async fn retry_or_fail<S: WriteStore, C: Clock + ?Sized>(
 /// One step compare-and-set on the walk's path. `Ok(false)` is plan D125's
 /// [`EngineError::StaleWrite`]: another writer moved the row first, and the walk writes nothing
 /// further.
-async fn move_step<S: WriteStore, C: Clock + ?Sized>(
+async fn move_step<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     step: StepId,
     from: StepStatus,
@@ -571,7 +571,7 @@ async fn move_step<S: WriteStore, C: Clock + ?Sized>(
 /// Plan D144: `answer_gate` is a compare-and-set on `awaiting_approval`, so `Ok(false)` is plan
 /// D125's [`EngineError::StaleWrite`]. Another writer answered or moved the step between the park
 /// and this write, and the walk writes nothing further.
-pub(crate) async fn reject_step<S: WriteStore + ?Sized>(
+pub(crate) async fn reject_step<S: htui_core::store::WorkerStore + ?Sized>(
     store: &S,
     run: RunId,
     step: StepId,
@@ -594,7 +594,7 @@ pub(crate) async fn reject_step<S: WriteStore + ?Sized>(
 }
 
 /// [`move_step`] for the run row.
-async fn move_run<S: WriteStore, C: Clock + ?Sized>(
+async fn move_run<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     from: RunStatus,
     to: RunStatus,
@@ -608,7 +608,7 @@ async fn move_run<S: WriteStore, C: Clock + ?Sized>(
 }
 
 /// Re-reads one step row after a write moved it (plan D16: nothing is remembered across a write).
-async fn reread<S: WriteStore, C: Clock + ?Sized>(
+async fn reread<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     step: &RunStep,
 ) -> Result<RunStep, EngineError> {
@@ -698,7 +698,7 @@ pub enum LoopOutcome {
 /// # Errors
 /// Every [`EngineError`] the writes can raise, and [`EngineError::StaleWrite`] when a retired row
 /// or, on escalation, the run was moved by another writer first (plan D125).
-pub async fn review_loop<S: WriteStore, C: Clock + ?Sized>(
+pub async fn review_loop<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     review: &RunStep,
 ) -> Result<LoopOutcome, EngineError> {
@@ -797,7 +797,7 @@ pub fn loop_target(snapshot: &GraphSnapshot, review_position: i32) -> Option<i32
 /// review half hashes the two latest review documents of this run through
 /// `prompt::digest::canonical`, the workspace's one normalisation, so a review re-emitted with
 /// different line endings does not read as progress.
-async fn no_progress<S: WriteStore, C: Clock + ?Sized>(
+async fn no_progress<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     steps: &[RunStep],
     target: i32,
@@ -832,7 +832,7 @@ async fn no_progress<S: WriteStore, C: Clock + ?Sized>(
 /// commit it makes is a descendant of both of attempt `a`'s hashes, pre- and post-merge, and
 /// differs from each. Keeping the pre-merge hash as well would therefore change no answer, and
 /// reconcile keeps a `NULL` `after_hash` `NULL`.
-async fn commits_are_identical<S: WriteStore, C: Clock + ?Sized>(
+async fn commits_are_identical<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     steps: &[RunStep],
     target: i32,
@@ -862,7 +862,7 @@ async fn commits_are_identical<S: WriteStore, C: Clock + ?Sized>(
 }
 
 /// The two latest review documents of this run, byte-identical after canonicalisation.
-async fn reviews_are_identical<S: WriteStore, C: Clock + ?Sized>(
+async fn reviews_are_identical<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     steps: &[RunStep],
     review_position: i32,
@@ -904,7 +904,7 @@ async fn reviews_are_identical<S: WriteStore, C: Clock + ?Sized>(
 
 /// §4.4 step 3, widened to the whole chain by plan D5 and split by status by fact-check F14b: every
 /// position of `from..=to` is retired through [`retire_slot`].
-async fn retire<S: WriteStore, C: Clock + ?Sized>(
+async fn retire<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     steps: &[RunStep],
     from: i32,
@@ -933,7 +933,7 @@ async fn retire<S: WriteStore, C: Clock + ?Sized>(
 /// # Errors
 /// Every [`EngineError`] `supersede_step` and `transition_step` can raise, and
 /// [`EngineError::StaleWrite`] when a `running` or `failed` row was moved first (plan D125).
-pub(crate) async fn retire_slot<S: WriteStore, C: Clock + ?Sized>(
+pub(crate) async fn retire_slot<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     steps: &[RunStep],
     position: i32,
@@ -983,7 +983,7 @@ pub(crate) async fn retire_slot<S: WriteStore, C: Clock + ?Sized>(
 /// `finish_run` is terminal-only by plan D7. The exact wording therefore lives in the `item_note`
 /// — which is what criterion 6 asserts (`docs/ANA-2.md:2101-2102`) — and in the
 /// [`RunFailure::ReviewLoopExhausted`] the caller receives. Carried as **R-3** for milestone 6 (milestone 5 left it open, blueprint R-25).
-async fn escalate<S: WriteStore, C: Clock + ?Sized>(
+async fn escalate<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     review: &RunStep,
     impl_phase: &SnapshotPhase,
