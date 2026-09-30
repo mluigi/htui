@@ -4623,3 +4623,266 @@ async fn a_lease_take_committed_mid_settle_fences_it() {
 
     db.drop_db().await;
 }
+
+/// Replaces the fixture box's `box.settings` with `settings`, raw: nothing on `WriteStore` writes
+/// an arbitrary key (MOD-41 blueprint F-37). The untyped form keeps `.sqlx/` where it is.
+async fn plant_box_settings(pool: &PgPool, settings: &serde_json::Value) {
+    sqlx::query("UPDATE box SET settings = $2 WHERE id = $1")
+        .bind(ids::BOX.as_uuid())
+        .bind(settings)
+        .execute(pool)
+        .await
+        .expect("plant the box settings");
+}
+
+/// The fixture box as `PgStore` reads it.
+async fn fixture_box_row(store: &PgStore) -> htui_core::model::BoxRow {
+    store
+        .box_row(ids::BOX)
+        .await
+        .expect("the box reads back")
+        .expect("the fixture box exists")
+}
+
+/// A [`BoxEdit`](htui_core::model::BoxEdit) naming only the executor.
+fn executor_edit(executor: htui_core::model::Executor) -> htui_core::model::BoxEdit {
+    htui_core::model::BoxEdit {
+        executor: Some(executor),
+        ..htui_core::model::BoxEdit::default()
+    }
+}
+
+/// MOD-41 plan D10: `edit_box`'s `jsonb_set` writes the `executor` key alone; every other key of
+/// the blob, known or not, survives. The `MemStore` half is
+/// `edit_box_keeps_every_other_settings_key_in_memory`.
+#[tokio::test(flavor = "multi_thread")]
+async fn edit_box_keeps_every_other_settings_key() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    plant_box_settings(
+        &db.pool,
+        &serde_json::json!({"max_concurrent_items": 1, "command_limits": {"verify": 2}, "x": true}),
+    )
+    .await;
+    let token = fixture_box_row(&db.store).await.edit_version;
+
+    let written = db
+        .store
+        .edit_box(
+            ids::BOX,
+            token,
+            executor_edit(htui_core::model::Executor::Worker),
+        )
+        .await
+        .expect("the edit is answered");
+    let CasOutcome::Applied(row) = written else {
+        panic!("an executor edit on the current token applies, got {written:?}");
+    };
+    assert_eq!(
+        row.settings,
+        serde_json::json!({
+            "max_concurrent_items": 1,
+            "command_limits": {"verify": 2},
+            "x": true,
+            "executor": "worker",
+        }),
+        "all four keys are present"
+    );
+    assert_eq!(row.edit_version, token + 1, "the edit moves the token");
+    assert_eq!(
+        fixture_box_row(&db.store).await,
+        row,
+        "the applied row is what a read answers"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-41 plan D10 (blueprint B-5): a blob that is not a JSON object cannot take the executor
+/// key, which `jsonb_set` would answer with `22023`. The edit is
+/// `Constraint(BOX_SETTINGS_NOT_AN_OBJECT)` and writes nothing, the token included; a quirks-only
+/// edit on the same row still applies. The `MemStore` half is
+/// `edit_box_refuses_a_non_object_settings_blob_in_memory`.
+#[tokio::test(flavor = "multi_thread")]
+async fn edit_box_refuses_a_non_object_settings_blob() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    for blob in [serde_json::json!([]), serde_json::json!("x")] {
+        plant_box_settings(&db.pool, &blob).await;
+        let before = fixture_box_row(&db.store).await;
+
+        let refused = db
+            .store
+            .edit_box(
+                ids::BOX,
+                before.edit_version,
+                executor_edit(htui_core::model::Executor::Tui),
+            )
+            .await;
+        match refused {
+            Err(htui_core::store::StoreError::Constraint(said)) => {
+                assert_eq!(said, htui_core::store::BOX_SETTINGS_NOT_AN_OBJECT, "{blob}")
+            }
+            other => panic!("{blob}: a non-object blob is a Constraint, got {other:?}"),
+        }
+        assert_eq!(
+            fixture_box_row(&db.store).await,
+            before,
+            "{blob}: the refused edit wrote nothing, the token included"
+        );
+
+        let quirks = db
+            .store
+            .edit_box(
+                ids::BOX,
+                before.edit_version,
+                htui_core::model::BoxEdit {
+                    quirks: Some("no executor named".to_owned()),
+                    ..htui_core::model::BoxEdit::default()
+                },
+            )
+            .await
+            .expect("the edit is answered");
+        let CasOutcome::Applied(row) = quirks else {
+            panic!("{blob}: a quirks-only edit applies, got {quirks:?}");
+        };
+        assert_eq!(row.quirks, "no executor named", "{blob}");
+        assert_eq!(row.settings, blob, "{blob}: the blob is left as it was");
+    }
+
+    db.drop_db().await;
+}
+
+/// MOD-41 plan D9: an executor this build does not know never fails `BoxSettings`' decode, so
+/// `claim_run`'s admission still reads the box's `max_concurrent_items`: with one slot, the
+/// second claim is `SlotFull`.
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_run_honours_the_limit_beside_an_unknown_executor() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    plant_box_settings(
+        &db.pool,
+        &serde_json::json!({"executor": 7, "max_concurrent_items": 1}),
+    )
+    .await;
+    // Empty `repo_scope` on both, so only the slot count can refuse (hazard H-10).
+    let mut queued = Vec::new();
+    for item in [ids::HTUI_ANA_2, ids::HTUI_CLEAN_1] {
+        queued.push(
+            db.store
+                .create_run(race_run(item))
+                .await
+                .expect("queue a graph run")
+                .id,
+        );
+    }
+    let [first, second] = queued[..] else {
+        panic!("two runs were queued")
+    };
+    let at = Utc::now();
+    let ttl = TimeDelta::minutes(5);
+    assert_eq!(
+        db.store
+            .claim_run(first, ids::BOX, uuid::Uuid::now_v7(), at, ttl)
+            .await
+            .expect("the claim is answered"),
+        Claim::Admitted,
+        "the first run takes the one slot"
+    );
+    assert_eq!(
+        db.store
+            .claim_run(second, ids::BOX, uuid::Uuid::now_v7(), at, ttl)
+            .await
+            .expect("the claim is answered"),
+        Claim::SlotFull {
+            running: 1,
+            limit: 1
+        },
+        "the unknown executor left `max_concurrent_items: 1` in force"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-41 plan D11: `queued_runs_on_box` answers this box's `queued` runs alone, by
+/// `(queued_at, id)`: not another box's queued run, not this box's running one. The `MemStore`
+/// half is `queued_runs_on_box_lists_this_boxs_queued_runs_in_queue_order` in `store::mem`.
+///
+/// The second box is planted raw (no `WriteStore` method creates one), untyped so `.sqlx/` stays
+/// where it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_runs_on_box_lists_this_boxs_queued_runs_in_queue_order() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let other = BoxId::new();
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version) \
+         VALUES ($1, (SELECT id FROM app_user ORDER BY created_at, id LIMIT 1), 'elsewhere', \
+                 'linux', '', 'x86_64', '0.0.0')",
+    )
+    .bind(other.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("plant the second box");
+
+    let early = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let late = early + TimeDelta::seconds(1);
+    let queue = |title: &'static str, target: BoxId, queued_at: DateTime<Utc>| {
+        let store = &db.store;
+        async move {
+            let item = store
+                .mint_item(race_item(ids::KIND_HTUI_FEAT, title))
+                .await
+                .expect("the mint lands")
+                .id;
+            store
+                .create_run(NewRun {
+                    target_box_id: target,
+                    queued_at,
+                    ..race_run(item)
+                })
+                .await
+                .expect("the run is queued")
+                .id
+        }
+    };
+    let running = queue("running on this box", ids::BOX, early).await;
+    let last = queue("queued last", ids::BOX, late).await;
+    let tied_a = queue("queued first, tied", ids::BOX, early).await;
+    let tied_b = queue("queued first, tied too", ids::BOX, early).await;
+    let _theirs = queue("queued on another box", other, early).await;
+    assert_eq!(
+        db.store
+            .claim_run(
+                running,
+                ids::BOX,
+                uuid::Uuid::now_v7(),
+                Utc::now(),
+                TimeDelta::minutes(5)
+            )
+            .await
+            .expect("the claim is answered"),
+        Claim::Admitted,
+        "one run on this box is running, not queued"
+    );
+
+    let (first, second) = if tied_a < tied_b {
+        (tied_a, tied_b)
+    } else {
+        (tied_b, tied_a)
+    };
+    assert_eq!(
+        db.store
+            .queued_runs_on_box(ids::BOX)
+            .await
+            .expect("the read is answered"),
+        vec![(first, early), (second, early), (last, late)],
+        "this box's three queued runs, by `(queued_at, id)`"
+    );
+
+    db.drop_db().await;
+}

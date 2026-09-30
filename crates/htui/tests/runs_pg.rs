@@ -549,6 +549,7 @@ async fn declare_tags(store: &PgStore, expected: i32, tags: &[&str]) {
             BoxEdit {
                 declared_tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
                 quirks: None,
+                executor: None,
             },
         )
         .await

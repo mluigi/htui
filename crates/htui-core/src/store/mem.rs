@@ -752,6 +752,17 @@ impl MemStore {
         }))
     }
 
+    /// This box's `queued` runs, `(id, queued_at)` by `(queued_at, id)` (MOD-41 plan D11).
+    /// `RunId`'s `Ord` is uuid byte order, which is Postgres' uuid order.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn queued_runs_on_box(&self, box_id: BoxId) -> Result<Vec<(RunId, DateTime<Utc>)>> {
+        // MOD-41 T7 red: the read answers nothing until the green commit.
+        let _ = box_id;
+        Ok(Vec::new())
+    }
+
     /// Every active run whose `repo_scope` intersects `scope`, in `queued_at` order: what §4.7's
     /// overlap refusal names. An empty `scope` intersects nothing (hazard H-10).
     ///
@@ -7407,6 +7418,7 @@ mod tests {
         let tags = |tags: &[&str]| BoxEdit {
             declared_tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
             quirks: None,
+            executor: None,
         };
         let right_token = store.edit_box(foreign, 0, tags(&["gpu"])).await;
         assert!(
@@ -8387,6 +8399,205 @@ mod tests {
                 Err(StoreError::NotFound { entity: "item", .. })
             ),
             "an unknown item is NotFound before the law is asked (plan D14)"
+        );
+    }
+
+    /// The demo store with the fixture box's `box.settings` replaced by `settings`.
+    fn demo_with_box_settings(settings: Value) -> MemStore {
+        let mut data = crate::fixtures::demo_data();
+        data.boxes
+            .iter_mut()
+            .find(|row| row.id == ids::BOX)
+            .expect("the fixture box")
+            .settings = settings;
+        MemStore::from_demo(data)
+    }
+
+    /// MOD-41 plan D10: an executor edit writes that key alone; every other key of the blob,
+    /// known or not, survives. The Postgres half is
+    /// `pg_criteria.rs::edit_box_keeps_every_other_settings_key`.
+    #[tokio::test]
+    async fn edit_box_keeps_every_other_settings_key_in_memory() {
+        use crate::model::{BoxEdit, Executor};
+
+        let store = demo_with_box_settings(json!({
+            "max_concurrent_items": 1,
+            "command_limits": {"verify": 2},
+            "x": true,
+        }));
+        let token = store
+            .box_row(ids::BOX)
+            .await
+            .expect("box_row never fails")
+            .expect("the fixture box")
+            .edit_version;
+        let written = store
+            .edit_box(
+                ids::BOX,
+                token,
+                BoxEdit {
+                    executor: Some(Executor::Worker),
+                    ..BoxEdit::default()
+                },
+            )
+            .await
+            .expect("the edit is answered");
+        let CasOutcome::Applied(row) = written else {
+            panic!("an executor edit on the current token applies, got {written:?}");
+        };
+        assert_eq!(
+            row.settings,
+            json!({
+                "max_concurrent_items": 1,
+                "command_limits": {"verify": 2},
+                "x": true,
+                "executor": "worker",
+            }),
+            "all four keys are present"
+        );
+        assert_eq!(row.edit_version, token + 1, "the edit moves the token");
+    }
+
+    /// MOD-41 plan D10: a `box.settings` blob that is not a JSON object cannot take the executor
+    /// key. The edit is `Constraint(BOX_SETTINGS_NOT_AN_OBJECT)` and writes nothing, the token
+    /// included; an edit that does not name the executor still applies to the same row. The
+    /// Postgres half is `pg_criteria.rs::edit_box_refuses_a_non_object_settings_blob`.
+    #[tokio::test]
+    async fn edit_box_refuses_a_non_object_settings_blob_in_memory() {
+        use crate::model::{BoxEdit, Executor};
+        use crate::store::BOX_SETTINGS_NOT_AN_OBJECT;
+
+        for blob in [json!([]), json!("x")] {
+            let store = demo_with_box_settings(blob.clone());
+            let before = store
+                .box_row(ids::BOX)
+                .await
+                .expect("box_row never fails")
+                .expect("the fixture box");
+            let refused = store
+                .edit_box(
+                    ids::BOX,
+                    before.edit_version,
+                    BoxEdit {
+                        executor: Some(Executor::Tui),
+                        ..BoxEdit::default()
+                    },
+                )
+                .await;
+            match refused {
+                Err(StoreError::Constraint(said)) => {
+                    assert_eq!(said, BOX_SETTINGS_NOT_AN_OBJECT, "{blob}");
+                }
+                other => panic!("{blob}: a non-object blob is a Constraint, got {other:?}"),
+            }
+            assert_eq!(
+                store.box_row(ids::BOX).await.expect("box_row never fails"),
+                Some(before.clone()),
+                "{blob}: the refused edit wrote nothing, the token included"
+            );
+
+            let quirks = store
+                .edit_box(
+                    ids::BOX,
+                    before.edit_version,
+                    BoxEdit {
+                        quirks: Some("no executor named".to_owned()),
+                        ..BoxEdit::default()
+                    },
+                )
+                .await
+                .expect("the edit is answered");
+            let CasOutcome::Applied(row) = quirks else {
+                panic!("{blob}: a quirks-only edit applies, got {quirks:?}");
+            };
+            assert_eq!(row.quirks, "no executor named", "{blob}");
+            assert_eq!(row.settings, blob, "{blob}: the blob is left as it was");
+        }
+    }
+
+    /// MOD-41 plan D11: `queued_runs_on_box` answers this box's `queued` runs alone, by
+    /// `(queued_at, id)`: not another box's queued run, not this box's running one. The Postgres
+    /// half is `pg_criteria.rs::queued_runs_on_box_lists_this_boxs_queued_runs_in_queue_order`.
+    #[tokio::test]
+    async fn queued_runs_on_box_lists_this_boxs_queued_runs_in_queue_order() {
+        let mut data = crate::fixtures::demo_data();
+        let mut elsewhere = data
+            .boxes
+            .iter()
+            .find(|row| row.id == ids::BOX)
+            .expect("the fixture box")
+            .clone();
+        let other = BoxId::new();
+        elsewhere.id = other;
+        elsewhere.hostname = "ELSEWHERE".to_owned();
+        data.boxes.push(elsewhere);
+        let store = MemStore::from_demo(data);
+
+        let early = Utc::now();
+        let late = early + TimeDelta::seconds(1);
+        let queue = |title: &'static str, target: BoxId, queued_at| {
+            let store = &store;
+            async move {
+                let item = store
+                    .mint_item(NewItem {
+                        id: ItemId::new(),
+                        project_id: ids::PROJECT_HTUI,
+                        kind_id: ids::KIND_HTUI_FEAT,
+                        title: title.to_owned(),
+                        body: String::new(),
+                        required_tags: Vec::new(),
+                        touched_paths: Vec::new(),
+                        priority: 0,
+                        step_graph_id: None,
+                        created_by: ids::USER,
+                        box_id: Some(ids::BOX),
+                    })
+                    .await
+                    .expect("the mint lands")
+                    .id;
+                store
+                    .create_run(NewRun {
+                        target_box_id: target,
+                        queued_at,
+                        ..graph_run(item, ids::PROJECT_HTUI, Vec::new())
+                    })
+                    .await
+                    .expect("the run is queued")
+                    .id
+            }
+        };
+        let running = queue("running on this box", ids::BOX, early).await;
+        let last = queue("queued last", ids::BOX, late).await;
+        let tied_a = queue("queued first, tied", ids::BOX, early).await;
+        let tied_b = queue("queued first, tied too", ids::BOX, early).await;
+        let _theirs = queue("queued on another box", other, early).await;
+        assert_eq!(
+            store
+                .claim_run(
+                    running,
+                    ids::BOX,
+                    Uuid::now_v7(),
+                    early,
+                    TimeDelta::minutes(5)
+                )
+                .await
+                .expect("the claim is answered"),
+            Claim::Admitted,
+            "one run on this box is running, not queued"
+        );
+
+        let (first, second) = if tied_a < tied_b {
+            (tied_a, tied_b)
+        } else {
+            (tied_b, tied_a)
+        };
+        assert_eq!(
+            store
+                .queued_runs_on_box(ids::BOX)
+                .await
+                .expect("the read is answered"),
+            vec![(first, early), (second, early), (last, late)],
+            "this box's three queued runs, by `(queued_at, id)`"
         );
     }
 

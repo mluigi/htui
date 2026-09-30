@@ -12174,6 +12174,7 @@ mod tests {
                 BoxEdit {
                     declared_tags: Some(Vec::new()),
                     quirks: None,
+                    executor: None,
                 },
             )
             .await

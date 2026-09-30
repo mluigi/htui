@@ -80,6 +80,7 @@ fn edit(box_id: BoxId, expected: i32, tags: Option<&[&str]>, quirks: Option<&str
         edit: BoxEdit {
             declared_tags: tags.map(|tags| tags.iter().map(|&tag| tag.to_owned()).collect()),
             quirks: quirks.map(str::to_owned),
+            executor: None,
         },
     }
 }

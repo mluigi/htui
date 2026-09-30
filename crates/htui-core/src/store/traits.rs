@@ -1668,6 +1668,15 @@ pub fn prompt_template_refusal(name: &str, body: &str) -> Option<String> {
 // Every rule and sentence of the four skill writers lives here, so `MemStore` and `PgStore` only
 // look facts up and refuse the same input with the same sentence (R-32).
 
+/// MOD-41 plan D10: [`WriteStore::edit_box`]'s refusal of an
+/// [`Executor::Other`](crate::model::Executor::Other), so the editor writes only the two values
+/// this build knows.
+pub const EXECUTOR_MUST_BE_KNOWN: &str = "executor must be tui or worker";
+
+/// MOD-41 plan D10: [`WriteStore::edit_box`]'s refusal to write `executor` into a `box.settings`
+/// blob that is not a JSON object (Postgres' `jsonb_set` errors on a scalar or an array).
+pub const BOX_SETTINGS_NOT_AN_OBJECT: &str = "box.settings is not a JSON object";
+
 /// MOD-9 D71: a name [`validate_name`] refuses.
 #[must_use]
 pub fn invalid_skill_name(name: &str) -> String {

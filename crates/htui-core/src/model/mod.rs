@@ -103,8 +103,8 @@ pub mod user;
 pub use agent::{Agent, AgentBox, AgentSummary, Billing, Transport};
 pub use box_::{
     BoxEdit, BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool,
-    DECLARED_TAG_MAX, DEFAULT_MAX_CONCURRENT_ITEMS, OsFamily, ProbedTool, canonical_declared_tags,
-    declared_tags_from_text, is_declared_tag,
+    DECLARED_TAG_MAX, DEFAULT_MAX_CONCURRENT_ITEMS, Executor, OsFamily, ProbedTool,
+    canonical_declared_tags, declared_tags_from_text, is_declared_tag,
 };
 pub use document::{Document, DocumentHead, NewDocument, ResolvedInput};
 pub use event::{EventKind, EventRole, SessionEvent};

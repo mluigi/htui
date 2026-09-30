@@ -3772,6 +3772,7 @@ async fn declare_tags<O: Orchestrate>(orch: &O, tags: &[&str]) {
             BoxEdit {
                 declared_tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
                 quirks: None,
+                executor: None,
             },
         )
         .await

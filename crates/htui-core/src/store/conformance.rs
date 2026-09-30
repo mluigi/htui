@@ -17,7 +17,7 @@ use crate::model::{
     Activation, Agent, AgentBox, AgentId, Attachment, Billing, BindingChange, BoxEdit, BoxId,
     BoxProbe, BoxRow, ChatRunSpec, CitationKind, Claim, CommandQueue, CommandRun, CommandRunId,
     CommandRunStatus, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EventKind, EventRole,
-    Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId,
+    Executor, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId,
     ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument,
     NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
     NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
@@ -35,9 +35,9 @@ use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::store::error::StoreError;
 use crate::store::traits::{
-    CasOutcome, DeleteReach, DeleteTarget, MAX_LEASE_TTL, ReadStore, SettingRung, StepFence,
-    UpdateOutcome, WriteStore, already_exists, citation_key, illegal_move, invalid_area_code,
-    requirement_withdrawn, resolution_not_closable, withdrawn_requirement_cited,
+    CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL, ReadStore,
+    SettingRung, StepFence, UpdateOutcome, WriteStore, already_exists, citation_key, illegal_move,
+    invalid_area_code, requirement_withdrawn, resolution_not_closable, withdrawn_requirement_cited,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -142,6 +142,9 @@ pub const CASES: &[&str] = &[
     "the_new_owner_writes_prompt_tree_and_commits",
     "an_unleased_prompt_write_is_refused_on_a_leased_run",
     "a_missing_step_is_not_found_before_the_fence",
+    "edit_box_writes_the_executor_and_keeps_every_other_setting",
+    "an_unknown_executor_is_refused_and_writes_nothing",
+    "an_executor_edit_is_a_compare_and_set",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -344,6 +347,15 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "a_missing_step_is_not_found_before_the_fence" => {
             a_missing_step_is_not_found_before_the_fence(store).await;
+        }
+        "edit_box_writes_the_executor_and_keeps_every_other_setting" => {
+            edit_box_writes_the_executor_and_keeps_every_other_setting(store).await;
+        }
+        "an_unknown_executor_is_refused_and_writes_nothing" => {
+            an_unknown_executor_is_refused_and_writes_nothing(store).await;
+        }
+        "an_executor_edit_is_a_compare_and_set" => {
+            an_executor_edit_is_a_compare_and_set(store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -5013,6 +5025,7 @@ async fn claim_run_fails_a_run_whose_item_needs_a_tag_the_box_lacks<S: WriteStor
             BoxEdit {
                 declared_tags: Some(tags(&["docker", "gpu", "vulkan"])),
                 quirks: None,
+                executor: None,
             },
         )
         .await
@@ -8197,6 +8210,7 @@ fn tags_edit(tags: &[&str]) -> BoxEdit {
     BoxEdit {
         declared_tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
         quirks: None,
+        executor: None,
     }
 }
 
@@ -8282,6 +8296,7 @@ async fn edit_box_is_cas_on_edit_version<S: WriteStore>(store: &S) {
             BoxEdit {
                 declared_tags: None,
                 quirks: Some(quirks.to_owned()),
+                executor: None,
             },
         )
         .await
@@ -8356,6 +8371,7 @@ async fn edit_box_is_cas_on_edit_version<S: WriteStore>(store: &S) {
             BoxEdit {
                 declared_tags: Some(Vec::new()),
                 quirks: Some(String::new()),
+                executor: None,
             },
         )
         .await
@@ -8499,6 +8515,165 @@ async fn edit_box_refuses_an_invalid_tag<S: WriteStore>(store: &S) {
     assert!(
         matches!(unknown, Err(StoreError::NotFound { entity: "box", .. })),
         "{CASE}: an unknown box wins over a refused tag, got {unknown:?}"
+    );
+}
+
+/// A [`BoxEdit`] that writes `box.settings.executor` and leaves both columns alone.
+fn executor_edit(executor: Executor) -> BoxEdit {
+    BoxEdit {
+        declared_tags: None,
+        quirks: None,
+        executor: Some(executor),
+    }
+}
+
+/// The demo box's `box.settings` blob, as [`WriteStore::boxes`] reads it now.
+async fn demo_box_settings<S: WriteStore>(store: &S, case: &str) -> Value {
+    store
+        .boxes()
+        .await
+        .expect(case)
+        .into_iter()
+        .find(|record| record.row.id == ids::BOX)
+        .unwrap_or_else(|| panic!("{case}: the fixture has its box"))
+        .row
+        .settings
+}
+
+/// MOD-41 plan D10: `edit_box` writes `box.settings.executor` key by key under the
+/// `edit_version` compare-and-set, and every other key of the blob survives. The demo box's blob
+/// is `{"max_concurrent_items": 2}`; a three-key blob is
+/// `pg_criteria.rs::edit_box_keeps_every_other_settings_key` on Postgres and
+/// `edit_box_keeps_every_other_settings_key_in_memory` on `MemStore`, because nothing on the trait
+/// writes an arbitrary key to seed one.
+async fn edit_box_writes_the_executor_and_keeps_every_other_setting<S: WriteStore>(store: &S) {
+    const CASE: &str = "edit_box_writes_the_executor_and_keeps_every_other_setting";
+    let before = demo_box_settings(store, CASE).await;
+    assert_eq!(
+        before,
+        json!({"max_concurrent_items": 2}),
+        "{CASE}: the demo box's blob"
+    );
+
+    let worker = store
+        .edit_box(ids::BOX, 0, executor_edit(Executor::Worker))
+        .await
+        .expect(CASE);
+    let CasOutcome::Applied(worker) = worker else {
+        panic!("{CASE}: an executor edit on the current token applies, got {worker:?}");
+    };
+    assert_eq!(worker.edit_version, 1, "{CASE}: the edit moves the token");
+    assert_eq!(
+        worker.settings,
+        json!({"max_concurrent_items": 2, "executor": "worker"}),
+        "{CASE}: the executor is written and `max_concurrent_items` survives"
+    );
+    assert_eq!(
+        demo_box_settings(store, CASE).await,
+        worker.settings,
+        "{CASE}: the applied row is what a read answers"
+    );
+
+    let tui = store
+        .edit_box(ids::BOX, worker.edit_version, executor_edit(Executor::Tui))
+        .await
+        .expect(CASE);
+    let CasOutcome::Applied(tui) = tui else {
+        panic!("{CASE}: an edit on the new token applies, got {tui:?}");
+    };
+    assert_eq!(
+        tui.edit_version, 2,
+        "{CASE}: the second edit moves the token"
+    );
+    assert_eq!(
+        tui.settings,
+        json!({"max_concurrent_items": 2, "executor": "tui"}),
+        "{CASE}: the executor is overwritten, `max_concurrent_items` still survives"
+    );
+    assert_eq!(
+        Executor::of(&tui.settings),
+        Executor::Tui,
+        "{CASE}: I-1's reading of the written blob"
+    );
+}
+
+/// MOD-41 plan D10: an [`Executor::Other`] is refused with [`EXECUTOR_MUST_BE_KNOWN`] and writes
+/// nothing, the token included. Precedence stays `NotFound`, `Stale`, `Constraint`: with a spent
+/// token the answer is `Stale`, and an unknown box is `NotFound`.
+async fn an_unknown_executor_is_refused_and_writes_nothing<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_unknown_executor_is_refused_and_writes_nothing";
+    let container = || executor_edit(Executor::Other("container".to_owned()));
+    let before = store.boxes().await.expect(CASE);
+
+    let refused = store.edit_box(ids::BOX, 0, container()).await;
+    match refused {
+        Err(StoreError::Constraint(said)) => assert_eq!(
+            said, EXECUTOR_MUST_BE_KNOWN,
+            "{CASE}: the refusal is the shared sentence"
+        ),
+        other => panic!("{CASE}: an unknown executor is a Constraint, got {other:?}"),
+    }
+    assert_eq!(
+        store.boxes().await.expect(CASE),
+        before,
+        "{CASE}: the refused edit wrote nothing, the token included"
+    );
+
+    let applied = store
+        .edit_box(ids::BOX, 0, executor_edit(Executor::Worker))
+        .await
+        .expect(CASE);
+    assert!(
+        matches!(&applied, CasOutcome::Applied(row) if row.edit_version == 1),
+        "{CASE}: a known executor on the current token applies, got {applied:?}"
+    );
+    let after = store.boxes().await.expect(CASE);
+
+    let spent = store.edit_box(ids::BOX, 0, container()).await;
+    assert!(
+        matches!(&spent, Ok(CasOutcome::Stale(row)) if row.edit_version == 1),
+        "{CASE}: a spent token wins over an unknown executor, got {spent:?}"
+    );
+    let unknown = store.edit_box(BoxId::new(), 0, container()).await;
+    assert!(
+        matches!(unknown, Err(StoreError::NotFound { entity: "box", .. })),
+        "{CASE}: an unknown box wins over an unknown executor, got {unknown:?}"
+    );
+    assert_eq!(
+        store.boxes().await.expect(CASE),
+        after,
+        "{CASE}: neither refusal wrote anything"
+    );
+}
+
+/// MOD-41 plan D10 (blueprint F-37): two executor edits from one token are a compare-and-set.
+/// The first applies; the second is `Stale` carrying the first's row, and the blob holds the
+/// first's executor only.
+async fn an_executor_edit_is_a_compare_and_set<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_executor_edit_is_a_compare_and_set";
+    let first = store
+        .edit_box(ids::BOX, 0, executor_edit(Executor::Worker))
+        .await
+        .expect(CASE);
+    let CasOutcome::Applied(first) = first else {
+        panic!("{CASE}: the first edit from the token applies, got {first:?}");
+    };
+
+    let second = store
+        .edit_box(ids::BOX, 0, executor_edit(Executor::Tui))
+        .await
+        .expect(CASE);
+    let CasOutcome::Stale(current) = second else {
+        panic!("{CASE}: the second edit from the same token is stale, got {second:?}");
+    };
+    assert_eq!(
+        current, first,
+        "{CASE}: `Stale` carries the first edit's row"
+    );
+    assert_eq!(
+        Executor::of(&demo_box_settings(store, CASE).await),
+        Executor::Worker,
+        "{CASE}: the blob holds the first edit's executor only"
     );
 }
 

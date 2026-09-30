@@ -574,6 +574,20 @@ impl Backend {
         }
     }
 
+    /// This box's `queued` runs, `(id, queued_at)` by `(queued_at, id)` (MOD-41 plan D11).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn queued_runs_on_box(&self, box_id: BoxId) -> Result<Vec<(RunId, DateTime<Utc>)>> {
+        match self {
+            Self::Memory(store) => store.queued_runs_on_box(box_id).await,
+            Self::Online { pg, .. } => pg.queued_runs_on_box(box_id).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
     /// Every active run whose `repo_scope` intersects `scope`, in `queued_at` order (§4.7).
     ///
     /// # Errors

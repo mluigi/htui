@@ -386,6 +386,7 @@ impl BoxesSection {
                         edit: BoxEdit {
                             declared_tags: Some(list),
                             quirks: None,
+                            executor: None,
                         },
                     }),
                 }
@@ -398,6 +399,7 @@ impl BoxesSection {
                     edit: BoxEdit {
                         declared_tags: None,
                         quirks: Some(text.to_owned()),
+                        executor: None,
                     },
                 })
             }
