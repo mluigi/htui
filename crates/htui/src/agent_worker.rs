@@ -22,8 +22,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use futures::future::BoxFuture;
 use htui_agent::acp::SESSION_STARTED;
-use htui_agent::auth::loopback::{DeliverLimits, RedirectUrl};
+use htui_agent::auth::loopback::{
+    self, Advertised, DELIVERY_IN_FLIGHT, DeliverError, DeliverLimits, ListenerReply,
+    NO_LOOPBACK_REDIRECT, RedirectUrl,
+};
 use htui_agent::auth::{
     AUTH_IDLE_CAP, AuthChoice, AuthEvent, AuthFlow, AuthOutcome, BrowserPolicy, OpenerCommand,
     open_url,
@@ -2900,6 +2904,13 @@ impl core::fmt::Debug for AuthArgs {
 /// the channel is closed and drained the instant the loop breaks (review L-1), so a command that
 /// arrives during the re-probe is refused rather than carried down with the task.
 ///
+/// **A pasted redirect is delivered from here** (MOD-22 D269). It is validated against the flow's
+/// own record of the advertised redirect, never the pane's, and its one `GET` runs beside the
+/// flow, so the wire, stderr and `x` are served while it is in flight. Every `AuthDeliver` is
+/// answered once, before the flow's own last frame. The address is a credential for the length
+/// of that `GET`: the credential rule of `htui_agent::auth::loopback` binds everything here, and
+/// nothing on this path is logged.
+///
 /// Nothing here touches `agent`. A login is a fact about a box (`R-AGT-9`).
 async fn run_auth(args: AuthArgs) {
     let AuthArgs {
@@ -2912,7 +2923,7 @@ async fn run_auth(args: AuthArgs) {
         cancel,
         mut commands,
         opener,
-        deliver_limits: _,
+        deliver_limits,
         frames,
     } = args;
     // The `AuthStart`'s address until the choice arrives, and the `AuthChoose`'s afterwards.
@@ -2937,6 +2948,10 @@ async fn run_auth(args: AuthArgs) {
 
     let mut listening = true;
     let mut serving = true;
+    // The loopback redirect the newest link advertised, if any, and the one delivery allowed in
+    // flight (MOD-22 D269).
+    let mut advertised: Option<Advertised> = None;
+    let mut delivering: Option<Delivering> = None;
     let outcome = loop {
         tokio::select! {
             // Biased towards the flow: the moment it has answered there is nothing left to
@@ -2944,7 +2959,16 @@ async fn run_auth(args: AuthArgs) {
             biased;
             outcome = &mut running => break outcome,
             event = events_rx.recv(), if listening => match event {
-                Some(event) => frames.reply(&addr, StoreReply::Auth(auth_frame(event))),
+                Some(event) => {
+                    // Read before `auth_frame` consumes it. Newest wins; a link that advertises
+                    // no loopback redirect leaves the previous one standing.
+                    if let AuthEvent::Url(link) = &event
+                        && let Some(found) = Advertised::from_auth_url(link)
+                    {
+                        advertised = Some(found);
+                    }
+                    frames.reply(&addr, StoreReply::Auth(auth_frame(event)));
+                }
                 None => listening = false,
             },
             command = commands.recv(), if serving => match command {
@@ -2973,7 +2997,37 @@ async fn run_auth(args: AuthArgs) {
                     };
                     frames.reply(&reply, answer);
                 }
-                Some(AuthCommand::Deliver { .. }) => todo!("MOD-22 T2"),
+                Some(AuthCommand::Deliver { url, reply }) => {
+                    // A bool, not `&delivering` in the scrutinee: the arm below assigns the slot.
+                    let in_flight = delivering.is_some();
+                    let refusal = match (advertised.as_ref(), in_flight) {
+                        (None, _) => Some(NO_LOOPBACK_REDIRECT.to_owned()),
+                        (Some(_), true) => Some(DELIVERY_IN_FLIGHT.to_owned()),
+                        (Some(found), false) => match loopback::validate(&url, found) {
+                            Ok(delivery) => {
+                                // Not awaited here, as `Open` is: a response deadline of
+                                // seconds would stop the wire and `x` for all of them.
+                                delivering = Some(Delivering {
+                                    reply: reply.clone(),
+                                    answer: Box::pin(loopback::deliver(delivery, deliver_limits)),
+                                });
+                                None
+                            }
+                            Err(err) => Some(err.to_string()),
+                        },
+                    };
+                    // The pasted text ends here; the delivery holds only what its `GET` needs.
+                    drop(url);
+                    if let Some(message) = refusal {
+                        frames.reply(
+                            &reply,
+                            StoreReply::Failed {
+                                request: "auth_deliver",
+                                message,
+                            },
+                        );
+                    }
+                }
                 // The runtime let go of this login **without** cancelling it: a panic on the worker
                 // loop, or any drop of `AgentRuntime` that never reached `shutdown`, closes this
                 // channel and drops the token clone rather than tripping it. A closed channel means
@@ -2988,6 +3042,9 @@ async fn run_auth(args: AuthArgs) {
                     cancel.cancel();
                 }
             },
+            (reply, answer) = settle(&mut delivering), if delivering.is_some() => {
+                frames.reply(&reply, delivered(answer));
+            }
         }
     };
 
@@ -2995,6 +3052,29 @@ async fn run_auth(args: AuthArgs) {
     // otherwise spend a request into: from here on `auth_command` fails to send and refuses the
     // request itself, which is the answer it already has words for.
     commands.close();
+    // A delivery still in flight is answered before the queue, the re-probe and the last frame
+    // (MOD-22 D269(d), D277), so its answer never trails the login's result (R-10). A flow that
+    // ended — `x`, a shutdown, the idle clock, a declined chooser — drops it at once: by now the
+    // child is reaped (`acp::auth::run`), so its own listener's socket has already ended, and a
+    // listener that is not the child's would otherwise hold `Cancelled` for the whole response
+    // deadline. Any other end waits for it, and `x` still cuts that wait short.
+    if let Some(pending) = delivering.take() {
+        let ended = cancel.is_cancelled()
+            || matches!(
+                outcome,
+                Ok(AuthOutcome::Cancelled | AuthOutcome::Declined | AuthOutcome::Idle { .. })
+            );
+        let answer = if ended {
+            ended_reply("auth_deliver")
+        } else {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => ended_reply("auth_deliver"),
+                answer = pending.answer => delivered(answer),
+            }
+        };
+        frames.reply(&pending.reply, answer);
+    }
     // What was already in the queue when the loop broke is answered at its own address rather than
     // dropped with the task: a `Served::Deferred` the pane never hears back from is the shape
     // MOD-20's review rejected, and this flow has nothing left to do for any of them.
@@ -3002,15 +3082,9 @@ async fn run_auth(args: AuthArgs) {
         let (request, reply) = match command {
             AuthCommand::Choose { reply, .. } => ("auth_choose", reply),
             AuthCommand::Open { reply, .. } => ("auth_open", reply),
-            AuthCommand::Deliver { .. } => todo!("MOD-22 T2"),
+            AuthCommand::Deliver { reply, .. } => ("auth_deliver", reply),
         };
-        frames.reply(
-            &reply,
-            StoreReply::Failed {
-                request,
-                message: LOGIN_ENDED.to_owned(),
-            },
-        );
+        frames.reply(&reply, ended_reply(request));
     }
 
     // The events sender lived inside the future that has just returned, so this drains what it
@@ -3070,6 +3144,58 @@ async fn run_auth(args: AuthArgs) {
         },
     };
     frames.reply(&addr, StoreReply::Auth(frame));
+}
+
+/// A delivery in flight (MOD-22 D269): who asked, and the one `GET`.
+struct Delivering {
+    reply: ReplyAddr,
+    answer: BoxFuture<'static, Result<ListenerReply, DeliverError>>,
+}
+
+impl core::fmt::Debug for Delivering {
+    /// The address only: the future holds the request line, which carries the pasted code.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Delivering")
+            .field("reply", &self.reply)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The in-flight delivery's answer, or never.
+///
+/// `tokio::select!` evaluates a branch's expression even while its precondition is false, so this
+/// is an `async fn` that touches the slot only when polled. It takes the slot **after** the answer,
+/// never before: when another arm wins, this future is dropped, and the delivery must still be
+/// there.
+async fn settle(slot: &mut Option<Delivering>) -> (ReplyAddr, Result<ListenerReply, DeliverError>) {
+    let Some(delivering) = slot.as_mut() else {
+        return std::future::pending().await;
+    };
+    let answer = delivering.answer.as_mut().await;
+    let delivering = slot
+        .take()
+        .expect("settled only while a delivery is in flight");
+    (delivering.reply, answer)
+}
+
+/// A delivery's answer as the reply its request is owed (D268): what the listener said, or why
+/// nothing usable came back. Neither carries a byte of the pasted address.
+fn delivered(answer: Result<ListenerReply, DeliverError>) -> StoreReply {
+    match answer {
+        Ok(reply) => StoreReply::Auth(AuthFrame::Delivered(reply)),
+        Err(err) => StoreReply::Failed {
+            request: "auth_deliver",
+            message: err.to_string(),
+        },
+    }
+}
+
+/// The refusal of a request this login can no longer serve ([`LOGIN_ENDED`]).
+fn ended_reply(request: &'static str) -> StoreReply {
+    StoreReply::Failed {
+        request,
+        message: LOGIN_ENDED.to_owned(),
+    }
 }
 
 /// One flow event as the frame the section renders. A total map, and deliberately dull: the two
@@ -6930,9 +7056,7 @@ pub(crate) mod tests {
     pub(crate) mod auth {
         use super::*;
         use htui_agent::acp::Handshake;
-        use htui_agent::auth::loopback::{
-            DELIVERY_IN_FLIGHT, DeliverError, NO_LOOPBACK_REDIRECT, PasteError,
-        };
+        use htui_agent::auth::loopback::PasteError;
         use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo, OpenerCommand};
         use htui_agent::probe::{CredentialTier, ProbeSource};
         use std::path::{Path, PathBuf};
