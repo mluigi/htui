@@ -13,7 +13,7 @@
 //! (§4.2 rule 5, §4.7 rule 8).
 #![cfg(feature = "test-support")]
 
-use htui_core::prompt::render::{self, UpstreamState};
+use htui_core::prompt::render::{self, HostnameLine, UpstreamState};
 use htui_core::prompt::{SectionName, fixtures};
 
 /// Every section a `phase_implement_attempt2()` spec renders, wrapped, in §4.2's table order.
@@ -37,7 +37,7 @@ fn phase_sections() -> Vec<(&'static str, String)> {
     ));
     out.push((
         "section_box",
-        render::wrap(&render::box_profile(&spec.box_profile)),
+        render::wrap(&render::box_profile(&spec.box_profile, HostnameLine::Shown)),
     ));
     out.push((
         "section_skills",
@@ -204,7 +204,29 @@ fn a_spec_with_nothing_to_say_renders_no_empty_wrappers() {
     insta::assert_snapshot!("section_item_empty", render::wrap(&render::item(&spec)));
     insta::assert_snapshot!(
         "section_box_minimal",
-        render::wrap(&render::box_profile(&spec.box_profile))
+        render::wrap(&render::box_profile(&spec.box_profile, HostnameLine::Shown))
+    );
+}
+
+/// MOD-33 D263, D269: the box section's two other forms. The digest form (`StandIn`) is what the
+/// residue scan, the estimate, the trim and the record see; `Omitted` is the project switch off.
+/// Each is `section_box` with its first content line changed or removed, and nothing else.
+#[test]
+fn the_box_section_renders_its_digest_and_off_forms() {
+    let spec = fixtures::phase_implement_attempt2();
+    insta::assert_snapshot!(
+        "section_box_stand_in",
+        render::wrap(&render::box_profile(
+            &spec.box_profile,
+            HostnameLine::StandIn
+        ))
+    );
+    insta::assert_snapshot!(
+        "section_box_no_hostname",
+        render::wrap(&render::box_profile(
+            &spec.box_profile,
+            HostnameLine::Omitted
+        ))
     );
 }
 
@@ -229,7 +251,10 @@ fn crlf_inputs_render_identical_bytes() {
         out.push(render::wrap(
             &render::upstream(&spec.upstream, &[]).expect("three entries"),
         ));
-        out.push(render::wrap(&render::box_profile(&spec.box_profile)));
+        out.push(render::wrap(&render::box_profile(
+            &spec.box_profile,
+            HostnameLine::Shown,
+        )));
         out.push(render::wrap(
             &render::skills(&spec.skills).expect("one binding"),
         ));

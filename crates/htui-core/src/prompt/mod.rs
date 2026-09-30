@@ -628,7 +628,10 @@ fn render_sections(
         Placeholder::Item => vec![render::item(spec)],
         Placeholder::Documents => spec.documents.iter().map(render::document).collect(),
         Placeholder::Upstream => render::upstream(upstream, &[]).into_iter().collect(),
-        Placeholder::Box => vec![render::box_profile(&spec.box_profile)],
+        Placeholder::Box => vec![render::box_profile(
+            &spec.box_profile,
+            render::HostnameLine::Shown,
+        )],
         Placeholder::Skills => render::skills(skills).into_iter().collect(),
         Placeholder::Excerpts => render::excerpts(&spec.excerpts.files).into_iter().collect(),
         Placeholder::VerifyFailure => spec
