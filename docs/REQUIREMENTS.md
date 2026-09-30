@@ -21,7 +21,9 @@ amended 2026-09-26 by maintainer decision on ANA-16 (`docs/ANA-16.md` §6.1 C5,
 `docs/decisions/ana/ana-16.md`) during MOD-40 — R-STO-5 amended in place (a headless process never
 migrates; it refuses and reports);
 amended 2026-09-29 by maintainer decision on MOD-50 (`docs/decisions/mod/mod-50.md`) — R-STO-8
-amended in place (requirement rows indexed; the decisions filter keyed on resolution).
+amended in place (requirement rows indexed; the decisions filter keyed on resolution);
+amended 2026-09-30 by maintainer decision on MOD-22 (`docs/decisions/mod/mod-22.md`, plan OQ-1) —
+R-AGT-9 amended in place (the loopback paste-back relays one authorization code once).
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -200,9 +202,11 @@ conflict. Their verdicts survive only where restated here.
   method is chosen from the ones that agent advertises; logging out is offered where the agent
   advertises it. `htui` triggers the flow and observes its outcome: it does not read, hold, transmit
   or store the credential, which stays wherever the agent keeps it (R-ID-7, R-SEC-2). Authentication
-  is a fact about a box, not about a registry row. Added by maintainer decision, 2026-09-09,
-  reversing `docs/ANA-4.md` §4.5's conclusion that `htui` cannot log an agent in; implemented as
-  MOD-21.
+  is a fact about a box, not about a registry row. When the browser cannot reach the agent's
+  loopback listener, the app relays the browser's redirect, which carries a one-use authorization
+  code, to that listener once and holds it for that request only (MOD-22). Added by maintainer
+  decision, 2026-09-09, reversing `docs/ANA-4.md` §4.5's conclusion that `htui` cannot log an agent
+  in; implemented as MOD-21; amended 2026-09-30 by maintainer decision on MOD-22.
 - **R-AGT-10 (must).** An agent whose adapter is not installed on a box can be installed **from the
   app**, from a source declared in its own registry row, with no code path per agent (R-AGT-5). The
   app re-probes after installing, so what the box can run is always the probe's answer rather than
