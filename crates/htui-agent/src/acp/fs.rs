@@ -83,7 +83,7 @@ impl SessionFs {
     pub async fn new(cwd: &Path, extra_dirs: &[PathBuf]) -> std::io::Result<Self> {
         let cwd = cwd.to_owned();
         let extra_dirs = extra_dirs.to_vec();
-        tokio::task::spawn_blocking(move || {
+        crate::contained::spawn_blocking(move || {
             let roots = std::iter::once(&cwd)
                 .chain(extra_dirs.iter())
                 .filter(|root| root.is_absolute())
@@ -176,7 +176,7 @@ fn normalise(path: &Path) -> PathBuf {
 /// Any I/O error other than `NotFound`, including a path that is a directory.
 pub async fn read_current(path: &ScopedPath) -> std::io::Result<String> {
     let path = path.clone();
-    tokio::task::spawn_blocking(move || match path.dir.read_to_string(&path.relative) {
+    crate::contained::spawn_blocking(move || match path.dir.read_to_string(&path.relative) {
         Ok(text) => Ok(text),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(err) => Err(err),
@@ -207,7 +207,7 @@ pub fn unified_diff(path: &str, old: &str, new: &str) -> String {
 pub async fn write_text(path: &ScopedPath, content: &str) -> std::io::Result<()> {
     let path = path.clone();
     let content = content.to_owned();
-    tokio::task::spawn_blocking(move || {
+    crate::contained::spawn_blocking(move || {
         if let Some(parent) = path.relative.parent()
             && !parent.as_os_str().is_empty()
         {

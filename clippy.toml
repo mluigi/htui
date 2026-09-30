@@ -1,1 +1,3 @@
+# crates/htui-agent/clippy.toml REPLACES this file for that crate (clippy does not merge them), so
+# a setting added here must be copied there too.
 msrv = "1.98"

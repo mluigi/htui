@@ -40,6 +40,11 @@
 //! through a data spec ([`box_probe::spec`]) that [`probe`]'s resolver walks. It never writes; the
 //! [`BoxProbe`](htui_core::model::BoxProbe) it returns is what the store records.
 //!
+//! [`contained`] is MOD-65's answer to "and what if a thread it starts panics": every blocking
+//! thread and task this crate starts runs inside [`excerpt::contain`]'s window, so a panic tokio
+//! catches and hands back as a `JoinError` is one `htui`'s panic hook leaves the terminal alone
+//! for. The raw tokio spawns are refused in this crate by its `clippy.toml`.
+//!
 //! Deliberately absent in milestones 1–2 (plan D16): any wire protocol (`acp/`, `cli/`), the chat
 //! tab, and quota. Each is a named seam, not a plan.
 #![warn(missing_docs)]
@@ -100,6 +105,7 @@ pub mod box_probe;
 pub mod cli;
 #[cfg(feature = "test-support")]
 pub mod conformance;
+pub mod contained;
 pub mod driver;
 pub mod error;
 pub mod event;

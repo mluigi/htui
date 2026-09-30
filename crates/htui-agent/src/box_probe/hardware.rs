@@ -65,7 +65,7 @@ impl HardwareSource for SystemHardware {
         Box::pin(async move {
             // `sysinfo` reads the OS synchronously: off the runtime. A panicked or cancelled
             // read is "unreadable", which is empty facts.
-            let facts = tokio::task::spawn_blocking(system_facts)
+            let facts = crate::contained::spawn_blocking(system_facts)
                 .await
                 .unwrap_or_default();
             let display_vendors = gpu_vendor_ids(&self.pci_root, env).await;
@@ -232,7 +232,7 @@ fn os_version() -> String {
 #[cfg(target_os = "linux")]
 async fn gpu_vendor_ids(root: &Path, _env: &ProbeEnv) -> Vec<String> {
     let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || pci_display_vendors(&root))
+    crate::contained::spawn_blocking(move || pci_display_vendors(&root))
         .await
         .unwrap_or_default()
 }

@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-65](docs/decisions/mod/mod-65.md)** - Every thread and task the agent runtime starts opens the contain window (done, 2026-09-30)
 - **[MOD-23](docs/decisions/mod/mod-23.md)** - Agent registry editing in the Settings agents section (done, 2026-09-30)
 - **[CLEAN-7](docs/decisions/clean/clean-7.md)** - Leftovers of the removed offline chat buffer (done, 2026-09-30)
 - **[MOD-9](docs/decisions/mod/mod-9.md)** - Skill library and templates (done, 2026-09-30)

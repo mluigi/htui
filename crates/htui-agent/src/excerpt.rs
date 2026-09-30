@@ -804,6 +804,11 @@ pub fn run_providers(
             // Named so an unwind line says whose defect it is, and `Builder` rather than
             // `thread::spawn` so a refused spawn is this provider's `:error` rather than a panic
             // on the assembler's own thread.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the provider thread runs `propose_caught`, which opens the contain window \
+                          itself (MOD-65)"
+            )]
             let spawned = std::thread::Builder::new().name(name).spawn(move || {
                 // Detached on purpose: see H-20 above.
                 let outcome = propose_caught(provider.as_ref(), &request.as_request());
@@ -1011,7 +1016,7 @@ pub struct StepPass {
 /// 3. Neither: no walk. The roots are recorded unscanned with the note
 ///    ``excerpt: template `name` places no {{excerpts}}; nothing was read``, and the file set
 ///    holds only `input.changed_paths`.
-/// 4. Otherwise the roots are listed once — under `tokio::task::spawn_blocking` when one is
+/// 4. Otherwise the roots are listed once — under [`crate::contained::spawn_blocking`] when one is
 ///    readable, inline (no I/O) when none is. When the walk is wanted for skills, the file set is
 ///    built in the same hop from that listing, `input.touched_prefixes` and `input.changed_paths`
 ///    ([`step_files`]); when it is not, `select` never reads the set, so it holds only
@@ -1101,7 +1106,7 @@ pub async fn step_pass(
     let (mut request, mut listing, mut files) = if readable {
         let roots = request.roots.clone();
         let changed = request.changed_paths.clone();
-        let walked = tokio::task::spawn_blocking(move || {
+        let walked = crate::contained::spawn_blocking(move || {
             let listing = walk_pass(&request);
             // MOD-9 D120: the file set is built off the runtime too, from the same listing.
             let files = file_set(wants_files, &listing, &request);
@@ -1155,7 +1160,7 @@ pub async fn step_pass(
                 request.budget_tokens = budget;
                 let selected = if readable {
                     let roots = request.roots.clone();
-                    tokio::task::spawn_blocking(move || excerpt_pass(&request, &listing, est))
+                    crate::contained::spawn_blocking(move || excerpt_pass(&request, &listing, est))
                         .await
                         .map_err(|error| (roots, join_note(&error)))
                 } else {

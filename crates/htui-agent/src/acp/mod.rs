@@ -771,7 +771,7 @@ pub async fn open_session(
     let (ready_tx, ready_rx) = oneshot::channel();
 
     let timeout = options.handshake_timeout;
-    let task = tokio::spawn(run_session(
+    let task = crate::contained::spawn(run_session(
         io,
         spec,
         prompt,

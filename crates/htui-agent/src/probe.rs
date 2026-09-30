@@ -494,7 +494,7 @@ async fn on_path(names: &[String], env: &ProbeEnv) -> Result<Option<PathBuf>> {
     let names = names.to_vec();
     let paths = env.var("PATH").map(ToOwned::to_owned);
     let cwd = env.cwd.clone();
-    tokio::task::spawn_blocking(move || {
+    crate::contained::spawn_blocking(move || {
         names
             .iter()
             .find_map(|name| which::which_in(name, paths.as_deref(), &cwd).ok())
@@ -858,7 +858,7 @@ pub async fn glob_first(patterns: &[String], env: &ProbeEnv) -> Result<Option<Pa
     if plans.is_empty() {
         return Ok(None);
     }
-    tokio::task::spawn_blocking(move || {
+    crate::contained::spawn_blocking(move || {
         plans
             .into_iter()
             .find_map(|(root, segments)| newest(walk(&root, &segments)))

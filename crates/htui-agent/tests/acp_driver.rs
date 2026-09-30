@@ -333,6 +333,10 @@ async fn open_session_times_out_and_kills_its_child() {
 
 #[cfg(unix)]
 #[tokio::test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fakes run under no TUI panic hook"
+)]
 async fn a_failed_handshake_still_reaps_its_child() {
     let tmp = tempfile::tempdir().expect("temp box");
     let child = spawn(
@@ -399,6 +403,10 @@ async fn a_failed_handshake_still_reaps_its_child() {
 /// failed rather than answering with a bare vendor string.
 #[cfg(unix)]
 #[tokio::test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fakes run under no TUI panic hook"
+)]
 async fn a_refused_session_new_answers_with_the_agents_own_message() {
     let tmp = tempfile::tempdir().expect("temp box");
     let child = spawn(

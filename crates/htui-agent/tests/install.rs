@@ -17,6 +17,11 @@
 //! This file may name a vendor; the `install/` sources may not (`R-AGT-5`, enforced by
 //! `the_installer_names_no_vendor` in `tests/extensibility.rs`).
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "test fakes run under no TUI panic hook"
+)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

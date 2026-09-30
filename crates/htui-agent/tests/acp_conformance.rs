@@ -9,6 +9,11 @@
 //! real client — handshake, `session/new`, `session/set_config_option`, `session/update` decoding,
 //! `session/request_permission` parking, `session/cancel`, and the `session/prompt` response.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "test fakes run under no TUI panic hook"
+)]
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

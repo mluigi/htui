@@ -20,6 +20,11 @@
 //!    and transport-closed strings — live below all of them, so a second transport reaches them
 //!    without importing the first.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "test fakes run under no TUI panic hook"
+)]
+
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};

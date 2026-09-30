@@ -123,7 +123,7 @@ pub async fn open_url(url: &str, opener: &OpenerCommand) -> Result<()> {
         .spawn()
         .map_err(|error| DriverError::Spawn(format!("`{program}`: {error}")))?;
     // Reaped, not supervised: nothing here holds the child, so nothing here can kill it.
-    tokio::spawn(async move {
+    crate::contained::spawn(async move {
         let _ = child.wait().await;
     });
     Ok(())

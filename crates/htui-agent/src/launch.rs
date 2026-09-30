@@ -1020,15 +1020,15 @@ impl Drop for ChildGuard {
 /// the type system enforce that rather than the caller's memory.
 ///
 /// The rest of the work stays on the caller's thread on purpose: `tokio::process::Command::spawn`
-/// is non-blocking, and the stderr reader is a `tokio::spawn`ed task, so this function must be
-/// called from within a runtime.
+/// is non-blocking, and the stderr reader is a task started with
+/// [`crate::contained::spawn`], so this function must be called from within a runtime.
 ///
 /// # Errors
 /// [`DriverError::Spawn`] when the command cannot be found or the operating system refuses the
 /// spawn; [`DriverError::Transport`] when the blocking lookup task itself fails to run.
 pub async fn spawn(launch: &ResolvedLaunch, cwd: &Path) -> Result<Spawned> {
     let command = launch.command.clone();
-    let program = tokio::task::spawn_blocking(move || which::which(&command))
+    let program = crate::contained::spawn_blocking(move || which::which(&command))
         .await
         .map_err(|error| DriverError::Transport(format!("resolving the command: {error}")))?
         .map_err(|error| {
@@ -1050,7 +1050,7 @@ pub async fn spawn(launch: &ResolvedLaunch, cwd: &Path) -> Result<Spawned> {
 
     if let Some(stderr) = child.stderr().take() {
         let tail = Arc::clone(&stderr_tail);
-        tokio::spawn(async move {
+        crate::contained::spawn(async move {
             // `read_until` and `from_utf8_lossy`, not `lines()`: that iterator answers
             // `Err(InvalidData)` on a single byte that is not UTF-8 and **ends** — which would end
             // this reader, close the tap and freeze the tail on the first stray byte an adapter

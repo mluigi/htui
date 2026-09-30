@@ -43,6 +43,11 @@
 //! `session_id` assertion mean blueprint H-17 ("the banner carries `htui`'s mint, whatever the CLI
 //! echoes") rather than a tautology.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "test fakes run under no TUI panic hook"
+)]
+
 use std::collections::{BTreeMap, VecDeque};
 
 use htui_agent::cli::CliDriver;

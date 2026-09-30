@@ -702,7 +702,7 @@ pub async fn open_session(
     // answers only *whether* the stream opened, and a disagreement with what `system/init` echoes
     // is a `warn!` there rather than a value here (blueprint H-17).
     let session_ref = AgentSessionRef::new(options.session_id.clone());
-    let task = tokio::spawn(run_session(
+    let task = crate::contained::spawn(run_session(
         io,
         spec,
         prompt,
@@ -778,7 +778,7 @@ async fn run_session(
     // channel receive *is* cancellation-safe, so the line splitting happens over there and the
     // supervisor only ever selects over whole lines.
     let (lines_tx, lines_rx) = mpsc::channel(EVENTS_CAPACITY);
-    let reading = tokio::spawn(read_lines(reader, lines_tx));
+    let reading = crate::contained::spawn(read_lines(reader, lines_tx));
 
     session_main(
         spec, prompt, options, ready, events, commands, lines_rx, writer, &child,
