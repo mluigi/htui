@@ -165,6 +165,9 @@ struct Built {
 struct Shared<P: ReplySink> {
     /// I-1: which process this runtime is.
     role: Role,
+    /// Plan D14, OQ-5: whether a sweep claims the box's queued rows; off only through
+    /// [`RunRuntime::without_claim_scan`].
+    claim_scan: bool,
     parts: Parts,
     drivers: Arc<DriverFactory>,
     clock: Arc<dyn Clock>,
@@ -885,6 +888,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
         Self {
             shared: Arc::new(Shared {
                 role: Role::Tui,
+                claim_scan: true,
                 parts,
                 drivers: Arc::new(drivers),
                 clock: Arc::new(SystemClock),
@@ -987,6 +991,18 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
     #[must_use]
     pub fn with_role(mut self, role: Role) -> Self {
         self.configure().role = role;
+        self
+    }
+
+    /// A runtime whose sweeps never claim the box's queued rows (plan D14 and OQ-5 off); it still
+    /// adopts. For `htui --demo` (MOD-41 finding T9-V1): the demo's seeded `queued` run is a
+    /// showcase, and claiming it would walk it with the production parts.
+    ///
+    /// # Panics
+    /// When called after the runtime has served.
+    #[must_use]
+    pub fn without_claim_scan(mut self) -> Self {
+        self.configure().claim_scan = false;
         self
     }
 
@@ -1493,8 +1509,9 @@ async fn reclaim<H: htui_core::store::WorkerHost, P: ReplySink>(
 /// D158, D189: one sweep. I-1 (plan D12, D13): only the process whose role matches the box's
 /// executor adopts or claims, so the executor is read first, at every sweep. Then the adoption
 /// (nothing is built when there is nothing to adopt: no dead walk of this process and no run
-/// holding a slot on this box), then the claim scan, always (blueprint B-8: `queued` rows hold no
-/// slot, so the adoption's short-circuit must not skip them).
+/// holding a slot on this box), then the claim scan, always unless the runtime was built
+/// [`RunRuntime::without_claim_scan`] (blueprint B-8: `queued` rows hold no slot, so the
+/// adoption's short-circuit must not skip them).
 async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, P>) {
     let host = &ctx.host;
     if !ctx.shared.sweep_fixed
@@ -1524,7 +1541,9 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
     {
         adopt(&ctx).await;
     }
-    claim_scan(&ctx, box_id).await;
+    if ctx.shared.claim_scan {
+        claim_scan(&ctx, box_id).await;
+    }
 }
 
 /// D158, D189: the sweep's adoption: every lapsed lease on the box adopted, and each run that

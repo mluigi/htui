@@ -41,9 +41,18 @@ pub type RunRuntime = htui_worker::RunRuntime<Backend, TuiReplies>;
 pub type RunServed = htui_worker::RunServed<ReplyAddr>;
 
 /// The production run runtime the store loop serves `backend` with.
+///
+/// Outside tests a memory backend is only ever `htui --demo`, whose seeded `queued` run (`RUN_2`
+/// on `FEAT-3`) is a showcase: its runtime never claim-scans, so no sweep walks that run with the
+/// production isolator and drivers (MOD-41 finding T9-V1). Every other backend gets
+/// [`htui_worker::RunRuntime::production`], whose sweep claims the box's queued rows (plan D14,
+/// OQ-5).
 #[must_use]
-pub fn production_for(_backend: &Backend) -> RunRuntime {
-    RunRuntime::production()
+pub fn production_for(backend: &Backend) -> RunRuntime {
+    match backend {
+        Backend::Memory(_) => RunRuntime::production().without_claim_scan(),
+        _ => RunRuntime::production(),
+    }
 }
 
 impl From<RunReply> for StoreReply {
