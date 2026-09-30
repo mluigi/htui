@@ -797,7 +797,8 @@ pub fn loop_target(snapshot: &GraphSnapshot, review_position: i32) -> Option<i32
 /// review half compares the reviews of the loop's last two turns — the two rows at
 /// `review_position` answered `Rejected` — read from every version the item holds rather than
 /// the latest per kind, and hashes them through `prompt::digest::canonical`, the workspace's one
-/// normalisation, so a review re-emitted with different line endings does not read as progress. The hash half is asked first, so a loop where both hold reports `no_progress_hash`.
+/// normalisation, so a review re-emitted with different line endings does not read as progress.
+/// The hash half is asked first, so a loop where both hold reports `no_progress_hash`.
 async fn no_progress<S: WriteStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     steps: &[RunStep],
@@ -864,13 +865,17 @@ async fn commits_are_identical<S: WriteStore, C: Clock + ?Sized>(
 
 /// The reviews of the loop's last two turns, byte-identical after canonicalisation.
 ///
-/// A turn is a row at `review_position` answered `Rejected`: both entry points stamp it before
-/// the loop runs (`reject` and `Engine::answer_gate`). A review answered `Retried`, or one a crash
+/// A turn is a row at `review_position` answered `Rejected`, stamped before the loop reads the
+/// steps on both of its entry points: [`reject_step`] in [`apply`]'s `never` × rejected arm, and
+/// `Engine::answer_gate` for a human; the recovery sweep's `settle_failed` re-enters only on a row
+/// already stamped. A review answered `Retried`, or one a crash
 /// interrupted (`gate_outcome` NULL), is no turn, though it may have written a review too; reading
 /// the two latest review documents instead would compare a retried review with its re-run and
 /// stop a loop that made progress (CLEAN-4 review M-1). The two rejected rows with the highest
 /// attempts are compared, each through the highest version of the review phase's `output_kind`
-/// it produced — a promoted review's chat may have written more than one.
+/// it produced — a promoted review's chat may have written more than one. One turn per attempt is
+/// assumed: `review` never fans out (plan D64), and a candidate's rejection writes no
+/// `gate_outcome`, so two rejected rows never share an attempt.
 ///
 /// Reads [`ReadStore::documents`](htui_core::store::ReadStore::documents): heads of every version
 /// of every kind, without bodies. `documents_of_kinds` answers only the latest version per kind,
@@ -1808,6 +1813,15 @@ mod tests {
             no_progress(&ctx, &steps, 2, 3, 2).await.expect("reads"),
             None,
             "the two rejected reviews differ; the retried one between them is not a loop turn"
+        );
+
+        // A promoted review's chat rewrites the first turn's review to repeat the last one: the
+        // turn is read through its newest version, so the two turns now agree.
+        produce(&store, "review", Some(&first), "tests added").await;
+        assert_eq!(
+            no_progress(&ctx, &steps, 2, 3, 2).await.expect("reads"),
+            Some(LoopStop::NoProgressReview),
+            "each turn is read through the newest review it produced"
         );
     }
 
