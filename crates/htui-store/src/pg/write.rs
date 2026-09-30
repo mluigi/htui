@@ -4584,7 +4584,7 @@ impl WriteStore for PgStore {
     /// [`MemStore`](htui_core::store::MemStore)'s map simply keeps the last. Batches are one row
     /// per repo in scope.
     ///
-    /// An empty slice still runs the existence and fence check ([`step_fence`]) and writes nothing.
+    /// An empty slice still runs the existence and fence check (`step_fence`) and writes nothing.
     ///
     /// The transaction also writes `run_step.isolation_path` (ANA-2 `:903`, plan D33), because a
     /// step has many trees and one isolation path and this is the only call that sees both. The
