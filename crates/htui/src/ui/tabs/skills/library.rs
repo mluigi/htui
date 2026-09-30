@@ -2116,12 +2116,12 @@ mod tests {
         (clock, Backend::memory(store))
     }
 
-    /// HANDOFF MOD-59 (a): another session re-describes the skill between the rename and the
-    /// worker's re-read, so the re-read holds their description, not ours. The rename's own
-    /// `SkillWritten` still closes the form; before MOD-59 the content match never held and the
+    /// HANDOFF MOD-59 (a): another session re-describes the skill between our `EditSkill` (a
+    /// re-describe too) and the worker's re-read, so the re-read holds their description, not ours.
+    /// The edit's own `SkillWritten` still closes the form; before MOD-59 the content match never held and the
     /// form refused `Esc` until the workspace changed.
     #[tokio::test]
-    async fn a_rename_lands_although_another_session_renamed_it_before_the_reread() {
+    async fn an_edit_lands_although_another_session_redescribed_the_skill_before_the_reread() {
         let backend = Backend::memory(MemStore::demo());
         let bench = Bench::new();
         let mut ctx = bench.ctx();

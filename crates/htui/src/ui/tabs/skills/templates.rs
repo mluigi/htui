@@ -1513,9 +1513,9 @@ mod tests {
     }
 
     /// MOD-59 D5: a save whose re-read failed was appended all the same. It lands: the editor
-    /// closes and the notice says what was saved and that the tree drawn is the one held. A
-    /// `TemplateSaved` whose re-read failed while no save is in flight has no scope to check, so it
-    /// changes nothing.
+    /// closes and the notice says what was saved and that the tree drawn is the one held, so a new
+    /// name it does not show leaves the cursor where it was. A `TemplateSaved` whose re-read failed
+    /// while no save is in flight has no scope to check, so it changes nothing.
     #[tokio::test]
     async fn a_save_whose_reread_failed_lands_and_keeps_the_tree_drawn() {
         let backend = Backend::memory(MemStore::demo());
@@ -1553,6 +1553,48 @@ mod tests {
         );
         assert_eq!(view.snapshot, before, "the tree drawn is the one held");
         assert_eq!(view.unavailable, None, "a tree is held, so it stays drawn");
+
+        // A new name lands the same way, but the held tree has no row for it yet: the cursor
+        // stays where it was rather than move onto a row that is not drawn.
+        let cursor = view.cursor;
+        view.on_key(key('n'), &mut ctx);
+        for c in "release-notes".chars() {
+            view.on_key(key(c), &mut ctx);
+        }
+        view.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ctx);
+        // `{{item}}`, so a phase role's "no item" question does not hold the save back.
+        for c in "{{item}}".chars() {
+            view.on_key(key(c), &mut ctx);
+        }
+        view.on_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &mut ctx,
+        );
+        let create = bench.one();
+        assert!(
+            matches!(&create, StoreRequest::SaveTemplate { name, expected: None, .. } if name == "release-notes"),
+            "{create:?}"
+        );
+        view.on_reply(
+            &StoreReply::TemplateSaved {
+                snapshot: Err("store unreachable: gone".to_owned()),
+                project: ids::PROJECT_VULKAN,
+                name: "release-notes".to_owned(),
+                version: 1,
+            },
+            &mut ctx,
+        );
+        assert!(matches!(view.mode, Mode::Browse), "{:?}", view.mode);
+        assert_eq!(view.busy, None);
+        assert!(
+            matches!(&view.notice, Some(Notice::Error(text)) if text.starts_with("saved v1 \u{2014}")),
+            "{:?}",
+            view.notice
+        );
+        assert_eq!(
+            view.cursor, cursor,
+            "the held tree has no `release-notes` row"
+        );
         assert_eq!(
             view.selected_template(),
             Some((ids::PROJECT_VULKAN, "implement".to_owned()))
