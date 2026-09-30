@@ -12,9 +12,10 @@ DESKTOP-HTUI (this box)     host          DESKTOP-HTUI (this box)
                             spec          probed under the current spec: no
                             probed tags   rust, msvc, cmake
                             declared tags gpu
-                            quirks        no admin rights
-                                          use the D: drive
-                            executor      tui
+                            quirks        (none)
+                            executor      executor of `DESKTOP-HTUI`: `tui` → `worker`? The TUI
+                                          stops walking runs here; `htui worker` must run on this
+                                          box.
                             tools         cargo 1.98.0, cmake, git 2.51.0, rustc 1.98.0
 
                             probe spec: seed · <digest>
@@ -30,5 +31,4 @@ DESKTOP-HTUI (this box)     host          DESKTOP-HTUI (this box)
 
 
 
-
-ctrl-s saves · Esc cancels · Enter breaks the line
+y write · n/esc cancel

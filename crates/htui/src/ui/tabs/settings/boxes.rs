@@ -1,6 +1,7 @@
 //! `Settings > Boxes` (MOD-7 milestone 2, PRD D4, `R-TUI-8`): every box of this user with its
-//! profile, tools, probed and declared tags, quirks and last probe; declared tags and quirks
-//! edited as a compare-and-set a reconnect cannot stale; the probe on this box only.
+//! profile, tools, probed and declared tags, quirks, executor and last probe; declared tags,
+//! quirks and the executor (MOD-41 plan D10) edited as a compare-and-set a reconnect cannot
+//! stale; the probe on this box only.
 //!
 //! Holds no store handle and mints no id (`R-NF-3`): every `BoxId` it sends came out of a
 //! [`BoxesSnapshot`].
@@ -15,7 +16,9 @@
 //! the editor early; if the save then comes back `BoxesStale`, `CHANGED_ELSEWHERE_CLOSED` says
 //! nothing was written and how to retry.
 
-use htui_core::model::{BoxId, BoxRecord, Scope, canonical_declared_tags, declared_tags_from_text};
+use htui_core::model::{
+    BoxId, BoxRecord, Executor, Scope, canonical_declared_tags, declared_tags_from_text,
+};
 
 use std::collections::BTreeSet;
 
@@ -45,8 +48,7 @@ const UNAVAILABLE: &str = "boxes unavailable";
 const NO_BOXES: &str = "no box is registered for this user yet";
 
 /// The Browse keys.
-const HINT_BROWSE: &str =
-    "j/k move \u{b7} t tags \u{b7} e quirks \u{b7} p probe this box \u{b7} r reload";
+const HINT_BROWSE: &str = "j/k move \u{b7} t tags \u{b7} e quirks \u{b7} w executor \u{b7} p probe this box \u{b7} r reload";
 
 /// The Browse keys with no list to act on.
 const HINT_NO_LIST: &str = "r reload";
@@ -56,6 +58,9 @@ const HINT_TAGS: &str = "Enter saves \u{b7} Esc cancels \u{b7} comma-separated";
 
 /// The quirks editor's keys (OQ-16: `Enter` is a line break, so `ctrl-s` saves).
 const HINT_QUIRKS: &str = "ctrl-s saves \u{b7} Esc cancels \u{b7} Enter breaks the line";
+
+/// The executor confirmation's keys (MOD-41 plan D10).
+const HINT_EXECUTOR: &str = "y write \u{b7} n/esc cancel";
 
 /// The list pane's width, the one-column gutter to the detail pane included.
 const LIST_WIDTH: u16 = 28;
@@ -79,6 +84,11 @@ const IN_FLIGHT: &str = "edit_box in flight";
 /// `ctrl-s` is the save that retries. Starts `changed elsewhere`, so `is_error` draws it in
 /// `theme.error`.
 const CHANGED_ELSEWHERE_QUIRKS: &str = "changed elsewhere since you opened it \u{2014} reloaded; ctrl-s retries against the current row";
+
+/// [`CHANGED_ELSEWHERE`] for the executor confirmation, where `y` is the write that retries
+/// (MOD-41 plan D10). Starts `changed elsewhere`, so `is_error` draws it in `theme.error`.
+const CHANGED_ELSEWHERE_EXECUTOR: &str =
+    "changed elsewhere since you opened it \u{2014} reloaded; y retries against the current row";
 
 /// `p` on a box that is not this one (PRD D4).
 const THIS_BOX_ONLY: &str = "the probe runs on this box only";
@@ -115,6 +125,53 @@ enum Mode {
     Tags(Editor<TextField, Vec<String>>),
     /// The quirks editor: free text over several lines.
     Quirks(Editor<TextArea, String>),
+    /// The executor flip, awaiting y/n (MOD-41 plan D10).
+    Executor(ExecutorFlip),
+}
+
+/// An open executor confirmation: the box, the token it opened on, and the flip it proposes.
+#[derive(Debug)]
+struct ExecutorFlip {
+    /// From the snapshot row the confirmation opened on.
+    box_id: BoxId,
+    /// `edit_version` at open; replaced only by a `BoxesStale` (D48).
+    expected: i32,
+    /// `Executor::of(&row.settings)` at open.
+    from: Executor,
+    /// What `y` writes: always `Tui` or `Worker`, since `edit_box` refuses `Other(_)` (F-35).
+    to: Executor,
+}
+
+impl ExecutorFlip {
+    /// The flip `w` proposes over `record`: `tui` to `worker`, and anything else back to `tui`,
+    /// the default (F-35: an unknown value cannot be written, so it cannot be kept either).
+    fn over(record: &BoxRecord) -> Self {
+        let from = Executor::of(&record.row.settings);
+        let to = match from {
+            Executor::Tui => Executor::Worker,
+            Executor::Worker | Executor::Other(_) => Executor::Tui,
+        };
+        Self {
+            box_id: record.row.id,
+            expected: record.row.edit_version,
+            from,
+            to,
+        }
+    }
+
+    /// The confirmation line over the box named `hostname`: the flip, then what it changes.
+    fn question(&self, hostname: &str) -> String {
+        let consequence = match self.to {
+            Executor::Worker => {
+                "The TUI stops walking runs here; `htui worker` must run on this box."
+            }
+            Executor::Tui | Executor::Other(_) => "The TUI walks this box's runs again.",
+        };
+        format!(
+            "executor of `{hostname}`: `{}` \u{2192} `{}`? {consequence}",
+            self.from, self.to
+        )
+    }
 }
 
 /// An open editor: the box, the token it opened on, the value it opened on, the widget.
@@ -163,6 +220,7 @@ impl BoxesSection {
             Mode::Browse => None,
             Mode::Tags(editor) => Some(editor.box_id),
             Mode::Quirks(editor) => Some(editor.box_id),
+            Mode::Executor(flip) => Some(flip.box_id),
         }
     }
 
@@ -236,6 +294,10 @@ impl BoxesSection {
                 editor.expected = token;
                 CHANGED_ELSEWHERE_QUIRKS
             }
+            (Some(token), Mode::Executor(flip)) => {
+                flip.expected = token;
+                CHANGED_ELSEWHERE_EXECUTOR
+            }
             (Some(_), Mode::Browse) => CHANGED_ELSEWHERE,
             (None, _) => {
                 self.mode = Mode::Browse;
@@ -245,9 +307,10 @@ impl BoxesSection {
         self.notice = Some(notice.to_owned());
     }
 
-    /// Whether `t`/`e`/`p` must do nothing: a list the read could not confirm (the body shows the
-    /// refusal, not the rows), or a save in flight (D56, the kinds section's `blocked`): its reply
-    /// closes whatever editor is open, so a second one would lose its text to the first's reply.
+    /// Whether `t`/`e`/`w`/`p` must do nothing: a list the read could not confirm (the body shows
+    /// the refusal, not the rows), or a save in flight (D56, the kinds section's `blocked`): its
+    /// reply closes whatever editor is open, so a second one would lose its text to the first's
+    /// reply.
     fn blocked(&mut self) -> bool {
         if self.unavailable.is_some() {
             return true;
@@ -303,6 +366,19 @@ impl BoxesSection {
         self.notice = None;
     }
 
+    /// `w` (MOD-41 plan D10): the executor confirmation over the selected row. Nothing is
+    /// written until `y`.
+    fn open_executor(&mut self) {
+        if self.blocked() {
+            return;
+        }
+        let Some(record) = self.selected_record() else {
+            return;
+        };
+        self.mode = Mode::Executor(ExecutorFlip::over(record));
+        self.notice = None;
+    }
+
     /// `p` (D49, PRD D4): milestone 1's probe, on this box only.
     ///
     /// One `ProbeBox` in flight per section, a deviation from D63: a second one would supersede
@@ -340,6 +416,7 @@ impl BoxesSection {
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let outcome = match &mut self.mode {
             Mode::Browse => return Handled::Pass,
+            Mode::Executor(_) => return self.on_executor_key(key, ctx),
             Mode::Tags(editor) => editor.input.on_key(key),
             // `PageUp`/`PageDown` move by the editor's drawn height.
             Mode::Quirks(editor) => editor.input.on_key(key, QUIRKS_HEIGHT),
@@ -362,9 +439,27 @@ impl BoxesSection {
         }
     }
 
-    /// `Enter` (tags) or `ctrl-s` (quirks): one `EditBox` with only the edited field, when the
-    /// value differs from what the editor opened on (D48, D59). The editor stays open until the
-    /// reply.
+    /// One key over the executor confirmation (MOD-41 plan D10): `y` writes, `n`/`Esc` cancel,
+    /// `CONTROL` chords pass (so `ctrl-c` still quits) and every other key is swallowed.
+    fn on_executor_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Handled::Pass;
+        }
+        match key.code {
+            KeyCode::Char('y') => self.submit(ctx),
+            KeyCode::Char('n') | KeyCode::Esc => {
+                // `busy` stays, as in `on_editor_key`: a write already sent is still answered.
+                self.mode = Mode::Browse;
+                self.notice = None;
+            }
+            _ => {}
+        }
+        Handled::Consumed
+    }
+
+    /// `Enter` (tags), `ctrl-s` (quirks) or `y` (executor): one `EditBox` with only the edited
+    /// field, when the value differs from what the editor opened on (D48, D59); a flip always
+    /// differs. The editor stays open until the reply.
     fn submit(&mut self, ctx: &Ctx<'_>) {
         if self.busy.is_some() {
             self.notice = Some(IN_FLIGHT.to_owned());
@@ -403,6 +498,14 @@ impl BoxesSection {
                     },
                 })
             }
+            Mode::Executor(flip) => Some(StoreRequest::EditBox {
+                box_id: flip.box_id,
+                expected: flip.expected,
+                edit: BoxEdit {
+                    executor: Some(flip.to.clone()),
+                    ..BoxEdit::default()
+                },
+            }),
         };
         match request {
             // Only a user who typed writes it: unchanged text closes the editor.
@@ -446,6 +549,8 @@ impl SettingsSection for BoxesSection {
         }
         // Browse. `j`, `k`, `t`, `e`, `p`, `r` are free: the global table binds `q`, `?`, the
         // digits and `w`, and the tab consumes `h`/`l`/`[`/`]`/arrows before a section sees them.
+        // `w` (MOD-41 plan D10) shadows the global workspace switcher only while a box is listed
+        // to act on; over no list it passes, so the switcher is still one key away.
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 self.move_selection(true);
@@ -461,6 +566,12 @@ impl SettingsSection for BoxesSection {
             }
             KeyCode::Char('e') => {
                 self.open_quirks();
+                Handled::Consumed
+            }
+            KeyCode::Char('w')
+                if self.unavailable.is_none() && self.selected_record().is_some() =>
+            {
+                self.open_executor();
                 Handled::Consumed
             }
             KeyCode::Char('p') => {
@@ -727,6 +838,27 @@ impl BoxesSection {
             }
         }
 
+        match &self.mode {
+            Mode::Executor(flip) => {
+                // The flip names its own box: after a reload the selection may be another one.
+                let hostname = snapshot
+                    .boxes
+                    .iter()
+                    .find(|listed| listed.row.id == flip.box_id)
+                    .map_or(row.hostname.as_str(), |listed| listed.row.hostname.as_str());
+                let question = wrapped(&flip.question(hostname), room)
+                    .into_iter()
+                    .map(|line| Line::styled(line, theme.base))
+                    .collect();
+                lines.extend(under_label("executor", question, theme));
+            }
+            _ => lines.push(labelled(
+                "executor",
+                Executor::of(&row.settings).to_string(),
+                theme,
+            )),
+        }
+
         let tools: Vec<String> = record
             .tools
             .iter()
@@ -761,6 +893,7 @@ impl BoxesSection {
             Mode::Browse => HINT_NO_LIST.to_owned(),
             Mode::Tags(_) => HINT_TAGS.to_owned(),
             Mode::Quirks(_) => HINT_QUIRKS.to_owned(),
+            Mode::Executor(_) => HINT_EXECUTOR.to_owned(),
         };
         if self.probing {
             hint.push_str(" \u{b7} probing\u{2026}");

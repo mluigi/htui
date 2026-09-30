@@ -14,10 +14,10 @@ DESKTOP-HTUI (this box)     host          DESKTOP-HTUI (this box)
                             declared tags gpu, vulkan
                                           seen: cmake, gpu, msvc, rust
                             quirks        (none)
+                            executor      tui
                             tools         cargo 1.98.0, cmake, git 2.51.0, rustc 1.98.0
 
                             probe spec: seed · <digest>
-
 
 
 
