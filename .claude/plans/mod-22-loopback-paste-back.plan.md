@@ -1,8 +1,8 @@
 # Plan: MOD-22 — complete a loopback OAuth login from a box the browser cannot reach
 
-> **Status: draft 2026-09-30, fact-checked 2026-09-30 (see "Verified claims"), awaiting maintainer
-> confirmation.** Every open question has a recommended answer. The plan adopts each one, so
-> implementation is not blocked once they are confirmed.
+> **Status: done 2026-09-30** (`docs/decisions/mod/mod-22.md`). Drafted and fact-checked
+> 2026-09-30 (see "Verified claims"), confirmed by the maintainer with every recommended answer,
+> implemented as T1-T4 plus two review rounds.
 
 **Source**: `HANDOFF.md` MOD-22 (the checklist entry at `:505-535`, from MOD-21). An agent's own
 login flow redirects to a listener **inside the adapter process**, on the loopback of the box `htui`
