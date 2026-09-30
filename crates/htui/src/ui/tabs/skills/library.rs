@@ -2013,6 +2013,112 @@ mod tests {
         );
     }
 
+    /// MOD-9 D127, D134 (milestone 3's review finding 6): a skill with no version row — only a
+    /// hand-written row reaches the state, so the reply is doctored — opens the editor on an
+    /// empty body with head token 0, and the save asks the writer for v1. `i` and `a` are not
+    /// blocked; the version, base and diff keys have nothing to act on and stay inert.
+    #[tokio::test]
+    async fn a_skill_with_no_version_opens_an_empty_editor_on_token_0() {
+        let backend = Backend::memory(MemStore::demo());
+        let scope = vulkan();
+        let (top_bar, keymap, theme, emit) = (
+            TopBarState::default(),
+            Keymap::default_global(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let mut ctx = Ctx::new(
+            &scope,
+            &[],
+            &top_bar,
+            &keymap,
+            &theme,
+            Origin::Tab(SkillsTab::ID),
+            &emit,
+        );
+        let mut view = LibraryView::default();
+        let StoreReply::Skills(mut snapshot) =
+            serve(&backend, &StoreRequest::Skills(scope.clone())).await
+        else {
+            panic!("the read answers `Skills`");
+        };
+        // The cursor starts on `rust-style`; strip its versions.
+        assert_eq!(snapshot.skills[0].skill.id, ids::SKILL_RUST_STYLE);
+        snapshot.skills[0].versions.clear();
+        view.on_reply(&StoreReply::Skills(snapshot), &mut ctx);
+
+        for c in [',', '.', 'b', 'd'] {
+            view.on_key(key(KeyCode::Char(c)), &mut ctx);
+            assert!(matches!(view.mode, Mode::Browse), "`{c}`: {:?}", view.mode);
+            assert_eq!(
+                (view.shown, view.base, view.pane),
+                (None, None, Pane::Body),
+                "`{c}` has no version to act on"
+            );
+            assert_eq!(view.notice, None, "`{c}` says nothing");
+        }
+        assert!(sent(&emit).is_empty(), "the inert keys send nothing");
+
+        view.on_key(key(KeyCode::Char('i')), &mut ctx);
+        assert!(
+            matches!(view.mode, Mode::Info(_)),
+            "`i` opens the info form (D134): {:?}",
+            view.mode
+        );
+        view.mode = Mode::Browse;
+        view.on_key(key(KeyCode::Char('a')), &mut ctx);
+        assert!(
+            view.attach.is_some(),
+            "`a` opens the attachments pane (D134)"
+        );
+        view.attach = None;
+
+        view.on_key(key(KeyCode::Char('E')), &mut ctx);
+        let pending = view
+            .external
+            .take()
+            .expect("`E` hands an editor to $EDITOR");
+        assert_eq!(
+            (
+                pending.editor.token,
+                pending.editor.from,
+                pending.editor.area.text()
+            ),
+            (0, None, "")
+        );
+        let _ = emit.take();
+
+        view.on_key(key(KeyCode::Char('e')), &mut ctx);
+        let Mode::Editing(editor) = &view.mode else {
+            panic!("`e` opens the editor: {:?}", view.mode);
+        };
+        assert_eq!(
+            (editor.token, editor.from, editor.area.text()),
+            (0, None, ""),
+            "an empty body over head token 0"
+        );
+        for c in "Body.".chars() {
+            view.on_key(key(KeyCode::Char(c)), &mut ctx);
+        }
+        view.on_key(ctrl('s'), &mut ctx);
+        let requests = sent(&emit);
+        let [
+            StoreRequest::SaveSkillVersion {
+                skill,
+                expected,
+                body,
+                ..
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("exactly one version save was sent: {requests:?}");
+        };
+        assert_eq!(
+            (*skill, *expected, body.as_str()),
+            (ids::SKILL_RUST_STYLE, 0, "Body.")
+        );
+    }
+
     /// D77: a blank body is refused by the view, and the refusal sends nothing.
     #[tokio::test]
     async fn a_blank_body_dispatches_no_request() {
