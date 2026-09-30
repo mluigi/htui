@@ -38,6 +38,11 @@
 //! transport — a session's child and a session's byte streams are separable in [`AcpIo`], and
 //! separating them here is what makes the assertion about the child alone.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "test fakes run under no TUI panic hook"
+)]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]

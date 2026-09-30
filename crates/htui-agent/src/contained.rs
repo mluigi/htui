@@ -50,6 +50,10 @@ use crate::excerpt::contain;
 /// # Panics
 /// As tokio's: when called outside a Tokio runtime.
 #[track_caller]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the wrapper the lint points at: the closure it hands tokio is `contain(f)`"
+)]
 pub fn spawn_blocking<F, R>(f: F) -> JoinHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
@@ -66,6 +70,10 @@ where
 /// # Panics
 /// As tokio's: when called outside a Tokio runtime.
 #[track_caller]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the wrapper the lint points at: the future it hands tokio opens the window per poll"
+)]
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
@@ -82,6 +90,10 @@ where
 /// # Panics
 /// As tokio's: when called outside a Tokio runtime.
 #[track_caller]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the wrapper the lint points at: the future it hands tokio opens the window per poll"
+)]
 pub fn spawn_in<T, F>(set: &mut JoinSet<T>, future: F) -> AbortHandle
 where
     T: Send + 'static,

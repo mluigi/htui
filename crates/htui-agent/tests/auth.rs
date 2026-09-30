@@ -19,6 +19,11 @@
 //! a case's own assertion living in its own file is what lets one of them change without the others
 //! being re-read.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "test fakes run under no TUI panic hook"
+)]
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

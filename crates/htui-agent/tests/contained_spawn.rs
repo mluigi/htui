@@ -87,6 +87,10 @@ fn every_contained_spawn_opens_the_window_and_a_raw_one_does_not() {
             let in_set = matches!(set.join_next().await, Some(Err(ref error)) if error.is_panic());
 
             // 4. The control: a raw spawn must record `false`, or cases 1-3 prove nothing.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the control: a raw spawn must record false, or cases 1-3 prove nothing"
+            )]
             let raw = tokio::task::spawn_blocking(|| {
                 panic!("raw: blocking");
             })
@@ -124,6 +128,10 @@ fn every_contained_spawn_opens_the_window_and_a_raw_one_does_not() {
             release_rx.await.ok();
             panic_is_contained()
         });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the raw task that checks no window stays open across the parked task's Pending"
+        )]
         let raw = tokio::spawn(async move {
             let inside = entered_rx.await.unwrap_or(false);
             let outside = panic_is_contained();

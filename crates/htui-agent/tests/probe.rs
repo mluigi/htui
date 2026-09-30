@@ -7,6 +7,11 @@
 //! `claude` row would spawn the real adapter inside `cargo test` (blueprint H-7); the live probe
 //! lives in `tests/probe_live.rs`, `#[ignore]`d.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "test fakes run under no TUI panic hook"
+)]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
