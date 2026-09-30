@@ -999,6 +999,32 @@ impl WriteStore for SpyStore {
     }
 }
 
+/// The recorder's surface (MOD-41 plan D4, D5): each method is the spy's own [`WriteStore`] method
+/// by path, so the refusals and the logs above apply whichever trait the recorder is bound on.
+impl htui_core::store::RecorderStore for SpyStore {
+    async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> StoreResult<usize> {
+        WriteStore::append_events(self, fence, events).await
+    }
+    async fn set_step_usage(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        usage: Value,
+        prompt_digest: Option<String>,
+    ) -> StoreResult<()> {
+        WriteStore::set_step_usage(self, fence, step, usage, prompt_digest).await
+    }
+    async fn set_agent_box_quota(
+        &self,
+        agent_id: AgentId,
+        box_id: BoxId,
+        quota: Value,
+        quota_at: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        WriteStore::set_agent_box_quota(self, agent_id, box_id, quota, quota_at).await
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // A scrubber that masks a value whatever its type
 // ---------------------------------------------------------------------------------------------

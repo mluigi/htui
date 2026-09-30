@@ -603,6 +603,32 @@ impl<'a, S: WriteStore> UsageSpy<'a, S> {
             .expect("the spy log is never poisoned")
             .clone()
     }
+
+    /// Logs one accepted `set_step_usage` write. Shared by the [`WriteStore`] and the
+    /// `RecorderStore` impls, so the log is the same whichever trait the recorder is bound on.
+    fn log_usage(&self, usage: Value, prompt_digest: Option<String>) {
+        self.calls
+            .lock()
+            .expect("the spy log is never poisoned")
+            .push(UsageCall {
+                usage,
+                prompt_digest,
+            });
+    }
+
+    /// Logs one accepted `set_agent_box_quota` call, written or not (MOD-40 plan D4). Shared as
+    /// [`UsageSpy::log_usage`] is.
+    fn log_quota(&self, agent_id: AgentId, box_id: BoxId, quota: Value, quota_at: DateTime<Utc>) {
+        self.quota_calls
+            .lock()
+            .expect("the spy log is never poisoned")
+            .push(QuotaCall {
+                agent_id,
+                box_id,
+                quota,
+                quota_at,
+            });
+    }
 }
 
 impl<S: WriteStore> ReadStore for UsageSpy<'_, S> {
@@ -738,13 +764,7 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
         self.inner
             .set_step_usage(fence, step, usage.clone(), prompt_digest.clone())
             .await?;
-        self.calls
-            .lock()
-            .expect("the spy log is never poisoned")
-            .push(UsageCall {
-                usage,
-                prompt_digest,
-            });
+        self.log_usage(usage, prompt_digest);
         Ok(())
     }
     async fn upsert_agent(
@@ -784,15 +804,7 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
             .inner
             .set_agent_box_quota(agent_id, box_id, quota.clone(), quota_at)
             .await?;
-        self.quota_calls
-            .lock()
-            .expect("the spy log is never poisoned")
-            .push(QuotaCall {
-                agent_id,
-                box_id,
-                quota,
-                quota_at,
-            });
+        self.log_quota(agent_id, box_id, quota, quota_at);
         Ok(written)
     }
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> StoreResult<()> {
@@ -1255,6 +1267,57 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
         kind: CitationKind,
     ) -> StoreResult<ItemRequirement> {
         self.inner.reconfirm(item, requirement, kind).await
+    }
+}
+
+/// The recorder's surface (MOD-41 plan D4, D5), logged exactly as the [`WriteStore`] impl logs.
+///
+/// Bounded on `RecorderStore` as well as [`WriteStore`] and forwarding to the inner store's
+/// `RecorderStore` methods: an impl forwarding to a generic `S: WriteStore` cannot prove its
+/// futures `Send` (plan fact-check P-1b). `S` sees both families, so every call on it is UFCS.
+impl<S: WriteStore + htui_core::store::RecorderStore> htui_core::store::RecorderStore
+    for UsageSpy<'_, S>
+{
+    async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> StoreResult<usize> {
+        htui_core::store::RecorderStore::append_events(self.inner, fence, events).await
+    }
+    async fn set_step_usage(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        usage: Value,
+        prompt_digest: Option<String>,
+    ) -> StoreResult<()> {
+        // The write first, the log after, as in the `WriteStore` impl.
+        htui_core::store::RecorderStore::set_step_usage(
+            self.inner,
+            fence,
+            step,
+            usage.clone(),
+            prompt_digest.clone(),
+        )
+        .await?;
+        self.log_usage(usage, prompt_digest);
+        Ok(())
+    }
+    async fn set_agent_box_quota(
+        &self,
+        agent_id: AgentId,
+        box_id: BoxId,
+        quota: Value,
+        quota_at: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        // The write first, the log after, as in the `WriteStore` impl.
+        let written = htui_core::store::RecorderStore::set_agent_box_quota(
+            self.inner,
+            agent_id,
+            box_id,
+            quota.clone(),
+            quota_at,
+        )
+        .await?;
+        self.log_quota(agent_id, box_id, quota, quota_at);
+        Ok(written)
     }
 }
 
