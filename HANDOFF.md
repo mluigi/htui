@@ -14,7 +14,14 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-29):** **TOOL-7 shipped** (`docs/decisions/tool/tool-7.md`): `scripts/hr` runs
+**Current status (2026-09-30):** **MOD-23 done** (`docs/decisions/mod/mod-23.md`): Settings > Agents
+edits the registry. `n` creates a row, `e` edits one (transport, command and shell-word args, models,
+default model, billing, enabled; `name` is create-only; a launch edit merges and never touches `env`),
+and `t` switches an agent off on this box. The switch is the new `agent_box.user_off` (migration
+`0008`), which no probe can undo and which refuses chat start and step promotion too. Writes are
+MOD-40's compare-and-set, answered by one self-naming `AgentWritten` reply. Follow-up **MOD-66**
+(per-box manual tool path).
+Before it, **TOOL-7 shipped** (`docs/decisions/tool/tool-7.md`): `scripts/hr` runs
 3–4 `/handoff-run` lifecycles side by side, each in its own container set (fresh clone on
 `hr/<ITEM>`, private Postgres/Qdrant, no git credentials), with cross-run ID leases through
 `scripts/hr-mint`; guide `docs/hr-sandbox.md`.
@@ -26,23 +33,17 @@ Item detail gained a **Reqs** sub-tab ("Documents" is now "Docs") to re-confirm,
 and the Runs pane's close-out picks the resolution, so an `open` item can now close as withdrawn,
 rejected, superseded or duplicate. CLEAN-6 was folded in, and the stale `Engine::close_out` doc comments were fixed once
 MOD-40 released `engine.rs`. No migration and no store change.
-Before it, **MOD-40 was done** (`docs/decisions/mod/mod-40.md`): step
-writes (`append_events`, `set_step_usage`, `finish_step`) are fenced by the run's lease owner, so a
-process that wakes after its run was adopted writes nothing to its old step. Lease times are
-stamped by Postgres, quota writes keep the newest, agent edits are a compare-and-set, the store
-worker beats `box.last_seen_at`, and a headless connect never migrates and refuses a build below
-`htui_target_version` (`R-STO-5` amended). No migration. **MOD-41** is no longer blocked.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
-(MOD-38) and `0007_skill_attachments` (MOD-9 milestone 2; cache: `0001`..`0004`), so **the next
-migration is `0008`** (cache: `0005`).
+(MOD-38), `0007_skill_attachments` (MOD-9 milestone 2) and `0008_agent_box_user_off` (MOD-23; cache:
+`0001`..`0004`), so **the next migration is `0009`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
-(done, all four milestones), MOD-38, MOD-9 milestones 1 to 4, MOD-40 and MOD-39 (re-counted
-2026-09-29): store conformance `CASES` 96, `READ_CASES` 14, `htui-orch` `CASES` 73, `GraphSource` 7
-methods, `StoreRequest` 85, `StoreReply` 47, `hierarchy::REQUEST_NAMES` 13, 288 `.sqlx` files, 107
+(done, all four milestones), MOD-38, MOD-9 milestones 1 to 4, MOD-40, MOD-39 and MOD-23 (re-counted
+2026-09-30): store conformance `CASES` 97, `READ_CASES` 14, `htui-orch` `CASES` 73, `GraphSource` 7
+methods, `StoreRequest` 88, `StoreReply` 48, `hierarchy::REQUEST_NAMES` 13, 289 `.sqlx` files, 110
 `crates/htui/tests/snapshots`,
-`MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 34 pinned commented
+`MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 35 pinned commented
 columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 2` with `skill_choices`.
 Excerpts reach phase prompts since MOD-7 milestone 4, so a phase-prompt digest recorded before
 2026-09-26 does not compare with a later one; handoff digests are unchanged.
@@ -249,6 +250,9 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   `TokenEstimator::for_model` (keyed on a model id), not `for_agent`, and every production
   `PromptSpec` passes `TokenEstimator::DEFAULT` today (`htui-orch/src/engine.rs:4323`, `:4945`,
   `htui/src/preview.rs:252`), so choosing it per group or per candidate is new wiring.
+  **MOD-23 note (2026-09-30, `docs/decisions/mod/mod-23.md`):** ANA-21 item 8's "MOD-23's editor
+  surfaces `settings.weights`" moved here: the Settings > Agents edit form carries `settings`
+  untouched, and a weights field is one more entry in its field list (plan D231).
 - [ ] **MOD-33 - The box hostname leaves the digest and gains a settings switch** (from MOD-2,
   finding L-5; maintainer-decided 2026-09-16). `R-PRM-1`, `R-PRM-3`, `R-TUI-8`. Two changes to the
   box section (`prompt/render.rs`, the §4.2 projection over `BoxProfile`):
@@ -598,39 +602,16 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   rather than a guess; it records no such fact yet. **Not
   blocked** — MOD-21 landed (`docs/decisions/mod/mod-21.md`). Found while running its live proof on
   2026-09-10.
-- [ ] **MOD-23 - Agent registry editing in the Settings agents section** (from MOD-2). `R-AGT-4`,
-  `R-AGT-6`, `R-TUI-8`. Create a manual agent row and edit an existing one: transport (`acp` or
-  `cli`), launch command and args, model list, default model, billing mode, the `agent` row's
-  `enabled` and the per-box `agent_box.enabled`. The surface is the **`agents` section of the
-  Settings tab, not a tab of its own** — `SettingsSection`/`SectionId("agents")` in the section
-  strip (`crates/htui/src/ui/tabs/settings/{mod.rs,agents.rs}`). It is **no longer the only
-  registered section**: MOD-15 added `hierarchy`, `kinds`, `prompt` and `connection` after it, so
-  MOD-34 added `qdrant` and MOD-7 milestone 2 `boxes`, so the strip is seven titles wide (61 of
-  the pinned 100 columns, `tests/settings.rs`) and
-  `SettingsSection::captures_input` now exists for a section that takes typed input. MOD-9 adds
-  none (its editors live in the Skills tab, PRD D1). MOD-2 built it read-only (`r` probe, `i` install, `a` authenticate, `o` open, `x` cancel)
-  and MOD-20/MOD-21 added the install and login actions, so what is missing is the **write** half
-  that `R-AGT-4`'s field list and `R-AGT-6`'s "manual entries allowed" still owe. MOD-2 milestone 5
-  **D45** already added `probe.source` (`probe` | `manual`) so that "a manual entry is never
-  overwritten by a probe that finds nothing" (`docs/ANA-4.md` §4.6) — a guard that today protects
-  rows no UI can create. Needs the same text-input widget MOD-22 needs and the Settings tab does not
-  have yet (`R-TUI-8`), off the UI task like every other request (`R-NF-3`). Registry writes are
-  server-only (`REGISTRY_ON_SERVER_ONLY`, MOD-6 plan D52), and since MOD-25 that is the whole story
-  — a box with no DSN browses read-only and edits nothing, so there is no second path to build here
-  (`docs/decisions/mod/mod-25.md`; ANA-10's `R-AGT-4` amendment is withdrawn with the mode). **Not
-  blocked**, and can start now. File collisions to expect in that one section file: MOD-2
-  milestone 7 already added a quota column to this table (plan D73), MOD-12 owns the Settings caps section,
-  MOD-15 **already landed** kinds and step graphs there (`docs/decisions/mod/mod-15.md`).
-  **Budget warning inherited from MOD-2 milestone 7 (plan D76,
-  T47/T48):** the table now runs eight columns with **no width slack left** — each sits at its own
-  longest string (`transport`/`models`/`enabled` at their headers, `billing` at `subscription`,
-  `default` at a 21-char model id, `quota` at `100% to 09-08`, `name` at `amp-acp`, `on this box` at
-  `unauthenticated`) inside 98 usable columns. A ninth column costs a **ranking decision**, not an
-  adjustment; an edit *pane* below the table, which this item needs anyway for its text input, is
-  the cheaper shape than more columns. Out of scope: the caps editor (MOD-12), box-profile capability
-  edits (MOD-7, done: Settings > Boxes, `docs/decisions/mod/mod-7.md`), and anything keyed on an
-  agent's name (`R-AGT-5`). Raised by the maintainer on
-  2026-09-10 while MOD-2 milestone 7 was in flight.
+- [ ] **MOD-66 - Per-box manual tool path editor in Settings > Agents** (from MOD-23, plan OQ-3).
+  `R-AGT-6`. ANA-4 §4.6 (`docs/ANA-4.md:796-798`) describes a per-box manual entry: write
+  `agent_box.path` and `probe.resolved` by hand and set `probe.status = "ready"`, protected by MOD-2
+  D45/D51's `probe.source = manual` (a probe that finds nothing keeps it). In the tree that record
+  never reaches a spawn: `ProbeSnapshot::recorded_launch` answers `None` for any `source` other than
+  `probe` (`crates/htui-agent/src/probe.rs:1174-1177`), and the driver resolves `agent.launch`
+  against `probe.tools`. So this item is the resolution rule plus a second form in the Agents section
+  (beside MOD-23's create/edit pane, `docs/decisions/mod/mod-23.md`) writing `probe.tools` with
+  `source: manual` for this box. MOD-23 already covers the common case, a registry row whose
+  `launch.command` is a literal path, which needs no probe. **Not blocked.**
 - [ ] **MOD-24 - Crash recovery of runs under the headless worker.** `R-HIS-1`, `R-ORCH-11`.
   **Rescoped by maintainer decision, 2026-09-25:** a run survives a crash through ANA-2 §4.9's
   reset-and-retry resume, not by re-hydrating the agent's context and continuing the exact step. The
@@ -806,6 +787,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 4 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-26 configurable hotkeys) |
-| MOD-N   | 35 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 35 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-64 TUI concepts search, MOD-66 per-box tool path editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-7 offline-buffer leftovers)            |
 | TOOL-N  | 0 |

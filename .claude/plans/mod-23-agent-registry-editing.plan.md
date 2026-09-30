@@ -1,7 +1,9 @@
 # Plan: MOD-23 — agent registry editing in the Settings agents section
 
 > **Status: fact-checked 2026-09-29 (53 claims: 44 TRUE, 6 line drifts fixed, 1 PARTIAL and 2 FALSE
-> amended — see "Verified claims"); **CONFIRMED by the maintainer 2026-09-29**, every OQ on its recommended answer.**
+> amended — see "Verified claims"); **CONFIRMED by the maintainer 2026-09-29**, every OQ on its recommended answer. **Implemented and
+> closed 2026-09-30** — write-up `docs/decisions/mod/mod-23.md`; review round added the chat-start and
+> promote gates on the switch (maintainer, L-3).**
 
 **Source**: `HANDOFF.md` MOD-23 (the checklist line at `:601-632`, from MOD-2). Create a manual
 agent row and edit an existing one — transport (`acp` | `cli`), launch command and args, model
