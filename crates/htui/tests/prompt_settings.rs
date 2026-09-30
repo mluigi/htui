@@ -25,6 +25,7 @@ use htui::ui::tabs::settings::{
 };
 use htui_core::fixtures::ids;
 use htui_core::model::{ProjectId, Scope, WorkspaceId};
+use htui_core::prompt::settings::resolve_box_hostname;
 use htui_core::prompt::{DEFAULTS, Rungs, SettingKey};
 use htui_core::store::{MemStore, SettingRung, StoreError};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
@@ -145,20 +146,20 @@ fn prompt_settings_names_are_stable() {
     assert_eq!(unique.len(), REQUEST_NAMES.len(), "three distinct names");
 }
 
-/// The shape of one read (D3/D4): ten `App` entries in `SettingKey::ALL` order, all empty on a
-/// fresh `MemStore` (F-7), and one project entry per scope project carrying exactly the keys the
-/// `Project` rung accepts, in [`project_keys`] order.
+/// The shape of one read (D3/D4): ten `App` entries in `SettingKey::app_keys` order, all empty on
+/// a fresh `MemStore` (F-7), and one project entry per scope project carrying exactly the keys the
+/// `Project` rung accepts, in [`project_keys`] order — `box_hostname` first (MOD-33 D276).
 ///
-/// The demo project's own blob already holds `token_budget`, so the second project value is a
+/// The demo project's own blob already holds `token_budget`, so the third project value is a
 /// stored number rather than `None` — which is what makes the `project_key` mapping of D2
 /// observable from the first read.
 #[tokio::test]
-async fn the_demo_snapshot_has_ten_app_entries_and_two_keys_per_project() {
+async fn the_demo_snapshot_has_ten_app_entries_and_three_keys_per_project() {
     let snapshot = demo_settings(&demo()).await;
 
     assert_eq!(snapshot.app.len(), 10);
     let keys: Vec<SettingKey> = snapshot.app.iter().map(|entry| entry.key).collect();
-    assert_eq!(keys, SettingKey::ALL);
+    assert_eq!(keys, SettingKey::app_keys().collect::<Vec<_>>());
     for entry in &snapshot.app {
         assert_eq!(entry.value, None, "`{:?}` holds nothing", entry.key);
         assert_eq!(entry.updated_at, None, "`{:?}` has no row", entry.key);
@@ -172,10 +173,15 @@ async fn the_demo_snapshot_has_ten_app_entries_and_two_keys_per_project() {
     assert_eq!(value_keys, project_keys().collect::<Vec<_>>());
     assert_eq!(
         value_keys,
-        vec![SettingKey::UpstreamHops, SettingKey::TokenBudget]
+        vec![
+            SettingKey::BoxHostname,
+            SettingKey::UpstreamHops,
+            SettingKey::TokenBudget
+        ]
     );
     assert_eq!(project.values[0].value, None);
-    assert_eq!(project.values[1].value, Some(json!(120_000)));
+    assert_eq!(project.values[1].value, None);
+    assert_eq!(project.values[2].value, Some(json!(120_000)));
 }
 
 /// `app_map` is the shape `Backend::app_settings` hands the resolvers: only the entries that carry
@@ -375,8 +381,50 @@ async fn set_setting_on_project_stores_under_the_project_key_and_keeps_foreign_k
     assert_eq!(blob.get("keep_raw_events"), Some(&json!(false)));
     assert_eq!(blob.get("token_budget"), Some(&json!(120_000)));
 
-    assert_eq!(entry.values[0].key, SettingKey::UpstreamHops);
-    assert_eq!(entry.values[0].value, Some(json!(2)));
+    assert_eq!(entry.values[1].key, SettingKey::UpstreamHops);
+    assert_eq!(entry.values[1].value, Some(json!(2)));
+    assert_ne!(
+        entry.project.updated_at, token,
+        "the project's own token is what a project-rung write moves"
+    );
+}
+
+/// MOD-33 D267/D276: the switch is a JSON boolean in the project's blob, written through the same
+/// key-level merge, and the reader's own resolver takes it.
+#[tokio::test]
+async fn set_setting_box_hostname_on_a_project_stores_a_boolean_and_keeps_foreign_keys() {
+    let backend = demo();
+
+    let before = demo_settings(&backend).await;
+    let token = before.projects[0].project.updated_at;
+
+    let after = settings(
+        serve(
+            &backend,
+            &StoreRequest::SetSetting {
+                scope: vulkan_scope(),
+                rung: SettingRung::Project(ids::PROJECT_VULKAN),
+                key: SettingKey::BoxHostname,
+                value: json!(false),
+                expected: Some(token),
+            },
+        )
+        .await,
+    );
+
+    let entry = &after.projects[0];
+    let blob = &entry.project.settings;
+    assert_eq!(blob.get("box_hostname"), Some(&json!(false)));
+    assert_eq!(blob.get("retention_days"), Some(&Value::Null));
+    assert_eq!(blob.get("keep_raw_events"), Some(&json!(false)));
+    assert_eq!(blob.get("token_budget"), Some(&json!(120_000)));
+
+    assert_eq!(entry.values[0].key, SettingKey::BoxHostname);
+    assert_eq!(entry.values[0].value, Some(json!(false)));
+    assert!(
+        !resolve_box_hostname(Some(blob)),
+        "the reader sees the switch off: {blob}"
+    );
     assert_ne!(
         entry.project.updated_at, token,
         "the project's own token is what a project-rung write moves"
@@ -648,18 +696,17 @@ fn project_token(snapshot: &SettingsSnapshot) -> DateTime<Utc> {
 }
 
 /// Which row of the tree one `App` key is: the `app` header is row 0 and the ten keys follow in
-/// `SettingKey::ALL` order (D9).
+/// `SettingKey::app_keys` order (D9).
 fn app_row(key: SettingKey) -> usize {
-    1 + SettingKey::ALL
-        .iter()
-        .position(|candidate| *candidate == key)
+    1 + SettingKey::app_keys()
+        .position(|candidate| candidate == key)
         .expect("one of the ten")
 }
 
 /// Which row of the tree one `Project`-rung key of the scope's single project is: the ten `App`
 /// rows and their header, then the `project` header.
 fn project_row(key: SettingKey) -> usize {
-    SettingKey::ALL.len()
+    SettingKey::app_keys().count()
         + 2
         + project_keys()
             .position(|candidate| candidate == key)
@@ -798,7 +845,7 @@ async fn the_demo_snapshot_renders_the_tree() {
         "and the scope's one project: {frame}"
     );
 
-    for key in SettingKey::ALL {
+    for key in SettingKey::app_keys() {
         let row = row_of(&frame, key, 0);
         assert!(
             row.contains("unset |"),
@@ -823,6 +870,10 @@ async fn the_demo_snapshot_renders_the_tree() {
         row_of(&frame, SettingKey::TokenBudget, 1).contains("120000 | 120000 (project)"),
         "the project's blob already holds the budget: {frame}"
     );
+    assert!(
+        row_of(&frame, SettingKey::BoxHostname, 0).contains("unset | on (default)"),
+        "no `app_setting` row can exist for the switch, so the compiled default answers: {frame}"
+    );
 
     insta::assert_snapshot!("demo", frame);
 }
@@ -842,7 +893,11 @@ async fn no_workspace_lists_the_app_group_alone() {
         !frame.contains("project "),
         "no project rung is listed: {frame}"
     );
-    assert_eq!(value_rows(&frame).len(), SettingKey::ALL.len(), "{frame}");
+    assert_eq!(
+        value_rows(&frame).len(),
+        SettingKey::app_keys().count(),
+        "{frame}"
+    );
 
     insta::assert_snapshot!("app_only", frame);
 }
@@ -888,7 +943,7 @@ async fn offline_is_unavailable_with_the_worker_sentence() {
 }
 
 /// D9: a key is listed on a rung only when its spec admits it. The `App` group is the ten of
-/// `SettingKey::ALL`; a project group is `project_keys()` and nothing else.
+/// `SettingKey::app_keys`; a project group is `project_keys()` and nothing else.
 #[tokio::test]
 async fn no_key_is_listed_on_a_rung_its_spec_refuses() {
     let (bench, section, _) = bench_with(&demo()).await;
@@ -897,11 +952,11 @@ async fn no_key_is_listed_on_a_rung_its_spec_refuses() {
 
     assert_eq!(
         rows.len(),
-        SettingKey::ALL.len() + project_keys().count(),
+        SettingKey::app_keys().count() + project_keys().count(),
         "ten app rows and one group of project rows: {frame}"
     );
 
-    let project_rows = &rows[SettingKey::ALL.len()..];
+    let project_rows = &rows[SettingKey::app_keys().count()..];
     assert_eq!(project_rows.len(), project_keys().count());
     for row in project_rows {
         let key = SettingKey::from_key(row.split_whitespace().next().unwrap_or(""))
@@ -985,6 +1040,56 @@ async fn e_on_a_project_row_carries_the_projects_updated_at() {
     assert_eq!(*rung, SettingRung::Project(ids::PROJECT_VULKAN));
     assert_eq!(*key, SettingKey::UpstreamHops);
     assert_eq!(*expected, Some(project_token(&snapshot)));
+}
+
+/// MOD-33 D276: `off` typed into the switch is a JSON `false` on the project rung, carrying the
+/// project row's token.
+#[tokio::test]
+async fn e_then_off_then_enter_sends_set_setting_false_on_the_project_rung() {
+    let (bench, mut section, snapshot) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, project_row(SettingKey::BoxHostname));
+
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "off");
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::SetSetting {
+            rung,
+            key,
+            value,
+            expected,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("`Enter` writes once: {asked:?}");
+    };
+    assert_eq!(*rung, SettingRung::Project(ids::PROJECT_VULKAN));
+    assert_eq!(*key, SettingKey::BoxHostname);
+    assert_eq!(*value, Value::Bool(false));
+    assert_eq!(*expected, Some(project_token(&snapshot)));
+}
+
+/// D11 for the switch: anything but on/off/true/false is refused by shape and asks nothing.
+#[tokio::test]
+async fn a_switch_that_is_not_on_or_off_is_refused_locally() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, project_row(SettingKey::BoxHostname));
+
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "maybe");
+    bench.key(&mut section, "enter");
+
+    assert!(bench.drained().is_empty(), "a shape refusal asks nothing");
+    assert!(
+        error_text(&bench, &section, 100)
+            .iter()
+            .any(|line| line.contains("`box_hostname` is on or off, or empty to clear")),
+        "{:?}",
+        error_text(&bench, &section, 100)
+    );
 }
 
 /// D10: an empty field **clears** rather than writing a guessed constant, so the rung below — and
@@ -1556,6 +1661,18 @@ async fn the_pane_prints_doc_range_and_rungs() {
         "{frame}"
     );
     assert!(frame.contains("rungs app|project|phase"), "{frame}");
+}
+
+/// D276: a switch has no numeric range to print, so its pane says what it takes and where.
+#[tokio::test]
+async fn the_switch_pane_says_on_or_off_and_the_project_rung() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, project_row(SettingKey::BoxHostname));
+
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("on or off \u{b7} rungs project"), "{frame}");
+    assert!(!frame.contains("range "), "no numeric range: {frame}");
+    assert!(!frame.contains("clamped to"), "no clamp line: {frame}");
 }
 
 /// While an editor is open every printable key is text, `l` included, so the tab's own section

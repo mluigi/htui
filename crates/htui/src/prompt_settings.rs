@@ -33,7 +33,7 @@ use crate::store_worker::{StoreReply, StoreRequest};
 /// convenience is not this milestone's to do.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsSnapshot {
-    /// The `App` rung, in [`SettingKey::ALL`] order — always ten entries.
+    /// The `App` rung, in [`SettingKey::app_keys`] order — always ten entries.
     pub app: Vec<AppEntry>,
     /// The scope's projects, in `scope.project_ids` order; an id that names no row is skipped
     /// (D3), exactly as [`crate::catalogue::snapshot`] skips one.
@@ -139,7 +139,9 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
     scope: &Scope,
 ) -> Result<SettingsSnapshot> {
     let mut app = Vec::with_capacity(SettingKey::ALL.len());
-    for key in SettingKey::ALL {
+    // `app_keys`, never `ALL`: a project-only key is a rung refusal on `App`, on both stores, and
+    // would fail the whole read (MOD-33 D276).
+    for key in SettingKey::app_keys() {
         let stored = store.setting(SettingRung::App, key).await?;
         app.push(AppEntry {
             key,

@@ -11,11 +11,12 @@
 //! Everything a row says comes out of the registry: the key, the label, the unit, the range, the
 //! doc line and the rungs it accepts are read from
 //! [`SettingKey::ALL`](htui_core::prompt::SettingKey::ALL) and
-//! [`SettingKey::spec`](htui_core::prompt::SettingKey::spec), so an eleventh key added by MOD-4 or
-//! MOD-12 appears here without this file being touched. The one exception is the **effective**
-//! column, which needs the reader's own per-key resolver and is therefore an exhaustive
-//! `match key` with no wildcard: an eleventh key is a compile error naming the missing arm rather
-//! than a silent blank (blueprint flag G, O-4).
+//! [`SettingKey::spec`](htui_core::prompt::SettingKey::spec), so a key of an existing kind appears
+//! here without this file being touched. Two exceptions: the **effective** column needs each key's
+//! own resolver and is therefore an exhaustive `match key` with no wildcard, so a new key is a
+//! compile error naming the missing arm rather than a silent blank (blueprint flag G, O-4); and a
+//! new [`SettingKind`] needs its parse in `submit` and its line in the pane — MOD-33's `Boolean`
+//! did.
 //!
 //! The section parses **shape** and nothing else (D11). Every bound — `min`, `max`, `not_above`,
 //! the phase narrowing — belongs to
@@ -32,7 +33,8 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use htui_core::model::Scope;
 use htui_core::prompt::settings::{
-    resolve_budget, resolve_excerpt_caps, resolve_hops, resolve_max_skill_tokens,
+    resolve_box_hostname, resolve_budget, resolve_excerpt_caps, resolve_hops,
+    resolve_max_skill_tokens,
 };
 use htui_core::prompt::{Budget, BudgetSource, SettingKey, SettingKind};
 use htui_core::store::SettingRung;
@@ -82,6 +84,19 @@ const APP_HEADER: &str = "app";
 
 /// The prefix of a project group's line (B-1).
 const PROJECT_HEADER: &str = "project";
+
+/// What the source column says for a project-only key nothing stores: no `app_setting` row can
+/// exist for it, so `app_setting_default` would name a rung it does not have (MOD-33 D276).
+const COMPILED_DEFAULT: &str = "default";
+
+/// What a [`SettingKind::Boolean`] row's effective column says when the switch is on.
+const SWITCH_ON: &str = "on";
+
+/// …and when it is off.
+const SWITCH_OFF: &str = "off";
+
+/// What a [`SettingKind::Boolean`] row's pane says in place of a numeric range.
+const SWITCH_RANGE: &str = "on or off";
 
 /// One line of the tree, by index into the snapshot (D9).
 ///
@@ -232,8 +247,8 @@ struct Effective {
     /// The same as a number, for D13's comparison; `None` for the one fraction key, whose stored
     /// unit and resolved unit are not the same thing.
     number: Option<i64>,
-    /// Which rung the reader took it from.
-    source: BudgetSource,
+    /// Which rung answered, as the row prints it.
+    source: &'static str,
     /// [`resolve_hops`]'s clamp note, when it made one (blueprint flag B).
     notes: Vec<String>,
 }
@@ -545,6 +560,9 @@ impl PromptSection {
                 .filter(|number| number.is_finite())
                 .map(Value::from)
                 .ok_or_else(|| fraction_sentence(target.key)),
+            SettingKind::Boolean => parse_switch(&text)
+                .map(Value::Bool)
+                .ok_or_else(|| switch_sentence(target.key)),
         };
         match value {
             Ok(value) => {
@@ -652,13 +670,15 @@ impl PromptSection {
                     .into_iter()
                     .map(|line| Line::styled(line, theme.dim)),
             );
-            lines.push(Line::styled(
-                format!(
+            let range = match spec.kind {
+                // `min` 0 and `max` 1 are nominal for a switch; the range it takes is two words.
+                SettingKind::Boolean => format!("{SWITCH_RANGE} \u{b7} rungs {}", spec.rungs),
+                SettingKind::Integer | SettingKind::Fraction => format!(
                     "range {}..={} {} \u{b7} rungs {}",
                     spec.min, spec.max, spec.unit, spec.rungs
                 ),
-                theme.dim,
-            ));
+            };
+            lines.push(Line::styled(range, theme.dim));
             // D13: the `not_above` rule is one-directional by decision, so a peer lowered under
             // this row's stored value leaves the row describing a number the reader will not use.
             // Derived from the spec and the resolver's own answer, so no key is named here.
@@ -941,16 +961,28 @@ fn effective(
     project_value: Option<&Value>,
     app: &BTreeMap<String, Value>,
 ) -> Effective {
-    let present = present_source(project_value, app.contains_key(key.key()));
+    let present = present_source(project_value, app.contains_key(key.key())).as_str();
     let mut notes = Vec::new();
     let (text, number, source) = match key {
+        // Project rung only, so there is no `app_setting` rung to name when it is unset (D276);
+        // `number: None`, the fraction key's precedent, so D13's clamp line never reads a switch.
+        SettingKey::BoxHostname => {
+            let on = resolve_box_hostname(project);
+            let source = if project_value.is_some() {
+                BudgetSource::Project.as_str()
+            } else {
+                COMPILED_DEFAULT
+            };
+            let text = if on { SWITCH_ON } else { SWITCH_OFF };
+            (text.to_owned(), None, source)
+        }
         // The one key that records its own provenance: the reader's answer is the label (D5).
         SettingKey::TokenBudget => {
             let budget = resolve_budget(None, project, app);
             (
                 budget.tokens.to_string(),
                 Some(budget.tokens),
-                budget.source,
+                budget.source.as_str(),
             )
         }
         SettingKey::UpstreamHops => {
@@ -1026,7 +1058,7 @@ fn value_line(key: SettingKey, stored: Option<&Value>, effective: &Effective) ->
         "  {:<width$}  {held} | {} ({})   {}",
         key.key(),
         effective.text,
-        effective.source.as_str(),
+        effective.source,
         key.spec().unit,
         width = *KEY_WIDTH,
     )
@@ -1049,6 +1081,22 @@ fn integer_sentence(key: SettingKey) -> String {
 /// D11's sentence for the one fraction key.
 fn fraction_sentence(key: SettingKey) -> String {
     format!("`{key}` is a decimal fraction, or empty to clear")
+}
+
+/// D276: `on`, `off`, `true`, `false`, ASCII case-insensitive; anything else is not a switch.
+fn parse_switch(text: &str) -> Option<bool> {
+    if text.eq_ignore_ascii_case(SWITCH_ON) || text.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if text.eq_ignore_ascii_case(SWITCH_OFF) || text.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// D11's sentence for a switch: shape, never a bound.
+fn switch_sentence(key: SettingKey) -> String {
+    format!("`{key}` is on or off, or empty to clear")
 }
 
 /// What a second write is told while the first is still out.
@@ -1151,6 +1199,22 @@ mod tests {
                     "project {project:?}, app holds {app_holds}"
                 );
             }
+        }
+    }
+
+    /// MOD-33 D276: the four spellings of a switch, in any ASCII case, and nothing else.
+    #[test]
+    fn a_switch_parses_on_off_true_false_in_any_case() {
+        for (text, on) in [
+            ("ON", true),
+            ("Off", false),
+            ("TRUE", true),
+            ("false", false),
+        ] {
+            assert_eq!(parse_switch(text), Some(on), "`{text}` is a switch");
+        }
+        for text in ["maybe", "1", "", "yes"] {
+            assert_eq!(parse_switch(text), None, "`{text}` is not a switch");
         }
     }
 }

@@ -46,6 +46,10 @@ pub const DEFAULTS: Defaults = Defaults {
     excerpt_provider_deadline_ms: 1_500,
 };
 
+/// `project.settings.box_hostname`'s compiled default: the hostname is rendered (MOD-33 D267).
+/// Not a field of [`Defaults`], which is the `app_setting` table: no App rung carries the key.
+pub const BOX_HOSTNAME_DEFAULT: bool = true;
+
 /// §4.3's permitted upstream hop range; a stored value outside it is clamped and noted.
 const HOPS_RANGE: (u8, u8) = (1, 2);
 /// The largest reserve the resolver will honour: half the budget. A row claiming more would leave
@@ -81,13 +85,12 @@ impl Defaults {
     /// The ten rows as `(key, value)` in **key byte order**, which is the order migration `0002`'s
     /// `INSERT` is compared against and the order a seeder must write them in.
     ///
-    /// Iterated out of [`SettingKey::ALL`] rather than spelled a second time (MOD-15 plan D7): the
-    /// key list has one home, so a key added to the registry cannot be forgotten here and drift
+    /// Iterated out of [`SettingKey::app_keys`] rather than spelled a second time (MOD-15 plan D7):
+    /// the key list has one home, so a key added to the registry cannot be forgotten here and drift
     /// past `the_defaults_are_migration_0002s_ten_rows_verbatim`.
     #[must_use]
     pub fn as_rows(&self) -> Vec<(&'static str, Value)> {
-        SettingKey::ALL
-            .into_iter()
+        SettingKey::app_keys()
             .map(|key| (key.key(), self.value_of(key)))
             .collect()
     }
@@ -100,6 +103,7 @@ impl Defaults {
     #[must_use]
     pub fn value_of(&self, key: SettingKey) -> Value {
         match key {
+            SettingKey::BoxHostname => Value::Bool(BOX_HOSTNAME_DEFAULT),
             SettingKey::ExcerptFileLineCap => Value::from(self.excerpt_file_line_cap),
             SettingKey::ExcerptHeadLines => Value::from(self.excerpt_head_lines),
             SettingKey::ExcerptMaxFileBytes => Value::from(self.excerpt_max_file_bytes),
@@ -123,6 +127,7 @@ impl Defaults {
     /// value the reader would have resolved rather than against nothing.
     fn integer(&self, key: SettingKey) -> i64 {
         match key {
+            SettingKey::BoxHostname => i64::from(BOX_HOSTNAME_DEFAULT),
             SettingKey::ExcerptFileLineCap => i64::from(self.excerpt_file_line_cap),
             SettingKey::ExcerptHeadLines => i64::from(self.excerpt_head_lines),
             SettingKey::ExcerptMaxFileBytes => {
@@ -141,39 +146,44 @@ impl Defaults {
     }
 }
 
-/// The ten `app_setting` keys of ANA-5 §5.3, declared in **key byte order**: the discriminant
-/// indexes [`SPECS`] and [`Self::ALL`] reproduces [`Defaults::as_rows`]'s order (MOD-15 plan D7).
+/// The eleven keys of the registry — ANA-5 §5.3's ten `app_setting` keys and MOD-33's
+/// project-only `box_hostname` — declared in **key byte order**: the discriminant indexes
+/// [`SPECS`].
 ///
 /// A typed key rather than a `&str`, because the writer this exists for is the one place a typo
 /// used to be invisible: `positive_i64` treats an unknown key exactly as it treats a malformed
 /// one, so a misspelled write would show one number in the editor and use another in the prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SettingKey {
+    /// `box_hostname`, the one [`SettingKind::Boolean`] and the one key only a project holds
+    /// (MOD-33 D267).
+    BoxHostname = 0,
     /// `excerpt_file_line_cap`.
-    ExcerptFileLineCap = 0,
+    ExcerptFileLineCap = 1,
     /// `excerpt_head_lines`.
-    ExcerptHeadLines = 1,
+    ExcerptHeadLines = 2,
     /// `excerpt_max_file_bytes`.
-    ExcerptMaxFileBytes = 2,
+    ExcerptMaxFileBytes = 3,
     /// `excerpt_max_files`.
-    ExcerptMaxFiles = 3,
+    ExcerptMaxFiles = 4,
     /// `excerpt_max_scan_files`.
-    ExcerptMaxScanFiles = 4,
+    ExcerptMaxScanFiles = 5,
     /// `excerpt_provider_deadline_ms`.
-    ExcerptProviderDeadlineMs = 5,
+    ExcerptProviderDeadlineMs = 6,
     /// `max_skill_tokens`.
-    MaxSkillTokens = 6,
+    MaxSkillTokens = 7,
     /// `prompt_reserve_fraction`, the one [`SettingKind::Fraction`] of the ten.
-    PromptReserveFraction = 7,
+    PromptReserveFraction = 8,
     /// `prompt_upstream_hops` on the App rung, `upstream_hops` on a project (flag A).
-    UpstreamHops = 8,
+    UpstreamHops = 9,
     /// `token_budget`, the only key all three rungs accept.
-    TokenBudget = 9,
+    TokenBudget = 10,
 }
 
 impl SettingKey {
-    /// Every key, in the order [`Defaults::as_rows`] emits and migration `0002` inserts.
-    pub const ALL: [Self; 10] = [
+    /// Every key, in key byte order. Not the `app_setting` list — that is [`Self::app_keys`].
+    pub const ALL: [Self; 11] = [
+        Self::BoxHostname,
         Self::ExcerptFileLineCap,
         Self::ExcerptHeadLines,
         Self::ExcerptMaxFileBytes,
@@ -185,6 +195,15 @@ impl SettingKey {
         Self::UpstreamHops,
         Self::TokenBudget,
     ];
+
+    /// The keys whose spec admits the `App` rung, in [`Self::ALL`] order: the ten `app_setting`
+    /// keys migration `0002` seeds, and no project-only key (MOD-33 D276). [`Defaults::as_rows`]
+    /// and the `app` group of `Settings > Prompt` iterate this, never `ALL`.
+    pub fn app_keys() -> impl Iterator<Item = Self> {
+        Self::ALL
+            .into_iter()
+            .filter(|key| key.spec().rungs.contains(Rungs::APP))
+    }
 
     /// This key's row of the registry.
     #[must_use]
@@ -198,7 +217,7 @@ impl SettingKey {
         self.spec().key
     }
 
-    /// The reverse of [`Self::key`], `None` for a string outside the ten.
+    /// The reverse of [`Self::key`], `None` for a string outside the eleven.
     ///
     /// The two MOD-6 cache keys (`cache_refresh_seconds`, `cache_overlap_seconds`) are deliberately
     /// outside: their reader is `connect.rs`'s own `> 0` rule and the `0002` pin asserts exactly
@@ -271,14 +290,18 @@ impl core::fmt::Display for Rungs {
     }
 }
 
-/// How a key's JSON is read (PRD D7's `kind`): every key but one is an integer, and
-/// `prompt_reserve_fraction` is a float the reader rounds to basis points.
+/// How a key's JSON is read (PRD D7's `kind`): nine keys are integers,
+/// `prompt_reserve_fraction` is a float the reader rounds to basis points, and `box_hostname` is a
+/// boolean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingKind {
     /// Read through `positive_i64` or a narrowing of it.
     Integer,
     /// Read through `as_f64` and rounded once, to basis points.
     Fraction,
+    /// A JSON `true`/`false` (MOD-33 D267). `min` 0 and `max` 1 are nominal: the reader takes the
+    /// boolean and nothing else, so a number, a string or `null` is refused rather than coerced.
+    Boolean,
 }
 
 /// One row of the registry (plan D7): the single source `DEFAULTS`, the migration pin, the
@@ -290,7 +313,8 @@ pub enum SettingKind {
 /// them against the resolver's constants, so a clamp that moves fails a unit test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SettingSpec {
-    /// The `app_setting.key` column value.
+    /// The `app_setting.key` column value. For a project-only key it is the registry's name and no
+    /// `app_setting` row ever carries it.
     pub key: &'static str,
     /// The name under which `project.settings` holds it; `Some` exactly when `rungs` has
     /// [`Rungs::PROJECT`]. Two of the ten spell it differently there (flag A), and writing the App
@@ -317,7 +341,18 @@ pub struct SettingSpec {
 const U32_MAX: i64 = u32::MAX as i64;
 
 /// The registry, indexed by [`SettingKey`]'s discriminant.
-pub const SPECS: [SettingSpec; 10] = [
+pub const SPECS: [SettingSpec; 11] = [
+    SettingSpec {
+        key: "box_hostname",
+        project_key: Some("box_hostname"),
+        kind: SettingKind::Boolean,
+        min: 0,
+        max: 1,
+        rungs: Rungs::PROJECT,
+        not_above: None,
+        unit: "on/off",
+        doc: "Whether a phase prompt's box section names this box; the digest never includes it.",
+    },
     SettingSpec {
         key: "excerpt_file_line_cap",
         project_key: None,
@@ -476,6 +511,8 @@ pub fn rung_refusal(key: SettingKey, at: Rungs) -> Option<String> {
 /// - `` `{key}` = {n} is outside {min}..={max} {unit} `` — for a fraction, `` `{key}` = {value}
 ///   rounds to {n} bp, outside {min}..={max} bp ``
 /// - `` `{key}` = {n} is above `{other}` = {m}; the reader would clamp it ``
+/// - `` `{key}` must be a JSON boolean, got {value} `` — for a [`SettingKind::Boolean`], whose
+///   only other check is the rung
 pub fn validate(
     key: SettingKey,
     at: Rungs,
@@ -523,6 +560,12 @@ pub fn validate(
                 ));
             }
             number
+        }
+        SettingKind::Boolean => {
+            let Some(on) = value.as_bool() else {
+                return Err(format!("`{key}` must be a JSON boolean, got {value}"));
+            };
+            i64::from(on)
         }
     };
 
@@ -716,6 +759,19 @@ pub fn resolve_max_skill_tokens(app: &BTreeMap<String, Value>) -> i64 {
     positive_i64(app.get("max_skill_tokens")).unwrap_or(DEFAULTS.max_skill_tokens)
 }
 
+/// `project.settings.box_hostname` (MOD-33 D267): whether the box section renders the hostname.
+///
+/// The house fall-through rule: absent, `null` or anything but a JSON boolean is not a value, and
+/// [`BOX_HOSTNAME_DEFAULT`] answers. Project rung only — there is no `app_setting` row to fall to.
+/// Resolved by the caller and carried on [`PromptSpec`](crate::prompt::PromptSpec), because
+/// `assemble` is pure (ANA-5 invariant 2).
+#[must_use]
+pub fn resolve_box_hostname(project: Option<&Value>) -> bool {
+    project_key(project, "box_hostname")
+        .and_then(Value::as_bool)
+        .unwrap_or(BOX_HOSTNAME_DEFAULT)
+}
+
 /// §5.3's six `excerpt_*` keys: the four caps the audit records, the walk's scan cap, and the
 /// provider deadline (blueprint B.8; T65 deferred this to T66 by name).
 ///
@@ -838,12 +894,114 @@ mod tests {
     fn every_default_validates_under_its_own_spec() {
         for key in SettingKey::ALL {
             let value = DEFAULTS.value_of(key);
+            // The first rung the spec accepts: a project-only key has no App rung to validate on.
+            let at = [Rungs::APP, Rungs::PROJECT, Rungs::PHASE]
+                .into_iter()
+                .find(|rung| key.spec().rungs.contains(*rung))
+                .expect("every key accepts some rung");
             assert_eq!(
-                validate(key, Rungs::APP, &value, None),
+                validate(key, at, &value, None),
                 Ok(()),
-                "the seeded default of {key} is a value its own spec accepts"
+                "the compiled-in default of {key} is a value its own spec accepts on the {at} rung"
             );
         }
+    }
+
+    /// MOD-33 D267: the one boolean, and the one key only a project holds.
+    #[test]
+    fn box_hostname_is_a_project_only_boolean() {
+        let spec = SettingKey::BoxHostname.spec();
+        assert_eq!(
+            *spec,
+            SettingSpec {
+                key: "box_hostname",
+                project_key: Some("box_hostname"),
+                kind: SettingKind::Boolean,
+                min: 0,
+                max: 1,
+                rungs: Rungs::PROJECT,
+                not_above: None,
+                unit: "on/off",
+                doc: spec.doc,
+            }
+        );
+        assert!(!spec.doc.is_empty(), "the editor has a line to show");
+        assert!(rung_refusal(SettingKey::BoxHostname, Rungs::APP).is_some());
+        assert!(rung_refusal(SettingKey::BoxHostname, Rungs::PHASE).is_some());
+        assert_eq!(rung_refusal(SettingKey::BoxHostname, Rungs::PROJECT), None);
+        assert_eq!(
+            SettingKey::ALL[0],
+            SettingKey::BoxHostname,
+            "`box_hostname` sorts first in key byte order"
+        );
+    }
+
+    /// D267: a boolean is read as a boolean — a number, a string or `null` is refused, not coerced.
+    #[test]
+    fn validate_takes_a_boolean_and_nothing_else() {
+        for on in [json!(true), json!(false)] {
+            assert_eq!(
+                validate(SettingKey::BoxHostname, Rungs::PROJECT, &on, None),
+                Ok(()),
+                "{on} is a switch value"
+            );
+        }
+        for value in [json!(1), json!("on"), Value::Null] {
+            let refused = validate(SettingKey::BoxHostname, Rungs::PROJECT, &value, None)
+                .expect_err("only a JSON boolean is a switch");
+            assert!(
+                refused.starts_with("`box_hostname` must be a JSON boolean, got "),
+                "the refusal of {value} names the key and the kind, got `{refused}`"
+            );
+        }
+        assert_eq!(
+            validate(SettingKey::BoxHostname, Rungs::APP, &json!(true), None),
+            Err(rung_refusal(SettingKey::BoxHostname, Rungs::APP).expect("no App rung")),
+            "the rung is checked before the kind"
+        );
+    }
+
+    /// The house fall-through rule: anything but a JSON boolean is not a value, and on answers.
+    #[test]
+    fn resolve_box_hostname_falls_through_to_on() {
+        for project in [
+            json!({}),
+            json!({"box_hostname": null}),
+            json!({"box_hostname": 1}),
+            json!({"box_hostname": "off"}),
+            json!("not an object"),
+        ] {
+            assert!(
+                resolve_box_hostname(Some(&project)),
+                "{project} carries no switch, so the default answers"
+            );
+        }
+        assert!(resolve_box_hostname(None), "no project blob at all");
+        assert!(!resolve_box_hostname(Some(&json!({"box_hostname": false}))));
+        assert!(resolve_box_hostname(Some(&json!({"box_hostname": true}))));
+    }
+
+    /// D276: the App group and `as_rows` are the ten `app_setting` keys, never the project-only one.
+    #[test]
+    fn app_keys_are_the_ten_app_setting_keys_in_byte_order() {
+        let app: Vec<SettingKey> = SettingKey::app_keys().collect();
+        assert_eq!(app.len(), 10, "migration 0002 seeds ten rows");
+        assert_eq!(SettingKey::app_keys().count(), 10);
+        assert!(!app.contains(&SettingKey::BoxHostname));
+        assert_eq!(
+            app,
+            SettingKey::ALL
+                .into_iter()
+                .filter(|key| *key != SettingKey::BoxHostname)
+                .collect::<Vec<_>>(),
+            "`ALL` without the project-only key, in the same order"
+        );
+        let keys: Vec<&str> = app.iter().map(|key| key.key()).collect();
+        assert!(
+            keys.windows(2)
+                .all(|pair| pair[0].as_bytes() < pair[1].as_bytes()),
+            "strictly ascending as bytes: {keys:?}"
+        );
     }
 
     /// `min`/`max` are the reader's clamps, asserted against the reader's own constants rather
@@ -945,7 +1103,7 @@ mod tests {
         sorted.dedup();
         assert_eq!(
             keys, sorted,
-            "ten distinct keys, strictly ascending as bytes"
+            "eleven distinct keys, strictly ascending as bytes"
         );
         assert!(
             SettingKey::from_key("cache_refresh_seconds").is_none(),
