@@ -3269,8 +3269,10 @@ fn chat_failed(message: String) -> Vec<StoreReply> {
 /// when another request arrives. Cancelling is untouched: an aborted task is dropped at an await
 /// and never reaches the catch, so a superseded preview or a shutdown still answers nothing.
 ///
-/// A panic on a thread the task starts (`spawn_blocking`, a provider thread) is not caught here;
-/// it comes back to the task as an error, as it always did.
+/// A panic on a thread the task starts (a blocking thread, a spawned task, a provider thread) is
+/// not caught here; it comes back to the task as an error, as it always did. It does not reach the
+/// terminal either: every blocking thread and task `htui_agent` starts opens its own window
+/// through [`htui_agent::contained`] (MOD-65), and a provider thread opens one in `run_providers`.
 async fn answering<F>(name: &'static str, task: F, answer: Option<Answer>)
 where
     F: Future<Output = ()>,
