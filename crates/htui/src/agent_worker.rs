@@ -3041,7 +3041,7 @@ async fn run_auth(args: AuthArgs) {
                     cancel.cancel();
                 }
             },
-            (reply, answer) = settle(&mut delivering), if delivering.is_some() => {
+            Some((reply, answer)) = settle(&mut delivering), if delivering.is_some() => {
                 frames.reply(&reply, delivered(answer));
             }
         }
@@ -3197,16 +3197,16 @@ impl core::fmt::Debug for Delivering {
 /// `tokio::select!` evaluates a branch's expression even while its precondition is false, so this
 /// is an `async fn` that touches the slot only when polled. It takes the slot **after** the answer,
 /// never before: when another arm wins, this future is dropped, and the delivery must still be
-/// there.
-async fn settle(slot: &mut Option<Delivering>) -> (ReplyAddr, Result<ListenerReply, DeliverError>) {
+/// there. `None` only if the slot emptied under the await, which nothing can do while this future
+/// holds it; the arm's pattern then disables itself instead of the worker panicking (review L-4).
+async fn settle(
+    slot: &mut Option<Delivering>,
+) -> Option<(ReplyAddr, Result<ListenerReply, DeliverError>)> {
     let Some(delivering) = slot.as_mut() else {
         return std::future::pending().await;
     };
     let answer = delivering.answer.as_mut().await;
-    let delivering = slot
-        .take()
-        .expect("settled only while a delivery is in flight");
-    (delivering.reply, answer)
+    slot.take().map(|delivering| (delivering.reply, answer))
 }
 
 /// A delivery's answer as the reply its request is owed (D268): what the listener said, or why
