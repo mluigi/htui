@@ -8754,7 +8754,9 @@ mod tests {
     /// MOD-41 plan D3: the self-fence is measured on tokio's monotonic clock, so a wall-clock
     /// step while a walk holds its lease moves it neither way. Every refresh fails
     /// (`MemFault::RefreshLease`, plan D152), and the walk mirrors tokio's paused time onto the
-    /// harness clock, which also steps +1 h at 10 s and -2 h at 20 s. The walk still ends
+    /// harness clock, which also steps +1 h at 10 s and -2 h at 50 s. The heartbeat's 40 s beat
+    /// therefore sees the wall clock an hour ahead (a fence cut early would trip there) and its
+    /// 80 s beat an hour behind (a fence extended would not trip there). The walk still ends
     /// `LeaseLost` exactly `ttl - refresh` (80 s) after the lease was taken, as with no step.
     #[tokio::test(start_paused = true)]
     async fn a_stepped_wall_clock_moves_no_fence() {
@@ -8773,7 +8775,7 @@ mod tests {
                 second += 1;
                 match second {
                     10 => clock.advance(TimeDelta::hours(1)),
-                    20 => clock.advance(TimeDelta::hours(-2)),
+                    50 => clock.advance(TimeDelta::hours(-2)),
                     _ => {}
                 }
             }
