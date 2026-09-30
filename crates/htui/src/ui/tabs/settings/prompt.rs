@@ -968,7 +968,10 @@ fn effective(
         // `number: None`, the fraction key's precedent, so D13's clamp line never reads a switch.
         SettingKey::BoxHostname => {
             let on = resolve_box_hostname(project);
-            let source = if project_value.is_some() {
+            // `project` only when the resolver would read the stored value: a non-boolean falls
+            // through to the default, so labelling it `project` would name a rung that answered
+            // nothing.
+            let source = if project_value.and_then(Value::as_bool).is_some() {
                 BudgetSource::Project.as_str()
             } else {
                 COMPILED_DEFAULT
@@ -1215,6 +1218,35 @@ mod tests {
         }
         for text in ["maybe", "1", "", "yes"] {
             assert_eq!(parse_switch(text), None, "`{text}` is not a switch");
+        }
+    }
+
+    /// MOD-33 review L5: the switch's row says `project` only when the project stores a JSON
+    /// boolean — the one value `resolve_box_hostname` reads — and `default` for anything else,
+    /// which the resolver falls through.
+    #[test]
+    fn the_switch_source_is_project_only_for_a_stored_boolean() {
+        let key = SettingKey::BoxHostname;
+        let app = BTreeMap::new();
+        for (stored, text, source) in [
+            (Some(json!(true)), SWITCH_ON, BudgetSource::Project.as_str()),
+            (
+                Some(json!(false)),
+                SWITCH_OFF,
+                BudgetSource::Project.as_str(),
+            ),
+            (Some(json!("off")), SWITCH_ON, COMPILED_DEFAULT),
+            (Some(json!(1)), SWITCH_ON, COMPILED_DEFAULT),
+            (Some(Value::Null), SWITCH_ON, COMPILED_DEFAULT),
+            (None, SWITCH_ON, COMPILED_DEFAULT),
+        ] {
+            let project = stored.as_ref().map_or_else(
+                || Value::Object(serde_json::Map::new()),
+                |value| blob(key, value.clone()),
+            );
+            let row = effective(key, Some(&project), project.get(key.key()), &app);
+            assert_eq!(row.text, text, "{stored:?}");
+            assert_eq!(row.source, source, "{stored:?}");
         }
     }
 }
