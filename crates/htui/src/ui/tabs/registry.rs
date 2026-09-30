@@ -22,8 +22,10 @@ use crossterm::event::KeyEvent;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TabId(pub &'static str);
 
-/// What a tab says when a reveal arrives over a field the user is typing in (MOD-64 D252).
-pub const CLOSE_THE_FIELD_FIRST: &str = "close the open field (Esc) first, then open the hit again";
+/// What a tab says when a reveal arrives over a field the user is typing in (MOD-64 D252). "Search
+/// again", not "open the hit again": the search overlay has closed, and a reopened one is empty
+/// (review 7).
+pub const CLOSE_THE_FIELD_FIRST: &str = "close the open field (Esc) first, then search again";
 
 impl core::fmt::Display for TabId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

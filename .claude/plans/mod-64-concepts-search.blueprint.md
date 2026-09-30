@@ -723,7 +723,7 @@ fn reveal(&mut self, _target: &RevealTarget, _ctx: &mut Ctx<'_>) -> bool {
 ```
 
 Also in `registry.rs`: `/// What a tab says when a reveal arrives over a field the user is typing in (MOD-64 D252).`
-`pub const CLOSE_THE_FIELD_FIRST: &str = "close the open field (Esc) first, then open the hit again";`
+`pub const CLOSE_THE_FIELD_FIRST: &str = "close the open field (Esc) first, then search again";` *(Amended at review, MOD-64 review 7: was "then open the hit again", but the overlay has closed and a reopened one is empty.)*
 
 ### 4.4 `crates/htui/src/ui/tabs/backlog/mod.rs`
 

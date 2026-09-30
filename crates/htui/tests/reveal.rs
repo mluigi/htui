@@ -239,3 +239,13 @@ async fn a_reveal_over_an_open_form_keeps_the_form() {
         "the text is kept: {frame}"
     );
 }
+
+/// MOD-64 review 7: by the time a tab refuses a reveal the search overlay has closed, and `Ctrl+F`
+/// opens an empty one, so the sentence asks for a new search rather than for the same hit.
+#[test]
+fn the_refusal_asks_for_a_new_search_not_the_same_hit() {
+    assert!(
+        CLOSE_THE_FIELD_FIRST.ends_with("then search again"),
+        "{CLOSE_THE_FIELD_FIRST}"
+    );
+}
