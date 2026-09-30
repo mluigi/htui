@@ -10,8 +10,8 @@ use htui_core::prompt::digest::{canonical, sha256_hex};
 use htui_core::prompt::{
     AssembleError, AssembledPrompt, PromptSpec, SectionName, UndigestedSpan, assemble, fixtures,
 };
-use htui_core::scrub::MinimalScrubber;
-use serde_json::json;
+use htui_core::scrub::{MinimalScrubber, Scrubber, Unmasked};
+use serde_json::{Value, json};
 
 /// No configured secrets; still fail-closed on the prefix rules.
 fn scrubber() -> MinimalScrubber {
@@ -117,6 +117,83 @@ fn an_off_switch_never_refuses_over_the_hostname() {
     let off = ok(&spec);
     assert!(!off.text.contains("sk-ant-"));
     assert!(!off.digest_text.contains("sk-ant-"));
+}
+
+/// Masks the one secret `SECRET` and fails closed on the prefix rules.
+fn secret_scrubber() -> MinimalScrubber {
+    MinimalScrubber::new(["SECRET".to_owned()])
+}
+
+#[test]
+fn a_known_secret_in_the_hostname_is_masked_in_the_text_and_never_moves_the_digest() {
+    let scrubber = secret_scrubber();
+    let assembled = |host: &str| {
+        assemble(&with_host(host), &scrubber)
+            .unwrap_or_else(|e| panic!("{host:?} must assemble: {e}"))
+    };
+    let secret = assembled("dev-SECRET-01");
+    let baseline = assembled("dev-win-01");
+    assert!(
+        secret.text.contains("hostname: dev-[REDACTED]-01\n"),
+        "{}",
+        secret.text
+    );
+    assert!(!secret.text.contains("SECRET"));
+    assert!(!secret.digest_text.contains("SECRET"));
+    assert_eq!(
+        secret.digest, baseline.digest,
+        "the hostname never moves the digest, masked or not"
+    );
+    assert_eq!(secret.digest_text, baseline.digest_text);
+}
+
+#[test]
+fn the_hostname_is_masked_before_its_line_breaks_are_collapsed() {
+    // A secret spanning a line break is only whole in the input: the sent line collapses the break
+    // to a space, so masking the rendered line alone would miss it (D269: masked as an input).
+    let scrubber = MinimalScrubber::new(["SE\nCRET".to_owned()]);
+    let prompt = assemble(&with_host("dev-SE\nCRET-01"), &scrubber)
+        .unwrap_or_else(|e| panic!("the spec must assemble: {e}"));
+    assert!(
+        prompt.text.contains("hostname: dev-[REDACTED]-01\n"),
+        "{}",
+        prompt.text
+    );
+    assert!(!prompt.text.contains("SE CRET"));
+}
+
+/// Refuses any string carrying `line` and masks nothing: a residue only the sent-form box
+/// section can spell.
+#[derive(Debug)]
+struct RefusesLine(&'static str);
+
+impl Scrubber for RefusesLine {
+    fn scrub(&self, value: &mut Value) -> Result<(), Unmasked> {
+        match value {
+            Value::String(text) if text.contains(self.0) => Err(Unmasked {
+                path: String::new(),
+                rule: "sent_hostname_line",
+            }),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[test]
+fn the_sent_form_box_section_is_scanned() {
+    // D269: the sent box goes through the same mask-and-scan as every rendered section. Neither
+    // the bare hostname input nor the digest form spells this line; only the sent form does.
+    let scrubber = RefusesLine("hostname: dev-win-01");
+    let mut off = fixtures::phase_implement_attempt2();
+    off.box_hostname = false;
+    assemble(&off, &scrubber).expect("with the switch off nothing spells the line");
+    match assemble(&fixtures::phase_implement_attempt2(), &scrubber) {
+        Err(AssembleError::Unmasked { section, rule, .. }) => {
+            assert_eq!(section, "box");
+            assert_eq!(rule, "sent_hostname_line");
+        }
+        other => panic!("the sent-form residue must refuse: {other:?}"),
+    }
 }
 
 #[test]
