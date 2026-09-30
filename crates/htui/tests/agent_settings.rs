@@ -497,6 +497,49 @@ async fn edit_agent_over_a_model_name_with_a_comma_is_failed_by_models() {
     );
 }
 
+/// Review L-5 (c): an edit over a stored `launch` that is not a JSON object is refused by
+/// `launch`, without quoting the document, and nothing is written.
+#[tokio::test]
+async fn edit_agent_over_a_non_object_launch_is_failed_by_launch() {
+    let store = MemStore::demo();
+    let backend = Backend::memory(store.clone());
+    let mut seeded = row(&registry(&backend).await, ids::AGENT_CLAUDE)
+        .agent
+        .clone();
+    seeded.launch = json!(["not-an-object"]);
+    let applied = store
+        .upsert_agent(&seeded, Some(seeded.updated_at))
+        .await
+        .expect("the memory store never fails");
+    assert!(matches!(applied, CasOutcome::Applied(_)), "the seed edit");
+    let before = row(&registry(&backend).await, ids::AGENT_CLAUDE)
+        .agent
+        .clone();
+
+    let (request, message) = refusal(
+        serve(
+            &backend,
+            &StoreRequest::EditAgent {
+                agent_id: ids::AGENT_CLAUDE,
+                expected: before.updated_at,
+                draft: draft(),
+            },
+        )
+        .await,
+    );
+
+    assert_eq!(request, "edit_agent");
+    assert!(message.starts_with("`launch`: "), "{message}");
+    assert!(
+        !message.contains("not-an-object"),
+        "the stored document is never quoted: {message}"
+    );
+    assert!(
+        row(&registry(&backend).await, ids::AGENT_CLAUDE).agent == before,
+        "nothing was written"
+    );
+}
+
 /// Plan D242: off, then on. The demo holds no `agent_box` row, so the switch writes a bare one;
 /// switching on with no probe document is `enabled`.
 #[tokio::test]

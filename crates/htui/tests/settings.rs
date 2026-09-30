@@ -3381,6 +3381,111 @@ async fn a_refused_write_keeps_the_form_open_with_the_sentence() {
     );
 }
 
+/// `settings/mod.rs`'s `CHANGED_ELSEWHERE_CLOSED`: a spent token with no form open to retry from.
+const CHANGED_ELSEWHERE_CLOSED: &str =
+    "changed elsewhere; nothing was written \u{2014} reopen the editor and retry";
+
+/// Review L-5 (a): `Esc` while an edit is in flight closes the form but not the guard, and each
+/// answer then lands on the closed-form branch: `Edited` says it saved, `Stale` says nothing was
+/// written and how to retry, and `Gone` says the row went. Each answer clears the guard.
+#[tokio::test]
+async fn esc_during_an_edit_then_each_answer_lands_on_the_closed_form() {
+    let bench = SectionBench::new().await;
+    let row = editable_row("alpha");
+    let agent_id = row.agent.id;
+    for (outcome, rows, expected) in [
+        (
+            AgentWrite::Edited {
+                id: agent_id,
+                name: "alpha".to_owned(),
+            },
+            vec![row.clone()],
+            "saved `alpha`",
+        ),
+        (
+            AgentWrite::Stale { id: agent_id },
+            vec![row.clone()],
+            CHANGED_ELSEWHERE_CLOSED,
+        ),
+        (
+            AgentWrite::Gone { id: agent_id },
+            Vec::new(),
+            "deleted elsewhere; nothing was written",
+        ),
+    ] {
+        let mut section = section_over(&bench, vec![row.clone()]);
+        bench.key(&mut section, "e");
+        pressed(&bench, &mut section, "tab", 2);
+        typed(&bench, &mut section, " --more");
+        bench.key(&mut section, "enter");
+        assert!(
+            matches!(
+                requests_of(&bench).as_slice(),
+                [StoreRequest::EditAgent { .. }]
+            ),
+            "the edit is in flight"
+        );
+
+        assert_eq!(bench.key(&mut section, "esc"), Handled::Consumed);
+        assert!(!section.captures_input(), "`Esc` closed the form");
+        bench.key(&mut section, "e");
+        assert_eq!(
+            errors_of(&bench.drained()),
+            vec!["`edit_agent` is still in flight".to_owned()],
+            "the guard outlives the form"
+        );
+
+        bench.reply(&mut section, &written(rows, outcome.clone()));
+        assert!(!section.captures_input(), "{outcome:?} opens nothing");
+        assert_eq!(
+            note_line(&render_section(&section, &bench.ctx())),
+            expected,
+            "{outcome:?}"
+        );
+        // `n` needs no row, so it answers the guard alone even after `Gone` emptied the table.
+        bench.key(&mut section, "n");
+        let emitted = bench.drained();
+        assert!(
+            errors_of(&emitted).is_empty() && section.captures_input(),
+            "{outcome:?} cleared the guard: {emitted:?}"
+        );
+    }
+}
+
+/// Review L-5 (b): only a registry write's own `Failed` clears the guard; a refusal of any other
+/// request the tab hands the section leaves the write in flight.
+#[tokio::test]
+async fn a_failed_for_another_request_does_not_clear_the_write_guard() {
+    let bench = SectionBench::new().await;
+    for other in [
+        "probe_agents",
+        "install_plan",
+        "auth_start",
+        "auth_open",
+        "box_edit",
+    ] {
+        let mut section = section_over(&bench, vec![registry_row("alpha", false)]);
+        bench.key(&mut section, "t");
+        let _ = bench.drained();
+
+        bench.reply(
+            &mut section,
+            &StoreReply::Failed {
+                request: other,
+                message: "refused".to_owned(),
+            },
+        );
+        bench.key(&mut section, "t");
+        let emitted = bench.drained();
+        assert_eq!(
+            errors_of(&emitted),
+            vec!["`set_agent_on_box` is still in flight".to_owned()],
+            "`{other}` is not this write's answer"
+        );
+        assert!(!asked_anything(&emitted), "`{other}`: {emitted:?}");
+    }
+}
+
 /// D240: a plain `Agents` reply (activation, a probe, a login's re-read) replaces the rows and
 /// never closes the form or moves its token.
 #[tokio::test]
