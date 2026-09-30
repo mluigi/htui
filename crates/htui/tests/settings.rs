@@ -1028,6 +1028,51 @@ async fn a_bracketed_paste_fills_an_unmasked_form_field() {
     );
 }
 
+/// Review round 2, test gap: a modal overlay over an open field takes a paste the way it takes a
+/// key it has no use for — it swallows it. The paste is dropped, never reaches the field under
+/// the overlay, and nothing renders it, before or after the overlay closes.
+#[tokio::test]
+async fn a_bracketed_paste_under_a_modal_overlay_reaches_no_field() {
+    let mut harness = Harness::demo().with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(AgentsSection::new()),
+        Box::new(ProbeSection),
+    ])));
+    harness.settle().await;
+    harness.key("n");
+    harness.settle().await;
+    let form = harness.render();
+    harness
+        .app()
+        .push_overlay(Box::new(htui::ui::overlay::WorkspaceSwitcher::new()));
+    harness.settle().await;
+    assert_ne!(harness.render(), form, "the overlay is up");
+
+    harness.paste("pasted-under-overlay");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("pasted-under-overlay"),
+        "the overlay swallowed it: {frame}"
+    );
+
+    harness.key("esc");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("pasted-under-overlay"),
+        "and the field under it never got it: {frame}"
+    );
+    for key in ["z", "q", "x"] {
+        harness.key(key);
+    }
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("zqx"),
+        "the form is still open under where the overlay was, and empty before: {frame}"
+    );
+}
+
 /// The strip has to fit the frame it is drawn in (D4; PRD risk "strip overflow at 100 columns").
 ///
 /// `render_strip` draws `format!(" {title} ")` per registered section, so the joined width is
