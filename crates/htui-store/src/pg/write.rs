@@ -158,7 +158,9 @@ async fn release_repo_references(conn: &mut PgConnection, id: ProjectId) -> Resu
     Ok(())
 }
 
-/// The existence check the two batch upserts share, on **their own transaction** (MOD-4 T2).
+/// The existence check the two batch upserts shared, on **their own transaction** (MOD-4 T2); since
+/// MOD-41 plan D1 they run [`step_fence`] instead, and this serves `record_command_run`,
+/// `close_out` and [`fenced_or_missing`].
 ///
 /// `run_step_tree` and `run_step_commit` both hang off `run_step` by a foreign key, so an unknown
 /// step would already be a `23503` - but that is [`StoreError::Constraint`] where the contract says
@@ -175,6 +177,33 @@ async fn step_exists(conn: &mut PgConnection, step: StepId) -> Result<()> {
             id: step.to_string(),
         })?;
     Ok(())
+}
+
+/// MOD-41 plan D1: `step` exists and its run carries `fence`'s lease, read `FOR SHARE OF r`
+/// inside the caller's transaction, so an adoption cannot commit between this check and the
+/// batch's writes. [`StoreError::NotFound`] first, then [`StoreError::Fenced`]: `append_events`'
+/// order. The fenced twin of [`step_exists`], for `upsert_step_tree` and `record_commits`;
+/// `close_out` keeps the unfenced check (blueprint B-1).
+async fn step_fence(conn: &mut PgConnection, step: StepId, fence: StepFence) -> Result<()> {
+    let owner = sqlx::query_scalar!(
+        r#"SELECT r.lease_owner AS "lease_owner?"
+             FROM run_step s JOIN run r ON r.id = s.run_id
+            WHERE s.id = $1
+              FOR SHARE OF r"#,
+        step.as_uuid(),
+    )
+    .fetch_optional(conn)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or_else(|| StoreError::NotFound {
+        entity: "run_step",
+        id: step.to_string(),
+    })?;
+    if owner == fence.owner() {
+        Ok(())
+    } else {
+        Err(StoreError::Fenced { step })
+    }
 }
 
 /// MOD-40 plan D1: why a fenced `UPDATE` of `step` matched no row. [`StoreError::NotFound`] when
@@ -1641,35 +1670,43 @@ impl WriteStore for PgStore {
     ///
     /// `updated_at` is not in the `SET` list: the migration's `BEFORE UPDATE` trigger owns it.
     ///
+    /// Written only while the step's run carries `fence`'s lease: `set_step_usage`'s predicate,
+    /// verbatim (MOD-41 plan D1), `FOR SHARE` on the run for `append_events`' reason.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] when the step does not exist - zero rows updated is the only thing
-    /// this statement can mean.
+    /// [`StoreError::NotFound`] when the step does not exist and [`StoreError::Fenced`] when it
+    /// does and its run does not carry `fence`'s lease, told apart by `step_exists`' follow-up
+    /// read on a miss.
     async fn set_step_prompt(
         &self,
-        _fence: StepFence,
+        fence: StepFence,
         step: StepId,
         digest: &str,
         trim: &Value,
     ) -> Result<()> {
         let updated = sqlx::query!(
-            "UPDATE run_step SET prompt_digest = $2, trim_record = $3 WHERE id = $1",
+            "UPDATE run_step SET prompt_digest = $2, trim_record = $3 \
+              WHERE id = $1 \
+                AND EXISTS (SELECT 1 FROM run r \
+                             WHERE r.id = run_step.run_id \
+                               AND r.lease_owner IS NOT DISTINCT FROM $4 \
+                               FOR SHARE)",
             step.as_uuid(),
             digest,
             trim,
+            fence.owner(),
         )
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?
         .rows_affected();
 
-        if updated == 0 {
-            return Err(StoreError::NotFound {
-                entity: "run_step",
-                id: step.to_string(),
-            });
+        if updated == 1 {
+            return Ok(());
         }
-        Ok(())
+        // Boxed as `set_step_usage`'s miss is: a debug build's worker stack.
+        Err(Box::pin(fenced_or_missing(&self.pool, step)).await)
     }
 
     // ---- MOD-15 milestone 1: the hierarchy (plan D1-D12) ---------------------------------------
@@ -4547,7 +4584,7 @@ impl WriteStore for PgStore {
     /// [`MemStore`](htui_core::store::MemStore)'s map simply keeps the last. Batches are one row
     /// per repo in scope.
     ///
-    /// An empty slice still runs the existence check and writes nothing.
+    /// An empty slice still runs the existence and fence check ([`step_fence`]) and writes nothing.
     ///
     /// The transaction also writes `run_step.isolation_path` (ANA-2 `:903`, plan D33), because a
     /// step has many trees and one isolation path and this is the only call that sees both. The
@@ -4561,16 +4598,18 @@ impl WriteStore for PgStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Constraint`] when a row's
-    /// `run_step_id` is not `step` or names an unknown repo.
+    /// In this order: [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Fenced`]
+    /// when the step's run has a `lease_owner` other than `fence`'s (MOD-41 plan D1);
+    /// [`StoreError::Constraint`] when a row's `run_step_id` is not `step` or names an unknown
+    /// repo.
     async fn upsert_step_tree(
         &self,
-        _fence: StepFence,
+        fence: StepFence,
         step: StepId,
         trees: &[RunStepTree],
     ) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        step_exists(&mut tx, step).await?;
+        step_fence(&mut tx, step, fence).await?;
 
         for row in trees {
             if row.run_step_id != step {
@@ -4645,16 +4684,18 @@ impl WriteStore for PgStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Constraint`] when a row's
-    /// `run_step_id` is not `step` or names an unknown repo.
+    /// In this order: [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Fenced`]
+    /// when the step's run has a `lease_owner` other than `fence`'s (MOD-41 plan D1);
+    /// [`StoreError::Constraint`] when a row's `run_step_id` is not `step` or names an unknown
+    /// repo.
     async fn record_commits(
         &self,
-        _fence: StepFence,
+        fence: StepFence,
         step: StepId,
         commits: &[RunStepCommit],
     ) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        step_exists(&mut tx, step).await?;
+        step_fence(&mut tx, step, fence).await?;
 
         for row in commits {
             if row.run_step_id != step {

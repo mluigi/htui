@@ -1579,7 +1579,7 @@ impl State {
     /// both values.
     fn set_step_prompt(
         &mut self,
-        _fence: StepFence,
+        fence: StepFence,
         step: StepId,
         digest: &str,
         trim: &Value,
@@ -1592,6 +1592,8 @@ impl State {
                 entity: "run_step",
                 id: step.to_string(),
             })?;
+        // MOD-41 plan D1: existence, then the fence, then the write.
+        Self::fence_holds(&self.lease_owners, row, fence)?;
         row.prompt_digest = Some(digest.to_owned());
         row.trim_record = Some(trim.clone());
         row.updated_at = now;
@@ -4559,7 +4561,7 @@ impl State {
     /// would make it a write.
     fn upsert_step_tree(
         &mut self,
-        _fence: StepFence,
+        fence: StepFence,
         step: StepId,
         trees: &[RunStepTree],
         now: DateTime<Utc>,
@@ -4567,7 +4569,7 @@ impl State {
         self.check_step_batch(
             "run_step_tree",
             step,
-            None,
+            Some(fence),
             trees.iter().map(|row| (row.run_step_id, row.repo_id)),
         )?;
         let chosen = trees
@@ -4596,14 +4598,14 @@ impl State {
     /// `run_step_commit` upserted on the same key (`R-ORCH-11`).
     fn record_commits(
         &mut self,
-        _fence: StepFence,
+        fence: StepFence,
         step: StepId,
         commits: &[RunStepCommit],
     ) -> Result<()> {
         self.check_step_batch(
             "run_step_commit",
             step,
-            None,
+            Some(fence),
             commits.iter().map(|row| (row.run_step_id, row.repo_id)),
         )?;
         for row in commits {
