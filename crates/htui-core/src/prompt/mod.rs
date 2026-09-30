@@ -540,6 +540,14 @@ pub fn assemble(
     let text = match &sent_box {
         None => digest_text.clone(),
         Some(sent) => {
+            // `sent_box` is `Some` only when the body places `{{box}}`, and `box` is a protected
+            // section the trimmer never drops, so `live` must still carry it: otherwise the sent
+            // text would silently equal the digest text while `undigested` claims otherwise.
+            debug_assert!(
+                live.iter()
+                    .any(|(_, section)| section.name == SectionName::Box),
+                "the box section is protected: a sent box needs a box section in `live` to replace"
+            );
             // Swapped by section name, never by searching the text (D263 (b)).
             let sent_live: Vec<(Placeholder, Rendered)> = live
                 .iter()
