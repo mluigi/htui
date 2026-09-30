@@ -22,8 +22,8 @@ use htui_core::store::{Result as StoreResult, StoreError};
 use htui_orch::{
     Adopted, Clock, Command, CommandOutcome, DeadWalks, DriverFor, Engine, EngineError,
     EngineParts, FirstCandidate, GixIsolator, Isolator, IsolatorConfig, LeaseTimes, Next,
-    OpeningPath, RepoCheckout, Rest, Resume, RunFence, SessionKey, ShellVerifier, SystemClock,
-    Tails, UnblockCase, Verifier, cleanup_enabled,
+    OpeningPath, RepoCheckout, ResolveError, Rest, Resume, RunFence, SessionKey, ShellVerifier,
+    SystemClock, Tails, UnblockCase, Verifier, cleanup_enabled,
 };
 use htui_store::{DATABASE_UNREACHABLE, identity};
 use serde_json::Value;
@@ -100,6 +100,26 @@ pub fn worker_walks(run: RunId) -> String {
     )
 }
 
+/// OQ-6: the first delay before a run whose resume failed is resumed again.
+const BACKOFF_FIRST: Duration = Duration::from_secs(5);
+/// OQ-6: the delay stops doubling here.
+const BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// OQ-6, blueprint B-10: when a run whose resume keeps failing may be resumed again, and the delay
+/// that got it there.
+#[derive(Debug, Clone, Copy)]
+struct Backoff {
+    due: tokio::time::Instant,
+    delay: Duration,
+}
+
+/// OQ-6: a resume that failed to resolve the live graph for a reason other than the store
+/// (`NoGraph`, `NoTemplate`, `NoAgentRow`, `EmptyScopeWithPrimary`, …; the refusals the resume
+/// handles itself are `resume_window`'s) is retried later, not at every poll.
+fn backs_off(err: &EngineError) -> bool {
+    matches!(err, EngineError::Resolve(resolve) if !matches!(resolve, ResolveError::Store(_)))
+}
+
 /// The `copy_max_total_bytes` a box with no `app_setting` for it copies up to: 20 GiB.
 const DEFAULT_COPY_MAX_TOTAL_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
@@ -170,6 +190,10 @@ struct Shared<P: ReplySink> {
     sweep_fixed: bool,
     /// D190: one sweep at a time.
     sweeping: AtomicBool,
+    /// I-1: the executor the last sweep read, so a change is logged once.
+    last_executor: StdMutex<Option<Executor>>,
+    /// OQ-6, blueprint B-10: the runs whose resume keeps failing (role [`Role::Worker`] only).
+    backoff: StdMutex<HashMap<RunId, Backoff>>,
 }
 
 /// One task of the runtime, with the run it works on once it knows it.
@@ -187,6 +211,70 @@ pub(crate) struct Tag {
 }
 
 impl<P: ReplySink> Shared<P> {
+    /// I-1: the box's executor as a sweep read it, logged once per change: at `info` for the
+    /// worker, whose whole job it decides (OQ-2), at `debug` for the TUI.
+    fn note_executor(&self, executor: &Executor) {
+        let mut last = self
+            .last_executor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if last.as_ref() == Some(executor) {
+            return;
+        }
+        *last = Some(executor.clone());
+        let executes = self.role.executes(executor);
+        match self.role {
+            Role::Worker => {
+                tracing::info!(%executor, executes, "this box's executor; the worker executes only on `worker`");
+            }
+            Role::Tui => {
+                tracing::debug!(%executor, executes, "this box's executor; the TUI executes only on `tui`");
+            }
+        }
+    }
+
+    /// OQ-6: `run`'s resume failed again; its next one waits, 5 s doubling to 5 min. Warned once
+    /// per step up.
+    fn step_backoff(&self, run: RunId) {
+        let mut backoff = self.backoff.lock().unwrap_or_else(PoisonError::into_inner);
+        let previous = backoff.get(&run).map(|entry| entry.delay);
+        let delay = previous.map_or(BACKOFF_FIRST, |delay| (delay * 2).min(BACKOFF_MAX));
+        if previous != Some(delay) {
+            tracing::warn!(
+                %run,
+                delay_secs = delay.as_secs(),
+                "a run's resume keeps failing; the worker waits before resuming it again"
+            );
+        }
+        backoff.insert(
+            run,
+            Backoff {
+                due: tokio::time::Instant::now() + delay,
+                delay,
+            },
+        );
+    }
+
+    /// OQ-6: `run`'s resume answered; its backoff is over.
+    fn clear_backoff(&self, run: RunId) {
+        self.backoff
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&run);
+    }
+
+    /// OQ-6: when `run` may be resumed again, for the worker only; the TUI never backs off.
+    fn backoff_due(&self, run: RunId) -> Option<tokio::time::Instant> {
+        if self.role != Role::Worker {
+            return None;
+        }
+        self.backoff
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&run)
+            .map(|entry| entry.due)
+    }
+
     /// M5 D84: a run a claim refused waits in `queued_at` order.
     fn queue(&self, queued_at: DateTime<Utc>, run: RunId) {
         self.queued
@@ -579,6 +667,12 @@ struct Kit<H: htui_core::store::WorkerHost> {
     dead_walks: Arc<DeadWalks>,
     agents: HashMap<AgentId, AgentSummary>,
     drivers: Arc<DriverFactory>,
+    /// I-1: which process this is.
+    role: Role,
+    /// I-1: the box's `settings.executor`, read by [`Executor::of`] alone (plan D9).
+    executor: Executor,
+    /// Plan D12: [`Role::tails`] over [`Self::executor`].
+    tails: Tails,
 }
 
 impl<H: htui_core::store::WorkerHost> Kit<H> {
@@ -594,6 +688,14 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
         let (isolator, verifier) = shared.singletons(host, &writer, start_run).await?;
         let sentence = |err: StoreError| err.to_string();
         let box_id = registered_box(host).await.map_err(sentence)?;
+        // I-1 (plan D12): per command and per sweep, the executor key alone (plan D9).
+        let executor = host
+            .box_row(box_id)
+            .await
+            .map_err(sentence)?
+            .map(|row| Executor::of(&row.settings))
+            .ok_or_else(|| "this box has no row".to_owned())?;
+        let tails = shared.role.tails(&executor);
         let user = host.this_user().await.map_err(sentence)?;
         let app = host.app_settings().await.map_err(sentence)?;
         let box_profile = host
@@ -628,7 +730,30 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             dead_walks: Arc::clone(&shared.dead_walks),
             agents,
             drivers: Arc::clone(&shared.drivers),
+            role: shared.role,
+            executor,
+            tails,
         })
+    }
+
+    /// Plan D9: the TUI refuses to start or walk on a box whose executor this build does not
+    /// know. `None` for every other role and executor.
+    fn walking_refusal(&self) -> Option<String> {
+        (self.role == Role::Tui && matches!(self.executor, Executor::Other(_)))
+            .then(|| unknown_executor(&self.executor))
+    }
+
+    /// [`Self::walking_refusal`] for `command` when it walks: `R`, `a`/`x`, `r`, `s` and `A`.
+    /// `u` is refused in its resume case only ([`unblock`]); `c`, `p`, `C` and `T` walk nothing.
+    fn refusal(&self, command: &Command) -> Option<String> {
+        match command {
+            Command::StartRun { .. }
+            | Command::AnswerGate { .. }
+            | Command::RetryStep { .. }
+            | Command::SelectFanout { .. }
+            | Command::AcceptArtifact { .. } => self.walking_refusal(),
+            _ => None,
+        }
     }
 
     /// The driver for one candidate: the registry row's, else the refusal (D156).
@@ -666,7 +791,7 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             owner: self.owner,
             dead_walks: &self.dead_walks,
             user: self.user,
-            tails: Tails::Walk,
+            tails: self.tails,
         })
     }
 }
@@ -778,6 +903,8 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 sweep_every: AtomicU64::new(millis(lease_period(&BTreeMap::new()))),
                 sweep_fixed: false,
                 sweeping: AtomicBool::new(false),
+                last_executor: StdMutex::default(),
+                backoff: StdMutex::default(),
             }),
             events: Some(receiver),
             host: PhantomData,
@@ -1337,6 +1464,12 @@ async fn reclaim<H: htui_core::store::WorkerHost, P: ReplySink>(
             return ctx.refuse(message);
         }
     };
+    // Blueprint B-7 (F-17): the claim queue claims too, so it honours I-1. The run leaves the
+    // queue; the executing process's claim scan finds it.
+    if !kit.role.executes(&kit.executor) {
+        tracing::debug!(%run, "not this process's to claim on this box (I-1)");
+        return;
+    }
     if ctx.tag_run(&kit.writer, run).await.map(|row| row.status) != Some(RunStatus::Queued) {
         return;
     }
@@ -1357,8 +1490,11 @@ async fn reclaim<H: htui_core::store::WorkerHost, P: ReplySink>(
     drop(guard);
 }
 
-/// D158, D189: one sweep. Nothing is built when there is nothing to adopt: no dead walk of this
-/// process and no run holding a slot on this box.
+/// D158, D189: one sweep. I-1 (plan D12, D13): only the process whose role matches the box's
+/// executor adopts or claims, so the executor is read first, at every sweep. Then the adoption
+/// (nothing is built when there is nothing to adopt: no dead walk of this process and no run
+/// holding a slot on this box), then the claim scan, always (blueprint B-8: `queued` rows hold no
+/// slot, so the adoption's short-circuit must not skip them).
 async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, P>) {
     let host = &ctx.host;
     if !ctx.shared.sweep_fixed
@@ -1371,11 +1507,30 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
     let Ok(box_id) = registered_box(host).await else {
         return;
     };
-    if ctx.shared.dead_walks.runs().is_empty()
-        && matches!(host.active_runs_on_box(box_id).await, Ok(0))
-    {
+    let executor = match host.box_row(box_id).await {
+        Ok(Some(row)) => Executor::of(&row.settings),
+        Ok(None) => return,
+        Err(err) => {
+            tracing::debug!(%err, "the sweep could not read this box's executor");
+            return;
+        }
+    };
+    ctx.shared.note_executor(&executor);
+    if !ctx.shared.role.executes(&executor) {
         return;
     }
+    if !ctx.shared.dead_walks.runs().is_empty()
+        || !matches!(host.active_runs_on_box(box_id).await, Ok(0))
+    {
+        adopt(&ctx).await;
+    }
+    claim_scan(&ctx, box_id).await;
+}
+
+/// D158, D189: the sweep's adoption: every lapsed lease on the box adopted, and each run that
+/// owes a walk resumed on its own task.
+async fn adopt<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P>) {
+    let host = &ctx.host;
     let kit = match Kit::read(&ctx.shared, host, false).await {
         Ok(kit) => kit,
         Err(message) => {
@@ -1419,10 +1574,59 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
     }
 }
 
+/// Plan D14, OQ-5: this box's queued rows join the claim queue in `(queued_at, id)` order and are
+/// claimed through [`claim_queued`], each under its run lock, whichever process queued them. A
+/// run this process is already working on (its own `StartRun` between `enqueue` and the lock, or
+/// a claim retry) is skipped (blueprint B-9); what is left of that race is a wrong refusal
+/// sentence on a TUI box, never a second claim. A row refused again (`SlotFull`, `Overlaps`) is
+/// tried at every sweep (F-36, logged at `debug`).
+async fn claim_scan<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: &TaskCtx<H, P>,
+    box_id: BoxId,
+) {
+    let queued = match ctx.host.queued_runs_on_box(box_id).await {
+        Ok(queued) => queued,
+        Err(err) => {
+            tracing::debug!(%err, "the claim scan could not list queued runs");
+            return;
+        }
+    };
+    let mut fed = false;
+    for (run, queued_at) in queued {
+        if ctx.shared.walks.is_live(run) {
+            continue;
+        }
+        ctx.shared.queue(queued_at, run);
+        fed = true;
+    }
+    if fed {
+        claim_queued(ctx).await;
+    }
+}
+
 /// D158: an adopted run's walk, resumed on its own task under its lock.
 async fn resumed<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, P>, run: RunId) {
     ctx.tag(run).await;
     let walk = ctx.shared.walks.child(run);
+    // OQ-6, blueprint B-10: a run whose resume keeps failing is adopted as any other (a sweep
+    // never re-adopts a lease this process owns, plan D88), and its resume waits here.
+    if let Some(due) = ctx.shared.backoff_due(run) {
+        tokio::select! {
+            biased;
+            () = walk.token.cancelled() => {
+                // Shutdown while waiting: the adopted lease is this owner's; give it back.
+                if let Some(store) = ctx.host.writer()
+                    && let Err(err) =
+                        htui_core::store::WorkerStore::release_lease(&store, run, ctx.shared.owner)
+                            .await
+                {
+                    tracing::warn!(%run, %err, "releasing a backed-off run's lease failed; it lapses");
+                }
+                return;
+            }
+            () = tokio::time::sleep_until(due) => {}
+        }
+    }
     let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
         return;
     };
@@ -1443,9 +1647,15 @@ async fn resumed<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, 
             ctx.refuse(PREEMPTED.to_owned());
         }
         Some(Ok(Resume::Walked(rest) | Resume::TopologyChanged { rest, .. })) => {
+            ctx.shared.clear_backoff(run);
             ctx.publish(Some(run), FrameKind::Rested(rest));
         }
-        Some(Err(err)) => ctx.refuse(err.to_string()),
+        Some(Err(err)) => {
+            if ctx.shared.role == Role::Worker && backs_off(&err) {
+                ctx.shared.step_backoff(run);
+            }
+            ctx.refuse(err.to_string());
+        }
     }
     drop(guard);
 }
@@ -1535,6 +1745,9 @@ async fn start_run<H: htui_core::store::WorkerHost, P: ReplySink>(
         Ok(kit) => kit,
         Err(message) => return ctx.refuse(message),
     };
+    if let Some(refusal) = kit.walking_refusal() {
+        return ctx.refuse(refusal);
+    }
     let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
     let engine = kit.engine(&driver);
     // The UI went while the parts were read: no run is enqueued for nobody to walk.
@@ -1545,8 +1758,22 @@ async fn start_run<H: htui_core::store::WorkerHost, P: ReplySink>(
         Ok(run) => run,
         Err(err) => return ctx.refuse(err.to_string()),
     };
+    // Blueprint B-9: the run is this task's before anything awaits, so a claim scan that read it
+    // meanwhile skips it.
+    let walk = ctx.shared.walks.child(run);
     let _ = ctx.tag.run.set(run);
     ctx.publish(Some(run), FrameKind::Started);
+    // Plan D12: on a `worker` box the TUI only enqueues; the box's worker claims the run.
+    if kit.tails == Tails::HandBack {
+        return ctx.done(CommandOutcome::Started {
+            run,
+            rest: Rest {
+                run: RunStatus::Queued,
+                position: None,
+                failure: None,
+            },
+        });
+    }
     // M5 D84: read now, so a refused claim joins the queue with no await after the refusal.
     let queued_at = htui_core::store::WorkerStore::run(&kit.writer, run)
         .await
@@ -1554,7 +1781,6 @@ async fn start_run<H: htui_core::store::WorkerHost, P: ReplySink>(
         .flatten()
         .map_or_else(|| ctx.shared.clock.now(), |row| row.queued_at);
 
-    let walk = ctx.shared.walks.child(run);
     let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
         return ctx.refuse(PREEMPTED.to_owned());
     };
@@ -1619,10 +1845,14 @@ async fn on_run<H: htui_core::store::WorkerHost, P: ReplySink>(
         Ok(kit) => kit,
         Err(message) => return ctx.refuse(message),
     };
+    if let Some(refusal) = kit.refusal(&command) {
+        return ctx.refuse(refusal);
+    }
     // `project_id` never changes, so the row read before the lock stands in for a failed one.
     let row = ctx.tag_run(&kit.writer, run).await.or(early);
     let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
     let engine = kit.engine(&driver);
+    let cancelling = matches!(command, Command::CancelRun { .. });
     match walked(&walk, engine.dispatch(command)).await {
         None => {
             engine.abandoned(run).await;
@@ -1688,6 +1918,12 @@ async fn on_run<H: htui_core::store::WorkerHost, P: ReplySink>(
             }
         }
         Some(Ok(outcome)) => ctx.done(outcome),
+        // OQ-4: on a `worker` box a live lease elsewhere is the box's worker walking the run.
+        Some(Err(EngineError::LeaseHeld { run: held }))
+            if cancelling && kit.tails == Tails::HandBack =>
+        {
+            ctx.refuse(worker_walks(held));
+        }
         Some(Err(err)) => ctx.refuse(err.to_string()),
     }
     drop(guard);
@@ -1707,6 +1943,12 @@ async fn unblock<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, 
         Ok(case) => case,
         Err(err) => return ctx.refuse(err.to_string()),
     };
+    // Plan D9: the resume case walks; the engine's `Tails` hands it back on a `worker` box.
+    if matches!(case, UnblockCase::Resume(_))
+        && let Some(refusal) = kit.walking_refusal()
+    {
+        return ctx.refuse(refusal);
+    }
     let run = match case {
         UnblockCase::Reopen => {
             return match engine.dispatch(Command::Unblock { item }).await {

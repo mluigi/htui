@@ -243,6 +243,13 @@ pub(crate) mod tests {
             })
             .await
             .expect("the demo project has no repo yet");
+        // MOD-41 OQ-5: a TUI sweep on a `tui` box claims every queued row of its box, and the
+        // demo seeds one (`RUN_2` on `FEAT-3`). Its walk would play the sessions a case scripts
+        // for its own runs, so the fixture ends it: every run a case sees is one it made.
+        store
+            .finish_run(ids::RUN_2, RunStatus::Cancelled, None, Utc::now())
+            .await
+            .expect("the seeded run is queued and cancellable");
         (store, agent)
     }
 
@@ -2722,11 +2729,6 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_tui_box_claims_a_queued_row_it_did_not_queue() {
         let fixture = Fixture::new().await;
-        fixture
-            .store
-            .finish_run(ids::RUN_2, RunStatus::Cancelled, None, Utc::now())
-            .await
-            .expect("the seeded queued run is cancellable");
         // Left `queued` by a process that enqueued it and died before its claim.
         let queued = queued_by_another(&fixture, ids::HTUI_ANA_2).await;
         let mut runtime = fixture.runtime();
