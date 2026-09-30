@@ -82,7 +82,7 @@ hand-written document end to end from the keyboard.**
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Filters | Backlog narrows by status, project, capability, readiness; filter state visible | in-progress | `.claude/plans/mod-13-filters.plan.md` |
+| 1 | Filters | Backlog narrows by status, project, capability, readiness; filter state visible | complete | `.claude/plans/mod-13-filters.plan.md` |
 | 2 | New and edit | Items minted and edited in-TUI through §7.1/§7.2, `touched_paths` validated, offline read-only notice | pending | — |
 | 3 | Divergence | A stale edit opens the three-way view and resolves to a `divergence_resolution` revision | pending | — |
 | 4 | `$EDITOR` round-trip | Long text edited externally, returns through the same compare-and-set | pending | — |

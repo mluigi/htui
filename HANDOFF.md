@@ -366,6 +366,14 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   **The scope line "mint per §7.1" above means ANA-9 §7.1's Postgres statement**, which is now the
   only mint. MOD-4's close-out writes a generated `summary` document with no human prose (MOD-4 risk
   R-43, `docs/decisions/mod/mod-4.md`); an editable summary is this item's editor's.
+  **Phase 1 landed (`c9c01dc`..`025ef49`, 2026-10-01):** Backlog filters. `f` opens a
+  capturing filter form in the list pane (status, project, required tags, ready here) and `F`
+  clears it. "Ready here" is ANA-9 §7.4 for this box, composed in the store worker so the
+  offline mirror answers it too (`Items { ready_here }`). With no filter set, the screen is
+  byte-identical. PRD `.claude/prds/mod-13-backlog-editing.prd.md` (5 milestones, all in MVP),
+  plan `.claude/plans/mod-13-filters.plan.md`, blueprint
+  `.claude/plans/mod-13-filters.blueprint.md`. Next: milestone 2,
+  `new`/`edit`.
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
   `R-NF-3`, `R-HIS-1`. **This is now the only Windows check** (TOOL-3 decided 2026-09-28,
   `docs/decisions/tool/tool-3.md`): the maintainer accepted that

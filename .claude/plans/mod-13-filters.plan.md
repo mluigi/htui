@@ -168,7 +168,7 @@ cargo test --workspace --all-features -- --test-threads=1   # full gate before c
 Blueprint: `.claude/plans/mod-13-filters.blueprint.md` (errata E1–E7 amend this plan; the blueprint wins on detail).
 
 ## Acceptance
-- [ ] All tasks complete
-- [ ] Validation passes
-- [ ] Patterns mirrored, not reinvented
-- [ ] No existing snapshot changed
+- [x] All tasks complete
+- [x] Validation passes
+- [x] Patterns mirrored, not reinvented
+- [x] No existing snapshot changed
