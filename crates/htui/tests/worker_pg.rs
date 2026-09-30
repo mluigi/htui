@@ -9,10 +9,10 @@
 //! answer. The two runtimes share one fake isolator and verifier, as two processes on one box
 //! share its filesystem.
 //!
-//! Case 4 is the headless connect's refusal, and cases 5 and 6 spawn the `htui` binary with a
+//! Case 4 is the headless connect's refusal, and cases 5 to 8 spawn the `htui` binary with a
 //! cleared environment whose `HOME` and `XDG_CONFIG_HOME` are a temporary directory, so nothing
 //! reaches the developer's `~/.config/htui` (blueprint F-22). No case walks a run with production
-//! parts.
+//! parts. Cases 7 and 8 (a signal during startup) need no server and never skip.
 //!
 //! Each case prints `testkit::SKIP` and returns with `HTUI_TEST_DATABASE_URL` unset, and panics
 //! instead when `CI` is set, like every other Postgres-backed suite.
@@ -688,7 +688,7 @@ async fn the_worker_refuses_a_pending_schema_and_writes_nothing() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Cases 5 and 6: the binary
+// Cases 5 to 8: the binary
 // ---------------------------------------------------------------------------------------------
 
 /// `dsn` with a password to look for, and that password: `sentinel-<uuid>` when the DSN carries
@@ -713,28 +713,66 @@ fn with_sentinel(dsn: &str) -> (String, String) {
 /// only `HOME` and `XDG_CONFIG_HOME` (the throwaway `home`) and `USERNAME=htui-ci`. Its stdin
 /// holds `dsn` and is closed.
 #[cfg(target_os = "linux")]
-fn spawn_binary(home: &std::path::Path, dsn: &str) -> std::process::Child {
+fn spawn_binary(home: &std::path::Path, dsn: &str) -> Reaped {
     use std::io::Write as _;
-    use std::process::{Command as Process, Stdio};
 
-    let mut child = Process::new(env!("CARGO_BIN_EXE_htui"))
-        .arg("worker")
-        .arg("--dsn-stdin")
-        .arg("--log")
-        .arg(home.join("w.log"))
-        .env_clear()
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home)
-        .env("USERNAME", "htui-ci")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn the htui binary");
+    let mut child = spawn_binary_waiting(home);
     let mut stdin = child.stdin.take().expect("a piped stdin");
     writeln!(stdin, "{dsn}").expect("write the DSN");
     drop(stdin);
     child
+}
+
+/// As [`spawn_binary`], but nothing is written to the child's stdin, which stays open.
+#[cfg(target_os = "linux")]
+fn spawn_binary_waiting(home: &std::path::Path) -> Reaped {
+    use std::process::{Command as Process, Stdio};
+
+    Reaped(
+        Process::new(env!("CARGO_BIN_EXE_htui"))
+            .arg("worker")
+            .arg("--dsn-stdin")
+            .arg("--log")
+            .arg(home.join("w.log"))
+            .env_clear()
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home)
+            .env("USERNAME", "htui-ci")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the htui binary"),
+    )
+}
+
+/// A spawned worker that is killed and reaped when the case ends, even by a panic: an orphan
+/// would outlive the suite and hold whatever it inherited (the gate's `flock` among them).
+#[cfg(target_os = "linux")]
+struct Reaped(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl std::ops::Deref for Reaped {
+    type Target = std::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::ops::DerefMut for Reaped {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// The child's exit status within `limit`, polled.
@@ -878,9 +916,105 @@ async fn the_worker_binary_refuses_a_dsn_it_cannot_use_without_echoing_it() {
         !stderr.contains(&sentinel),
         "the DSN's password is on stderr"
     );
-    let text = std::fs::read_to_string(home.path().join("w.log")).unwrap_or_default();
+    let text = std::fs::read_to_string(home.path().join("w.log")).expect("the refusal is logged");
+    let sentence = stderr
+        .trim_end()
+        .strip_prefix("htui: ")
+        .expect("checked above");
+    // MOD-41 E-1: stderr and the log, at `warn`: an `error` line would be a GlitchTip report.
+    assert!(
+        text.lines()
+            .any(|line| line.contains(sentence) && line.contains("WARN")),
+        "the refusal is a `warn` line in the log: {text:?}"
+    );
     assert!(
         !text.contains(&sentinel),
         "the DSN's password is in the log"
     );
+}
+
+/// Whether `pid` has installed its own SIGTERM handler (`SigCgt` in `/proc/<pid>/status`): from
+/// then on a SIGTERM is the worker's to act on, not the default termination.
+#[cfg(target_os = "linux")]
+fn catches_sigterm(pid: u32) -> bool {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigCgt:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .is_some_and(|mask| mask & (1 << (15 - 1)) != 0)
+}
+
+/// Waits until the child's SIGTERM handler is in, then sends it SIGTERM.
+#[cfg(target_os = "linux")]
+async fn terminate_once_handled(child: &mut std::process::Child) {
+    let pid = child.id();
+    let deadline = Instant::now() + PATIENCE;
+    while !catches_sigterm(pid) {
+        if let Some(status) = child.try_wait().expect("poll the child") {
+            panic!(
+                "the worker exited ({status}) before its handlers were in: {}",
+                stderr_of(child)
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the worker installed no SIGTERM handler"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let killed = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("run kill");
+    assert!(killed.success(), "SIGTERM was delivered");
+}
+
+/// Plan D14, docs/htui-worker.md: SIGTERM stops the worker while it still waits for its DSN on
+/// stdin, exit 0, and nothing is minted. Needs no server: the worker never gets that far.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_worker_binary_stops_on_a_signal_while_it_waits_for_its_dsn() {
+    let home = tempfile::tempdir().expect("a throwaway home");
+    let mut child = spawn_binary_waiting(home.path());
+    let stdin = child.stdin.take().expect("a piped stdin");
+
+    terminate_once_handled(&mut child).await;
+    let status = exit_within(&mut child, Duration::from_secs(10)).await;
+    drop(stdin);
+    let stderr = stderr_of(&mut child);
+    assert_eq!(status.code(), Some(0), "a clean shutdown: {stderr}");
+    assert!(
+        !home.path().join("htui").join("box.toml").exists(),
+        "nothing was minted"
+    );
+    let text = std::fs::read_to_string(home.path().join("w.log")).unwrap_or_default();
+    assert!(!text.contains("htui worker ready"), "never ready: {text}");
+}
+
+/// Plan D14: SIGTERM stops the worker in the middle of its connect, exit 0, without waiting for
+/// `CONNECT_TIMEOUT`. The "server" accepts the connection and never answers. Needs no server.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_worker_binary_stops_on_a_signal_while_it_connects() {
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a silent listener");
+    let port = silent.local_addr().expect("its address").port();
+    let home = tempfile::tempdir().expect("a throwaway home");
+    let mut child = spawn_binary(
+        home.path(),
+        &format!("postgres://htui:sentinel@127.0.0.1:{port}/htui"),
+    );
+
+    let (_held, _) = tokio::time::timeout(PATIENCE, silent.accept())
+        .await
+        .expect("the worker connects within the patience window")
+        .expect("accept the worker");
+    terminate_once_handled(&mut child).await;
+    let status = exit_within(&mut child, htui_store::pg::CONNECT_TIMEOUT / 2).await;
+    let stderr = stderr_of(&mut child);
+    assert_eq!(status.code(), Some(0), "a clean shutdown: {stderr}");
+    let text = std::fs::read_to_string(home.path().join("w.log")).unwrap_or_default();
+    assert!(!text.contains("htui worker ready"), "never ready: {text}");
 }
