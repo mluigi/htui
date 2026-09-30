@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use htui_agent::acp::SESSION_STARTED;
+use htui_agent::auth::loopback::{DeliverLimits, RedirectUrl};
 use htui_agent::auth::{
     AUTH_IDLE_CAP, AuthChoice, AuthEvent, AuthFlow, AuthOutcome, BrowserPolicy, OpenerCommand,
     open_url,
@@ -279,6 +280,11 @@ impl core::fmt::Debug for LiveInstall {
 /// side can reword without the other.
 pub const AUTH_ALREADY_CHOSEN: &str = "a method was already chosen";
 
+/// What every request a finished login can no longer serve is told (MOD-22 D287): a command
+/// `auth_command` could not send, one still queued when the flow ended, and a delivery the flow's
+/// end overtook.
+const LOGIN_ENDED: &str = "this login has ended";
+
 /// What the worker asks a live login to do (MOD-21 D18).
 ///
 /// The [`ChatCommand`] shape, and for the same reason: there are two things a running flow can be
@@ -299,6 +305,18 @@ pub enum AuthCommand {
     Open {
         /// The link, as the adapter printed it.
         url: String,
+        /// Who to answer, once.
+        reply: ReplyAddr,
+    },
+    /// Relay a pasted redirect to the flow's own loopback listener (MOD-22 D269).
+    ///
+    /// Validated again here against the flow's own record of the advertised redirect, never the
+    /// pane's. The address is a credential for the length of the one `GET` (the credential rule
+    /// of `htui_agent::auth::loopback`), and [`RedirectUrl`]'s `Debug` keeps this enum's derive
+    /// safe.
+    Deliver {
+        /// The pasted address.
+        url: RedirectUrl,
         /// Who to answer, once.
         reply: ReplyAddr,
     },
@@ -434,6 +452,11 @@ pub struct AgentRuntime {
     /// [`OpenerCommand::Platform`] in production. The injected seam a login case needs: `set_var`
     /// is forbidden here, so a test that must not launch the maintainer's browser says so as data.
     opener: OpenerCommand,
+    /// What a delivered paste may wait for (MOD-22 D267, D278).
+    ///
+    /// [`DeliverLimits::default`] in production; a login case injects milliseconds through
+    /// [`with_deliver_limits`](Self::with_deliver_limits).
+    deliver_limits: DeliverLimits,
     /// The box probe running right now, if any (MOD-7 D11, blueprint D27).
     ///
     /// One deep, and it holds the same claim as the install, the login and the agent probe: it
@@ -554,6 +577,7 @@ impl AgentRuntime {
             install: None,
             auth: None,
             opener: OpenerCommand::Platform,
+            deliver_limits: DeliverLimits::default(),
             box_probe: None,
             registration_probe: false,
             probe_env: None,
@@ -680,6 +704,16 @@ impl AgentRuntime {
     #[must_use]
     pub fn with_opener(mut self, opener: OpenerCommand) -> Self {
         self.opener = opener;
+        self
+    }
+
+    /// The deadlines a delivered paste runs under (MOD-22 D278).
+    ///
+    /// Production leaves it at [`DeliverLimits::default`]. The seam a case needs to reach
+    /// `DeliverError::Timeout` without waiting fifteen seconds.
+    #[must_use]
+    pub fn with_deliver_limits(mut self, limits: DeliverLimits) -> Self {
+        self.deliver_limits = limits;
         self
     }
 
@@ -1109,6 +1143,14 @@ impl AgentRuntime {
             StoreRequest::AuthOpen { url } => self.auth_command(
                 "auth_open",
                 AuthCommand::Open {
+                    url: url.clone(),
+                    reply: addr,
+                },
+            ),
+            // A wiped copy: the envelope's own is wiped when the loop drops the envelope.
+            StoreRequest::AuthDeliver { url } => self.auth_command(
+                "auth_deliver",
+                AuthCommand::Deliver {
                     url: url.clone(),
                     reply: addr,
                 },
@@ -1593,6 +1635,7 @@ impl AgentRuntime {
                 cancel: cancel.clone(),
                 commands: commands_rx,
                 opener: self.opener.clone(),
+                deliver_limits: self.deliver_limits,
                 frames,
             }),
             Some(answer),
@@ -1630,7 +1673,7 @@ impl AgentRuntime {
             self.auth.take_if(|live| live.task.is_finished());
             return Served::Reply(StoreReply::Failed {
                 request,
-                message: "this login has ended".to_owned(),
+                message: LOGIN_ENDED.to_owned(),
             });
         }
         Served::Deferred
@@ -2821,6 +2864,7 @@ struct AuthArgs {
     cancel: CancellationToken,
     commands: mpsc::UnboundedReceiver<AuthCommand>,
     opener: OpenerCommand,
+    deliver_limits: DeliverLimits,
     frames: Frames,
 }
 
@@ -2868,6 +2912,7 @@ async fn run_auth(args: AuthArgs) {
         cancel,
         mut commands,
         opener,
+        deliver_limits: _,
         frames,
     } = args;
     // The `AuthStart`'s address until the choice arrives, and the `AuthChoose`'s afterwards.
@@ -2928,6 +2973,7 @@ async fn run_auth(args: AuthArgs) {
                     };
                     frames.reply(&reply, answer);
                 }
+                Some(AuthCommand::Deliver { .. }) => todo!("MOD-22 T2"),
                 // The runtime let go of this login **without** cancelling it: a panic on the worker
                 // loop, or any drop of `AgentRuntime` that never reached `shutdown`, closes this
                 // channel and drops the token clone rather than tripping it. A closed channel means
@@ -2956,12 +3002,13 @@ async fn run_auth(args: AuthArgs) {
         let (request, reply) = match command {
             AuthCommand::Choose { reply, .. } => ("auth_choose", reply),
             AuthCommand::Open { reply, .. } => ("auth_open", reply),
+            AuthCommand::Deliver { .. } => todo!("MOD-22 T2"),
         };
         frames.reply(
             &reply,
             StoreReply::Failed {
                 request,
-                message: "this login has ended".to_owned(),
+                message: LOGIN_ENDED.to_owned(),
             },
         );
     }
@@ -6883,6 +6930,9 @@ pub(crate) mod tests {
     pub(crate) mod auth {
         use super::*;
         use htui_agent::acp::Handshake;
+        use htui_agent::auth::loopback::{
+            DELIVERY_IN_FLIGHT, DeliverError, NO_LOOPBACK_REDIRECT, PasteError,
+        };
         use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo, OpenerCommand};
         use htui_agent::probe::{CredentialTier, ProbeSource};
         use std::path::{Path, PathBuf};
@@ -6901,6 +6951,14 @@ pub(crate) mod tests {
         /// *credential* never becomes one.
         pub(crate) const LINK: &str = "https://h.invalid/login?state=SENTINEL-TOKEN-VALUE";
 
+        /// The authorization code a pasted redirect carries (MOD-22): no frame, no `Debug` and
+        /// no log line may ever carry it (the credential rule of `htui_agent::auth::loopback`).
+        pub(crate) const CODE: &str = "CODE-SENTINEL-4f1c";
+
+        /// The `state` a loopback link carries and a pasted redirect echoes. Unlike [`CODE`] it
+        /// is on screen already, as part of the link.
+        pub(crate) const STATE: &str = "STATE-SENTINEL-9a2e";
+
         /// How long a case waits on a child before calling the flow stuck rather than slow.
         const PATIENCE: Duration = Duration::from_secs(30);
 
@@ -6914,8 +6972,9 @@ pub(crate) mod tests {
         /// pid and the credential go; `FIXTURE_INIT` is the `initialize` result on one line;
         /// `FIXTURE_KEY` unset makes `authenticate` refuse the way a real adapter refuses a login
         /// it has no variable for; `FIXTURE_HOLD` makes it never answer; `FIXTURE_URL` is a link
-        /// printed to stderr before the answer; `FIXTURE_CRED` is written into the credential file
-        /// on success and removed on `logout`.
+        /// printed to stderr before the answer; `FIXTURE_WAIT_FOR` is a path `authenticate` waits to
+        /// exist, every 50 ms, before answering (MOD-22: the case's listener creates it);
+        /// `FIXTURE_CRED` is written into the credential file on success and removed on `logout`.
         ///
         /// The id is echoed back **as it arrived**, quotes and all: this SDK sends a UUID *string*
         /// as its JSON-RPC id, and a fixture that assumed a number would answer with a line the
@@ -6929,6 +6988,7 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$FIXTURE_INIT" ;;
     *'"method":"authenticate"'*)
       if [ -n "$FIXTURE_URL" ]; then echo "open the following link to log in: $FIXTURE_URL" >&2; fi
+      if [ -n "$FIXTURE_WAIT_FOR" ]; then while [ ! -e "$FIXTURE_WAIT_FOR" ]; do sleep 0.05; done; fi
       if [ -n "$FIXTURE_HOLD" ]; then sleep 3600; fi
       if [ -z "$FIXTURE_KEY" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"the FIXTURE_KEY variable must be set where this server is launched from"}}\n' "$id"
@@ -8214,6 +8274,7 @@ done
                 cancel: CancellationToken::new(),
                 commands: commands_rx,
                 opener: OpenerCommand::Custom(recorder(tmp.path())),
+                deliver_limits: DeliverLimits::default(),
                 frames: Frames::new(
                     tx,
                     ReplyAddr {
@@ -8247,6 +8308,793 @@ done
                 "a login that has ended opens nothing: {:?}",
                 opened(tmp.path())
             );
+        }
+
+        // -------------------------------------------------------------------------------------
+        // MOD-22: a pasted redirect, delivered from inside the live flow (D269, D277, D286)
+        //
+        // No assertion message here prints a reply that could carry the code sentinel unless
+        // the assertion is the one proving it absent.
+        // -------------------------------------------------------------------------------------
+
+        /// The listener's page, as a browser would have been shown it.
+        const SIGNED_IN: &str = "<title>signed in</title>";
+
+        /// A patience for a refusal that must *not* happen: nothing connects within it.
+        const QUIET: Duration = Duration::from_millis(200);
+
+        /// A loopback listener on a free port, and the port.
+        async fn listener() -> (u16, tokio::net::TcpListener) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a free loopback port");
+            let port = listener.local_addr().expect("a bound address").port();
+            (port, listener)
+        }
+
+        /// The link a loopback adapter prints: a vendor URL whose `redirect_uri` is this box's
+        /// `127.0.0.1:<port>/`, carrying [`STATE`].
+        fn loopback_link(port: u16) -> String {
+            format!(
+                "https://h.invalid/login?redirect_uri=http%3A%2F%2F127.0.0.1%3A{port}%2F&state={STATE}"
+            )
+        }
+
+        /// The address a browser would fail to open: `code` is [`CODE`], `state` is `state`.
+        fn pasted(port: u16, state: &str) -> RedirectUrl {
+            RedirectUrl::new(format!(
+                "http://127.0.0.1:{port}/?code={CODE}&state={state}"
+            ))
+        }
+
+        /// The `DeliverLimits` a case with a silent listener would otherwise wait fifteen seconds
+        /// on.
+        fn quick_limits() -> DeliverLimits {
+            DeliverLimits {
+                connect: Duration::from_millis(500),
+                response: Duration::from_millis(200),
+            }
+        }
+
+        /// Reads one request head (through the blank line) off `stream`.
+        async fn read_head(stream: &mut tokio::net::TcpStream) -> String {
+            use tokio::io::AsyncReadExt as _;
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream
+                    .read(&mut buf)
+                    .await
+                    .expect("the request is readable");
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..read]);
+            }
+            String::from_utf8_lossy(&head).into_owned()
+        }
+
+        /// A listener that reads one request, answers `200` with [`SIGNED_IN`] and closes, and
+        /// only **then** lets the adapter answer `authenticate` (it creates `marker`, which the
+        /// fixture's `FIXTURE_WAIT_FOR` polls for) once `release` fires. Yields the head it read.
+        fn answering_listener(
+            listener: tokio::net::TcpListener,
+            marker: PathBuf,
+            release: oneshot::Receiver<()>,
+        ) -> JoinHandle<String> {
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt as _;
+                let (mut stream, _) = listener.accept().await.expect("the delivery connects");
+                let head = read_head(&mut stream).await;
+                let answer = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{SIGNED_IN}",
+                    SIGNED_IN.len()
+                );
+                stream
+                    .write_all(answer.as_bytes())
+                    .await
+                    .expect("the answer is written");
+                stream.shutdown().await.expect("the answer is closed");
+                drop(stream);
+                let _ = release.await;
+                std::fs::write(&marker, b"").expect("the marker lands");
+                head
+            })
+        }
+
+        /// A listener that accepts and says nothing, holding the connection until aborted.
+        fn silent_listener(listener: tokio::net::TcpListener) -> JoinHandle<()> {
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                loop {
+                    let (stream, _) = listener.accept().await.expect("a delivery connects");
+                    held.push(stream);
+                }
+            })
+        }
+
+        /// Whether `listener` is connected to within [`QUIET`].
+        async fn accepts_within_quiet(listener: &tokio::net::TcpListener) -> bool {
+            tokio::time::timeout(QUIET, listener.accept()).await.is_ok()
+        }
+
+        /// Chooses [`METHOD`] at seq 2 and waits for the link the adapter prints.
+        async fn choose_and_await_link(
+            runtime: &mut AgentRuntime,
+            backend: &Backend,
+            tx: &mpsc::UnboundedSender<ReplyEnvelope>,
+            rx: &mut mpsc::UnboundedReceiver<ReplyEnvelope>,
+        ) -> String {
+            let served = runtime
+                .serve(
+                    backend,
+                    tx,
+                    &envelope(
+                        2,
+                        StoreRequest::AuthChoose {
+                            choice: AuthChoice::Method(METHOD.to_owned()),
+                        },
+                    ),
+                )
+                .await;
+            assert!(matches!(served, Served::Deferred), "{served:?}");
+            loop {
+                match next_frame(rx).await {
+                    (seq, AuthFrame::Url(url)) => {
+                        assert_eq!(seq, 2, "the link answers the choice");
+                        return url;
+                    }
+                    (_, other) => assert!(
+                        matches!(other, AuthFrame::Line(_)),
+                        "a flow says nothing but lines before its link: {other:?}"
+                    ),
+                }
+            }
+        }
+
+        /// `AuthDeliver` at `seq`, which the live flow takes (`Served::Deferred`).
+        async fn deliver_at(
+            runtime: &mut AgentRuntime,
+            backend: &Backend,
+            tx: &mpsc::UnboundedSender<ReplyEnvelope>,
+            seq: Seq,
+            url: RedirectUrl,
+        ) {
+            let served = runtime
+                .serve(
+                    backend,
+                    tx,
+                    &envelope(seq, StoreRequest::AuthDeliver { url }),
+                )
+                .await;
+            assert!(
+                matches!(served, Served::Deferred),
+                "a delivery goes into the running flow: {served:?}"
+            );
+        }
+
+        /// `AuthCancel` at `seq`, answered `Cancelling` at once.
+        async fn cancel_at(
+            runtime: &mut AgentRuntime,
+            backend: &Backend,
+            tx: &mpsc::UnboundedSender<ReplyEnvelope>,
+            seq: Seq,
+        ) {
+            let served = runtime
+                .serve(backend, tx, &envelope(seq, StoreRequest::AuthCancel))
+                .await;
+            assert!(
+                matches!(
+                    served,
+                    Served::Reply(StoreReply::Auth(AuthFrame::Cancelling))
+                ),
+                "a cancel is answered at once: {served:?}"
+            );
+        }
+
+        /// Every reply up to and including the flow's terminal frame, `Failed`s included
+        /// ([`next_frame`] panics on those).
+        async fn replies_until_terminal(
+            rx: &mut mpsc::UnboundedReceiver<ReplyEnvelope>,
+        ) -> Vec<(Seq, StoreReply)> {
+            let mut replies = Vec::new();
+            loop {
+                let reply = next_reply(rx).await;
+                let last = matches!(&reply.reply, StoreReply::Auth(frame) if is_terminal(frame));
+                replies.push((reply.seq, reply.reply));
+                if last {
+                    return replies;
+                }
+            }
+        }
+
+        /// Whether `reply` is a refusal of `auth_deliver` that says exactly `sentence`.
+        fn refused_with(reply: &StoreReply, sentence: &str) -> bool {
+            matches!(
+                reply,
+                StoreReply::Failed { request, message }
+                    if *request == "auth_deliver" && message == sentence
+            )
+        }
+
+        /// The next reply must be the refusal of the deliver at `seq`, in `sentence`.
+        async fn expect_refusal(
+            rx: &mut mpsc::UnboundedReceiver<ReplyEnvelope>,
+            seq: Seq,
+            sentence: &str,
+        ) {
+            let reply = next_reply(rx).await;
+            assert_eq!(reply.seq, seq, "a deliver is answered at its own address");
+            assert!(
+                refused_with(&reply.reply, sentence),
+                "expected `{sentence}`, got {:?}",
+                reply.reply
+            );
+        }
+
+        /// D269 end to end: the paste reaches the port the link advertised, as one `GET` of the
+        /// pasted path and query, and the listener's answer reaches the pane **before** the
+        /// login's own result.
+        #[tokio::test]
+        async fn a_pasted_redirect_reaches_the_advertised_port_and_the_login_completes() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (port, bound) = listener().await;
+            let link = loopback_link(port);
+            let marker = tmp.path().join("delivered");
+            let marker_text = marker.to_string_lossy().into_owned();
+            let (store, agent_id) = login_store(
+                tmp.path(),
+                &[
+                    ("FIXTURE_KEY", "set"),
+                    ("FIXTURE_CRED", CREDENTIAL),
+                    ("FIXTURE_URL", &link),
+                    ("FIXTURE_WAIT_FOR", &marker_text),
+                ],
+            )
+            .await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (release, released) = oneshot::channel();
+            let _ = release.send(());
+            let head = answering_listener(bound, marker, released);
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            let url = choose_and_await_link(&mut runtime, &backend, &tx, &mut rx).await;
+            assert_eq!(url, link);
+            deliver_at(&mut runtime, &backend, &tx, 3, pasted(port, STATE)).await;
+            let replies = replies_until_terminal(&mut rx).await;
+
+            let head = tokio::time::timeout(PATIENCE, head)
+                .await
+                .expect("the delivery reached the listener")
+                .expect("the listener ran");
+            assert_eq!(
+                head.lines().next(),
+                Some(format!("GET /?code={CODE}&state={STATE} HTTP/1.1").as_str()),
+                "one GET of the pasted path and query, to the advertised port"
+            );
+            let delivered = replies.iter().position(|(seq, reply)| {
+                *seq == 3
+                    && matches!(
+                        reply,
+                        StoreReply::Auth(AuthFrame::Delivered(said))
+                            if said.status == 200 && said.said.as_deref() == Some("signed in")
+                    )
+            });
+            let done = replies.iter().position(|(seq, reply)| {
+                *seq == 2
+                    && matches!(
+                        reply,
+                        StoreReply::Auth(AuthFrame::Done {
+                            status: ProbeStatus::Ready,
+                            ..
+                        })
+                    )
+            });
+            assert!(
+                delivered.is_some() && done.is_some() && delivered < done,
+                "`Delivered` at the deliver's seq, then `Done {{ ready }}` at the choice's: \
+                 {replies:?}"
+            );
+
+            runtime.finish_background(PATIENCE).await;
+        }
+
+        /// D265 in the worker: the port is checked against the flow's own record, and a paste
+        /// for another one connects nowhere.
+        #[tokio::test]
+        async fn a_paste_for_another_port_is_refused_and_nothing_connects() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (advertised, on_advertised) = listener().await;
+            let (other, on_other) = listener().await;
+            let link = loopback_link(advertised);
+            let (store, agent_id) = login_store(
+                tmp.path(),
+                &[
+                    ("FIXTURE_KEY", "set"),
+                    ("FIXTURE_HOLD", "1"),
+                    ("FIXTURE_URL", &link),
+                ],
+            )
+            .await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            choose_and_await_link(&mut runtime, &backend, &tx, &mut rx).await;
+            deliver_at(&mut runtime, &backend, &tx, 3, pasted(other, STATE)).await;
+            expect_refusal(
+                &mut rx,
+                3,
+                &format!(
+                    "the address is for port {other}; this login is listening on {advertised}"
+                ),
+            )
+            .await;
+            assert!(
+                !accepts_within_quiet(&on_advertised).await,
+                "the advertised port heard nothing"
+            );
+            assert!(
+                !accepts_within_quiet(&on_other).await,
+                "and neither did the pasted one"
+            );
+
+            cancel_at(&mut runtime, &backend, &tx, 4).await;
+            let replies = replies_until_terminal(&mut rx).await;
+            assert!(
+                matches!(
+                    replies.last(),
+                    Some((2, StoreReply::Auth(AuthFrame::Cancelled)))
+                ),
+                "the login is still the pane's to cancel: {replies:?}"
+            );
+
+            runtime.finish_background(PATIENCE).await;
+        }
+
+        /// D247's rule (MOD-23): the worker's check is the authority, whatever the pane let
+        /// through.
+        #[tokio::test]
+        async fn a_stale_state_is_refused_by_the_worker_even_if_the_pane_let_it_through() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (port, bound) = listener().await;
+            let link = loopback_link(port);
+            let (store, agent_id) = login_store(
+                tmp.path(),
+                &[
+                    ("FIXTURE_KEY", "set"),
+                    ("FIXTURE_HOLD", "1"),
+                    ("FIXTURE_URL", &link),
+                ],
+            )
+            .await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            choose_and_await_link(&mut runtime, &backend, &tx, &mut rx).await;
+            deliver_at(&mut runtime, &backend, &tx, 3, pasted(port, "OTHER-STATE")).await;
+            expect_refusal(&mut rx, 3, &PasteError::StaleState.to_string()).await;
+            assert!(!accepts_within_quiet(&bound).await, "nothing connected");
+
+            cancel_at(&mut runtime, &backend, &tx, 4).await;
+            replies_until_terminal(&mut rx).await;
+            runtime.finish_background(PATIENCE).await;
+        }
+
+        /// A link with no loopback `redirect_uri` (MOD-21's own) gives the worker nothing to
+        /// deliver to.
+        #[tokio::test]
+        async fn a_deliver_before_any_loopback_redirect_is_refused() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (port, bound) = listener().await;
+            let (store, agent_id) = login_store(
+                tmp.path(),
+                &[
+                    ("FIXTURE_KEY", "set"),
+                    ("FIXTURE_HOLD", "1"),
+                    ("FIXTURE_URL", LINK),
+                ],
+            )
+            .await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            assert_eq!(
+                choose_and_await_link(&mut runtime, &backend, &tx, &mut rx).await,
+                LINK
+            );
+            deliver_at(&mut runtime, &backend, &tx, 3, pasted(port, STATE)).await;
+            expect_refusal(&mut rx, 3, NO_LOOPBACK_REDIRECT).await;
+            assert!(!accepts_within_quiet(&bound).await, "nothing connected");
+
+            cancel_at(&mut runtime, &backend, &tx, 4).await;
+            replies_until_terminal(&mut rx).await;
+            runtime.finish_background(PATIENCE).await;
+        }
+
+        /// `auth_command`'s first refusal covers the new request too.
+        #[tokio::test]
+        async fn a_deliver_with_no_login_running_is_refused() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, _agent_id) = login_store(tmp.path(), &[("FIXTURE_KEY", "set")]).await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, _rx) = mpsc::unbounded_channel();
+
+            match runtime
+                .serve(
+                    &backend,
+                    &tx,
+                    &envelope(
+                        1,
+                        StoreRequest::AuthDeliver {
+                            url: pasted(9, STATE),
+                        },
+                    ),
+                )
+                .await
+            {
+                Served::Reply(reply) => assert!(
+                    matches!(
+                        &reply,
+                        StoreReply::Failed { request, message }
+                            if *request == "auth_deliver" && message == "no login is running"
+                    ),
+                    "refused by name: {reply:?}"
+                ),
+                other => panic!("a deliver with no flow is refused, not served: {other:?}"),
+            }
+            assert_eq!(fixture_pid(tmp.path()), None, "and nothing ran");
+        }
+
+        /// One delivery at a time: a second is refused by name, and the first is still answered
+        /// exactly once when the login ends under it.
+        #[tokio::test]
+        async fn a_second_deliver_while_one_is_in_flight_is_refused() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (port, bound) = listener().await;
+            let silent = silent_listener(bound);
+            let link = loopback_link(port);
+            let (store, agent_id) = login_store(
+                tmp.path(),
+                &[
+                    ("FIXTURE_KEY", "set"),
+                    ("FIXTURE_HOLD", "1"),
+                    ("FIXTURE_URL", &link),
+                ],
+            )
+            .await;
+            let backend = Backend::memory(store);
+            // The default limits (F-5): the first delivery outlives everything below.
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            choose_and_await_link(&mut runtime, &backend, &tx, &mut rx).await;
+            deliver_at(&mut runtime, &backend, &tx, 3, pasted(port, STATE)).await;
+            deliver_at(&mut runtime, &backend, &tx, 4, pasted(port, STATE)).await;
+            expect_refusal(&mut rx, 4, DELIVERY_IN_FLIGHT).await;
+
+            cancel_at(&mut runtime, &backend, &tx, 5).await;
+            let replies = replies_until_terminal(&mut rx).await;
+            let first = replies
+                .iter()
+                .position(|(seq, reply)| *seq == 3 && refused_with(reply, LOGIN_ENDED));
+            assert!(
+                first.is_some() && first < Some(replies.len() - 1),
+                "the first delivery is answered `{LOGIN_ENDED}` before the stream ends: \
+                 {replies:?}"
+            );
+            assert!(
+                matches!(
+                    replies.last(),
+                    Some((2, StoreReply::Auth(AuthFrame::Cancelled)))
+                ),
+                "{replies:?}"
+            );
+
+            silent.abort();
+            runtime.finish_background(PATIENCE).await;
+        }
+
+        /// D269(c)/D277: the delivery runs beside the flow, so `x` is served while it is in
+        /// flight, and a cancelled login does not wait out the response deadline.
+        #[tokio::test]
+        async fn cancel_is_served_while_a_delivery_is_in_flight() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (port, bound) = listener().await;
+            let silent = silent_listener(bound);
+            let link = loopback_link(port);
+            let (store, agent_id) = login_store(
+                tmp.path(),
+                &[
+                    ("FIXTURE_KEY", "set"),
+                    ("FIXTURE_HOLD", "1"),
+                    ("FIXTURE_URL", &link),
+                ],
+            )
+            .await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            let pid = fixture_pid(tmp.path()).expect("the fixture wrote its pid when it started");
+            choose_and_await_link(&mut runtime, &backend, &tx, &mut rx).await;
+            deliver_at(&mut runtime, &backend, &tx, 3, pasted(port, STATE)).await;
+
+            cancel_at(&mut runtime, &backend, &tx, 4).await;
+            let replies =
+                tokio::time::timeout(Duration::from_secs(5), replies_until_terminal(&mut rx))
+                    .await
+                    .expect("the login ends well inside the 15 s response deadline");
+            let answers: Vec<_> = replies.iter().filter(|(seq, _)| *seq == 3).collect();
+            assert!(
+                answers.len() == 1 && refused_with(&answers[0].1, LOGIN_ENDED),
+                "the deliver is answered exactly once, `{LOGIN_ENDED}`: {replies:?}"
+            );
+            assert!(
+                matches!(
+                    replies.last(),
+                    Some((2, StoreReply::Auth(AuthFrame::Cancelled)))
+                ),
+                "{replies:?}"
+            );
+            assert_not_running(pid, "a login cancelled mid-delivery").await;
+
+            silent.abort();
+            runtime.finish_background(PATIENCE).await;
+        }
+
+        /// D286: the one reason `with_deliver_limits` exists. A listener that never answers
+        /// times the delivery out, and the login is still there to finish or cancel.
+        #[tokio::test]
+        async fn a_silent_listener_times_the_delivery_out_and_the_login_keeps_running() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (port, bound) = listener().await;
+            let silent = silent_listener(bound);
+            let link = loopback_link(port);
+            let (store, agent_id) = login_store(
+                tmp.path(),
+                &[
+                    ("FIXTURE_KEY", "set"),
+                    ("FIXTURE_HOLD", "1"),
+                    ("FIXTURE_URL", &link),
+                ],
+            )
+            .await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path()).with_deliver_limits(quick_limits());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            choose_and_await_link(&mut runtime, &backend, &tx, &mut rx).await;
+            deliver_at(&mut runtime, &backend, &tx, 3, pasted(port, STATE)).await;
+            let reply = next_reply(&mut rx).await;
+            assert_eq!(reply.seq, 3, "answered at the deliver's own address");
+            assert!(
+                matches!(
+                    &reply.reply,
+                    StoreReply::Failed { request, message }
+                        if *request == "auth_deliver" && message.contains("did not answer within")
+                ),
+                "a silent listener times out: {:?}",
+                reply.reply
+            );
+            assert!(runtime.auth_running(), "and the login keeps running");
+
+            cancel_at(&mut runtime, &backend, &tx, 4).await;
+            let replies = replies_until_terminal(&mut rx).await;
+            assert!(
+                matches!(
+                    replies.last(),
+                    Some((2, StoreReply::Auth(AuthFrame::Cancelled)))
+                ),
+                "{replies:?}"
+            );
+
+            silent.abort();
+            runtime.finish_background(PATIENCE).await;
+        }
+
+        /// R-10's ordering (D286): a listener that lets the adapter finish and closes without a
+        /// word is still answered for, and **before** the login's own result.
+        #[tokio::test]
+        async fn a_delivery_the_listener_drops_is_answered_before_the_logins_result() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (port, bound) = listener().await;
+            let link = loopback_link(port);
+            let marker = tmp.path().join("delivered");
+            let marker_text = marker.to_string_lossy().into_owned();
+            let (store, agent_id) = login_store(
+                tmp.path(),
+                &[
+                    ("FIXTURE_KEY", "set"),
+                    ("FIXTURE_CRED", CREDENTIAL),
+                    ("FIXTURE_URL", &link),
+                    ("FIXTURE_WAIT_FOR", &marker_text),
+                ],
+            )
+            .await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let dropping = tokio::spawn(async move {
+                let (mut stream, _) = bound.accept().await.expect("the delivery connects");
+                read_head(&mut stream).await;
+                std::fs::write(&marker, b"").expect("the marker lands");
+                drop(stream);
+            });
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            choose_and_await_link(&mut runtime, &backend, &tx, &mut rx).await;
+            deliver_at(&mut runtime, &backend, &tx, 3, pasted(port, STATE)).await;
+            let replies = replies_until_terminal(&mut rx).await;
+            tokio::time::timeout(PATIENCE, dropping)
+                .await
+                .expect("the delivery reached the listener")
+                .expect("the listener ran");
+
+            let closed = DeliverError::ClosedWithoutAnswer {
+                target: format!("127.0.0.1:{port}"),
+            }
+            .to_string();
+            let answered = replies
+                .iter()
+                .position(|(seq, reply)| *seq == 3 && refused_with(reply, &closed));
+            let done = replies.iter().position(|(seq, reply)| {
+                *seq == 2 && matches!(reply, StoreReply::Auth(AuthFrame::Done { .. }))
+            });
+            assert!(
+                answered.is_some() && done.is_some() && answered < done,
+                "the dropped delivery is answered before `Done`: {replies:?}"
+            );
+
+            runtime.finish_background(PATIENCE).await;
+        }
+
+        /// Review L-1 for the new command: a `Deliver` still queued when the flow ends is refused
+        /// at its own address rather than dropped.
+        #[tokio::test]
+        async fn a_deliver_queued_when_the_flow_ends_is_refused_rather_than_dropped() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let backend = Backend::memory(MemStore::demo());
+            let writer = recording_writer(&backend).expect("a memory backend hands out a writer");
+            let origin = Origin::Tab(crate::ui::tabs::TabId("settings"));
+            let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            // Queued before the flow is polled even once, and never read by the loop.
+            commands_tx
+                .send(AuthCommand::Deliver {
+                    url: pasted(9, STATE),
+                    reply: ReplyAddr {
+                        seq: 3,
+                        origin: origin.clone(),
+                    },
+                })
+                .expect("the task holds the receiver");
+
+            run_auth(AuthArgs {
+                driver: Box::new(RefusingDriver),
+                agent: login_row(AgentId::new(), Transport::Acp, tmp.path(), &[]),
+                existing: None,
+                box_id: ids::BOX,
+                writer,
+                cwd: tmp.path().to_path_buf(),
+                cancel: CancellationToken::new(),
+                commands: commands_rx,
+                opener: OpenerCommand::Custom(recorder(tmp.path())),
+                deliver_limits: DeliverLimits::default(),
+                frames: Frames::new(
+                    tx,
+                    ReplyAddr {
+                        seq: 2,
+                        origin: origin.clone(),
+                    },
+                ),
+            })
+            .await;
+
+            let mut replies = Vec::new();
+            while let Some(reply) = rx.recv().await {
+                replies.push((reply.seq, reply.reply));
+            }
+            assert!(
+                replies
+                    .iter()
+                    .any(|(seq, reply)| *seq == 3 && refused_with(reply, LOGIN_ENDED)),
+                "the queued deliver is answered at its own address: {replies:?}"
+            );
+            assert!(
+                matches!(
+                    replies.last(),
+                    Some((2, StoreReply::Auth(AuthFrame::Failed { .. })))
+                ),
+                "and the stream still ends with the flow's own last frame: {replies:?}"
+            );
+        }
+
+        /// The credential rule (D273) through the worker: the pasted code is on no frame and in
+        /// no `Debug` — the runtime's, the command's or the request's. The state is allowed: the
+        /// link on screen already shows it.
+        #[tokio::test]
+        async fn no_frame_and_no_debug_carries_the_pasted_code() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (port, bound) = listener().await;
+            let link = loopback_link(port);
+            let marker = tmp.path().join("delivered");
+            let marker_text = marker.to_string_lossy().into_owned();
+            let (store, agent_id) = login_store(
+                tmp.path(),
+                &[
+                    ("FIXTURE_KEY", "set"),
+                    ("FIXTURE_CRED", CREDENTIAL),
+                    ("FIXTURE_URL", &link),
+                    ("FIXTURE_WAIT_FOR", &marker_text),
+                ],
+            )
+            .await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (release, released) = oneshot::channel();
+            let head = answering_listener(bound, marker, released);
+
+            let request = StoreRequest::AuthDeliver {
+                url: pasted(port, STATE),
+            };
+            let command = AuthCommand::Deliver {
+                url: pasted(port, STATE),
+                reply: ReplyAddr {
+                    seq: 3,
+                    origin: Origin::Tab(crate::ui::tabs::TabId("settings")),
+                },
+            };
+            let mut printed = vec![format!("{request:?}"), format!("{command:?}")];
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+            choose_and_await_link(&mut runtime, &backend, &tx, &mut rx).await;
+            deliver_at(&mut runtime, &backend, &tx, 3, pasted(port, STATE)).await;
+            // The listener has answered; the adapter is still waiting on the marker.
+            let delivered = next_reply(&mut rx).await;
+            assert_eq!(delivered.seq, 3);
+            assert!(
+                matches!(delivered.reply, StoreReply::Auth(AuthFrame::Delivered(_))),
+                "the listener's answer is relayed"
+            );
+            printed.push(format!("{:?}", delivered.reply));
+            printed.push(format!("{runtime:?}"));
+            printed.push(format!("{:?}", runtime.auth));
+            let _ = release.send(());
+
+            for (_, reply) in replies_until_terminal(&mut rx).await {
+                printed.push(format!("{reply:?}"));
+            }
+            assert!(
+                tokio::time::timeout(PATIENCE, head)
+                    .await
+                    .expect("the delivery reached the listener")
+                    .expect("the listener ran")
+                    .contains(CODE),
+                "and the code really did travel, to the listener alone"
+            );
+            for text in &printed {
+                assert!(
+                    !text.contains(CODE),
+                    "a frame or a `Debug` carried the pasted code"
+                );
+            }
+
+            runtime.finish_background(PATIENCE).await;
         }
     }
 
