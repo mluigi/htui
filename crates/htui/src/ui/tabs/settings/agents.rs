@@ -714,6 +714,8 @@ impl AgentsSection {
             // The opener was spawned. Not the end of anything: the flow is still waiting on the
             // human this link was for.
             AuthFrame::Opened => self.notice = Some(OPENED.to_owned()),
+            // MOD-22 D268: what the listener said, on the note line. T3 adds the rest.
+            AuthFrame::Delivered(reply) => self.notice = Some(reply.summary()),
             AuthFrame::Done { call, status } => {
                 let what = match call {
                     AuthCall::Authenticate(_) => "logged in",

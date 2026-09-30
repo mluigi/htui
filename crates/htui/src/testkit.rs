@@ -291,6 +291,7 @@ impl Harness {
                         | StoreRequest::AuthStart { .. }
                         | StoreRequest::AuthChoose { .. }
                         | StoreRequest::AuthOpen { .. }
+                        | StoreRequest::AuthDeliver { .. }
                         | StoreRequest::AuthCancel,
                         _,
                     ) => match self.runtime.as_mut() {
