@@ -8536,6 +8536,29 @@ mod tests {
             };
             assert_eq!(row.quirks, "no executor named", "{blob}");
             assert_eq!(row.settings, blob, "{blob}: the blob is left as it was");
+
+            // Precedence (trait doc): `NotFound`, then `Stale`, before the blob's `Constraint`.
+            let tui = || BoxEdit {
+                executor: Some(Executor::Tui),
+                ..BoxEdit::default()
+            };
+            assert_eq!(
+                store.edit_box(ids::BOX, before.edit_version, tui()).await,
+                Ok(CasOutcome::Stale(row.clone())),
+                "{blob}: a spent token is Stale before the non-object blob refuses"
+            );
+            let unknown = BoxId::new();
+            match store.edit_box(unknown, row.edit_version, tui()).await {
+                Err(StoreError::NotFound { entity: "box", id }) => {
+                    assert_eq!(id, unknown.to_string(), "{blob}");
+                }
+                other => panic!("{blob}: an unknown box is NotFound, got {other:?}"),
+            }
+            assert_eq!(
+                store.box_row(ids::BOX).await.expect("box_row never fails"),
+                Some(row),
+                "{blob}: neither refusal wrote anything"
+            );
         }
     }
 

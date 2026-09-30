@@ -4754,6 +4754,41 @@ async fn edit_box_refuses_a_non_object_settings_blob() {
         };
         assert_eq!(row.quirks, "no executor named", "{blob}");
         assert_eq!(row.settings, blob, "{blob}: the blob is left as it was");
+
+        // Precedence (trait doc): `NotFound`, then `Stale`, before the blob's `Constraint`.
+        let spent = db
+            .store
+            .edit_box(
+                ids::BOX,
+                before.edit_version,
+                executor_edit(htui_core::model::Executor::Tui),
+            )
+            .await;
+        assert_eq!(
+            spent,
+            Ok(CasOutcome::Stale(row.clone())),
+            "{blob}: a spent token is Stale before the non-object blob refuses"
+        );
+        let unknown = BoxId::new();
+        match db
+            .store
+            .edit_box(
+                unknown,
+                row.edit_version,
+                executor_edit(htui_core::model::Executor::Tui),
+            )
+            .await
+        {
+            Err(htui_core::store::StoreError::NotFound { entity: "box", id }) => {
+                assert_eq!(id, unknown.to_string(), "{blob}");
+            }
+            other => panic!("{blob}: an unknown box is NotFound, got {other:?}"),
+        }
+        assert_eq!(
+            fixture_box_row(&db.store).await,
+            row,
+            "{blob}: neither refusal wrote anything"
+        );
     }
 
     db.drop_db().await;
