@@ -83,7 +83,6 @@ async fn start_opens_the_mirror_offline_and_reports_online_over_a_migrated_datab
                 "cache_overlap_seconds is seeded at 300"
             );
             assert_eq!(settings.this_box, pg.this_box());
-            assert_eq!(settings.this_user, pg.this_user());
         }
         other => panic!("expected Online, got {other:?}"),
     }

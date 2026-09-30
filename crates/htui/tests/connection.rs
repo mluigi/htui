@@ -1660,9 +1660,13 @@ async fn rebuild_needs_a_confirmation_and_names_both_lists() {
     assert!(bench.drained().is_empty());
 
     let frame = flattened(&frame_of(&bench, &section));
-    for survives in ["schema_version", "db_fingerprint", "built_at", "pending/"] {
+    for survives in ["schema_version", "db_fingerprint", "built_at"] {
         assert!(frame.contains(survives), "`{survives}` survives: {frame}");
     }
+    assert!(
+        !frame.contains("pending/"),
+        "D1: no pending/ buffer survives, because none exists: {frame}"
+    );
     let tables = format!(
         "{} mirrored tables",
         htui_store::cache::MIRRORED_TABLES.len()

@@ -288,12 +288,9 @@ async fn a_real_claude_cli_session_streams_two_turns_into_the_store_and_then_end
     while let Ok(Some(envelope)) = tokio::time::timeout_at(deadline, rx.recv()).await {
         match envelope.reply {
             StoreReply::ChatAccepted {
-                session_ref,
-                caps,
-                writer_label,
-                ..
+                session_ref, caps, ..
             } => {
-                println!("accepted: session {session_ref:?} into `{writer_label}`");
+                println!("accepted: session {session_ref:?}");
                 accepted_caps = Some(caps);
             }
             StoreReply::Chat(ChatFrame::Event(frame)) => {

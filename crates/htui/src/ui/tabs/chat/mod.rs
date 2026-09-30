@@ -14,9 +14,9 @@
 //! frames the whole time and is exactly where it was when `Esc` closes the replay.
 //!
 //! Milestone 4 also let a chat start with the store unreachable, in which case its rows went to the
-//! offline buffer instead of to Postgres, and the header said so (D42) from the `writer_label` the
-//! acceptance carried. Since MOD-25 an offline chat is refused before it starts, the buffer has
-//! been removed, and the tab ignores `writer_label`.
+//! offline buffer instead of to Postgres, and the header said so (D42) from a writer label the
+//! acceptance carried. Since MOD-25 an offline chat is refused before it starts and the buffer has
+//! been removed; CLEAN-7 took the label off `StoreReply::ChatAccepted`.
 //!
 //! Since MOD-4 milestone 6 the tab also drives a **promoted graph step** (plan D165): the Runs
 //! pane's `p` asks the shell to promote on this tab's behalf, the `Orch(Promoted)` reply names
@@ -546,7 +546,6 @@ impl Tab for ChatTab {
                 step_id,
                 session_ref,
                 caps,
-                writer_label: _,
             } => {
                 self.pending_start = false;
                 self.refusal = None;
@@ -819,7 +818,6 @@ mod tests {
                     usage_mid_turn: true,
                     authenticate: true,
                 },
-                writer_label: "memory",
             },
             &mut shell.ctx(),
         );
@@ -1096,7 +1094,6 @@ mod tests {
                 step_id: fresh.session().expect("a session").step_id,
                 session_ref: None,
                 caps: fresh.session().expect("a session").caps,
-                writer_label: "memory",
             },
             &mut shell.ctx(),
         );

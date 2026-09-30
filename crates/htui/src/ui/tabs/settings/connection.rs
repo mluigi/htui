@@ -137,7 +137,7 @@ const CONFIRM_CLEAR: &str = "Remove the DSN from the keyring? This session keeps
 /// destroys is worse than no confirmation at all.
 fn confirm_rebuild() -> String {
     format!(
-        "Rebuild the mirror? Survives: the file, schema_version, db_fingerprint, built_at, the pending/ buffer. Goes: the {} mirrored tables, cache_cursor, last_full_refresh_at. The next refresh pass refills it. y / n",
+        "Rebuild the mirror? Survives: the file, schema_version, db_fingerprint, built_at. Goes: the {} mirrored tables, cache_cursor, last_full_refresh_at. The next refresh pass refills it. y / n",
         MIRRORED_TABLES.len()
     )
 }
@@ -993,12 +993,15 @@ mod tests {
             "schema_version",
             "db_fingerprint",
             "built_at",
-            "pending/",
             tables.as_str(),
             "cache_cursor",
             "last_full_refresh_at",
         ] {
             assert!(confirm_rebuild().contains(named), "`{named}`");
         }
+        assert!(
+            !confirm_rebuild().contains("pending/"),
+            "D1: `CacheStore::rebuild` has no pending/ buffer to spare"
+        );
     }
 }

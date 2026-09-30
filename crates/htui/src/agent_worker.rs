@@ -890,7 +890,6 @@ impl AgentRuntime {
         let writer = backend
             .writer()
             .ok_or_else(|| StoreError::Unreachable(htui_store::DATABASE_UNREACHABLE.to_owned()))?;
-        let writer_label = writer.label();
         let box_id = registered_box(backend).await?;
         let summary = backend
             .agents()
@@ -913,12 +912,9 @@ impl AgentRuntime {
             .map_err(|err| StoreError::Backend(err.to_string()))?;
         let settings: AgentSettings =
             serde_json::from_value(summary.agent.settings.clone()).unwrap_or_default();
-        let project_caps = project_caps_for(
-            &writer,
-            project_id,
-            backend.project_settings(project_id).await?,
-        )?;
-        let quota_latch = quota_latch_for(&writer, &summary.agent, box_id, settings.quota.source);
+        let project_caps =
+            project_caps_for(project_id, backend.project_settings(project_id).await?)?;
+        let quota_latch = quota_latch_for(&summary.agent, box_id, settings.quota.source);
         let Some(tail) = writer.step_events(step_id).await? else {
             return Ok(Served::Reply(StoreReply::Failed {
                 request: PROMOTE_STEP,
@@ -965,7 +961,6 @@ impl AgentRuntime {
         let args = ChatArgs {
             driver,
             writer,
-            writer_label,
             binding: ChatBinding::Promoted { step_id, tail },
             spec,
             prompt: opening_text,
@@ -1765,7 +1760,6 @@ impl AgentRuntime {
         let writer = backend
             .writer()
             .ok_or_else(|| StoreError::Unreachable(htui_store::DATABASE_UNREACHABLE.to_owned()))?;
-        let writer_label = writer.label();
         let box_id = backend
             .box_info()
             .await?
@@ -1815,11 +1809,8 @@ impl AgentRuntime {
         // a cap an operator wrote and `htui` ignored is the risk table's "wrong by a factor of a
         // million" pointing the other way — a run that was supposed to be bounded and was not. An
         // absent *row* is [`project_caps_for`]'s question.
-        let project_caps = project_caps_for(
-            &writer,
-            project_id,
-            backend.project_settings(project_id).await?,
-        )?;
+        let project_caps =
+            project_caps_for(project_id, backend.project_settings(project_id).await?)?;
         if project_caps.batch_micros.is_some() {
             // Plan D71: read and reported, never compared. A batch spans runs MOD-4 does not yet
             // create, so enforcing it here would mean inventing the batch identity
@@ -1830,7 +1821,7 @@ impl AgentRuntime {
                 "a batch cap is set; a chat does not enforce it (ANA-4 §9: MOD-12 does)"
             );
         }
-        let quota_latch = quota_latch_for(&writer, &summary.agent, box_id, settings.quota.source);
+        let quota_latch = quota_latch_for(&summary.agent, box_id, settings.quota.source);
 
         let chat = ChatRunSpec::mint(project_id, box_id, user, Some(agent_id), model.clone());
         writer.start_chat_run(&chat).await?;
@@ -1925,7 +1916,6 @@ impl AgentRuntime {
         let args = ChatArgs {
             driver,
             writer,
-            writer_label,
             binding: ChatBinding::Fresh(chat),
             spec,
             prompt,
@@ -1996,9 +1986,6 @@ const PROMOTE_STEP: &str = crate::run_worker::ORCH_NAMES[5];
 pub struct ChatArgs {
     driver: Box<dyn AgentDriver>,
     writer: Writer,
-    /// [`Writer::label`], taken before the writer moves, for `StoreReply::ChatAccepted`
-    /// (plan D42).
-    writer_label: &'static str,
     /// What the session records against (blueprint D205).
     binding: ChatBinding,
     spec: SessionSpec,
@@ -2019,8 +2006,10 @@ pub struct ChatArgs {
     /// struct would be one bug away from each other.
     project_caps: ProjectCaps,
     /// Plan D66-D68: the `agent_box` row this chat latches its allowance into
-    /// ([`quota_latch_for`]).
-    quota_latch: Option<QuotaLatch>,
+    /// ([`quota_latch_for`]). Always one: `Backend::writer` answers `None` offline, so a chat that
+    /// gets this far has a store with an `agent_box` table. `Recorder`'s own latch stays an
+    /// `Option` for the recorders that have none.
+    quota_latch: QuotaLatch,
 }
 
 impl core::fmt::Debug for ChatArgs {
@@ -2030,9 +2019,6 @@ impl core::fmt::Debug for ChatArgs {
             .field("step", &self.binding.step_id())
             .field("spec", &self.spec)
             .field("project_caps", &self.project_caps)
-            // Whether this chat latches, not which row it names: `Recorder`'s own `Debug` makes
-            // the same choice for the same reason.
-            .field("quota_latch", &self.quota_latch.is_some())
             .finish()
     }
 }
@@ -2047,7 +2033,6 @@ impl core::fmt::Debug for ChatArgs {
 ///
 /// A document that does not parse refuses too — that is `start_chat`'s own comment.
 fn project_caps_for(
-    _writer: &Writer,
     project_id: ProjectId,
     settings: Option<Value>,
 ) -> Result<ProjectCaps, StoreError> {
@@ -2066,24 +2051,20 @@ fn project_caps_for(
 /// The `agent_box` row a chat latches its allowance into (plan D66-D68).
 ///
 /// The decision is made **here**, at chat start, rather than discovered on the first `usage` row.
-/// Before MOD-25 a buffered offline chat got `None`, because the offline mirror has no `agent_box`
-/// table to latch into (plan D52); a chat now starts only online, so every chat gets a latch.
+/// Every chat gets one: `Backend::writer` answers `None` offline (MOD-25), so a chat that gets this
+/// far has a store with an `agent_box` table. The `None` an offline chat once got (the mirror has
+/// none, plan D52) left with the offline path (CLEAN-7).
 ///
 /// `source` is `agent.settings.quota.source` and `billing` is `agent.billing`, both read off the
 /// row. Nothing here looks at `agent.name` (`R-AGT-5`) — the name is logged, and a log line is not
 /// a dispatch.
-fn quota_latch_for(
-    _writer: &Writer,
-    agent: &Agent,
-    box_id: BoxId,
-    source: QuotaSource,
-) -> Option<QuotaLatch> {
-    Some(QuotaLatch {
+fn quota_latch_for(agent: &Agent, box_id: BoxId, source: QuotaSource) -> QuotaLatch {
+    QuotaLatch {
         agent_id: agent.id,
         box_id,
         source,
         billing: agent.billing,
-    })
+    }
 }
 
 /// Everything the probe task owns (MOD-2 D53).
@@ -3352,7 +3333,6 @@ pub async fn run_chat(args: ChatArgs) {
     let ChatArgs {
         driver,
         writer,
-        writer_label,
         binding,
         spec,
         prompt,
@@ -3402,7 +3382,6 @@ pub async fn run_chat(args: ChatArgs) {
         step_id,
         session_ref: session.session_ref().cloned(),
         caps,
-        writer_label,
     });
 
     let (ui_tx, mut ui_rx) = mpsc::channel(UI_FRAMES);
@@ -3420,9 +3399,7 @@ pub async fn run_chat(args: ChatArgs) {
     // Two opt-in builders rather than two more `new` parameters, because most recorders in this
     // tree have neither (plan D66-D68, D70). The grace the cap's cancel takes is this runtime's
     // own `CANCEL_GRACE`, riding on `RunCap` so `htui_agent::record::pump` keeps its signature.
-    if let Some(latch) = quota_latch {
-        recorder = recorder.with_quota_latch(latch);
-    }
+    recorder = recorder.with_quota_latch(quota_latch);
     if let Some(micros) = project_caps.run_micros {
         recorder = recorder.with_run_cap(RunCap { micros, grace });
     }
@@ -5825,10 +5802,10 @@ pub(crate) mod tests {
                 assert_eq!(request, "probe_agents");
                 assert!(
                     message.contains(htui_store::REGISTRY_ON_SERVER_ONLY),
-                    "the buffered writer's own sentence, not a second one: {message}"
+                    "the offline backend's own sentence, not a second one: {message}"
                 );
             }
-            other => panic!("a buffered writer refuses the probe: {other:?}"),
+            other => panic!("an offline backend refuses the probe: {other:?}"),
         }
         assert_eq!(
             runtime.background_len(),
@@ -5942,9 +5919,9 @@ pub(crate) mod tests {
     /// cannot hold the row refuses the **plan**, so no registry read is ever spent on an install
     /// whose result could not be written.
     #[tokio::test]
-    async fn a_plan_is_refused_before_any_request_on_a_buffered_writer() {
+    async fn a_plan_is_refused_before_any_request_on_an_offline_backend() {
         let root = tempfile::tempdir().expect("a throwaway config root");
-        let cache = htui_store::CacheStore::open(root.path(), "install-buffered", 1)
+        let cache = htui_store::CacheStore::open(root.path(), "install-offline", 1)
             .await
             .expect("a fresh mirror");
         let backend = Backend::Offline {
@@ -5973,10 +5950,10 @@ pub(crate) mod tests {
                 assert_eq!(request, "install_plan");
                 assert!(
                     message.contains(htui_store::REGISTRY_ON_SERVER_ONLY),
-                    "the buffered writer's own sentence, not a second one: {message}"
+                    "the offline backend's own sentence, not a second one: {message}"
                 );
             }
-            other => panic!("a buffered writer refuses the plan: {other:?}"),
+            other => panic!("an offline backend refuses the plan: {other:?}"),
         }
         assert!(
             !runtime.install_running(),
@@ -7138,9 +7115,9 @@ done
         /// D18's first refusal, in the probe's own order: a writer that cannot hold the row
         /// refuses the login **before** an adapter is spawned to produce one.
         #[tokio::test]
-        async fn a_start_is_refused_before_any_spawn_on_a_buffered_writer() {
+        async fn a_start_is_refused_before_any_spawn_on_an_offline_backend() {
             let tmp = tempfile::tempdir().expect("a throwaway directory");
-            let cache = htui_store::CacheStore::open(tmp.path(), "login-buffered", 1)
+            let cache = htui_store::CacheStore::open(tmp.path(), "login-offline", 1)
                 .await
                 .expect("a fresh mirror");
             let backend = Backend::Offline {
@@ -7167,10 +7144,10 @@ done
                     assert_eq!(request, "auth_start");
                     assert!(
                         message.contains(htui_store::REGISTRY_ON_SERVER_ONLY),
-                        "the buffered writer's own sentence, not a second one: {message}"
+                        "the offline backend's own sentence, not a second one: {message}"
                     );
                 }
-                other => panic!("a buffered writer refuses the login: {other:?}"),
+                other => panic!("an offline backend refuses the login: {other:?}"),
             }
             assert!(!runtime.auth_running(), "and holds no claim afterwards");
             assert_eq!(runtime.background_len(), 0);

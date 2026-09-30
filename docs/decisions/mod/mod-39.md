@@ -67,7 +67,8 @@ refusal frees only the write in flight; an amend over a head withdrawn elsewhere
 ## Carried
 
 - **CLEAN-7**: the stale offline-buffer comments were fixed here at the maintainer's request
-  (`ffd4ffc`); the code and UI text the removed buffer left behind are CLEAN-7.
+  (`ffd4ffc`); the code and UI text the removed buffer left behind are CLEAN-7
+  (`docs/decisions/clean/clean-7.md`).
 - **MOD-60**: the tab's `tree::pad`/`clip` and the Reqs pane's `cut` count `char`s, and on a narrow
   pane `pad` cuts the ` · read-only` marker before the project name.
 - **MOD-59**: the Requirements tab lands writes by content like the Skills tab; a reply that names

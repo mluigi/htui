@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use htui_core::model::{BoxId, ProjectId, UserId};
+use htui_core::model::{BoxId, ProjectId};
 use htui_core::store::{Result, StoreError};
 use serde_json::Value;
 use sqlx::{AssertSqlSafe, PgPool, Row as _, Sqlite, SqlitePool, Transaction};
@@ -36,10 +36,10 @@ const TRANSCRIPT_STEPS_KEY: &str = "cached_transcript_steps";
 
 /// Cursor-pass tuning, read from `app_setting` at connect (§4.4, §6.2).
 ///
-/// `this_box` and `this_user` are not tuning; they are here because §6.2 step 2 mirrors the *own*
-/// `box` row, and because both [`Refresher::spawn`] and [`run_pass`] would otherwise need two more
-/// arguments each (deviation from blueprint C.13, same components). `this_user` was for the upload
-/// of the offline chat buffer, which is gone (MOD-25); the pass no longer reads it.
+/// `this_box` is not tuning; it is here because §6.2 step 2 mirrors the *own* `box` row, and
+/// because both [`Refresher::spawn`] and [`run_pass`] would otherwise need one more argument each
+/// (deviation from blueprint C.13, same components). Its twin `this_user` was for the upload of
+/// the offline chat buffer, which MOD-25 removed; the field outlived it until CLEAN-7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefreshSettings {
     /// `app_setting.cache_refresh_seconds`, default 30 s.
@@ -50,9 +50,6 @@ pub struct RefreshSettings {
     pub transcript_steps: i64,
     /// [`crate::PgStore::this_box`]: whose `box` row is mirrored.
     pub this_box: BoxId,
-    /// [`crate::PgStore::this_user`]: was `run.started_by` of an uploaded offline chat; unread
-    /// since that upload was removed.
-    pub this_user: UserId,
 }
 
 impl Default for RefreshSettings {
@@ -62,7 +59,6 @@ impl Default for RefreshSettings {
             overlap: Duration::from_secs(DEFAULT_OVERLAP_SECONDS),
             transcript_steps: DEFAULT_TRANSCRIPT_STEPS,
             this_box: BoxId::default(),
-            this_user: UserId::default(),
         }
     }
 }
