@@ -268,12 +268,9 @@ async fn a_real_agy_session_streams_three_turns_into_the_store_and_answers_11_14
     while let Ok(Some(envelope)) = tokio::time::timeout_at(deadline, rx.recv()).await {
         match envelope.reply {
             StoreReply::ChatAccepted {
-                session_ref,
-                caps,
-                writer_label,
-                ..
+                session_ref, caps, ..
             } => {
-                println!("accepted: session {session_ref:?} into `{writer_label}`");
+                println!("accepted: session {session_ref:?}");
                 // Milestone 6's criterion 11: an `agy` chat differs from a `claude` one by the
                 // registry row and the capability banner, and the banner is the same because both
                 // rows are `acp` with `session.resume` on.

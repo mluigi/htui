@@ -890,7 +890,6 @@ impl AgentRuntime {
         let writer = backend
             .writer()
             .ok_or_else(|| StoreError::Unreachable(htui_store::DATABASE_UNREACHABLE.to_owned()))?;
-        let writer_label = writer.label();
         let box_id = registered_box(backend).await?;
         let summary = backend
             .agents()
@@ -962,7 +961,6 @@ impl AgentRuntime {
         let args = ChatArgs {
             driver,
             writer,
-            writer_label,
             binding: ChatBinding::Promoted { step_id, tail },
             spec,
             prompt: opening_text,
@@ -1762,7 +1760,6 @@ impl AgentRuntime {
         let writer = backend
             .writer()
             .ok_or_else(|| StoreError::Unreachable(htui_store::DATABASE_UNREACHABLE.to_owned()))?;
-        let writer_label = writer.label();
         let box_id = backend
             .box_info()
             .await?
@@ -1919,7 +1916,6 @@ impl AgentRuntime {
         let args = ChatArgs {
             driver,
             writer,
-            writer_label,
             binding: ChatBinding::Fresh(chat),
             spec,
             prompt,
@@ -1990,9 +1986,6 @@ const PROMOTE_STEP: &str = crate::run_worker::ORCH_NAMES[5];
 pub struct ChatArgs {
     driver: Box<dyn AgentDriver>,
     writer: Writer,
-    /// [`Writer::label`], taken before the writer moves, for `StoreReply::ChatAccepted`
-    /// (plan D42).
-    writer_label: &'static str,
     /// What the session records against (blueprint D205).
     binding: ChatBinding,
     spec: SessionSpec,
@@ -3338,7 +3331,6 @@ pub async fn run_chat(args: ChatArgs) {
     let ChatArgs {
         driver,
         writer,
-        writer_label,
         binding,
         spec,
         prompt,
@@ -3388,7 +3380,6 @@ pub async fn run_chat(args: ChatArgs) {
         step_id,
         session_ref: session.session_ref().cloned(),
         caps,
-        writer_label,
     });
 
     let (ui_tx, mut ui_rx) = mpsc::channel(UI_FRAMES);

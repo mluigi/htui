@@ -57,8 +57,10 @@ pub enum Writer {
 }
 
 impl Writer {
-    /// The backend label this writer belongs to, for logs and for the chat header (plan D42: the
-    /// maintainer must be able to tell a recorded conversation from one that is only on this disk).
+    /// The backend label this writer belongs to, for the `Debug` of every task that holds one. Plan
+    /// D42 also put it in the chat header, to tell a recorded conversation from one only on this
+    /// disk; that went with the offline buffer (MOD-25), and the label left `ChatAccepted` in
+    /// CLEAN-7.
     #[must_use]
     pub const fn label(&self) -> &'static str {
         match self {
@@ -203,7 +205,8 @@ impl ReadStore for Writer {
     // ---- ANA-2 §8's five run reads (MOD-4 milestone 1, plan D1) --------------------------------
     //
     // Delegation, like every read above: a `Writer` decides *which* store, never *what* a read
-    // means. The `Buffered` arm is where the refusal lives.
+    // means. A store that cannot record never gets this far: `Backend::writer` answers `None`
+    // (MOD-25).
 
     async fn run(&self, id: RunId) -> Result<Option<Run>> {
         match self {

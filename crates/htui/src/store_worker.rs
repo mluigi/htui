@@ -939,12 +939,6 @@ pub enum StoreReply {
         session_ref: Option<AgentSessionRef>,
         /// What this transport can do, for the tab's capability banner.
         caps: DriverCaps,
-        /// `Writer::label()` of the store this chat records into: `memory` or `online` (MOD-2 D42).
-        ///
-        /// It was carried so the tab could say that a conversation was only on this disk (the
-        /// `buffered` label, gone since MOD-25 made an offline chat refuse); the tab ignores it
-        /// now.
-        writer_label: &'static str,
     },
     /// Answer to [`StoreRequest::StoreState`].
     StoreState {
