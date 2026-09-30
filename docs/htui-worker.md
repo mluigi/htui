@@ -36,6 +36,11 @@ What it does:
   they were queued, adopts the box's `running` runs that nobody holds (a lease given back or
   lapsed), and walks them. It refreshes each walk's lease and fences itself before its lease can
   lapse, exactly as the TUI does.
+- Picks up a repo or checkout change (a repo added, a checkout path set or moved) at the next
+  sweep when no run is walking, with no restart; the box's command limits and
+  `copy_max_total_bytes` are read again at that point. While a run is walking, the worker keeps
+  adopting but claims no queued run until its walks rest, so no walk has its checkouts moved
+  under it. A change to the limits alone reaches the worker at its next restart.
 - Marks the box as seen (`box.last_seen_at`) once at start and then every minute, whatever the
   executor.
 - Logs `htui worker ready` once connected, with the box id and the pool size.
@@ -106,6 +111,12 @@ finishes it exactly as it would finish a run whose process crashed at that point
 | `c` cancel | A `queued` or parked run cancels as before. A run the worker is walking is refused: "the worker on this box is walking run …; cancelling a live run needs MOD-42's cancel command". Nothing is written. | Keeps walking. |
 | `C`, `T`, `o` | Unchanged. | — |
 
+**Cleanup is not serialised with the worker.** The TUI's cleanup (`c` on a run that has rested,
+and `T`) still runs `git worktree remove` in the TUI, and nothing orders it against the worker's
+`git worktree add` on the same repository: the locks that order them are per process. A rare race
+fails one candidate with a readable error, or leaves a tree behind that `T` removes when you run
+it again. A lock across processes is deferred.
+
 Two consequences of recovering "as after a crash":
 
 - **A graph changed mid-run.** The worker re-checks the item's **live** step graph before it walks
@@ -139,7 +150,8 @@ The worker reads the Postgres connection string from exactly one of these, in th
 
 With none of them, the worker exits 2 with a sentence naming all three. The DSN is **never** read
 from `argv`, from any other environment variable or from a plain file, and it is never written to a
-log or an error report. It is held in a buffer that is wiped once the connection is open.
+log or an error report. The copy htui reads is wiped once the connection is open; the Postgres
+driver keeps the password in memory for the life of the process so it can reconnect.
 
 ## Pool size
 
@@ -179,8 +191,9 @@ read again after every sync; without it, or with any other value, the interval i
 | Code | Meaning |
 |---|---|
 | `0` | Clean shutdown on a signal. |
-| `1` | A failure after the worker started. |
+| `1` | Reserved for a failure after the worker started. This build produces none: a store outage is logged, not an exit (below). |
 | `2` | A startup refusal: no DSN, a connection that could not be made, a schema or build the database refuses, a `--log` file that cannot be opened, a signal handler that cannot be installed, or a command line `htui` refuses (a usage error, such as `htui --log PATH worker`). A schema or build refusal writes nothing to the database. Other refusals may not be clean: a first start mints `box.toml` before it connects, and a refusal while seeding or registering this box comes after some of those rows are written, as the TUI's start would write them. |
+| `101` | A panic that stops the process: a bug in `htui`. It is reported to GlitchTip (see [Error reports](#error-reports)). A panic inside a run's walk is reported too, but does not stop the worker: the run is adopted again, [backed off](#a-run-whose-resume-keeps-failing). |
 
 A store outage while running is not an exit: the worker logs it and carries on, and its walks fence
 themselves until the next poll succeeds.
@@ -192,7 +205,7 @@ an agent row it needs is gone), the resume fails, the lease goes back, and the n
 adopt it again. So the worker backs off **per run**: it still adopts the run, but waits before
 resuming it, first 5 seconds, then twice as long each time, up to 5 minutes. It logs
 "a run's resume keeps failing; the worker waits before resuming it again" at `warn` once per step
-up. A resume that succeeds clears the delay; the delays are kept in memory, so a restart starts
+up. A resume whose walk panics is backed off the same way. A resume that succeeds clears the delay; the delays are kept in memory, so a restart starts
 over. A failing database is not backed off this way. Fix what the run needs, or cancel it.
 
 ## A queued cancel interrupted halfway
@@ -225,7 +238,7 @@ This is the same write the cancel's second half makes; `UPDATE 1` means it appli
 The `htui` binary sends crash and error reports to the maintainer's GlitchTip (Sentry-compatible)
 server; this build has no setting to turn that off. For the worker:
 
-- An exit 1, a panic or a log line at `error` level is reported, with the recent `info` and `warn`
+- A panic (exit 101) or a log line at `error` level is reported, with the recent `info` and `warn`
   lines as breadcrumbs.
 - A startup refusal (exit 2) is **not** sent as a report: it is a configuration state, and it goes
   to standard error and the log only.
@@ -287,7 +300,7 @@ Notes:
   (for example `~/.local/bin`), add an `Environment=PATH=…` line.
 - The service has no Secret Service session, so the keyring counts as absent and the credential is
   used. The DSN never appears in the unit file, the environment or the process list.
-- `Restart=on-failure` restarts on exit 1 and on exit 2, which also covers a database that is not
+- `Restart=on-failure` restarts on any non-zero exit (2, or 101 after a panic), which also covers a database that is not
   up yet at boot; `RestartSec=` spaces the attempts. A clean stop (exit 0) is not restarted, and
   `systemctl stop` sends SIGTERM, which the worker handles.
 - Then flip the box's executor to `worker` in **Settings › Boxes**.

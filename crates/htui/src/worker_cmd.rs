@@ -18,7 +18,8 @@ use crate::concepts;
 pub enum WorkerExit {
     /// Exit 2: nothing ran (no DSN, connect or schema refused, signals not installable).
     Refused(String),
-    /// Exit 1: the worker ran and failed.
+    /// Exit 1: reserved for a failure after the worker started. This build produces none: a store
+    /// outage is logged and waited out, not an exit (MOD-41 review R-3). A panic exits 101.
     Failed(String),
 }
 
