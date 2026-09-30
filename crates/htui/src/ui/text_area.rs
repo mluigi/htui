@@ -342,18 +342,24 @@ impl TextArea {
     /// A bracketed paste (MOD-22 review M-1), inserted at the cursor as typing it would: its line
     /// breaks (`\r\n`, a lone `\r`, `\n`) become `\n`, every other control character is dropped.
     pub fn on_paste(&mut self, text: &str) {
+        // Review R2-L4: normalised once, inserted once and re-segmented once, so a large paste is
+        // linear rather than one whole-buffer segmentation per character.
+        let mut kept = String::with_capacity(text.len());
         let mut chars = text.chars().peekable();
         while let Some(c) = chars.next() {
             match c {
                 '\r' => {
                     chars.next_if_eq(&'\n');
-                    self.insert('\n');
+                    kept.push('\n');
                 }
-                '\n' => self.insert('\n'),
+                '\n' => kept.push('\n'),
                 c if c.is_control() => {}
-                c => self.insert(c),
+                c => kept.push(c),
             }
         }
+        self.text.insert_str(self.cursor, &kept);
+        self.cursor += kept.len();
+        self.step_out_of_cluster();
         self.goal_col = None;
     }
 
@@ -365,10 +371,15 @@ impl TextArea {
     fn insert(&mut self, c: char) {
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
-        // If the char merged into the cluster before it, the cursor is now *inside* that cluster;
-        // step on to its end rather than stranding it between a base and its mark. `at < cursor`
-        // matters: a cluster that merely *starts* at the cursor is not one containing it, and
-        // treating it as one walks the cursor off the end of every plain insertion.
+        self.step_out_of_cluster();
+        self.goal_col = None;
+    }
+
+    /// After an insertion: if what was inserted merged into a cluster, the cursor is now *inside*
+    /// it; step on to its end rather than stranding it between a base and its mark. `at < cursor`
+    /// matters: a cluster that merely *starts* at the cursor is not one containing it, and
+    /// treating it as one walks the cursor off the end of every plain insertion.
+    fn step_out_of_cluster(&mut self) {
         if let Some(end) = self
             .text
             .grapheme_indices(true)
@@ -377,7 +388,6 @@ impl TextArea {
         {
             self.cursor = end;
         }
-        self.goal_col = None;
     }
 
     /// The grapheme boundary before the cursor, if any.
@@ -598,6 +608,21 @@ mod tests {
         area.on_paste("a\r\nb\rc\nd\u{7}");
         assert_eq!(area.text(), "<a\nb\nc\nd>");
         assert_eq!(area.cursor(), "<a\nb\nc\nd".len(), "after the paste");
+    }
+
+    /// Review R2-L4: a large paste lands whole, lines and all, with the cursor after it — in one
+    /// insertion, not one re-segmentation of the whole buffer per character.
+    #[test]
+    fn a_large_paste_lands_whole() {
+        let line = "a line of pasted text, é and 漢字 included\r\n";
+        let paste = line.repeat(50 * 1024 / line.len() + 1);
+        assert!(paste.len() >= 50 * 1024);
+        let mut area = TextArea::with_text("before|after");
+        area.set_cursor("before|".len());
+        area.on_paste(&paste);
+        let landed = paste.replace("\r\n", "\n");
+        assert_eq!(area.text(), format!("before|{landed}after"));
+        assert_eq!(area.cursor(), "before|".len() + landed.len());
     }
 
     fn press(area: &mut TextArea, code: KeyCode) -> FieldOutcome {
