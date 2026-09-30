@@ -61,9 +61,9 @@ pub trait CaseHarness: Sync {
 
 /// The surface a case drives.
 ///
-/// `store()` is a `MemStore` rather than an `impl WriteStore` because a case asserts over rows and
+/// `store()` is a `MemStore` rather than an `impl WorkerStore` because a case asserts over rows and
 /// the suite's only store is the in-memory one. The *engine* is what stays generic over
-/// `S: WriteStore`; nothing here weakens that.
+/// `S: WorkerStore`; nothing here weakens that.
 #[allow(async_fn_in_trait)]
 pub trait Orchestrate {
     /// Send one command through the walk.

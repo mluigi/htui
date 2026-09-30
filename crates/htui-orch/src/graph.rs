@@ -46,8 +46,9 @@ const DEFAULT_MAX_AGENTS_PER_RUN: u32 = 8;
 /// generic source whatsoever. This trait is that source, and it lives here rather than in
 /// `htui-core` so invariant 10 holds in both directions: the engine never names a concrete store,
 /// and `htui-store` never learns that an engine exists. `fake.rs` implements it for `MemStore`
-/// (T3). `htui` cannot implement it for `Backend` (both are foreign there, E0117), so
-/// `run_worker::BackendGraphs` wraps a `Backend` and implements it (MOD-4 plan D155). MOD-9
+/// (T3). The host cannot implement it for its store handle (both are foreign there, E0117), so
+/// `htui_worker::HostGraphs` wraps a `WorkerHost` and implements it (MOD-4 plan D155; it was
+/// `run_worker::BackendGraphs` over a `Backend` until MOD-41 T6). MOD-9
 /// added `bound_skills` and MOD-7 milestone 3 `missing_tags`, for the same reason.
 ///
 /// `app_setting` is deliberately **not** a method of this trait (blueprint A-2): those reads are

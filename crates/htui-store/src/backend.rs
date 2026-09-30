@@ -132,9 +132,9 @@ impl Backend {
     /// An **owned** writable handle, or `None` (MOD-2 D26, D34; MOD-25).
     ///
     /// The counterpart of [`Backend::writable`] for a caller that outlives one call — the chat
-    /// recorder, which is generic over `S: WriteStore` and lives inside a spawned session task.
+    /// recorder, which is generic over `S: RecorderStore` and lives inside a spawned session task.
     /// [`Backend::Memory`] answers `Some` here and `None` there, because a `MemStore` **is** a
-    /// `WriteStore` even though it is not a [`PgStore`].
+    /// `RecorderStore` even though it is not a [`PgStore`].
     ///
     /// **[`Backend::Offline`] answers `None` since MOD-25.** Between MOD-2 milestone 4 and MOD-25
     /// it answered `Some(Writer::Buffered(..))`: a chat that could not reach Postgres recorded
