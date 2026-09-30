@@ -1,15 +1,18 @@
 //! Skills, their versions and their bindings (`docs/ANA-9.md` §5.6), plus the `R-SKL-2`
 //! resolution the prompt's skills section renders (`docs/ANA-5.md` §4.2).
 //!
-//! The writers are MOD-9 milestone 3's (`WriteStore::create_skill` and three others); a `glob`
-//! attachment fires from PRD milestone 5 (D86). Since MOD-9 milestone 2 (ANA-22 §6-§7) a skill
-//! attaches globally, to a project or to one phase; [`resolve`] picks the most specific
-//! attachment per skill, and [`select`] decides, per step, which winners render and records why.
+//! The writers are MOD-9 milestone 3's (`WriteStore::create_skill` and three others). Since MOD-9
+//! milestone 2 (ANA-22 §6-§7) a skill attaches globally, to a project or to one phase; [`resolve`]
+//! picks the most specific attachment per skill, and [`select`] decides, per step, which winners
+//! render and records why — a `glob` winner against the step's [`StepFiles`] (MOD-9 D111).
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::model::ids::{PhaseId, ProjectId, SkillBindingId, SkillId, UserId};
+use crate::model::skill_glob::SkillGlobs;
 
 str_enum!(
     /// `skill_binding.activation` (ANA-22 §6 item 4): whether the winning attachment puts its
@@ -18,8 +21,8 @@ str_enum!(
         /// Always rendered. The column default, so every binding written before `0007` is
         /// unchanged.
         Always => "always",
-        /// Rendered when the step's file set matches `globs` (PRD milestone 5, D86). Until the
-        /// matcher fires, a `glob` winner is inactive and records `no_path` (plan D40, OQ-12).
+        /// Rendered when the step's file set matches `globs`: `matched`, else `no_match` or
+        /// `no_path` (MOD-9 D111).
         Glob => "glob",
         /// Attached more broadly but not here: a narrower `off` hides a broader attachment.
         Off => "off",
@@ -113,7 +116,8 @@ pub struct SkillBinding {
     /// `skill_binding.activation`.
     pub activation: Activation,
     /// `skill_binding.globs`: the effective globs, non-empty when `activation` is `Glob`
-    /// (`skill_binding_glob_needs_globs`). Nothing matches them before PRD milestone 5 (D86).
+    /// (`skill_binding_glob_needs_globs`); `select` matches them against the step's files (MOD-9
+    /// D111).
     pub globs: Vec<String>,
     /// `skill_binding.languages`: as authored, display only; the matcher reads `globs`.
     pub languages: Vec<String>,
@@ -300,7 +304,7 @@ pub struct BoundSkill {
     pub level: SkillLevel,
     /// The winning attachment's activation, which [`select`] reads.
     pub activation: Activation,
-    /// The winning attachment's globs, for PRD milestone 5's matcher (D86). Recorded nowhere yet.
+    /// The winning attachment's globs, matched by `select` against `StepFiles`, MOD-9 D111.
     pub globs: Vec<String>,
 }
 
@@ -376,26 +380,31 @@ pub fn resolve(rows: Vec<(SkillBinding, String)>, versions: &[SkillVersion]) -> 
 }
 
 /// Why a candidate did or did not render (plan D40, ANA-22 §6 item 8). Serialised snake_case into
-/// `trim_record.skill_choices[].reason`. PRD milestone 5 (D86) adds `matched` (with the path) and
-/// `no_match`; no variant here is renamed then.
+/// `trim_record.skill_choices[].reason`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChoiceReason {
-    /// `activation = always`: rendered. The only active reason.
+    /// `activation = always`: rendered. Active; `Matched` is the other active reason.
     Always,
     /// `activation = off` on the winning attachment.
     Off,
-    /// `activation = glob` and no repo root resolves for the step (every step, until PRD milestone
-    /// 5, D86).
+    /// `activation = glob` and no repo the globs can reach was listed for the step (MOD-9 D112).
     NoPath,
     /// The winning attachment's pin names no version, or the skill has none.
     MissingVersion,
     /// The template body places no `{{skills}}`, so nothing could render.
     NotPlaced,
+    /// MOD-9 D109: `activation = glob` and a file of the step's set matched; the choice carries
+    /// the file as `path`. Active, like `Always`.
+    Matched,
+    /// MOD-9 D109/D112: `activation = glob`, a repo the globs can reach was listed, and nothing in
+    /// it matched (or the stored globs no longer compile, R-53).
+    NoMatch,
 }
 
 impl ChoiceReason {
-    /// The serde spelling: `always`, `off`, `no_path`, `missing_version`, `not_placed`.
+    /// The serde spelling: `always`, `off`, `no_path`, `missing_version`, `not_placed`, `matched`,
+    /// `no_match`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -404,6 +413,8 @@ impl ChoiceReason {
             Self::NoPath => "no_path",
             Self::MissingVersion => "missing_version",
             Self::NotPlaced => "not_placed",
+            Self::Matched => "matched",
+            Self::NoMatch => "no_match",
         }
     }
 }
@@ -427,32 +438,95 @@ pub struct SkillChoice {
     pub active: bool,
     /// Why.
     pub reason: ChoiceReason,
+    /// MOD-9 D109: `<repo>:<path>` of the file that woke a `matched` choice, masked like `name`;
+    /// `None` for every other reason, and then absent from the JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
-/// Plan D40: decides every candidate, in order, for one step. Pure.
+/// MOD-9 D110: one step's file set for `glob` matching (ANA-22 §5.4 F2): per repo slug, the
+/// repo-relative paths, and which repos were reached (listed, even to zero files). Byte order
+/// throughout (`str`'s `Ord`), so the first match never depends on walk order (D113).
+/// `Default` reaches nothing, which is `no_path` for every `glob` winner.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepFiles {
+    /// Every reached repo, keyed by slug, and the paths inserted under it.
+    repos: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl StepFiles {
+    /// Marks `repo` as listed, with no file added.
+    pub fn reach(&mut self, repo: &str) {
+        self.repos.entry(repo.to_owned()).or_default();
+    }
+
+    /// Adds `repo:path`, reaching `repo`.
+    pub fn insert(&mut self, repo: &str, path: &str) {
+        self.repos
+            .entry(repo.to_owned())
+            .or_default()
+            .insert(path.to_owned());
+    }
+
+    /// Whether `repo` was reached.
+    #[must_use]
+    pub fn is_reached(&self, repo: &str) -> bool {
+        self.repos.contains_key(repo)
+    }
+
+    /// Every reached repo and its paths, in repo byte order, paths in byte order.
+    pub fn repos(&self) -> impl Iterator<Item = (&str, &BTreeSet<String>)> {
+        self.repos
+            .iter()
+            .map(|(repo, paths)| (repo.as_str(), paths))
+    }
+
+    /// Keeps the `(repo, path)` pairs `keep` answers `true` for; a repo stays reached even when
+    /// every path under it goes (MOD-9 D132).
+    pub fn retain(&mut self, mut keep: impl FnMut(&str, &str) -> bool) {
+        for (repo, paths) in &mut self.repos {
+            paths.retain(|path| keep(repo, path));
+        }
+    }
+
+    /// Whether no repo was reached (MOD-9 D137).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.repos.is_empty()
+    }
+}
+
+/// Plan D40, MOD-9 D111: decides every candidate, in order, for one step. Pure.
 ///
 /// The rules, first match wins: a body that does not place `{{skills}}` (`placed == false`) makes
-/// every candidate `not_placed`; `version: None` is `missing_version`; `Off` is `off`; `Glob` is
-/// `no_path` (no step resolves a root before PRD milestone 5, D86; OQ-12); `Always` is `always`
-/// and the only active outcome. Returns the active candidates in input order — which is collapse
-/// order, the render order — and one [`SkillChoice`] per candidate in the same order.
+/// every candidate `not_placed`; `version: None` is `missing_version`; `Off` is `off`; `Always` is
+/// `always`; a `Glob` whose stored globs no longer compile is `no_match` (R-53); a `Glob` matching
+/// a file of `files` is `matched`, with the first match in `(repo bytes, path bytes)` order as
+/// its `path` (D113); any other `Glob` is `no_match` when `files` reached a repo its globs can
+/// match in (D112), else `no_path`. `always` and `matched` are the active outcomes. Returns the
+/// active candidates in input order — which is collapse order, the render order — and one
+/// [`SkillChoice`] per candidate in the same order.
 #[must_use]
-pub fn select(candidates: Vec<BoundSkill>, placed: bool) -> (Vec<BoundSkill>, Vec<SkillChoice>) {
+pub fn select(
+    candidates: Vec<BoundSkill>,
+    placed: bool,
+    files: &StepFiles,
+) -> (Vec<BoundSkill>, Vec<SkillChoice>) {
     let mut active = Vec::with_capacity(candidates.len());
     let mut choices = Vec::with_capacity(candidates.len());
     for skill in candidates {
-        let reason = if !placed {
-            ChoiceReason::NotPlaced
+        let (reason, path) = if !placed {
+            (ChoiceReason::NotPlaced, None)
         } else if skill.version.is_none() {
-            ChoiceReason::MissingVersion
+            (ChoiceReason::MissingVersion, None)
         } else {
             match skill.activation {
-                Activation::Off => ChoiceReason::Off,
-                Activation::Glob => ChoiceReason::NoPath,
-                Activation::Always => ChoiceReason::Always,
+                Activation::Off => (ChoiceReason::Off, None),
+                Activation::Glob => glob_reason(&skill.globs, files),
+                Activation::Always => (ChoiceReason::Always, None),
             }
         };
-        let is_active = reason == ChoiceReason::Always;
+        let is_active = matches!(reason, ChoiceReason::Always | ChoiceReason::Matched);
         choices.push(SkillChoice {
             skill: skill.skill_id,
             name: skill.name.clone(),
@@ -461,12 +535,41 @@ pub fn select(candidates: Vec<BoundSkill>, placed: bool) -> (Vec<BoundSkill>, Ve
             activation: skill.activation,
             active: is_active,
             reason,
+            path,
         });
         if is_active {
             active.push(skill);
         }
     }
     (active, choices)
+}
+
+/// MOD-9 D111-D113: one `glob` winner's reason over the step's files, and the matched
+/// `<repo>:<path>`. `files.repos()` is byte order, so the first hit is the deterministic one.
+fn glob_reason(globs: &[String], files: &StepFiles) -> (ChoiceReason, Option<String>) {
+    // MOD-9 D111 (R-53): globs stored before a refusal rule changed are a quiet `no_match`.
+    let Ok(compiled) = SkillGlobs::compile(globs) else {
+        return (ChoiceReason::NoMatch, None);
+    };
+    for (repo, paths) in files.repos() {
+        if let Some(path) = compiled.first_match(repo, paths.iter().map(String::as_str)) {
+            return (ChoiceReason::Matched, Some(format!("{repo}:{path}")));
+        }
+    }
+    if files.repos().any(|(repo, _)| compiled.reaches(repo)) {
+        (ChoiceReason::NoMatch, None)
+    } else {
+        (ChoiceReason::NoPath, None)
+    }
+}
+
+/// MOD-9 D111: whether a walk could change any choice — the collapsed winners hold a `Glob`
+/// with a version. `BoundSkill::collapse` first, so a project `glob` under a phase `off` is not one.
+#[must_use]
+pub fn needs_files(candidates: &[BoundSkill]) -> bool {
+    BoundSkill::collapse(candidates.to_vec())
+        .iter()
+        .any(|skill| skill.activation == Activation::Glob && skill.version.is_some())
 }
 
 #[cfg(test)]
@@ -496,6 +599,24 @@ mod tests {
             activation: Activation::Always,
             globs: Vec::new(),
         }
+    }
+
+    /// MOD-9 D111: a project-level `glob` candidate with a version.
+    fn glob(name: &str, globs: &[&str]) -> BoundSkill {
+        BoundSkill {
+            activation: Activation::Glob,
+            globs: globs.iter().map(|&glob| glob.to_owned()).collect(),
+            ..bound(SkillId::new(), name, 1, 0, SkillLevel::Project)
+        }
+    }
+
+    /// MOD-9 D110: a step's file set holding each `(repo, path)`, in the order given.
+    fn files(entries: &[(&str, &str)]) -> StepFiles {
+        let mut files = StepFiles::default();
+        for &(repo, path) in entries {
+            files.insert(repo, path);
+        }
+        files
     }
 
     fn binding(skill_id: SkillId, pinned_version: Option<i32>) -> SkillBinding {
@@ -731,7 +852,7 @@ mod tests {
             "the project's off wins over the global always"
         );
 
-        let (active, choices) = select(candidates, true);
+        let (active, choices) = select(candidates, true, &StepFiles::default());
         assert!(active.is_empty(), "an off winner renders nothing");
         assert_eq!(
             choices
@@ -847,7 +968,7 @@ mod tests {
             with("d", Activation::Always, None),
         ];
 
-        let (active, choices) = select(candidates.clone(), true);
+        let (active, choices) = select(candidates.clone(), true, &StepFiles::default());
         assert_eq!(
             choices.iter().map(|c| c.reason).collect::<Vec<_>>(),
             vec![
@@ -868,7 +989,7 @@ mod tests {
         );
         assert_eq!(active, vec![candidates[0].clone()], "only `always` renders");
 
-        let (active, choices) = select(candidates, false);
+        let (active, choices) = select(candidates, false, &StepFiles::default());
         assert!(active.is_empty(), "nothing renders where nothing is placed");
         assert!(
             choices
@@ -876,6 +997,145 @@ mod tests {
                 .all(|c| c.reason == ChoiceReason::NotPlaced && !c.active),
             "every candidate is not_placed: {choices:?}"
         );
+
+        // MOD-9 D111: a matching file never beats `not_placed`, `missing_version` or `off`.
+        let rust = files(&[("htui", "src/lib.rs")]);
+        let versionless = BoundSkill {
+            version: None,
+            ..glob("e", &["**/*.rs"])
+        };
+        let (_, choices) = select(vec![versionless], true, &rust);
+        assert_eq!(choices[0].reason, ChoiceReason::MissingVersion);
+        assert_eq!(choices[0].path, None);
+        let (active, choices) = select(vec![glob("f", &["**/*.rs"])], false, &rust);
+        assert!(active.is_empty());
+        assert_eq!(choices[0].reason, ChoiceReason::NotPlaced);
+        let off = BoundSkill {
+            activation: Activation::Off,
+            ..glob("g", &["**/*.rs"])
+        };
+        let (active, choices) = select(vec![off], true, &rust);
+        assert!(active.is_empty());
+        assert_eq!(choices[0].reason, ChoiceReason::Off);
+        assert_eq!(choices[0].path, None);
+    }
+
+    /// MOD-9 D109/D111: a `glob` winner whose globs match a file of the step's set is `matched`,
+    /// active, and names the file.
+    #[test]
+    fn select_matches_a_glob_against_the_step_files() {
+        let candidate = glob("g", &["**/*.rs"]);
+        let (active, choices) = select(
+            vec![candidate.clone()],
+            true,
+            &files(&[("htui", "src/lib.rs")]),
+        );
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].reason, ChoiceReason::Matched);
+        assert!(choices[0].active, "matched is active");
+        assert_eq!(choices[0].path.as_deref(), Some("htui:src/lib.rs"));
+        assert_eq!(active, vec![candidate], "a matched skill renders");
+    }
+
+    /// MOD-9 D113: the recorded path is the first in `(repo bytes, path bytes)` order, never the
+    /// order the files arrived in.
+    #[test]
+    fn the_first_match_is_the_first_in_repo_then_path_byte_order() {
+        let candidate = glob("g", &["**/*.rs"]);
+        let set = files(&[("htui", "a/x.rs"), ("htui", "a.rs"), ("api", "z.rs")]);
+        let (_, choices) = select(vec![candidate.clone()], true, &set);
+        assert_eq!(
+            choices[0].path.as_deref(),
+            Some("api:z.rs"),
+            "`api` sorts before `htui`"
+        );
+        let set = files(&[("htui", "a/x.rs"), ("htui", "a.rs")]);
+        let (_, choices) = select(vec![candidate], true, &set);
+        assert_eq!(
+            choices[0].path.as_deref(),
+            Some("htui:a.rs"),
+            "`.` (0x2E) sorts before `/` (0x2F), whatever the walk's order"
+        );
+    }
+
+    /// MOD-9 D112: a reached repo the globs can match in, with nothing matching — even with no file
+    /// at all — is `no_match`.
+    #[test]
+    fn a_glob_over_a_reached_repo_with_no_match_records_no_match() {
+        let candidate = glob("g", &["**/*.rs"]);
+        let (active, choices) = select(
+            vec![candidate.clone()],
+            true,
+            &files(&[("htui", "README.md")]),
+        );
+        assert!(active.is_empty());
+        assert_eq!(choices[0].reason, ChoiceReason::NoMatch);
+        assert!(!choices[0].active);
+        assert_eq!(choices[0].path, None);
+
+        let mut reached = StepFiles::default();
+        reached.reach("htui");
+        let (_, choices) = select(vec![candidate], true, &reached);
+        assert_eq!(
+            choices[0].reason,
+            ChoiceReason::NoMatch,
+            "a repo listed to zero files is still reached"
+        );
+    }
+
+    /// MOD-9 D112: no reached repo the globs can match in is `no_path`.
+    #[test]
+    fn a_glob_reaching_no_listed_repo_records_no_path() {
+        let (_, choices) = select(vec![glob("g", &["**/*.rs"])], true, &StepFiles::default());
+        assert_eq!(choices[0].reason, ChoiceReason::NoPath);
+        let (_, choices) = select(
+            vec![glob("g", &["web:**/*.ts"])],
+            true,
+            &files(&[("htui", "a.ts")]),
+        );
+        assert_eq!(
+            choices[0].reason,
+            ChoiceReason::NoPath,
+            "`web:` cannot match in `htui`, the only repo listed"
+        );
+        assert_eq!(choices[0].path, None);
+    }
+
+    /// MOD-9 D111 (R-53): stored globs that no longer compile are `no_match`, checked before reach.
+    #[test]
+    fn a_glob_that_does_not_compile_records_no_match() {
+        let (active, choices) = select(vec![glob("g", &["[a"])], true, &StepFiles::default());
+        assert!(active.is_empty());
+        assert_eq!(choices[0].reason, ChoiceReason::NoMatch);
+        assert_eq!(choices[0].path, None);
+    }
+
+    /// MOD-9 D111: only a collapsed `glob` winner with a version needs the step's files.
+    #[test]
+    fn needs_files_sees_only_a_glob_winner_with_a_version() {
+        let project = glob("g", &["**/*.rs"]);
+        let phase_off = BoundSkill {
+            level: SkillLevel::Phase,
+            activation: Activation::Off,
+            ..project.clone()
+        };
+        assert!(
+            !needs_files(&[project.clone(), phase_off]),
+            "a narrower `off` hides the project `glob`"
+        );
+        let versionless = BoundSkill {
+            version: None,
+            ..project.clone()
+        };
+        assert!(!needs_files(&[versionless]));
+        assert!(!needs_files(&[bound(
+            SkillId::new(),
+            "a",
+            1,
+            0,
+            SkillLevel::Project
+        )]));
+        assert!(needs_files(&[project]));
     }
 
     /// Plan D55: the record's keys, and the snake_case spellings of the two plain enums.
@@ -889,9 +1149,10 @@ mod tests {
             activation: Activation::Glob,
             active: false,
             reason: ChoiceReason::MissingVersion,
+            path: None,
         };
         let value = serde_json::to_value(&choice).expect("a choice serialises");
-        let keys: std::collections::BTreeSet<&str> = value
+        let keys: BTreeSet<&str> = value
             .as_object()
             .expect("an object")
             .keys()
@@ -921,6 +1182,8 @@ mod tests {
             ChoiceReason::NoPath,
             ChoiceReason::MissingVersion,
             ChoiceReason::NotPlaced,
+            ChoiceReason::Matched,
+            ChoiceReason::NoMatch,
         ] {
             assert_eq!(
                 serde_json::to_value(reason).expect("a reason serialises"),
@@ -938,6 +1201,24 @@ mod tests {
         assert!(
             SkillLevel::Global < SkillLevel::Project && SkillLevel::Project < SkillLevel::Phase
         );
+
+        // MOD-9 D109: a matched choice adds `path`, last; a v 2 choice reads back with none.
+        let matched = SkillChoice {
+            version: Some(1),
+            active: true,
+            reason: ChoiceReason::Matched,
+            path: Some("htui:src/lib.rs".to_owned()),
+            ..choice.clone()
+        };
+        let value = serde_json::to_value(&matched).expect("a matched choice serialises");
+        let object = value.as_object().expect("an object");
+        assert_eq!(object.len(), 8, "the seven keys plus `path`");
+        assert_eq!(value["path"], serde_json::json!("htui:src/lib.rs"));
+        assert_eq!(value["reason"], serde_json::json!("matched"));
+        let v2 = serde_json::to_value(&choice).expect("a choice serialises");
+        let read: SkillChoice = serde_json::from_value(v2).expect("a v 2 choice reads back");
+        assert_eq!(read.path, None);
+        assert_eq!(read, choice);
     }
 
     /// D71: the Agent Skills rule, byte for byte; the demo names pass.

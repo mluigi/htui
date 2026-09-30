@@ -12,10 +12,11 @@ use std::sync::Arc;
 
 use htui_agent::excerpt::{
     FsRepoReader, GITIGNORE_MAX_BYTES, PassInput, SkipRule, excerpt_pass, excerpt_roots,
-    excerpts_for, run_providers, touched_prefixes,
+    run_providers, step_pass, touched_prefixes, walk_pass,
 };
 use htui_core::model::{
-    BoxId, Isolation, ProjectId, Repo, RepoBoxPath, RepoId, RunStepTree, StepId,
+    Activation, BoundSkill, BoxId, Isolation, ProjectId, Repo, RepoBoxPath, RepoId, RunStepTree,
+    SkillId, SkillLevel, StepId,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, BuiltinRanker, ExcerptCandidate, ExcerptCaps, ExcerptProvider, ExcerptReason,
@@ -23,7 +24,7 @@ use htui_core::prompt::excerpt::{
     RootRecord, RootSource, select,
 };
 use htui_core::prompt::settings::resolve_excerpt_caps;
-use htui_core::prompt::{PromptSpec, TokenEstimator, body_of, fixtures};
+use htui_core::prompt::{PromptSpec, TokenEstimator, assemble, body_of, fixtures};
 use htui_core::scrub::MinimalScrubber;
 
 // ---------------------------------------------------------------------------------------------
@@ -1103,6 +1104,7 @@ fn readable_input(dir: &std::path::Path) -> PassInput {
         roots: vec![fs_root(dir)],
         touched_prefixes: vec![PathPrefix::parse("src/lib.rs", "htui")],
         notes: vec!["excerpt: a caller's own note".to_owned()],
+        changed_paths: Vec::new(),
     }
 }
 
@@ -1111,10 +1113,8 @@ fn excerpt_pass_selects_a_touched_file_from_a_real_tree() {
     let dir = tempfile::tempdir().expect("a throwaway root");
     write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
 
-    let set = excerpt_pass(
-        &base_request(&["src/lib.rs"], vec![fs_root(dir.path())]),
-        TokenEstimator::DEFAULT,
-    );
+    let req = base_request(&["src/lib.rs"], vec![fs_root(dir.path())]);
+    let set = excerpt_pass(&req, &walk_pass(&req), TokenEstimator::DEFAULT);
 
     assert!(
         set.files
@@ -1141,10 +1141,8 @@ fn excerpt_pass_records_a_no_path_root_and_scans_nothing() {
         root: std::path::PathBuf::new(),
         source: RootSource::NoPath,
     };
-    let set = excerpt_pass(
-        &base_request(&["src/lib.rs"], vec![root]),
-        TokenEstimator::DEFAULT,
-    );
+    let req = base_request(&["src/lib.rs"], vec![root]);
+    let set = excerpt_pass(&req, &walk_pass(&req), TokenEstimator::DEFAULT);
 
     assert!(set.files.is_empty());
     assert_eq!(set.audit.considered, 0);
@@ -1239,19 +1237,20 @@ fn touched_prefixes_follow_the_overlap_primary_rule() {
 }
 
 #[tokio::test]
-async fn excerpts_for_reads_a_tree_it_can_render() {
+async fn step_pass_reads_a_tree_it_can_render() {
     let dir = tempfile::tempdir().expect("a throwaway root");
     write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
     let input = readable_input(dir.path());
     let caller_notes = input.notes.clone();
 
-    let set = excerpts_for(
+    let set = step_pass(
         &phase_spec(),
         input,
         &BTreeMap::new(),
         &MinimalScrubber::new([]),
     )
-    .await;
+    .await
+    .excerpts;
 
     assert!(
         set.files
@@ -1268,7 +1267,7 @@ async fn excerpts_for_reads_a_tree_it_can_render() {
 }
 
 #[tokio::test]
-async fn excerpts_for_skips_a_template_without_the_placeholder() {
+async fn step_pass_skips_a_template_without_the_placeholder() {
     let dir = tempfile::tempdir().expect("a throwaway root");
     write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
     let mut spec = phase_spec();
@@ -1277,13 +1276,14 @@ async fn excerpts_for_skips_a_template_without_the_placeholder() {
         .expect("`verdict` is a default body")
         .to_owned();
 
-    let set = excerpts_for(
+    let set = step_pass(
         &spec,
         readable_input(dir.path()),
         &BTreeMap::new(),
         &MinimalScrubber::new([]),
     )
-    .await;
+    .await
+    .excerpts;
 
     assert!(set.files.is_empty());
     assert_eq!(set.audit.considered, 0);
@@ -1305,15 +1305,16 @@ async fn excerpts_for_skips_a_template_without_the_placeholder() {
 }
 
 #[tokio::test]
-async fn excerpts_for_with_no_roots_is_the_empty_audit() {
+async fn step_pass_with_no_roots_is_the_empty_audit() {
     let app = BTreeMap::new();
-    let set = excerpts_for(
+    let set = step_pass(
         &phase_spec(),
         PassInput::default(),
         &app,
         &MinimalScrubber::new([]),
     )
-    .await;
+    .await
+    .excerpts;
 
     assert_eq!(set.audit.provider_set, vec![BUILTIN_ID.to_owned()]);
     assert!(set.audit.roots.is_empty());
@@ -1325,7 +1326,7 @@ async fn excerpts_for_with_no_roots_is_the_empty_audit() {
 }
 
 #[tokio::test]
-async fn excerpts_for_drops_a_file_the_scrubber_refuses() {
+async fn step_pass_drops_a_file_the_scrubber_refuses() {
     let dir = tempfile::tempdir().expect("a throwaway root");
     write(
         dir.path(),
@@ -1335,13 +1336,14 @@ async fn excerpts_for_drops_a_file_the_scrubber_refuses() {
     let mut input = readable_input(dir.path());
     input.notes = Vec::new();
 
-    let set = excerpts_for(
+    let set = step_pass(
         &phase_spec(),
         input,
         &BTreeMap::new(),
         &MinimalScrubber::new([]),
     )
-    .await;
+    .await
+    .excerpts;
 
     assert!(set.files.is_empty(), "{:?}", set.files);
     assert_eq!(set.audit.selected, 1, "the ranker chose it and paid for it");
@@ -1356,7 +1358,7 @@ async fn excerpts_for_drops_a_file_the_scrubber_refuses() {
 }
 
 #[tokio::test]
-async fn excerpts_for_never_persists_a_note_naming_a_masked_path() {
+async fn step_pass_never_persists_a_note_naming_a_masked_path() {
     // Review finding M-1. `select`'s own notes name `repo:path` as the reader listed it. A file
     // under a directory named after a known secret that the reader lists but cannot read — here,
     // bytes that are not UTF-8 — would have put the secret in the stored record.
@@ -1379,15 +1381,17 @@ async fn excerpts_for_never_persists_a_note_naming_a_masked_path() {
         roots: vec![fs_root(dir.path())],
         touched_prefixes: vec![PathPrefix::parse(&format!("{secret}/bad.rs"), "htui")],
         notes: Vec::new(),
+        changed_paths: Vec::new(),
     };
 
-    let set = excerpts_for(
+    let set = step_pass(
         &phase_spec(),
         input,
         &BTreeMap::new(),
         &MinimalScrubber::new([secret.to_owned()]),
     )
-    .await;
+    .await
+    .excerpts;
 
     assert!(set.files.is_empty(), "{:?}", set.files);
     assert!(!set.notes.is_empty(), "the unreadable file is still noted");
@@ -1405,4 +1409,346 @@ async fn excerpts_for_never_persists_a_note_naming_a_masked_path() {
         "{:?}",
         set.notes
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-9 D120: `step_pass` — one walk for the excerpts and the `glob` file set
+// ---------------------------------------------------------------------------------------------
+
+/// A project `glob` skill over `globs`, versioned, so `needs_files` counts it.
+fn glob_skill(globs: &[&str]) -> BoundSkill {
+    BoundSkill {
+        skill_id: SkillId::new(),
+        name: "globbed".to_owned(),
+        version: Some(1),
+        position: 0,
+        body: "Mind the globs.\n".to_owned(),
+        level: SkillLevel::Project,
+        activation: Activation::Glob,
+        globs: globs.iter().map(|glob| (*glob).to_owned()).collect(),
+    }
+}
+
+/// `phase_spec()` under the default `verdict` body, which places `{{skills}}` and not
+/// `{{excerpts}}`, carrying `skills`.
+fn verdict_spec(skills: Vec<BoundSkill>) -> PromptSpec {
+    let mut spec = phase_spec();
+    spec.template.name = "verdict".to_owned();
+    spec.body = body_of("verdict")
+        .expect("`verdict` is a default body")
+        .to_owned();
+    spec.skills = skills;
+    spec
+}
+
+/// Every `(repo, path)` of a file set, in its byte order.
+fn file_rows(files: &htui_core::model::StepFiles) -> Vec<(String, String)> {
+    files
+        .repos()
+        .flat_map(|(repo, paths)| {
+            paths
+                .iter()
+                .map(move |path| (repo.to_owned(), path.clone()))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn step_pass_lists_for_a_glob_skill_when_the_body_places_no_excerpts() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
+    let input = readable_input(dir.path());
+    let caller_notes = input.notes.clone();
+
+    let pass = step_pass(
+        &verdict_spec(vec![glob_skill(&["**/*.rs"])]),
+        input,
+        &BTreeMap::new(),
+        &MinimalScrubber::new([]),
+    )
+    .await;
+
+    assert!(pass.files.is_reached("htui"), "{:?}", pass.files);
+    assert_eq!(
+        file_rows(&pass.files),
+        vec![("htui".to_owned(), "src/lib.rs".to_owned())]
+    );
+    assert!(pass.excerpts.files.is_empty(), "{:?}", pass.excerpts.files);
+    assert_eq!(pass.excerpts.audit.considered, 0);
+    assert_eq!(
+        pass.excerpts.audit.roots,
+        vec![RootRecord {
+            repo: "htui".to_owned(),
+            source: RootSource::RunStepTree,
+            scan_truncated: false,
+        }]
+    );
+    assert!(
+        pass.excerpts.notes.starts_with(&caller_notes),
+        "the caller's notes go first: {:?}",
+        pass.excerpts.notes
+    );
+    assert!(
+        pass.excerpts.notes.contains(
+            &"excerpt: template `verdict` places no {{excerpts}}; the walk listed files for glob \
+              skills only"
+                .to_owned()
+        ),
+        "{:?}",
+        pass.excerpts.notes
+    );
+}
+
+#[tokio::test]
+async fn step_pass_skips_the_walk_without_excerpts_or_a_glob_winner() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
+    let unversioned = BoundSkill {
+        version: None,
+        ..glob_skill(&["**/*.rs"])
+    };
+
+    for skills in [Vec::new(), vec![unversioned]] {
+        let pass = step_pass(
+            &verdict_spec(skills.clone()),
+            readable_input(dir.path()),
+            &BTreeMap::new(),
+            &MinimalScrubber::new([]),
+        )
+        .await;
+
+        assert!(
+            pass.files.is_empty(),
+            "no walk for {skills:?}: {:?}",
+            pass.files
+        );
+        assert!(
+            pass.excerpts.notes.contains(
+                &"excerpt: template `verdict` places no {{excerpts}}; nothing was read".to_owned()
+            ),
+            "{:?}",
+            pass.excerpts.notes
+        );
+    }
+}
+
+#[tokio::test]
+async fn step_pass_narrows_files_to_touched_prefixes() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
+    write(dir.path(), "docs/a.md", b"# A\n");
+
+    let pass = step_pass(
+        &verdict_spec(vec![glob_skill(&["**/*.rs"])]),
+        readable_input(dir.path()),
+        &BTreeMap::new(),
+        &MinimalScrubber::new([]),
+    )
+    .await;
+
+    assert!(pass.files.is_reached("htui"));
+    assert_eq!(
+        file_rows(&pass.files),
+        vec![("htui".to_owned(), "src/lib.rs".to_owned())],
+        "`docs/a.md` is under no touched prefix"
+    );
+}
+
+#[tokio::test]
+async fn step_pass_feeds_changed_paths_to_tier_2() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
+    write(dir.path(), "src/other.rs", b"pub fn other() {}\n");
+    let mut input = readable_input(dir.path());
+    input.changed_paths = vec![RepoPath {
+        repo: "htui".to_owned(),
+        path: "src/other.rs".to_owned(),
+    }];
+    // A placed `glob` winner, so the file set is built from the listing (MOD-9 D120).
+    let mut spec = phase_spec();
+    spec.skills = vec![glob_skill(&["**/*.rs"])];
+
+    let pass = step_pass(&spec, input, &BTreeMap::new(), &MinimalScrubber::new([])).await;
+
+    assert!(
+        pass.excerpts
+            .files
+            .iter()
+            .any(|file| file.path == "src/other.rs" && file.reason == ExcerptReason::PrevDiff),
+        "{:?}",
+        pass.excerpts.files
+    );
+    assert_eq!(
+        file_rows(&pass.files),
+        vec![
+            ("htui".to_owned(), "src/lib.rs".to_owned()),
+            ("htui".to_owned(), "src/other.rs".to_owned()),
+        ],
+        "the touched file, and the changed one"
+    );
+}
+
+#[tokio::test]
+async fn step_pass_withholds_an_unmaskable_path_from_files() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
+    write(dir.path(), "src/sk-live.rs", b"pub fn live() {}\n");
+    let mut input = readable_input(dir.path());
+    input.touched_prefixes = Vec::new();
+
+    let pass = step_pass(
+        &verdict_spec(vec![glob_skill(&["**/*.rs"])]),
+        input,
+        &BTreeMap::new(),
+        &MinimalScrubber::new([]),
+    )
+    .await;
+
+    assert_eq!(
+        file_rows(&pass.files),
+        vec![("htui".to_owned(), "src/lib.rs".to_owned())]
+    );
+    assert!(
+        pass.excerpts.notes.contains(
+            &"skills: 1 path(s) withheld from glob matching; the scrubber refused them".to_owned()
+        ),
+        "{:?}",
+        pass.excerpts.notes
+    );
+    for note in &pass.excerpts.notes {
+        assert!(!note.contains("sk-live"), "a note names the path: {note}");
+    }
+}
+
+/// MOD-9 D120 (review finding 1): with no placed, versioned `glob` winner, `select` never reads the
+/// file set, so none is built from the listing: it holds the changed paths alone, scrub-filtered,
+/// and no `skills:` withheld note is left — whether the body places `{{excerpts}}` or not.
+#[tokio::test]
+async fn step_pass_builds_no_listing_file_set_without_a_glob_winner() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
+    write(dir.path(), "src/other.rs", b"pub fn other() {}\n");
+    write(dir.path(), "src/sk-live.rs", b"pub fn live() {}\n");
+    let changed = vec![
+        RepoPath {
+            repo: "htui".to_owned(),
+            path: "src/other.rs".to_owned(),
+        },
+        RepoPath {
+            repo: "htui".to_owned(),
+            path: "src/sk-live.rs".to_owned(),
+        },
+    ];
+
+    for spec in [phase_spec(), verdict_spec(Vec::new())] {
+        let mut input = readable_input(dir.path());
+        input.touched_prefixes = Vec::new();
+        input.changed_paths = changed.clone();
+
+        let pass = step_pass(&spec, input, &BTreeMap::new(), &MinimalScrubber::new([])).await;
+
+        assert_eq!(
+            file_rows(&pass.files),
+            vec![("htui".to_owned(), "src/other.rs".to_owned())],
+            "`{}`: the changed paths alone, the refused one withheld",
+            spec.template.name
+        );
+        assert!(
+            !pass
+                .excerpts
+                .notes
+                .iter()
+                .any(|note| note.starts_with("skills:")),
+            "`{}`: no glob winner, so no withheld note: {:?}",
+            spec.template.name,
+            pass.excerpts.notes
+        );
+    }
+}
+
+/// MOD-9 D132 (review finding 3): on the glob-only branch — `{{skills}}` placed with a `glob`
+/// winner, `{{excerpts}}` not — the listing's own notes are withheld when the scrubber would
+/// change them. `FsRepoReader` prunes a denied file inside its walk, so the listing's notes that
+/// name a string are the per-repo ones; here a repo whose slug is a session secret has no readable
+/// root, and the walk's "no readable root for repo `…`" note would carry the secret.
+#[tokio::test]
+async fn step_pass_withholds_a_listing_note_on_the_glob_only_branch() {
+    let secret = "hunter2hunter2";
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
+    let input = PassInput {
+        roots: vec![
+            fs_root(dir.path()),
+            RepoRoot {
+                repo: secret.to_owned(),
+                root: std::path::PathBuf::new(),
+                source: RootSource::NoPath,
+            },
+        ],
+        touched_prefixes: vec![PathPrefix::parse("src/lib.rs", "htui")],
+        notes: Vec::new(),
+        changed_paths: Vec::new(),
+    };
+    let scrubber = MinimalScrubber::new([secret.to_owned()]);
+    let mut spec = verdict_spec(vec![glob_skill(&["**/*.rs"])]);
+
+    let pass = step_pass(&spec, input, &BTreeMap::new(), &scrubber).await;
+
+    assert!(
+        pass.excerpts.notes.contains(
+            &"excerpt: a note was withheld; it named a string the scrubber masks or refuses"
+                .to_owned()
+        ),
+        "{:?}",
+        pass.excerpts.notes
+    );
+    for note in &pass.excerpts.notes {
+        assert!(!note.contains(secret), "a note names the secret: {note}");
+    }
+    spec.excerpts = pass.excerpts;
+    spec.step_files = pass.files;
+    let assembled = assemble(&spec, &scrubber).expect("the spec assembles");
+    assert!(
+        assembled.trim.to_value(&scrubber).is_ok(),
+        "the record scrubs clean"
+    );
+}
+
+/// MOD-9 D132 (review finding 4): the caller's notes are withheld as the pass's are. An engine
+/// note carries an isolator's stderr, which can name a credential-shaped checkout path; kept, it
+/// would make the record refuse (`TrimRecord::to_value`) and fail the step.
+#[tokio::test]
+async fn step_pass_withholds_an_unmaskable_caller_note() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
+    let withheld =
+        "excerpt: a note was withheld; it named a string the scrubber masks or refuses".to_owned();
+    let scrubber = MinimalScrubber::new([]);
+
+    for mut spec in [phase_spec(), verdict_spec(Vec::new())] {
+        let mut input = readable_input(dir.path());
+        input.notes = vec![
+            "changed paths unavailable: cannot lock /srv/sk-live-checkout/.git/index.lock"
+                .to_owned(),
+            "excerpt: a caller's own note".to_owned(),
+        ];
+
+        let pass = step_pass(&spec, input, &BTreeMap::new(), &scrubber).await;
+
+        assert_eq!(
+            pass.excerpts.notes[..2],
+            [withheld.clone(), "excerpt: a caller's own note".to_owned()],
+            "`{}`: withheld in place, first: {:?}",
+            spec.template.name,
+            pass.excerpts.notes
+        );
+        spec.excerpts = pass.excerpts;
+        spec.step_files = pass.files;
+        let assembled = assemble(&spec, &scrubber).expect("the spec assembles");
+        assert!(
+            assembled.trim.to_value(&scrubber).is_ok(),
+            "`{}`: the record scrubs clean",
+            spec.template.name
+        );
+    }
 }

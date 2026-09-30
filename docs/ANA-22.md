@@ -370,3 +370,11 @@ seed (at least `rust`, `c`, `cpp`, `python`, `typescript`, `javascript`, `go`, `
   pane, the language map and the glob matcher (`globset`, §8's open choice) used at save, and the
   clone gap; glob *firing* over §5.4's F2 file set moved to a new MOD-9 PRD milestone 5. A `glob`
   attachment records `no_path` until then. The verdict is unchanged.
+- 2026-09-30 — **row 5 shipped** (MOD-9 milestone 5, `.claude/plans/mod-9-glob-attachments-fire.plan.md`,
+  write-up `docs/decisions/mod/mod-9.md`): glob firing over §5.4's F2 file set as §6 item 7 states,
+  with `StepFiles` a per-repo reach map rather than §7.2's two-armed `Resolved | NoPath` enum
+  (D110), §6 item 8's match recorded as `reason: "matched"` with a separate `path` key
+  (`<repo>:<path>`) and `no_match` (D109), the trim record at `v 3` (D118), and a judge recording
+  `no_path` because it runs in no tree (D123). The file set is bounded by the excerpt walk's scan
+  cap and skip rules, so a glob can never match a skipped file such as `**/Cargo.lock` (R-44,
+  R-48). The verdict is unchanged.

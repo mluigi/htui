@@ -2498,7 +2498,8 @@ mod tests {
         );
     }
 
-    /// The fixture record **is** `prompt::fixtures::demo_trim_record()`, byte for byte.
+    /// The fixture record **is** `prompt::fixtures::demo_trim_record()`, byte for byte but for `v`
+    /// (MOD-9 D118: written before `0008`, it stays `v 2`).
     ///
     /// It is spelled out as a literal rather than computed because `crate::fixtures` is the
     /// `demo` feature and `crate::prompt::fixtures` is `test-support`, and the `htui` binary
@@ -2515,13 +2516,21 @@ mod tests {
             .iter()
             .find(|step| step.id == ids::STEP_IMPL)
             .expect("the demo run has an `implement` step");
+        let mut live = crate::prompt::fixtures::demo_trim_record()
+            .to_value(&crate::scrub::MinimalScrubber::new([]))
+            .expect("the demo record is plain data and carries nothing credential-shaped");
+        // MOD-9 D118: the demo's record was written before `0008`, so it stays `v 2` while the
+        // assembler writes `v 3`; v 3 only adds reasons and an optional `path` it does not use.
+        // Every other byte is still the assembler's.
+        assert_eq!(
+            step.trim_record.as_ref().map(|record| &record["v"]),
+            Some(&serde_json::json!(2)),
+            "MOD-9 D118: the demo record predates 0008 and stays v 2"
+        );
+        live["v"] = serde_json::json!(2);
         assert_eq!(
             step.trim_record.as_ref(),
-            Some(
-                &crate::prompt::fixtures::demo_trim_record()
-                    .to_value(&crate::scrub::MinimalScrubber::new([]))
-                    .expect("the demo record is plain data and carries nothing credential-shaped")
-            ),
+            Some(&live),
             "the fixture literal and the assembler's own record must not drift"
         );
     }

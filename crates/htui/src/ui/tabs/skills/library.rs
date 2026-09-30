@@ -701,7 +701,10 @@ impl LibraryView {
     }
 
     /// A version, diff, edit, rename or attach key. With no skill under the cursor (an empty
-    /// library, or nothing read yet) it does nothing.
+    /// library, or nothing read yet) it does nothing. A skill with no version row (only a
+    /// hand-written row reaches that) opens `e`/`E` on an empty body over head token 0, which the
+    /// writer saves as v1; `i` and `a` work as for any skill; the version, base and diff keys have
+    /// nothing to act on (MOD-9 D127, D134).
     fn on_skill_key(&mut self, key: char, ctx: &Ctx<'_>) {
         let Some(snapshot) = &self.snapshot else {
             return;
@@ -711,17 +714,28 @@ impl LibraryView {
         };
         let (skill, name) = (entry.skill.id, entry.skill.name.clone());
         let versions: Vec<i32> = entry.versions.iter().map(|row| row.version).collect();
-        let (Some(head), Some(shown)) = (snapshot.head(skill), self.shown_row(snapshot, skill))
-        else {
-            return;
+        // MOD-9 D127: no early return on a missing head any more — only the keys that read a
+        // version need one.
+        let head = snapshot.head(skill).map(|row| row.version);
+        let shown = self
+            .shown_row(snapshot, skill)
+            .map(|row| (row.version, row.body.clone()));
+        let versioned = head.zip(shown.as_ref().map(|(version, _)| *version));
+        // What `e` and `E` edit: the shown version over the head's token, or, with no version,
+        // an empty body over token 0 (`add_skill_version`'s "no version yet", MOD-9 D127).
+        let (token, from, body) = match (head, shown) {
+            (Some(head), Some((version, body))) => (head, Some(version), body),
+            _ => (0, None, String::new()),
         };
-        let (head, shown_version, shown_body) = (head.version, shown.version, shown.body.clone());
-        let index = versions
-            .iter()
-            .position(|version| *version == shown_version)
-            .unwrap_or(0);
         match key {
             ',' | '.' => {
+                let Some((head, shown_version)) = versioned else {
+                    return;
+                };
+                let index = versions
+                    .iter()
+                    .position(|version| *version == shown_version)
+                    .unwrap_or(0);
                 let index = if key == ',' {
                     index.saturating_sub(1)
                 } else {
@@ -732,10 +746,16 @@ impl LibraryView {
                 self.scroll.reset();
             }
             'b' => {
+                let Some((_, shown_version)) = versioned else {
+                    return;
+                };
                 self.base = Some(shown_version);
                 self.notice = Some(Notice::Info(format!("base v{shown_version}")));
             }
             'd' => {
+                let Some((_, shown_version)) = versioned else {
+                    return;
+                };
                 if self.pane == Pane::Diff {
                     self.pane = Pane::Body;
                 } else if self.base.is_none() && !versions.contains(&(shown_version - 1)) {
@@ -750,17 +770,16 @@ impl LibraryView {
             }
             'e' => {
                 let target = Target::Version { skill, name };
-                self.mode =
-                    Mode::Editing(Editor::new(target, head, Some(shown_version), &shown_body));
+                self.mode = Mode::Editing(Editor::new(target, token, from, &body));
             }
             'E' => {
                 ctx.emit(Action::EditExternally(ExternalEdit {
-                    text: shown_body.clone(),
+                    text: body.clone(),
                     stem: name.clone(),
                 }));
                 let target = Target::Version { skill, name };
                 self.external = Some(Pending {
-                    editor: Editor::new(target, head, Some(shown_version), &shown_body),
+                    editor: Editor::new(target, token, from, &body),
                     resume: false,
                 });
             }
@@ -1679,9 +1698,13 @@ impl LibraryView {
             (Target::New { .. }, _) => {
                 format!(" {name} \u{b7} new, saves v1 \u{b7} ~{tokens} tokens ")
             }
-            (Target::Version { .. }, from) => format!(
-                " {name} \u{b7} editing from v{}, saves v{} \u{b7} ~{tokens} tokens ",
-                from.unwrap_or(editor.token),
+            // MOD-9 D127: a skill with no version row has nothing to edit from.
+            (Target::Version { .. }, None) => format!(
+                " {name} \u{b7} no version yet, saves v{} \u{b7} ~{tokens} tokens ",
+                editor.saves()
+            ),
+            (Target::Version { .. }, Some(from)) => format!(
+                " {name} \u{b7} editing from v{from}, saves v{} \u{b7} ~{tokens} tokens ",
                 editor.saves()
             ),
         };
@@ -2010,6 +2033,112 @@ mod tests {
             ),
             "{:?}",
             view.notice
+        );
+    }
+
+    /// MOD-9 D127, D134 (milestone 3's review finding 6): a skill with no version row — only a
+    /// hand-written row reaches the state, so the reply is doctored — opens the editor on an
+    /// empty body with head token 0, and the save asks the writer for v1. `i` and `a` are not
+    /// blocked; the version, base and diff keys have nothing to act on and stay inert.
+    #[tokio::test]
+    async fn a_skill_with_no_version_opens_an_empty_editor_on_token_0() {
+        let backend = Backend::memory(MemStore::demo());
+        let scope = vulkan();
+        let (top_bar, keymap, theme, emit) = (
+            TopBarState::default(),
+            Keymap::default_global(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let mut ctx = Ctx::new(
+            &scope,
+            &[],
+            &top_bar,
+            &keymap,
+            &theme,
+            Origin::Tab(SkillsTab::ID),
+            &emit,
+        );
+        let mut view = LibraryView::default();
+        let StoreReply::Skills(mut snapshot) =
+            serve(&backend, &StoreRequest::Skills(scope.clone())).await
+        else {
+            panic!("the read answers `Skills`");
+        };
+        // The cursor starts on `rust-style`; strip its versions.
+        assert_eq!(snapshot.skills[0].skill.id, ids::SKILL_RUST_STYLE);
+        snapshot.skills[0].versions.clear();
+        view.on_reply(&StoreReply::Skills(snapshot), &mut ctx);
+
+        for c in [',', '.', 'b', 'd'] {
+            view.on_key(key(KeyCode::Char(c)), &mut ctx);
+            assert!(matches!(view.mode, Mode::Browse), "`{c}`: {:?}", view.mode);
+            assert_eq!(
+                (view.shown, view.base, view.pane),
+                (None, None, Pane::Body),
+                "`{c}` has no version to act on"
+            );
+            assert_eq!(view.notice, None, "`{c}` says nothing");
+        }
+        assert!(sent(&emit).is_empty(), "the inert keys send nothing");
+
+        view.on_key(key(KeyCode::Char('i')), &mut ctx);
+        assert!(
+            matches!(view.mode, Mode::Info(_)),
+            "`i` opens the info form (D134): {:?}",
+            view.mode
+        );
+        view.mode = Mode::Browse;
+        view.on_key(key(KeyCode::Char('a')), &mut ctx);
+        assert!(
+            view.attach.is_some(),
+            "`a` opens the attachments pane (D134)"
+        );
+        view.attach = None;
+
+        view.on_key(key(KeyCode::Char('E')), &mut ctx);
+        let pending = view
+            .external
+            .take()
+            .expect("`E` hands an editor to $EDITOR");
+        assert_eq!(
+            (
+                pending.editor.token,
+                pending.editor.from,
+                pending.editor.area.text()
+            ),
+            (0, None, "")
+        );
+        let _ = emit.take();
+
+        view.on_key(key(KeyCode::Char('e')), &mut ctx);
+        let Mode::Editing(editor) = &view.mode else {
+            panic!("`e` opens the editor: {:?}", view.mode);
+        };
+        assert_eq!(
+            (editor.token, editor.from, editor.area.text()),
+            (0, None, ""),
+            "an empty body over head token 0"
+        );
+        for c in "Body.".chars() {
+            view.on_key(key(KeyCode::Char(c)), &mut ctx);
+        }
+        view.on_key(ctrl('s'), &mut ctx);
+        let requests = sent(&emit);
+        let [
+            StoreRequest::SaveSkillVersion {
+                skill,
+                expected,
+                body,
+                ..
+            },
+        ] = requests.as_slice()
+        else {
+            panic!("exactly one version save was sent: {requests:?}");
+        };
+        assert_eq!(
+            (*skill, *expected, body.as_str()),
+            (ids::SKILL_RUST_STYLE, 0, "Body.")
         );
     }
 

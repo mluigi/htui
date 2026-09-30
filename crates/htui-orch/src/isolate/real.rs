@@ -21,7 +21,8 @@ use tokio::sync::OwnedMutexGuard;
 use super::copy;
 use super::git::{self, Cli, blocking};
 use super::{
-    FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree, ResetReport,
+    ChangedPaths, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared, PreparedTree,
+    ResetReport,
 };
 
 // One named free function per refusal sentence, the house style of `htui_core`'s store refusals
@@ -1273,7 +1274,34 @@ impl GixIsolator {
     }
 
     /// One repository's slice of [`Isolator::diff`]: its name, its range and both texts, or `None`
-    /// when the row committed nothing.
+    /// when the row committed nothing. The range is [`range_of`](Self::range_of)'s.
+    async fn diff_of(
+        &self,
+        git: &Cli,
+        trees: &[RunStepTree],
+        commit: &RunStepCommit,
+    ) -> Result<Option<(String, String, String, String)>, IsolateError> {
+        let Some(range) = self.range_of(trees, commit).await? else {
+            return Ok(None);
+        };
+        let stat = git
+            .diff(&range.repo, &range.before, &range.after, true)
+            .await?;
+        let patch = git
+            .diff(&range.repo, &range.before, &range.after, false)
+            .await?;
+        Ok(Some((
+            range.name,
+            format!("{}..{}", range.before, range.after),
+            stat,
+            patch,
+        )))
+    }
+
+    /// MOD-9 D119: the repository and range `diff` reads for one committed row — the copy tree or
+    /// the checkout (D74), the reconcile merge from its first parent (D141, D146) — or `None` when
+    /// the row committed nothing. [`diff_of`](Self::diff_of) and
+    /// [`changed_paths`](Isolator::changed_paths) both read it, so they never disagree on a range.
     ///
     /// D74 (blueprint A-3) chooses the repository that holds `after`: a `copy` tree's own object
     /// database until reconcile, and the checkout after it, because the merge commit exists only
@@ -1284,12 +1312,11 @@ impl GixIsolator {
     /// itself unless another run's merge moved the primary first (D136). Plan D146: whether
     /// `after` is that merge is always asked of the checkout, where the merge lives, never of a
     /// `copy` tree, and only for a `worktree` or `copy` row: the in-place modes never merge.
-    async fn diff_of(
+    async fn range_of(
         &self,
-        git: &Cli,
         trees: &[RunStepTree],
         commit: &RunStepCommit,
-    ) -> Result<Option<(String, String, String, String)>, IsolateError> {
+    ) -> Result<Option<Range>, IsolateError> {
         let before = commit.before_hash.as_str();
         let Some(after) = commit
             .after_hash
@@ -1340,15 +1367,26 @@ impl GixIsolator {
                 blocking(move || git::reconcile_parent(&probe, &base, &hex, step)).await?;
         }
         let before = merged_onto.as_deref().unwrap_or(before);
-        let stat = git.diff(&repo, before, after, true).await?;
-        let patch = git.diff(&repo, before, after, false).await?;
-        Ok(Some((
-            checkout.name.clone(),
-            format!("{before}..{after}"),
-            stat,
-            patch,
-        )))
+        Ok(Some(Range {
+            repo,
+            name: checkout.name.clone(),
+            before: before.to_owned(),
+            after: after.to_owned(),
+        }))
     }
+}
+
+/// MOD-9 D119: one committed row's range, as [`GixIsolator::range_of`] chose it.
+#[derive(Debug)]
+struct Range {
+    /// The repository that holds `after` (D74).
+    repo: PathBuf,
+    /// The checkout's name, for a multi-repo diff's headers.
+    name: String,
+    /// The range's start: the row's `before_hash`, or a reconcile merge's first parent (D141).
+    before: String,
+    /// The row's `after_hash`.
+    after: String,
 }
 
 /// The primary checkout is not where `reconcile` left it, so there is nothing safe to merge into.
@@ -1489,6 +1527,37 @@ impl Isolator for GixIsolator {
                     ),
                 }),
             })
+        })
+    }
+
+    /// MOD-9 D119: one `git diff --name-only` per committed row, over `range_of`'s range — the
+    /// one `diff` reads. No usable `git` is the empty set, as `diff` is `Ok(None)`.
+    fn changed_paths<'a>(
+        &'a self,
+        trees: &'a [RunStepTree],
+        commits: &'a [RunStepCommit],
+    ) -> IsolatorFuture<'a, ChangedPaths> {
+        Box::pin(async move {
+            let Ok(git) = self.cli() else {
+                return Ok(ChangedPaths::default());
+            };
+            let git = git.clone();
+            let mut changed = ChangedPaths::default();
+            for commit in commits {
+                let Some(range) = self.range_of(trees, commit).await? else {
+                    continue;
+                };
+                let part = git
+                    .name_only(&range.repo, &range.before, &range.after)
+                    .await?;
+                changed.truncated |= part.truncated;
+                changed
+                    .paths
+                    .extend(part.paths.into_iter().map(|path| (commit.repo_id, path)));
+            }
+            changed.paths.sort();
+            changed.paths.dedup();
+            Ok(changed)
         })
     }
 

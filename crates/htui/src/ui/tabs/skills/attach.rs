@@ -9,8 +9,8 @@
 //! writer's own sentences, so what the form shows before save is what the store would store or
 //! refuse (D79, D93). The store checks everything again behind its compare-and-set (D78).
 //!
-//! A `glob` attachment is written and shown, but nothing matches it before PRD milestone 5 (D86,
-//! OQ-14): its row says so, as a run's record says `no_path`.
+//! A `glob` attachment fires over the step's file set (MOD-9 D111); a project or phase row whose
+//! globs reach a repo with no path on this box says so (MOD-9 D126).
 //!
 //! A form over a row with **no** attachment is prefilled from the imported `source` of the skill's
 //! head (milestone 4, import plan D96): ANA-22 §7.3's activation, globs and languages, read back
@@ -20,7 +20,7 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::skill::resolve;
-use htui_core::model::skill_glob::{canonical_globs, split_list};
+use htui_core::model::skill_glob::{SkillGlobs, canonical_globs, split_list};
 use htui_core::model::skill_import::prefill_from_source;
 use htui_core::model::skill_language;
 use htui_core::model::{
@@ -52,9 +52,6 @@ const FORM_HEIGHT: u16 = 9;
 
 /// A row with no attachment.
 const NO_ROW: &str = "\u{2014}";
-
-/// A `glob` row, until PRD milestone 5 (R-28).
-const FIRES_LATER: &str = "fires from milestone 5";
 
 /// The form's last line: the any-repo rule of a bare glob (R-30).
 const GLOB_HELP: &str =
@@ -728,7 +725,10 @@ impl AttachPane {
 
     /// A row's summary: `—` with no attachment, else `<activation> · <v N | latest> · pos <p>`,
     /// then `<n> globs` (with ` ?` when a qualifier names a repo the project no longer has, D79's
-    /// rename case) and, on a `glob` row, that it fires from milestone 5 (R-28).
+    /// rename case) and, on a project or phase `glob` row, `no path here: <repos>` naming the
+    /// project's repos its globs reach that have no path on this box (MOD-9 D126). A global row
+    /// spans every project and a glob that no longer compiles is the form's to report, so neither
+    /// adds the warning.
     fn summary(&self, row: ARow, snapshot: &SkillsSnapshot) -> String {
         let Some(stored) = snapshot.binding(self.key_of(row, snapshot)) else {
             return NO_ROW.to_owned();
@@ -750,8 +750,21 @@ impl AttachPane {
             let mark = if stale { " ?" } else { "" };
             parts.push(format!("{} globs{mark}", stored.globs.len()));
         }
-        if stored.activation == Activation::Glob {
-            parts.push(FIRES_LATER.to_owned());
+        // MOD-9 D126: ANA-22 §9's "the editor warns when the scoped project has repos with no
+        // path row" — a glob that can only reach such repos would record `no_path` here.
+        if stored.activation == Activation::Glob
+            && let Some(entry) = stored.project_id.and_then(|p| snapshot.project(p))
+            && let Ok(compiled) = SkillGlobs::compile(&stored.globs)
+        {
+            let missing: Vec<&str> = entry
+                .unrooted
+                .iter()
+                .map(String::as_str)
+                .filter(|repo| compiled.reaches(repo))
+                .collect();
+            if !missing.is_empty() {
+                parts.push(format!("no path here: {}", missing.join(", ")));
+            }
         }
         parts.join(" \u{b7} ")
     }

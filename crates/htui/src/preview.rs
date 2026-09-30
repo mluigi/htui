@@ -9,7 +9,8 @@
 //! make the preview's bytes a thing no real run would ever produce, which defeats the only purpose
 //! it has. Since MOD-7 milestone 4 the excerpt section is real: the roots are this box's
 //! `repo_box_path` rows, the rung a run reads before its trees exist, and the pass is
-//! `htui_agent::excerpt::excerpts_for`, the engine's own.
+//! `htui_agent::excerpt::step_pass`, the engine's own. Since MOD-9 milestone 5 the same pass
+//! builds the `glob` file set, so a glob attachment fires here over that checkout (MOD-9 D124).
 //!
 //! **It writes nothing.** No `set_step_prompt`, no `prompt` event, no run. That is correctness
 //! rather than caution: `set_step_prompt` writes *a step's* audit row and a preview has no step.
@@ -26,8 +27,8 @@
 //! `skill*` and `box_tool` are not mirrored, so an offline preview is not one missing setting but
 //! four missing tables; `htui` is an online-only program and says so in one sentence.
 
-use htui_agent::excerpt::{PassInput, excerpt_roots, excerpts_for, touched_prefixes};
-use htui_core::model::{ItemId, PromptScope, RepoId, Scope};
+use htui_agent::excerpt::{PassInput, excerpt_roots, step_pass, touched_prefixes};
+use htui_core::model::{ItemId, PromptScope, RepoId, Scope, StepFiles};
 use htui_core::prompt::excerpt::ExcerptSet;
 use htui_core::prompt::{
     AssembledPrompt, DEFAULT_TEMPLATES, InputDocument, PromptSpec, TemplateRef, TemplateRole,
@@ -82,10 +83,11 @@ const DOCUMENTS_NOTE: &str = "preview: documents are latest-per-kind; ANA-2 inpu
 /// Blueprint H-21: `documents_of_kinds(item, &[])` would otherwise return `summary` too.
 const SUMMARY_NOTE: &str = "preview: the `summary` kind is excluded from documents; §4.3 renders \
                             it as upstream context instead";
-/// MOD-9 D45: which phase's attachments the preview shows, and why a glob one never renders here.
+/// MOD-9 D45, D124: which phase's attachments the preview shows, and what a glob one matches.
 const SKILLS_NOTE: &str = "preview: phase-level skills come from the first phase of the item's \
-                           graph that uses this template; a glob attachment records no_path \
-                           until glob activation lands (MOD-9 OQ-12)";
+                           graph that uses this template; glob attachments match this box's \
+                           repo_box_path listing, narrowed to touched_paths, with no previous \
+                           attempt";
 
 /// MOD-9 D45's second note: no phase of the item's graph uses the chosen template, or the item
 /// resolves to no graph, so only global and project attachments apply.
@@ -271,6 +273,7 @@ pub async fn build(
         roots: excerpt_roots(&repo_scope, &[], &paths, box_id),
         touched_prefixes: touched_prefixes(&row.touched_paths, &repos),
         notes: Vec::new(),
+        changed_paths: Vec::new(),
     };
 
     let mut spec = PromptSpec {
@@ -289,6 +292,7 @@ pub async fn build(
         box_profile,
         skills,
         excerpts: ExcerptSet::default(),
+        step_files: StepFiles::default(),
         command_queue: false,
         verify_failure: None,
         previous_diff: None,
@@ -305,7 +309,10 @@ pub async fn build(
     // both, so the pass drops exactly what `assemble` would refuse to send.
     let scrubber = MinimalScrubber::new([]);
     // The engine's own pass, one call (MOD-7 P-1): the preview's bytes and a run's cannot drift.
-    spec.excerpts = excerpts_for(&spec, input, &app, &scrubber).await;
+    // MOD-9 D124: and the `glob` file set, from the same walk, with no previous attempt.
+    let pass = step_pass(&spec, input, &app, &scrubber).await;
+    spec.excerpts = pass.excerpts;
+    spec.step_files = pass.files;
 
     Ok(PromptPreview {
         item,

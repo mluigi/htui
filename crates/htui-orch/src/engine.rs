@@ -25,20 +25,23 @@ use futures::future::Either;
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposure};
 use htui_agent::event::{DoneEvent, StopReason};
-use htui_agent::excerpt::{PassInput, excerpt_roots, excerpts_for, touched_prefixes};
+use htui_agent::excerpt::{PassInput, excerpt_roots, step_pass, touched_prefixes};
 use htui_agent::record::{Recorder, RunCap, pump};
 use htui_core::model::{
     BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus, Document, DocumentId,
     EventKind, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote,
     NewRun, NewRunStep, NoteId, Project, ProjectId, ProjectSettings, PromptScope, Repo, RepoId,
     Resolution, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary,
-    SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepId, StepOutcome, StepStatus,
-    TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome, missing_tags_failure,
+    SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOutcome,
+    StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome, missing_tags_failure,
 };
-use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoRoot, RootSource};
+use htui_core::prompt::excerpt::{
+    BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
+};
 use htui_core::prompt::{
     AssembledPrompt, DiffBlock, InputDocument, JudgeCandidate, PromptSpec, SectionName,
     TemplateRef, TemplateRole, TokenEstimator, TrimStrategy, VerifyFailure, assemble, settings,
+    withhold_unmaskable_notes,
 };
 use htui_core::scrub::Scrubber;
 use htui_core::store::{StepFence, StoreError, WriteStore};
@@ -4439,6 +4442,10 @@ where
             // No pass for a judge (plan D109): its placeholder set cannot place `{{excerpts}}`
             // (`template.rs:188-215`), so a file read here could only reach the audit.
             excerpts: no_excerpts(caps),
+            // MOD-9 D123: a judge runs in no tree (`prepare(…, &[], Isolation::Local, None)`) and
+            // gets no pass, so a placed `glob` winner records `no_path` truthfully; the default
+            // judge body places no `{{skills}}` and records `not_placed`.
+            step_files: StepFiles::default(),
             command_queue: false,
             verify_failure: None,
             previous_diff: None,
@@ -4959,15 +4966,17 @@ where
     }
 
     /// ANA-5 §4.5 for a phase prompt (MOD-7 milestone 4, plan D107–D109, D125): the roots, then
-    /// the shared pass, into `spec.excerpts`.
+    /// the shared pass, into `spec.excerpts` and `spec.step_files` (MOD-9 D120, D122).
     ///
     /// The scope is `run.repo_scope` joined to the names of `repos(run.project_id)`. An id with no
     /// row there is left out with a note. The roots are this step's `run_step_tree` rows, else
     /// this box's `repo_box_path` rows, else `no_path` (`excerpt_roots`). A step with no tree rows
     /// at all, which is a fan-out group before its candidates are prepared (`drive_group`, OQ-32),
     /// that read a root from `repo_box_path` says so (D108). The item is re-read for
-    /// `touched_paths`, with the same read `phase_spec` uses. Everything else, the placeholder
-    /// test, the residual, the blocking read and the scrub filter, is `excerpts_for`'s.
+    /// `touched_paths`, with the same read `phase_spec` uses. From attempt 2 a phase step also
+    /// reads the previous attempt's winner's changed paths (MOD-9 D122), for excerpt tier 2 and the
+    /// `glob` file set. Everything else, the placeholder test, the walk, the residual, the blocking
+    /// read and the scrub filters, is `step_pass`'s.
     ///
     /// # Errors
     /// A store read's failure. Nothing about the excerpts themselves is an error: §4.5 fails open.
@@ -5007,13 +5016,21 @@ where
                     .to_owned(),
             );
         }
+        // MOD-9 D122: a judge or a first attempt has no previous attempt to read.
+        let changed = if matches!(spec.role, TemplateRole::Phase) && step.attempt > 1 {
+            self.changed_paths(run, step, &scope, &mut notes).await?
+        } else {
+            Vec::new()
+        };
         let input = PassInput {
             roots,
             touched_prefixes: touched_prefixes(&row.touched_paths, &repos),
             notes,
+            changed_paths: changed,
         };
-        let excerpts = excerpts_for(spec, input, &self.parts.app, self.parts.scrubber).await;
-        spec.excerpts = excerpts;
+        let pass = step_pass(spec, input, &self.parts.app, self.parts.scrubber).await;
+        spec.excerpts = pass.excerpts;
+        spec.step_files = pass.files;
         Ok(())
     }
 
@@ -5134,6 +5151,9 @@ where
             // a file. So the caps are recorded and nothing else, and `with_excerpts` replaces this
             // for a phase prompt.
             excerpts: no_excerpts(caps),
+            // MOD-9 D117: reaches no repo here, for the same reason as `excerpts`: the handoff
+            // matches nothing, and `with_excerpts` replaces it for a phase prompt.
+            step_files: StepFiles::default(),
             command_queue: phase.command_queue != htui_core::model::CommandQueue::Off,
             // Plan D67: what the previous attempt's winner left — its failed verify and its diff —
             // forwarded to a phase step's next attempt; `None` on attempt 1 and for a judge.
@@ -5239,11 +5259,58 @@ where
         let previous_diff = match self.parts.isolator.diff(&trees, &commits).await {
             Ok(diff) => diff,
             Err(err) => {
-                notes.push(format!("previous_diff unavailable: {err}"));
+                // MOD-9 D132: `err` carries git's stderr, which can name a checkout path, and this
+                // note joins the record through the spec's own notes, which `step_pass` never
+                // sees; the record is scrubbed fail-closed, so it is withheld here.
+                let mut note = [format!("previous_diff unavailable: {err}")];
+                withhold_unmaskable_notes(&mut note, self.parts.scrubber);
+                notes.extend(note);
                 None
             }
         };
         Ok((verify_failure, previous_diff))
+    }
+
+    /// MOD-9 D122: the previous attempt's winner's changed paths, by scope name, for excerpt
+    /// tier 2 and the `glob` file set. An isolator error is a note and an empty list (the
+    /// `previous_diff unavailable` shape); no winner is empty with no note (`forwarded` notes it).
+    /// A path in a repo outside `scope` is dropped.
+    async fn changed_paths(
+        &self,
+        run: &Run,
+        step: &RunStep,
+        scope: &[(RepoId, String)],
+        notes: &mut Vec<String>,
+    ) -> Result<Vec<RepoPath>, EngineError> {
+        let steps = self.parts.store.run_steps(run.id).await?;
+        let Some(previous) = winner_at(&steps, step.position, step.attempt - 1) else {
+            return Ok(Vec::new());
+        };
+        let trees = self.parts.store.step_trees(previous.id).await?;
+        let commits = self.parts.store.step_commits(previous.id).await?;
+        let changed = match self.parts.isolator.changed_paths(&trees, &commits).await {
+            Ok(changed) => changed,
+            Err(err) => {
+                notes.push(format!("changed paths unavailable: {err}"));
+                return Ok(Vec::new());
+            }
+        };
+        if changed.truncated {
+            notes.push("changed paths: the list was cut at 64 KiB".to_owned());
+        }
+        Ok(changed
+            .paths
+            .into_iter()
+            .filter_map(|(id, path)| {
+                scope
+                    .iter()
+                    .find(|(scoped, _)| *scoped == id)
+                    .map(|(_, name)| RepoPath {
+                        repo: name.clone(),
+                        path,
+                    })
+            })
+            .collect())
     }
 
     /// **Stage 4 — session.** One driver, one session, one turn, one recorder.
@@ -12886,6 +12953,498 @@ mod tests {
             panic!("the fake agent row does not resume: {:?}", opening.path);
         };
         assert!(!text.contains("<file path="), "{text}");
+    }
+
+    // -- MOD-9 D120-D123: glob attachments fire --------------------------------------------------
+
+    /// MOD-9 D122: a project `glob` attachment of a new skill `name` over `globs`, written through
+    /// `set_skill_binding`, on every phase of the HTUI project.
+    async fn attach_glob(
+        harness: &Harness,
+        name: &str,
+        globs: &[&str],
+    ) -> htui_core::model::SkillId {
+        use htui_core::model::{
+            Activation, Attachment, BindingChange, NewSkill, SkillBindingKey, SkillId,
+        };
+
+        let store = &harness.orch.store;
+        let (skill, _) = store
+            .create_skill(NewSkill {
+                id: SkillId::new(),
+                name: name.to_owned(),
+                description: String::new(),
+                body: "Glob body.".to_owned(),
+                source: serde_json::json!({}),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("a new skill");
+        let outcome = store
+            .set_skill_binding(
+                SkillBindingKey {
+                    skill: skill.id,
+                    project: Some(ids::PROJECT_HTUI),
+                    phase: None,
+                },
+                None,
+                BindingChange::Attach(Attachment {
+                    pinned_version: None,
+                    position: 0,
+                    activation: Activation::Glob,
+                    globs: globs.iter().map(|glob| (*glob).to_owned()).collect(),
+                    languages: Vec::new(),
+                }),
+            )
+            .await
+            .expect("the project attach is legal");
+        assert!(
+            matches!(outcome, CasOutcome::Applied(Some(_))),
+            "{outcome:?}"
+        );
+        skill.id
+    }
+
+    /// The recorded choice named `name`.
+    fn choice_named<'a>(
+        choices: &'a [htui_core::model::SkillChoice],
+        name: &str,
+    ) -> &'a htui_core::model::SkillChoice {
+        choices
+            .iter()
+            .find(|choice| choice.name == name)
+            .unwrap_or_else(|| panic!("`{name}` is a recorded candidate: {choices:?}"))
+    }
+
+    /// A stored step's `trim_record.skill_choices`, decoded.
+    fn stored_choices(step: &htui_core::model::RunStep) -> Vec<htui_core::model::SkillChoice> {
+        serde_json::from_value(
+            step.trim_record
+                .as_ref()
+                .and_then(|record| record.get("skill_choices"))
+                .cloned()
+                .expect("the step's trim record carries its skill choices"),
+        )
+        .expect("the record's skill choices decode")
+    }
+
+    /// A stored step's `trim_record.notes`.
+    fn stored_notes(step: &htui_core::model::RunStep) -> Vec<String> {
+        step.trim_record
+            .as_ref()
+            .and_then(|record| record.get("notes"))
+            .and_then(serde_json::Value::as_array)
+            .expect("the step's trim record carries its notes")
+            .iter()
+            .filter_map(|note| note.as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// MOD-9 D120, D122: a `glob` skill whose glob matches a file of the step's own tree renders,
+    /// and its choice names the file that woke it.
+    #[tokio::test]
+    async fn a_glob_skill_fires_on_a_file_in_the_step_tree() {
+        use htui_core::model::ChoiceReason;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        attach_glob(&harness, "rust-glob", &["**/*.rs"]).await;
+        harness_engine!(harness.orch, engine);
+
+        let prompt = engine
+            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .await
+            .expect("no store fault")
+            .expect("the `prd` prompt assembles");
+
+        assert!(
+            prompt.text.contains("<skill name=\"rust-glob\""),
+            "{}",
+            prompt.text
+        );
+        let choice = choice_named(&prompt.trim.skill_choices, "rust-glob");
+        assert_eq!(
+            (choice.reason, choice.active, choice.path.as_deref()),
+            (ChoiceReason::Matched, true, Some("htui:src/lib.rs"))
+        );
+    }
+
+    /// MOD-9 D112: the tree was reached and no file matches, so the choice is `no_match`, not
+    /// `no_path`, and nothing renders.
+    #[tokio::test]
+    async fn a_glob_skill_with_no_matching_file_records_no_match() {
+        use htui_core::model::ChoiceReason;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        attach_glob(&harness, "py-glob", &["**/*.py"]).await;
+        harness_engine!(harness.orch, engine);
+
+        let prompt = engine
+            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .await
+            .expect("no store fault")
+            .expect("the `prd` prompt assembles");
+
+        assert!(
+            !prompt.text.contains("<skill name=\"py-glob\""),
+            "{}",
+            prompt.text
+        );
+        let choice = choice_named(&prompt.trim.skill_choices, "py-glob");
+        assert_eq!(
+            (choice.reason, choice.active, choice.path.as_deref()),
+            (ChoiceReason::NoMatch, false, None)
+        );
+    }
+
+    /// The retry set-up of `a_forward_with_nothing_to_render_degrades_to_trim_notes`: `prd` runs
+    /// the `implement` template ungated with one retry and a verify that fails attempt 1, over the
+    /// primary repo `htui` holding `src/lib.rs` in a real tree, with an `md-style` `glob`
+    /// attachment over `**/*.md`. Returns the repo.
+    async fn glob_retry_prologue(harness: &Harness, dir: &std::path::Path) -> RepoId {
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                if phase.name == "prd" {
+                    phase.gate = Gate::Never;
+                    phase.retry_limit = 1;
+                    phase.verify_command = Some("cargo test".to_owned());
+                    phase.template_name = "implement".to_owned();
+                }
+            })
+            .await;
+        harness
+            .orch
+            .verifier
+            .script_report(crate::fake::FakeVerifier::fail(1));
+        let repo = harness.add_primary_repo().await;
+        harness.orch.isolator.root_trees_at(dir);
+        write_tree(dir, repo, "src/lib.rs", "pub fn marker() {}\n");
+        attach_glob(harness, "md-style", &["**/*.md"]).await;
+        repo
+    }
+
+    /// `StartRun` on `FEAT-3`, and its two `prd` attempts once attempt 2 has run.
+    async fn run_two_attempts(
+        harness: &Harness,
+    ) -> (htui_core::model::RunStep, htui_core::model::RunStep) {
+        let CommandOutcome::Started { run, rest } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        assert_eq!(
+            (rest.run, rest.position),
+            (RunStatus::AwaitingApproval, Some(1)),
+            "attempt 2 ran, passed, and `plan` parked"
+        );
+        let steps = harness.orch.steps(run).await;
+        let attempt = |n: i32| {
+            steps
+                .iter()
+                .find(|step| step.position == 0 && step.attempt == n)
+                .unwrap_or_else(|| panic!("attempt {n} ran"))
+                .clone()
+        };
+        (attempt(1), attempt(2))
+    }
+
+    /// MOD-9 D121, D122: attempt 2 matches against attempt 1's winner's changed paths. The tree
+    /// holds no `.md` file, so only the changed path can wake `md-style`; an id outside the run's
+    /// scope is dropped.
+    #[tokio::test]
+    async fn a_retry_matches_the_previous_attempts_changed_paths() {
+        use crate::isolate::ChangedPaths;
+        use htui_core::model::ChoiceReason;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let repo = glob_retry_prologue(&harness, dir.path()).await;
+        harness.orch.isolator.script_changed_paths(ChangedPaths {
+            paths: vec![
+                (repo, "docs/notes.md".to_owned()),
+                (RepoId::new(), "stray.md".to_owned()),
+            ],
+            truncated: false,
+        });
+
+        let (first, second) = run_two_attempts(&harness).await;
+
+        let before = stored_choices(&first);
+        let before = choice_named(&before, "md-style");
+        assert_eq!(
+            (before.reason, before.path.as_deref()),
+            (ChoiceReason::NoMatch, None),
+            "attempt 1 has no previous attempt and no `.md` in its tree"
+        );
+        let after = stored_choices(&second);
+        let after = choice_named(&after, "md-style");
+        assert_eq!(
+            (after.reason, after.active, after.path.as_deref()),
+            (ChoiceReason::Matched, true, Some("htui:docs/notes.md"))
+        );
+        let requests = harness.orch.isolator.changed_path_requests();
+        assert_eq!(requests.len(), 1, "only attempt 2 asks: {requests:?}");
+        assert!(
+            !requests[0].trees.is_empty(),
+            "attempt 1's tree rows: {requests:?}"
+        );
+        assert!(
+            requests[0]
+                .trees
+                .iter()
+                .chain(&requests[0].commits)
+                .all(|id| *id == first.id),
+            "every row is attempt 1's: {requests:?}"
+        );
+    }
+
+    /// MOD-9 D122: an isolator error is a trim note on attempt 2, never a failed step.
+    #[tokio::test]
+    async fn changed_paths_unavailable_is_a_note_not_a_failure() {
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        glob_retry_prologue(&harness, dir.path()).await;
+        harness.orch.isolator.fail_changed_paths("index.lock held");
+
+        let (_, second) = run_two_attempts(&harness).await;
+
+        assert_eq!(second.status, StepStatus::Done);
+        let notes = stored_notes(&second);
+        assert!(
+            notes.iter().any(|note| {
+                note.starts_with("changed paths unavailable: ") && note.contains("index.lock held")
+            }),
+            "{notes:?}"
+        );
+    }
+
+    /// MOD-9 D122, D132 (review finding 4): an isolator error naming a credential-shaped path is
+    /// withheld from the trim notes by `step_pass`, not left to refuse the record and fail the
+    /// step.
+    #[tokio::test]
+    async fn an_unmaskable_changed_paths_error_is_withheld_not_a_failure() {
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        glob_retry_prologue(&harness, dir.path()).await;
+        harness
+            .orch
+            .isolator
+            .fail_changed_paths("cannot lock /srv/sk-live-checkout/.git/index.lock");
+
+        let (_, second) = run_two_attempts(&harness).await;
+
+        assert_eq!(second.status, StepStatus::Done);
+        let notes = stored_notes(&second);
+        assert!(
+            notes.contains(
+                &"excerpt: a note was withheld; it named a string the scrubber masks or refuses"
+                    .to_owned()
+            ),
+            "{notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|note| note.contains("sk-live")),
+            "{notes:?}"
+        );
+    }
+
+    /// MOD-9 D132 (review finding 4 residue): the `previous_diff unavailable` note carries the
+    /// isolator's error too, and joins the record through the spec's own notes rather than
+    /// `step_pass`, so a credential-shaped path in it is withheld where it is written, not left to
+    /// refuse the record and fail the step.
+    #[tokio::test]
+    async fn an_unmaskable_previous_diff_error_is_withheld_not_a_failure() {
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        glob_retry_prologue(&harness, dir.path()).await;
+        harness
+            .orch
+            .isolator
+            .fail_diff("cannot lock /srv/sk-live-checkout/.git/index.lock");
+
+        let (_, second) = run_two_attempts(&harness).await;
+
+        assert_eq!(second.status, StepStatus::Done);
+        let notes = stored_notes(&second);
+        assert!(
+            notes.contains(
+                &"excerpt: a note was withheld; it named a string the scrubber masks or refuses"
+                    .to_owned()
+            ),
+            "{notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|note| note.contains("sk-live")),
+            "{notes:?}"
+        );
+    }
+
+    /// MOD-9 D122 (review finding 3): a changed-path list the isolator cut is a trim note on
+    /// attempt 2, and the paths it kept still match.
+    #[tokio::test]
+    async fn a_cut_changed_path_list_is_a_note() {
+        use crate::isolate::ChangedPaths;
+        use htui_core::model::ChoiceReason;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let repo = glob_retry_prologue(&harness, dir.path()).await;
+        harness.orch.isolator.script_changed_paths(ChangedPaths {
+            paths: vec![(repo, "docs/notes.md".to_owned())],
+            truncated: true,
+        });
+
+        let (first, second) = run_two_attempts(&harness).await;
+
+        assert!(
+            !stored_notes(&first)
+                .iter()
+                .any(|note| note.starts_with("changed paths")),
+            "attempt 1 reads no changed paths"
+        );
+        let notes = stored_notes(&second);
+        assert!(
+            notes.contains(&"changed paths: the list was cut at 64 KiB".to_owned()),
+            "{notes:?}"
+        );
+        let after = stored_choices(&second);
+        let after = choice_named(&after, "md-style");
+        assert_eq!(
+            (after.reason, after.path.as_deref()),
+            (ChoiceReason::Matched, Some("htui:docs/notes.md"))
+        );
+    }
+
+    /// MOD-9 D122: a fan-out group assembles before any candidate tree exists, and its file set is
+    /// this box's `repo_box_path` checkout.
+    #[tokio::test]
+    async fn a_fan_out_group_matches_under_repo_box_path() {
+        use htui_core::model::ChoiceReason;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let repo = harness.add_primary_repo().await;
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir_all(checkout.join("src")).expect("mkdir");
+        std::fs::write(checkout.join("src/lib.rs"), "pub fn marker() {}\n").expect("write");
+        harness
+            .orch
+            .store
+            .upsert_repo_box_path(&htui_core::model::RepoBoxPath {
+                repo_id: repo,
+                box_id: harness.orch.box_id(),
+                local_path: checkout.to_string_lossy().into_owned(),
+                updated_at: harness.orch.clock.now(),
+            })
+            .await
+            .expect("the repo and the box both have rows");
+        touch_feat_3(&harness, &["src/lib.rs"]).await;
+        let (row, snapshot, prd) = skills_prologue(&harness).await;
+        attach_glob(&harness, "rust-glob", &["**/*.rs"]).await;
+        let group = htui_core::model::RunStep {
+            id: StepId::new(),
+            ..prd.clone()
+        };
+        harness_engine!(harness.orch, engine);
+        let mut spec = engine
+            .phase_spec(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                true,
+            )
+            .await
+            .expect("the spec is built")
+            .expect("`prd` requires nothing");
+
+        engine
+            .with_excerpts(&row, &group, ids::HTUI_FEAT_3, &mut spec)
+            .await
+            .expect("no store fault");
+
+        assert!(spec.step_files.is_reached("htui"), "{:?}", spec.step_files);
+        let assembled =
+            htui_core::prompt::assemble(&spec, &htui_core::scrub::MinimalScrubber::new([]))
+                .expect("the spec assembles");
+        let choice = choice_named(&assembled.trim.skill_choices, "rust-glob");
+        assert_eq!(
+            (choice.reason, choice.path.as_deref()),
+            (ChoiceReason::Matched, Some("htui:src/lib.rs"))
+        );
+    }
+
+    /// MOD-9 D123: a judge runs in no tree and gets no pass, so a placed `glob` winner records
+    /// `no_path` in both orders. Pins the behaviour the judge's spec already had.
+    #[tokio::test]
+    async fn a_judge_records_no_path_for_a_placed_glob_winner() {
+        use htui_core::model::{ChoiceReason, NewPromptTemplate, PromptTemplateId};
+
+        let harness = Harness::new().await;
+        let default = htui_core::prompt::body_of("judge").expect("`judge` has a default body");
+        let body = default.replacen("{{task}}\n", "{{task}}\n{{skills}}\n", 1);
+        assert_ne!(
+            body, default,
+            "the default places `{{{{task}}}}` on its own line"
+        );
+        let appended = harness
+            .orch
+            .store
+            .append_prompt_template(
+                NewPromptTemplate {
+                    id: PromptTemplateId::new(),
+                    project_id: ids::PROJECT_HTUI,
+                    name: "judge".to_owned(),
+                    body,
+                    created_by: harness.orch.user(),
+                },
+                Some(1),
+            )
+            .await
+            .expect("a judge body may place `{{skills}}` (D48)");
+        assert!(matches!(appended, CasOutcome::Applied(_)), "{appended:?}");
+        let (row, snapshot, prd) = skills_prologue(&harness).await;
+        attach_glob(&harness, "rust-glob", &["**/*.rs"]).await;
+        let implement = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == "implement")
+            .expect("the feature graph has an implement phase");
+
+        harness_engine!(harness.orch, engine);
+        let JudgePrompts {
+            forward, reversed, ..
+        } = engine
+            .judge_prompts(&row, &snapshot, implement, 1, &[&prd])
+            .await
+            .expect("the judge's inputs are read")
+            .expect("the judge assembles");
+
+        for prompt in [&forward, &reversed] {
+            assert!(
+                choice_rows(&prompt.trim.skill_choices).contains(&(
+                    "rust-glob".to_owned(),
+                    Some(1),
+                    false,
+                    ChoiceReason::NoPath
+                )),
+                "{:?}",
+                prompt.trim.skill_choices
+            );
+        }
     }
 
     // -- MOD-9 D44: skills reach the run -------------------------------------------------------

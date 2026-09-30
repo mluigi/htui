@@ -58,8 +58,8 @@ pub use gate::{
 };
 pub use graph::{GraphSource, ResolveError, Resolved, override_graph, resolve, topology};
 pub use isolate::{
-    Clock, FanoutSlot, GixIsolator, IsolateError, Isolator, IsolatorConfig, IsolatorFuture,
-    Prepared, PreparedTree, RepoCheckout, ResetReport, SystemClock,
+    ChangedPaths, Clock, FanoutSlot, GixIsolator, IsolateError, Isolator, IsolatorConfig,
+    IsolatorFuture, Prepared, PreparedTree, RepoCheckout, ResetReport, SystemClock,
 };
 pub use recover::{Heartbeat, LeaseTimes};
 pub use select::{SkipCause, Walk, walk};

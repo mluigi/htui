@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-9](docs/decisions/mod/mod-9.md)** - Skill library and templates (done, 2026-09-30)
 - **[MOD-64](docs/decisions/mod/mod-64.md)** - Concepts search in the TUI (done, 2026-09-30)
 - **[TOOL-7](docs/decisions/tool/tool-7.md)** - Containerized handoff-run sandboxes (shipped, 2026-09-29)
 - **[MOD-39](docs/decisions/mod/mod-39.md)** - Requirements tab and item traceability (done, 2026-09-29)

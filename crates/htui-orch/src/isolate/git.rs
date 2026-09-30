@@ -365,6 +365,27 @@ impl Cli {
         extra_env: &[(&str, &str)],
         stdout: Capture,
     ) -> Result<Exited, IsolateError> {
+        let captured = self
+            .run_captured(verb, cwd, args, extra_env, stdout)
+            .await?;
+        Ok(Exited {
+            code: captured.code,
+            stdout: captured.stdout.into_string(),
+            stderr: captured.stderr,
+        })
+    }
+
+    /// MOD-9 D130: [`run_capturing`](Cli::run_capturing)'s body, with stdout handed back as the
+    /// undecoded sink, so [`name_only`](Cli::name_only) can read bytes where every other verb
+    /// reads text.
+    async fn run_captured(
+        &self,
+        verb: &'static str,
+        cwd: &Path,
+        args: &[&OsStr],
+        extra_env: &[(&str, &str)],
+        stdout: Capture,
+    ) -> Result<Captured, IsolateError> {
         let build = || {
             let mut command = self.command(cwd);
             command.args(args);
@@ -379,6 +400,7 @@ impl Cli {
         let out = std::sync::Mutex::new(match stdout {
             Capture::Tail => Sink::Tail(TailBuffer::new(CAPTURE_TAIL)),
             Capture::Head => Sink::Head(HeadBuffer::new(DIFF_CAP)),
+            Capture::HeadBytes => Sink::HeadBytes(HeadBuffer::new(DIFF_CAP)),
         });
         let err = std::sync::Mutex::new(Sink::Tail(TailBuffer::new(CAPTURE_TAIL)));
         let stdout = child.stdout().take();
@@ -405,9 +427,9 @@ impl Cli {
                 let status = status.map_err(|err| {
                     IsolateError::Git(format!("git {verb}: waiting failed: {err}"))
                 })?;
-                Ok(Exited {
+                Ok(Captured {
                     code: status.code(),
-                    stdout: into_string(out),
+                    stdout: into_sink(out),
                     stderr: into_string(err),
                 })
             }
@@ -428,6 +450,19 @@ enum Capture {
     Tail,
     /// The first [`DIFF_CAP`] bytes: a patch is read from its first header (D55).
     Head,
+    /// MOD-9 D130: the first [`DIFF_CAP`] bytes, never decoded.
+    HeadBytes,
+}
+
+/// MOD-9 D130: one verb's exit and its undecoded stdout sink.
+#[derive(Debug)]
+struct Captured {
+    /// `None` when the child was killed by a signal.
+    code: Option<i32>,
+    /// The stdout capture as [`Capture`] asked for it.
+    stdout: Sink,
+    /// The last [`CAPTURE_TAIL`] bytes of stderr, lossily decoded.
+    stderr: String,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -839,6 +874,78 @@ impl Cli {
         }
         Ok(exited.stdout)
     }
+
+    /// MOD-9 D119/D130: `git diff --no-color --name-only -z --no-renames --no-ext-diff
+    /// --no-textconv <before> <after> --` in `repo`, stdout head-capped at [`DIFF_CAP`] as bytes.
+    ///
+    /// The flags are [`diff`](Cli::diff)'s discipline plus `-z`, which removes git's path quoting,
+    /// and `--no-renames`, which lists a rename under its old and its new name. The bytes are never
+    /// decoded as a whole (`parse_name_only`): a lossy decode would turn a non-UTF-8 name into a
+    /// plausible path. Not retried: a read (M3 D39).
+    ///
+    /// # Errors
+    /// [`IsolateError::Git`] for a spawn or budget failure, or for a non-zero exit (a revision the
+    /// repository does not hold, among them), named `git diff` as [`diff`](Cli::diff)'s are.
+    pub async fn name_only(
+        &self,
+        repo: &Path,
+        before: &str,
+        after: &str,
+    ) -> Result<NameOnly, IsolateError> {
+        let args = [
+            OsStr::new("diff"),
+            OsStr::new("--no-color"),
+            OsStr::new("--name-only"),
+            OsStr::new("-z"),
+            OsStr::new("--no-renames"),
+            OsStr::new("--no-ext-diff"),
+            OsStr::new("--no-textconv"),
+            OsStr::new(before),
+            OsStr::new(after),
+            OsStr::new("--"),
+        ];
+        let captured = self
+            .run_captured("diff", repo, &args, &[], Capture::HeadBytes)
+            .await?;
+        if captured.code != Some(0) {
+            return Err(Exited {
+                code: captured.code,
+                stdout: String::new(),
+                stderr: captured.stderr,
+            }
+            .failure("diff"));
+        }
+        let (bytes, overflowed) = captured.stdout.into_bytes();
+        Ok(parse_name_only(&bytes, overflowed))
+    }
+}
+
+/// MOD-9 D119: one range's changed names, in git's order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NameOnly {
+    /// Repo-relative, `/`-separated names; a non-UTF-8 or empty one was dropped.
+    pub paths: Vec<String>,
+    /// The output overflowed [`DIFF_CAP`]; the partial last entry was dropped.
+    pub truncated: bool,
+}
+
+/// MOD-9 D130: NUL-split; the final segment is always dropped (empty when git finished its last
+/// entry, partial when the cap cut it); a non-UTF-8 or empty entry is dropped; `truncated =
+/// overflowed`.
+fn parse_name_only(bytes: &[u8], overflowed: bool) -> NameOnly {
+    let mut segments: Vec<&[u8]> = bytes.split(|byte| *byte == 0).collect();
+    // `-z` ends every whole entry with a NUL, so the last segment is empty when git finished and
+    // the cut entry when the cap stopped it: either way it is not a name.
+    segments.pop();
+    NameOnly {
+        paths: segments
+            .into_iter()
+            .filter(|segment| !segment.is_empty())
+            .filter_map(|segment| std::str::from_utf8(segment).ok())
+            .map(str::to_owned)
+            .collect(),
+        truncated: overflowed,
+    }
 }
 
 /// The sleeps between retries (plan D39): 200, 400 and 800 ms, so four attempts in all.
@@ -1108,6 +1215,12 @@ impl HeadBuffer {
         self.kept.extend_from_slice(&chunk[..chunk.len().min(room)]);
     }
 
+    /// MOD-9 D130: the kept bytes and whether anything was dropped after them.
+    #[must_use]
+    pub fn into_bytes(self) -> (Vec<u8>, bool) {
+        (self.kept, self.overflowed)
+    }
+
     /// The buffer as text, lossily, with `\n[diff truncated at 64 KiB]` appended when it
     /// overflowed.
     ///
@@ -1122,25 +1235,39 @@ impl HeadBuffer {
     }
 }
 
-/// One pipe's capture: a tail for everything but `diff`'s stdout, which keeps its head.
+/// One pipe's capture: a tail for everything but `diff`'s stdout, which keeps its head — as text
+/// for the patch, as bytes for the names (MOD-9 D130).
 #[derive(Debug)]
 enum Sink {
     Tail(TailBuffer),
     Head(HeadBuffer),
+    HeadBytes(HeadBuffer),
 }
 
 impl Sink {
     fn push(&mut self, chunk: &[u8]) {
         match self {
             Self::Tail(tail) => tail.push(chunk),
-            Self::Head(head) => head.push(chunk),
+            Self::Head(head) | Self::HeadBytes(head) => head.push(chunk),
         }
     }
 
+    /// The capture as text; a byte head is decoded lossily with no truncation marker (MOD-9
+    /// D130), since nothing reads it as text.
     fn into_string(self) -> String {
         match self {
             Self::Tail(tail) => tail.into_string(),
             Self::Head(head) => head.into_string(),
+            Self::HeadBytes(head) => String::from_utf8_lossy(&head.into_bytes().0).into_owned(),
+        }
+    }
+
+    /// MOD-9 D130: the capture's bytes and whether a head dropped any; a tail does not record
+    /// what it dropped and reports `false`.
+    fn into_bytes(self) -> (Vec<u8>, bool) {
+        match self {
+            Self::Tail(tail) => (tail.bytes.into(), false),
+            Self::Head(head) | Self::HeadBytes(head) => head.into_bytes(),
         }
     }
 }
@@ -1171,9 +1298,13 @@ async fn read_tail(
 
 /// The text a shared capture holds.
 fn into_string(tail: std::sync::Mutex<Sink>) -> String {
+    into_sink(tail).into_string()
+}
+
+/// MOD-9 D130: the capture a shared sink holds, undecoded.
+fn into_sink(tail: std::sync::Mutex<Sink>) -> Sink {
     tail.into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .into_string()
 }
 
 /// Kills a supervised child's whole group and waits for it — for at most [`KILL_GRACE`].
@@ -2158,8 +2289,8 @@ mod tests {
         commit_file, commit_removal, empty_repo, has_object, repo_with_one_commit,
     };
     use super::{
-        CAPTURE_TAIL, Cli, DIFF_CAP, Exited, HeadBuffer, MIN_GIT, SCRUBBED_ENV, TailBuffer,
-        ancestor_walk, is_lock_error, merge_walk,
+        CAPTURE_TAIL, Cli, DIFF_CAP, Exited, HeadBuffer, MIN_GIT, NameOnly, SCRUBBED_ENV,
+        TailBuffer, ancestor_walk, is_lock_error, merge_walk, parse_name_only,
     };
     use crate::isolate::IsolateError;
 
@@ -3617,6 +3748,200 @@ mod tests {
             "abcd",
             "exactly the cap is not an overflow"
         );
+    }
+
+    /// MOD-9 D119 test support: one `git` verb in `repo`, with the child environment scrubbed as
+    /// [`Cli`]'s own is and a fixed identity, for the renames and removals `testkit::commit_file`
+    /// cannot make.
+    fn git_in(git: &Cli, repo: &std::path::Path, args: &[&OsStr]) {
+        let mut command = std::process::Command::new(git.binary());
+        command.current_dir(repo);
+        for key in SCRUBBED_ENV {
+            command.env_remove(key);
+        }
+        let status = command
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .status()
+            .expect("git runs");
+        assert!(
+            status.success(),
+            "git {args:?} failed in {}",
+            repo.display()
+        );
+    }
+
+    /// `git add -A` then `git commit -m <message>`; returns the new `HEAD`.
+    fn commit_all(git: &Cli, repo: &std::path::Path, message: &str) -> String {
+        git_in(git, repo, &[OsStr::new("add"), OsStr::new("-A")]);
+        git_in(
+            git,
+            repo,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("-q"),
+                OsStr::new("-m"),
+                OsStr::new(message),
+            ],
+        );
+        super::head(repo).expect("HEAD reads")
+    }
+
+    /// MOD-9 D119: every changed name, a rename under both of its names (`--no-renames`), a space
+    /// and a newline kept verbatim (`-z`, no quoting).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn name_only_lists_every_changed_path_with_renames_split() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path();
+        empty_repo(repo);
+        for (name, body) in [
+            ("f", "first\n"),
+            ("old.rs", "fn old() {}\n"),
+            ("gone.rs", "x\n"),
+        ] {
+            std::fs::write(repo.join(name), body).expect("the file is written");
+        }
+        let before = commit_all(&git, repo, "base");
+
+        std::fs::write(repo.join("f"), "second\n").expect("f is modified");
+        git_in(
+            &git,
+            repo,
+            &[
+                OsStr::new("mv"),
+                OsStr::new("old.rs"),
+                OsStr::new("moved.rs"),
+            ],
+        );
+        git_in(
+            &git,
+            repo,
+            &[OsStr::new("rm"), OsStr::new("-q"), OsStr::new("gone.rs")],
+        );
+        std::fs::write(repo.join("a b.rs"), "a\n").expect("a spaced name is written");
+        std::fs::write(repo.join("new\nline.rs"), "n\n").expect("a newline name is written");
+        let after = commit_all(&git, repo, "after");
+
+        let mut listed = git
+            .name_only(repo, &before, &after)
+            .await
+            .expect("the names read");
+        listed.paths.sort();
+        assert_eq!(
+            listed,
+            NameOnly {
+                paths: [
+                    "a b.rs",
+                    "f",
+                    "gone.rs",
+                    "moved.rs",
+                    "new\nline.rs",
+                    "old.rs"
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+                truncated: false,
+            }
+        );
+    }
+
+    /// MOD-9 D119: a name that is not UTF-8 is dropped, never decoded into a plausible path.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn name_only_drops_a_non_utf8_name() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let repo = dir.path();
+        let before = repo_with_one_commit(repo);
+        std::fs::write(repo.join(OsStr::from_bytes(b"\xff\xfe.rs")), "x\n")
+            .expect("a non-UTF-8 name is written");
+        std::fs::write(repo.join("ok.rs"), "ok\n").expect("ok.rs is written");
+        let after = commit_all(&git, repo, "names");
+
+        assert_eq!(
+            git.name_only(repo, &before, &after)
+                .await
+                .expect("the names read"),
+            NameOnly {
+                paths: vec!["ok.rs".to_owned()],
+                truncated: false,
+            }
+        );
+    }
+
+    /// MOD-9 D119: an empty range names nothing and is not an error.
+    #[tokio::test]
+    async fn name_only_of_an_empty_range_is_empty() {
+        let Some(git) = crate::skip_without_git!() else {
+            return;
+        };
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let head = repo_with_one_commit(dir.path());
+        assert_eq!(
+            git.name_only(dir.path(), &head, &head)
+                .await
+                .expect("the empty range reads"),
+            NameOnly::default()
+        );
+    }
+
+    /// MOD-9 D130: the byte capture hands back what it kept and whether it dropped anything.
+    #[test]
+    fn head_bytes_capture_reports_overflow() {
+        let mut over = HeadBuffer::new(8);
+        over.push(b"abcdefghij");
+        assert_eq!(over.into_bytes(), (b"abcdefgh".to_vec(), true));
+
+        let mut exact = HeadBuffer::new(8);
+        exact.push(b"abcd");
+        exact.push(b"efgh");
+        assert_eq!(
+            exact.into_bytes(),
+            (b"abcdefgh".to_vec(), false),
+            "exactly the cap is not an overflow"
+        );
+    }
+
+    /// MOD-9 D130: the final NUL-split segment is always dropped — partial when the cap cut it,
+    /// empty when git finished its last entry — and never a second one.
+    #[test]
+    fn name_only_drops_a_partial_last_entry_when_capped() {
+        let names = |paths: &[&str], truncated: bool| NameOnly {
+            paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+            truncated,
+        };
+        assert_eq!(
+            parse_name_only(b"a.rs\0b.rs\0c.r", true),
+            names(&["a.rs", "b.rs"], true),
+            "the cut entry goes"
+        );
+        assert_eq!(
+            parse_name_only(b"a.rs\0b.rs\0", true),
+            names(&["a.rs", "b.rs"], true),
+            "cut exactly on a NUL: both entries are whole"
+        );
+        assert_eq!(
+            parse_name_only(b"a.rs\0b.rs\0", false),
+            names(&["a.rs", "b.rs"], false)
+        );
+        assert_eq!(parse_name_only(b"", false), NameOnly::default());
     }
 
     /// A-3's read: whether an object database holds a commit, with no subprocess.

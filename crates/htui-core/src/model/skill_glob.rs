@@ -174,7 +174,7 @@ pub fn split_list(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// A compiled attachment, for PRD milestone 5's `select` (D86). Tested now, called there.
+/// A compiled attachment: `select`'s matcher (MOD-9 D111).
 #[derive(Debug, Clone)]
 pub struct SkillGlobs {
     /// Each glob's qualifier and matcher, in stored order.
@@ -209,6 +209,15 @@ impl SkillGlobs {
                     && compiled.is_match_candidate(&candidate)
             })
         })
+    }
+
+    /// MOD-9 D112: whether any glob can match in `repo`: an unqualified one, or one qualified
+    /// with `repo`.
+    #[must_use]
+    pub fn reaches(&self, repo: &str) -> bool {
+        self.globs
+            .iter()
+            .any(|(qualifier, _)| qualifier.as_deref().is_none_or(|own| own == repo))
     }
 }
 
@@ -437,5 +446,19 @@ mod tests {
             "`htui:src/**` does not match in `web`; the bare `**/*.md` does"
         );
         assert_eq!(globs.first_match("web", ["src/x.rs"]), None);
+    }
+
+    /// MOD-9 D112: a bare glob reaches every repo, a qualified one only its own.
+    #[test]
+    fn reaches_follows_the_qualifier() {
+        let compile = |globs: &[&str]| SkillGlobs::compile(&strings(globs)).expect("compiles");
+        assert!(compile(&["**/*.rs"]).reaches("anything"));
+        assert!(compile(&["web:**/*.ts"]).reaches("web"));
+        assert!(!compile(&["web:**/*.ts"]).reaches("htui"));
+        assert!(
+            compile(&["web:a", "b"]).reaches("htui"),
+            "the bare `b` reaches `htui`"
+        );
+        assert!(!compile(&[]).reaches("htui"), "no glob reaches nothing");
     }
 }

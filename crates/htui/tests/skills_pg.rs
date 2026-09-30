@@ -167,3 +167,63 @@ async fn a_skill_created_edited_and_attached_in_the_tui_lands_on_postgres() {
     );
     stack.finish().await;
 }
+
+/// MOD-9 D127 (milestone 3's review finding 6): a skill written by hand with no `skill_version`
+/// row — `create_skill` always writes v1 with the row, so only raw SQL reaches the state, and
+/// `MemStore` cannot — opens in the editor from the view, and the save lands as v1 on the
+/// server through `add_skill_version`'s `expected = 0`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skill_with_no_version_is_edited_into_v1_on_postgres() {
+    let Some(mut stack) = Stack::new().await else {
+        return;
+    };
+    sqlx::query("INSERT INTO skill (name, description, created_by) VALUES ($1, '', $2)")
+        .bind("bare-skill")
+        .bind(ids::USER.as_uuid())
+        .execute(&stack.db.pool)
+        .await
+        .expect("plant a skill with no version");
+    let harness = &mut stack.harness;
+    harness.key("2");
+    harness.settle().await;
+    // Name order puts `bare-skill` first, under the cursor.
+    let frame = harness.render();
+    assert!(
+        frame.contains("bare-skill"),
+        "the bare skill is listed: {frame}"
+    );
+
+    harness.key("e");
+    type_text(harness, "Bare.");
+    let frame = harness.render();
+    assert!(
+        frame.contains("bare-skill \u{b7} no version yet, saves v1"),
+        "the editor's title names no version to edit from: {frame}"
+    );
+    harness.key("ctrl-s");
+    harness.settle().await;
+
+    let store = &stack.db.store;
+    let skill = store
+        .skills()
+        .await
+        .expect("the server's library")
+        .into_iter()
+        .find(|skill| skill.name == "bare-skill")
+        .expect("the bare skill is on the server");
+    let versions: Vec<(i32, String)> = store
+        .skill_versions(skill.id)
+        .await
+        .expect("the server's versions")
+        .into_iter()
+        .map(|row| (row.version, row.body))
+        .collect();
+    assert_eq!(versions, [(1, "Bare.".to_owned())], "the save wrote v1");
+    let frame = harness.render();
+    let row = frame
+        .lines()
+        .find(|line| line.contains("bare-skill"))
+        .unwrap_or_else(|| panic!("the bare skill is still listed: {frame}"));
+    assert!(row.contains("v1"), "the library row names v1: {frame}");
+    stack.finish().await;
+}

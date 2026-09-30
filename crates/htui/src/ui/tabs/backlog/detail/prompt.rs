@@ -9,7 +9,7 @@
 //! the body is the canonical text verbatim, so a `</section>` inside a document body is inert
 //! (blueprint H-28).
 
-use htui_core::model::{ItemId, SkillChoice};
+use htui_core::model::{ChoiceReason, ItemId, SkillChoice};
 use htui_core::prompt::{Section, TrimRecord};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -209,16 +209,18 @@ fn render_lines(preview: &PromptPreview) -> Vec<Row> {
 }
 
 /// One skill choice as the pane lists it: `<name> v<N|?> · <level> · <activation> → <outcome>`,
-/// where the outcome is `active` or the reason. CR and LF in a name become spaces, so one choice
-/// is one row.
+/// where the outcome is `active` for `always`, `matched <repo:path>` for `matched` (MOD-9 D125),
+/// the reason otherwise. CR and LF in a name or a path become spaces, so one choice is one row.
 fn choice_line(choice: &SkillChoice) -> String {
     let version = choice
         .version
         .map_or_else(|| "?".to_owned(), |version| version.to_string());
-    let outcome = if choice.active {
-        "active"
-    } else {
-        choice.reason.as_str()
+    let outcome = match (choice.reason, &choice.path) {
+        (ChoiceReason::Always, _) => "active".to_owned(),
+        (ChoiceReason::Matched, Some(path)) => {
+            format!("matched {}", path.replace(['\n', '\r'], " "))
+        }
+        (reason, _) => reason.as_str().to_owned(),
     };
     format!(
         "{} v{version} \u{b7} {} \u{b7} {} \u{2192} {outcome}",
@@ -411,7 +413,7 @@ impl DetailTab for PromptTab {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use htui_core::model::{Activation, ChoiceReason, SkillLevel};
+    use htui_core::model::{Activation, SkillLevel};
     use ratatui::buffer::Buffer;
     use ratatui::widgets::Widget as _;
 
@@ -485,6 +487,7 @@ mod tests {
             activation: Activation::Off,
             active: false,
             reason: ChoiceReason::Off,
+            path: None,
         });
         // The fixture records no note, and the block's place is "before the notes".
         assembled.trim.notes.push("a note".to_owned());
@@ -535,5 +538,64 @@ mod tests {
             .position(|row| row.text.starts_with("section "))
             .expect("the section table is rendered");
         assert!(table < at, "the block sits below the section table");
+    }
+
+    #[test]
+    fn a_matched_choice_names_its_path() {
+        // MOD-9 D125: a matched glob says which file woke it, CR and LF flattened as in names.
+        let line = choice_line(&SkillChoice {
+            skill: htui_core::fixtures::ids::SKILL_TESTS,
+            name: "rust-glob".to_owned(),
+            version: Some(1),
+            level: SkillLevel::Project,
+            activation: Activation::Glob,
+            active: true,
+            reason: ChoiceReason::Matched,
+            path: Some("htui:src/lib\nx.rs".to_owned()),
+        });
+        assert_eq!(
+            line,
+            "rust-glob v1 \u{b7} project \u{b7} glob \u{2192} matched htui:src/lib x.rs"
+        );
+    }
+
+    #[test]
+    fn a_no_match_choice_is_dim_and_says_so() {
+        // MOD-9 D125: `no_match` is inactive, so its row is dim and names the reason.
+        let mut assembled = htui_core::prompt::assemble(
+            &htui_core::prompt::fixtures::phase_implement_attempt2(),
+            &htui_core::scrub::MinimalScrubber::new([]),
+        )
+        .expect("the fixture assembles");
+        assembled.trim.skill_choices.push(SkillChoice {
+            skill: htui_core::fixtures::ids::SKILL_TESTS,
+            name: "rust-glob".to_owned(),
+            version: Some(1),
+            level: SkillLevel::Project,
+            activation: Activation::Glob,
+            active: false,
+            reason: ChoiceReason::NoMatch,
+            path: None,
+        });
+        let preview = PromptPreview {
+            item: htui_core::fixtures::ids::HTUI_FEAT_1,
+            available: vec!["implement".to_owned()],
+            template: Some(htui_core::prompt::TemplateRef {
+                name: "implement".to_owned(),
+                version: 1,
+            }),
+            outcome: Ok(assembled),
+        };
+
+        let rows = render_lines(&preview);
+        let row = rows
+            .iter()
+            .find(|row| row.text.contains("rust-glob"))
+            .unwrap_or_else(|| panic!("the no_match choice is a row: {rows:#?}"));
+        assert!(
+            row.text.ends_with("glob \u{2192} no_match"),
+            "the reason is spelled out: {row:?}"
+        );
+        assert!(row.dim, "an inactive choice is dim: {row:?}");
     }
 }

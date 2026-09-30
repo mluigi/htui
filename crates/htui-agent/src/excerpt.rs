@@ -21,9 +21,10 @@
 //! [`crate::probe`]'s glob walker already established, and the `.gitignore` matcher is a declared
 //! **subset** rather than a glob crate.
 //!
-//! MOD-7 milestone 4 wires the pass. [`excerpts_for`] is the one function both the engine's phase
-//! prompt and the Backlog preview call, so the bytes a maintainer previews and the bytes a run sends
-//! cannot drift (MOD-2 D103).
+//! MOD-7 milestone 4 wires the pass, and MOD-9 milestone 5 makes it one walk for the excerpts and
+//! the `glob` file set. [`step_pass`] is the one function both the engine's phase prompt and the
+//! Backlog preview call, so the bytes a maintainer previews and the bytes a run sends cannot drift
+//! (MOD-2 D103).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -33,16 +34,16 @@ use std::time::Instant;
 
 use tracing::warn;
 
-use htui_core::model::{BoxId, Repo, RepoBoxPath, RepoId, RunStepTree};
+use htui_core::model::{BoxId, Repo, RepoBoxPath, RepoId, RunStepTree, StepFiles, needs_files};
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, BuiltinRanker, ExcerptAudit, ExcerptCandidate, ExcerptCaps, ExcerptProvider,
-    ExcerptRequest, ExcerptSet, OwnedExcerptRequest, PathPrefix, ProviderError, RepoReader,
-    RepoRoot, RootRecord, RootSource, select, skip_by_path,
+    ExcerptRequest, ExcerptSet, Listing, OwnedExcerptRequest, PathPrefix, ProviderError, RepoPath,
+    RepoReader, RepoRoot, RootRecord, RootSource, list, select_listed, skip_by_path, step_files,
 };
 use htui_core::prompt::settings::resolve_excerpt_caps;
 use htui_core::prompt::{
-    Placeholder, PromptSpec, TokenEstimator, drop_unmaskable_excerpts, excerpt_residual, parse,
-    withhold_unmaskable_notes,
+    Placeholder, PromptSpec, TokenEstimator, drop_unmaskable_excerpts, drop_unmaskable_files,
+    excerpt_residual, parse, withhold_unmaskable_notes,
 };
 use htui_core::scrub::Scrubber;
 
@@ -54,7 +55,7 @@ pub const BINARY_PROBE_BYTES: usize = 8_192;
 ///
 /// Re-exported from `htui-core` rather than spelled again here. The ceiling is a property of
 /// [`ExcerptCandidate`], which that crate owns, and
-/// [`select`] clamps to it as well — two independent `100`s
+/// [`select`](htui_core::prompt::excerpt::select) clamps to it as well — two independent `100`s
 /// were how finding F-100 arrived, with the invariant enforced only by the impure crate.
 pub use htui_core::prompt::excerpt::MAX_PROVIDER_WEIGHT;
 
@@ -952,85 +953,129 @@ pub struct PassInput {
     /// The caller's own notes about the roots, which go first: a scope repo with no row, or
     /// D108's "no `run_step_tree` row yet".
     pub notes: Vec<String>,
+    /// MOD-9 D121: the previous attempt's changed paths, repo-qualified by name; empty on
+    /// attempt 1 and in the preview. Excerpt tier 2 and the `glob` file set both read it.
+    pub changed_paths: Vec<RepoPath>,
 }
 
-/// §4.5 over the filesystem (plan D119): the built-in provider, then `select` over an
-/// `FsRepoReader` built from the request's own caps (F-101). **Blocking**: `excerpts_for` calls it
-/// under `spawn_blocking` whenever a root is readable.
+/// MOD-9 D114: §4.5 steps 1-2 over the filesystem — every root resolved and listed once through
+/// an `FsRepoReader` built from the request's own caps. **Blocking**: it walks every readable
+/// root.
 #[must_use]
-pub fn excerpt_pass(req: &OwnedExcerptRequest, est: TokenEstimator) -> ExcerptSet {
+pub fn walk_pass(req: &OwnedExcerptRequest) -> Listing {
+    list(&FsRepoReader::new(req.caps), &req.as_request())
+}
+
+/// §4.5 steps 3-10 over the filesystem (plan D119, MOD-9 D114): the built-in provider, then
+/// `select_listed` over a [`walk_pass`] listing already taken and an `FsRepoReader` built from the
+/// request's own caps (F-101). **Blocking** (reads files): `step_pass` calls it under
+/// `spawn_blocking` whenever a root is readable.
+#[must_use]
+pub fn excerpt_pass(
+    req: &OwnedExcerptRequest,
+    listing: &Listing,
+    est: TokenEstimator,
+) -> ExcerptSet {
     let providers: Vec<Arc<dyn ExcerptProvider>> = vec![Arc::new(BuiltinRanker)];
     let request = req.as_request();
     let (merged, provider_set) = run_providers(&providers, &request);
-    select(
+    select_listed(
         &FsRepoReader::new(req.caps),
         &request,
+        listing,
         merged,
         provider_set,
         est,
     )
 }
 
-/// The excerpt set for `spec` (plan D109, D118, D119; MOD-7 milestone 4 D126, D128).
+/// MOD-9 D120: one step's pass — the excerpt set and the `glob` file set, from one walk.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepPass {
+    /// For `spec.excerpts`.
+    pub excerpts: ExcerptSet,
+    /// For `spec.step_files`, already scrub-filtered (MOD-9 D116).
+    pub files: StepFiles,
+}
+
+/// The shared pass for `spec` (MOD-9 D120, D121, D132): the excerpt set **and** the `glob` file
+/// set, from one walk of the roots. The one function both the engine's phase prompt and the
+/// Backlog preview call, so the bytes a maintainer previews and the bytes a run sends cannot drift
+/// (MOD-2 D103).
 ///
 /// 1. `resolve_excerpt_caps(app)`.
-/// 2. `spec.body` parsed in `spec.role` does not place `{{excerpts}}` (or does not parse): no
-///    pass. The roots are recorded unscanned, with the note
-///    ``excerpt: template `name` places no {{excerpts}}; nothing was read``.
-/// 3. No readable root (none, or all `NoPath`): [`excerpt_pass`] **inline**, with a zero budget.
-///    It reads nothing and spawns nothing (H-9), and records each `NoPath` with `select`'s own "no
-///    readable root" note.
-/// 4. Otherwise the budget is `excerpt_residual(spec, scrubber)`. An `Err` records the roots
-///    unscanned, because `assemble` will refuse the same way. Then [`excerpt_pass`] runs under
-///    `tokio::task::spawn_blocking`; a `JoinError` records the roots unscanned with
-///    `excerpt: the pass panicked; no excerpts`, or `excerpt: the pass was cancelled; no excerpts`
-///    when the task never ran (§4.5 fail-open).
-/// 5. `withhold_unmaskable_notes(&mut set.notes, scrubber)`: a pass note names `repo:path` as the
-///    reader returned it, so a note the scrubber would **mask or refuse** is replaced by a fixed
-///    line that names nothing. The record-wide pass ([`TrimRecord::to_value`], MOD-32) is what makes the
-///    record safe, and it is now the first line of defence; this function is the second, kept
-///    because a withheld note reads as a withheld note, where a masked one would read "a file in
-///    repo `[REDACTED]` dropped", which names a value no reader can resolve (P-2).
-/// 6. `drop_unmaskable_excerpts(&mut set, scrubber)`, whose notes are built safe.
-/// 7. `set.notes` = `input.notes`, then the pass's notes, then the drop notes.
+/// 2. `spec.body` parsed in `spec.role`: whether it places `{{excerpts}}` and `{{skills}}` (a
+///    parse error places neither). The walk is wanted for excerpts when `{{excerpts}}` is placed,
+///    and for skills when `{{skills}}` is placed and a collapsed winner is a versioned `glob`
+///    ([`needs_files`]).
+/// 3. Neither: no walk. The roots are recorded unscanned with the note
+///    ``excerpt: template `name` places no {{excerpts}}; nothing was read``, and the file set
+///    holds only `input.changed_paths`.
+/// 4. Otherwise the roots are listed once — under `tokio::task::spawn_blocking` when one is
+///    readable, inline (no I/O) when none is. When the walk is wanted for skills, the file set is
+///    built in the same hop from that listing, `input.touched_prefixes` and `input.changed_paths`
+///    ([`step_files`]); when it is not, `select` never reads the set, so it holds only
+///    `input.changed_paths`.
+/// 5. `drop_unmaskable_files` runs on the file set on **every** branch, before the residual. Its
+///    note is the last of `excerpts.notes`, and is left only when the walk is wanted for skills.
+/// 6. `{{excerpts}}` not placed: no file is read. The set records the listing's roots and
+///    nothing considered, with the note
+///    ``excerpt: template `name` places no {{excerpts}}; the walk listed files for glob skills
+///    only`` and then the listing's own notes, each withheld when the scrubber would change it.
+/// 7. Otherwise the budget is `excerpt_residual` over the spec **with** the file set, so a newly
+///    active skill is paid for before excerpts are chosen; an `Err` records the roots unscanned,
+///    because `assemble` will refuse the same way. Then [`excerpt_pass`] selects over the same
+///    listing (blocking hop when readable). Its notes name `repo:path` as the reader returned
+///    it, so `withhold_unmaskable_notes` replaces any the scrubber would mask or refuse with a
+///    fixed line (P-2), then `drop_unmaskable_excerpts` drops a refused file with a note built
+///    safe. The record-wide pass (`TrimRecord::to_value`, MOD-32) is the first line of defence;
+///    these are the second, kept because a withheld note reads as a withheld note.
 ///
-/// The request is `item_key`, `item_body`, `phase` and the input documents' bodies from `spec`,
-/// `input.touched_prefixes`, no `changed_paths` (D122), `input.roots`, the budget, and the caps,
-/// `scan_cap` and `deadline` of step 1. `est` is `spec.estimator`.
-pub async fn excerpts_for(
+/// Every hop fails open: a `JoinError` in the walk records the roots unscanned with today's
+/// "panicked"/"cancelled" note and a file set of the changed paths alone; one in the selection
+/// keeps the listing's file set. Caller notes always come first, each withheld when the scrubber
+/// would change it.
+pub async fn step_pass(
     spec: &PromptSpec,
     input: PassInput,
     app: &BTreeMap<String, serde_json::Value>,
     scrubber: &dyn Scrubber,
-) -> ExcerptSet {
+) -> StepPass {
     let (caps, scan_cap, deadline) = resolve_excerpt_caps(app);
     let PassInput {
         roots,
         touched_prefixes,
-        notes,
+        mut notes,
+        changed_paths,
     } = input;
+    // MOD-9 D132: a caller's note can carry an isolator's stderr (`changed paths unavailable:
+    // …`), which can name a checkout path; the record is scrubbed fail-closed, so the caller's
+    // notes are withheld as the pass's are, in place, before any branch.
+    withhold_unmaskable_notes(&mut notes, scrubber);
 
-    let places = parse(spec.role, &spec.body)
-        .is_ok_and(|parsed| parsed.used.contains(&Placeholder::Excerpts));
-    if !places {
-        let mut notes = notes;
+    let (places_excerpts, places_skills) =
+        parse(spec.role, &spec.body).map_or((false, false), |parsed| {
+            (
+                parsed.used.contains(&Placeholder::Excerpts),
+                parsed.used.contains(&Placeholder::Skills),
+            )
+        });
+    // MOD-9 D120: a placed `glob` winner needs the listing even where no excerpt is read.
+    let wants_files = places_skills && needs_files(&spec.skills);
+    if !places_excerpts && !wants_files {
         notes.push(format!(
             "excerpt: template `{}` places no {{{{excerpts}}}}; nothing was read",
             spec.template.name
         ));
-        return unscanned(&roots, caps, notes);
+        return with_files(
+            unscanned(&roots, caps, notes),
+            changed_only(&changed_paths),
+            scrubber,
+            false,
+        );
     }
 
     let readable = roots.iter().any(|root| root.source != RootSource::NoPath);
-    let budget_tokens = if readable {
-        match excerpt_residual(spec, scrubber) {
-            Ok(budget) => budget,
-            // `assemble` refuses this spec the same way, so nothing read here could be sent.
-            Err(_) => return unscanned(&roots, caps, notes),
-        }
-    } else {
-        0
-    };
     let request = OwnedExcerptRequest {
         item_key: spec.item_key.clone(),
         item_body: spec.item_body.clone(),
@@ -1041,47 +1086,180 @@ pub async fn excerpts_for(
             .map(|document| document.body.clone())
             .collect(),
         touched_prefixes,
-        // D122: the previous attempt's diff carries no repo-qualified path list.
-        changed_paths: Vec::new(),
+        // MOD-9 D121: tier 2 reads the previous attempt's changed paths.
+        changed_paths,
         roots,
-        budget_tokens,
+        // Set below, once the residual is known (it depends on the file set).
+        budget_tokens: 0,
         caps,
         scan_cap,
         deadline,
     };
     let est = spec.estimator;
 
-    let mut set = if readable {
+    // MOD-9 D114: one walk, for the excerpts and the file set both.
+    let (mut request, mut listing, mut files) = if readable {
         let roots = request.roots.clone();
-        match tokio::task::spawn_blocking(move || excerpt_pass(&request, est)).await {
-            Ok(set) => set,
+        let changed = request.changed_paths.clone();
+        let walked = tokio::task::spawn_blocking(move || {
+            let listing = walk_pass(&request);
+            // MOD-9 D120: the file set is built off the runtime too, from the same listing.
+            let files = file_set(wants_files, &listing, &request);
+            (request, listing, files)
+        })
+        .await;
+        match walked {
+            Ok(walked) => walked,
             Err(error) => {
-                let mut notes = notes;
-                notes.push(
-                    if error.is_panic() {
-                        "excerpt: the pass panicked; no excerpts"
-                    } else {
-                        // The runtime shut down before the blocking task ran.
-                        "excerpt: the pass was cancelled; no excerpts"
-                    }
-                    .to_owned(),
+                // MOD-9 D132: no listing, so the file set is the changed paths alone.
+                notes.push(join_note(&error));
+                return with_files(
+                    unscanned(&roots, caps, notes),
+                    changed_only(&changed),
+                    scrubber,
+                    wants_files,
                 );
-                return unscanned(&roots, caps, notes);
             }
         }
     } else {
-        // No readable root: `select` lists nothing and reads nothing, and the one provider runs
-        // on this thread, so there is no I/O to move off the runtime (H-9).
-        excerpt_pass(&request, est)
+        // No readable root: the walk records each `NoPath` and lists nothing, so there is no I/O
+        // to move off the runtime (H-9).
+        let listing = walk_pass(&request);
+        let files = file_set(wants_files, &listing, &request);
+        (request, listing, files)
     };
-    // The pass's own notes name `repo:path` as the reader returned it, so they are checked
-    // before `drop_unmaskable_excerpts` appends its own, which are built safe (P-2).
-    withhold_unmaskable_notes(&mut set.notes, scrubber);
-    drop_unmaskable_excerpts(&mut set, scrubber);
-    let mut all = notes;
-    all.append(&mut set.notes);
-    set.notes = all;
-    set
+
+    // MOD-9 D132: before the residual, which assembles the spec with this file set. It stays on
+    // the runtime: `scrubber` is a borrow, and `spawn_blocking` takes only `'static` data. Without
+    // a `glob` winner the set is the changed paths alone, so this costs nothing per listed file.
+    let withheld = withhold_files(&mut files, scrubber, wants_files);
+
+    let mut excerpts = if places_excerpts {
+        let residual = if readable {
+            // MOD-9 D120: the residual with the file set in place, so an active `glob` skill is
+            // paid for before excerpts are chosen.
+            excerpt_residual(
+                &PromptSpec {
+                    step_files: files.clone(),
+                    ..spec.clone()
+                },
+                scrubber,
+            )
+        } else {
+            Ok(0)
+        };
+        match residual {
+            // `assemble` refuses this spec the same way, so nothing read here could be sent.
+            Err(_) => unscanned(&request.roots, caps, notes),
+            Ok(budget) => {
+                request.budget_tokens = budget;
+                let selected = if readable {
+                    let roots = request.roots.clone();
+                    tokio::task::spawn_blocking(move || excerpt_pass(&request, &listing, est))
+                        .await
+                        .map_err(|error| (roots, join_note(&error)))
+                } else {
+                    Ok(excerpt_pass(&request, &listing, est))
+                };
+                match selected {
+                    Ok(mut set) => {
+                        // The pass's own notes name `repo:path` as the reader returned it, so
+                        // they are checked before `drop_unmaskable_excerpts` appends its own,
+                        // which are built safe (P-2).
+                        withhold_unmaskable_notes(&mut set.notes, scrubber);
+                        drop_unmaskable_excerpts(&mut set, scrubber);
+                        let mut all = notes;
+                        all.append(&mut set.notes);
+                        set.notes = all;
+                        set
+                    }
+                    Err((roots, note)) => {
+                        notes.push(note);
+                        unscanned(&roots, caps, notes)
+                    }
+                }
+            }
+        }
+    } else {
+        // MOD-9 D132: the listing's notes name `repo:path` raw, and the record is scrubbed
+        // fail-closed, so they are withheld here as the selection's are.
+        withhold_unmaskable_notes(&mut listing.notes, scrubber);
+        let mut all = notes;
+        all.push(format!(
+            "excerpt: template `{}` places no {{{{excerpts}}}}; the walk listed files for glob \
+             skills only",
+            spec.template.name
+        ));
+        all.append(&mut listing.notes);
+        ExcerptSet {
+            files: Vec::new(),
+            audit: ExcerptAudit {
+                provider_set: vec![BUILTIN_ID.to_owned()],
+                roots: listing.roots,
+                considered: 0,
+                selected: 0,
+                caps,
+                files: Vec::new(),
+            },
+            notes: all,
+        }
+    };
+    if let Some(note) = withheld {
+        excerpts.notes.push(note);
+    }
+    StepPass { excerpts, files }
+}
+
+/// The note a blocking hop's `JoinError` leaves: a panic, or a runtime that shut down before the
+/// task ran (§4.5 fail-open).
+fn join_note(error: &tokio::task::JoinError) -> String {
+    if error.is_panic() {
+        "excerpt: the pass panicked; no excerpts"
+    } else {
+        // The runtime shut down before the blocking task ran.
+        "excerpt: the pass was cancelled; no excerpts"
+    }
+    .to_owned()
+}
+
+/// MOD-9 D132: a branch that skipped the listing's file filter runs it here, and its note goes
+/// last.
+fn with_files(
+    mut excerpts: ExcerptSet,
+    mut files: StepFiles,
+    scrubber: &dyn Scrubber,
+    wants_files: bool,
+) -> StepPass {
+    if let Some(note) = withhold_files(&mut files, scrubber, wants_files) {
+        excerpts.notes.push(note);
+    }
+    StepPass { excerpts, files }
+}
+
+/// MOD-9 D115, D120: the step's file set. From the listing only when a placed, versioned `glob`
+/// winner will read it ([`needs_files`]); otherwise `select` never reads it, so the listing is
+/// not copied and the set is the changed paths alone ([`changed_only`]).
+fn file_set(wants_files: bool, listing: &Listing, request: &OwnedExcerptRequest) -> StepFiles {
+    if wants_files {
+        step_files(listing, &request.touched_prefixes, &request.changed_paths)
+    } else {
+        changed_only(&request.changed_paths)
+    }
+}
+
+/// MOD-9 D132: the file set with no listing — `changed`, under the listing's own path rules.
+fn changed_only(changed: &[RepoPath]) -> StepFiles {
+    step_files(&Listing::default(), &[], changed)
+}
+
+/// MOD-9 D116, D132: `drop_unmaskable_files` on `files`, whose note is kept only when a `glob`
+/// winner reads the set; with none, a withheld path changed nothing a reader could see.
+fn withhold_files(
+    files: &mut StepFiles,
+    scrubber: &dyn Scrubber,
+    wants_files: bool,
+) -> Option<String> {
+    drop_unmaskable_files(files, scrubber).filter(|_| wants_files)
 }
 
 /// The set a pass that read nothing records: the built-in registered, every root as given and

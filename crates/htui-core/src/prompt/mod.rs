@@ -22,8 +22,10 @@
 //! [`excerpt`]'s five-tier ranker, its [`ExcerptProvider`](excerpt::ExcerptProvider) seam and
 //! [`excerpt::select`], whose filesystem half is `htui_agent::excerpt`. MOD-7 milestone 4 adds
 //! [`excerpt_residual`] (D118), [`drop_unmaskable_excerpts`] (D129) and
-//! [`withhold_unmaskable_notes`] (P-2), which `htui_agent::excerpt::excerpts_for` uses. It is the one pass both the engine's phase prompt and
-//! the Backlog preview run, and a caller with no readable root gets the empty audit from it.
+//! [`withhold_unmaskable_notes`] (P-2), and MOD-9 milestone 5 adds [`drop_unmaskable_files`]
+//! (MOD-9 D116), which the shared pass `htui_agent::excerpt::step_pass` uses. It is the one pass
+//! both the engine's phase prompt and the Backlog preview run, and a caller with no readable root
+//! gets the empty audit from it.
 
 pub mod defaults;
 pub mod digest;
@@ -54,7 +56,7 @@ use serde_json::Value;
 
 use crate::model::box_::BoxProfile;
 use crate::model::link::UpstreamEntry;
-use crate::model::skill::{BoundSkill, SkillChoice, select};
+use crate::model::skill::{BoundSkill, SkillChoice, StepFiles, select};
 use crate::prompt::render::Rendered;
 use crate::prompt::trim::{Inputs, Trimmer};
 use crate::scrub::Scrubber;
@@ -101,6 +103,11 @@ pub struct PromptSpec {
     pub skills: Vec<BoundSkill>,
     /// §4.5's read and windowed excerpts, with the audit half the ranker filled.
     pub excerpts: ExcerptSet,
+    /// MOD-9 D110/D117: the F2 file set a `glob` attachment matches against — the excerpt walk's
+    /// listing under the step's roots, narrowed to `touched_paths`, plus the previous attempt's
+    /// changed paths, already scrub-filtered (D116). `StepFiles::default()` reaches no repo, so a
+    /// `glob` winner records `no_path`: the judge's, the handoff's, every hand-built spec's.
+    pub step_files: StepFiles,
     /// Whether `R-MCP-4`'s `command_run` exposure is on for this phase (§4.2 `:484`).
     pub command_queue: bool,
     /// The previous attempt's verification output; `None` on attempt 1.
@@ -520,8 +527,9 @@ pub fn assemble(
 }
 
 /// ANA-5 §4.4 step 6's residual (MOD-7 milestone 4, D118): the tokens left under the target once
-/// everything but the excerpts is assembled. `spec` is assembled with an empty [`ExcerptSet`] and
-/// the answer is `(trim.target - trim.estimated_after).max(0)`, the budget §4.5's selection may
+/// everything but the excerpts is assembled — the spec's `step_files` included, so an active
+/// matched skill is paid for first (MOD-9 D120). `spec` is assembled with an empty [`ExcerptSet`]
+/// and the answer is `(trim.target - trim.estimated_after).max(0)`, the budget §4.5's selection may
 /// spend. The excerpt section's framing is not in it; an overshoot is §4.4's to trim, and excerpt
 /// files are what it drops first.
 ///
@@ -858,7 +866,17 @@ fn scrubbed_inputs(
     // MOD-9 D43: collapse the candidates, then decide them. Only the active ones render, are
     // estimated and meet the cap; every candidate is recorded.
     let placed = parsed.used.contains(&Placeholder::Skills);
-    let (skills, skill_choices) = select(BoundSkill::collapse(spec.skills.clone()), placed);
+    let (skills, mut skill_choices) = select(
+        BoundSkill::collapse(spec.skills.clone()),
+        placed,
+        &spec.step_files,
+    );
+    // MOD-9 D117: the matched path is recorded, never rendered; masked as the names are.
+    for choice in &mut skill_choices {
+        if let Some(path) = &mut choice.path {
+            mask(scrubber, path, &skills_name)?;
+        }
+    }
     let candidates = judge_candidates(&spec);
     Ok(ScrubbedInputs {
         spec,
@@ -957,6 +975,37 @@ pub fn drop_unmaskable_excerpts(set: &mut ExcerptSet, scrubber: &dyn Scrubber) {
         set.notes.push(note);
     }
     set.files = kept;
+}
+
+/// MOD-9 D116: withholds from `glob` matching every file whose repo slug, path or joined
+/// `repo:path` the scrubber refuses (`refused_rule`), so a refused path can never be the recorded
+/// match — `assemble` masks it joined (D117), and the record is scrubbed fail-closed
+/// (`TrimRecord::to_value`). Count only — the note names no repo and no
+/// path, stricter than `drop_unmaskable_excerpts`. `None` when nothing was withheld.
+#[must_use]
+pub fn drop_unmaskable_files(files: &mut StepFiles, scrubber: &dyn Scrubber) -> Option<String> {
+    let mut withheld = 0usize;
+    // MOD-9 D116: a repo slug is scrubbed once, not once per path under it.
+    let mut slugs: BTreeMap<String, bool> = BTreeMap::new();
+    files.retain(|repo, path| {
+        let repo_refused = if let Some(refused) = slugs.get(repo) {
+            *refused
+        } else {
+            let refused = refused_rule(scrubber, repo).is_some();
+            slugs.insert(repo.to_owned(), refused);
+            refused
+        };
+        // MOD-9 D117: `assemble` masks the recorded match as the joined `repo:path`, and a secret
+        // can span the `:`, so the join is checked as well as its halves.
+        let refused = repo_refused
+            || refused_rule(scrubber, path).is_some()
+            || refused_rule(scrubber, &format!("{repo}:{path}")).is_some();
+        withheld += usize::from(refused);
+        !refused
+    });
+    (withheld > 0).then(|| {
+        format!("skills: {withheld} path(s) withheld from glob matching; the scrubber refused them")
+    })
 }
 
 /// What [`withhold_unmaskable_notes`] puts in place of a note it withholds.
@@ -1171,6 +1220,115 @@ mod tests {
         }
         assert!(SectionName::FailureReason.is_protected(TemplateRole::Handoff));
         assert!(!SectionName::FailureReason.is_protected(TemplateRole::Phase));
+    }
+
+    /// MOD-9 D116: a refused repo slug or path is withheld from matching, counted, never named;
+    /// a repo stays reached when every path under it goes (D132).
+    #[test]
+    fn drop_unmaskable_files_withholds_and_counts_without_naming() {
+        let scrubber = crate::scrub::MinimalScrubber::new([]);
+        let mut files = StepFiles::default();
+        for (repo, path) in [
+            ("htui", "src/a.rs"),
+            ("htui", "src/sk-live.rs"),
+            ("htui", "docs/ghp_token.md"),
+            ("sk-repo", "x.rs"),
+        ] {
+            files.insert(repo, path);
+        }
+
+        let note = drop_unmaskable_files(&mut files, &scrubber);
+        assert_eq!(
+            note.as_deref(),
+            Some("skills: 3 path(s) withheld from glob matching; the scrubber refused them")
+        );
+        let note = note.unwrap_or_default();
+        assert!(
+            !note.contains("sk-") && !note.contains("ghp_"),
+            "the note names nothing"
+        );
+        let mut kept = StepFiles::default();
+        kept.insert("htui", "src/a.rs");
+        kept.reach("sk-repo");
+        assert_eq!(files, kept, "the refused repo stays reached with no file");
+
+        assert_eq!(
+            drop_unmaskable_files(&mut files, &scrubber),
+            None,
+            "nothing left to withhold"
+        );
+        assert_eq!(files, kept);
+    }
+
+    /// MOD-9 D116, D117 (review finding 2): `assemble` masks the joined `repo:path`, so a path
+    /// whose repo and path each scrub clean but whose join the scrubber refuses is withheld too.
+    /// A secret `i:X` spans the separator: `htui:Xsk-1.rs` masks to `htu[REDACTED]sk-1.rs`, where
+    /// `sk-` now starts a token.
+    #[test]
+    fn drop_unmaskable_files_withholds_a_path_whose_join_the_scrubber_refuses() {
+        let scrubber = crate::scrub::MinimalScrubber::new(["i:X".to_owned()]);
+        assert_eq!(refused_rule(&scrubber, "htui"), None);
+        assert_eq!(refused_rule(&scrubber, "Xsk-1.rs"), None);
+        assert!(
+            refused_rule(&scrubber, "htui:Xsk-1.rs").is_some(),
+            "the joined form trips a prefix rule once masked"
+        );
+        let mut files = StepFiles::default();
+        files.insert("htui", "Xsk-1.rs");
+        files.insert("htui", "src/a.rs");
+
+        assert_eq!(
+            drop_unmaskable_files(&mut files, &scrubber).as_deref(),
+            Some("skills: 1 path(s) withheld from glob matching; the scrubber refused them")
+        );
+        let mut kept = StepFiles::default();
+        kept.insert("htui", "src/a.rs");
+        assert_eq!(files, kept);
+
+        // What `assemble` would have done with it as the recorded match.
+        let mut matched = "htui:Xsk-1.rs".to_owned();
+        assert!(
+            mask(&scrubber, &mut matched, "skills").is_err(),
+            "`assemble` refuses the joined path"
+        );
+    }
+
+    /// MOD-9 D116 (review finding 1): a repo slug is scrubbed once, however many paths it holds.
+    #[test]
+    fn drop_unmaskable_files_scrubs_each_repo_slug_once() {
+        /// Counts the scrubs of one exact string, and delegates.
+        #[derive(Debug)]
+        struct Counting {
+            inner: crate::scrub::MinimalScrubber,
+            of: &'static str,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl Scrubber for Counting {
+            fn scrub(&self, value: &mut Value) -> Result<(), crate::scrub::Unmasked> {
+                if value.as_str() == Some(self.of) {
+                    self.calls
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.inner.scrub(value)
+            }
+        }
+        let scrubber = Counting {
+            inner: crate::scrub::MinimalScrubber::new([]),
+            of: "htui",
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut files = StepFiles::default();
+        for path in ["src/a.rs", "src/b.rs", "src/c.rs", "src/sk-live.rs"] {
+            files.insert("htui", path);
+        }
+        files.insert("docs", "guide.md");
+
+        assert!(drop_unmaskable_files(&mut files, &scrubber).is_some());
+        assert_eq!(
+            scrubber.calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "`htui` holds four paths and is scrubbed once"
+        );
     }
 }
 

@@ -14,7 +14,15 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-30):** **MOD-64 was done** (`docs/decisions/mod/mod-64.md`): `Ctrl+F`
+**Current status (2026-09-30):** **MOD-9 done** (`docs/decisions/mod/mod-9.md`): templates and
+skills are edited, versioned and diffed in the Skills tab, skills are attached at global, project
+or phase level with `always`, `glob` or `off`, SKILL.md files import, and phase steps, judges and
+the preview carry the winners. Its fifth and last milestone makes a `glob` attachment fire over the
+step's file set (the excerpt walk's listing narrowed to `touched_paths`, plus the previous
+attempt's changed paths, which now feed excerpt tier 2 too), recorded as `matched <repo:path>` or
+`no_match` in `trim_record` `v 3` (migration `0008`, comment only). MOD-55, MOD-57 and MOD-59
+carry on from it.
+Before it, **MOD-64 was done** (`docs/decisions/mod/mod-64.md`): `Ctrl+F`
 opens a concepts search overlay from every tab (scope: the workspace or one project, `Ctrl+D`
 decisions, `Ctrl+R` re-index), served off the store worker's loop by `ConceptsRuntime`; `Enter`
 selects the hit in the Backlog or the Requirements tab, and a Qdrant error stays inside the box.
@@ -22,33 +30,31 @@ Before it, **TOOL-7 shipped** (`docs/decisions/tool/tool-7.md`): `scripts/hr` ru
 3–4 `/handoff-run` lifecycles side by side, each in its own container set (fresh clone on
 `hr/<ITEM>`, private Postgres/Qdrant, no git credentials), with cross-run ID leases through
 `scripts/hr-mint`; guide `docs/hr-sandbox.md`.
-Before it, **MOD-39 was done** (`docs/decisions/mod/mod-39.md`): the
-Requirements tab is in (tab 3, so Settings is now 4 and Chat 5), with the project → area →
-requirement tree, coverage with suspect markers, the revision trail with each deciding item, and
-maintainer-only create, amend and withdraw (the maintainer is the project's requirement-spec owner).
-Item detail gained a **Reqs** sub-tab ("Documents" is now "Docs") to re-confirm, cite and uncite,
-and the Runs pane's close-out picks the resolution, so an `open` item can now close as withdrawn,
-rejected, superseded or duplicate. CLEAN-6 was folded in, and the stale `Engine::close_out` doc comments were fixed once
-MOD-40 released `engine.rs`. No migration and no store change.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
-(MOD-38) and `0007_skill_attachments` (MOD-9 milestone 2; cache: `0001`..`0004`), so **the next
-migration is `0008`** (cache: `0005`).
+(MOD-38), `0007_skill_attachments` (MOD-9 milestone 2) and `0008_trim_record_v3` (MOD-9 milestone 5,
+comment only; cache: `0001`..`0004`), so **the next migration is `0009`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
-(done, all four milestones), MOD-38, MOD-9 milestones 1 to 4, MOD-40, MOD-39 and MOD-64 (re-counted
-2026-09-30): store conformance `CASES` 96, `READ_CASES` 14, `htui-orch` `CASES` 73, `GraphSource` 7
-methods, `StoreRequest` 87, `StoreReply` 48, `hierarchy::REQUEST_NAMES` 13, 288 `.sqlx` files, 112
+(done, all four milestones), MOD-38, MOD-9 (done, all five milestones), MOD-40, MOD-39 and MOD-64
+(re-counted 2026-09-30): store conformance `CASES` 96, `READ_CASES` 14, `htui-orch` `CASES` 73,
+`GraphSource` 7 methods, `StoreRequest` 87, `StoreReply` 48, `hierarchy::REQUEST_NAMES` 13,
+`skills::REQUEST_NAMES` 6, `TABLES` 39, 288 `.sqlx` files, 112
 `crates/htui/tests/snapshots`,
 `MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 34 pinned commented
-columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 2` with `skill_choices`.
+columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 3` with `skill_choices` (a
+`matched` choice carries `path`, `<repo>:<path>`); `Isolator` gained `changed_paths` (MOD-9 D119).
 Excerpts reach phase prompts since MOD-7 milestone 4, so a phase-prompt digest recorded before
-2026-09-26 does not compare with a later one; handoff digests are unchanged.
+2026-09-26 does not compare with a later one; since MOD-9 milestone 5 (2026-09-30) a matched `glob`
+skill renders and a retry's excerpts rank the previous attempt's changed paths, so those digests
+move too; handoff digests are unchanged.
 `cargo doc --workspace --no-deps --keep-going` shows exactly six baseline errors (`htui-core`
 `MIRRORED_TABLES`; `htui-store` `step_exists`, `HashEmbedder` in `embed.rs`, and three private
 links MOD-38 added in `pg/write.rs`: `set_requirement_spec` to `cas_miss`, `amend_requirement` and
 `withdraw_requirement` to `revise_requirement`; the count read five before 2026-09-26, but
-`HashEmbedder` already failed at `98e6d2f`). `git` ≥ 2.33.0 is a runtime dependency
+`HashEmbedder` already failed at `98e6d2f`). With `-D warnings`, `cargo doc` also fails on four
+pre-existing private-item links (`store/traits.rs:1251`, `agent_worker.rs:729`,
+`ui/text_area.rs:18`, `ui/text_field.rs:5`; recorded at MOD-9's close, `docs/decisions/mod/mod-9.md`). `git` ≥ 2.33.0 is a runtime dependency
 of the `worktree` isolation mode and of reconciliation. **Production `approve` and `accept` are
 greyed and every production judge fails until MOD-11**, because no agent can write its phase's
 `output_kind` document yet, so production fan-outs go to the human (`s` in the Runs pane).
@@ -80,9 +86,9 @@ ANA-5 (`docs/decisions/ana/ana-5.md`) — the prompt contract, no new crate, no 
 ANA-17 (`docs/decisions/ana/ana-17.md`) settling its block separator and keeping one frame for
 every model;
 ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set status tables,
-`htui-orch`, now built (MOD-4, `docs/decisions/mod/mod-4.md`). MOD-9, MOD-11, MOD-12, MOD-13 and
-MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
-`docs/decisions/mod/mod-7.md`).
+`htui-orch`, now built (MOD-4, `docs/decisions/mod/mod-4.md`). MOD-11, MOD-12, MOD-13 and MOD-14
+can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
+`docs/decisions/mod/mod-7.md`; MOD-9 is done, `docs/decisions/mod/mod-9.md`).
 
 ---
 
@@ -175,7 +181,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
     F-K, H-9, H-10; drive plan, "What this milestone touches").
   - **R-6**: nothing writes `phase_agent` for an override graph copy: `WriteStore` has no
     `phase_agent` writer at all. The `is_override` half is closed, since MOD-9 milestone 3's
-    `override_graph` (`crates/htui-orch/src/graph.rs`) writes it on every copy. The plans
+    (`docs/decisions/mod/mod-9.md`) `override_graph` (`crates/htui-orch/src/graph.rs`) writes it on every copy. The plans
     named MOD-15's phase editor as its owner, but MOD-15 closed on 2026-09-17, so it lands here
     (engine blueprint F-J; drive plan, "What this milestone touches").
   - **R-29**: Postgres stores `queued_at` in microseconds and `MemStore` in nanoseconds, so a
@@ -298,7 +304,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   ` · read-only` marker before the project name) and the Reqs sub-tab's `cut`
   (`docs/decisions/mod/mod-39.md`, "Carried").
 - [ ] **MOD-59 - A write's reply names itself, so a form never stays "in flight"** (from MOD-9
-  milestone 3 review, finding 3). `R-TUI-7`, `R-NF-3`. The Skills and Templates views decide that a
+  milestone 3 review, finding 3; `docs/decisions/mod/mod-9.md`). `R-TUI-7`, `R-NF-3`. The Skills and Templates views decide that a
   save landed by finding what they sent in the re-read snapshot (`ui/tabs/skills/library.rs` `land`,
   milestone 1's D27 in `templates.rs`). If another session changes the same skill, binding or
   template between the write and the worker's re-read, or `MemStore` stamps two writes with the same
@@ -330,92 +336,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   `.claude/plans/mod-7-box-settings-section.plan.md`. Unblocked: MOD-7 is done
   (`docs/decisions/mod/mod-7.md`); its milestone 2 landed
   (the Boxes section, `crates/htui/src/ui/tabs/settings/boxes.rs`, and `crate::box_settings`).
-- [ ] **MOD-9 - Skill library and templates.** `R-SKL-1..4`, `R-PRM-4`, `R-TUI-7`. Versioned skills,
-  project and phase bindings, template rows, Skills tab editor with version diff, import of
-  existing skill markdown files. Per ANA-5 (`docs/ANA-5.md` §4.1, §5.4): template save validation
-  calls `htui_core::prompt::template::parse`; `judge` and `handoff` are reserved names whose
-  `TemplateRole` derives from the row name; the closed placeholder tables are the editor's inline
-  help. Not blocked, and the dependency is now satisfied: **MOD-2 shipped the validator**
-  (`docs/decisions/mod/mod-2.md`), so ANA-5 risk 11 is closed. Three things are waiting here by
-  name. `htui_core::prompt::template::parse` refuses with a **byte offset**, so the editor can put
-  the cursor on the mistake rather than reporting "invalid". `htui_core::prompt::render::template_text`
-  is deliberately kept though the assembler no longer calls it (MOD-2 finding F-83, `fd9e752`): it is
-  for exactly this editor, which has a `ParsedTemplate` and no scrubber, and its doc says so. And the
-  skill model layer is here already, read-only (MOD-2 D105) — `Skill`, `SkillVersion`,
-  `SkillBinding`, `BoundSkill` with the `R-SKL-2` collapse and the `max_skill_tokens` cap — so this
-  item owns only the writers `upsert_skill`, `add_skill_version` and `set_skill_binding`, plus the
-  editor. `htui_core::prompt::defaults::DEFAULT_TEMPLATES` is the ten bodies to seed *from*; seeding
-  them into a project's `prompt_template` rows **landed with MOD-15** (ANA-5 §4.6,
-  `docs/decisions/mod/mod-15.md`): `htui_core::seed` writes all ten at version 1 on create. **PRD:**
-  `.claude/prds/mod-9-skill-library-templates.prd.md` (2026-09-25) — everything in the Skills tab
-  (templates and skills views, no Settings section), in-app `TextArea` plus `$EDITOR`, bound skills
-  wired into engine and preview. Milestones 1 (templates editable), 2 (skills reach the run), 3 (skill
-  writers, bindings) and 4 (SKILL.md import) have landed, the last two following ANA-22's verdict
-  (`docs/decisions/ana/ana-22.md`, concluded 2026-09-25: skills attached at global, project or phase
-  level with the activation on the attachment, §7 schema and import mapping, §8 phasing).
-  Agent help while editing is MOD-55.
-  **Phase 1 landed (`e971418`..`caacc96`, 2026-09-25):** milestone 1, templates editable — the
-  `append_prompt_template` compare-and-set writer on every store (append-only, head version as the
-  token), `ui::TextArea`, the `$EDITOR` handoff with the terminal suspended and SIGINT/SIGQUIT held
-  off htui, `Templates`/`SaveTemplate` on the store worker, and the Skills tab's `Templates` view
-  (parse-gated save with the cursor on the error, wrapped and scrollable diff between any two
-  versions or against the built-in default); plan `.claude/plans/mod-9-templates-editable.plan.md`,
-  blueprint `.claude/plans/mod-9-templates-editable.blueprint.md`.
-  **Phase 2 landed (`7be0794`..`fd5161e`, 2026-09-26):** milestone 2, skills reach the run, widened
-  by the maintainer to ANA-22's storage and activation read side. Migration `0007_skill_attachments`
-  (ANA-22 §7.1: global level, `activation`/`globs`/`languages`, `skill_version.source`); one pure
-  `model::skill::resolve` (most specific attachment wins, a missing winning pin never falls back)
-  shared by both stores; `select` in the assembler (`always` active; `off`, `glob`→`no_path`,
-  `missing_version`, `not_placed` inactive) with every choice in `trim_record.skill_choices`
-  (record `v: 2`); `GraphSource::bound_skills`, so phase steps and judges get the phase's
-  candidates (a judge body may place `{{skills}}`, D48, though the default judge does not: its
-  replayed `{{task}}` already carries them) and handoffs none; the preview resolves the phase that
-  uses the chosen template and the Prompt sub-tab lists the choices. `R-SKL-2` amended. Plan
-  `.claude/plans/mod-9-skills-reach-the-run.plan.md`, blueprint
-  `.claude/plans/mod-9-skills-reach-the-run.blueprint.md` (final review `rust-reviewer` APPROVE
-  WITH FIXES, findings applied).
-  **Phase 3 landed (`df91c82`..`e5db119`, 2026-09-26):** milestone 3, skills editable and
-  attachable, **split by the maintainer** (glob *firing* is the PRD's new row 5, "Glob attachments
-  fire": the F2 file set, roots for fan-out groups, changed paths, `matched`/`no_match`; unblocked
-  now that MOD-7 milestone 4 runs the excerpt pass over `repo_box_path` roots). Shipped: skill names checked by the Agent Skills rule; `globset` (new
-  dependency) behind `model::skill_glob` (`<repo>:` qualifiers, brace-aware lists,
-  `canonical_globs`) and a seed language map (`model::skill_language`, fourteen languages); seven
-  `WriteStore` methods on every store (`skills`, `skill_versions`, `skill_bindings`, `create_skill`
-  with v1 in one transaction, `update_skill`, `add_skill_version`, `set_skill_binding`), each writer
-  a compare-and-set with one refusal chain (`check_attachment`), `CASES` 82; the clone gap closed
-  (`NewStepGraph.is_override` written, `override_graph` checks every copy before any write and
-  carries the source phases' attachments; the engine's clone-gap note is gone); `crate::skills` on
-  the store worker; the Skills view (library, versions, diff, `TextArea` and `$EDITOR`, token
-  estimate, rename; attachments pane with a global row, winner stars, a form showing the effective
-  globs and a repo picker). No migration; `.sqlx` 280. Plan
-  `.claude/plans/mod-9-skills-editable.plan.md`, blueprint
-  `.claude/plans/mod-9-skills-editable.blueprint.md` (F-H decided: an override clone is checked
-  first, then refused). Review `rust-reviewer` APPROVE WITH FIXES: findings 1, 2, 4, 5, 7 and the
-  acceptance gap (a phase `off` over a global `always`, end to end) applied (`22822ca`..`e5db119`);
-  finding 3 opened as MOD-59; finding 8 accepted (documented residue in `crates/htui/src/skills.rs`).
-  **Phase 4 landed (`09fd007`..`6af3f53`, 2026-09-29):** milestone 4, SKILL.md import, ported
-  from PR #10 (`4abb49a`..`bbac75c`) onto the milestone 3 above; #10's own milestone 3 was not taken.
-  A hand-written frontmatter reader (`model::frontmatter`, no YAML dependency, per-key issues with
-  byte and line, block scalars accepted) and ANA-22 §7.3's mapping (`model::skill_import`,
-  `prefill_from_source`); `StoreRequest::ImportSkills` / `StoreReply::SkillImports`
-  (`skills::REQUEST_NAMES` 5 → 6) walking a file or directory on the store worker
-  (`crate::skill_import`: any SKILL.md to depth 4, a rules directory's `*.md`/`*.mdc`, a hidden tool
-  root's rules child only, bundled `scripts/`/`references/`/`assets/` skipped and listed, 64-file
-  and 256 KiB caps asked before the read) and writing through `create_skill`, or through
-  `update_skill` for a moved description and `add_skill_version` for a changed body when the name
-  exists — never an attachment; the Skills
-  view's `I` path form and per-file report; the attachments pane prefilling a new attachment from
-  the head's `source`. Three review findings fixed in the port: a hidden tool root collected its own
-  markdown and skipped its rules files, a `<name>.instructions.md` or snake-case stem was refused,
-  and a name repeated in one import answered a spurious stale refusal. No migration, no
-  `WriteStore` method, no `.sqlx` file, no dependency. Plan
-  `.claude/plans/mod-9-skill-import.plan.md`, blueprint
-  `.claude/plans/mod-9-skill-import.blueprint.md`, each headed by the port's departures.
-  **Row 5 (glob attachments fire) is next, and is the last open part of MOD-9.** Carry into it: a
-  `glob` attachment still records `no_path`, and an imported file's globs prefill the form but
-  match nothing until row 5. Still open from milestone 3: the Skills view cannot open an editor on
-  a skill with no version (review finding 6, `library.rs` `on_skill_key`); import cannot produce
-  one (`create_skill` writes v1 with the row), so only a hand-written row can.
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
   pattern masks, fail-closed persistence gate, Settings tab secret provider section. **No longer
@@ -605,8 +525,8 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   registered section**: MOD-15 added `hierarchy`, `kinds`, `prompt` and `connection` after it, so
   MOD-34 added `qdrant` and MOD-7 milestone 2 `boxes`, so the strip is seven titles wide (61 of
   the pinned 100 columns, `tests/settings.rs`) and
-  `SettingsSection::captures_input` now exists for a section that takes typed input. MOD-9 adds
-  none (its editors live in the Skills tab, PRD D1). MOD-2 built it read-only (`r` probe, `i` install, `a` authenticate, `o` open, `x` cancel)
+  `SettingsSection::captures_input` now exists for a section that takes typed input. MOD-9 added
+  none (its editors live in the Skills tab, PRD D1; `docs/decisions/mod/mod-9.md`). MOD-2 built it read-only (`r` probe, `i` install, `a` authenticate, `o` open, `x` cancel)
   and MOD-20/MOD-21 added the install and login actions, so what is missing is the **write** half
   that `R-AGT-4`'s field list and `R-AGT-6`'s "manual entries allowed" still owe. MOD-2 milestone 5
   **D45** already added `probe.source` (`probe` | `manual`) so that "a manual entry is never
@@ -732,15 +652,16 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   not the worker, resolves project secrets. Blocked on MOD-47, MOD-10.
 
 - [ ] **MOD-55 - Ask an agent for help while editing a template or skill** (from MOD-9, PRD gate
-  2026-09-25). `R-SKL-3`, `R-PRM-4`. MOD-9's editor (Skills tab, `TextArea` and `$EDITOR`,
+  2026-09-25; `docs/decisions/mod/mod-9.md`). `R-SKL-3`, `R-PRM-4`. MOD-9's editor (Skills tab, `TextArea` and `$EDITOR`,
   `.claude/prds/mod-9-skill-library-templates.prd.md` D2) gains an action that sends the body being
   edited, the role's placeholder table and the maintainer's request to a configured agent and offers
   the reply as a proposed edit, shown as a diff and saved only through the same `parse` gate. Open:
   which agent and model answer (the chat driver or a one-shot CLI call), whether the exchange is
-  recorded, and how secrets in a body are scrubbed before they leave. Not blocked: MOD-9 milestone 1 (templates editable) landed 2026-09-25.
+  recorded, and how secrets in a body are scrubbed before they leave. Not blocked: MOD-9 is done (`docs/decisions/mod/mod-9.md`); the editor this extends landed with
+  its milestone 1 and the Skills view with milestone 3.
 
-- [ ] **MOD-57 - Run the external editor inside the TUI pane** (from MOD-9, merge of MOD-7
-  milestone 2, maintainer-decided 2026-09-26). `R-TUI-1`, `R-TUI-7`, `R-NF-1`. Today `E`/`Ctrl+E`
+- [ ] **MOD-57 - Run the external editor inside the TUI pane** (from MOD-9, `docs/decisions/mod/mod-9.md`;
+  merge of MOD-7 milestone 2, maintainer-decided 2026-09-26). `R-TUI-1`, `R-TUI-7`, `R-NF-1`. Today `E`/`Ctrl+E`
   in the Templates editor (and any later user of the shared `ui::TextArea`) suspends the whole TUI
   and runs `$VISUAL`/`$EDITOR` full-screen (`crates/htui/src/editor.rs`). Offer a toggle that runs
   the editor inside the editing pane instead, with the rest of the TUI still drawn: a pseudo-terminal
@@ -792,6 +713,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 4 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-26 configurable hotkeys) |
-| MOD-N   | 34 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 33 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-7 offline-buffer leftovers)            |
 | TOOL-N  | 0 |

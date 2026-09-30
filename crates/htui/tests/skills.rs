@@ -22,8 +22,8 @@ use htui::testkit::Harness;
 use htui::ui::tabs::SkillsTab;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Activation, Attachment, BindingChange, NewRepo, NewSkillVersion, RepoId, SkillBinding,
-    SkillBindingKey, SkillVersion,
+    Activation, Attachment, BindingChange, NewRepo, NewSkillVersion, RepoBoxPath, RepoId,
+    SkillBinding, SkillBindingKey, SkillVersion,
 };
 use htui_core::store::{CasOutcome, MemStore, WriteStore};
 
@@ -180,11 +180,12 @@ async fn set_binding(
     );
 }
 
-/// Adds repo `name` to `htui`.
-async fn add_repo(store: &MemStore, name: &str, is_primary: bool) {
+/// Adds repo `name` to `htui`, answering its id.
+async fn add_repo(store: &MemStore, name: &str, is_primary: bool) -> RepoId {
+    let id = RepoId::new();
     store
         .create_repo(NewRepo {
-            id: RepoId::new(),
+            id,
             project_id: ids::PROJECT_HTUI,
             name: name.to_owned(),
             remote_url: None,
@@ -193,6 +194,39 @@ async fn add_repo(store: &MemStore, name: &str, is_primary: bool) {
         })
         .await
         .expect("the repo write");
+    id
+}
+
+/// Roots `repo` on the demo box, as a `repo_box_path` row (MOD-9 D126).
+async fn root_on_this_box(store: &MemStore, repo: RepoId) {
+    store
+        .upsert_repo_box_path(&RepoBoxPath {
+            repo_id: repo,
+            box_id: ids::BOX,
+            local_path: format!("/src/{repo}"),
+            updated_at: DateTime::UNIX_EPOCH,
+        })
+        .await
+        .expect("the path write");
+}
+
+/// Sets `htui`'s demo `tests` row to `glob` over `globs` and `languages`.
+async fn tests_row_as_glob(store: &MemStore, globs: &[&str], languages: &[&str]) {
+    let row = htui_row(store, ids::SKILL_TESTS)
+        .await
+        .expect("the demo `tests` row");
+    set_binding(
+        store,
+        SkillBindingKey::of(&row),
+        Some(row.updated_at),
+        BindingChange::Attach(Attachment {
+            activation: Activation::Glob,
+            globs: globs.iter().map(|glob| (*glob).to_owned()).collect(),
+            languages: languages.iter().map(|lang| (*lang).to_owned()).collect(),
+            ..always()
+        }),
+    )
+    .await;
 }
 
 // --- snapshots ---------------------------------------------------------------------------------
@@ -638,33 +672,65 @@ async fn the_winning_row_is_starred_per_project() {
     );
 }
 
+/// MOD-9 D126: a project `glob` row whose globs reach a repo with no path on this box says so;
+/// the demo box has no `repo_box_path` row for either repo.
 #[tokio::test]
-async fn a_glob_row_says_it_fires_from_milestone_5() {
+async fn a_glob_row_names_repos_with_no_path_here() {
     let store = MemStore::demo();
-    let row = htui_row(&store, ids::SKILL_TESTS)
-        .await
-        .expect("the demo `tests` row");
-    set_binding(
-        &store,
-        SkillBindingKey::of(&row),
-        Some(row.updated_at),
-        BindingChange::Attach(Attachment {
-            activation: Activation::Glob,
-            languages: vec!["rust".to_owned()],
-            ..always()
-        }),
-    )
-    .await;
+    add_repo(&store, "htui", true).await;
+    add_repo(&store, "web", false).await;
+    tests_row_as_glob(&store, &[], &["rust"]).await;
     let mut harness = open_platform_over(store).await;
     select(&mut harness, "tests");
     harness.key("a");
     let frame = harness.render();
     assert!(
         line_with(&frame, " htui ").contains(
-            "glob \u{b7} latest \u{b7} pos 0 \u{b7} 2 globs \u{b7} fires from milestone 5"
+            "glob \u{b7} latest \u{b7} pos 0 \u{b7} 2 globs \u{b7} no path here: htui, web"
         ),
         "{frame}"
     );
+}
+
+/// MOD-9 D126: with every repo rooted on this box there is nothing to warn about.
+#[tokio::test]
+async fn a_glob_row_with_every_repo_rooted_adds_nothing() {
+    let store = MemStore::demo();
+    let htui = add_repo(&store, "htui", true).await;
+    let web = add_repo(&store, "web", false).await;
+    root_on_this_box(&store, htui).await;
+    root_on_this_box(&store, web).await;
+    tests_row_as_glob(&store, &[], &["rust"]).await;
+    let mut harness = open_platform_over(store).await;
+    select(&mut harness, "tests");
+    harness.key("a");
+    let frame = harness.render();
+    let line = line_with(&frame, " htui ");
+    assert!(
+        line.trim_end().ends_with("\u{b7} 2 globs"),
+        "the summary ends at the globs: {frame}"
+    );
+    assert!(!line.contains("no path here"), "{frame}");
+}
+
+/// MOD-9 D126 (D112's reach): a glob qualified with `web` can only fire in `web`, so only `web`
+/// is named, though `htui` has no path either.
+#[tokio::test]
+async fn a_qualified_glob_warns_only_for_its_own_repo() {
+    let store = MemStore::demo();
+    add_repo(&store, "htui", true).await;
+    add_repo(&store, "web", false).await;
+    tests_row_as_glob(&store, &["web:**/*.ts"], &[]).await;
+    let mut harness = open_platform_over(store).await;
+    select(&mut harness, "tests");
+    harness.key("a");
+    let frame = harness.render();
+    let line = line_with(&frame, " htui ");
+    assert!(
+        line.contains("glob \u{b7} latest \u{b7} pos 0 \u{b7} 1 globs \u{b7} no path here: web"),
+        "{frame}"
+    );
+    assert!(!line.contains("no path here: htui"), "{frame}");
 }
 
 #[tokio::test]
@@ -761,8 +827,10 @@ async fn an_attachment_saved_in_the_form_lands_and_the_form_closes() {
         frame.contains("effective:  **/*.rs, **/Cargo.toml"),
         "{frame}"
     );
+    // The form's field sits at the panel's left border; the `htui` row's `2 globs` now ends its
+    // line too (MOD-9 D126 dropped `fires from milestone 5`), so the needle carries the border.
     assert!(
-        line_with(&frame, "globs       ") == "globs",
+        line_with(&frame, "\u{2502}globs       ") == "globs",
         "the stored globs minus the language's are empty: {frame}"
     );
 }
