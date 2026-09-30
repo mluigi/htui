@@ -45,13 +45,11 @@ async fn platform_scope() -> Scope {
     Scope::from_workspace(platform)
 }
 
-/// Settings whose identity halves point at the demo box and the demo user, as `load_demo` leaves
-/// [`htui_store::PgStore`].
+/// Settings whose `this_box` points at the demo box, as `load_demo` leaves [`htui_store::PgStore`].
 fn settings(db: &common::TestDb, transcript_steps: i64) -> RefreshSettings {
     RefreshSettings {
         transcript_steps,
         this_box: db.store.this_box(),
-        this_user: db.store.this_user(),
         ..RefreshSettings::default()
     }
 }

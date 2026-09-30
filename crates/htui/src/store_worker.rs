@@ -2185,8 +2185,8 @@ async fn go_online(
         tracing::error!("no mirror to go online over; keeping the current backend");
         return;
     };
-    // Read before the move: `this_box`, `this_user` and the two cache settings are what only a
-    // connected server knows (blueprint C.13's `RefreshSettings`).
+    // Read before the move: `this_box` and the two cache settings are what only a connected server
+    // knows (blueprint C.13's `RefreshSettings`).
     let settings = connect::refresh_settings(&pg, base).await;
     *backend = Backend::Online { pg, cache };
     if let Some(previous) = refresher.take() {

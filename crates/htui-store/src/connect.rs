@@ -610,16 +610,15 @@ pub fn persist_registration(root: &Path, presented: &Identity, store: &PgStore) 
     Ok(())
 }
 
-/// Fills in what only a connected server knows: this box, this user and the two cache settings.
+/// Fills in what only a connected server knows: this box and the two cache settings.
 ///
-/// `this_box` / `this_user` come from the store ([`PgStore::this_box`], [`PgStore::this_user`]);
-/// the interval and the overlap come from `app_setting`, which [`PgStore::seed_if_empty`] seeds
-/// with 30 s and 300 s. A missing, non-numeric or non-positive value keeps `base`'s value, and a
-/// failed read is a `warn!` rather than a refusal to mirror at all.
+/// `this_box` comes from the store ([`PgStore::this_box`]); the interval and the overlap come from
+/// `app_setting`, which [`PgStore::seed_if_empty`] seeds with 30 s and 300 s. A missing,
+/// non-numeric or non-positive value keeps `base`'s value, and a failed read is a `warn!` rather
+/// than a refusal to mirror at all.
 pub async fn refresh_settings(pg: &PgStore, base: RefreshSettings) -> RefreshSettings {
     let mut settings = RefreshSettings {
         this_box: pg.this_box(),
-        this_user: pg.this_user(),
         ..base
     };
 
