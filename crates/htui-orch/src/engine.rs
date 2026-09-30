@@ -8766,15 +8766,18 @@ mod tests {
 
         let clock = &harness.orch.clock;
         let walk = async move {
-            for second in 1_u32.. {
+            let mut second = 0_u32;
+            loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 clock.advance(TimeDelta::seconds(1));
+                second += 1;
                 match second {
                     10 => clock.advance(TimeDelta::hours(1)),
                     20 => clock.advance(TimeDelta::hours(-2)),
                     _ => {}
                 }
             }
+            #[allow(unreachable_code)]
             Ok::<(), EngineError>(())
         };
         let taken = tokio::time::Instant::now();
@@ -8814,13 +8817,16 @@ mod tests {
 
         let clock = &harness.orch.clock;
         let walk = async move {
-            for second in 1_u32.. {
+            let mut second = 0_u32;
+            loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 clock.advance(TimeDelta::seconds(1));
+                second += 1;
                 if second == 10 {
                     clock.advance(TimeDelta::days(1));
                 }
             }
+            #[allow(unreachable_code)]
             Ok::<(), EngineError>(())
         };
         let still = tokio::time::timeout(
