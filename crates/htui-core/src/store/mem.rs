@@ -8568,7 +8568,7 @@ mod tests {
             "the fixture's queued runs predate this case's, got {fixture:?}"
         );
         let late = early + TimeDelta::seconds(1);
-        let queue = |title: &'static str, target: BoxId, queued_at| {
+        let queue = |id: RunId, title: &'static str, target: BoxId, queued_at| {
             let store = &store;
             async move {
                 let item = store
@@ -8590,6 +8590,7 @@ mod tests {
                     .id;
                 store
                     .create_run(NewRun {
+                        id,
                         target_box_id: target,
                         queued_at,
                         ..graph_run(item, ids::PROJECT_HTUI, Vec::new())
@@ -8599,11 +8600,17 @@ mod tests {
                     .id
             }
         };
-        let running = queue("running on this box", ids::BOX, early).await;
-        let last = queue("queued last", ids::BOX, late).await;
-        let tied_a = queue("queued first, tied", ids::BOX, early).await;
-        let tied_b = queue("queued first, tied too", ids::BOX, early).await;
-        let _theirs = queue("queued on another box", other, early).await;
+        // The tied pair is inserted larger id first, so insertion order disagrees with `id` order
+        // and only the `id` tie-break puts the smaller one first.
+        let (first, second) = {
+            let (a, b) = (RunId::new(), RunId::new());
+            if a < b { (a, b) } else { (b, a) }
+        };
+        let running = queue(RunId::new(), "running on this box", ids::BOX, early).await;
+        let last = queue(RunId::new(), "queued last", ids::BOX, late).await;
+        queue(second, "queued first, tied, larger id", ids::BOX, early).await;
+        queue(first, "queued first, tied, smaller id", ids::BOX, early).await;
+        let _theirs = queue(RunId::new(), "queued on another box", other, early).await;
         assert_eq!(
             store
                 .claim_run(
@@ -8619,11 +8626,6 @@ mod tests {
             "one run on this box is running, not queued"
         );
 
-        let (first, second) = if tied_a < tied_b {
-            (tied_a, tied_b)
-        } else {
-            (tied_b, tied_a)
-        };
         let mut expected = fixture;
         expected.extend([(first, early), (second, early), (last, late)]);
         assert_eq!(
