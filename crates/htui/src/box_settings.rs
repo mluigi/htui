@@ -77,7 +77,8 @@ pub async fn snapshot(backend: &Backend, writer: &Writer) -> Result<BoxesSnapsho
 /// vanished under an open editor reaches the section as a snapshot without it.
 ///
 /// # Errors
-/// Whatever the seam reports (a `Constraint` becomes `Failed` with the tag sentence), plus
+/// Whatever the seam reports (a `Constraint` becomes `Failed` with the store's tag or executor
+/// sentence), plus
 /// `Unreachable` offline and `Backend` for a request that is not one of the two.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
     let writer = backend
@@ -96,8 +97,8 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             // The worker re-reads rather than handing the section the single row `Stale` carries:
             // the section renders the whole list, and a row patched in locally would be a second
             // source of truth. A box gone under the editor is a miss like a spent token (D48's
-            // `DELETED_ELSEWHERE`); a refused tag list stays an error, so `Failed` carries the
-            // store's sentence.
+            // `DELETED_ELSEWHERE`); a refused tag list or executor (MOD-41 plan D10) stays an
+            // error, so `Failed` carries the store's sentence.
             let applied = match writer.edit_box(*box_id, *expected, edit.clone()).await {
                 Ok(CasOutcome::Applied(_)) => true,
                 Ok(CasOutcome::Stale(_)) | Err(StoreError::NotFound { entity: "box", .. }) => false,

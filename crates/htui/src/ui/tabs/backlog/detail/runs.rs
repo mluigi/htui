@@ -1166,6 +1166,12 @@ impl DetailTab for RunsTab {
         !matches!(self.mode, Mode::Browse)
     }
 
+    /// MOD-41 plan D16: an item is selected and one of its runs is `queued`, `running` or
+    /// `awaiting_approval`, as the last `Runs` reply had it.
+    fn has_active_run(&self) -> bool {
+        self.item.is_some() && self.runs.iter().any(|run| run.status.is_active())
+    }
+
     /// The pane's replies (blueprint §9.5): its rows, its verdicts, the stream's invalidations,
     /// the answers to what it sent, and the document it opened.
     ///

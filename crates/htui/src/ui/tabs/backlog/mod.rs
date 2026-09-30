@@ -32,6 +32,10 @@ const DETAIL_PERCENT: u16 = 45;
 /// How far the link traversal of the Graph sub-tab reaches (plan D11).
 const HOPS: u8 = 1;
 
+/// Refreshes between two `Runs` polls: five of the shell's one-second refreshes, so 5 s (MOD-41
+/// plan D16, OQ-3).
+const REFRESHES_PER_RUNS_POLL: u32 = 5;
+
 /// The Backlog screen.
 ///
 /// Holds no store handle and no channel (`R-NF-3`): rows arrive through [`Tab::on_reply`] and
@@ -46,6 +50,9 @@ pub struct BacklogTab {
     selected: Option<Selection>,
     /// Body, Runs, Graph, Docs, Notes, Prompt, Reqs, in that order.
     detail: DetailRegistry,
+    /// The shell's refreshes this tab has seen while active; every
+    /// [`REFRESHES_PER_RUNS_POLL`]th is a `Runs` poll (MOD-41 plan D16).
+    refreshes: u32,
 }
 
 impl Default for BacklogTab {
@@ -75,6 +82,7 @@ impl BacklogTab {
             folded: Vec::new(),
             selected: None,
             detail,
+            refreshes: 0,
         }
     }
 
@@ -250,6 +258,24 @@ impl Tab for BacklogTab {
         self.detail.on_reply(reply, ctx);
     }
 
+    /// MOD-41 plan D16: every fifth refresh (5 s), the selected item's runs are read again while
+    /// the detail shows one of them active, so a run another process walks moves on screen. No
+    /// frame reaches this process for such a run; MOD-43's `LISTEN` keeps this as its backstop.
+    ///
+    /// `Runs` only: `RunsTab::on_runs` asks for `RunActions` after every `Runs` reply, so asking
+    /// for both would read the verdicts twice. The reply keeps the cursor (MOD-4 D198).
+    fn on_refresh(&mut self, ctx: &mut Ctx<'_>) {
+        self.refreshes = self.refreshes.wrapping_add(1);
+        if !self.refreshes.is_multiple_of(REFRESHES_PER_RUNS_POLL) {
+            return;
+        }
+        if let Some(item) = self.selected_item()
+            && self.detail.has_active_run()
+        {
+            ctx.request(StoreRequest::Runs(item));
+        }
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let [left, right] = panes(area);
 
@@ -362,6 +388,7 @@ mod tests {
             folded: Vec::new(),
             selected: Some(first),
             detail,
+            refreshes: 0,
         };
 
         let (top_bar, keymap, theme, emit) = (

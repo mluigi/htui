@@ -18,7 +18,7 @@ use htui::testkit::{Harness, SectionBench};
 use htui::ui::tabs::settings::{BoxesSection, SettingsSection, SettingsTab};
 use htui_agent::box_probe::spec;
 use htui_core::fixtures::{demo_data, ids};
-use htui_core::model::{BoxEdit, BoxId, BoxRecord, Scope, canonical_declared_tags};
+use htui_core::model::{BoxEdit, BoxId, BoxRecord, Executor, Scope, canonical_declared_tags};
 use htui_core::store::{MemStore, StoreError};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use serde_json::{Value, json};
@@ -41,6 +41,23 @@ fn two_boxes() -> MemStore {
         .clone();
     second.id = BoxId::from_uuid(Uuid::from_u128(1));
     second.hostname = "SECOND-BOX".to_owned();
+    data.boxes.push(second);
+    MemStore::from_demo(data)
+}
+
+/// [`two_boxes`] with `SECOND-BOX` handed to `htui worker` (MOD-41 plan D10): its settings blob
+/// keeps the fixture's admission limit beside `executor`.
+fn two_boxes_one_worker() -> MemStore {
+    let mut data = demo_data();
+    let mut second = data
+        .boxes
+        .iter()
+        .find(|row| row.id == ids::BOX)
+        .expect("the fixture box")
+        .clone();
+    second.id = BoxId::from_uuid(Uuid::from_u128(1));
+    second.hostname = "SECOND-BOX".to_owned();
+    second.settings = json!({ "max_concurrent_items": 2, "executor": "worker" });
     data.boxes.push(second);
     MemStore::from_demo(data)
 }
@@ -384,6 +401,16 @@ fn tags_of(edit: &BoxEdit) -> Option<Vec<&str>> {
 /// The detail pane's `host` row for `hostname`: the 14-wide label column, then the value.
 fn host_row(hostname: &str) -> String {
     format!("{:<14}{hostname}", "host")
+}
+
+/// The detail pane's `executor` row for `executor`: the 14-wide label column, then the value.
+fn executor_row(executor: &str) -> String {
+    format!("{:<14}{executor}", "executor")
+}
+
+/// A frame's words joined by single spaces, so a sentence the detail pane wrapped reads whole.
+fn words(frame: &str) -> String {
+    frame.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The last line of a frame that is not blank: the notice when one shows, else the hint.
@@ -792,7 +819,7 @@ async fn a_refused_read_keeps_an_open_editor_visible_and_blocks_new_ones() {
     );
 
     bench.key(&mut section, "esc");
-    for key in ["t", "e", "p"] {
+    for key in ["t", "e", "p", "w"] {
         bench.key(&mut section, key);
         assert!(!section.captures_input(), "{key} opened nothing");
     }
@@ -925,6 +952,233 @@ async fn ctrl_c_passes_through_an_open_quirks_editor() {
     bench.key(&mut section, "e");
     assert_eq!(bench.key(&mut section, "ctrl-c"), Handled::Pass);
     assert!(section.captures_input(), "the editor is still open");
+}
+
+/// MOD-41 plan D10: the detail pane shows the selected box's executor: `tui` when the key is
+/// missing, `worker` as written, and an unknown value as its text.
+#[tokio::test]
+async fn the_boxes_section_shows_each_box_s_executor() {
+    let (bench, mut section) = bench_with(&snap_of(two_boxes_one_worker()).await).await;
+
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains(&host_row("DESKTOP-HTUI (this box)")),
+        "{frame}"
+    );
+    assert!(
+        frame.contains(&executor_row("tui")),
+        "a box without the key is a TUI box: {frame}"
+    );
+
+    bench.key(&mut section, "k");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains(&host_row("SECOND-BOX")), "{frame}");
+    assert!(
+        frame.contains(&executor_row("worker")),
+        "the planted worker box: {frame}"
+    );
+
+    let mut snapshot = snap_of(MemStore::demo()).await;
+    snapshot.boxes[0].row.settings = json!({ "executor": "container" });
+    let (bench, section) = bench_with(&snapshot).await;
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains(&executor_row("container")),
+        "an unknown executor shows its text: {frame}"
+    );
+}
+
+/// MOD-41 plan D10: `w` asks first and writes nothing; `y` sends the executor alone against the
+/// row's token, and the reply to it closes the confirmation; `n` and `Esc` send nothing.
+#[tokio::test]
+async fn w_flips_the_executor_after_confirmation() {
+    let (bench, mut section) = bench_with(&demo_at_version(3).await).await;
+
+    assert_eq!(bench.key(&mut section, "w"), Handled::Consumed);
+    assert!(section.captures_input(), "the confirmation takes the keys");
+    assert!(requests(&bench).is_empty(), "`w` alone writes nothing");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        words(&frame).contains("executor of `DESKTOP-HTUI`: `tui` \u{2192} `worker`?"),
+        "{frame}"
+    );
+    assert!(frame.contains("y write \u{b7} n/esc cancel"), "{frame}");
+
+    assert_eq!(bench.key(&mut section, "y"), Handled::Consumed);
+    let (box_id, expected, edit) = only_edit(&requests(&bench));
+    assert_eq!(box_id, ids::BOX);
+    assert_eq!(expected, 3, "the row's edit_version");
+    assert_eq!(
+        edit,
+        BoxEdit {
+            executor: Some(Executor::Worker),
+            ..BoxEdit::default()
+        },
+        "the executor alone"
+    );
+    feed(&bench, &mut section, &demo_at_version(4).await);
+    assert!(
+        !section.captures_input(),
+        "the reply to the write closes the confirmation"
+    );
+
+    for cancel in ["n", "esc"] {
+        let (bench, mut section) = bench_with(&demo_at_version(3).await).await;
+        bench.key(&mut section, "w");
+        assert_eq!(bench.key(&mut section, cancel), Handled::Consumed);
+        assert!(!section.captures_input(), "`{cancel}` returns to browse");
+        assert!(requests(&bench).is_empty(), "`{cancel}` sends nothing");
+    }
+}
+
+/// MOD-41 blueprint F-35: `edit_box` refuses an unknown executor, so from `worker` or from any
+/// value this build does not know, `w` proposes `tui`, the default.
+#[tokio::test]
+async fn w_from_worker_or_an_unknown_executor_proposes_tui() {
+    for settings in [
+        json!({ "executor": "worker" }),
+        json!({ "executor": "container" }),
+        json!({ "executor": 7 }),
+    ] {
+        let mut snapshot = snap_of(MemStore::demo()).await;
+        snapshot.boxes[0].row.settings = settings.clone();
+        let (bench, mut section) = bench_with(&snapshot).await;
+
+        bench.key(&mut section, "w");
+        let frame = bench.render_section(&section, 100);
+        assert!(
+            words(&frame).contains("\u{2192} `tui`? The TUI walks this box's runs again."),
+            "{settings}: {frame}"
+        );
+        bench.key(&mut section, "y");
+        let (_, _, edit) = only_edit(&requests(&bench));
+        assert_eq!(
+            edit.executor,
+            Some(Executor::Tui),
+            "{settings} flips to tui"
+        );
+    }
+}
+
+/// MOD-41 plan D10, D48: a spent token keeps the confirmation open with the current row's token
+/// and the stale notice, which names `y` as the retry; `y` retries against the new token.
+#[tokio::test]
+async fn a_stale_executor_edit_says_so() {
+    let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+
+    bench.key(&mut section, "w");
+    bench.key(&mut section, "y");
+    only_edit(&requests(&bench));
+    bench.reply(
+        &mut section,
+        &StoreReply::BoxesStale(Box::new(demo_at_version(5).await)),
+    );
+
+    assert!(section.captures_input(), "the confirmation stays open");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("changed elsewhere since you opened it"),
+        "{frame}"
+    );
+    assert!(frame.contains("y retries"), "{frame}");
+    assert!(!frame.contains("Enter retries"), "{frame}");
+
+    bench.key(&mut section, "y");
+    let (box_id, expected, edit) = only_edit(&requests(&bench));
+    assert_eq!(box_id, ids::BOX);
+    assert_eq!(expected, 5, "the current row's token");
+    assert_eq!(edit.executor, Some(Executor::Worker));
+}
+
+/// MOD-41 plan D10, D48: a plain read that drops the flip's own box moves the selection, but the
+/// confirmation still names the box `y` writes to, never the newly selected one.
+#[tokio::test]
+async fn the_executor_confirmation_names_its_own_box_after_it_leaves_the_list() {
+    let (bench, mut section) = bench_with(&snap_of(two_boxes_one_worker()).await).await;
+
+    bench.key(&mut section, "k");
+    bench.key(&mut section, "w");
+    feed(&bench, &mut section, &snap_of(MemStore::demo()).await);
+
+    let frame = words(&bench.render_section(&section, 100));
+    assert!(
+        frame.contains("executor of `SECOND-BOX`: `worker` \u{2192} `tui`?"),
+        "{frame}"
+    );
+    assert!(!frame.contains("executor of `DESKTOP-HTUI`"), "{frame}");
+
+    bench.key(&mut section, "y");
+    let (box_id, _, edit) = only_edit(&requests(&bench));
+    assert_eq!(
+        box_id,
+        BoxId::from_uuid(Uuid::from_u128(1)),
+        "the flip's own box"
+    );
+    assert_eq!(edit.executor, Some(Executor::Tui));
+}
+
+/// MOD-41 plan D10: `w` over a save in flight opens nothing and says so, like `t` and `e`.
+#[tokio::test]
+async fn w_while_a_save_is_in_flight_opens_nothing() {
+    let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+
+    bench.key(&mut section, "t");
+    type_at(&bench, &mut section, ", vulkan");
+    bench.key(&mut section, "enter");
+    only_edit(&requests(&bench));
+    bench.key(&mut section, "esc");
+    assert_eq!(bench.key(&mut section, "w"), Handled::Consumed);
+
+    assert!(!section.captures_input(), "no confirmation opened");
+    assert!(requests(&bench).is_empty());
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("edit_box in flight"), "{frame}");
+}
+
+/// MOD-41 plan D10: `w` shadows the global workspace switcher only over a listed box. Before the
+/// first read, over a refused read and over an empty list it passes, so the switcher still opens.
+#[tokio::test]
+async fn w_passes_to_the_workspace_switcher_with_no_box_to_act_on() {
+    let bench = SectionBench::new().await;
+    let mut section = BoxesSection::new();
+    assert_eq!(bench.key(&mut section, "w"), Handled::Pass, "not read yet");
+
+    let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "boxes",
+            message: "store unreachable".to_owned(),
+        },
+    );
+    assert_eq!(
+        bench.key(&mut section, "w"),
+        Handled::Pass,
+        "a refused read"
+    );
+    assert!(!section.captures_input());
+
+    let mut empty = snap_of(MemStore::demo()).await;
+    empty.boxes.clear();
+    let (bench, mut section) = bench_with(&empty).await;
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("no box is registered for this user yet"),
+        "{frame}"
+    );
+    assert_eq!(bench.key(&mut section, "w"), Handled::Pass, "an empty list");
+    assert!(!section.captures_input());
+    assert!(requests(&bench).is_empty());
+}
+
+/// MOD-41 plan D10: a `CONTROL` chord passes through the confirmation, so `ctrl-c` still quits.
+#[tokio::test]
+async fn ctrl_c_passes_through_the_executor_confirmation() {
+    let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+
+    bench.key(&mut section, "w");
+    assert_eq!(bench.key(&mut section, "ctrl-c"), Handled::Pass);
+    assert!(section.captures_input(), "the confirmation is still open");
 }
 
 /// D47, D51, D57: the demo box through the shell.
@@ -1074,5 +1328,26 @@ async fn a_stale_editor_renders() {
 
     insta::with_settings!({ filters => vec![DIGEST_FILTER] }, {
         insta::assert_snapshot!("stale", frame);
+    });
+}
+
+/// MOD-41 plan D10: the executor confirmation over the demo box.
+#[tokio::test]
+async fn the_executor_confirmation_renders() {
+    let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+    bench.key(&mut section, "w");
+
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        words(&frame).contains(
+            "executor of `DESKTOP-HTUI`: `tui` \u{2192} `worker`? The TUI stops walking runs \
+             here; `htui worker` must run on this box."
+        ),
+        "{frame}"
+    );
+    assert!(frame.contains("y write \u{b7} n/esc cancel"), "{frame}");
+
+    insta::with_settings!({ filters => vec![DIGEST_FILTER] }, {
+        insta::assert_snapshot!("executor_confirm", frame);
     });
 }

@@ -13,6 +13,7 @@ DESKT… …00000200 (this box) os            windows 10.0.26200 · x86_64
                             probed tags   rust, msvc, cmake
                             declared tags gpu
                             quirks        (none)
+                            executor      tui
                             tools         cargo 1.98.0, cmake, git 2.51.0, rustc 1.98.0
 
                             probe spec: seed · <digest>
@@ -30,5 +31,4 @@ DESKT… …00000200 (this box) os            windows 10.0.26200 · x86_64
 
 
 
-
-j/k move · t tags · e quirks · p probe this box · r reload
+j/k move · t tags · e quirks · w executor · p probe this box · r reload
