@@ -17,7 +17,7 @@ use htui::concepts_worker::{ConceptsRuntime, MemIndex, NOT_AVAILABLE};
 use htui::store_worker::{self, StoreReply, StoreRequest};
 use htui::testkit::Harness;
 use htui::ui::overlay::ConceptsSearch;
-use htui::ui::overlay::concepts_search::{CHANGED, IDLE, LOADING};
+use htui::ui::overlay::concepts_search::{CHANGED, IDLE, INDEXING, LOADING};
 use htui::ui::tabs::{BacklogTab, ChatTab, RequirementsTab};
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::ids;
@@ -362,26 +362,28 @@ async fn without_a_concepts_runtime_the_search_says_not_available() {
     assert_eq!(harness.app().status, None);
 }
 
+/// D240, end to end. An index run's reply carries no echo, so only the forgotten freshness entry
+/// keeps a closed box's `Ctrl+R` report out of a reopened one (a search's `Hits` would be dropped
+/// by its query echo alone, and could not tell).
 #[tokio::test]
 async fn a_reply_to_a_closed_search_is_not_shown_by_a_reopened_one() {
-    let index = seeded().await;
-    let mut harness = open(Some(Arc::clone(&index))).await;
+    let mut harness = open(Some(Arc::new(MemIndex::new()))).await;
     harness.key("ctrl-f");
-    type_text(&mut harness, MIXED);
-    harness.key("enter");
+    harness.key("ctrl-r");
     harness.key("esc");
     harness.key("ctrl-f");
     harness.drive_to_end().await;
 
+    let (backend, scope) = platform_scope().await;
+    let report = MemIndex::new().seed(&backend, &scope).await;
     let frame = harness.render();
+    assert!(search_is_open(&mut harness));
     assert!(frame.contains(IDLE), "{frame}");
-    let hits = expected(&index, MIXED, platform_scope().await.1.project_ids, false).await;
-    for hit in &hits {
-        assert!(
-            !frame.contains(&clip(&format_hit(hit), HIT_CELLS)),
-            "the closed search's hit reached the reopened box:\n{frame}"
-        );
-    }
+    assert!(
+        !frame.contains(&clip(&report_line(&report), INNER_CELLS)),
+        "the closed box's index report reached the reopened one:\n{frame}"
+    );
+    assert!(!frame.contains(INDEXING), "{frame}");
 }
 
 #[tokio::test]
