@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 
 use htui_core::model::{BoxId, OsFamily};
 use htui_core::store::StoreError;
+use htui_store::pg::PoolSize;
 use htui_store::{
     HTUI_VERSION, HeadlessError, MIGRATOR, MigrationState, PgStore, Registration,
     TARGET_VERSION_KEY, identity,
@@ -982,7 +983,7 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(db.migrations_at_connect, MigrationState::Pending(7));
 
-    let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT)
+    let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
         .await
         .expect_err("a pending schema is refused");
     assert_eq!(refused, HeadlessError::MigrationsPending(7));
@@ -1001,7 +1002,7 @@ async fn a_headless_connect_never_migrates() {
         .execute(&db.pool)
         .await
         .expect("drop the bookkeeping table");
-    let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT)
+    let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
         .await
         .expect_err("no migrations table is every migration pending");
     assert_eq!(refused, HeadlessError::MigrationsPending(7));
@@ -1037,7 +1038,7 @@ async fn a_headless_connect_refuses_a_newer_schema() {
     let refusal = |why: &'static str| {
         let (url, stranger) = (db.url.clone(), stranger.clone());
         async move {
-            match PgStore::connect_headless(&url, &stranger, HEADLESS_WAIT).await {
+            match PgStore::connect_headless(&url, &stranger, HEADLESS_WAIT, PoolSize::TUI).await {
                 Err(HeadlessError::Store(StoreError::Backend(text))) => text,
                 other => panic!("expected a store refusal ({why}), got {other:?}"),
             }
@@ -1181,7 +1182,7 @@ async fn a_headless_connect_below_the_target_refuses() {
     };
 
     plant_target(&db.pool, json!("99.0.0")).await;
-    let refused = PgStore::connect_headless(&db.url, &stranger, HEADLESS_WAIT)
+    let refused = PgStore::connect_headless(&db.url, &stranger, HEADLESS_WAIT, PoolSize::TUI)
         .await
         .expect_err("a build below the target is refused");
     assert_eq!(
@@ -1198,7 +1199,7 @@ async fn a_headless_connect_below_the_target_refuses() {
     );
 
     plant_target(&db.pool, json!("banana")).await;
-    match PgStore::connect_headless(&db.url, &stranger, HEADLESS_WAIT).await {
+    match PgStore::connect_headless(&db.url, &stranger, HEADLESS_WAIT, PoolSize::TUI).await {
         Err(HeadlessError::Store(StoreError::Backend(text))) => assert!(
             text.contains("htui_target_version") && text.contains("not a version"),
             "the refusal names the key and the reason, got {text}"
@@ -1208,7 +1209,7 @@ async fn a_headless_connect_below_the_target_refuses() {
     assert_eq!(registered().await, 0, "refused before the bootstrap");
 
     plant_target(&db.pool, json!(HTUI_VERSION)).await;
-    let store = PgStore::connect_headless(&db.url, &stranger, HEADLESS_WAIT)
+    let store = PgStore::connect_headless(&db.url, &stranger, HEADLESS_WAIT, PoolSize::TUI)
         .await
         .expect("at the target a headless process connects");
     assert_eq!(
@@ -1219,9 +1220,56 @@ async fn a_headless_connect_below_the_target_refuses() {
     assert_eq!(store.below_target(), None);
 
     plant_target(&db.pool, json!("0.0.1")).await;
-    PgStore::connect_headless(&db.url, &stranger, HEADLESS_WAIT)
+    PgStore::connect_headless(&db.url, &stranger, HEADLESS_WAIT, PoolSize::TUI)
         .await
         .expect("above the target a headless process connects");
+
+    db.drop_db().await;
+}
+
+/// MOD-41 PRD D7: a headless pool holds exactly the connections its caller asked for, not the
+/// TUI's eight (blueprint §13.4).
+#[tokio::test]
+async fn a_headless_pool_honours_its_size() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+
+    let store =
+        PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::clamped(3))
+            .await
+            .expect("a headless connect over an up-to-date schema");
+    assert_eq!(
+        store.pool().options().get_max_connections(),
+        3,
+        "the pool is the size `--pool-size` asked for"
+    );
+    store.pool().close().await;
+
+    db.drop_db().await;
+}
+
+/// MOD-41 PRD D7: `--pool-size` is clamped to `2..=8` before the pool is built, so a real connect
+/// never holds fewer than two connections or more than the TUI's eight (blueprint §13.4).
+#[tokio::test]
+async fn a_headless_pool_is_clamped() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+
+    for (requested, used) in [(1, PoolSize::MIN), (64, PoolSize::MAX)] {
+        let size = PoolSize::clamped(requested);
+        assert_eq!(size.get(), used, "{requested} is clamped to {used}");
+        let store = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, size)
+            .await
+            .expect("a headless connect over an up-to-date schema");
+        assert_eq!(
+            store.pool().options().get_max_connections(),
+            used,
+            "a pool of {requested} is built with {used} connections"
+        );
+        store.pool().close().await;
+    }
 
     db.drop_db().await;
 }

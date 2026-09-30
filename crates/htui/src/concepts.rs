@@ -12,7 +12,7 @@
 use anyhow::{Context as _, bail};
 use htui_core::model::{ProjectId, RequirementState, Resolution, Scope};
 use htui_store::embed::FastEmbedder;
-use htui_store::pg::CONNECT_TIMEOUT;
+use htui_store::pg::{CONNECT_TIMEOUT, PoolSize};
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::vector::{Hit, PointType, QdrantStore, SearchQuery, VectorStore as _};
 use htui_store::vector_sync::Indexer;
@@ -65,7 +65,8 @@ async fn open() -> anyhow::Result<(PgStore, QdrantStore<FastEmbedder>)> {
         bail!("no Postgres DSN is stored; run `htui --set-dsn` first");
     };
     let identity = identity::load_or_mint(&identity::config_root()?)?;
-    let pg = match PgStore::connect_headless(&dsn, &identity, CONNECT_TIMEOUT).await {
+    let pg = match PgStore::connect_headless(&dsn, &identity, CONNECT_TIMEOUT, PoolSize::TUI).await
+    {
         Ok(pg) => pg,
         // The bail text is today's, kept byte for byte (plan D8).
         Err(HeadlessError::MigrationsPending(n)) => {

@@ -162,6 +162,34 @@ impl MigrationState {
     }
 }
 
+/// A Postgres pool size (PRD D7): `htui worker --pool-size`, clamped to `2..=8`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolSize(u32);
+
+impl PoolSize {
+    /// The smallest pool: one walk and one read never wait on each other.
+    pub const MIN: u32 = 2;
+    /// The largest: today's TUI pool.
+    pub const MAX: u32 = 8;
+    /// The TUI's pool, today's value (`open_pool`'s former constant).
+    pub const TUI: Self = Self(8);
+    /// `htui worker`'s default.
+    pub const WORKER_DEFAULT: Self = Self(4);
+
+    /// `requested` clamped to `MIN..=MAX`, with a `warn` when it moved.
+    #[must_use]
+    pub fn clamped(requested: u32) -> Self {
+        // T11 red: not clamped yet.
+        Self(requested)
+    }
+
+    /// The connection count.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 impl PgStore {
     /// Connects, checks the schema, seeds if empty and registers this box.
     ///
@@ -214,7 +242,7 @@ impl PgStore {
         identity: &Identity,
         connect_timeout: Duration,
     ) -> Result<Connected> {
-        let pool = open_pool(dsn, connect_timeout).await?;
+        let pool = open_pool(dsn, connect_timeout, PoolSize::TUI).await?;
 
         let migrations = schema_state(&pool).await?;
         let mut store = Self {
@@ -243,6 +271,9 @@ impl PgStore {
     /// migrates" is not "never writes": the bootstrap writes `app_user`, `capability_tag`,
     /// `app_setting` defaults, the seeded agents and this box's row, as `connect` always has.
     ///
+    /// The pool holds `pool` connections, and is built before any setting is read (PRD D7): its
+    /// size is the caller's, never a stored one.
+    ///
     /// # Errors
     ///
     /// [`HeadlessError::Store`] for everything [`PgStore::connect`] refuses, and for a malformed
@@ -251,8 +282,9 @@ impl PgStore {
         dsn: &str,
         identity: &Identity,
         connect_timeout: Duration,
+        pool: PoolSize,
     ) -> core::result::Result<Self, HeadlessError> {
-        let pool = open_pool(dsn, connect_timeout).await?;
+        let pool = open_pool(dsn, connect_timeout, pool).await?;
         let mut conn = pool.acquire().await.map_err(map_sqlx)?;
         let migrations = if migrations_table_exists(&mut conn).await? {
             applied_state(&mut conn).await?
@@ -724,8 +756,9 @@ impl NewBoxRow<'_> {
     }
 }
 
-/// The pool both connects open: eight connections, `connect_timeout` to acquire one.
-async fn open_pool(dsn: &str, connect_timeout: Duration) -> Result<PgPool> {
+/// The pool both connects open: `pool` connections, `connect_timeout` to acquire one.
+async fn open_pool(dsn: &str, connect_timeout: Duration, pool: PoolSize) -> Result<PgPool> {
+    let _ = pool; // T11 red: the size is not honoured yet.
     let options = PgConnectOptions::from_str(dsn).map_err(map_sqlx)?;
     PgPoolOptions::new()
         .max_connections(8)

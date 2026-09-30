@@ -1,10 +1,16 @@
-//! The Postgres DSN in the OS keyring (plan D7, blueprint C.3).
+//! The Postgres DSN in the OS keyring (plan D7, blueprint C.3), and the sources a headless worker
+//! may fall back to (MOD-41 PRD D3, plan D14).
 //!
 //! One entry, `("htui", "postgres-dsn")`, written by `htui --set-dsn` and removed by
-//! `htui --clear-dsn`. The binary reads the DSN from here and **nowhere else**: there is no
-//! env-var fallback (`R-STO-1`), so a DSN never appears in `argv`, in a shell history or in a
-//! dotfile. `HTUI_TEST_DATABASE_URL` is read by the integration-test harness only, never by this
-//! crate at run time.
+//! `htui --clear-dsn`. The TUI reads the DSN from here and **nowhere else**. `htui worker` reads
+//! it from exactly three sources, through [`headless_dsn`]: with `--dsn-stdin`, one line from
+//! stdin and nothing else; otherwise the keyring; otherwise, on Linux, the systemd credential
+//! `$CREDENTIALS_DIRECTORY/htui-dsn` ([`CREDENTIAL_NAME`]), which `systemd-creds` keeps encrypted
+//! at rest and shows to the unit alone. **Never argv, the environment or a plain file**
+//! (`R-STO-1` as amended): there is no env-var fallback, so a DSN never appears in `argv`, in a
+//! shell history or in a dotfile. `CREDENTIALS_DIRECTORY` names a directory, not the secret.
+//! `HTUI_TEST_DATABASE_URL` is read by the integration-test harness only, never by this crate at
+//! run time.
 //!
 //! TLS is whatever the DSN's `sslmode=` says; `PgConnectOptions::from_str` handles it (`R-STO-2`).
 //!
@@ -15,6 +21,7 @@
 
 use htui_core::store::{Result, StoreError};
 use keyring::{Entry, Error as KeyringError};
+use zeroize::Zeroizing;
 
 /// Keyring service name of the DSN entry.
 pub const SERVICE: &str = "htui";
@@ -139,6 +146,87 @@ pub fn clear_dsn() -> Result<()> {
         };
     }
     Slot::open(SERVICE, USER)?.clear()
+}
+
+/// The systemd credential name `htui worker` reads (`LoadCredentialEncrypted=htui-dsn:…`).
+pub const CREDENTIAL_NAME: &str = "htui-dsn";
+
+/// Where `htui worker` may read its DSN (PRD D3, plan D14).
+pub struct DsnSources<'a> {
+    /// `Some` exactly when `--dsn-stdin` was given: one line from it, and no other source.
+    pub stdin: Option<&'a mut dyn std::io::BufRead>,
+    /// `$CREDENTIALS_DIRECTORY` as the caller read it (a directory, not the secret; passed in so
+    /// tests need no `set_var`). Read on Linux only.
+    pub credentials_dir: Option<&'a std::path::Path>,
+}
+
+impl core::fmt::Debug for DsnSources<'_> {
+    /// Whether stdin is a source, never what it holds.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DsnSources")
+            .field("stdin", &self.stdin.is_some())
+            .field("credentials_dir", &self.credentials_dir)
+            .finish()
+    }
+}
+
+/// Why no DSN was found. No variant carries the DSN.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DsnSourceError {
+    /// `--dsn-stdin` read a blank line or end of input.
+    #[error("no DSN on stdin; nothing was read")]
+    EmptyStdin,
+    /// Stdin failed.
+    #[error("stdin could not be read: {0}")]
+    Stdin(String),
+    /// The credential exists and could not be read.
+    #[error("the systemd credential {path} could not be read: {why}")]
+    Credential {
+        /// Its path.
+        path: String,
+        /// The OS error.
+        why: String,
+    },
+    /// No source had one.
+    #[error(
+        "no Postgres DSN: the OS keyring has none ({keyring}), and there is no \
+         $CREDENTIALS_DIRECTORY/htui-dsn; run `htui --set-dsn`, provision the systemd \
+         credential, or pass `--dsn-stdin`"
+    )]
+    NoSource {
+        /// What the keyring answered: "empty" or its error.
+        keyring: String,
+    },
+}
+
+/// One DSN line, trimmed, in a wiped buffer; `None` for a blank line or end of input. `htui
+/// --set-dsn` and `htui worker --dsn-stdin` share it.
+///
+/// # Errors
+///
+/// Whatever `reader` fails with.
+pub fn read_dsn_line(
+    reader: &mut dyn std::io::BufRead,
+) -> std::io::Result<Option<Zeroizing<String>>> {
+    let mut line = Zeroizing::new(String::new());
+    reader.read_line(&mut line)?;
+    let dsn = line.trim();
+    Ok((!dsn.is_empty()).then(|| Zeroizing::new(dsn.to_owned())))
+}
+
+/// `htui worker`'s DSN (PRD D3): `--dsn-stdin` alone when given; else the keyring (an `Err` is
+/// "no keyring", not a failure); else, on Linux, `credentials_dir/htui-dsn`.
+///
+/// # Errors
+///
+/// [`DsnSourceError`]; never the DSN.
+pub fn headless_dsn(
+    sources: DsnSources<'_>,
+) -> core::result::Result<Zeroizing<String>, DsnSourceError> {
+    let _ = sources; // T11 red: no source is read yet.
+    Err(DsnSourceError::NoSource {
+        keyring: "empty".to_owned(),
+    })
 }
 
 /// Retrieves the stored Qdrant URL, if any.
@@ -383,5 +471,162 @@ mod tests {
         );
         slot.clear().expect("clear");
         assert_eq!(slot.get().expect("read"), None);
+    }
+}
+
+/// `htui worker`'s DSN sources (MOD-41 PRD D3, blueprint §13.4), over the process-wide fake
+/// keyring: never the developer's.
+#[cfg(test)]
+mod headless_dsn_tests {
+    use super::{CREDENTIAL_NAME, DsnSourceError, DsnSources, headless_dsn, set_dsn};
+    use crate::testkit::{mock_keyring, mock_keyring_broken};
+    use std::io::Cursor;
+
+    /// A DSN nothing else in these cases spells, so an answer names its source.
+    const KEYRING_DSN: &str = "postgres://keyring@h:5432/db";
+    /// What `--dsn-stdin` is handed.
+    const STDIN_DSN: &str = "postgres://stdin@h:5432/db";
+    /// What the systemd credential holds.
+    #[cfg(target_os = "linux")]
+    const CREDENTIAL_DSN: &str = "postgres://credential@h:5432/db";
+
+    /// A credentials directory holding `htui-dsn` with `text` in it.
+    #[cfg(target_os = "linux")]
+    fn credentials(text: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a credentials directory");
+        std::fs::write(dir.path().join(CREDENTIAL_NAME), text).expect("write the credential");
+        dir
+    }
+
+    #[tokio::test]
+    async fn stdin_wins_and_the_keyring_is_not_read() {
+        let guard = mock_keyring().await;
+        set_dsn(KEYRING_DSN).expect("the fake keyring stores");
+        let mut stdin = Cursor::new(format!("{STDIN_DSN}\n").into_bytes());
+        let dsn = headless_dsn(DsnSources {
+            stdin: Some(&mut stdin),
+            credentials_dir: None,
+        })
+        .expect("stdin holds a DSN");
+        assert_eq!(dsn.as_str(), STDIN_DSN, "--dsn-stdin is explicit and wins");
+        drop(guard);
+
+        let _broken = mock_keyring_broken().await;
+        let mut stdin = Cursor::new(format!("{STDIN_DSN}\n").into_bytes());
+        let dsn = headless_dsn(DsnSources {
+            stdin: Some(&mut stdin),
+            credentials_dir: None,
+        })
+        .expect("a keyring that cannot be opened is never opened under --dsn-stdin");
+        assert_eq!(dsn.as_str(), STDIN_DSN);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_keyring_is_read_before_the_credential() {
+        let _guard = mock_keyring().await;
+        set_dsn(KEYRING_DSN).expect("the fake keyring stores");
+        let dir = credentials(CREDENTIAL_DSN);
+        let dsn = headless_dsn(DsnSources {
+            stdin: None,
+            credentials_dir: Some(dir.path()),
+        })
+        .expect("the keyring holds a DSN");
+        assert_eq!(
+            dsn.as_str(),
+            KEYRING_DSN,
+            "the keyring comes first (plan D14)"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_missing_keyring_falls_back_to_the_credential() {
+        let _broken = mock_keyring_broken().await;
+        let dir = credentials(&format!("{CREDENTIAL_DSN}\n"));
+        let dsn = headless_dsn(DsnSources {
+            stdin: None,
+            credentials_dir: Some(dir.path()),
+        })
+        .expect("a keyring-less host reads the credential");
+        assert_eq!(
+            dsn.as_str(),
+            CREDENTIAL_DSN,
+            "a keyring error is no keyring, not a failure; the credential is trimmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_source_is_an_error_naming_all_three() {
+        let _guard = mock_keyring().await;
+        let err = headless_dsn(DsnSources {
+            stdin: None,
+            credentials_dir: None,
+        })
+        .expect_err("an empty keyring and no credentials directory hold no DSN");
+        assert_eq!(
+            err,
+            DsnSourceError::NoSource {
+                keyring: "empty".to_owned()
+            }
+        );
+        let text = err.to_string();
+        for source in ["keyring", "CREDENTIALS_DIRECTORY", "--dsn-stdin"] {
+            assert!(
+                text.contains(source),
+                "the refusal names {source}, got {text}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_credential_is_read_only_from_the_given_directory() {
+        let _guard = mock_keyring().await;
+        let elsewhere = credentials(CREDENTIAL_DSN);
+        let given = tempfile::tempdir().expect("an empty credentials directory");
+        let err = headless_dsn(DsnSources {
+            stdin: None,
+            credentials_dir: Some(given.path()),
+        })
+        .expect_err("a credential outside the given directory is not a source");
+        assert!(
+            matches!(err, DsnSourceError::NoSource { .. }),
+            "got {err:?}"
+        );
+        drop(elsewhere);
+    }
+
+    #[tokio::test]
+    async fn a_blank_line_is_no_dsn() {
+        let _guard = mock_keyring().await;
+        set_dsn(KEYRING_DSN).expect("the fake keyring stores");
+        let mut stdin = Cursor::new(b"   \n".to_vec());
+        let err = headless_dsn(DsnSources {
+            stdin: Some(&mut stdin),
+            credentials_dir: None,
+        })
+        .expect_err("a blank line is no DSN");
+        assert_eq!(
+            err,
+            DsnSourceError::EmptyStdin,
+            "explicit wins: a blank --dsn-stdin never falls through to the keyring"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_credential_file_holding_only_whitespace_is_no_dsn() {
+        let _guard = mock_keyring().await;
+        let dir = credentials(" \n\t\n");
+        let err = headless_dsn(DsnSources {
+            stdin: None,
+            credentials_dir: Some(dir.path()),
+        })
+        .expect_err("whitespace is not a DSN");
+        assert!(
+            matches!(err, DsnSourceError::NoSource { .. }),
+            "got {err:?}"
+        );
     }
 }
