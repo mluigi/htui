@@ -396,6 +396,19 @@ impl Stack {
             .expect("read run.lease_owner")
     }
 
+    /// Polls until `run`'s lease is given back: `release_lease` is its own write, after the walk
+    /// has settled the run, so a rested run may still hold it for a moment.
+    async fn released(&self, run: RunId) {
+        let deadline = Instant::now() + PATIENCE;
+        while let Some(owner) = self.lease_owner(run).await {
+            assert!(
+                Instant::now() < deadline,
+                "run {run}'s lease was not given back within {PATIENCE:?}: {owner} holds it"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     async fn last_seen(&self, id: BoxId) -> chrono::DateTime<Utc> {
         sqlx::query_scalar::<_, chrono::DateTime<Utc>>("SELECT last_seen_at FROM box WHERE id = $1")
             .bind(id.as_uuid())
@@ -509,11 +522,7 @@ async fn a_headless_worker_drives_a_queued_run_to_rest() {
         "the worker walked it to the end"
     );
     assert_eq!(row.lease_box_id, Some(ids::BOX));
-    assert_eq!(
-        stack.lease_owner(run).await,
-        None,
-        "the lease was given back"
-    );
+    stack.released(run).await;
     let steps = stack.steps(run).await;
     assert!(
         !steps.is_empty() && steps.iter().all(|step| step.status == StepStatus::Done),
@@ -546,11 +555,7 @@ async fn a_tui_exit_does_not_interrupt_a_worker_run() {
     stack.exit_tui().await;
     let row = stack.rested(run).await;
     assert_eq!(row.status, RunStatus::Done, "the worker settled the run");
-    assert_eq!(
-        stack.lease_owner(run).await,
-        None,
-        "the lease was given back"
-    );
+    stack.released(run).await;
     worker.stop().await;
     stack.finish().await;
 }
