@@ -1,6 +1,6 @@
 # Plan: MOD-41 — Headless worker (`htui worker`)
 
-**Status: FACT-CHECKED 2026-09-29 (five independent verification passes; falsified claims amended in place, see "Fact-check record") — awaiting maintainer CONFIRM.**
+**Status: CONFIRMED by the maintainer 2026-09-30, OQ-1 to OQ-6 as recommended. Fact-checked 2026-09-29 (five independent verification passes; falsified claims amended in place, see "Fact-check record").**
 
 **Source**: `.claude/prds/mod-41-headless-worker.prd.md`, all four milestones, with its binding gate
 decisions PRD D1-D7 (maintainer, 2026-09-29, "all recomm"). Design: `docs/ANA-16.md` §5.5, §7,
