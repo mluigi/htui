@@ -513,15 +513,17 @@ fn slug(node: &LinkNode, root_project: ProjectId) -> Option<&str> {
     (node.project_id != root_project).then_some(node.project_slug.as_str())
 }
 
-/// Cells of a non-root row but its kind, label and title: cursor, space, indent, arrow, three
-/// separators, the status and the repeat mark.
+/// Cells of a non-root row before its label, but the kind: cursor, space, indent, arrow and the
+/// separators either side of the kind. Everything the key never gives way to.
+fn lead_cells(row: &GraphRow<'_>, link: Link) -> usize {
+    2 + indent(row.level) + cell_width(link.arrow.glyph()) + 2
+}
+
+/// Cells of a non-root row but its kind, label and title: [`lead_cells`], the separator before
+/// the status, the status and the repeat mark.
 fn fixed_cells(row: &GraphRow<'_>, link: Link) -> usize {
     let repeat = if link.repeat { cell_width(REPEAT) } else { 0 };
-    2 + indent(row.level)
-        + cell_width(link.arrow.glyph())
-        + 3
-        + cell_width(row.node.status.as_str())
-        + repeat
+    lead_cells(row, link) + 1 + cell_width(row.node.status.as_str()) + repeat
 }
 
 /// Cells of `node`'s whole `[slug:]KEY` label.
@@ -567,8 +569,11 @@ fn line(
     } else {
         kind.to_owned()
     };
+    // The label's room with the status kept, and the key's once the status gives way: the status
+    // is cut at the pane edge by `cut`, the key only when nothing else is left (L5).
     let room = width.saturating_sub(fixed_cells(row, link) + cell_width(&kind));
-    let label = fit_label(&node.key, slug(node, root_project), room);
+    let bare_room = width.saturating_sub(lead_cells(row, link) + cell_width(&kind));
+    let label = fit_label(&node.key, slug(node, root_project), room, bare_room);
 
     spans.push(Span::raw(" ".repeat(indent(row.level))));
     spans.push(Span::styled(link.arrow.glyph(), theme.dim));
@@ -587,22 +592,25 @@ fn line(
     Line::from(cut(spans, width))
 }
 
-/// The `[slug:]KEY` label in at most `room` cells (§1.5 steps 3-4, L5).
+/// The `[slug:]KEY` label (§1.5 steps 3-4, L5): `room` is what the label has beside the whole
+/// status, `bare_room` what the key alone has once the status gives way.
 ///
-/// Whole when it fits; then the slug clipped, while it keeps two cells; then the key alone,
-/// clipped if it must be. The slug gives way first: the key is what names the item.
-fn fit_label(key: &str, slug: Option<&str>, room: usize) -> String {
+/// Whole when it fits `room`; then the slug clipped, while it keeps two cells; then the key alone,
+/// in `bare_room`, clipped only if even that is too little. The degradation order is title, kind
+/// padding, slug, status, key: the key is what names the item.
+fn fit_label(key: &str, slug: Option<&str>, room: usize, bare_room: usize) -> String {
     let key_width = cell_width(key);
-    let Some(slug) = slug else {
-        return clip(key, room);
-    };
-    if cell_width(slug) + 1 + key_width <= room {
-        return format!("{slug}:{key}");
+    if let Some(slug) = slug {
+        if cell_width(slug) + 1 + key_width <= room {
+            return format!("{slug}:{key}");
+        }
+        if let Some(slug_room) = room.checked_sub(key_width + 1)
+            && slug_room >= 2
+        {
+            return format!("{}:{key}", clip(slug, slug_room));
+        }
     }
-    match room.checked_sub(key_width + 1) {
-        Some(slug_room) if slug_room >= 2 => format!("{}:{key}", clip(slug, slug_room)),
-        _ => clip(key, room),
-    }
+    clip(key, bare_room.max(room))
 }
 
 /// `text` in at most `room` cells, cut at a grapheme boundary and ended with `…` when it is cut.
@@ -1180,15 +1188,19 @@ mod tests {
 
     #[test]
     fn fit_label_gives_up_the_slug_before_the_key() {
-        assert_eq!(fit_label("FEAT-1", None, 6), "FEAT-1");
-        assert_eq!(fit_label("FEAT-1", None, 4), "FEA…");
-        assert_eq!(fit_label("FEAT-1", None, 0), "");
-        assert_eq!(fit_label("FEAT-1", Some("agy"), 10), "agy:FEAT-1");
+        assert_eq!(fit_label("FEAT-1", None, 6, 6), "FEAT-1");
+        assert_eq!(fit_label("FEAT-1", None, 4, 4), "FEA…");
+        assert_eq!(fit_label("FEAT-1", None, 0, 0), "");
+        assert_eq!(fit_label("FEAT-1", Some("agy"), 10, 10), "agy:FEAT-1");
         // Two columns of slug is the least worth drawing.
-        assert_eq!(fit_label("FEAT-1", Some("vulkan"), 9), "v…:FEAT-1");
-        assert_eq!(fit_label("FEAT-1", Some("vulkan"), 8), "FEAT-1");
-        assert_eq!(fit_label("FEAT-1", Some("vulkan"), 3), "FE…");
-        assert_eq!(fit_label("FEAT-1", Some("vulkan"), 0), "");
+        assert_eq!(fit_label("FEAT-1", Some("vulkan"), 9, 9), "v…:FEAT-1");
+        assert_eq!(fit_label("FEAT-1", Some("vulkan"), 8, 8), "FEAT-1");
+        assert_eq!(fit_label("FEAT-1", Some("vulkan"), 3, 3), "FE…");
+        assert_eq!(fit_label("FEAT-1", Some("vulkan"), 0, 0), "");
+        // The status gives way before the key: the key takes the status's room, the slug does not.
+        assert_eq!(fit_label("FEAT-1", None, 0, 6), "FEAT-1");
+        assert_eq!(fit_label("FEAT-1", Some("vulkan"), 0, 13), "FEAT-1");
+        assert_eq!(fit_label("FEAT-1", Some("vulkan"), 0, 4), "FEA…");
     }
 
     #[tokio::test]
@@ -1505,10 +1517,13 @@ mod tests {
         };
         // 17 fixed cells and `origin` leave 8 for the label: one for the slug, so it goes whole.
         assert_eq!(at(31), "  → origin FEAT-1 in_progress");
-        assert_eq!(at(25), "  → origin F… in_progress");
-        assert_eq!(at(23), "  → origin  in_progress");
+        // Then the status gives way, cut at the pane edge, and the key goes last.
+        assert_eq!(at(25), "  → origin FEAT-1 in_prog");
+        assert_eq!(at(23), "  → origin FEAT-1 in_pr");
+        assert_eq!(at(17), "  → origin FEAT-1");
+        assert_eq!(at(16), "  → origin FEAT…");
 
-        // A label with no slug is clipped too, not left to the pane edge.
+        // A label with no slug keeps its key over its status too.
         let graph = demo(ids::HTUI_FEAT_1).await;
         let feat_1 = rows(&graph, 2);
         let drawn = line(
@@ -1520,7 +1535,13 @@ mod tests {
             18,
             &shell.theme,
         );
-        assert_eq!(text(&drawn), "  → origin A… done");
+        assert_eq!(text(&drawn), "  → origin ANA-1 d");
+
+        // An 80-column terminal's pane: the widest status gives way before the key does.
+        let tool_1 = |width| text(&lines(&feat_1, 0, &shell.projects, width, &shell.theme)[4]);
+        assert_eq!(tool_1(34), "    ← blocked_by TOOL-1 awaiting_a");
+        assert_eq!(tool_1(23), "    ← blocked_by TOOL-1");
+        assert_eq!(tool_1(22), "    ← blocked_by TOOL…");
     }
 
     /// L8: no graph yet is a pending read, not an item without links.
@@ -1632,11 +1653,23 @@ mod tests {
             for depth in 1..=GraphTab::MAX_HOPS {
                 let rows = rows(&graph, depth);
                 for width in 0..=PANE {
-                    for drawn in lines(&rows, 1, &shell.projects, width, &shell.theme) {
+                    let drawn = lines(&rows, 1, &shell.projects, width, &shell.theme);
+                    for (row, drawn) in rows.iter().zip(&drawn) {
+                        let drawn = text(drawn);
+                        assert!(cell_width(&drawn) <= width, "{drawn:?} at {width}");
+                        // The key is the last thing to go: whole whenever the row's lead, its
+                        // unpadded kind and the key itself fit.
+                        let Some(link) = row.link else { continue };
+                        let key = row.node.key.as_str();
+                        let needs = 2
+                            + indent(row.level)
+                            + 2
+                            + cell_width(link.kind.as_str())
+                            + 1
+                            + cell_width(key);
                         assert!(
-                            cell_width(&text(&drawn)) <= width,
-                            "{:?} at {width}",
-                            text(&drawn)
+                            width < needs || drawn.contains(key),
+                            "{drawn:?} at {width} lost {key}"
                         );
                     }
                 }
