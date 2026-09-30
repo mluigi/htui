@@ -1755,6 +1755,10 @@ async fn two_no_commit_implement_attempts_stop_the_loop_in_worktree_mode() {
 /// Plan D66's other half, which is what closes R-8: two `implement` attempts that **do** commit
 /// can never agree on `after_hash` in `worktree` mode, because attempt 2 branches from a primary
 /// that already holds attempt 1's merge. The loop goes on to a third attempt.
+///
+/// The two reviews say different things (CLEAN-4 plan D3). The fake's default output is one fixed
+/// string, so two default reviews would stop the loop on `no_progress_review` at attempt 2, and
+/// the third attempt would stop proving anything about the hash half.
 #[tokio::test]
 async fn two_committing_implement_attempts_never_look_identical_in_worktree_mode() {
     let Some(git) = skip_without_git!() else {
@@ -1762,6 +1766,16 @@ async fn two_committing_implement_attempts_never_look_identical_in_worktree_mode
     };
     let fix = Fixture::new(Isolation::Worktree, None).await;
     fix.three_implement_attempts().await;
+    fix.orch.script(
+        "review",
+        1,
+        ScriptedStep::review("request-changes", "first"),
+    );
+    fix.orch.script(
+        "review",
+        2,
+        ScriptedStep::review("request-changes", "second"),
+    );
     let sink = CommittingSink {
         orch: &fix.orch,
         repos: &["core"],

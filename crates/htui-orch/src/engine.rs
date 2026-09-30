@@ -7710,6 +7710,7 @@ mod tests {
                 note.body.contains("review loop exhausted after 2 attempts")
                     && note.body.contains("implement")
                     && note.body.contains("attempt 2")
+                    && note.body.contains("stop reason `exhausted`")
             }),
             "criterion 6's exact wording: {notes:?}"
         );
