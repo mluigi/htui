@@ -201,7 +201,9 @@ async fn answer(
 
 /// MOD-59 D5: the reply to a save that applied, whatever its re-read came to. The project, name
 /// and version are the stored row's (`append_prompt_template`); a failed re-read travels as its
-/// `StoreError` rendered through `Display`, the sentence `Failed` would carry.
+/// `StoreError` rendered through `Display`, the sentence `Failed` would carry. An unreachable
+/// re-read is then no `Err` to the worker loop: it reaches neither its `go_offline` nor the status
+/// line, and the refresher's health pass takes the backend offline instead.
 fn saved(reread: Result<TemplatesSnapshot>, row: &PromptTemplate) -> StoreReply {
     StoreReply::TemplateSaved {
         snapshot: reread.map(Box::new).map_err(|err| err.to_string()),

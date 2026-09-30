@@ -845,7 +845,9 @@ async fn answer(
 
 /// MOD-59 D5: the reply to a tab write that applied, whatever its re-read came to. A failed
 /// re-read travels as its `StoreError` rendered through `Display`, the sentence `Failed` would
-/// carry.
+/// carry. An unreachable re-read is then no `Err` to the worker loop: it reaches neither its
+/// `go_offline` nor the status line, and the refresher's health pass takes the backend offline
+/// instead.
 fn written(reread: Result<RequirementsSnapshot>, outcome: RequirementWrite) -> StoreReply {
     StoreReply::RequirementWritten {
         snapshot: reread.map(Box::new).map_err(|err| err.to_string()),

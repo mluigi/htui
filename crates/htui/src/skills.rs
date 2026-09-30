@@ -468,6 +468,8 @@ async fn reread(backend: &Backend, writer: &Writer, scope: &Scope) -> Result<Ski
 
 /// MOD-59 D5: the reply to a write that applied, whatever its re-read came to. A failed re-read
 /// travels as its `StoreError` rendered through `Display`, the sentence `Failed` would carry.
+/// An unreachable re-read is then no `Err` to the worker loop: it reaches neither its `go_offline`
+/// nor the status line, and the refresher's health pass takes the backend offline instead.
 fn written(reread: Result<SkillsSnapshot>, outcome: SkillWrite) -> StoreReply {
     StoreReply::SkillWritten {
         snapshot: reread.map(Box::new).map_err(|err| err.to_string()),
