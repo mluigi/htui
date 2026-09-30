@@ -103,7 +103,7 @@ pub async fn handshake(io: AcpIo, settings: &AcpSettings, timeout: Duration) -> 
 
     let (answer_tx, answer_rx) = oneshot::channel();
     let capabilities = client::client_capabilities(&settings.client_capabilities);
-    let task = tokio::spawn(async move {
+    let task = crate::contained::spawn(async move {
         let transport = ByteStreams::new(writer.compat_write(), reader.compat());
         let connected = Client
             .builder()

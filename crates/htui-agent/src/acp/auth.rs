@@ -196,7 +196,7 @@ pub async fn run(io: AcpIo, settings: &AcpSettings, flow: WireFlow) -> Result<Au
     let stage = Arc::new(AtomicU8::new(Stage::Initialize.code()));
     let waiting_on = Arc::clone(&stage);
     let token = cancel.clone();
-    let task = tokio::spawn(async move {
+    let task = crate::contained::spawn(async move {
         let transport = ByteStreams::new(writer.compat_write(), reader.compat());
         let connected = Client
             .builder()

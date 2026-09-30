@@ -44,11 +44,11 @@ use crate::probe::{
 /// 2. `Verifying`: [`fetch::verify_digest`] against the digest the consent pane already showed.
 ///    A published digest that does not match is [`InstallError::DigestMismatch`] with **nothing**
 ///    unpacked; none published records the computed one as unverified (plan D2).
-/// 3. `Unpacking`: [`archive::unpack`] under `spawn_blocking`, its byte counter polled every
-///    `progress_every` while the handle is awaited — the only way to report on work a
-///    [`JoinHandle::abort`](tokio::task::JoinHandle::abort) cannot even stop (blueprint P-3). The
-///    `cmd` must be in the tree, and it is made executable **in staging** so the promoted tree is
-///    never unrunnable for an instant (hazard H-5).
+/// 3. `Unpacking`: [`archive::unpack`] under [`crate::contained::spawn_blocking`], its byte
+///    counter polled every `progress_every` while the handle is awaited — the only way to report
+///    on work a [`JoinHandle::abort`](tokio::task::JoinHandle::abort) cannot even stop (blueprint
+///    P-3). The `cmd` must be in the tree, and it is made executable **in staging** so the
+///    promoted tree is never unrunnable for an instant (hazard H-5).
 /// 4. [`Layout::set_aside`] takes a same-version tree out of the way of the rename.
 /// 5. [`Layout::promote`] — one rename, and the install is committed.
 /// 6. The post-promote check (hazard H-4): [`resolve_tool`] over the row's own glob must answer a
@@ -365,7 +365,7 @@ async fn unpack_polling(
     let counter = Arc::clone(&written);
     let (archive_path, tree, cmd_at) = (from.to_path_buf(), into.to_path_buf(), into.join(cmd));
     let token = cancel.clone();
-    let mut handle = tokio::task::spawn_blocking(move || {
+    let mut handle = crate::contained::spawn_blocking(move || {
         archive::unpack(&archive_path, &tree, format, &token, &counter)?;
         if !cmd_at.exists() {
             return Err(InstallError::Archive {

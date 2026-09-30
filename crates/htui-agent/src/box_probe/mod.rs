@@ -116,7 +116,7 @@ async fn probe_tools(
     for (name, probe) in tools {
         let (name, probe) = (name.clone(), probe.clone());
         let (env, permits) = (Arc::clone(env), Arc::clone(permits));
-        set.spawn(async move {
+        crate::contained::spawn_in(&mut set, async move {
             // The semaphore is never closed, so `acquire` cannot fail; a failure would only mean
             // running unthrottled, never skipping the tool.
             let _permit = permits.acquire_owned().await.ok();
@@ -220,7 +220,7 @@ async fn ask_tools(
         };
         let (tag, matches) = (rule.tag.clone(), ask.matches.clone());
         let (env, permits) = (Arc::clone(env), Arc::clone(permits));
-        set.spawn(async move {
+        crate::contained::spawn_in(&mut set, async move {
             let _permit = permits.acquire_owned().await.ok();
             let answer = ask_tool(&launch, &matches, &env).await;
             (tag, answer)

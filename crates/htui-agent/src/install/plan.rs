@@ -271,7 +271,7 @@ pub(crate) fn cmd_relative(cmd: &str) -> Result<PathBuf, PlanError> {
 /// free space, which is the number D11's arithmetic is about. It is a blocking `statvfs`, so it
 /// runs where blocking calls belong.
 async fn available_space(root: PathBuf) -> Option<u64> {
-    tokio::task::spawn_blocking(move || {
+    crate::contained::spawn_blocking(move || {
         root.ancestors()
             .find_map(|path| fs4::available_space(path).ok())
     })
