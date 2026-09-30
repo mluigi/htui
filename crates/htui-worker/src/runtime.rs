@@ -2381,7 +2381,7 @@ mod role_gate {
     use htui_core::fixtures::{demo_at, demo_data, edit_agent, ids};
     use htui_core::model::{
         Agent, AgentBox, AgentId, Billing, BoxEdit, DocumentId, Executor, ItemId, NewDocument,
-        NewRepo, NewRun, RepoId, RunId, RunMode, RunStatus, RunStep, SnapshotPhase,
+        NewRepo, NewRun, RepoBoxPath, RepoId, RunId, RunMode, RunStatus, RunStep, SnapshotPhase,
         TIMESTAMPTZ_DIGITS, Transport,
     };
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
@@ -2391,7 +2391,7 @@ mod role_gate {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{Role, RunRuntime};
+    use super::{BACKOFF_FIRST, BACKOFF_MAX, Role, RunRuntime};
     use crate::graphs::HostGraphs;
     use crate::{FrameKind, LiveChats, ReplySink, RunFrame, RunReply, RunRequest, StepAuthor};
 
@@ -2607,6 +2607,16 @@ mod role_gate {
 
     /// A `queued` run of `item`, created by another process at `queued_at`.
     async fn queued(store: &MemStore, item: ItemId, queued_at: DateTime<Utc>) -> RunId {
+        queued_over(store, item, queued_at, None).await
+    }
+
+    /// [`queued`] over `scope`, or the default scope when `None`.
+    async fn queued_over(
+        store: &MemStore,
+        item: ItemId,
+        queued_at: DateTime<Utc>,
+        scope: Option<&[RepoId]>,
+    ) -> RunId {
         let row = store
             .item(item)
             .await
@@ -2619,7 +2629,7 @@ mod role_gate {
             &row,
             RunMode::Manual,
             &app,
-            None,
+            scope,
             ids::BOX,
         )
         .await
@@ -2814,5 +2824,215 @@ mod role_gate {
             .map(Duration::as_secs)
             .collect();
         assert_eq!(at, [0, 5, 15, 35], "4 resumes, not 60");
+    }
+
+    /// A transport whose every session panics as it is built: the walk task dies (D158).
+    #[derive(Debug)]
+    struct Panics;
+
+    impl TransportBuilder for Panics {
+        fn build(
+            &self,
+            _agent: &Agent,
+            _on_box: Option<&AgentBox>,
+            _caps: DriverCaps,
+        ) -> Result<Box<dyn AgentDriver>, DriverError> {
+            panic!("the scripted transport panics as its session is built");
+        }
+    }
+
+    /// MOD-41 review R-2 (OQ-6): a resume whose walk panics steps its run's backoff like a resume
+    /// that fails. The supervisor marks the run dead, so the next sweep gives its lease back and
+    /// adopts it again; the resume that adoption spawns waits [`BACKOFF_FIRST`], not one sweep.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_whose_resume_panics_backs_off() {
+        let clock = Arc::new(TokioClock::new());
+        let store = seeded(MemStore::demo().with_clock(Arc::clone(&clock) as Arc<dyn Clock>)).await;
+        set_executor(&store, Executor::Worker).await;
+        let run = stranded(&store, ids::HTUI_ANA_2).await;
+        let mut factory = DriverFactory::new();
+        factory.register("acp", Box::new(Panics));
+        let mut runtime = RunRuntime::with_parts(
+            Arc::new(FakeIsolator::new()) as Arc<dyn Isolator>,
+            Arc::new(FakeVerifier::new()),
+            factory,
+        )
+        .with_clock(clock)
+        .with_author(Arc::new(OutputAuthor))
+        .with_role(Role::Worker);
+        let backend = Backend::memory(store.clone());
+        let sink = Timed::new();
+        runtime
+            .serve_request(
+                &backend,
+                &sink,
+                1,
+                RunRequest::Stream {
+                    item: ids::HTUI_ANA_2,
+                },
+                &LiveChats::default(),
+            )
+            .await;
+
+        for _ in 0..20 {
+            runtime.sweep_with(&backend, &sink);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let at: Vec<u64> = sink
+            .errors_of(ids::HTUI_ANA_2)
+            .iter()
+            .map(Duration::as_secs)
+            .collect();
+        assert_eq!(
+            at.get(..2),
+            Some(&[0, BACKOFF_FIRST.as_secs()][..]),
+            "run {run}: the resume after a panic waits {BACKOFF_FIRST:?}, not the next sweep: {at:?}"
+        );
+    }
+
+    /// A throwaway directory, removed with everything under it when the case ends.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("htui-worker-case-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&path).expect("a scratch directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A real repository `name` with one commit under `root`, a non-primary repo of the demo
+    /// project whose checkout on this box is it.
+    async fn checkout(store: &MemStore, root: &std::path::Path, name: &str) -> RepoId {
+        let path = root.join(name);
+        std::fs::create_dir_all(&path).expect("the repository directory");
+        htui_orch::isolate::git::testkit::repo_with_one_commit(&path);
+        let id = RepoId::new();
+        store
+            .create_repo(NewRepo {
+                id,
+                project_id: ids::PROJECT_HTUI,
+                name: name.to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: false,
+            })
+            .await
+            .expect("the demo project holds no repo of this name");
+        store
+            .upsert_repo_box_path(&RepoBoxPath {
+                repo_id: id,
+                box_id: ids::BOX,
+                local_path: path.to_string_lossy().into_owned(),
+                updated_at: Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS),
+            })
+            .await
+            .expect("both ids name rows");
+        id
+    }
+
+    /// Polls until `run` has left `queued`.
+    async fn claimed(store: &MemStore, run: RunId) {
+        tokio::time::timeout(PATIENCE, async {
+            while status_of(store, run).await == RunStatus::Queued {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("run {run} was not claimed within {PATIENCE:?}"));
+    }
+
+    /// MOD-41 review R-1 (blueprint D202): the worker has no `StartRun` to re-read the repo map,
+    /// so its sweep does, once per sweep while no walk is live. A checkout registered after the
+    /// isolator was built reaches the next claim: the run scoped to it walks, and is not failed
+    /// with "no checkout for this repo on this box".
+    #[tokio::test]
+    async fn a_worker_sweep_picks_up_a_new_checkout() {
+        if let Err(skip) = htui_orch::isolate::git::testkit::usable_git() {
+            println!("{skip}");
+            return;
+        }
+        let scratch = Scratch::new();
+        let store = seeded(MemStore::demo()).await;
+        set_executor(&store, Executor::Worker).await;
+        let alpha = checkout(&store, &scratch.0, "alpha").await;
+        let first = queued_over(
+            &store,
+            ids::HTUI_ANA_2,
+            Utc::now() - TimeDelta::minutes(2),
+            Some(&[alpha]),
+        )
+        .await;
+        let mut factory = DriverFactory::new();
+        factory.register("acp", Box::new(OneTurn));
+        let mut runtime: RunRuntime<Backend, Timed> = RunRuntime::new(factory)
+            .with_author(Arc::new(OutputAuthor))
+            .with_role(Role::Worker)
+            .with_scratch_root(scratch.0.join("trees"));
+        let backend = Backend::memory(store.clone());
+        let sink = Timed::new();
+
+        runtime.sweep_with(&backend, &sink);
+        rests_at(&store, first, RunStatus::AwaitingApproval).await;
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        assert_eq!(runtime.isolator_builds(), 1, "built over `alpha` alone");
+        store
+            .finish_run(first, RunStatus::Cancelled, None, Utc::now())
+            .await
+            .expect("the parked run is cancellable");
+
+        let beta = checkout(&store, &scratch.0, "beta").await;
+        let second = queued_over(&store, ids::HTUI_CLEAN_1, Utc::now(), Some(&[beta])).await;
+        runtime.sweep_with(&backend, &sink);
+        claimed(&store, second).await;
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        let row = store.run(second).await.expect("the read").expect("the run");
+        assert_eq!(
+            row.status,
+            RunStatus::AwaitingApproval,
+            "the run over the new checkout walks: {:?}",
+            row.failure
+        );
+        assert_eq!(
+            runtime.isolator_builds(),
+            2,
+            "the sweep rebuilt the isolator over `alpha` and `beta`"
+        );
+    }
+
+    /// MOD-41 review R-8: a sweep's prune drops a backoff entry whose due is past by more than
+    /// the grace (`max(BACKOFF_MAX, 2 x sweep period)`) and whose run no task works on; a fresh
+    /// entry, and a stale one whose run is live, stay.
+    #[tokio::test(start_paused = true)]
+    async fn prune_drops_a_stale_backoff_entry() {
+        let runtime = worker_runtime().with_sweep_every(Duration::from_secs(1));
+        let shared = &runtime.shared;
+        let (stale, live, fresh) = (RunId::new(), RunId::new(), RunId::new());
+        shared.step_backoff(stale);
+        shared.step_backoff(live);
+        let walk = shared.walks.child(live);
+        tokio::time::advance(BACKOFF_FIRST + BACKOFF_MAX + Duration::from_secs(1)).await;
+        shared.step_backoff(fresh);
+
+        shared.prune();
+        let kept: std::collections::BTreeSet<RunId> = shared
+            .backoff
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(
+            kept,
+            [live, fresh].into_iter().collect(),
+            "the stale entry of a run no task works on is pruned"
+        );
+        drop(walk);
     }
 }
