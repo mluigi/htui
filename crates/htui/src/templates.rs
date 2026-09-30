@@ -3,11 +3,10 @@
 //!
 //! One read per event and never one per keystroke, one reply out, and the one write through
 //! `WriteStore::append_prompt_template`, whose token is the head version the editor opened on
-//! (PRD D5, plan D1). The view renders from the snapshot and never patches a row into it.
-//!
-//! Known residue, the same one [`crate::prompt_settings`] and [`crate::catalogue`] carry: a
-//! re-read that fails *after* an applied write answers `Failed`, so the view is told nothing
-//! happened when a version has in fact been appended.
+//! (PRD D5, plan D1). The view renders from the snapshot and never patches a row into it. A save
+//! that applied answers [`StoreReply::TemplateSaved`] naming the row it appended (MOD-59), so the
+//! view lands it on its own reply and never by searching the snapshot; a re-read that fails after
+//! it still answers `TemplateSaved`, carrying the failure, because the version has been appended.
 //!
 //! The worker fills `created_by` from [`Backend::this_user`], as [`crate::hierarchy`] does: the
 //! render side never holds a `UserId` (`R-NF-3`). Nothing here reads the clock; the store stamps
@@ -126,6 +125,11 @@ pub const READ_NAME: &str = REQUEST_NAMES[0];
 
 /// Serves one template request, off the UI task.
 ///
+/// The read answers [`StoreReply::Templates`]. A save answers [`StoreReply::TemplateSaved`] when
+/// it applied, even when only the re-read after it failed (MOD-59 D1, D5), and
+/// [`StoreReply::TemplatesStale`] when its token was spent; a refusal stays an error, so
+/// [`crate::store_worker::serve`] answers `Failed` with the store's sentence.
+///
 /// # Errors
 /// Whatever the seam reports; offline, [`StoreError::Unreachable`] with `PROMPT_ON_SERVER_ONLY`
 /// for the read and `DATABASE_UNREACHABLE` for the save; [`StoreError::Backend`] for a request
@@ -163,10 +167,11 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             // The worker re-reads rather than handing the view the one row the outcome carries:
             // the view renders a tree, and a row patched in locally would be a second source of
             // truth (the `cas` shape of `catalogue.rs` and `prompt_settings.rs`).
-            let fresh = Box::new(snapshot(backend, scope).await?);
             Ok(match outcome {
-                CasOutcome::Applied(_) => StoreReply::Templates(fresh),
-                CasOutcome::Stale(_) => StoreReply::TemplatesStale(fresh),
+                CasOutcome::Applied(row) => saved(snapshot(backend, scope).await, &row),
+                CasOutcome::Stale(_) => {
+                    StoreReply::TemplatesStale(Box::new(snapshot(backend, scope).await?))
+                }
             })
         }
         // `try_serve` routes exactly this module's two variants here, so the last arm is
@@ -179,9 +184,21 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
     }
 }
 
+/// MOD-59 D5: the reply to a save that applied, whatever its re-read came to. The project, name
+/// and version are the stored row's (`append_prompt_template`); a failed re-read travels as its
+/// `StoreError` rendered through `Display`, the sentence `Failed` would carry.
+fn saved(reread: Result<TemplatesSnapshot>, row: &PromptTemplate) -> StoreReply {
+    StoreReply::TemplateSaved {
+        snapshot: reread.map(Box::new).map_err(|err| err.to_string()),
+        project: row.project_id,
+        name: row.name.clone(),
+        version: row.version,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot, serve};
+    use super::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot, saved, serve};
     use crate::store_worker::{self, StoreReply, StoreRequest};
     use htui_core::fixtures::ids;
     use htui_core::model::{ProjectId, Scope};
@@ -435,6 +452,38 @@ mod tests {
             .head(ids::PROJECT_HTUI, "implement-2")
             .expect("the new name is in the fresh snapshot");
         assert_eq!((head.version, head.body.as_str()), (1, body));
+    }
+
+    /// MOD-59 D5: a re-read that fails after a save applied still answers `TemplateSaved`, the
+    /// failure rendered as `Failed` would render it. `MemStore` cannot fail a read inside one
+    /// `serve`, so the mapping is pinned here.
+    #[tokio::test]
+    async fn a_reread_that_fails_after_a_save_still_answers_template_saved() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+        let row = read(&backend, &scope)
+            .await
+            .head(ids::PROJECT_HTUI, "implement")
+            .expect("the fixture holds `implement`")
+            .clone();
+
+        let reply = saved(Err(StoreError::Unreachable("gone".to_owned())), &row);
+
+        match reply {
+            StoreReply::TemplateSaved {
+                snapshot: Err(message),
+                project,
+                name,
+                version,
+            } => {
+                assert_eq!(message, "store unreachable: gone");
+                assert_eq!(
+                    (project, name.as_str(), version),
+                    (ids::PROJECT_HTUI, "implement", 1)
+                );
+            }
+            other => panic!("an appended version answers `TemplateSaved`, not {other:?}"),
+        }
     }
 
     #[tokio::test]

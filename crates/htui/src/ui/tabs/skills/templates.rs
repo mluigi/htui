@@ -7,6 +7,11 @@
 //! `parse` is the only validator, run on `Ctrl+S` and on an `$EDITOR` return; the store runs it
 //! again behind the compare-and-set (plan D4), so a body the view let through cannot land broken.
 //!
+//! A save **lands on its own reply** (MOD-59): only a `TemplateSaved` while the save is in flight
+//! closes the editor; a plain `Templates` read never does, so a read served ahead of the save
+//! leaves the editor, the token and `busy` alone. A `TemplatesStale` keeps the draft and moves the
+//! token to the head as it is now.
+//!
 //! The token a save carries is the head version when the editor opened, not the version shown:
 //! editing v1 while v3 is head saves v4 (plan D1, OQ-5).
 
@@ -102,6 +107,12 @@ fn template_changed_elsewhere(head: i32) -> String {
          kept and Ctrl+S saves it as v{}",
         head + 1
     )
+}
+
+/// MOD-59 D5: a save that applied although its re-read failed. It landed; the view still draws
+/// what it held, and `r` reads again.
+fn landed_unread(landed: &str, why: &str) -> String {
+    format!("{landed} \u{2014} the re-read failed, r reloads: {why}")
 }
 
 /// The Templates view. Holds no store handle and no `UserId` (`R-NF-3`).
@@ -217,8 +228,8 @@ struct Editor {
     confirm_item: bool,
     /// `Esc` warned about unsaved changes; the next one discards.
     esc_armed: bool,
-    /// The body the save in flight carries: what tells that save's row from another session's
-    /// at the same version, and a draft typed on since from the one that was saved.
+    /// The body the save in flight carries: what tells a draft typed on since from the one that
+    /// was saved.
     sent: Option<String>,
 }
 
@@ -352,11 +363,36 @@ impl TemplatesView {
                 if !in_scope(snapshot, ctx) {
                     return;
                 }
+                // A read never lands a save (MOD-59 D4): only the save's own reply does.
                 self.snapshot = Some((**snapshot).clone());
                 self.unavailable = None;
-                self.land_save();
                 self.clamp_cursor();
             }
+            StoreReply::TemplateSaved {
+                snapshot,
+                project,
+                name,
+                version,
+            } => match snapshot {
+                Ok(snapshot) => {
+                    if !in_scope(snapshot, ctx) {
+                        return;
+                    }
+                    self.snapshot = Some((**snapshot).clone());
+                    self.unavailable = None;
+                    self.land_save(*project, name, *version, None);
+                    self.clamp_cursor();
+                }
+                // No snapshot to check the scope by: only the save in flight owns this reply, and
+                // a scope change has already forgotten that (`on_scope_change`).
+                Err(why) if self.busy == Some(SAVE_NAME) => {
+                    if self.snapshot.is_none() {
+                        self.unavailable = Some(why.clone());
+                    }
+                    self.land_save(*project, name, *version, Some(why));
+                }
+                Err(_) => {}
+            },
             StoreReply::TemplatesStale(snapshot) => {
                 if !in_scope(snapshot, ctx) {
                     return;
@@ -828,64 +864,54 @@ impl TemplatesView {
         self.cursor = self.cursor.min(self.rows().len().saturating_sub(1));
     }
 
-    /// Blueprint D27 (F-J): a `Templates` reply is the save's answer only while the save is in
-    /// flight **and** it holds a version above the token. A read served before the save (a `Tab`
-    /// away and back, `2`, `r`) refreshes the tree and leaves the editor, the token and `busy`
-    /// alone.
-    ///
-    /// "Above the token" is narrowed to the one row an applied save writes: version `token + 1`
-    /// with the body that was sent. A read that shows another session's `token + 1` is not the
-    /// answer either; the save's own reply is then `TemplatesStale`, which keeps the draft.
+    /// MOD-59 D4: the save in flight landed. `project`, `name` and `version` are the store's own
+    /// answer, so nothing here searches the snapshot for the body sent; every plain `Templates`
+    /// read leaves the editor, the token and `busy` alone. `unread` is the re-read's failure (D5):
+    /// the version was appended, and the notice says the tree drawn is the one held, which may not
+    /// show a new name yet (the cursor then stays where it was).
     ///
     /// Keys typed while the save was in flight still edit the draft. When they did, the editor
     /// stays open on them with the token at the saved version, so the next `Ctrl+S` appends them.
-    fn land_save(&mut self) {
+    fn land_save(&mut self, project: ProjectId, name: &str, version: i32, unread: Option<&str>) {
         if self.busy != Some(SAVE_NAME) {
             return;
         }
-        let (Some(snapshot), Mode::Editing(editor)) = (&self.snapshot, &self.mode) else {
-            return;
-        };
-        let Some(sent) = editor.sent.as_deref() else {
-            return;
-        };
-        let version = editor.token.unwrap_or(0) + 1;
-        if snapshot
-            .version(editor.project, &editor.name, version)
-            .is_none_or(|row| row.body != sent)
-        {
-            return;
-        }
-        let saved = Row::Template {
-            project: editor.project,
-            name: editor.name.clone(),
-        };
         self.busy = None;
         self.shown = None;
         self.base = None;
         self.pane = Pane::Body;
         self.scroll.reset();
+        let saved = Row::Template {
+            project,
+            name: name.to_owned(),
+        };
         if let Some(index) = self.rows().iter().position(|row| *row == saved) {
             self.cursor = index;
         }
-        let Mode::Editing(editor) = &mut self.mode else {
-            return;
+        let landed = match &mut self.mode {
+            Mode::Editing(editor) => {
+                let sent = editor.sent.take().unwrap_or_default();
+                if editor.area.text() == sent {
+                    self.mode = Mode::Browse;
+                    format!("saved v{version}")
+                } else {
+                    editor.token = Some(version);
+                    editor.from = Some(version);
+                    editor.original = sent;
+                    editor.confirm_item = false;
+                    editor.esc_armed = false;
+                    format!(
+                        "saved v{version} \u{2014} later edits kept, Ctrl+S saves them as v{}",
+                        version + 1
+                    )
+                }
+            }
+            Mode::Browse | Mode::Naming { .. } => format!("saved v{version}"),
         };
-        let sent = editor.sent.take().unwrap_or_default();
-        if editor.area.text() == sent {
-            self.notice = Some(Notice::Info(format!("saved v{version}")));
-            self.mode = Mode::Browse;
-        } else {
-            editor.token = Some(version);
-            editor.from = Some(version);
-            editor.original = sent;
-            editor.confirm_item = false;
-            editor.esc_armed = false;
-            self.notice = Some(Notice::Info(format!(
-                "saved v{version} \u{2014} later edits kept, Ctrl+S saves them as v{}",
-                version + 1
-            )));
-        }
+        self.notice = Some(match unread {
+            None => Notice::Info(landed),
+            Some(why) => Notice::Error(landed_unread(&landed, why)),
+        });
     }
 
     // --- frames --------------------------------------------------------------------------------

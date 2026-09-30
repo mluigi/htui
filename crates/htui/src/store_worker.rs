@@ -596,6 +596,8 @@ pub enum StoreRequest {
     Templates(Scope),
     /// Append version `expected + 1` of `(project, name)` iff `expected` is its head (`None`: a new
     /// name). The worker fills `created_by` (`this_user`); the view never holds a `UserId`.
+    /// Answered with [`StoreReply::TemplateSaved`] when it applied (MOD-59),
+    /// [`StoreReply::TemplatesStale`] when the token was spent.
     SaveTemplate {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -1072,8 +1074,9 @@ pub enum StoreReply {
     /// A settings write missed its CAS token (M5 D14, PRD D8): the rungs as they are now, for the
     /// editor to reload against. The editor keeps its typed text and retries only on `Enter`.
     PromptSettingsStale(Box<SettingsSnapshot>),
-    /// The scope's prompt templates, freshly read: the answer to [`StoreRequest::Templates`] and to
-    /// a [`StoreRequest::SaveTemplate`] that applied (MOD-9 D5).
+    /// The scope's prompt templates, freshly read: the answer to [`StoreRequest::Templates`] (MOD-9
+    /// D5). A read answer only: a save that applied answers [`StoreReply::TemplateSaved`]
+    /// (MOD-59).
     Templates(Box<TemplatesSnapshot>),
     /// A template save missed its CAS token (PRD D5): the templates as they are now, for the editor
     /// to reload against. The editor keeps its typed text and retries only by hand.
