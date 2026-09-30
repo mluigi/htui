@@ -1565,9 +1565,10 @@ async fn a_failed_install_with_manual_steps_renders_them_under_the_table() {
 /// A failure the user cannot route around is one sentence on the hint line, not a pane.
 ///
 /// The sentence is shorter than MOD-20 wrote it: the idle hint gained `a authenticate` (MOD-21
-/// D20) and the hint row is one line of the 100-column frame, so a notice and the keys share it.
-/// What this case is about is that a failure with no steps *is* a notice, and a fixture long enough
-/// to be clipped at the frame's edge would be asserting the width rather than the routing.
+/// D20); since MOD-23 D245 the keys and the notice are two lines, so the notice no longer shares
+/// the keys' row. What this case is about is that a failure with no steps *is* a notice, and a
+/// fixture long enough to be clipped at the frame's edge would be asserting the width rather than
+/// the routing.
 #[tokio::test]
 async fn a_failure_without_manual_steps_is_a_notice() {
     let bench = SectionBench::new().await;
