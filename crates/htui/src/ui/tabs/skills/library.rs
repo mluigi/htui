@@ -1232,25 +1232,23 @@ impl LibraryView {
         if self.busy != Some(outcome.request_name()) {
             return;
         }
-        self.busy = None;
-        // `send` sets `busy` and `sent` together, so the write `busy` names has its `Sent`.
-        let Some(sent) = self.sent.take() else {
-            return;
-        };
-        let landed = match (outcome, sent) {
-            (SkillWrite::Created { skill, name }, Sent::Create { body, .. }) => {
+        let landed = match (outcome, self.sent.take()) {
+            (SkillWrite::Created { skill, name }, Some(Sent::Create { body, .. })) => {
                 self.landed_version(*skill, name, 1, &body)
             }
-            (SkillWrite::Versioned { skill, version }, Sent::Version { body, .. }) => {
+            (SkillWrite::Versioned { skill, version }, Some(Sent::Version { body, .. })) => {
                 let name = snapshot_name(self.snapshot.as_ref(), *skill);
                 self.landed_version(*skill, &name, *version, &body)
             }
-            (SkillWrite::Edited { skill, name }, Sent::Rename { .. }) => {
+            (SkillWrite::Edited { skill, name }, Some(Sent::Rename { .. })) => {
                 self.select(*skill);
                 self.mode = Mode::Browse;
                 format!("saved `{name}`")
             }
-            (SkillWrite::Attached { key, updated_at }, Sent::Binding { change, target, .. }) => {
+            (
+                SkillWrite::Attached { key, updated_at },
+                Some(Sent::Binding { change, target, .. }),
+            ) => {
                 let kept = self
                     .attach
                     .as_mut()
@@ -1261,15 +1259,28 @@ impl LibraryView {
                     format!("attached to {target}")
                 }
             }
-            (SkillWrite::Detached { key }, Sent::Binding { change, target, .. }) => {
+            (SkillWrite::Detached { key }, Some(Sent::Binding { change, target, .. })) => {
                 if let Some(pane) = &mut self.attach {
                     pane.on_landed(*key, &change, None);
                 }
                 format!("detached from {target}")
             }
-            // `busy` named this outcome's write, and `sent` is that write's: unreachable.
-            _ => return,
+            // `send` sets `busy` and `sent` together, so the write `busy` names has its own
+            // `Sent` and this arm is unreachable. Were it reached, the write has still landed:
+            // the draft closes rather than stay "saving…" with nothing in flight (MOD-59 review
+            // L1).
+            _ => {
+                self.busy = None;
+                self.mode = Mode::Browse;
+                self.attach = None;
+                self.notice = Some(Notice::Error(format!(
+                    "`{}` landed \u{2014} r reloads",
+                    outcome.request_name()
+                )));
+                return;
+            }
         };
+        self.busy = None;
         self.notice = Some(match unread {
             None => Notice::Info(landed),
             Some(why) => Notice::Error(landed_unread(&landed, why)),
@@ -2528,6 +2539,45 @@ mod tests {
                 &view.notice,
                 Some(Notice::Error(text)) if text.starts_with("created `docs-style` v1")
             ),
+            "{:?}",
+            view.notice
+        );
+    }
+
+    /// MOD-59 review L1: `send` stores `busy` and `sent` together, so a landing whose `Sent` is
+    /// another write's cannot happen. Were it to, the write has still landed: the draft closes on
+    /// an error notice rather than stay "saving\u{2026}" with nothing in flight.
+    #[test]
+    fn a_landing_without_its_own_sent_falls_back_to_browse() {
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let target = Target::New {
+            name: "docs-style".to_owned(),
+            description: String::new(),
+        };
+        let mut view = LibraryView {
+            busy: Some("edit_skill"),
+            sent: Some(Sent::Create {
+                name: "docs-style".to_owned(),
+                body: "B.\n".to_owned(),
+            }),
+            mode: Mode::Editing(Editor::new(target, 0, None, "B.\n")),
+            notice: Some(Notice::Info(SAVING.to_owned())),
+            ..LibraryView::default()
+        };
+
+        view.on_reply(
+            &unread(SkillWrite::Edited {
+                skill: ids::SKILL_RUST_STYLE,
+                name: "rust-style".to_owned(),
+            }),
+            &mut ctx,
+        );
+        assert_eq!(view.busy, None);
+        assert!(view.sent.is_none());
+        assert!(matches!(view.mode, Mode::Browse), "{:?}", view.mode);
+        assert!(
+            matches!(&view.notice, Some(Notice::Error(text)) if text.contains("edit_skill")),
             "{:?}",
             view.notice
         );
