@@ -71,7 +71,11 @@ text were read with `grep`/`sed`. The fact-check pass re-reads each claim at its
 
 ## Open questions for the maintainer
 
-- [ ] **OQ-1 — `R-AGT-9` says `htui` "does not read, hold, transmit or store the credential".**
+**CONFIRMED by the maintainer 2026-09-30: all six recommendations accepted as written.** Execution
+shape: T1 → T2 → T3 → T4 **serially** — T2 ∩ T3 is empty, but both gates run the workspace suite
+against the one sandbox Postgres, and two concurrent suites have crashed it before.
+
+- [x] **OQ-1 — `R-AGT-9` says `htui` "does not read, hold, transmit or store the credential".**
       Paste-back does **hold** an authorization `code` for one request and **transmits** it once, to
       the agent's own listener on loopback. The token the agent then mints never touches `htui`.
       **Recommended:** accept. The main thread amends `R-AGT-9` with one sentence: "When the browser
@@ -80,7 +84,7 @@ text were read with `grep`/`sed`. The fact-check pass re-reads each claim at its
       (MOD-22)." D273's module doc states the same bound in code. **Alternative:** keep the
       requirement literal and drop the item. The `curl` workaround then stays the only route, which
       is the gap `R-AGT-9` was written to close.
-- [ ] **OQ-2 — Masked or plain field.** **Recommended (D272): masked.** `TextField::masked()` draws
+- [x] **OQ-2 — Masked or plain field.** **Recommended (D272): masked.** `TextField::masked()` draws
       `•` per grapheme plus a count (`crates/htui/src/ui/text_field.rs:249-356`). Its `text()`
       answers `None` (`:181-187`), so the only way out of the buffer is `take()` (`:202-205`), and
       the buffer is `Zeroizing` (`:45-57`). "The pane must not echo it" then holds by construction,
@@ -89,26 +93,26 @@ text were read with `grep`/`sed`. The fact-check pass re-reads each claim at its
       `state`, no `code`), which is what a user would have looked for. **Alternative:** a plain field
       while typing, emptied on submit. It is easier to eyeball, but a code sits on screen, in
       terminal scrollback and in screen recordings until the user presses `Enter`.
-- [ ] **OQ-3 — `state` when the link carried none.** The item requires `code` and `state` present.
+- [x] **OQ-3 — `state` when the link carried none.** The item requires `code` and `state` present.
       OAuth makes `state` RECOMMENDED rather than REQUIRED (RFC 6749 §4.1.1), so an adapter that
       sends none makes every paste fail. **Recommended (D265):** keep the item's rule. `state` is
       always required, and it must equal the link's `state` when the link carried one. `agy`'s link
       carries one (MOD-21's fixture `LINK` models it, `crates/htui/src/agent_worker.rs:6902`), and
       relaxing the rule later is additive. **Alternative:** require `state` only when the link
       carried one.
-- [ ] **OQ-4 — How much of the listener's answer to show.** **Recommended (D268):** the status line
+- [x] **OQ-4 — How much of the listener's answer to show.** **Recommended (D268):** the status line
       plus a short excerpt: the HTML `<title>`, else the first text line. The excerpt is at most 80
       columns, and the pasted `code`/`state` values are blanked if the listener echoes them. For a
       `3xx`, the pane shows the `Location` **host** only. This is "reports what the listener said"
       without printing a page. **Alternative:** status line only. Safer still, but "400 Bad Request"
       with no reason leaves the user guessing.
-- [ ] **OQ-5 — `url` as a declared dependency.** **Recommended (D264, D267):** promote `url = "2.5"`
+- [x] **OQ-5 — `url` as a declared dependency.** **Recommended (D264, D267):** promote `url = "2.5"`
       the way `zeroize`, `hmac` and `shell-words` were promoted. 2.5.8 is already compiled as a
       `reqwest` 0.13.5 dependency (`Cargo.lock:7113-7114`; listed by `reqwest`), so nothing new is
       downloaded. Percent-decoding a `redirect_uri` nested inside another URL's query, and comparing
       bracketed IPv6 hosts, are exactly the parts a hand-written parser gets wrong. **Alternative:**
       `form_urlencoded` (also compiled) plus hand splitting.
-- [ ] **OQ-6 — The live proof.** **Recommended:** a manual TUI run by the maintainer on the
+- [x] **OQ-6 — The live proof.** **Recommended:** a manual TUI run by the maintainer on the
       server-to-laptop setup that found the gap. The steps are under "Validation → live check", and
       the result goes into the decision doc as MOD-21's did. There is no new `#[ignore]` test: the
       deliverable is the TUI path, and `auth_live.rs` drives `htui-agent` without a pane.
