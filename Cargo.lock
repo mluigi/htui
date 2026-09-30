@@ -3045,6 +3045,7 @@ dependencies = [
  "htui-core",
  "htui-orch",
  "htui-store",
+ "htui-worker",
  "insta",
  "ratatui",
  "sentry",
