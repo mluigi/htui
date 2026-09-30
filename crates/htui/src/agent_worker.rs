@@ -907,6 +907,11 @@ impl AgentRuntime {
                 summary.agent.name
             )));
         }
+        // MOD-23 review L-3: a promotion is a chat on this box, so the per-box switch gates it the
+        // way it gates `ChatStart`. Offline, `CacheStore::agents` answers `user_off: false`
+        // because `agent_box` is not mirrored — but an offline backend has no writer and was
+        // refused above.
+        refuse_switched_off(&summary)?;
         let driver = self
             .factory
             .driver_for(&summary.agent, summary.on_box.as_ref())
@@ -1794,17 +1799,10 @@ impl AgentRuntime {
                 summary.agent.name
             )));
         }
-        // MOD-23 review L-3: the per-box switch gates a chat started on this box, whatever the
-        // probe's verdict. Read off the summary this path already holds, so it costs no read and
-        // refuses before any row is written; a row with no `agent_box` row is `user_off: false`.
-        // Offline, `CacheStore::agents` answers `user_off: false` because `agent_box` is not
-        // mirrored — but an offline backend has no writer and was refused above.
-        if summary.user_off {
-            return Err(StoreError::Constraint(format!(
-                "agent `{}` is switched off on this box; Settings > Agents, t switches it on",
-                summary.agent.name
-            )));
-        }
+        // MOD-23 review L-3: the per-box switch gates a chat started on this box. Offline,
+        // `CacheStore::agents` answers `user_off: false` because `agent_box` is not mirrored — but
+        // an offline backend has no writer and was refused above.
+        refuse_switched_off(&summary)?;
         let driver = self
             .factory
             .driver_for(&summary.agent, summary.on_box.as_ref())
@@ -2147,6 +2145,23 @@ async fn run_probe(args: ProbeArgs) {
         },
     };
     frames.reply(&frames.addr(), reply);
+}
+
+/// The per-box switch at a chat's start (MOD-23 review L-3): a row the human switched off on this
+/// box (`agent_box.user_off`) is refused whatever the probe's verdict, by `ChatStart` and by a
+/// promotion alike, with this one sentence.
+///
+/// Read off the [`AgentSummary`](htui_core::model::AgentSummary) both paths already hold, so it
+/// costs no read and refuses before any row is written. A row with no `agent_box` row is
+/// `user_off: false` and passes. Reads the switch, never the name (`R-AGT-5`).
+fn refuse_switched_off(summary: &htui_core::model::AgentSummary) -> Result<(), StoreError> {
+    if summary.user_off {
+        return Err(StoreError::Constraint(format!(
+            "agent `{}` is switched off on this box; Settings > Agents, t switches it on",
+            summary.agent.name
+        )));
+    }
+    Ok(())
 }
 
 /// [`run_probe`]'s loop, shared with the box probe (MOD-7 D11): every enabled row of `agents`

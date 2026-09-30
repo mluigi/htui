@@ -1167,6 +1167,53 @@ async fn promotion_opens_the_chat_on_the_same_step() {
     stable().bind(|| insta::assert_snapshot!("chat_promoted", rendered));
 }
 
+/// Review L-3: promoting a step whose agent is switched off on this box (`agent_box.user_off`) is
+/// refused with the chat-start sentence, and no session is started.
+#[tokio::test]
+async fn promoting_onto_a_row_switched_off_on_this_box_is_refused() {
+    let (mut harness, store) =
+        promotion_harness(Script::one_turn(vec![chunk("Here."), done()])).await;
+    let (run, step) = parked(&mut harness, &store).await;
+    // After the walk, so the switch gates the promotion and not the run's own agent choice.
+    store
+        .set_agent_box_enabled(scripted_id(&store).await, ids::BOX, false)
+        .await
+        .expect("the switch lands");
+
+    promote(&mut harness, run, step.id).await;
+
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some(
+            "promote_step: constraint violated: agent `scripted` is switched off on this box; \
+             Settings > Agents, t switches it on"
+        )
+    );
+    assert!(harness.chat_steps().is_empty(), "no session was started");
+}
+
+/// Review L-3: a row switched off and back on promotes as before.
+#[tokio::test]
+async fn promoting_onto_a_row_switched_back_on_opens_the_chat() {
+    let (mut harness, store) =
+        promotion_harness(Script::one_turn(vec![chunk("Here."), done()])).await;
+    let (run, step) = parked(&mut harness, &store).await;
+    let agent_id = scripted_id(&store).await;
+    store
+        .set_agent_box_enabled(agent_id, ids::BOX, false)
+        .await
+        .expect("the switch lands");
+    store
+        .set_agent_box_enabled(agent_id, ids::BOX, true)
+        .await
+        .expect("the switch lands");
+
+    promote(&mut harness, run, step.id).await;
+
+    assert_eq!(harness.app().status, None, "nothing was refused");
+    assert_eq!(harness.chat_steps(), vec![step.id], "the step's session");
+}
+
 /// ANA-5 criterion 17: a message composed in the promoted chat is a `follow_up` on the step's own
 /// log, and every turn the chat opens comes after the ones the walk wrote.
 #[tokio::test]
