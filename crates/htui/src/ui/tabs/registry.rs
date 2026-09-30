@@ -61,6 +61,10 @@ pub trait Tab {
     /// The `$EDITOR` handoff this tab asked for came back (MOD-9 D10). Defaulted, the trait's
     /// second default after `focus_section`, so no other tab changes.
     fn on_external_edit(&mut self, _outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {}
+    /// The shell's once-a-second refresh reached the active tab (MOD-41 plan D16). Defaulted, the
+    /// trait's third default after `focus_section` and `on_external_edit`, so no other tab
+    /// changes. A view trait, not a store trait: the no-default rule does not apply.
+    fn on_refresh(&mut self, _ctx: &mut Ctx<'_>) {}
 }
 
 /// Every registered tab, in registration order, plus which one is active.
