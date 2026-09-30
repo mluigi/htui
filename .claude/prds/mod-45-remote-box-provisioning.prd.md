@@ -137,8 +137,8 @@ one command. Agent login (MOD-22) is the only manual step left.**
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Provision a host | One command takes a reachable Linux host with sudo to a running, self-registered `htui worker`, with the DSN encrypted on the host and nowhere else. | pending | — |
-| 2 | Safe re-run and refusals | Re-running on a provisioned host changes nothing and says so. Every preflight failure refuses before a remote write, with the reason. The guide covers provisioning and agent login. | pending | — |
+| 1 | Provision a host | One command takes a reachable Linux host with sudo to a running, self-registered `htui worker`, with the DSN encrypted on the host and nowhere else. | in-progress | [plan](../plans/mod-45-remote-box-provisioning.plan.md) |
+| 2 | Safe re-run and refusals | Re-running on a provisioned host changes nothing and says so. Every preflight failure refuses before a remote write, with the reason. The guide covers provisioning and agent login. | in-progress | [plan](../plans/mod-45-remote-box-provisioning.plan.md) |
 
 Milestone 1 is the happy path end to end. Milestone 2 hardens it and can ship with it or right after
 it.
