@@ -40,8 +40,9 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{Action, Ctx, Handled, RevealTarget};
 use crate::requirements::{
-    BLANK_AREA_TITLE, BLANK_BODY, DECIDING_KEY_NEEDED, DETAIL_NAME, READ_NAME, RequirementDetail,
-    RequirementText, RequirementWrite, RequirementsSnapshot, is_tab_write, not_the_maintainer,
+    BLANK_AREA_TITLE, BLANK_BODY, DECIDING_KEY_NEEDED, DETAIL_NAME, MINT_NAME, READ_NAME,
+    RequirementDetail, RequirementText, RequirementWrite, RequirementsSnapshot, is_tab_write,
+    not_the_maintainer,
 };
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::backlog::detail::Scroll;
@@ -120,6 +121,13 @@ fn in_flight(busy: &str) -> String {
 /// what it held, and `r` reads again.
 fn landed_unread(landed: &str, why: &str) -> String {
     format!("{landed} \u{2014} the re-read failed, r reloads: {why}")
+}
+
+/// MOD-59 review M1: a mint's `Failed`. A mint whose COMMIT landed but whose answer was lost comes
+/// back as the same `Failed`, and its retry would mint a second requirement, so the notice does not
+/// call it a refusal. The form keeps its text, and `r` is text there: `Esc` first.
+fn mint_failed(why: &str) -> String {
+    format!("{why} \u{2014} it may have been written; Esc then r reloads to check before you retry")
 }
 
 /// A `RequirementsStale` over an open form: the text is kept and the token moved to the head.
@@ -1078,11 +1086,17 @@ impl Tab for RequirementsTab {
             StoreReply::Failed { request, message }
                 if is_tab_write(request) && self.busy == Some(*request) =>
             {
-                // D5: a tab write's `Failed` is a refusal; nothing was written, so the form keeps
-                // its text. A write that applied answers `RequirementWritten`, even when only its
-                // re-read failed, so a mint is never re-checked here (MOD-59).
+                // D5: a write that applied answers `RequirementWritten`, even when only its
+                // re-read failed, so the form keeps its text and nothing is re-read here. An area,
+                // amend or withdraw that failed wrote nothing, or its retry is refused. A mint's
+                // `Failed` may be a COMMIT whose answer was lost, and its retry mints again, so
+                // its notice hedges (MOD-59 review M1).
                 self.busy = None;
-                self.notice = Some(Notice::Error(message.clone()));
+                self.notice = Some(Notice::Error(if *request == MINT_NAME {
+                    mint_failed(message)
+                } else {
+                    message.clone()
+                }));
             }
             _ => {}
         }
@@ -1772,10 +1786,12 @@ mod tests {
         assert_eq!(tab.unavailable, None, "a tree was held");
     }
 
-    /// MOD-59 D5: a refused mint is a refusal. Nothing was written, so the form keeps its text and
-    /// nothing is read to check.
+    /// MOD-59 review M1: a mint's `Failed` may not be a refusal. A mint whose COMMIT landed but
+    /// whose answer was lost comes back as the same `Failed`, and a retry would mint it twice, so
+    /// the notice hedges and says how to look. The form keeps its text and nothing is read to
+    /// check: the reload is the user's.
     #[tokio::test]
-    async fn a_refused_mint_frees_the_form_without_a_read() {
+    async fn a_failed_mint_says_it_may_have_been_written_and_reads_nothing() {
         let (snapshot, projects, scope) = platform().await;
         let bench = Bench::new(scope, projects);
         let mut tab = tab_on(snapshot);
@@ -1785,12 +1801,19 @@ mod tests {
             &mut tab,
             &StoreReply::Failed {
                 request: name,
-                message: "refused".to_owned(),
+                message: "store unreachable: reset".to_owned(),
             },
         );
 
         assert_eq!(tab.busy, None);
-        assert_eq!(tab.notice, Some(Notice::Error("refused".to_owned())));
+        assert_eq!(
+            tab.notice,
+            Some(Notice::Error(
+                "store unreachable: reset \u{2014} it may have been written; Esc then r reloads to \
+                 check before you retry"
+                    .to_owned()
+            ))
+        );
         assert!(
             matches!(tab.mode, Mode::Requirement(_)),
             "the form keeps its text"

@@ -35,6 +35,14 @@
 //! cite, uncite or re-confirm answers `Failed`, so the Reqs sub-tab is told nothing happened when
 //! the write has in fact landed.
 //!
+//! Known residue, the mint's (MOD-59 review M1): a mint whose COMMIT succeeded but whose answer
+//! the connection lost is the store's error, so the worker answers `Failed` for a requirement that
+//! exists. Every other tab write is a compare-and-set or a unique code, so its retry is refused;
+//! a mint's retry mints a second requirement, and a requirement is withdrawn, never deleted. The
+//! tab therefore does not call a mint's `Failed` a refusal: its notice says the requirement may
+//! have been written and how to look before a retry. It keeps the form's text and reads nothing,
+//! so the check is the user's.
+//!
 //! The worker fills the author and the box from [`Backend::this_user`] and [`Backend::box_info`];
 //! the render side never holds a `UserId` (`R-NF-3`). Nothing here reads the clock: the store
 //! stamps every instant.
@@ -234,6 +242,10 @@ pub const DETAIL_NAME: &str = REQUEST_NAMES[1];
 
 /// The sub-tab's read.
 pub const CITATIONS_NAME: &str = REQUEST_NAMES[2];
+
+/// The tab's mint: the one tab write whose retry mints again rather than being refused, so its
+/// `Failed` is not known to be a refusal (MOD-59 review M1).
+pub const MINT_NAME: &str = REQUEST_NAMES[4];
 
 /// Whether `name` is one of the tab's four writes.
 #[must_use]
