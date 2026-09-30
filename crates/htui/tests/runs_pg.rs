@@ -1058,7 +1058,8 @@ async fn unblock_follows_an_escalated_run_on_postgres() {
     let run = stack.start(item).await;
 
     // `prd`, `plan`, `implement` approved; `review` rejected; the second `implement` approved;
-    // the second `review` rejected, which the loop cannot make progress past.
+    // the second `review` rejected, which the loop cannot make progress past: `OutputAuthor`
+    // writes one body for every step, so the two reviews repeat each other (CLEAN-4).
     let mut answered = Vec::new();
     for _ in 0..8 {
         if stack.item(item).await.status == Status::Blocked {
@@ -1095,6 +1096,13 @@ async fn unblock_follows_an_escalated_run_on_postgres() {
     assert_eq!(stack.run(run).await.status, RunStatus::AwaitingApproval);
     let review = stack.step_at(run, 3).await;
     assert_eq!((review.status, review.attempt), (StepStatus::Failed, 2));
+    assert!(
+        stack.notes(item).await.iter().any(|body| {
+            body.contains("review loop exhausted after 2 attempts")
+                && body.contains("stop reason `no_progress_review`")
+        }),
+        "the two reviews are the one authored body, so the review half stopped the loop"
+    );
 
     stack.command(Command::Unblock { item }).await;
     assert_eq!(stack.take_status(), None, "the unblock was accepted");

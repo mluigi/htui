@@ -794,11 +794,10 @@ pub fn loop_target(snapshot: &GraphSnapshot, review_position: i32) -> Option<i32
 /// Both halves are computed from rows the step already wrote. The hash half compares the two
 /// implement attempts' `run_step_commit` rows per repo, with "both `None`" counting as identical —
 /// two attempts that committed nothing are exactly the failure mode ANA-2 `:735-739` names. The
-/// review half compares the two highest versions of the review phase's `output_kind` that this
-/// run's steps at `review_position` produced, read from every version the item holds rather
-/// than the latest per kind, and hashes them through `prompt::digest::canonical`, the workspace's
-/// one normalisation, so a review re-emitted with different line endings does not read as
-/// progress. The hash half is asked first, so a loop where both hold reports `no_progress_hash`.
+/// review half compares the reviews of the loop's last two turns — the two rows at
+/// `review_position` answered `Rejected` — read from every version the item holds rather than
+/// the latest per kind, and hashes them through `prompt::digest::canonical`, the workspace's one
+/// normalisation, so a review re-emitted with different line endings does not read as progress. The hash half is asked first, so a loop where both hold reports `no_progress_hash`.
 async fn no_progress<S: WriteStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     steps: &[RunStep],
@@ -863,20 +862,25 @@ async fn commits_are_identical<S: WriteStore, C: Clock + ?Sized>(
     }))
 }
 
-/// The two latest review documents this run's steps at `review_position` produced, byte-identical
-/// after canonicalisation.
+/// The reviews of the loop's last two turns, byte-identical after canonicalisation.
+///
+/// A turn is a row at `review_position` answered `Rejected`: both entry points stamp it before
+/// the loop runs (`reject` and `Engine::answer_gate`). A review answered `Retried`, or one a crash
+/// interrupted (`gate_outcome` NULL), is no turn, though it may have written a review too; reading
+/// the two latest review documents instead would compare a retried review with its re-run and
+/// stop a loop that made progress (CLEAN-4 review M-1). The two rejected rows with the highest
+/// attempts are compared, each through the highest version of the review phase's `output_kind`
+/// it produced — a promoted review's chat may have written more than one.
 ///
 /// Reads [`ReadStore::documents`](htui_core::store::ReadStore::documents): heads of every version
 /// of every kind, without bodies. `documents_of_kinds` answers only the latest version per kind,
 /// so it can never hold two reviews, and reading through it left `LoopStop::NoProgressReview`
-/// unreachable from MOD-4 milestone 2 until CLEAN-4. The heads are kept when their `kind` is the
-/// review phase's `output_kind` and their `produced_by_step_id` is one of this run's rows at
-/// `review_position`. The two highest versions win, and only those two bodies are read, through
+/// unreachable from MOD-4 milestone 2 until CLEAN-4. Only the two chosen bodies are read, through
 /// [`ReadStore::document`](htui_core::store::ReadStore::document).
 ///
 /// Every "cannot tell" answers `false`, so the loop is not stopped: a chat run, a snapshot with
-/// no such position, fewer than two reviews, or a head whose body read answers `None` because the
-/// row went between the two reads.
+/// no such position, fewer than two turns, a turn that wrote no review, or a head whose body read
+/// answers `None` because the row went between the two reads.
 async fn reviews_are_identical<S: WriteStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     steps: &[RunStep],
@@ -894,30 +898,30 @@ async fn reviews_are_identical<S: WriteStore, C: Clock + ?Sized>(
     else {
         return Ok(false);
     };
-    let mine: Vec<StepId> = steps
+    let mut turns: Vec<&RunStep> = steps
         .iter()
-        .filter(|step| step.position == review_position)
-        .map(|step| step.id)
-        .collect();
-    let mut heads: Vec<_> = ctx
-        .store
-        .documents(item)
-        .await?
-        .into_iter()
-        .filter(|head| {
-            head.kind == kind
-                && head
-                    .produced_by_step_id
-                    .is_some_and(|step| mine.contains(&step))
+        .filter(|step| {
+            step.position == review_position && step.gate_outcome == Some(GateOutcome::Rejected)
         })
         .collect();
-    heads.sort_by_key(|head| core::cmp::Reverse(head.version));
-    let [newest, previous, ..] = heads.as_slice() else {
+    turns.sort_by_key(|step| core::cmp::Reverse(step.attempt));
+    let [newest, previous, ..] = turns.as_slice() else {
+        return Ok(false);
+    };
+    let heads = ctx.store.documents(item).await?;
+    let review_of = |step: StepId| {
+        heads
+            .iter()
+            .filter(|head| head.kind == kind && head.produced_by_step_id == Some(step))
+            .max_by_key(|head| head.version)
+            .map(|head| head.id)
+    };
+    let (Some(newest), Some(previous)) = (review_of(newest.id), review_of(previous.id)) else {
         return Ok(false);
     };
     let (Some(newest), Some(previous)) = (
-        ctx.store.document(newest.id).await?,
-        ctx.store.document(previous.id).await?,
+        ctx.store.document(newest).await?,
+        ctx.store.document(previous).await?,
     ) else {
         return Ok(false);
     };
@@ -1048,8 +1052,8 @@ mod tests {
     use htui_core::model::{Document, GraphSnapshot, VerifyOutcome};
 
     use htui_core::model::{
-        DocumentId, NewDocument, NewRepo, NewRunStep, RepoId, Run, RunStep, RunStepCommit,
-        StepStatus,
+        DocumentId, GateOutcome, NewDocument, NewRepo, NewRunStep, RepoId, Run, RunStep,
+        RunStepCommit, StepStatus,
     };
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 
@@ -1464,6 +1468,29 @@ mod tests {
             .expect("the item, the step and the user exist");
     }
 
+    /// A `review` row of `RUN_3` at `(3, attempt, 0)`, parked and then answered `outcome`, which is
+    /// how every review that reaches the loop is marked (`Rejected`) and how a retried one is
+    /// (`Retried`).
+    async fn review_at(store: &MemStore, attempt: i32, outcome: GateOutcome) -> RunStep {
+        let row = step_at(
+            store,
+            3,
+            "review",
+            attempt,
+            0,
+            &[StepStatus::Running, StepStatus::AwaitingApproval],
+        )
+        .await;
+        assert!(
+            store
+                .answer_gate(row.id, outcome, None, epoch())
+                .await
+                .expect("the row exists"),
+            "the row was awaiting an answer"
+        );
+        row
+    }
+
     /// The status of every `RUN_3` row, by id.
     async fn status_of(store: &MemStore, id: htui_core::model::StepId) -> StepStatus {
         store
@@ -1645,28 +1672,8 @@ mod tests {
             user: ids::USER,
             box_id: ids::BOX,
         };
-        let first = step_at(
-            &store,
-            3,
-            "review",
-            1,
-            0,
-            &[
-                StepStatus::Running,
-                StepStatus::Failed,
-                StepStatus::Cancelled,
-            ],
-        )
-        .await;
-        let second = step_at(
-            &store,
-            3,
-            "review",
-            2,
-            0,
-            &[StepStatus::Running, StepStatus::Failed],
-        )
-        .await;
+        let first = review_at(&store, 1, GateOutcome::Rejected).await;
+        let second = review_at(&store, 2, GateOutcome::Rejected).await;
         produce(
             &store,
             "review",
@@ -1709,28 +1716,8 @@ mod tests {
             user: ids::USER,
             box_id: ids::BOX,
         };
-        let first = step_at(
-            &store,
-            3,
-            "review",
-            1,
-            0,
-            &[
-                StepStatus::Running,
-                StepStatus::Failed,
-                StepStatus::Cancelled,
-            ],
-        )
-        .await;
-        let second = step_at(
-            &store,
-            3,
-            "review",
-            2,
-            0,
-            &[StepStatus::Running, StepStatus::Failed],
-        )
-        .await;
+        let first = review_at(&store, 1, GateOutcome::Rejected).await;
+        let second = review_at(&store, 2, GateOutcome::Rejected).await;
         produce(
             &store,
             "review",
@@ -1744,6 +1731,22 @@ mod tests {
             no_progress(&ctx, &steps, 2, 3, 2).await.expect("reads"),
             None,
             "the second review says something the first did not"
+        );
+
+        // A newer document of another kind by the second review, repeating the first review: the
+        // review half reads the review phase's `output_kind`, not whatever the row wrote last.
+        produce(
+            &store,
+            "plan",
+            Some(&second),
+            "---\nverdict: request-changes\n---\nno tests\n",
+        )
+        .await;
+        let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
+        assert_eq!(
+            no_progress(&ctx, &steps, 2, 3, 2).await.expect("reads"),
+            None,
+            "a document of another kind is not the review"
         );
 
         // Two higher versions of kind `review` repeating the second: one by the implement at
@@ -1767,21 +1770,44 @@ mod tests {
         );
 
         // The control: a third review of this loop that repeats the second.
-        let third = step_at(
-            &store,
-            3,
-            "review",
-            3,
-            0,
-            &[StepStatus::Running, StepStatus::Failed],
-        )
-        .await;
+        let third = review_at(&store, 3, GateOutcome::Rejected).await;
         produce(&store, "review", Some(&third), SECOND).await;
         let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
         assert_eq!(
             no_progress(&ctx, &steps, 2, 3, 3).await.expect("reads"),
             Some(LoopStop::NoProgressReview),
             "the two latest reviews of this loop repeat each other, whatever lies between them"
+        );
+    }
+
+    /// CLEAN-4 review M-1: the review half compares the reviews of two loop turns, not the two
+    /// latest review documents. A review answered `Retried` sits between them here and repeats the
+    /// last one, so reading the two latest documents would compare that pair and stop a loop that
+    /// made progress; only the rows answered `Rejected` are loop turns.
+    #[tokio::test]
+    async fn no_progress_review_skips_a_retried_review() {
+        let store = MemStore::demo();
+        let (run, snapshot) = run_3();
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+        };
+        let first = review_at(&store, 1, GateOutcome::Rejected).await;
+        produce(&store, "review", Some(&first), "no tests").await;
+        let retried = review_at(&store, 2, GateOutcome::Retried).await;
+        produce(&store, "review", Some(&retried), "tests added").await;
+        let last = review_at(&store, 3, GateOutcome::Rejected).await;
+        produce(&store, "review", Some(&last), "tests added").await;
+        let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
+
+        assert_eq!(
+            no_progress(&ctx, &steps, 2, 3, 2).await.expect("reads"),
+            None,
+            "the two rejected reviews differ; the retried one between them is not a loop turn"
         );
     }
 
