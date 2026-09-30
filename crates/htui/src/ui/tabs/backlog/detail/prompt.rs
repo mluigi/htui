@@ -537,4 +537,63 @@ mod tests {
             .expect("the section table is rendered");
         assert!(table < at, "the block sits below the section table");
     }
+
+    #[test]
+    fn a_matched_choice_names_its_path() {
+        // MOD-9 D125: a matched glob says which file woke it, CR and LF flattened as in names.
+        let line = choice_line(&SkillChoice {
+            skill: htui_core::fixtures::ids::SKILL_TESTS,
+            name: "rust-glob".to_owned(),
+            version: Some(1),
+            level: SkillLevel::Project,
+            activation: Activation::Glob,
+            active: true,
+            reason: ChoiceReason::Matched,
+            path: Some("htui:src/lib\nx.rs".to_owned()),
+        });
+        assert_eq!(
+            line,
+            "rust-glob v1 \u{b7} project \u{b7} glob \u{2192} matched htui:src/lib x.rs"
+        );
+    }
+
+    #[test]
+    fn a_no_match_choice_is_dim_and_says_so() {
+        // MOD-9 D125: `no_match` is inactive, so its row is dim and names the reason.
+        let mut assembled = htui_core::prompt::assemble(
+            &htui_core::prompt::fixtures::phase_implement_attempt2(),
+            &htui_core::scrub::MinimalScrubber::new([]),
+        )
+        .expect("the fixture assembles");
+        assembled.trim.skill_choices.push(SkillChoice {
+            skill: htui_core::fixtures::ids::SKILL_TESTS,
+            name: "rust-glob".to_owned(),
+            version: Some(1),
+            level: SkillLevel::Project,
+            activation: Activation::Glob,
+            active: false,
+            reason: ChoiceReason::NoMatch,
+            path: None,
+        });
+        let preview = PromptPreview {
+            item: htui_core::fixtures::ids::HTUI_FEAT_1,
+            available: vec!["implement".to_owned()],
+            template: Some(htui_core::prompt::TemplateRef {
+                name: "implement".to_owned(),
+                version: 1,
+            }),
+            outcome: Ok(assembled),
+        };
+
+        let rows = render_lines(&preview);
+        let row = rows
+            .iter()
+            .find(|row| row.text.contains("rust-glob"))
+            .unwrap_or_else(|| panic!("the no_match choice is a row: {rows:#?}"));
+        assert!(
+            row.text.ends_with("glob \u{2192} no_match"),
+            "the reason is spelled out: {row:?}"
+        );
+        assert!(row.dim, "an inactive choice is dim: {row:?}");
+    }
 }

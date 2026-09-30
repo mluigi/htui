@@ -65,6 +65,9 @@ pub struct ProjectSkills {
     pub graphs: Vec<(StepGraph, Vec<StepGraphPhase>)>,
     /// Its repo names, byte order: D79's repo picker and the marks on a glob naming no repo.
     pub repos: Vec<String>,
+    /// MOD-9 D126: its repo names with no `repo_box_path` row for this box, byte order; every
+    /// repo when the box is unregistered.
+    pub unrooted: Vec<String>,
 }
 
 impl SkillsSnapshot {
@@ -167,6 +170,7 @@ pub async fn snapshot(writer: &Writer, scope: &Scope) -> Result<SkillsSnapshot> 
             bindings,
             graphs,
             repos,
+            unrooted: Vec::new(),
         });
     }
     let mut skills = Vec::new();
@@ -365,8 +369,8 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
     use htui_core::fixtures::{self, ids};
     use htui_core::model::{
-        Activation, Attachment, BindingChange, NewRepo, PhaseId, RepoId, Scope, SkillBindingKey,
-        SkillId, SkillPatch, StepGraph, StepGraphId,
+        Activation, Attachment, BindingChange, NewRepo, PhaseId, RepoBoxPath, RepoId, Scope,
+        SkillBindingKey, SkillId, SkillPatch, StepGraph, StepGraphId,
     };
     use htui_core::store::{MemStore, StoreError, WriteStore as _};
     use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PROMPT_ON_SERVER_ONLY};
@@ -623,6 +627,50 @@ mod tests {
             "no global row"
         );
         assert_eq!(snapshot.project(ids::PROJECT_VULKAN), None);
+    }
+
+    /// MOD-9 D126: the snapshot names the repos this box has no checkout path for, so the
+    /// attachments pane can warn on a `glob` row that could never fire here.
+    #[tokio::test]
+    async fn the_snapshot_lists_repos_with_no_path_on_this_box() {
+        let store = MemStore::demo();
+        let rooted = RepoId::new();
+        for (id, name, is_primary) in [(rooted, "htui", true), (RepoId::new(), "web", false)] {
+            store
+                .create_repo(NewRepo {
+                    id,
+                    project_id: ids::PROJECT_HTUI,
+                    name: name.to_owned(),
+                    remote_url: None,
+                    default_branch: "main".to_owned(),
+                    is_primary,
+                })
+                .await
+                .expect("the demo takes a repo on `htui`");
+        }
+        store
+            .upsert_repo_box_path(&RepoBoxPath {
+                repo_id: rooted,
+                box_id: ids::BOX,
+                local_path: "/src/htui".to_owned(),
+                updated_at: DateTime::UNIX_EPOCH,
+            })
+            .await
+            .expect("the path write");
+        let backend = Backend::memory(store);
+        let scope = platform_scope(&backend).await;
+
+        let snapshot = read(&backend, &scope).await;
+
+        let htui = snapshot
+            .project(ids::PROJECT_HTUI)
+            .expect("htui is in the scope");
+        assert_eq!(htui.repos, ["htui", "web"]);
+        assert_eq!(htui.unrooted, ["web"], "only `web` has no path on this box");
+        let agy = snapshot
+            .project(ids::PROJECT_AGY)
+            .expect("agy is in the scope");
+        assert!(agy.unrooted.is_empty(), "agy has no repo to be unrooted");
     }
 
     #[tokio::test]
