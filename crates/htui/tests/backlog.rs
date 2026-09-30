@@ -10,6 +10,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use htui::agent_worker::AgentRuntime;
 use htui::app::Action;
+use htui::keymap::KeyScope;
 use htui::requirements::decision_citation_stays;
 use htui::run_worker::{self, LiveChats, RunRuntime, StepAuthor};
 use htui::testkit::Harness;
@@ -252,6 +253,20 @@ async fn h_and_l_cycle_the_sub_tabs_both_ways() {
             .contains("Stand up the terminal application"),
         "[ goes back to Body"
     );
+}
+
+/// MOD-14 D8: `m` opens the Graph from the Backlog's own arm; its binding is the help box's half,
+/// next to the `Enter` row it mirrors.
+#[tokio::test]
+async fn m_is_on_the_backlog_help_line() {
+    let mut harness = Harness::demo();
+    htui::app::register_all(harness.app());
+    let help = harness
+        .app()
+        .keymap
+        .help_line(&KeyScope::Tab(BacklogTab::ID));
+    assert!(help.contains("m open graph"), "{help}");
+    assert!(help.contains("Enter replay step"), "{help}");
 }
 
 // ---------------------------------------------------------------------------------------------

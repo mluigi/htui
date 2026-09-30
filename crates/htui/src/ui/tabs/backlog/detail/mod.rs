@@ -154,6 +154,15 @@ impl DetailRegistry {
         }
     }
 
+    /// Activates the sub-tab registered under `id` (MOD-14 D8: `m` opens the Graph). `false` (and no
+    /// change) when nothing is registered under it.
+    pub fn select_id(&mut self, id: DetailId) -> bool {
+        match self.tabs.iter().position(|tab| tab.id() == id) {
+            Some(idx) => self.select(idx),
+            None => false,
+        }
+    }
+
     /// Activates the next sub-tab, wrapping (`l`, `]`, `Right`).
     pub fn cycle_next(&mut self) {
         if !self.tabs.is_empty() {
