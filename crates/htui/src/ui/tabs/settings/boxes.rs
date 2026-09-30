@@ -134,6 +134,9 @@ enum Mode {
 struct ExecutorFlip {
     /// From the snapshot row the confirmation opened on.
     box_id: BoxId,
+    /// That row's hostname, kept for the question: a plain read that drops the box moves the
+    /// selection, and the question must still name the box `y` writes to (D48).
+    hostname: String,
     /// `edit_version` at open; replaced only by a `BoxesStale` (D48).
     expected: i32,
     /// `Executor::of(&row.settings)` at open.
@@ -153,14 +156,15 @@ impl ExecutorFlip {
         };
         Self {
             box_id: record.row.id,
+            hostname: record.row.hostname.clone(),
             expected: record.row.edit_version,
             from,
             to,
         }
     }
 
-    /// The confirmation line over the box named `hostname`: the flip, then what it changes.
-    fn question(&self, hostname: &str) -> String {
+    /// The confirmation line over the flip's own box: the flip, then what it changes.
+    fn question(&self) -> String {
         let consequence = match self.to {
             Executor::Worker => {
                 "The TUI stops walking runs here; `htui worker` must run on this box."
@@ -168,8 +172,8 @@ impl ExecutorFlip {
             Executor::Tui | Executor::Other(_) => "The TUI walks this box's runs again.",
         };
         format!(
-            "executor of `{hostname}`: `{}` \u{2192} `{}`? {consequence}",
-            self.from, self.to
+            "executor of `{}`: `{}` \u{2192} `{}`? {consequence}",
+            self.hostname, self.from, self.to
         )
     }
 }
@@ -840,13 +844,9 @@ impl BoxesSection {
 
         match &self.mode {
             Mode::Executor(flip) => {
-                // The flip names its own box: after a reload the selection may be another one.
-                let hostname = snapshot
-                    .boxes
-                    .iter()
-                    .find(|listed| listed.row.id == flip.box_id)
-                    .map_or(row.hostname.as_str(), |listed| listed.row.hostname.as_str());
-                let question = wrapped(&flip.question(hostname), room)
+                // The flip names its own box, kept from open: after a reload that dropped it the
+                // selection is another box, and `y` still writes to the flip's.
+                let question = wrapped(&flip.question(), room)
                     .into_iter()
                     .map(|line| Line::styled(line, theme.base))
                     .collect();
