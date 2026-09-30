@@ -8,8 +8,9 @@
 //! sub-tab never names the list it re-roots.
 
 use core::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
-use htui_core::model::{ItemId, LinkEdge, LinkGraph, LinkKind, LinkNode, ProjectId, ProjectRef};
+use htui_core::model::{ItemId, LinkGraph, LinkKind, LinkNode, ProjectId, ProjectRef};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -80,6 +81,31 @@ struct Link {
     repeat: bool,
 }
 
+/// One line of the tree, as an index into the `LinkGraph` it was built from.
+///
+/// Stored rather than borrowed, so the tree is built once per reply and per depth change and never
+/// per key or per frame (M2); [`TreeRow::resolve`] turns it into a [`GraphRow`] to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TreeRow {
+    /// `0` for the root, one more than the row it hangs under otherwise.
+    level: u8,
+    /// `None` on the root row.
+    link: Option<Link>,
+    /// Index into `LinkGraph::nodes`.
+    node: usize,
+}
+
+impl TreeRow {
+    /// The row read against `graph`, which must be the graph it was built from.
+    fn resolve(self, graph: &LinkGraph) -> GraphRow<'_> {
+        GraphRow {
+            level: self.level,
+            link: self.link,
+            node: &graph.nodes[self.node],
+        }
+    }
+}
+
 /// One line of the tree, borrowed from the `LinkGraph` it was built from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct GraphRow<'a> {
@@ -103,11 +129,13 @@ impl GraphRow<'_> {
 pub struct GraphTab {
     /// The `Links` reply for the selected item, fetched at `MAX_HOPS`.
     graph: Option<LinkGraph>,
+    /// `graph`'s tree at `depth`: rebuilt when either changes, empty while no graph is loaded.
+    rows: Vec<TreeRow>,
     /// Whether an item is selected at all.
     item: Option<ItemId>,
     /// Why the `Links` read for the selected item was refused, until another answer arrives.
     failed: Option<String>,
-    /// Index into the visible rows.
+    /// Index into `rows`.
     cursor: usize,
     /// View depth, `1..=MAX_HOPS`. A preference: survives `on_item_change` (D2).
     depth: u8,
@@ -125,6 +153,7 @@ impl GraphTab {
     pub const fn new() -> Self {
         Self {
             graph: None,
+            rows: Vec::new(),
             item: None,
             failed: None,
             cursor: 0,
@@ -132,17 +161,31 @@ impl GraphTab {
         }
     }
 
+    /// Rebuilds `rows` from `graph` at `depth`: the one place the tree is built.
+    fn rebuild(&mut self) {
+        self.rows = self
+            .graph
+            .as_ref()
+            .map(|graph| tree(graph, self.depth))
+            .unwrap_or_default();
+    }
+
+    /// Row `at`, read against the graph it was built from.
+    fn row(&self, at: usize) -> Option<GraphRow<'_>> {
+        let graph = self.graph.as_ref()?;
+        self.rows.get(at).map(|row| row.resolve(graph))
+    }
+
     /// The rows at the current view depth; empty while no graph is loaded.
     fn visible(&self) -> Vec<GraphRow<'_>> {
-        self.graph
-            .as_ref()
-            .map(|graph| rows(graph, self.depth))
-            .unwrap_or_default()
+        self.graph.as_ref().map_or_else(Vec::new, |graph| {
+            self.rows.iter().map(|row| row.resolve(graph)).collect()
+        })
     }
 
     /// Moves the cursor `delta` rows, clamped to the rows (0 when there are none).
     fn move_cursor(&mut self, delta: isize) {
-        let last = self.visible().len().saturating_sub(1);
+        let last = self.rows.len().saturating_sub(1);
         self.cursor = self.cursor.saturating_add_signed(delta).min(last);
     }
 
@@ -155,8 +198,9 @@ impl GraphTab {
         if depth == self.depth {
             return;
         }
-        let item = self.visible().get(self.cursor).map(|row| row.node.item_id);
+        let item = self.row(self.cursor).map(|row| row.node.item_id);
         self.depth = depth;
+        self.rebuild();
         self.cursor = item
             .and_then(|id| {
                 self.visible()
@@ -169,8 +213,7 @@ impl GraphTab {
     /// `Enter`: re-root on the item under the cursor, or say why not (D6, D7). Nothing on the
     /// root row, or with no graph loaded.
     fn re_root(&self, ctx: &Ctx<'_>) {
-        let rows = self.visible();
-        let Some(row) = rows.get(self.cursor) else {
+        let Some(row) = self.row(self.cursor) else {
             return;
         };
         if row.link.is_none() {
@@ -210,70 +253,151 @@ fn node_order(a: &LinkNode, b: &LinkNode) -> Ordering {
         .then_with(|| a.item_id.cmp(&b.item_id))
 }
 
+/// An edge between two ranked nodes: `from` and `to` are ranks, `edge` indexes `LinkGraph::edges`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ranked {
+    /// Rank of the edge's `from` end.
+    from: usize,
+    /// Rank of the edge's `to` end.
+    to: usize,
+    /// Index into `LinkGraph::edges`.
+    edge: usize,
+}
+
 /// The tree of `graph` cut at view depth `depth` (D2, D3, D4), in preorder, the root first.
 ///
-/// Nodes are ranked by [`node_order`] and edges by their endpoints' ranks, then their kind. A
-/// node's tree parent is its first-ranked neighbour one level up, joined by the first edge between
-/// the two; every other edge hangs, as a `(*)` leaf, under its shallower endpoint (the first-ranked
-/// one on a tie). A node with no neighbour one level up (a malformed reply) is dropped with its
-/// edges. The walk terminates because a tree parent is strictly shallower than its child.
-fn rows(graph: &LinkGraph, depth: u8) -> Vec<GraphRow<'_>> {
-    let Some(root) = graph.node(graph.root) else {
+/// Nodes are ranked by [`rank_nodes`] and edges by [`rank_edges`]; [`tree_parents`] picks each
+/// node's tree edge and [`hang_edges`] hangs every other edge as a `(*)` leaf. A node with no
+/// neighbour one level up is dropped with its edges: a malformed reply, or the offline cache's
+/// legitimate partial one, where a node reached only through an item whose project is not
+/// mirrored arrives without the edge that reached it. The walk terminates because a tree parent is
+/// strictly shallower than its child.
+fn tree(graph: &LinkGraph, depth: u8) -> Vec<TreeRow> {
+    let nodes = rank_nodes(graph, depth);
+    let Some(&root) = nodes.first() else {
         return Vec::new();
     };
-    let mut nodes: Vec<&LinkNode> = graph
+    let edges = rank_edges(graph, &nodes);
+    let depths: Vec<u8> = nodes.iter().map(|&at| graph.nodes[at].depth).collect();
+    let parent = tree_parents(&depths, &edges);
+    let under = hang_edges(graph, &nodes, &edges, &parent);
+    let mut out = vec![TreeRow {
+        level: 0,
+        link: None,
+        node: root,
+    }];
+    walk(0, 1, &nodes, &under, &mut out);
+    out
+}
+
+/// The nodes shown at view depth `depth`, as indices into `LinkGraph::nodes` in rank order: the
+/// root first whatever depth the reply gave it, then [`node_order`]. Empty when the reply does not
+/// hold its own root.
+///
+/// One rank per item: the first copy in rank order wins. A set rather than `dedup_by_key`, which
+/// only drops *adjacent* duplicates, and two copies of an item at different depths are not.
+fn rank_nodes(graph: &LinkGraph, depth: u8) -> Vec<usize> {
+    let root = graph.root;
+    if graph.node(root).is_none() {
+        return Vec::new();
+    }
+    let mut ranked: Vec<usize> = graph
         .nodes
         .iter()
-        .filter(|node| node.item_id == root.item_id || (node.depth > 0 && node.depth <= depth))
+        .enumerate()
+        .filter(|(_, node)| node.item_id == root || (node.depth > 0 && node.depth <= depth))
+        .map(|(at, _)| at)
         .collect();
-    nodes.sort_by(|a, b| {
-        // The root ranks first whatever depth the reply gave it.
-        (a.item_id != root.item_id)
-            .cmp(&(b.item_id != root.item_id))
+    ranked.sort_by(|&a, &b| {
+        let (a, b) = (&graph.nodes[a], &graph.nodes[b]);
+        (a.item_id != root)
+            .cmp(&(b.item_id != root))
             .then_with(|| node_order(a, b))
     });
-    nodes.dedup_by_key(|node| node.item_id);
-    let rank = |id: ItemId| nodes.iter().position(|node| node.item_id == id);
+    let mut seen = HashSet::with_capacity(ranked.len());
+    ranked.retain(|&at| seen.insert(graph.nodes[at].item_id));
+    ranked
+}
 
-    let mut edges: Vec<(usize, usize, &LinkEdge)> = graph
+/// The edges between two ranked nodes, ordered by their endpoints' ranks, then their kind.
+fn rank_edges(graph: &LinkGraph, nodes: &[usize]) -> Vec<Ranked> {
+    let rank: HashMap<ItemId, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(rank, &at)| (graph.nodes[at].item_id, rank))
+        .collect();
+    let mut edges: Vec<Ranked> = graph
         .edges
         .iter()
-        .filter_map(|edge| Some((rank(edge.from_item_id)?, rank(edge.to_item_id)?, edge)))
+        .enumerate()
+        .filter_map(|(at, edge)| {
+            Some(Ranked {
+                from: *rank.get(&edge.from_item_id)?,
+                to: *rank.get(&edge.to_item_id)?,
+                edge: at,
+            })
+        })
         .collect();
     edges.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then(a.1.cmp(&b.1))
-            .then_with(|| a.2.kind.as_str().cmp(b.2.kind.as_str()))
+        a.from.cmp(&b.from).then(a.to.cmp(&b.to)).then_with(|| {
+            let (a, b) = (&graph.edges[a.edge], &graph.edges[b.edge]);
+            a.kind.as_str().cmp(b.kind.as_str())
+        })
     });
+    edges
+}
 
-    // Tree edges, by child rank: `(parent rank, edge index)`. Ranks ascend with depth, so every
-    // candidate parent has been decided (kept or dropped) before its children are looked at.
-    let mut parent: Vec<Option<(usize, usize)>> = vec![None; nodes.len()];
-    let mut kept = vec![false; nodes.len()];
-    kept[0] = true;
-    for child in 1..nodes.len() {
-        let wanted = nodes[child].depth.checked_sub(1);
-        parent[child] = edges
+/// Each ranked node's tree edge, as `(parent rank, index into edges)`; `None` for the root and for
+/// a node that is dropped.
+///
+/// A node's tree parent is its first-ranked neighbour one level up (`depths` are the nodes' reply
+/// depths, by rank) that is itself kept, joined by the first edge between the two. Ranks ascend
+/// with depth, so every candidate parent has been decided (kept or dropped) before its children
+/// are looked at.
+fn tree_parents(depths: &[u8], edges: &[Ranked]) -> Vec<Option<(usize, usize)>> {
+    // Each node's neighbours, as `(other rank, index into edges)`. A self-loop is nobody's parent.
+    let mut adjacent: Vec<Vec<(usize, usize)>> = vec![Vec::new(); depths.len()];
+    for (at, edge) in edges.iter().enumerate() {
+        if edge.from != edge.to {
+            adjacent[edge.from].push((edge.to, at));
+            adjacent[edge.to].push((edge.from, at));
+        }
+    }
+    let mut parent: Vec<Option<(usize, usize)>> = vec![None; depths.len()];
+    let mut kept = vec![false; depths.len()];
+    if let Some(root) = kept.first_mut() {
+        *root = true;
+    }
+    for child in 1..depths.len() {
+        let wanted = depths[child].checked_sub(1);
+        parent[child] = adjacent[child]
             .iter()
-            .enumerate()
-            .filter_map(|(at, &(from, to, _))| {
-                let other = match (from == child, to == child) {
-                    (true, false) => to,
-                    (false, true) => from,
-                    _ => return None,
-                };
-                (kept[other] && Some(nodes[other].depth) == wanted).then_some((other, at))
-            })
+            .copied()
+            .filter(|&(other, _)| kept[other] && Some(depths[other]) == wanted)
             .min();
         kept[child] = parent[child].is_some();
     }
+    parent
+}
 
-    // What hangs under each node: its tree children and the non-tree edges it owns.
+/// What hangs under each ranked node, sorted: its tree children and the non-tree edges it owns.
+///
+/// A non-tree edge hangs, as a `(*)` leaf, under its shallower endpoint (the first-ranked one on a
+/// tie); an edge with a dropped end is not drawn.
+fn hang_edges(
+    graph: &LinkGraph,
+    nodes: &[usize],
+    edges: &[Ranked],
+    parent: &[Option<(usize, usize)>],
+) -> Vec<Vec<(usize, Link)>> {
+    let node = |rank: usize| &graph.nodes[nodes[rank]];
+    let kept = |rank: usize| rank == 0 || parent[rank].is_some();
     let mut under: Vec<Vec<(usize, Link)>> = vec![Vec::new(); nodes.len()];
-    for (at, &(from, to, edge)) in edges.iter().enumerate() {
-        if !kept[from] || !kept[to] {
+    for (at, &Ranked { from, to, edge }) in edges.iter().enumerate() {
+        if !kept(from) || !kept(to) {
             continue;
         }
+        let edge = &graph.edges[edge];
         let tree = |child: usize| parent[child].is_some_and(|(_, tree_edge)| tree_edge == at);
         let (owner, other, repeat) = if from != to && tree(to) {
             (from, to, false)
@@ -283,7 +407,7 @@ fn rows(graph: &LinkGraph, depth: u8) -> Vec<GraphRow<'_>> {
             (from.min(to), from.max(to), true)
         };
         // A self-loop has `owner == other` and reads outward.
-        let arrow = if nodes[owner].item_id == edge.from_item_id {
+        let arrow = if node(owner).item_id == edge.from_item_id {
             Arrow::Out
         } else {
             Arrow::In
@@ -299,7 +423,7 @@ fn rows(graph: &LinkGraph, depth: u8) -> Vec<GraphRow<'_>> {
     }
     for children in &mut under {
         children.sort_by(|(a, a_link), (b, b_link)| {
-            let (a, b) = (nodes[*a], nodes[*b]);
+            let (a, b) = (node(*a), node(*b));
             a.key
                 .as_bytes()
                 .cmp(b.key.as_bytes())
@@ -309,26 +433,19 @@ fn rows(graph: &LinkGraph, depth: u8) -> Vec<GraphRow<'_>> {
                 .then_with(|| (a_link.arrow == Arrow::In).cmp(&(b_link.arrow == Arrow::In)))
         });
     }
-
-    let mut out = vec![GraphRow {
-        level: 0,
-        link: None,
-        node: nodes[0],
-    }];
-    walk(0, 1, &nodes, &under, &mut out);
-    out
+    under
 }
 
-/// Preorder: the rows under `at`, each at `level`, a tree child followed by its own subtree.
-fn walk<'a>(
+/// Preorder: the rows under rank `at`, each at `level`, a tree child followed by its own subtree.
+fn walk(
     at: usize,
     level: u8,
-    nodes: &[&'a LinkNode],
+    nodes: &[usize],
     under: &[Vec<(usize, Link)>],
-    out: &mut Vec<GraphRow<'a>>,
+    out: &mut Vec<TreeRow>,
 ) {
     for &(other, link) in &under[at] {
-        out.push(GraphRow {
+        out.push(TreeRow {
             level,
             link: Some(link),
             node: nodes[other],
@@ -381,32 +498,19 @@ fn line(
     let kind = link.kind.as_str();
     let key = node.key.as_str();
     let slug = (node.project_id != root_project).then_some(node.project_slug.as_str());
-    let label = slug.map_or_else(|| key.to_owned(), |slug| format!("{slug}:{key}"));
+    let label_width = slug.map_or(0, |slug| slug.chars().count() + 1) + key.chars().count();
     let repeat = if link.repeat { REPEAT } else { "" };
     // Everything but the kind and the label: cursor, space, indent, arrow, three separators,
     // the status and the repeat mark.
     let fixed = 2 + indent + 1 + 3 + status.len() + repeat.chars().count();
 
     let padded = format!("{kind:<KIND_WIDTH$}");
-    let (kind, label) = if fixed + padded.len() + label.chars().count() <= width {
-        (padded, label)
-    } else if fixed + kind.len() + label.chars().count() <= width {
-        (kind.to_owned(), label)
+    let kind = if fixed + padded.len() + label_width <= width {
+        padded
     } else {
-        // The slug gives way before the key does: the key is what names the item.
-        let label_room = width.saturating_sub(fixed + kind.len());
-        let label = match slug {
-            Some(slug) => match label_room.checked_sub(key.chars().count() + 1) {
-                Some(slug_room) if slug_room >= 2 => {
-                    format!("{}:{key}", clip(slug, slug_room))
-                }
-                // Too little for a readable slug: the key alone, clipped if it must be.
-                _ => clip(key, label_room),
-            },
-            None => clip(key, label_room),
-        };
-        (kind.to_owned(), label)
+        kind.to_owned()
     };
+    let label = fit_label(key, slug, width.saturating_sub(fixed + kind.len()));
 
     spans.push(Span::raw(" ".repeat(indent)));
     spans.push(Span::styled(link.arrow.glyph(), theme.dim));
@@ -423,6 +527,24 @@ fn line(
         push_title(&mut spans, &node.title, width, title_style);
     }
     Line::from(spans)
+}
+
+/// The `[slug:]KEY` label in at most `room` columns (§1.5 steps 3-4, L5).
+///
+/// Whole when it fits; then the slug clipped, while it keeps two columns; then the key alone,
+/// clipped if it must be. The slug gives way first: the key is what names the item.
+fn fit_label(key: &str, slug: Option<&str>, room: usize) -> String {
+    let key_width = key.chars().count();
+    let Some(slug) = slug else {
+        return clip(key, room);
+    };
+    if slug.chars().count() + 1 + key_width <= room {
+        return format!("{slug}:{key}");
+    }
+    match room.checked_sub(key_width + 1) {
+        Some(slug_room) if slug_room >= 2 => format!("{}:{key}", clip(slug, slug_room)),
+        _ => clip(key, room),
+    }
 }
 
 /// `text` in at most `room` columns, `…`-clipped: [`list::clip`], except that no room is no text
@@ -458,6 +580,7 @@ impl DetailTab for GraphTab {
     fn on_item_change(&mut self, item: Option<ItemId>) {
         self.item = item;
         self.graph = None;
+        self.rows.clear();
         self.failed = None;
         self.cursor = 0;
     }
@@ -494,6 +617,7 @@ impl DetailTab for GraphTab {
         match reply {
             StoreReply::Links(graph) if Some(graph.root) == self.item => {
                 self.graph = Some(graph.clone());
+                self.rebuild();
                 self.failed = None;
                 self.cursor = 0;
             }
@@ -501,6 +625,7 @@ impl DetailTab for GraphTab {
             // is empty rather than claiming the item has no links.
             StoreReply::Failed { request, message } if *request == LINKS => {
                 self.graph = None;
+                self.rows.clear();
                 self.failed = Some(message.clone());
                 self.cursor = 0;
             }
@@ -577,6 +702,7 @@ mod tests {
     use crate::keymap::Keymap;
     use crate::store_worker::Origin;
     use crate::ui::tabs::BacklogTab;
+    use htui_core::model::LinkEdge;
 
     /// The detail pane's inner width at `DEFAULT_SIZE`, pinned by the Backlog tab's
     /// `the_detail_strip_fits_the_detail_pane`.
@@ -636,6 +762,14 @@ mod tests {
             .expect("the memory store never fails")
     }
 
+    /// The tree of `graph` at `depth`, read against it.
+    fn rows(graph: &LinkGraph, depth: u8) -> Vec<GraphRow<'_>> {
+        tree(graph, depth)
+            .into_iter()
+            .map(|row| row.resolve(graph))
+            .collect()
+    }
+
     /// A tree as text: `{indent}{arrow} {kind} {slug:}KEY{ (*)}`, the root as its bare key.
     fn shape(rows: &[GraphRow<'_>]) -> Vec<String> {
         let root = rows.first().map(|row| row.node.project_id);
@@ -671,6 +805,7 @@ mod tests {
         let mut tab = GraphTab::new();
         tab.on_item_change(Some(graph.root));
         tab.graph = Some(graph);
+        tab.rebuild();
         tab
     }
 
@@ -897,6 +1032,71 @@ mod tests {
             ["R", "→ relates R (*)", "→ blocked_by X", "→ relates X (*)",]
         );
         assert_eq!(rows.len(), 1 + 3);
+    }
+
+    /// A ranked edge with no graph behind it, for `tree_parents`.
+    fn ranked(from: usize, to: usize, edge: usize) -> Ranked {
+        Ranked { from, to, edge }
+    }
+
+    #[test]
+    fn a_tree_parent_is_the_first_ranked_kept_neighbour_one_level_up() {
+        // 0 is the root; 1 and 2 are one hop out, 3 two hops out and adjacent to both.
+        let depths = [0, 1, 1, 2];
+        let edges = [
+            ranked(0, 1, 0),
+            ranked(0, 2, 1),
+            ranked(1, 3, 2),
+            ranked(3, 1, 3),
+            ranked(2, 3, 4),
+        ];
+        assert_eq!(
+            tree_parents(&depths, &edges),
+            [None, Some((0, 0)), Some((0, 1)), Some((1, 2))],
+            "3 hangs under 1, the first-ranked candidate, by the first edge between them"
+        );
+
+        // A same-level neighbour is not a parent, and a self-loop is nobody's.
+        let depths = [0, 1, 1];
+        let edges = [ranked(0, 0, 0), ranked(0, 2, 1), ranked(1, 2, 2)];
+        assert_eq!(tree_parents(&depths, &edges), [None, None, Some((0, 1))]);
+
+        // A node whose only neighbour one level up was dropped is dropped too.
+        let depths = [0, 1, 2];
+        let edges = [ranked(1, 2, 0)];
+        assert_eq!(tree_parents(&depths, &edges), [None, None, None]);
+    }
+
+    #[test]
+    fn a_duplicate_node_keeps_its_first_ranked_copy() {
+        let r = node(1, "R", 0);
+        let x = node(2, "X", 1);
+        let y = node(3, "Y", 1);
+        let mut x_again = x.clone();
+        x_again.depth = 2;
+        let graph = LinkGraph {
+            root: r.item_id,
+            edges: vec![
+                edge(&r, LinkKind::Relates, &x),
+                edge(&r, LinkKind::Relates, &y),
+            ],
+            nodes: vec![x_again, y, r, x],
+        };
+        assert_eq!(rank_nodes(&graph, 3), [2, 3, 1], "R, X at depth 1, Y");
+        assert_eq!(shape(&rows(&graph, 3)), ["R", "→ relates X", "→ relates Y"]);
+    }
+
+    #[test]
+    fn fit_label_gives_up_the_slug_before_the_key() {
+        assert_eq!(fit_label("FEAT-1", None, 6), "FEAT-1");
+        assert_eq!(fit_label("FEAT-1", None, 4), "FEA…");
+        assert_eq!(fit_label("FEAT-1", None, 0), "");
+        assert_eq!(fit_label("FEAT-1", Some("agy"), 10), "agy:FEAT-1");
+        // Two columns of slug is the least worth drawing.
+        assert_eq!(fit_label("FEAT-1", Some("vulkan"), 9), "v…:FEAT-1");
+        assert_eq!(fit_label("FEAT-1", Some("vulkan"), 8), "FEAT-1");
+        assert_eq!(fit_label("FEAT-1", Some("vulkan"), 3), "FE…");
+        assert_eq!(fit_label("FEAT-1", Some("vulkan"), 0), "");
     }
 
     #[tokio::test]
@@ -1224,8 +1424,8 @@ mod tests {
     async fn the_narrowest_label_keeps_the_key() {
         let shell = Shell::platform().await;
         let graph = demo(ids::AGY_FIX_1).await;
-        let rows = rows(&graph, 2);
-        let vulkan = rows
+        let fix_1 = rows(&graph, 2);
+        let vulkan = fix_1
             .iter()
             .find(|row| row.node.item_id == ids::VULKAN_FEAT_1)
             .expect("vulkan FEAT-1 is one hop from agy FIX-1");
@@ -1233,7 +1433,7 @@ mod tests {
             let drawn = line(
                 vulkan,
                 false,
-                rows[0].node.project_id,
+                fix_1[0].node.project_id,
                 false,
                 width,
                 &shell.theme,
@@ -1248,7 +1448,7 @@ mod tests {
 
         // A label with no slug is clipped too, not left to the pane edge.
         let graph = demo(ids::HTUI_FEAT_1).await;
-        let feat_1 = super::rows(&graph, 2);
+        let feat_1 = rows(&graph, 2);
         let drawn = line(
             &feat_1[1],
             false,
