@@ -47,7 +47,7 @@ pub use settings::{
     rung_refusal, validate,
 };
 pub use template::{ParsedTemplate, Placeholder, Span, TemplateError, TemplateRole, parse};
-pub use trim::{Section, SectionEntry, TrimRecord, TrimStrategy};
+pub use trim::{Section, SectionEntry, TrimRecord, TrimStrategy, UndigestedSpan};
 
 use std::collections::BTreeMap;
 
@@ -57,7 +57,7 @@ use serde_json::Value;
 use crate::model::box_::BoxProfile;
 use crate::model::link::UpstreamEntry;
 use crate::model::skill::{BoundSkill, SkillChoice, StepFiles, select};
-use crate::prompt::render::Rendered;
+use crate::prompt::render::{HostnameLine, Rendered};
 use crate::prompt::trim::{Inputs, Trimmer};
 use crate::scrub::Scrubber;
 
@@ -97,6 +97,10 @@ pub struct PromptSpec {
     pub upstream: Vec<UpstreamEntry>,
     /// The §4.2 box projection. Carries no path, by type (`BoxProfile` drops `box_tool.path`).
     pub box_profile: BoxProfile,
+    /// `project.settings.box_hostname`, resolved by the caller (MOD-33 D267, D268): whether the box
+    /// section names the hostname. `true` renders it and keeps it out of the digest (D263);
+    /// `false` omits the line and neither masks nor scans the value (D269).
+    pub box_hostname: bool,
     /// The step's skill candidates, resolved by `model::skill::resolve`: global, project and phase
     /// attachments, most specific winning, inactive ones included. The assembler collapses and
     /// selects (MOD-9 D43).
@@ -319,16 +323,27 @@ impl Serialize for SectionName {
     }
 }
 
-/// The assembled prompt: one `String`, three uses (§4.7 step 8).
+/// The assembled prompt: two canonical strings from one set of trimmed sections (§4.7 step 8 as
+/// amended by MOD-33).
 ///
-/// `text` is canonical and is what is sent, what is digested and what is persisted. Canonicalising
-/// for the hash while sending the original bytes was considered and rejected: the digest would then
-/// describe a string nobody was given.
+/// `text` is what is sent and what is persisted. `digest_text` is what is digested: the same text
+/// with every undigested span's value replaced by its fixed stand-in — today only the box section's
+/// hostname, as [`render::HOSTNAME_STAND_IN`] — and the two differ in exactly those spans, which
+/// `trim.undigested` names. With no such span they are one string.
+///
+/// Canonicalising for the hash while sending the original bytes was considered and rejected: the
+/// digest would then describe a string nobody was given. The digest text is not that option: it
+/// differs from the sent text only in declared, recorded spans, never in formatting.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssembledPrompt {
-    /// The canonical assembled prompt.
+    /// The canonical assembled prompt, as sent.
     pub text: String,
-    /// `sha256` over [`text`](Self::text)'s UTF-8 bytes, lowercase hex, 64 characters.
+    /// The canonical text [`digest`](Self::digest) is over: [`text`](Self::text) with each span of
+    /// `trim.undigested` replaced by its stand-in. Handed to the recorder, which hashes it (D271);
+    /// never sent, never persisted.
+    pub digest_text: String,
+    /// `sha256` over [`digest_text`](Self::digest_text)'s UTF-8 bytes, lowercase hex, 64
+    /// characters.
     pub digest: String,
     /// The record's own rows, kept here so a reader need not open the record.
     pub sections: Vec<Section>,
@@ -422,7 +437,8 @@ impl From<TemplateError> for AssembleError {
 /// The one entry point: `PromptSpec` in, canonical bytes and their audit out (§4.7 `:1385-1398`).
 ///
 /// **Pure by contract** (ANA-5 invariant 2): the same spec and the same scrubber rules produce the
-/// same bytes on any box. There is no store handle, no I/O, no clock and no unordered map in the
+/// same bytes on any box. `text` and `digest_text` are two substitutions of one set of trimmed
+/// sections (MOD-33 D263). There is no store handle, no I/O, no clock and no unordered map in the
 /// path, and the two inputs whose order a caller could get wrong — the upstream walk and the skill
 /// bindings — are re-sorted here rather than trusted, because three backends and two collations
 /// produce them.
@@ -488,6 +504,19 @@ pub fn assemble(
             *value = scrub_text(scrubber, value, &name)?;
         }
     }
+    // MOD-33 D263/D269: the sent form of the box section, when it carries the hostname. Rendered
+    // from the masked spec and put through the same mask-and-scan as every section above, so a
+    // known secret masked in the digest form cannot survive in the sent form. The box is protected
+    // and never re-rendered by the trimmer, so this is the section the trim keeps, with the
+    // hostname line in its sent form.
+    let sent_box = if spec.box_hostname && parsed.used.contains(&Placeholder::Box) {
+        let mut section = render::box_profile(&spec.box_profile, HostnameLine::Shown);
+        let name = section.name.render();
+        section.content = scrub_text(scrubber, &section.content, &name)?;
+        Some(section)
+    } else {
+        None
+    };
     let scalars = scalar_substitutions(spec);
 
     // 4. Estimate, 5. refuse, 6. trim — all three inside the trimmer, which owns the arithmetic.
@@ -503,23 +532,50 @@ pub fn assemble(
     trimmer.run();
     let (sections, live, kept_excerpts) = trimmer.finish();
 
-    // 7. Substitute in span order: the frame's literals, each slot's sections wrapped.
-    let text = substitute(&parsed, &masked.literals, &live, &scalars);
+    // 7. Substitute in span order: the frame's literals, each slot's sections wrapped — once per
+    // form. 8. Canonicalise both and digest the digest text. With no hostname rendered the two
+    // forms are one string (MOD-33 D263).
+    let digest_text = digest::canonical(&substitute(&parsed, &masked.literals, &live, &scalars));
+    let text = match &sent_box {
+        None => digest_text.clone(),
+        Some(sent) => {
+            // Swapped by section name, never by searching the text (D263 (b)).
+            let sent_live: Vec<(Placeholder, Rendered)> = live
+                .iter()
+                .map(|(placeholder, section)| {
+                    let section = if section.name == SectionName::Box {
+                        sent.clone()
+                    } else {
+                        section.clone()
+                    };
+                    (*placeholder, section)
+                })
+                .collect();
+            digest::canonical(&substitute(&parsed, &masked.literals, &sent_live, &scalars))
+        }
+    };
+    let digest = digest::sha256_hex(&digest_text);
+    // Listed once however many `{{box}}` slots: one sent section feeds them all.
+    let undigested = if sent_box.is_some() {
+        vec![UndigestedSpan::BoxHostname]
+    } else {
+        Vec::new()
+    };
 
-    // 8. Canonicalise and digest. 9. Record.
-    let text = digest::canonical(&text);
-    let digest = digest::sha256_hex(&text);
+    // 9. Record.
     let record = trim::record(
         spec,
         &spec.template,
         template_tokens,
         sections,
         masked.skill_choices.clone(),
+        undigested,
         surviving_audit(spec, &kept_excerpts, scrubber)?,
         notes(spec),
     );
     Ok(AssembledPrompt {
         text,
+        digest_text,
         digest,
         sections: record.sections.clone(),
         trim: record,
@@ -550,7 +606,9 @@ pub fn excerpt_residual(spec: &PromptSpec, scrubber: &dyn Scrubber) -> Result<i6
 ///
 /// `literals` is the frame's literal spans, already LF-normalised and masked, in the same order the
 /// spans appear — so the iterator and the walk stay in step and the estimate at step 4 was over the
-/// very strings this substitutes (H-1).
+/// very strings this substitutes (H-1) — except the box section's hostname value, which the
+/// estimate measured as the stand-in and the sent substitution carries as the hostname (MOD-33
+/// D265). `assemble` calls this twice, once per form.
 fn substitute(
     parsed: &ParsedTemplate,
     literals: &[String],
@@ -628,9 +686,15 @@ fn render_sections(
         Placeholder::Item => vec![render::item(spec)],
         Placeholder::Documents => spec.documents.iter().map(render::document).collect(),
         Placeholder::Upstream => render::upstream(upstream, &[]).into_iter().collect(),
+        // MOD-33 D263: the pipeline's box is the **digest form**; `assemble` renders the sent
+        // form after the trim.
         Placeholder::Box => vec![render::box_profile(
             &spec.box_profile,
-            render::HostnameLine::Shown,
+            if spec.box_hostname {
+                HostnameLine::StandIn
+            } else {
+                HostnameLine::Omitted
+            },
         )],
         Placeholder::Skills => render::skills(skills).into_iter().collect(),
         Placeholder::Excerpts => render::excerpts(&spec.excerpts.files).into_iter().collect(),
@@ -767,12 +831,17 @@ fn scrubbed_inputs(
         }
     }
 
-    // `box` and `skills` are protected and are never re-rendered, but they are digested bytes and
-    // the one scrub is here now, so they are masked here too rather than in two places.
+    // `box` and `skills` are protected and never re-rendered by the trimmer; `assemble` re-renders
+    // the box once more after the trim, in its sent form, from these same masked inputs (MOD-33
+    // D263). They are masked here rather than in two places. The hostname is masked only when the
+    // switch renders it: a value the model never sees must not refuse a prompt (D269).
     let box_name = SectionName::Box.render();
+    let shown = spec.box_hostname;
     let profile = &mut spec.box_profile;
+    if shown {
+        mask(scrubber, &mut profile.hostname, &box_name)?;
+    }
     for value in [
-        &mut profile.hostname,
         &mut profile.os_version,
         &mut profile.arch,
         &mut profile.cpu,

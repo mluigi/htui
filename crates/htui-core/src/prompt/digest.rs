@@ -2,10 +2,12 @@
 //!
 //! `R-ORCH-11` records a prompt digest per step and `docs/ANA-4.md:338-340` fixes what is digested:
 //! "the assembled prompt text once ... **ANA-5 supplies the text**". ANA-5 chose the smallest thing
-//! that answers the audit question — the text alone, canonicalised, **as sent** — over `text` plus
-//! `sections[]`, which would have made the digest a function of the estimator version, and over
-//! canonicalising for the hash while sending the original bytes, which would make the digest
-//! describe a string nobody was given.
+//! that answers the audit question — the text alone, canonicalised, as sent **with each undigested
+//! span's value replaced by its fixed stand-in** (MOD-33: the box hostname, as `[hostname]`) —
+//! over `text` plus `sections[]`, which would have made the digest a function of the estimator
+//! version, and over canonicalising for the hash while sending the original bytes, which would
+//! make the digest describe a string nobody was given. The digest text differs from the sent text
+//! only in the spans `trim_record.undigested` names, never in formatting.
 //!
 //! This module owns steps 5–7 of §4.7's pipeline and nothing else. Steps 1–4 (render, scrub, trim,
 //! substitute) are `assemble()`'s in [`crate::prompt`], and step 2's scrub is the ANA-7 scrubber's;
@@ -65,10 +67,11 @@ pub fn canonical(text: &str) -> String {
 
 /// §4.7 step 7: `sha256` over the UTF-8 bytes, lowercase hex, all 64 characters.
 ///
-/// The same `sha2` call `htui_agent::record::Recorder::record_prompt` makes over the scrubbed
-/// payload text, so the recorder's recomputation is an identity rather than a second opinion. That
-/// is what makes ANA-5 criterion 11 checkable at all: the text sent, the text digested and the text
-/// stored are one string.
+/// The same `sha2` call `htui_agent::record::Recorder::record_prompt_digesting` makes over the
+/// scrubbed **digest text**, so the recorder's recomputation is an identity over the string ANA-5
+/// supplies for digesting rather than a second opinion. That is what makes ANA-5 criterion 11
+/// checkable at all. The text sent and the text digested differ only in the spans
+/// `trim_record.undigested` names (MOD-33 D271).
 #[must_use]
 pub fn sha256_hex(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))

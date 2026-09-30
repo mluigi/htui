@@ -1847,7 +1847,7 @@ async fn cli_agent_is_refused_at_a_gated_phase<H: CaseHarness>(harness: &H) {
 /// sleep anywhere, and the reason is readable on the item.
 ///
 /// `set_app_setting("step_deadline_seconds", 1)` is the only rung a case can reach: `SettingKey` is
-/// a closed enum of ten that does not carry the key and `ProjectPatch` has no `settings` field, so
+/// a closed enum of eleven that does not carry the key and `ProjectPatch` has no `settings` field, so
 /// the app rung is the one that can be planted. The elapse happens between the driver's `done` and
 /// the settle, which is exactly where a real overrun would be noticed.
 ///

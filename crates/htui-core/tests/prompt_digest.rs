@@ -999,15 +999,22 @@ fn to_value_is_byte_stable_and_carries_the_documented_keys() {
             "estimated_after",
             "sections",
             "skill_choices",
+            "undigested",
             "excerpts",
             "notes",
         ]),
-        "§5.1's twelve keys and MOD-9 D42's skill_choices: thirteen, no more and no fewer"
+        "§5.1's twelve keys, MOD-9 D42's skill_choices and MOD-33 D270's undigested: fourteen, \
+         no more and no fewer"
     );
     assert_eq!(
         first["v"],
-        serde_json::json!(3),
-        "MOD-9 D118 bumped the record to v 3"
+        serde_json::json!(4),
+        "MOD-33 D270 bumped the record to v 4"
+    );
+    assert_eq!(
+        first["undigested"],
+        serde_json::json!(["box.hostname"]),
+        "MOD-33 D270: the implement body places `{{box}}` with the hostname on"
     );
     // `phase_implement_attempt2` carries one `Always` skill, placed by the implement body.
     let choices = first["skill_choices"]

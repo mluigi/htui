@@ -53,10 +53,10 @@ const DOCUMENT_FLOOR_PERCENT: usize = 25;
 const VERIFY_FLOOR_LINES: usize = 200;
 /// §4.6c's floor for a handoff `step_summary`.
 const STEP_SUMMARY_FLOOR_LINES: usize = 20;
-/// `trim_record.v`: version 3 since MOD-9 D118 added `matched`, `no_match` and
-/// `skill_choices[].path`; 2 since MOD-9 D42 added `skill_choices`; first, so a reader can branch
-/// (§5.1).
-const RECORD_VERSION: u8 = 3;
+/// `trim_record.v`: version 4 since MOD-33 D270 added `undigested`; 3 since MOD-9 D118 added
+/// `matched`, `no_match` and `skill_choices[].path`; 2 since MOD-9 D42 added `skill_choices`;
+/// first, so a reader can branch (§5.1).
+const RECORD_VERSION: u8 = 4;
 
 /// How a section lost content. Closed vocabulary (§5.1 `:1545`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -92,6 +92,27 @@ impl TrimStrategy {
             Self::StatOnly => "stat_only",
             Self::StubLadder => "stub_ladder",
             Self::Dropped => "dropped",
+        }
+    }
+}
+
+/// A span rendered into the prompt text but excluded from `prompt_digest` (MOD-33 D263, D270).
+///
+/// Closed vocabulary, like [`TrimStrategy`]; the digest text carries the span's fixed stand-in
+/// in its place, and the recorder hashes the digest text (D271).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum UndigestedSpan {
+    /// The box section's `hostname:` value; the digest sees [`render::HOSTNAME_STAND_IN`].
+    #[serde(rename = "box.hostname")]
+    BoxHostname,
+}
+
+impl UndigestedSpan {
+    /// The one spelling, as `trim_record.undigested[]` serialises it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BoxHostname => "box.hostname",
         }
     }
 }
@@ -172,7 +193,7 @@ pub struct TemplateRecord {
     pub role: TemplateRole,
 }
 
-/// `run_step.trim_record`, version 2 (ANA-5 §5.1 as amended by MOD-9 D42).
+/// `run_step.trim_record`, version 4 (ANA-5 §5.1 as amended by MOD-9 D42/D118 and MOD-33 D270).
 ///
 /// Byte-stable, but **not** by the route §5.1 assumed. §5.1 says "`serde_json::Map` is a `BTreeMap`
 /// in this workspace, so object keys serialise sorted"; that is false in a workspace build
@@ -206,6 +227,11 @@ pub struct TrimRecord {
     /// Every skill candidate and whether it rendered, in collapse order (MOD-9 D42, ANA-22 §6
     /// item 8). Always present; `[]` when the step had no candidate.
     pub skill_choices: Vec<SkillChoice>,
+    /// Every span rendered into the prompt but excluded from `prompt_digest` (MOD-33 D270):
+    /// `["box.hostname"]` when the box section named the hostname, else `[]`. Always present, and
+    /// listed once however often the body places `{{box}}`. In v 4, a `box` entry in `sections`
+    /// beside an empty list means the project's switch was off.
+    pub undigested: Vec<UndigestedSpan>,
     /// §4.5's audit, verbatim.
     pub excerpts: ExcerptAudit,
     /// Conditions that are not errors: a clamped `hops`, a skipped repo, a declared stand-in.
@@ -1077,12 +1103,18 @@ fn elided_lines<'a>(lines: &'a [&'a str], kept: usize, tail_only: bool) -> Vec<&
 
 /// Builds the record once the trim has run. One function, so `sections[0]` is `template` in every
 /// role and every path (P-9).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the record's eight inputs are eight different facts from one assembly; a struct \
+              would be built at its one call site only"
+)]
 pub(crate) fn record(
     spec: &PromptSpec,
     template: &TemplateRef,
     template_tokens: i64,
     sections: Vec<Section>,
     skill_choices: Vec<SkillChoice>,
+    undigested: Vec<UndigestedSpan>,
     excerpts: ExcerptAudit,
     notes: Vec<String>,
 ) -> TrimRecord {
@@ -1105,6 +1137,7 @@ pub(crate) fn record(
         estimated_after: rows.iter().map(|row| row.tokens_after).sum(),
         sections: rows,
         skill_choices,
+        undigested,
         excerpts,
         notes,
     }
@@ -1119,6 +1152,15 @@ mod tests {
             .map(|n| format!("line {n}: the recorder buffers rows and flushes on the boundary."))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn the_undigested_spelling_is_the_serde_one() {
+        assert_eq!(
+            serde_json::to_value(UndigestedSpan::BoxHostname).expect("a unit variant"),
+            serde_json::json!(UndigestedSpan::BoxHostname.as_str())
+        );
+        assert_eq!(UndigestedSpan::BoxHostname.as_str(), "box.hostname");
     }
 
     #[test]
