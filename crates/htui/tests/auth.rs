@@ -67,6 +67,15 @@ const CREDENTIAL: &str = "SECRET-SENTINEL";
 /// The link the fixture prints to its own stderr, which is what `o` forwards to the opener.
 const LINK: &str = "https://h.invalid/login?state=abc";
 
+/// The authorization code a pasted redirect carries (MOD-22). A sentinel, so a case can prove it
+/// reached the listener and never a rendered frame. No assertion message in this file prints
+/// anything that could hold it.
+const CODE: &str = "CODE-SENTINEL-4f1c";
+
+/// The `state` a loopback link advertises and its pasted redirect echoes back (MOD-22). Unlike
+/// [`CODE`] it may be drawn: the link that carries it is on screen as `link: …`.
+const STATE: &str = "STATE-SENTINEL-9a2e";
+
 /// How long a case waits on a flow before calling it stuck rather than slow.
 const PATIENCE: Duration = Duration::from_secs(60);
 
@@ -85,6 +94,8 @@ const TICK: Duration = Duration::from_millis(10);
 /// makes `authenticate` refuse the way an adapter refuses a login it has no variable for;
 /// `FIXTURE_HOLD` makes it never answer, which is how a case gets to press `o` and `x` while a
 /// login is genuinely in flight; `FIXTURE_URL` is a link printed to stderr before the answer;
+/// `FIXTURE_WAIT_FOR` is a path `authenticate` waits to exist, every 50 ms, before answering
+/// (MOD-22 D284: the case creates it once it has seen the listener's answer);
 /// `FIXTURE_CRED` is written into the credential file on success and removed on `logout`.
 ///
 /// The id is echoed back **as it arrived**, quotes and all: this SDK sends a UUID *string* as its
@@ -99,6 +110,7 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$FIXTURE_INIT" ;;
     *'"method":"authenticate"'*)
       if [ -n "$FIXTURE_URL" ]; then echo "open the following link to log in: $FIXTURE_URL" >&2; fi
+      if [ -n "$FIXTURE_WAIT_FOR" ]; then while [ ! -e "$FIXTURE_WAIT_FOR" ]; do sleep 0.05; done; fi
       if [ -n "$FIXTURE_HOLD" ]; then sleep 3600; fi
       if [ -z "$FIXTURE_KEY" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"the FIXTURE_KEY variable must be set where this server is launched from"}}\n' "$id"
@@ -235,6 +247,59 @@ fn recorder(dir: &Path) -> PathBuf {
         ),
     );
     path
+}
+
+/// The link a loopback adapter prints (MOD-22): a vendor URL whose `redirect_uri` is this box's
+/// `127.0.0.1:<port>/`, carrying [`STATE`].
+fn loopback_link(port: u16) -> String {
+    format!("https://h.invalid/login?redirect_uri=http%3A%2F%2F127.0.0.1%3A{port}%2F&state={STATE}")
+}
+
+/// The page the case's listener answers with, as a browser would have been shown it.
+const SIGNED_IN_PAGE: &str = "<html><head><title>signed in</title></head></html>";
+
+/// Fails the case if `frame` carries [`CODE`]. The message is fixed on purpose: a message that
+/// printed the frame would print the very thing it caught.
+fn swept(frame: &str) {
+    assert!(
+        !frame.contains(CODE),
+        "a rendered frame carries the pasted code"
+    );
+}
+
+/// A listener on `listener` that accepts one connection, reads its request head, answers `200 OK`
+/// with [`SIGNED_IN_PAGE`] and closes. The head goes out on the returned channel **after** the
+/// answer is written, so the case asserts on it without holding the delivery up.
+fn answering_listener(listener: tokio::net::TcpListener) -> tokio::sync::oneshot::Receiver<String> {
+    let (head_tx, head_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut stream, _) = listener.accept().await.expect("the delivery connects");
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream
+                .read(&mut buf)
+                .await
+                .expect("the request is readable");
+            if read == 0 {
+                break;
+            }
+            head.extend_from_slice(&buf[..read]);
+        }
+        let answer = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{SIGNED_IN_PAGE}",
+            SIGNED_IN_PAGE.len()
+        );
+        stream
+            .write_all(answer.as_bytes())
+            .await
+            .expect("the answer is written");
+        stream.shutdown().await.expect("the answer is closed");
+        let _ = head_tx.send(String::from_utf8_lossy(&head).into_owned());
+    });
+    head_rx
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -598,5 +663,140 @@ async fn the_agent_table_is_unchanged_by_a_login() {
         rig.agent_columns(),
         columns,
         "and the registry's own columns are what they were"
+    );
+}
+
+/// MOD-22 end to end, the item's own acceptance: a login whose browser is on another machine. The
+/// adapter advertises a loopback redirect, `p` opens the paste field, the address the browser could
+/// not open is typed **through the whole shell**, and `Enter` delivers it to the listener on this
+/// box. The note line then says what the listener answered, and the login finishes through MOD-21's
+/// own path: the adapter answers `authenticate`, the flow re-probes, the cell reads the verdict.
+///
+/// Two things make this a proof rather than a race (blueprint F-7, D284). The adapter is held on
+/// `FIXTURE_WAIT_FOR` and the marker is created only **after** a rendered frame has shown the
+/// listener's answer: `Done` overwrites the note, so an adapter free to finish in the same drive as
+/// the delivery would leave no frame to assert on. And every frame this case renders, at every
+/// step, is swept for [`CODE`] — including one after each typed character.
+///
+/// The address is typed a character at a time through `App::on_key`, not `Harness::key`, which
+/// parses chords and would refuse `?`. It holds `h`, `?` and digits, each of which the shell binds
+/// on its own (section cycle, help, tab switch): landing in the field is D270's capture, shown at
+/// the level a human types at.
+#[tokio::test]
+async fn p_paste_enter_delivers_to_the_listener_and_the_cell_reads_the_probes_verdict() {
+    use crossterm::event::{KeyCode, KeyEvent};
+
+    let (port, listener) = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free loopback port");
+        let port = listener.local_addr().expect("a bound address").port();
+        (port, listener)
+    };
+    let head = answering_listener(listener);
+
+    // The marker's directory is the case's own and is made first: the rig makes its own and would
+    // otherwise have to hand its path back before the fixture's environment is written.
+    let marks = tempfile::tempdir().expect("a throwaway directory");
+    let marker = marks.path().join("delivered");
+    let link = loopback_link(port);
+    let marker_text = marker.to_string_lossy().into_owned();
+    let mut rig = Rig::new(&[
+        ("FIXTURE_KEY", "set"),
+        ("FIXTURE_CRED", CREDENTIAL),
+        ("FIXTURE_URL", &link),
+        ("FIXTURE_WAIT_FOR", &marker_text),
+    ])
+    .await;
+    assert_eq!(
+        rig.on_box_cell(),
+        "unauthenticat",
+        "the box starts where the probe left it"
+    );
+
+    rig.start_login().await;
+    rig.harness.key("Enter");
+    let redirect = format!("redirect: 127.0.0.1:{port}");
+    rig.until("advertised its redirect", |frame| {
+        swept(frame);
+        frame.contains(&redirect)
+    })
+    .await;
+
+    rig.harness.key("p");
+    let prompt = format!("paste the address the browser could not open (127.0.0.1:{port}):");
+    rig.until("opened the field", |frame| {
+        swept(frame);
+        frame.contains(&prompt)
+    })
+    .await;
+
+    let pasted = format!("http://127.0.0.1:{port}/?code={CODE}&state={STATE}");
+    for c in pasted.chars() {
+        rig.harness.app().on_key(KeyEvent::from(KeyCode::Char(c)));
+        let frame = rig.harness.render();
+        swept(&frame);
+        assert!(
+            frame.contains(&prompt),
+            "every typed character lands in the field, so the prompt stays up"
+        );
+    }
+    let count = format!("({})", pasted.chars().count());
+    let frame = rig.harness.render();
+    assert!(
+        frame.contains(&count),
+        "the field counts every character typed and shows none of them"
+    );
+
+    rig.harness.key("Enter");
+    let heard = format!("127.0.0.1:{port} answered 200 OK");
+    let frame = rig
+        .until("heard the listener", |frame| {
+            swept(frame);
+            frame.contains(&heard)
+        })
+        .await;
+    assert!(
+        frame.contains("\"signed in\""),
+        "the note line carries what the listener's page said: {frame}"
+    );
+    assert!(
+        frame.contains("logging in\u{2026}"),
+        "the delivery is answered and the login is still running: {frame}"
+    );
+    let head = tokio::time::timeout(PATIENCE, head)
+        .await
+        .expect("the listener read a request inside the patience window")
+        .expect("the listener handed its request head over");
+    // Checked with `starts_with` and a fixed message: the head carries the code sentinel, and a
+    // failing `assert_eq!` would print it.
+    assert!(
+        head.starts_with(&format!("GET /?code={CODE}&state={STATE} HTTP/1.1\r\n")),
+        "the listener got the pasted code and state in one GET on its own path"
+    );
+
+    // Only now does the adapter get to answer `authenticate` (D284).
+    std::fs::write(&marker, b"").expect("the marker lands");
+    let frame = rig
+        .until("finished", |frame| {
+            swept(frame);
+            frame.contains("logged in:")
+        })
+        .await;
+    assert!(
+        frame.contains("logged in: ready"),
+        "the notice is the probe's verdict, not the call's: {frame}"
+    );
+    assert_eq!(
+        rig.stored_status().await.as_deref(),
+        Some("ready"),
+        "and it is the row the flow wrote"
+    );
+    let frame = rig.harness.render();
+    swept(&frame);
+    assert_ne!(
+        rig.on_box_cell(),
+        "unauthenticat",
+        "the cell was re-read from that row: {frame}"
     );
 }
