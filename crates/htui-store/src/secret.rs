@@ -223,10 +223,38 @@ pub fn read_dsn_line(
 pub fn headless_dsn(
     sources: DsnSources<'_>,
 ) -> core::result::Result<Zeroizing<String>, DsnSourceError> {
-    let _ = sources; // T11 red: no source is read yet.
-    Err(DsnSourceError::NoSource {
-        keyring: "empty".to_owned(),
-    })
+    if let Some(stdin) = sources.stdin {
+        return read_dsn_line(stdin)
+            .map_err(|err| DsnSourceError::Stdin(err.to_string()))?
+            .ok_or(DsnSourceError::EmptyStdin);
+    }
+    // `get_dsn` answers a plain `String`: wrapped at once.
+    let keyring = match get_dsn() {
+        Ok(Some(dsn)) => return Ok(Zeroizing::new(dsn)),
+        Ok(None) => "empty".to_owned(),
+        Err(err) => err.to_string(),
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = sources.credentials_dir {
+        let path = dir.join(CREDENTIAL_NAME);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let text = Zeroizing::new(text);
+                let dsn = text.trim();
+                if !dsn.is_empty() {
+                    return Ok(Zeroizing::new(dsn.to_owned()));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(DsnSourceError::Credential {
+                    path: path.display().to_string(),
+                    why: err.to_string(),
+                });
+            }
+        }
+    }
+    Err(DsnSourceError::NoSource { keyring })
 }
 
 /// Retrieves the stored Qdrant URL, if any.

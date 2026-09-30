@@ -179,8 +179,11 @@ impl PoolSize {
     /// `requested` clamped to `MIN..=MAX`, with a `warn` when it moved.
     #[must_use]
     pub fn clamped(requested: u32) -> Self {
-        // T11 red: not clamped yet.
-        Self(requested)
+        let used = requested.clamp(Self::MIN, Self::MAX);
+        if used != requested {
+            tracing::warn!(requested, used, "the pool size is clamped to 2..=8");
+        }
+        Self(used)
     }
 
     /// The connection count.
@@ -758,10 +761,9 @@ impl NewBoxRow<'_> {
 
 /// The pool both connects open: `pool` connections, `connect_timeout` to acquire one.
 async fn open_pool(dsn: &str, connect_timeout: Duration, pool: PoolSize) -> Result<PgPool> {
-    let _ = pool; // T11 red: the size is not honoured yet.
     let options = PgConnectOptions::from_str(dsn).map_err(map_sqlx)?;
     PgPoolOptions::new()
-        .max_connections(8)
+        .max_connections(pool.get())
         .acquire_timeout(connect_timeout)
         .connect_with(options)
         .await
