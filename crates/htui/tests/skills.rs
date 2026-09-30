@@ -827,8 +827,10 @@ async fn an_attachment_saved_in_the_form_lands_and_the_form_closes() {
         frame.contains("effective:  **/*.rs, **/Cargo.toml"),
         "{frame}"
     );
+    // The form's field sits at the panel's left border; the `htui` row's `2 globs` now ends its
+    // line too (MOD-9 D126 dropped `fires from milestone 5`), so the needle carries the border.
     assert!(
-        line_with(&frame, "globs       ") == "globs",
+        line_with(&frame, "\u{2502}globs       ") == "globs",
         "the stored globs minus the language's are empty: {frame}"
     );
 }

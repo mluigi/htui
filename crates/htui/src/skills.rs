@@ -18,8 +18,8 @@
 //! every instant.
 
 use htui_core::model::{
-    NewSkill, NewSkillVersion, ProjectId, Scope, Skill, SkillBinding, SkillBindingKey, SkillId,
-    SkillVersion, StepGraph, StepGraphPhase,
+    NewSkill, NewSkillVersion, ProjectId, RepoBoxPath, Scope, Skill, SkillBinding, SkillBindingKey,
+    SkillId, SkillVersion, StepGraph, StepGraphPhase,
 };
 use htui_core::store::{CasOutcome, Result, StoreError, WriteStore as _};
 use htui_store::{Backend, DATABASE_UNREACHABLE, PROMPT_ON_SERVER_ONLY, Writer};
@@ -139,6 +139,10 @@ pub enum StaleWhat {
 /// override graphs, `phases(g)` per graph and `repos(p)`'s names; then `skills()` and
 /// `skill_versions(s)` per skill.
 ///
+/// `box_paths` is this box's `repo_box_path` rows, read by the caller once per request through
+/// the `Backend` (never once per repo), empty when the box is unregistered: each project's
+/// [`unrooted`](ProjectSkills::unrooted) is its repos with no row there (MOD-9 D126, D131).
+///
 /// Attachments are read **before** versions (the milestone 2 review's rule): a write landing
 /// between the two can then only add a version no attachment names yet, never leave a pin naming
 /// a version the read missed. N+1 reads on purpose, per event and never per keystroke (R-27,
@@ -146,7 +150,11 @@ pub enum StaleWhat {
 ///
 /// # Errors
 /// Whatever the store reports.
-pub async fn snapshot(writer: &Writer, scope: &Scope) -> Result<SkillsSnapshot> {
+pub async fn snapshot(
+    writer: &Writer,
+    scope: &Scope,
+    box_paths: &[RepoBoxPath],
+) -> Result<SkillsSnapshot> {
     let global = writer.skill_bindings(None).await?;
     let mut projects = Vec::with_capacity(scope.project_ids.len());
     for project in &scope.project_ids {
@@ -159,18 +167,21 @@ pub async fn snapshot(writer: &Writer, scope: &Scope) -> Result<SkillsSnapshot> 
             let phases = writer.phases(graph.id).await?;
             graphs.push((graph, phases));
         }
-        let repos = writer
-            .repos(*project)
-            .await?
-            .into_iter()
-            .map(|repo| repo.name)
+        let rows = writer.repos(*project).await?;
+        // MOD-9 D126: the repos a `glob` attachment could never fire in on this box.
+        let mut unrooted: Vec<String> = rows
+            .iter()
+            .filter(|repo| !box_paths.iter().any(|path| path.repo_id == repo.id))
+            .map(|repo| repo.name.clone())
             .collect();
+        unrooted.sort();
+        let repos = rows.into_iter().map(|repo| repo.name).collect();
         projects.push(ProjectSkills {
             project: *project,
             bindings,
             graphs,
             repos,
-            unrooted: Vec::new(),
+            unrooted,
         });
     }
     let mut skills = Vec::new();
@@ -227,8 +238,9 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             let writer = backend
                 .writer()
                 .ok_or_else(|| StoreError::Unreachable(PROMPT_ON_SERVER_ONLY.to_owned()))?;
+            let box_paths = this_box_paths(backend).await?;
             Ok(StoreReply::Skills(Box::new(
-                snapshot(&writer, scope).await?,
+                snapshot(&writer, scope, &box_paths).await?,
             )))
         }
         StoreRequest::CreateSkill {
@@ -251,7 +263,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                     created_by,
                 })
                 .await?;
-            answer(&writer, scope, None).await
+            answer(backend, &writer, scope, None).await
         }
         StoreRequest::EditSkill {
             scope,
@@ -268,7 +280,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 }) => Some(StaleWhat::Skill(*skill)),
                 Err(other) => return Err(other),
             };
-            answer(&writer, scope, stale).await
+            answer(backend, &writer, scope, stale).await
         }
         StoreRequest::SaveSkillVersion {
             scope,
@@ -292,7 +304,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 }) => Some(StaleWhat::Version(*skill)),
                 Err(other) => return Err(other),
             };
-            answer(&writer, scope, stale).await
+            answer(backend, &writer, scope, stale).await
         }
         StoreRequest::SetSkillBinding {
             scope,
@@ -313,7 +325,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 }) => Some(StaleWhat::Binding(*key)),
                 Err(other) => return Err(other),
             };
-            answer(&writer, scope, stale).await
+            answer(backend, &writer, scope, stale).await
         }
         StoreRequest::ImportSkills { scope, paths } => {
             // The filesystem is read here and not in the view (`R-NF-3`): the walk is unbounded
@@ -321,8 +333,9 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             // report travels beside a library the view renders from rather than a row it patches.
             let report = skill_import::import(backend, paths).await?;
             let writer = write_access(backend)?;
+            let box_paths = this_box_paths(backend).await?;
             Ok(StoreReply::SkillImports(Box::new(SkillImports {
-                snapshot: snapshot(&writer, scope).await?,
+                snapshot: snapshot(&writer, scope, &box_paths).await?,
                 report,
             })))
         }
@@ -343,15 +356,32 @@ fn write_access(backend: &Backend) -> Result<Writer> {
         .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))
 }
 
+/// This box's `repo_box_path` rows, or none when the box is unregistered (every repo then
+/// unrooted). Read after the writer check, so an offline arm still refuses with its own sentence
+/// first (the `hierarchy::serve` order; MOD-9 D131).
+async fn this_box_paths(backend: &Backend) -> Result<Vec<RepoBoxPath>> {
+    match backend.box_info().await? {
+        Some(info) => backend.repo_paths(info.box_id).await,
+        None => Ok(Vec::new()),
+    }
+}
+
 /// `skill_version.source` for a version written from the view: `{}` (D77, D87).
 fn empty_source() -> serde_json::Value {
     serde_json::Value::Object(serde_json::Map::new())
 }
 
 /// The re-read every write answers with: `Skills` when `stale` is `None`, otherwise `SkillsStale`
-/// naming the write.
-async fn answer(writer: &Writer, scope: &Scope, stale: Option<StaleWhat>) -> Result<StoreReply> {
-    let fresh = Box::new(snapshot(writer, scope).await?);
+/// naming the write. Its callers are past `write_access`, so this box's paths are read here
+/// (MOD-9 D131).
+async fn answer(
+    backend: &Backend,
+    writer: &Writer,
+    scope: &Scope,
+    stale: Option<StaleWhat>,
+) -> Result<StoreReply> {
+    let box_paths = this_box_paths(backend).await?;
+    let fresh = Box::new(snapshot(writer, scope, &box_paths).await?);
     Ok(match stale {
         None => StoreReply::Skills(fresh),
         Some(what) => StoreReply::SkillsStale {
