@@ -37,9 +37,15 @@
 //! the pane's field before it is refused, and an adapter that prints the callback on its own stderr
 //! is shown by MOD-21's pane as every stderr line is.
 
-use std::net::SocketAddr;
+use std::cmp::Reverse;
+use std::io::ErrorKind;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::TcpStream;
+use tokio::time::{Instant, timeout, timeout_at};
+use url::{Host, Url};
 use zeroize::Zeroizing;
 
 /// D265 (1): the longest paste [`validate`] accepts, in bytes after trimming. Also the capacity
@@ -114,8 +120,18 @@ impl Advertised {
     /// link, `None` when absent or empty. No DNS lookup happens.
     #[must_use]
     pub fn from_auth_url(link: &str) -> Option<Self> {
-        let _ = link;
-        todo!("MOD-22 T1 (b)")
+        let link = Url::parse(link.trim()).ok()?;
+        let redirect = first_pair(&link, "redirect_uri")?;
+        let redirect = Url::parse(&redirect).ok()?;
+        if redirect.scheme() != "http" || !is_loopback(&redirect.host()?) {
+            return None;
+        }
+        Some(Self {
+            host: redirect.host_str()?.to_owned(),
+            port: redirect.port_or_known_default()?,
+            path: redirect.path().to_owned(),
+            state: first_pair(&link, "state").filter(|state| !state.is_empty()),
+        })
     }
 
     /// The host as `url` serialises it: `127.0.0.1`, `[::1]`, `localhost`.
@@ -140,6 +156,38 @@ impl Advertised {
     #[must_use]
     pub fn target(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    /// D290: where to connect, from this host and never from a paste. `localhost` is
+    /// `127.0.0.1` then `[::1]`; no name is ever resolved.
+    fn socket_addrs(&self) -> Vec<SocketAddr> {
+        if self.host.eq_ignore_ascii_case("localhost") {
+            return vec![
+                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), self.port),
+                SocketAddr::new(Ipv6Addr::LOCALHOST.into(), self.port),
+            ];
+        }
+        let literal = self.host.trim_start_matches('[').trim_end_matches(']');
+        literal
+            .parse::<IpAddr>()
+            .map(|ip| vec![SocketAddr::new(ip, self.port)])
+            .unwrap_or_default()
+    }
+}
+
+/// The first `name` pair of `url`'s query, percent-decoded.
+fn first_pair(url: &Url, name: &str) -> Option<String> {
+    url.query_pairs()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+}
+
+/// D264 (3): `127.0.0.0/8`, `::1`, or the name `localhost` in any case.
+fn is_loopback(host: &Host<&str>) -> bool {
+    match host {
+        Host::Ipv4(ip) => ip.is_loopback(),
+        Host::Ipv6(ip) => *ip == Ipv6Addr::LOCALHOST,
+        Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
     }
 }
 
@@ -289,7 +337,21 @@ impl ListenerReply {
     /// when there is a `location_host`, and `: "{said}"` when there is an excerpt.
     #[must_use]
     pub fn summary(&self) -> String {
-        todo!("MOD-22 T1 (b)")
+        let mut out = format!("{} answered {}", self.target, self.status);
+        if !self.reason.is_empty() {
+            out.push(' ');
+            out.push_str(&self.reason);
+        }
+        if let Some(host) = &self.location_host {
+            out.push_str(", redirecting to ");
+            out.push_str(host);
+        }
+        if let Some(said) = &self.said {
+            out.push_str(": \"");
+            out.push_str(said);
+            out.push('"');
+        }
+        out
     }
 }
 
@@ -334,7 +396,7 @@ pub enum DeliverError {
         /// [`Advertised::target`].
         target: String,
         /// The error's kind.
-        kind: std::io::ErrorKind,
+        kind: ErrorKind,
     },
 }
 
@@ -345,8 +407,138 @@ pub enum DeliverError {
 ///
 /// The [`PasteError`] of the first rule the paste breaks.
 pub fn validate(url: &RedirectUrl, advertised: &Advertised) -> Result<Delivery, PasteError> {
-    let _ = (url.as_str(), advertised);
-    todo!("MOD-22 T1 (b)")
+    // (1)
+    let text = url.as_str().trim();
+    if text.is_empty() {
+        return Err(PasteError::Empty);
+    }
+    if text.len() > PASTE_MAX {
+        return Err(PasteError::TooLong);
+    }
+    // (2): `Url::parse("localhost:39879/?…")` succeeds with the scheme `localhost`.
+    let text = if text.contains("://") {
+        Zeroizing::new(text.to_owned())
+    } else {
+        Zeroizing::new(format!("http://{text}"))
+    };
+    // (3)–(8)
+    let parsed = Url::parse(&text).map_err(|_| PasteError::NotAUrl)?;
+    if parsed.scheme() != "http" {
+        return Err(PasteError::NotHttp);
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(PasteError::HasUserinfo);
+    }
+    if parsed.host_str() != Some(advertised.host()) {
+        return Err(PasteError::WrongHost {
+            advertised: advertised.target(),
+        });
+    }
+    let pasted = parsed.port_or_known_default().unwrap_or(80);
+    if pasted != advertised.port() {
+        return Err(PasteError::WrongPort {
+            pasted,
+            advertised: advertised.port(),
+        });
+    }
+    if parsed.path() != advertised.path() {
+        return Err(PasteError::WrongPath {
+            advertised: format!("{}{}", advertised.target(), advertised.path()),
+        });
+    }
+    // (9)–(12), over the raw query: only the `error`, `code` and `state` values are ever decoded,
+    // each into a wiped buffer, so an encoded code leaves no unwiped decoded copy behind.
+    let query = parsed.query().unwrap_or_default();
+    if let Some((_, raw)) = raw_pairs(query).find(|(key, _)| key.as_str() == "error") {
+        let error = form_decode(raw)
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            .take(64)
+            .collect();
+        return Err(PasteError::BrowserError { error });
+    }
+    let (code, raw_code) = exactly_one(query, "code", PasteError::MissingCode)?;
+    let (state, raw_state) = exactly_one(query, "state", PasteError::MissingState)?;
+    if let Some(expected) = &advertised.state
+        && state.as_str() != expected
+    {
+        return Err(PasteError::StaleState);
+    }
+
+    // What an echo is blanked of: both values as decoded and as they travel, longest first so a
+    // secret that contains another is blanked whole.
+    let mut secrets: Vec<Zeroizing<String>> = Vec::with_capacity(4);
+    for value in [code.as_str(), raw_code, state.as_str(), raw_state] {
+        if !value.is_empty() && !secrets.iter().any(|known| known.as_str() == value) {
+            secrets.push(Zeroizing::new(value.to_owned()));
+        }
+    }
+    secrets.sort_by_key(|secret| Reverse(secret.len()));
+
+    Ok(Delivery {
+        targets: advertised.socket_addrs(),
+        host_header: advertised.target(),
+        request_target: Zeroizing::new(format!("{}?{query}", parsed.path())),
+        secrets,
+    })
+}
+
+/// A query's pairs as `(decoded name, raw value)`, split as `form_urlencoded` splits them: on
+/// `&`, empty segments skipped, then on the first `=`. No value is decoded here.
+fn raw_pairs(query: &str) -> impl Iterator<Item = (Zeroizing<String>, &str)> {
+    query
+        .split('&')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            let (name, value) = segment.split_once('=').unwrap_or((segment, ""));
+            (form_decode(name), value)
+        })
+}
+
+/// `application/x-www-form-urlencoded` decoding, as `Url::query_pairs` does it (`+` is a space,
+/// `%XX` a byte, invalid UTF-8 replaced), into a wiped buffer.
+fn form_decode(raw: &str) -> Zeroizing<String> {
+    let mut bytes = Zeroizing::new(Vec::with_capacity(raw.len()));
+    let raw = raw.as_bytes();
+    let digit = |at: usize| raw.get(at).and_then(|byte| char::from(*byte).to_digit(16));
+    let mut at = 0;
+    while let Some(&byte) = raw.get(at) {
+        match (byte, digit(at + 1), digit(at + 2)) {
+            (b'%', Some(high), Some(low)) => {
+                // Two hex digits are at most 255.
+                bytes.push((high * 16 + low) as u8);
+                at += 3;
+            }
+            (b'+', ..) => {
+                bytes.push(b' ');
+                at += 1;
+            }
+            (byte, ..) => {
+                bytes.push(byte);
+                at += 1;
+            }
+        }
+    }
+    Zeroizing::new(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// D265 (10)/(11): the one non-empty `name` of the query, decoded, and its raw spelling.
+fn exactly_one<'q>(
+    query: &'q str,
+    name: &'static str,
+    missing: PasteError,
+) -> Result<(Zeroizing<String>, &'q str), PasteError> {
+    let mut values: Vec<(Zeroizing<String>, &str)> = raw_pairs(query)
+        .filter(|(key, _)| key.as_str() == name)
+        .map(|(_, raw)| (form_decode(raw), raw))
+        .collect();
+    if values.iter().all(|(value, _)| value.is_empty()) {
+        return Err(missing);
+    }
+    if values.len() > 1 {
+        return Err(PasteError::RepeatedParameter(name));
+    }
+    values.pop().ok_or(missing)
 }
 
 /// D267: one `GET` to the advertised loopback port, following nothing, reading at most
@@ -360,12 +552,359 @@ pub async fn deliver(
     delivery: Delivery,
     limits: DeliverLimits,
 ) -> Result<ListenerReply, DeliverError> {
-    let Delivery {
-        targets,
-        host_header,
-        request_target,
+    let target = delivery.target();
+    let mut stream = connect(&delivery.targets, &target, limits.connect).await?;
+    let deadline = Instant::now() + limits.response;
+    let timed_out = |target: String| DeliverError::Timeout {
+        target,
+        after: limits.response,
+    };
+
+    // The request, built in place with room to spare so it never reallocates, and wiped on drop.
+    let mut request = Zeroizing::new(Vec::with_capacity(
+        delivery.request_target.len() + delivery.host_header.len() + 128,
+    ));
+    for part in [
+        "GET ",
+        delivery.request_target.as_str(),
+        " HTTP/1.1\r\nHost: ",
+        delivery.host_header.as_str(),
+        "\r\nUser-Agent: htui\r\nAccept: text/html, text/plain, */*\r\nConnection: close\r\n\r\n",
+    ] {
+        request.extend_from_slice(part.as_bytes());
+    }
+    match timeout_at(deadline, stream.write_all(&request)).await {
+        Err(_) => return Err(timed_out(target)),
+        Ok(Err(err)) if is_closed(err.kind()) => {
+            return Err(DeliverError::ClosedWithoutAnswer { target });
+        }
+        Ok(Err(err)) => {
+            return Err(DeliverError::Io {
+                target,
+                kind: err.kind(),
+            });
+        }
+        Ok(Ok(())) => {}
+    }
+    drop(request);
+
+    // D276: read until EOF, a reset, the cap, a complete framing, or the deadline.
+    let mut buffer = Zeroizing::new(vec![0u8; RESPONSE_CAP]);
+    let mut len = 0;
+    let ended = loop {
+        if len == RESPONSE_CAP {
+            break Ended::Cap;
+        }
+        if is_framed(&buffer[..len]) {
+            break Ended::Framed;
+        }
+        match timeout_at(deadline, stream.read(&mut buffer[len..])).await {
+            Err(_) => break Ended::Deadline,
+            Ok(Ok(0)) => break Ended::Eof,
+            Ok(Ok(read)) => len += read,
+            Ok(Err(err))
+                if matches!(
+                    err.kind(),
+                    ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                ) =>
+            {
+                break Ended::Reset;
+            }
+            Ok(Err(err)) => {
+                return Err(DeliverError::Io {
+                    target,
+                    kind: err.kind(),
+                });
+            }
+        }
+    };
+    drop(stream);
+    let answer = &buffer[..len];
+
+    if answer.is_empty() {
+        return Err(match ended {
+            Ended::Deadline => timed_out(target),
+            _ => DeliverError::ClosedWithoutAnswer { target },
+        });
+    }
+    let Some(line_end) = find(answer, b"\n") else {
+        let may_be_http = answer.starts_with(HTTP) || HTTP.starts_with(answer);
+        return Err(match ended {
+            Ended::Deadline if may_be_http => timed_out(target),
+            _ => DeliverError::NotHttp { target },
+        });
+    };
+    let Some((status, reason)) = status_line(&answer[..line_end]) else {
+        return Err(DeliverError::NotHttp { target });
+    };
+    Ok(reply(target, status, reason, answer, &delivery.secrets))
+}
+
+/// What every HTTP/1 status line starts with.
+const HTTP: &[u8] = b"HTTP/1.";
+
+/// Why the read loop stopped (D276).
+enum Ended {
+    Eof,
+    Reset,
+    Cap,
+    Framed,
+    Deadline,
+}
+
+/// A write error that means the listener went away rather than that the socket broke.
+fn is_closed(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+    )
+}
+
+/// D267: each target in order; a refusal moves to the next, and none left is
+/// [`DeliverError::NothingListening`].
+async fn connect(
+    targets: &[SocketAddr],
+    target: &str,
+    limit: Duration,
+) -> Result<TcpStream, DeliverError> {
+    for addr in targets {
+        match timeout(limit, TcpStream::connect(*addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            // A `localhost` fallback to `[::1]` on a box with no IPv6 loopback is "not there"
+            // too, not a broken socket.
+            Ok(Err(err))
+                if matches!(
+                    err.kind(),
+                    ErrorKind::ConnectionRefused | ErrorKind::AddrNotAvailable
+                ) => {}
+            Ok(Err(err)) => {
+                return Err(DeliverError::Io {
+                    target: target.to_owned(),
+                    kind: err.kind(),
+                });
+            }
+            Err(_) => {
+                return Err(DeliverError::Timeout {
+                    target: target.to_owned(),
+                    after: limit,
+                });
+            }
+        }
+    }
+    Err(DeliverError::NothingListening {
+        target: target.to_owned(),
+    })
+}
+
+/// Where `needle` first starts in `haystack`.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// `HTTP/1.x SSS reason` → the status in `100..=599` and the raw reason; `None` otherwise.
+fn status_line(line: &[u8]) -> Option<(u16, String)> {
+    let line = String::from_utf8_lossy(line);
+    let line = line.trim_end_matches('\r');
+    let mut parts = line.splitn(3, ' ');
+    let version = parts.next()?;
+    let code = parts.next()?;
+    if !version.starts_with("HTTP/1.")
+        || code.len() != 3
+        || !code.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let status: u16 = code.parse().ok()?;
+    (100..=599)
+        .contains(&status)
+        .then(|| (status, parts.next().unwrap_or_default().to_owned()))
+}
+
+/// The end of the head, blank line included, and the head's header lines.
+fn split_head(answer: &[u8]) -> Option<(usize, &[u8])> {
+    let crlf = find(answer, b"\r\n\r\n").map(|at| at + 4);
+    let lf = find(answer, b"\n\n").map(|at| at + 2);
+    let end = match (crlf, lf) {
+        (Some(a), Some(b)) => a.min(b),
+        (a, b) => a.or(b)?,
+    };
+    Some((end, &answer[..end]))
+}
+
+/// The value of header `name` (case-insensitive) in `head`, past the status line.
+fn header(head: &[u8], name: &str) -> Option<String> {
+    String::from_utf8_lossy(head)
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim().to_owned())
+}
+
+fn is_chunked(head: &[u8]) -> bool {
+    header(head, "transfer-encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+}
+
+/// D276 (d): the head is complete and the body is complete by its framing.
+fn is_framed(answer: &[u8]) -> bool {
+    let Some((end, head)) = split_head(answer) else {
+        return false;
+    };
+    let body = &answer[end..];
+    let status = find(head, b"\n").and_then(|at| status_line(&head[..at]));
+    if matches!(status, Some((204 | 304, _))) {
+        return true;
+    }
+    if is_chunked(head) {
+        return dechunk(body).1;
+    }
+    match header(head, "content-length").and_then(|value| value.parse::<usize>().ok()) {
+        Some(length) => body.len() >= length,
+        None => false,
+    }
+}
+
+/// A chunked body, decoded as far as it goes, and whether its terminal chunk was seen (or its
+/// framing broke, which ends it at what was decoded).
+fn dechunk(mut body: &[u8]) -> (Zeroizing<Vec<u8>>, bool) {
+    let mut out = Zeroizing::new(Vec::with_capacity(body.len()));
+    loop {
+        let Some(line_end) = find(body, b"\n") else {
+            return (out, false);
+        };
+        let size = String::from_utf8_lossy(&body[..line_end]);
+        let size = size.split(';').next().unwrap_or_default().trim();
+        let Ok(size) = usize::from_str_radix(size, 16) else {
+            return (out, true);
+        };
+        if size == 0 {
+            return (out, true);
+        }
+        body = &body[line_end + 1..];
+        if body.len() < size {
+            out.extend_from_slice(body);
+            return (out, false);
+        }
+        out.extend_from_slice(&body[..size]);
+        body = &body[size..];
+        body = body
+            .strip_prefix(b"\r\n")
+            .or_else(|| body.strip_prefix(b"\n"))
+            .unwrap_or(body);
+    }
+}
+
+/// D268, D289: what the listener said, blanked of every secret.
+fn reply(
+    target: String,
+    status: u16,
+    reason: String,
+    answer: &[u8],
+    secrets: &[Zeroizing<String>],
+) -> ListenerReply {
+    let reason = Zeroizing::new(reason);
+    let (head, body): (&[u8], Zeroizing<Vec<u8>>) = match split_head(answer) {
+        Some((end, head)) if is_chunked(head) => (head, dechunk(&answer[end..]).0),
+        Some((end, head)) => (head, Zeroizing::new(answer[end..].to_vec())),
+        None => (answer, Zeroizing::new(Vec::new())),
+    };
+    let body = blank(
+        Zeroizing::new(String::from_utf8_lossy(&body).into_owned()),
         secrets,
-    } = delivery;
-    let _ = (targets, host_header, request_target, secrets, limits);
-    todo!("MOD-22 T1 (b)")
+    );
+
+    let location_host = if (300..=399).contains(&status) {
+        header(head, "location")
+            .map(|location| blank(Zeroizing::new(location), secrets))
+            .and_then(|location| Url::parse(&location).ok())
+            .and_then(|location| location.host_str().map(str::to_owned))
+            .map(|host| cut(&blank(Zeroizing::new(host), secrets), EXCERPT_WIDTH))
+    } else {
+        None
+    };
+    let reason = cut(&tidy(&blank(reason, secrets), secrets), 40);
+    let said = excerpt(&body)
+        .map(|said| cut(&tidy(&said, secrets), EXCERPT_WIDTH))
+        .filter(|said| !said.is_empty());
+
+    ListenerReply {
+        target,
+        status,
+        reason,
+        said,
+        location_host,
+    }
+}
+
+/// D268 (2): the `<title>`, else the first body line that is non-blank once its tags are gone.
+fn excerpt(body: &str) -> Option<Zeroizing<String>> {
+    let lower = Zeroizing::new(body.to_ascii_lowercase());
+    if let Some(open) = lower.find("<title")
+        && let Some(start) = lower[open..].find('>').map(|at| open + at + 1)
+        && let Some(end) = lower[start..].find("</title>").map(|at| start + at)
+    {
+        let title = Zeroizing::new(strip_tags(&body[start..end]));
+        if !title.trim().is_empty() {
+            return Some(title);
+        }
+    }
+    body.lines()
+        .map(|line| Zeroizing::new(strip_tags(line)))
+        .find(|line| !line.trim().is_empty())
+}
+
+/// Everything between a `<` and the next `>`, gone.
+fn strip_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for c in text.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// D268 (1)/(4): every secret replaced by `…`.
+fn blank(mut text: Zeroizing<String>, secrets: &[Zeroizing<String>]) -> Zeroizing<String> {
+    for secret in secrets {
+        if text.contains(secret.as_str()) {
+            text = Zeroizing::new(text.replace(secret.as_str(), "…"));
+        }
+    }
+    text
+}
+
+/// D268 (3)/(4): control characters dropped, whitespace runs collapsed to one space, trimmed,
+/// and the secrets blanked again.
+fn tidy(text: &str, secrets: &[Zeroizing<String>]) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(String::with_capacity(text.len()));
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+        } else if !c.is_control() {
+            out.push(c);
+        }
+    }
+    let trimmed = out.trim_end().len();
+    out.truncate(trimmed);
+    blank(out, secrets)
+}
+
+/// D268 (5): at most `width` chars, the last one `…` when cut.
+fn cut(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let mut out: String = text.chars().take(width - 1).collect();
+    out.push('…');
+    out
 }
