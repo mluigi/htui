@@ -47,6 +47,9 @@ const TITLE_MIN: usize = 8;
 /// Marks a non-tree edge (D3).
 const REPEAT: &str = " (*)";
 
+/// `StoreRequest::Links`' name: what a refused `Links` read is answered `Failed` under.
+const LINKS: &str = "links";
+
 /// Which way an edge points relative to the row it hangs under (D4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arrow {
@@ -102,6 +105,8 @@ pub struct GraphTab {
     graph: Option<LinkGraph>,
     /// Whether an item is selected at all.
     item: Option<ItemId>,
+    /// Why the `Links` read for the selected item was refused, until another answer arrives.
+    failed: Option<String>,
     /// Index into the visible rows.
     cursor: usize,
     /// View depth, `1..=MAX_HOPS`. A preference: survives `on_item_change` (D2).
@@ -121,6 +126,7 @@ impl GraphTab {
         Self {
             graph: None,
             item: None,
+            failed: None,
             cursor: 0,
             depth: DEFAULT_DEPTH,
         }
@@ -143,8 +149,12 @@ impl GraphTab {
     /// Changes the view depth, keeping the cursor on its item's own row when it is still shown.
     ///
     /// The row index moves with the depth (preorder changes), so the cursor follows the item, not
-    /// the index; an item the new depth hides sends it back to the root.
+    /// the index; an item the new depth hides sends it back to the root. A depth the clamp left
+    /// where it was changes nothing, so the cursor stays even on a `(*)` row.
     fn set_depth(&mut self, depth: u8) {
+        if depth == self.depth {
+            return;
+        }
         let item = self.visible().get(self.cursor).map(|row| row.node.item_id);
         self.depth = depth;
         self.cursor = item
@@ -388,12 +398,12 @@ fn line(
         let label = match slug {
             Some(slug) => match label_room.checked_sub(key.chars().count() + 1) {
                 Some(slug_room) if slug_room >= 2 => {
-                    format!("{}:{key}", list::clip(slug, slug_room))
+                    format!("{}:{key}", clip(slug, slug_room))
                 }
-                _ => list::clip(&label, label_room),
+                // Too little for a readable slug: the key alone, clipped if it must be.
+                _ => clip(key, label_room),
             },
-            // Nothing left to give: ratatui cuts the rest at the pane edge.
-            None => label,
+            None => clip(key, label_room),
         };
         (kind.to_owned(), label)
     };
@@ -413,6 +423,16 @@ fn line(
         push_title(&mut spans, &node.title, width, title_style);
     }
     Line::from(spans)
+}
+
+/// `text` in at most `room` columns, `…`-clipped: [`list::clip`], except that no room is no text
+/// (`list::clip` answers a lone `…` there, one column over).
+fn clip(text: &str, room: usize) -> String {
+    if room == 0 {
+        String::new()
+    } else {
+        list::clip(text, room)
+    }
 }
 
 /// Appends `' ' + title`, clipped to what is left of `width`, when at least [`TITLE_MIN`]
@@ -438,6 +458,7 @@ impl DetailTab for GraphTab {
     fn on_item_change(&mut self, item: Option<ItemId>) {
         self.item = item;
         self.graph = None;
+        self.failed = None;
         self.cursor = 0;
     }
 
@@ -467,20 +488,37 @@ impl DetailTab for GraphTab {
         Handled::Consumed
     }
 
-    /// The `Links` reply for the selected item. One for another root is dropped: the shell's
-    /// staleness index already does that, this is the cheap guard on top.
+    /// The `Links` reply for the selected item, or its refusal (L8). One for another root is
+    /// dropped: the shell's staleness index already does that, this is the cheap guard on top.
     fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
-        if let StoreReply::Links(graph) = reply
-            && Some(graph.root) == self.item
-        {
-            self.graph = Some(graph.clone());
-            self.cursor = 0;
+        match reply {
+            StoreReply::Links(graph) if Some(graph.root) == self.item => {
+                self.graph = Some(graph.clone());
+                self.failed = None;
+                self.cursor = 0;
+            }
+            // The refusal is on the status line already (`app/update.rs`); the pane says why it
+            // is empty rather than claiming the item has no links.
+            StoreReply::Failed { request, message } if *request == LINKS => {
+                self.graph = None;
+                self.failed = Some(message.clone());
+                self.cursor = 0;
+            }
+            _ => {}
         }
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if self.item.is_none() {
             message(frame, area, "No item selected.", ctx.theme);
+            return;
+        }
+        if self.graph.is_none() {
+            let text = match self.failed.as_deref() {
+                Some(why) => format!("Links unavailable: {why}"),
+                None => "Loading links\u{2026}".to_owned(),
+            };
+            message(frame, area, &text, ctx.theme);
             return;
         }
         let rows = self.visible();
@@ -1128,6 +1166,158 @@ mod tests {
                 "  ← relates    FEAT-3 queued Postgres stor…",
             ]
         );
+    }
+
+    /// The pane drawn into a `width` x `height` area, one `String` per row, trailing blanks
+    /// trimmed (the Runs pane's `lines`).
+    fn draw(tab: &GraphTab, shell: &Shell, width: u16, height: u16) -> Vec<String> {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+            .expect("the test backend is constructible");
+        term.draw(|frame| tab.render(frame, frame.area(), &shell.ctx()))
+            .expect("the pane draws");
+        let buffer = term.backend().buffer();
+        (buffer.area.top()..buffer.area.bottom())
+            .map(|y| {
+                let row: String = (buffer.area.left()..buffer.area.right())
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect();
+                row.trim_end().to_owned()
+            })
+            .collect()
+    }
+
+    /// M1: a depth `+` / `-` cannot change is a no-op, so the cursor stays on a `(*)` row rather
+    /// than jumping to its item's own row.
+    #[tokio::test]
+    async fn a_clamped_depth_change_leaves_the_cursor_where_it_is() {
+        let shell = Shell::platform().await;
+        let mut ctx = shell.ctx();
+        let mut tab = pane(demo(ids::HTUI_FEAT_1).await);
+        tab.on_key(key(KeyCode::Char('+')), &mut ctx);
+        assert_eq!(tab.depth, GraphTab::MAX_HOPS);
+        for _ in 0..4 {
+            tab.on_key(key(KeyCode::Char('J')), &mut ctx);
+        }
+        let on_repeat = |tab: &GraphTab| {
+            let row = tab.visible()[tab.cursor];
+            row.is_repeat() && row.node.item_id == ids::HTUI_FEAT_3
+        };
+        assert!(on_repeat(&tab), "{:#?}", shape(&tab.visible()));
+        tab.on_key(key(KeyCode::Char('+')), &mut ctx);
+        assert_eq!(tab.cursor, 4, "`+` at MAX_HOPS moves nothing");
+
+        tab.on_key(key(KeyCode::Char('-')), &mut ctx);
+        tab.on_key(key(KeyCode::Char('-')), &mut ctx);
+        assert_eq!(tab.depth, 1);
+        // Depth 1 is `FEAT-1`, `ANA-1`, `FEAT-3 (*)`, `FEAT-2`, `FEAT-3`: back up onto the repeat.
+        tab.on_key(key(KeyCode::Char('K')), &mut ctx);
+        tab.on_key(key(KeyCode::Char('K')), &mut ctx);
+        assert_eq!(tab.cursor, 2);
+        assert!(on_repeat(&tab), "{:#?}", shape(&tab.visible()));
+        tab.on_key(key(KeyCode::Char('-')), &mut ctx);
+        assert_eq!(tab.cursor, 2, "`-` at 1 moves nothing");
+    }
+
+    /// L5: when the slug cannot keep two cells the key is what is clipped, never the slug; and a
+    /// label with no room left is empty rather than a one-cell-over ellipsis.
+    #[tokio::test]
+    async fn the_narrowest_label_keeps_the_key() {
+        let shell = Shell::platform().await;
+        let graph = demo(ids::AGY_FIX_1).await;
+        let rows = rows(&graph, 2);
+        let vulkan = rows
+            .iter()
+            .find(|row| row.node.item_id == ids::VULKAN_FEAT_1)
+            .expect("vulkan FEAT-1 is one hop from agy FIX-1");
+        let at = |width| {
+            let drawn = line(
+                vulkan,
+                false,
+                rows[0].node.project_id,
+                false,
+                width,
+                &shell.theme,
+            );
+            assert!(drawn.width() <= width, "{:?} at {width}", text(&drawn));
+            text(&drawn)
+        };
+        // 17 fixed cells and `origin` leave 8 for the label: one for the slug, so it goes whole.
+        assert_eq!(at(31), "  → origin FEAT-1 in_progress");
+        assert_eq!(at(25), "  → origin F… in_progress");
+        assert_eq!(at(23), "  → origin  in_progress");
+
+        // A label with no slug is clipped too, not left to the pane edge.
+        let graph = demo(ids::HTUI_FEAT_1).await;
+        let feat_1 = super::rows(&graph, 2);
+        let drawn = line(
+            &feat_1[1],
+            false,
+            feat_1[0].node.project_id,
+            true,
+            18,
+            &shell.theme,
+        );
+        assert_eq!(text(&drawn), "  → origin A… done");
+    }
+
+    /// L8: no graph yet is a pending read, not an item without links.
+    #[tokio::test]
+    async fn the_pane_says_loading_until_the_links_arrive() {
+        let shell = Shell::platform().await;
+        let mut ctx = shell.ctx();
+        let mut tab = GraphTab::new();
+        tab.on_item_change(Some(ids::HTUI_FEAT_1));
+        assert_eq!(draw(&tab, &shell, 43, 6)[0], "Loading links\u{2026}");
+        tab.on_reply(&StoreReply::Links(demo(ids::HTUI_FEAT_1).await), &mut ctx);
+        assert_eq!(
+            draw(&tab, &shell, 43, 6)[0],
+            "▸ FEAT-1 in_progress TUI scaffold"
+        );
+    }
+
+    /// L8: a refused `Links` read says so, and the next selection is pending again.
+    #[tokio::test]
+    async fn a_failed_links_read_says_so() {
+        let shell = Shell::platform().await;
+        let mut ctx = shell.ctx();
+        let mut tab = GraphTab::new();
+        tab.on_item_change(Some(ids::HTUI_FEAT_1));
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: "documents",
+                message: "not ours".to_owned(),
+            },
+            &mut ctx,
+        );
+        assert_eq!(draw(&tab, &shell, 43, 6)[0], "Loading links\u{2026}");
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: LINKS,
+                message: "connection refused".to_owned(),
+            },
+            &mut ctx,
+        );
+        assert_eq!(
+            draw(&tab, &shell, 43, 6)[0],
+            "Links unavailable: connection refused"
+        );
+        tab.on_item_change(Some(ids::HTUI_FEAT_2));
+        assert_eq!(draw(&tab, &shell, 43, 6)[0], "Loading links\u{2026}");
+        tab.on_reply(&StoreReply::Links(demo(ids::HTUI_FEAT_2).await), &mut ctx);
+        assert_eq!(
+            tab.visible().len(),
+            6,
+            "a later answer replaces the refusal"
+        );
+    }
+
+    #[test]
+    fn links_is_the_links_request_name() {
+        let request = crate::store_worker::StoreRequest::Links {
+            id: ids::HTUI_FEAT_1,
+            hops: GraphTab::MAX_HOPS,
+        };
+        assert_eq!(request.name(), LINKS);
     }
 
     #[tokio::test]
