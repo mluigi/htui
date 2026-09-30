@@ -2731,7 +2731,8 @@ fn focused_on(section: &AgentsSection, bench: &SectionBench, label: &str) -> boo
     let prefix = format!("{label:<width$}: ", width = LABEL_WIDTH);
     accented_lines(section, &bench.ctx())
         .iter()
-        .any(|line| line.starts_with(prefix.as_str()))
+        // Trimmed: a field holding only spaces draws its label and nothing after the colon.
+        .any(|line| line.starts_with(prefix.trim_end()))
 }
 
 /// The section's last line: the note (D245).
