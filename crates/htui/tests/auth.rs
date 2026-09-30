@@ -488,7 +488,7 @@ async fn x_mid_login_ends_cancelled_and_the_cell_goes_back() {
         })
         .await;
     assert!(
-        frame.contains("o open link \u{b7} x cancel"),
+        frame.contains("o open link \u{b7} p paste redirect \u{b7} x cancel"),
         "a login is running and offering its cancel key: {frame}"
     );
 

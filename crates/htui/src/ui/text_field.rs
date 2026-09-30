@@ -96,6 +96,18 @@ impl TextField {
         }
     }
 
+    /// An empty masked field reserving `bytes` up front (MOD-22 D275).
+    ///
+    /// For a secret longer than a DSN: a pasted redirect is hundreds of characters, and every
+    /// time a `String` outgrows its capacity it frees the old allocation **unwiped**. Opened at
+    /// the longest text its caller will accept, a field never reallocates on the way to a value
+    /// that caller could use.
+    #[must_use]
+    pub fn masked_with_capacity(bytes: usize) -> Self {
+        let _ = bytes;
+        todo!("MOD-22 T3 (b)")
+    }
+
     /// An unmasked field holding `text`, cursor at the end — how an editor prefills a row.
     #[must_use]
     pub fn with_text(text: &str) -> Self {
@@ -669,6 +681,32 @@ mod tests {
         // The unmasked field makes no such promise and should not pay for one: it holds a slug, a
         // name or a path, and it is not what this reservation exists for.
         assert_eq!(TextField::new().text.capacity(), 0);
+    }
+
+    /// MOD-22 D275: a field opened at the longest paste its caller accepts takes a pasted redirect
+    /// of several hundred characters in its first allocation. At `masked()`'s 256 bytes the same
+    /// paste would have left an unwiped copy of its first 256 and 512 bytes behind.
+    #[test]
+    fn a_masked_field_opened_with_capacity_takes_a_long_paste_without_reallocating() {
+        let mut field = TextField::masked_with_capacity(8192);
+        let reserved = field.text.capacity();
+        assert!(
+            reserved >= 8192,
+            "the reservation is what was asked for: {reserved}"
+        );
+        assert!(field.is_masked());
+
+        let paste = "a".repeat(600);
+        for c in paste.chars() {
+            field.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(field.len(), 600);
+        assert_eq!(
+            field.text.capacity(),
+            reserved,
+            "600 bytes fitted in the first allocation, so nothing was freed unwiped"
+        );
+        assert_eq!(field.take(), paste);
     }
 
     /// D3: `clear` wipes the buffer where it is instead of dropping it.

@@ -47,6 +47,7 @@
 //! branches on an agent's name (`R-AGT-5`).
 
 use chrono::{DateTime, Utc};
+use htui_agent::auth::loopback::Advertised;
 use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::install::PlanError;
 use htui_agent::probe::{ProbeSnapshot, ProbeStatus};
@@ -289,6 +290,15 @@ enum AuthState {
         url: Option<String>,
         /// `x` was pressed, or the runtime acknowledged one.
         cancelling: bool,
+        /// MOD-22 D264: the newest loopback redirect the adapter's links advertised; `p` is
+        /// offered only with one, and a paste is pre-checked against it.
+        advertised: Option<Advertised>,
+        /// MOD-22 D270, D272: the masked paste field, open between `p` and `Enter`/`Esc`. Dropped,
+        /// and so wiped, on submit, on cancel and when the flow ends.
+        paste: Option<TextField>,
+        /// MOD-22 D270: an `AuthDeliver` is unanswered; a second one would make the first's answer
+        /// stale in `App::is_fresh`, so `p` is refused until it lands.
+        delivering: bool,
     },
 }
 
@@ -615,6 +625,9 @@ impl AgentsSection {
             lines: VecDeque::new(),
             url: None,
             cancelling: false,
+            advertised: None,
+            paste: None,
+            delivering: false,
         };
         self.notice = None;
         ctx.request(StoreRequest::AuthChoose { choice });
@@ -636,6 +649,9 @@ impl AgentsSection {
                     lines: VecDeque::new(),
                     url: None,
                     cancelling: true,
+                    advertised: None,
+                    paste: None,
+                    delivering: false,
                 };
             }
         }
@@ -1773,10 +1789,12 @@ impl SettingsSection for AgentsSection {
         "Agents"
     }
 
-    /// While a registry form is open (blueprint F-11): `l` and `h` are letters there, not section
-    /// cycling. Derived from the mode, never a flag.
+    /// While a registry form is open (blueprint F-11), and while the login's paste field is
+    /// (MOD-22 D270): `l` and `h` are letters there, not section cycling. Derived from the state,
+    /// never a flag.
     fn captures_input(&self) -> bool {
         matches!(self.mode, Mode::Editing(_))
+            || matches!(self.auth, AuthState::Running { paste: Some(_), .. })
     }
 
     fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
