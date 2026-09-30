@@ -24,7 +24,7 @@ use htui_core::prompt::excerpt::{
     RootRecord, RootSource, select,
 };
 use htui_core::prompt::settings::resolve_excerpt_caps;
-use htui_core::prompt::{PromptSpec, TokenEstimator, body_of, fixtures};
+use htui_core::prompt::{PromptSpec, TokenEstimator, assemble, body_of, fixtures};
 use htui_core::scrub::MinimalScrubber;
 
 // ---------------------------------------------------------------------------------------------
@@ -1664,4 +1664,52 @@ async fn step_pass_builds_no_listing_file_set_without_a_glob_winner() {
             pass.excerpts.notes
         );
     }
+}
+
+/// MOD-9 D132 (review finding 3): on the glob-only branch — `{{skills}}` placed with a `glob`
+/// winner, `{{excerpts}}` not — the listing's own notes are withheld when the scrubber would
+/// change them. `FsRepoReader` prunes a denied file inside its walk, so the listing's notes that
+/// name a string are the per-repo ones; here a repo whose slug is a session secret has no readable
+/// root, and the walk's "no readable root for repo `…`" note would carry the secret.
+#[tokio::test]
+async fn step_pass_withholds_a_listing_note_on_the_glob_only_branch() {
+    let secret = "hunter2hunter2";
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
+    let input = PassInput {
+        roots: vec![
+            fs_root(dir.path()),
+            RepoRoot {
+                repo: secret.to_owned(),
+                root: std::path::PathBuf::new(),
+                source: RootSource::NoPath,
+            },
+        ],
+        touched_prefixes: vec![PathPrefix::parse("src/lib.rs", "htui")],
+        notes: Vec::new(),
+        changed_paths: Vec::new(),
+    };
+    let scrubber = MinimalScrubber::new([secret.to_owned()]);
+    let mut spec = verdict_spec(vec![glob_skill(&["**/*.rs"])]);
+
+    let pass = step_pass(&spec, input, &BTreeMap::new(), &scrubber).await;
+
+    assert!(
+        pass.excerpts.notes.contains(
+            &"excerpt: a note was withheld; it named a string the scrubber masks or refuses"
+                .to_owned()
+        ),
+        "{:?}",
+        pass.excerpts.notes
+    );
+    for note in &pass.excerpts.notes {
+        assert!(!note.contains(secret), "a note names the secret: {note}");
+    }
+    spec.excerpts = pass.excerpts;
+    spec.step_files = pass.files;
+    let assembled = assemble(&spec, &scrubber).expect("the spec assembles");
+    assert!(
+        assembled.trim.to_value(&scrubber).is_ok(),
+        "the record scrubs clean"
+    );
 }

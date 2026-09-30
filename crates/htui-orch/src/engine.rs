@@ -13224,6 +13224,42 @@ mod tests {
         );
     }
 
+    /// MOD-9 D122 (review finding 3): a changed-path list the isolator cut is a trim note on
+    /// attempt 2, and the paths it kept still match.
+    #[tokio::test]
+    async fn a_cut_changed_path_list_is_a_note() {
+        use crate::isolate::ChangedPaths;
+        use htui_core::model::ChoiceReason;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let repo = glob_retry_prologue(&harness, dir.path()).await;
+        harness.orch.isolator.script_changed_paths(ChangedPaths {
+            paths: vec![(repo, "docs/notes.md".to_owned())],
+            truncated: true,
+        });
+
+        let (first, second) = run_two_attempts(&harness).await;
+
+        assert!(
+            !stored_notes(&first)
+                .iter()
+                .any(|note| note.starts_with("changed paths")),
+            "attempt 1 reads no changed paths"
+        );
+        let notes = stored_notes(&second);
+        assert!(
+            notes.contains(&"changed paths: the list was cut at 64 KiB".to_owned()),
+            "{notes:?}"
+        );
+        let after = stored_choices(&second);
+        let after = choice_named(&after, "md-style");
+        assert_eq!(
+            (after.reason, after.path.as_deref()),
+            (ChoiceReason::Matched, Some("htui:docs/notes.md"))
+        );
+    }
+
     /// MOD-9 D122: a fan-out group assembles before any candidate tree exists, and its file set is
     /// this box's `repo_box_path` checkout.
     #[tokio::test]
