@@ -541,6 +541,68 @@ async fn a_fresh_row_is_not_re_probed_and_a_stale_one_is() {
     );
 }
 
+/// Review L-3: a row switched off on this box (`agent_box.user_off`) is refused at chat start with
+/// one sentence, even when its probe says `ready`, and no chat step is minted.
+#[tokio::test]
+async fn a_row_switched_off_on_this_box_is_refused_at_chat_start() {
+    let (mut harness, store) = harness(Script::one_turn(vec![chunk("hi"), done()])).await;
+    let agent_id = scripted_id(&store).await;
+    store
+        .upsert_agent_box(&probed(agent_id, chrono::Utc::now()))
+        .await
+        .expect("the ready row lands");
+    store
+        .set_agent_box_enabled(agent_id, ids::BOX, false)
+        .await
+        .expect("the switch lands");
+
+    compose(&mut harness, "anyone there");
+    harness.drive().await;
+
+    assert!(
+        harness.chat_steps().is_empty(),
+        "a switched-off row starts no chat"
+    );
+    let frame = harness.render();
+    // The body wraps the sentence, so it is read with the border and the line breaks taken out.
+    let body = frame
+        .lines()
+        .map(|line| line.trim_matches(|c: char| c == '\u{2502}' || c.is_whitespace()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        body.contains(
+            "agent `scripted` is switched off on this box; Settings > Agents, t switches it on"
+        ),
+        "{frame}"
+    );
+}
+
+/// Review L-3: a row switched off and on again chats as before; a row never switched is every
+/// other test in this file.
+#[tokio::test]
+async fn a_row_switched_back_on_chats_as_before() {
+    let (mut harness, store) = harness(Script::one_turn(vec![chunk("hi"), done()])).await;
+    let agent_id = scripted_id(&store).await;
+    store
+        .set_agent_box_enabled(agent_id, ids::BOX, false)
+        .await
+        .expect("the switch lands");
+    store
+        .set_agent_box_enabled(agent_id, ids::BOX, true)
+        .await
+        .expect("the switch lands");
+
+    compose(&mut harness, "anyone there");
+    harness.drive_to_end().await;
+
+    assert_eq!(harness.chat_steps().len(), 1, "the chat started");
+    assert!(
+        !harness.render().contains("switched off"),
+        "no refusal on screen"
+    );
+}
+
 // -------------------------------------------------------------------------------------------
 // Replay (MOD-2 milestone 4, T20): the same tab, the same transcript, over persisted rows.
 // -------------------------------------------------------------------------------------------

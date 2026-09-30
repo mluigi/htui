@@ -1794,6 +1794,17 @@ impl AgentRuntime {
                 summary.agent.name
             )));
         }
+        // MOD-23 review L-3: the per-box switch gates a chat started on this box, whatever the
+        // probe's verdict. Read off the summary this path already holds, so it costs no read and
+        // refuses before any row is written; a row with no `agent_box` row is `user_off: false`.
+        // Offline, `CacheStore::agents` answers `user_off: false` because `agent_box` is not
+        // mirrored — but an offline backend has no writer and was refused above.
+        if summary.user_off {
+            return Err(StoreError::Constraint(format!(
+                "agent `{}` is switched off on this box; Settings > Agents, t switches it on",
+                summary.agent.name
+            )));
+        }
         let driver = self
             .factory
             .driver_for(&summary.agent, summary.on_box.as_ref())
@@ -2173,6 +2184,11 @@ async fn probe_agents_on(
             ProbeOutcome::Row(mut row) => {
                 writer.upsert_agent_box(&row).await?;
                 // MOD-23 D243: the store kept `enabled AND NOT user_off`; the reply says the same.
+                //
+                // Review L-1: `user_off` is the start-of-walk read's, so a switch flipped while
+                // this walk runs shows on the next read, not in this reply. The store row is right
+                // regardless (`upsert_agent_box` applies the rule against the row it writes), and
+                // the section's `on this box` cell checks `user_off` before `enabled`.
                 row.enabled &= !summary.user_off;
                 summary.on_box = Some(row);
             }
