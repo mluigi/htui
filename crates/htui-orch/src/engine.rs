@@ -13224,6 +13224,36 @@ mod tests {
         );
     }
 
+    /// MOD-9 D122, D132 (review finding 4): an isolator error naming a credential-shaped path is
+    /// withheld from the trim notes by `step_pass`, not left to refuse the record and fail the
+    /// step.
+    #[tokio::test]
+    async fn an_unmaskable_changed_paths_error_is_withheld_not_a_failure() {
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        glob_retry_prologue(&harness, dir.path()).await;
+        harness
+            .orch
+            .isolator
+            .fail_changed_paths("cannot lock /srv/sk-live-checkout/.git/index.lock");
+
+        let (_, second) = run_two_attempts(&harness).await;
+
+        assert_eq!(second.status, StepStatus::Done);
+        let notes = stored_notes(&second);
+        assert!(
+            notes.contains(
+                &"excerpt: a note was withheld; it named a string the scrubber masks or refuses"
+                    .to_owned()
+            ),
+            "{notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|note| note.contains("sk-live")),
+            "{notes:?}"
+        );
+    }
+
     /// MOD-9 D122 (review finding 3): a changed-path list the isolator cut is a trim note on
     /// attempt 2, and the paths it kept still match.
     #[tokio::test]

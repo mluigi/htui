@@ -10,7 +10,7 @@
 //! it has. Since MOD-7 milestone 4 the excerpt section is real: the roots are this box's
 //! `repo_box_path` rows, the rung a run reads before its trees exist, and the pass is
 //! `htui_agent::excerpt::step_pass`, the engine's own. Since MOD-9 milestone 5 the same pass
-//! builds the `glob` file set, so a glob attachment fires here over that checkout (D124).
+//! builds the `glob` file set, so a glob attachment fires here over that checkout (MOD-9 D124).
 //!
 //! **It writes nothing.** No `set_step_prompt`, no `prompt` event, no run. That is correctness
 //! rather than caution: `set_step_prompt` writes *a step's* audit row and a preview has no step.

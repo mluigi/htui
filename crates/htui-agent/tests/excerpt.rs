@@ -1713,3 +1713,42 @@ async fn step_pass_withholds_a_listing_note_on_the_glob_only_branch() {
         "the record scrubs clean"
     );
 }
+
+/// MOD-9 D132 (review finding 4): the caller's notes are withheld as the pass's are. An engine
+/// note carries an isolator's stderr, which can name a credential-shaped checkout path; kept, it
+/// would make the record refuse (`TrimRecord::to_value`) and fail the step.
+#[tokio::test]
+async fn step_pass_withholds_an_unmaskable_caller_note() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
+    let withheld =
+        "excerpt: a note was withheld; it named a string the scrubber masks or refuses".to_owned();
+    let scrubber = MinimalScrubber::new([]);
+
+    for mut spec in [phase_spec(), verdict_spec(Vec::new())] {
+        let mut input = readable_input(dir.path());
+        input.notes = vec![
+            "changed paths unavailable: cannot lock /srv/sk-live-checkout/.git/index.lock"
+                .to_owned(),
+            "excerpt: a caller's own note".to_owned(),
+        ];
+
+        let pass = step_pass(&spec, input, &BTreeMap::new(), &scrubber).await;
+
+        assert_eq!(
+            pass.excerpts.notes[..2],
+            [withheld.clone(), "excerpt: a caller's own note".to_owned()],
+            "`{}`: withheld in place, first: {:?}",
+            spec.template.name,
+            pass.excerpts.notes
+        );
+        spec.excerpts = pass.excerpts;
+        spec.step_files = pass.files;
+        let assembled = assemble(&spec, &scrubber).expect("the spec assembles");
+        assert!(
+            assembled.trim.to_value(&scrubber).is_ok(),
+            "`{}`: the record scrubs clean",
+            spec.template.name
+        );
+    }
+}

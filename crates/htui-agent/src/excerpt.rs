@@ -1033,7 +1033,8 @@ pub struct StepPass {
 ///
 /// Every hop fails open: a `JoinError` in the walk records the roots unscanned with today's
 /// "panicked"/"cancelled" note and a file set of the changed paths alone; one in the selection
-/// keeps the listing's file set. Caller notes always come first.
+/// keeps the listing's file set. Caller notes always come first, each withheld when the scrubber
+/// would change it.
 pub async fn step_pass(
     spec: &PromptSpec,
     input: PassInput,
@@ -1044,9 +1045,13 @@ pub async fn step_pass(
     let PassInput {
         roots,
         touched_prefixes,
-        notes,
+        mut notes,
         changed_paths,
     } = input;
+    // MOD-9 D132: a caller's note can carry an isolator's stderr (`changed paths unavailable:
+    // …`), which can name a checkout path; the record is scrubbed fail-closed, so the caller's
+    // notes are withheld as the pass's are, in place, before any branch.
+    withhold_unmaskable_notes(&mut notes, scrubber);
 
     let (places_excerpts, places_skills) =
         parse(spec.role, &spec.body).map_or((false, false), |parsed| {
@@ -1058,7 +1063,6 @@ pub async fn step_pass(
     // MOD-9 D120: a placed `glob` winner needs the listing even where no excerpt is read.
     let wants_files = places_skills && needs_files(&spec.skills);
     if !places_excerpts && !wants_files {
-        let mut notes = notes;
         notes.push(format!(
             "excerpt: template `{}` places no {{{{excerpts}}}}; nothing was read",
             spec.template.name
@@ -1108,7 +1112,6 @@ pub async fn step_pass(
             Ok(walked) => walked,
             Err(error) => {
                 // MOD-9 D132: no listing, so the file set is the changed paths alone.
-                let mut notes = notes;
                 notes.push(join_note(&error));
                 return with_files(
                     unscanned(&roots, caps, notes),
@@ -1171,7 +1174,6 @@ pub async fn step_pass(
                         set
                     }
                     Err((roots, note)) => {
-                        let mut notes = notes;
                         notes.push(note);
                         unscanned(&roots, caps, notes)
                     }
