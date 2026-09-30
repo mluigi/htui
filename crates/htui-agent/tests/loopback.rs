@@ -6,6 +6,11 @@
 //! No assertion here prints a real code. The pasted `code` and `state` are the sentinels
 //! [`CODE`] and [`STATE`], and every redaction case asserts their absence.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "test fakes run under no TUI panic hook"
+)]
+
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
