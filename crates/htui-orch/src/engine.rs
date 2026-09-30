@@ -1675,15 +1675,20 @@ where
         let row = self.run(run).await?;
         crate::command::cancel_enabled(&row)?;
         if row.status == RunStatus::Queued {
-            if let Some(outcome) = self.cancel_queued(&row).await? {
-                return Ok(outcome);
-            }
-            // OQ-4: a claim won between the read and the compare-and-set. The run is leased now,
-            // and the leased path refuses a live lease with `LeaseHeld`, writing nothing.
-            let row = self.run(run).await?;
-            crate::command::cancel_enabled(&row)?;
-            return self.cancel_leased(&row).await;
+            return self.cancel_from_queued(&row).await;
         }
+        self.cancel_leased(&row).await
+    }
+
+    /// [`Self::cancel_run`] of a run read `queued` (OQ-4): the compare-and-set first. When a
+    /// claim won between the read and it, the run is leased now: it is read again and takes the
+    /// leased path, which refuses a live lease with `LeaseHeld`, writing nothing.
+    async fn cancel_from_queued(&self, row: &Run) -> Result<CommandOutcome, EngineError> {
+        if let Some(outcome) = self.cancel_queued(row).await? {
+            return Ok(outcome);
+        }
+        let row = self.run(row.id).await?;
+        crate::command::cancel_enabled(&row)?;
         self.cancel_leased(&row).await
     }
 
@@ -13790,8 +13795,9 @@ mod queued_cancel {
     }
 
     /// F-21: a claim lands between the cancel's read and its compare-and-set. `cancel_queued`
-    /// over the stale row answers `None` and writes nothing; the command then takes the leased
-    /// path, which the claimer's live lease refuses with `LeaseHeld`.
+    /// over the stale row answers `None` and writes nothing; `cancel_from_queued`, the command's
+    /// path from that stale row, then re-reads and takes the leased path, which the claimer's
+    /// live lease refuses with `LeaseHeld` (finding T9-A1). A fresh `CancelRun` is refused alike.
     #[tokio::test]
     async fn a_queued_cancel_loses_cleanly_to_a_concurrent_claim() {
         let orch = harness().await;
@@ -13836,6 +13842,14 @@ mod queued_cancel {
         assert!(
             cancelled.is_none(),
             "OQ-4: the run left `queued` first, so the queued cancel writes nothing: {cancelled:?}"
+        );
+        let refused = engine
+            .cancel_from_queued(&stale)
+            .await
+            .expect_err("the claim won, and its lease is live");
+        assert!(
+            matches!(refused, EngineError::LeaseHeld { run: held } if held == run),
+            "OQ-4: the stale queued read falls back to the leased path: {refused}"
         );
         let refused = engine
             .dispatch(Command::CancelRun { run })
