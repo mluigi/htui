@@ -21,8 +21,9 @@ use htui_agent::fake::FakeAdapter;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::{demo_at, edit_agent, ids};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, CitationKind, DocumentId, ItemId, NewDocument, NewRunStep,
-    Resolution, RunStatus, RunStep, SnapshotPhase, Status, StepId, Transport, WorkspaceSummary,
+    Agent, AgentBox, AgentId, Billing, CitationKind, DocumentId, ItemId, NewDocument, NewItem,
+    NewRunStep, Resolution, RunStatus, RunStep, Scope, SnapshotPhase, Status, StepId, Transport,
+    WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 use htui_orch::Clock;
@@ -1189,4 +1190,219 @@ async fn the_runs_pane_poll_keeps_the_cursor() {
         (Some("running"), Some(true)),
         "the poll re-read the run and the cursor stayed on `plan`:\n{frame}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Filters (MOD-13 milestone 1, plan D1-D6, blueprint §4).
+// ---------------------------------------------------------------------------------------------
+
+/// [`backlog`] over `store` instead of the plain demo.
+async fn backlog_over(store: MemStore) -> Harness {
+    let mut harness = Harness::over(store)
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+    harness.drive_to_end().await;
+    harness.app().update(Action::SetScope {
+        workspace: workspace("platform").await,
+    });
+    harness.drive_to_end().await;
+    harness
+}
+
+/// Presses each of `keys`, then serves what they asked for.
+async fn keys(harness: &mut Harness, keys: &[&str]) {
+    for key in keys {
+        harness.key(key);
+    }
+    harness.drive_to_end().await;
+}
+
+/// `f`, then `l` five times to `done` on the Status row, ticked with `space`.
+const TICK_DONE: [&str; 7] = ["f", "l", "l", "l", "l", "l", "space"];
+
+/// From the Status row, down to Tags and type `rust`.
+const TYPE_RUST: [&str; 6] = ["down", "down", "r", "u", "s", "t"];
+
+/// The list pane's title row: the frame line holding `Backlog (`.
+fn list_title(frame: &str) -> &str {
+    frame
+        .lines()
+        .find(|line| line.contains("Backlog ("))
+        .expect("the list pane has a title")
+}
+
+/// D1, D2: a status filter reads only that status.
+#[tokio::test]
+async fn filtering_by_status_done_lists_only_done_items() {
+    let mut harness = backlog().await;
+    keys(&mut harness, &TICK_DONE).await;
+    keys(&mut harness, &["enter"]).await;
+    let frame = harness.render();
+    assert!(
+        list_title(&frame).contains("Backlog (2) · status:done "),
+        "{frame}"
+    );
+    assert!(frame.contains("Data model, box registry"), "{frame}");
+    assert!(frame.contains("Prompt assembly survey"), "{frame}");
+    assert!(!frame.contains("TUI scaffold"), "{frame}");
+    assert_eq!(harness.app().status, None);
+}
+
+/// D1: a project filter reads only that project's items.
+#[tokio::test]
+async fn filtering_by_one_project_lists_only_its_items() {
+    let mut harness = backlog().await;
+    keys(&mut harness, &["f", "j", "space", "enter"]).await;
+    let frame = harness.render();
+    assert!(
+        list_title(&frame).contains("Backlog (8) · project:htui "),
+        "{frame}"
+    );
+    assert!(!frame.contains("ACP transport upgrade"), "{frame}");
+}
+
+/// D3: the capability filter keeps the items whose required tags hold `rust`.
+#[tokio::test]
+async fn filtering_by_the_rust_tag_lists_only_rust_items() {
+    let mut harness = backlog().await;
+    keys(&mut harness, &["f"]).await;
+    keys(&mut harness, &TYPE_RUST).await;
+    keys(&mut harness, &["enter"]).await;
+    let frame = harness.render();
+    assert!(
+        list_title(&frame).contains("Backlog (4) · tags:rust "),
+        "htui FEAT-1/2/3 and agy FEAT-1:\n{frame}"
+    );
+    assert!(
+        frame.contains("ACP transport upgrade"),
+        "agy FEAT-1:\n{frame}"
+    );
+    assert!(
+        !frame.contains("Data model, box registry"),
+        "untagged htui ANA-1 is gone:\n{frame}"
+    );
+}
+
+/// D2: "ready here" is `MemStore::ready_items` for this box. The demo plus an open item needing
+/// `cuda`, which the store-side half alone would keep (blueprint E1).
+#[tokio::test]
+async fn ready_here_lists_what_this_box_can_start() {
+    let store = MemStore::demo();
+    store
+        .mint_item(NewItem {
+            id: ItemId::new(),
+            project_id: ids::PROJECT_HTUI,
+            kind_id: ids::KIND_HTUI_FEAT,
+            title: "needs a GPU toolchain".to_owned(),
+            body: String::new(),
+            required_tags: vec!["cuda".to_owned()],
+            touched_paths: Vec::new(),
+            priority: 0,
+            step_graph_id: None,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        })
+        .await
+        .expect("the mint lands");
+    let platform = Scope::from_workspace(&workspace("platform").await);
+    let ready = store
+        .ready_items(&platform, ids::BOX)
+        .await
+        .expect("the read is total");
+    assert_eq!(ready.len(), 3, "htui ANA-2, agy FEAT-1 and agy FIX-1");
+
+    let mut harness = backlog_over(store).await;
+    assert!(
+        harness.render().contains("needs a GPU toolchain"),
+        "unfiltered, the cuda item is listed"
+    );
+    keys(
+        &mut harness,
+        &["f", "down", "down", "down", "space", "enter"],
+    )
+    .await;
+    let frame = harness.render();
+    assert!(
+        list_title(&frame).contains(&format!("Backlog ({}) · ready here ", ready.len())),
+        "{frame}"
+    );
+    for item in &ready {
+        let head: String = item.title.chars().take(20).collect();
+        assert!(frame.contains(&head), "{} is listed:\n{frame}", item.key);
+    }
+    assert!(
+        !frame.contains("needs a GPU toolchain"),
+        "this box has no `cuda`:\n{frame}"
+    );
+    assert_eq!(harness.app().status, None);
+}
+
+/// D5: `F` restores the whole list and its plain title.
+#[tokio::test]
+async fn shift_f_restores_the_whole_list() {
+    let mut harness = backlog().await;
+    keys(&mut harness, &TICK_DONE).await;
+    keys(&mut harness, &["enter"]).await;
+    assert!(list_title(&harness.render()).contains("Backlog (2) · "));
+    keys(&mut harness, &["F"]).await;
+    let frame = harness.render();
+    let title = list_title(&frame);
+    assert!(title.contains("Backlog (11) "), "{frame}");
+    assert!(
+        !title.contains('·'),
+        "no summary without a filter:\n{frame}"
+    );
+    assert!(frame.contains("TUI scaffold"), "{frame}");
+}
+
+/// Blueprint E4: `f` and `F` are on the Backlog's help line, next to `m`.
+#[tokio::test]
+async fn f_and_shift_f_are_on_the_backlog_help_line() {
+    let mut harness = Harness::demo();
+    htui::app::register_all(harness.app());
+    let help = harness
+        .app()
+        .keymap
+        .help_line(&KeyScope::Tab(BacklogTab::ID));
+    assert!(help.contains("f filter"), "{help}");
+    assert!(help.contains("F clear filter"), "{help}");
+}
+
+/// D1: the open form at the bottom of the list pane, `done` ticked and `rust` typed, nothing
+/// applied yet: the title is still the whole list's.
+#[tokio::test]
+async fn the_filter_form_renders_in_the_list_pane() {
+    let mut harness = backlog().await;
+    keys(&mut harness, &TICK_DONE).await;
+    keys(&mut harness, &TYPE_RUST).await;
+    let frame = harness.render();
+    assert!(list_title(&frame).contains("Backlog (11) "), "{frame}");
+    assert!(frame.contains("Filter"), "{frame}");
+    assert!(frame.contains("[x] done"), "{frame}");
+    assert!(frame.contains("> tags    rust"), "{frame}");
+    insta::assert_snapshot!("filter_form", frame);
+}
+
+/// D5: a filtered list names its filter in the title; the cursor lands on its first item.
+#[tokio::test]
+async fn the_filtered_list_names_its_filter() {
+    let mut harness = backlog().await;
+    keys(&mut harness, &TICK_DONE).await;
+    keys(&mut harness, &["enter"]).await;
+    let frame = harness.render();
+    assert!(frame.contains("┌ Backlog (2) · status:done"), "{frame}");
+    assert!(frame.contains("┌ ANA-1"), "{frame}");
+    insta::assert_snapshot!("filtered_list", frame);
+}
+
+/// D5, blueprint E3: a filter nothing matches says so, even though the project headers remain.
+#[tokio::test]
+async fn a_filter_nothing_matches_says_so() {
+    let mut harness = backlog().await;
+    keys(&mut harness, &TICK_DONE).await;
+    keys(&mut harness, &TYPE_RUST).await;
+    keys(&mut harness, &["enter"]).await;
+    let frame = harness.render();
+    assert!(frame.contains("No items match the filter."), "{frame}");
+    insta::assert_snapshot!("filter_no_match", frame);
 }
