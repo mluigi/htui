@@ -529,6 +529,7 @@ mod tests {
             vec![StoreRequest::Items {
                 scope: scope.clone(),
                 filter: ItemFilter::default(),
+                ready_here: false,
             }]
         }
         fn on_scope_change(&mut self, _scope: &Scope) {}
@@ -1220,6 +1221,7 @@ mod tests {
             ctx.request(StoreRequest::Items {
                 scope: ctx.scope.clone(),
                 filter: ItemFilter::default(),
+                ready_here: false,
             });
             true
         }

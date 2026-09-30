@@ -118,6 +118,10 @@ pub enum StoreRequest {
         scope: Scope,
         /// Conjunctive filter; `ItemFilter::default()` means "everything in scope".
         filter: ItemFilter,
+        /// MOD-13 D2: ANA-9 §7.4 for *this* box. The worker adds `ready: Some(true)` and keeps the
+        /// rows whose `required_tags ⊆ probed_tags ∪ declared_tags` of `Backend::box_info()`;
+        /// `None` (unregistered box) = no tags, as §7.4's `LEFT JOIN … COALESCE`.
+        ready_here: bool,
     },
     /// One item with its body.
     Item(ItemId),
@@ -1428,9 +1432,11 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::ActiveRuns { scope } => {
             StoreReply::ActiveRuns(backend.active_runs(scope).await?)
         }
-        StoreRequest::Items { scope, filter } => {
-            StoreReply::Items(backend.items(scope, filter).await?)
-        }
+        StoreRequest::Items {
+            scope,
+            filter,
+            ready_here,
+        } => StoreReply::Items(read_items(backend, scope, filter, *ready_here).await?),
         StoreRequest::Item(id) => StoreReply::Item(Box::new(backend.item(*id).await?)),
         StoreRequest::Links { id, hops } => StoreReply::Links(backend.links(*id, *hops).await?),
         StoreRequest::Documents(id) => StoreReply::Documents(backend.documents(*id).await?),
@@ -1597,6 +1603,43 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             message: NO_RUN_RUNTIME.to_owned(),
         },
     })
+}
+
+/// MOD-13 D2: `Items`, with this box's readiness composed in. Not `Backend::ready_items`, which
+/// refuses offline (MOD-25: an offline box still browses).
+///
+/// The box row is read first, so a refused `box_info` costs no item read; it answers `Failed`
+/// like every other arm.
+async fn read_items(
+    backend: &Backend,
+    scope: &Scope,
+    filter: &ItemFilter,
+    ready_here: bool,
+) -> StoreResult<Vec<ItemSummary>> {
+    if !ready_here {
+        return backend.items(scope, filter).await;
+    }
+    let info = backend.box_info().await?;
+    let filter = ItemFilter {
+        ready: Some(true),
+        ..filter.clone()
+    };
+    Ok(runnable_here(
+        backend.items(scope, &filter).await?,
+        info.as_ref(),
+    ))
+}
+
+/// The rows `info` has every required tag for, in the store's order; `None` has no tags
+/// (MOD-13 D2, the capability half of `MemStore::ready_items`).
+fn runnable_here(rows: Vec<ItemSummary>, info: Option<&BoxInfo>) -> Vec<ItemSummary> {
+    rows.into_iter()
+        .filter(|row| {
+            row.required_tags.iter().all(|tag| {
+                info.is_some_and(|b| b.probed_tags.contains(tag) || b.declared_tags.contains(tag))
+            })
+        })
+        .collect()
 }
 
 /// Renders a store error into the reply the asking view receives.
@@ -2434,9 +2477,9 @@ fn spawn_refresher(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use htui_core::fixtures::ids;
-    use htui_core::model::BoxId;
-    use htui_core::store::MemStore;
+    use htui_core::fixtures::{DemoData, demo_data, ids};
+    use htui_core::model::{BoxId, NewItem, OsFamily, Status};
+    use htui_core::store::{MemStore, WriteStore as _};
     use htui_store::{CacheStore, Identity};
 
     fn demo() -> Backend {
@@ -2592,6 +2635,7 @@ mod tests {
             &StoreRequest::Items {
                 scope,
                 filter: ItemFilter::default(),
+                ready_here: false,
             },
         )
         .await
@@ -2600,6 +2644,210 @@ mod tests {
         };
         assert_eq!(items.len(), 11, "eight htui items plus three agy items");
         assert_eq!(items[0].key, "ANA-1");
+    }
+
+    /// The demo plus one open htui item needing `cuda`, a tag the demo box has neither probed nor
+    /// declared (MOD-13 blueprint E1: no demo item exercises the capability half on its own). The
+    /// mint is `mem.rs`'s `the_eleven_inherent_reads_answer_from_the_fixture`'s. Clones share
+    /// state, so the returned store sees what a `Backend` over its clone reads.
+    async fn with_cuda(store: MemStore) -> (MemStore, ItemId) {
+        let id = store
+            .mint_item(NewItem {
+                id: ItemId::new(),
+                project_id: ids::PROJECT_HTUI,
+                kind_id: ids::KIND_HTUI_FEAT,
+                title: "needs a GPU toolchain".to_owned(),
+                body: String::new(),
+                required_tags: vec!["cuda".to_owned()],
+                touched_paths: Vec::new(),
+                priority: 0,
+                step_graph_id: None,
+                created_by: ids::USER,
+                box_id: Some(ids::BOX),
+            })
+            .await
+            .expect("the mint lands")
+            .id;
+        (store, id)
+    }
+
+    /// One `Items` read through `serve`, unwrapped.
+    async fn items_of(
+        backend: &Backend,
+        scope: &Scope,
+        filter: ItemFilter,
+        ready_here: bool,
+    ) -> Vec<ItemSummary> {
+        let reply = serve(
+            backend,
+            &StoreRequest::Items {
+                scope: scope.clone(),
+                filter,
+                ready_here,
+            },
+        )
+        .await;
+        let StoreReply::Items(items) = reply else {
+            panic!("wrong reply variant: {reply:?}")
+        };
+        items
+    }
+
+    fn ids_of(rows: &[ItemSummary]) -> Vec<ItemId> {
+        rows.iter().map(|row| row.id).collect()
+    }
+
+    /// MOD-13 D2: `ready_here` is ANA-9 §7.4 for this box, the same rows in the same order as
+    /// `MemStore::ready_items` (which `pg_criteria.rs` pins against `PgStore`).
+    #[tokio::test]
+    async fn ready_here_equals_ready_items_for_this_box() {
+        let (store, needs_cuda) = with_cuda(MemStore::demo()).await;
+        let backend = Backend::memory(store.clone());
+        let scope = platform_scope(&backend).await;
+
+        let open = items_of(
+            &backend,
+            &scope,
+            ItemFilter {
+                ready: Some(true),
+                ..ItemFilter::default()
+            },
+            false,
+        )
+        .await;
+        assert!(
+            ids_of(&open).contains(&needs_cuda),
+            "the store-side half alone keeps the cuda item, so the capability half is exercised"
+        );
+
+        let ready = items_of(&backend, &scope, ItemFilter::default(), true).await;
+        assert_eq!(
+            ready,
+            store
+                .ready_items(&scope, ids::BOX)
+                .await
+                .expect("the read is total")
+        );
+        let ready = ids_of(&ready);
+        for id in [ids::HTUI_ANA_2, ids::AGY_FEAT_1, ids::AGY_FIX_1] {
+            assert!(ready.contains(&id), "{id:?} is ready on this box");
+        }
+        assert!(!ready.contains(&needs_cuda), "this box has no `cuda`");
+    }
+
+    /// MOD-13 D2: an unregistered box (`box_info()` is `None`) has no tags, as §7.4's
+    /// `LEFT JOIN … COALESCE`: only the untagged ready items stay.
+    #[tokio::test]
+    async fn ready_here_with_an_unregistered_box_keeps_only_untagged_items() {
+        let store = MemStore::from_demo(DemoData {
+            this_box: None,
+            ..demo_data()
+        });
+        let backend = Backend::memory(store.clone());
+        let scope = platform_scope(&backend).await;
+        let ready = items_of(&backend, &scope, ItemFilter::default(), true).await;
+        assert_eq!(
+            ready,
+            store
+                .ready_items(&scope, BoxId::new())
+                .await
+                .expect("the read is total")
+        );
+        assert_eq!(ids_of(&ready), [ids::HTUI_ANA_2, ids::AGY_FIX_1]);
+    }
+
+    /// MOD-13 D2: readiness stays one conjunct among the others.
+    #[tokio::test]
+    async fn ready_here_is_conjunctive_with_projects_tags_and_statuses() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+        let agy = items_of(
+            &backend,
+            &scope,
+            ItemFilter {
+                project_ids: Some(vec![ids::PROJECT_AGY]),
+                ..ItemFilter::default()
+            },
+            true,
+        )
+        .await;
+        assert_eq!(ids_of(&agy), [ids::AGY_FEAT_1, ids::AGY_FIX_1]);
+        let rust = items_of(
+            &backend,
+            &scope,
+            ItemFilter {
+                tags: Some(vec!["rust".to_owned()]),
+                ..ItemFilter::default()
+            },
+            true,
+        )
+        .await;
+        assert_eq!(ids_of(&rust), [ids::AGY_FEAT_1]);
+        let done = items_of(
+            &backend,
+            &scope,
+            ItemFilter {
+                statuses: Some(vec![Status::Done]),
+                ..ItemFilter::default()
+            },
+            true,
+        )
+        .await;
+        assert!(done.is_empty(), "a done item is never ready: {done:?}");
+    }
+
+    /// MOD-13 D2: without `ready_here` the read is the store's, unchanged, and needs no box row.
+    #[tokio::test]
+    async fn ready_here_false_never_reads_the_box() {
+        let backend = Backend::memory(MemStore::from_demo(DemoData {
+            this_box: None,
+            ..demo_data()
+        }));
+        let scope = platform_scope(&backend).await;
+        let items = items_of(&backend, &scope, ItemFilter::default(), false).await;
+        assert_eq!(items.len(), 11, "the same rows as the unfiltered read");
+    }
+
+    /// MOD-13 D2: the capability half keeps the store's order, and no box row means no tags.
+    #[test]
+    fn runnable_here_keeps_order_and_treats_none_as_no_tags() {
+        let row = |key: &str, tags: &[&str]| ItemSummary {
+            id: ItemId::new(),
+            project_id: ids::PROJECT_HTUI,
+            kind_id: ids::KIND_HTUI_FEAT,
+            key: key.to_owned(),
+            key_prefix: "FEAT".to_owned(),
+            key_number: 1,
+            title: key.to_owned(),
+            status: Status::Open,
+            priority: 0,
+            required_tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            updated_at: Utc::now(),
+            touched_paths: Vec::new(),
+        };
+        let rows = vec![
+            row("C", &["gpu"]),
+            row("A", &[]),
+            row("B", &["rust", "gpu"]),
+            row("D", &["cuda"]),
+        ];
+        let keys = |rows: Vec<ItemSummary>| -> Vec<String> {
+            rows.into_iter().map(|row| row.key).collect()
+        };
+        let info = BoxInfo {
+            box_id: ids::BOX,
+            hostname: "DESKTOP-HTUI".to_owned(),
+            os_family: OsFamily::Linux,
+            probed_tags: vec!["gpu".to_owned()],
+            declared_tags: vec!["rust".to_owned()],
+            settings: Value::Null,
+        };
+        assert_eq!(
+            keys(runnable_here(rows.clone(), Some(&info))),
+            ["C", "A", "B"],
+            "probed and declared tags both count; store order is kept"
+        );
+        assert_eq!(keys(runnable_here(rows, None)), ["A"]);
     }
 
     #[tokio::test]
@@ -2864,6 +3112,7 @@ mod tests {
             StoreRequest::Items {
                 scope: scope.clone(),
                 filter: ItemFilter::default(),
+                ready_here: false,
             },
         )
         .await;

@@ -219,6 +219,7 @@ impl Tab for BacklogTab {
         vec![StoreRequest::Items {
             scope: scope.clone(),
             filter: ItemFilter::default(),
+            ready_here: false,
         }]
     }
 
@@ -357,6 +358,7 @@ impl Tab for BacklogTab {
                 ctx.request(StoreRequest::Items {
                     scope: ctx.scope.clone(),
                     filter: ItemFilter::default(),
+                    ready_here: false,
                 });
             }
         }
@@ -545,6 +547,7 @@ mod tests {
         let read = StoreRequest::Items {
             scope: scope.clone(),
             filter: ItemFilter::default(),
+            ready_here: false,
         };
         assert_eq!(ITEMS_READ, read.name());
         let mut tab = BacklogTab::new();
