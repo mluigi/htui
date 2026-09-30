@@ -682,6 +682,9 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   `.claude/prds/mod-41-headless-worker.prd.md` (plan `.claude/plans/mod-41-headless-worker.plan.md`,
   confirmed 2026-09-30): `set_step_prompt`, `upsert_step_tree` and `record_commits` take a
   `StepFence` on both stores, and the lease heartbeat fences on tokio's monotonic clock.
+  **Phase 2 landed (`b2532ab`..`d72a235`, 2026-09-30):** milestone 2: run supervision moved into the
+  UI-free crate `crates/htui-worker` (no `ratatui`/`crossterm`, pinned by `tests/deps.rs`), behind
+  `RecorderStore`/`WorkerStore`/`WorkerHost` in `htui-core`; the engine is generic over `WorkerStore`.
 - [ ] **MOD-42 - Permission and control relay through Postgres** (from ANA-16, §8 item 3).
   `R-AGT-1`, `R-HIS-1`, `R-TUI-6`. The engine's `pump` (`record.rs:1684-1703`) cannot answer a
   parked ACP request, so engine-driven ACP steps fail on their first permission request today. The
