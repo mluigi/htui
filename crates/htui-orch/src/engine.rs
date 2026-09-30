@@ -1542,7 +1542,9 @@ where
     /// [`Self::unblock_case`] decides, then: [`UnblockCase::Reopen`] moves the item
     /// `blocked -> open`; [`UnblockCase::FollowRun`] moves it `blocked -> awaiting_approval`
     /// beside its parked run, so the run's gate verbs reach it (R-4); [`UnblockCase::Resume`]
-    /// resumes the parked run through [`Self::resume`] (R-7). Each writes a note first.
+    /// resumes the parked run through [`Self::resume`] under [`Tails::Walk`] (R-7), and on a
+    /// worker box ([`Tails::HandBack`]) only unparks it through [`Self::hand_back_resume`] and
+    /// hands it to the box's worker (MOD-41 plan D12). Each writes a note first.
     async fn unblock(&self, item: ItemId) -> Result<CommandOutcome, EngineError> {
         let case = self.unblock_case(item).await?;
         let now = self.now();
@@ -2815,7 +2817,9 @@ where
     /// `walk_resumed`). Milestone 5's sweep adopts and adjudicates but does not walk; this is the
     /// walk it hands a `Walk` run off to, and `htui`'s `run_worker` is the caller that does, on
     /// the run's own task under its lock (MOD-4 plan D157, D158). `Unblock`'s third case calls it
-    /// too (plan D161).
+    /// too (plan D161) under [`Tails::Walk`]; under [`Tails::HandBack`] that case only unparks
+    /// the run instead, and the box's worker runs this on adoption (MOD-41
+    /// plan D12).
     /// That heartbeat sleeps on `tokio::time`, so the caller needs a Tokio runtime with the time
     /// driver enabled (blueprint H-3).
     ///
