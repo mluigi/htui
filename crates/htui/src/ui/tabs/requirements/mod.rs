@@ -125,9 +125,13 @@ fn landed_unread(landed: &str, why: &str) -> String {
 
 /// MOD-59 review M1: a mint's `Failed`. A mint whose COMMIT landed but whose answer was lost comes
 /// back as the same `Failed`, and its retry would mint a second requirement, so the notice does not
-/// call it a refusal. The form keeps its text, and `r` is text there: `Esc` first.
+/// call it a refusal. The form keeps its text, and the tab re-reads the tree, which is drawn beside
+/// the form: the check needs no `Esc`, which would drop the draft (re-review L1).
 fn mint_failed(why: &str) -> String {
-    format!("{why} \u{2014} it may have been written; Esc then r reloads to check before you retry")
+    format!(
+        "{why} \u{2014} it may have been written; the tree is being re-read, look for it there \
+         before Ctrl+S"
+    )
 }
 
 /// A `RequirementsStale` over an open form: the text is kept and the token moved to the head.
@@ -1108,16 +1112,18 @@ impl Tab for RequirementsTab {
                 if is_tab_write(request) && self.busy == Some(*request) =>
             {
                 // D5: a write that applied answers `RequirementWritten`, even when only its
-                // re-read failed, so the form keeps its text and nothing is re-read here. An area,
-                // amend or withdraw that failed wrote nothing, or its retry is refused. A mint's
-                // `Failed` may be a COMMIT whose answer was lost, and its retry mints again, so
-                // its notice hedges (MOD-59 review M1).
+                // re-read failed, so the form keeps its text. An area, amend or withdraw that
+                // failed wrote nothing, or its retry is refused. A mint's `Failed` may be a COMMIT
+                // whose answer was lost, and its retry mints again, so its notice hedges (MOD-59
+                // review M1) and the tree is re-read for the user to check (re-review L1). That
+                // read is a plain `Requirements`, which lands nothing and closes no form (D4).
                 self.busy = None;
-                self.notice = Some(Notice::Error(if *request == MINT_NAME {
-                    mint_failed(message)
+                if *request == MINT_NAME {
+                    self.notice = Some(Notice::Error(mint_failed(message)));
+                    ctx.request(StoreRequest::Requirements(ctx.scope.clone()));
                 } else {
-                    message.clone()
-                }));
+                    self.notice = Some(Notice::Error(message.clone()));
+                }
             }
             _ => {}
         }
@@ -1904,15 +1910,24 @@ mod tests {
         assert_eq!(tab.unavailable, None, "a tree was held");
     }
 
-    /// MOD-59 review M1: a mint's `Failed` may not be a refusal. A mint whose COMMIT landed but
-    /// whose answer was lost comes back as the same `Failed`, and a retry would mint it twice, so
-    /// the notice hedges and says how to look. The form keeps its text and nothing is read to
-    /// check: the reload is the user's.
+    /// The open form's body, or `None` when no requirement form is open.
+    fn draft(tab: &RequirementsTab) -> Option<&str> {
+        match &tab.mode {
+            Mode::Requirement(form) => Some(form.body.text()),
+            _ => None,
+        }
+    }
+
+    /// MOD-59 review M1, re-review L1: a mint's `Failed` may not be a refusal. A mint whose
+    /// COMMIT landed but whose answer was lost comes back as the same `Failed`, and a retry would
+    /// mint it twice, so the notice hedges. `Esc` would drop the draft, so the tab re-reads the
+    /// tree itself (drawn beside the form) and the notice points there, not at `Esc`. That plain
+    /// read lands nothing: the form stays open with its text.
     #[tokio::test]
-    async fn a_failed_mint_says_it_may_have_been_written_and_reads_nothing() {
+    async fn a_failed_mint_rereads_the_tree_and_keeps_the_draft() {
         let (snapshot, projects, scope) = platform().await;
-        let bench = Bench::new(scope, projects);
-        let mut tab = tab_on(snapshot);
+        let bench = Bench::new(scope.clone(), projects);
+        let mut tab = tab_on(snapshot.clone());
         let name = mint(&bench, &mut tab, "Never written.");
 
         bench.reply(
@@ -1924,20 +1939,32 @@ mod tests {
         );
 
         assert_eq!(tab.busy, None);
-        assert_eq!(
-            tab.notice,
-            Some(Notice::Error(
-                "store unreachable: reset \u{2014} it may have been written; Esc then r reloads to \
-                 check before you retry"
-                    .to_owned()
-            ))
-        );
+        let hedge = tab.notice.clone();
         assert!(
-            matches!(tab.mode, Mode::Requirement(_)),
+            matches!(&hedge, Some(Notice::Error(text))
+                if text.starts_with("store unreachable: reset \u{2014} it may have been written")
+                    && text.contains("Ctrl+S")
+                    && !text.contains("Esc")),
+            "{hedge:?}"
+        );
+        assert_eq!(
+            draft(&tab),
+            Some("Never written."),
             "the form keeps its text"
         );
         let sent = bench.emit.take();
-        assert!(requests(&sent).is_empty(), "nothing is read: {sent:?}");
+        assert!(
+            matches!(
+                requests(&sent).as_slice(),
+                [StoreRequest::Requirements(read)] if *read == scope
+            ),
+            "exactly one tree read: {sent:?}"
+        );
+
+        bench.reply(&mut tab, &StoreReply::Requirements(Box::new(snapshot)));
+        assert_eq!(draft(&tab), Some("Never written."), "a read closes no form");
+        assert_eq!(tab.busy, None);
+        assert_eq!(tab.notice, hedge, "the hedge stays up");
     }
 
     /// MOD-39 review #4: an amend form a stale answer kept open over a head withdrawn elsewhere

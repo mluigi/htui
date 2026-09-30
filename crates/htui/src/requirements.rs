@@ -40,8 +40,11 @@
 //! exists. Every other tab write is a compare-and-set or a unique code, so its retry is refused;
 //! a mint's retry mints a second requirement, and a requirement is withdrawn, never deleted. The
 //! tab therefore does not call a mint's `Failed` a refusal: its notice says the requirement may
-//! have been written and how to look before a retry. It keeps the form's text and reads nothing,
-//! so the check is the user's.
+//! have been written, the form keeps its text, and the tab re-reads the tree, which is drawn beside
+//! the form, for the user to look for it before `Ctrl+S` retries (re-review L1). The check is
+//! still the user's: nothing matches the draft against the tree. A connection lost mid-COMMIT
+//! takes the worker offline, so that re-read is the mirror's, which may not hold the mint yet; a
+//! re-read refused outright puts its own refusal in the notice in place of the hedge.
 //!
 //! The worker fills the author and the box from [`Backend::this_user`] and [`Backend::box_info`];
 //! the render side never holds a `UserId` (`R-NF-3`). Nothing here reads the clock: the store
