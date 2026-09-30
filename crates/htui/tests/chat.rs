@@ -969,6 +969,13 @@ async fn graph_store() -> MemStore {
         })
         .await
         .expect("the demo project has no repo yet");
+    // MOD-41 OQ-5: the store loop's sweep on a `tui` box claims every queued row of the box, and
+    // the demo seeds one (`RUN_2` on `FEAT-3`). Its walk would play the sessions a case scripts
+    // for its own run, so the fixture ends it: every run a case sees is one it started.
+    store
+        .finish_run(ids::RUN_2, RunStatus::Cancelled, None, chrono::Utc::now())
+        .await
+        .expect("the seeded run is queued and cancellable");
     store
 }
 
