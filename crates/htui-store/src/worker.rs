@@ -569,6 +569,9 @@ impl htui_core::store::WorkerHost for PgStore {
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
         PgStore::missing_tags(self, item, box_id).await
     }
+    async fn queued_runs_on_box(&self, box_id: BoxId) -> Result<Vec<(RunId, DateTime<Utc>)>> {
+        PgStore::queued_runs_on_box(self, box_id).await
+    }
 }
 
 impl htui_core::store::WorkerHost for Backend {
@@ -645,6 +648,9 @@ impl htui_core::store::WorkerHost for Backend {
     }
     async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
         Backend::missing_tags(self, item, box_id).await
+    }
+    async fn queued_runs_on_box(&self, box_id: BoxId) -> Result<Vec<(RunId, DateTime<Utc>)>> {
+        Backend::queued_runs_on_box(self, box_id).await
     }
 }
 

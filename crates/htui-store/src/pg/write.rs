@@ -22,10 +22,10 @@ use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord,
     BoxRow, BoxSettings, BoxTool, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId,
-    CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, GateOutcome, Isolation, Item, ItemId,
-    ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, NewCommandRun,
-    NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor, GateOutcome, Isolation,
+    Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision,
+    NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate,
+    NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
     NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Priority, Project, ProjectId,
     ProjectPatch, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
     Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
@@ -40,9 +40,10 @@ use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::seed;
 use htui_core::store::{
-    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung,
-    StepFence, StoreError, StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, already_exists,
-    chat_step_status, check_attachment, citation_key, close_out_needs_a_summary, expected_on_row,
+    BOX_SETTINGS_NOT_AN_OBJECT, BindingFacts, CasOutcome, DeleteReach, DeleteTarget,
+    EXECUTOR_MUST_BE_KNOWN, ReadStore as _, Result, SettingRung, StepFence, StoreError,
+    StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, already_exists, chat_step_status,
+    check_attachment, citation_key, close_out_needs_a_summary, expected_on_row,
     failure_disagrees_with_status, finish_run_item_mirror, finish_run_needs_a_terminal_status,
     graph_not_in_project, illegal_move, invalid_area_code, invalid_prefix, item_has_a_live_run,
     item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move, new_skill_refusal,
@@ -1494,33 +1495,45 @@ impl WriteStore for PgStore {
         edit: BoxEdit,
     ) -> Result<CasOutcome<BoxRow>> {
         let me = self.this_user();
-        let tags = match edit
+        let executor = edit.executor.as_ref();
+        let tags = edit
             .declared_tags
             .as_deref()
             .map(canonical_declared_tags)
-            .transpose()
-        {
-            Ok(tags) => tags,
-            Err(sentence) => {
-                let current = self.box_row(id).await?.filter(|row| row.user_id == me);
-                return match current {
-                    None => Err(StoreError::NotFound {
-                        entity: "box",
-                        id: id.to_string(),
-                    }),
-                    Some(row) if row.edit_version != expected => Ok(CasOutcome::Stale(row)),
-                    Some(_) => Err(StoreError::Constraint(sentence)),
-                };
-            }
+            .transpose();
+        // MOD-41 blueprint B-5: a refusal known before the statement reads the row first, so
+        // `NotFound` and `Stale` keep their precedence over it (MOD-7 D41, plan D10).
+        let refused = match (&tags, executor) {
+            (Err(sentence), _) => Some(sentence.clone()),
+            (Ok(_), Some(Executor::Other(_))) => Some(EXECUTOR_MUST_BE_KNOWN.to_owned()),
+            _ => None,
         };
+        if let Some(sentence) = refused {
+            let current = self.box_row(id).await?.filter(|row| row.user_id == me);
+            return match current {
+                None => Err(StoreError::NotFound {
+                    entity: "box",
+                    id: id.to_string(),
+                }),
+                Some(row) if row.edit_version != expected => Ok(CasOutcome::Stale(row)),
+                Some(_) => Err(StoreError::Constraint(sentence)),
+            };
+        }
+        let tags = tags.expect("a refused tag list returned above");
+        // `jsonb_set` errors (`22023`) on a blob that is not an object, so the `WHERE` refuses one
+        // instead and the miss below names it: race-safe, one statement (blueprint B-5).
         let written = sqlx::query_as!(
             BoxRow,
             r#"
             UPDATE box
                SET declared_tags = COALESCE($3, declared_tags),
                    quirks        = COALESCE($4, quirks),
+                   settings      = CASE WHEN $6::text IS NULL THEN settings
+                                        ELSE jsonb_set(settings, '{executor}', to_jsonb($6::text))
+                                   END,
                    edit_version  = edit_version + 1
              WHERE id = $1 AND user_id = $5 AND edit_version = $2
+               AND ($6::text IS NULL OR jsonb_typeof(settings) = 'object')
             RETURNING id             AS "id: BoxId",
                       user_id        AS "user_id: htui_core::model::UserId",
                       hostname,
@@ -1534,17 +1547,28 @@ impl WriteStore for PgStore {
             tags.as_deref(),
             edit.quirks,
             me.as_uuid(),
+            executor.map(Executor::as_str),
         )
         .fetch_optional(&self.pool)
         .await
         .map_err(map_sqlx)?;
         match written {
             Some(row) => Ok(CasOutcome::Applied(row)),
-            None => cas_miss(
-                self.box_row(id).await?.filter(|row| row.user_id == me),
-                "box",
-                id,
-            ),
+            None => {
+                let current = self.box_row(id).await?.filter(|row| row.user_id == me);
+                match current {
+                    Some(row)
+                        if row.edit_version == expected
+                            && executor.is_some()
+                            && !row.settings.is_object() =>
+                    {
+                        Err(StoreError::Constraint(
+                            BOX_SETTINGS_NOT_AN_OBJECT.to_owned(),
+                        ))
+                    }
+                    other => cas_miss(other, "box", id),
+                }
+            }
         }
     }
 

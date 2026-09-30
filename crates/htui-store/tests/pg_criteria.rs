@@ -4829,7 +4829,17 @@ async fn queued_runs_on_box_lists_this_boxs_queued_runs_in_queue_order() {
     .await
     .expect("plant the second box");
 
+    // The fixture already queues a run on this box, stamped at the fixture's clock: it leads.
+    let fixture = db
+        .store
+        .queued_runs_on_box(ids::BOX)
+        .await
+        .expect("the read is answered");
     let early = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    assert!(
+        fixture.iter().all(|(_, at)| *at < early),
+        "the fixture's queued runs predate this case's, got {fixture:?}"
+    );
     let late = early + TimeDelta::seconds(1);
     let queue = |title: &'static str, target: BoxId, queued_at: DateTime<Utc>| {
         let store = &db.store;
@@ -4875,13 +4885,15 @@ async fn queued_runs_on_box_lists_this_boxs_queued_runs_in_queue_order() {
     } else {
         (tied_b, tied_a)
     };
+    let mut expected = fixture;
+    expected.extend([(first, early), (second, early), (last, late)]);
     assert_eq!(
         db.store
             .queued_runs_on_box(ids::BOX)
             .await
             .expect("the read is answered"),
-        vec![(first, early), (second, early), (last, late)],
-        "this box's three queued runs, by `(queued_at, id)`"
+        expected,
+        "this box's queued runs, the fixture's then this case's three, by `(queued_at, id)`"
     );
 
     db.drop_db().await;

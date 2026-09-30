@@ -25,10 +25,10 @@ use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AppUser, BindingChange, BoundSkill, BoxEdit, BoxId,
     BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec,
     CitationKind, Claim, CommandRun, CommandRunId, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS,
-    Document, DocumentHead, DocumentId, GateOutcome, Item, ItemCitation, ItemFilter, ItemId,
-    ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement, ItemRevision,
-    ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem,
-    NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    Document, DocumentHead, DocumentId, Executor, GateOutcome, Item, ItemCitation, ItemFilter,
+    ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement,
+    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument,
+    NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
     NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
     Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
     PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
@@ -48,9 +48,10 @@ use crate::prompt::template::TemplateRole;
 use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
-    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StepFence,
-    StoredSetting, UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment,
-    citation_key, close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
+    BOX_SETTINGS_NOT_AN_OBJECT, BindingFacts, CasOutcome, DeleteReach, DeleteTarget,
+    EXECUTOR_MUST_BE_KNOWN, ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome,
+    WriteStore, already_exists, chat_step_status, check_attachment, citation_key,
+    close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
     finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project,
     invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
     lease_ttl_micros, legal_move, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
@@ -758,9 +759,16 @@ impl MemStore {
     /// # Errors
     /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
     pub async fn queued_runs_on_box(&self, box_id: BoxId) -> Result<Vec<(RunId, DateTime<Utc>)>> {
-        // MOD-41 T7 red: the read answers nothing until the green commit.
-        let _ = box_id;
-        Ok(Vec::new())
+        Ok(self.read(|state| {
+            let mut rows: Vec<(RunId, DateTime<Utc>)> = state
+                .runs
+                .values()
+                .filter(|row| row.target_box_id == box_id && row.status == RunStatus::Queued)
+                .map(|row| (row.id, row.queued_at))
+                .collect();
+            rows.sort_by_key(|(id, at)| (*at, *id));
+            rows
+        }))
     }
 
     /// Every active run whose `repo_scope` intersects `scope`, in `queued_at` order: what §4.7's
@@ -1826,8 +1834,10 @@ impl State {
     }
 
     /// `edit_version` compare-and-set on one box of `user` (MOD-7 D41): `NotFound` for an unknown
-    /// id or another user's box, then `Stale` for a spent token, then `Constraint` for a tag, and
-    /// only then the write. `now` stands in for Postgres's `set_updated_at` trigger.
+    /// id or another user's box, then `Stale` for a spent token, then `Constraint` for a tag, an
+    /// unknown executor or a non-object `settings` blob (MOD-41 plan D10), and only then the
+    /// write. The executor is written as one key of the blob, so every other key survives. `now`
+    /// stands in for Postgres's `set_updated_at` trigger.
     fn edit_box(
         &mut self,
         user: Option<UserId>,
@@ -1851,6 +1861,14 @@ impl State {
             .map(canonical_declared_tags)
             .transpose()
             .map_err(StoreError::Constraint)?;
+        if matches!(edit.executor, Some(Executor::Other(_))) {
+            return Err(StoreError::Constraint(EXECUTOR_MUST_BE_KNOWN.to_owned()));
+        }
+        if edit.executor.is_some() && !row.settings.is_object() {
+            return Err(StoreError::Constraint(
+                BOX_SETTINGS_NOT_AN_OBJECT.to_owned(),
+            ));
+        }
         let row = self
             .boxes
             .get_mut(&id)
@@ -1860,6 +1878,12 @@ impl State {
         }
         if let Some(quirks) = edit.quirks {
             row.quirks = quirks;
+        }
+        if let Some(executor) = edit.executor {
+            row.settings.as_object_mut().expect("checked above").insert(
+                Executor::KEY.to_owned(),
+                Value::String(executor.as_str().to_owned()),
+            );
         }
         row.edit_version += 1;
         row.updated_at = now;
@@ -8533,7 +8557,16 @@ mod tests {
         data.boxes.push(elsewhere);
         let store = MemStore::from_demo(data);
 
+        // The fixture already queues a run on this box, stamped at the fixture's clock: it leads.
+        let fixture = store
+            .queued_runs_on_box(ids::BOX)
+            .await
+            .expect("the read is answered");
         let early = Utc::now();
+        assert!(
+            fixture.iter().all(|(_, at)| *at < early),
+            "the fixture's queued runs predate this case's, got {fixture:?}"
+        );
         let late = early + TimeDelta::seconds(1);
         let queue = |title: &'static str, target: BoxId, queued_at| {
             let store = &store;
@@ -8591,13 +8624,15 @@ mod tests {
         } else {
             (tied_b, tied_a)
         };
+        let mut expected = fixture;
+        expected.extend([(first, early), (second, early), (last, late)]);
         assert_eq!(
             store
                 .queued_runs_on_box(ids::BOX)
                 .await
                 .expect("the read is answered"),
-            vec![(first, early), (second, early), (last, late)],
-            "this box's three queued runs, by `(queued_at, id)`"
+            expected,
+            "this box's queued runs, the fixture's then this case's three, by `(queued_at, id)`"
         );
     }
 

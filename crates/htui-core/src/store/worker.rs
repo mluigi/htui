@@ -352,6 +352,14 @@ pub trait WorkerHost: Clone + Send + Sync + 'static {
         item: ItemId,
         box_id: BoxId,
     ) -> impl Future<Output = Result<Vec<String>>> + Send;
+
+    // -- MOD-41 T7 (plan D11)
+    /// `Backend::queued_runs_on_box`: this box's `queued` runs, `(id, queued_at)` in
+    /// `(queued_at, id)` order.
+    fn queued_runs_on_box(
+        &self,
+        box_id: BoxId,
+    ) -> impl Future<Output = Result<Vec<(RunId, DateTime<Utc>)>>> + Send;
 }
 
 impl RecorderStore for MemStore {

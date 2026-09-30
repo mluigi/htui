@@ -1995,9 +1995,22 @@ impl PgStore {
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
     pub async fn queued_runs_on_box(&self, box_id: BoxId) -> Result<Vec<(RunId, DateTime<Utc>)>> {
-        // MOD-41 T7 red: the read answers nothing until the green commit.
-        let _ = box_id;
-        Ok(Vec::new())
+        let rows = sqlx::query!(
+            r#"
+            SELECT id AS "id: RunId", queued_at
+              FROM run
+             WHERE target_box_id = $1 AND status = 'queued'
+             ORDER BY queued_at, id
+            "#,
+            box_id.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.id, row.queued_at))
+            .collect())
     }
 
     /// Every active run whose `repo_scope` intersects `scope`, in `(queued_at, id)` order: what

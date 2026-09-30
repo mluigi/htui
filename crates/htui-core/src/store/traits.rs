@@ -444,17 +444,18 @@ pub trait WriteStore: ReadStore {
     /// Whatever the backend's read fails with.
     async fn boxes(&self) -> Result<Vec<BoxRecord>>;
 
-    /// The declared-tags and quirks editors' compare-and-set (MOD-7 milestone 2, D41): writes the
-    /// columns `edit` names, and `edit_version + 1`, where the row is this user's and its
-    /// `edit_version` is `expected`, in one statement. A narrow human writer (MOD-2 D74): never
-    /// `hostname`, the probe columns, `htui_version`, `settings`, `machine_fingerprint`,
-    /// `probe_spec_digest`, `last_seen_at` or `box_tool`. Registration and the probe never write
-    /// `edit_version`, so neither can stale an open editor.
+    /// The box editors' compare-and-set (MOD-7 milestone 2, D41; MOD-41 plan D10): writes the
+    /// columns `edit` names, the `executor` key of `box.settings` when `edit.executor` is `Some`,
+    /// and `edit_version + 1`, where the row is this user's and its `edit_version` is `expected`,
+    /// in one statement. A narrow human writer (MOD-2 D74): never `hostname`, the probe columns,
+    /// `htui_version`, any other `settings` key, `machine_fingerprint`, `probe_spec_digest`,
+    /// `last_seen_at` or `box_tool`. Registration and the probe never write `edit_version`, so
+    /// neither can stale an open editor.
     ///
     /// **Every human writer of `box` is this compare-and-set** (MOD-40 plan D6, `docs/ANA-16.md`
-    /// C7). `box.settings`, which admission reads under `claim_run`'s row lock, has **no** writer
-    /// at all today: registration, the probe and this editor all leave it at its default. The first
-    /// one extends [`BoxEdit`] and rides this statement's `edit_version` guard; a second, unguarded
+    /// C7). It is `box.settings`' only writer, which admission reads under `claim_run`'s row lock:
+    /// key by key (`executor` only), under the same `edit_version` guard, and every other key
+    /// (`max_concurrent_items`, `command_limits`, unknown ones) survives. A second, unguarded
     /// `UPDATE box SET settings` would let two editors overwrite each other silently.
     ///
     /// Answers [`CasOutcome::Applied`] with the row as written, or [`CasOutcome::Stale`] with the
@@ -466,7 +467,10 @@ pub trait WriteStore: ReadStore {
     /// unknown id **or a box of another `app_user`** (the reach of [`boxes`](WriteStore::boxes));
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) carrying
     /// [`canonical_declared_tags`](crate::model::canonical_declared_tags)'s sentence for a tag it
-    /// refuses. Precedence: `NotFound`, then `Stale`, then `Constraint`.
+    /// refuses, [`EXECUTOR_MUST_BE_KNOWN`] for an
+    /// [`Executor::Other`](crate::model::Executor::Other), or [`BOX_SETTINGS_NOT_AN_OBJECT`] for an
+    /// executor asked of a blob that is not a JSON object. Precedence: `NotFound`, then `Stale`,
+    /// then `Constraint` (tags, executor, blob), and a refusal writes nothing.
     async fn edit_box(&self, id: BoxId, expected: i32, edit: BoxEdit)
     -> Result<CasOutcome<BoxRow>>;
 
