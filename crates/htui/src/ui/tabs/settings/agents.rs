@@ -75,7 +75,7 @@ use std::path::Path;
 use crate::agent_settings::{
     self, AgentDraft, AgentWrite, DraftFields, FIELD_LABELS, REQUEST_NAMES, Refusal,
 };
-use crate::agent_worker::{AUTH_ALREADY_CHOSEN, NO_LOGIN_RUNNING};
+use crate::agent_worker::{AUTH_ALREADY_CHOSEN, LOGIN_ENDED, NO_LOGIN_RUNNING};
 use crate::app::{Action, Ctx, Handled};
 use crate::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
 use crate::ui::tabs::settings::{
@@ -2219,9 +2219,24 @@ impl SettingsSection for AgentsSection {
             {
                 self.auth = AuthState::Idle;
             }
-            StoreReply::Failed { request, .. } if *request == "auth_deliver" => {
-                if let AuthState::Running { delivering, .. } = &mut self.auth {
+            StoreReply::Failed { request, message } if *request == "auth_deliver" => {
+                if let AuthState::Running {
+                    delivering,
+                    cancelling,
+                    advertised,
+                    paste,
+                    ..
+                } = &mut self.auth
+                {
                     *delivering = false;
+                    // Review R2-L1: the pane checks host and port only, so most refusals of a
+                    // paste arrive here, after the field closed. One the worker answered — not
+                    // the flow's end overtaking it, which waits for the last frame — reopens a
+                    // fresh masked field for the re-paste; the sentence is the shell's, from this
+                    // same reply.
+                    if message != LOGIN_ENDED && !*cancelling && advertised.is_some() {
+                        *paste = Some(TextField::masked_with_capacity(PASTE_MAX));
+                    }
                 }
             }
             // `agent` is mirrored since MOD-2 milestone 4 (plan D31), so an offline backend

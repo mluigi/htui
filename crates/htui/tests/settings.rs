@@ -3092,12 +3092,11 @@ async fn a_paste_for_the_right_host_and_port_is_sent_for_the_worker_to_judge() {
                 message: refusal.to_string(),
             },
         );
+        // Review R2-L1: the worker's refusal reopens the field for the re-paste.
         let rendered = render_section(&section, &bench.ctx());
-        assert!(rendered.contains(REDIRECT_LINE), "{rendered}");
+        assert!(rendered.contains(PASTE_PROMPT), "{rendered}");
         assert!(!rendered.contains(DELIVERING), "{rendered}");
-        assert_eq!(bench.key(&mut section, "p"), Handled::Consumed);
-        assert!(bench.drained().is_empty(), "p opens again");
-        assert!(section.captures_input());
+        assert!(section.captures_input(), "the field is open again");
     }
 }
 
@@ -3240,13 +3239,70 @@ async fn a_refused_auth_deliver_keeps_the_login_pane_and_its_link() {
         rendered.contains(&format!("link: {LOOPBACK_LINK}")),
         "{rendered}"
     );
-    assert!(rendered.contains(REDIRECT_LINE), "{rendered}");
     assert_eq!(on_box_cell(&rendered, "loginable"), "logging in\u{2026}");
+    // Review R2-L1: the field is back for the re-paste; `Esc` closes it onto the redirect line,
+    // and `p` opens it again.
+    assert!(section.captures_input(), "{rendered}");
+    assert_eq!(bench.key(&mut section, "Esc"), Handled::Consumed);
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(rendered.contains(REDIRECT_LINE), "{rendered}");
 
     assert_eq!(bench.key(&mut section, "p"), Handled::Consumed);
     let emitted = bench.drained();
     assert!(emitted.is_empty(), "p opens again: {emitted:?}");
     assert!(section.captures_input());
+}
+
+/// Review R2-L1: the pane checks host and port only, so a stale state, a missing code or a wrong
+/// path is refused by the worker after the field has closed. That refusal reopens a fresh, empty,
+/// masked field for the re-paste — the sentence itself is the shell's, from the same reply — as
+/// long as the login is still running with a redirect and is not being cancelled.
+#[tokio::test]
+async fn a_refused_delivery_reopens_an_empty_masked_field() {
+    let bench = SectionBench::new().await;
+    for refusal in [
+        PasteError::StaleState.to_string(),
+        PasteError::MissingCode.to_string(),
+        DeliverError::NothingListening {
+            target: "127.0.0.1:39879".to_owned(),
+        }
+        .to_string(),
+    ] {
+        let mut section = delivering_over(&bench);
+        assert!(!section.captures_input());
+        bench.reply(
+            &mut section,
+            &StoreReply::Failed {
+                request: "auth_deliver",
+                message: refusal.clone(),
+            },
+        );
+        assert!(
+            section.captures_input(),
+            "{refusal}: the field is open again"
+        );
+        let rendered = render_section(&section, &bench.ctx());
+        assert!(rendered.contains(PASTE_PROMPT), "{refusal}: {rendered}");
+        assert!(!rendered.contains(DELIVERING), "{refusal}: {rendered}");
+        let field =
+            field_line(&rendered).unwrap_or_else(|| panic!("the field is drawn: {rendered}"));
+        assert!(field.contains("(0)"), "{refusal}: fresh and empty: {field}");
+        assert!(bench.drained().is_empty(), "{refusal}: and it asks nothing");
+    }
+
+    // A login on its way out has nothing to paste into.
+    let mut section = delivering_over(&bench);
+    bench.key(&mut section, "x");
+    bench.reply(&mut section, &StoreReply::Auth(AuthFrame::Cancelling));
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "auth_deliver",
+            message: PasteError::StaleState.to_string(),
+        },
+    );
+    assert!(!section.captures_input(), "cancelling: no field");
 }
 
 /// The refusal of an `auth_deliver` that means no login is held at all clears the pane, as it does
