@@ -39,7 +39,7 @@ const TRANSCRIPT_STEPS_KEY: &str = "cached_transcript_steps";
 /// `this_box` is not tuning; it is here because §6.2 step 2 mirrors the *own* `box` row, and
 /// because both [`Refresher::spawn`] and [`run_pass`] would otherwise need one more argument each
 /// (deviation from blueprint C.13, same components). Its twin `this_user` was for the upload of
-/// the offline chat buffer (MOD-25) and was removed with it (CLEAN-7).
+/// the offline chat buffer, which MOD-25 removed; the field outlived it until CLEAN-7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefreshSettings {
     /// `app_setting.cache_refresh_seconds`, default 30 s.

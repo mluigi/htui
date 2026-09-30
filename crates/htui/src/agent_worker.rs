@@ -2006,8 +2006,9 @@ pub struct ChatArgs {
     /// struct would be one bug away from each other.
     project_caps: ProjectCaps,
     /// Plan D66-D68: the `agent_box` row this chat latches its allowance into
-    /// ([`quota_latch_for`]). Always one, since a chat starts only online; `Recorder`'s own latch
-    /// stays an `Option` for the recorders that have none.
+    /// ([`quota_latch_for`]). Always one: `Backend::writer` answers `None` offline, so a chat that
+    /// gets this far has a store with an `agent_box` table. `Recorder`'s own latch stays an
+    /// `Option` for the recorders that have none.
     quota_latch: QuotaLatch,
 }
 
@@ -2050,8 +2051,9 @@ fn project_caps_for(
 /// The `agent_box` row a chat latches its allowance into (plan D66-D68).
 ///
 /// The decision is made **here**, at chat start, rather than discovered on the first `usage` row.
-/// Every chat gets one: a chat starts only online (MOD-25), and the `None` an offline chat once got
-/// (the mirror has no `agent_box` table, plan D52) left with the offline path (CLEAN-7).
+/// Every chat gets one: `Backend::writer` answers `None` offline (MOD-25), so a chat that gets this
+/// far has a store with an `agent_box` table. The `None` an offline chat once got (the mirror has
+/// none, plan D52) left with the offline path (CLEAN-7).
 ///
 /// `source` is `agent.settings.quota.source` and `billing` is `agent.billing`, both read off the
 /// row. Nothing here looks at `agent.name` (`R-AGT-5`) — the name is logged, and a log line is not
