@@ -613,7 +613,8 @@ pub enum StoreRequest {
     /// graphs and repo names (MOD-9 D81). Answered with [`StoreReply::Skills`].
     Skills(Scope),
     /// `create_skill`: the row and its version 1 together (D75, D77). The worker mints the id and
-    /// fills `created_by`; the view never holds a `UserId`. A refusal (name, blank body, taken
+    /// fills `created_by`; the view never holds a `UserId`. Answered with
+    /// [`StoreReply::SkillWritten`] when it applied (MOD-59); a refusal (name, blank body, taken
     /// name) is [`StoreReply::Failed`].
     CreateSkill {
         /// The scope the reply re-reads.
@@ -625,9 +626,9 @@ pub enum StoreRequest {
         /// Version 1's body. Its `Debug` is its length.
         body: TemplateBody,
     },
-    /// `update_skill` under CAS on `skill.updated_at` (D76): answered with [`StoreReply::Skills`]
-    /// when it applied and [`StoreReply::SkillsStale`] when the token was spent or the skill is
-    /// gone.
+    /// `update_skill` under CAS on `skill.updated_at` (D76): answered with
+    /// [`StoreReply::SkillWritten`] when it applied (MOD-59) and [`StoreReply::SkillsStale`] when
+    /// the token was spent or the skill is gone.
     EditSkill {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -639,8 +640,8 @@ pub enum StoreRequest {
         patch: SkillPatch,
     },
     /// `add_skill_version`: append version `expected + 1` iff `expected` is the head (D75, D89).
-    /// The worker fills `created_by`. [`StoreReply::SkillsStale`] when the head moved or the skill
-    /// is gone.
+    /// The worker fills `created_by`. Answered with [`StoreReply::SkillWritten`] when it applied
+    /// (MOD-59), [`StoreReply::SkillsStale`] when the head moved or the skill is gone.
     SaveSkillVersion {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -651,9 +652,10 @@ pub enum StoreRequest {
         /// The new body. Its `Debug` is its length.
         body: TemplateBody,
     },
-    /// `set_skill_binding`: attach, change or detach the one row at `key` (D78, D90).
-    /// [`StoreReply::SkillsStale`] when the row at the key is not the one the form opened on, or
-    /// its skill, project or phase is gone.
+    /// `set_skill_binding`: attach, change or detach the one row at `key` (D78, D90). Answered
+    /// with [`StoreReply::SkillWritten`] when it applied (MOD-59), [`StoreReply::SkillsStale`]
+    /// when the row at the key is not the one the form opened on, or its skill, project or phase
+    /// is gone.
     SetSkillBinding {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -1076,8 +1078,9 @@ pub enum StoreReply {
     /// A template save missed its CAS token (PRD D5): the templates as they are now, for the editor
     /// to reload against. The editor keeps its typed text and retries only by hand.
     TemplatesStale(Box<TemplatesSnapshot>),
-    /// The Skills view's snapshot, freshly read: the answer to [`StoreRequest::Skills`] and to
-    /// every skill write that applied (MOD-9 D81).
+    /// The Skills view's snapshot, freshly read: the answer to [`StoreRequest::Skills`] (MOD-9
+    /// D81). A read answer only: a skill write that applied answers [`StoreReply::SkillWritten`]
+    /// (MOD-59).
     Skills(Box<SkillsSnapshot>),
     /// A skill write missed its token, or its skill, project or phase is gone (D81, D97): the
     /// snapshot as it is now and which write it answers. The draft keeps its text and retries only

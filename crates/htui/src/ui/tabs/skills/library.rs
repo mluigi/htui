@@ -4,9 +4,10 @@
 //!
 //! Every read and write goes through `StoreRequest` (`R-NF-3`): the view holds no store handle and
 //! no `UserId`, renders from the last [`SkillsSnapshot`] and never patches a row into it. A write
-//! **lands by content** (D98, milestone 1's D27): a `Skills` reply closes the draft only when it
-//! holds what was sent, so a read served ahead of the write leaves the draft, the token and `busy`
-//! alone. A `SkillsStale` keeps the draft and moves the token to the row as it is now.
+//! **lands on its own reply** (MOD-59): only a `SkillWritten` naming the write in flight closes
+//! the draft; a plain `Skills` read never does, so a read served ahead of the write leaves the
+//! draft, the token and `busy` alone. A `SkillsStale` keeps the draft and moves the token to the
+//! row as it is now.
 //!
 //! The token a version save carries is the head when the editor opened, not the version shown:
 //! editing v1 while v2 is head saves v3 (milestone 1's OQ-5, as the Templates view).
@@ -23,7 +24,6 @@ use core::cell::Cell;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::skill::validate_name;
-use htui_core::model::skill_language;
 use htui_core::model::{
     Activation, BindingChange, BoundSkill, SkillBindingKey, SkillId, SkillLevel, SkillPatch,
     SkillVersion,
@@ -39,7 +39,7 @@ use super::attach::{AttachOutcome, AttachPane};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{ExternalEdit, ExternalEditOutcome};
 use crate::skill_import::ImportOutcome;
-use crate::skills::{READ_NAME, REQUEST_NAMES, SkillsSnapshot, StaleWhat};
+use crate::skills::{READ_NAME, REQUEST_NAMES, SkillWrite, SkillsSnapshot, StaleWhat};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::TemplateBody;
 use crate::ui::tabs::backlog::detail::Scroll;
@@ -148,6 +148,12 @@ fn version_changed_elsewhere(head: i32) -> String {
 /// A key while a write is in flight: one at a time (`settings/prompt.rs`' rule).
 fn in_flight(busy: &str) -> String {
     format!("`{busy}` is still in flight")
+}
+
+/// MOD-59 D5: a write that applied although its re-read failed. It landed; the view still draws
+/// what it held, and `r` reads again.
+fn landed_unread(landed: &str, why: &str) -> String {
+    format!("{landed} \u{2014} the re-read failed, r reloads: {why}")
 }
 
 /// D99 (F-I): the estimate of one skill's block as `render::skills` writes it, `version` and
@@ -360,8 +366,10 @@ struct Pending {
     resume: bool,
 }
 
-/// The write in flight and what it carries (D98): what tells its own landing from a read served
-/// ahead of it. Custom `Debug`: body lengths only.
+/// The write in flight and what it carries (D98): the bodies the estimate and the "later edits
+/// kept" rule compare with, and the attachment's change and name for the landing (MOD-59: the
+/// landing itself is the reply's outcome, never a search for these). Custom `Debug`: body lengths
+/// only.
 pub(super) enum Sent {
     /// `CreateSkill`.
     Create {
@@ -554,11 +562,31 @@ impl LibraryView {
                 if !in_scope(snapshot, ctx) {
                     return;
                 }
+                // A read never lands a write (MOD-59 D4): only the write's own reply does.
                 self.snapshot = Some((**snapshot).clone());
                 self.unavailable = None;
-                self.land();
                 self.clamp();
             }
+            StoreReply::SkillWritten { snapshot, outcome } => match snapshot {
+                Ok(snapshot) => {
+                    if !in_scope(snapshot, ctx) {
+                        return;
+                    }
+                    self.snapshot = Some((**snapshot).clone());
+                    self.unavailable = None;
+                    self.land(outcome, None);
+                    self.clamp();
+                }
+                // No snapshot to check the scope by: only the write in flight owns this reply, and
+                // a scope change has already forgotten that (`on_scope_change`).
+                Err(why) if self.busy == Some(outcome.request_name()) => {
+                    if self.snapshot.is_none() {
+                        self.unavailable = Some(why.clone());
+                    }
+                    self.land(outcome, Some(why));
+                }
+                Err(_) => {}
+            },
             StoreReply::SkillsStale { snapshot, what } => {
                 if !in_scope(snapshot, ctx) {
                     return;
@@ -1192,97 +1220,56 @@ impl LibraryView {
 
     // --- replies -------------------------------------------------------------------------------
 
-    /// D98: a `Skills` reply is the write's answer only while the write is in flight **and** the
-    /// snapshot holds what it sent (§6.4's table). Otherwise it refreshes the library and leaves
-    /// the draft, the token and `busy` alone: a read served ahead of the write, or another
-    /// session's row at the same key.
-    fn land(&mut self) {
-        let (Some(snapshot), Some(sent)) = (&self.snapshot, &self.sent) else {
-            return;
-        };
-        let landed = match sent {
-            Sent::Create { name, body } => snapshot.by_name(name).is_some_and(|entry| {
-                snapshot
-                    .version(entry.skill.id, 1)
-                    .is_some_and(|row| row.body == *body)
-            }),
-            Sent::Version { skill, token, body } => snapshot
-                .version(*skill, token + 1)
-                .is_some_and(|row| row.body == *body),
-            Sent::Rename {
-                skill,
-                token,
-                patch,
-            } => snapshot.entry(*skill).is_some_and(|entry| {
-                entry.skill.updated_at != *token
-                    && patch
-                        .name
-                        .as_ref()
-                        .is_none_or(|name| *name == entry.skill.name)
-                    && patch
-                        .description
-                        .as_ref()
-                        .is_none_or(|description| *description == entry.skill.description)
-            }),
-            Sent::Binding {
-                key,
-                token,
-                change: BindingChange::Attach(attachment),
-                ..
-            } => snapshot.binding(*key).is_some_and(|row| {
-                Some(row.updated_at) != *token
-                    && (row.pinned_version, row.position, row.activation)
-                        == (
-                            attachment.pinned_version,
-                            attachment.position,
-                            attachment.activation,
-                        )
-                    && row.languages == skill_language::normalise(&attachment.languages)
-            }),
-            Sent::Binding {
-                key,
-                change: BindingChange::Detach,
-                ..
-            } => snapshot.binding(*key).is_none(),
-        };
-        if !landed {
+    /// MOD-59 D4: the write in flight landed. `outcome` is the store's own answer, so nothing here
+    /// searches the snapshot for what was sent; a reply for any other write, and every plain
+    /// `Skills` read, leaves the draft, the token and `busy` alone. `unread` is the re-read's
+    /// failure (D5): the write landed, and the notice says the library drawn is the one held.
+    fn land(&mut self, outcome: &SkillWrite, unread: Option<&str>) {
+        if self.busy != Some(outcome.request_name()) {
             return;
         }
         self.busy = None;
+        // `send` sets `busy` and `sent` together, so the write `busy` names has its `Sent`.
         let Some(sent) = self.sent.take() else {
             return;
         };
-        match sent {
-            Sent::Create { name, body } => self.landed_version(&name, 1, &body),
-            Sent::Version { skill, token, body } => {
-                let name = snapshot_name(self.snapshot.as_ref(), skill);
-                self.landed_version(&name, token + 1, &body);
+        let landed = match (outcome, sent) {
+            (SkillWrite::Created { skill, name }, Sent::Create { body, .. }) => {
+                self.landed_version(*skill, name, 1, &body)
             }
-            Sent::Rename { skill, .. } => {
-                let name = snapshot_name(self.snapshot.as_ref(), skill);
-                self.select(skill);
+            (SkillWrite::Versioned { skill, version }, Sent::Version { body, .. }) => {
+                let name = snapshot_name(self.snapshot.as_ref(), *skill);
+                self.landed_version(*skill, &name, *version, &body)
+            }
+            (SkillWrite::Edited { skill, name }, Sent::Rename { .. }) => {
+                self.select(*skill);
                 self.mode = Mode::Browse;
-                self.notice = Some(Notice::Info(format!("saved `{name}`")));
+                format!("saved `{name}`")
             }
-            Sent::Binding {
-                key,
-                change,
-                target,
-                ..
-            } => {
-                let kept = match (&mut self.attach, &self.snapshot) {
-                    (Some(pane), Some(snapshot)) => pane.on_landed(key, &change, snapshot),
-                    _ => false,
-                };
-                self.notice = Some(Notice::Info(match change {
-                    BindingChange::Attach(_) if kept => {
-                        format!("attached to {target} \u{2014} later edits kept, Ctrl+S saves them")
-                    }
-                    BindingChange::Attach(_) => format!("attached to {target}"),
-                    BindingChange::Detach => format!("detached from {target}"),
-                }));
+            (SkillWrite::Attached { key, updated_at }, Sent::Binding { change, target, .. }) => {
+                let kept = self
+                    .attach
+                    .as_mut()
+                    .is_some_and(|pane| pane.on_landed(*key, &change, Some(*updated_at)));
+                if kept {
+                    format!("attached to {target} \u{2014} later edits kept, Ctrl+S saves them")
+                } else {
+                    format!("attached to {target}")
+                }
             }
-        }
+            (SkillWrite::Detached { key }, Sent::Binding { change, target, .. }) => {
+                if let Some(pane) = &mut self.attach {
+                    pane.on_landed(*key, &change, None);
+                }
+                format!("detached from {target}")
+            }
+            // `busy` named this outcome's write, and `sent` is that write's: unreachable.
+            _ => return,
+        };
+        self.notice = Some(match unread {
+            None => Notice::Info(landed),
+            Some(why) => Notice::Error(landed_unread(&landed, why)),
+        });
     }
 
     /// An import came back (import plan D102): the counts in the notice, or the report when a file
@@ -1328,19 +1315,13 @@ impl LibraryView {
     }
 
     /// A version landed (a create's v1 or an append): the cursor goes onto the skill and the pane
-    /// back to its head's body. Keys typed while the save was in flight still edited the draft;
-    /// when they did, the editor stays open on them with the token at the saved version, so the
-    /// next `Ctrl+S` appends them (the Templates view's rule).
-    fn landed_version(&mut self, name: &str, version: i32, body: &str) {
+    /// back to its head's body; the answer is the notice's text. `skill` is the write's own
+    /// outcome, so a create whose re-read failed, which the held library does not show yet, still
+    /// lands (MOD-59 D5; `select` leaves the cursor on an unknown id). Keys typed while the save
+    /// was in flight still edited the draft; when they did, the editor stays open on them with the
+    /// token at the saved version, so the next `Ctrl+S` appends them (the Templates view's rule).
+    fn landed_version(&mut self, skill: SkillId, name: &str, version: i32, body: &str) -> String {
         let tokens = estimate(name, version, body);
-        let Some(skill) = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.by_name(name))
-            .map(|entry| entry.skill.id)
-        else {
-            return;
-        };
         self.select(skill);
         let verb = if version == 1 {
             format!("created `{name}` v1")
@@ -1348,12 +1329,11 @@ impl LibraryView {
             format!("saved v{version}")
         };
         let Mode::Editing(editor) = &mut self.mode else {
-            self.notice = Some(Notice::Info(format!("{verb} \u{b7} ~{tokens} tokens")));
-            return;
+            return format!("{verb} \u{b7} ~{tokens} tokens");
         };
         if editor.area.text() == body {
             self.mode = Mode::Browse;
-            self.notice = Some(Notice::Info(format!("{verb} \u{b7} ~{tokens} tokens")));
+            format!("{verb} \u{b7} ~{tokens} tokens")
         } else {
             editor.target = Target::Version {
                 skill,
@@ -1363,11 +1343,11 @@ impl LibraryView {
             editor.from = Some(version);
             body.clone_into(&mut editor.original);
             editor.esc_armed = false;
-            self.notice = Some(Notice::Info(format!(
+            format!(
                 "{verb} \u{b7} ~{tokens} tokens \u{2014} later edits kept, Ctrl+S saves them as \
                  v{}",
                 version + 1
-            )));
+            )
         }
     }
 
@@ -1780,7 +1760,7 @@ mod tests {
     use super::*;
     use crate::app::{Action, Emit, TopBarState};
     use crate::keymap::Keymap;
-    use crate::skills::{self, SkillWrite};
+    use crate::skills;
     use crate::store_worker::Origin;
     use crate::ui::Theme;
     use crate::ui::tabs::SkillsTab;
