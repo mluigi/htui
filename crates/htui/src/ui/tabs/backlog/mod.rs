@@ -6,6 +6,7 @@
 //! [`DetailTab`](detail::DetailTab) body or a binding, not as a change here.
 
 pub mod detail;
+pub mod filter;
 pub mod list;
 
 use htui_core::model::{ItemFilter, ItemId, ItemSummary, ProjectId, Scope};
