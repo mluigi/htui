@@ -239,12 +239,13 @@ impl BacklogTab {
 
     /// A key while the filter form is open (MOD-13 D1).
     ///
-    /// Everything but a `CONTROL` chord is consumed, open or not by the form: the global keymap
-    /// resolves only what a tab passes, so a passed `q` would quit, a digit or `Tab` switch tabs,
-    /// `w` open the switcher. `CONTROL` passes so `ctrl-c` still quits and `Ctrl+F` still
-    /// searches, as from every text field (the `boxes.rs` editor rule).
+    /// Every plain key is consumed, used by the form or not: the global keymap resolves only what
+    /// a tab passes, so a passed `q` would quit, a digit or `Tab` switch tabs, `w` open the
+    /// switcher. A chord ([`filter::CHORD`]: any modifier but `SHIFT`) passes, the rule
+    /// `TextField::on_key` applies (review L4), so `ctrl-c` still quits and `Ctrl+F` still
+    /// searches, and an `Alt` chord is never read as its letter.
     fn on_form_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.modifiers.intersects(filter::CHORD) {
             return Handled::Pass;
         }
         let Some(form) = self.form.as_mut() else {
@@ -267,8 +268,11 @@ impl BacklogTab {
     /// still reads.
     fn apply(&mut self, filter: BacklogFilter, ctx: &Ctx<'_>) {
         self.filter = filter;
-        // A filtered reply must not decide a reveal sent before it (D251): the item may be hidden.
-        self.pending_reveal = None;
+        // A filtered reply must not decide a reveal sent before it (D251): the item may be
+        // hidden. An unfiltered one may, and is the read a reveal miss waits for (review N5).
+        if !self.filter.is_empty() {
+            self.pending_reveal = None;
+        }
         ctx.request(self.filter.to_request(ctx.scope));
     }
 }
@@ -1167,6 +1171,58 @@ mod tests {
                 .any(|action| matches!(action, Action::Error(_))),
             "the filtered list reports nothing"
         );
+    }
+
+    /// MOD-13 review N5: applying no filter right after a reveal miss keeps the reveal armed. The
+    /// unfiltered reply it waits for can still decide it.
+    #[tokio::test]
+    async fn applying_no_filter_keeps_a_pending_reveal() {
+        let bench = Bench::new().await;
+        let mut tab = BacklogTab::new();
+        let target = RevealTarget::Item {
+            id: htui_core::fixtures::ids::HTUI_ANA_2,
+            key: "ANA-2".to_owned(),
+        };
+        assert!(tab.reveal(&target, &mut bench.ctx()));
+        press(&mut tab, &bench, KeyCode::Char('f'));
+        press(&mut tab, &bench, KeyCode::Enter);
+        assert!(tab.pending_reveal.is_some(), "still armed");
+
+        tab.on_reply(&StoreReply::Items(bench.items.clone()), &mut bench.ctx());
+        assert_eq!(
+            tab.selected,
+            Some(Selection::Item(htui_core::fixtures::ids::HTUI_ANA_2)),
+            "the reply decided it"
+        );
+    }
+
+    /// MOD-13 review L4: the open form passes every chord but `SHIFT`, as `TextField` does, so an
+    /// `Alt` chord reaches the shell instead of acting as its letter.
+    #[tokio::test]
+    async fn an_alt_chord_passes_through_the_open_form() {
+        let bench = Bench::new().await;
+        let mut tab = BacklogTab {
+            filter: done_only(),
+            ..bench.tab()
+        };
+        press(&mut tab, &bench, KeyCode::Char('f'));
+        for modifier in [
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::META,
+            KeyModifiers::HYPER,
+        ] {
+            assert_eq!(
+                tab.on_key(
+                    KeyEvent::new(KeyCode::Char('x'), modifier),
+                    &mut bench.ctx()
+                ),
+                Handled::Pass,
+                "{modifier:?}"
+            );
+        }
+        press(&mut tab, &bench, KeyCode::Enter);
+        assert_eq!(tab.filter, done_only(), "no chord cleared the draft");
     }
 
     /// MOD-13 D6: a scope change keeps the filter minus the projects the new scope lacks, and

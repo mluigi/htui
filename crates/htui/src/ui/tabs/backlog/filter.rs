@@ -9,7 +9,7 @@
 //! overlay: an overlay factory cannot be seeded with the current filter. It is pure — no `Ctx` —
 //! and answers the tab with a [`FormOutcome`], as `requirements/forms.rs` does.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use htui_core::model::{ItemFilter, ProjectId, ProjectRef, Scope, Status, declared_tags_from_text};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -31,6 +31,25 @@ pub const HINT_TAGS: &str = "comma list · ↑/↓ row · Enter apply · Esc can
 
 /// Width of a row's label column, after the two-cell focus marker.
 const LABEL: usize = 8;
+
+/// The modifiers that make a key a chord aimed elsewhere, not a form key (MOD-13 review L4):
+/// every one but `SHIFT`, which is how a terminal reports a capital. The rule
+/// [`TextField::on_key`] applies, so the form and its tag field agree on what a chord is.
+pub const CHORD: KeyModifiers = KeyModifiers::CONTROL
+    .union(KeyModifiers::ALT)
+    .union(KeyModifiers::SUPER)
+    .union(KeyModifiers::META)
+    .union(KeyModifiers::HYPER);
+
+/// `declared_tags_from_text`'s refusal, worded for this form (MOD-13 review N2). The rule is the
+/// declared-tag rule (D3), but these are the tags an item *requires*, so the sentence names a
+/// `tag`, not a `declared tag`. The shared sentence stays Settings > Boxes'.
+fn required_tag_refusal(sentence: String) -> String {
+    match sentence.strip_prefix("declared tag ") {
+        Some(rest) => format!("tag {rest}"),
+        None => sentence,
+    }
+}
 
 /// What narrows the Backlog list. `default()` is the whole scope, and shows nothing (D5).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -83,7 +102,9 @@ impl BacklogFilter {
     /// What the list title appends while a filter is set (D5), e.g.
     /// `status:open,done · project:htui · tags:gpu,rust · ready here`; `None` without one.
     ///
-    /// Project names come from `projects` (`ctx.projects`); an id it lacks is skipped.
+    /// Project names come from `projects` (`ctx.projects`); an id it lacks is skipped, and so is
+    /// the whole `project:` part when it names none (MOD-13 review N3). A filter with nothing to
+    /// name is `None`, like no filter.
     #[must_use]
     pub fn summary(&self, projects: &[ProjectRef]) -> Option<String> {
         if self.is_empty() {
@@ -101,7 +122,9 @@ impl BacklogFilter {
                 .filter_map(|id| projects.iter().find(|project| project.project_id == *id))
                 .map(|project| project.name.as_str())
                 .collect();
-            parts.push(format!("project:{}", names.join(",")));
+            if !names.is_empty() {
+                parts.push(format!("project:{}", names.join(",")));
+            }
         }
         if !self.tags.is_empty() {
             parts.push(format!("tags:{}", self.tags.join(",")));
@@ -109,7 +132,7 @@ impl BacklogFilter {
         if self.ready_here {
             parts.push("ready here".to_owned());
         }
-        Some(parts.join(" · "))
+        (!parts.is_empty()).then(|| parts.join(" · "))
     }
 
     /// Drops the projects `scope` lacks (D6), so a gone project cannot silently empty the list.
@@ -149,8 +172,9 @@ pub enum FormOutcome {
     Cancel,
     /// `Enter` with a valid tag list: close the form and read with this filter.
     Apply(BacklogFilter),
-    /// `Enter` with a refused tag list: `declared_tags_from_text`'s sentence, for the status line
-    /// (D3). The form stays open with the text to fix.
+    /// `Enter` with a refused tag list: `declared_tags_from_text`'s sentence, worded for a
+    /// required tag, for the status line (D3, review N2). The form stays open with the text to
+    /// fix.
     Refused(String),
 }
 
@@ -195,11 +219,16 @@ impl FilterForm {
         self.row
     }
 
-    /// Feeds one key. The tab has already diverted `CONTROL` chords.
+    /// Feeds one key.
     ///
     /// On the Tags row every plain character is text (blueprint E7), so rows move with
     /// `Up`/`Down`/`Tab`/`BackTab` there; `j`/`k`/`h`/`l`/`space`/`x` act on the other rows.
+    /// A [`CHORD`] does nothing on any row (MOD-13 review L4): the tab passes chords on before
+    /// they reach here, and this keeps `Alt+x` from clearing a form driven directly.
     pub fn on_key(&mut self, key: KeyEvent) -> FormOutcome {
+        if key.modifiers.intersects(CHORD) {
+            return FormOutcome::Stay;
+        }
         if self.row == FilterRow::Tags {
             return match self.tags.on_key(key) {
                 FieldOutcome::Submit => self.apply(),
@@ -296,7 +325,7 @@ impl FilterForm {
                 tags,
                 ..self.draft.clone()
             }),
-            Err(sentence) => FormOutcome::Refused(sentence),
+            Err(sentence) => FormOutcome::Refused(required_tag_refusal(sentence)),
         }
     }
 
@@ -744,7 +773,8 @@ mod tests {
         );
     }
 
-    /// MOD-13 D3: a refusal is `declared_tags_from_text`'s sentence, and the form stays open.
+    /// MOD-13 D3, review N2: a refusal is `declared_tags_from_text`'s rule, worded for a
+    /// required tag, and the form stays open.
     #[test]
     fn a_refused_tag_list_stays_open() {
         let mut form = open();
@@ -754,7 +784,9 @@ mod tests {
         assert_eq!(
             form.on_key(key(KeyCode::Enter)),
             FormOutcome::Refused(
-                declared_tags_from_text("Rust").expect_err("a capital is refused")
+                "tag `Rust` is not 1-64 characters of a-z, 0-9, `_` and `-` starting with a \
+                 letter or a digit"
+                    .to_owned()
             )
         );
         assert_eq!(form.tags.text(), Some("Rust"), "the text is kept to fix");
@@ -778,6 +810,52 @@ mod tests {
             FormOutcome::Apply(filter),
             "applied untouched, it is the same filter"
         );
+    }
+
+    /// MOD-13 review L4: a chord is not a form key. `Alt+x` does not clear, `Alt+Enter` does not
+    /// apply, `Alt+space` does not tick; the tab passes them on before they get here.
+    #[test]
+    fn a_chord_on_a_choice_row_changes_nothing() {
+        let filter = BacklogFilter {
+            statuses: vec![Status::Done],
+            ..BacklogFilter::default()
+        };
+        let mut form = FilterForm::open(&filter, &projects());
+        for code in [
+            KeyCode::Char('x'),
+            KeyCode::Enter,
+            KeyCode::Char(' '),
+            KeyCode::Esc,
+        ] {
+            assert_eq!(
+                form.on_key(KeyEvent::new(code, KeyModifiers::ALT)),
+                FormOutcome::Stay,
+                "Alt+{code:?}"
+            );
+        }
+        assert_eq!(form.draft, filter, "the draft is untouched");
+        assert_eq!(
+            form.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::SUPER)),
+            FormOutcome::Stay
+        );
+        assert_eq!(form.row, FilterRow::Status, "and no chord moved the row");
+    }
+
+    /// MOD-13 review N3: a project the list cannot name is left out of the summary rather than
+    /// printed as a bare `project:`.
+    #[test]
+    fn summary_skips_a_project_it_cannot_name() {
+        let unknown = BacklogFilter {
+            statuses: vec![Status::Done],
+            projects: vec![ProjectId::new()],
+            ..BacklogFilter::default()
+        };
+        assert_eq!(unknown.summary(&projects()).as_deref(), Some("status:done"));
+        let only = BacklogFilter {
+            projects: vec![ProjectId::new()],
+            ..BacklogFilter::default()
+        };
+        assert_eq!(only.summary(&projects()), None, "nothing to name");
     }
 
     /// A paste lands in the tag field on the Tags row and nowhere else.
