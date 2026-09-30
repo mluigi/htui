@@ -243,9 +243,9 @@ pub struct Started {
     pub events_tx: mpsc::Sender<(u64, ConnEvent)>,
     /// The scope the worker publishes on every `Items` request; the refresher reads it.
     pub projects: watch::Sender<Vec<ProjectId>>,
-    /// Cursor-pass tuning the worker starts from. `this_box`, `this_user`, the interval and the
-    /// overlap are filled in from the connected server by [`refresh_settings`]; what survives from
-    /// here is `transcript_steps` and the fallbacks.
+    /// Cursor-pass tuning the worker starts from. `this_box`, the interval and the overlap are
+    /// filled in from the connected server by [`refresh_settings`]; what survives from here is
+    /// `transcript_steps` and the fallbacks.
     pub settings: RefreshSettings,
     /// The box heartbeat's period, [`BOX_HEARTBEAT`] from both constructors. A field rather
     /// than the constant in the loop so a test can beat in milliseconds against a real server,
