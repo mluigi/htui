@@ -1,6 +1,6 @@
 # Plan: MOD-59 - A write's reply names itself, so a form never stays "in flight"
 
-**Status: CONFIRMED by the maintainer 2026-09-30.**
+**Status: CONFIRMED by the maintainer 2026-09-30; implemented and closed out 2026-09-30 (`docs/decisions/mod/mod-59.md`). Blueprint deviations DV-1..DV-3 applied, DV-4 not; review findings in the write-up.**
 
 **Source**: `HANDOFF.md:268-279` (MOD-59, from MOD-9 milestone 3 review, finding 3; found
 2026-09-26; MOD-39 addendum). Requirements `R-TUI-7`, `R-NF-3`.

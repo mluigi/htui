@@ -14,93 +14,16 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-30):** **MOD-14 done** (`docs/decisions/mod/mod-14.md`): the Backlog's
+**Current status (2026-09-30):** **MOD-59 done** (`docs/decisions/mod/mod-59.md`): an applied Skills,
+Templates or Requirements write answers its own reply (`SkillWritten`, `TemplateSaved`,
+`RequirementWritten`, as MOD-23's `AgentWritten`), so a form lands on its write and never stays "in
+flight" when another session changed the row or a read arrived first; a write whose re-read failed
+still lands, and a failed mint is hedged and re-reads the tree.
+Before it, **MOD-14 done** (`docs/decisions/mod/mod-14.md`): the Backlog's
 Graph sub-tab draws the selected item's link neighbourhood as a tree, 1-3 hops (`+`/`-`, default 2,
 fetched at 3), across projects, with link kind and status per row; `J`/`K` move, `Enter` re-roots the
 Backlog selection through MOD-64's reveal, a node outside the workspace refuses on the status line,
 and `m` opens the sub-tab (`R-TUI-2` `open graph`).
-Before it, **MOD-22 done** (`docs/decisions/mod/mod-22.md`): a login whose
-browser cannot reach the box completes from the TUI. While a login runs, `p` in Settings > Agents
-opens a masked field for the `http://127.0.0.1:<port>/?code=…&state=…` address the browser could
-not open; it is checked against the `redirect_uri` the login link advertised and sent as one raw
-loopback `GET` from the login's own task, the listener's answer is shown, and MOD-21's path finishes
-the login. The URL is a credential for one request (`R-AGT-9` amended). Bracketed paste is now on
-app-wide and reaches only a field that captures input. Live proof on the server-plus-laptop setup
-is the maintainer's (OQ-6).
-Before that, **ANA-26 concluded** (`docs/ANA-26.md`,
-`docs/decisions/ana/ana-26.md`): every key outside text entry becomes a named action in one
-compiled-in catalogue; a user overrides only what they change in a local `<config_root>/keys.toml`
-(never the store), an invalid file refuses to start with `path:line` errors, `ctrl-c` always quits
-(MOD-57's terminal pane excepted), and every hint and the `?` box are generated. New requirement
-`R-TUI-10`; `R-TUI-1` and `R-STO-1` amended. Implemented by **MOD-67**.
-Before it, **MOD-33 was done** (`docs/decisions/mod/mod-33.md`): the box
-hostname is rendered but not digested. `prompt_digest` is `sha256` of a digest text in which the box
-section's hostname value is the stand-in `[hostname]`; the model still sees the real value, the
-recorder hashes the digest text (`record_prompt_digesting`), and `trim_record` `v 4` lists
-`undigested: ["box.hostname"]`. A per-project switch, `project.settings.box_hostname` (default on,
-Settings > Prompt), omits the line entirely. Migration `0010` restates the two column comments.
-Amends ANA-5 §4.2/§4.7 (recorded in the write-up, not in `docs/ANA-5.md`).
-Earlier completions are in `DECISIONS.md`.
-**Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
-`0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
-(MOD-38), `0007_skill_attachments` (MOD-9 milestone 2), `0008_trim_record_v3` (MOD-9 milestone 5,
-comment only) `0009_agent_box_user_off` (MOD-23) and `0010_prompt_digest_undigested` (MOD-33, comment only;
-cache: `0001`..`0004`), so **the next migration is `0011`** (cache: `0005`).
-`max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
-(done, all four milestones), MOD-38, MOD-9 (done, all five milestones), MOD-40, MOD-39, MOD-64,
-MOD-23 and MOD-22 (re-counted 2026-09-30): store conformance `CASES` 97, `READ_CASES` 14, `htui-orch` `CASES` 73,
-`GraphSource` 7 methods, `StoreRequest` 91, `StoreReply` 49, `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
-`skills::REQUEST_NAMES` 6, `TABLES` 39, 289 `.sqlx` files, 116
-`crates/htui/tests/snapshots`,
-`MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 35 pinned commented
-columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 4` (MOD-33 `undigested`) with `skill_choices` (a
-`matched` choice carries `path`, `<repo>:<path>`); `Isolator` gained `changed_paths` (MOD-9 D119).
-Excerpts reach phase prompts since MOD-7 milestone 4, so a phase-prompt digest recorded before
-2026-09-26 does not compare with a later one; since MOD-9 milestone 5 (2026-09-30) a matched `glob`
-skill renders and a retry's excerpts rank the previous attempt's changed paths, so those digests
-move too; handoff digests are unchanged. Since MOD-33 (2026-09-30) a phase prompt digests
-`[hostname]` in place of the box's hostname, so every box-bearing phase digest moved once more.
-`cargo doc --workspace --no-deps --keep-going` shows exactly six baseline errors (`htui-core`
-`MIRRORED_TABLES`; `htui-store` `step_exists`, `HashEmbedder` in `embed.rs`, and three private
-links MOD-38 added in `pg/write.rs`: `set_requirement_spec` to `cas_miss`, `amend_requirement` and
-`withdraw_requirement` to `revise_requirement`; the count read five before 2026-09-26, but
-`HashEmbedder` already failed at `98e6d2f`). With `-D warnings`, `cargo doc` also fails on four
-pre-existing private-item links (`store/traits.rs:1251`, `agent_worker.rs:729`,
-`ui/text_area.rs:18`, `ui/text_field.rs:5`; recorded at MOD-9's close, `docs/decisions/mod/mod-9.md`). `git` ≥ 2.33.0 is a runtime dependency
-of the `worktree` isolation mode and of reconciliation. **Production `approve` and `accept` are
-greyed and every production judge fails until MOD-11**, because no agent can write its phase's
-`output_kind` document yet, so production fan-outs go to the human (`s` in the Runs pane).
-Adapters install under `HTUI_AGENTS_ROOT`, default
-`dirs::data_local_dir()/htui/agents`; `HTUI_TOOL_<NAME>` still overrides everything. Dev Postgres
-via `compose.yaml` (port 5439, loopback only since TOOL-7); tests need
-`HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres` and the
-`USERNAME=htui-ci` prefix of TOOL-2 (`docs/decisions/mod/mod-6.md`). Under load the dev Postgres
-goes into recovery (`57P03`) and a failure seen then is re-run alone before it is believed;
-`htui-store` `tests/cache.rs::the_spawned_refresher_passes_and_follows_the_scope` has timed out
-once that way.
-**Live coordinates the agent work left, kept here because open items depend on them.** `claude` on
-this box is **2.1.267** (2.1.272 at the last estimator re-measure); the seed passes no `--bare`;
-`--permission-prompts none` is the deterministic way to provoke a policy denial, and
-`~/.claude/settings.json`'s allow list (`Bash(ls *)`) is why the obvious way does not. The CLI
-reports `claude_code_version` on `system/init` (there is no `version` key), re-emits `system/init`
-on **every turn** of a multi-turn session, and emits a `system/status` row per turn that
-`docs/ANA-4.md` §6.2 does not name. This box's live quota blob is `status: "allowed_warning"` at
-0.77 utilization; MOD-4 milestone 4 (D61) made `allowed_warning` selectable, so the `claude-cli`
-row is no longer skipped for it. `agy_acp_server` **1.1.1** is installed here and emits **no `usage_update`
-whatsoever**, which is why its seed keeps `quota.source: "none"` and why the GPT/Gemini estimator
-row cannot be measured on this box (MOD-2 F-17). `--uid=` is **mandatory** for it. Its credentials
-live in `$GEMINI_HOME/antigravity-acp/acp_token.json`, a sibling of and separate from the `agy`
-CLI's own directory (MOD-21).
-**Concluded analyses the open items lean on:** ANA-10 (`docs/decisions/ana/ana-10.md`) — **its
-verdict is withdrawn**, see MOD-25 (`docs/decisions/mod/mod-25.md`); the document stays in the tree
-as the analysis that was done and not taken, and anything leaning on its local-only half is stale;
-ANA-5 (`docs/decisions/ana/ana-5.md`) — the prompt contract, no new crate, no new migration, with
-ANA-17 (`docs/decisions/ana/ana-17.md`) settling its block separator and keeping one frame for
-every model;
-ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set status tables,
-`htui-orch`, now built (MOD-4, `docs/decisions/mod/mod-4.md`). MOD-11, MOD-12 and MOD-13
-can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
-`docs/decisions/mod/mod-7.md`; MOD-9 is done, `docs/decisions/mod/mod-9.md`).
 
 ---
 
@@ -265,18 +188,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   counters: the Requirements tab's `tree::pad`/`clip` (on a narrow pane `pad` cuts the
   ` · read-only` marker before the project name) and the Reqs sub-tab's `cut`
   (`docs/decisions/mod/mod-39.md`, "Carried").
-- [ ] **MOD-59 - A write's reply names itself, so a form never stays "in flight"** (from MOD-9
-  milestone 3 review, finding 3; `docs/decisions/mod/mod-9.md`). `R-TUI-7`, `R-NF-3`. The Skills and Templates views decide that a
-  save landed by finding what they sent in the re-read snapshot (`ui/tabs/skills/library.rs` `land`,
-  milestone 1's D27 in `templates.rs`). If another session changes the same skill, binding or
-  template between the write and the worker's re-read, or `MemStore` stamps two writes with the same
-  instant, the predicate never holds: `busy` stays set and the editor, rename form or attachment
-  form refuses `Esc` and `Ctrl+S` until the workspace changes. Make a write's reply identify itself
-  (e.g. `StoreReply::SkillsWritten { snapshot, what }` and a templates twin) so landing no longer
-  depends on content, or release the form on any reply to the write's request name. Found
-  2026-09-26. MOD-39's Requirements tab lands the same way (`ui/tabs/requirements/mod.rs` `land`),
-  and re-reads after a refused mint because the worker answers `Failed` when only its re-read
-  failed; a reply that names its write would retire both (`docs/decisions/mod/mod-39.md`).
 - [ ] **MOD-49 - Interactive path picker for repo and workspace roots** (from MOD-7). `R-BOX-4`,
   `R-TUI-8`. MOD-7 D5 infers each repo's path on a box and falls back to a typed path in a text box
   when inference fails; as built, the typed fallback is Settings > Hierarchy's `b` (MOD-7 milestone
@@ -624,6 +535,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 30 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 29 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                              |
 | TOOL-N  | 0 |
