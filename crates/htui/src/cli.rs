@@ -8,19 +8,21 @@ use std::path::PathBuf;
 #[command(
     name = "htui",
     version,
-    about = "Terminal UI for the htui workflow store"
+    about = "Terminal UI for the htui workflow store",
+    args_conflicts_with_subcommands = true
 )]
 pub struct Args {
     /// A subcommand instead of the TUI. With one, no flag of the TUI may be given.
-    #[arg(skip)]
+    #[command(subcommand)]
     pub command: Option<Command>,
 
     /// Load the demo fixture instead of connecting to Postgres.
     #[arg(long)]
     pub demo: bool,
 
-    /// Write logs to this file. Never stdout: stdout is the TUI.
-    #[arg(long, env = "HTUI_LOG", value_name = "PATH")]
+    /// Write logs to this file. Never stdout: stdout is the TUI. After a subcommand
+    /// (`htui worker --log PATH`), not before it; `HTUI_LOG` works with either.
+    #[arg(long, env = "HTUI_LOG", value_name = "PATH", global = true)]
     pub log: Option<PathBuf>,
 
     /// Read a Postgres DSN from stdin, store it in the OS keyring and exit (`R-STO-1`).

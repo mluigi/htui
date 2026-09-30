@@ -32,6 +32,7 @@ pub mod store_worker;
 pub mod templates;
 pub mod terminal;
 pub mod ui;
+pub mod worker_cmd;
 
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
@@ -73,6 +74,12 @@ use crate::keymap::Keymap;
 /// the terminal fails. The terminal is restored on every path out of here, error included
 /// (MOD-1 plan D8).
 pub async fn run(args: cli::Args) -> anyhow::Result<()> {
+    if let Some(cli::Command::Worker(_worker)) = &args.command {
+        return Err(worker_cmd::WorkerExit::Refused(
+            "`htui worker` is not built yet (MOD-41 T12)".to_owned(),
+        )
+        .into());
+    }
     init_tracing(args.log.as_deref())?;
 
     if args.set_dsn {
