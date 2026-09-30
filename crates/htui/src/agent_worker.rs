@@ -8437,8 +8437,8 @@ done
         // -------------------------------------------------------------------------------------
         // MOD-22: a pasted redirect, delivered from inside the live flow (D269, D277, D286)
         //
-        // No assertion message here prints a reply that could carry the code sentinel unless
-        // the assertion is the one proving it absent.
+        // No assertion message here prints what the listener received: that alone carries the
+        // code sentinel. Replies are printed freely, since the rule is that none can carry it.
         // -------------------------------------------------------------------------------------
 
         /// The listener's page, as a browser would have been shown it.
@@ -8694,9 +8694,9 @@ done
                 .await
                 .expect("the delivery reached the listener")
                 .expect("the listener ran");
-            assert_eq!(
-                head.lines().next(),
-                Some(format!("GET /?code={CODE}&state={STATE} HTTP/1.1").as_str()),
+            let request_line = format!("GET /?code={CODE}&state={STATE} HTTP/1.1\r\n");
+            assert!(
+                head.starts_with(&request_line),
                 "one GET of the pasted path and query, to the advertised port"
             );
             let delivered = replies.iter().position(|(seq, reply)| {
