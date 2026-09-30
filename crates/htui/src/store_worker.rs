@@ -51,7 +51,7 @@ use crate::requirements::{
 };
 use crate::run_worker::{LiveChats, RunRuntime, RunServed};
 use crate::skill_import::SkillImports;
-use crate::skills::{self, SkillsSnapshot, StaleWhat};
+use crate::skills::{self, SkillWrite, SkillsSnapshot, StaleWhat};
 use crate::templates::{self, TemplateBody, TemplatesSnapshot};
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
@@ -1087,6 +1087,16 @@ pub enum StoreReply {
         snapshot: Box<SkillsSnapshot>,
         /// Which write went stale.
         what: StaleWhat,
+    },
+    /// The answer to every skill write that applied (MOD-59 D1): the snapshot re-read after it,
+    /// and what the write did. Self-naming: the Skills view lands a write on this variant alone,
+    /// and a plain [`StoreReply::Skills`] never closes its editor, form or question.
+    SkillWritten {
+        /// The snapshot as it is now; or, when only the re-read failed, its `StoreError` rendered
+        /// through `Display`. The write landed either way (D5).
+        snapshot: Result<Box<SkillsSnapshot>, String>,
+        /// What the write did.
+        outcome: SkillWrite,
     },
     /// The library after an import, and what happened to every file it touched
     /// ([`StoreRequest::ImportSkills`], MOD-9 import plan D97). One variant and not two: a file

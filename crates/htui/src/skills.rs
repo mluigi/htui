@@ -17,6 +17,7 @@
 //! render side never holds a `UserId` (`R-NF-3`). Nothing here reads the clock: the store stamps
 //! every instant.
 
+use chrono::{DateTime, Utc};
 use htui_core::model::{
     NewSkill, NewSkillVersion, ProjectId, RepoBoxPath, Scope, Skill, SkillBinding, SkillBindingKey,
     SkillId, SkillVersion, StepGraph, StepGraphPhase,
@@ -214,6 +215,60 @@ pub const REQUEST_NAMES: [&str; 6] = [
 /// leaves the form or editor over its text.
 pub const READ_NAME: &str = REQUEST_NAMES[0];
 
+/// What one skill write did (MOD-59 D2), carried by [`StoreReply::SkillWritten`] beside the
+/// snapshot re-read. Ids, names, keys and tokens only: a body stays in the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillWrite {
+    /// [`StoreRequest::CreateSkill`]: the skill and its version 1 landed.
+    Created {
+        /// The id the worker minted.
+        skill: SkillId,
+        /// The name, as stored.
+        name: String,
+    },
+    /// [`StoreRequest::SaveSkillVersion`]: a version was appended.
+    Versioned {
+        /// Which skill.
+        skill: SkillId,
+        /// The version the store appended.
+        version: i32,
+    },
+    /// [`StoreRequest::EditSkill`]: the rename or re-describe applied.
+    Edited {
+        /// Which skill.
+        skill: SkillId,
+        /// The name, as stored.
+        name: String,
+    },
+    /// [`StoreRequest::SetSkillBinding`] with an attach: the row at `key` is the one sent.
+    Attached {
+        /// The attachment's key.
+        key: SkillBindingKey,
+        /// The landed row's `updated_at`: the token a kept edit saves over (MOD-59 DV-1), not the
+        /// re-read's row, which another session may already have written over.
+        updated_at: DateTime<Utc>,
+    },
+    /// [`StoreRequest::SetSkillBinding`] with a detach: no row at `key`.
+    Detached {
+        /// The attachment's key.
+        key: SkillBindingKey,
+    },
+}
+
+impl SkillWrite {
+    /// The [`StoreRequest::name`] of the write this answers: what the view's `busy` holds while
+    /// it is in flight, so only that write lands on it (MOD-59 D4).
+    #[must_use]
+    pub const fn request_name(&self) -> &'static str {
+        match self {
+            Self::Created { .. } => REQUEST_NAMES[1],
+            Self::Edited { .. } => REQUEST_NAMES[2],
+            Self::Versioned { .. } => REQUEST_NAMES[3],
+            Self::Attached { .. } | Self::Detached { .. } => REQUEST_NAMES[4],
+        }
+    }
+}
+
 /// Serves one skill request, off the UI task (D97).
 ///
 /// The read answers [`StoreReply::Skills`]. A write answers `Skills` when it applied and
@@ -393,7 +448,7 @@ async fn answer(
 
 #[cfg(test)]
 mod tests {
-    use super::{READ_NAME, REQUEST_NAMES, SkillsSnapshot, StaleWhat, serve};
+    use super::{READ_NAME, REQUEST_NAMES, SkillWrite, SkillsSnapshot, StaleWhat, serve};
     use crate::store_worker::{self, StoreReply, StoreRequest};
     use crate::templates::TemplateBody;
     use chrono::{DateTime, Duration, Utc};
@@ -430,10 +485,14 @@ mod tests {
         }
     }
 
-    /// The snapshot of a `Skills` reply, or a panic naming what came back instead.
-    async fn applied(backend: &Backend, request: &StoreRequest) -> SkillsSnapshot {
+    /// The snapshot and outcome of a `SkillWritten` reply whose re-read succeeded, or a panic
+    /// naming what came back instead (MOD-59 D1).
+    async fn applied(backend: &Backend, request: &StoreRequest) -> (SkillsSnapshot, SkillWrite) {
         match serve(backend, request).await {
-            Ok(StoreReply::Skills(snapshot)) => *snapshot,
+            Ok(StoreReply::SkillWritten {
+                snapshot: Ok(snapshot),
+                outcome,
+            }) => (*snapshot, outcome),
             other => panic!("{} answered {other:?}", request.name()),
         }
     }
@@ -703,12 +762,14 @@ mod tests {
         assert!(agy.unrooted.is_empty(), "agy has no repo to be unrooted");
     }
 
+    /// MOD-59 D1, D2: every write that applied answers `SkillWritten`, naming what the store
+    /// stored, beside the snapshot re-read after it.
     #[tokio::test]
-    async fn each_write_answers_skills_when_it_applies() {
+    async fn each_write_answers_skill_written_with_what_the_store_stored() {
         let backend = demo();
         let scope = platform_scope(&backend).await;
 
-        let created = applied(
+        let (created, outcome) = applied(
             &backend,
             &create(&scope, "docs-style", "Write the doc first.\n"),
         )
@@ -717,6 +778,14 @@ mod tests {
             .by_name("docs-style")
             .expect("the created skill is in the fresh snapshot")
             .clone();
+        assert_eq!(
+            outcome,
+            SkillWrite::Created {
+                skill: entry.skill.id,
+                name: "docs-style".to_owned(),
+            },
+            "the id the worker minted"
+        );
         assert_eq!(
             entry
                 .versions
@@ -734,7 +803,7 @@ mod tests {
         assert_eq!(entry.versions[0].source, serde_json::json!({}));
         let id = entry.skill.id;
 
-        let edited = applied(
+        let (edited, outcome) = applied(
             &backend,
             &edit(&scope, id, entry.skill.updated_at, "Docs, then code."),
         )
@@ -743,8 +812,15 @@ mod tests {
             edited.entry(id).map(|e| e.skill.description.as_str()),
             Some("Docs, then code.")
         );
+        assert_eq!(
+            outcome,
+            SkillWrite::Edited {
+                skill: id,
+                name: "docs-style".to_owned(),
+            }
+        );
 
-        let saved = applied(
+        let (saved, outcome) = applied(
             &backend,
             &save(&scope, id, 1, "Write the doc first, always.\n"),
         )
@@ -753,13 +829,20 @@ mod tests {
         assert_eq!(head.version, 2);
         assert_eq!(head.body, "Write the doc first, always.\n");
         assert_eq!(head.created_by, ids::USER);
+        assert_eq!(
+            outcome,
+            SkillWrite::Versioned {
+                skill: id,
+                version: 2,
+            }
+        );
 
         let key = SkillBindingKey {
             skill: id,
             project: None,
             phase: None,
         };
-        let attached = applied(
+        let (attached, outcome) = applied(
             &backend,
             &bind(&scope, key, None, BindingChange::Attach(always())),
         )
@@ -769,13 +852,22 @@ mod tests {
             .expect("the global attachment is in the fresh snapshot")
             .clone();
         assert_eq!(attached.global, std::slice::from_ref(&row));
+        assert_eq!(
+            outcome,
+            SkillWrite::Attached {
+                key,
+                updated_at: row.updated_at,
+            },
+            "the landed row's token (MOD-59 DV-1)"
+        );
 
-        let detached = applied(
+        let (detached, outcome) = applied(
             &backend,
             &bind(&scope, key, Some(row.updated_at), BindingChange::Detach),
         )
         .await;
         assert!(detached.global.is_empty(), "the detach re-reads without it");
+        assert_eq!(outcome, SkillWrite::Detached { key });
     }
 
     #[tokio::test]
@@ -950,6 +1042,43 @@ mod tests {
         ];
         let names: Vec<&str> = samples.iter().map(StoreRequest::name).collect();
         assert_eq!(names, REQUEST_NAMES);
+
+        // MOD-59 D4: each outcome names the write it answers, the name the view's `busy` holds.
+        let key = demo_phase_key();
+        let outcomes = [
+            (
+                SkillWrite::Created {
+                    skill: ids::SKILL_TESTS,
+                    name: "docs-style".to_owned(),
+                },
+                &samples[1],
+            ),
+            (
+                SkillWrite::Edited {
+                    skill: ids::SKILL_TESTS,
+                    name: "tests".to_owned(),
+                },
+                &samples[2],
+            ),
+            (
+                SkillWrite::Versioned {
+                    skill: ids::SKILL_TESTS,
+                    version: 2,
+                },
+                &samples[3],
+            ),
+            (
+                SkillWrite::Attached {
+                    key,
+                    updated_at: DateTime::UNIX_EPOCH,
+                },
+                &samples[4],
+            ),
+            (SkillWrite::Detached { key }, &samples[4]),
+        ];
+        for (outcome, request) in &outcomes {
+            assert_eq!(outcome.request_name(), request.name(), "{outcome:?}");
+        }
     }
 
     /// `StoreRequest` derives `Debug`; a skill body is user text, so a create and a save print

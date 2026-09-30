@@ -1768,15 +1768,19 @@ fn in_scope(snapshot: &SkillsSnapshot, ctx: &Ctx<'_>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use chrono::TimeDelta;
+    use htui_core::clock::{TestClock, epoch};
     use htui_core::fixtures::ids;
-    use htui_core::model::Scope;
-    use htui_core::store::{BLANK_SKILL_BODY, MemStore};
+    use htui_core::model::{Attachment, Scope};
+    use htui_core::store::{BLANK_SKILL_BODY, CasOutcome, MemStore, WriteStore as _};
     use htui_store::Backend;
 
     use super::*;
     use crate::app::{Action, Emit, TopBarState};
     use crate::keymap::Keymap;
-    use crate::skills;
+    use crate::skills::{self, SkillWrite};
     use crate::store_worker::Origin;
     use crate::ui::Theme;
     use crate::ui::tabs::SkillsTab;
@@ -1817,9 +1821,53 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
-    /// D98: a `Skills` read served while a version save is in flight is not the save's answer.
-    /// `settle` serves in queue order, save first, so only a direct drive can put a read's reply
-    /// ahead of the save's.
+    /// Each char of `text` as a plain key.
+    fn type_text(view: &mut LibraryView, text: &str, ctx: &mut Ctx<'_>) {
+        for c in text.chars() {
+            view.on_key(key(KeyCode::Char(c)), ctx);
+        }
+    }
+
+    /// The snapshot a reply carries, whichever variant it is; a panic when it carries none.
+    fn snapshot_of(reply: &StoreReply) -> &SkillsSnapshot {
+        match reply {
+            StoreReply::Skills(snapshot)
+            | StoreReply::SkillWritten {
+                snapshot: Ok(snapshot),
+                ..
+            }
+            | StoreReply::SkillsStale { snapshot, .. } => snapshot,
+            other => panic!("no snapshot in {other:?}"),
+        }
+    }
+
+    /// HANDOFF MOD-59's race: another session wrote between the write and the worker's re-read,
+    /// so the write's own reply carries the snapshot `read` saw. A panic when `written` is not a
+    /// `SkillWritten` (the worker before MOD-59 answered `Skills`).
+    fn raced(written: StoreReply, read: StoreReply) -> StoreReply {
+        match (written, read) {
+            (StoreReply::SkillWritten { outcome, .. }, StoreReply::Skills(snapshot)) => {
+                StoreReply::SkillWritten {
+                    snapshot: Ok(snapshot),
+                    outcome,
+                }
+            }
+            (written, read) => panic!("not a write and a read: {written:?}, {read:?}"),
+        }
+    }
+
+    /// MOD-59 D5: the reply to a write that applied although its re-read failed.
+    fn unread(outcome: SkillWrite) -> StoreReply {
+        StoreReply::SkillWritten {
+            snapshot: Err("store unreachable: gone".to_owned()),
+            outcome,
+        }
+    }
+
+    /// MOD-59 D4: a `Skills` read served while a version save is in flight is not the save's
+    /// answer: a plain `Skills` never lands; the write's own `SkillWritten` does. `settle` serves
+    /// in queue order, save first, so only a direct drive can put a read's reply ahead of the
+    /// save's.
     #[tokio::test]
     async fn a_read_reply_does_not_close_the_editor_mid_save() {
         let backend = Backend::memory(MemStore::demo());
@@ -1879,8 +1927,8 @@ mod tests {
         );
     }
 
-    /// The same rule for the attachment form: the form stays open over a read that does not hold
-    /// the row it sent, and closes on the one that does.
+    /// The same rule for the attachment form: a plain `Skills` never lands, so the form stays
+    /// open over the read; the write's own `SkillWritten` closes it (MOD-59 D4).
     #[tokio::test]
     async fn a_read_reply_does_not_close_the_attach_form_mid_save() {
         let backend = Backend::memory(MemStore::demo());
@@ -2019,13 +2067,16 @@ mod tests {
             "{:?}",
             view.notice
         );
-        let StoreReply::Skills(landed) = &saved else {
-            panic!("the attach answers with the library: {saved:?}");
+        let StoreReply::SkillWritten {
+            outcome: SkillWrite::Attached {
+                updated_at: token, ..
+            },
+            ..
+        } = &saved
+        else {
+            panic!("the attach answers with its own outcome: {saved:?}");
         };
-        let token = landed
-            .binding(written)
-            .expect("the attach landed")
-            .updated_at;
+        let token = *token;
 
         // The next save writes the edit over the landed row, and nothing typed after it closes
         // the form.
@@ -2064,6 +2115,477 @@ mod tests {
             "{:?}",
             view.notice
         );
+    }
+
+    /// What a `Ctx` borrows, held by the test: the Harness's startup scope and a fresh `Emit`.
+    struct Bench {
+        /// [`vulkan`].
+        scope: Scope,
+        /// The top bar.
+        top_bar: TopBarState,
+        /// The default keymap.
+        keymap: Keymap,
+        /// The default theme.
+        theme: Theme,
+        /// What the view emitted.
+        emit: Emit,
+    }
+
+    impl Bench {
+        fn new() -> Self {
+            Self {
+                scope: vulkan(),
+                top_bar: TopBarState::default(),
+                keymap: Keymap::default_global(),
+                theme: Theme::default(),
+                emit: Emit::default(),
+            }
+        }
+
+        fn ctx(&self) -> Ctx<'_> {
+            Ctx::new(
+                &self.scope,
+                &[],
+                &self.top_bar,
+                &self.keymap,
+                &self.theme,
+                Origin::Tab(SkillsTab::ID),
+                &self.emit,
+            )
+        }
+
+        /// The one request the view sent since the last drain, or a panic naming what it sent.
+        fn one(&self) -> StoreRequest {
+            let requests = sent(&self.emit);
+            let [request] = requests.as_slice() else {
+                panic!("exactly one request was sent: {requests:?}");
+            };
+            request.clone()
+        }
+    }
+
+    /// A `MemStore` whose clock never moves unless the test moves it: every write it stamps
+    /// carries the same instant (HANDOFF MOD-59, scenario (b)).
+    fn frozen() -> (TestClock, Backend) {
+        let clock = TestClock::new();
+        let store = MemStore::demo().with_clock(Arc::new(clock.clone()));
+        (clock, Backend::memory(store))
+    }
+
+    /// HANDOFF MOD-59 (a): another session re-describes the skill between the rename and the
+    /// worker's re-read, so the re-read holds their description, not ours. The rename's own
+    /// `SkillWritten` still closes the form; before MOD-59 the content match never held and the
+    /// form refused `Esc` until the workspace changed.
+    #[tokio::test]
+    async fn a_rename_lands_although_another_session_renamed_it_before_the_reread() {
+        let backend = Backend::memory(MemStore::demo());
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        let read = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+
+        view.on_key(key(KeyCode::Char('i')), &mut ctx);
+        view.on_key(key(KeyCode::Tab), &mut ctx);
+        type_text(&mut view, " Mine.", &mut ctx);
+        view.on_key(ctrl('s'), &mut ctx);
+        let edit = bench.one();
+        assert!(matches!(edit, StoreRequest::EditSkill { .. }), "{edit:?}");
+        let written = serve(&backend, &edit).await;
+        let ours = snapshot_of(&written)
+            .entry(ids::SKILL_RUST_STYLE)
+            .expect("rust-style is in the re-read")
+            .skill
+            .updated_at;
+
+        // Another session, over the row our rename left.
+        let theirs = backend
+            .writer()
+            .expect("a memory backend has a writer")
+            .update_skill(
+                ids::SKILL_RUST_STYLE,
+                ours,
+                SkillPatch {
+                    name: None,
+                    description: Some("Theirs.".to_owned()),
+                },
+            )
+            .await
+            .expect("the other session's write");
+        assert!(matches!(theirs, CasOutcome::Applied(_)), "{theirs:?}");
+        let read = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
+
+        view.on_reply(&raced(written, read), &mut ctx);
+        assert!(matches!(view.mode, Mode::Browse), "{:?}", view.mode);
+        assert_eq!(view.busy, None);
+        assert_eq!(
+            view.notice,
+            Some(Notice::Info("saved `rust-style`".to_owned()))
+        );
+    }
+
+    /// MOD-59 DV-1: an attach whose form was edited during its save stays open, and its next
+    /// `Ctrl+S` carries the token of the row *this* write landed, not the re-read's row, which
+    /// another session wrote over in between. So their row is met with `SkillsStale`, never
+    /// silently overwritten.
+    #[tokio::test]
+    async fn kept_attach_edits_save_over_the_writes_own_row_not_the_racing_one() {
+        let (clock, backend) = frozen();
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        let read = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+        let written = SkillBindingKey {
+            skill: ids::SKILL_RUST_STYLE,
+            project: Some(ids::PROJECT_VULKAN),
+            phase: None,
+        };
+
+        // `a` on `rust-style`; `j` to `vulkan-tutorials`; `Enter` opens a new form (`always`);
+        // `Space` twice while the save is in flight: `always` becomes `off`.
+        view.on_key(key(KeyCode::Char('a')), &mut ctx);
+        view.on_key(key(KeyCode::Char('j')), &mut ctx);
+        view.on_key(key(KeyCode::Enter), &mut ctx);
+        view.on_key(ctrl('s'), &mut ctx);
+        let save = bench.one();
+        view.on_key(key(KeyCode::Char(' ')), &mut ctx);
+        view.on_key(key(KeyCode::Char(' ')), &mut ctx);
+        let reply = serve(&backend, &save).await;
+        let ours = snapshot_of(&reply)
+            .binding(written)
+            .expect("the attach landed")
+            .updated_at;
+
+        // Another session, a second later, over the row our attach left.
+        clock.advance(TimeDelta::seconds(1));
+        let theirs = backend
+            .writer()
+            .expect("a memory backend has a writer")
+            .set_skill_binding(
+                written,
+                Some(ours),
+                BindingChange::Attach(Attachment {
+                    pinned_version: None,
+                    position: 1,
+                    activation: Activation::Always,
+                    globs: Vec::new(),
+                    languages: Vec::new(),
+                }),
+            )
+            .await
+            .expect("the other session's write");
+        assert!(matches!(theirs, CasOutcome::Applied(_)), "{theirs:?}");
+        let read = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
+
+        view.on_reply(&raced(reply, read), &mut ctx);
+        assert_eq!(view.busy, None, "the save landed");
+        assert!(view.captures_input(), "the later edit keeps the form open");
+        assert!(
+            matches!(
+                &view.notice,
+                Some(Notice::Info(text)) if text.contains("later edits kept")
+            ),
+            "{:?}",
+            view.notice
+        );
+
+        view.on_key(ctrl('s'), &mut ctx);
+        let again = bench.one();
+        let StoreRequest::SetSkillBinding { expected, .. } = &again else {
+            panic!("not an attach: {again:?}");
+        };
+        assert_eq!(
+            *expected,
+            Some(ours),
+            "the kept edit saves over our own row's token"
+        );
+        let answer = serve(&backend, &again).await;
+        assert!(
+            matches!(
+                answer,
+                StoreReply::SkillsStale {
+                    what: StaleWhat::Binding(key),
+                    ..
+                } if key == written
+            ),
+            "their row is a conflict, not an overwrite: {answer:?}"
+        );
+    }
+
+    /// HANDOFF MOD-59 (b): a `MemStore` whose clock does not move stamps a second rename with
+    /// the instant the first one left, so the row's `updated_at` equals the token the form carried.
+    /// The rename still lands on its own reply; before MOD-59 the `updated_at != token` check never
+    /// held and the form wedged.
+    #[tokio::test]
+    async fn a_rename_at_the_stores_frozen_instant_still_lands() {
+        let (_clock, backend) = frozen();
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        let read = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+
+        // The first rename moves the row from the fixture's instant to the clock's.
+        view.on_key(key(KeyCode::Char('i')), &mut ctx);
+        view.on_key(key(KeyCode::Tab), &mut ctx);
+        type_text(&mut view, "A", &mut ctx);
+        view.on_key(ctrl('s'), &mut ctx);
+        let first = bench.one();
+        let reply = serve(&backend, &first).await;
+        view.on_reply(&reply, &mut ctx);
+        assert!(matches!(view.mode, Mode::Browse), "{:?}", view.mode);
+        assert_eq!(view.busy, None);
+
+        // The second opens on the clock's instant, and the store stamps it with the same one.
+        view.on_key(key(KeyCode::Char('i')), &mut ctx);
+        view.on_key(key(KeyCode::Tab), &mut ctx);
+        type_text(&mut view, "B", &mut ctx);
+        view.on_key(ctrl('s'), &mut ctx);
+        let second = bench.one();
+        let StoreRequest::EditSkill { expected, .. } = &second else {
+            panic!("not a rename: {second:?}");
+        };
+        assert_eq!(*expected, epoch(), "the form opened on the frozen instant");
+        let reply = serve(&backend, &second).await;
+        let landed = snapshot_of(&reply)
+            .entry(ids::SKILL_RUST_STYLE)
+            .expect("rust-style is in the re-read");
+        assert!(
+            landed.skill.description.ends_with("AB"),
+            "the rename applied"
+        );
+        assert_eq!(
+            landed.skill.updated_at, *expected,
+            "precondition: the row carries the very token the rename sent"
+        );
+
+        view.on_reply(&reply, &mut ctx);
+        assert!(matches!(view.mode, Mode::Browse), "{:?}", view.mode);
+        assert_eq!(view.busy, None);
+        assert_eq!(
+            view.notice,
+            Some(Notice::Info("saved `rust-style`".to_owned()))
+        );
+    }
+
+    /// HANDOFF MOD-59 (b) for an attachment: a change to a row stamped at the store's frozen
+    /// instant lands, though the row it leaves carries the token the form sent.
+    #[tokio::test]
+    async fn an_attach_over_a_row_stamped_at_the_same_instant_still_lands() {
+        let (_clock, backend) = frozen();
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        let read = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+
+        // `a` on `rust-style`; `j` to `vulkan-tutorials`; `Enter` opens a new form; save it.
+        view.on_key(key(KeyCode::Char('a')), &mut ctx);
+        view.on_key(key(KeyCode::Char('j')), &mut ctx);
+        view.on_key(key(KeyCode::Enter), &mut ctx);
+        view.on_key(ctrl('s'), &mut ctx);
+        let first = bench.one();
+        let reply = serve(&backend, &first).await;
+        view.on_reply(&reply, &mut ctx);
+        assert_eq!(view.busy, None);
+        assert!(!view.captures_input(), "the first attach closed its form");
+
+        // `Enter` on the row it left: the form opens on the frozen instant; `Space` twice turns
+        // `always` into `off`.
+        view.on_key(key(KeyCode::Enter), &mut ctx);
+        view.on_key(key(KeyCode::Char(' ')), &mut ctx);
+        view.on_key(key(KeyCode::Char(' ')), &mut ctx);
+        view.on_key(ctrl('s'), &mut ctx);
+        let second = bench.one();
+        let StoreRequest::SetSkillBinding { expected, .. } = &second else {
+            panic!("not an attach: {second:?}");
+        };
+        assert_eq!(
+            *expected,
+            Some(epoch()),
+            "the form opened on the frozen instant"
+        );
+        let reply = serve(&backend, &second).await;
+        assert!(
+            !matches!(reply, StoreReply::SkillsStale { .. }),
+            "the change applied: {reply:?}"
+        );
+
+        view.on_reply(&reply, &mut ctx);
+        assert_eq!(view.busy, None, "the change landed");
+        assert!(
+            !view.captures_input(),
+            "nothing typed since: the form closed"
+        );
+        assert!(
+            matches!(&view.notice, Some(Notice::Info(text)) if text.starts_with("attached to ")),
+            "{:?}",
+            view.notice
+        );
+    }
+
+    /// MOD-59 D4: a read served after the save, which already shows the saved version, still is
+    /// not the save's answer. Only the save's own `SkillWritten` closes the editor.
+    #[tokio::test]
+    async fn a_read_that_shows_the_saved_version_does_not_land_the_save() {
+        let backend = Backend::memory(MemStore::demo());
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        let read = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+
+        view.on_key(key(KeyCode::Char('e')), &mut ctx);
+        view.on_key(key(KeyCode::Char('x')), &mut ctx);
+        view.on_key(ctrl('s'), &mut ctx);
+        let save = bench.one();
+        let saved = serve(&backend, &save).await;
+        let shows = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
+        assert_eq!(
+            snapshot_of(&shows)
+                .head(ids::SKILL_RUST_STYLE)
+                .map(|row| row.version),
+            Some(3),
+            "precondition: the read holds the saved version"
+        );
+
+        view.on_reply(&shows, &mut ctx);
+        assert!(
+            matches!(view.mode, Mode::Editing(_)),
+            "a read is not the save's answer: {:?}",
+            view.mode
+        );
+        assert_eq!(view.busy, Some("save_skill_version"), "still in flight");
+
+        view.on_reply(&saved, &mut ctx);
+        assert!(matches!(view.mode, Mode::Browse), "{:?}", view.mode);
+        assert_eq!(view.busy, None);
+        assert!(
+            matches!(&view.notice, Some(Notice::Info(text)) if text.starts_with("saved v3 \u{b7} ~")),
+            "{:?}",
+            view.notice
+        );
+    }
+
+    /// MOD-59 D5: a save that applied although its re-read failed closes the editor, says what
+    /// landed and that the re-read failed, and keeps drawing the library the view held.
+    #[tokio::test]
+    async fn a_save_whose_reread_failed_lands_and_keeps_the_library_drawn() {
+        let backend = Backend::memory(MemStore::demo());
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        let read = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+        let before = view.snapshot.clone();
+
+        view.on_key(key(KeyCode::Char('e')), &mut ctx);
+        view.on_key(key(KeyCode::Char('x')), &mut ctx);
+        view.on_key(ctrl('s'), &mut ctx);
+        let _save = bench.one();
+
+        view.on_reply(
+            &unread(SkillWrite::Versioned {
+                skill: ids::SKILL_RUST_STYLE,
+                version: 3,
+            }),
+            &mut ctx,
+        );
+        assert!(matches!(view.mode, Mode::Browse), "{:?}", view.mode);
+        assert_eq!(view.busy, None);
+        assert!(view.sent.is_none(), "{:?}", view.sent);
+        assert!(
+            matches!(
+                &view.notice,
+                Some(Notice::Error(text))
+                    if text.starts_with("saved v3 \u{b7} ~")
+                        && text.contains("the re-read failed, r reloads: store unreachable: gone")
+            ),
+            "{:?}",
+            view.notice
+        );
+        assert_eq!(view.snapshot, before, "the held library stays drawn");
+        assert_eq!(view.unavailable, None, "there is a library to draw");
+    }
+
+    /// MOD-59 D5: a create whose re-read failed lands with nothing to select, and the pane says
+    /// the library is unavailable only because the view held none.
+    #[test]
+    fn a_create_whose_reread_failed_is_unavailable_only_when_nothing_was_held() {
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let target = Target::New {
+            name: "docs-style".to_owned(),
+            description: String::new(),
+        };
+        let mut view = LibraryView {
+            busy: Some("create_skill"),
+            sent: Some(Sent::Create {
+                name: "docs-style".to_owned(),
+                body: "B.\n".to_owned(),
+            }),
+            mode: Mode::Editing(Editor::new(target, 0, None, "B.\n")),
+            ..LibraryView::default()
+        };
+
+        view.on_reply(
+            &unread(SkillWrite::Created {
+                skill: SkillId::new(),
+                name: "docs-style".to_owned(),
+            }),
+            &mut ctx,
+        );
+        assert_eq!(view.unavailable.as_deref(), Some("store unreachable: gone"));
+        assert!(matches!(view.mode, Mode::Browse), "{:?}", view.mode);
+        assert_eq!(view.busy, None);
+        assert!(
+            matches!(
+                &view.notice,
+                Some(Notice::Error(text)) if text.starts_with("created `docs-style` v1")
+            ),
+            "{:?}",
+            view.notice
+        );
+    }
+
+    /// MOD-59 D4, H-5: a `SkillWritten` for a write other than the one in flight lands nothing;
+    /// with no snapshot it cannot even be scope-checked, so it touches neither the pane nor the
+    /// notice.
+    #[tokio::test]
+    async fn a_skill_written_for_another_write_does_not_land() {
+        let backend = Backend::memory(MemStore::demo());
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        let read = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+
+        view.on_key(key(KeyCode::Char('i')), &mut ctx);
+        view.on_key(key(KeyCode::Tab), &mut ctx);
+        type_text(&mut view, "x", &mut ctx);
+        view.on_key(ctrl('s'), &mut ctx);
+        let _edit = bench.one();
+        assert_eq!(view.busy, Some("edit_skill"));
+
+        let versioned = SkillWrite::Versioned {
+            skill: ids::SKILL_RUST_STYLE,
+            version: 3,
+        };
+        view.on_reply(
+            &StoreReply::SkillWritten {
+                snapshot: Ok(Box::new(snapshot_of(&read).clone())),
+                outcome: versioned.clone(),
+            },
+            &mut ctx,
+        );
+        assert_eq!(view.busy, Some("edit_skill"), "not the rename's answer");
+        assert!(matches!(view.mode, Mode::Info(_)), "{:?}", view.mode);
+
+        view.on_reply(&unread(versioned), &mut ctx);
+        assert_eq!(view.busy, Some("edit_skill"));
+        assert_eq!(view.unavailable, None);
+        assert_eq!(view.notice, Some(Notice::Info(SAVING.to_owned())));
     }
 
     /// MOD-9 D127, D134 (milestone 3's review finding 6): a skill with no version row — only a
