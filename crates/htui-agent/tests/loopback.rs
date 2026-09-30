@@ -197,6 +197,71 @@ fn a_paste_without_a_scheme_is_read_as_http() {
     assert_eq!(delivery.target(), "127.0.0.1:39879");
 }
 
+/// Review L-6: a scheme is detected only at the start. A scheme-less paste whose query carries a
+/// `://` (a `next=http://…` echoed by a vendor) is still the `http` address it looks like.
+#[test]
+fn a_scheme_less_paste_whose_query_carries_a_scheme_is_still_read_as_http() {
+    let text = format!("127.0.0.1:39879/?code={CODE}&state={STATE}&next=http://example.com/");
+    let delivery = validate(&paste(&text), &advertised(39879)).expect("read as http");
+    assert_eq!(delivery.target(), "127.0.0.1:39879");
+
+    let at = Advertised::from_auth_url(&link("localhost:39879", STATE)).expect("link");
+    let text = format!("localhost:39879/?code={CODE}&state={STATE}&back=https://x.invalid/");
+    let delivery = validate(&paste(&text), &at).expect("`localhost:` is a host, not a scheme");
+    assert_eq!(delivery.target(), "localhost:39879");
+}
+
+/// Review L-6: an `error=` with nothing usable in it is refused with a sentence of its own, not
+/// with a pair of empty backticks.
+#[test]
+fn an_empty_error_value_is_refused_without_empty_backticks() {
+    let at = advertised(39879);
+    for query in [
+        format!("error=&state={STATE}"),
+        format!("error=%3C%3E&code={CODE}&state={STATE}"),
+    ] {
+        let err = validate(&paste(&format!("http://127.0.0.1:39879/?{query}")), &at)
+            .expect_err("an error redirect");
+        assert_eq!(err, PasteError::BrowserErrorUnnamed, "{query}");
+        let sentence = err.to_string();
+        assert!(!sentence.contains("``"), "{sentence}");
+        assert!(sentence.contains("the login was not granted"), "{sentence}");
+    }
+}
+
+/// Review L-6 (maintainer OQ-3 keeps `state` required): when the login's own link carried no
+/// state either, the refusal says that is why the redirect cannot be checked, rather than asking
+/// for a state the address never had.
+#[test]
+fn a_stateless_paste_for_a_stateless_link_says_the_link_carried_no_state() {
+    let stateless = Advertised::from_auth_url(
+        "https://auth.example.invalid/o?client_id=c&redirect_uri=http%3A%2F%2F127.0.0.1%3A39879%2F",
+    )
+    .expect("a link without state");
+    let err = validate(
+        &paste(&format!("http://127.0.0.1:39879/?code={CODE}")),
+        &stateless,
+    )
+    .expect_err("state stays required");
+    assert_eq!(err, PasteError::UnverifiableWithoutState);
+    let sentence = err.to_string();
+    assert!(
+        sentence.contains("the login link carried no state"),
+        "{sentence}"
+    );
+    assert_no_sentinel(&sentence);
+
+    // With a state on the link, a stateless paste is still just missing its state.
+    assert_eq!(
+        validate(
+            &paste(&format!("http://127.0.0.1:39879/?code={CODE}")),
+            &advertised(39879)
+        )
+        .expect_err("no state"),
+        PasteError::MissingState
+    );
+}
+
 #[test]
 fn wrong_port_names_both_ports_and_nothing_else() {
     let err = validate(&paste(&good(50651)), &advertised(39879)).expect_err("another port");
@@ -335,15 +400,22 @@ fn each_rule_refuses_with_its_own_variant() {
         assert_eq!(got, expected, "row {i}");
     }
 
+    // Review L-6: the sentence is derived from the constant, not a copy of it.
     let too_long = PasteError::TooLong.to_string();
-    assert!(too_long.contains("8192"));
-    assert!(too_long.contains(&PASTE_MAX.to_string()));
+    assert_eq!(
+        too_long,
+        format!("the pasted text is longer than {PASTE_MAX} bytes; paste the address bar only")
+    );
 }
 
 #[test]
 fn every_paste_error_sentence_is_free_of_pasted_text() {
     let at = advertised(39879);
     let other_state = Advertised::from_auth_url(&link("127.0.0.1:39879", "S1")).expect("S1");
+    let stateless = Advertised::from_auth_url(
+        "https://auth.example.invalid/o?client_id=c&redirect_uri=http%3A%2F%2F127.0.0.1%3A39879%2F",
+    )
+    .expect("a link without state");
     let q = format!("code={CODE}&state={STATE}");
     let cases: Vec<(String, &Advertised)> = vec![
         (" ".to_owned(), &at),
@@ -362,6 +434,8 @@ fn every_paste_error_sentence_is_free_of_pasted_text() {
         (format!("http://127.0.0.1:39879/?code={CODE}"), &at),
         (format!("http://127.0.0.1:39879/?{q}&code={CODE}"), &at),
         (format!("http://127.0.0.1:39879/?{q}"), &other_state),
+        (format!("http://127.0.0.1:39879/?error=&{q}"), &at),
+        (format!("http://127.0.0.1:39879/?code={CODE}"), &stateless),
     ];
     let mut variants = HashSet::new();
     for (text, advertised) in cases {
@@ -372,7 +446,7 @@ fn every_paste_error_sentence_is_free_of_pasted_text() {
     }
     // RepeatedParameter("state") shares its discriminant with "code"; both are covered above and
     // in `each_rule_refuses_with_its_own_variant`.
-    assert_eq!(variants.len(), 13, "every PasteError variant is exercised");
+    assert_eq!(variants.len(), 15, "every PasteError variant is exercised");
     let twice = format!("http://127.0.0.1:39879/?{q}&state={STATE}");
     let err = validate(&paste(&twice), &at).expect_err("state twice");
     assert_no_sentinel(&err.to_string());

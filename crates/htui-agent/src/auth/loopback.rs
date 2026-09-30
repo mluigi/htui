@@ -245,7 +245,10 @@ pub enum PasteError {
     #[error("nothing was pasted")]
     Empty,
     /// Longer than [`PASTE_MAX`] bytes after trimming.
-    #[error("the pasted text is longer than 8192 bytes; paste the address bar only")]
+    #[error(
+        "the pasted text is longer than {max} bytes; paste the address bar only",
+        max = PASTE_MAX
+    )]
     TooLong,
     /// Not parseable as a URL.
     #[error("the pasted text is not an address")]
@@ -279,15 +282,25 @@ pub enum PasteError {
     /// The browser came back with an OAuth `error` instead of a `code`.
     #[error("the browser came back with `{error}` instead of a code; the login was not granted")]
     BrowserError {
-        /// The `error` value, filtered to `[A-Za-z0-9._-]` and cut to 64 characters.
+        /// The `error` value, filtered to `[A-Za-z0-9._-]` and cut to 64 characters; never empty.
         error: String,
     },
+    /// An OAuth `error` whose value is empty once filtered: the same refusal, with nothing to name.
+    #[error("the browser came back with an error instead of a code; the login was not granted")]
+    BrowserErrorUnnamed,
     /// No non-empty `code`.
     #[error("the address has no code; copy the whole address the browser could not open")]
     MissingCode,
     /// No non-empty `state`.
     #[error("the address has no state; copy the whole address the browser could not open")]
     MissingState,
+    /// No non-empty `state`, and the running login's link carried none either (maintainer OQ-3
+    /// keeps `state` required): there is nothing to tell this adapter's redirect from another's.
+    #[error(
+        "the address has no state and the login link carried no state, so this adapter's \
+         redirect cannot be verified; it cannot be pasted here"
+    )]
+    UnverifiableWithoutState,
     /// `code` or `state` more than once.
     #[error("the address carries {0} more than once")]
     RepeatedParameter(&'static str),
@@ -415,8 +428,9 @@ pub fn validate(url: &RedirectUrl, advertised: &Advertised) -> Result<Delivery, 
     if text.len() > PASTE_MAX {
         return Err(PasteError::TooLong);
     }
-    // (2): `Url::parse("localhost:39879/?…")` succeeds with the scheme `localhost`.
-    let text = if text.contains("://") {
+    // (2): `Url::parse("localhost:39879/?…")` succeeds with the scheme `localhost`. A scheme is
+    // looked for at the start only: a `://` inside the query is not one (review L-6).
+    let text = if has_scheme(text) {
         Zeroizing::new(text.to_owned())
     } else {
         Zeroizing::new(format!("http://{text}"))
@@ -454,11 +468,20 @@ pub fn validate(url: &RedirectUrl, advertised: &Advertised) -> Result<Delivery, 
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
             .take(64)
-            .collect();
-        return Err(PasteError::BrowserError { error });
+            .collect::<String>();
+        return Err(if error.is_empty() {
+            PasteError::BrowserErrorUnnamed
+        } else {
+            PasteError::BrowserError { error }
+        });
     }
     let (code, raw_code) = exactly_one(query, "code", PasteError::MissingCode)?;
-    let (state, raw_state) = exactly_one(query, "state", PasteError::MissingState)?;
+    let no_state = if advertised.state.is_some() {
+        PasteError::MissingState
+    } else {
+        PasteError::UnverifiableWithoutState
+    };
+    let (state, raw_state) = exactly_one(query, "state", no_state)?;
     if let Some(expected) = &advertised.state
         && state.as_str() != expected
     {
@@ -480,6 +503,17 @@ pub fn validate(url: &RedirectUrl, advertised: &Advertised) -> Result<Delivery, 
         host_header: advertised.target(),
         request_target: Zeroizing::new(format!("{}?{query}", parsed.path())),
         secrets,
+    })
+}
+
+/// Whether `text` starts with an RFC 3986 scheme and `://`: a letter, then letters, digits, `+`,
+/// `-` or `.`. Only the text before the **first** `://` is looked at, so a URL in the query of a
+/// scheme-less paste is not mistaken for the paste's own scheme.
+fn has_scheme(text: &str) -> bool {
+    text.split_once("://").is_some_and(|(scheme, _)| {
+        let mut chars = scheme.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
     })
 }
 
