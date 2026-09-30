@@ -267,6 +267,72 @@ async fn a_repo_path_row_puts_its_files_in_the_preview() {
 }
 
 #[tokio::test]
+async fn the_preview_fires_a_glob_skill_over_repo_box_path() {
+    // MOD-9 D124: the preview runs the engine's pass over this box's `repo_box_path` checkout, so a
+    // project `glob` attachment matching a file there renders, with no previous attempt.
+    use htui_core::model::{Attachment, BindingChange, NewSkill, SkillBindingKey, SkillId};
+    use htui_core::store::CasOutcome;
+
+    let (store, _dir) = a_project_with_a_checkout().await;
+    let (skill, _) = store
+        .create_skill(NewSkill {
+            id: SkillId::new(),
+            name: "rust-glob".to_owned(),
+            description: String::new(),
+            body: "Glob body.".to_owned(),
+            source: serde_json::json!({}),
+            created_by: ids::USER,
+        })
+        .await
+        .expect("a new skill");
+    let outcome = store
+        .set_skill_binding(
+            SkillBindingKey {
+                skill: skill.id,
+                project: Some(ids::PROJECT_HTUI),
+                phase: None,
+            },
+            None,
+            BindingChange::Attach(Attachment {
+                pinned_version: None,
+                position: 0,
+                activation: Activation::Glob,
+                globs: vec!["**/*.rs".to_owned()],
+                languages: Vec::new(),
+            }),
+        )
+        .await
+        .expect("the project attach is legal");
+    assert!(
+        matches!(outcome, CasOutcome::Applied(Some(_))),
+        "{outcome:?}"
+    );
+    let scope = platform_scope().await;
+    let item = item_id("FEAT-1").await;
+
+    let preview = preview::build(&Backend::memory(store), item, None, &scope)
+        .await
+        .expect("the demo store answers every prompt read");
+    let assembled = preview.outcome.as_ref().expect("the demo item assembles");
+
+    assert!(
+        assembled.text.contains("<skill name=\"rust-glob\""),
+        "{}",
+        assembled.text
+    );
+    let choice = assembled
+        .trim
+        .skill_choices
+        .iter()
+        .find(|choice| choice.name == "rust-glob")
+        .expect("`rust-glob` is a recorded candidate");
+    assert_eq!(
+        (choice.reason, choice.active, choice.path.as_deref()),
+        (ChoiceReason::Matched, true, Some("htui:src/lib.rs"))
+    );
+}
+
+#[tokio::test]
 async fn a_repo_without_a_path_row_records_no_path() {
     // ANA-5 §4.5 step 1: every repo of the project is a root, and one with no row on this box is
     // recorded `no_path` rather than dropped, with `select`'s own note saying nothing was scanned.
@@ -327,7 +393,8 @@ async fn the_preview_declares_its_stand_ins() {
     for stand_in in [
         "preview: documents are latest-per-kind; ANA-2 input_kinds resolution arrives with MOD-4",
         "preview: phase-level skills come from the first phase of the item's graph that uses \
-         this template; a glob attachment records no_path until glob activation lands (MOD-9 OQ-12)",
+         this template; glob attachments match this box's repo_box_path listing, narrowed to \
+         touched_paths, with no previous attempt",
         "preview: output_kind defaults to the template name; the phase row's value arrives with \
          MOD-4",
         "preview: command_queue exposure is a phase setting (R-MCP-4); absent until MOD-4",
@@ -339,10 +406,11 @@ async fn the_preview_declares_its_stand_ins() {
     }
 }
 
-/// MOD-9 D45's skills stand-in, verbatim.
+/// MOD-9 D45, D124's skills stand-in, verbatim.
 const SKILLS_NOTE: &str = "preview: phase-level skills come from the first phase of the item's \
-                           graph that uses this template; a glob attachment records no_path \
-                           until glob activation lands (MOD-9 OQ-12)";
+                           graph that uses this template; glob attachments match this box's \
+                           repo_box_path listing, narrowed to touched_paths, with no previous \
+                           attempt";
 
 /// The start of MOD-9 D45's second note, the one a preview adds when no phase uses its template.
 const NO_PHASE: &str = "preview: no phase of this item's graph uses template";

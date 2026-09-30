@@ -33,7 +33,7 @@ use std::time::Instant;
 
 use tracing::warn;
 
-use htui_core::model::{BoxId, Repo, RepoBoxPath, RepoId, RunStepTree};
+use htui_core::model::{BoxId, Repo, RepoBoxPath, RepoId, RunStepTree, StepFiles};
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, BuiltinRanker, ExcerptAudit, ExcerptCandidate, ExcerptCaps, ExcerptProvider,
     ExcerptRequest, ExcerptSet, Listing, OwnedExcerptRequest, PathPrefix, ProviderError, RepoPath,
@@ -986,6 +986,56 @@ pub fn excerpt_pass(
         provider_set,
         est,
     )
+}
+
+/// MOD-9 D120: one step's pass — the excerpt set and the `glob` file set, from one walk.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepPass {
+    /// For `spec.excerpts`.
+    pub excerpts: ExcerptSet,
+    /// For `spec.step_files`, already scrub-filtered (MOD-9 D116).
+    pub files: StepFiles,
+}
+
+/// The shared pass for `spec` (MOD-9 D120, D121, D132): the excerpt set **and** the `glob` file
+/// set, from one walk of the roots. The one function both the engine's phase prompt and the
+/// Backlog preview call, so the bytes a maintainer previews and the bytes a run sends cannot drift
+/// (MOD-2 D103).
+///
+/// 1. `resolve_excerpt_caps(app)`.
+/// 2. `spec.body` parsed in `spec.role`: whether it places `{{excerpts}}` and `{{skills}}` (a
+///    parse error places neither). The walk is wanted for excerpts when `{{excerpts}}` is placed,
+///    and for skills when `{{skills}}` is placed and a collapsed winner is a versioned `glob`
+///    ([`needs_files`](htui_core::model::needs_files)).
+/// 3. Neither: no walk. The roots are recorded unscanned with the note
+///    ``excerpt: template `name` places no {{excerpts}}; nothing was read``, and the file set
+///    holds only `input.changed_paths`.
+/// 4. Otherwise the roots are listed once — under `tokio::task::spawn_blocking` when one is
+///    readable, inline (no I/O) when none is — and the file set is built from that listing,
+///    `input.touched_prefixes` and `input.changed_paths`
+///    ([`step_files`](htui_core::prompt::excerpt::step_files)).
+/// 5. `drop_unmaskable_files` runs on the file set on **every** branch, before the residual, and
+///    its note is the last of `excerpts.notes`.
+/// 6. `{{excerpts}}` not placed: no file is read. The set records the listing's roots and
+///    nothing considered, with the note
+///    ``excerpt: template `name` places no {{excerpts}}; the walk listed files for glob skills
+///    only`` and then the listing's own notes, each withheld when the scrubber would change it.
+/// 7. Otherwise the budget is `excerpt_residual` over the spec **with** the file set, so a newly
+///    active skill is paid for before excerpts are chosen; an `Err` records the roots unscanned,
+///    because `assemble` will refuse the same way. Then [`excerpt_pass`] selects over the same
+///    listing (blocking hop when readable), and the notes are filtered as [`excerpts_for`] did.
+///
+/// Every hop fails open: a `JoinError` in the walk records the roots unscanned with today's
+/// "panicked"/"cancelled" note and a file set of the changed paths alone; one in the selection
+/// keeps the listing's file set. Caller notes always come first.
+pub async fn step_pass(
+    spec: &PromptSpec,
+    input: PassInput,
+    app: &BTreeMap<String, serde_json::Value>,
+    scrubber: &dyn Scrubber,
+) -> StepPass {
+    let _ = (spec, input, app, scrubber);
+    todo!("MOD-9 D120: the shared pass")
 }
 
 /// The excerpt set for `spec` (plan D109, D118, D119; MOD-7 milestone 4 D126, D128).

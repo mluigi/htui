@@ -12893,6 +12893,401 @@ mod tests {
         assert!(!text.contains("<file path="), "{text}");
     }
 
+    // -- MOD-9 D120-D123: glob attachments fire --------------------------------------------------
+
+    /// MOD-9 D122: a project `glob` attachment of a new skill `name` over `globs`, written through
+    /// `set_skill_binding`, on every phase of the HTUI project.
+    async fn attach_glob(
+        harness: &Harness,
+        name: &str,
+        globs: &[&str],
+    ) -> htui_core::model::SkillId {
+        use htui_core::model::{
+            Activation, Attachment, BindingChange, NewSkill, SkillBindingKey, SkillId,
+        };
+
+        let store = &harness.orch.store;
+        let (skill, _) = store
+            .create_skill(NewSkill {
+                id: SkillId::new(),
+                name: name.to_owned(),
+                description: String::new(),
+                body: "Glob body.".to_owned(),
+                source: serde_json::json!({}),
+                created_by: ids::USER,
+            })
+            .await
+            .expect("a new skill");
+        let outcome = store
+            .set_skill_binding(
+                SkillBindingKey {
+                    skill: skill.id,
+                    project: Some(ids::PROJECT_HTUI),
+                    phase: None,
+                },
+                None,
+                BindingChange::Attach(Attachment {
+                    pinned_version: None,
+                    position: 0,
+                    activation: Activation::Glob,
+                    globs: globs.iter().map(|glob| (*glob).to_owned()).collect(),
+                    languages: Vec::new(),
+                }),
+            )
+            .await
+            .expect("the project attach is legal");
+        assert!(
+            matches!(outcome, CasOutcome::Applied(Some(_))),
+            "{outcome:?}"
+        );
+        skill.id
+    }
+
+    /// The recorded choice named `name`.
+    fn choice_named<'a>(
+        choices: &'a [htui_core::model::SkillChoice],
+        name: &str,
+    ) -> &'a htui_core::model::SkillChoice {
+        choices
+            .iter()
+            .find(|choice| choice.name == name)
+            .unwrap_or_else(|| panic!("`{name}` is a recorded candidate: {choices:?}"))
+    }
+
+    /// A stored step's `trim_record.skill_choices`, decoded.
+    fn stored_choices(step: &htui_core::model::RunStep) -> Vec<htui_core::model::SkillChoice> {
+        serde_json::from_value(
+            step.trim_record
+                .as_ref()
+                .and_then(|record| record.get("skill_choices"))
+                .cloned()
+                .expect("the step's trim record carries its skill choices"),
+        )
+        .expect("the record's skill choices decode")
+    }
+
+    /// A stored step's `trim_record.notes`.
+    fn stored_notes(step: &htui_core::model::RunStep) -> Vec<String> {
+        step.trim_record
+            .as_ref()
+            .and_then(|record| record.get("notes"))
+            .and_then(serde_json::Value::as_array)
+            .expect("the step's trim record carries its notes")
+            .iter()
+            .filter_map(|note| note.as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// MOD-9 D120, D122: a `glob` skill whose glob matches a file of the step's own tree renders,
+    /// and its choice names the file that woke it.
+    #[tokio::test]
+    async fn a_glob_skill_fires_on_a_file_in_the_step_tree() {
+        use htui_core::model::ChoiceReason;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        attach_glob(&harness, "rust-glob", &["**/*.rs"]).await;
+        harness_engine!(harness.orch, engine);
+
+        let prompt = engine
+            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .await
+            .expect("no store fault")
+            .expect("the `prd` prompt assembles");
+
+        assert!(
+            prompt.text.contains("<skill name=\"rust-glob\""),
+            "{}",
+            prompt.text
+        );
+        let choice = choice_named(&prompt.trim.skill_choices, "rust-glob");
+        assert_eq!(
+            (choice.reason, choice.active, choice.path.as_deref()),
+            (ChoiceReason::Matched, true, Some("htui:src/lib.rs"))
+        );
+    }
+
+    /// MOD-9 D112: the tree was reached and no file matches, so the choice is `no_match`, not
+    /// `no_path`, and nothing renders.
+    #[tokio::test]
+    async fn a_glob_skill_with_no_matching_file_records_no_match() {
+        use htui_core::model::ChoiceReason;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_, row, snapshot, prd) =
+            excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        attach_glob(&harness, "py-glob", &["**/*.py"]).await;
+        harness_engine!(harness.orch, engine);
+
+        let prompt = engine
+            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .await
+            .expect("no store fault")
+            .expect("the `prd` prompt assembles");
+
+        assert!(
+            !prompt.text.contains("<skill name=\"py-glob\""),
+            "{}",
+            prompt.text
+        );
+        let choice = choice_named(&prompt.trim.skill_choices, "py-glob");
+        assert_eq!(
+            (choice.reason, choice.active, choice.path.as_deref()),
+            (ChoiceReason::NoMatch, false, None)
+        );
+    }
+
+    /// The retry set-up of `a_forward_with_nothing_to_render_degrades_to_trim_notes`: `prd` runs
+    /// the `implement` template ungated with one retry and a verify that fails attempt 1, over the
+    /// primary repo `htui` holding `src/lib.rs` in a real tree, with an `md-style` `glob`
+    /// attachment over `**/*.md`. Returns the repo.
+    async fn glob_retry_prologue(harness: &Harness, dir: &std::path::Path) -> RepoId {
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                if phase.name == "prd" {
+                    phase.gate = Gate::Never;
+                    phase.retry_limit = 1;
+                    phase.verify_command = Some("cargo test".to_owned());
+                    phase.template_name = "implement".to_owned();
+                }
+            })
+            .await;
+        harness
+            .orch
+            .verifier
+            .script_report(crate::fake::FakeVerifier::fail(1));
+        let repo = harness.add_primary_repo().await;
+        harness.orch.isolator.root_trees_at(dir);
+        write_tree(dir, repo, "src/lib.rs", "pub fn marker() {}\n");
+        attach_glob(harness, "md-style", &["**/*.md"]).await;
+        repo
+    }
+
+    /// `StartRun` on `FEAT-3`, and its two `prd` attempts once attempt 2 has run.
+    async fn run_two_attempts(
+        harness: &Harness,
+    ) -> (htui_core::model::RunStep, htui_core::model::RunStep) {
+        let CommandOutcome::Started { run, rest } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+        assert_eq!(
+            (rest.run, rest.position),
+            (RunStatus::AwaitingApproval, Some(1)),
+            "attempt 2 ran, passed, and `plan` parked"
+        );
+        let steps = harness.orch.steps(run).await;
+        let attempt = |n: i32| {
+            steps
+                .iter()
+                .find(|step| step.position == 0 && step.attempt == n)
+                .unwrap_or_else(|| panic!("attempt {n} ran"))
+                .clone()
+        };
+        (attempt(1), attempt(2))
+    }
+
+    /// MOD-9 D121, D122: attempt 2 matches against attempt 1's winner's changed paths. The tree
+    /// holds no `.md` file, so only the changed path can wake `md-style`; an id outside the run's
+    /// scope is dropped.
+    #[tokio::test]
+    async fn a_retry_matches_the_previous_attempts_changed_paths() {
+        use crate::isolate::ChangedPaths;
+        use htui_core::model::ChoiceReason;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let repo = glob_retry_prologue(&harness, dir.path()).await;
+        harness.orch.isolator.script_changed_paths(ChangedPaths {
+            paths: vec![
+                (repo, "docs/notes.md".to_owned()),
+                (RepoId::new(), "stray.md".to_owned()),
+            ],
+            truncated: false,
+        });
+
+        let (first, second) = run_two_attempts(&harness).await;
+
+        let before = stored_choices(&first);
+        let before = choice_named(&before, "md-style");
+        assert_eq!(
+            (before.reason, before.path.as_deref()),
+            (ChoiceReason::NoMatch, None),
+            "attempt 1 has no previous attempt and no `.md` in its tree"
+        );
+        let after = stored_choices(&second);
+        let after = choice_named(&after, "md-style");
+        assert_eq!(
+            (after.reason, after.active, after.path.as_deref()),
+            (ChoiceReason::Matched, true, Some("htui:docs/notes.md"))
+        );
+        let requests = harness.orch.isolator.changed_path_requests();
+        assert_eq!(requests.len(), 1, "only attempt 2 asks: {requests:?}");
+        assert!(
+            !requests[0].trees.is_empty(),
+            "attempt 1's tree rows: {requests:?}"
+        );
+        assert!(
+            requests[0]
+                .trees
+                .iter()
+                .chain(&requests[0].commits)
+                .all(|id| *id == first.id),
+            "every row is attempt 1's: {requests:?}"
+        );
+    }
+
+    /// MOD-9 D122: an isolator error is a trim note on attempt 2, never a failed step.
+    #[tokio::test]
+    async fn changed_paths_unavailable_is_a_note_not_a_failure() {
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        glob_retry_prologue(&harness, dir.path()).await;
+        harness.orch.isolator.fail_changed_paths("index.lock held");
+
+        let (_, second) = run_two_attempts(&harness).await;
+
+        assert_eq!(second.status, StepStatus::Done);
+        let notes = stored_notes(&second);
+        assert!(
+            notes.iter().any(|note| {
+                note.starts_with("changed paths unavailable: ") && note.contains("index.lock held")
+            }),
+            "{notes:?}"
+        );
+    }
+
+    /// MOD-9 D122: a fan-out group assembles before any candidate tree exists, and its file set is
+    /// this box's `repo_box_path` checkout.
+    #[tokio::test]
+    async fn a_fan_out_group_matches_under_repo_box_path() {
+        use htui_core::model::ChoiceReason;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let repo = harness.add_primary_repo().await;
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir_all(checkout.join("src")).expect("mkdir");
+        std::fs::write(checkout.join("src/lib.rs"), "pub fn marker() {}\n").expect("write");
+        harness
+            .orch
+            .store
+            .upsert_repo_box_path(&htui_core::model::RepoBoxPath {
+                repo_id: repo,
+                box_id: harness.orch.box_id(),
+                local_path: checkout.to_string_lossy().into_owned(),
+                updated_at: harness.orch.clock.now(),
+            })
+            .await
+            .expect("the repo and the box both have rows");
+        touch_feat_3(&harness, &["src/lib.rs"]).await;
+        let (row, snapshot, prd) = skills_prologue(&harness).await;
+        attach_glob(&harness, "rust-glob", &["**/*.rs"]).await;
+        let group = htui_core::model::RunStep {
+            id: StepId::new(),
+            ..prd.clone()
+        };
+        harness_engine!(harness.orch, engine);
+        let mut spec = engine
+            .phase_spec(
+                &row,
+                &snapshot,
+                &prd,
+                &snapshot.phases[0],
+                ids::HTUI_FEAT_3,
+                true,
+            )
+            .await
+            .expect("the spec is built")
+            .expect("`prd` requires nothing");
+
+        engine
+            .with_excerpts(&row, &group, ids::HTUI_FEAT_3, &mut spec)
+            .await
+            .expect("no store fault");
+
+        assert!(spec.step_files.is_reached("htui"), "{:?}", spec.step_files);
+        let assembled =
+            htui_core::prompt::assemble(&spec, &htui_core::scrub::MinimalScrubber::new([]))
+                .expect("the spec assembles");
+        let choice = choice_named(&assembled.trim.skill_choices, "rust-glob");
+        assert_eq!(
+            (choice.reason, choice.path.as_deref()),
+            (ChoiceReason::Matched, Some("htui:src/lib.rs"))
+        );
+    }
+
+    /// MOD-9 D123: a judge runs in no tree and gets no pass, so a placed `glob` winner records
+    /// `no_path` in both orders. Pins the behaviour the judge's spec already had.
+    #[tokio::test]
+    async fn a_judge_records_no_path_for_a_placed_glob_winner() {
+        use htui_core::model::{ChoiceReason, NewPromptTemplate, PromptTemplateId};
+
+        let harness = Harness::new().await;
+        let default = htui_core::prompt::body_of("judge").expect("`judge` has a default body");
+        let body = default.replacen("{{task}}\n", "{{task}}\n{{skills}}\n", 1);
+        assert_ne!(
+            body, default,
+            "the default places `{{{{task}}}}` on its own line"
+        );
+        let appended = harness
+            .orch
+            .store
+            .append_prompt_template(
+                NewPromptTemplate {
+                    id: PromptTemplateId::new(),
+                    project_id: ids::PROJECT_HTUI,
+                    name: "judge".to_owned(),
+                    body,
+                    created_by: harness.orch.user(),
+                },
+                Some(1),
+            )
+            .await
+            .expect("a judge body may place `{{skills}}` (D48)");
+        assert!(matches!(appended, CasOutcome::Applied(_)), "{appended:?}");
+        let (row, snapshot, prd) = skills_prologue(&harness).await;
+        attach_glob(&harness, "rust-glob", &["**/*.rs"]).await;
+        let implement = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == "implement")
+            .expect("the feature graph has an implement phase");
+
+        harness_engine!(harness.orch, engine);
+        let JudgePrompts {
+            forward, reversed, ..
+        } = engine
+            .judge_prompts(&row, &snapshot, implement, 1, &[&prd])
+            .await
+            .expect("the judge's inputs are read")
+            .expect("the judge assembles");
+
+        for prompt in [&forward, &reversed] {
+            assert!(
+                choice_rows(&prompt.trim.skill_choices).contains(&(
+                    "rust-glob".to_owned(),
+                    Some(1),
+                    false,
+                    ChoiceReason::NoPath
+                )),
+                "{:?}",
+                prompt.trim.skill_choices
+            );
+        }
+    }
+
     // -- MOD-9 D44: skills reach the run -------------------------------------------------------
 
     /// The prologue every skills case shares (blueprint §4.6, D67): `FEAT-3` parked at `prd`, its
