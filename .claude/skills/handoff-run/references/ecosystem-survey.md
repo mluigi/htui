@@ -95,3 +95,26 @@ Two corrections to the M1 table above, both found while doing this:
   listing, which is what the survey read.
 
 The environment prerequisite is now the `graphify` user skill — not ecc.
+
+## htui revisit — repo-scoped forks (2026-09-30)
+
+The M3 table's user-scope paths existed only on the machine that did the fork. On the htui
+Linux host `~/.claude/commands/` never received `plan.md`/`plan-prd.md`, so `plan` and
+`plan-prd` resolved to nothing — on the host and in every `scripts/hr` sandbox, which shares
+`~/.claude`. `code-architect` and `rust-reviewer` did exist in `~/.claude/agents/`, but only
+by hand-copy on this one machine.
+
+The M3 reason for user scope (a session cwd of `engine/` missing a workspace-root
+`.claude/`) does not apply to htui: it is a single repo, and a sandbox clone carries its own
+`.claude/`. The forks now live in the repo, where every checkout and sandbox sees them:
+
+| Name | Path | Source |
+|---|---|---|
+| `plan` | `.claude/skills/plan/SKILL.md` | ecc `c888d2b` `commands/plan.md`, verbatim plus `name:` |
+| `plan-prd` | `.claude/skills/plan-prd/SKILL.md` | ecc `c888d2b` `commands/plan-prd.md`, verbatim plus `name:` |
+| `code-architect` | `.claude/agents/code-architect.md` | `~/.claude/agents/` copy (Gortex tools added 2026-09-24) |
+| `rust-reviewer` | `.claude/agents/rust-reviewer.md` | `~/.claude/agents/` copy |
+
+Project-scope agents take precedence over same-named user-scope ones, so the user-scope copies
+can stay for other repos. With `graphify` already tracked at `.claude/skills/graphify/`, **the workflow
+has no user-scope prerequisite left.**
