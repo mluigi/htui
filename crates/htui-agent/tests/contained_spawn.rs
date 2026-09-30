@@ -48,10 +48,12 @@ fn every_contained_spawn_opens_the_window_and_a_raw_one_does_not() {
     // Built before the hook goes in, so a failure here still reports its message. Two workers, so
     // every panic in cases 1-4 happens on a thread other than this one. One blocking thread, so
     // case 4's raw closure runs on the very thread case 1's contained closure panicked on: its
-    // `false` then proves the window closed again after a panic, on a thread tokio reuses.
+    // `false` then proves the window closed again after a panic, on a thread tokio reuses. Kept
+    // alive for an hour rather than tokio's 10 s, so a slow run cannot retire it between the two.
     let pool = Builder::new_multi_thread()
         .worker_threads(2)
         .max_blocking_threads(1)
+        .thread_keep_alive(core::time::Duration::from_secs(3600))
         .build()
         .expect("a two-worker runtime builds");
     // One thread for case 5: the parked task and the raw task must share it, or the raw task would

@@ -184,3 +184,25 @@ the sites use the helper are structural: the clippy guard (D5) and its mutation 
 | `#[expect(…, reason = …)]` has precedent in the repo | true | `crates/htui-agent/tests/recorder.rs:263` |
 | The root `clippy.toml` holds only `msrv = "1.98"`, so copying that line keeps the crate's config complete | true | `clippy.toml` |
 | No production seam makes `system_facts` or the unpack panic on demand | true | `HardwareSource` fake replaces `SystemHardware` whole (`hardware.rs`); `archive::unpack` takes real paths |
+
+---
+
+## Amendments after review (2026-09-30, maintainer-approved)
+
+The `rust-reviewer` pass (3 MEDIUM, 5 LOW, all applied; re-review approved) changed two statements
+above. They are recorded here rather than edited in place, so the confirmed text stays as it was
+approved.
+
+- **D7 reversed.** `std::thread::spawn`, `std::thread::Builder::spawn`,
+  `std::thread::Builder::spawn_scoped` and `std::thread::Scope::spawn` are now in the lint. The
+  excerpt provider thread carries a reasoned `#[expect]` naming `propose_caught`. The lint also
+  covers `Runtime::spawn`/`spawn_blocking`, `JoinSet::spawn_on`/`spawn_blocking_on`, and the
+  `spawn_local` family. `JoinSet`'s `Extend`/`FromIterator` spawn inside tokio, where no lint can
+  see them, and the module doc forbids them.
+- **"Unchanged" in Out of scope was wrong.** MOD-65 **widens** MOD-53's abort case from `answering`
+  tasks to all 21 sites. Before, a panic in the ACP `run_session` or the unpack restored the
+  terminal on its first hook call, even when a `Drop` then panicked and aborted. Now the first hook
+  skips the restore, so the abort leaves the terminal raw.
+- **Deferred by the maintainer: the cancel drop.** tokio drops a cancelled task's future (abort,
+  runtime shutdown) outside the window, so a `Drop` that panics on cancel is survived by tokio but
+  still restores the terminal.
