@@ -614,8 +614,6 @@ impl AttachPane {
                 change: BindingChange::Detach,
             }),
             sent: Box::new(Sent::Binding {
-                key: row,
-                token: Some(token),
                 change: BindingChange::Detach,
                 target,
             }),
@@ -643,12 +641,7 @@ impl AttachPane {
                 expected: token,
                 change: change.clone(),
             }),
-            sent: Box::new(Sent::Binding {
-                key,
-                token,
-                change,
-                target,
-            }),
+            sent: Box::new(Sent::Binding { change, target }),
         }
     }
 

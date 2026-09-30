@@ -25,8 +25,7 @@ use core::cell::Cell;
 use chrono::{DateTime, Utc};
 use htui_core::model::skill::validate_name;
 use htui_core::model::{
-    Activation, BindingChange, BoundSkill, SkillBindingKey, SkillId, SkillLevel, SkillPatch,
-    SkillVersion,
+    Activation, BindingChange, BoundSkill, SkillId, SkillLevel, SkillPatch, SkillVersion,
 };
 use htui_core::prompt::{TokenEstimator, render};
 use htui_core::store::{invalid_skill_name, skill_body_refusal};
@@ -367,41 +366,24 @@ struct Pending {
 }
 
 /// The write in flight and what it carries (D98): the bodies the estimate and the "later edits
-/// kept" rule compare with, and the attachment's change and name for the landing (MOD-59: the
-/// landing itself is the reply's outcome, never a search for these). Custom `Debug`: body lengths
-/// only.
+/// kept" rule compare with, and the attachment's change and name for the landing and the stale
+/// sentence. Nothing else: which skill or row was written, its name and its new token are the
+/// reply's outcome (MOD-59), never a search for what was sent. Custom `Debug`: body lengths only.
 pub(super) enum Sent {
     /// `CreateSkill`.
     Create {
-        /// The new skill's name.
-        name: String,
         /// Version 1's body.
         body: String,
     },
-    /// `EditSkill`.
-    Rename {
-        /// Which skill.
-        skill: SkillId,
-        /// The token it carried.
-        token: DateTime<Utc>,
-        /// What it changes.
-        patch: SkillPatch,
-    },
+    /// `EditSkill`: the outcome names the skill and its name.
+    Rename,
     /// `SaveSkillVersion`.
     Version {
-        /// Which skill.
-        skill: SkillId,
-        /// The head it carried; the save writes `token + 1`.
-        token: i32,
         /// The body.
         body: String,
     },
     /// `SetSkillBinding`.
     Binding {
-        /// The attachment's key.
-        key: SkillBindingKey,
-        /// The row's `updated_at` it carried; `None` for "no row".
-        token: Option<DateTime<Utc>>,
         /// Attach or detach.
         change: BindingChange,
         /// What the notice calls the row.
@@ -412,36 +394,17 @@ pub(super) enum Sent {
 impl core::fmt::Debug for Sent {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Create { name, body } => f
+            Self::Create { body } => f
                 .debug_struct("Create")
-                .field("name", name)
                 .field("body_len", &body.len())
                 .finish(),
-            Self::Rename {
-                skill,
-                token,
-                patch,
-            } => f
-                .debug_struct("Rename")
-                .field("skill", skill)
-                .field("token", token)
-                .field("patch", patch)
-                .finish(),
-            Self::Version { skill, token, body } => f
+            Self::Rename => f.write_str("Rename"),
+            Self::Version { body } => f
                 .debug_struct("Version")
-                .field("skill", skill)
-                .field("token", token)
                 .field("body_len", &body.len())
                 .finish(),
-            Self::Binding {
-                key,
-                token,
-                change,
-                target,
-            } => f
+            Self::Binding { change, target } => f
                 .debug_struct("Binding")
-                .field("key", key)
-                .field("token", token)
                 .field("change", change)
                 .field("target", target)
                 .finish(),
@@ -1053,13 +1016,9 @@ impl LibraryView {
                 scope: ctx.scope.clone(),
                 skill,
                 expected: token,
-                patch: patch.clone(),
-            },
-            Sent::Rename {
-                skill,
-                token,
                 patch,
             },
+            Sent::Rename,
             ctx,
         );
     }
@@ -1131,10 +1090,7 @@ impl LibraryView {
                     description: description.clone(),
                     body: TemplateBody::new(body.clone()),
                 },
-                Sent::Create {
-                    name: name.clone(),
-                    body,
-                },
+                Sent::Create { body },
             ),
             Target::Version { skill, .. } => {
                 let head = self
@@ -1155,11 +1111,7 @@ impl LibraryView {
                         expected: editor.token,
                         body: TemplateBody::new(body.clone()),
                     },
-                    Sent::Version {
-                        skill: *skill,
-                        token: editor.token,
-                        body,
-                    },
+                    Sent::Version { body },
                 )
             }
         };
@@ -1233,22 +1185,19 @@ impl LibraryView {
             return;
         }
         let landed = match (outcome, self.sent.take()) {
-            (SkillWrite::Created { skill, name }, Some(Sent::Create { body, .. })) => {
+            (SkillWrite::Created { skill, name }, Some(Sent::Create { body })) => {
                 self.landed_version(*skill, name, 1, &body)
             }
-            (SkillWrite::Versioned { skill, version }, Some(Sent::Version { body, .. })) => {
+            (SkillWrite::Versioned { skill, version }, Some(Sent::Version { body })) => {
                 let name = snapshot_name(self.snapshot.as_ref(), *skill);
                 self.landed_version(*skill, &name, *version, &body)
             }
-            (SkillWrite::Edited { skill, name }, Some(Sent::Rename { .. })) => {
+            (SkillWrite::Edited { skill, name }, Some(Sent::Rename)) => {
                 self.select(*skill);
                 self.mode = Mode::Browse;
                 format!("saved `{name}`")
             }
-            (
-                SkillWrite::Attached { key, updated_at },
-                Some(Sent::Binding { change, target, .. }),
-            ) => {
+            (SkillWrite::Attached { key, updated_at }, Some(Sent::Binding { change, target })) => {
                 let kept = self
                     .attach
                     .as_mut()
@@ -1259,7 +1208,7 @@ impl LibraryView {
                     format!("attached to {target}")
                 }
             }
-            (SkillWrite::Detached { key }, Some(Sent::Binding { change, target, .. })) => {
+            (SkillWrite::Detached { key }, Some(Sent::Binding { change, target })) => {
                 if let Some(pane) = &mut self.attach {
                     pane.on_landed(*key, &change, None);
                 }
@@ -1768,7 +1717,7 @@ mod tests {
     use chrono::TimeDelta;
     use htui_core::clock::{TestClock, epoch};
     use htui_core::fixtures::ids;
-    use htui_core::model::{Attachment, Scope};
+    use htui_core::model::{Attachment, Scope, SkillBindingKey};
     use htui_core::store::{BLANK_SKILL_BODY, CasOutcome, MemStore, WriteStore as _};
     use htui_store::Backend;
 
@@ -2517,7 +2466,6 @@ mod tests {
         let mut view = LibraryView {
             busy: Some("create_skill"),
             sent: Some(Sent::Create {
-                name: "docs-style".to_owned(),
                 body: "B.\n".to_owned(),
             }),
             mode: Mode::Editing(Editor::new(target, 0, None, "B.\n")),
@@ -2558,7 +2506,6 @@ mod tests {
         let mut view = LibraryView {
             busy: Some("edit_skill"),
             sent: Some(Sent::Create {
-                name: "docs-style".to_owned(),
                 body: "B.\n".to_owned(),
             }),
             mode: Mode::Editing(Editor::new(target, 0, None, "B.\n")),
@@ -2833,8 +2780,6 @@ mod tests {
         let view = LibraryView {
             mode: Mode::Editing(editor),
             sent: Some(Sent::Version {
-                skill: ids::SKILL_TESTS,
-                token: 1,
                 body: "secret sent".to_owned(),
             }),
             ..LibraryView::default()
@@ -2846,7 +2791,6 @@ mod tests {
         let create = format!(
             "{:?}",
             Sent::Create {
-                name: "docs".to_owned(),
                 body: "secret body".to_owned(),
             }
         );
