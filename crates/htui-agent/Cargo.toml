@@ -21,7 +21,7 @@ serde      = { workspace = true }
 serde_json = { workspace = true }
 thiserror  = { workspace = true }
 sha2       = { workspace = true }
-tokio      = { workspace = true, features = ["sync", "rt", "time", "process", "io-util", "fs"] }
+tokio      = { workspace = true, features = ["sync", "rt", "time", "process", "io-util", "fs", "net"] }
 tracing    = { workspace = true }
 # Milestone 2 (T7): the ACP config type the launch row builds, the process supervisor that owns
 # the child, `AsyncRead`/`AsyncWrite` -> `futures` adapters for the SDK's byte streams, and the
@@ -33,6 +33,10 @@ which                 = { workspace = true }
 # Milestone 3 (T11): `edit_proposal.diff` is a unified diff synthesized from the old/new full text
 # ACP carries (`docs/ANA-4.md` §4.3); this is the first consumer of the workspace declaration.
 similar               = { workspace = true }
+# MOD-22 T1: `auth/loopback.rs` parses the advertised redirect (`url`), holds a pasted authorization
+# code in a wiped buffer (`zeroize`) and delivers it over a plain loopback socket (tokio `net`).
+url                   = { workspace = true }
+zeroize               = { workspace = true }
 cap-std               = { workspace = true }
 # Milestone 5 (T24): the probe's version tier compiles `VersionProbe.pattern` (`regex`) and
 # compares the capture with `VersionProbe.min` (`semver`), and its glob walker expands a leading

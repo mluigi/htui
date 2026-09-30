@@ -3094,9 +3094,11 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
  "uuid",
  "which",
  "windows",
+ "zeroize",
  "zip",
 ]
 

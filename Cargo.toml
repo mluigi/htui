@@ -131,6 +131,10 @@ unicode-segmentation   = "1.13"
 # MOD-23 D236 (OQ-2): the agent form's `args` field as POSIX shell words. 1.1.1 is already compiled
 # as a dependency of agent-client-protocol, so this promotes a transitive crate and adds nothing.
 shell-words            = "1.1"
+# MOD-22 D264/D267 (OQ-5): the login pane's paste-back reads a `redirect_uri` nested in another
+# URL's query and compares loopback hosts. 2.5.8 is already compiled as a dependency of `reqwest`
+# and `tower-http`, so this promotes a transitive crate and adds nothing.
+url                    = "2.5"
 
 [workspace.lints.rust]
 unsafe_code                   = "forbid"
