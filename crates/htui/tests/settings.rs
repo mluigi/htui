@@ -3437,10 +3437,21 @@ async fn t_sends_set_agent_on_box_with_the_inverse_of_the_switch() {
         ),
         "{requests:?}"
     );
+    // A row a probe has answered on this box: its verdict is what decides now.
+    let mut probed_beta = probed_row(
+        "beta",
+        true,
+        Some("0.48.0"),
+        Some(json!({ "status": "ready", "source": "probe" })),
+    );
+    probed_beta.agent.id = beta_id;
+    if let Some(on_box) = probed_beta.on_box.as_mut() {
+        on_box.agent_id = beta_id;
+    }
     bench.reply(
         &mut section,
         &written(
-            Vec::new(),
+            vec![probed_beta],
             AgentWrite::Switched {
                 id: beta_id,
                 name: "beta".to_owned(),
@@ -3453,6 +3464,42 @@ async fn t_sends_set_agent_on_box_with_the_inverse_of_the_switch() {
         note.contains("`beta` switched on; the probe's verdict decides"),
         "{note}"
     );
+}
+
+/// Review L-2: switching on a row no probe has answered on this box says so and offers `r`, rather
+/// than promising a verdict that does not exist: no `agent_box` row, a bare one the switch wrote,
+/// and a row the re-read lacks all read the same.
+#[tokio::test]
+async fn switching_on_an_unprobed_row_says_not_probed_yet() {
+    let bench = SectionBench::new().await;
+    let absent = registry_row("absent", false);
+    let mut bare = probed_row("bare", true, None, None);
+    if let Some(on_box) = bare.on_box.as_mut() {
+        on_box.probed_at = None;
+    }
+    for (rows, id, name) in [
+        (vec![absent.clone()], absent.agent.id, "absent"),
+        (vec![bare.clone()], bare.agent.id, "bare"),
+        (Vec::new(), absent.agent.id, "absent"),
+    ] {
+        let mut section = section_over(&bench, rows.clone());
+        let _ = bench.drained();
+        bench.reply(
+            &mut section,
+            &written(
+                rows,
+                AgentWrite::Switched {
+                    id,
+                    name: name.to_owned(),
+                    enabled: true,
+                },
+            ),
+        );
+        assert_eq!(
+            note_line(&render_section(&section, &bench.ctx())),
+            format!("`{name}` switched on; not probed yet \u{b7} r probes")
+        );
+    }
 }
 
 /// D232: `n`, `e` and `t` are refused by one sentence while a probe, an install or a login runs.

@@ -1342,9 +1342,19 @@ impl AgentsSection {
                     self.notice = Some(GONE_CLOSED.to_owned());
                 }
             }
-            AgentWrite::Switched { name, enabled, .. } => {
-                self.notice = Some(if *enabled {
+            AgentWrite::Switched { id, name, enabled } => {
+                // Review L-2: with no verdict on this box — no `agent_box` row, or a bare one the
+                // switch itself wrote — there is nothing for the probe to decide yet.
+                let probed = self
+                    .agents
+                    .iter()
+                    .find(|summary| summary.agent.id == *id)
+                    .and_then(|summary| summary.on_box.as_ref())
+                    .is_some_and(|row| row.probe.is_some() || row.probed_at.is_some());
+                self.notice = Some(if *enabled && probed {
                     format!("`{name}` switched on; the probe's verdict decides")
+                } else if *enabled {
+                    format!("`{name}` switched on; not probed yet \u{b7} r probes")
                 } else {
                     format!("`{name}` switched off on this box")
                 });
