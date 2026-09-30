@@ -47,8 +47,8 @@ pub use graphs::HostGraphs;
 #[doc(hidden)]
 pub use runtime::testing;
 pub use runtime::{
-    PREEMPTED, REPOS_MOVED, Role, RunLocks, RunRuntime, UNBLOCK_MOVED, WALK_PANICKED,
-    switched_off, unknown_executor, worker_walks,
+    PREEMPTED, REPOS_MOVED, Role, RunLocks, RunRuntime, UNBLOCK_MOVED, WALK_PANICKED, switched_off,
+    unknown_executor, worker_walks,
 };
 pub use views::{
     Enabled, FrameKind, ItemActions, LiveChats, ORCH_NAMES, OrchReply, OrchRequest, ProgressSink,
