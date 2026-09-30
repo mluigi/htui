@@ -23,7 +23,7 @@
 //! [`excerpt::select`], whose filesystem half is `htui_agent::excerpt`. MOD-7 milestone 4 adds
 //! [`excerpt_residual`] (D118), [`drop_unmaskable_excerpts`] (D129) and
 //! [`withhold_unmaskable_notes`] (P-2), and MOD-9 milestone 5 adds [`drop_unmaskable_files`]
-//! (D116), which the shared pass in `htui_agent::excerpt` uses. It is the one pass both the
+//! (D116), which the shared pass `htui_agent::excerpt::step_pass` uses. It is the one pass both the
 //! engine's phase prompt and the Backlog preview run, and a caller with no readable root gets the
 //! empty audit from it.
 

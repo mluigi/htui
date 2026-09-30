@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use htui_agent::excerpt::{
     FsRepoReader, GITIGNORE_MAX_BYTES, PassInput, SkipRule, excerpt_pass, excerpt_roots,
-    excerpts_for, run_providers, step_pass, touched_prefixes, walk_pass,
+    run_providers, step_pass, touched_prefixes, walk_pass,
 };
 use htui_core::model::{
     Activation, BoundSkill, BoxId, Isolation, ProjectId, Repo, RepoBoxPath, RepoId, RunStepTree,
@@ -1237,19 +1237,20 @@ fn touched_prefixes_follow_the_overlap_primary_rule() {
 }
 
 #[tokio::test]
-async fn excerpts_for_reads_a_tree_it_can_render() {
+async fn step_pass_reads_a_tree_it_can_render() {
     let dir = tempfile::tempdir().expect("a throwaway root");
     write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
     let input = readable_input(dir.path());
     let caller_notes = input.notes.clone();
 
-    let set = excerpts_for(
+    let set = step_pass(
         &phase_spec(),
         input,
         &BTreeMap::new(),
         &MinimalScrubber::new([]),
     )
-    .await;
+    .await
+    .excerpts;
 
     assert!(
         set.files
@@ -1266,7 +1267,7 @@ async fn excerpts_for_reads_a_tree_it_can_render() {
 }
 
 #[tokio::test]
-async fn excerpts_for_skips_a_template_without_the_placeholder() {
+async fn step_pass_skips_a_template_without_the_placeholder() {
     let dir = tempfile::tempdir().expect("a throwaway root");
     write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
     let mut spec = phase_spec();
@@ -1275,13 +1276,14 @@ async fn excerpts_for_skips_a_template_without_the_placeholder() {
         .expect("`verdict` is a default body")
         .to_owned();
 
-    let set = excerpts_for(
+    let set = step_pass(
         &spec,
         readable_input(dir.path()),
         &BTreeMap::new(),
         &MinimalScrubber::new([]),
     )
-    .await;
+    .await
+    .excerpts;
 
     assert!(set.files.is_empty());
     assert_eq!(set.audit.considered, 0);
@@ -1303,15 +1305,16 @@ async fn excerpts_for_skips_a_template_without_the_placeholder() {
 }
 
 #[tokio::test]
-async fn excerpts_for_with_no_roots_is_the_empty_audit() {
+async fn step_pass_with_no_roots_is_the_empty_audit() {
     let app = BTreeMap::new();
-    let set = excerpts_for(
+    let set = step_pass(
         &phase_spec(),
         PassInput::default(),
         &app,
         &MinimalScrubber::new([]),
     )
-    .await;
+    .await
+    .excerpts;
 
     assert_eq!(set.audit.provider_set, vec![BUILTIN_ID.to_owned()]);
     assert!(set.audit.roots.is_empty());
@@ -1323,7 +1326,7 @@ async fn excerpts_for_with_no_roots_is_the_empty_audit() {
 }
 
 #[tokio::test]
-async fn excerpts_for_drops_a_file_the_scrubber_refuses() {
+async fn step_pass_drops_a_file_the_scrubber_refuses() {
     let dir = tempfile::tempdir().expect("a throwaway root");
     write(
         dir.path(),
@@ -1333,13 +1336,14 @@ async fn excerpts_for_drops_a_file_the_scrubber_refuses() {
     let mut input = readable_input(dir.path());
     input.notes = Vec::new();
 
-    let set = excerpts_for(
+    let set = step_pass(
         &phase_spec(),
         input,
         &BTreeMap::new(),
         &MinimalScrubber::new([]),
     )
-    .await;
+    .await
+    .excerpts;
 
     assert!(set.files.is_empty(), "{:?}", set.files);
     assert_eq!(set.audit.selected, 1, "the ranker chose it and paid for it");
@@ -1354,7 +1358,7 @@ async fn excerpts_for_drops_a_file_the_scrubber_refuses() {
 }
 
 #[tokio::test]
-async fn excerpts_for_never_persists_a_note_naming_a_masked_path() {
+async fn step_pass_never_persists_a_note_naming_a_masked_path() {
     // Review finding M-1. `select`'s own notes name `repo:path` as the reader listed it. A file
     // under a directory named after a known secret that the reader lists but cannot read — here,
     // bytes that are not UTF-8 — would have put the secret in the stored record.
@@ -1380,13 +1384,14 @@ async fn excerpts_for_never_persists_a_note_naming_a_masked_path() {
         changed_paths: Vec::new(),
     };
 
-    let set = excerpts_for(
+    let set = step_pass(
         &phase_spec(),
         input,
         &BTreeMap::new(),
         &MinimalScrubber::new([secret.to_owned()]),
     )
-    .await;
+    .await
+    .excerpts;
 
     assert!(set.files.is_empty(), "{:?}", set.files);
     assert!(!set.notes.is_empty(), "the unreadable file is still noted");

@@ -21,9 +21,10 @@
 //! [`crate::probe`]'s glob walker already established, and the `.gitignore` matcher is a declared
 //! **subset** rather than a glob crate.
 //!
-//! MOD-7 milestone 4 wires the pass. [`excerpts_for`] is the one function both the engine's phase
-//! prompt and the Backlog preview call, so the bytes a maintainer previews and the bytes a run sends
-//! cannot drift (MOD-2 D103).
+//! MOD-7 milestone 4 wires the pass, and MOD-9 milestone 5 makes it one walk for the excerpts and
+//! the `glob` file set. [`step_pass`] is the one function both the engine's phase prompt and the
+//! Backlog preview call, so the bytes a maintainer previews and the bytes a run sends cannot drift
+//! (MOD-2 D103).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -967,7 +968,7 @@ pub fn walk_pass(req: &OwnedExcerptRequest) -> Listing {
 
 /// §4.5 steps 3-10 over the filesystem (plan D119, MOD-9 D114): the built-in provider, then
 /// `select_listed` over a [`walk_pass`] listing already taken and an `FsRepoReader` built from the
-/// request's own caps (F-101). **Blocking** (reads files): `excerpts_for` calls it under
+/// request's own caps (F-101). **Blocking** (reads files): `step_pass` calls it under
 /// `spawn_blocking` whenever a root is readable.
 #[must_use]
 pub fn excerpt_pass(
@@ -1193,16 +1194,6 @@ pub async fn step_pass(
         excerpts.notes.push(note);
     }
     StepPass { excerpts, files }
-}
-
-/// The excerpt half of [`step_pass`], for the callers not yet moved to it (MOD-9 D133).
-pub async fn excerpts_for(
-    spec: &PromptSpec,
-    input: PassInput,
-    app: &BTreeMap<String, serde_json::Value>,
-    scrubber: &dyn Scrubber,
-) -> ExcerptSet {
-    step_pass(spec, input, app, scrubber).await.excerpts
 }
 
 /// The note a blocking hop's `JoinError` leaves: a panic, or a runtime that shut down before the
