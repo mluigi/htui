@@ -19,6 +19,12 @@ const GAP: usize = 2;
 /// How far an item row is indented under its project header.
 const INDENT: usize = 2;
 
+/// The empty list without a filter.
+pub const NO_ITEMS: &str = "No items in this workspace.";
+
+/// The empty list under a filter (MOD-13 D5).
+pub const NO_MATCH: &str = "No items match the filter.";
+
 /// Which row of the list the cursor is on.
 ///
 /// Selecting a project header is a real state, not a placeholder: it is what `Enter` folds, and
@@ -45,6 +51,8 @@ pub struct ListView<'a> {
     pub folded: &'a [ProjectId],
     /// The cursor.
     pub selected: Option<Selection>,
+    /// The active filter's summary; `None` = no filter (MOD-13 D5).
+    pub filter: Option<&'a str>,
 }
 
 /// Groups the items by project.
@@ -89,20 +97,35 @@ pub fn rows(
     out
 }
 
+/// The list pane's title: the count, then the active filter's summary when there is one
+/// (MOD-13 D5). Without a filter it is byte-for-byte the pre-MOD-13 title.
+#[must_use]
+pub fn title(count: usize, filter: Option<&str>) -> String {
+    match filter {
+        None => format!(" Backlog ({count}) "),
+        Some(summary) => format!(" Backlog ({count}) · {summary} "),
+    }
+}
+
 /// Draws the list pane.
 pub fn render(frame: &mut Frame<'_>, area: Rect, view: &ListView<'_>, theme: &Theme) {
     let block = Block::new()
         .borders(Borders::ALL)
-        .title(format!(" Backlog ({}) ", view.items.len()));
+        .title(title(view.items.len(), view.filter));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let mut lines = lines(view, theme, usize::from(inner.width));
-    if lines.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::styled("No items in this workspace.", theme.dim)),
-            inner,
-        );
+    // MOD-13 blueprint E3: every scope project has a header row even with no item under it, so
+    // an empty filtered result is told by its items, not by its lines. Unfiltered, the check is
+    // the pre-MOD-13 one.
+    if lines.is_empty() || (view.filter.is_some() && view.items.is_empty()) {
+        let empty = if view.filter.is_some() {
+            NO_MATCH
+        } else {
+            NO_ITEMS
+        };
+        frame.render_widget(Paragraph::new(Line::styled(empty, theme.dim)), inner);
         return;
     }
 
@@ -223,4 +246,21 @@ pub fn window(cursor: usize, len: usize, height: usize) -> usize {
     cursor
         .saturating_sub(height / 2)
         .min(len.saturating_sub(height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MOD-13 D5: no filter, the title every existing snapshot pins.
+    #[test]
+    fn the_title_without_a_filter_is_unchanged() {
+        assert_eq!(title(11, None), " Backlog (11) ");
+    }
+
+    /// MOD-13 D5: an active filter appends its summary after the count.
+    #[test]
+    fn the_title_with_a_filter_appends_its_summary() {
+        assert_eq!(title(2, Some("status:done")), " Backlog (2) · status:done ");
+    }
 }

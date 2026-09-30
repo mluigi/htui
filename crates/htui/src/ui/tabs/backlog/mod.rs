@@ -1,15 +1,19 @@
 //! The Backlog tab: the scope's items on the left, the selected item's detail on the right.
 //!
 //! MOD-1 is a skeleton (PRD scope): the tab reads, groups, folds and scrolls, and does not write
-//! anything. Filters and editing are MOD-13, run actions MOD-4, graph traversal MOD-14 (its hop
-//! count and the `m` key are the two lines it adds here) — each of them lands as a
+//! anything. Editing is MOD-13, run actions MOD-4, graph traversal MOD-14 (its hop count and the
+//! `m` key are the two lines it adds here) — each of them lands as a
 //! [`DetailTab`](detail::DetailTab) body or a binding, not as a change here.
+//!
+//! MOD-13 milestone 1's filters are the exception, because they narrow the list itself: the
+//! active [`BacklogFilter`] lives here, `f` opens its [`FilterForm`] as a capturing panel at the
+//! bottom of the list pane and `F` clears it (D1).
 
 pub mod detail;
 pub mod filter;
 pub mod list;
 
-use htui_core::model::{ItemFilter, ItemId, ItemSummary, ProjectId, Scope};
+use htui_core::model::{ItemId, ItemSummary, ProjectId, Scope};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 
@@ -18,6 +22,7 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::backlog::detail::{
     BodyTab, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab, RunsTab,
 };
+use crate::ui::tabs::backlog::filter::{BacklogFilter, FilterForm, FormOutcome};
 use crate::ui::tabs::backlog::list::{ListView, Selection};
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -63,6 +68,10 @@ pub struct BacklogTab {
     /// The shell's refreshes this tab has seen while active; every
     /// [`REFRESHES_PER_RUNS_POLL`]th is a `Runs` poll (MOD-41 plan D16).
     refreshes: u32,
+    /// MOD-13 D1: the active filter; `default()` = the whole scope (D5).
+    filter: BacklogFilter,
+    /// The open filter form, capturing every key while `Some`.
+    form: Option<FilterForm>,
 }
 
 impl Default for BacklogTab {
@@ -94,6 +103,8 @@ impl BacklogTab {
             detail,
             pending_reveal: None,
             refreshes: 0,
+            filter: BacklogFilter::default(),
+            form: None,
         }
     }
 
@@ -205,6 +216,41 @@ impl BacklogTab {
         self.folded.retain(|folded| *folded != project);
         self.go(Some(Selection::Item(id)), ctx);
     }
+
+    /// A key while the filter form is open (MOD-13 D1).
+    ///
+    /// Everything but a `CONTROL` chord is consumed, open or not by the form: the global keymap
+    /// resolves only what a tab passes, so a passed `q` would quit, a digit or `Tab` switch tabs,
+    /// `w` open the switcher. `CONTROL` passes so `ctrl-c` still quits and `Ctrl+F` still
+    /// searches, as from every text field (the `boxes.rs` editor rule).
+    fn on_form_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Handled::Pass;
+        }
+        let Some(form) = self.form.as_mut() else {
+            return Handled::Pass;
+        };
+        match form.on_key(key) {
+            FormOutcome::Stay => {}
+            FormOutcome::Cancel => self.form = None,
+            FormOutcome::Refused(sentence) => ctx.emit(Action::Error(sentence)),
+            FormOutcome::Apply(filter) => {
+                self.form = None;
+                self.apply(filter, ctx);
+            }
+        }
+        Handled::Consumed
+    }
+
+    /// Sets the filter and re-reads: one `Items`, the request kind the unfiltered list uses, so
+    /// the shell's staleness index supersedes an earlier read (MOD-13 D2). An unchanged filter
+    /// still reads.
+    fn apply(&mut self, filter: BacklogFilter, ctx: &Ctx<'_>) {
+        self.filter = filter;
+        // A filtered reply must not decide a reveal sent before it (D251): the item may be hidden.
+        self.pending_reveal = None;
+        ctx.request(self.filter.to_request(ctx.scope));
+    }
 }
 
 impl Tab for BacklogTab {
@@ -216,20 +262,22 @@ impl Tab for BacklogTab {
         "Backlog"
     }
 
+    /// The list under the active filter (MOD-13 D2); no filter is the whole scope (D5).
     fn wants_requests(&self, scope: &Scope) -> Vec<StoreRequest> {
-        vec![StoreRequest::Items {
-            scope: scope.clone(),
-            filter: ItemFilter::default(),
-            ready_here: false,
-        }]
+        vec![self.filter.to_request(scope)]
     }
 
-    fn on_scope_change(&mut self, _scope: &Scope) {
+    /// MOD-13 D6: the filter survives a scope change minus the projects the new scope lacks, so a
+    /// gone project cannot silently empty the list. The form closes: its project list was the old
+    /// scope's.
+    fn on_scope_change(&mut self, scope: &Scope) {
         self.items.clear();
         self.folded.clear();
         self.selected = None;
         self.detail.on_item_change(None);
         self.pending_reveal = None;
+        self.filter.retain_projects(scope);
+        self.form = None;
     }
 
     /// A capturing sub-tab (a typed note, a typed-back key, a `y`/`n`) gets every key first: the
@@ -237,11 +285,22 @@ impl Tab for BacklogTab {
     /// the sub-tab is waiting for (MOD-4 plan OQ-7).
     /// MOD-22 review M-1: a bracketed paste reaches a capturing sub-tab's field and nothing else;
     /// the list never takes one.
+    /// MOD-13 D1: the open filter form captures ahead of the sub-tabs; a paste goes to its tag
+    /// field.
     fn on_paste(&mut self, text: &str, ctx: &mut Ctx<'_>) -> Handled {
+        if let Some(form) = self.form.as_mut() {
+            form.on_paste(text);
+            return Handled::Consumed;
+        }
         self.detail.on_paste(text, ctx)
     }
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        // MOD-13 D1: first, so the form owns every letter while it is open. It only opens while
+        // no sub-tab captures (`f` is below that guard).
+        if self.form.is_some() {
+            return self.on_form_key(key, ctx);
+        }
         if self.detail.captures_input() {
             return self.detail.on_key(key, ctx);
         }
@@ -262,6 +321,16 @@ impl Tab for BacklogTab {
             // the note's.
             KeyCode::Char('m') => {
                 self.detail.select_id(GraphTab::ID);
+            }
+            // MOD-13 D1: `f` opens the filter form on the active filter, `F` clears it. A
+            // terminal's `F` carries SHIFT; only CONTROL and ALT are diverted above.
+            KeyCode::Char('f') => {
+                self.form = Some(FilterForm::open(&self.filter, ctx.projects));
+            }
+            KeyCode::Char('F') => {
+                if !self.filter.is_empty() {
+                    self.apply(BacklogFilter::default(), ctx);
+                }
             }
             // A project header folds; on an item row there is nothing to fold, and `Enter` is
             // the detail pane's — the Runs pane replays the step under its cursor with it
@@ -321,14 +390,29 @@ impl Tab for BacklogTab {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let [left, right] = panes(area);
+        // MOD-13 D1: the open form takes the bottom of the list pane.
+        let (list_area, form_area) = match self.form {
+            Some(_) => {
+                let [list, form] =
+                    Layout::vertical([Constraint::Min(0), Constraint::Length(filter::FORM_HEIGHT)])
+                        .areas(left);
+                (list, Some(form))
+            }
+            None => (left, None),
+        };
 
+        let summary = self.filter.summary(ctx.projects);
         let view = ListView {
             items: &self.items,
             projects: ctx.projects,
             folded: &self.folded,
             selected: self.selected,
+            filter: summary.as_deref(),
         };
-        list::render(frame, left, &view, ctx.theme);
+        list::render(frame, list_area, &view, ctx.theme);
+        if let (Some(form), Some(at)) = (&self.form, form_area) {
+            filter::render(frame, at, form, ctx.theme);
+        }
         detail::render(
             frame,
             right,
@@ -342,8 +426,9 @@ impl Tab for BacklogTab {
         let RevealTarget::Item { id, key } = target else {
             return false;
         };
-        // A half-typed note or reject reason would be lost by the move (`go` resets the sub-tabs).
-        if self.detail.captures_input() {
+        // A half-typed note or reject reason would be lost by the move (`go` resets the sub-tabs),
+        // and so would a half-edited filter.
+        if self.form.is_some() || self.detail.captures_input() {
             ctx.emit(Action::Error(CLOSE_THE_FIELD_FIRST.to_owned()));
             return true;
         }
@@ -354,13 +439,13 @@ impl Tab for BacklogTab {
                 self.select_item(*id, project, ctx);
             }
             // Not loaded, or not in the rows read so far: re-read and decide on arrival (D251).
+            // MOD-13 D4: the re-read is unfiltered. The tab cannot tell "hidden by the filter"
+            // from "not in the workspace" before the reply, so the filter goes either way, and
+            // D251's error then speaks for the whole workspace.
             None => {
+                self.filter = BacklogFilter::default();
                 self.pending_reveal = Some((*id, key.clone()));
-                ctx.request(StoreRequest::Items {
-                    scope: ctx.scope.clone(),
-                    filter: ItemFilter::default(),
-                    ready_here: false,
-                });
+                ctx.request(self.filter.to_request(ctx.scope));
             }
         }
         true
@@ -395,6 +480,7 @@ mod tests {
     use crate::ui::Theme;
     use crate::ui::layout::chrome;
     use crate::ui::tabs::backlog::detail::{DetailId, DetailTab};
+    use htui_core::model::ItemFilter;
     use htui_core::store::{MemStore, ReadStore as _};
 
     /// A sub-tab that records every key it is offered and captures while `capturing` is set (the
@@ -467,6 +553,8 @@ mod tests {
             detail,
             pending_reveal: None,
             refreshes: 0,
+            filter: BacklogFilter::default(),
+            form: None,
         };
 
         let (top_bar, keymap, theme, emit) = (
@@ -637,6 +725,8 @@ mod tests {
             detail: BacklogTab::new().detail,
             pending_reveal: None,
             refreshes: 0,
+            filter: BacklogFilter::default(),
+            form: None,
         };
         let (top_bar, keymap, theme, emit) = (
             TopBarState::default(),
@@ -682,6 +772,8 @@ mod tests {
             detail,
             pending_reveal: None,
             refreshes: 0,
+            filter: BacklogFilter::default(),
+            form: None,
         };
         let (top_bar, keymap, theme, emit) = (
             TopBarState::default(),
@@ -707,6 +799,439 @@ mod tests {
         assert_eq!(tab.on_key(m, &mut ctx), Handled::Consumed);
         assert_eq!(tab.detail.active_id(), Some(GraphTab::ID));
         assert_eq!(seen.borrow().len(), 1, "the probe saw nothing new");
+    }
+
+    // ---- MOD-13 milestone 1: the filter ------------------------------------------------------
+
+    /// The Platform fixture a `Ctx` borrows from, for the filter cases.
+    struct Bench {
+        scope: Scope,
+        projects: Vec<htui_core::model::ProjectRef>,
+        items: Vec<ItemSummary>,
+        first: Selection,
+        top_bar: TopBarState,
+        keymap: Keymap,
+        theme: Theme,
+        emit: Emit,
+    }
+
+    impl Bench {
+        async fn new() -> Self {
+            let (scope, projects, items, first) = platform().await;
+            Self {
+                scope,
+                projects,
+                items,
+                first,
+                top_bar: TopBarState::default(),
+                keymap: Keymap::new(),
+                theme: Theme::default(),
+                emit: Emit::default(),
+            }
+        }
+
+        fn ctx(&self) -> Ctx<'_> {
+            Ctx::new(
+                &self.scope,
+                &self.projects,
+                &self.top_bar,
+                &self.keymap,
+                &self.theme,
+                Origin::Tab(BacklogTab::ID),
+                &self.emit,
+            )
+        }
+
+        /// A settled tab over the whole scope, its cursor on the first item.
+        fn tab(&self) -> BacklogTab {
+            BacklogTab {
+                items: self.items.clone(),
+                selected: Some(self.first),
+                ..BacklogTab::new()
+            }
+        }
+
+        /// Everything emitted since the last call, drained.
+        fn actions(&self) -> Vec<Action> {
+            self.emit.take()
+        }
+    }
+
+    /// The `Items` reads among `actions`.
+    fn items_reads(actions: &[Action]) -> Vec<(ItemFilter, bool)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Store(StoreRequest::Items {
+                    filter, ready_here, ..
+                }) => Some((filter.clone(), *ready_here)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn press(tab: &mut BacklogTab, bench: &Bench, code: KeyCode) -> Handled {
+        tab.on_key(KeyEvent::from(code), &mut bench.ctx())
+    }
+
+    fn done_only() -> BacklogFilter {
+        BacklogFilter {
+            statuses: vec![htui_core::model::Status::Done],
+            ..BacklogFilter::default()
+        }
+    }
+
+    /// MOD-13 D1: `f` opens the form, and while it is open the list's letters and the global
+    /// ones (`q` would quit) are the form's.
+    #[tokio::test]
+    async fn f_opens_the_filter_form_and_it_captures() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        assert_eq!(
+            press(&mut tab, &bench, KeyCode::Char('f')),
+            Handled::Consumed
+        );
+        assert!(tab.form.is_some(), "the form is open");
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('q'),
+            KeyCode::Char('3'),
+            KeyCode::Tab,
+        ] {
+            assert_eq!(
+                press(&mut tab, &bench, code),
+                Handled::Consumed,
+                "{code:?} is the form's"
+            );
+        }
+        assert_eq!(
+            tab.selected,
+            Some(bench.first),
+            "the list cursor did not move"
+        );
+        assert!(bench.actions().is_empty(), "and nothing was read");
+    }
+
+    /// MOD-13 D2: applying sends exactly one `Items`, the same request kind the unfiltered list
+    /// uses, so the staleness index supersedes it.
+    #[tokio::test]
+    async fn applying_the_form_sends_one_filtered_items_read() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        press(&mut tab, &bench, KeyCode::Char('f'));
+        for _ in 0..5 {
+            press(&mut tab, &bench, KeyCode::Char('l'));
+        }
+        press(&mut tab, &bench, KeyCode::Char(' '));
+        assert!(bench.actions().is_empty(), "nothing is read before `Enter`");
+        assert_eq!(press(&mut tab, &bench, KeyCode::Enter), Handled::Consumed);
+
+        let actions = bench.actions();
+        assert_eq!(
+            items_reads(&actions),
+            [(
+                ItemFilter {
+                    statuses: Some(vec![htui_core::model::Status::Done]),
+                    ..ItemFilter::default()
+                },
+                false
+            )],
+            "{actions:?}"
+        );
+        assert_eq!(actions.len(), 1, "and nothing else: {actions:?}");
+        assert!(tab.form.is_none(), "the form closed");
+        assert_eq!(tab.filter, done_only());
+    }
+
+    /// MOD-13 D3: a refused tag list goes to the status line and the form stays open to fix it.
+    #[tokio::test]
+    async fn a_refused_tag_list_keeps_the_form_open_and_reports_it() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        press(&mut tab, &bench, KeyCode::Char('f'));
+        press(&mut tab, &bench, KeyCode::Down);
+        press(&mut tab, &bench, KeyCode::Down);
+        tab.on_key(
+            KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+            &mut bench.ctx(),
+        );
+        press(&mut tab, &bench, KeyCode::Enter);
+
+        let actions = bench.actions();
+        assert!(
+            matches!(actions.as_slice(), [Action::Error(_)]),
+            "one refusal and no read: {actions:?}"
+        );
+        assert!(tab.form.is_some(), "the form stays open");
+        assert!(tab.filter.is_empty(), "and the filter is untouched");
+    }
+
+    /// MOD-13 D5: `F` clears an active filter and reads the whole scope again.
+    #[tokio::test]
+    async fn shift_f_clears_the_filter_and_re_reads() {
+        let bench = Bench::new().await;
+        let mut tab = BacklogTab {
+            filter: done_only(),
+            ..bench.tab()
+        };
+        assert_eq!(
+            press(&mut tab, &bench, KeyCode::Char('F')),
+            Handled::Consumed
+        );
+        assert!(tab.filter.is_empty());
+        let actions = bench.actions();
+        assert_eq!(items_reads(&actions), [(ItemFilter::default(), false)]);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+    }
+
+    #[tokio::test]
+    async fn shift_f_without_a_filter_sends_nothing() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        assert_eq!(
+            press(&mut tab, &bench, KeyCode::Char('F')),
+            Handled::Consumed
+        );
+        assert!(bench.actions().is_empty());
+    }
+
+    /// MOD-13 D2: a tab activation or refresh reads with the active filter, not the whole scope.
+    #[tokio::test]
+    async fn wants_requests_carries_the_active_filter() {
+        let bench = Bench::new().await;
+        let tab = BacklogTab {
+            filter: BacklogFilter {
+                tags: vec!["rust".to_owned()],
+                ready_here: true,
+                ..BacklogFilter::default()
+            },
+            ..bench.tab()
+        };
+        let requests: Vec<Action> = tab
+            .wants_requests(&bench.scope)
+            .into_iter()
+            .map(Action::Store)
+            .collect();
+        assert_eq!(
+            items_reads(&requests),
+            [(
+                ItemFilter {
+                    tags: Some(vec!["rust".to_owned()]),
+                    ..ItemFilter::default()
+                },
+                true
+            )]
+        );
+        assert_eq!(requests.len(), 1);
+        assert!(
+            BacklogTab::new()
+                .wants_requests(&bench.scope)
+                .iter()
+                .all(|request| matches!(
+                    request,
+                    StoreRequest::Items { filter, ready_here: false, .. }
+                        if *filter == ItemFilter::default()
+                )),
+            "no filter is the pre-MOD-13 read (D5)"
+        );
+    }
+
+    /// MOD-13 D4: a reveal of an item the filter hides clears the filter and re-reads, so D251's
+    /// "not in this backlog" only fires for an item the workspace does not hold.
+    #[tokio::test]
+    async fn a_reveal_of_a_hidden_item_clears_the_filter() {
+        let bench = Bench::new().await;
+        let done: Vec<ItemSummary> = bench
+            .items
+            .iter()
+            .filter(|item| item.status == htui_core::model::Status::Done)
+            .cloned()
+            .collect();
+        assert!(
+            done.iter()
+                .all(|item| item.id != htui_core::fixtures::ids::HTUI_ANA_2)
+        );
+        let mut tab = BacklogTab {
+            items: done,
+            filter: done_only(),
+            ..bench.tab()
+        };
+        let target = RevealTarget::Item {
+            id: htui_core::fixtures::ids::HTUI_ANA_2,
+            key: "ANA-2".to_owned(),
+        };
+        assert!(tab.reveal(&target, &mut bench.ctx()));
+        assert!(tab.filter.is_empty(), "the filter is cleared");
+        assert!(tab.pending_reveal.is_some(), "the next list decides");
+        let actions = bench.actions();
+        assert_eq!(items_reads(&actions), [(ItemFilter::default(), false)]);
+
+        tab.on_reply(&StoreReply::Items(bench.items.clone()), &mut bench.ctx());
+        assert_eq!(
+            tab.selected,
+            Some(Selection::Item(htui_core::fixtures::ids::HTUI_ANA_2))
+        );
+        assert!(
+            !bench
+                .actions()
+                .iter()
+                .any(|action| matches!(action, Action::Error(_))),
+            "the whole list holds it, so nothing is reported"
+        );
+    }
+
+    /// A reveal would drop the half-edited form, as it would a half-typed note.
+    #[tokio::test]
+    async fn a_reveal_while_the_form_is_open_asks_to_close_it_first() {
+        let bench = Bench::new().await;
+        let mut tab = BacklogTab {
+            filter: done_only(),
+            ..bench.tab()
+        };
+        press(&mut tab, &bench, KeyCode::Char('f'));
+        let target = RevealTarget::Item {
+            id: htui_core::fixtures::ids::HTUI_ANA_2,
+            key: "ANA-2".to_owned(),
+        };
+        assert!(tab.reveal(&target, &mut bench.ctx()));
+        let actions = bench.actions();
+        assert!(
+            matches!(actions.as_slice(), [Action::Error(sentence)] if sentence == CLOSE_THE_FIELD_FIRST),
+            "{actions:?}"
+        );
+        assert!(tab.form.is_some());
+        assert_eq!(tab.filter, done_only(), "the filter stays");
+        assert!(tab.pending_reveal.is_none());
+    }
+
+    /// MOD-13 blueprint §6: a filtered reply must not decide a reveal sent before it.
+    #[tokio::test]
+    async fn applying_a_filter_disarms_a_pending_reveal() {
+        let bench = Bench::new().await;
+        let mut tab = BacklogTab::new();
+        let target = RevealTarget::Item {
+            id: ItemId::default(),
+            key: "GONE-1".to_owned(),
+        };
+        assert!(tab.reveal(&target, &mut bench.ctx()));
+        assert!(tab.pending_reveal.is_some());
+        let _ = bench.actions();
+
+        press(&mut tab, &bench, KeyCode::Char('f'));
+        press(&mut tab, &bench, KeyCode::Char(' '));
+        press(&mut tab, &bench, KeyCode::Enter);
+        assert!(tab.pending_reveal.is_none(), "the filter disarmed it");
+        let _ = bench.actions();
+
+        tab.on_reply(&StoreReply::Items(Vec::new()), &mut bench.ctx());
+        assert!(
+            !bench
+                .actions()
+                .iter()
+                .any(|action| matches!(action, Action::Error(_))),
+            "the filtered list reports nothing"
+        );
+    }
+
+    /// MOD-13 D6: a scope change keeps the filter minus the projects the new scope lacks, and
+    /// closes the form, whose project list belonged to the old scope.
+    #[tokio::test]
+    async fn a_scope_change_drops_the_projects_it_lacks_and_closes_the_form() {
+        use htui_core::fixtures::ids::{PROJECT_AGY, PROJECT_HTUI};
+        let bench = Bench::new().await;
+        let htui_only = Scope {
+            workspace_id: bench.scope.workspace_id,
+            project_ids: vec![PROJECT_HTUI],
+        };
+        let mut tab = BacklogTab {
+            filter: BacklogFilter {
+                projects: vec![PROJECT_HTUI, PROJECT_AGY],
+                ..done_only()
+            },
+            ..bench.tab()
+        };
+        press(&mut tab, &bench, KeyCode::Char('f'));
+        tab.on_scope_change(&htui_only);
+        assert_eq!(tab.filter.projects, [PROJECT_HTUI]);
+        assert_eq!(tab.filter.statuses, done_only().statuses, "status is kept");
+        assert!(tab.form.is_none(), "the form closed");
+
+        let mut agy = BacklogTab {
+            filter: BacklogFilter {
+                projects: vec![PROJECT_AGY],
+                ..BacklogFilter::default()
+            },
+            ..bench.tab()
+        };
+        agy.on_scope_change(&htui_only);
+        assert!(
+            agy.filter.is_empty(),
+            "a filter naming only a gone project is no filter, not an empty list"
+        );
+    }
+
+    /// A filtered reply without the cursor's row moves the cursor to its first item, which
+    /// re-reads that item's detail.
+    #[tokio::test]
+    async fn a_filtered_reply_moves_the_cursor_to_its_first_item() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        let Selection::Item(first) = bench.first else {
+            panic!("the first row is an item")
+        };
+        let others: Vec<ItemSummary> = bench
+            .items
+            .iter()
+            .filter(|item| item.id != first)
+            .cloned()
+            .collect();
+        let expected = list::rows(&others, &bench.projects, &[])
+            .into_iter()
+            .find(|row| matches!(row, Selection::Item(_)))
+            .expect("another item");
+        tab.on_reply(&StoreReply::Items(others), &mut bench.ctx());
+        assert_eq!(tab.selected, Some(expected));
+        let Selection::Item(id) = expected else {
+            unreachable!()
+        };
+        assert!(
+            bench.actions().iter().any(
+                |action| matches!(action, Action::Store(StoreRequest::Item(read)) if *read == id)
+            ),
+            "the new row's detail is read"
+        );
+    }
+
+    /// MOD-52: `ctrl-c` quits from inside the form, as it does from every text field.
+    #[tokio::test]
+    async fn ctrl_c_passes_through_the_open_form() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        press(&mut tab, &bench, KeyCode::Char('f'));
+        assert_eq!(
+            tab.on_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &mut bench.ctx()
+            ),
+            Handled::Pass
+        );
+        assert!(tab.form.is_some());
+    }
+
+    /// MOD-22 review M-1: a paste reaches the open form's tag field, not the detail pane.
+    #[tokio::test]
+    async fn a_paste_while_the_form_is_open_goes_to_its_tag_field() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        press(&mut tab, &bench, KeyCode::Char('f'));
+        press(&mut tab, &bench, KeyCode::Down);
+        press(&mut tab, &bench, KeyCode::Down);
+        assert_eq!(
+            tab.on_paste("rust, gpu", &mut bench.ctx()),
+            Handled::Consumed
+        );
+        press(&mut tab, &bench, KeyCode::Enter);
+        assert_eq!(tab.filter.tags, ["gpu", "rust"]);
     }
 
     /// The sub-tab strip fits inside the detail pane at the harness's pinned size, so a longer title, another sub-tab or a narrower pane fails here

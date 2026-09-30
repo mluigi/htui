@@ -48,6 +48,8 @@ use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsT
 ///    D236), a chord so no tab's letters and no text field's input can take it.
 /// 8. The Backlog tab's `m` is bound to its `open graph` help text (MOD-14 D8). The tab's own
 ///    arm selects the Graph sub-tab; the binding only puts `m open graph` on the help line.
+/// 9. The Backlog tab's `f` and `F` are bound to their `filter` and `clear filter` help texts
+///    (MOD-13 D1), for the same reason: the tab's own arms open and clear the filter.
 ///
 /// Calling this twice would stack a second switcher; the shell calls it exactly once, between
 /// [`App::new`] and [`App::start`].
@@ -122,4 +124,14 @@ pub fn register_all(app: &mut App) {
         action: Action::Tab(TabAction::Focus(BacklogTab::ID)),
         help: "open graph",
     });
+    // MOD-13 D1: `f` opens the filter form and `F` clears the filter, in the Backlog's own arms,
+    // which always consume the key; these rows are the help box's half, as the `m` row is.
+    for (key, help) in [('f', "filter"), ('F', "clear filter")] {
+        app.keymap.bind(Binding {
+            scope: KeyScope::Tab(BacklogTab::ID),
+            key: KeyChord::new(KeyCode::Char(key), KeyModifiers::NONE),
+            action: Action::Tab(TabAction::Focus(BacklogTab::ID)),
+            help,
+        });
+    }
 }
