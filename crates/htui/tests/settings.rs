@@ -3054,29 +3054,96 @@ async fn a_refused_auth_deliver_keeps_the_login_pane_and_its_link() {
     assert!(section.captures_input());
 }
 
-/// The two refusals of an `auth_deliver` that mean the flow is **gone** clear the pane, as they do
+/// The refusal of an `auth_deliver` that means no login is held at all clears the pane, as it does
 /// for `auth_choose` (review L-4's rule): there is no login left to paste into or to cancel.
 #[tokio::test]
-async fn a_deliver_refused_because_the_login_is_gone_clears_the_pane() {
+async fn a_deliver_refused_because_no_login_is_running_clears_the_pane() {
     let bench = SectionBench::new().await;
-    for message in ["no login is running", "this login has ended"] {
-        let mut section = delivering_over(&bench);
-        bench.reply(
-            &mut section,
-            &StoreReply::Failed {
-                request: "auth_deliver",
-                message: message.to_owned(),
-            },
-        );
-        let rendered = render_section(&section, &bench.ctx());
-        assert_eq!(
-            on_box_cell(&rendered, "loginable"),
-            as_drawn("unauthenticated"),
-            "`{message}` leaves a state a second `a` can start from"
-        );
-        assert!(!rendered.contains(DELIVERING), "{rendered}");
-        assert!(!rendered.contains("link: "), "{rendered}");
-    }
+    let mut section = delivering_over(&bench);
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "auth_deliver",
+            message: "no login is running".to_owned(),
+        },
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        on_box_cell(&rendered, "loginable"),
+        as_drawn("unauthenticated"),
+        "a state a second `a` can start from"
+    );
+    assert!(!rendered.contains(DELIVERING), "{rendered}");
+    assert!(!rendered.contains("link: "), "{rendered}");
+}
+
+/// Review L-2: `this login has ended` is a delivery the flow's end overtook. The flow is on its way
+/// out — draining, re-probing — and the worker guarantees its own terminal frame follows, so the
+/// pane only stops waiting for the delivery and stays until that frame: `cancelling…` after an `x`,
+/// `logging in…` otherwise. An `a` meanwhile is the pane's own "already running" rather than an
+/// `AuthStart` the worker would refuse while the old flow holds its claim, and that would make the
+/// flow's own last frame stale.
+#[tokio::test]
+async fn a_deliver_overtaken_by_the_logins_end_waits_for_the_flows_last_frame() {
+    let bench = SectionBench::new().await;
+    let ended = || StoreReply::Failed {
+        request: "auth_deliver",
+        message: "this login has ended".to_owned(),
+    };
+
+    // `x` during a delivery.
+    let mut section = delivering_over(&bench);
+    assert_eq!(bench.key(&mut section, "x"), Handled::Consumed);
+    let _ = bench.drained();
+    bench.reply(&mut section, &StoreReply::Auth(AuthFrame::Cancelling));
+    bench.reply(&mut section, &ended());
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        on_box_cell(&rendered, "loginable"),
+        "cancelling\u{2026}",
+        "the pane is still the flow's until its last frame: {rendered}"
+    );
+    assert!(!rendered.contains(DELIVERING), "{rendered}");
+
+    assert_eq!(bench.key(&mut section, "a"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(
+        errors_of(&emitted),
+        vec!["a login is already running".to_owned()]
+    );
+    assert!(!asked_anything(&emitted), "no AuthStart: {emitted:?}");
+
+    bench.reply(&mut section, &StoreReply::Auth(AuthFrame::Cancelled));
+    let _ = bench.drained();
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        on_box_cell(&rendered, "loginable"),
+        as_drawn("unauthenticated")
+    );
+    assert_eq!(bench.key(&mut section, "a"), Handled::Consumed);
+    assert!(
+        matches!(&requests_of(&bench)[..], [StoreRequest::AuthStart { .. }]),
+        "after the flow's own last frame, `a` starts the next login"
+    );
+
+    // No `x`: the login completed under the delivery, and its re-probe is still to come.
+    let mut section = delivering_over(&bench);
+    bench.reply(&mut section, &ended());
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(on_box_cell(&rendered, "loginable"), "logging in\u{2026}");
+    assert!(!rendered.contains(DELIVERING), "{rendered}");
+    assert!(rendered.contains(REDIRECT_LINE), "{rendered}");
+    bench.reply(
+        &mut section,
+        &StoreReply::Auth(AuthFrame::Done {
+            call: AuthCall::Authenticate(METHOD.to_owned()),
+            status: ProbeStatus::Ready,
+        }),
+    );
+    assert!(
+        matches!(&requests_of(&bench)[..], [StoreRequest::Agents]),
+        "the flow's own Done re-reads the row"
+    );
 }
 
 /// D282: the runtime acknowledging a cancel closes an open field; there is nothing left to send it

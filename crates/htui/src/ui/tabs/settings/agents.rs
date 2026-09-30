@@ -74,7 +74,7 @@ use std::path::Path;
 use crate::agent_settings::{
     self, AgentDraft, AgentWrite, DraftFields, FIELD_LABELS, REQUEST_NAMES, Refusal,
 };
-use crate::agent_worker::{AUTH_ALREADY_CHOSEN, LOGIN_ENDED, NO_LOGIN_RUNNING};
+use crate::agent_worker::{AUTH_ALREADY_CHOSEN, NO_LOGIN_RUNNING};
 use crate::app::{Action, Ctx, Handled};
 use crate::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
 use crate::ui::tabs::settings::{
@@ -176,12 +176,6 @@ const HINT_PASTING: &str = "Enter sends \u{b7} Esc cancels";
 
 /// What `p` says while the login is being cancelled (MOD-22 D282).
 const PASTE_CANCELLING: &str = "this login is being cancelled; there is nothing to paste into";
-
-/// The two refusals of a request into a login that mean the flow is **gone** rather than that the
-/// one request was answered no: `agent_worker`'s `auth_command` answers the first
-/// ([`NO_LOGIN_RUNNING`]) when no login is held and the second ([`LOGIN_ENDED`]) when the flow's task has already closed its queue (MOD-22
-/// D287). The section tests pin both as literal text.
-const LOGIN_GONE: [&str; 2] = [NO_LOGIN_RUNNING, LOGIN_ENDED];
 
 /// What the `on this box` column reads between `a` and the flow's own method list.
 const STARTING: &str = "starting\u{2026}";
@@ -2188,10 +2182,16 @@ impl SettingsSection for AgentsSection {
             // the link is still there to try again with.
             StoreReply::Failed { request, .. } if *request == "auth_open" => {}
             // MOD-22 D270: the same for a refused or failed delivery — one request answered no;
-            // the login and its link stay, and `p` works again. Unless the refusal says the flow
-            // itself is gone, which is `auth_choose`'s rule: a state a second `a` can start from.
+            // the login and its link stay, and `p` works again. Unless the refusal says no login
+            // is held at all, which is `auth_choose`'s rule: a state a second `a` can start from.
+            //
+            // `agent_worker::LOGIN_ENDED` is not that (review L-2): the flow's end overtook the delivery, and
+            // the worker guarantees the flow's own terminal frame follows — after its drain and
+            // its re-probe. Idling here would offer `a` while the old flow still holds its claim,
+            // and a refused `AuthStart` would make that last frame stale; so the arm below only
+            // stops waiting for the delivery, and the terminal frame ends the pane.
             StoreReply::Failed { request, message }
-                if *request == "auth_deliver" && LOGIN_GONE.contains(&message.as_str()) =>
+                if *request == "auth_deliver" && message == NO_LOGIN_RUNNING =>
             {
                 self.auth = AuthState::Idle;
             }
