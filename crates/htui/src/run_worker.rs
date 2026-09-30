@@ -40,6 +40,12 @@ pub type RunRuntime = htui_worker::RunRuntime<Backend, TuiReplies>;
 /// What the TUI's runtime decided about one request, at a [`ReplyAddr`] (MOD-41 plan D7).
 pub type RunServed = htui_worker::RunServed<ReplyAddr>;
 
+/// The production run runtime the store loop serves `backend` with.
+#[must_use]
+pub fn production_for(_backend: &Backend) -> RunRuntime {
+    RunRuntime::production()
+}
+
 impl From<RunReply> for StoreReply {
     fn from(reply: RunReply) -> Self {
         match reply {
@@ -163,7 +169,7 @@ pub(crate) mod tests {
     use super::{
         FrameKind, HostGraphs, LiveChats, ORCH_NAMES, OrchReply, OrchRequest, PREEMPTED, ReplySink,
         RunReply, RunRequest, RunRuntime, RunServed, StepAuthor, TuiReplies, TuiRuns as _,
-        WALK_PANICKED,
+        WALK_PANICKED, production_for,
     };
     use crate::agent_worker::AgentRuntime;
     use crate::store_worker::{
@@ -2739,6 +2745,50 @@ pub(crate) mod tests {
         let row = fixture.run(queued).await;
         assert_eq!(row.executing_box_id, Some(ids::BOX), "claimed on this box");
         assert!(!fixture.steps(queued).await.is_empty(), "and walked");
+    }
+
+    /// MOD-41 finding T9-V1: `--demo` is the production runtime over `MemStore::demo()`, whose
+    /// seeded `queued` run (`RUN_2` on `FEAT-3`) is a showcase. A sweep there claims nothing, so
+    /// no production isolator, driver or scratch tree ever touches it.
+    #[tokio::test]
+    async fn the_demo_stores_production_sweep_leaves_its_queued_run_queued() {
+        let store = MemStore::demo();
+        let backend = Backend::memory(store.clone());
+        let mut runtime = production_for(&backend);
+
+        let (replies, _answers) = mpsc::unbounded_channel();
+        runtime.sweep(&backend, &replies);
+        assert!(runtime.settle(PATIENCE).await.is_empty(), "no task stuck");
+
+        let row = store
+            .run(ids::RUN_2)
+            .await
+            .expect("the read answers")
+            .expect("the demo's queued run");
+        assert_eq!(
+            (row.status, row.executing_box_id, row.lease_expires_at),
+            (RunStatus::Queued, None, None),
+            "the showcase run is not claimed"
+        );
+        let item = store
+            .item(ids::HTUI_FEAT_3)
+            .await
+            .expect("the read answers")
+            .expect("the demo item");
+        assert_eq!(
+            item.status,
+            Status::Queued,
+            "its item still shows it queued"
+        );
+        assert!(
+            store
+                .run_steps(ids::RUN_2)
+                .await
+                .expect("the read answers")
+                .iter()
+                .all(|step| step.status == StepStatus::Pending),
+            "and nothing walked"
+        );
     }
 
     /// Plan D13 (`tui → worker`): a TUI walk in flight when the box flips keeps its lease and its
