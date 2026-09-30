@@ -2826,6 +2826,9 @@ pub(crate) mod tests {
             .await;
         within("the session starting", stall.reached.notified()).await;
         let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+        // A run of another item whose foreign lease lapsed: what a `tui` box's sweep would adopt.
+        let lapsed = stranded(&fixture, ids::AGY_FEAT_1).await;
+        let before = fixture.run(lapsed).await;
         set_executor(&fixture, Executor::Worker).await;
 
         runtime.sweep(&backend, &replies);
@@ -2860,6 +2863,13 @@ pub(crate) mod tests {
             matches!(&started, Some(CommandOutcome::Started { rest, .. }) if rest.run == RunStatus::AwaitingApproval),
             "the start rested normally: {started:?}"
         );
+        let row = fixture.run(lapsed).await;
+        assert_eq!(
+            (row.status, row.lease_expires_at),
+            (RunStatus::Running, before.lease_expires_at),
+            "the sweep in between adopted nothing: the lease is still the lapsed stranger's"
+        );
+        assert!(fixture.steps(lapsed).await.is_empty(), "nothing walked");
     }
 
     /// Plan D13 (`worker → tui`): the worker's walk in flight when the box flips back keeps its
