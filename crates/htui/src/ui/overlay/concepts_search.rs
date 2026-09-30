@@ -408,7 +408,7 @@ impl Overlay for ConceptsSearch {
         frame.render_widget(Paragraph::new(Line::from(spans)), query);
 
         let hit_cells = cells.saturating_sub(cell_width(CURSOR));
-        let lines: Vec<Line<'static>> = self
+        let mut lines: Vec<Line<'static>> = self
             .hits
             .iter()
             .enumerate()
@@ -422,12 +422,31 @@ impl Overlay for ConceptsSearch {
                 )
             })
             .collect();
+        let (mut status_text, status_style) = self.status(ctx.scope, theme);
+        let (mut index_text, index_style) = self.index_line(theme);
+        if self.hits.is_empty() {
+            // Review 8: an error too wide for its row is drawn whole in the empty hit rows, search
+            // first, and its own row is left blank rather than repeating the start of it.
+            let status_is_error = self.notice.is_none() && self.error.is_some();
+            let index_is_error = matches!(self.index, IndexLine::Failed(_));
+            for (is_error, text, style) in [
+                (status_is_error, &mut status_text, status_style),
+                (index_is_error, &mut index_text, index_style),
+            ] {
+                if is_error && cell_width(text) > cells {
+                    lines.extend(
+                        wrap(text, cells)
+                            .into_iter()
+                            .map(|wrapped| Line::styled(wrapped, style)),
+                    );
+                    text.clear();
+                }
+            }
+        }
         frame.render_widget(Paragraph::new(lines), hits);
 
-        let (text, style) = self.status(ctx.scope, theme);
-        frame.render_widget(row(&text, style), status);
-        let (text, style) = self.index_line(theme);
-        frame.render_widget(row(&text, style), index);
+        frame.render_widget(row(&status_text, status_style), status);
+        frame.render_widget(row(&index_text, index_style), index);
         frame.render_widget(row(HINT, theme.dim), hint);
     }
 }
@@ -461,6 +480,28 @@ fn clip(text: &str, cells: usize) -> String {
         out.push_str(grapheme);
     }
     out
+}
+
+/// `text` broken into rows of at most `cells` display cells, at grapheme boundaries (MOD-54's
+/// measure, [`clip`]'s rule): a wide glyph that would pass the edge starts the next row whole,
+/// never split. A cluster wider than a whole row gets a row to itself rather than being lost.
+fn wrap(text: &str, cells: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0;
+    for grapheme in graphemes(text) {
+        let width = cell_width(grapheme);
+        if used + width > cells && !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        used += width;
+        row.push_str(grapheme);
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -947,6 +988,95 @@ mod tests {
             clip("a一b", 2),
             "a",
             "a wide glyph that would pass the edge stops the line"
+        );
+    }
+
+    /// Review 8: with no hits to draw, an error wider than its row is drawn whole, wrapped across
+    /// the hit rows at grapheme boundaries (a wide glyph that would pass the edge starts the next
+    /// row), and its own row is left blank rather than repeating the start of it.
+    #[test]
+    fn a_long_error_wraps_across_the_empty_hit_rows() {
+        let bench = Bench::platform();
+        // 21 cells, then 60 wide glyphs: 36 of them fill the first row to 93 of its 94 cells.
+        let long = format!("cannot reach Qdrant: {} end", "一".repeat(60));
+        let rows = [
+            format!("cannot reach Qdrant: {}", "一".repeat(36)),
+            format!("{} end", "一".repeat(24)),
+        ];
+
+        let mut search = ConceptsSearch::new();
+        bench.typed(&mut search, "tui");
+        bench.code(&mut search, KeyCode::Enter);
+        let sent = searches(&bench);
+        bench.reply(
+            &mut search,
+            ConceptsReply::Hits {
+                query: sent[0].clone(),
+                outcome: Err(long.clone()),
+            },
+        );
+        let frame = bench.render(&search);
+        let lines: Vec<&str> = frame.lines().collect();
+        let first = lines
+            .iter()
+            .position(|line| line.contains(&rows[0]))
+            .unwrap_or_else(|| panic!("the error's first row:\n{frame}"));
+        assert!(lines[first + 1].contains(&rows[1]), "{frame}");
+        assert_eq!(
+            frame.matches("cannot reach Qdrant").count(),
+            1,
+            "drawn once: {frame}"
+        );
+
+        let mut search = ConceptsSearch::new();
+        bench.ctrl(&mut search, 'r');
+        let _ = bench.emit.take();
+        bench.reply(&mut search, ConceptsReply::Indexed(Err(long.clone())));
+        let frame = bench.render(&search);
+        let lines: Vec<&str> = frame.lines().collect();
+        let first = lines
+            .iter()
+            .position(|line| line.contains(&rows[0]))
+            .unwrap_or_else(|| panic!("the index run's error, first row:\n{frame}"));
+        assert!(lines[first + 1].contains(&rows[1]), "{frame}");
+        assert_eq!(frame.matches("cannot reach Qdrant").count(), 1, "{frame}");
+    }
+
+    #[test]
+    fn a_short_error_stays_on_its_row() {
+        let bench = Bench::platform();
+        let mut search = ConceptsSearch::new();
+        bench.ctrl(&mut search, 'r');
+        bench.reply(
+            &mut search,
+            ConceptsReply::Indexed(Err("qdrant: upsert: refused".to_owned())),
+        );
+        let frame = bench.render(&search);
+        let at = frame
+            .lines()
+            .position(|line| line.contains("qdrant: upsert: refused"))
+            .expect("drawn");
+        let hint = frame
+            .lines()
+            .position(|line| line.contains("Esc close"))
+            .expect("the hint");
+        assert_eq!(at + 1, hint, "the index row, just above the hint:\n{frame}");
+    }
+
+    #[test]
+    fn wrap_breaks_at_grapheme_boundaries_and_never_splits_a_wide_glyph() {
+        assert_eq!(wrap("abcde", 2), ["ab", "cd", "e"]);
+        assert_eq!(wrap("a一b", 2), ["a", "一", "b"]);
+        assert_eq!(
+            wrap("e\u{301}x", 1),
+            ["e\u{301}", "x"],
+            "a cluster stays whole"
+        );
+        assert!(wrap("", 4).is_empty());
+        assert_eq!(
+            wrap("一", 1),
+            ["一"],
+            "too wide for any row: alone, not lost"
         );
     }
 
