@@ -14,13 +14,14 @@
 //! key on a project this user does not own, or offline, answers the status line and sends nothing,
 //! and the hint row dims the four write words.
 //!
-//! One write in flight (`busy`, the Skills tab's rule), and a write **lands by content** (blueprint
-//! F-16): a `Requirements` reply closes the form only when it shows what was sent, so a read served
-//! ahead of the write leaves the form and `busy` alone. A `RequirementsStale` (an amend or withdraw
-//! that missed its version) keeps the form and its text, moves the token to the head and says so; the
-//! retry is the user's `Ctrl+S`. Forms save on `Ctrl+S` from any field, because `TextArea` breaks
-//! the line on `Enter` (blueprint F-1); a withdraw ends with the requirement's key typed back, the
-//! close-out pattern.
+//! One write in flight (`busy`, the Skills tab's rule), and a write **lands on its own reply**
+//! (MOD-59): only a `RequirementWritten` naming the write in flight closes the form; a plain
+//! `Requirements` never does, so a read served ahead of the write leaves the form and `busy` alone.
+//! A write whose re-read failed lands all the same, and the notice says the tree is the one held. A
+//! `RequirementsStale` (an amend or withdraw that missed its version) keeps the form and its text,
+//! moves the token to the head and says so; the retry is the user's `Ctrl+S`. Forms save on
+//! `Ctrl+S` from any field, because `TextArea` breaks the line on `Enter` (blueprint F-1); a
+//! withdraw ends with the requirement's key typed back, the close-out pattern.
 
 mod detail;
 mod forms;
@@ -28,9 +29,7 @@ mod tree;
 
 use core::cell::Cell;
 
-use htui_core::model::{
-    Priority, ProjectId, RequirementArea, RequirementAreaId, RequirementId, RequirementState, Scope,
-};
+use htui_core::model::{ProjectId, RequirementArea, RequirementId, RequirementState, Scope};
 use htui_core::store::{invalid_area_code, requirement_withdrawn};
 use htui_store::DATABASE_UNREACHABLE;
 use ratatui::Frame;
@@ -42,7 +41,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use crate::app::{Action, Ctx, Handled, RevealTarget};
 use crate::requirements::{
     BLANK_AREA_TITLE, BLANK_BODY, DECIDING_KEY_NEEDED, DETAIL_NAME, READ_NAME, RequirementDetail,
-    RequirementText, RequirementsSnapshot, is_tab_write, not_the_maintainer,
+    RequirementText, RequirementWrite, RequirementsSnapshot, is_tab_write, not_the_maintainer,
 };
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::backlog::detail::Scroll;
@@ -78,8 +77,6 @@ const SELECT_A_ROW: &str = "select a requirement";
 
 /// A write went out.
 const SAVING: &str = "saving\u{2026}";
-/// A refused mint while the re-read checks whether it applied anyway (MOD-39 review).
-const CHECKING_MINT: &str = "the save was refused; checking whether it was written\u{2026}";
 
 /// `n` on a project row.
 const SELECT_AN_AREA: &str = "select an area first";
@@ -117,6 +114,12 @@ const WITHDRAW_HINT: &str = "Enter next  Esc cancel";
 /// A key while a write is in flight: one at a time (the Skills tab's rule).
 fn in_flight(busy: &str) -> String {
     format!("`{busy}` is still in flight")
+}
+
+/// MOD-59 D5: a write that applied although its re-read failed. It landed; the tab still draws
+/// what it held, and `r` reads again.
+fn landed_unread(landed: &str, why: &str) -> String {
+    format!("{landed} \u{2014} the re-read failed, r reloads: {why}")
 }
 
 /// A `RequirementsStale` over an open form: the text is kept and the token moved to the head.
@@ -161,14 +164,9 @@ pub struct RequirementsTab {
     pane_rows: Cell<usize>,
     /// Browsing, filtering, or a form.
     mode: Mode,
-    /// The tab write in flight, by `StoreRequest::name`: one at a time.
+    /// The tab write in flight, by `StoreRequest::name`: one at a time, and the only write a
+    /// `RequirementWritten` lands (MOD-59 D4).
     busy: Option<&'static str>,
-    /// What the write in flight carries, for the landing (blueprint F-16).
-    sent: Option<Sent>,
-    /// A refused mint's sentence while the re-read checks whether it landed anyway: the worker
-    /// answers `Failed` when the write applied and only its re-read failed, and a retried mint
-    /// would write a second requirement that can be withdrawn but never deleted (MOD-39 review).
-    verifying: Option<String>,
     /// The last outcome, one line above the hint.
     notice: Option<Notice>,
     /// A reveal waiting for the next `Requirements` reply (MOD-64 D235).
@@ -192,88 +190,6 @@ enum Mode {
     Requirement(RequirementForm),
     /// `W`.
     Withdraw(WithdrawForm),
-}
-
-/// The write in flight and what tells its own landing from a read served ahead of it (F-16).
-/// Custom `Debug`: the body's length only.
-enum Sent {
-    /// `CreateRequirementArea`: the project has an area with this code.
-    Area {
-        /// The area's project.
-        project: ProjectId,
-        /// The code sent.
-        code: String,
-    },
-    /// `MintRequirement`: the area holds a requirement not in `known` with this body.
-    Mint {
-        /// The area's project.
-        project: ProjectId,
-        /// The area.
-        area: RequirementAreaId,
-        /// The body sent.
-        body: String,
-        /// The project's requirements when the mint went out.
-        known: Vec<RequirementId>,
-    },
-    /// `AmendRequirement`: the version moved past the token and the row reads as sent. The
-    /// content, not the version alone: another session's amend moves the version too, and taken
-    /// for this one it would close the form over text that was never written.
-    Amend {
-        /// The requirement.
-        id: RequirementId,
-        /// The token sent.
-        expected_version: i32,
-        /// The body sent.
-        body: String,
-        /// The rationale sent.
-        rationale: String,
-        /// The priority sent.
-        priority: Priority,
-    },
-    /// `WithdrawRequirement`: the requirement is withdrawn.
-    Withdraw {
-        /// The requirement.
-        id: RequirementId,
-    },
-}
-
-impl core::fmt::Debug for Sent {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Area { project, code } => f
-                .debug_struct("Area")
-                .field("project", project)
-                .field("code", code)
-                .finish(),
-            Self::Mint {
-                project,
-                area,
-                body,
-                known,
-            } => f
-                .debug_struct("Mint")
-                .field("project", project)
-                .field("area", area)
-                .field("body_len", &body.len())
-                .field("known", &known.len())
-                .finish(),
-            Self::Amend {
-                id,
-                expected_version,
-                body,
-                rationale,
-                priority,
-            } => f
-                .debug_struct("Amend")
-                .field("id", id)
-                .field("expected_version", expected_version)
-                .field("body_len", &body.len())
-                .field("rationale_len", &rationale.len())
-                .field("priority", priority)
-                .finish(),
-            Self::Withdraw { id } => f.debug_struct("Withdraw").field("id", id).finish(),
-        }
-    }
 }
 
 /// One line of report above the hint.
@@ -600,10 +516,9 @@ impl RequirementsTab {
                     StoreRequest::CreateRequirementArea {
                         scope,
                         project,
-                        code: code.clone(),
+                        code,
                         title,
                     },
-                    Sent::Area { project, code },
                     ctx,
                 );
             }
@@ -615,31 +530,15 @@ impl RequirementsTab {
                 }
                 let rationale = RequirementText::new(form.rationale.text());
                 let priority = form.priority;
-                let (request, sent) = match &form.target {
-                    FormTarget::Mint { project, area, .. } => {
-                        let known = self
-                            .snapshot
-                            .as_ref()
-                            .and_then(|snapshot| snapshot.project(*project))
-                            .map(|entry| entry.requirements.iter().map(|row| row.id).collect())
-                            .unwrap_or_default();
-                        (
-                            StoreRequest::MintRequirement {
-                                scope,
-                                project: *project,
-                                area: *area,
-                                body: RequirementText::new(body.clone()),
-                                rationale,
-                                priority,
-                            },
-                            Sent::Mint {
-                                project: *project,
-                                area: *area,
-                                body,
-                                known,
-                            },
-                        )
-                    }
+                let request = match &form.target {
+                    FormTarget::Mint { project, area, .. } => StoreRequest::MintRequirement {
+                        scope,
+                        project: *project,
+                        area: *area,
+                        body: RequirementText::new(body),
+                        rationale,
+                        priority,
+                    },
                     FormTarget::Amend {
                         id,
                         expected_version,
@@ -662,27 +561,18 @@ impl RequirementsTab {
                             self.notice = Some(Notice::Error(DECIDING_KEY_NEEDED.to_owned()));
                             return;
                         }
-                        (
-                            StoreRequest::AmendRequirement {
-                                scope,
-                                id: *id,
-                                expected_version: *expected_version,
-                                body: RequirementText::new(body.clone()),
-                                rationale: rationale.clone(),
-                                priority,
-                                deciding,
-                            },
-                            Sent::Amend {
-                                id: *id,
-                                expected_version: *expected_version,
-                                body,
-                                rationale: rationale.as_str().to_owned(),
-                                priority,
-                            },
-                        )
+                        StoreRequest::AmendRequirement {
+                            scope,
+                            id: *id,
+                            expected_version: *expected_version,
+                            body: RequirementText::new(body),
+                            rationale,
+                            priority,
+                            deciding,
+                        }
                     }
                 };
-                self.send(request, sent, ctx);
+                self.send(request, ctx);
             }
             Mode::Withdraw(WithdrawForm::Deciding {
                 id,
@@ -716,86 +606,72 @@ impl RequirementsTab {
                     self.notice = Some(Notice::Error(NOT_THE_REQUIREMENT_KEY.to_owned()));
                     return;
                 }
-                let id = *id;
                 let request = StoreRequest::WithdrawRequirement {
                     scope,
-                    id,
+                    id: *id,
                     expected_version: *expected_version,
                     deciding: deciding.clone(),
                 };
-                self.send(request, Sent::Withdraw { id }, ctx);
+                self.send(request, ctx);
             }
             Mode::Browse | Mode::Filter { .. } => {}
         }
     }
 
     /// Sends one tab write and marks it in flight.
-    fn send(&mut self, request: StoreRequest, sent: Sent, ctx: &Ctx<'_>) {
+    fn send(&mut self, request: StoreRequest, ctx: &Ctx<'_>) {
         self.busy = Some(request.name());
-        self.sent = Some(sent);
         self.notice = Some(Notice::Info(SAVING.to_owned()));
         ctx.request(request);
     }
 
-    /// A `Requirements` reply while a write is in flight: whether it shows the write (F-16). When
-    /// it does, the form closes, the notice says what landed, the cursor goes to the row it landed
-    /// on and that row's detail is re-read.
-    fn land(&mut self, ctx: &Ctx<'_>) -> bool {
-        let (Some(snapshot), Some(sent)) = (&self.snapshot, &self.sent) else {
-            return false;
-        };
-        let landed = match sent {
-            Sent::Area { project, code } => snapshot
-                .project(*project)
-                .and_then(|entry| entry.areas.iter().find(|area| area.code == *code))
-                .map(|area| (format!("added area {code}"), Row::Area(area.id))),
-            Sent::Mint {
-                project,
-                area,
-                body,
-                known,
-            } => snapshot
-                .project(*project)
-                .and_then(|entry| {
-                    entry
-                        .in_area(*area)
-                        .find(|row| !known.contains(&row.id) && row.body == *body)
-                })
-                .map(|row| (format!("minted {}", row.key), Row::Requirement(row.id))),
-            Sent::Amend {
-                id,
-                expected_version,
-                body,
-                rationale,
-                priority,
-            } => snapshot
-                .requirement(*id)
-                .filter(|row| {
-                    row.version > *expected_version
-                        && row.body == *body
-                        && row.rationale == *rationale
-                        && row.priority == *priority
-                })
-                .map(|row| {
-                    (
-                        format!("amended {} to v{}", row.key, row.version),
-                        Row::Requirement(row.id),
-                    )
-                }),
-            Sent::Withdraw { id } => snapshot
-                .requirement(*id)
-                .filter(|row| row.state == RequirementState::Withdrawn)
-                .map(|row| (format!("withdrew {}", row.key), Row::Requirement(row.id))),
-        };
-        let Some((message, row)) = landed else {
-            return false;
+    /// MOD-59 D4: the tab write in flight landed. `outcome` is the store's own answer, so nothing
+    /// here searches the snapshot: the form closes, the notice says what landed, and the cursor
+    /// goes to the row it landed on, whose detail is re-read, when the tree drawn holds it.
+    /// `unread` is the re-read's failure (D5): the tree is the one held before the write, which may
+    /// not hold a new row yet.
+    fn land(&mut self, outcome: &RequirementWrite, unread: Option<&str>, ctx: &Ctx<'_>) {
+        let (landed, row) = match outcome {
+            RequirementWrite::Area { id, code } => (format!("added area {code}"), Row::Area(*id)),
+            RequirementWrite::Minted { id, key } => {
+                (format!("minted {key}"), Row::Requirement(*id))
+            }
+            RequirementWrite::Amended { id, key, version } => (
+                format!("amended {key} to v{version}"),
+                Row::Requirement(*id),
+            ),
+            RequirementWrite::Withdrawn { id, key } => {
+                (format!("withdrew {key}"), Row::Requirement(*id))
+            }
         };
         self.busy = None;
-        self.sent = None;
         self.mode = Mode::Browse;
-        self.notice = Some(Notice::Info(message));
-        self.select_row(row, ctx);
-        true
+        self.notice = Some(match unread {
+            None => Notice::Info(landed),
+            Some(why) => Notice::Error(landed_unread(&landed, why)),
+        });
+        let held = self.snapshot.as_ref().is_some_and(|snapshot| match row {
+            Row::Area(id) => snapshot.area(id).is_some(),
+            Row::Requirement(id) => snapshot.requirement(id).is_some(),
+            Row::Project(id) => snapshot.project(id).is_some(),
+        });
+        if held {
+            self.select_row(row, ctx);
+        }
+    }
+
+    /// A read's tail, shared by a `Requirements` reply and a `RequirementWritten` that lands
+    /// nothing (MOD-59 H-10): a pending reveal is decided, and the cursor re-selected.
+    fn after_read(&mut self, ctx: &Ctx<'_>) {
+        // MOD-64 D251: a reveal of a requirement that was not read is decided by this one.
+        if let Some((id, key)) = self.pending_reveal.take() {
+            if self.holds(id) {
+                self.select_row(Row::Requirement(id), ctx);
+            } else {
+                self.notice = Some(Notice::Error(not_in_these_requirements(&key)));
+            }
+        }
+        self.reselect(ctx);
     }
 
     /// Makes `row` visible, puts the cursor on it and re-reads its detail: `land`'s tail, shared
@@ -858,7 +734,6 @@ impl RequirementsTab {
         if self.busy.take().is_none() {
             return;
         }
-        self.sent = None;
         let id = match &self.mode {
             Mode::Requirement(RequirementForm {
                 target: FormTarget::Amend { id, .. },
@@ -1134,29 +1009,35 @@ impl Tab for RequirementsTab {
                 if !snapshot.is_for(ctx.scope) {
                     return;
                 }
+                // A read never lands a write (MOD-59 D4): only the write's own reply does.
                 self.snapshot = Some((**snapshot).clone());
                 self.recovered();
-                if self.busy.is_some() && self.land(ctx) {
-                    self.verifying = None;
-                    return;
-                }
-                if let Some(message) = self.verifying.take() {
-                    // The mint did not land after all: the refusal stands, and the form keeps
-                    // its text for a retry.
-                    self.busy = None;
-                    self.sent = None;
-                    self.notice = Some(Notice::Error(message));
-                }
-                // MOD-64 D251: a reveal of a requirement that was not read is decided by this one.
-                if let Some((id, key)) = self.pending_reveal.take() {
-                    if self.holds(id) {
-                        self.select_row(Row::Requirement(id), ctx);
+                self.after_read(ctx);
+            }
+            StoreReply::RequirementWritten { snapshot, outcome } => match snapshot {
+                Ok(snapshot) => {
+                    if !snapshot.is_for(ctx.scope) {
+                        return;
+                    }
+                    self.snapshot = Some((**snapshot).clone());
+                    self.recovered();
+                    if self.busy == Some(outcome.request_name()) {
+                        self.land(outcome, None, ctx);
                     } else {
-                        self.notice = Some(Notice::Error(not_in_these_requirements(&key)));
+                        // Not this tab's write in flight: a read like any other (H-10).
+                        self.after_read(ctx);
                     }
                 }
-                self.reselect(ctx);
-            }
+                // No snapshot to check the scope by: only the write in flight owns this reply,
+                // and a scope change has already forgotten that (`on_scope_change`).
+                Err(why) if self.busy == Some(outcome.request_name()) => {
+                    if self.snapshot.is_none() {
+                        self.unavailable = Some(why.clone());
+                    }
+                    self.land(outcome, Some(why), ctx);
+                }
+                Err(_) => {}
+            },
             StoreReply::RequirementsStale(snapshot) => {
                 if !snapshot.is_for(ctx.scope) {
                     return;
@@ -1183,14 +1064,6 @@ impl Tab for RequirementsTab {
             StoreReply::Failed { request, message } if *request == READ_NAME => {
                 // D251: a refused read must not leave a jump armed for a later one.
                 self.pending_reveal = None;
-                if let Some(refused) = self.verifying.take() {
-                    // The check could not be made: report the mint's own refusal.
-                    self.busy = None;
-                    self.sent = None;
-                    self.notice = Some(Notice::Error(refused));
-                    self.unavailable = Some(message.clone());
-                    return;
-                }
                 // A snapshot already held stays drawn, and the refusal is the notice.
                 if self.snapshot.is_some() {
                     self.notice = Some(Notice::Error(message.clone()));
@@ -1205,17 +1078,10 @@ impl Tab for RequirementsTab {
             StoreReply::Failed { request, message }
                 if is_tab_write(request) && self.busy == Some(*request) =>
             {
-                if matches!(self.sent, Some(Sent::Mint { .. })) {
-                    // The mint may have applied with only its re-read failing: look before
-                    // offering a retry that would mint a second requirement.
-                    self.verifying = Some(message.clone());
-                    self.notice = Some(Notice::Info(CHECKING_MINT.to_owned()));
-                    ctx.request(StoreRequest::Requirements(ctx.scope.clone()));
-                    return;
-                }
-                // A refused write leaves the form as it was: nothing was written.
+                // D5: a tab write's `Failed` is a refusal; nothing was written, so the form keeps
+                // its text. A write that applied answers `RequirementWritten`, even when only its
+                // re-read failed, so a mint is never re-checked here (MOD-59).
                 self.busy = None;
-                self.sent = None;
                 self.notice = Some(Notice::Error(message.clone()));
             }
             _ => {}

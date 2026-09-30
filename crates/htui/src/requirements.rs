@@ -3,10 +3,14 @@
 //! and the seven writes, the [`crate::templates`] shape.
 //!
 //! One read per event and never one per keystroke, one reply out. Every write re-reads rather than
-//! handing the view the row its outcome carries: a tab write answers a fresh
-//! [`RequirementsSnapshot`], a citation write a fresh [`ItemCitations`]. An amend or withdraw that
-//! missed its version answers [`StoreReply::RequirementsStale`] (plan P3); every other refusal
-//! stays an error, so [`crate::store_worker::serve`] answers `Failed` with the store's sentence.
+//! handing the view the row its outcome carries: a tab write that applied answers
+//! [`StoreReply::RequirementWritten`], a fresh [`RequirementsSnapshot`] beside what the store wrote
+//! (MOD-59), so the tab lands it on its own reply and never by searching the snapshot; a citation
+//! write answers a fresh [`ItemCitations`]. A re-read that fails after a tab write applied still
+//! answers `RequirementWritten`, carrying the failure, because the write has landed. An amend or
+//! withdraw that missed its version answers [`StoreReply::RequirementsStale`] (plan P3); every
+//! other refusal stays an error, so [`crate::store_worker::serve`] answers `Failed` with the
+//! store's sentence.
 //!
 //! **The maintainer gate** (PRD D1, plan P5): area create, mint, amend and withdraw are the
 //! project's requirements owner's (`requirement_spec.owner_id`). A project with no spec is
@@ -27,9 +31,9 @@
 //! text filter is a substring of key or title, so `ANA-1` would also find `ANA-10` (blueprint
 //! F-11). An unknown key is refused before any write.
 //!
-//! Known residue, the one [`crate::templates`] and [`crate::skills`] carry: a re-read that fails
-//! *after* an applied write answers `Failed`, so the view is told nothing happened when the write
-//! has in fact landed.
+//! Known residue, the citation writes' alone (MOD-59 D6): a re-read that fails *after* an applied
+//! cite, uncite or re-confirm answers `Failed`, so the Reqs sub-tab is told nothing happened when
+//! the write has in fact landed.
 //!
 //! The worker fills the author and the box from [`Backend::this_user`] and [`Backend::box_info`];
 //! the render side never holds a `UserId` (`R-NF-3`). Nothing here reads the clock: the store
@@ -432,13 +436,20 @@ impl RequirementWrite {
 
 /// Serves one requirement request, off the UI task.
 ///
+/// The tab's read answers [`StoreReply::Requirements`]. A tab write answers
+/// [`StoreReply::RequirementWritten`] when it applied, even when only the re-read after it failed
+/// (MOD-59 D1, D5), and an amend or withdraw that missed its version answers
+/// [`StoreReply::RequirementsStale`]; a refusal stays an error.
+///
 /// # Errors
 /// Whatever the seam reports; offline, [`StoreError::Unreachable`] with `DATABASE_UNREACHABLE`
 /// for the seven writes; [`StoreError::Constraint`] for a refused input or a user who is not the
 /// maintainer; [`StoreError::Backend`] for a request that is not one of this module's ten.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
     match request {
-        StoreRequest::Requirements(scope) => answer(backend, scope, false).await,
+        StoreRequest::Requirements(scope) => Ok(StoreReply::Requirements(Box::new(
+            snapshot(backend, scope).await?,
+        ))),
         StoreRequest::RequirementDetail(id) => Ok(StoreReply::RequirementDetail(Box::new(
             detail(backend, *id).await?,
         ))),
@@ -476,7 +487,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 .map_or(0, |last| last + 1);
             let me = backend.this_user().await?;
             gate(backend, &writer, *project, me).await?;
-            writer
+            let area = writer
                 .create_requirement_area(NewRequirementArea {
                     id: RequirementAreaId::new(),
                     project_id: *project,
@@ -486,7 +497,11 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                     position,
                 })
                 .await?;
-            answer(backend, scope, false).await
+            let landed = RequirementWrite::Area {
+                id: area.id,
+                code: area.code,
+            };
+            answer(backend, scope, Some(landed)).await
         }
         StoreRequest::MintRequirement {
             scope,
@@ -514,7 +529,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             let me = backend.this_user().await?;
             let box_id = backend.box_info().await?.map(|row| row.box_id);
             gate(backend, &writer, *project, me).await?;
-            writer
+            let row = writer
                 .mint_requirement(
                     *area,
                     NewRequirement {
@@ -527,7 +542,11 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                     },
                 )
                 .await?;
-            answer(backend, scope, false).await
+            let landed = RequirementWrite::Minted {
+                id: row.id,
+                key: row.key,
+            };
+            answer(backend, scope, Some(landed)).await
         }
         StoreRequest::AmendRequirement {
             scope,
@@ -553,10 +572,18 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 box_id,
                 reason: "amended".to_owned(),
             };
-            let update = writer
+            let landed = match writer
                 .amend_requirement(*id, *expected_version, patch, deciding)
-                .await?;
-            answer(backend, scope, is_diverged(&update)).await
+                .await?
+            {
+                RequirementUpdate::Updated(row) => Some(RequirementWrite::Amended {
+                    id: row.id,
+                    key: row.key,
+                    version: row.version,
+                }),
+                RequirementUpdate::Diverged { .. } => None,
+            };
+            answer(backend, scope, landed).await
         }
         StoreRequest::WithdrawRequirement {
             scope,
@@ -570,10 +597,17 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             let me = backend.this_user().await?;
             let box_id = backend.box_info().await?.map(|row| row.box_id);
             gate(backend, &writer, project, me).await?;
-            let update = writer
+            let landed = match writer
                 .withdraw_requirement(*id, *expected_version, deciding, me, box_id)
-                .await?;
-            answer(backend, scope, is_diverged(&update)).await
+                .await?
+            {
+                RequirementUpdate::Updated(row) => Some(RequirementWrite::Withdrawn {
+                    id: row.id,
+                    key: row.key,
+                }),
+                RequirementUpdate::Diverged { .. } => None,
+            };
+            answer(backend, scope, landed).await
         }
         StoreRequest::CiteRequirement {
             item,
@@ -776,21 +810,32 @@ async fn gate_after_read(
     }
 }
 
-/// Whether an amend or withdraw missed its version.
-const fn is_diverged(update: &RequirementUpdate) -> bool {
-    matches!(update, RequirementUpdate::Diverged { .. })
+/// The scope re-read after a tab write (MOD-59 D1, D5): `RequirementWritten` naming what `landed`
+/// wrote, or `RequirementsStale` when an amend or withdraw missed its version (`None`). The worker
+/// re-reads rather than handing the view the row the outcome carries: the view renders a tree, and
+/// a row patched in locally would be a second source of truth. A re-read that fails after an
+/// applied write still answers `RequirementWritten`, because the write landed; after a missed one
+/// it stays an error (D3).
+async fn answer(
+    backend: &Backend,
+    scope: &Scope,
+    landed: Option<RequirementWrite>,
+) -> Result<StoreReply> {
+    let fresh = snapshot(backend, scope).await;
+    match landed {
+        Some(outcome) => Ok(written(fresh, outcome)),
+        None => Ok(StoreReply::RequirementsStale(Box::new(fresh?))),
+    }
 }
 
-/// The scope re-read: [`StoreReply::Requirements`], or [`StoreReply::RequirementsStale`] after a
-/// missed version. The worker re-reads rather than handing the view the row the outcome carries:
-/// the view renders a tree, and a row patched in locally would be a second source of truth.
-async fn answer(backend: &Backend, scope: &Scope, stale: bool) -> Result<StoreReply> {
-    let fresh = Box::new(snapshot(backend, scope).await?);
-    Ok(if stale {
-        StoreReply::RequirementsStale(fresh)
-    } else {
-        StoreReply::Requirements(fresh)
-    })
+/// MOD-59 D5: the reply to a tab write that applied, whatever its re-read came to. A failed
+/// re-read travels as its `StoreError` rendered through `Display`, the sentence `Failed` would
+/// carry.
+fn written(reread: Result<RequirementsSnapshot>, outcome: RequirementWrite) -> StoreReply {
+    StoreReply::RequirementWritten {
+        snapshot: reread.map(Box::new).map_err(|err| err.to_string()),
+        outcome,
+    }
 }
 
 /// The item's citations re-read after a citation write.
@@ -807,7 +852,7 @@ mod tests {
         ItemCitations, READ_NAME, REQUEST_NAMES, RequirementDetail, RequirementText,
         RequirementWrite, RequirementsSnapshot, decision_citation_not_cited,
         decision_citation_stays, gate_after_read, is_citation_write, is_tab_write, matches_filter,
-        no_deciding_item, not_the_maintainer, requirement_of_another_project, serve,
+        no_deciding_item, not_the_maintainer, requirement_of_another_project, serve, written,
     };
     use crate::store_worker::{self, StoreReply, StoreRequest};
     use chrono::TimeDelta;
@@ -1340,6 +1385,33 @@ mod tests {
             matches!(again, Ok(StoreReply::RequirementsStale(_))),
             "a second withdraw at the old version is stale: {again:?}"
         );
+    }
+
+    /// MOD-59 D5: a re-read that fails after a tab write applied still answers
+    /// `RequirementWritten`, the failure rendered as `Failed` would render it. `MemStore` cannot
+    /// fail a read inside one `serve`, so the mapping is pinned here.
+    #[test]
+    fn a_reread_that_fails_after_a_tab_write_still_answers_requirement_written() {
+        let outcome = RequirementWrite::Minted {
+            id: ids::REQ_ENT_2,
+            key: "R-ENT-2".to_owned(),
+        };
+
+        let reply = written(
+            Err(StoreError::Unreachable("gone".to_owned())),
+            outcome.clone(),
+        );
+
+        match reply {
+            StoreReply::RequirementWritten {
+                snapshot: Err(message),
+                outcome: landed,
+            } => {
+                assert_eq!(message, "store unreachable: gone");
+                assert_eq!(landed, outcome);
+            }
+            other => panic!("a landed write answers `RequirementWritten`, not {other:?}"),
+        }
     }
 
     #[tokio::test]

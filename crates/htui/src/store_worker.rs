@@ -730,7 +730,8 @@ pub enum StoreRequest {
     /// One item's citations and what it could cite (plan P8), answered with
     /// [`StoreReply::ItemCitations`].
     ItemRequirements(ItemId),
-    /// `create_requirement_area`, gated (PRD D1). The worker picks `position` (last + 1).
+    /// `create_requirement_area`, gated (PRD D1). The worker picks `position` (last + 1). Answered
+    /// with [`StoreReply::RequirementWritten`] when it applied (MOD-59).
     CreateRequirementArea {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -742,6 +743,7 @@ pub enum StoreRequest {
         title: String,
     },
     /// `mint_requirement`, gated. The worker mints the id and fills `created_by` and `box_id`.
+    /// Answered with [`StoreReply::RequirementWritten`] when it applied (MOD-59).
     MintRequirement {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -757,7 +759,8 @@ pub enum StoreRequest {
         priority: Priority,
     },
     /// `amend_requirement` at `expected_version`, gated; `deciding` is the typed item key (plan
-    /// P6). [`StoreReply::RequirementsStale`] on `Diverged`.
+    /// P6). Answered with [`StoreReply::RequirementWritten`] when it applied (MOD-59),
+    /// [`StoreReply::RequirementsStale`] on `Diverged`.
     AmendRequirement {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -774,7 +777,9 @@ pub enum StoreRequest {
         /// The deciding item's key, as typed.
         deciding: String,
     },
-    /// `withdraw_requirement` at `expected_version`, gated; `deciding` as above.
+    /// `withdraw_requirement` at `expected_version`, gated; `deciding` as above. Answered with
+    /// [`StoreReply::RequirementWritten`] when it applied (MOD-59),
+    /// [`StoreReply::RequirementsStale`] on `Diverged`.
     WithdrawRequirement {
         /// The scope the reply re-reads.
         scope: Scope,
@@ -1160,8 +1165,9 @@ pub enum StoreReply {
         /// What the write did.
         outcome: AgentWrite,
     },
-    /// The scope's requirements, freshly read: the answer to [`StoreRequest::Requirements`] and to
-    /// every tab write that applied (MOD-39 plan P3).
+    /// The scope's requirements, freshly read: the answer to [`StoreRequest::Requirements`] (MOD-39
+    /// plan P3). A read answer only: a tab write that applied answers
+    /// [`StoreReply::RequirementWritten`] (MOD-59).
     Requirements(Box<RequirementsSnapshot>),
     /// An amend or withdraw missed its version (plan P3): the snapshot as it is now. The form keeps
     /// its text and retries only by hand.
