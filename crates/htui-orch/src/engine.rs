@@ -13636,18 +13636,52 @@ mod tests {
         );
     }
 
-    /// The seq-0 `prompt` payload's `(text, digest)` and the step's `prompt_digest`, for the one
-    /// step `started` parks.
-    async fn recorded_prompt(harness: &Harness) -> (String, String, Option<String>) {
+    /// The seq-0 `prompt` payload's `(text, digest)`, the step's `prompt_digest`, and the step's
+    /// prompt re-assembled along `assemble_prompt`'s path — stage 3's own, whose `digest` is what
+    /// `set_step_prompt` wrote before the session — for the one step `started` parks.
+    /// `MemStore` keeps no history of the column the recorder overwrites, so the pre-flight
+    /// digest is recomputed; the caller's text equality is what proves it is the same prompt.
+    async fn recorded_prompt(
+        harness: &Harness,
+    ) -> (
+        String,
+        String,
+        Option<String>,
+        htui_core::prompt::AssembledPrompt,
+    ) {
         let (run, step) = started(harness).await;
-        let prompt_digest = harness
+        let step_row = harness
             .orch
             .steps(run)
             .await
             .into_iter()
             .find(|row| row.id == step)
-            .expect("the parked step")
-            .prompt_digest;
+            .expect("the parked step");
+        let prompt_digest = step_row.prompt_digest.clone();
+        let row = harness.orch.run(run).await;
+        let snapshot = snapshot_of(harness, run).await;
+        let phase = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == step_row.phase_name)
+            .expect("the parked step's phase");
+        let item = row.item_id.expect("an item's run");
+        harness_engine!(harness.orch, engine);
+        // Stage 3's `assemble_prompt`, step by step, as it stood before the session: the step's
+        // own output document did not exist yet, so it is not an input of the pre-flight prompt.
+        let mut spec = engine
+            .phase_spec(&row, &snapshot, &step_row, phase, item, true)
+            .await
+            .expect("the spec is built")
+            .expect("the parked phase requires nothing missing");
+        spec.documents
+            .retain(|document| document.kind != phase.output_kind);
+        engine
+            .with_excerpts(&row, &step_row, item, &mut spec)
+            .await
+            .expect("the excerpt pass runs");
+        let preflight = htui_core::prompt::assemble(&spec, engine.parts.scrubber)
+            .expect("the demo phase prompt assembles");
         let payload = harness
             .orch
             .store
@@ -13665,21 +13699,27 @@ mod tests {
                 .unwrap_or_else(|| panic!("the payload carries `{key}`"))
                 .to_owned()
         };
-        (field("text"), field("digest"), prompt_digest)
+        (field("text"), field("digest"), prompt_digest, preflight)
     }
 
-    /// MOD-33 D271, ANA-5 §12 criterion 11: a box-bearing phase step's `prompt_digest` is the
-    /// payload's `digest`, which is over the digest text and not over the text sent; and a box
-    /// whose hostname differs records the same digest.
+    /// MOD-33 D271, ANA-5 §12 criterion 11: a box-bearing phase step's `prompt_digest` — the
+    /// recorder's, over the digest text — is stage 3's pre-flight digest and the payload's
+    /// `digest`, and not the hash of the text sent; and a box whose hostname differs records the
+    /// same digest.
     #[tokio::test]
     async fn a_step_digest_is_the_payload_digest_and_not_the_sent_text_hash() {
         let first = Harness::new().await;
-        let (text, digest, prompt_digest) = recorded_prompt(&first).await;
+        let (text, digest, prompt_digest, preflight) = recorded_prompt(&first).await;
+        assert_eq!(
+            preflight.text, text,
+            "the re-assembly is the prompt the session was sent"
+        );
         assert_eq!(
             prompt_digest.as_deref(),
-            Some(digest.as_str()),
-            "criterion 11"
+            Some(preflight.digest.as_str()),
+            "criterion 11: the recorder's digest is stage 3's pre-flight one"
         );
+        assert_eq!(digest, preflight.digest, "the payload carries it too");
         assert_ne!(
             digest,
             htui_core::prompt::digest::sha256_hex(&text),
@@ -13697,7 +13737,10 @@ mod tests {
             .hostname = "a-much-longer-build-host.example.internal".to_owned();
         orch.store = MemStore::from_demo(data).with_clock(std::sync::Arc::new(orch.clock.clone()));
         let second = Harness { orch };
-        let (other_text, other_digest, other_prompt_digest) = recorded_prompt(&second).await;
+        let (other_text, other_digest, other_prompt_digest, other_preflight) =
+            recorded_prompt(&second).await;
+        assert_eq!(other_preflight.text, other_text);
+        assert_eq!(other_preflight.digest, preflight.digest);
         assert!(
             other_text.contains("hostname: a-much-longer-build-host.example.internal\n"),
             "{other_text}"
