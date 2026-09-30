@@ -20,8 +20,8 @@ use htui_agent::fake::FakeAdapter;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::{demo_at, edit_agent, ids};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, CitationKind, DocumentId, ItemId, NewDocument, Resolution,
-    RunStep, SnapshotPhase, Status, Transport, WorkspaceSummary,
+    Agent, AgentBox, AgentId, Billing, CitationKind, DocumentId, ItemId, NewDocument, NewRunStep,
+    Resolution, RunStatus, RunStep, SnapshotPhase, Status, StepId, Transport, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 use htui_orch::Clock;
@@ -740,4 +740,228 @@ async fn the_runs_pane_greys_a_key_with_the_guard_s_sentence() {
     harness.key("a");
     harness.drive().await;
     assert_eq!(harness.app().status.as_deref(), Some(sentence.as_str()));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Runs poll (MOD-41 plan D16, OQ-3, blueprint §12).
+// ---------------------------------------------------------------------------------------------
+
+/// Rows down to htui `FEAT-3`, the item whose run (`RUN_2`) is the fixture's only active one.
+const TO_FEAT_3: usize = 5;
+
+/// 250 ms ticks between two `Runs` polls: a refresh is every fourth tick and a poll every fifth
+/// refresh, so 5 s (D16).
+const TICKS_PER_POLL: usize = 20;
+
+/// A settled Backlog tab over `store`, scoped to `Platform`, with no run runtime: nothing but the
+/// poll can tell the pane that a run moved, because no process here walks it and so no
+/// `RunStream` frame is ever sent (the store worker only acknowledges the subscription).
+async fn polled(store: MemStore) -> Harness {
+    let mut harness = Harness::over(store)
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+    harness.drive_to_end().await;
+    harness.app().update(Action::SetScope {
+        workspace: workspace("platform").await,
+    });
+    harness.drive_to_end().await;
+    harness
+}
+
+/// `n` 250 ms ticks, each followed by a drive that serves what it asked for.
+async fn tick(harness: &mut Harness, n: usize) {
+    for _ in 0..n {
+        harness.app().update(Action::Tick);
+        harness.drive().await;
+    }
+}
+
+/// Columns left of the detail pane's contents at 100x30: the list's 55 (its `LIST_PERCENT`) and
+/// the detail pane's own left border.
+const DETAIL_INSIDE: usize = 56;
+
+/// The detail pane's half of a frame: every row from inside the pane's left border, so the list's
+/// item statuses (`awaiting_approval` is one of them) are not read as a run's.
+fn detail_pane(frame: &str) -> String {
+    frame
+        .lines()
+        .map(|line| line.chars().skip(DETAIL_INSIDE).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The run-grid status cell of the only `graph` run on the pane.
+fn run_status(frame: &str) -> Option<String> {
+    detail_pane(frame).lines().find_map(|line| {
+        let mut cells = line.split_whitespace();
+        cells.position(|cell| cell == "graph")?;
+        cells.next().map(str::to_owned)
+    })
+}
+
+/// The demo with `RUN_2`, `FEAT-3`'s queued run, moved on to `running` as a claim would.
+async fn running_store() -> MemStore {
+    let store = MemStore::demo();
+    assert!(
+        store
+            .transition_run(
+                ids::RUN_2,
+                RunStatus::Queued,
+                RunStatus::Running,
+                demo_at(2, 9)
+            )
+            .await
+            .expect("the run exists"),
+        "`RUN_2` was queued"
+    );
+    store
+}
+
+/// D16: a run another process walks moves in the store; the pane re-reads it on the fifth
+/// refresh, and not before.
+#[tokio::test]
+async fn the_runs_pane_rereads_an_active_run_every_poll() {
+    let store = running_store().await;
+    let mut harness = polled(store.clone()).await;
+    down(&mut harness, TO_FEAT_3).await;
+    sub_tab(&mut harness, 1);
+    let frame = harness.render();
+    assert_eq!(
+        run_status(&frame).as_deref(),
+        Some("running"),
+        "FEAT-3's run shows running:\n{frame}"
+    );
+
+    assert!(
+        store
+            .transition_run(
+                ids::RUN_2,
+                RunStatus::Running,
+                RunStatus::AwaitingApproval,
+                demo_at(2, 10),
+            )
+            .await
+            .expect("the run exists"),
+        "the other process parks the run"
+    );
+
+    tick(&mut harness, TICKS_PER_POLL - 1).await;
+    let frame = harness.render();
+    assert_eq!(
+        run_status(&frame).as_deref(),
+        Some("running"),
+        "nineteen ticks are four refreshes: no poll yet:\n{frame}"
+    );
+
+    tick(&mut harness, 1).await;
+    let frame = harness.render();
+    assert_eq!(
+        run_status(&frame).as_deref(),
+        Some("awaiting"),
+        "the twentieth tick is the fifth refresh, and the poll shows the park:\n{frame}"
+    );
+    assert_eq!(harness.app().status, None, "and nothing failed");
+}
+
+/// D16: an item whose every run is terminal is not polled. A step written behind the pane's back
+/// stays unseen through two poll periods, and a re-selection (which does read) shows it.
+#[tokio::test]
+async fn the_runs_pane_does_not_poll_a_finished_item() {
+    let store = MemStore::demo();
+    let mut harness = polled(store.clone()).await;
+    down(&mut harness, TO_FEAT_1).await;
+    sub_tab(&mut harness, 1);
+    let frame = harness.render();
+    assert_eq!(
+        run_status(&frame).as_deref(),
+        Some("done"),
+        "FEAT-1's only run is done:\n{frame}"
+    );
+
+    store
+        .create_step(NewRunStep {
+            id: StepId::new(),
+            run_id: ids::RUN_1,
+            position: 4,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "unpolled".to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE),
+            model: Some("sonnet".to_owned()),
+        })
+        .await
+        .expect("the step lands");
+
+    tick(&mut harness, 2 * TICKS_PER_POLL).await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("unpolled"),
+        "forty ticks sent no `Runs` for an item with no active run:\n{frame}"
+    );
+
+    harness.key("k");
+    harness.drive().await;
+    harness.key("j");
+    harness.drive().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("unpolled"),
+        "the step is there for a read to find:\n{frame}"
+    );
+}
+
+/// D16 with MOD-4 D198: the cursor on the second entry stays on it across a poll that changed the
+/// rows.
+#[tokio::test]
+async fn the_runs_pane_poll_keeps_the_cursor() {
+    let store = MemStore::demo();
+    store
+        .create_step(NewRunStep {
+            id: StepId::new(),
+            run_id: ids::RUN_2,
+            position: 1,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "plan".to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE),
+            model: Some("sonnet".to_owned()),
+        })
+        .await
+        .expect("the second step lands");
+    let mut harness = polled(store.clone()).await;
+    down(&mut harness, TO_FEAT_3).await;
+    sub_tab(&mut harness, 1);
+    harness.key("J");
+    let cursor_on = |frame: &str| {
+        detail_pane(frame)
+            .lines()
+            .find(|line| line.contains('\u{25b8}'))
+            .map(|line| line.contains("plan"))
+    };
+    let frame = harness.render();
+    assert_eq!(
+        (run_status(&frame).as_deref(), cursor_on(&frame)),
+        (Some("queued"), Some(true)),
+        "`J` put the cursor on the second step, `plan`:\n{frame}"
+    );
+
+    assert!(
+        store
+            .transition_run(
+                ids::RUN_2,
+                RunStatus::Queued,
+                RunStatus::Running,
+                demo_at(2, 9)
+            )
+            .await
+            .expect("the run exists"),
+        "a worker claims the run"
+    );
+    tick(&mut harness, TICKS_PER_POLL).await;
+    let frame = harness.render();
+    assert_eq!(
+        (run_status(&frame).as_deref(), cursor_on(&frame)),
+        (Some("running"), Some(true)),
+        "the poll re-read the run and the cursor stayed on `plan`:\n{frame}"
+    );
 }
