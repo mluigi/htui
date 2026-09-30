@@ -1,6 +1,6 @@
 # Plan: MOD-64 — concepts search in the TUI
 
-**Status: CONFIRMED by the maintainer 2026-09-29 with OQ-1..OQ-4 defaults as written.**
+**Status: CONFIRMED by the maintainer 2026-09-29 with OQ-1..OQ-4 defaults as written.** **IMPLEMENTED** `191a7ec`..`6cf2696` (2026-09-30); final review `rust-reviewer` APPROVE WITH FIXES, all eight findings applied. Write-up: `docs/decisions/mod/mod-64.md`.
 
 **Source**: `HANDOFF.md` MOD-64 (from MOD-50, 2026-09-29): a search overlay over the concepts index
 — free text, scoped to the selected project or all, a decisions toggle, hits listed as

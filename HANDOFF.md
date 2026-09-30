@@ -14,7 +14,11 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-29):** **TOOL-7 shipped** (`docs/decisions/tool/tool-7.md`): `scripts/hr` runs
+**Current status (2026-09-30):** **MOD-64 was done** (`docs/decisions/mod/mod-64.md`): `Ctrl+F`
+opens a concepts search overlay from every tab (scope: the workspace or one project, `Ctrl+D`
+decisions, `Ctrl+R` re-index), served off the store worker's loop by `ConceptsRuntime`; `Enter`
+selects the hit in the Backlog or the Requirements tab, and a Qdrant error stays inside the box.
+Before it, **TOOL-7 shipped** (`docs/decisions/tool/tool-7.md`): `scripts/hr` runs
 3–4 `/handoff-run` lifecycles side by side, each in its own container set (fresh clone on
 `hr/<ITEM>`, private Postgres/Qdrant, no git credentials), with cross-run ID leases through
 `scripts/hr-mint`; guide `docs/hr-sandbox.md`.
@@ -26,21 +30,15 @@ Item detail gained a **Reqs** sub-tab ("Documents" is now "Docs") to re-confirm,
 and the Runs pane's close-out picks the resolution, so an `open` item can now close as withdrawn,
 rejected, superseded or duplicate. CLEAN-6 was folded in, and the stale `Engine::close_out` doc comments were fixed once
 MOD-40 released `engine.rs`. No migration and no store change.
-Before it, **MOD-40 was done** (`docs/decisions/mod/mod-40.md`): step
-writes (`append_events`, `set_step_usage`, `finish_step`) are fenced by the run's lease owner, so a
-process that wakes after its run was adopted writes nothing to its old step. Lease times are
-stamped by Postgres, quota writes keep the newest, agent edits are a compare-and-set, the store
-worker beats `box.last_seen_at`, and a headless connect never migrates and refuses a build below
-`htui_target_version` (`R-STO-5` amended). No migration. **MOD-41** is no longer blocked.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
 (MOD-38) and `0007_skill_attachments` (MOD-9 milestone 2; cache: `0001`..`0004`), so **the next
 migration is `0008`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
-(done, all four milestones), MOD-38, MOD-9 milestones 1 to 4, MOD-40 and MOD-39 (re-counted
-2026-09-29): store conformance `CASES` 96, `READ_CASES` 14, `htui-orch` `CASES` 73, `GraphSource` 7
-methods, `StoreRequest` 85, `StoreReply` 47, `hierarchy::REQUEST_NAMES` 13, 288 `.sqlx` files, 107
+(done, all four milestones), MOD-38, MOD-9 milestones 1 to 4, MOD-40, MOD-39 and MOD-64 (re-counted
+2026-09-30): store conformance `CASES` 96, `READ_CASES` 14, `htui-orch` `CASES` 73, `GraphSource` 7
+methods, `StoreRequest` 87, `StoreReply` 48, `hierarchy::REQUEST_NAMES` 13, 288 `.sqlx` files, 112
 `crates/htui/tests/snapshots`,
 `MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 34 pinned commented
 columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 2` with `skill_choices`.
@@ -677,7 +675,7 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   trait exists yet either. The MOD-4 (M6) dependency is met.
   **MOD-34 left the concepts-index sync here** (`docs/decisions/mod/mod-34.md`, `R-STO-8`):
   run `htui_store::vector_sync::Indexer::sync` as a background job; until then it is
-  `htui --index-items`.
+  `htui --index-items`, or `Ctrl+R` in the TUI's concepts search (MOD-64, `docs/decisions/mod/mod-64.md`).
 - [ ] **MOD-42 - Permission and control relay through Postgres** (from ANA-16, §8 item 3).
   `R-AGT-1`, `R-HIS-1`, `R-TUI-6`. The engine's `pump` (`record.rs:1684-1703`) cannot answer a
   parked ACP request, so engine-driven ACP steps fail on their first permission request today. The
@@ -753,18 +751,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   preferred. The three crates are not in `Cargo.lock`, so the plan owns that dependency decision.
   Not blocked. Its in-app widget draws through `ui::cells` (MOD-54, done:
   `docs/decisions/mod/mod-54.md`); the rest of the display-width work is MOD-60.
-- [ ] **MOD-64 - Concepts search in the TUI** (from MOD-50, 2026-09-29). `R-STO-8`, `R-TUI-2`.
-  The concepts index is reachable only from the command line today (`htui --index-items`,
-  `htui --search-items [--decisions]`, `crates/htui/src/concepts.rs`); inside the TUI, Qdrant is
-  only a Settings section. Add a search overlay: free text, scoped to the selected project or all,
-  a decisions toggle, and hits listed as `concepts::format_hit` prints them. Enter on an item or
-  document hit selects that item in the Backlog; a requirement hit opens it in the
-  Requirements tab (MOD-39, done: `docs/decisions/mod/mod-39.md`). Embedding the query loads the model synchronously
-  (`FastEmbedder::new`, MOD-34 review), so the search runs off the UI thread, and a missing or
-  unreachable Qdrant is an inline error that affects nothing else (`R-STO-8`). Whether the TUI also
-  offers a re-index action, or leaves that to MOD-41's background sync, is this item's call. MOD-50
-  is done (`docs/decisions/mod/mod-50.md`): hits carry an `Owner` (item or requirement), the
-  resolution and the requirement state, and `concepts::DECISION_RESOLUTIONS` is the decisions set.
 
 ### Deferred backlog
 
@@ -806,6 +792,6 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 4 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-26 configurable hotkeys) |
-| MOD-N   | 35 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-64 TUI concepts search; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 34 (MOD-9 skills, MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-23 agent registry editing, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-4 unreachable `NoProgressReview`, CLEAN-7 offline-buffer leftovers)            |
 | TOOL-N  | 0 |

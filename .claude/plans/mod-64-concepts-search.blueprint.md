@@ -1,6 +1,6 @@
 # Blueprint: MOD-64, concepts search in the TUI
 
-**Status**: accepted (2026-09-29); F1 resolved by the maintainer as `find` (D236, D257 amended). Findings F1–F13 (§0) and decisions D241–D262 (§11) are proposed
+**Status**: accepted (2026-09-29); F1 resolved by the maintainer as `find` (D236, D257 amended). Findings F1–F13 (§0) and decisions D241–D262 (§11) are proposed **Superseded at review (2026-09-30):** the model load and the Qdrant connection no longer follow D245, F9 and §3.2's `OnceCell` design — one shared in-flight load (retried once after a failure) and a connection cached by URL and key (review findings 2 and 3; plan D238 as amended).
 here. **Blocker** means the plan, read literally, fails its own acceptance or its own named test, or
 leaves the gate red. The Fix column is what the implementer builds.
 
