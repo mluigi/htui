@@ -1528,7 +1528,7 @@ async fn an_unreadable_usage_row_is_still_summed_into_step_usage() {
     assert_eq!(
         htui_core::model::UsageTotals::from_rows(&log).to_value(),
         summary.usage,
-        "the recorder's sum and the uploader's sum over the same persisted rows are one document"
+        "the recorder's sum and a fresh sum over the same persisted rows are one document"
     );
 }
 

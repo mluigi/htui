@@ -6843,7 +6843,7 @@ mod tests {
 
     /// The chat pair of plan D4: both rows minted `running`, and `finish_chat_run` closing both.
     #[tokio::test]
-    async fn a_chat_run_mints_the_two_rows_the_offline_upload_would() {
+    async fn a_chat_run_mints_its_run_and_step_rows_running() {
         let store = MemStore::demo();
         let before = store
             .active_runs(&Scope {

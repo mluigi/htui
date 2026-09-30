@@ -237,7 +237,7 @@ async fn an_online_chat_header_says_nothing_about_a_buffer() {
     let rendered = harness.render();
     assert!(
         !rendered.contains("buffered"),
-        "a memory chat is not buffered: {rendered}"
+        "the header names no buffer: {rendered}"
     );
     assert_eq!(
         harness.chat_steps().len(),

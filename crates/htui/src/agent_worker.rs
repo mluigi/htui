@@ -5800,10 +5800,10 @@ pub(crate) mod tests {
                 assert_eq!(request, "probe_agents");
                 assert!(
                     message.contains(htui_store::REGISTRY_ON_SERVER_ONLY),
-                    "the buffered writer's own sentence, not a second one: {message}"
+                    "the offline backend's own sentence, not a second one: {message}"
                 );
             }
-            other => panic!("a buffered writer refuses the probe: {other:?}"),
+            other => panic!("an offline backend refuses the probe: {other:?}"),
         }
         assert_eq!(
             runtime.background_len(),
@@ -5917,9 +5917,9 @@ pub(crate) mod tests {
     /// cannot hold the row refuses the **plan**, so no registry read is ever spent on an install
     /// whose result could not be written.
     #[tokio::test]
-    async fn a_plan_is_refused_before_any_request_on_a_buffered_writer() {
+    async fn a_plan_is_refused_before_any_request_on_an_offline_backend() {
         let root = tempfile::tempdir().expect("a throwaway config root");
-        let cache = htui_store::CacheStore::open(root.path(), "install-buffered", 1)
+        let cache = htui_store::CacheStore::open(root.path(), "install-offline", 1)
             .await
             .expect("a fresh mirror");
         let backend = Backend::Offline {
@@ -5948,10 +5948,10 @@ pub(crate) mod tests {
                 assert_eq!(request, "install_plan");
                 assert!(
                     message.contains(htui_store::REGISTRY_ON_SERVER_ONLY),
-                    "the buffered writer's own sentence, not a second one: {message}"
+                    "the offline backend's own sentence, not a second one: {message}"
                 );
             }
-            other => panic!("a buffered writer refuses the plan: {other:?}"),
+            other => panic!("an offline backend refuses the plan: {other:?}"),
         }
         assert!(
             !runtime.install_running(),
@@ -7113,9 +7113,9 @@ done
         /// D18's first refusal, in the probe's own order: a writer that cannot hold the row
         /// refuses the login **before** an adapter is spawned to produce one.
         #[tokio::test]
-        async fn a_start_is_refused_before_any_spawn_on_a_buffered_writer() {
+        async fn a_start_is_refused_before_any_spawn_on_an_offline_backend() {
             let tmp = tempfile::tempdir().expect("a throwaway directory");
-            let cache = htui_store::CacheStore::open(tmp.path(), "login-buffered", 1)
+            let cache = htui_store::CacheStore::open(tmp.path(), "login-offline", 1)
                 .await
                 .expect("a fresh mirror");
             let backend = Backend::Offline {
@@ -7142,10 +7142,10 @@ done
                     assert_eq!(request, "auth_start");
                     assert!(
                         message.contains(htui_store::REGISTRY_ON_SERVER_ONLY),
-                        "the buffered writer's own sentence, not a second one: {message}"
+                        "the offline backend's own sentence, not a second one: {message}"
                     );
                 }
-                other => panic!("a buffered writer refuses the login: {other:?}"),
+                other => panic!("an offline backend refuses the login: {other:?}"),
             }
             assert!(!runtime.auth_running(), "and holds no claim afterwards");
             assert_eq!(runtime.background_len(), 0);

@@ -110,7 +110,7 @@ fn canonical(mut graph: LinkGraph) -> LinkGraph {
 }
 
 /// One synthetic `session_event` row.
-fn pending_event(step: StepId, seq: i32) -> SessionEvent {
+fn synthetic_event(step: StepId, seq: i32) -> SessionEvent {
     SessionEvent {
         run_step_id: step,
         seq,
@@ -1171,7 +1171,7 @@ async fn five_thousand_events_replay_from_the_mirror_in_order() {
     .await
     .expect("insert the replay step");
 
-    let inserted: Vec<SessionEvent> = (0..5_000).map(|seq| pending_event(step, seq)).collect();
+    let inserted: Vec<SessionEvent> = (0..5_000).map(|seq| synthetic_event(step, seq)).collect();
     let mut tx = db.pool.begin().await.expect("begin");
     for event in &inserted {
         sqlx::query(
@@ -1636,7 +1636,7 @@ async fn steps_beyond_n_lose_their_events() {
     // would assert that a step outside the window keeps its events.
     let newest = ids::STEP_R3_RESEARCH_B;
     for seq in 0..3 {
-        let event = pending_event(newest, seq);
+        let event = synthetic_event(newest, seq);
         sqlx::query(
             "INSERT INTO session_event (run_step_id, seq, turn, kind, role, payload, at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -1711,7 +1711,7 @@ async fn a_running_step_is_mirrored_only_once_it_has_finished() {
     .await
     .expect("insert a running step");
     for seq in 0..3 {
-        let event = pending_event(running, seq);
+        let event = synthetic_event(running, seq);
         sqlx::query(
             "INSERT INTO session_event (run_step_id, seq, turn, kind, role, payload, at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -1740,7 +1740,7 @@ async fn a_running_step_is_mirrored_only_once_it_has_finished() {
 
     // Two more events land and the step finishes; now the whole log is copied at once.
     for seq in 3..5 {
-        let event = pending_event(running, seq);
+        let event = synthetic_event(running, seq);
         sqlx::query(
             "INSERT INTO session_event (run_step_id, seq, turn, kind, role, payload, at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7)",
