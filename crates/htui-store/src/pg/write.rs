@@ -160,7 +160,7 @@ async fn release_repo_references(conn: &mut PgConnection, id: ProjectId) -> Resu
 
 /// The existence check the two batch upserts shared, on **their own transaction** (MOD-4 T2); since
 /// MOD-41 plan D1 they run [`step_fence`] instead, and this serves `record_command_run`,
-/// `close_out` and [`fenced_or_missing`].
+/// `interrupt_step`, `close_out` and [`fenced_or_missing`].
 ///
 /// `run_step_tree` and `run_step_commit` both hang off `run_step` by a foreign key, so an unknown
 /// step would already be a `23503` - but that is [`StoreError::Constraint`] where the contract says
