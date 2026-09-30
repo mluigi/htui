@@ -1090,6 +1090,33 @@ async fn a_stale_executor_edit_says_so() {
     assert_eq!(edit.executor, Some(Executor::Worker));
 }
 
+/// MOD-41 plan D10, D48: a plain read that drops the flip's own box moves the selection, but the
+/// confirmation still names the box `y` writes to, never the newly selected one.
+#[tokio::test]
+async fn the_executor_confirmation_names_its_own_box_after_it_leaves_the_list() {
+    let (bench, mut section) = bench_with(&snap_of(two_boxes_one_worker()).await).await;
+
+    bench.key(&mut section, "k");
+    bench.key(&mut section, "w");
+    feed(&bench, &mut section, &snap_of(MemStore::demo()).await);
+
+    let frame = words(&bench.render_section(&section, 100));
+    assert!(
+        frame.contains("executor of `SECOND-BOX`: `worker` \u{2192} `tui`?"),
+        "{frame}"
+    );
+    assert!(!frame.contains("executor of `DESKTOP-HTUI`"), "{frame}");
+
+    bench.key(&mut section, "y");
+    let (box_id, _, edit) = only_edit(&requests(&bench));
+    assert_eq!(
+        box_id,
+        BoxId::from_uuid(Uuid::from_u128(1)),
+        "the flip's own box"
+    );
+    assert_eq!(edit.executor, Some(Executor::Tui));
+}
+
 /// MOD-41 plan D10: `w` over a save in flight opens nothing and says so, like `t` and `e`.
 #[tokio::test]
 async fn w_while_a_save_is_in_flight_opens_nothing() {
@@ -1106,6 +1133,42 @@ async fn w_while_a_save_is_in_flight_opens_nothing() {
     assert!(requests(&bench).is_empty());
     let frame = bench.render_section(&section, 100);
     assert!(frame.contains("edit_box in flight"), "{frame}");
+}
+
+/// MOD-41 plan D10: `w` shadows the global workspace switcher only over a listed box. Before the
+/// first read, over a refused read and over an empty list it passes, so the switcher still opens.
+#[tokio::test]
+async fn w_passes_to_the_workspace_switcher_with_no_box_to_act_on() {
+    let bench = SectionBench::new().await;
+    let mut section = BoxesSection::new();
+    assert_eq!(bench.key(&mut section, "w"), Handled::Pass, "not read yet");
+
+    let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "boxes",
+            message: "store unreachable".to_owned(),
+        },
+    );
+    assert_eq!(
+        bench.key(&mut section, "w"),
+        Handled::Pass,
+        "a refused read"
+    );
+    assert!(!section.captures_input());
+
+    let mut empty = snap_of(MemStore::demo()).await;
+    empty.boxes.clear();
+    let (bench, mut section) = bench_with(&empty).await;
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("no box is registered for this user yet"),
+        "{frame}"
+    );
+    assert_eq!(bench.key(&mut section, "w"), Handled::Pass, "an empty list");
+    assert!(!section.captures_input());
+    assert!(requests(&bench).is_empty());
 }
 
 /// MOD-41 plan D10: a `CONTROL` chord passes through the confirmation, so `ctrl-c` still quits.
