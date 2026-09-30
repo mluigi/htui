@@ -159,6 +159,80 @@ pub struct BoxEdit {
     pub declared_tags: Option<Vec<String>>,
     /// `box.quirks`, whole, lines separated by `\n`; stored as given (D43).
     pub quirks: Option<String>,
+    /// `box.settings.executor` (MOD-41 plan D10): `Some` writes that key only, and every other
+    /// key of the blob survives. [`Executor::Other`] is refused.
+    pub executor: Option<Executor>,
+}
+
+/// Which process executes runs on a box: `box.settings.executor` (MOD-41 PRD D4, plan D9, I-1).
+///
+/// Decoding never fails: `"tui"`/`"worker"` are their variants, any other string or JSON value is
+/// [`Executor::Other`], which neither role executes under (fail closed).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum Executor {
+    /// The TUI's run runtime claims, adopts and sweeps (the default).
+    #[default]
+    Tui,
+    /// `htui worker` does; the TUI queues and hands back.
+    Worker,
+    /// A value this build does not know, kept as written (`7`, `"container"`, `null` → `"null"`).
+    Other(String),
+}
+
+impl Executor {
+    /// The `box.settings` key.
+    pub const KEY: &'static str = "executor";
+
+    /// As stored: `tui`, `worker`, or the unknown text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Tui => "tui",
+            Self::Worker => "worker",
+            Self::Other(text) => text,
+        }
+    }
+
+    /// The lenient mapping of one JSON value: a known string is its variant, anything else is
+    /// [`Executor::Other`] carrying the string, or the value's JSON text.
+    fn from_value(value: &Value) -> Self {
+        match value.as_str() {
+            Some("tui") => Self::Tui,
+            Some("worker") => Self::Worker,
+            Some(other) => Self::Other(other.to_owned()),
+            None => Self::Other(value.to_string()),
+        }
+    }
+
+    /// I-1's reading (plan D9, fact-check F-M2): the `executor` key alone, never the whole
+    /// [`BoxSettings`] decode, so a malformed sibling key cannot make a worker box read as a TUI
+    /// box. Missing key → [`Executor::Tui`]; a non-object blob → [`Executor::Other`], which fails
+    /// closed.
+    #[must_use]
+    pub fn of(settings: &Value) -> Self {
+        match settings {
+            Value::Object(map) => map.get(Self::KEY).map_or(Self::Tui, Self::from_value),
+            other => Self::Other(format!("<box.settings is not an object: {other}>")),
+        }
+    }
+}
+
+impl core::fmt::Display for Executor {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for Executor {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// `BoxSettings.executor`'s decoder: whatever the value, an [`Executor`] (plan D9), so the field
+/// can never fail the struct's decode and drop `max_concurrent_items` with it.
+fn executor_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Executor, D::Error> {
+    Value::deserialize(d).map(|value| Executor::from_value(&value))
 }
 
 /// Whether `tag` is a declared tag (MOD-7 D42): 1 to [`DECLARED_TAG_MAX`] chars of
@@ -235,8 +309,9 @@ pub struct BoxInfo {
 
 /// `box.settings` as ANA-2 §4.7 reads it.
 ///
-/// Read-only this milestone (plan D11): MOD-15's key-level `set_setting` is the only writer, so
-/// unknown keys survive because nothing here is ever re-serialised onto the row.
+/// Never re-serialised onto the row, so unknown keys survive. The blob's only writer is
+/// `WriteStore::edit_box` (MOD-41 plan D10), key by key under the `edit_version` compare-and-set;
+/// no `set_setting` rung reaches it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BoxSettings {
@@ -249,6 +324,10 @@ pub struct BoxSettings {
     pub max_concurrent_items: Option<u32>,
     /// `R-MCP-3`'s `{class: n}`; empty = the `app_setting` rung.
     pub command_limits: BTreeMap<String, u32>,
+    /// `box.settings.executor` for display and round-trips. **I-1 never reads this field**: it
+    /// reads [`Executor::of`] (a bad sibling key would make this struct fall back to default).
+    #[serde(default, deserialize_with = "executor_lenient")]
+    pub executor: Executor,
 }
 
 /// The value `0003_orchestration.sql` seeds under `app_setting.max_concurrent_items`, and what a
@@ -644,5 +723,95 @@ mod tests {
             canonical_declared_tags(&owned(&["vulkan", "gpu", "gpu"])),
             Ok(owned(&["gpu", "vulkan"]))
         );
+    }
+
+    /// Decodes a blob the way both admission readers do (`from_value(..).ok()`).
+    fn settings(blob: &Value) -> Option<BoxSettings> {
+        serde_json::from_value::<BoxSettings>(blob.clone()).ok()
+    }
+
+    /// MOD-41 plan D9: an unknown executor never fails the struct's decode, so it cannot drop
+    /// `max_concurrent_items` to its fallback.
+    #[test]
+    fn an_unknown_executor_keeps_the_admission_limit() {
+        for (blob, kept) in [
+            (json!({"executor": 7, "max_concurrent_items": 1}), "7"),
+            (
+                json!({"executor": "container", "max_concurrent_items": 1}),
+                "container",
+            ),
+        ] {
+            let decoded = settings(&blob).expect("an unknown executor still decodes");
+            assert_eq!(decoded.max_concurrent_items, Some(1), "{blob}");
+            assert_eq!(decoded.executor, Executor::Other(kept.to_owned()), "{blob}");
+            assert_eq!(
+                Executor::of(&blob),
+                Executor::Other(kept.to_owned()),
+                "{blob}"
+            );
+        }
+    }
+
+    /// MOD-41 plan D9: no `executor` key is the TUI, through both readings.
+    #[test]
+    fn a_missing_executor_is_tui() {
+        for blob in [json!({}), json!({"max_concurrent_items": 1})] {
+            assert_eq!(Executor::of(&blob), Executor::Tui, "{blob}");
+            assert_eq!(
+                settings(&blob).expect("the blob decodes").executor,
+                Executor::Tui,
+                "{blob}"
+            );
+        }
+    }
+
+    /// MOD-41 plan D9 (fact-check F-M2): a malformed sibling key fails the whole-struct decode,
+    /// whose `.ok()` fallback reads `Tui`; `Executor::of` still reads the worker, so I-1 fails
+    /// closed rather than letting two processes execute on the box.
+    #[test]
+    fn a_bad_sibling_key_still_reads_the_worker_executor() {
+        let blob = json!({"executor": "worker", "max_concurrent_items": "2"});
+        assert_eq!(Executor::of(&blob), Executor::Worker);
+        assert_eq!(
+            settings(&blob).unwrap_or_default().executor,
+            Executor::Tui,
+            "the struct decode falls back to its default, which is why I-1 never reads it"
+        );
+    }
+
+    /// MOD-41 plan D9: a blob that is not a JSON object names no executor this build knows.
+    #[test]
+    fn a_non_object_blob_is_other() {
+        for blob in [json!([]), json!("x"), Value::Null] {
+            assert!(
+                matches!(Executor::of(&blob), Executor::Other(_)),
+                "{blob} reads as `Other`, which fails closed"
+            );
+        }
+    }
+
+    /// Each variant serialises as its bare text, and an unknown text survives decode → encode.
+    #[test]
+    fn executor_round_trips_as_its_text() {
+        for (executor, text) in [
+            (Executor::Tui, "tui"),
+            (Executor::Worker, "worker"),
+            (Executor::Other("container".to_owned()), "container"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(&executor).expect("an executor serialises"),
+                json!(text)
+            );
+            assert_eq!(executor.to_string(), text);
+            let blob = json!({ Executor::KEY: text });
+            assert_eq!(Executor::of(&blob), executor, "{blob}");
+            let decoded = settings(&blob).expect("the blob decodes");
+            assert_eq!(decoded.executor, executor, "{blob}");
+            assert_eq!(
+                serde_json::to_value(&decoded).expect("settings serialise")[Executor::KEY],
+                json!(text),
+                "{blob}"
+            );
+        }
     }
 }

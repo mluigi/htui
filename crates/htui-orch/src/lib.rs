@@ -1,7 +1,7 @@
 //! `htui-orch`: the step-graph orchestrator (`docs/ANA-2.md` §4.2), milestone 2 — a graph walks.
 //!
 //! Depends on `htui-core` and `htui-agent`, **never** on `htui-store` (ANA-2 invariant 10,
-//! `docs/ANA-2.md:143-146`): the engine is generic over `S: WriteStore` and holds no store handle
+//! `docs/ANA-2.md:143-146`): the engine is generic over `S: WorkerStore` and holds no store handle
 //! of its own, which is what keeps it headless (`R-ORCH-12`) and what keeps `htui-store` from
 //! ever learning that an orchestrator exists.
 //!
@@ -48,7 +48,7 @@ pub use command::{
 };
 pub use engine::{
     Adopted, AgentSelector, DeadWalks, DriverFor, Engine, EngineParts, FirstCandidate, Next,
-    NoSink, Resume, RunFence, SessionKey, SessionSink, live_step_at, required_inputs,
+    NoSink, Resume, RunFence, SessionKey, SessionSink, Tails, live_step_at, required_inputs,
 };
 #[cfg(feature = "test-support")]
 pub use engine::{claim_fake, dispatch_fake, resume_fake, sweep_fake};

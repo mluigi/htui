@@ -25,7 +25,7 @@ use crate::agent_worker::{AgentRuntime, ChatTask, Served};
 use crate::app::{Action, App, Ctx, Emit, Handled, TopBarState};
 use crate::concepts_worker::{ConceptsRuntime, ConceptsServed};
 use crate::keymap::{KeyChord, Keymap};
-use crate::run_worker::{RunRuntime, RunServed};
+use crate::run_worker::{RunRuntime, RunServed, TuiRuns as _};
 use crate::store_worker::{self, Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::overlay::Overlay;
@@ -204,7 +204,7 @@ impl Harness {
                             .await
                         {
                             Served::Start { step_id, task } => {
-                                self.chats.push((step_id, ended.after(task)));
+                                self.chats.push((step_id, Box::pin(ended.after(task))));
                                 return;
                             }
                             Served::Deferred => return,
@@ -327,23 +327,22 @@ impl Harness {
                             .as_ref()
                             .map(store_worker::live_chats)
                             .unwrap_or_default();
-                        let served = match self.runs.as_mut() {
+                        match self.runs.as_mut() {
                             Some(runs) => {
-                                runs.serve(&self.backend, &self.replies.0, &envelope, &live)
+                                match runs
+                                    .serve(&self.backend, &self.replies.0, &envelope, &live)
                                     .await
+                                {
+                                    RunServed::Reply(reply) => reply.into(),
+                                    // The runtime's task answers this request itself.
+                                    RunServed::Deferred => continue,
+                                    attach @ RunServed::Attach { .. } => {
+                                        self.on_run_served(attach).await;
+                                        continue;
+                                    }
+                                }
                             }
-                            None => RunServed::Reply(
-                                store_worker::serve(&self.backend, &envelope.request).await,
-                            ),
-                        };
-                        match served {
-                            RunServed::Reply(reply) => reply,
-                            // The runtime's task answers this request itself.
-                            RunServed::Deferred => continue,
-                            attach @ RunServed::Attach { .. } => {
-                                self.on_run_served(attach).await;
-                                continue;
-                            }
+                            None => store_worker::serve(&self.backend, &envelope.request).await,
                         }
                     }
                     // MOD-64 D231: through the concepts runtime when a test installed one; without

@@ -91,6 +91,11 @@ pub trait DetailTab {
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
     /// Draws into the detail pane, below the sub-tab strip.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>);
+    /// Whether this sub-tab shows a run that is still active (MOD-41 plan D16): what the Backlog
+    /// tab's `Runs` poll asks before it re-reads. Only [`RunsTab`] shows runs.
+    fn has_active_run(&self) -> bool {
+        false
+    }
 }
 
 /// The sub-tabs of the detail pane, in registration order, plus which one is active.
@@ -205,6 +210,13 @@ impl DetailRegistry {
         for tab in &mut self.tabs {
             tab.on_reply(reply, ctx);
         }
+    }
+
+    /// Whether any sub-tab shows a run that is still active (MOD-41 plan D16), whichever is the
+    /// one on screen: the poll keeps a hidden Runs pane current too.
+    #[must_use]
+    pub fn has_active_run(&self) -> bool {
+        self.tabs.iter().any(|tab| tab.has_active_run())
     }
 
     /// Whether the active sub-tab is taking every key (MOD-4 plan OQ-7, blueprint D201).

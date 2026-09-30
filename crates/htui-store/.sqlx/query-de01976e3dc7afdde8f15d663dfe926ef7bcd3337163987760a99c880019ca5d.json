@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run_step SET prompt_digest = $2, trim_record = $3 WHERE id = $1 AND EXISTS (SELECT 1 FROM run r WHERE r.id = run_step.run_id AND r.lease_owner IS NOT DISTINCT FROM $4 FOR SHARE)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Jsonb",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "de01976e3dc7afdde8f15d663dfe926ef7bcd3337163987760a99c880019ca5d"
+}

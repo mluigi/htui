@@ -22,10 +22,10 @@ use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord,
     BoxRow, BoxSettings, BoxTool, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId,
-    CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, GateOutcome, Isolation, Item, ItemId,
-    ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, NewCommandRun,
-    NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor, GateOutcome, Isolation,
+    Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision,
+    NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate,
+    NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
     NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Priority, Project, ProjectId,
     ProjectPatch, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
     Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
@@ -39,6 +39,7 @@ use htui_core::model::{
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::seed;
+use htui_core::store::traits::{BOX_SETTINGS_NOT_AN_OBJECT, EXECUTOR_MUST_BE_KNOWN};
 use htui_core::store::{
     BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung,
     StepFence, StoreError, StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, already_exists,
@@ -158,7 +159,9 @@ async fn release_repo_references(conn: &mut PgConnection, id: ProjectId) -> Resu
     Ok(())
 }
 
-/// The existence check the two batch upserts share, on **their own transaction** (MOD-4 T2).
+/// The existence check the two batch upserts shared, on **their own transaction** (MOD-4 T2); since
+/// MOD-41 plan D1 they run [`step_fence`] instead, and this serves `record_command_run`,
+/// `interrupt_step`, `close_out` and [`fenced_or_missing`].
 ///
 /// `run_step_tree` and `run_step_commit` both hang off `run_step` by a foreign key, so an unknown
 /// step would already be a `23503` - but that is [`StoreError::Constraint`] where the contract says
@@ -175,6 +178,33 @@ async fn step_exists(conn: &mut PgConnection, step: StepId) -> Result<()> {
             id: step.to_string(),
         })?;
     Ok(())
+}
+
+/// MOD-41 plan D1: `step` exists and its run carries `fence`'s lease, read `FOR SHARE OF r`
+/// inside the caller's transaction, so an adoption cannot commit between this check and the
+/// batch's writes. [`StoreError::NotFound`] first, then [`StoreError::Fenced`]: `append_events`'
+/// order. The fenced twin of [`step_exists`], for `upsert_step_tree` and `record_commits`;
+/// `close_out` keeps the unfenced check (blueprint B-1).
+async fn step_fence(conn: &mut PgConnection, step: StepId, fence: StepFence) -> Result<()> {
+    let owner = sqlx::query_scalar!(
+        r#"SELECT r.lease_owner AS "lease_owner?"
+             FROM run_step s JOIN run r ON r.id = s.run_id
+            WHERE s.id = $1
+              FOR SHARE OF r"#,
+        step.as_uuid(),
+    )
+    .fetch_optional(conn)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or_else(|| StoreError::NotFound {
+        entity: "run_step",
+        id: step.to_string(),
+    })?;
+    if owner == fence.owner() {
+        Ok(())
+    } else {
+        Err(StoreError::Fenced { step })
+    }
 }
 
 /// MOD-40 plan D1: why a fenced `UPDATE` of `step` matched no row. [`StoreError::NotFound`] when
@@ -1505,33 +1535,45 @@ impl WriteStore for PgStore {
         edit: BoxEdit,
     ) -> Result<CasOutcome<BoxRow>> {
         let me = self.this_user();
-        let tags = match edit
+        let executor = edit.executor.as_ref();
+        let tags = edit
             .declared_tags
             .as_deref()
             .map(canonical_declared_tags)
-            .transpose()
-        {
-            Ok(tags) => tags,
-            Err(sentence) => {
-                let current = self.box_row(id).await?.filter(|row| row.user_id == me);
-                return match current {
-                    None => Err(StoreError::NotFound {
-                        entity: "box",
-                        id: id.to_string(),
-                    }),
-                    Some(row) if row.edit_version != expected => Ok(CasOutcome::Stale(row)),
-                    Some(_) => Err(StoreError::Constraint(sentence)),
-                };
-            }
+            .transpose();
+        // MOD-41 blueprint B-5: a refusal known before the statement reads the row first, so
+        // `NotFound` and `Stale` keep their precedence over it (MOD-7 D41, plan D10).
+        let refused = match (&tags, executor) {
+            (Err(sentence), _) => Some(sentence.clone()),
+            (Ok(_), Some(Executor::Other(_))) => Some(EXECUTOR_MUST_BE_KNOWN.to_owned()),
+            _ => None,
         };
+        if let Some(sentence) = refused {
+            let current = self.box_row(id).await?.filter(|row| row.user_id == me);
+            return match current {
+                None => Err(StoreError::NotFound {
+                    entity: "box",
+                    id: id.to_string(),
+                }),
+                Some(row) if row.edit_version != expected => Ok(CasOutcome::Stale(row)),
+                Some(_) => Err(StoreError::Constraint(sentence)),
+            };
+        }
+        let tags = tags.expect("a refused tag list returned above");
+        // `jsonb_set` errors (`22023`) on a blob that is not an object, so the `WHERE` refuses one
+        // instead and the miss below names it: race-safe, one statement (blueprint B-5).
         let written = sqlx::query_as!(
             BoxRow,
             r#"
             UPDATE box
                SET declared_tags = COALESCE($3, declared_tags),
                    quirks        = COALESCE($4, quirks),
+                   settings      = CASE WHEN $6::text IS NULL THEN settings
+                                        ELSE jsonb_set(settings, '{executor}', to_jsonb($6::text))
+                                   END,
                    edit_version  = edit_version + 1
              WHERE id = $1 AND user_id = $5 AND edit_version = $2
+               AND ($6::text IS NULL OR jsonb_typeof(settings) = 'object')
             RETURNING id             AS "id: BoxId",
                       user_id        AS "user_id: htui_core::model::UserId",
                       hostname,
@@ -1545,17 +1587,28 @@ impl WriteStore for PgStore {
             tags.as_deref(),
             edit.quirks,
             me.as_uuid(),
+            executor.map(Executor::as_str),
         )
         .fetch_optional(&self.pool)
         .await
         .map_err(map_sqlx)?;
         match written {
             Some(row) => Ok(CasOutcome::Applied(row)),
-            None => cas_miss(
-                self.box_row(id).await?.filter(|row| row.user_id == me),
-                "box",
-                id,
-            ),
+            None => {
+                let current = self.box_row(id).await?.filter(|row| row.user_id == me);
+                match current {
+                    Some(row)
+                        if row.edit_version == expected
+                            && executor.is_some()
+                            && !row.settings.is_object() =>
+                    {
+                        Err(StoreError::Constraint(
+                            BOX_SETTINGS_NOT_AN_OBJECT.to_owned(),
+                        ))
+                    }
+                    other => cas_miss(other, "box", id),
+                }
+            }
         }
     }
 
@@ -1681,29 +1734,43 @@ impl WriteStore for PgStore {
     ///
     /// `updated_at` is not in the `SET` list: the migration's `BEFORE UPDATE` trigger owns it.
     ///
+    /// Written only while the step's run carries `fence`'s lease: `set_step_usage`'s predicate,
+    /// verbatim (MOD-41 plan D1), `FOR SHARE` on the run for `append_events`' reason.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] when the step does not exist - zero rows updated is the only thing
-    /// this statement can mean.
-    async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> Result<()> {
+    /// [`StoreError::NotFound`] when the step does not exist and [`StoreError::Fenced`] when it
+    /// does and its run does not carry `fence`'s lease, told apart by `step_exists`' follow-up
+    /// read on a miss.
+    async fn set_step_prompt(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        digest: &str,
+        trim: &Value,
+    ) -> Result<()> {
         let updated = sqlx::query!(
-            "UPDATE run_step SET prompt_digest = $2, trim_record = $3 WHERE id = $1",
+            "UPDATE run_step SET prompt_digest = $2, trim_record = $3 \
+              WHERE id = $1 \
+                AND EXISTS (SELECT 1 FROM run r \
+                             WHERE r.id = run_step.run_id \
+                               AND r.lease_owner IS NOT DISTINCT FROM $4 \
+                               FOR SHARE)",
             step.as_uuid(),
             digest,
             trim,
+            fence.owner(),
         )
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?
         .rows_affected();
 
-        if updated == 0 {
-            return Err(StoreError::NotFound {
-                entity: "run_step",
-                id: step.to_string(),
-            });
+        if updated == 1 {
+            return Ok(());
         }
-        Ok(())
+        // Boxed as `set_step_usage`'s miss is: a debug build's worker stack.
+        Err(Box::pin(fenced_or_missing(&self.pool, step)).await)
     }
 
     // ---- MOD-15 milestone 1: the hierarchy (plan D1-D12) ---------------------------------------
@@ -4581,7 +4648,7 @@ impl WriteStore for PgStore {
     /// [`MemStore`](htui_core::store::MemStore)'s map simply keeps the last. Batches are one row
     /// per repo in scope.
     ///
-    /// An empty slice still runs the existence check and writes nothing.
+    /// An empty slice still runs the existence and fence check (`step_fence`) and writes nothing.
     ///
     /// The transaction also writes `run_step.isolation_path` (ANA-2 `:903`, plan D33), because a
     /// step has many trees and one isolation path and this is the only call that sees both. The
@@ -4595,11 +4662,18 @@ impl WriteStore for PgStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Constraint`] when a row's
-    /// `run_step_id` is not `step` or names an unknown repo.
-    async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> Result<()> {
+    /// In this order: [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Fenced`]
+    /// when the step's run has a `lease_owner` other than `fence`'s (MOD-41 plan D1);
+    /// [`StoreError::Constraint`] when a row's `run_step_id` is not `step` or names an unknown
+    /// repo.
+    async fn upsert_step_tree(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        trees: &[RunStepTree],
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        step_exists(&mut tx, step).await?;
+        step_fence(&mut tx, step, fence).await?;
 
         for row in trees {
             if row.run_step_id != step {
@@ -4674,11 +4748,18 @@ impl WriteStore for PgStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Constraint`] when a row's
-    /// `run_step_id` is not `step` or names an unknown repo.
-    async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> Result<()> {
+    /// In this order: [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Fenced`]
+    /// when the step's run has a `lease_owner` other than `fence`'s (MOD-41 plan D1);
+    /// [`StoreError::Constraint`] when a row's `run_step_id` is not `step` or names an unknown
+    /// repo.
+    async fn record_commits(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        commits: &[RunStepCommit],
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        step_exists(&mut tx, step).await?;
+        step_fence(&mut tx, step, fence).await?;
 
         for row in commits {
             if row.run_step_id != step {

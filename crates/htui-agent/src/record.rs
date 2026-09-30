@@ -23,7 +23,8 @@
 //! 3. **The prompt digest.** `sha256` over the text the assembler supplies for digesting (the
 //!    sent text itself unless a span is undigested, MOD-33), computed once, written both as the
 //!    `digest` key of the `prompt` payload and through
-//!    [`WriteStore::set_step_usage`]`(step, usage, Some(digest))`. Later usage writes for the same
+//!    [`WriteStore::set_step_usage`](htui_core::store::WriteStore::set_step_usage)`(step, usage,
+//!    Some(digest))`. Later usage writes for the same
 //!    step pass `None`, as that method's contract says. Passing `Some` rather than ANA-5 §4.4's
 //!    `None` is the plan's X8 ruling, and it stands until milestone 9. A continuing recorder owes
 //!    no digest: it records no prompt, so `run_step.prompt_digest` stays the original prompt's.
@@ -50,10 +51,11 @@
 //! 5. **The passive quota latch** (`docs/ANA-4.md` §7 `:1131-1135`, plan D66-D68). The recorder is
 //!    the only place that sees every `usage` row, so it is where `agent_box.quota` is refreshed:
 //!    it normalizes the row's vendor rate-limit blob into §7's document and writes two columns
-//!    through [`WriteStore::set_agent_box_quota`]. Opt-in ([`Recorder::with_quota_latch`]),
-//!    best-effort — a refused allowance write never fails a turn — and silent when a row has
-//!    nothing to say, which is what keeps a turn's first, blob-less report from erasing the last
-//!    one.
+//!    through
+//!    [`WriteStore::set_agent_box_quota`](htui_core::store::WriteStore::set_agent_box_quota).
+//!    Opt-in ([`Recorder::with_quota_latch`]), best-effort — a refused allowance write never fails
+//!    a turn — and silent when a row has nothing to say, which is what keeps a turn's first,
+//!    blob-less report from erasing the last one.
 //! 6. **The per-run cap** (`docs/ANA-4.md` §7 `:1143-1150`, §11 criterion 8, plan D69-D70). The
 //!    same fact that makes the recorder the latch's home makes it the cap's: it is the only place
 //!    that sees every `usage` row. What it does with the cap is **detect** — [`Recorder::record`]
@@ -91,8 +93,9 @@
 //! write (`finish_chat_run` in milestone 3, MOD-4 for graph steps), and milestone 1 has no session
 //! to attach it to.
 //!
-//! Deliberately absent: the offline path. The recorder writes through a [`WriteStore`] and
-//! nothing else; choosing `append_pending` over the store is milestone 4 (plan D8, D16).
+//! Deliberately absent: the offline path. The recorder writes through a
+//! [`RecorderStore`](htui_core::store::RecorderStore) and nothing else; choosing `append_pending`
+//! over the store is milestone 4 (plan D8, D16).
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -104,7 +107,7 @@ use htui_core::model::{
     StepId, UsageTotals, quota::normalize,
 };
 use htui_core::scrub::{Scrubber, Unmasked};
-use htui_core::store::{StepFence, StoreError, WriteStore};
+use htui_core::store::{StepFence, StoreError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -371,7 +374,7 @@ enum RawTarget {
 /// Borrows its store and its scrubber: one recorder lives for one `run_step`, inside the task that
 /// pumps that step's session, and it holds no lock across an `.await` because it holds no lock at
 /// all.
-pub struct Recorder<'a, S: WriteStore> {
+pub struct Recorder<'a, S: htui_core::store::RecorderStore> {
     store: &'a S,
     scrubber: &'a dyn Scrubber,
     step: StepId,
@@ -443,8 +446,8 @@ pub struct Recorder<'a, S: WriteStore> {
     rows: usize,
 }
 
-impl<S: WriteStore> core::fmt::Debug for Recorder<'_, S> {
-    /// Prints the recorder's own state. The store is not printed: `WriteStore` does not require
+impl<S: htui_core::store::RecorderStore> core::fmt::Debug for Recorder<'_, S> {
+    /// Prints the recorder's own state. The store is not printed: `RecorderStore` does not require
     /// `Debug`, and a store's contents are not what a recorder log is about.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Recorder")
@@ -470,7 +473,7 @@ impl<S: WriteStore> core::fmt::Debug for Recorder<'_, S> {
     }
 }
 
-impl<'a, S: WriteStore> Recorder<'a, S> {
+impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
     /// Opens a recorder over one `run_step`.
     ///
     /// `retain_raw` is `SessionSpec.retain_raw`, itself `project.settings.keep_raw_events`. `ui`
@@ -1212,7 +1215,7 @@ impl<'a, S: WriteStore> Recorder<'a, S> {
     }
 
     /// Writes `run_step.usage`, carrying the prompt digest on the first call only (the contract of
-    /// [`WriteStore::set_step_usage`], plan D15(b)).
+    /// [`WriteStore::set_step_usage`](htui_core::store::WriteStore::set_step_usage), plan D15(b)).
     async fn sync_step(&mut self) -> Result<(), RecordError> {
         if !self.usage_dirty && self.digest_pending.is_none() {
             return Ok(());
@@ -1848,7 +1851,7 @@ where
 /// [`DriverError::Closed`] when the transport ends the stream without a `done`, whatever
 /// [`AgentSession::next_event`] returned otherwise, and the recorder's own failures mapped through
 /// [`RecordError`].
-pub async fn pump<S: WriteStore>(
+pub async fn pump<S: htui_core::store::RecorderStore>(
     session: &mut dyn AgentSession,
     recorder: &mut Recorder<'_, S>,
 ) -> Result<DoneEvent, DriverError> {
@@ -1899,7 +1902,7 @@ pub async fn pump<S: WriteStore>(
 /// # Errors
 /// The recorder's own, mapped through [`RecordError`]: a store that refuses the closing flush is
 /// reported to the caller, and the rows it numbered stay owed (blueprint H-2).
-pub async fn enforce_breach<S: WriteStore>(
+pub async fn enforce_breach<S: htui_core::store::RecorderStore>(
     session: &mut dyn AgentSession,
     recorder: &mut Recorder<'_, S>,
     breach: CapBreach,
@@ -2174,7 +2177,7 @@ mod tests {
         let (store, chat) = open_step().await;
         let scrubber = scrubber();
         store
-            .set_step_prompt(chat.step_id, "d0", &json!({}))
+            .set_step_prompt(StepFence::Unleased, chat.step_id, "d0", &json!({}))
             .await
             .expect("the original prompt's digest must land");
         let tail = seed(&store, chat.step_id, &earlier_log(chat.step_id)).await;

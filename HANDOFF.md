@@ -14,7 +14,14 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-30):** **CLEAN-4 done** (`docs/decisions/clean/clean-4.md`): the
+**Current status (2026-10-01):** **MOD-41 is done** (`docs/decisions/mod/mod-41.md`): `htui worker`
+runs a box's runs with no terminal (guide `docs/htui-worker.md`). Run supervision lives in the
+UI-free crate `crates/htui-worker` behind `RecorderStore`/`WorkerStore`/`WorkerHost`;
+`box.settings.executor` (Settings > Boxes, `w`) decides whether the TUI or the worker claims, adopts
+and sweeps on a box, and on a worker box the TUI hands answered runs back. The remaining step writes
+are lease-fenced, the heartbeat fences on a monotonic clock, and the worker re-syncs the concepts
+index. `R-ORCH-12` is now must; `R-ID-2` and `R-STO-1` were amended. No migration.
+Before it, **CLEAN-4 was done** (`docs/decisions/clean/clean-4.md`): the
 review loop's `no_progress_review` stop is reachable. The predicate's review half compares the
 reviews of the loop's last two turns (review rows answered `Rejected`, each read through its newest
 `output_kind` document from `documents()` heads) instead of reading the latest-per-kind
@@ -42,10 +49,10 @@ comment only) `0009_agent_box_user_off` (MOD-23) and `0010_prompt_digest_undiges
 cache: `0001`..`0004`), so **the next migration is `0011`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
 (done, all four milestones), MOD-38, MOD-9 (done, all five milestones), MOD-40, MOD-39, MOD-64,
-MOD-23 and MOD-22 (re-counted 2026-09-30): store conformance `CASES` 97, `READ_CASES` 14, `htui-orch` `CASES` 73,
+MOD-23, MOD-22 and MOD-41 (re-counted 2026-10-01): store conformance `CASES` 104, `READ_CASES` 14, `htui-orch` `CASES` 86,
 `GraphSource` 7 methods, `StoreRequest` 91, `StoreReply` 49, `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
-`skills::REQUEST_NAMES` 6, `TABLES` 39, 289 `.sqlx` files, 116
-`crates/htui/tests/snapshots`,
+`skills::REQUEST_NAMES` 6, `TABLES` 39, 291 `.sqlx` files, 121
+`crates/htui/tests/snapshots`, six workspace members (`htui-worker` since MOD-41),
 `MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 35 pinned commented
 columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 4` (MOD-33 `undigested`) with `skill_choices` (a
 `matched` choice carries `path`, `<repo>:<path>`); `Isolator` gained `changed_paths` (MOD-9 D119).
@@ -334,7 +341,10 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   is `NoSink`, so no step writes its `output_kind` document outside a test (MOD-4 risk R-50). Both
   clear once `document_write` exists.
   **Relates to ANA-16** (`docs/ANA-16.md` §8): the MCP server must be reachable inside a container
-  or on a remote box, and a stdio `McpServerSpec` must be launchable there (MOD-44, MOD-41).
+  or on a remote box, and a stdio `McpServerSpec` must be launchable there (MOD-44; `htui worker`, MOD-41, done).
+  **MOD-41 left the sink fence here** (`docs/decisions/mod/mod-41.md`, PRD D5): the step sink's
+  `write_document` is still unfenced; fence it with the step's `StepFence` when this item adds the
+  first production author.
   **MOD-34 left the `search_concepts` tool here** (`docs/decisions/mod/mod-34.md`): expose
   `htui_store::vector::VectorStore::search` (`R-STO-8`), scoped to the step's projects.
 - [ ] **MOD-12 - Auto mode queue runner** (from ANA-2). `R-ORCH-6`, `R-ORCH-9`, `R-ORCH-2` hard
@@ -457,49 +467,26 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   as built by MOD-4 M6 (`crates/htui-orch/src/engine.rs` `sweep`/`recover_step`, conformance cases in
   `crates/htui-orch/src/conformance.rs`): a crash costs at most the interrupted step, which is reset
   to `before_hash` and retried, or marked `done` when its `after_hash` and output document exist.
-  **What is left for this item:** once MOD-41 hosts run supervision, (1) a TUI exit or crash no
-  longer interrupts a run the worker owns, and (2) an end-to-end test kills the `htui worker`
+  **What is left for this item:** MOD-41 is done (`docs/decisions/mod/mod-41.md`): `htui worker`
+  hosts run supervision, and on a box whose executor is `worker` (1) a TUI exit or crash no longer
+  interrupts a run the worker owns (pinned by `crates/htui/tests/worker_pg.rs`). Left: (2) an end-to-end test kills the `htui worker`
   process mid-step and after a step's artefacts are written, restarts it, and checks that the sweep
   resets-and-retries the first and marks the second `done`. **Not in scope:** continuing an
   interrupted step inside the agent's own session (`claude --resume <id>`, ACP `session/load` once
   MOD-37 carries it) on the unreset tree; it would need an ANA-2 §4.9 amendment, works only on the
   box that holds the agent's transcript, and can be raised again after MOD-37. Continuing across a
   worker-to-TUI re-attach of a live agent is MOD-46/MOD-47 territory, not this item's.
-  Blocked on MOD-41. Relates to ANA-16 (`docs/ANA-16.md` §8), which flagged the conflict this
-  decision settles.
+  Not blocked (MOD-41 is done). Relates to ANA-16 (`docs/ANA-16.md` §8), which flagged the
+  conflict this decision settles.
 
-- [ ] **MOD-41 - Headless worker (`htui worker`)** (from ANA-16, §8 item 2). `R-ORCH-12`, `R-ID-2`,
-  `R-STO-1`, `R-NF-2`, `R-NF-3`. A ratatui-free entry point hosting MOD-4 M6's run supervision (lease
-  refresh, sweep, one engine task per claimed run, claims only `target_box_id = self`). Reaches the
-  store only through a narrow worker-store trait so a later control-plane client (MOD-47) can
-  implement it. Per-worker pool size setting for the connection budget. Asks MOD-4 M6 to put
-  `run_worker` in a library both binaries link. **Open questions for the maintainer (requirement
-  amendments):** `R-ID-2` (as `R-ORCH-12` foresees); `R-ORCH-12` moves from later to must; `R-STO-1`
-  headless DSN source (keyring `linux-native` or a systemd credential, `Cargo.toml:45-46` compiles
-  only `sync-secret-service`). No blockers left: MOD-40 is done (`docs/decisions/mod/mod-40.md`),
-  and the MOD-4 (M6) and MOD-7 dependencies are met (MOD-7 is done, `docs/decisions/mod/mod-7.md`,
-  so the worker can register through its id-keyed `register_box`).
-  **MOD-40 left these here** (`docs/decisions/mod/mod-40.md`): the worker connects with
-  `PgStore::connect_headless`, which never migrates and refuses a pending schema or a build below
-  `htui_target_version`. Only `append_events`, `set_step_usage` and `finish_step` are fenced by lease
-  owner. `set_step_prompt`, `upsert_step_tree`, `record_commits` and the sink's output document are
-  still unfenced step writes, and a holder that wakes after `done` makes the last two before its
-  fenced `finish_step`. The heartbeat's self-fence reads the wall clock, so an NTP step or a suspend
-  during a lease still moves it; a monotonic clock is this item's (MOD-40 blueprint F-38).
-  **MOD-4 M6 landed without these asks, so they are this item's** (MOD-4 done,
-  `docs/decisions/mod/mod-4.md`): `run_worker` still lives in the TUI crate
-  (`crates/htui/src/run_worker.rs`, whose crate depends on `ratatui` and `crossterm`), so moving it
-  into a library crate the TUI and `htui worker` both link is part of this item; no worker-store
-  trait exists yet either. The MOD-4 (M6) dependency is met.
-  **MOD-34 left the concepts-index sync here** (`docs/decisions/mod/mod-34.md`, `R-STO-8`):
-  run `htui_store::vector_sync::Indexer::sync` as a background job; until then it is
-  `htui --index-items`, or `Ctrl+R` in the TUI's concepts search (MOD-64, `docs/decisions/mod/mod-64.md`).
 - [ ] **MOD-42 - Permission and control relay through Postgres** (from ANA-16, §8 item 3).
   `R-AGT-1`, `R-HIS-1`, `R-TUI-6`. The engine's `pump` (`record.rs:1684-1703`) cannot answer a
   parked ACP request, so engine-driven ACP steps fail on their first permission request today. The
   worker records `permission_request`, waits on a `permission_answer` row, then answers the session;
   cancel and follow-up become command rows. Answers from another box go through the relay, never
-  `take_lease`. MOD-41 consumes it.
+  `take_lease`. `htui worker` (MOD-41, done: `docs/decisions/mod/mod-41.md`) consumes it; MOD-41's
+  hand-back is the in-box half of its command rows, and cancelling a live worker walk is refused
+  until this item (`docs/htui-worker.md`).
   **MOD-4 M6 landed without closing this gap** (MOD-4 done, `docs/decisions/mod/mod-4.md`): the
   engine still drives a graph step through `pump` (`crates/htui-orch/src/engine.rs:5146`, `pump` now
   at `crates/htui-agent/src/record.rs:1725-1743`) with the default `PermissionPolicy`, so engine-driven
@@ -507,7 +494,7 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
   until its worker claims it; the Runs view follows `session_event` by `seq` with `LISTEN`/`NOTIFY`
-  hints and a poll backstop, and shows worker liveness. Blocked on MOD-41, MOD-42, and MOD-12 for
+  hints and a poll backstop, and shows worker liveness. Blocked on MOD-42, and MOD-12 for
   auto mode.
 - [ ] **MOD-44 - Container execution environment** (from ANA-16, §8 item 5). `R-BOX-1..3`,
   `R-AGT-5`, `R-AGT-6`, `R-AGT-9`, `R-SEC-2`, `R-MCP-1`, `R-NF-1`, `R-NF-2`. A child `box` of kind
@@ -517,13 +504,15 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   credentials on a named volume; the container never holds the DSN. Linux and macOS first (Windows
   via MOD-16). **Open question for the maintainer:** `R-NF-2` amendment (`dockerd` as an opt-in,
   per-box dependency). The MOD-7 dependency is met (done, `docs/decisions/mod/mod-7.md`: id-keyed
-  registration, the box probe, capability tags); needs MOD-41 to survive TUI exit.
+  registration, the box probe, capability tags); survives TUI exit through `htui worker` (MOD-41, done: `docs/decisions/mod/mod-41.md`).
 - [ ] **MOD-45 - Remote box provisioning over SSH** (from ANA-16, §8 item 6). `R-BOX-1`, `R-BOX-4`,
   `R-AGT-9`, `R-STO-1`. System `ssh` to install the matching `htui` build and a user service running
   `htui worker`; credential passed on the worker's stdin, never argv or a file; the worker
   self-registers (through MOD-7's id-keyed `register_box` and box probe, done,
   `docs/decisions/mod/mod-7.md`). Agent login via MOD-22's paste-back (done, `docs/decisions/mod/mod-22.md`). SSH is not used after provisioning. Under
-  phase 2 (MOD-47) it installs an enrolment token instead of a DSN. Blocked on MOD-41.
+  phase 2 (MOD-47) it installs an enrolment token instead of a DSN. Not blocked: MOD-41 is done (`docs/decisions/mod/mod-41.md`; the sample unit in
+  `docs/htui-worker.md` is a system unit with `User=`, since user-scoped encrypted credentials need
+  systemd 256).
 - [ ] **MOD-46 - Live streaming via `NOTIFY` (optional)** (from ANA-16, §8 item 7). `R-HIS-1`,
   `R-NF-3`. Transient `NOTIFY` deltas under 8000 bytes between recorder flushes, droppable, superseded
   by durable `session_event` rows. Start only if 16 KiB flush bursts prove unusable; replaced by
@@ -541,7 +530,9 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   (optional self-hosted server), `R-ID-2` (self-hosted control plane is not a cloud service),
   `R-ORCH-12` ("polling Postgres or the control plane"), `R-STO-1` (worker holds a box-scoped
   revocable key), `R-STO-5` (server owns migrations for workers), `R-USR-3` (roles enforced in the
-  server). Blocked on MOD-41, MOD-42 (MOD-40 is done, `docs/decisions/mod/mod-40.md`).
+  server). Blocked on MOD-42 (MOD-40 and MOD-41 are done: `docs/decisions/mod/mod-40.md`,
+  `docs/decisions/mod/mod-41.md`; the worker reaches the store only through `WorkerStore`/`WorkerHost`,
+  which a control-plane client would implement).
 - [ ] **MOD-48 - Config manager and secret distribution (phase 2)** (from ANA-16, §6.2, §8 item 9).
   `R-ID-3`, `R-AGT-9`, `R-AGT-10`, `R-SEC-1`, `R-SEC-2`. `GetManifest`/`WatchManifest` over agent
   registry, box profiles, settings, images, target build and digest; full resync on a stale cursor;
@@ -610,6 +601,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 30 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 29 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

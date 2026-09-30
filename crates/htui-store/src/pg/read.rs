@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 
+use chrono::{DateTime, Utc};
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile,
     BoxRow, BoxTool, CitationKind, CommandQueue, CoverageRow, Document, DocumentHead, DocumentId,
@@ -1990,6 +1991,32 @@ impl PgStore {
         .await
         .map_err(map_sqlx)?;
         Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    /// This box's `queued` runs, `(id, queued_at)` by `(queued_at, id)` (MOD-41 plan D11). No
+    /// index covers `(target_box_id, status)`; a per-user table scanned every 5 s is accepted
+    /// (R-6).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn queued_runs_on_box(&self, box_id: BoxId) -> Result<Vec<(RunId, DateTime<Utc>)>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id AS "id: RunId", queued_at
+              FROM run
+             WHERE target_box_id = $1 AND status = 'queued'
+             ORDER BY queued_at, id
+            "#,
+            box_id.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.id, row.queued_at))
+            .collect())
     }
 
     /// Every active run whose `repo_scope` intersects `scope`, in `(queued_at, id)` order: what

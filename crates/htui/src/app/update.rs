@@ -131,8 +131,44 @@ impl App {
                 let scope = self.scope.clone();
                 self.dispatch(Origin::App, StoreRequest::ActiveRuns { scope });
             }
+            self.refresh_active_tab();
             self.dirty = true;
         }
+    }
+
+    /// MOD-41 plan D16: the active tab's refresh hook, with a [`Ctx`] addressed as that tab, then
+    /// what it emitted drained, as [`App::finish_external_edit`] does.
+    fn refresh_active_tab(&mut self) {
+        let Some(id) = self.tabs.active_id() else {
+            return;
+        };
+        let origin = Origin::Tab(id);
+        {
+            let Self {
+                scope,
+                projects,
+                top_bar,
+                keymap,
+                theme,
+                emit,
+                tabs,
+                ..
+            } = self;
+            let Some(view) = tabs.active_mut() else {
+                return;
+            };
+            let mut ctx = Ctx::new(
+                scope,
+                projects,
+                top_bar,
+                keymap,
+                theme,
+                origin.clone(),
+                emit,
+            );
+            view.on_refresh(&mut ctx);
+        }
+        self.drain(&origin);
     }
 
     /// Enters a workspace: the only path that changes the scope (plan D10).

@@ -3045,6 +3045,7 @@ dependencies = [
  "htui-core",
  "htui-orch",
  "htui-store",
+ "htui-worker",
  "insta",
  "ratatui",
  "sentry",
@@ -3169,6 +3170,22 @@ dependencies = [
  "uuid",
  "windows-registry",
  "zeroize",
+]
+
+[[package]]
+name = "htui-worker"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "htui-agent",
+ "htui-core",
+ "htui-orch",
+ "htui-store",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

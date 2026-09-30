@@ -481,17 +481,18 @@ pub trait WriteStore: ReadStore {
     /// Whatever the backend's read fails with.
     async fn boxes(&self) -> Result<Vec<BoxRecord>>;
 
-    /// The declared-tags and quirks editors' compare-and-set (MOD-7 milestone 2, D41): writes the
-    /// columns `edit` names, and `edit_version + 1`, where the row is this user's and its
-    /// `edit_version` is `expected`, in one statement. A narrow human writer (MOD-2 D74): never
-    /// `hostname`, the probe columns, `htui_version`, `settings`, `machine_fingerprint`,
-    /// `probe_spec_digest`, `last_seen_at` or `box_tool`. Registration and the probe never write
-    /// `edit_version`, so neither can stale an open editor.
+    /// The box editors' compare-and-set (MOD-7 milestone 2, D41; MOD-41 plan D10): writes the
+    /// columns `edit` names, the `executor` key of `box.settings` when `edit.executor` is `Some`,
+    /// and `edit_version + 1`, where the row is this user's and its `edit_version` is `expected`,
+    /// in one statement. A narrow human writer (MOD-2 D74): never `hostname`, the probe columns,
+    /// `htui_version`, any other `settings` key, `machine_fingerprint`, `probe_spec_digest`,
+    /// `last_seen_at` or `box_tool`. Registration and the probe never write `edit_version`, so
+    /// neither can stale an open editor.
     ///
     /// **Every human writer of `box` is this compare-and-set** (MOD-40 plan D6, `docs/ANA-16.md`
-    /// C7). `box.settings`, which admission reads under `claim_run`'s row lock, has **no** writer
-    /// at all today: registration, the probe and this editor all leave it at its default. The first
-    /// one extends [`BoxEdit`] and rides this statement's `edit_version` guard; a second, unguarded
+    /// C7). It is `box.settings`' only writer, which admission reads under `claim_run`'s row lock:
+    /// key by key (`executor` only), under the same `edit_version` guard, and every other key
+    /// (`max_concurrent_items`, `command_limits`, unknown ones) survives. A second, unguarded
     /// `UPDATE box SET settings` would let two editors overwrite each other silently.
     ///
     /// Answers [`CasOutcome::Applied`] with the row as written, or [`CasOutcome::Stale`] with the
@@ -503,7 +504,10 @@ pub trait WriteStore: ReadStore {
     /// unknown id **or a box of another `app_user`** (the reach of [`boxes`](WriteStore::boxes));
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) carrying
     /// [`canonical_declared_tags`](crate::model::canonical_declared_tags)'s sentence for a tag it
-    /// refuses. Precedence: `NotFound`, then `Stale`, then `Constraint`.
+    /// refuses, [`EXECUTOR_MUST_BE_KNOWN`] for an
+    /// [`Executor::Other`](crate::model::Executor::Other), or [`BOX_SETTINGS_NOT_AN_OBJECT`] for an
+    /// executor asked of a blob that is not a JSON object. Precedence: `NotFound`, then `Stale`,
+    /// then `Constraint` (tags, executor, blob), and a refusal writes nothing.
     async fn edit_box(&self, id: BoxId, expected: i32, edit: BoxEdit)
     -> Result<CasOutcome<BoxRow>>;
 
@@ -556,11 +560,21 @@ pub trait WriteStore: ReadStore {
     /// Not folded into `set_step_usage`: that one is the **chat** path's digest writer (plan D97),
     /// whose prompt has no template, no sections and no trim record to write.
     ///
+    /// Written only while the step's run carries `fence`'s lease (MOD-41 plan D1, as
+    /// [`set_step_usage`](WriteStore::set_step_usage) since MOD-40 plan D1).
+    ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) with `entity: "run_step"` when
-    /// the step does not exist.
-    async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> Result<()>;
+    /// the step does not exist; [`StoreError::Fenced`](crate::store::StoreError::Fenced) when it
+    /// does and its run's `lease_owner` is not `fence`'s.
+    async fn set_step_prompt(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        digest: &str,
+        trim: &Value,
+    ) -> Result<()>;
 
     // ---- MOD-15 milestone 1: the hierarchy (plan D1-D12) -----------------------------------
     //
@@ -1252,20 +1266,37 @@ pub trait WriteStore: ReadStore {
     /// column is left as it was rather than cleared. One step has many trees and one
     /// `isolation_path`, and this is where that choice is made, so the two can never disagree.
     ///
+    /// Written only while the step's run carries `fence`'s lease (MOD-41 plan D1, as
+    /// [`set_step_usage`](WriteStore::set_step_usage) since MOD-40 plan D1).
+    ///
     /// # Errors
-    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
+    /// In this order: [`StoreError::NotFound`](crate::store::StoreError::NotFound)
+    /// `{ entity: "run_step" }`; [`StoreError::Fenced`](crate::store::StoreError::Fenced) when the
+    /// step's run has a `lease_owner` other than `fence`'s;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when a row's
     /// `run_step_id` is not `step` or names an unknown repo.
-    async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> Result<()>;
+    async fn upsert_step_tree(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        trees: &[RunStepTree],
+    ) -> Result<()>;
 
-    /// `R-ORCH-11`'s two hashes, upserted on `(run_step_id, repo_id)`; same refusals as
+    /// `R-ORCH-11`'s two hashes, upserted on `(run_step_id, repo_id)`; same fence and refusals as
     /// [`upsert_step_tree`](WriteStore::upsert_step_tree).
     ///
     /// # Errors
-    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
+    /// In this order: [`StoreError::NotFound`](crate::store::StoreError::NotFound)
+    /// `{ entity: "run_step" }`; [`StoreError::Fenced`](crate::store::StoreError::Fenced) when the
+    /// step's run has a `lease_owner` other than `fence`'s;
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when a row's
     /// `run_step_id` is not `step` or names an unknown repo.
-    async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> Result<()>;
+    async fn record_commits(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        commits: &[RunStepCommit],
+    ) -> Result<()>;
 
     /// Records one `command_run` row (ANA-2 §4.2, `docs/ANA-2.md:501-506`; plan D31): this
     /// milestone's `verify_command` runs, later MOD-11's queue.
@@ -1680,6 +1711,15 @@ pub fn prompt_template_refusal(name: &str, body: &str) -> Option<String> {
 //
 // Every rule and sentence of the four skill writers lives here, so `MemStore` and `PgStore` only
 // look facts up and refuse the same input with the same sentence (R-32).
+
+/// MOD-41 plan D10: [`WriteStore::edit_box`]'s refusal of an
+/// [`Executor::Other`](crate::model::Executor::Other), so the editor writes only the two values
+/// this build knows.
+pub const EXECUTOR_MUST_BE_KNOWN: &str = "executor must be tui or worker";
+
+/// MOD-41 plan D10: [`WriteStore::edit_box`]'s refusal to write `executor` into a `box.settings`
+/// blob that is not a JSON object (Postgres' `jsonb_set` errors on a scalar or an array).
+pub const BOX_SETTINGS_NOT_AN_OBJECT: &str = "box.settings is not a JSON object";
 
 /// MOD-9 D71: a name [`validate_name`] refuses.
 #[must_use]
@@ -2114,8 +2154,9 @@ impl<T> CasOutcome<T> {
 
 /// Which lease a step write is made under (MOD-40 plan D1, PRD D1).
 ///
-/// [`WriteStore::append_events`], [`WriteStore::set_step_usage`] and [`WriteStore::finish_step`]
-/// take one and write only while the step's run carries exactly that lease:
+/// [`WriteStore::append_events`], [`WriteStore::set_step_usage`], [`WriteStore::finish_step`]
+/// (MOD-40), [`WriteStore::set_step_prompt`], [`WriteStore::upsert_step_tree`] and
+/// [`WriteStore::record_commits`] (MOD-41 plan D1) take one and write only while the step's run carries exactly that lease:
 /// `run.lease_owner IS NOT DISTINCT FROM` [`StepFence::owner`]. A process whose run another process
 /// adopted ([`WriteStore::adopt_runs`], [`WriteStore::take_lease`]) still holds its old `Lease`,
 /// and the store answers it with [`StoreError::Fenced`](crate::store::StoreError::Fenced) and

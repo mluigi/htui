@@ -37,7 +37,7 @@ use uuid::Uuid;
 pub use htui_core::clock::TestClock;
 
 use crate::command::{Command, CommandOutcome, EngineError};
-use crate::engine::{DeadWalks, SessionKey};
+use crate::engine::{DeadWalks, SessionKey, Tails};
 use crate::graph::GraphSource;
 use crate::isolate::{
     ChangedPaths, Clock, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared,
@@ -859,9 +859,10 @@ const STAND_IN_MODEL: &str = "sonnet";
 /// make the engine's `G` be `&MemStore` and every call site `&&MemStore`. The engine borrows `&G`,
 /// so the source is used "over `&MemStore`" exactly as plan D19 says either way. Local trait,
 /// foreign type — the orphan rule permits it, and it lives behind `test-support` because
-/// `MemStore` is the fake harness's store. Milestone 6's source over `Backend` is `htui`'s
-/// `run_worker::BackendGraphs`, a newtype: `impl GraphSource for Backend` in `htui` would be an
-/// orphan impl (E0117, MOD-4 plan D155).
+/// `MemStore` is the fake harness's store. Milestone 6's source over a host is
+/// `htui_worker::HostGraphs`, a newtype (MOD-41 T6; it was `htui`'s `run_worker::BackendGraphs`):
+/// `impl GraphSource for Backend` outside `htui-store` would be an orphan impl (E0117, MOD-4 plan
+/// D155).
 ///
 /// Each body calls the *inherent* method of the same name. Method resolution prefers inherent
 /// candidates over trait ones, so this is delegation and not recursion — and
@@ -1289,6 +1290,9 @@ pub struct FakeOrchestrator {
     /// MOD-4 plan D162: the phases whose pinned template stage 3 refuses. Carried by
     /// [`restarted`](Self::restarted): it is the graph's, not the process's.
     refused_prompts: Mutex<BTreeSet<String>>,
+    /// MOD-41 plan D12: who walks a command's tail in the engines built over this harness.
+    /// [`Tails::Walk`] in [`demo`](Self::demo) and in [`restarted`](Self::restarted).
+    tails: Mutex<Tails>,
     default_script: ScriptedStep,
     caps: DriverCaps,
     box_id: BoxId,
@@ -1323,6 +1327,7 @@ impl FakeOrchestrator {
             after_done_advance: Mutex::new(None),
             stalls: Mutex::new(BTreeMap::new()),
             refused_prompts: Mutex::new(BTreeSet::new()),
+            tails: Mutex::new(Tails::Walk),
             default_script: ScriptedStep::done_with_output("scripted output"),
             caps: FakeDriver::full_caps(),
             box_id: ids::BOX,
@@ -1377,6 +1382,7 @@ impl FakeOrchestrator {
                     .expect("no panic holds the fake orchestrator's lock")
                     .clone(),
             ),
+            tails: Mutex::new(Tails::Walk),
             default_script: self.default_script.clone(),
             caps: self.caps,
             box_id: self.box_id,
@@ -1730,6 +1736,30 @@ impl FakeOrchestrator {
     #[must_use]
     pub const fn owner(&self) -> Uuid {
         self.owner
+    }
+
+    /// MOD-41 plan D12: who walks a command's tail in the engines built over this harness.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn tails(&self) -> Tails {
+        *self
+            .tails
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+    }
+
+    /// Sets [`tails`](Self::tails) for every engine built from now on: a TUI on a `worker` box is
+    /// [`Tails::HandBack`] (MOD-41 plan D12).
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    pub fn set_tails(&self, tails: Tails) {
+        *self
+            .tails
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock") = tails;
     }
 
     /// The driver capabilities every session is built with.

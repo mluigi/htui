@@ -25,10 +25,10 @@ use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AppUser, BindingChange, BoundSkill, BoxEdit, BoxId,
     BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec,
     CitationKind, Claim, CommandRun, CommandRunId, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS,
-    Document, DocumentHead, DocumentId, GateOutcome, Item, ItemCitation, ItemFilter, ItemId,
-    ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement, ItemRevision,
-    ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem,
-    NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    Document, DocumentHead, DocumentId, Executor, GateOutcome, Item, ItemCitation, ItemFilter,
+    ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement,
+    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument,
+    NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
     NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
     Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
     PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
@@ -48,9 +48,10 @@ use crate::prompt::template::TemplateRole;
 use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
-    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ReadStore, SettingRung, StepFence,
-    StoredSetting, UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment,
-    citation_key, close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
+    BOX_SETTINGS_NOT_AN_OBJECT, BindingFacts, CasOutcome, DeleteReach, DeleteTarget,
+    EXECUTOR_MUST_BE_KNOWN, ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome,
+    WriteStore, already_exists, chat_step_status, check_attachment, citation_key,
+    close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
     finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project,
     invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
     lease_ttl_micros, legal_move, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
@@ -754,6 +755,24 @@ impl MemStore {
                         && matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval)
                 })
                 .count()
+        }))
+    }
+
+    /// This box's `queued` runs, `(id, queued_at)` by `(queued_at, id)` (MOD-41 plan D11).
+    /// `RunId`'s `Ord` is uuid byte order, which is Postgres' uuid order.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn queued_runs_on_box(&self, box_id: BoxId) -> Result<Vec<(RunId, DateTime<Utc>)>> {
+        Ok(self.read(|state| {
+            let mut rows: Vec<(RunId, DateTime<Utc>)> = state
+                .runs
+                .values()
+                .filter(|row| row.target_box_id == box_id && row.status == RunStatus::Queued)
+                .map(|row| (row.id, row.queued_at))
+                .collect();
+            rows.sort_by_key(|(id, at)| (*at, *id));
+            rows
         }))
     }
 
@@ -1587,6 +1606,7 @@ impl State {
     /// both values.
     fn set_step_prompt(
         &mut self,
+        fence: StepFence,
         step: StepId,
         digest: &str,
         trim: &Value,
@@ -1599,6 +1619,8 @@ impl State {
                 entity: "run_step",
                 id: step.to_string(),
             })?;
+        // MOD-41 plan D1: existence, then the fence, then the write.
+        Self::fence_holds(&self.lease_owners, row, fence)?;
         row.prompt_digest = Some(digest.to_owned());
         row.trim_record = Some(trim.clone());
         row.updated_at = now;
@@ -1883,8 +1905,10 @@ impl State {
     }
 
     /// `edit_version` compare-and-set on one box of `user` (MOD-7 D41): `NotFound` for an unknown
-    /// id or another user's box, then `Stale` for a spent token, then `Constraint` for a tag, and
-    /// only then the write. `now` stands in for Postgres's `set_updated_at` trigger.
+    /// id or another user's box, then `Stale` for a spent token, then `Constraint` for a tag, an
+    /// unknown executor or a non-object `settings` blob (MOD-41 plan D10), and only then the
+    /// write. The executor is written as one key of the blob, so every other key survives. `now`
+    /// stands in for Postgres's `set_updated_at` trigger.
     fn edit_box(
         &mut self,
         user: Option<UserId>,
@@ -1908,6 +1932,14 @@ impl State {
             .map(canonical_declared_tags)
             .transpose()
             .map_err(StoreError::Constraint)?;
+        if matches!(edit.executor, Some(Executor::Other(_))) {
+            return Err(StoreError::Constraint(EXECUTOR_MUST_BE_KNOWN.to_owned()));
+        }
+        if edit.executor.is_some() && !row.settings.is_object() {
+            return Err(StoreError::Constraint(
+                BOX_SETTINGS_NOT_AN_OBJECT.to_owned(),
+            ));
+        }
         let row = self
             .boxes
             .get_mut(&id)
@@ -1917,6 +1949,12 @@ impl State {
         }
         if let Some(quirks) = edit.quirks {
             row.quirks = quirks;
+        }
+        if let Some(executor) = edit.executor {
+            row.settings.as_object_mut().expect("checked above").insert(
+                Executor::KEY.to_owned(),
+                Value::String(executor.as_str().to_owned()),
+            );
         }
         row.edit_version += 1;
         row.updated_at = now;
@@ -4578,13 +4616,22 @@ impl State {
 
     /// Every row of a tree or commit batch belongs to `step` and names a repo that exists; the
     /// whole batch is checked before the first insert, as [`State::append_events`] does.
+    ///
+    /// MOD-41 plan D1 (blueprint B-1): with `Some(fence)`, the step's run must carry that lease,
+    /// checked after the step's existence and before the rows. `close_out`'s per-commit check
+    /// passes `None`: close-out runs on a finished item with no lease, and Postgres's `close_out`
+    /// checks existence only.
     fn check_step_batch(
         &self,
         table: &str,
         step: StepId,
+        fence: Option<StepFence>,
         rows: impl IntoIterator<Item = (StepId, RepoId)>,
     ) -> Result<()> {
-        self.require_step(step)?;
+        let row = self.require_step(step)?;
+        if let Some(fence) = fence {
+            Self::fence_holds(&self.lease_owners, row, fence)?;
+        }
         for (run_step_id, repo_id) in rows {
             if run_step_id != step {
                 return Err(StoreError::Constraint(row_names_another_step(
@@ -4620,6 +4667,7 @@ impl State {
     /// would make it a write.
     fn upsert_step_tree(
         &mut self,
+        fence: StepFence,
         step: StepId,
         trees: &[RunStepTree],
         now: DateTime<Utc>,
@@ -4627,6 +4675,7 @@ impl State {
         self.check_step_batch(
             "run_step_tree",
             step,
+            Some(fence),
             trees.iter().map(|row| (row.run_step_id, row.repo_id)),
         )?;
         let chosen = trees
@@ -4653,10 +4702,16 @@ impl State {
     }
 
     /// `run_step_commit` upserted on the same key (`R-ORCH-11`).
-    fn record_commits(&mut self, step: StepId, commits: &[RunStepCommit]) -> Result<()> {
+    fn record_commits(
+        &mut self,
+        fence: StepFence,
+        step: StepId,
+        commits: &[RunStepCommit],
+    ) -> Result<()> {
         self.check_step_batch(
             "run_step_commit",
             step,
+            Some(fence),
             commits.iter().map(|row| (row.run_step_id, row.repo_id)),
         )?;
         for row in commits {
@@ -4921,6 +4976,7 @@ impl State {
             self.check_step_batch(
                 "run_step_commit",
                 row.run_step_id,
+                None,
                 std::iter::once((row.run_step_id, row.repo_id)),
             )?;
         }
@@ -5852,9 +5908,15 @@ impl WriteStore for MemStore {
         self.write(|state| state.finish_chat_run(run, step, status, finished_at, now))
     }
 
-    async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> Result<()> {
+    async fn set_step_prompt(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        digest: &str,
+        trim: &Value,
+    ) -> Result<()> {
         let now = self.now();
-        self.write(|state| state.set_step_prompt(step, digest, trim, now))
+        self.write(|state| state.set_step_prompt(fence, step, digest, trim, now))
     }
 
     // MOD-15 milestone 1. Each arm takes the lock and hands one `State` method the store's clock;
@@ -6240,13 +6302,23 @@ impl WriteStore for MemStore {
         self.write(|state| state.supersede_step(step, now))
     }
 
-    async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> Result<()> {
+    async fn upsert_step_tree(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        trees: &[RunStepTree],
+    ) -> Result<()> {
         let now = self.now();
-        self.write(|state| state.upsert_step_tree(step, trees, now))
+        self.write(|state| state.upsert_step_tree(fence, step, trees, now))
     }
 
-    async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> Result<()> {
-        self.write(|state| state.record_commits(step, commits))
+    async fn record_commits(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        commits: &[RunStepCommit],
+    ) -> Result<()> {
+        self.write(|state| state.record_commits(fence, step, commits))
     }
 
     async fn record_command_run(&self, new: NewCommandRun) -> Result<CommandRun> {
@@ -6637,6 +6709,7 @@ mod tests {
             .expect("the usage write lands");
         store
             .set_step_prompt(
+                StepFence::Unleased,
                 ids::STEP_IMPL,
                 "9f8e",
                 &json!({ "estimated_after": 34_000, "sections": [], "v": 1 }),
@@ -6668,7 +6741,7 @@ mod tests {
         );
 
         let unknown = store
-            .set_step_prompt(StepId::new(), "9f8e", &json!({}))
+            .set_step_prompt(StepFence::Unleased, StepId::new(), "9f8e", &json!({}))
             .await;
         assert!(
             matches!(
@@ -7725,6 +7798,7 @@ mod tests {
         let tags = |tags: &[&str]| BoxEdit {
             declared_tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
             quirks: None,
+            executor: None,
         };
         let right_token = store.edit_box(foreign, 0, tags(&["gpu"])).await;
         assert!(
@@ -8708,6 +8782,241 @@ mod tests {
         );
     }
 
+    /// The demo store with the fixture box's `box.settings` replaced by `settings`.
+    fn demo_with_box_settings(settings: Value) -> MemStore {
+        let mut data = crate::fixtures::demo_data();
+        data.boxes
+            .iter_mut()
+            .find(|row| row.id == ids::BOX)
+            .expect("the fixture box")
+            .settings = settings;
+        MemStore::from_demo(data)
+    }
+
+    /// MOD-41 plan D10: an executor edit writes that key alone; every other key of the blob,
+    /// known or not, survives. The Postgres half is
+    /// `pg_criteria.rs::edit_box_keeps_every_other_settings_key`.
+    #[tokio::test]
+    async fn edit_box_keeps_every_other_settings_key_in_memory() {
+        use crate::model::{BoxEdit, Executor};
+
+        let store = demo_with_box_settings(json!({
+            "max_concurrent_items": 1,
+            "command_limits": {"verify": 2},
+            "x": true,
+        }));
+        let token = store
+            .box_row(ids::BOX)
+            .await
+            .expect("box_row never fails")
+            .expect("the fixture box")
+            .edit_version;
+        let written = store
+            .edit_box(
+                ids::BOX,
+                token,
+                BoxEdit {
+                    executor: Some(Executor::Worker),
+                    ..BoxEdit::default()
+                },
+            )
+            .await
+            .expect("the edit is answered");
+        let CasOutcome::Applied(row) = written else {
+            panic!("an executor edit on the current token applies, got {written:?}");
+        };
+        assert_eq!(
+            row.settings,
+            json!({
+                "max_concurrent_items": 1,
+                "command_limits": {"verify": 2},
+                "x": true,
+                "executor": "worker",
+            }),
+            "all four keys are present"
+        );
+        assert_eq!(row.edit_version, token + 1, "the edit moves the token");
+    }
+
+    /// MOD-41 plan D10: a `box.settings` blob that is not a JSON object cannot take the executor
+    /// key. The edit is `Constraint(BOX_SETTINGS_NOT_AN_OBJECT)` and writes nothing, the token
+    /// included; an edit that does not name the executor still applies to the same row. The
+    /// Postgres half is `pg_criteria.rs::edit_box_refuses_a_non_object_settings_blob`.
+    #[tokio::test]
+    async fn edit_box_refuses_a_non_object_settings_blob_in_memory() {
+        use crate::model::{BoxEdit, Executor};
+        use crate::store::traits::BOX_SETTINGS_NOT_AN_OBJECT;
+
+        for blob in [json!([]), json!("x")] {
+            let store = demo_with_box_settings(blob.clone());
+            let before = store
+                .box_row(ids::BOX)
+                .await
+                .expect("box_row never fails")
+                .expect("the fixture box");
+            let refused = store
+                .edit_box(
+                    ids::BOX,
+                    before.edit_version,
+                    BoxEdit {
+                        executor: Some(Executor::Tui),
+                        ..BoxEdit::default()
+                    },
+                )
+                .await;
+            match refused {
+                Err(StoreError::Constraint(said)) => {
+                    assert_eq!(said, BOX_SETTINGS_NOT_AN_OBJECT, "{blob}");
+                }
+                other => panic!("{blob}: a non-object blob is a Constraint, got {other:?}"),
+            }
+            assert_eq!(
+                store.box_row(ids::BOX).await.expect("box_row never fails"),
+                Some(before.clone()),
+                "{blob}: the refused edit wrote nothing, the token included"
+            );
+
+            let quirks = store
+                .edit_box(
+                    ids::BOX,
+                    before.edit_version,
+                    BoxEdit {
+                        quirks: Some("no executor named".to_owned()),
+                        ..BoxEdit::default()
+                    },
+                )
+                .await
+                .expect("the edit is answered");
+            let CasOutcome::Applied(row) = quirks else {
+                panic!("{blob}: a quirks-only edit applies, got {quirks:?}");
+            };
+            assert_eq!(row.quirks, "no executor named", "{blob}");
+            assert_eq!(row.settings, blob, "{blob}: the blob is left as it was");
+
+            // Precedence (trait doc): `NotFound`, then `Stale`, before the blob's `Constraint`.
+            let tui = || BoxEdit {
+                executor: Some(Executor::Tui),
+                ..BoxEdit::default()
+            };
+            assert_eq!(
+                store.edit_box(ids::BOX, before.edit_version, tui()).await,
+                Ok(CasOutcome::Stale(row.clone())),
+                "{blob}: a spent token is Stale before the non-object blob refuses"
+            );
+            let unknown = BoxId::new();
+            match store.edit_box(unknown, row.edit_version, tui()).await {
+                Err(StoreError::NotFound { entity: "box", id }) => {
+                    assert_eq!(id, unknown.to_string(), "{blob}");
+                }
+                other => panic!("{blob}: an unknown box is NotFound, got {other:?}"),
+            }
+            assert_eq!(
+                store.box_row(ids::BOX).await.expect("box_row never fails"),
+                Some(row),
+                "{blob}: neither refusal wrote anything"
+            );
+        }
+    }
+
+    /// MOD-41 plan D11: `queued_runs_on_box` answers this box's `queued` runs alone, by
+    /// `(queued_at, id)`: not another box's queued run, not this box's running one. The Postgres
+    /// half is `pg_criteria.rs::queued_runs_on_box_lists_this_boxs_queued_runs_in_queue_order`.
+    #[tokio::test]
+    async fn queued_runs_on_box_lists_this_boxs_queued_runs_in_queue_order() {
+        let mut data = crate::fixtures::demo_data();
+        let mut elsewhere = data
+            .boxes
+            .iter()
+            .find(|row| row.id == ids::BOX)
+            .expect("the fixture box")
+            .clone();
+        let other = BoxId::new();
+        elsewhere.id = other;
+        elsewhere.hostname = "ELSEWHERE".to_owned();
+        data.boxes.push(elsewhere);
+        let store = MemStore::from_demo(data);
+
+        // The fixture already queues a run on this box, stamped at the fixture's clock: it leads.
+        let fixture = store
+            .queued_runs_on_box(ids::BOX)
+            .await
+            .expect("the read is answered");
+        let early = Utc::now();
+        assert!(
+            fixture.iter().all(|(_, at)| *at < early),
+            "the fixture's queued runs predate this case's, got {fixture:?}"
+        );
+        let late = early + TimeDelta::seconds(1);
+        let queue = |id: RunId, title: &'static str, target: BoxId, queued_at| {
+            let store = &store;
+            async move {
+                let item = store
+                    .mint_item(NewItem {
+                        id: ItemId::new(),
+                        project_id: ids::PROJECT_HTUI,
+                        kind_id: ids::KIND_HTUI_FEAT,
+                        title: title.to_owned(),
+                        body: String::new(),
+                        required_tags: Vec::new(),
+                        touched_paths: Vec::new(),
+                        priority: 0,
+                        step_graph_id: None,
+                        created_by: ids::USER,
+                        box_id: Some(ids::BOX),
+                    })
+                    .await
+                    .expect("the mint lands")
+                    .id;
+                store
+                    .create_run(NewRun {
+                        id,
+                        target_box_id: target,
+                        queued_at,
+                        ..graph_run(item, ids::PROJECT_HTUI, Vec::new())
+                    })
+                    .await
+                    .expect("the run is queued")
+                    .id
+            }
+        };
+        // The tied pair is inserted larger id first, so insertion order disagrees with `id` order
+        // and only the `id` tie-break puts the smaller one first.
+        let (first, second) = {
+            let (a, b) = (RunId::new(), RunId::new());
+            if a < b { (a, b) } else { (b, a) }
+        };
+        let running = queue(RunId::new(), "running on this box", ids::BOX, early).await;
+        let last = queue(RunId::new(), "queued last", ids::BOX, late).await;
+        queue(second, "queued first, tied, larger id", ids::BOX, early).await;
+        queue(first, "queued first, tied, smaller id", ids::BOX, early).await;
+        let _theirs = queue(RunId::new(), "queued on another box", other, early).await;
+        assert_eq!(
+            store
+                .claim_run(
+                    running,
+                    ids::BOX,
+                    Uuid::now_v7(),
+                    early,
+                    TimeDelta::minutes(5)
+                )
+                .await
+                .expect("the claim is answered"),
+            Claim::Admitted,
+            "one run on this box is running, not queued"
+        );
+
+        let mut expected = fixture;
+        expected.extend([(first, early), (second, early), (last, late)]);
+        assert_eq!(
+            store
+                .queued_runs_on_box(ids::BOX)
+                .await
+                .expect("the read is answered"),
+            expected,
+            "this box's queued runs, the fixture's then this case's three, by `(queued_at, id)`"
+        );
+    }
+
     /// ANA-2 §4.7's admission: the repo-scope overlap refuses before the slot count does, and the
     /// slot count is `box.settings.max_concurrent_items`.
     #[tokio::test]
@@ -9632,7 +9941,11 @@ mod tests {
         };
 
         store
-            .upsert_step_tree(ids::STEP_R2_PRD, &[tree(second, false), tree(first, false)])
+            .upsert_step_tree(
+                StepFence::Unleased,
+                ids::STEP_R2_PRD,
+                &[tree(second, false), tree(first, false)],
+            )
             .await
             .expect("both rows land");
         let rows = store
@@ -9645,7 +9958,7 @@ mod tests {
             "repo_id order regardless of input order"
         );
         store
-            .upsert_step_tree(ids::STEP_R2_PRD, &[tree(first, true)])
+            .upsert_step_tree(StepFence::Unleased, ids::STEP_R2_PRD, &[tree(first, true)])
             .await
             .expect("the upsert replaces rather than inserts");
         let rows = store
@@ -9661,7 +9974,9 @@ mod tests {
         };
         assert!(
             matches!(
-                store.upsert_step_tree(ids::STEP_R2_PRD, &[stray]).await,
+                store
+                    .upsert_step_tree(StepFence::Unleased, ids::STEP_R2_PRD, &[stray])
+                    .await,
                 Err(StoreError::Constraint(_))
             ),
             "a row for another step is refused"
@@ -9669,21 +9984,27 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .upsert_step_tree(ids::STEP_R2_PRD, &[tree(RepoId::new(), false)])
+                    .upsert_step_tree(
+                        StepFence::Unleased,
+                        ids::STEP_R2_PRD,
+                        &[tree(RepoId::new(), false)]
+                    )
                     .await,
                 Err(StoreError::Constraint(_))
             ),
             "an unknown repo is a foreign key refusal"
         );
         assert!(matches!(
-            store.upsert_step_tree(StepId::new(), &[]).await,
+            store
+                .upsert_step_tree(StepFence::Unleased, StepId::new(), &[])
+                .await,
             Err(StoreError::NotFound {
                 entity: "run_step",
                 ..
             })
         ));
         store
-            .upsert_step_tree(ids::STEP_R2_PRD, &[])
+            .upsert_step_tree(StepFence::Unleased, ids::STEP_R2_PRD, &[])
             .await
             .expect("an empty slice checks the step and writes nothing");
 
@@ -9695,13 +10016,18 @@ mod tests {
         };
         store
             .record_commits(
+                StepFence::Unleased,
                 ids::STEP_R2_PRD,
                 &[commit(second, None), commit(first, None)],
             )
             .await
             .expect("both rows land");
         store
-            .record_commits(ids::STEP_R2_PRD, &[commit(first, Some("def"))])
+            .record_commits(
+                StepFence::Unleased,
+                ids::STEP_R2_PRD,
+                &[commit(first, Some("def"))],
+            )
             .await
             .expect("the upsert replaces");
         let commits = store
@@ -9714,7 +10040,9 @@ mod tests {
         );
         assert_eq!(commits[0].after_hash.as_deref(), Some("def"));
         assert!(matches!(
-            store.record_commits(StepId::new(), &[]).await,
+            store
+                .record_commits(StepFence::Unleased, StepId::new(), &[])
+                .await,
             Err(StoreError::NotFound {
                 entity: "run_step",
                 ..
@@ -10016,6 +10344,69 @@ mod tests {
                 .expect("the commits read back")
                 .len(),
             1
+        );
+    }
+
+    /// MOD-41 blueprint B-1: `close_out`'s per-commit check passes no fence. Close-out runs on a
+    /// finished item with no lease of its own, so its commits land even on a run whose lease
+    /// still names a dead owner, where a fenced `record_commits` under no lease is refused.
+    #[tokio::test]
+    async fn close_out_records_commits_without_a_fence() {
+        let store = MemStore::demo();
+        let repo = a_repo(&store, "core").await;
+        let run = store.read(|state| {
+            state
+                .steps
+                .get(&ids::STEP_IMPL)
+                .expect("the fixture step")
+                .run_id
+        });
+        assert!(
+            store.read(|state| !state.lease_owners.contains_key(&run)),
+            "the finished run's lease was released"
+        );
+        let dead = Uuid::now_v7();
+        store.write(|state| state.lease_owners.insert(run, dead));
+        let commit = RunStepCommit {
+            run_step_id: ids::STEP_IMPL,
+            repo_id: repo,
+            before_hash: "abc".to_owned(),
+            after_hash: Some("def".to_owned()),
+        };
+        assert!(
+            matches!(
+                store
+                    .record_commits(
+                        StepFence::Unleased,
+                        ids::STEP_IMPL,
+                        std::slice::from_ref(&commit)
+                    )
+                    .await,
+                Err(StoreError::Fenced { step }) if step == ids::STEP_IMPL
+            ),
+            "the fenced writer is refused on a run whose lease names an owner"
+        );
+
+        store
+            .transition(ids::HTUI_FEAT_1, Status::InProgress, Status::Done)
+            .await
+            .expect("the item finishes");
+        store
+            .close_out(
+                ids::HTUI_FEAT_1,
+                Resolution::Done,
+                a_document(ids::HTUI_FEAT_1, "summary", None),
+                std::slice::from_ref(&commit),
+            )
+            .await
+            .expect("close-out checks the step, not a fence");
+        assert_eq!(
+            store
+                .step_commits(ids::STEP_IMPL)
+                .await
+                .expect("the commits read back"),
+            vec![commit],
+            "the close-out's one commit row is stored"
         );
     }
 

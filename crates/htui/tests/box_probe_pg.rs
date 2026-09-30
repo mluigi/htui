@@ -366,6 +366,7 @@ fn tags(tags: &[&str]) -> BoxEdit {
     BoxEdit {
         declared_tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
         quirks: None,
+        executor: None,
     }
 }
 
@@ -742,6 +743,7 @@ async fn another_box_of_this_user_is_editable() {
                 edit: BoxEdit {
                     declared_tags: None,
                     quirks: Some("x".to_owned()),
+                    executor: None,
                 },
             })
             .await,
@@ -788,6 +790,7 @@ async fn another_users_box_is_not_listed_and_not_editable() {
                 edit: BoxEdit {
                     declared_tags: Some(vec!["gpu".to_owned()]),
                     quirks: Some("x".to_owned()),
+                    executor: None,
                 },
             })
             .await,

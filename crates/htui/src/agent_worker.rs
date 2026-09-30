@@ -2208,10 +2208,10 @@ fn refuse_switched_off(summary: &htui_core::model::AgentSummary) -> Result<(), S
 }
 
 /// The one sentence for an agent switched off on this box (MOD-23 review L-3, re-review Low-1):
-/// [`refuse_switched_off`]'s, and `run_worker`'s `Kit::driver`'s for a step admitted before the
+/// [`refuse_switched_off`]'s, and `htui_worker`'s `Kit::driver`'s for a step admitted before the
 /// switch. The name is only quoted, never branched on (`R-AGT-5`).
 pub(crate) fn switched_off(name: &str) -> String {
-    format!("agent `{name}` is switched off on this box; Settings > Agents, t switches it on")
+    htui_worker::switched_off(name)
 }
 
 /// [`run_probe`]'s loop, shared with the box probe (MOD-7 D11): every enabled row of `agents`

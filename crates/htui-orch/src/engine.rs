@@ -44,7 +44,7 @@ use htui_core::prompt::{
     withhold_unmaskable_notes,
 };
 use htui_core::scrub::Scrubber;
-use htui_core::store::{StepFence, StoreError, WriteStore};
+use htui_core::store::{StepFence, StoreError};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -376,13 +376,23 @@ impl RunFence for NoFence {
     }
 }
 
+/// Who walks a command's tail (MOD-41 plan D12, OQ-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tails {
+    /// This engine walks every tail: the TUI on a `tui` box, and `htui worker` always.
+    Walk,
+    /// The command's leased window is written, then the lease is released and the run's rest is
+    /// read: the box's worker adopts the run at its next poll (the TUI on a `worker` box).
+    HandBack,
+}
+
 /// Everything [`Engine::new`] borrows, as a struct literal rather than a builder.
 ///
-/// A builder would let a caller forget one of fifteen fields and find out at run time; a literal
+/// A builder would let a caller forget one of sixteen fields and find out at run time; a literal
 /// cannot compile until every one of them is named.
 pub struct EngineParts<'a, S, G, I, V, C, A, K>
 where
-    S: WriteStore,
+    S: htui_core::store::WorkerStore,
     G: GraphSource,
     I: Isolator + ?Sized,
     V: Verifier + ?Sized,
@@ -424,6 +434,8 @@ where
     pub dead_walks: &'a DeadWalks,
     /// `run.started_by` and `item_note.created_by`.
     pub user: UserId,
+    /// Plan D12 (MOD-41): walk command tails, or hand them back to the box's worker.
+    pub tails: Tails,
 }
 
 /// `Debug` is hand written for one field: a driver factory is a `dyn Fn` and `dyn Fn` is not
@@ -431,7 +443,7 @@ where
 /// `SessionSpec` uses (`crates/htui-agent/src/driver.rs:281-298`), for the same reason.
 impl<S, G, I, V, C, A, K> core::fmt::Debug for EngineParts<'_, S, G, I, V, C, A, K>
 where
-    S: WriteStore,
+    S: htui_core::store::WorkerStore,
     G: GraphSource,
     I: Isolator + ?Sized,
     V: Verifier + ?Sized,
@@ -449,6 +461,7 @@ where
             .field("box_id", &self.box_id)
             .field("owner", &self.owner)
             .field("user", &self.user)
+            .field("tails", &self.tails)
             .finish_non_exhaustive()
     }
 }
@@ -457,7 +470,7 @@ where
 #[derive(Debug)]
 pub struct Engine<'a, S, G, I, V, C, A, K>
 where
-    S: WriteStore,
+    S: htui_core::store::WorkerStore,
     G: GraphSource,
     I: Isolator + ?Sized,
     V: Verifier + ?Sized,
@@ -527,7 +540,7 @@ pub enum Next {
 
 impl<'a, S, G, I, V, C, A, K> Engine<'a, S, G, I, V, C, A, K>
 where
-    S: WriteStore,
+    S: htui_core::store::WorkerStore,
     G: GraphSource,
     I: Isolator + ?Sized,
     V: Verifier + ?Sized,
@@ -687,6 +700,7 @@ where
     /// [`EngineError`] the walk raises.
     pub async fn claim(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
         let now = self.now();
+        let sent = tokio::time::Instant::now();
         let ttl = self.lease_times().ttl;
         // Anything but `Admitted` is a refusal. `MissingTags` is `R-ORCH-10`'s: `claim_run`
         // already failed the run and blocked its item, and the engine adds the note (D78). The
@@ -718,10 +732,11 @@ where
             }
         }
 
-        // `now` was read before the claim was sent, so `now + ttl` is a fence the store's expiry
-        // cannot precede (MOD-40 plan OQ-2, blueprint F-38).
+        // `sent` was read before the claim was sent, so `sent + ttl` is a fence the store's
+        // expiry cannot precede (MOD-40 plan OQ-2), on tokio's monotonic clock, which no
+        // wall-clock step moves (MOD-41 plan D3). `now` only stamps the rows.
         let rest = self
-            .walk_leased(run, now + ttl, self.run_to_rest(run))
+            .walk_leased(run, self.lease_until(sent), self.run_to_rest(run))
             .await?;
         Ok(CommandOutcome::Started { run, rest })
     }
@@ -841,6 +856,11 @@ where
             Ok(())
         })
         .await?;
+        // MOD-41 plan D12: on a `worker` box the TUI hands the tail back. The adopter finishes an
+        // approval by the frontier reconcile (plan D97) and a rejection by D131's `settle_failed`.
+        if self.parts.tails == Tails::HandBack {
+            return self.hand_back(run.id).await;
+        }
 
         // Blueprint F-M: everything after the unpark writes to a `running` run, so all of it —
         // the review loop or the reconcile, not only `run_to_rest` — runs under the heartbeat.
@@ -1017,6 +1037,26 @@ where
             Ok(())
         })
         .await?;
+        // MOD-41 plan D12: the hand-back admits the next attempt in a window of its own, so the
+        // adopter walks a `pending` row rather than reading D131's unfinished failure or
+        // reconciling the previous winner again. Blueprint F-34: that window runs without the
+        // heartbeat; `admit` is bounded (stage-1 reads and `create_step`s), and any error of it
+        // gives the lease back (plan D149).
+        if self.parts.tails == Tails::HandBack {
+            let admitted = self
+                .leased_window(run.id, async {
+                    let run = self.run(run.id).await?;
+                    let steps = self.parts.store.run_steps(run.id).await?;
+                    let attempt = next_attempt(&steps, row.position);
+                    self.admit(&run, snapshot, phase, attempt).await
+                })
+                .await?;
+            let handed = self.hand_back(run.id).await?;
+            return Ok(CommandOutcome::Retried {
+                step: row.id,
+                rest: admitted.unwrap_or(handed),
+            });
+        }
 
         // Admitted rather than created outright, so the next attempt passes through the capability
         // interlock like any other — a phase whose only candidate lost its inline-approval
@@ -1056,6 +1096,20 @@ where
             Ok(())
         })
         .await?;
+        // MOD-41 plan D12: as `retry_guarded`'s hand-back, the whole next group admitted.
+        if self.parts.tails == Tails::HandBack {
+            let admitted = self
+                .leased_window(run.id, async {
+                    let run = self.run(run.id).await?;
+                    self.admit(&run, snapshot, phase, attempt + 1).await
+                })
+                .await?;
+            let handed = self.hand_back(run.id).await?;
+            return Ok(CommandOutcome::Retried {
+                step: row.id,
+                rest: admitted.unwrap_or(handed),
+            });
+        }
 
         let tail = async {
             let run = self.run(run.id).await?;
@@ -1121,6 +1175,13 @@ where
             Ok(())
         })
         .await?;
+        // MOD-41 plan D12: the adopter's frontier reconcile merges the same siblings
+        // (`group_at(&steps, position, attempt)` minus the winner).
+        if self.parts.tails == Tails::HandBack {
+            return Ok(CommandOutcome::Selected {
+                rest: self.hand_back(run.id).await?,
+            });
+        }
 
         let tail = async {
             let run = self.run(run.id).await?;
@@ -1402,7 +1463,10 @@ where
                 })
                 .await?;
             let after = self.parts.isolator.capture(row.id, &trees).await?;
-            self.parts.store.record_commits(row.id, &after).await?;
+            self.parts
+                .store
+                .record_commits(StepFence::Lease(self.parts.owner), row.id, &after)
+                .await?;
             let verify_outcome = verify.as_ref().map(|report| report.outcome);
             let verify_exit_code = verify.as_ref().and_then(|report| report.exit_code);
             self.parts
@@ -1481,7 +1545,9 @@ where
     /// [`Self::unblock_case`] decides, then: [`UnblockCase::Reopen`] moves the item
     /// `blocked -> open`; [`UnblockCase::FollowRun`] moves it `blocked -> awaiting_approval`
     /// beside its parked run, so the run's gate verbs reach it (R-4); [`UnblockCase::Resume`]
-    /// resumes the parked run through [`Self::resume`] (R-7). Each writes a note first.
+    /// resumes the parked run through [`Self::resume`] under [`Tails::Walk`] (R-7), and on a
+    /// worker box ([`Tails::HandBack`]) only unparks it through [`Self::hand_back_resume`] and
+    /// hands it to the box's worker (MOD-41 plan D12). Each writes a note first.
     async fn unblock(&self, item: ItemId) -> Result<CommandOutcome, EngineError> {
         let case = self.unblock_case(item).await?;
         let now = self.now();
@@ -1534,8 +1600,11 @@ where
             UnblockCase::Resume(run) => {
                 self.note(item, format!("unblocked: resuming run {run}"), None, now)
                     .await?;
-                Some(match self.resume(run).await? {
-                    Resume::Walked(rest) | Resume::TopologyChanged { rest, .. } => rest,
+                Some(match self.parts.tails {
+                    Tails::Walk => match self.resume(run).await? {
+                        Resume::Walked(rest) | Resume::TopologyChanged { rest, .. } => rest,
+                    },
+                    Tails::HandBack => self.hand_back_resume(run).await?,
                 })
             }
         };
@@ -1546,7 +1615,7 @@ where
     ///
     /// The reads [`Self::close_out_preview`] counts over, the guard
     /// ([`crate::command::close_out_enabled`]), then one `summary` document built by
-    /// [`closeout::summary`] and written by `WriteStore::close_out` with the item's move to
+    /// [`closeout::summary`] and written by `WorkerStore::close_out` with the item's move to
     /// `closed` as `resolution`, in one transaction. No run lease is involved: the store re-checks
     /// a live run, the item's status and `Resolution::closes_from` inside that transaction, so a
     /// run started since is refused there with nothing written. The commit rows already exist, so
@@ -1598,7 +1667,9 @@ where
     /// walk of the run before it cancels (MOD-4 plan D157).
     ///
     /// Since MOD-4 plan D179 (R-28) a `running` or parked run's lease is taken first, as every
-    /// other command's is, and given back once the run is cancelled and cleaned up.
+    /// other command's is, and given back once the run is cancelled and cleaned up. Since MOD-41
+    /// OQ-4 a `queued` run's cancel is a compare-and-set on `queued` (another process's worker may
+    /// claim it at any time), which falls back to the leased path when the claim won.
     ///
     /// # Errors
     /// [`EngineError::RunStatus`] for a run that has already finished; [`EngineError::LeaseHeld`]
@@ -1606,15 +1677,67 @@ where
     pub async fn cancel_run(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
         let row = self.run(run).await?;
         crate::command::cancel_enabled(&row)?;
-        let position = self.resting(&row).await?.position;
-
-        // MOD-4 plan D179 (R-28): a `running` or parked run's lease is taken after the guard and
-        // before the first write, so a live stranger's lease refuses the cancel with nothing
-        // written (`LeaseHeld`). A `queued` run was never claimed and has no lease to take.
-        let leased = matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval);
-        if leased {
-            self.take_lease(run).await?;
+        if row.status == RunStatus::Queued {
+            return self.cancel_from_queued(&row).await;
         }
+        self.cancel_leased(&row).await
+    }
+
+    /// [`Self::cancel_run`] of a run read `queued` (OQ-4): the compare-and-set first. When a
+    /// claim won between the read and it, the run is leased now: it is read again and takes the
+    /// leased path, which refuses a live lease with `LeaseHeld`, writing nothing.
+    async fn cancel_from_queued(&self, row: &Run) -> Result<CommandOutcome, EngineError> {
+        if let Some(outcome) = self.cancel_queued(row).await? {
+            return Ok(outcome);
+        }
+        let row = self.run(row.id).await?;
+        crate::command::cancel_enabled(&row)?;
+        self.cancel_leased(&row).await
+    }
+
+    /// OQ-4, B-6: `queued → cancelled` as a compare-and-set, then the item `queued → open` that
+    /// `finish_run` would have mirrored, then plan D36's cleanup. `None` when the run left
+    /// `queued` first: another process claimed it, and nothing is written. A `queued` run was
+    /// never claimed, so it has no step and no lease to take.
+    ///
+    /// E-2 (accepted): the run's move and the item's are two statements, so a crash between them
+    /// leaves the item `queued` beside a cancelled run.
+    async fn cancel_queued(&self, row: &Run) -> Result<Option<CommandOutcome>, EngineError> {
+        let position = self.resting(row).await?.position;
+        let now = self.now();
+        if !self
+            .parts
+            .store
+            .transition_run(row.id, RunStatus::Queued, RunStatus::Cancelled, now)
+            .await?
+        {
+            return Ok(None);
+        }
+        if let Some(item) = row.item_id {
+            // `Ok(false)`: the item was moved by another writer; the run is cancelled either way.
+            self.parts
+                .store
+                .transition(item, Status::Queued, Status::Open)
+                .await?;
+        }
+        self.cleanup_run(row.id).await?;
+        Ok(Some(CommandOutcome::Cancelled {
+            rest: Rest {
+                run: RunStatus::Cancelled,
+                position,
+                failure: None,
+            },
+        }))
+    }
+
+    /// [`Self::cancel_run`] of a `running` or parked run (MOD-4 plan D179, R-28): its lease is
+    /// taken after the guard and before the first write, so a live stranger's lease refuses the
+    /// cancel with nothing written (`LeaseHeld`). Then every unsettled step moves to `cancelled`,
+    /// the run does, plan D36's cleanup runs, and the lease is given back.
+    async fn cancel_leased(&self, row: &Run) -> Result<CommandOutcome, EngineError> {
+        let run = row.id;
+        let position = self.resting(row).await?.position;
+        self.take_lease(run).await?;
         let window = async {
             let now = self.now();
             let steps = self.parts.store.run_steps(run).await?;
@@ -1636,12 +1759,8 @@ where
                 .await?;
             self.cleanup_run(run).await
         };
-        if leased {
-            self.leased_window(run, window).await?;
-            self.release_lease(run).await;
-        } else {
-            window.await?;
-        }
+        self.leased_window(run, window).await?;
+        self.release_lease(run).await;
         Ok(CommandOutcome::Cancelled {
             rest: Rest {
                 run: RunStatus::Cancelled,
@@ -1655,9 +1774,9 @@ where
 
     /// Plan D86/D107: `walk` raced against [`crate::recover::heartbeat`] in this task.
     ///
-    /// `until` is the local instant the caller's lease take (`claim_run`, `take_lease` or the
-    /// sweep's renewal) lapses by at the earliest: the instant it was sent plus the TTL (MOD-40
-    /// plan D10, OQ-2). The heartbeat's first fence is that `until` less one refresh (plan D143),
+    /// `until` is tokio's monotonic instant the caller's lease take (`claim_run`, `take_lease` or
+    /// the sweep's renewal) lapses by at the earliest: the instant it was sent plus the TTL (MOD-40
+    /// plan D10, OQ-2; MOD-41 plan D3). The heartbeat's first fence is that `until` less one refresh (plan D143),
     /// not a lease the heartbeat assumes from its own start.
     ///
     /// On the walk's answer, the lease is released when the run rests anywhere but `running`
@@ -1684,7 +1803,7 @@ where
     async fn walk_leased<T, F>(
         &self,
         run: RunId,
-        until: DateTime<Utc>,
+        until: tokio::time::Instant,
         walk: F,
     ) -> Result<T, EngineError>
     where
@@ -1713,7 +1832,7 @@ where
     async fn heartbeaten<T, F>(
         &self,
         run: RunId,
-        until: DateTime<Utc>,
+        until: tokio::time::Instant,
         walk: F,
     ) -> Result<Result<T, EngineError>, EngineError>
     where
@@ -1721,12 +1840,7 @@ where
     {
         let times = self.lease_times();
         let (store, owner) = (self.parts.store, self.parts.owner);
-        let beat = recover::heartbeat(
-            |ttl| store.refresh_lease(run, owner, ttl),
-            until,
-            self.parts.clock,
-            times,
-        );
+        let beat = recover::heartbeat(|ttl| store.refresh_lease(run, owner, ttl), until, times);
         // Both boxed: `select` needs `Unpin`, and dropping `select`'s output does not drop a
         // stack-pinned walk (blueprint H-11). A boxed one goes when its box does.
         match futures::future::select(Box::pin(walk), Box::pin(beat)).await {
@@ -1782,15 +1896,16 @@ where
 
     /// Plan D87/D108: `take_lease(run, box, owner, ttl)`, after a command's pure guard and before
     /// its first write.
-    /// Answers the local instant its lease lapses by at the earliest (the send instant plus the
-    /// TTL), which the command's [`Self::walk_leased`] fences from (plan D143).
+    /// Answers tokio's monotonic instant its lease lapses by at the earliest (the send instant
+    /// plus the TTL), which the command's [`Self::walk_leased`] fences from (plan D143; MOD-41
+    /// plan D3).
     ///
     /// Plan D130: a zero-row answer re-reads the run to say why. Not `running` or
     /// `awaiting_approval` → [`EngineError::RunStatus`] naming the status; a run on this box →
     /// [`EngineError::LeaseHeld`] (the store's only remaining refusal is a live foreign lease;
     /// never this process's, which the take would have renewed); a run on another box →
     /// [`EngineError::RunStatus`] saying so, whatever its lease (MOD-40 blueprint B26).
-    async fn take_lease(&self, run: RunId) -> Result<DateTime<Utc>, EngineError> {
+    async fn take_lease(&self, run: RunId) -> Result<tokio::time::Instant, EngineError> {
         if let Some(until) = self.renew_lease(run).await? {
             return Ok(until);
         }
@@ -1816,9 +1931,9 @@ where
         })
     }
 
-    /// The store's `take_lease(run, box, owner, ttl)` and its bare answer: the local instant the
-    /// lease lapses by at the earliest, `now + ttl` with `now` read before the take (plan D143),
-    /// `None` for "not takeable here", which [`Self::take_lease`] words and the sweep skips (plan
+    /// The store's `take_lease(run, box, owner, ttl)` and its bare answer: tokio's monotonic
+    /// instant the lease lapses by at the earliest, `sent + ttl` with `sent` read before the take
+    /// (plan D143; MOD-41 plan D3), `None` for "not takeable here", which [`Self::take_lease`] words and the sweep skips (plan
     /// D126).
     ///
     /// Plan D140: a run taken here is about to be walked, so it leaves [`DeadWalks`]. The sweep
@@ -1828,8 +1943,8 @@ where
     /// first, best-effort (a `warn`), since no later pre-pass will. Every caller holds the run's
     /// lock (a command, MOD-4 plan D157) or the sweep's fence (plan D189), so no walk of the run is
     /// live in this process and the guards are a dead walk's.
-    async fn renew_lease(&self, run: RunId) -> Result<Option<DateTime<Utc>>, EngineError> {
-        let now = self.now();
+    async fn renew_lease(&self, run: RunId) -> Result<Option<tokio::time::Instant>, EngineError> {
+        let sent = tokio::time::Instant::now();
         let ttl = self.lease_times().ttl;
         let taken = self
             .parts
@@ -1840,7 +1955,7 @@ where
             self.release_guards(run, "releasing a dead walk's guards at a lease take failed")
                 .await;
         }
-        Ok(taken.then_some(now + ttl))
+        Ok(taken.then(|| self.lease_until(sent)))
     }
 
     /// `Isolator::release(run)`, best-effort: a failure is a `warn` saying `what`, and nothing
@@ -1876,8 +1991,8 @@ where
     /// The `until` a lease taken at this instant runs to: what a test hands
     /// [`Self::walk_leased`] as the lease its caller has just written.
     #[cfg(test)]
-    fn fresh_until(&self) -> DateTime<Utc> {
-        self.now() + self.lease_times().ttl
+    fn fresh_until(&self) -> tokio::time::Instant {
+        self.lease_until(tokio::time::Instant::now())
     }
 
     /// MOD-4 plan D188 (blueprint F-D): a walk the worker dropped mid-flight — a preempting
@@ -1892,6 +2007,40 @@ where
             tracing::warn!(%run, %err, "releasing an abandoned walk's guards failed");
         }
         self.release_lease(run).await;
+    }
+
+    /// MOD-41 plan D12: the command's window is written; the lease goes back, and the answer is
+    /// the run's rest as read now (the box's worker adopts it at its next poll). A release that
+    /// fails puts the run in [`DeadWalks`], and the worker adopts it once the lease lapses.
+    async fn hand_back(&self, run: RunId) -> Result<Rest, EngineError> {
+        self.release_lease(run).await;
+        self.resting(&self.run(run).await?).await
+    }
+
+    /// MOD-41 plan D12's `u` on a worker box: the lease, then only `walk_resumed_from`'s unpark
+    /// (MOD-4 plan D180's compare-and-set), then the lease back. The adopter's `resume` runs
+    /// `resume_window` once; running it here too would resolve the live graph twice (plan D12).
+    async fn hand_back_resume(&self, run: RunId) -> Result<Rest, EngineError> {
+        self.take_lease(run).await?;
+        self.leased_window(run, async {
+            let row = self.run(run).await?;
+            if row.status == RunStatus::AwaitingApproval {
+                let snapshot = Self::snapshot_of(&row)?;
+                let steps = self.parts.store.run_steps(run).await?;
+                if resumable_park(&cursor(&snapshot, &steps))
+                    && !self.unpark(&row, self.now()).await?
+                {
+                    return Err(stale_run(
+                        run,
+                        RunStatus::AwaitingApproval,
+                        RunStatus::Running,
+                    ));
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        self.hand_back(run).await
     }
 
     /// Plan D87/D139: the store's `release_lease(run, owner)`. The lease reads as expired at once,
@@ -2559,6 +2708,10 @@ where
     /// reads than a cached walk would make and it is the point: there is no cursor to be stale, so
     /// a row another process moved is seen on the next pass rather than overwritten.
     ///
+    /// Call only under `walk_leased`: its step writes carry this process's lease
+    /// (`StepFence::Lease(parts.owner)`, MOD-41 plan D2), so a walk without that lease meets
+    /// [`StoreError::Fenced`] at its first prompt, tree or commit write.
+    ///
     /// # Errors
     /// Every [`EngineError`].
     pub async fn run_to_rest(&self, run: RunId) -> Result<Rest, EngineError> {
@@ -2672,7 +2825,9 @@ where
     /// `walk_resumed`). Milestone 5's sweep adopts and adjudicates but does not walk; this is the
     /// walk it hands a `Walk` run off to, and `htui`'s `run_worker` is the caller that does, on
     /// the run's own task under its lock (MOD-4 plan D157, D158). `Unblock`'s third case calls it
-    /// too (plan D161).
+    /// too (plan D161) under [`Tails::Walk`]; under [`Tails::HandBack`] that case only unparks
+    /// the run instead, and the box's worker runs this on adoption (MOD-41
+    /// plan D12).
     /// That heartbeat sleeps on `tokio::time`, so the caller needs a Tokio runtime with the time
     /// driver enabled (blueprint H-3).
     ///
@@ -3129,7 +3284,10 @@ where
             .iter()
             .map(|tree| tree.tree.clone())
             .collect();
-        self.parts.store.upsert_step_tree(step.id, &trees).await?;
+        self.parts
+            .store
+            .upsert_step_tree(StepFence::Lease(self.parts.owner), step.id, &trees)
+            .await?;
         let before: Vec<RunStepCommit> = prepared
             .trees
             .iter()
@@ -3140,7 +3298,10 @@ where
                 after_hash: None,
             })
             .collect();
-        self.parts.store.record_commits(step.id, &before).await?;
+        self.parts
+            .store
+            .record_commits(StepFence::Lease(self.parts.owner), step.id, &before)
+            .await?;
 
         // -- stage 3: prompt ------------------------------------------------------------------
         let prompt = match self
@@ -3181,7 +3342,12 @@ where
             .map_err(htui_agent::RecordError::from)?;
         self.parts
             .store
-            .set_step_prompt(step.id, &prompt.digest, &trim)
+            .set_step_prompt(
+                StepFence::Lease(self.parts.owner),
+                step.id,
+                &prompt.digest,
+                &trim,
+            )
             .await?;
 
         // -- stage 4: session -----------------------------------------------------------------
@@ -3211,7 +3377,10 @@ where
 
         // -- stage 5: settle ------------------------------------------------------------------
         let after = self.parts.isolator.capture(step.id, &trees).await?;
-        self.parts.store.record_commits(step.id, &after).await?;
+        self.parts
+            .store
+            .record_commits(StepFence::Lease(self.parts.owner), step.id, &after)
+            .await?;
         let output = self.output_of(item, phase, step.id).await?;
         let now = self.now();
         let settled = gate::settle(&SettleInput {
@@ -3691,7 +3860,12 @@ where
     async fn release_trees(&self, step: &RunStep, trees: &[RunStepTree]) {
         match self.parts.isolator.capture(step.id, trees).await {
             Ok(after) => {
-                if let Err(err) = self.parts.store.record_commits(step.id, &after).await {
+                if let Err(err) = self
+                    .parts
+                    .store
+                    .record_commits(StepFence::Lease(self.parts.owner), step.id, &after)
+                    .await
+                {
                     tracing::warn!(step = %step.id, %err, "a failed candidate's commits were not recorded");
                 }
             }
@@ -3745,7 +3919,10 @@ where
             .map(|tree| tree.tree.clone())
             .collect();
         *trees = Some(rows.clone());
-        self.parts.store.upsert_step_tree(step.id, &rows).await?;
+        self.parts
+            .store
+            .upsert_step_tree(StepFence::Lease(self.parts.owner), step.id, &rows)
+            .await?;
         let before: Vec<RunStepCommit> = prepared
             .trees
             .iter()
@@ -3756,7 +3933,10 @@ where
                 after_hash: None,
             })
             .collect();
-        self.parts.store.record_commits(step.id, &before).await?;
+        self.parts
+            .store
+            .record_commits(StepFence::Lease(self.parts.owner), step.id, &before)
+            .await?;
 
         // -- stage 3: the group's one prompt (plan D58) ----------------------------------------
         let trim = prompt
@@ -3765,7 +3945,12 @@ where
             .map_err(htui_agent::RecordError::from)?;
         self.parts
             .store
-            .set_step_prompt(step.id, &prompt.digest, &trim)
+            .set_step_prompt(
+                StepFence::Lease(self.parts.owner),
+                step.id,
+                &prompt.digest,
+                &trim,
+            )
             .await?;
 
         // -- stage 4: this candidate's own session (plan D68) ---------------------------------
@@ -3812,7 +3997,10 @@ where
         // -- stage 5: settle on the candidate's own terms (plan D48) ---------------------------
         let after = self.parts.isolator.capture(step.id, &rows).await?;
         *captured = true;
-        self.parts.store.record_commits(step.id, &after).await?;
+        self.parts
+            .store
+            .record_commits(StepFence::Lease(self.parts.owner), step.id, &after)
+            .await?;
         let output = self.output_of(item, phase, step.id).await?;
         let now = self.now();
         // `verify_outcome: None`: a candidate's verify is the prefilter's to read (plan D49), not
@@ -4600,7 +4788,12 @@ where
             .map_err(htui_agent::RecordError::from)?;
         self.parts
             .store
-            .set_step_prompt(judge.id, &prompts.forward.digest, &trim)
+            .set_step_prompt(
+                StepFence::Lease(self.parts.owner),
+                judge.id,
+                &prompts.forward.digest,
+                &trim,
+            )
             .await?;
         let jp = judge_phase(phase, prompts.template.clone(), candidate);
 
@@ -4757,7 +4950,10 @@ where
         {
             Ok(after) => {
                 // ANA-2 `:987-988`: the winner's `after_hash` becomes the merge commit.
-                self.parts.store.record_commits(step.id, &after).await?;
+                self.parts
+                    .store
+                    .record_commits(StepFence::Lease(self.parts.owner), step.id, &after)
+                    .await?;
                 Ok(None)
             }
             Err(err) => {
@@ -5482,6 +5678,19 @@ where
         LeaseTimes::from_app(&self.parts.app)
     }
 
+    /// The instant a lease sent at `sent` lapses by at the earliest, on tokio's monotonic clock
+    /// (MOD-41 plan D3): `sent` plus the TTL. A TTL that is not a positive span adds nothing, and
+    /// one past the platform's last instant answers `sent`, so the heartbeat fences at once
+    /// rather than panicking (blueprint F-4).
+    fn lease_until(&self, sent: tokio::time::Instant) -> tokio::time::Instant {
+        let ttl = self
+            .lease_times()
+            .ttl
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO);
+        sent.checked_add(ttl).unwrap_or(sent)
+    }
+
     /// The `GateContext` stage 6 and the review loop share.
     const fn gate_context<'r>(
         &'r self,
@@ -6063,7 +6272,7 @@ pub fn truncated(now: DateTime<Utc>) -> DateTime<Utc> {
 /// rather than in `fake.rs` for the reason the file itself gives: every part is already public on
 /// the orchestrator, and what was missing was `engine.rs`. Putting it beside the `Engine` keeps
 /// `fake.rs` exactly as T3 shipped it, and lets `conformance.rs`'s `impl Orchestrate for
-/// FakeOrchestrator` call one function instead of re-deciding fifteen fields per case.
+/// FakeOrchestrator` call one function instead of re-deciding sixteen fields per case.
 ///
 /// A fresh `Engine` per command is not a concession to the test: the engine holds nothing across a
 /// call (plan D16), so this is the shape milestone 6's Runs tab has too.
@@ -6128,7 +6337,7 @@ pub async fn sweep_fake(orch: &crate::fake::FakeOrchestrator) -> Result<Vec<Adop
     engine.sweep().await
 }
 
-/// The fifteen fields, filled from the harness.
+/// The sixteen fields, filled from the harness.
 ///
 /// `app` is read here rather than cached because `MemStore::set_app_setting` (`mem.rs:430`) is the
 /// only writer a case can reach for `step_deadline_seconds` — `SettingKey` is a closed enum of
@@ -6178,6 +6387,7 @@ pub(crate) async fn fake_parts<'a>(
         owner: orch.owner(),
         dead_walks: &orch.dead_walks,
         user: orch.user(),
+        tails: orch.tails(),
     })
 }
 
@@ -6216,7 +6426,7 @@ mod tests {
         SnapshotPhase, Status, StepGraphId, StepGraphPhase, StepId, StepStatus,
     };
     use htui_core::store::mem::MemFault;
-    use htui_core::store::{CasOutcome, MemStore, ReadStore as _, WriteStore as _};
+    use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
 
     use super::{
         AgentSelector, FirstCandidate, JudgePrompts, NoSink, Resume, SessionKey, required_inputs,
@@ -6519,6 +6729,7 @@ mod tests {
             owner: orch.owner(),
             dead_walks: &orch.dead_walks,
             user: orch.user(),
+            tails: super::Tails::Walk,
         });
 
         let CommandOutcome::Started { run, .. } = engine
@@ -6606,6 +6817,7 @@ mod tests {
             owner: orch.owner(),
             dead_walks: &orch.dead_walks,
             user: orch.user(),
+            tails: super::Tails::Walk,
         });
 
         let CommandOutcome::Started { run, rest } = engine
@@ -6807,7 +7019,7 @@ mod tests {
         harness
             .orch
             .store
-            .record_commits(slot[1].id, &moved[..1])
+            .record_commits(StepFence::Unleased, slot[1].id, &moved[..1])
             .await
             .expect("the row is the step's own");
         let prepares = harness.orch.isolator.prepares();
@@ -8775,6 +8987,108 @@ mod tests {
         );
     }
 
+    /// MOD-41 plan D3: the self-fence is measured on tokio's monotonic clock, so a wall-clock
+    /// step while a walk holds its lease moves it neither way. Every refresh fails
+    /// (`MemFault::RefreshLease`, plan D152), and the walk mirrors tokio's paused time onto the
+    /// harness clock, which also steps +1 h at 10 s and -2 h at 50 s. The heartbeat's 40 s beat
+    /// therefore sees the wall clock an hour ahead (a fence cut early would trip there) and its
+    /// 80 s beat an hour behind (a fence extended would not trip there). The walk still ends
+    /// `LeaseLost` exactly `ttl - refresh` (80 s) after the lease was taken, as with no step.
+    #[tokio::test(start_paused = true)]
+    async fn a_stepped_wall_clock_moves_no_fence() {
+        let harness = Harness::new().await;
+        harness_engine!(harness.orch, engine);
+        let times = crate::recover::LeaseTimes::from_app(&BTreeMap::new());
+        let run = leased_run(&harness).await;
+        harness.orch.store.set_fault(MemFault::RefreshLease, true);
+
+        let clock = &harness.orch.clock;
+        let walk = async move {
+            let mut second = 0_u32;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                clock.advance(TimeDelta::seconds(1));
+                second += 1;
+                match second {
+                    10 => clock.advance(TimeDelta::hours(1)),
+                    50 => clock.advance(TimeDelta::hours(-2)),
+                    _ => {}
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), EngineError>(())
+        };
+        let taken = tokio::time::Instant::now();
+        let walked = tokio::time::timeout(
+            std::time::Duration::from_millis(600_500),
+            engine.walk_leased(run, engine.fresh_until(), walk),
+        )
+        .await
+        .expect("the walk stops itself at its fence, whatever the wall clock did");
+
+        let refused = walked.expect_err("no refresh ever succeeded");
+        assert!(
+            matches!(refused, EngineError::LeaseLost { run: lost } if lost == run),
+            "{refused}"
+        );
+        let ttl = times.ttl.to_std().expect("the default TTL is positive");
+        assert_eq!(
+            taken.elapsed(),
+            ttl - times.refresh,
+            "the fence stands one refresh before the lease lapses, on tokio's clock alone"
+        );
+    }
+
+    /// MOD-41 plan D3, the forward half: a wall clock stepped a day ahead while every refresh
+    /// succeeds does not expire the live lease. Three whole intervals later the walk is still
+    /// running, and the store's lease was renewed from its stepped clock.
+    ///
+    /// A regression pin, not a red case (blueprint F-3): it held before D3 too, because
+    /// `MemStore::refresh_lease` answers at the first poll, before the wall-clock fence's zero
+    /// `timeout` could trip.
+    #[tokio::test(start_paused = true)]
+    async fn a_forward_step_does_not_expire_a_live_lease() {
+        let harness = Harness::new().await;
+        harness_engine!(harness.orch, engine);
+        let times = crate::recover::LeaseTimes::from_app(&BTreeMap::new());
+        let run = leased_run(&harness).await;
+
+        let clock = &harness.orch.clock;
+        let walk = async move {
+            let mut second = 0_u32;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                clock.advance(TimeDelta::seconds(1));
+                second += 1;
+                if second == 10 {
+                    clock.advance(TimeDelta::days(1));
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), EngineError>(())
+        };
+        let still = tokio::time::timeout(
+            times.refresh * 3 + std::time::Duration::from_secs(1),
+            engine.walk_leased(run, engine.fresh_until(), walk),
+        )
+        .await;
+        assert!(
+            still.is_err(),
+            "the walk still holds its lease three intervals after a +1 day step"
+        );
+        let expires = harness
+            .orch
+            .run(run)
+            .await
+            .lease_expires_at
+            .expect("a running run carries its lease");
+        assert!(
+            expires > harness.orch.clock.now(),
+            "the last refresh renewed the lease from the stepped clock: {expires}"
+        );
+        assert!(!harness.orch.dead_walks.contains(run), "no fence tripped");
+    }
+
     /// Plan D140: a release that fails puts the run in the dead-walk set, and the sweep retries
     /// it until the store answers. `MemFault::ReleaseLease` makes every release `Unreachable` at
     /// first (plan D152), so the sweep's retry fails too and plan D88 keeps it off the run, whose
@@ -9191,6 +9505,7 @@ mod tests {
             owner: parts.owner,
             dead_walks: parts.dead_walks,
             user: parts.user,
+            tails: super::Tails::Walk,
         });
 
         let refused = engine
@@ -11570,6 +11885,7 @@ mod tests {
             owner: parts.owner,
             dead_walks: parts.dead_walks,
             user: parts.user,
+            tails: super::Tails::Walk,
         });
 
         let refused = engine
@@ -12096,6 +12412,7 @@ mod tests {
                 BoxEdit {
                     declared_tags: Some(Vec::new()),
                     quirks: None,
+                    executor: None,
                 },
             )
             .await
@@ -12478,6 +12795,7 @@ mod tests {
             owner: parts.owner,
             dead_walks: parts.dead_walks,
             user: parts.user,
+            tails: super::Tails::Walk,
         });
 
         assert_send(&engine.dispatch(Command::CancelRun { run: ids::RUN_2 }));
@@ -14138,5 +14456,185 @@ mod tests {
         .snapshot
         .phases
         .remove(0)
+    }
+}
+
+/// MOD-41 T9 (OQ-4, blueprint B-6, F-21): the queued cancel, white-box over `cancel_queued`, whose
+/// race with another process's claim no conformance case can reach between the read and the write.
+#[cfg(test)]
+mod queued_cancel {
+    use chrono::TimeDelta;
+    use htui_core::fixtures::ids;
+    use htui_core::model::{RunMode, RunStatus, SnapshotCandidate, Status};
+    use htui_core::store::{ReadStore as _, WriteStore as _};
+
+    use super::SessionKey;
+    use crate::command::{Command, CommandOutcome, EngineError};
+    use crate::fake::FakeOrchestrator;
+    use crate::isolate::Clock as _;
+
+    /// The demo harness with `FEAT-3` freed of its seeded queued run.
+    async fn harness() -> FakeOrchestrator {
+        let orch = FakeOrchestrator::demo();
+        orch.store
+            .finish_run(ids::RUN_2, RunStatus::Cancelled, None, orch.clock.now())
+            .await
+            .expect("the seeded run is queued and cancellable");
+        orch
+    }
+
+    /// F-21: a claim lands between the cancel's read and its compare-and-set. `cancel_queued`
+    /// over the stale row answers `None` and writes nothing; `cancel_from_queued`, the command's
+    /// path from that stale row, then re-reads and takes the leased path, which the claimer's
+    /// live lease refuses with `LeaseHeld` (finding T9-A1). A fresh `CancelRun` is refused alike.
+    #[tokio::test]
+    async fn a_queued_cancel_loses_cleanly_to_a_concurrent_claim() {
+        let orch = harness().await;
+        let graphs = orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let engine = super::Engine::new(
+            super::fake_parts(&orch, &graphs, &driver, &scrubber)
+                .await
+                .expect("the harness has a box"),
+        );
+        let run = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .await
+            .expect("the item is open");
+        let stale = orch
+            .store
+            .run(run)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the run was enqueued");
+        assert_eq!(stale.status, RunStatus::Queued);
+
+        let claimer = uuid::Uuid::now_v7();
+        let claim = orch
+            .store
+            .claim_run(run, ids::BOX, claimer, orch.clock.now(), TimeDelta::days(1))
+            .await
+            .expect("the claim answers");
+        assert!(claim.is_admitted(), "{claim}");
+        let steps = orch
+            .store
+            .run_steps(run)
+            .await
+            .expect("MemStore never fails a read");
+
+        let cancelled = engine
+            .cancel_queued(&stale)
+            .await
+            .expect("the compare-and-set answers");
+        assert!(
+            cancelled.is_none(),
+            "OQ-4: the run left `queued` first, so the queued cancel writes nothing: {cancelled:?}"
+        );
+        let refused = engine
+            .cancel_from_queued(&stale)
+            .await
+            .expect_err("the claim won, and its lease is live");
+        assert!(
+            matches!(refused, EngineError::LeaseHeld { run: held } if held == run),
+            "OQ-4: the stale queued read falls back to the leased path: {refused}"
+        );
+        let refused = engine
+            .dispatch(Command::CancelRun { run })
+            .await
+            .expect_err("a live lease elsewhere");
+        assert!(
+            matches!(refused, EngineError::LeaseHeld { run: held } if held == run),
+            "{refused}"
+        );
+
+        let row = orch
+            .store
+            .run(run)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the run is there");
+        assert_eq!(row.status, RunStatus::Running, "the claimer's walk stands");
+        assert!(
+            orch.store
+                .refresh_lease(run, claimer, TimeDelta::days(1))
+                .await
+                .expect("MemStore refreshes"),
+            "the lease is still the claimer's"
+        );
+        assert_eq!(
+            orch.store
+                .run_steps(run)
+                .await
+                .expect("MemStore never fails a read"),
+            steps,
+            "no step was cancelled"
+        );
+        assert_eq!(
+            orch.store
+                .item(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the item is there")
+                .status,
+            Status::InProgress
+        );
+    }
+
+    /// B-6: a queued cancel moves the run to `cancelled` and the item back to `open`, so a second
+    /// `StartRun` on the item is admitted.
+    #[tokio::test]
+    async fn a_queued_cancel_moves_the_item_back_to_open() {
+        let orch = harness().await;
+        let graphs = orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let engine = super::Engine::new(
+            super::fake_parts(&orch, &graphs, &driver, &scrubber)
+                .await
+                .expect("the harness has a box"),
+        );
+        let run = engine
+            .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+            .await
+            .expect("the item is open");
+
+        let outcome = engine
+            .dispatch(Command::CancelRun { run })
+            .await
+            .expect("a queued run is cancellable");
+        assert!(
+            matches!(outcome, CommandOutcome::Cancelled { ref rest } if rest.run == RunStatus::Cancelled),
+            "{outcome:?}"
+        );
+        let row = orch
+            .store
+            .run(run)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the run is there");
+        assert_eq!(row.status, RunStatus::Cancelled);
+        assert!(row.finished_at.is_some(), "a cancelled run is finished");
+        assert_eq!(
+            orch.store
+                .item(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the item is there")
+                .status,
+            Status::Open
+        );
+
+        let again = engine
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the item is free for a second run");
+        assert!(matches!(again, CommandOutcome::Started { .. }), "{again:?}");
     }
 }

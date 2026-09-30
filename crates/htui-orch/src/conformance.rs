@@ -35,7 +35,7 @@ use uuid::Uuid;
 use crate::command::{
     Command, CommandOutcome, EngineError, GateAnswer, OpeningPath, Rest, UnblockCase,
 };
-use crate::engine::{Adopted, Next, Resume};
+use crate::engine::{Adopted, Next, Resume, Tails};
 use crate::fake::{
     FakeIsolator, FakeOrchestrator, FakeVerifier, RESTART_GAP, ScriptedStep, TestClock,
 };
@@ -61,9 +61,9 @@ pub trait CaseHarness: Sync {
 
 /// The surface a case drives.
 ///
-/// `store()` is a `MemStore` rather than an `impl WriteStore` because a case asserts over rows and
+/// `store()` is a `MemStore` rather than an `impl WorkerStore` because a case asserts over rows and
 /// the suite's only store is the in-memory one. The *engine* is what stays generic over
-/// `S: WriteStore`; nothing here weakens that.
+/// `S: WorkerStore`; nothing here weakens that.
 #[allow(async_fn_in_trait)]
 pub trait Orchestrate {
     /// Send one command through the walk.
@@ -144,6 +144,10 @@ pub trait Orchestrate {
     /// The lease owner this orchestrator writes (blueprint F-J), so a case can tell whose lease
     /// a run carries.
     fn owner(&self) -> Uuid;
+
+    /// MOD-41 plan D12: who walks a command's tail from now on. [`Tails::HandBack`] is the TUI on
+    /// a `worker` box: the window is written, the lease released, and the box's worker adopts.
+    fn set_tails(&self, tails: Tails);
 
     /// `Engine::sweep` (plan D98): adopt every expired lease on the box, adjudicate, walk nothing.
     ///
@@ -252,6 +256,10 @@ impl Orchestrate for FakeOrchestrator {
         Self::owner(self)
     }
 
+    fn set_tails(&self, tails: Tails) {
+        Self::set_tails(self, tails);
+    }
+
     async fn sweep(&self) -> Result<Vec<Adopted>, EngineError> {
         Self::sweep(self).await
     }
@@ -307,11 +315,11 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Seventy-four, and the count is pinned in two places on purpose — here by
+/// Eighty-six, and the count is pinned in two places on purpose — here by
 /// `cases_are_unique_and_counted` and out of crate by `tests/fake_conformance.rs` —
 /// because a binding that silently ran one fewer of them would still be green.
 ///
-/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1.
+/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11.
 ///
 /// **Eighteen before milestone 4.** Six are `docs/ANA-2.md` §12's validation criteria (1, 2, 3,
 /// 5, 6 and 7); four are contract lines §12 does not number but §4.2 states outright; one is the
@@ -365,6 +373,15 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// **One for CLEAN-4** (plan D4): criterion 7's review half, which a reader that saw only the
 /// latest version per kind had left unreachable: two identical reviews stop the loop on
 /// `no_progress_review` with no repo in scope.
+///
+/// **One for MOD-41 T1** (plan D1, D2): a walk woken after its session's `Done`, whose run
+/// another process adopted, records no commits.
+///
+/// **Eleven for MOD-41 T9** (plan D12, OQ-1, OQ-6): each walking command handed back on a
+/// `worker` box — approve, reject (loopable and terminal), select, retry of a failed step, resume,
+/// accept, retry of an awaiting step, group retry, retry past the budget — adopted and walked by
+/// the box's worker to the in-process rest; the changed-graph park the crash path's topology gate
+/// makes; and the hand-back's window, which writes no step past itself.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -537,6 +554,24 @@ pub const CASES: &[&str] = &[
     // MOD-40 plan D1, D2: a walk that wakes after another process adopted its run writes nothing
     // to the step.
     "a_suspended_walk_cannot_write_after_adoption",
+    // MOD-41 plan D1, D2: a walk woken after its session's `Done`, whose run another process
+    // adopted, records no commits: its capture is fenced.
+    "a_walk_woken_after_done_records_no_commits",
+    // MOD-41 plan D12, OQ-1, R-1: each walking command handed back on a `worker` box, adopted and
+    // walked by the box's worker, rests the run where the in-process tail did.
+    "an_approval_handed_back_is_walked_by_the_adopter",
+    "a_rejection_handed_back_is_walked_by_the_adopter",
+    "a_selection_handed_back_is_walked_by_the_adopter",
+    "a_retry_of_a_failed_step_handed_back_is_walked_by_the_adopter",
+    "a_resume_handed_back_is_walked_by_the_adopter",
+    "an_accept_handed_back_is_walked_by_the_adopter",
+    "a_retry_of_an_awaiting_step_handed_back_is_walked_by_the_adopter",
+    "a_group_retry_handed_back_is_walked_by_the_adopter",
+    "a_retry_past_the_budget_handed_back_is_walked_not_reparked",
+    // MOD-41 OQ-6 (blueprint F-24): the adopter's tail is the crash path, topology gate and all.
+    "a_handed_back_run_on_a_changed_graph_parks_with_the_topology_note",
+    // MOD-41 plan D12: a hand-back writes its window and nothing past it.
+    "a_hand_back_writes_no_step_past_the_window",
 ];
 
 /// Run one case by name.
@@ -559,6 +594,17 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
 /// # Panics
 /// On a name [`CASES`] holds and this `match` does not.
 fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+    hand_back_case(name, harness).unwrap_or_else(|| earlier_case(name, harness))
+}
+
+/// [`case`] for every name before MOD-41 T9's.
+///
+/// # Panics
+/// On a name [`CASES`] holds and neither this `match` nor [`hand_back_case`] does.
+fn earlier_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
     match name {
         "feat_walks_end_to_end" => Box::pin(feat_walks_end_to_end(harness)),
         "live_run_ignores_a_gate_edit" => Box::pin(live_run_ignores_a_gate_edit(harness)),
@@ -752,6 +798,9 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         "a_suspended_walk_cannot_write_after_adoption" => {
             Box::pin(a_suspended_walk_cannot_write_after_adoption(harness))
         }
+        "a_walk_woken_after_done_records_no_commits" => {
+            Box::pin(a_walk_woken_after_done_records_no_commits(harness))
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -761,6 +810,52 @@ pub async fn run_all<H: CaseHarness>(harness: &H) {
     for name in CASES {
         run_case(name, harness).await;
     }
+}
+
+/// MOD-41 T9's cases, in a frame of their own. An unoptimised build gives every arm of a `match`
+/// a stack slot for its case future before the future is boxed, and eighty-five of them in one
+/// frame overflowed a test thread's 2 MiB before the first poll. [`case`] calls this and
+/// [`earlier_case`] in turn and holds no slot itself, so neither frame is live under the other.
+fn hand_back_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "an_approval_handed_back_is_walked_by_the_adopter" => {
+            Box::pin(an_approval_handed_back_is_walked_by_the_adopter(harness))
+        }
+        "a_rejection_handed_back_is_walked_by_the_adopter" => {
+            Box::pin(a_rejection_handed_back_is_walked_by_the_adopter(harness))
+        }
+        "a_selection_handed_back_is_walked_by_the_adopter" => {
+            Box::pin(a_selection_handed_back_is_walked_by_the_adopter(harness))
+        }
+        "a_retry_of_a_failed_step_handed_back_is_walked_by_the_adopter" => {
+            Box::pin(a_retry_of_a_failed_step_handed_back_is_walked_by_the_adopter(harness))
+        }
+        "a_resume_handed_back_is_walked_by_the_adopter" => {
+            Box::pin(a_resume_handed_back_is_walked_by_the_adopter(harness))
+        }
+        "an_accept_handed_back_is_walked_by_the_adopter" => {
+            Box::pin(an_accept_handed_back_is_walked_by_the_adopter(harness))
+        }
+        "a_retry_of_an_awaiting_step_handed_back_is_walked_by_the_adopter" => {
+            Box::pin(a_retry_of_an_awaiting_step_handed_back_is_walked_by_the_adopter(harness))
+        }
+        "a_group_retry_handed_back_is_walked_by_the_adopter" => {
+            Box::pin(a_group_retry_handed_back_is_walked_by_the_adopter(harness))
+        }
+        "a_retry_past_the_budget_handed_back_is_walked_not_reparked" => Box::pin(
+            a_retry_past_the_budget_handed_back_is_walked_not_reparked(harness),
+        ),
+        "a_handed_back_run_on_a_changed_graph_parks_with_the_topology_note" => {
+            Box::pin(a_handed_back_run_on_a_changed_graph_parks_with_the_topology_note(harness))
+        }
+        "a_hand_back_writes_no_step_past_the_window" => {
+            Box::pin(a_hand_back_writes_no_step_past_the_window(harness))
+        }
+        _ => return None,
+    })
 }
 
 // -- what every case needs, written once ---------------------------------------------------------
@@ -3849,6 +3944,7 @@ async fn declare_tags<O: Orchestrate>(orch: &O, tags: &[&str]) {
             BoxEdit {
                 declared_tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
                 quirks: None,
+                executor: None,
             },
         )
         .await
@@ -4264,6 +4360,90 @@ async fn a_suspended_walk_cannot_write_after_adoption<H: CaseHarness>(harness: &
     );
 }
 
+/// MOD-41 plan D1, D2: a walk suspended after its session's `Done`, whose run another process
+/// adopted meanwhile, wakes into stage 5 and records no commits. Its capture's
+/// `record_commits(Lease(a))` is the first write after the wake, and the fence refuses it: the
+/// walk ends `LeaseLost` through `heartbeaten`'s `is_fenced` arm, its guards are released once,
+/// and the step's trees and commits are the ones the adopter found.
+async fn a_walk_woken_after_done_records_no_commits<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    let (stalled, wake) = orch.suspend_after_done("prd", 1, None);
+    let mut walk = Box::pin(orch.dispatch(Command::StartRun {
+        item: ids::HTUI_FEAT_3,
+        mode: RunMode::Manual,
+        repo_scope: None,
+    }));
+    if let Either::Left(_) =
+        futures::future::select(walk.as_mut(), Box::pin(stalled.notified())).await
+    {
+        panic!("the walk finished instead of suspending");
+    }
+    let run = orch
+        .store()
+        .runs(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .find(|run| run.status == RunStatus::Running)
+        .expect("the suspended walk left the run `running`")
+        .id;
+    let prd = step_at(&orch, run, 0, 1).await;
+    let rows_of_step = async |step: StepId| {
+        (
+            orch.store()
+                .step_trees(step)
+                .await
+                .expect("MemStore never fails a read"),
+            orch.store()
+                .step_commits(step)
+                .await
+                .expect("MemStore never fails a read"),
+        )
+    };
+    let (trees, commits) = rows_of_step(prd.id).await;
+    assert!(
+        !trees.is_empty() && commits.iter().all(|row| row.after_hash.is_none()),
+        "stage 2 recorded the tree and the base, and no capture yet: {trees:?} {commits:?}"
+    );
+
+    let other = orch.restarted();
+    assert_eq!(
+        other.sweep().await.expect("the sweep adopts"),
+        [Adopted {
+            run,
+            next: Next::Walk
+        }]
+    );
+    let adopted = rows_of_step(prd.id).await;
+
+    wake.notify_one();
+    let woke = walk.await;
+    assert!(
+        matches!(&woke, Err(EngineError::LeaseLost { run: lost }) if *lost == run),
+        "{woke:?}"
+    );
+    assert_eq!(
+        orch.isolator().releases(),
+        1,
+        "the fenced walk's guards are released, once"
+    );
+    assert_eq!(
+        rows_of_step(prd.id).await,
+        adopted,
+        "the woken capture recorded no commits and no trees (MOD-41 plan D1)"
+    );
+    assert!(
+        other
+            .store()
+            .refresh_lease(run, other.owner(), TimeDelta::minutes(1))
+            .await
+            .expect("MemStore refreshes"),
+        "the adopter still holds the lease: the woken walk released none"
+    );
+}
+
 // -- MOD-4 milestone 5: the recovery sweep (plan D89-D98, blueprint A-2, A-3) -----------------------
 
 /// A process killed mid-walk (plan D100, blueprint A-2): `StartRun` on `item` is polled until
@@ -4359,8 +4539,10 @@ async fn a_finished_step_is_adopted_through_its_gate<H: CaseHarness>(harness: &H
             .find(|row| row.repo_id == repo)
             .expect("stage 2 recorded the base")
             .before_hash;
+        // The crash left the run leased to `orch`: the capture lands under its lease.
         orch.store()
             .record_commits(
+                StepFence::Lease(orch.owner()),
                 prd.id,
                 &[htui_core::model::RunStepCommit {
                     run_step_id: prd.id,
@@ -4568,7 +4750,7 @@ async fn a_dirty_tree_is_never_reset<H: CaseHarness>(harness: &H) {
         tree.dirty = true;
     }
     orch.store()
-        .upsert_step_tree(prd.id, &trees)
+        .upsert_step_tree(StepFence::Lease(orch.owner()), prd.id, &trees)
         .await
         .expect("MemStore rewrites the rows");
     let listed = tree_text(&orch, prd.id).await;
@@ -5949,6 +6131,643 @@ async fn close_out_is_refused_while_a_run_is_live<H: CaseHarness>(harness: &H) {
     );
 }
 
+// -- MOD-41 T9: the hand-back (plan D12, OQ-1, OQ-6) ---------------------------------------------
+
+/// A step as the hand-back cases compare two runs' rows: `(position, attempt, fanout_index,
+/// phase_name, status)`. Ids, instants and notes differ between two harnesses by construction.
+type Shape = (i32, i32, i32, String, StepStatus);
+
+/// The run's rows as [`Shape`]s, in `(position, attempt, fanout_index)` order.
+fn shape(steps: &[RunStep]) -> Vec<Shape> {
+    steps
+        .iter()
+        .map(|step| {
+            (
+                step.position,
+                step.attempt,
+                step.fanout_index,
+                step.phase_name.clone(),
+                step.status,
+            )
+        })
+        .collect()
+}
+
+/// The command a hand-back case compares (MOD-41 plan D12's table).
+#[derive(Debug, Clone, Copy)]
+enum Act {
+    /// `a`: the one parked step approved.
+    Approve,
+    /// `x`: the one parked step rejected.
+    Reject,
+    /// `s`: candidate `index` of the parked slot at `position`, attempt 1.
+    Select { position: i32, index: i32 },
+    /// `r`: the latest attempt at `position` (fan-out index 0 of a group).
+    Retry { position: i32 },
+    /// `u` in its resume case, on `item`.
+    Unblock(ItemId),
+    /// `A`: the promoted step at position 0, attempt 1.
+    Accept,
+}
+
+/// `what` on `run`, unwrapped to the rest its answer carries.
+///
+/// # Panics
+/// When the command is refused, which no hand-back case expects.
+async fn act<O: Orchestrate>(orch: &O, run: RunId, what: Act) -> Rest {
+    match what {
+        Act::Approve => answer(orch, run, GateAnswer::Approved).await.1,
+        Act::Reject => {
+            answer(
+                orch,
+                run,
+                GateAnswer::Rejected {
+                    note: "not this".to_owned(),
+                },
+            )
+            .await
+            .1
+        }
+        Act::Select { position, index } => {
+            let winner = candidate(&steps_of(orch, run).await, position, 1, index).id;
+            let outcome = orch
+                .dispatch(Command::SelectFanout {
+                    run,
+                    position,
+                    attempt: 1,
+                    winner,
+                })
+                .await
+                .expect("the parked slot is selectable");
+            let CommandOutcome::Selected { rest } = outcome else {
+                panic!("`SelectFanout` answers `Selected`, not {outcome:?}");
+            };
+            rest
+        }
+        Act::Retry { position } => {
+            let steps = steps_of(orch, run).await;
+            let latest = steps
+                .iter()
+                .filter(|step| step.position == position && step.fanout_index >= 0)
+                .max_by_key(|step| (step.attempt, std::cmp::Reverse(step.fanout_index)))
+                .expect("the position has a step to retry");
+            let outcome = orch
+                .dispatch(Command::RetryStep {
+                    run,
+                    step: latest.id,
+                })
+                .await
+                .expect("the step is retryable");
+            let CommandOutcome::Retried { rest, .. } = outcome else {
+                panic!("`RetryStep` answers `Retried`, not {outcome:?}");
+            };
+            rest
+        }
+        Act::Unblock(item) => {
+            let (case, rest) = unblock(orch, item).await;
+            assert_eq!(case, UnblockCase::Resume(run));
+            rest.expect("the resume case answers a rest")
+        }
+        Act::Accept => {
+            let prd = step_at(orch, run, 0, 1).await;
+            let outcome = accept(orch, run, prd.id)
+                .await
+                .expect("a promoted step with its document");
+            let CommandOutcome::Accepted { rest } = outcome else {
+                panic!("`AcceptArtifact` answers `Accepted`, not {outcome:?}");
+            };
+            rest
+        }
+    }
+}
+
+/// The hand-back's own half (MOD-41 plan D12): the command's window is written and its answer is
+/// the run `running` with its lease released, so no process holds it and A's owner is gone.
+async fn assert_handed_back<O: Orchestrate>(a: &O, run: RunId, rest: &Rest) {
+    assert_eq!(
+        rest.run,
+        RunStatus::Running,
+        "plan D12: the hand-back walks no tail; the run is left `running` for the box's worker"
+    );
+    let row = run_of(a, run).await;
+    assert_eq!(row.status, RunStatus::Running);
+    assert!(
+        row.lease_expires_at
+            .is_some_and(|until| until <= a.clock().now()),
+        "the lease was released: {:?}",
+        row.lease_expires_at
+    );
+    assert!(
+        !a.store()
+            .refresh_lease(run, a.owner(), TimeDelta::minutes(1))
+            .await
+            .expect("MemStore refreshes"),
+        "and it is no longer the handing process's"
+    );
+}
+
+/// The adopter's half (MOD-41 plan D12): `b.sweep()` adopts `run`, and a [`Next::Walk`] is
+/// walked through `b.resume(run)`, as the runtime does (`sweep` alone never walks). A recovery
+/// that lands the run itself — a park or a finish — answers [`Resume::Walked`] with that rest.
+///
+/// # Panics
+/// When the sweep does not adopt the run, or its recovery errs.
+async fn adopted<O: Orchestrate>(b: &O, run: RunId) -> Resume {
+    let adopted = b.sweep().await.expect("the sweep adopts");
+    let next = adopted
+        .into_iter()
+        .find(|adopted| adopted.run == run)
+        .unwrap_or_else(|| panic!("the handed-back run {run} was adopted"))
+        .next;
+    match next {
+        Next::Walk => b.resume(run).await.expect("the adopter walks it"),
+        Next::Parked(rest) | Next::Finished(rest) => Resume::Walked(rest),
+        Next::Error(err) => panic!("the adopter could not recover the handed-back run: {err}"),
+    }
+}
+
+/// MOD-41 plan D12, R-1: `what` in-process on `control`, and handed back on `a` then adopted and
+/// walked by `a.restarted()`, rest where they rest and write the same rows. Answers the adopter.
+async fn hand_back_matches<O: Orchestrate>(
+    control: (&O, RunId),
+    handed: (&O, RunId),
+    what: Act,
+) -> O {
+    let (c, c_run) = control;
+    let expected = act(c, c_run, what).await;
+    let expected_steps = shape(&steps_of(c, c_run).await);
+
+    let (a, run) = handed;
+    a.set_tails(Tails::HandBack);
+    let rest = act(a, run, what).await;
+    assert_handed_back(a, run, &rest).await;
+
+    let b = a.restarted();
+    let Resume::Walked(rest) = adopted(&b, run).await else {
+        panic!("{what:?}: the live graph did not move, so the adopter walks its snapshot");
+    };
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (expected.run, expected.position, expected.failure),
+        "{what:?}: the adopter rests the run where the in-process command did"
+    );
+    assert_eq!(
+        shape(&steps_of(&b, run).await),
+        expected_steps,
+        "{what:?}: and writes the same rows"
+    );
+    b
+}
+
+/// `FEAT-3` started and parked at `prd`'s gate.
+async fn parked_at_prd<O: Orchestrate>(orch: &O) -> RunId {
+    free_feat_3(orch).await;
+    start(orch, ids::HTUI_FEAT_3).await.0
+}
+
+/// How many merges of `step` the two processes' isolators recorded between them.
+fn merges_of<O: Orchestrate>(a: &O, b: &O, step: StepId) -> usize {
+    a.isolator()
+        .reconciles()
+        .iter()
+        .chain(b.isolator().reconciles().iter())
+        .filter(|(winner, _)| *winner == step)
+        .count()
+}
+
+/// MOD-41 plan D12 (`a`): an approval handed back is finished by the adopter's frontier
+/// reconcile, which merges `prd`, and its walk parks at `plan`'s gate, as the in-process tail did.
+async fn an_approval_handed_back_is_walked_by_the_adopter<H: CaseHarness>(harness: &H) {
+    let (control, a) = (harness.fresh(), harness.fresh());
+    let c_run = parked_at_prd(&control).await;
+    let run = parked_at_prd(&a).await;
+
+    let b = Box::pin(hand_back_matches(
+        (&control, c_run),
+        (&a, run),
+        Act::Approve,
+    ))
+    .await;
+    let prd = step_at(&b, run, 0, 1).await;
+    assert_eq!(
+        b.isolator().reconciles(),
+        [(prd.id, Vec::new())],
+        "the adopter's frontier reconcile finished the approval (plan D97)"
+    );
+}
+
+/// `FEAT-3` walked to its first `review` gate, both review attempts scripted to approve.
+async fn parked_at_review<O: Orchestrate>(orch: &O) -> RunId {
+    free_feat_3(orch).await;
+    orch.script("review", 1, ScriptedStep::review("approve", "first"));
+    orch.script("review", 2, ScriptedStep::review("approve", "second"));
+    let run = start(orch, ids::HTUI_FEAT_3).await.0;
+    approve(orch, run, 3).await;
+    run
+}
+
+/// MOD-41 plan D12 (`x`): a rejection handed back is finished by D131's `settle_failed`. A
+/// loopable review's rejection runs the review loop and parks the next `implement`; a rejection
+/// with no loop fails the run `rejected`. Both as the in-process tail.
+async fn a_rejection_handed_back_is_walked_by_the_adopter<H: CaseHarness>(harness: &H) {
+    let (control, a) = (harness.fresh(), harness.fresh());
+    let c_run = parked_at_review(&control).await;
+    let run = parked_at_review(&a).await;
+    let b = hand_back_matches((&control, c_run), (&a, run), Act::Reject).await;
+    assert_eq!(
+        step_at(&b, run, 2, 2).await.status,
+        StepStatus::AwaitingApproval,
+        "the loop resumed and parked the re-run implement"
+    );
+
+    let (control, a) = (harness.fresh(), harness.fresh());
+    let c_run = parked_at_prd(&control).await;
+    let run = parked_at_prd(&a).await;
+    let b = hand_back_matches((&control, c_run), (&a, run), Act::Reject).await;
+    let row = run_of(&b, run).await;
+    assert_eq!(row.status, RunStatus::Failed, "no loop: the run ends");
+    assert_eq!(
+        row.failure,
+        Some(
+            RunFailure::Rejected {
+                phase: "prd".to_owned()
+            }
+            .to_string()
+        )
+    );
+}
+
+/// `ANA-2`'s `research` fanned out three ways with no judge, parked for a human's selection.
+async fn selection_parked<O: Orchestrate>(orch: &O) -> RunId {
+    fan_research(orch, Gate::Never, false).await;
+    research_candidates(orch, 1);
+    let (run, rest) = start(orch, ids::HTUI_ANA_2).await;
+    assert_eq!(rest.run, RunStatus::AwaitingApproval);
+    run
+}
+
+/// MOD-41 plan D12 (`s`): a selection handed back is finished by the adopter's frontier
+/// reconcile, which merges the winner over its siblings, and the walk finishes the run.
+async fn a_selection_handed_back_is_walked_by_the_adopter<H: CaseHarness>(harness: &H) {
+    let (control, a) = (harness.fresh(), harness.fresh());
+    let c_run = selection_parked(&control).await;
+    let run = selection_parked(&a).await;
+    let what = Act::Select {
+        position: 0,
+        index: 1,
+    };
+
+    let b = hand_back_matches((&control, c_run), (&a, run), what).await;
+    let winner = candidate(&steps_of(&b, run).await, 0, 1, 1).id;
+    let merges: Vec<_> = b
+        .isolator()
+        .reconciles()
+        .into_iter()
+        .filter(|(merged, _)| *merged == winner)
+        .collect();
+    assert_eq!(
+        merges.len(),
+        1,
+        "the human's pick was merged once: {merges:?}"
+    );
+    assert_eq!(merges[0].1.len(), 2, "over its two siblings");
+}
+
+/// `FEAT-3`'s `prd` crashed with a `local` tree recorded dirty, and a second process's sweep
+/// parked the run over the failed step (plan D93): the process that acts next, and the run.
+async fn parked_over_a_dirty_tree<H: CaseHarness>(harness: &H) -> (H::Orch, RunId) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "prd" {
+            phase.isolation = Some(Isolation::Local);
+        }
+    })
+    .await;
+    let stalled = orch.stall_after_done("prd", 1, None, false);
+    let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+    let prd = step_at(&orch, run, 0, 1).await;
+    let mut trees = orch
+        .store()
+        .step_trees(prd.id)
+        .await
+        .expect("MemStore never fails a read");
+    for tree in &mut trees {
+        tree.dirty = true;
+    }
+    orch.store()
+        .upsert_step_tree(StepFence::Lease(orch.owner()), prd.id, &trees)
+        .await
+        .expect("MemStore rewrites the rows");
+    let other = orch.restarted();
+    let adopted = other.sweep().await.expect("the sweep adopts");
+    assert!(
+        matches!(
+            &adopted[..],
+            [Adopted {
+                next: Next::Parked(_),
+                ..
+            }]
+        ),
+        "{adopted:?}"
+    );
+    assert_eq!(step_at(&other, run, 0, 1).await.status, StepStatus::Failed);
+    (other, run)
+}
+
+/// MOD-41 plan D12 (`r` on a `failed` step): the retry's `admit` is in the handed-back window,
+/// so the adopter walks the new attempt rather than reading D131's unfinished failure.
+async fn a_retry_of_a_failed_step_handed_back_is_walked_by_the_adopter<H: CaseHarness>(
+    harness: &H,
+) {
+    let (control, c_run) = parked_over_a_dirty_tree(harness).await;
+    let (a, run) = parked_over_a_dirty_tree(harness).await;
+
+    let b = Box::pin(hand_back_matches(
+        (&control, c_run),
+        (&a, run),
+        Act::Retry { position: 0 },
+    ))
+    .await;
+    assert_eq!(
+        step_at(&b, run, 0, 2).await.status,
+        StepStatus::AwaitingApproval,
+        "attempt 2 was walked to its gate"
+    );
+}
+
+/// `FEAT-3` parked over a reconcile its isolator refused (R-7): `prd` is `done`, unmerged.
+async fn parked_over_a_refused_reconcile<O: Orchestrate>(orch: &O) -> RunId {
+    primary_repo(orch).await;
+    free_feat_3(orch).await;
+    repoint(orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "prd" {
+            phase.gate = Gate::Never;
+        }
+    })
+    .await;
+    orch.isolator().refuse_reconcile("dirty_primary_tree");
+    let (run, rest) = start(orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(0))
+    );
+    run
+}
+
+/// MOD-41 plan D12 (`u`, resume case): the handed-back unblock only unparks, and the adopter's
+/// `resume` merges `prd` and walks on to `plan`'s gate, as the in-process resume did.
+async fn a_resume_handed_back_is_walked_by_the_adopter<H: CaseHarness>(harness: &H) {
+    let (control, a) = (harness.fresh(), harness.fresh());
+    let c_run = parked_over_a_refused_reconcile(&control).await;
+    let run = parked_over_a_refused_reconcile(&a).await;
+    assert_eq!(
+        item_of(&a, ids::HTUI_FEAT_3).await.status,
+        Status::AwaitingApproval
+    );
+
+    let b = Box::pin(hand_back_matches(
+        (&control, c_run),
+        (&a, run),
+        Act::Unblock(ids::HTUI_FEAT_3),
+    ))
+    .await;
+    let prd = step_at(&b, run, 0, 1).await;
+    assert_eq!(
+        b.isolator().reconciles(),
+        [(prd.id, Vec::new())],
+        "the adopter merged `prd` once"
+    );
+}
+
+/// `FEAT-3`'s `prd` promoted at its gate, with a passing verify scripted for the accept.
+async fn promoted_prd<O: Orchestrate>(orch: &O) -> RunId {
+    primary_repo(orch).await;
+    let run = parked_at_prd(orch).await;
+    let prd = step_at(orch, run, 0, 1).await;
+    promote(orch, run, prd.id).await;
+    orch.verifier().script_report(FakeVerifier::pass());
+    run
+}
+
+/// MOD-41 plan D12 (`A`): the accept's verify runs in the handing process (its window), then its
+/// approval is handed back and finished by the adopter.
+async fn an_accept_handed_back_is_walked_by_the_adopter<H: CaseHarness>(harness: &H) {
+    let (control, a) = (harness.fresh(), harness.fresh());
+    let c_run = promoted_prd(&control).await;
+    let run = promoted_prd(&a).await;
+
+    let b = hand_back_matches((&control, c_run), (&a, run), Act::Accept).await;
+    let prd = step_at(&b, run, 0, 1).await;
+    assert_eq!(
+        (prd.gate_outcome, prd.verify_outcome),
+        (Some(GateOutcome::Approved), Some(VerifyOutcome::Pass)),
+        "the verify ran in the handing process"
+    );
+    assert!(
+        b.isolator()
+            .reconciles()
+            .iter()
+            .any(|(winner, _)| *winner == prd.id),
+        "the adopter merged the accepted step"
+    );
+}
+
+/// MOD-41 plan D12 (`r` on an `awaiting_approval` step): the new attempt is admitted inside the
+/// window, so the adopter walks it and never reconciles the previous winner a second time.
+async fn a_retry_of_an_awaiting_step_handed_back_is_walked_by_the_adopter<H: CaseHarness>(
+    harness: &H,
+) {
+    let (control, a) = (harness.fresh(), harness.fresh());
+    let c_run = parked_at_prd(&control).await;
+    approve(&control, c_run, 1).await;
+    let run = parked_at_prd(&a).await;
+    approve(&a, run, 1).await;
+
+    let b = Box::pin(hand_back_matches(
+        (&control, c_run),
+        (&a, run),
+        Act::Retry { position: 1 },
+    ))
+    .await;
+    let prd = step_at(&b, run, 0, 1).await;
+    assert_eq!(
+        merges_of(&a, &b, prd.id),
+        1,
+        "the previous winner was merged once, by its own approval"
+    );
+}
+
+/// `ANA-2` with `research` ungated and `verdict` fanned out three ways with no judge: the walk
+/// merges `research` and parks the `verdict` slot for a human.
+async fn verdict_slot_parked<O: Orchestrate>(orch: &O) -> RunId {
+    repoint(orch, ids::HTUI_ANA_2, |phase| {
+        phase.gate = Gate::Never;
+        if phase.name == "verdict" {
+            phase.fan_out = 3;
+        }
+    })
+    .await;
+    let (run, rest) = start(orch, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(1)),
+        "the `verdict` slot awaits a human"
+    );
+    run
+}
+
+/// MOD-41 plan D12 (`r` on a group): the slot is retired and the next group admitted inside the
+/// window, so the adopter walks it and never reconciles the previous winner a second time.
+async fn a_group_retry_handed_back_is_walked_by_the_adopter<H: CaseHarness>(harness: &H) {
+    let (control, a) = (harness.fresh(), harness.fresh());
+    let c_run = verdict_slot_parked(&control).await;
+    let run = verdict_slot_parked(&a).await;
+
+    let b = Box::pin(hand_back_matches(
+        (&control, c_run),
+        (&a, run),
+        Act::Retry { position: 1 },
+    ))
+    .await;
+    let research = step_at(&b, run, 0, 1).await;
+    assert_eq!(
+        merges_of(&a, &b, research.id),
+        1,
+        "the previous winner was merged once, by its own walk"
+    );
+    assert_eq!(
+        slot_of(&steps_of(&b, run).await, 1, 2).len(),
+        3,
+        "the next group was admitted whole"
+    );
+}
+
+/// `FEAT-3` with no retry budget, whose `prd` crashed unfinished and was parked `interrupted` by
+/// a second process's sweep (plan D92, blueprint A-8): the process that acts next, and the run.
+async fn parked_interrupted_out_of_budget<H: CaseHarness>(harness: &H) -> (H::Orch, RunId) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| phase.retry_limit = 0).await;
+    let stalled = orch.stall_after_done("prd", 1, None, false);
+    let run = crash(&orch, ids::HTUI_FEAT_3, &stalled).await;
+    let other = orch.restarted();
+    let adopted = other.sweep().await.expect("the sweep adopts");
+    assert!(
+        matches!(
+            &adopted[..],
+            [Adopted {
+                next: Next::Parked(Rest {
+                    failure: Some(RunFailure::Interrupted { .. }),
+                    ..
+                }),
+                ..
+            }]
+        ),
+        "{adopted:?}"
+    );
+    (other, run)
+}
+
+/// MOD-41 plan D12 (`r` past the budget): without the window's `admit`, the adopter would read
+/// the retried step as D131's unfinished failure and re-park it `interrupted`. With it, the new
+/// attempt walks, as in-process.
+async fn a_retry_past_the_budget_handed_back_is_walked_not_reparked<H: CaseHarness>(harness: &H) {
+    let (control, c_run) = parked_interrupted_out_of_budget(harness).await;
+    let (a, run) = parked_interrupted_out_of_budget(harness).await;
+
+    let b = Box::pin(hand_back_matches(
+        (&control, c_run),
+        (&a, run),
+        Act::Retry { position: 0 },
+    ))
+    .await;
+    assert_eq!(
+        step_at(&b, run, 0, 2).await.status,
+        StepStatus::AwaitingApproval,
+        "attempt 2 walked to its gate; the run was not re-parked `interrupted`"
+    );
+    assert_eq!(run_of(&b, run).await.failure, None);
+}
+
+/// MOD-41 OQ-6, blueprint F-24: the adopter's tail is the crash path. A handed-back approval
+/// whose item's graph gained a phase meanwhile is merged by the frontier reconcile first, and
+/// then the resume's topology gate parks the run and the item with one `topology mismatch` note.
+async fn a_handed_back_run_on_a_changed_graph_parks_with_the_topology_note<H: CaseHarness>(
+    harness: &H,
+) {
+    let a = harness.fresh();
+    let run = parked_at_prd(&a).await;
+    a.set_tails(Tails::HandBack);
+    let rest = act(&a, run, Act::Approve).await;
+    assert_handed_back(&a, run, &rest).await;
+    insert_verify_phase(&a, ids::HTUI_FEAT_3).await;
+
+    let b = a.restarted();
+    let resumed = adopted(&b, run).await;
+    assert!(
+        matches!(
+            resumed,
+            Resume::TopologyChanged {
+                rest: Rest {
+                    run: RunStatus::AwaitingApproval,
+                    ..
+                },
+                ..
+            }
+        ),
+        "{resumed:?}"
+    );
+    assert_eq!(run_of(&b, run).await.status, RunStatus::AwaitingApproval);
+    assert_eq!(
+        item_of(&b, ids::HTUI_FEAT_3).await.status,
+        Status::AwaitingApproval
+    );
+    let notes = notes_of(&b, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        notes
+            .iter()
+            .filter(|body| body.starts_with("topology mismatch"))
+            .count(),
+        1,
+        "{notes:?}"
+    );
+    let prd = step_at(&b, run, 0, 1).await;
+    assert_eq!(
+        b.isolator().reconciles(),
+        [(prd.id, Vec::new())],
+        "F-24: the frontier merge happened before the topology gate"
+    );
+}
+
+/// MOD-41 plan D12: a hand-back writes its window and nothing past it. After the approval the
+/// rows are the ones before with the answered step moved, no step exists at a later position,
+/// and the run is `running` with its lease released.
+async fn a_hand_back_writes_no_step_past_the_window<H: CaseHarness>(harness: &H) {
+    let a = harness.fresh();
+    let run = parked_at_prd(&a).await;
+    let before = shape(&steps_of(&a, run).await);
+    assert_eq!(
+        before,
+        [(0, 1, 0, "prd".to_owned(), StepStatus::AwaitingApproval)]
+    );
+
+    a.set_tails(Tails::HandBack);
+    let rest = act(&a, run, Act::Approve).await;
+    assert_handed_back(&a, run, &rest).await;
+    assert_eq!(
+        shape(&steps_of(&a, run).await),
+        [(0, 1, 0, "prd".to_owned(), StepStatus::Done)],
+        "the answered step moved, and nothing else was written"
+    );
+    assert!(
+        a.isolator().reconciles().is_empty(),
+        "the merge is the adopter's"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -5973,8 +6792,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            74,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            86,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -5995,8 +6814,11 @@ mod tests {
              lease, four promotions, five accepts, `Unblock`'s three cases, and criterion \
              20's close-out and its refusal), and MOD-7 milestone 3's two (criterion 14's \
              capability half and §4.10's claim-time half), and MOD-40 milestone 1's one (a \
-             suspended walk fenced after adoption), and CLEAN-4's one (identical reviews stop \
-             the loop on `no_progress_review`)"
+             suspended walk fenced after adoption), CLEAN-4's one (identical reviews stop \
+             the loop on `no_progress_review`), and MOD-41 T1's fenced capture (a walk \
+             woken after `Done` records no commits, plan D1), and MOD-41 T9's eleven hand-back cases (plan D12: \
+             one per walking command and retry route walked by the adopter, the changed-graph \
+             park of OQ-6, and the window that writes nothing past itself)"
         );
     }
 
@@ -6030,7 +6852,7 @@ mod fanout_paths {
     use htui_core::model::{
         Gate, Isolation, NewRunStep, RunStatus, RunStep, RunStepCommit, Status, StepId, StepStatus,
     };
-    use htui_core::store::{ReadStore as _, WriteStore as _};
+    use htui_core::store::{ReadStore as _, StepFence, WriteStore as _};
 
     use super::{
         FakeOrchestrator, Orchestrate, RunFailure, ScriptedStep, candidate, fan_research,
@@ -6548,8 +7370,10 @@ mod fanout_paths {
                 .await
                 .expect("MemStore takes the move");
         }
+        // The park released the lease: the hand-written slot is unleased.
         orch.store()
             .record_commits(
+                StepFence::Unleased,
                 zero,
                 &[RunStepCommit {
                     run_step_id: zero,
@@ -6714,6 +7538,7 @@ mod fanout_paths {
             owner: parts.owner,
             dead_walks: parts.dead_walks,
             user: parts.user,
+            tails: crate::engine::Tails::Walk,
         });
 
         let err = engine
@@ -6787,7 +7612,7 @@ mod recovery_paths {
         CommandRunId, CommandRunStatus, Gate, Isolation, NewCommandRun, RunStatus, RunStepCommit,
         StepStatus, VerifyOutcome,
     };
-    use htui_core::store::{ReadStore as _, WriteStore as _};
+    use htui_core::store::{ReadStore as _, StepFence, WriteStore as _};
 
     use super::{
         Adopted, FakeOrchestrator, Next, Orchestrate, Rest, RunFailure, candidate, crash,
@@ -6891,6 +7716,7 @@ mod recovery_paths {
             .before_hash;
         orch.store()
             .record_commits(
+                StepFence::Lease(orch.owner()),
                 stuck.id,
                 &[RunStepCommit {
                     run_step_id: stuck.id,

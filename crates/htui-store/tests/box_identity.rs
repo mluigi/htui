@@ -607,6 +607,7 @@ async fn a_reconnect_leaves_edit_version_and_the_edited_fields_alone() {
             BoxEdit {
                 declared_tags: Some(vec!["gpu".to_owned()]),
                 quirks: Some("a\nb".to_owned()),
+                executor: None,
             },
         )
         .await
@@ -655,6 +656,7 @@ async fn a_reconnect_leaves_edit_version_and_the_edited_fields_alone() {
             BoxEdit {
                 declared_tags: None,
                 quirks: Some("c".to_owned()),
+                executor: None,
             },
         )
         .await
@@ -704,6 +706,7 @@ async fn another_users_box_is_not_found_by_edit_box() {
             BoxEdit {
                 declared_tags: Some(vec!["gpu".to_owned()]),
                 quirks: None,
+                executor: None,
             },
         )
         .await;
@@ -722,6 +725,7 @@ async fn another_users_box_is_not_found_by_edit_box() {
                 BoxEdit {
                     declared_tags: Some(vec!["BAD".to_owned()]),
                     quirks: None,
+                    executor: None,
                 },
             )
             .await;

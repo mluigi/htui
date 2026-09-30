@@ -27,6 +27,9 @@ amended 2026-09-30 by maintainer decision on ANA-26 (`docs/ANA-26.md` §9,
 amended in place.
 and by maintainer decision on MOD-22 (`docs/decisions/mod/mod-22.md`, plan OQ-1) —
 R-AGT-9 amended in place (the loopback paste-back relays one authorization code once).
+amended 2026-09-29 by maintainer decision on MOD-41 (`.claude/prds/mod-41-headless-worker.prd.md`
+D1-D3, `docs/ANA-16.md` §7) — R-ID-2, R-STO-1 and R-ORCH-12 amended in place (a per-box headless
+worker; its DSN source; remote dispatch promoted to must), R-LATER-4 narrowed to scheduling.
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -52,7 +55,9 @@ conflict. Their verdicts survive only where restated here.
   `tokio`) that wraps AI coding agents to run a backlog of work items through configurable step
   graphs across projects, repositories and machines.
 - **R-ID-2 (must).** `htui` is not an IDE, not a code editor, not a terminal multiplexer, and not a
-  cloud-hosted service. It is a local-first, developer-guided harness.
+  cloud-hosted service. It is a local-first, developer-guided harness. A headless `htui worker`
+  process per box, started by the user and talking only to that user's Postgres, is part of `htui`;
+  it is not a hosted service (R-ORCH-12). Amended by maintainer decision on MOD-41, 2026-09-29.
 - **R-ID-3 (must).** Postgres is the single source of truth.
   Everything `htui` knows lives there: items, documents, runs, transcripts, skills, templates, box
   profiles, agent registry, settings.
@@ -147,7 +152,11 @@ conflict. Their verdicts survive only where restated here.
   Linux secret service), never in a file — including when the connection string is typed into the
   TUI rather than passed to `htui --set-dsn`. Local files under the user's config directory that
   hold no secret and no domain data (the box identity, the read-only cache, the key bindings of
-  R-TUI-10) are not a store.
+  R-TUI-10) are not a store. One exception, for a headless worker (R-ORCH-12) on
+  a Linux host with no secret service: the DSN may be a systemd credential encrypted at rest and
+  bound to the host (`systemd-creds encrypt`, read from `$CREDENTIALS_DIRECTORY`), or be read once
+  from the worker's stdin and held only in memory. Never in `argv`, the environment, or a plaintext
+  file. Amended by maintainer decision on MOD-41, 2026-09-29.
 - **R-STO-2 (must).** TLS to Postgres is supported and optional.
 - **R-STO-3 (must).** Each box keeps a read-only cache of the projects it has opened under the
   user's config directory, refreshed on every successful connection. Contents: items, links,
@@ -256,9 +265,9 @@ conflict. Their verdicts survive only where restated here.
   a subset of the box's tags, listing the missing tags. Auto mode filters the queue the same way.
 - **R-ORCH-11 (must).** Every run records: item, target box, executing box, graph snapshot, and per
   step: agent, model, gate outcome, status, exit code, prompt digest, commit hashes, usage, timing.
-- **R-ORCH-12 (later).** Remote dispatch: queue an item from one box to run on another. Requires a
-  headless `htui` worker per box polling Postgres, which amends R-ID-2. Version one stores the
-  target box and executes only when it is the local box.
+- **R-ORCH-12 (must).** Remote dispatch: queue an item from one box to run on another. Requires a
+  headless `htui` worker per box polling Postgres (R-ID-2). Promoted from later by maintainer
+  decision on MOD-41, 2026-09-29; delivered by MOD-41 (worker) and MOD-43 (targeting).
 - **R-ORCH-13 (later).** Scheduling: run the queue inside a time window on a chosen box.
 
 ## 7. Run history (R-HIS)
@@ -367,7 +376,8 @@ Designed for, not built in version one. Each needs its own `ANA-N` before implem
 - **R-LATER-3.** Legacy import of markdown workflow repos (`HANDOFF.md`, `DECISIONS.md`,
   `docs/decisions/**`, `docs/ANA-*.md`) into projects, items, documents and links, mapping old
   prefixes to kinds per project, preserving keys.
-- **R-LATER-4.** Remote dispatch and scheduling (R-ORCH-12, R-ORCH-13).
+- **R-LATER-4.** Scheduling (R-ORCH-13). Remote dispatch (R-ORCH-12) was promoted to must on
+  MOD-41, 2026-09-29.
 - **R-LATER-5.** Team support (R-USR-3).
 - **R-LATER-6.** Additional agents beyond `claude` and `agy` via the registry (R-AGT-5).
 - **R-LATER-7.** External context tools (Headroom, Serena, Graphify) as excerpt providers for

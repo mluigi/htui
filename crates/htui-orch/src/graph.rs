@@ -21,8 +21,7 @@ use htui_core::model::{
     SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
 };
 use htui_core::store::{
-    BindingFacts, CasOutcome, ReadStore, Result, StoreError, UpdateOutcome, WriteStore,
-    check_attachment,
+    BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WriteStore, check_attachment,
 };
 use serde_json::Value;
 
@@ -47,8 +46,9 @@ const DEFAULT_MAX_AGENTS_PER_RUN: u32 = 8;
 /// generic source whatsoever. This trait is that source, and it lives here rather than in
 /// `htui-core` so invariant 10 holds in both directions: the engine never names a concrete store,
 /// and `htui-store` never learns that an engine exists. `fake.rs` implements it for `MemStore`
-/// (T3). `htui` cannot implement it for `Backend` (both are foreign there, E0117), so
-/// `run_worker::BackendGraphs` wraps a `Backend` and implements it (MOD-4 plan D155). MOD-9
+/// (T3). The host cannot implement it for its store handle (both are foreign there, E0117), so
+/// `htui_worker::HostGraphs` wraps a `WorkerHost` and implements it (MOD-4 plan D155; it was
+/// `run_worker::BackendGraphs` over a `Backend` until MOD-41 T6). MOD-9
 /// added `bound_skills` and MOD-7 milestone 3 `missing_tags`, for the same reason.
 ///
 /// `app_setting` is deliberately **not** a method of this trait (blueprint A-2): those reads are
@@ -56,7 +56,7 @@ const DEFAULT_MAX_AGENTS_PER_RUN: u32 = 8;
 /// `htui_core::prompt::settings::resolve_budget` already uses.
 ///
 /// Plain `async fn` with the targeted allow, mirroring `htui-core`'s own store seam
-/// (`crates/htui-core/src/store/traits.rs:62`): the engine is already generic over `S: WriteStore`
+/// (`crates/htui-core/src/store/traits.rs:62`): the engine is already generic over `S: WorkerStore`
 /// and takes `G` beside it, so no `dyn GraphSource` is ever formed and a boxed-future alias in the
 /// shape of `htui_agent::driver::DriverFuture` would buy an allocation per read and nothing else.
 #[allow(async_fn_in_trait)]
@@ -295,7 +295,7 @@ pub fn topology(phases: &[SnapshotPhase]) -> std::result::Result<String, Resolve
 ///
 /// # Errors
 /// Any [`ResolveError`]; a missing `project` row is [`StoreError::NotFound`].
-pub async fn resolve<S: ReadStore + WriteStore, G: GraphSource>(
+pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
     store: &S,
     source: &G,
     item: &Item,
@@ -861,12 +861,14 @@ mod tests {
         Activation, Gate, NewRepo, PromptTemplateId, RepoId, RepoScope, RunScope, SkillBinding,
         SkillBindingId,
     };
-    use htui_core::store::{MemStore, StoreError, glob_names_unknown_repo, negative_position};
+    use htui_core::store::{
+        MemStore, ReadStore, StoreError, glob_names_unknown_repo, negative_position,
+    };
     use serde_json::json;
 
     use super::{
         Agent, AgentBox, AgentId, BTreeMap, BoundSkill, BoxId, GraphSource, Isolation, Item,
-        ItemId, PhaseAgent, PhaseId, ProjectId, PromptTemplate, ReadStore, ResolveError, Resolved,
+        ItemId, PhaseAgent, PhaseId, ProjectId, PromptTemplate, ResolveError, Resolved,
         ResolvedGraph, Result, RunMode, SnapshotTemplate, StepGraphId, StepGraphPhase, Value,
         WriteStore, override_graph, resolve,
     };

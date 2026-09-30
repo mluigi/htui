@@ -1,0 +1,39 @@
+[package]
+name        = "htui-worker"
+version     = "0.1.0"
+description = "Run supervision without a UI: the runtime `htui` and `htui worker` share (MOD-41)"
+
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+
+[features]
+default = []
+# `htui_worker::testing`: the run runtime's white-box surface, for `htui`'s run_worker tests
+# (MOD-41 plan D8).
+test-support = []
+
+[dependencies]
+htui-core  = { workspace = true }
+htui-agent = { workspace = true }
+htui-orch  = { workspace = true }
+# PgStore (the worker's host), identity::config_root and DATABASE_UNREACHABLE (MOD-41 plan D6).
+htui-store = { workspace = true }
+chrono     = { workspace = true }
+serde_json = { workspace = true }
+tokio      = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+tokio-util = { workspace = true }
+tracing    = { workspace = true }
+uuid       = { workspace = true }
+# Never ratatui or crossterm: tests/deps.rs.
+
+[dev-dependencies]
+htui-core  = { workspace = true, features = ["test-support"] }
+htui-orch  = { workspace = true, features = ["test-support"] }
+htui-agent = { workspace = true, features = ["test-support"] }
+htui-store = { workspace = true, features = ["demo", "test-support"] }
+tokio      = { workspace = true, features = ["test-util", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -26,6 +26,7 @@ pub mod secret;
 pub mod testkit;
 pub mod vector;
 pub mod vector_sync;
+mod worker;
 pub mod writer;
 
 pub use backend::Backend;

@@ -49,7 +49,7 @@ use crate::prompt_settings::{self, SettingsSnapshot};
 use crate::requirements::{
     self, ItemCitations, RequirementDetail, RequirementText, RequirementsSnapshot,
 };
-use crate::run_worker::{LiveChats, RunRuntime, RunServed};
+use crate::run_worker::{LiveChats, RunRuntime, RunServed, TuiRuns as _};
 use crate::skill_import::SkillImports;
 use crate::skills::{self, SkillsSnapshot, StaleWhat};
 use crate::templates::{self, TemplateBody, TemplatesSnapshot};
@@ -1574,7 +1574,8 @@ pub fn spawn_with(
     tx: mpsc::UnboundedSender<ReplyEnvelope>,
     runtime: AgentRuntime,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_with_runtimes(started, rx, tx, runtime, RunRuntime::production())
+    let runs = crate::run_worker::production_for(&started.backend);
+    spawn_with_runtimes(started, rx, tx, runtime, runs)
 }
 
 /// The steps a chat of this process is live on (blueprint D206): the runtime's chats whose
@@ -2016,7 +2017,7 @@ pub(crate) fn spawn_with_concepts(
                         | StoreRequest::RunActions(_) => {
                             let live = live_chats(&runtime);
                             match runs.serve(&backend, &tx, &envelope, &live).await {
-                                RunServed::Reply(reply) => reply,
+                                RunServed::Reply(reply) => reply.into(),
                                 RunServed::Deferred => continue,
                                 attach @ RunServed::Attach { .. } => {
                                     on_run_served(attach, &mut runtime, &backend, &tx).await;

@@ -38,6 +38,10 @@ const HOPS: u8 = GraphTab::MAX_HOPS;
 /// `StoreRequest::Items`' name: what a refused list read is answered `Failed` under.
 const ITEMS_READ: &str = "items";
 
+/// Refreshes between two `Runs` polls: five of the shell's one-second refreshes, so 5 s (MOD-41
+/// plan D16, OQ-3).
+const REFRESHES_PER_RUNS_POLL: u32 = 5;
+
 /// The Backlog screen.
 ///
 /// Holds no store handle and no channel (`R-NF-3`): rows arrive through [`Tab::on_reply`] and
@@ -55,6 +59,9 @@ pub struct BacklogTab {
     /// A reveal waiting for the next `Items` reply (MOD-64 D235), with the key its miss is
     /// reported by.
     pending_reveal: Option<(ItemId, String)>,
+    /// The shell's refreshes this tab has seen while active; every
+    /// [`REFRESHES_PER_RUNS_POLL`]th is a `Runs` poll (MOD-41 plan D16).
+    refreshes: u32,
 }
 
 impl Default for BacklogTab {
@@ -85,6 +92,7 @@ impl BacklogTab {
             selected: None,
             detail,
             pending_reveal: None,
+            refreshes: 0,
         }
     }
 
@@ -291,6 +299,24 @@ impl Tab for BacklogTab {
         self.detail.on_reply(reply, ctx);
     }
 
+    /// MOD-41 plan D16: every fifth refresh (5 s), the selected item's runs are read again while
+    /// the detail shows one of them active, so a run another process walks moves on screen. No
+    /// frame reaches this process for such a run; MOD-43's `LISTEN` keeps this as its backstop.
+    ///
+    /// `Runs` only: `RunsTab::on_runs` asks for `RunActions` after every `Runs` reply, so asking
+    /// for both would read the verdicts twice. The reply keeps the cursor (MOD-4 D198).
+    fn on_refresh(&mut self, ctx: &mut Ctx<'_>) {
+        self.refreshes = self.refreshes.wrapping_add(1);
+        if !self.refreshes.is_multiple_of(REFRESHES_PER_RUNS_POLL) {
+            return;
+        }
+        if let Some(item) = self.selected_item()
+            && self.detail.has_active_run()
+        {
+            ctx.request(StoreRequest::Runs(item));
+        }
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let [left, right] = panes(area);
 
@@ -437,6 +463,7 @@ mod tests {
             selected: Some(first),
             detail,
             pending_reveal: None,
+            refreshes: 0,
         };
 
         let (top_bar, keymap, theme, emit) = (
@@ -605,6 +632,7 @@ mod tests {
             selected: Some(first),
             detail: BacklogTab::new().detail,
             pending_reveal: None,
+            refreshes: 0,
         };
         let (top_bar, keymap, theme, emit) = (
             TopBarState::default(),
@@ -649,6 +677,7 @@ mod tests {
             selected: Some(first),
             detail,
             pending_reveal: None,
+            refreshes: 0,
         };
         let (top_bar, keymap, theme, emit) = (
             TopBarState::default(),

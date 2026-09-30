@@ -454,10 +454,16 @@ impl WriteStore for Writer {
         }
     }
 
-    async fn set_step_prompt(&self, step: StepId, digest: &str, trim: &Value) -> Result<()> {
+    async fn set_step_prompt(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        digest: &str,
+        trim: &Value,
+    ) -> Result<()> {
         match self {
-            Self::Memory(store) => store.set_step_prompt(step, digest, trim).await,
-            Self::Online(pg) => pg.set_step_prompt(step, digest, trim).await,
+            Self::Memory(store) => store.set_step_prompt(fence, step, digest, trim).await,
+            Self::Online(pg) => pg.set_step_prompt(fence, step, digest, trim).await,
         }
     }
 
@@ -963,17 +969,27 @@ impl WriteStore for Writer {
         }
     }
 
-    async fn upsert_step_tree(&self, step: StepId, trees: &[RunStepTree]) -> Result<()> {
+    async fn upsert_step_tree(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        trees: &[RunStepTree],
+    ) -> Result<()> {
         match self {
-            Self::Memory(store) => store.upsert_step_tree(step, trees).await,
-            Self::Online(pg) => pg.upsert_step_tree(step, trees).await,
+            Self::Memory(store) => store.upsert_step_tree(fence, step, trees).await,
+            Self::Online(pg) => pg.upsert_step_tree(fence, step, trees).await,
         }
     }
 
-    async fn record_commits(&self, step: StepId, commits: &[RunStepCommit]) -> Result<()> {
+    async fn record_commits(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        commits: &[RunStepCommit],
+    ) -> Result<()> {
         match self {
-            Self::Memory(store) => store.record_commits(step, commits).await,
-            Self::Online(pg) => pg.record_commits(step, commits).await,
+            Self::Memory(store) => store.record_commits(fence, step, commits).await,
+            Self::Online(pg) => pg.record_commits(fence, step, commits).await,
         }
     }
 

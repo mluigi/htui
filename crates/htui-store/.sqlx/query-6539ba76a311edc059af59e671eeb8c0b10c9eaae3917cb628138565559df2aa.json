@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE box\n               SET declared_tags = COALESCE($3, declared_tags),\n                   quirks        = COALESCE($4, quirks),\n                   edit_version  = edit_version + 1\n             WHERE id = $1 AND user_id = $5 AND edit_version = $2\n            RETURNING id             AS \"id: BoxId\",\n                      user_id        AS \"user_id: htui_core::model::UserId\",\n                      hostname,\n                      os_family      AS \"os_family: htui_core::model::OsFamily\",\n                      os_version, arch, cpu, ram_mb, gpu_present, gpu_vendor, htui_version,\n                      probed_tags, declared_tags, quirks, settings,\n                      registered_at, last_seen_at, last_probed_at, updated_at, edit_version\n            ",
+  "query": "\n            UPDATE box\n               SET declared_tags = COALESCE($3, declared_tags),\n                   quirks        = COALESCE($4, quirks),\n                   settings      = CASE WHEN $6::text IS NULL THEN settings\n                                        ELSE jsonb_set(settings, '{executor}', to_jsonb($6::text))\n                                   END,\n                   edit_version  = edit_version + 1\n             WHERE id = $1 AND user_id = $5 AND edit_version = $2\n               AND ($6::text IS NULL OR jsonb_typeof(settings) = 'object')\n            RETURNING id             AS \"id: BoxId\",\n                      user_id        AS \"user_id: htui_core::model::UserId\",\n                      hostname,\n                      os_family      AS \"os_family: htui_core::model::OsFamily\",\n                      os_version, arch, cpu, ram_mb, gpu_present, gpu_vendor, htui_version,\n                      probed_tags, declared_tags, quirks, settings,\n                      registered_at, last_seen_at, last_probed_at, updated_at, edit_version\n            ",
   "describe": {
     "columns": [
       {
@@ -230,7 +230,8 @@
         "Int4",
         "TextArray",
         "Text",
-        "Uuid"
+        "Uuid",
+        "Text"
       ]
     },
     "nullable": [
@@ -256,5 +257,5 @@
       false
     ]
   },
-  "hash": "56d111ed20605a5512ec4905159721915f64fd6bf80cfa480dba429c17588620"
+  "hash": "6539ba76a311edc059af59e671eeb8c0b10c9eaae3917cb628138565559df2aa"
 }

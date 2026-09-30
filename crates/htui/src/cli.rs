@@ -8,15 +8,21 @@ use std::path::PathBuf;
 #[command(
     name = "htui",
     version,
-    about = "Terminal UI for the htui workflow store"
+    about = "Terminal UI for the htui workflow store",
+    args_conflicts_with_subcommands = true
 )]
 pub struct Args {
+    /// A subcommand instead of the TUI. With one, no flag of the TUI may be given.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Load the demo fixture instead of connecting to Postgres.
     #[arg(long)]
     pub demo: bool,
 
-    /// Write logs to this file. Never stdout: stdout is the TUI.
-    #[arg(long, env = "HTUI_LOG", value_name = "PATH")]
+    /// Write logs to this file. Never stdout: stdout is the TUI. After a subcommand
+    /// (`htui worker --log PATH`), not before it; `HTUI_LOG` works with either.
+    #[arg(long, env = "HTUI_LOG", value_name = "PATH", global = true)]
     pub log: Option<PathBuf>,
 
     /// Read a Postgres DSN from stdin, store it in the OS keyring and exit (`R-STO-1`).
@@ -60,10 +66,31 @@ pub struct Args {
     pub limit: Option<u64>,
 }
 
+/// `htui`'s subcommands (MOD-41 plan D14).
+#[derive(Debug, Clone, PartialEq, Eq, clap::Subcommand)]
+pub enum Command {
+    /// Run this box's runs with no terminal: claim queued runs targeted at this box, walk them,
+    /// heartbeat, recover, and stop on SIGINT/SIGTERM. The DSN comes from the OS keyring, the
+    /// systemd credential `htui-dsn`, or `--dsn-stdin`; never argv or the environment.
+    /// Engine-driven ACP steps still fail on their first permission request (MOD-42).
+    Worker(WorkerArgs),
+}
+
+/// `htui worker`'s flags. None reads the environment.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct WorkerArgs {
+    /// Postgres connections, 2 to 8 (clamped).
+    #[arg(long, value_name = "N", default_value_t = 4)]
+    pub pool_size: u32,
+    /// Read the DSN from one line of stdin instead of the keyring or the credential.
+    #[arg(long)]
+    pub dsn_stdin: bool,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Args;
-    use clap::Parser as _;
+    use super::{Args, Command, WorkerArgs};
+    use clap::{CommandFactory as _, Parser as _};
 
     #[test]
     fn the_dsn_flags_exclude_each_other_and_demo() {
@@ -123,5 +150,88 @@ mod tests {
         assert!(args.offline);
         assert!(!args.demo);
         assert_eq!(args.log.as_deref(), Some(std::path::Path::new("htui.log")));
+    }
+
+    /// MOD-41 plan D14: `htui worker` takes `--pool-size` (default 4) and `--dsn-stdin`.
+    #[test]
+    fn worker_parses_its_two_flags() {
+        let args = Args::try_parse_from(["htui", "worker", "--pool-size", "6", "--dsn-stdin"])
+            .expect("parse");
+        assert_eq!(
+            args.command,
+            Some(Command::Worker(WorkerArgs {
+                pool_size: 6,
+                dsn_stdin: true,
+            }))
+        );
+        let args = Args::try_parse_from(["htui", "worker"]).expect("parse");
+        assert_eq!(
+            args.command,
+            Some(Command::Worker(WorkerArgs {
+                pool_size: 4,
+                dsn_stdin: false,
+            }))
+        );
+    }
+
+    /// Plan D14: every flat flag parses as before, with no subcommand; none may stand beside one.
+    #[test]
+    fn flat_flags_still_parse_and_refuse_a_subcommand_beside_them() {
+        let args = Args::try_parse_from(["htui", "--offline"]).expect("parse");
+        assert!(args.offline);
+        assert_eq!(args.command, None);
+        assert!(
+            Args::try_parse_from(["htui", "--demo", "worker"]).is_err(),
+            "a TUI flag beside `worker` must not parse"
+        );
+    }
+
+    /// PRD D3, plan D14: no argument of `htui worker` reads the environment, except the
+    /// propagated global `--log`, whose `HTUI_LOG` is the TUI's.
+    #[test]
+    fn no_worker_argument_reads_the_environment() {
+        let mut command = Args::command();
+        command.build();
+        let worker = command
+            .find_subcommand("worker")
+            .expect("`worker` is a subcommand");
+        let mut saw_log = false;
+        for arg in worker.get_arguments() {
+            if arg.get_id() == "log" {
+                saw_log = true;
+                assert_eq!(
+                    arg.get_env(),
+                    Some(std::ffi::OsStr::new("HTUI_LOG")),
+                    "the global `--log` keeps `HTUI_LOG`"
+                );
+            } else {
+                assert_eq!(
+                    arg.get_env(),
+                    None,
+                    "`htui worker --{}` must not read the environment",
+                    arg.get_id()
+                );
+            }
+        }
+        assert!(saw_log, "`--log` is propagated to `worker`");
+    }
+
+    /// Plan D14 (clap 4.6.6 with `args_conflicts_with_subcommands`): the global `--log` goes after
+    /// the subcommand.
+    #[test]
+    fn log_goes_after_the_subcommand() {
+        let args = Args::try_parse_from(["htui", "worker", "--log", "x"]).expect("parse");
+        assert_eq!(args.log.as_deref(), Some(std::path::Path::new("x")));
+        assert!(matches!(args.command, Some(Command::Worker(_))));
+        assert!(
+            Args::try_parse_from(["htui", "--log", "x", "worker"]).is_err(),
+            "`--log` before `worker` must not parse"
+        );
+    }
+
+    /// PRD D3: the DSN is never an argument.
+    #[test]
+    fn worker_takes_no_dsn_argument() {
+        assert!(Args::try_parse_from(["htui", "worker", "--dsn", "x"]).is_err());
     }
 }

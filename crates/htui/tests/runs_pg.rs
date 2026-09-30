@@ -15,7 +15,7 @@
 //!
 //! MOD-7 milestone 3 adds criterion 14's capability half and ANA-2 §4.10's claim-time half, driven
 //! through the same `RunRuntime`: the enqueue refusal reads tags through
-//! `run_worker::BackendGraphs`, and the claim's through `PgStore::claim_run`.
+//! `htui_worker::HostGraphs`, and the claim's through `PgStore::claim_run`.
 //!
 //! Every case builds the same stack: a throwaway database with the demo world
 //! (`testkit::demo_db`), a throwaway mirror (`CacheStore`), `Backend::Online` over the two, and a
@@ -549,6 +549,7 @@ async fn declare_tags(store: &PgStore, expected: i32, tags: &[&str]) {
             BoxEdit {
                 declared_tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
                 quirks: None,
+                executor: None,
             },
         )
         .await
@@ -1152,7 +1153,7 @@ async fn unblock_follows_an_escalated_run_on_postgres() {
 
 /// ANA-2 §12 criterion 14 in full on Postgres (MOD-7 milestone 3, plan D89): an item requiring
 /// tags the box has neither probed nor declared is refused at `StartRun` through the worker, read
-/// through `run_worker::BackendGraphs`. No `run` row is written, the item is `blocked`, and one
+/// through `htui_worker::HostGraphs`. No `run` row is written, the item is `blocked`, and one
 /// note on this box carries exactly the missing tags; `Unblock` reopens the item, and once the box
 /// declares the tags `StartRun` walks.
 #[tokio::test(flavor = "multi_thread")]

@@ -16,7 +16,7 @@ test-support = ["htui-core/test-support", "htui-agent/test-support"]
 
 [dependencies]
 # ANA-2 invariant 10 (`docs/ANA-2.md:143-146`): **never** `htui-store`. The engine stays generic
-# over `S: WriteStore` so it is headless (`R-ORCH-12`) and so `htui-store` never learns about it.
+# over `S: WorkerStore` so it is headless (`R-ORCH-12`) and so `htui-store` never learns about it.
 # No `sha2` either: the workspace's one hasher is `htui_core::prompt::digest::sha256_hex`.
 htui-core  = { workspace = true }
 htui-agent = { workspace = true }

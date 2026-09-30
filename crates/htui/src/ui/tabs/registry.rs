@@ -82,6 +82,11 @@ pub trait Tab {
     fn reveal(&mut self, _target: &RevealTarget, _ctx: &mut Ctx<'_>) -> bool {
         false
     }
+
+    /// The shell's once-a-second refresh reached the active tab (MOD-41 plan D16). Defaulted, the
+    /// trait's third default after `focus_section` and `on_external_edit`, so no other tab
+    /// changes. A view trait, not a store trait: the no-default rule does not apply.
+    fn on_refresh(&mut self, _ctx: &mut Ctx<'_>) {}
 }
 
 /// Every registered tab, in registration order, plus which one is active.
