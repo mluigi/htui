@@ -269,10 +269,11 @@ struct Ranked {
 ///
 /// Nodes are ranked by [`rank_nodes`] and edges by [`rank_edges`]; [`tree_parents`] picks each
 /// node's tree edge and [`hang_edges`] hangs every other edge as a `(*)` leaf. A node with no
-/// neighbour one level up is dropped with its edges: a malformed reply, or the offline cache's
-/// legitimate partial one, where a node reached only through an item whose project is not
-/// mirrored arrives without the edge that reached it. The walk terminates because a tree parent is
-/// strictly shallower than its child.
+/// neighbour one level up is dropped with its edges. That is a malformed reply, or a legitimate
+/// offline one: the cache walks links through items whose project it does not mirror but cannot
+/// return those items, so a node reached only through one arrives with its depth and without the
+/// neighbour one level up. The walk terminates because a tree parent is strictly shallower than
+/// its child.
 fn tree(graph: &LinkGraph, depth: u8) -> Vec<TreeRow> {
     let nodes = rank_nodes(graph, depth);
     let Some(&root) = nodes.first() else {
@@ -1693,6 +1694,41 @@ mod tests {
                 "  → relates X open X title",
                 "  → origin long-project:Y open",
             ]
+        );
+    }
+
+    /// L7: a pane shorter than the tree scrolls it so the cursor row stays on screen, the footer
+    /// kept below it.
+    #[tokio::test]
+    async fn a_short_pane_scrolls_to_keep_the_cursor_visible() {
+        let shell = Shell::platform().await;
+        let mut ctx = shell.ctx();
+        let mut tab = pane(demo(ids::HTUI_FEAT_1).await);
+        for _ in 0..4 {
+            tab.on_key(key(KeyCode::Char('J')), &mut ctx);
+        }
+        // Three tree rows and the footer: the cursor sits mid-window.
+        assert_eq!(
+            draw(&tab, &shell, 43, 4),
+            [
+                "    ← origin     FEAT-3 queued (*)",
+                "▸   ← blocked_by TOOL-1 awaiting_approval",
+                "  ← blocked_by FEAT-2 blocked Agent driver…",
+                "depth 2/3 · +/- depth · Enter re-root",
+            ]
+        );
+        for _ in 0..3 {
+            tab.on_key(key(KeyCode::Char('J')), &mut ctx);
+        }
+        assert_eq!(
+            draw(&tab, &shell, 43, 4),
+            [
+                "  ← blocked_by FEAT-2 blocked Agent driver…",
+                "    ← relates    agy:FEAT-1 open ACP trans…",
+                "▸ ← relates    FEAT-3 queued Postgres stor…",
+                "depth 2/3 · +/- depth · Enter re-root",
+            ],
+            "the last row is the window's last"
         );
     }
 

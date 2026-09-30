@@ -878,6 +878,48 @@ async fn enter_on_a_node_outside_the_workspace_refuses_on_the_status_line() {
     insta::assert_snapshot!("graph_outside_workspace", frame);
 }
 
+/// Review L7: under the shell's real registration, whose Backlog `Enter` row is the `replay step`
+/// miss, `Enter` on the Graph's root row is consumed and nothing reaches the status line. On Body
+/// the same key does fall through to the miss, which is what gives the first half its meaning.
+#[tokio::test]
+async fn enter_on_the_graph_root_row_is_consumed_under_the_real_registration() {
+    let mut harness = Harness::demo().with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+    htui::app::register_all(harness.app());
+    harness.drive_to_end().await;
+    harness.app().update(Action::SetScope {
+        workspace: workspace("platform").await,
+    });
+    harness.drive_to_end().await;
+    down(&mut harness, TO_FEAT_1).await;
+    harness.key("m");
+    let frame = harness.render();
+    assert!(
+        frame.contains("┌ FEAT-1") && frame.contains("▸ FEAT-1 in_progress"),
+        "the Graph, its cursor on the root row:\n{frame}"
+    );
+    assert_eq!(harness.app().status, None);
+
+    harness.key("enter");
+    harness.drive_to_end().await;
+    assert_eq!(harness.app().status, None, "the Graph consumed `Enter`");
+
+    sub_tab_back(&mut harness, TO_GRAPH);
+    harness.key("enter");
+    harness.drive_to_end().await;
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("select a step in the Runs pane (J/K) to replay it"),
+        "from Body, the miss answers"
+    );
+}
+
+/// Cycles `n` sub-tabs to the left.
+fn sub_tab_back(harness: &mut Harness, n: usize) {
+    for _ in 0..n {
+        harness.key("h");
+    }
+}
+
 /// D8: `m` lands on the Graph from whichever sub-tab is showing.
 #[tokio::test]
 async fn m_opens_the_graph_from_any_sub_tab() {
