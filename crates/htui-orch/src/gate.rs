@@ -1025,7 +1025,10 @@ mod tests {
     use htui_core::fixtures::{demo_data, ids};
     use htui_core::model::{Document, GraphSnapshot, VerifyOutcome};
 
-    use htui_core::model::{NewRepo, NewRunStep, RepoId, Run, RunStep, RunStepCommit, StepStatus};
+    use htui_core::model::{
+        DocumentId, NewDocument, NewRepo, NewRunStep, RepoId, Run, RunStep, RunStepCommit,
+        StepStatus,
+    };
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 
     use super::{
@@ -1374,10 +1377,12 @@ mod tests {
         (run, snapshot)
     }
 
-    /// Inserts a `research` row of `RUN_3` at `(0, attempt, fanout_index)` and walks it through
-    /// `path` with legal compare-and-sets, starting from `pending`.
-    async fn step(
+    /// Inserts a `phase_name` row of `RUN_3` at `(position, attempt, fanout_index)` and walks it
+    /// through `path` with legal compare-and-sets, starting from `pending`.
+    async fn step_at(
         store: &MemStore,
+        position: i32,
+        phase_name: &str,
         attempt: i32,
         fanout_index: i32,
         path: &[StepStatus],
@@ -1386,10 +1391,10 @@ mod tests {
             .create_step(NewRunStep {
                 id: htui_core::model::StepId::new(),
                 run_id: ids::RUN_3,
-                position: 0,
+                position,
                 attempt,
                 fanout_index,
-                phase_name: "research".to_owned(),
+                phase_name: phase_name.to_owned(),
                 agent_id: Some(ids::AGENT_CLAUDE),
                 model: Some("opus".to_owned()),
             })
@@ -1407,6 +1412,34 @@ mod tests {
             from = to;
         }
         row
+    }
+
+    /// A `research` row of `RUN_3` at `(0, attempt, fanout_index)`: [`step_at`] at position 0.
+    async fn step(
+        store: &MemStore,
+        attempt: i32,
+        fanout_index: i32,
+        path: &[StepStatus],
+    ) -> RunStep {
+        step_at(store, 0, "research", attempt, fanout_index, path).await
+    }
+
+    /// Writes `body` as a `kind` document of `RUN_3`'s item (`HTUI_ANA_1`), produced by `by` or
+    /// by hand. The store allocates the version, so write order is version order.
+    async fn produce(store: &MemStore, kind: &str, by: Option<&RunStep>, body: &str) {
+        store
+            .write_document(NewDocument {
+                id: DocumentId::new(),
+                item_id: ids::HTUI_ANA_1,
+                kind: kind.to_owned(),
+                title: kind.to_owned(),
+                body: body.to_owned(),
+                produced_by_step_id: by.map(|step| step.id),
+                created_by: ids::USER,
+                created_at: epoch(),
+            })
+            .await
+            .expect("the item, the step and the user exist");
     }
 
     /// The status of every `RUN_3` row, by id.
@@ -1558,6 +1591,175 @@ mod tests {
             no_progress(&ctx, &steps, 0, 1, 2).await.expect("reads"),
             Some(LoopStop::NoProgressHash),
             "the winner repeated attempt 1's winner"
+        );
+    }
+
+    /// CLEAN-4 (plan D5): the review half reads every version, not the latest per kind. Two
+    /// reviews of this loop that differ only in `\r\n` against `\n` are one review after
+    /// `canonical`, so the loop stops on `no_progress_review`. `RUN_3` holds no repo, so the hash
+    /// half cannot decide, and the review half is the one that answers.
+    #[tokio::test]
+    async fn no_progress_review_fires_on_reviews_equal_after_canonicalisation() {
+        let store = MemStore::demo();
+        let (run, snapshot) = run_3();
+        assert!(
+            run.repo_scope.is_empty(),
+            "the hash half answers false on an empty scope, so it cannot be what fires"
+        );
+        let review = snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.position == 3)
+            .expect("the FEAT snapshot has a position 3");
+        assert_eq!(
+            (review.name.as_str(), review.output_kind.as_str()),
+            ("review", "review")
+        );
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+        };
+        let first = step_at(
+            &store,
+            3,
+            "review",
+            1,
+            0,
+            &[
+                StepStatus::Running,
+                StepStatus::Failed,
+                StepStatus::Cancelled,
+            ],
+        )
+        .await;
+        let second = step_at(
+            &store,
+            3,
+            "review",
+            2,
+            0,
+            &[StepStatus::Running, StepStatus::Failed],
+        )
+        .await;
+        produce(
+            &store,
+            "review",
+            Some(&first),
+            "---\r\nverdict: request-changes\r\n---\r\nno tests\r\n",
+        )
+        .await;
+        produce(
+            &store,
+            "review",
+            Some(&second),
+            "---\nverdict: request-changes\n---\nno tests\n",
+        )
+        .await;
+        let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
+
+        assert_eq!(
+            no_progress(&ctx, &steps, 2, 3, 2).await.expect("reads"),
+            Some(LoopStop::NoProgressReview),
+            "the two reviews differ only in line endings, which `canonical` erases"
+        );
+    }
+
+    /// CLEAN-4 (plan D5), the two ways the review half must still answer no: two reviews of this
+    /// loop that say different things, and `review`-kind documents from outside `review_position`
+    /// (the implement at position 2, and one written by hand) whose body would make the top two
+    /// identical if they were counted. The last leg is the control: a third review of this loop
+    /// that repeats the second *is* read, so the `None`s above come from the filter and not from
+    /// an empty read.
+    #[tokio::test]
+    async fn no_progress_review_counts_only_this_loops_reviews() {
+        const SECOND: &str = "---\nverdict: request-changes\n---\nstill no tests\n";
+        let store = MemStore::demo();
+        let (run, snapshot) = run_3();
+        let ctx = GateContext {
+            store: &store,
+            clock: &SystemClock,
+            run: &run,
+            snapshot: &snapshot,
+            user: ids::USER,
+            box_id: ids::BOX,
+        };
+        let first = step_at(
+            &store,
+            3,
+            "review",
+            1,
+            0,
+            &[
+                StepStatus::Running,
+                StepStatus::Failed,
+                StepStatus::Cancelled,
+            ],
+        )
+        .await;
+        let second = step_at(
+            &store,
+            3,
+            "review",
+            2,
+            0,
+            &[StepStatus::Running, StepStatus::Failed],
+        )
+        .await;
+        produce(
+            &store,
+            "review",
+            Some(&first),
+            "---\nverdict: request-changes\n---\nno tests\n",
+        )
+        .await;
+        produce(&store, "review", Some(&second), SECOND).await;
+        let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
+        assert_eq!(
+            no_progress(&ctx, &steps, 2, 3, 2).await.expect("reads"),
+            None,
+            "the second review says something the first did not"
+        );
+
+        // Two higher versions of kind `review` repeating the second: one by the implement at
+        // position 2, one by hand. Neither is a review of this loop.
+        let implement = step_at(
+            &store,
+            2,
+            "implement",
+            2,
+            0,
+            &[StepStatus::Running, StepStatus::Done],
+        )
+        .await;
+        produce(&store, "review", Some(&implement), SECOND).await;
+        produce(&store, "review", None, SECOND).await;
+        let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
+        assert_eq!(
+            no_progress(&ctx, &steps, 2, 3, 2).await.expect("reads"),
+            None,
+            "a `review`-kind document from outside `review_position` is not a review of this loop"
+        );
+
+        // The control: a third review of this loop that repeats the second.
+        let third = step_at(
+            &store,
+            3,
+            "review",
+            3,
+            0,
+            &[StepStatus::Running, StepStatus::Failed],
+        )
+        .await;
+        produce(&store, "review", Some(&third), SECOND).await;
+        let steps = store.run_steps(ids::RUN_3).await.expect("RUN_3 exists");
+        assert_eq!(
+            no_progress(&ctx, &steps, 2, 3, 3).await.expect("reads"),
+            Some(LoopStop::NoProgressReview),
+            "the two latest reviews of this loop repeat each other, whatever lies between them"
         );
     }
 

@@ -307,11 +307,11 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Seventy-three, and the count is pinned in two places on purpose — here by
+/// Seventy-four, and the count is pinned in two places on purpose — here by
 /// `cases_are_unique_and_counted` and out of crate by `tests/fake_conformance.rs` —
 /// because a binding that silently ran one fewer of them would still be green.
 ///
-/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18 + 2 + 1.
+/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1.
 ///
 /// **Eighteen before milestone 4.** Six are `docs/ANA-2.md` §12's validation criteria (1, 2, 3,
 /// 5, 6 and 7); four are contract lines §12 does not number but §4.2 states outright; one is the
@@ -361,6 +361,10 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 ///
 /// **One for MOD-40 milestone 1** (plan D1, D2): a suspended walk, woken after another process
 /// adopted its run, writes nothing to the step.
+///
+/// **One for CLEAN-4** (plan D4): criterion 7's review half, which a reader that saw only the
+/// latest version per kind had left unreachable: two identical reviews stop the loop on
+/// `no_progress_review` with no repo in scope.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -375,6 +379,9 @@ pub const CASES: &[&str] = &[
     // Criterion 7 (`:2103`): two identical `after_hash` values mean the loop stopped making
     // progress, and it is stopped before its retry budget says so.
     "identical_after_hash_stops_the_loop",
+    // CLEAN-4 plan D4: criterion 7's other half, two identical review bodies with no repo in
+    // scope, stop the loop on `no_progress_review` before its budget does.
+    "identical_reviews_stop_the_loop",
     // `docs/ANA-2.md:414`: a missing required input fails the run before a token is spent.
     "missing_input_fails_before_a_token",
     // `:430`: a step that produced no document of its `output_kind` settles `failed`.
@@ -545,7 +552,7 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
 ///
 /// A plain function rather than a `match` inside [`run_case`]'s own body, and that is about the
 /// stack, not style: an unoptimised build gives every arm's case future its own stack slot, so a
-/// seventy-three-arm `match` in an `async fn` puts all seventy-three in the one frame every case is
+/// seventy-four-arm `match` in an `async fn` puts all seventy-four in the one frame every case is
 /// then polled beneath, and the recovery cases' walks overflowed a test thread's 2 MiB. Here the
 /// slots are gone before the first poll.
 ///
@@ -563,6 +570,7 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         "identical_after_hash_stops_the_loop" => {
             Box::pin(identical_after_hash_stops_the_loop(harness))
         }
+        "identical_reviews_stop_the_loop" => Box::pin(identical_reviews_stop_the_loop(harness)),
         "missing_input_fails_before_a_token" => {
             Box::pin(missing_input_fails_before_a_token(harness))
         }
@@ -1707,6 +1715,83 @@ async fn identical_after_hash_stops_the_loop<H: CaseHarness>(harness: &H) {
                 && body.contains("stop reason `no_progress_hash`")
         }),
         "the budget permitted a third attempt; the predicate is what stopped it: {notes:?}"
+    );
+    assert!(
+        !steps_of(&orch, run)
+            .await
+            .iter()
+            .any(|step| step.attempt == 3),
+        "no third implement attempt was created, though `retry_limit = 3` would have allowed one"
+    );
+}
+
+/// CLEAN-4 (plan D4): two identical review documents stop the loop *before* its retry budget says
+/// so, on `no_progress_review`, criterion 7's other half.
+///
+/// The twin of `identical_after_hash_stops_the_loop` with the halves swapped. **No repo is in
+/// scope**, so the hash half answers false on the empty `repo_scope` and cannot be what stops
+/// the loop. Both review attempts are scripted with one body, so the review half does.
+/// `retry_limit = 3` on `implement` again means the budget would have permitted a third attempt.
+async fn identical_reviews_stop_the_loop<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "implement" {
+            phase.retry_limit = 3;
+        }
+    })
+    .await;
+    orch.script(
+        "review",
+        1,
+        ScriptedStep::review("request-changes", "no tests"),
+    );
+    orch.script(
+        "review",
+        2,
+        ScriptedStep::review("request-changes", "no tests"),
+    );
+
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        run_of(&orch, run).await.repo_scope.is_empty(),
+        "plan D14: no primary repo, so `repo_scope: None` resolves to nothing and the hash half \
+         cannot decide"
+    );
+
+    approve(&orch, run, 3).await; // prd, plan, implement 1
+    answer(
+        &orch,
+        run,
+        GateAnswer::Rejected {
+            note: "attempt 1 is no better".to_owned(),
+        },
+    )
+    .await; // review 1 -> the loop resumes at implement 2
+    approve(&orch, run, 1).await; // implement 2
+    let (_, rest) = answer(
+        &orch,
+        run,
+        GateAnswer::Rejected {
+            note: "attempt 2 is no better".to_owned(),
+        },
+    )
+    .await; // review 2 -> the same review, so the loop stops
+
+    assert_eq!(rest.failure, Some(RunFailure::ReviewLoopExhausted(2)));
+    assert_eq!(run_of(&orch, run).await.status, RunStatus::AwaitingApproval);
+    assert_eq!(
+        item_of(&orch, ids::HTUI_FEAT_3).await.status,
+        Status::Blocked
+    );
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes.iter().any(|body| {
+            body.contains("review loop exhausted after 2 attempts")
+                && body.contains("stop reason `no_progress_review`")
+        }),
+        "the budget permitted a third attempt and no repo was in scope; the review half is what \
+         stopped it: {notes:?}"
     );
     assert!(
         !steps_of(&orch, run)
@@ -5888,8 +5973,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            73,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            74,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -5910,7 +5995,8 @@ mod tests {
              lease, four promotions, five accepts, `Unblock`'s three cases, and criterion \
              20's close-out and its refusal), and MOD-7 milestone 3's two (criterion 14's \
              capability half and §4.10's claim-time half), and MOD-40 milestone 1's one (a \
-             suspended walk fenced after adoption)"
+             suspended walk fenced after adoption), and CLEAN-4's one (identical reviews stop \
+             the loop on `no_progress_review`)"
         );
     }
 
