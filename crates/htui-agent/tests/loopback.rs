@@ -940,14 +940,43 @@ async fn a_non_http_answer_is_not_http() {
     );
 }
 
+/// Review L-9: a port on `[::1]` whose `127.0.0.1` twin this test holds bound — not listening,
+/// and without `SO_REUSEADDR` — so a connect there is refused, and no other test binding
+/// `127.0.0.1:0` in parallel can be handed the same port and answer the delivery instead. A port
+/// whose twin someone else already holds is let go and another drawn. `None` when `[::1]` cannot
+/// be bound at all.
+async fn ipv6_only_port() -> Option<(TcpListener, tokio::net::TcpSocket)> {
+    for _ in 0..32 {
+        let listener = match TcpListener::bind("[::1]:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                // Written past the harness's capture, so a skip is seen rather than read as a pass.
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "NOTE: localhost_falls_back_to_the_ipv6_loopback SKIPPED: the IPv6 loopback \
+                     cannot be bound here ({err})"
+                );
+                return None;
+            }
+        };
+        let port = listener.local_addr().expect("addr").port();
+        let twin = tokio::net::TcpSocket::new_v4().expect("an IPv4 socket");
+        twin.set_reuseaddr(false).expect("no SO_REUSEADDR");
+        if twin
+            .bind(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .is_ok()
+        {
+            return Some((listener, twin));
+        }
+    }
+    panic!("no [::1] port in 32 draws had a free 127.0.0.1 twin");
+}
+
 #[tokio::test]
 async fn localhost_falls_back_to_the_ipv6_loopback() {
-    let listener = match TcpListener::bind("[::1]:0").await {
-        Ok(listener) => listener,
-        Err(err) => {
-            eprintln!("skipped: the IPv6 loopback cannot be bound here ({err})");
-            return;
-        }
+    let Some((listener, _twin)) = ipv6_only_port().await else {
+        return;
     };
     let port = listener.local_addr().expect("addr").port();
     let server = tokio::spawn(async move {

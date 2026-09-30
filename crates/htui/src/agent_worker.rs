@@ -8558,15 +8558,21 @@ done
             })
         }
 
-        /// A listener that accepts and says nothing, holding the connection until aborted.
-        fn silent_listener(listener: tokio::net::TcpListener) -> JoinHandle<()> {
-            tokio::spawn(async move {
+        /// A listener that accepts and says nothing, holding every connection until aborted, and
+        /// signals each accept on the receiver it returns (review L-9).
+        fn silent_listener(
+            listener: tokio::net::TcpListener,
+        ) -> (JoinHandle<()>, mpsc::UnboundedReceiver<()>) {
+            let (accepted_tx, accepted) = mpsc::unbounded_channel();
+            let task = tokio::spawn(async move {
                 let mut held = Vec::new();
                 loop {
                     let (stream, _) = listener.accept().await.expect("a delivery connects");
                     held.push(stream);
+                    let _ = accepted_tx.send(());
                 }
-            })
+            });
+            (task, accepted)
         }
 
         /// Whether `listener` is connected to within [`QUIET`].
@@ -8916,7 +8922,7 @@ done
         async fn a_second_deliver_while_one_is_in_flight_is_refused() {
             let tmp = tempfile::tempdir().expect("a throwaway directory");
             let (port, bound) = listener().await;
-            let silent = silent_listener(bound);
+            let (silent, _accepted) = silent_listener(bound);
             let link = loopback_link(port);
             let (store, agent_id) = login_store(
                 tmp.path(),
@@ -8966,7 +8972,7 @@ done
         async fn cancel_is_served_while_a_delivery_is_in_flight() {
             let tmp = tempfile::tempdir().expect("a throwaway directory");
             let (port, bound) = listener().await;
-            let silent = silent_listener(bound);
+            let (silent, mut accepted) = silent_listener(bound);
             let link = loopback_link(port);
             let (store, agent_id) = login_store(
                 tmp.path(),
@@ -8985,6 +8991,12 @@ done
             let pid = fixture_pid(tmp.path()).expect("the fixture wrote its pid when it started");
             choose_and_await_link(&mut runtime, &backend, &tx, &mut rx).await;
             deliver_at(&mut runtime, &backend, &tx, 3, pasted(port, STATE)).await;
+            // Review L-9: the listener has accepted the delivery's connection, so the `x` below
+            // lands on a delivery that is provably in flight rather than one not yet started.
+            tokio::time::timeout(Duration::from_secs(5), accepted.recv())
+                .await
+                .expect("the delivery connects well inside its deadlines")
+                .expect("the listener is still accepting");
 
             cancel_at(&mut runtime, &backend, &tx, 4).await;
             let replies =
@@ -9015,7 +9027,7 @@ done
         async fn a_silent_listener_times_the_delivery_out_and_the_login_keeps_running() {
             let tmp = tempfile::tempdir().expect("a throwaway directory");
             let (port, bound) = listener().await;
-            let silent = silent_listener(bound);
+            let (silent, _accepted) = silent_listener(bound);
             let link = loopback_link(port);
             let (store, agent_id) = login_store(
                 tmp.path(),
