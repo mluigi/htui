@@ -39,8 +39,11 @@ What it does:
 - Picks up a repo or checkout change (a repo added, a checkout path set or moved) at the next
   sweep when no run is walking, with no restart; the box's command limits and
   `copy_max_total_bytes` are read again at that point. While a run is walking, the worker keeps
-  adopting but claims no queued run until its walks rest, so no walk has its checkouts moved
-  under it. A change to the limits alone reaches the worker at its next restart.
+  adopting but its sweep claims no queued run until its walks rest, so no walk has its checkouts
+  moved under it. A run whose claim the worker already had to put back (its slot full, or its
+  scope overlapping a walk) is still claimed when one of the walks rests, with the checkouts the
+  worker read before the change. A change to the limits alone reaches the worker at its next
+  restart.
 - Marks the box as seen (`box.last_seen_at`) once at start and then every minute, whatever the
   executor.
 - Logs `htui worker ready` once connected, with the box id and the pool size.

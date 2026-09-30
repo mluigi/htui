@@ -1545,7 +1545,8 @@ async fn reclaim<H: htui_core::store::WorkerHost, P: ReplySink>(
 /// no `StartRun` of its own, then re-reads its repo map (MOD-41 review R-1, blueprint D202): a
 /// repo or checkout change rebuilds the isolator and the verifier, with the limits read afresh,
 /// when no walk of this process is live, and while one is ([`REPOS_MOVED`]) the sweep still adopts
-/// but claims nothing this tick. Then the adoption
+/// but skips its claim scan this tick (a refused claim's retry, M5 D84, still runs when a walk
+/// rests, with the parts the process has). Then the adoption
 /// (nothing is built when there is nothing to adopt: no dead walk of this process and no run
 /// holding a slot on this box), then the claim scan, always unless the runtime was built
 /// [`RunRuntime::without_claim_scan`] (blueprint B-8: `queued` rows hold no slot, so the
@@ -1582,8 +1583,9 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
     {
         match ctx.shared.singletons(host, &writer, true).await {
             Ok(_) => {}
-            // D202 (R-39): the isolator is never swapped under a live walk; this tick's claims
-            // would walk with the stale one, so they wait for a sweep with no walk live.
+            // D202 (R-39): the isolator is never swapped under a live walk, so the claim scan
+            // waits for a sweep with no walk live. A claim this process had refused (M5 D84) is
+            // still retried when one of its walks rests, with the parts it has.
             Err(message) if message == REPOS_MOVED => {
                 tracing::debug!(%message, "the sweep claims nothing this tick");
                 claims = false;
