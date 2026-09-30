@@ -1432,6 +1432,7 @@ impl CacheStore {
                         updated_at: ts_col("agent.updated_at", get(row, "updated_at")?)?,
                     },
                     on_box: None,
+                    user_off: false,
                 })
             })
             .collect()

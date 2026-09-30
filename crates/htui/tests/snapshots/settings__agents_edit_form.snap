@@ -1,0 +1,33 @@
+---
+source: crates/htui/tests/settings.rs
+expression: rendered
+---
+name         transport billing      models default               enabled quota         on this box
+agent-a      acp       subscription 0      —                     yes     —             not probed
+agent-b      acp       subscription 11     gemini-3.7-flash-high yes     —             not probed
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+edit agent-b
+transport    : acp
+command      : ${demo_server}
+args         : --flag 'a b'
+models       : …gemini-3.6-flash-medium, gemini-3.6-flash-low, gemini-pro-agent, gemini-3.1-pro-low
+default model: gemini-3.7-flash-high
+billing      : subscription
+enabled (y/n): y
+Tab next field · Enter saves · Esc cancels

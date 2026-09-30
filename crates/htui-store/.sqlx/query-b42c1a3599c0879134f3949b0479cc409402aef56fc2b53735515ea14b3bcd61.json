@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO agent_box (agent_id, box_id, enabled, user_off) VALUES ($1, $2, $3, NOT $3) ON CONFLICT (agent_id, box_id) DO UPDATE SET user_off = NOT $3, enabled  = $3 AND (agent_box.probe IS NULL OR COALESCE(agent_box.probe->>'status' = 'ready', false))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b42c1a3599c0879134f3949b0479cc409402aef56fc2b53735515ea14b3bcd61"
+}

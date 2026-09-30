@@ -795,6 +795,16 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
             });
         Ok(written)
     }
+    async fn set_agent_box_enabled(
+        &self,
+        agent_id: AgentId,
+        box_id: BoxId,
+        enabled: bool,
+    ) -> StoreResult<()> {
+        self.inner
+            .set_agent_box_enabled(agent_id, box_id, enabled)
+            .await
+    }
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> StoreResult<()> {
         self.inner.start_chat_run(chat).await
     }

@@ -28,6 +28,9 @@
 //!
 //! **MOD-9 milestone 3** adds the skill readers to `WriteStore` beside their writers (plan D75),
 //! as MOD-15 did; the bound-skill read the prompt uses stays inherent.
+//!
+//! **MOD-23** adds one narrow writer, [`WriteStore::set_agent_box_enabled`], the per-box switch
+//! (plan D242).
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
@@ -367,6 +370,11 @@ pub trait WriteStore: ReadStore {
     /// the one sharp edge the design keeps, and `store::conformance`'s
     /// `upsert_agent_box_cannot_write_quota` is what pins it.
     ///
+    /// Since MOD-23 (D242) the update writes `enabled` as `row.enabled && !user_off`: a row the
+    /// human switched off on this box stays off whatever the probe proposes. The insert is
+    /// unchanged, since a fresh row has `user_off = false`.
+    /// [`set_agent_box_enabled`](WriteStore::set_agent_box_enabled) is the switch.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the agent or the box
@@ -393,9 +401,9 @@ pub trait WriteStore: ReadStore {
     /// the latch always has a document, and a row nobody has latched into is `NULL` from its
     /// insert. **MOD-7 is the caller that will**: unregistering an agent from a box, or a
     /// re-registration that must not carry the last box's allowance forward, has to put the pair
-    /// back to `NULL`, and that is when these two parameters become `Option`s across the six
+    /// back to `NULL`, and that is when these two parameters become `Option`s across the five
     /// implementations and `store::conformance`. Widening them before there is a caller would be
-    /// six signatures changed to express a case no code can reach.
+    /// five signatures changed to express a case no code can reach.
     ///
     /// # Newest wins (MOD-40 plan D4)
     ///
@@ -421,6 +429,35 @@ pub trait WriteStore: ReadStore {
         quota: Value,
         quota_at: DateTime<Utc>,
     ) -> Result<bool>;
+
+    /// Switches this agent on or off **on one box** (MOD-23 D242): writes `agent_box.user_off` and
+    /// re-derives `agent_box.enabled`, and nothing else. It never writes `probe`, `version`,
+    /// `path`, `probed_at`, `quota` or `quota_at`.
+    ///
+    /// The probe proposes `enabled` and the human vetoes it. `false` sets `user_off` and
+    /// `enabled = false`, and while `user_off` holds,
+    /// [`upsert_agent_box`](WriteStore::upsert_agent_box) cannot turn `enabled` back on. `true`
+    /// clears `user_off` and sets `enabled` to the stored probe's verdict: `true` when the row
+    /// holds no probe document, else whether its `status` is `ready` (a document without a
+    /// `status` is not ready).
+    ///
+    /// An absent row is inserted bare: `enabled` as switched, every probe column `NULL`, so a
+    /// reader treats it as never probed. No compare-and-set: the switch is an absolute set, and a
+    /// token on `agent_box.updated_at` would be spent by every probe. The last of two concurrent
+    /// switches wins, and both see it on their re-read.
+    ///
+    /// The only writer of `user_off` (MOD-2 D74's single-writer shape).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the agent or the box
+    /// does not exist; nothing is written.
+    async fn set_agent_box_enabled(
+        &self,
+        agent_id: AgentId,
+        box_id: BoxId,
+        enabled: bool,
+    ) -> Result<()>;
 
     /// Writes one box probe (MOD-7 D10): the hardware columns, `probed_tags`, `htui_version`,
     /// `last_probed_at` and `probe_spec_digest`, and replaces this box's `box_tool` set, in one

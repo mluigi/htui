@@ -10,7 +10,7 @@
 //! What `r` does **not** do is refresh that column. Quota is latched from the usage a run reports,
 //! never polled: a probe handshake reports no allowance at all, so a re-probe moves every other
 //! column and this one on no row. `docs/ANA-4.md` §7 asks for that limit to be stated rather than
-//! implied, and `QUOTA_NOTE` on the hint line is where this section states it. (A code span, not
+//! implied, and `QUOTA_NOTE` on the note line is where this section states it. (A code span, not
 //! an intra-doc link: this is the **module**'s documentation and the constant is private, so the
 //! link is the one `rustdoc` rejects without `--document-private-items`. The two references further
 //! down are inside private items' own docs and stay links.)
@@ -36,6 +36,15 @@
 //! state would leave a running download with nothing on screen to cancel it with, and a login that
 //! lost its state would leave a spawned adapter, an open loopback listener and a human half-way
 //! through a browser page with no key on screen to stop any of it.
+//!
+//! Since MOD-23 it is also where a registry row is **written** (plan D230-D232): `n` opens a
+//! create form and `e` an edit form in the pane under the table, and `t` flips this box's
+//! per-box switch for the highlighted row. The form is hierarchy's one-line-field shape; its rules
+//! are `crate::agent_settings`'s, run here for an instant refusal and again by the worker before
+//! it writes (D247). Every write is one request (`R-NF-3`), answered by one self-naming
+//! [`StoreReply::AgentWritten`] (D240): a plain [`StoreReply::Agents`] replaces the rows and never
+//! closes the form or moves its token. The form never shows `launch.env` (D235), and nothing here
+//! branches on an agent's name (`R-AGT-5`).
 
 use chrono::{DateTime, Utc};
 use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
@@ -43,21 +52,27 @@ use htui_agent::install::PlanError;
 use htui_agent::probe::{ProbeSnapshot, ProbeStatus};
 use htui_agent::registry::caps_for;
 use htui_agent::{InstallOutcome, InstallPhase, InstallPlan, ManualSteps};
-use htui_core::model::{AgentId, AgentSummary, Scope};
+use htui_core::model::{Agent, AgentId, AgentSummary, Scope, Transport};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::path::Path;
 
+use crate::agent_settings::{
+    self, AgentDraft, AgentWrite, DraftFields, FIELD_LABELS, REQUEST_NAMES, Refusal,
+};
 use crate::agent_worker::AUTH_ALREADY_CHOSEN;
 use crate::app::{Action, Ctx, Handled};
 use crate::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
-use crate::ui::Theme;
-use crate::ui::tabs::settings::{SectionId, SettingsSection, message};
-use crossterm::event::{KeyCode, KeyEvent};
+use crate::ui::tabs::settings::{
+    CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
+    is_error, message,
+};
+use crate::ui::{FieldOutcome, TextField, Theme};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// What the `on this box` column reads while this box has no `agent_box` row for the agent.
 const NOT_PROBED: &str = "not probed";
@@ -79,23 +94,57 @@ const FULL: f64 = 1.0;
 /// allowance is exhausted while the predicate would still select it (review L-3).
 const NEARLY_FULL: f64 = 99.0;
 
-/// The hint line with nothing in flight. It stands in for a help entry: a Settings section has no
-/// [`KeyScope`](crate::keymap::KeyScope) of its own (MOD-20 D19), so the keys are written where
-/// they are pressed.
-const HINT_IDLE: &str = "j/k select \u{b7} r probe \u{b7} i install \u{b7} a authenticate";
+/// The keys line with nothing in flight (79 of the 98 columns, MOD-23 D245). It stands in for a
+/// help entry: a Settings section has no [`KeyScope`](crate::keymap::KeyScope) of its own (MOD-20
+/// D19), so the keys are written where they are pressed.
+const HINT_IDLE: &str = "j/k select \u{b7} n new \u{b7} e edit \u{b7} t this box \u{b7} r probe \u{b7} i install \u{b7} a authenticate";
 
-/// What the idle line adds when it has the room: the one limit of this section that is not a key
-/// (MOD-2 D73).
+/// What the note line says when there is no notice and the section is idle: the one limit of this
+/// section that is not a key (MOD-2 D73).
 ///
 /// `r` re-probes every row and moves the `quota` column on none of them, because a probe handshake
 /// reports no allowance and the value is latched from what a chat reports instead. `docs/ANA-4.md`
 /// §7 asks for that to be "stated in the UI rather than implied", and this is the statement.
 ///
-/// *When it has the room*, because the hint row is one line of a 100-column frame: a notice is the
-/// answer to what the user just pressed, and a standing sentence that clipped a failure's own words
-/// off the right edge would be the wrong half of the line to keep. It is on the line the section
-/// **rests** in, which is the line a limit is read from.
+/// A notice wins the line: it is the answer to what the user just pressed. Since MOD-23 D245 the
+/// note has a line of its own under the keys, so neither clips the other; it is on the line the
+/// section **rests** in, which is the line a limit is read from.
 const QUOTA_NOTE: &str = "quota latches per chat, r cannot refresh it";
+
+/// The keys line while a registry form is open (MOD-23 D245).
+const HINT_EDITING: &str = "Tab next field \u{b7} Enter saves \u{b7} Esc cancels";
+
+/// What the `on this box` column reads for a row the human switched off on this box (MOD-23 D244).
+/// Twelve characters, inside the 13-wide column.
+const SWITCHED_OFF: &str = "switched off";
+
+/// What an edit that changed nothing says as it closes (plan D239's "unchanged closes").
+const UNCHANGED: &str = "nothing changed; nothing was written";
+
+/// What a missing row says when no form is open to close: the write was `t`'s, or the form went
+/// before its answer came back. Opens like [`DELETED_ELSEWHERE`], so [`is_error`] draws it the same.
+const GONE_CLOSED: &str = "deleted elsewhere; nothing was written";
+
+/// What `Created` adds for a `cli` row with no `settings.cli` block (plan R-9, blueprint F-13): such
+/// a row resolves to the bare adapter id `cli`, which no build registers. Decided from the row's
+/// data alone, never its name (`R-AGT-5`).
+const NEEDS_CLI_BLOCK: &str =
+    " \u{b7} a `cli` row needs a settings.cli block to chat (adapter id `cli` is not registered)";
+
+/// What a spent token says when fields the user changed were changed elsewhere too (review M-1),
+/// before their labels ([`clash_notice`]): shorter than [`CHANGED_ELSEWHERE`] so labels fit the
+/// bordered 98. Labels only, never a value. Opens like [`CHANGED_ELSEWHERE`], so [`is_error`] draws
+/// it the same.
+const CHANGED_ON_BOTH_SIDES: &str =
+    "changed elsewhere \u{2014} reloaded; Enter retries \u{b7} also changed elsewhere: ";
+
+/// The widest note line the running app draws (MOD-23 re-review Low-2): the Settings pane's
+/// border costs two of the harness's 100, and the note is one line with no wrap.
+const NOTE_WIDTH: usize = 98;
+
+/// What `Edited` adds when the save changed what a probe checked (plan D246): the stored verdict is
+/// now older than the row, so the next chat re-probes by itself.
+const REPROBES: &str = " \u{b7} the next chat re-probes; r probes now";
 
 /// The hint line while a plan waits for an answer.
 const HINT_PENDING: &str = "y install \u{b7} n cancel";
@@ -243,6 +292,64 @@ enum AuthState {
     },
 }
 
+/// What the section is doing besides an install and a login (MOD-23 D230): browsing the table, or
+/// one registry form open under it. `Browse` captures nothing.
+#[derive(Debug, Default)]
+enum Mode {
+    /// The rows, the cursor and the tab's own `h`/`l`.
+    #[default]
+    Browse,
+    /// A create or an edit form, taking every printable key.
+    Editing(Editor),
+}
+
+/// The open form (plan D231): which write it makes, its fields in tab order, and which one has
+/// focus.
+///
+/// It holds its own row identity (blueprint F-14) and never an index into the table: a create or a
+/// failed read can re-sort or clear the rows under an open form.
+#[derive(Debug)]
+struct Editor {
+    /// The write `Enter` makes.
+    target: Target,
+    /// The inputs, labelled from [`FIELD_LABELS`].
+    fields: Vec<Field>,
+    /// Index into `fields`.
+    focus: usize,
+}
+
+/// What an open form writes.
+#[derive(Debug)]
+enum Target {
+    /// `n`: a new row, whose `settings` start as this row's (OQ-5), named in the header.
+    Create {
+        /// The highlighted row when `n` was pressed; `None` on an empty table.
+        settings_from: Option<(AgentId, String)>,
+    },
+    /// `e`: one existing row, as a compare-and-set on its `updated_at`.
+    Edit {
+        /// The row.
+        agent_id: AgentId,
+        /// Its name, for the header (plan D233: never edited).
+        name: String,
+        /// The token: the row's `updated_at` as a registry reply answered it (MOD-40 F-17).
+        expected: DateTime<Utc>,
+        /// The draft the row prefilled, which `Enter` compares against ("unchanged closes").
+        opened: AgentDraft,
+        /// Whether the draft in flight changes `transport`, `command` or `args` (plan D246).
+        relaunch: bool,
+    },
+}
+
+/// One labelled input of the form: `settings/hierarchy.rs`'s `Field`, private here.
+#[derive(Debug)]
+struct Field {
+    /// One of [`FIELD_LABELS`].
+    label: &'static str,
+    /// The buffer; its `Debug` never prints the text.
+    input: TextField,
+}
+
 /// The registry as a table of name, transport, billing, models, default, enabled and per-box
 /// state, with a row cursor, the install one row at a time and the login one row at a time.
 #[derive(Debug, Default)]
@@ -266,7 +373,13 @@ pub struct AgentsSection {
     install: InstallState,
     /// The login this section is waiting on (MOD-21 D20).
     auth: AuthState,
-    /// The last outcome, one line on the hint row.
+    /// Browsing, or a registry form open under the table (MOD-23 D230).
+    mode: Mode,
+    /// The registry write in flight, by request name (MOD-23 D232, blueprint F-20). It refuses a
+    /// second write and every probe, install and login key until [`StoreReply::AgentWritten`] or
+    /// the write's own [`StoreReply::Failed`] lands, and nothing else clears it.
+    busy: Option<&'static str>,
+    /// The last outcome, on the note line under the keys.
     notice: Option<String>,
 }
 
@@ -858,11 +971,14 @@ impl AgentsSection {
     ///
     /// An install this section is running wins over everything, because it is the one thing on
     /// screen the user is waiting on. Then a probe in flight, because none of the rows on screen
-    /// answer the question they just asked. Then a box with no `agent_box` row at all. Then the
-    /// snapshot's own verdict when it is not `ready` — `missing`, `unauthenticated` and `failed`
-    /// are the three facts a version string cannot express (plan D50). Everything left is a row
-    /// that works, or one written before the `probe` column existed, and both are answered by the
-    /// version.
+    /// answer the question they just asked. Then the per-box switch (MOD-23 D244): a row the human
+    /// switched off reads `switched off` ahead of the probe's words, because the switch decides
+    /// selection before they do. Then a box with no `agent_box` row at all, or a bare one the
+    /// switch wrote that no probe has filled (`probed_at` and `probe` both absent), which is the
+    /// same fact. Then the snapshot's own verdict when it is not `ready` — `missing`,
+    /// `unauthenticated` and `failed` are the three facts a version string cannot express (plan
+    /// D50). Everything left is a row that works, or one written before the `probe` column
+    /// existed, and both are answered by the version.
     fn on_box_cell(&self, summary: &AgentSummary) -> String {
         if let Some(cell) = self.install_cell(summary.agent.id) {
             return cell;
@@ -875,9 +991,15 @@ impl AgentsSection {
         if self.probing {
             return PROBING.to_owned();
         }
+        if summary.user_off {
+            return SWITCHED_OFF.to_owned();
+        }
         let Some(row) = summary.on_box.as_ref() else {
             return NOT_PROBED.to_owned();
         };
+        if row.probed_at.is_none() && row.probe.is_none() {
+            return NOT_PROBED.to_owned();
+        }
         let status = row
             .probe
             .as_ref()
@@ -924,7 +1046,16 @@ impl AgentsSection {
     /// An install pane wins over a login one: the two cannot be *in flight* together (each refuses
     /// while the other is), and the one state that can outlive its action — `Manual` — is a failure
     /// the user still has to read and dismiss.
-    fn pane(&self, theme: &Theme) -> Vec<Line<'static>> {
+    ///
+    /// An open registry form wins over both (MOD-23 D230): it can only be opened while no install
+    /// and no login is in flight, so the one it can cover is a `Manual` pane, which is back the
+    /// moment the form closes. It takes the width because its fields draw a window of their text.
+    fn pane(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+        if let Mode::Editing(editor) = &self.mode {
+            return core::iter::once(Line::styled(editor.header(), theme.base))
+                .chain(editor.lines(width, theme))
+                .collect();
+        }
         match &self.install {
             InstallState::Pending { plan } => core::iter::once(Line::default())
                 .chain(
@@ -947,33 +1078,297 @@ impl AgentsSection {
         }
     }
 
-    /// The one line under the pane: which keys mean something here, the one limit that is not a
-    /// key, and the last outcome.
+    /// The two lines under the pane (MOD-23 D245, blueprint F-12): which keys mean something here,
+    /// then the note — the last outcome, else [`QUOTA_NOTE`] while the section is idle.
     ///
-    /// Keys and note separately because only one state has anything to say beyond its keys, and
-    /// because all three want the same room: a notice wins it, [`QUOTA_NOTE`] takes it when there
-    /// is no notice, and every other state has only keys to write there.
-    fn hint(&self) -> String {
-        let (keys, note) = match &self.install {
+    /// Two lines rather than one since MOD-23 added three keys: the idle keys and the note were
+    /// already 95 of the 98 columns together. A `None` note still takes its line, so the layout
+    /// never changes height with it.
+    fn hint(&self) -> (&'static str, Option<String>) {
+        let keys = match (&self.mode, &self.install) {
+            (Mode::Editing(_), _) => HINT_EDITING,
             // With no install in flight the login owns the line, because it is the only other
             // thing here that binds keys of its own.
-            InstallState::Idle => match &self.auth {
-                AuthState::Idle => (HINT_IDLE, Some(QUOTA_NOTE)),
-                AuthState::Choosing { .. } => (HINT_CHOOSING, None),
-                AuthState::Starting { .. } | AuthState::Running { .. } => (HINT_AUTH_RUNNING, None),
+            (Mode::Browse, InstallState::Idle) => match &self.auth {
+                AuthState::Idle => HINT_IDLE,
+                AuthState::Choosing { .. } => HINT_CHOOSING,
+                AuthState::Starting { .. } | AuthState::Running { .. } => HINT_AUTH_RUNNING,
             },
             // A pre-flight is one registry read and one `HEAD`, so this is usually gone before it
             // is read — but `x` is offered here too, because a plan task that ends without a frame
             // would otherwise leave no way out of this state (review finding, MOD-20 T8).
-            InstallState::Planning { .. } => (HINT_RUNNING, None),
-            InstallState::Pending { .. } => (HINT_PENDING, None),
-            InstallState::Running { .. } => (HINT_RUNNING, None),
-            InstallState::Manual { .. } => (HINT_MANUAL, None),
+            (Mode::Browse, InstallState::Planning { .. } | InstallState::Running { .. }) => {
+                HINT_RUNNING
+            }
+            (Mode::Browse, InstallState::Pending { .. }) => HINT_PENDING,
+            (Mode::Browse, InstallState::Manual { .. }) => HINT_MANUAL,
         };
-        match (&self.notice, note) {
-            (Some(notice), _) => format!("{keys} \u{b7} {notice}"),
-            (None, Some(note)) => format!("{keys} \u{b7} {note}"),
-            (None, None) => keys.to_owned(),
+        let idle = matches!(self.mode, Mode::Browse)
+            && matches!(self.install, InstallState::Idle)
+            && matches!(self.auth, AuthState::Idle);
+        let note = self
+            .notice
+            .clone()
+            .or_else(|| idle.then(|| QUOTA_NOTE.to_owned()));
+        (keys, note)
+    }
+
+    /// Whether `n`, `e` or `t` is refused right now, with the status-line sentence that says why
+    /// (MOD-23 D232, blueprint F-20).
+    ///
+    /// A write in flight first: one registry write at a time. Then an install, a login and a probe,
+    /// in [`begin_install`](Self::begin_install)'s order and for its reason: each ends by writing
+    /// this box's `agent_box` row, and a `launch` edited under a running probe would be recorded
+    /// against the old recipe.
+    fn refuse_write(&self, ctx: &mut Ctx<'_>) -> bool {
+        let refusal = if let Some(busy) = self.busy {
+            in_flight(busy)
+        } else if self.install_in_flight() {
+            "an install is running; edit afterwards".to_owned()
+        } else if self.auth_in_flight() {
+            "a login is running; edit afterwards".to_owned()
+        } else if self.probing {
+            "a probe is running; edit afterwards".to_owned()
+        } else {
+            return false;
+        };
+        ctx.emit(Action::Error(refusal));
+        true
+    }
+
+    /// `n`: the create form, its `settings` source the highlighted row (OQ-5).
+    fn open_create(&mut self) {
+        let settings_from = self
+            .selected()
+            .map(|summary| (summary.agent.id, summary.agent.name.clone()));
+        self.mode = Mode::Editing(Editor::create(settings_from));
+        self.notice = None;
+    }
+
+    /// `e`: the edit form over the highlighted row, or say there is none.
+    fn open_edit(&mut self, ctx: &mut Ctx<'_>) {
+        let Some(summary) = self.selected() else {
+            ctx.emit(Action::Error("no agent row is selected".to_owned()));
+            return;
+        };
+        // Review L-4: a stored model name with a comma would not survive the form's `models`.
+        if let Err(refusal) = agent_settings::editable(&summary.agent) {
+            ctx.emit(Action::Error(refusal.to_string()));
+            return;
+        }
+        self.mode = Mode::Editing(Editor::edit(summary));
+        self.notice = None;
+    }
+
+    /// `t`: flip this box's switch for the highlighted row (MOD-23 D242). The switch is
+    /// `!user_off`, so the request carries `user_off` as the new value.
+    fn switch_this_box(&mut self, ctx: &mut Ctx<'_>) {
+        let Some(summary) = self.selected() else {
+            ctx.emit(Action::Error("no agent row is selected".to_owned()));
+            return;
+        };
+        let request = StoreRequest::SetAgentOnBox {
+            agent_id: summary.agent.id,
+            enabled: summary.user_off,
+        };
+        self.notice = None;
+        self.send(request, ctx);
+    }
+
+    /// Sends one registry write and holds the guard until its answer (blueprint F-20).
+    fn send(&mut self, request: StoreRequest, ctx: &mut Ctx<'_>) {
+        self.busy = Some(request.name());
+        ctx.request(request);
+    }
+
+    /// One key while a form is open (plan D231): `settings/hierarchy.rs`'s rule.
+    ///
+    /// The focused field answers first, so `l`, `q`, `n` and the digits are letters here; what it
+    /// passes on is the form's own navigation, and everything left over is swallowed rather than
+    /// offered to the shell — with `CONTROL` chords excepted, so `ctrl-c` still quits.
+    fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let Mode::Editing(editor) = &mut self.mode else {
+            return Handled::Pass;
+        };
+        let outcome = match editor.fields.get_mut(editor.focus) {
+            Some(field) => field.input.on_key(key),
+            None => FieldOutcome::Pass,
+        };
+        match outcome {
+            FieldOutcome::Consumed => Handled::Consumed,
+            FieldOutcome::Submit => {
+                self.submit(ctx);
+                Handled::Consumed
+            }
+            FieldOutcome::Cancel => {
+                self.mode = Mode::Browse;
+                self.notice = None;
+                Handled::Consumed
+            }
+            FieldOutcome::Pass => {
+                let len = editor.fields.len().max(1);
+                match key.code {
+                    KeyCode::Tab | KeyCode::Down => {
+                        editor.focus = (editor.focus + 1) % len;
+                        Handled::Consumed
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        editor.focus = (editor.focus + len - 1) % len;
+                        Handled::Consumed
+                    }
+                    _ if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
+                    _ => Handled::Consumed,
+                }
+            }
+        }
+    }
+
+    /// `Enter` in a form: the local rules, then one request (plan D247).
+    ///
+    /// The form **stays open** until the reply lands, so a refusal from the worker (a taken name)
+    /// leaves the text where it was and a second `Enter` retries it — which is why the first
+    /// statement refuses while a write is in flight (blueprint F-20). A local refusal sends
+    /// nothing, puts the field's sentence on the note line and moves the focus to that field.
+    fn submit(&mut self, ctx: &mut Ctx<'_>) {
+        if let Some(busy) = self.busy {
+            ctx.emit(Action::Error(in_flight(busy)));
+            return;
+        }
+        let Mode::Editing(editor) = &mut self.mode else {
+            return;
+        };
+        match editor.request(&self.agents) {
+            Ok(Some(request)) => {
+                self.notice = None;
+                self.send(request, ctx);
+            }
+            Ok(None) => {
+                self.mode = Mode::Browse;
+                self.notice = Some(UNCHANGED.to_owned());
+            }
+            Err(refusal) => {
+                editor.focus_on(refusal.field);
+                self.notice = Some(refusal.to_string());
+            }
+        }
+    }
+
+    /// Whether the open form is the edit form of `id`.
+    fn editing(&self, id: AgentId) -> bool {
+        matches!(
+            &self.mode,
+            Mode::Editing(Editor { target: Target::Edit { agent_id, .. }, .. }) if *agent_id == id
+        )
+    }
+
+    /// What one registry write did (MOD-23 D240), once the rows are the re-read's.
+    ///
+    /// Every outcome lands here and nowhere else: a plain [`StoreReply::Agents`] never closes the
+    /// form or moves its token.
+    fn on_written(&mut self, outcome: &AgentWrite) {
+        match outcome {
+            AgentWrite::Created { id, name } => {
+                if matches!(
+                    self.mode,
+                    Mode::Editing(Editor {
+                        target: Target::Create { .. },
+                        ..
+                    })
+                ) {
+                    self.mode = Mode::Browse;
+                }
+                // By id, not by where the cursor was (F-14): the re-read sorted the new row in.
+                let row = self
+                    .agents
+                    .iter()
+                    .position(|summary| summary.agent.id == *id);
+                if let Some(index) = row {
+                    self.cursor.select(Some(index));
+                }
+                let mut notice = format!("created `{name}`");
+                if row
+                    .and_then(|index| self.agents.get(index))
+                    .is_some_and(|summary| needs_cli_block(&summary.agent))
+                {
+                    notice.push_str(NEEDS_CLI_BLOCK);
+                }
+                self.notice = Some(notice);
+            }
+            AgentWrite::Edited { id, name } => {
+                let mut notice = format!("saved `{name}`");
+                if self.editing(*id) {
+                    if let Mode::Editing(Editor {
+                        target: Target::Edit { relaunch: true, .. },
+                        ..
+                    }) = &self.mode
+                    {
+                        notice.push_str(REPROBES);
+                    }
+                    self.mode = Mode::Browse;
+                }
+                self.notice = Some(notice);
+            }
+            AgentWrite::Stale { id } => {
+                if !self.editing(*id) {
+                    self.notice = Some(CHANGED_ELSEWHERE_CLOSED.to_owned());
+                    return;
+                }
+                let current = self
+                    .agents
+                    .iter()
+                    .find(|summary| summary.agent.id == *id)
+                    .map(|summary| {
+                        (
+                            summary.agent.updated_at,
+                            agent_settings::draft_of(&summary.agent),
+                        )
+                    });
+                match current {
+                    // Review M-1: the fields the user left alone take the re-read's values, the
+                    // ones they changed keep their text, and the token and the "unchanged"
+                    // baseline are the row's now.
+                    Some((updated_at, draft)) => {
+                        let clashes = match &mut self.mode {
+                            Mode::Editing(editor) => editor.rebase(updated_at, draft),
+                            Mode::Browse => Vec::new(),
+                        };
+                        self.notice = Some(if clashes.is_empty() {
+                            CHANGED_ELSEWHERE.to_owned()
+                        } else {
+                            clash_notice(&clashes)
+                        });
+                    }
+                    None => {
+                        self.mode = Mode::Browse;
+                        self.notice = Some(DELETED_ELSEWHERE.to_owned());
+                    }
+                }
+            }
+            AgentWrite::Gone { id } => {
+                if self.editing(*id) {
+                    self.mode = Mode::Browse;
+                    self.notice = Some(DELETED_ELSEWHERE.to_owned());
+                } else {
+                    self.notice = Some(GONE_CLOSED.to_owned());
+                }
+            }
+            AgentWrite::Switched { id, name, enabled } => {
+                // Review L-2: with no verdict on this box — no `agent_box` row, or a bare one the
+                // switch itself wrote — there is nothing for the probe to decide yet.
+                let probed = self
+                    .agents
+                    .iter()
+                    .find(|summary| summary.agent.id == *id)
+                    .and_then(|summary| summary.on_box.as_ref())
+                    .is_some_and(|row| row.probe.is_some() || row.probed_at.is_some());
+                self.notice = Some(if *enabled && probed {
+                    format!("`{name}` switched on; the probe's verdict decides")
+                } else if *enabled {
+                    format!("`{name}` switched on; not probed yet \u{b7} r probes")
+                } else {
+                    format!("`{name}` switched off on this box")
+                });
+            }
         }
     }
 
@@ -1098,6 +1493,275 @@ impl AgentsSection {
     }
 }
 
+impl Editor {
+    /// The create form (plan D231): all eight fields, with `transport`, `billing` and `enabled`
+    /// holding the values a new row most often wants, so a literal `command` is all it needs.
+    fn create(settings_from: Option<(AgentId, String)>) -> Self {
+        let texts = [
+            "",
+            Transport::Acp.as_str(),
+            "",
+            "",
+            "",
+            "",
+            htui_core::model::Billing::Subscription.as_str(),
+            "y",
+        ];
+        Self {
+            target: Target::Create { settings_from },
+            fields: FIELD_LABELS
+                .iter()
+                .zip(texts)
+                .map(|(label, text)| Field::new(label, text))
+                .collect(),
+            focus: 0,
+        }
+    }
+
+    /// The edit form over one row: every field but `name` (plan D233), prefilled from
+    /// [`agent_settings::draft_of`] so the prefill and the "unchanged" check read `launch` the way
+    /// the worker does. `env` has no field (D235).
+    fn edit(summary: &AgentSummary) -> Self {
+        let opened = agent_settings::draft_of(&summary.agent);
+        let texts = prefill(&opened);
+        Self {
+            fields: FIELD_LABELS[1..]
+                .iter()
+                .zip(texts)
+                .map(|(label, text)| Field::new(label, &text))
+                .collect(),
+            target: Target::Edit {
+                agent_id: summary.agent.id,
+                name: summary.agent.name.clone(),
+                expected: summary.agent.updated_at,
+                opened,
+                relaunch: false,
+            },
+            focus: 0,
+        }
+    }
+
+    /// A spent token under an open edit form (review M-1): rebase the form onto `current`, the row
+    /// as the re-read answered it, and answer the labels of the fields changed on both sides.
+    ///
+    /// A field whose text is still what the old baseline prefilled takes `current`'s text, so a
+    /// retry carries another writer's change instead of reverting it (`EditAgent` sends the whole
+    /// draft). A field the user changed keeps its text; it is a clash when `current` changed it
+    /// too, to something else. Then the token and the "unchanged" baseline are `current`'s.
+    fn rebase(&mut self, updated_at: DateTime<Utc>, current: AgentDraft) -> Vec<&'static str> {
+        let Target::Edit {
+            expected,
+            opened,
+            relaunch,
+            ..
+        } = &mut self.target
+        else {
+            return Vec::new();
+        };
+        let before = prefill(opened);
+        let after = prefill(&current);
+        let mut clashes = Vec::new();
+        // The edit form's fields are `FIELD_LABELS[1..]`, which is `prefill`'s order.
+        for ((field, old), new) in self.fields.iter_mut().zip(before).zip(after) {
+            if field.text() == old {
+                if new != old {
+                    field.input = TextField::with_text(&new);
+                }
+            } else if new != old && field.text() != new {
+                clashes.push(field.label);
+            }
+        }
+        *expected = updated_at;
+        *opened = current;
+        *relaunch = false;
+        clashes
+    }
+
+    /// The text of the field labelled `label`, or `""` when the form has none (the edit form's
+    /// `name`).
+    fn text(&self, label: &str) -> &str {
+        self.fields
+            .iter()
+            .find(|field| field.label == label)
+            .map_or("", Field::text)
+    }
+
+    /// Moves the focus to the field a refusal names; a field this form does not have (`launch`)
+    /// leaves it where it is.
+    fn focus_on(&mut self, label: &str) {
+        if let Some(index) = self.fields.iter().position(|field| field.label == label) {
+            self.focus = index;
+        }
+    }
+
+    /// The form's request, `None` for an edit that changed nothing, or the first refusal in tab
+    /// order (plan D247). A create also refuses a name the table already lists (D234); the store's
+    /// `UNIQUE` stays the authority.
+    fn request(&mut self, agents: &[AgentSummary]) -> Result<Option<StoreRequest>, Refusal> {
+        let name = self.text(FIELD_LABELS[0]).to_owned();
+        let draft = agent_settings::draft_from_fields(&DraftFields {
+            transport: self.text(FIELD_LABELS[1]),
+            command: self.text(FIELD_LABELS[2]),
+            args: self.text(FIELD_LABELS[3]),
+            models: self.text(FIELD_LABELS[4]),
+            default_model: self.text(FIELD_LABELS[5]),
+            billing: self.text(FIELD_LABELS[6]),
+            enabled: self.text(FIELD_LABELS[7]),
+        });
+        match &mut self.target {
+            Target::Create { settings_from } => {
+                let name = agent_settings::parse_name(&name)?;
+                if agents.iter().any(|summary| summary.agent.name == name) {
+                    return Err(Refusal {
+                        field: FIELD_LABELS[0],
+                        reason: format!("`{name}` is already registered"),
+                    });
+                }
+                Ok(Some(StoreRequest::CreateAgent {
+                    name,
+                    draft: draft?,
+                    settings_from: settings_from.as_ref().map(|(id, _)| *id),
+                }))
+            }
+            Target::Edit {
+                agent_id,
+                expected,
+                opened,
+                relaunch,
+                ..
+            } => {
+                let draft = draft?;
+                if draft == *opened {
+                    return Ok(None);
+                }
+                *relaunch = opened.transport != draft.transport
+                    || opened.command != draft.command
+                    || opened.args != draft.args;
+                Ok(Some(StoreRequest::EditAgent {
+                    agent_id: *agent_id,
+                    expected: *expected,
+                    draft,
+                }))
+            }
+        }
+    }
+
+    /// The pane's first line: what `Enter` writes, and where a new row's `settings` come from.
+    fn header(&self) -> String {
+        match &self.target {
+            Target::Create {
+                settings_from: Some((_, name)),
+            } => format!("new agent \u{b7} settings from {name}"),
+            Target::Create {
+                settings_from: None,
+            } => "new agent \u{b7} settings {}".to_owned(),
+            Target::Edit { name, .. } => format!("edit {name}"),
+        }
+    }
+
+    /// One line per field, the focused label accented and the focused field carrying the cursor:
+    /// `settings/hierarchy.rs`'s `Editor::lines`. The label column is 13 wide (`default model`),
+    /// which leaves 83 columns of text at the bordered 98 (D231).
+    fn lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+        let label_width = self
+            .fields
+            .iter()
+            .map(|field| field.label.chars().count())
+            .max()
+            .unwrap_or(0);
+        self.fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let focused = index == self.focus;
+                let padding = " ".repeat(label_width - field.label.chars().count());
+                let style = if focused { theme.accent } else { theme.dim };
+                let mut spans = vec![Span::styled(format!("{}{padding}: ", field.label), style)];
+                let room = usize::from(width).saturating_sub(label_width + 2);
+                spans.extend(
+                    field
+                        .input
+                        .line(u16::try_from(room).unwrap_or(u16::MAX), focused, theme)
+                        .spans,
+                );
+                Line::from(spans)
+            })
+            .collect()
+    }
+}
+
+impl Field {
+    /// A field labelled `label` holding `text`, cursor at the end.
+    fn new(label: &'static str, text: &str) -> Self {
+        Self {
+            label,
+            input: TextField::with_text(text),
+        }
+    }
+
+    /// What was typed. Never masked here, so [`TextField::text`] always answers.
+    fn text(&self) -> &str {
+        self.input.text().unwrap_or_default()
+    }
+}
+
+/// [`CHANGED_ON_BOTH_SIDES`] with the clashing labels in form order, as many as fit
+/// [`NOTE_WIDTH`], then ` +N more` for the rest (MOD-23 re-review Low-2). Greedy and
+/// deterministic: a label is shown only if it and the count still owed after it fit, so the
+/// line never passes the width.
+fn clash_notice(clashes: &[&str]) -> String {
+    let mut notice = CHANGED_ON_BOTH_SIDES.to_owned();
+    let mut shown = 0;
+    for (index, label) in clashes.iter().enumerate() {
+        let separator = if index == 0 { "" } else { ", " };
+        let after = clashes.len() - index - 1;
+        let owed = if after == 0 {
+            String::new()
+        } else {
+            format!(" +{after} more")
+        };
+        let width =
+            notice.chars().count() + separator.len() + label.chars().count() + owed.chars().count();
+        if width > NOTE_WIDTH {
+            break;
+        }
+        notice.push_str(separator);
+        notice.push_str(label);
+        shown += 1;
+    }
+    let hidden = clashes.len() - shown;
+    if hidden > 0 {
+        notice.push_str(&format!(" +{hidden} more"));
+    }
+    notice
+}
+
+/// The edit form's text for `draft`, in `FIELD_LABELS[1..]` order: what the form prefills, and
+/// what a `Stale` rebase compares against (review M-1).
+fn prefill(draft: &AgentDraft) -> [String; 7] {
+    [
+        draft.transport.as_str().to_owned(),
+        draft.command.clone(),
+        agent_settings::format_args(&draft.args),
+        agent_settings::format_models(&draft.models),
+        draft.default_model.clone().unwrap_or_default(),
+        draft.billing.as_str().to_owned(),
+        if draft.enabled { "y" } else { "n" }.to_owned(),
+    ]
+}
+
+/// The refusal of a key pressed while a registry write is in flight (blueprint F-20).
+fn in_flight(request: &str) -> String {
+    format!("`{request}` is still in flight")
+}
+
+/// Whether a row cannot chat for want of a `settings.cli` block (plan R-9, blueprint F-13): a `cli`
+/// row without one resolves to the bare adapter id `cli`. Read from the row's data, never its name
+/// (`R-AGT-5`), and without `htui_agent`'s private `adapter_id_from`.
+fn needs_cli_block(agent: &Agent) -> bool {
+    agent.transport == Transport::Cli && agent.settings.get("cli").is_none()
+}
+
 impl SettingsSection for AgentsSection {
     fn id(&self) -> SectionId {
         Self::ID
@@ -1105,6 +1769,12 @@ impl SettingsSection for AgentsSection {
 
     fn title(&self) -> &str {
         "Agents"
+    }
+
+    /// While a registry form is open (blueprint F-11): `l` and `h` are letters there, not section
+    /// cycling. Derived from the mode, never a flag.
+    fn captures_input(&self) -> bool {
+        matches!(self.mode, Mode::Editing(_))
     }
 
     fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
@@ -1115,6 +1785,12 @@ impl SettingsSection for AgentsSection {
     fn on_scope_change(&mut self, _scope: &Scope) {}
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        // An open registry form answers first (MOD-23 D231). It cannot coexist with either modal
+        // below: it only opens while no install and no login is in flight (D232), and each modal
+        // belongs to one of those. The order only fixes which answers first.
+        if matches!(self.mode, Mode::Editing(_)) {
+            return self.on_editor_key(key, ctx);
+        }
         // A plan on screen answers first, and answers everything: MOD-20 D19's modality.
         if matches!(self.install, InstallState::Pending { .. }) {
             return self.answer_consent(key, ctx);
@@ -1125,10 +1801,37 @@ impl SettingsSection for AgentsSection {
         if matches!(self.auth, AuthState::Choosing { .. }) {
             return self.answer_chooser(key, ctx);
         }
-        // `a`, `i`, `j`, `k`, `o`, `x` and `r` are free: the global table binds `q`, `?`, the
-        // digits, `ctrl-c` and `-`, and the tab itself consumes `h`/`l`/`[`/`]`/arrows before a
-        // section is offered the key.
+        // `a`, `e`, `i`, `j`, `k`, `n`, `o`, `r`, `t` and `x` are free: the global keymap binds `q`,
+        // `Tab`/`BackTab`, the digits, `?`, `ctrl-c` and `w`, and the tab itself consumes
+        // `h`/`l`/`[`/`]`/arrows before a section is offered the key. `n` is also the consent and
+        // chooser modals' "no", and they answer above, before this match.
         match key.code {
+            // MOD-23 D232 and blueprint F-20: one registry write at a time, and none of the three
+            // flows that write this box's `agent_box` row beside it.
+            KeyCode::Char('r' | 'i' | 'a') if self.busy.is_some() => {
+                if let Some(busy) = self.busy {
+                    ctx.emit(Action::Error(in_flight(busy)));
+                }
+                Handled::Consumed
+            }
+            KeyCode::Char('n') => {
+                if !self.refuse_write(ctx) {
+                    self.open_create();
+                }
+                Handled::Consumed
+            }
+            KeyCode::Char('e') => {
+                if !self.refuse_write(ctx) {
+                    self.open_edit(ctx);
+                }
+                Handled::Consumed
+            }
+            KeyCode::Char('t') => {
+                if !self.refuse_write(ctx) {
+                    self.switch_this_box(ctx);
+                }
+                Handled::Consumed
+            }
             KeyCode::Char('j') => {
                 self.move_cursor(true);
                 Handled::Consumed
@@ -1217,6 +1920,22 @@ impl SettingsSection for AgentsSection {
                 self.probing = false;
                 self.clamp_cursor();
             }
+            // MOD-23 D240: the one reply a registry write lands on. The rows are the re-read's, and
+            // the guard is down. Not `probing`, `install` or `auth`: none of them is this write's.
+            StoreReply::AgentWritten { agents, outcome } => {
+                self.agents = agents.clone();
+                self.unavailable = None;
+                self.busy = None;
+                self.clamp_cursor();
+                self.on_written(outcome);
+            }
+            // A registry write was refused — a taken name, a field the worker refused, this box not
+            // registered, or offline. The shell has put `{request}: {message}` on the status line;
+            // the note line says it under the form, which stays open over its text.
+            StoreReply::Failed { request, message } if REQUEST_NAMES.contains(request) => {
+                self.busy = None;
+                self.notice = Some(message.clone());
+            }
             StoreReply::Install(frame) => self.on_install_frame(frame, ctx),
             StoreReply::Auth(frame) => self.on_auth_frame(frame, ctx),
             // The shell has already put the message on the status line (`App::update`), so the
@@ -1269,10 +1988,11 @@ impl SettingsSection for AgentsSection {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let pane = self.pane(ctx.theme);
-        let [rows, consent, hint] = Layout::vertical([
+        let pane = self.pane(area.width, ctx.theme);
+        let [rows, consent, keys_area, note_area] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(u16::try_from(pane.len()).unwrap_or(u16::MAX)),
+            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -1287,10 +2007,17 @@ impl SettingsSection for AgentsSection {
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), consent);
         }
-        frame.render_widget(
-            Paragraph::new(Line::styled(self.hint(), ctx.theme.dim)),
-            hint,
-        );
+        let (keys, note) = self.hint();
+        frame.render_widget(Paragraph::new(Line::styled(keys, ctx.theme.dim)), keys_area);
+        if let Some(note) = note {
+            // `settings/mod.rs`'s rule: a compare-and-set miss is the one notice to act on.
+            let style = if is_error(&note) {
+                ctx.theme.error
+            } else {
+                ctx.theme.dim
+            };
+            frame.render_widget(Paragraph::new(Line::styled(note, style)), note_area);
+        }
     }
 }
 

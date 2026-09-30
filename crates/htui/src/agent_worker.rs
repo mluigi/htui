@@ -906,6 +906,11 @@ impl AgentRuntime {
                 summary.agent.name
             )));
         }
+        // MOD-23 review L-3: a promotion is a chat on this box, so the per-box switch gates it the
+        // way it gates `ChatStart`. Offline, `CacheStore::agents` answers `user_off: false`
+        // because `agent_box` is not mirrored — but an offline backend has no writer and was
+        // refused above.
+        refuse_switched_off(&summary)?;
         let driver = self
             .factory
             .driver_for(&summary.agent, summary.on_box.as_ref())
@@ -1788,6 +1793,10 @@ impl AgentRuntime {
                 summary.agent.name
             )));
         }
+        // MOD-23 review L-3: the per-box switch gates a chat started on this box. Offline,
+        // `CacheStore::agents` answers `user_off: false` because `agent_box` is not mirrored — but
+        // an offline backend has no writer and was refused above.
+        refuse_switched_off(&summary)?;
         let driver = self
             .factory
             .driver_for(&summary.agent, summary.on_box.as_ref())
@@ -2119,12 +2128,40 @@ async fn run_probe(args: ProbeArgs) {
     frames.reply(&frames.addr(), reply);
 }
 
+/// The per-box switch at a chat's start (MOD-23 review L-3): a row the human switched off on this
+/// box (`agent_box.user_off`) is refused whatever the probe's verdict, by `ChatStart` and by a
+/// promotion alike, with this one sentence.
+///
+/// Read off the [`AgentSummary`](htui_core::model::AgentSummary) both paths already hold, so it
+/// costs no read. A row with no `agent_box` row is `user_off: false` and passes. Reads the switch,
+/// never the name (`R-AGT-5`).
+///
+/// What a refusal leaves differs by path (MOD-23 re-review Low-3). For `ChatStart` it refuses
+/// before this runtime writes any row. For a promotion it does **not**: the engine has already
+/// written the promotion by the time `bind_promoted` runs, so a refused promotion leaves the step
+/// `awaiting_approval` with `promoted_at` set and no chat, exactly as the `agent is disabled`
+/// refusal beside it does. Promoting again once the switch is on opens the chat.
+fn refuse_switched_off(summary: &htui_core::model::AgentSummary) -> Result<(), StoreError> {
+    if summary.user_off {
+        return Err(StoreError::Constraint(switched_off(&summary.agent.name)));
+    }
+    Ok(())
+}
+
+/// The one sentence for an agent switched off on this box (MOD-23 review L-3, re-review Low-1):
+/// [`refuse_switched_off`]'s, and `run_worker`'s `Kit::driver`'s for a step admitted before the
+/// switch. The name is only quoted, never branched on (`R-AGT-5`).
+pub(crate) fn switched_off(name: &str) -> String {
+    format!("agent `{name}` is switched off on this box; Settings > Agents, t switches it on")
+}
+
 /// [`run_probe`]'s loop, shared with the box probe (MOD-7 D11): every enabled row of `agents`
 /// probed on `box_id` through `env`, one at a time, each fresh row written through `writer`.
 ///
-/// The rows come back as this probe left them: `on_box` replaced by what was written, and left
-/// as read for a disabled row or a hand-written one the probe kept (plan D51). The first write
-/// that fails ends the walk with its error.
+/// The rows come back as this probe left them: `on_box` replaced by what was written, with
+/// `enabled` as the store kept it under the per-box switch (MOD-23 D243), and left as read for a
+/// disabled row or a hand-written one the probe kept (plan D51). The first write that fails ends
+/// the walk with its error.
 async fn probe_agents_on(
     writer: &Writer,
     box_id: BoxId,
@@ -2150,8 +2187,15 @@ async fn probe_agents_on(
         )
         .await
         {
-            ProbeOutcome::Row(row) => {
+            ProbeOutcome::Row(mut row) => {
                 writer.upsert_agent_box(&row).await?;
+                // MOD-23 D243: the store kept `enabled AND NOT user_off`; the reply says the same.
+                //
+                // Review L-1: `user_off` is the start-of-walk read's, so a switch flipped while
+                // this walk runs shows on the next read, not in this reply. The store row is right
+                // regardless (`upsert_agent_box` applies the rule against the row it writes), and
+                // the section's `on this box` cell checks `user_off` before `enabled`.
+                row.enabled &= !summary.user_off;
                 summary.on_box = Some(row);
             }
             // Plan D51: a hand-written row the probe could not confirm is left exactly as it is,
@@ -5903,6 +5947,86 @@ pub(crate) mod tests {
                 .count(),
             3,
             "the reply states what the task itself wrote"
+        );
+    }
+
+    /// MOD-23 D243: a row the human switched off on this box stays off in the probe's own reply,
+    /// as the store keeps it (`enabled AND NOT user_off`), though the probe finds it `ready`. The
+    /// row is a `cli` row whose `launch` is a literal command with no `discovery`, so it probes
+    /// `ready` and nothing is spawned: a `cli` row has no handshake. (Blueprint F-10 said `acp`,
+    /// but an `acp` row with no `discovery` does run tier 2: `probe.rs`'s `is_none_or`.) The box
+    /// probe shares `probe_agents_on`, so this covers its reply too.
+    #[tokio::test]
+    async fn a_probe_reply_keeps_a_switched_off_row_off() {
+        let tmp = tempfile::tempdir().expect("a throwaway directory");
+        let command = tmp.path().join("agent-bin");
+        std::fs::write(&command, "").expect("the literal command exists");
+        let store = MemStore::demo();
+        let now = Utc::now();
+        let agent = Agent {
+            id: AgentId::new(),
+            name: "agent-literal".to_owned(),
+            transport: Transport::Cli,
+            launch: json!({ "command": command.to_string_lossy(), "args": [], "env": {} }),
+            models: Vec::new(),
+            default_model: None,
+            billing: htui_core::model::Billing::Subscription,
+            enabled: true,
+            settings: json!({}),
+            created_at: now,
+            updated_at: now,
+        };
+        store
+            .upsert_agent(&agent, None)
+            .await
+            .expect("the new row lands");
+        store
+            .set_agent_box_enabled(agent.id, ids::BOX, false)
+            .await
+            .expect("the switch lands");
+        let rows: Vec<_> = store
+            .agents()
+            .await
+            .expect("the memory store never fails")
+            .into_iter()
+            .filter(|summary| summary.agent.id == agent.id)
+            .collect();
+        assert!(rows[0].user_off, "the read carries the switch");
+
+        let replied = probe_agents_on(
+            &Writer::Memory(store.clone()),
+            ids::BOX,
+            rows,
+            &ProbeEnv::host(tmp.path().to_path_buf()).without_versions(),
+        )
+        .await
+        .expect("the memory store never fails");
+
+        let on_box = replied[0].on_box.as_ref().expect("the probe wrote a row");
+        assert_eq!(
+            on_box
+                .probe
+                .as_ref()
+                .and_then(|probe| probe.get("status"))
+                .and_then(Value::as_str),
+            Some("ready"),
+            "a literal command resolves without a spawn"
+        );
+        assert!(
+            !on_box.enabled,
+            "the reply says what the store kept: a switched-off row stays off"
+        );
+        let stored = store
+            .agents()
+            .await
+            .expect("the memory store never fails")
+            .into_iter()
+            .find(|summary| summary.agent.id == agent.id)
+            .expect("the row is still listed");
+        assert!(stored.user_off);
+        assert!(
+            !stored.on_box.expect("the probe's row").enabled,
+            "the store kept the veto"
         );
     }
 

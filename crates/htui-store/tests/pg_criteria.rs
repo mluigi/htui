@@ -1997,6 +1997,292 @@ async fn an_upsert_can_neither_set_nor_clear_the_quota_columns() {
     db.drop_db().await;
 }
 
+/// MOD-23 (plan D242): a probed `agent_box` row for `agent_id` on `box_id`, as the probe writes
+/// one, stamped with microsecond literals so a read-back compares stamps for equality.
+fn switch_probed_row(
+    agent_id: AgentId,
+    box_id: BoxId,
+    probe: serde_json::Value,
+    enabled: bool,
+) -> AgentBox {
+    let probed_at: DateTime<Utc> = "2026-09-29T06:00:00.000123Z"
+        .parse()
+        .expect("a microsecond-precision literal");
+    AgentBox {
+        agent_id,
+        box_id,
+        enabled,
+        version: Some("1.2.3".to_owned()),
+        path: Some("/usr/bin/agent".to_owned()),
+        probed_at: Some(probed_at),
+        quota: None,
+        quota_at: None,
+        updated_at: probed_at,
+        probe: Some(probe),
+    }
+}
+
+/// MOD-23 (plan D242): this box's summary of one agent through the inherent `PgStore::agents`,
+/// the read the Settings tab gets.
+async fn switch_summary(store: &PgStore, agent_id: AgentId) -> htui_core::model::AgentSummary {
+    store
+        .agents()
+        .await
+        .expect("agents must not fail")
+        .into_iter()
+        .find(|row| row.agent.id == agent_id)
+        .expect("the agent is registered")
+}
+
+/// MOD-23 plan D242: the Postgres half of
+/// `mem.rs::a_switched_off_row_stays_off_under_an_upsert_that_says_enabled`. A re-probe's
+/// `upsert_agent_box` that says `enabled: true` over a switched-off row writes every other column
+/// it owns and leaves `enabled` false: `enabled = EXCLUDED.enabled AND NOT agent_box.user_off`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_switched_off_row_survives_a_re_probe_on_postgres() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let this_box = db.store.this_box();
+    let ready = switch_probed_row(
+        ids::AGENT_CLAUDE,
+        this_box,
+        serde_json::json!({ "status": "ready", "source": "probe" }),
+        true,
+    );
+    db.store
+        .upsert_agent_box(&ready)
+        .await
+        .expect("the probe row lands");
+    db.store
+        .set_agent_box_enabled(ids::AGENT_CLAUDE, this_box, false)
+        .await
+        .expect("the switch lands");
+
+    db.store
+        .upsert_agent_box(&AgentBox {
+            version: Some("1.3.0".to_owned()),
+            ..ready
+        })
+        .await
+        .expect("a re-probe lands on a switched-off row");
+
+    let summary = switch_summary(&db.store, ids::AGENT_CLAUDE).await;
+    let row = summary.on_box.expect("this box has an agent_box row");
+    assert!(!row.enabled, "the re-probe cannot switch the row back on");
+    assert!(summary.user_off, "`ab.user_off` is projected");
+    assert_eq!(
+        row.version.as_deref(),
+        Some("1.3.0"),
+        "the upsert still wrote the columns it owns: only `enabled` is vetoed"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-23 plan D242, blueprint D249: switching on clears `user_off` and re-derives `enabled` from
+/// the stored probe. `ready` is enabled, `unauthenticated` is not, and a probe document without
+/// `status` is not either, **without** the `23502` the plan's arm raised (`true AND NULL`).
+#[tokio::test(flavor = "multi_thread")]
+async fn switching_on_restores_the_probe_verdict_on_postgres() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let this_box = db.store.this_box();
+    for (agent_id, probe, enabled) in [
+        (
+            ids::AGENT_CLAUDE,
+            serde_json::json!({ "status": "ready", "source": "probe" }),
+            true,
+        ),
+        (
+            ids::AGENT_AGY,
+            serde_json::json!({ "status": "unauthenticated", "source": "probe" }),
+            false,
+        ),
+        (
+            ids::AGENT_CLAUDE_CLI,
+            serde_json::json!({ "source": "probe" }),
+            false,
+        ),
+    ] {
+        db.store
+            .upsert_agent_box(&switch_probed_row(agent_id, this_box, probe, enabled))
+            .await
+            .expect("the probe row lands");
+        db.store
+            .set_agent_box_enabled(agent_id, this_box, false)
+            .await
+            .expect("switched off");
+        db.store
+            .set_agent_box_enabled(agent_id, this_box, true)
+            .await
+            .expect("switched back on, a status-less probe included");
+    }
+
+    let ready = switch_summary(&db.store, ids::AGENT_CLAUDE).await;
+    assert!(
+        ready.on_box.as_ref().expect("a row").enabled,
+        "a `ready` row switched back on is enabled"
+    );
+    assert!(!ready.user_off, "and the veto is gone");
+
+    let unauthenticated = switch_summary(&db.store, ids::AGENT_AGY).await;
+    assert!(
+        !unauthenticated.on_box.as_ref().expect("a row").enabled,
+        "an `unauthenticated` row switched back on is still unavailable"
+    );
+    assert!(
+        !unauthenticated.user_off,
+        "but it is the probe that says so now, not the switch"
+    );
+
+    let status_less = switch_summary(&db.store, ids::AGENT_CLAUDE_CLI).await;
+    assert!(
+        !status_less.on_box.as_ref().expect("a row").enabled,
+        "a probe document without `status` is not ready (D249's COALESCE)"
+    );
+    assert!(!status_less.user_off, "and the switch-on landed");
+
+    db.drop_db().await;
+}
+
+/// MOD-23 plan D242: the switch is one statement two columns wide. `probe` (compared as a JSON
+/// value), `version`, `path`, `probed_at`, `quota` and `quota_at` read back identical across an
+/// off and an on, and `updated_at` is moved by the `BEFORE UPDATE` trigger.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_switch_leaves_the_probe_columns_byte_identical_on_postgres() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let this_box = db.store.this_box();
+    db.store
+        .upsert_agent_box(&switch_probed_row(
+            ids::AGENT_CLAUDE,
+            this_box,
+            serde_json::json!({
+                "status": "ready",
+                "source": "probe",
+                "tools": { "claude": "2.1.263", "node": "22.19.0" },
+                "stderr_tail": null,
+            }),
+            true,
+        ))
+        .await
+        .expect("the probe row lands");
+    let quota_at: DateTime<Utc> = "2026-09-29T09:00:00.000456Z"
+        .parse()
+        .expect("a microsecond-precision literal");
+    db.store
+        .set_agent_box_quota(
+            ids::AGENT_CLAUDE,
+            this_box,
+            serde_json::json!({ "source": "acp_meta_rate_limit", "spend": { "session_micros": 351 } }),
+            quota_at,
+        )
+        .await
+        .expect("the latch lands");
+    let before = switch_summary(&db.store, ids::AGENT_CLAUDE)
+        .await
+        .on_box
+        .expect("a row");
+    let stamped_before: DateTime<Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM agent_box WHERE agent_id = $1 AND box_id = $2")
+            .bind(ids::AGENT_CLAUDE.as_uuid())
+            .bind(this_box.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read updated_at");
+
+    db.store
+        .set_agent_box_enabled(ids::AGENT_CLAUDE, this_box, false)
+        .await
+        .expect("switched off");
+    db.store
+        .set_agent_box_enabled(ids::AGENT_CLAUDE, this_box, true)
+        .await
+        .expect("switched on");
+
+    let after = switch_summary(&db.store, ids::AGENT_CLAUDE)
+        .await
+        .on_box
+        .expect("a row");
+    assert_eq!(
+        AgentBox {
+            updated_at: before.updated_at,
+            ..after.clone()
+        },
+        before,
+        "`probe`, `version`, `path`, `probed_at`, `quota` and `quota_at` are untouched, and a \
+         `ready` row switched off and on is enabled again"
+    );
+    let stamped_after: DateTime<Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM agent_box WHERE agent_id = $1 AND box_id = $2")
+            .bind(ids::AGENT_CLAUDE.as_uuid())
+            .bind(this_box.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read updated_at");
+    assert!(
+        stamped_after > stamped_before,
+        "`updated_at` is the trigger's, and the switch moved it"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-23 plan D242: the switch on an agent this box has never probed inserts a bare row, every
+/// probe column `NULL` and `user_off` true, so the setting survives until the first probe.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_switch_on_an_unprobed_agent_inserts_a_bare_row_on_postgres() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let this_box = db.store.this_box();
+    assert!(
+        switch_summary(&db.store, ids::AGENT_AGY)
+            .await
+            .on_box
+            .is_none(),
+        "the demo holds no agent_box row"
+    );
+
+    db.store
+        .set_agent_box_enabled(ids::AGENT_AGY, this_box, false)
+        .await
+        .expect("an absent pair is written, not refused");
+
+    let summary = switch_summary(&db.store, ids::AGENT_AGY).await;
+    assert!(summary.user_off, "the switch is reported");
+    let row = summary.on_box.expect("the switch inserted a row");
+    assert_eq!(
+        AgentBox {
+            agent_id: ids::AGENT_AGY,
+            box_id: this_box,
+            enabled: false,
+            version: None,
+            path: None,
+            probed_at: None,
+            quota: None,
+            quota_at: None,
+            updated_at: row.updated_at,
+            probe: None,
+        },
+        row,
+        "a bare row: switched off, and never probed"
+    );
+    let user_off: bool =
+        sqlx::query_scalar("SELECT user_off FROM agent_box WHERE agent_id = $1 AND box_id = $2")
+            .bind(ids::AGENT_AGY.as_uuid())
+            .bind(this_box.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read user_off");
+    assert!(user_off, "the column itself holds the veto");
+
+    db.drop_db().await;
+}
+
 /// MOD-40 plan D4: a latch older than the stored `quota_at` writes **nothing** — the whole row,
 /// read as `jsonb`, is byte-identical across it, `updated_at` included: a guarded `UPDATE` that
 /// matched no row fires no `BEFORE UPDATE` trigger. The conformance case

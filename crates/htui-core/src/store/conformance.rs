@@ -138,6 +138,7 @@ pub const CASES: &[&str] = &[
     "upsert_agent_with_a_spent_token_is_stale_and_writes_nothing",
     "upsert_agent_with_the_current_token_applies",
     "a_lease_ttl_out_of_range_is_refused",
+    "set_agent_box_enabled_switches_one_row_or_refuses",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -329,6 +330,9 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
             upsert_agent_with_the_current_token_applies(store).await
         }
         "a_lease_ttl_out_of_range_is_refused" => a_lease_ttl_out_of_range_is_refused(store).await,
+        "set_agent_box_enabled_switches_one_row_or_refuses" => {
+            set_agent_box_enabled_switches_one_row_or_refuses(store).await
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -1826,6 +1830,82 @@ async fn upsert_agent_box_cannot_write_quota<S: WriteStore>(store: &S) {
         .expect(
             "upsert_agent_box_cannot_write_quota: the latch still finds the row after two upserts",
         );
+}
+
+/// MOD-23 (plan D242, blueprint D249): `set_agent_box_enabled`, the per-box switch. It writes an
+/// absent pair bare, switches an existing pair off and back on, re-derives `enabled` from the
+/// stored probe when switching on (a status-less probe is not ready and is not an error), and
+/// refuses an unknown agent or box with `Constraint`. What the switch leaves alone, and that an
+/// upsert cannot undo it, is read back where a concrete store can be named
+/// (`mem.rs::a_switched_off_row_stays_off_under_an_upsert_that_says_enabled` and
+/// `pg_criteria.rs::a_switched_off_row_survives_a_re_probe_on_postgres`), because [`WriteStore`]
+/// has no registry read.
+async fn set_agent_box_enabled_switches_one_row_or_refuses<S: WriteStore>(store: &S) {
+    const CASE: &str = "set_agent_box_enabled_switches_one_row_or_refuses";
+
+    // The demo holds no `agent_box` row (blueprint F-19), so this pair is absent: the switch
+    // writes it rather than refusing it.
+    store
+        .set_agent_box_enabled(ids::AGENT_AGY, ids::BOX, false)
+        .await
+        .expect(CASE);
+
+    // A probe still lands on a switched-off row; it only cannot turn it back on.
+    let probed = AgentBox {
+        agent_id: ids::AGENT_AGY,
+        box_id: ids::BOX,
+        enabled: true,
+        version: Some("0.9.0".to_owned()),
+        path: Some("/usr/bin/agy".to_owned()),
+        probed_at: Some(Utc::now()),
+        quota: None,
+        quota_at: None,
+        updated_at: Utc::now(),
+        probe: Some(json!({ "status": "ready", "source": "probe" })),
+    };
+    store.upsert_agent_box(&probed).await.expect(CASE);
+
+    // An existing pair, on and then off.
+    store
+        .set_agent_box_enabled(ids::AGENT_AGY, ids::BOX, true)
+        .await
+        .expect(CASE);
+    store
+        .set_agent_box_enabled(ids::AGENT_AGY, ids::BOX, false)
+        .await
+        .expect(CASE);
+
+    // D249: a probe document without `status` switched on is "not ready", not a NOT NULL
+    // violation (`true AND NULL` on Postgres without the `COALESCE`).
+    store
+        .upsert_agent_box(&AgentBox {
+            probe: Some(json!({ "source": "probe" })),
+            ..probed
+        })
+        .await
+        .expect(CASE);
+    let status_less = store
+        .set_agent_box_enabled(ids::AGENT_AGY, ids::BOX, true)
+        .await;
+    assert!(
+        status_less.is_ok(),
+        "{CASE}: switching on over a status-less probe is not an error, got {status_less:?}"
+    );
+
+    let unknown_agent = store
+        .set_agent_box_enabled(AgentId::new(), ids::BOX, false)
+        .await;
+    assert!(
+        matches!(unknown_agent, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown agent is refused, got {unknown_agent:?}"
+    );
+    let unknown_box = store
+        .set_agent_box_enabled(ids::AGENT_AGY, BoxId::new(), true)
+        .await;
+    assert!(
+        matches!(unknown_box, Err(StoreError::Constraint(_))),
+        "{CASE}: an unknown box is refused, got {unknown_box:?}"
+    );
 }
 
 /// `set_step_prompt` writes `run_step.prompt_digest` and `run_step.trim_record`, both, on an

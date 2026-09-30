@@ -4,6 +4,7 @@
 //! snapshot suite is pinned to.
 #![cfg(feature = "testkit")]
 
+use htui::agent_settings::{AgentDraft, AgentWrite};
 use htui::app::{Action, Ctx, Handled};
 use htui::qdrant_settings_info::{QdrantSnapshot, QdrantState};
 use htui::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
@@ -256,6 +257,7 @@ fn probed_row(
             updated_at: htui_core::fixtures::demo_at(0, 0),
         },
         on_box: None,
+        user_off: false,
     };
     summary.on_box = Some(AgentBox {
         agent_id: summary.agent.id,
@@ -1563,9 +1565,10 @@ async fn a_failed_install_with_manual_steps_renders_them_under_the_table() {
 /// A failure the user cannot route around is one sentence on the hint line, not a pane.
 ///
 /// The sentence is shorter than MOD-20 wrote it: the idle hint gained `a authenticate` (MOD-21
-/// D20) and the hint row is one line of the 100-column frame, so a notice and the keys share it.
-/// What this case is about is that a failure with no steps *is* a notice, and a fixture long enough
-/// to be clipped at the frame's edge would be asserting the width rather than the routing.
+/// D20); since MOD-23 D245 the keys and the notice are two lines, so the notice no longer shares
+/// the keys' row. What this case is about is that a failure with no steps *is* a notice, and a
+/// fixture long enough to be clipped at the frame's edge would be asserting the width rather than
+/// the routing.
 #[tokio::test]
 async fn a_failure_without_manual_steps_is_a_notice() {
     let bench = SectionBench::new().await;
@@ -2650,6 +2653,1271 @@ async fn a_failed_or_idle_flow_leaves_a_notice_and_an_idle_section() {
         "the notice says what happened rather than implying the user did it: {rendered}"
     );
     assert!(rendered.contains("a authenticate"), "{rendered}");
+}
+
+// -------------------------------------------------------------------------------------------
+// MOD-23 T3: the registry editor (plan D230-D232, D244, D245; blueprint §5)
+// -------------------------------------------------------------------------------------------
+
+/// The label column of the form: `default model` and `enabled (y/n)` are both 13 wide (D231).
+const LABEL_WIDTH: usize = 13;
+
+/// The idle keys line (D245), written out rather than read from the section: this is the pin.
+const IDLE_KEYS: &str = "j/k select \u{b7} n new \u{b7} e edit \u{b7} t this box \u{b7} r probe \u{b7} i install \u{b7} a authenticate";
+
+/// The idle note line, the one limit of this section that is not a key (MOD-2 D73).
+const IDLE_NOTE: &str = "quota latches per chat, r cannot refresh it";
+
+/// What an edit that changed nothing says (blueprint §5.1).
+const UNCHANGED: &str = "nothing changed; nothing was written";
+
+/// `settings/mod.rs`'s `CHANGED_ELSEWHERE`, which is `pub(crate)`: the section's own sentence for
+/// a spent token under an open editor.
+const CHANGED_ELSEWHERE: &str = "changed elsewhere since you opened it \u{2014} reloaded; Enter retries against the current row";
+
+/// `settings/mod.rs`'s `DELETED_ELSEWHERE`, for the same reason.
+const DELETED_ELSEWHERE: &str = "deleted elsewhere \u{2014} the editor was closed";
+
+/// Review M-1: a `Stale` whose re-read changed fields the user had changed too names them.
+const CHANGED_ON_BOTH_SIDES: &str = "changed elsewhere \u{2014} reloaded; Enter retries \u{b7} also changed elsewhere: command, models";
+
+/// A valid create form, in `FIELD_LABELS` order: name, transport, command, args, models, default
+/// model, billing, enabled.
+const VALID_CREATE: [&str; 8] = [
+    "gamma",
+    "acp",
+    "/opt/demo/bin/agent",
+    "--flag 'a b'",
+    "m1, m2",
+    "m2",
+    "subscription",
+    "y",
+];
+
+/// Types `text` into a section one character at a time, as a terminal delivers it.
+fn typed(bench: &SectionBench, section: &mut AgentsSection, text: &str) {
+    for c in text.chars() {
+        let mut ctx = bench.ctx();
+        section.on_key(KeyEvent::from(KeyCode::Char(c)), &mut ctx);
+    }
+}
+
+/// Presses `chord` `times` times.
+fn pressed(bench: &SectionBench, section: &mut AgentsSection, chord: &str, times: usize) {
+    for _ in 0..times {
+        bench.key(section, chord);
+    }
+}
+
+/// Fills an open form from its focused field onwards: each value replaces the field's text, and
+/// `Tab` moves on after every value but the last, so focus ends on the last field filled.
+fn filled(bench: &SectionBench, section: &mut AgentsSection, values: &[&str]) {
+    for (index, value) in values.iter().enumerate() {
+        pressed(bench, section, "backspace", 64);
+        typed(bench, section, value);
+        if index + 1 < values.len() {
+            bench.key(section, "tab");
+        }
+    }
+}
+
+/// The text of one form field as drawn, or `None` when the form has no such field.
+fn field_of(rendered: &str, label: &str) -> Option<String> {
+    let prefix = format!("{label:<width$}: ", width = LABEL_WIDTH);
+    rendered
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .map(|rest| rest.trim_end().to_owned())
+}
+
+/// Whether the field labelled `label` holds the focus: its label is the accented one.
+fn focused_on(section: &AgentsSection, bench: &SectionBench, label: &str) -> bool {
+    let prefix = format!("{label:<width$}: ", width = LABEL_WIDTH);
+    accented_lines(section, &bench.ctx())
+        .iter()
+        // Trimmed: a field holding only spaces draws its label and nothing after the colon.
+        .any(|line| line.starts_with(prefix.trim_end()))
+}
+
+/// The section's last line: the note (D245).
+fn note_line(rendered: &str) -> String {
+    rendered
+        .lines()
+        .last()
+        .expect("the section always draws a note line")
+        .to_owned()
+}
+
+/// A registry row carrying a model list, a default and a stamp of its own, so an edit has
+/// something to prefill and a token to send.
+fn editable_row(name: &str) -> AgentSummary {
+    let mut row = registry_row(name, false);
+    row.agent.models = vec!["m1".to_owned(), "m2".to_owned()];
+    row.agent.default_model = Some("m1".to_owned());
+    row.agent.launch["args"] = json!(["--flag", "a b"]);
+    row.agent.updated_at = htui_core::fixtures::demo_at(1, 0);
+    row
+}
+
+/// The `AgentWritten` reply a write is answered with.
+fn written(agents: Vec<AgentSummary>, outcome: AgentWrite) -> StoreReply {
+    StoreReply::AgentWritten { agents, outcome }
+}
+
+/// `n` opens the create form, and from then on the section takes every printable key (F-11):
+/// `l` and `h` are letters, not section cycling, and so is `q`. A `CONTROL` chord still passes, so
+/// `ctrl-c` quits.
+#[tokio::test]
+async fn n_opens_the_create_form_and_captures_input() {
+    let bench = SectionBench::new().await;
+    let mut section = section_over(
+        &bench,
+        vec![registry_row("alpha", false), registry_row("beta", false)],
+    );
+    let _ = bench.drained();
+    assert!(!section.captures_input(), "browsing captures nothing");
+
+    assert_eq!(bench.key(&mut section, "n"), Handled::Consumed);
+    assert!(
+        section.captures_input(),
+        "an open form takes every printable key"
+    );
+    for chord in ["l", "h", "q"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Consumed, "{chord}");
+    }
+    assert_eq!(
+        bench.key(&mut section, "ctrl-c"),
+        Handled::Pass,
+        "a CONTROL chord passes, so the shell still quits"
+    );
+
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        field_of(&rendered, "name").as_deref(),
+        Some("lhq"),
+        "{rendered}"
+    );
+    assert_eq!(field_of(&rendered, "transport").as_deref(), Some("acp"));
+    assert_eq!(
+        field_of(&rendered, "billing").as_deref(),
+        Some("subscription")
+    );
+    assert_eq!(field_of(&rendered, "enabled (y/n)").as_deref(), Some("y"));
+    assert!(
+        rendered.contains("new agent \u{b7} settings from alpha"),
+        "the header names the highlighted row the settings come from (OQ-5): {rendered}"
+    );
+    assert!(
+        requests_of(&bench).is_empty(),
+        "opening a form asks for nothing"
+    );
+}
+
+/// F-11 through the whole tab: with the form open, `SettingsTab` hands `l` and `h` to the section
+/// instead of cycling, and `q` does not quit. Closing the form gives the tab its keys back.
+#[tokio::test]
+async fn the_settings_tab_gives_an_open_form_every_letter() {
+    let mut harness = Harness::demo().with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(AgentsSection::new()),
+        Box::new(ProbeSection),
+    ])));
+    harness.settle().await;
+
+    harness.key("n");
+    harness.key("l");
+    harness.key("h");
+    harness.key("q");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("box profile arrives with MOD-7"),
+        "`l` did not cycle to the next section: {frame}"
+    );
+    assert!(
+        frame.contains("lhq"),
+        "the letters landed in the form: {frame}"
+    );
+    assert!(!harness.app().should_quit, "`q` is a letter in the form");
+
+    harness.key("esc");
+    harness.key("l");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("box profile arrives with MOD-7"),
+        "with the form closed `l` cycles again: {frame}"
+    );
+}
+
+/// `Enter` sends exactly one `CreateAgent`, with the parsed draft and the highlighted row as the
+/// settings source; a second `Enter` before the reply is refused (F-20).
+#[tokio::test]
+async fn enter_on_the_create_form_sends_create_agent_with_the_parsed_draft_and_the_source_row() {
+    let bench = SectionBench::new().await;
+    let beta = registry_row("beta", false);
+    let beta_id = beta.agent.id;
+    let mut section = section_over(&bench, vec![registry_row("alpha", false), beta]);
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "n");
+    filled(&bench, &mut section, &VALID_CREATE);
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "enter"), Handled::Consumed);
+    let requests = requests_of(&bench);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    match &requests[0] {
+        StoreRequest::CreateAgent {
+            name,
+            draft,
+            settings_from,
+        } => {
+            assert_eq!(name, "gamma");
+            assert_eq!(
+                *draft,
+                AgentDraft {
+                    transport: Transport::Acp,
+                    command: "/opt/demo/bin/agent".to_owned(),
+                    args: vec!["--flag".to_owned(), "a b".to_owned()],
+                    models: vec!["m1".to_owned(), "m2".to_owned()],
+                    default_model: Some("m2".to_owned()),
+                    billing: Billing::Subscription,
+                    enabled: true,
+                }
+            );
+            assert_eq!(*settings_from, Some(beta_id), "the highlighted row");
+        }
+        other => panic!("expected CreateAgent, got {other:?}"),
+    }
+
+    assert_eq!(bench.key(&mut section, "enter"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert!(
+        !asked_anything(&emitted),
+        "one write at a time: {emitted:?}"
+    );
+    assert_eq!(
+        errors_of(&emitted),
+        vec!["`create_agent` is still in flight".to_owned()]
+    );
+}
+
+/// Every draft rule refuses locally, by field, before a request is spent: the note line starts
+/// with the field and the focus moves to it.
+#[tokio::test]
+async fn a_bad_field_is_refused_locally_by_name_and_sends_nothing() {
+    let bench = SectionBench::new().await;
+    for (index, bad, field) in [
+        (0, "Bad Name", "name"),
+        (0, "alpha", "name"),
+        (1, "ssh", "transport"),
+        (2, "  ", "command"),
+        (3, "'open", "args"),
+        (4, "m1, m1", "models"),
+        (5, "m9", "default model"),
+        (6, "free", "billing"),
+        (7, "maybe", "enabled (y/n)"),
+    ] {
+        let mut section = section_over(&bench, vec![registry_row("alpha", false)]);
+        bench.key(&mut section, "n");
+        let mut values = VALID_CREATE;
+        values[index] = bad;
+        filled(&bench, &mut section, &values);
+        let _ = bench.drained();
+
+        assert_eq!(bench.key(&mut section, "enter"), Handled::Consumed);
+        let emitted = bench.drained();
+        assert!(
+            !asked_anything(&emitted),
+            "`{bad}` sends nothing: {emitted:?}"
+        );
+        let rendered = render_section(&section, &bench.ctx());
+        let note = note_line(&rendered);
+        assert!(
+            note.starts_with(&format!("`{field}`: ")),
+            "`{bad}` is refused by `{field}`: `{note}`"
+        );
+        assert!(
+            section.captures_input(),
+            "the form stays open over its text"
+        );
+        assert!(
+            focused_on(&section, &bench, field),
+            "the focus moves to `{field}`:\n{rendered}"
+        );
+    }
+}
+
+/// `e` prefills the highlighted row: no `name` field, `args` as shell words, `env` nowhere on
+/// screen. `Enter` after one edit sends the row's own token.
+#[tokio::test]
+async fn e_prefills_the_highlighted_row_without_a_name_field_and_sends_its_token() {
+    let bench = SectionBench::new().await;
+    let mut row = editable_row("alpha");
+    row.agent.launch["env"] = json!({ "TOKEN": "s3cret-value" });
+    let (agent_id, expected) = (row.agent.id, row.agent.updated_at);
+    let mut section = section_over(&bench, vec![row]);
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    assert!(section.captures_input());
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        field_of(&rendered, "name"),
+        None,
+        "a name is never edited (D233)"
+    );
+    for (label, text) in [
+        ("transport", "acp"),
+        ("command", "${demo_server}"),
+        ("args", "--flag 'a b'"),
+        ("models", "m1, m2"),
+        ("default model", "m1"),
+        ("billing", "subscription"),
+        ("enabled (y/n)", "y"),
+    ] {
+        assert_eq!(
+            field_of(&rendered, label).as_deref(),
+            Some(text),
+            "`{label}`:\n{rendered}"
+        );
+    }
+    assert!(rendered.contains("edit alpha"), "{rendered}");
+    assert!(
+        !rendered.contains("s3cret-value") && !rendered.contains("TOKEN"),
+        "`env` is never shown (D235):\n{rendered}"
+    );
+
+    pressed(&bench, &mut section, "tab", 3);
+    typed(&bench, &mut section, ", m3");
+    bench.key(&mut section, "enter");
+    let requests = requests_of(&bench);
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    match &requests[0] {
+        StoreRequest::EditAgent {
+            agent_id: asked,
+            expected: token,
+            draft,
+        } => {
+            assert_eq!(*asked, agent_id);
+            assert_eq!(*token, expected, "the token the registry read answered");
+            assert_eq!(draft.models, ["m1", "m2", "m3"]);
+            assert_eq!(draft.args, ["--flag", "a b"], "the prefill round-trips");
+        }
+        other => panic!("expected EditAgent, got {other:?}"),
+    }
+}
+
+/// Review L-4: `e` over a row whose stored model name holds a comma opens nothing and says why:
+/// the form's comma-separated `models` would split the name on save.
+#[tokio::test]
+async fn e_refuses_a_row_whose_model_name_holds_a_comma() {
+    let bench = SectionBench::new().await;
+    let mut row = editable_row("alpha");
+    row.agent.models = vec!["m1".to_owned(), "vendor,model".to_owned()];
+    let mut section = section_over(&bench, vec![row]);
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(
+        errors_of(&emitted),
+        vec!["`models`: a stored model name contains a comma; edit it with SQL".to_owned()]
+    );
+    assert!(!asked_anything(&emitted), "{emitted:?}");
+    assert!(!section.captures_input(), "no form opened");
+}
+
+/// Plan D239's "unchanged closes": `e` then `Enter` writes nothing.
+#[tokio::test]
+async fn an_unchanged_edit_closes_without_a_write() {
+    let bench = SectionBench::new().await;
+    let mut section = section_over(&bench, vec![editable_row("alpha")]);
+    bench.key(&mut section, "e");
+    let _ = bench.drained();
+
+    bench.key(&mut section, "enter");
+    assert!(requests_of(&bench).is_empty(), "nothing to write");
+    assert!(!section.captures_input(), "the form closed");
+    assert_eq!(
+        note_line(&render_section(&section, &bench.ctx())),
+        UNCHANGED
+    );
+}
+
+/// `Edited` closes the form; the notice adds the re-probe clause only when `transport`, `command`
+/// or `args` changed (D246).
+#[tokio::test]
+async fn agent_written_edited_closes_the_form_and_says_re_probe_when_launch_changed() {
+    let bench = SectionBench::new().await;
+    let row = editable_row("alpha");
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row.clone()]);
+
+    bench.key(&mut section, "e");
+    pressed(&bench, &mut section, "tab", 2);
+    typed(&bench, &mut section, " --more");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &written(
+            vec![row.clone()],
+            AgentWrite::Edited {
+                id: agent_id,
+                name: "alpha".to_owned(),
+            },
+        ),
+    );
+    assert!(!section.captures_input(), "`Edited` closes the form");
+    let note = note_line(&render_section(&section, &bench.ctx()));
+    assert!(note.contains("saved `alpha`"), "{note}");
+    assert!(
+        note.contains("r probes now"),
+        "an args edit re-probes: {note}"
+    );
+
+    bench.key(&mut section, "e");
+    pressed(&bench, &mut section, "tab", 3);
+    typed(&bench, &mut section, ", mz");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &written(
+            vec![row],
+            AgentWrite::Edited {
+                id: agent_id,
+                name: "alpha".to_owned(),
+            },
+        ),
+    );
+    let note = note_line(&render_section(&section, &bench.ctx()));
+    assert!(note.contains("saved `alpha`"), "{note}");
+    assert!(
+        !note.contains("r probes now"),
+        "a models edit changes nothing a probe checked: {note}"
+    );
+}
+
+/// `Created` closes the form and moves the cursor onto the new row by id, wherever the re-read
+/// sorted it (F-14).
+#[tokio::test]
+async fn agent_written_created_selects_the_new_row() {
+    let bench = SectionBench::new().await;
+    let (alpha, gamma) = (registry_row("alpha", false), registry_row("gamma", false));
+    let mut section = section_over(&bench, vec![alpha.clone(), gamma.clone()]);
+    bench.key(&mut section, "n");
+    let mut values = VALID_CREATE;
+    values[0] = "beta";
+    filled(&bench, &mut section, &values);
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    let beta = registry_row("beta", false);
+    let beta_id = beta.agent.id;
+    bench.reply(
+        &mut section,
+        &written(
+            vec![alpha, beta, gamma],
+            AgentWrite::Created {
+                id: beta_id,
+                name: "beta".to_owned(),
+            },
+        ),
+    );
+    assert!(!section.captures_input(), "`Created` closes the form");
+    assert!(
+        accented_lines(&section, &bench.ctx())[0].starts_with("beta"),
+        "the cursor is on the new row"
+    );
+    let note = note_line(&render_section(&section, &bench.ctx()));
+    assert!(note.contains("created `beta`"), "{note}");
+    assert!(
+        !note.contains("settings.cli"),
+        "an acp row needs no cli block: {note}"
+    );
+}
+
+/// R-9 (F-13): a new `cli` row with no `settings.cli` block cannot chat yet, and the notice says so
+/// from the row's data alone.
+#[tokio::test]
+async fn a_created_cli_row_without_a_cli_block_says_so() {
+    let bench = SectionBench::new().await;
+    let mut section = section_over(&bench, vec![registry_row("alpha", false)]);
+    bench.key(&mut section, "n");
+    let mut values = VALID_CREATE;
+    values[1] = "cli";
+    filled(&bench, &mut section, &values);
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    let mut gamma = registry_row("gamma", false);
+    gamma.agent.transport = Transport::Cli;
+    let gamma_id = gamma.agent.id;
+    bench.reply(
+        &mut section,
+        &written(
+            vec![registry_row("alpha", false), gamma],
+            AgentWrite::Created {
+                id: gamma_id,
+                name: "gamma".to_owned(),
+            },
+        ),
+    );
+    let note = note_line(&render_section_at(&section, &bench.ctx(), 200));
+    assert!(note.contains("created `gamma`"), "{note}");
+    assert!(
+        note.contains("a `cli` row needs a settings.cli block to chat"),
+        "{note}"
+    );
+}
+
+/// `Stale` keeps the form and its text, takes the new token, and says so; the next `Enter` sends
+/// the new token.
+#[tokio::test]
+async fn agent_written_stale_keeps_the_text_and_takes_the_new_token() {
+    let bench = SectionBench::new().await;
+    let row = editable_row("alpha");
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row.clone()]);
+    bench.key(&mut section, "e");
+    pressed(&bench, &mut section, "tab", 3);
+    typed(&bench, &mut section, ", m9");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    let mut moved = row;
+    moved.agent.updated_at = htui_core::fixtures::demo_at(2, 0);
+    bench.reply(
+        &mut section,
+        &written(vec![moved], AgentWrite::Stale { id: agent_id }),
+    );
+    assert!(section.captures_input(), "the form stays open");
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        field_of(&rendered, "models").as_deref(),
+        Some("m1, m2, m9"),
+        "the typed text is kept"
+    );
+    assert_eq!(note_line(&rendered), CHANGED_ELSEWHERE);
+
+    bench.key(&mut section, "enter");
+    let requests = requests_of(&bench);
+    assert!(
+        matches!(
+            requests.as_slice(),
+            [StoreRequest::EditAgent { expected, .. }]
+                if *expected == htui_core::fixtures::demo_at(2, 0)
+        ),
+        "the retry carries the new token: {requests:?}"
+    );
+}
+
+/// Review M-1: a `Stale` reply rebases every field the user left alone onto the re-read row, so
+/// the retry carries another writer's change instead of silently reverting it; the fields the user
+/// changed keep their text.
+#[tokio::test]
+async fn agent_written_stale_rebases_untouched_fields() {
+    let bench = SectionBench::new().await;
+    let row = editable_row("alpha");
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row.clone()]);
+    bench.key(&mut section, "e");
+    pressed(&bench, &mut section, "tab", 3);
+    typed(&bench, &mut section, ", m9");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    let mut moved = row;
+    moved.agent.updated_at = htui_core::fixtures::demo_at(2, 0);
+    moved.agent.launch["command"] = json!("/opt/remote/bin/agent");
+    bench.reply(
+        &mut section,
+        &written(vec![moved], AgentWrite::Stale { id: agent_id }),
+    );
+    assert!(section.captures_input(), "the form stays open");
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        field_of(&rendered, "command").as_deref(),
+        Some("/opt/remote/bin/agent"),
+        "an untouched field takes the other writer's value:\n{rendered}"
+    );
+    assert_eq!(
+        field_of(&rendered, "models").as_deref(),
+        Some("m1, m2, m9"),
+        "the user's edit is kept"
+    );
+    assert_eq!(
+        note_line(&rendered),
+        CHANGED_ELSEWHERE,
+        "nothing clashed, so the plain sentence"
+    );
+
+    bench.key(&mut section, "enter");
+    let requests = requests_of(&bench);
+    match requests.as_slice() {
+        [
+            StoreRequest::EditAgent {
+                expected, draft, ..
+            },
+        ] => {
+            assert_eq!(*expected, htui_core::fixtures::demo_at(2, 0));
+            assert_eq!(
+                draft.command, "/opt/remote/bin/agent",
+                "the retry carries the other writer's command"
+            );
+            assert_eq!(draft.models, ["m1", "m2", "m9"], "and the user's models");
+            assert_eq!(draft.args, ["--flag", "a b"]);
+        }
+        other => panic!("expected one EditAgent, got {other:?}"),
+    }
+}
+
+/// Review M-1: a field changed on both sides keeps the user's text, and the notice names it (and
+/// only by label, never by value); a field only the other writer changed is rebased silently.
+#[tokio::test]
+async fn agent_written_stale_names_the_fields_changed_on_both_sides() {
+    let bench = SectionBench::new().await;
+    let row = editable_row("alpha");
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row.clone()]);
+    bench.key(&mut section, "e");
+    bench.key(&mut section, "tab");
+    filled(&bench, &mut section, &["/opt/mine/bin/agent"]);
+    pressed(&bench, &mut section, "tab", 2);
+    typed(&bench, &mut section, ", m9");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    let mut moved = row;
+    moved.agent.updated_at = htui_core::fixtures::demo_at(2, 0);
+    moved.agent.launch["command"] = json!("/opt/theirs/bin/agent");
+    moved.agent.launch["args"] = json!(["--theirs"]);
+    moved.agent.models = vec!["m1".to_owned(), "m7".to_owned()];
+    bench.reply(
+        &mut section,
+        &written(vec![moved], AgentWrite::Stale { id: agent_id }),
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        field_of(&rendered, "command").as_deref(),
+        Some("/opt/mine/bin/agent")
+    );
+    assert_eq!(field_of(&rendered, "models").as_deref(), Some("m1, m2, m9"));
+    assert_eq!(
+        field_of(&rendered, "args").as_deref(),
+        Some("--theirs"),
+        "a field only the other writer changed is rebased"
+    );
+    let note = note_line(&rendered);
+    assert_eq!(note, CHANGED_ON_BOTH_SIDES, "{rendered}");
+    assert!(
+        !note.contains("/opt/") && !note.contains("m7") && !note.contains("m9"),
+        "labels only, never a value: {note}"
+    );
+    assert!(
+        SECTION_BORDERED as usize >= CHANGED_ON_BOTH_SIDES.chars().count(),
+        "the notice fits the bordered pane"
+    );
+}
+
+/// Opens the edit form over `row`, fills its seven fields with `mine`, sends it, and answers it
+/// `Stale` with `theirs` as the re-read: the note line the rebase leaves.
+fn stale_note(
+    bench: &SectionBench,
+    row: &AgentSummary,
+    mine: &[&str; 7],
+    theirs: AgentSummary,
+) -> String {
+    let mut section = section_over(bench, vec![row.clone()]);
+    bench.key(&mut section, "e");
+    filled(bench, &mut section, mine);
+    bench.key(&mut section, "enter");
+    assert!(
+        matches!(
+            requests_of(bench).as_slice(),
+            [StoreRequest::EditAgent { .. }]
+        ),
+        "the edit is sent"
+    );
+    bench.reply(
+        &mut section,
+        &written(vec![theirs], AgentWrite::Stale { id: row.agent.id }),
+    );
+    note_line(&render_section_at(&section, &bench.ctx(), 200))
+}
+
+/// MOD-23 re-review Low-2: three clashing fields whose labels do not all fit are listed as many
+/// as fit, then counted, and the notice fits the bordered 98.
+#[tokio::test]
+async fn a_stale_with_three_clashes_counts_what_does_not_fit() {
+    let bench = SectionBench::new().await;
+    let row = editable_row("alpha");
+    let mut theirs = row.clone();
+    theirs.agent.updated_at = htui_core::fixtures::demo_at(2, 0);
+    theirs.agent.launch["command"] = json!("/opt/theirs/bin/agent");
+    theirs.agent.models = vec!["m1".to_owned(), "m7".to_owned()];
+    theirs.agent.default_model = Some("m7".to_owned());
+    let note = stale_note(
+        &bench,
+        &row,
+        &[
+            "acp",
+            "/opt/mine/bin/agent",
+            "--flag 'a b'",
+            "m1, m2, m9",
+            "m2",
+            "subscription",
+            "y",
+        ],
+        theirs,
+    );
+    assert_eq!(
+        note,
+        "changed elsewhere \u{2014} reloaded; Enter retries \u{b7} also changed elsewhere: command, \
+         models +1 more"
+    );
+    assert!(note.chars().count() <= SECTION_BORDERED as usize, "{note}");
+}
+
+/// MOD-23 re-review Low-2: all seven fields clashing still fit, with the count of the rest.
+#[tokio::test]
+async fn a_stale_with_all_seven_clashes_fits_and_counts_the_rest() {
+    let bench = SectionBench::new().await;
+    let row = editable_row("alpha");
+    let mut theirs = row.clone();
+    theirs.agent.updated_at = htui_core::fixtures::demo_at(2, 0);
+    theirs.agent.transport = Transport::Cli;
+    theirs.agent.launch["command"] = json!("/opt/theirs/bin/agent");
+    theirs.agent.launch["args"] = json!(["--theirs"]);
+    theirs.agent.models = vec!["m1".to_owned(), "m7".to_owned()];
+    theirs.agent.default_model = Some("m7".to_owned());
+    theirs.agent.billing = Billing::PerToken;
+    theirs.agent.enabled = false;
+    // Each of the user's texts differs from the prefill and from the re-read's, `CLI`, `PER_TOKEN`
+    // and `N` included: the comparison is of the text, as the form holds it.
+    let note = stale_note(
+        &bench,
+        &row,
+        &[
+            "CLI",
+            "/opt/mine/bin/agent",
+            "--mine",
+            "m1, m2, m9",
+            "m9",
+            "PER_TOKEN",
+            "N",
+        ],
+        theirs,
+    );
+    assert_eq!(
+        note,
+        "changed elsewhere \u{2014} reloaded; Enter retries \u{b7} also changed elsewhere: \
+         transport, command +5 more"
+    );
+    assert!(note.chars().count() <= SECTION_BORDERED as usize, "{note}");
+}
+
+/// `Gone` closes the form with the section's deleted sentence.
+#[tokio::test]
+async fn agent_written_gone_closes_with_deleted_elsewhere() {
+    let bench = SectionBench::new().await;
+    let row = editable_row("alpha");
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row]);
+    bench.key(&mut section, "e");
+    pressed(&bench, &mut section, "tab", 3);
+    typed(&bench, &mut section, ", m9");
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    bench.reply(
+        &mut section,
+        &written(Vec::new(), AgentWrite::Gone { id: agent_id }),
+    );
+    assert!(!section.captures_input(), "the form closed");
+    assert_eq!(
+        note_line(&render_section(&section, &bench.ctx())),
+        DELETED_ELSEWHERE
+    );
+}
+
+/// A `Failed` named in `REQUEST_NAMES` keeps the form open with the worker's sentence and clears
+/// the in-flight guard, so a second `Enter` sends.
+#[tokio::test]
+async fn a_refused_write_keeps_the_form_open_with_the_sentence() {
+    let bench = SectionBench::new().await;
+    let mut section = section_over(&bench, vec![registry_row("alpha", false)]);
+    bench.key(&mut section, "n");
+    filled(&bench, &mut section, &VALID_CREATE);
+    bench.key(&mut section, "enter");
+    let _ = bench.drained();
+
+    let message = "constraint violated: agent_name_key";
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "create_agent",
+            message: message.to_owned(),
+        },
+    );
+    assert!(
+        section.captures_input(),
+        "the form stays open over its text"
+    );
+    assert!(
+        note_line(&render_section(&section, &bench.ctx())).contains(message),
+        "the worker's sentence is on the note line"
+    );
+
+    bench.key(&mut section, "enter");
+    let requests = requests_of(&bench);
+    assert!(
+        matches!(requests.as_slice(), [StoreRequest::CreateAgent { .. }]),
+        "the guard is cleared and `Enter` retries: {requests:?}"
+    );
+}
+
+/// `settings/mod.rs`'s `CHANGED_ELSEWHERE_CLOSED`: a spent token with no form open to retry from.
+const CHANGED_ELSEWHERE_CLOSED: &str =
+    "changed elsewhere; nothing was written \u{2014} reopen the editor and retry";
+
+/// Review L-5 (a): `Esc` while an edit is in flight closes the form but not the guard, and each
+/// answer then lands on the closed-form branch: `Edited` says it saved, `Stale` says nothing was
+/// written and how to retry, and `Gone` says the row went. Each answer clears the guard.
+#[tokio::test]
+async fn esc_during_an_edit_then_each_answer_lands_on_the_closed_form() {
+    let bench = SectionBench::new().await;
+    let row = editable_row("alpha");
+    let agent_id = row.agent.id;
+    for (outcome, rows, expected) in [
+        (
+            AgentWrite::Edited {
+                id: agent_id,
+                name: "alpha".to_owned(),
+            },
+            vec![row.clone()],
+            "saved `alpha`",
+        ),
+        (
+            AgentWrite::Stale { id: agent_id },
+            vec![row.clone()],
+            CHANGED_ELSEWHERE_CLOSED,
+        ),
+        (
+            AgentWrite::Gone { id: agent_id },
+            Vec::new(),
+            "deleted elsewhere; nothing was written",
+        ),
+    ] {
+        let mut section = section_over(&bench, vec![row.clone()]);
+        bench.key(&mut section, "e");
+        pressed(&bench, &mut section, "tab", 2);
+        typed(&bench, &mut section, " --more");
+        bench.key(&mut section, "enter");
+        assert!(
+            matches!(
+                requests_of(&bench).as_slice(),
+                [StoreRequest::EditAgent { .. }]
+            ),
+            "the edit is in flight"
+        );
+
+        assert_eq!(bench.key(&mut section, "esc"), Handled::Consumed);
+        assert!(!section.captures_input(), "`Esc` closed the form");
+        bench.key(&mut section, "e");
+        assert_eq!(
+            errors_of(&bench.drained()),
+            vec!["`edit_agent` is still in flight".to_owned()],
+            "the guard outlives the form"
+        );
+
+        bench.reply(&mut section, &written(rows, outcome.clone()));
+        assert!(!section.captures_input(), "{outcome:?} opens nothing");
+        assert_eq!(
+            note_line(&render_section(&section, &bench.ctx())),
+            expected,
+            "{outcome:?}"
+        );
+        // `n` needs no row, so it answers the guard alone even after `Gone` emptied the table.
+        bench.key(&mut section, "n");
+        let emitted = bench.drained();
+        assert!(
+            errors_of(&emitted).is_empty() && section.captures_input(),
+            "{outcome:?} cleared the guard: {emitted:?}"
+        );
+    }
+}
+
+/// Review L-5 (b): only a registry write's own `Failed` clears the guard; a refusal of any other
+/// request the tab hands the section leaves the write in flight.
+#[tokio::test]
+async fn a_failed_for_another_request_does_not_clear_the_write_guard() {
+    let bench = SectionBench::new().await;
+    for other in [
+        "probe_agents",
+        "install_plan",
+        "auth_start",
+        "auth_open",
+        "box_edit",
+    ] {
+        let mut section = section_over(&bench, vec![registry_row("alpha", false)]);
+        bench.key(&mut section, "t");
+        let _ = bench.drained();
+
+        bench.reply(
+            &mut section,
+            &StoreReply::Failed {
+                request: other,
+                message: "refused".to_owned(),
+            },
+        );
+        bench.key(&mut section, "t");
+        let emitted = bench.drained();
+        assert_eq!(
+            errors_of(&emitted),
+            vec!["`set_agent_on_box` is still in flight".to_owned()],
+            "`{other}` is not this write's answer"
+        );
+        assert!(!asked_anything(&emitted), "`{other}`: {emitted:?}");
+    }
+}
+
+/// D240: a plain `Agents` reply (activation, a probe, a login's re-read) replaces the rows and
+/// never closes the form or moves its token.
+#[tokio::test]
+async fn an_agents_reply_does_not_close_the_form_or_move_its_token() {
+    let bench = SectionBench::new().await;
+    let row = editable_row("alpha");
+    let opened_at = row.agent.updated_at;
+    let mut section = section_over(&bench, vec![row.clone()]);
+    bench.key(&mut section, "e");
+    pressed(&bench, &mut section, "tab", 3);
+    typed(&bench, &mut section, ", m9");
+
+    let mut moved = row;
+    moved.agent.updated_at = htui_core::fixtures::demo_at(2, 0);
+    bench.reply(&mut section, &StoreReply::Agents(vec![moved]));
+    assert!(section.captures_input(), "the form is still open");
+
+    let _ = bench.drained();
+    bench.key(&mut section, "enter");
+    let requests = requests_of(&bench);
+    assert!(
+        matches!(
+            requests.as_slice(),
+            [StoreRequest::EditAgent { expected, .. }] if *expected == opened_at
+        ),
+        "the token is still the one the form opened on: {requests:?}"
+    );
+}
+
+/// `t` flips this box's switch: a row that is on is sent `enabled: false`, a switched-off row
+/// `enabled: true`. The reply's notice names the row.
+#[tokio::test]
+async fn t_sends_set_agent_on_box_with_the_inverse_of_the_switch() {
+    let bench = SectionBench::new().await;
+    let alpha = registry_row("alpha", false);
+    let mut beta = registry_row("beta", false);
+    beta.user_off = true;
+    let (alpha_id, beta_id) = (alpha.agent.id, beta.agent.id);
+    let mut section = section_over(&bench, vec![alpha.clone(), beta.clone()]);
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "t"), Handled::Consumed);
+    let requests = requests_of(&bench);
+    assert!(
+        matches!(
+            requests.as_slice(),
+            [StoreRequest::SetAgentOnBox { agent_id, enabled: false }] if *agent_id == alpha_id
+        ),
+        "{requests:?}"
+    );
+    let mut off = alpha;
+    off.user_off = true;
+    bench.reply(
+        &mut section,
+        &written(
+            vec![off, beta],
+            AgentWrite::Switched {
+                id: alpha_id,
+                name: "alpha".to_owned(),
+                enabled: false,
+            },
+        ),
+    );
+    let note = note_line(&render_section(&section, &bench.ctx()));
+    assert!(note.contains("`alpha` switched off on this box"), "{note}");
+
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "t");
+    let requests = requests_of(&bench);
+    assert!(
+        matches!(
+            requests.as_slice(),
+            [StoreRequest::SetAgentOnBox { agent_id, enabled: true }] if *agent_id == beta_id
+        ),
+        "{requests:?}"
+    );
+    // A row a probe has answered on this box: its verdict is what decides now.
+    let mut probed_beta = probed_row(
+        "beta",
+        true,
+        Some("0.48.0"),
+        Some(json!({ "status": "ready", "source": "probe" })),
+    );
+    probed_beta.agent.id = beta_id;
+    if let Some(on_box) = probed_beta.on_box.as_mut() {
+        on_box.agent_id = beta_id;
+    }
+    bench.reply(
+        &mut section,
+        &written(
+            vec![probed_beta],
+            AgentWrite::Switched {
+                id: beta_id,
+                name: "beta".to_owned(),
+                enabled: true,
+            },
+        ),
+    );
+    let note = note_line(&render_section(&section, &bench.ctx()));
+    assert!(
+        note.contains("`beta` switched on; the probe's verdict decides"),
+        "{note}"
+    );
+}
+
+/// Review L-2: switching on a row no probe has answered on this box says so and offers `r`, rather
+/// than promising a verdict that does not exist: no `agent_box` row, a bare one the switch wrote,
+/// and a row the re-read lacks all read the same.
+#[tokio::test]
+async fn switching_on_an_unprobed_row_says_not_probed_yet() {
+    let bench = SectionBench::new().await;
+    let absent = registry_row("absent", false);
+    let mut bare = probed_row("bare", true, None, None);
+    if let Some(on_box) = bare.on_box.as_mut() {
+        on_box.probed_at = None;
+    }
+    for (rows, id, name) in [
+        (vec![absent.clone()], absent.agent.id, "absent"),
+        (vec![bare.clone()], bare.agent.id, "bare"),
+        (Vec::new(), absent.agent.id, "absent"),
+    ] {
+        let mut section = section_over(&bench, rows.clone());
+        let _ = bench.drained();
+        bench.reply(
+            &mut section,
+            &written(
+                rows,
+                AgentWrite::Switched {
+                    id,
+                    name: name.to_owned(),
+                    enabled: true,
+                },
+            ),
+        );
+        assert_eq!(
+            note_line(&render_section(&section, &bench.ctx())),
+            format!("`{name}` switched on; not probed yet \u{b7} r probes")
+        );
+    }
+}
+
+/// D232: `n`, `e` and `t` are refused by one sentence while a probe, an install or a login runs.
+#[tokio::test]
+async fn n_e_and_t_are_refused_while_a_probe_an_install_or_a_login_runs() {
+    let bench = SectionBench::new().await;
+    let probing = {
+        let mut section = section_over(&bench, vec![registry_row("declared", true)]);
+        bench.key(&mut section, "r");
+        (section, "a probe is running; edit afterwards")
+    };
+    let installing = {
+        let mut section = section_over(&bench, vec![registry_row("declared", true)]);
+        bench.key(&mut section, "i");
+        (section, "an install is running; edit afterwards")
+    };
+    let logging_in = {
+        let mut section = section_over(
+            &bench,
+            vec![login_row(
+                "loginable",
+                ProbeStatus::Unauthenticated,
+                &[METHOD],
+            )],
+        );
+        bench.key(&mut section, "a");
+        (section, "a login is running; edit afterwards")
+    };
+    let _ = bench.drained();
+
+    for (mut section, expected) in [probing, installing, logging_in] {
+        for chord in ["n", "e", "t"] {
+            assert_eq!(bench.key(&mut section, chord), Handled::Consumed, "{chord}");
+            let emitted = bench.drained();
+            assert_eq!(errors_of(&emitted), vec![expected.to_owned()], "{chord}");
+            assert!(!asked_anything(&emitted), "{chord}: {emitted:?}");
+            assert!(!section.captures_input(), "{chord} opened nothing");
+        }
+    }
+}
+
+/// D232 and F-20: while a registry write is in flight, `r`, `i` and `a` are refused, and so are
+/// `n`, `e` and `t`; the guard clears on the write's own `Failed`.
+#[tokio::test]
+async fn r_i_and_a_are_refused_while_a_registry_write_is_in_flight() {
+    let bench = SectionBench::new().await;
+    let mut section = section_over(&bench, vec![registry_row("declared", true)]);
+    bench.key(&mut section, "t");
+    let _ = bench.drained();
+
+    for chord in ["r", "i", "a", "n", "e", "t"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Consumed, "{chord}");
+        let emitted = bench.drained();
+        assert_eq!(
+            errors_of(&emitted),
+            vec!["`set_agent_on_box` is still in flight".to_owned()],
+            "{chord}"
+        );
+        assert!(!asked_anything(&emitted), "{chord}: {emitted:?}");
+    }
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "set_agent_on_box",
+            message: "this box is not registered yet".to_owned(),
+        },
+    );
+    bench.key(&mut section, "t");
+    assert!(
+        matches!(
+            requests_of(&bench).as_slice(),
+            [StoreRequest::SetAgentOnBox { .. }]
+        ),
+        "the write's own `Failed` clears the guard"
+    );
+}
+
+/// D244: a row the human switched off on this box reads `switched off`, ahead of the probe's words,
+/// and the 12 characters fit the 13-wide column at the bordered width.
+#[tokio::test]
+async fn a_switched_off_row_reads_switched_off() {
+    let bench = SectionBench::new().await;
+    let mut row = probed_row(
+        "vetoed",
+        false,
+        Some("0.48.0"),
+        Some(json!({ "status": "ready", "source": "probe" })),
+    );
+    row.user_off = true;
+    let section = section_over(&bench, vec![row]);
+    let rendered = render_section_at(&section, &bench.ctx(), SECTION_BORDERED);
+    let bordered = SECTION_BORDERED as usize;
+    assert_eq!(
+        cell_at(
+            &rendered,
+            "vetoed",
+            bordered,
+            on_box_at(bordered),
+            ON_BOX_WIDTH
+        ),
+        "switched off",
+        "{rendered}"
+    );
+}
+
+/// D244: a row the switch inserted, never probed, reads `not probed` like an absent one.
+#[tokio::test]
+async fn a_bare_row_reads_not_probed() {
+    let bench = SectionBench::new().await;
+    let mut row = probed_row("bare", true, None, None);
+    if let Some(on_box) = row.on_box.as_mut() {
+        on_box.probed_at = None;
+    }
+    let section = section_over(&bench, vec![row]);
+    assert_eq!(
+        on_box_cell(&render_section(&section, &bench.ctx()), "bare"),
+        "not probed"
+    );
+}
+
+/// D245: the keys and the note are two lines, the note last (which is what
+/// [`the_idle_hint_says_r_cannot_refresh_quota`] reads).
+#[tokio::test]
+async fn the_idle_keys_and_the_quota_note_are_two_lines() {
+    let bench = SectionBench::new().await;
+    let section = section_over(&bench, vec![registry_row("declared", true)]);
+    let rendered = render_section(&section, &bench.ctx());
+    let lines: Vec<&str> = rendered.lines().collect();
+    assert_eq!(lines[lines.len() - 2], IDLE_KEYS, "{rendered}");
+    assert_eq!(lines[lines.len() - 1], IDLE_NOTE, "{rendered}");
+}
+
+/// The create form under the table (D230, D231).
+#[tokio::test]
+async fn the_create_form_renders_under_the_table() {
+    let bench = SectionBench::new().await;
+    let mut section = section_over(
+        &bench,
+        vec![registry_row("alpha", false), registry_row("beta", false)],
+    );
+    bench.key(&mut section, "n");
+    typed(&bench, &mut section, "gamma");
+    let rendered = render_section(&section, &bench.ctx());
+    insta::assert_snapshot!("agents_create_form", rendered);
+}
+
+/// The edit form over a row carrying the second seed's model list and default (F-24): the long
+/// `models` line is clipped with a leading `…` to its tail, and the 21-character default is whole.
+#[tokio::test]
+async fn the_edit_form_renders_the_rows_own_values() {
+    let bench = SectionBench::new().await;
+    let seeded = htui_core::model::agent::seed_rows(htui_core::fixtures::demo_at(0, 0))
+        .into_iter()
+        .max_by_key(|agent| agent.models.len())
+        .expect("the seeds carry a model list");
+    let mut row = registry_row("agent-b", false);
+    row.agent.models = seeded.models;
+    row.agent.default_model = seeded.default_model;
+    row.agent.launch["args"] = json!(["--flag", "a b"]);
+    let mut section = section_over(&bench, vec![registry_row("agent-a", false), row]);
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "e");
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        field_of(&rendered, "default model").as_deref(),
+        Some(SEEDED_MODEL),
+        "{rendered}"
+    );
+    assert!(
+        field_of(&rendered, "models").is_some_and(|models| models.starts_with('\u{2026}')),
+        "{rendered}"
+    );
+    insta::assert_snapshot!("agents_edit_form", rendered);
+}
+
+/// A switched-off row in the table, beside one that is on (D244).
+#[tokio::test]
+async fn a_switched_off_row_renders_in_the_table() {
+    let bench = SectionBench::new().await;
+    let on = probed_row(
+        "running",
+        true,
+        Some("0.48.0"),
+        Some(json!({ "status": "ready", "source": "probe" })),
+    );
+    let mut off = probed_row(
+        "vetoed",
+        false,
+        Some("0.48.0"),
+        Some(json!({ "status": "ready", "source": "probe" })),
+    );
+    off.user_off = true;
+    let section = section_over(&bench, vec![on, off]);
+    let rendered = render_section(&section, &bench.ctx());
+    insta::assert_snapshot!("agents_switched_off", rendered);
 }
 
 /// A Qdrant snapshot with the URL stored and no key.

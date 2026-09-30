@@ -37,6 +37,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 
+use crate::agent_settings::{self, AgentDraft, AgentWrite};
 use crate::agent_worker::{AgentRuntime, Served};
 use crate::box_settings::{self, BoxesSnapshot};
 use crate::catalogue::{self, CatalogueSnapshot};
@@ -231,6 +232,44 @@ pub enum StoreRequest {
         expected: i32,
         /// Only the edited field is `Some`.
         edit: BoxEdit,
+    },
+    /// Create one `agent` row from the Settings form (MOD-23 D239). The worker mints the id and
+    /// the clock, builds `launch` as `{command, args, env: {}}`, and copies `settings` from
+    /// `settings_from` (OQ-5) or starts from `{}`. Served in the loop by
+    /// [`agent_settings::serve`]; answered with [`StoreReply::AgentWritten`] (`Created`), or with
+    /// [`StoreReply::Failed`] for a refused name or field or a taken name. Offline:
+    /// `REGISTRY_ON_SERVER_ONLY`.
+    CreateAgent {
+        /// `agent.name`, as typed; checked again by the worker (D234).
+        name: String,
+        /// The parsed form; checked again by the worker (D247).
+        draft: AgentDraft,
+        /// The row whose `settings` document the new row starts from; `None`, or a row that is
+        /// gone by the time the worker reads, starts from `{}`.
+        settings_from: Option<AgentId>,
+    },
+    /// Edit one `agent` row as a compare-and-set on `updated_at` (MOD-40 D5, MOD-23 D239). `name`,
+    /// `settings` and every `launch` key but `command` and `args` are kept. Answered with
+    /// [`StoreReply::AgentWritten`] (`Edited`, `Stale` or `Gone`), or with [`StoreReply::Failed`]
+    /// for a refused field. Offline: `REGISTRY_ON_SERVER_ONLY`.
+    EditAgent {
+        /// The row.
+        agent_id: AgentId,
+        /// The `updated_at` of the row as a registry read answered it, never a built one (MOD-40
+        /// blueprint F-17).
+        expected: DateTime<Utc>,
+        /// The parsed form; checked again by the worker (D247).
+        draft: AgentDraft,
+    },
+    /// Switch one agent on or off on **this** box (MOD-23 D242): `agent_box.user_off`, through
+    /// `WriteStore::set_agent_box_enabled`. Answered with [`StoreReply::AgentWritten`]
+    /// (`Switched`), or with [`StoreReply::Failed`] before this box is registered. Offline:
+    /// `REGISTRY_ON_SERVER_ONLY`.
+    SetAgentOnBox {
+        /// The agent.
+        agent_id: AgentId,
+        /// `false` switches it off here; `true` returns it to the probe's verdict.
+        enabled: bool,
     },
     /// Pre-flight an adapter install for one registry row (MOD-20 D13, D18).
     ///
@@ -784,6 +823,10 @@ impl StoreRequest {
             // The two of `box_settings::REQUEST_NAMES`, in that order (MOD-7 milestone 2, D46).
             Self::Boxes => "boxes",
             Self::EditBox { .. } => "edit_box",
+            // The three of `agent_settings::REQUEST_NAMES`, in that order (MOD-23 D241).
+            Self::CreateAgent { .. } => "create_agent",
+            Self::EditAgent { .. } => "edit_agent",
+            Self::SetAgentOnBox { .. } => "set_agent_on_box",
             Self::InstallPlan { .. } => "install_plan",
             Self::InstallConfirm { .. } => "install_confirm",
             Self::InstallCancel => "install_cancel",
@@ -1060,6 +1103,16 @@ pub enum StoreReply {
     /// A box edit missed its token, or its box is gone (D46, D48): the boxes as they are now, for
     /// the editor to reload against. The editor keeps its typed text and retries only on save.
     BoxesStale(Box<BoxesSnapshot>),
+    /// The answer to every agent registry write (MOD-23 D240): the registry re-read after the
+    /// write, and what the write did. Self-naming (MOD-59): the Settings section lands a write on
+    /// this variant alone, and a plain [`StoreReply::Agents`] never closes its form or moves its
+    /// token.
+    AgentWritten {
+        /// The registry as it is now, ordered by name, whatever the outcome.
+        agents: Vec<AgentSummary>,
+        /// What the write did.
+        outcome: AgentWrite,
+    },
     /// The scope's requirements, freshly read: the answer to [`StoreRequest::Requirements`] and to
     /// every tab write that applied (MOD-39 plan P3).
     Requirements(Box<RequirementsSnapshot>),
@@ -1371,6 +1424,12 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::Boxes | StoreRequest::EditBox { .. } => {
             box_settings::serve(backend, request).await?
         }
+        // The three agent registry writes, or-ed for the reason the arms above are: a guard does
+        // not count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-23
+        // D241). Served here, in the loop: one statement and one read each (`R-NF-3`).
+        StoreRequest::CreateAgent { .. }
+        | StoreRequest::EditAgent { .. }
+        | StoreRequest::SetAgentOnBox { .. } => agent_settings::serve(backend, request).await?,
         // The ten requirement requests, or-ed for the reason the arms above are: a guard does not
         // count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-39 plan
         // P1).
@@ -3439,6 +3498,36 @@ mod tests {
                 .name(),
             ],
             box_settings::REQUEST_NAMES
+        );
+    }
+
+    /// The three agent registry requests are named exactly as `agent_settings::REQUEST_NAMES`
+    /// lists them, so the section's `Failed` match and the worker cannot drift apart (MOD-23
+    /// D241).
+    #[test]
+    fn agent_requests_are_named_as_agent_settings_lists_them() {
+        let draft = agent_settings::draft_of(&htui_core::model::agent::seed_rows(Utc::now())[0]);
+        assert_eq!(
+            [
+                StoreRequest::CreateAgent {
+                    name: "agent-x".to_owned(),
+                    draft: draft.clone(),
+                    settings_from: None,
+                }
+                .name(),
+                StoreRequest::EditAgent {
+                    agent_id: AgentId::new(),
+                    expected: Utc::now(),
+                    draft,
+                }
+                .name(),
+                StoreRequest::SetAgentOnBox {
+                    agent_id: AgentId::new(),
+                    enabled: false,
+                }
+                .name(),
+            ],
+            agent_settings::REQUEST_NAMES
         );
     }
 

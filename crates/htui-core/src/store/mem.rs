@@ -177,6 +177,10 @@ struct State {
     /// `agent_box`, keyed as its composite primary key is. Empty until something probes a box:
     /// no fixture loads it (MOD-2 plan D3).
     agent_boxes: HashMap<(AgentId, BoxId), AgentBox>,
+    /// `agent_box.user_off` (MOD-23 D242): the `(agent, box)` pairs the human switched off. A
+    /// side set rather than an `AgentBox` field, because the column is not part of the row type.
+    /// Written by [`WriteStore::set_agent_box_enabled`] only.
+    agent_boxes_off: HashSet<(AgentId, BoxId)>,
     /// `item_key_counter` (§4.1): the highest number minted per `(project, prefix)`.
     item_key_counter: HashMap<(ProjectId, String), i32>,
     /// `item`.
@@ -294,6 +298,7 @@ impl MemStore {
             app_settings: BTreeMap::new(),
             agents: data.agents.into_iter().map(|row| (row.id, row)).collect(),
             agent_boxes: HashMap::new(),
+            agent_boxes_off: HashSet::new(),
             item_key_counter: data.item_key_counter,
             items: data.items.into_iter().map(|row| (row.id, row)).collect(),
             revisions: data
@@ -1484,6 +1489,9 @@ impl State {
                     .this_box
                     .and_then(|box_id| self.agent_boxes.get(&(agent.id, box_id)))
                     .cloned(),
+                user_off: self
+                    .this_box
+                    .is_some_and(|box_id| self.agent_boxes_off.contains(&(agent.id, box_id))),
             })
             .collect()
     }
@@ -1653,6 +1661,11 @@ impl State {
     /// puts the stored pair back, which is the `SET quota = EXCLUDED.quota` the statement no longer
     /// carries. The two backends have to agree here or the conformance case passes on one and
     /// fails on the other.
+    ///
+    /// On the update, `enabled` is ANDed with the per-box switch (MOD-23 D242), which is
+    /// `SET enabled = EXCLUDED.enabled AND NOT user_off`: a row the human switched off on this box
+    /// stays off whatever the probe proposes. The insert is unchanged, since a fresh row has no
+    /// switch.
     fn upsert_agent_box(&mut self, row: &AgentBox, now: DateTime<Utc>) -> Result<()> {
         if !self.agents.contains_key(&row.agent_id) {
             return Err(StoreError::Constraint(format!(
@@ -1666,7 +1679,10 @@ impl State {
                 row.box_id
             )));
         }
-        match self.agent_boxes.get_mut(&(row.agent_id, row.box_id)) {
+        let key = (row.agent_id, row.box_id);
+        // Read before `get_mut` borrows `agent_boxes`: MOD-23 D242's veto.
+        let switched_off = self.agent_boxes_off.contains(&key);
+        match self.agent_boxes.get_mut(&key) {
             Some(stored) => {
                 // D74: `*stored = row.clone()` is this backend's spelling of
                 // `SET quota = EXCLUDED.quota`, so the stored pair is taken out and put back.
@@ -1674,6 +1690,7 @@ impl State {
                 *stored = row.clone();
                 stored.quota = quota;
                 stored.quota_at = quota_at;
+                stored.enabled = row.enabled && !switched_off;
                 stored.updated_at = now;
             }
             None => {
@@ -1683,7 +1700,7 @@ impl State {
                     quota_at: None,
                     ..row.clone()
                 };
-                self.agent_boxes.insert((row.agent_id, row.box_id), fresh);
+                self.agent_boxes.insert(key, fresh);
             }
         }
         Ok(())
@@ -1715,6 +1732,60 @@ impl State {
         row.quota_at = Some(quota_at);
         row.updated_at = now;
         Ok(true)
+    }
+
+    /// The per-box switch (MOD-23 D242): Postgres's one statement, written out. The referents in
+    /// `upsert_agent_box`'s order and with its sentences; then an absent row is inserted bare, and
+    /// a present one gets `enabled` (switched off) or the stored probe's verdict (switched on), with
+    /// `updated_at` bumped as the trigger does it there.
+    fn set_agent_box_enabled(
+        &mut self,
+        agent_id: AgentId,
+        box_id: BoxId,
+        enabled: bool,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        if !self.agents.contains_key(&agent_id) {
+            return Err(StoreError::Constraint(format!(
+                "agent_box.agent_id `{agent_id}` references no agent"
+            )));
+        }
+        if !self.boxes.contains_key(&box_id) {
+            return Err(StoreError::Constraint(format!(
+                "agent_box.box_id `{box_id}` references no box"
+            )));
+        }
+        let key = (agent_id, box_id);
+        if enabled {
+            self.agent_boxes_off.remove(&key);
+        } else {
+            self.agent_boxes_off.insert(key);
+        }
+        match self.agent_boxes.get_mut(&key) {
+            Some(row) => {
+                row.enabled = enabled && probe_says_ready(row.probe.as_ref());
+                row.updated_at = now;
+            }
+            None => {
+                // The column defaults of Postgres's two-column `INSERT`: never probed.
+                self.agent_boxes.insert(
+                    key,
+                    AgentBox {
+                        agent_id,
+                        box_id,
+                        enabled,
+                        version: None,
+                        path: None,
+                        probed_at: None,
+                        quota: None,
+                        quota_at: None,
+                        updated_at: now,
+                        probe: None,
+                    },
+                );
+            }
+        }
+        Ok(())
     }
 
     /// One box probe (MOD-7 D10): the nine probe columns, the whole `box_tool` set and the spec
@@ -5515,6 +5586,14 @@ fn rows(count: usize) -> u64 {
     u64::try_from(count).unwrap_or(u64::MAX)
 }
 
+/// The stored probe's verdict when the per-box switch goes back on (MOD-23 D242, blueprint D249):
+/// Postgres's `probe IS NULL OR COALESCE(probe->>'status' = 'ready', false)`, written out. No
+/// document is `true`; a document is ready only when its `status` is the string `ready`, so a
+/// JSON `null` and a document without a `status` are both `false`, as the `COALESCE` makes them.
+fn probe_says_ready(probe: Option<&Value>) -> bool {
+    probe.is_none_or(|doc| doc.get("status").and_then(Value::as_str) == Some("ready"))
+}
+
 /// The refusal both writers of `project.settings` give a blob that is not a JSON object (D7).
 ///
 /// One sentence rather than two: `set_setting` cannot merge a key into a scalar and `clear_setting`
@@ -5724,6 +5803,16 @@ impl WriteStore for MemStore {
     ) -> Result<bool> {
         let now = self.now();
         self.write(|state| state.set_agent_box_quota(agent_id, box_id, quota, quota_at, now))
+    }
+
+    async fn set_agent_box_enabled(
+        &self,
+        agent_id: AgentId,
+        box_id: BoxId,
+        enabled: bool,
+    ) -> Result<()> {
+        let now = self.now();
+        self.write(|state| state.set_agent_box_enabled(agent_id, box_id, enabled, now))
     }
 
     async fn record_box_probe(&self, probe: &BoxProbe) -> Result<()> {
@@ -7107,6 +7196,273 @@ mod tests {
                 })
             ),
             "a row that has never been probed has no columns to latch into, got {missing:?}"
+        );
+    }
+
+    /// MOD-23 (plan D242): this box's summary of one agent, read back through the inherent
+    /// registry read the Settings tab uses.
+    async fn this_box_summary(store: &MemStore, agent_id: AgentId) -> crate::model::AgentSummary {
+        store
+            .agents()
+            .await
+            .expect("agents must not fail")
+            .into_iter()
+            .find(|row| row.agent.id == agent_id)
+            .expect("the agent is registered")
+    }
+
+    /// MOD-23 (plan D242): a probed `agent_box` row for `agent_id` on `ids::BOX`, as the probe
+    /// writes one: `probe` is its §4.6 snapshot and `enabled` its verdict.
+    fn probed_box(agent_id: AgentId, probe: Value, enabled: bool) -> AgentBox {
+        let probed_at = Utc::now() - TimeDelta::hours(1);
+        AgentBox {
+            agent_id,
+            box_id: ids::BOX,
+            enabled,
+            version: Some("1.2.3".to_owned()),
+            path: Some("/usr/bin/agent".to_owned()),
+            probed_at: Some(probed_at),
+            quota: None,
+            quota_at: None,
+            updated_at: probed_at,
+            probe: Some(probe),
+        }
+    }
+
+    /// MOD-23 plan D242: the human vetoes and the probe cannot overrule. An upsert that says
+    /// `enabled: true` over a switched-off row writes every other column it owns and leaves
+    /// `enabled` false, which is Postgres's `enabled = EXCLUDED.enabled AND NOT user_off`.
+    #[tokio::test]
+    async fn a_switched_off_row_stays_off_under_an_upsert_that_says_enabled() {
+        let store = MemStore::demo();
+        let ready = probed_box(
+            ids::AGENT_CLAUDE,
+            json!({ "status": "ready", "source": "probe" }),
+            true,
+        );
+        store
+            .upsert_agent_box(&ready)
+            .await
+            .expect("the probe row lands");
+        store
+            .set_agent_box_enabled(ids::AGENT_CLAUDE, ids::BOX, false)
+            .await
+            .expect("the switch lands");
+
+        store
+            .upsert_agent_box(&AgentBox {
+                version: Some("1.3.0".to_owned()),
+                ..ready
+            })
+            .await
+            .expect("a re-probe lands on a switched-off row");
+
+        let summary = this_box_summary(&store, ids::AGENT_CLAUDE).await;
+        let row = summary.on_box.expect("this box has an agent_box row");
+        assert!(!row.enabled, "the re-probe cannot switch the row back on");
+        assert!(summary.user_off, "the switch is reported");
+        assert_eq!(
+            row.version.as_deref(),
+            Some("1.3.0"),
+            "the upsert still wrote the columns it owns: only `enabled` is vetoed"
+        );
+    }
+
+    /// MOD-23 plan D242, blueprint D249: switching on clears the veto and re-derives `enabled`
+    /// from the stored probe, so a row the probe found unusable stays unusable and a probe
+    /// document without a `status` reads as not ready rather than as an error.
+    #[tokio::test]
+    async fn switching_on_restores_the_probe_verdict() {
+        let store = MemStore::demo();
+        for (agent_id, probe, enabled) in [
+            (
+                ids::AGENT_CLAUDE,
+                json!({ "status": "ready", "source": "probe" }),
+                true,
+            ),
+            (
+                ids::AGENT_AGY,
+                json!({ "status": "unauthenticated", "source": "probe" }),
+                false,
+            ),
+            (ids::AGENT_CLAUDE_CLI, json!({ "source": "probe" }), false),
+        ] {
+            store
+                .upsert_agent_box(&probed_box(agent_id, probe, enabled))
+                .await
+                .expect("the probe row lands");
+            store
+                .set_agent_box_enabled(agent_id, ids::BOX, false)
+                .await
+                .expect("switched off");
+            store
+                .set_agent_box_enabled(agent_id, ids::BOX, true)
+                .await
+                .expect("switched back on");
+        }
+
+        let ready = this_box_summary(&store, ids::AGENT_CLAUDE).await;
+        assert!(
+            ready.on_box.as_ref().expect("a row").enabled,
+            "a `ready` row switched back on is enabled"
+        );
+        assert!(!ready.user_off, "and the veto is gone");
+
+        let unauthenticated = this_box_summary(&store, ids::AGENT_AGY).await;
+        assert!(
+            !unauthenticated.on_box.as_ref().expect("a row").enabled,
+            "an `unauthenticated` row switched back on is still unavailable"
+        );
+        assert!(
+            !unauthenticated.user_off,
+            "but it is the probe that says so now, not the switch"
+        );
+
+        let status_less = this_box_summary(&store, ids::AGENT_CLAUDE_CLI).await;
+        assert!(
+            !status_less.on_box.as_ref().expect("a row").enabled,
+            "a probe document without `status` is not ready (D249's COALESCE)"
+        );
+        assert!(!status_less.user_off, "and the switch-on landed");
+    }
+
+    /// MOD-23 plan D242: the switch is two columns wide, `user_off` and `enabled`. The probe's
+    /// columns and the quota latch's pair are byte-identical across an off and an on, and
+    /// `updated_at` moves as Postgres's `BEFORE UPDATE` trigger moves it.
+    #[tokio::test]
+    async fn the_switch_leaves_probe_version_path_probed_at_and_quota_alone() {
+        let store = MemStore::demo();
+        store
+            .upsert_agent_box(&probed_box(
+                ids::AGENT_CLAUDE,
+                json!({ "status": "ready", "source": "probe", "tools": { "claude": "1.2.3" } }),
+                true,
+            ))
+            .await
+            .expect("the probe row lands");
+        store
+            .set_agent_box_quota(
+                ids::AGENT_CLAUDE,
+                ids::BOX,
+                json!({ "source": "acp_meta_rate_limit", "spend": { "session_micros": 351 } }),
+                Utc::now(),
+            )
+            .await
+            .expect("the latch lands");
+        let before = this_box_summary(&store, ids::AGENT_CLAUDE)
+            .await
+            .on_box
+            .expect("a row");
+
+        store
+            .set_agent_box_enabled(ids::AGENT_CLAUDE, ids::BOX, false)
+            .await
+            .expect("switched off");
+        store
+            .set_agent_box_enabled(ids::AGENT_CLAUDE, ids::BOX, true)
+            .await
+            .expect("switched on");
+
+        let after = this_box_summary(&store, ids::AGENT_CLAUDE)
+            .await
+            .on_box
+            .expect("a row");
+        assert_eq!(
+            AgentBox {
+                updated_at: before.updated_at,
+                ..after.clone()
+            },
+            before,
+            "`probe`, `version`, `path`, `probed_at`, `quota` and `quota_at` are untouched, and \
+             a `ready` row switched off and on is enabled again"
+        );
+        assert!(
+            after.updated_at > before.updated_at,
+            "`updated_at` moves, as Postgres's `BEFORE UPDATE` trigger moves it"
+        );
+    }
+
+    /// MOD-23 plan D242: `user_off` is this box's. A switch on another box's row of the same
+    /// registry is not reported here, just as its `agent_box` row is not joined in.
+    #[tokio::test]
+    async fn agents_reports_user_off_for_this_box_only() {
+        let store = MemStore::demo();
+        let other = BoxId::new();
+        let mut elsewhere = store
+            .box_row(ids::BOX)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the fixture box");
+        elsewhere.id = other;
+        elsewhere.hostname = "elsewhere".to_owned();
+        store.write(|state| {
+            state.boxes.insert(other, elsewhere);
+        });
+
+        store
+            .set_agent_box_enabled(ids::AGENT_CLAUDE, ids::BOX, false)
+            .await
+            .expect("switched off here");
+        store
+            .set_agent_box_enabled(ids::AGENT_AGY, other, false)
+            .await
+            .expect("switched off elsewhere");
+
+        assert!(
+            this_box_summary(&store, ids::AGENT_CLAUDE).await.user_off,
+            "this box's switch is reported"
+        );
+        let agy = this_box_summary(&store, ids::AGENT_AGY).await;
+        assert!(!agy.user_off, "another box's switch is not this box's");
+        assert!(agy.on_box.is_none(), "nor is its row");
+
+        store
+            .set_agent_box_enabled(ids::AGENT_CLAUDE, ids::BOX, true)
+            .await
+            .expect("switched back on here");
+        assert!(
+            !this_box_summary(&store, ids::AGENT_CLAUDE).await.user_off,
+            "switching back on clears it"
+        );
+    }
+
+    /// MOD-23 plan D242, blueprint F-2: the switch on an agent this box has never probed inserts
+    /// a bare row, so the setting survives until the first probe. Every probe column is empty,
+    /// which is how a reader tells it from a probed row.
+    #[tokio::test]
+    async fn a_switch_on_an_unprobed_agent_inserts_a_bare_row() {
+        let store = MemStore::demo();
+        assert!(
+            this_box_summary(&store, ids::AGENT_AGY)
+                .await
+                .on_box
+                .is_none(),
+            "the demo holds no agent_box row"
+        );
+
+        store
+            .set_agent_box_enabled(ids::AGENT_AGY, ids::BOX, false)
+            .await
+            .expect("an absent pair is written, not refused");
+
+        let summary = this_box_summary(&store, ids::AGENT_AGY).await;
+        assert!(summary.user_off, "the switch is reported");
+        let row = summary.on_box.expect("the switch inserted a row");
+        assert_eq!(
+            AgentBox {
+                agent_id: ids::AGENT_AGY,
+                box_id: ids::BOX,
+                enabled: false,
+                version: None,
+                path: None,
+                probed_at: None,
+                quota: None,
+                quota_at: None,
+                updated_at: row.updated_at,
+                probe: None,
+            },
+            row,
+            "a bare row: switched off, and never probed"
         );
     }
 

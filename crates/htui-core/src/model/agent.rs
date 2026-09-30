@@ -67,7 +67,8 @@ pub struct AgentBox {
     pub agent_id: AgentId,
     /// `agent_box.box_id`.
     pub box_id: BoxId,
-    /// `agent_box.enabled`.
+    /// `agent_box.enabled`: the probe's verdict (`ready`), vetoed by the per-box switch
+    /// ([`AgentSummary::user_off`], MOD-23 D242).
     pub enabled: bool,
     /// `agent_box.version` as reported by the installed agent.
     pub version: Option<String>,
@@ -190,8 +191,14 @@ struct AgentSeed {
 pub struct AgentSummary {
     /// The `agent` row.
     pub agent: Agent,
-    /// This box's `agent_box` row; `Some` when a probe has run on this box, `None` otherwise.
+    /// This box's `agent_box` row; `Some` when a probe or the per-box switch wrote one, `None`
+    /// otherwise.
     pub on_box: Option<AgentBox>,
+    /// `agent_box.user_off` of this box's row (MOD-23 D242): the human switched this agent off on
+    /// this box, so no probe turns `on_box.enabled` back on. `false` when there is no row, and
+    /// always `false` from the offline mirror, which does not hold `agent_box`.
+    #[serde(default)]
+    pub user_off: bool,
 }
 
 #[cfg(test)]
