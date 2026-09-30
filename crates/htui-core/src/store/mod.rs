@@ -6,6 +6,7 @@
 pub mod error;
 pub mod mem;
 pub mod traits;
+mod worker;
 
 #[cfg(feature = "test-support")]
 pub mod conformance;
@@ -29,3 +30,4 @@ pub use traits::{
     step_slot_is_taken, summary_names_another_item, winner_is_not_settled,
     withdrawn_requirement_cited,
 };
+pub use worker::{RecorderStore, WorkerHost, WorkerStore};
