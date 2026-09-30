@@ -10,7 +10,9 @@
 //! the one is the negation of the other: what the hook decides is exactly what the window says on
 //! the panicking thread.
 
+use std::panic::PanicHookInfo;
 use std::sync::{Arc, Mutex};
+use std::thread::ThreadId;
 
 use htui_agent::contained;
 use htui_agent::excerpt::panic_is_contained;
@@ -18,22 +20,38 @@ use tokio::runtime::Builder;
 use tokio::sync::oneshot;
 use tokio::task::{JoinSet, yield_now};
 
+/// One panic as the hook saw it: its message, what the window said, and the thread it ran on.
+type Decision = (String, bool, ThreadId);
+
+/// The panics this test raises on purpose; any other message goes on to the previous hook.
+const CASE_PREFIXES: [&str; 2] = ["contained:", "raw:"];
+
 /// The decision recorded for the panic whose message is `key`, and how many panics carried it.
-fn decision(seen: &[(String, bool)], key: &str) -> (Option<bool>, usize) {
+fn decision(seen: &[Decision], key: &str) -> (Option<bool>, usize) {
     let matching: Vec<bool> = seen
         .iter()
-        .filter(|(message, _)| message == key)
-        .map(|(_, contained)| *contained)
+        .filter(|(message, _, _)| message == key)
+        .map(|(_, contained, _)| *contained)
         .collect();
     (matching.first().copied(), matching.len())
+}
+
+/// The thread the panic whose message is `key` ran on.
+fn thread_of(seen: &[Decision], key: &str) -> Option<ThreadId> {
+    seen.iter()
+        .find(|(message, _, _)| message == key)
+        .map(|(_, _, thread)| *thread)
 }
 
 #[test]
 fn every_contained_spawn_opens_the_window_and_a_raw_one_does_not() {
     // Built before the hook goes in, so a failure here still reports its message. Two workers, so
-    // every panic in cases 1-4 happens on a thread other than this one.
+    // every panic in cases 1-4 happens on a thread other than this one. One blocking thread, so
+    // case 4's raw closure runs on the very thread case 1's contained closure panicked on: its
+    // `false` then proves the window closed again after a panic, on a thread tokio reuses.
     let pool = Builder::new_multi_thread()
         .worker_threads(2)
+        .max_blocking_threads(1)
         .build()
         .expect("a two-worker runtime builds");
     // One thread for case 5: the parked task and the raw task must share it, or the raw task would
@@ -43,10 +61,14 @@ fn every_contained_spawn_opens_the_window_and_a_raw_one_does_not() {
         .expect("a current-thread runtime builds");
 
     // What the window said, per panic, keyed by the panic's message: the panics arrive from
-    // different threads, so their order means nothing. Replaces the default hook rather than
-    // chaining it: the four panics below are all expected. Nothing is asserted while this hook is
-    // installed, because a failing assertion's own message would land in the recorder (H-6).
-    let decisions: Arc<Mutex<Vec<(String, bool)>>> = Arc::default();
+    // different threads, so their order means nothing. The four expected panics are recorded and
+    // kept off stderr; any other panic goes on to the previous hook, so an unexpected one still
+    // prints. The asserts still wait until the hook is back (H-6): recorded, not printed, is how
+    // a case panic would read otherwise.
+    let previous: Arc<dyn Fn(&PanicHookInfo<'_>) + Send + Sync> =
+        Arc::from(std::panic::take_hook());
+    let forward = Arc::clone(&previous);
+    let decisions: Arc<Mutex<Vec<Decision>>> = Arc::default();
     let recorder = Arc::clone(&decisions);
     std::panic::set_hook(Box::new(move |info| {
         let payload = info.payload();
@@ -55,8 +77,15 @@ fn every_contained_spawn_opens_the_window_and_a_raw_one_does_not() {
             .map(|text| (*text).to_owned())
             .or_else(|| payload.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "<non-text>".to_owned());
+        if !CASE_PREFIXES
+            .iter()
+            .any(|prefix| message.starts_with(prefix))
+        {
+            forward(info);
+            return;
+        }
         if let Ok(mut seen) = recorder.lock() {
-            seen.push((message, panic_is_contained()));
+            seen.push((message, panic_is_contained(), std::thread::current().id()));
         }
     }));
 
@@ -144,7 +173,9 @@ fn every_contained_spawn_opens_the_window_and_a_raw_one_does_not() {
         }
     });
 
+    // The recorder comes off and the hook that was there before goes back.
     let _ = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| previous(info)));
     drop(pool);
     drop(current);
 
@@ -189,6 +220,12 @@ fn every_contained_spawn_opens_the_window_and_a_raw_one_does_not() {
          {seen:?}"
     );
     assert_eq!(seen.len(), 4, "four panics, four decisions: {seen:?}");
+    assert_eq!(
+        thread_of(&seen, "raw: blocking"),
+        thread_of(&seen, "contained: blocking"),
+        "case 4 reuses case 1's blocking thread (one blocking thread), so its `false` is a window \
+         closed after a panic: {seen:?}"
+    );
 
     let (inside, outside, after) =
         window.expect("case 5: both tasks on the current-thread runtime finished");
