@@ -1065,6 +1065,28 @@ impl SettingsSection for HierarchySection {
         !matches!(self.mode, Mode::Browse)
     }
 
+    /// MOD-22 review M-1: a bracketed paste into the open form's focused field, or into the
+    /// typed-slug confirmation. The warning before it is not a field: a paste there is dropped, so
+    /// its `y` advances nothing.
+    fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        match &mut self.mode {
+            Mode::Editing(editor) => {
+                if let Some(field) = editor.fields.get_mut(editor.focus) {
+                    field.input.on_paste(text);
+                }
+                Handled::Consumed
+            }
+            Mode::Deleting {
+                stage: DeleteStage::Typed { field, .. },
+                ..
+            } => {
+                field.on_paste(text);
+                Handled::Consumed
+            }
+            Mode::Browse | Mode::Deleting { .. } => Handled::Pass,
+        }
+    }
+
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         if matches!(self.mode, Mode::Editing(_)) {
             return self.on_editor_key(key, ctx);

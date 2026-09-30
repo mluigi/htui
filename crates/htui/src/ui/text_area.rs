@@ -7,9 +7,10 @@
 //! fed one at `skills/templates.rs:395` and `:698`, and that position has to land on the offending
 //! token. What changed is the *stepping* -- `Left`/`Right`/`Backspace`/`Delete` move by **grapheme
 //! cluster**, `set_cursor` floors to a cluster start, and `cursor_line_col` counts clusters -- so
-//! none of them can split a combining sequence (MOD-54 D8, D13). Hard lines only: no soft wrap, undo, selection, history, mask,
-//! bracketed paste or `Zeroizing` (MOD-9 PRD risk row 5; what it holds is not secret, though its
-//! `Debug` still prints lengths only). `ctrl-s` submits, because `Enter` breaks the line and no
+//! none of them can split a combining sequence (MOD-54 D8, D13). Hard lines only: no soft wrap, undo, selection, history, mask or
+//! `Zeroizing` (MOD-9 PRD risk row 5; what it holds is not secret, though its `Debug` still prints
+//! lengths only). A bracketed paste arrives whole through [`TextArea::on_paste`] (MOD-22 review
+//! M-1), its line breaks kept. `ctrl-s` submits, because `Enter` breaks the line and no
 //! terminal mode that reports `Ctrl+Enter` is enabled (MOD-7 plan OQ-16); every other chord
 //! passes to the caller. [`TextArea::with_text`] turns `\r\n` and a lone `\r` into `\n` (MOD-7
 //! D59), so the text it hands back is what an editor opened on compares against.
@@ -338,6 +339,24 @@ impl TextArea {
             .collect()
     }
 
+    /// A bracketed paste (MOD-22 review M-1), inserted at the cursor as typing it would: its line
+    /// breaks (`\r\n`, a lone `\r`, `\n`) become `\n`, every other control character is dropped.
+    pub fn on_paste(&mut self, text: &str) {
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\r' => {
+                    chars.next_if_eq(&'\n');
+                    self.insert('\n');
+                }
+                '\n' => self.insert('\n'),
+                c if c.is_control() => {}
+                c => self.insert(c),
+            }
+        }
+        self.goal_col = None;
+    }
+
     /// Inserts one char at the cursor and steps over the whole cluster it joined.
     ///
     /// A combining mark, a ZWJ or a variation selector merges into the cluster **before** it, which
@@ -568,6 +587,17 @@ mod tests {
 
     fn chord(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    /// MOD-22 review M-1: a paste keeps its lines, every spelling of a break becoming `\n`, and
+    /// drops the other control characters.
+    #[test]
+    fn a_paste_keeps_its_lines_and_drops_other_controls() {
+        let mut area = TextArea::with_text("<>");
+        area.set_cursor(1);
+        area.on_paste("a\r\nb\rc\nd\u{7}");
+        assert_eq!(area.text(), "<a\nb\nc\nd>");
+        assert_eq!(area.cursor(), "<a\nb\nc\nd".len(), "after the paste");
     }
 
     fn press(area: &mut TextArea, code: KeyCode) -> FieldOutcome {

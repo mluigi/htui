@@ -19,6 +19,7 @@ use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
 use crate::ui::tabs::{Tab, TabId, TabRegistry};
 use crate::ui::{Theme, layout, top_bar};
 use crossterm::event::{Event, KeyEvent, KeyEventKind};
+use zeroize::Zeroizing;
 
 /// What the status line says when anything but a tab asks for `$EDITOR` (MOD-9 D10): the outcome
 /// is handed back through `Tab::on_external_edit`, so there would be no one to hand it to.
@@ -407,14 +408,95 @@ impl App {
         self.drain(&origin);
     }
 
-    /// A terminal event. Only key presses reach views; a resize just asks for a redraw.
+    /// A terminal event. Key presses and bracketed pastes reach views; a resize just asks for a
+    /// redraw.
     pub fn on_terminal_event(&mut self, event: Event) {
         match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 self.on_key(key);
             }
+            // Wrapped before anything reads it: a paste may be a credential (MOD-22's redirect),
+            // and this buffer is wiped however the paste ends.
+            Event::Paste(text) => self.on_paste(&Zeroizing::new(text)),
             Event::Resize(_, _) => self.dirty = true,
             _ => {}
+        }
+    }
+
+    /// A bracketed paste (MOD-22 review M-1): the propagation chain of [`on_key`](Self::on_key)
+    /// with **no keymap in it**. The top overlay, then — unless that overlay is modal — the active
+    /// tab, each taking it only into a field it is capturing input with; whatever none of them
+    /// takes is dropped and does nothing else. So a paste made before a field is open is never a
+    /// key: its digits switch no tab, its `/` opens no filter, its `q` quits nothing.
+    ///
+    /// Unlike a key it does not clear the status line: a paste nothing took did nothing, and one a
+    /// field refused says why through the same line.
+    pub fn on_paste(&mut self, text: &Zeroizing<String>) {
+        self.dirty = true;
+
+        if let Some(id) = self.overlays.top().map(Overlay::id) {
+            let origin = Origin::Overlay(id);
+            let handled = {
+                let Self {
+                    scope,
+                    projects,
+                    top_bar,
+                    keymap,
+                    theme,
+                    emit,
+                    overlays,
+                    ..
+                } = self;
+                match overlays.top_mut() {
+                    Some(top) => {
+                        let mut ctx = Ctx::new(
+                            scope,
+                            projects,
+                            top_bar,
+                            keymap,
+                            theme,
+                            origin.clone(),
+                            emit,
+                        );
+                        top.on_paste(text, &mut ctx)
+                    }
+                    None => Handled::Pass,
+                }
+            };
+            self.drain(&origin);
+            if handled == Handled::Consumed || self.overlays.top().is_some_and(Overlay::is_modal) {
+                return;
+            }
+        }
+
+        if let Some(id) = self.tabs.active_id() {
+            let origin = Origin::Tab(id);
+            {
+                let Self {
+                    scope,
+                    projects,
+                    top_bar,
+                    keymap,
+                    theme,
+                    emit,
+                    tabs,
+                    ..
+                } = self;
+                if let Some(tab) = tabs.active_mut() {
+                    let mut ctx = Ctx::new(
+                        scope,
+                        projects,
+                        top_bar,
+                        keymap,
+                        theme,
+                        origin.clone(),
+                        emit,
+                    );
+                    // `Pass` is the drop: there is no keymap for a paste to fall through to.
+                    let _ = tab.on_paste(text, &mut ctx);
+                }
+            }
+            self.drain(&origin);
         }
     }
 

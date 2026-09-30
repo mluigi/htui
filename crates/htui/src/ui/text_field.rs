@@ -7,7 +7,16 @@
 //! sequence. Every cell count in this file comes from that one module, so it cannot drift from
 //! `ratatui`, which is what actually draws the result.
 //!
-//! Multi-line, history, bracketed paste, a reveal toggle and validation are deliberately not built.
+//! Multi-line, history, a reveal toggle and validation are deliberately not built.
+//!
+//! **Bracketed paste** (MOD-22 review M-1) arrives as one [`on_paste`](TextField::on_paste), never
+//! as keys: the shell enables the terminal's bracketed-paste mode, so a paste is one
+//! `Event::Paste` that reaches a field only while its view captures input, and is dropped —
+//! wiped — anywhere else. Before that mode a paste was replayed as keystrokes, so text pasted
+//! before a field was open ran as commands: its digits switched tabs, its `/` opened an unmasked
+//! filter and the rest of it (an OAuth `?code=…`) was echoed there in clear. A paste into this
+//! single-line widget drops its line breaks and every other control character, and a masked field
+//! takes one only whole and only within the capacity it was opened with.
 //!
 //! **`Zeroizing` arrived with milestone 6** (D3), and it covers exactly this much: the buffer is
 //! wiped when the field drops, when [`clear`](TextField::clear) is called, and — because
@@ -26,6 +35,11 @@ use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::ui::Theme;
 use crate::ui::cells::{cell_width, graphemes};
+
+/// What a view says when a paste does not fit a masked field's reservation and was refused whole
+/// (MOD-22 review M-1).
+pub const PASTE_DOES_NOT_FIT: &str =
+    "the pasted text is longer than this field holds; nothing was pasted";
 
 /// What one key did to the field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +197,39 @@ impl TextField {
             KeyCode::Esc => FieldOutcome::Cancel,
             _ => FieldOutcome::Pass,
         }
+    }
+
+    /// A bracketed paste (MOD-22 review M-1), inserted at the cursor as one edit; `false` when it
+    /// was refused and the field is unchanged.
+    ///
+    /// One line: line breaks and every other control character are dropped rather than inserted,
+    /// so a copied trailing newline is not an `Enter`. A **masked** field takes the paste only
+    /// whole and only when it fits the capacity the field was opened with
+    /// ([`masked_with_capacity`](TextField::masked_with_capacity)), so its buffer never
+    /// reallocates and no prefix of a secret is freed unwiped on the way; one that does not fit is
+    /// refused whole (`false`) for the caller to say so. An unmasked field grows as it needs to,
+    /// reserving once.
+    pub fn on_paste(&mut self, text: &str) -> bool {
+        let kept = || text.chars().filter(|c| !c.is_control());
+        let adds: usize = kept().map(char::len_utf8).sum();
+        if adds == 0 {
+            return true;
+        }
+        if self.masked && self.text.len() + adds > self.text.capacity() {
+            return false;
+        }
+        self.text.reserve(adds);
+        let mut at = self.byte_of(self.cursor);
+        for c in kept() {
+            self.text.insert(at, c);
+            at += c.len_utf8();
+        }
+        self.cursor = self
+            .text
+            .grapheme_indices(true)
+            .take_while(|(byte, _)| *byte < at)
+            .count();
+        true
     }
 
     /// What was typed, or `None` while the field is masked.
@@ -707,6 +754,50 @@ mod tests {
             "600 bytes fitted in the first allocation, so nothing was freed unwiped"
         );
         assert_eq!(field.take(), paste);
+    }
+
+    /// Review M-1: a paste is one insertion at the cursor, its line breaks and control characters
+    /// dropped, and the cursor lands after it.
+    #[test]
+    fn a_paste_inserts_at_the_cursor_without_line_breaks() {
+        let mut field = TextField::with_text("ae");
+        field.on_key(key(KeyCode::Left));
+        assert!(field.on_paste("b\r\nc\td\u{7}\n"));
+        assert_eq!(field.text(), Some("abcde"));
+        assert_eq!(field.cursor, 4, "after the pasted `d`, before `e`");
+
+        assert!(field.on_paste("\n\r"), "nothing to insert is not a refusal");
+        assert_eq!(field.text(), Some("abcde"));
+
+        let mut marks = TextField::with_text("x");
+        assert!(marks.on_paste("a\u{301}\u{1f468}\u{200d}\u{1f469}"));
+        assert_eq!(marks.len(), 3);
+        assert_eq!(marks.cursor, 3, "the cursor counts clusters, not chars");
+    }
+
+    /// Review M-1: a masked field takes a paste within its reservation — drawn as dots — and
+    /// refuses one past it whole, so the buffer never reallocates.
+    #[test]
+    fn a_masked_field_takes_a_paste_that_fits_and_refuses_one_that_does_not() {
+        let mut field = TextField::masked_with_capacity(64);
+        let reserved = field.text.capacity();
+        assert!(field.on_paste("hunter2\n"));
+        assert_eq!(drawn_text(&field, 12, true), "•••••••  (7)");
+        assert_eq!(field.text(), None, "and it is still unreadable");
+
+        assert!(
+            !field.on_paste(&"x".repeat(reserved)),
+            "a paste past the reservation is refused"
+        );
+        assert_eq!(field.len(), 7, "whole: nothing of it went in");
+        assert_eq!(field.text.capacity(), reserved);
+
+        assert!(
+            field.on_paste(&"y".repeat(reserved - 7)),
+            "one that fits exactly"
+        );
+        assert_eq!(field.text.capacity(), reserved, "and nothing reallocated");
+        assert_eq!(field.take().len(), reserved);
     }
 
     /// D3: `clear` wipes the buffer where it is instead of dropping it.

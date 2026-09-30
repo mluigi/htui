@@ -1107,6 +1107,27 @@ impl Tab for RequirementsTab {
         }
     }
 
+    /// MOD-22 review M-1: a bracketed paste into the filter — which then filters by it, as typing
+    /// it would — or into the open form's focused field. While a write is in flight the form
+    /// swallows it, as it swallows keys.
+    fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        match &mut self.mode {
+            Mode::Browse => return Handled::Pass,
+            Mode::Filter { field } => {
+                field.on_paste(text);
+                field
+                    .text()
+                    .unwrap_or_default()
+                    .clone_into(&mut self.filter);
+            }
+            _ if self.busy.is_some() => {}
+            Mode::NewArea(form) => form.on_paste(text),
+            Mode::Requirement(form) => form.on_paste(text),
+            Mode::Withdraw(form) => form.on_paste(text),
+        }
+        Handled::Consumed
+    }
+
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::Requirements(snapshot) => {

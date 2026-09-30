@@ -55,6 +55,28 @@ impl Composer {
         self.text.clear();
     }
 
+    /// A bracketed paste (MOD-22 review M-1), appended as typing it would be — the composer is one
+    /// line, so each line break becomes one space and every other control character is dropped.
+    /// `false` while the composer is closed: then it is not its to take.
+    pub fn on_paste(&mut self, text: &str) -> bool {
+        if !self.active {
+            return false;
+        }
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\r' => {
+                    chars.next_if_eq(&'\n');
+                    self.text.push(' ');
+                }
+                '\n' => self.text.push(' '),
+                c if c.is_control() => {}
+                c => self.text.push(c),
+            }
+        }
+        true
+    }
+
     /// Feeds one key.
     pub fn on_key(&mut self, key: KeyEvent) -> ComposerOutcome {
         if !self.active {
@@ -106,6 +128,20 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::from(code)
+    }
+
+    /// MOD-22 review M-1: an open composer takes a paste on its one line, breaks as spaces; a
+    /// closed one takes nothing.
+    #[test]
+    fn a_paste_lands_in_an_open_composer_only() {
+        let mut composer = Composer::default();
+        assert!(!composer.on_paste("ignored"));
+        assert_eq!(composer.text(), "");
+
+        composer.enter();
+        assert!(composer.on_paste("one\r\ntwo\nthree\u{7}"));
+        assert_eq!(composer.text(), "one two three");
+        assert!(composer.is_active(), "a pasted newline is not an Enter");
     }
 
     #[test]

@@ -12,6 +12,13 @@
 //! D217). Nothing here may take a ratatui init again, and `Suspend::enter` has to say so for
 //! itself: the temptation arrives mid-session, with a terminal already up and no ratatui init
 //! running to defer to.
+//!
+//! **Bracketed paste** (MOD-22 review M-1) is on for exactly as long as the alternate screen is:
+//! [`init`] and `Suspend::enter` turn it on with the screen, and every way the terminal is given
+//! back — [`restore_terminal`] (the panic hook and [`TerminalGuard`]'s restore) and
+//! `Suspend::leave` — turns it off first. With it on, a paste is one `Event::Paste` the shell
+//! routes to a capturing field or drops; without it, a paste is replayed as keystrokes and runs as
+//! commands wherever no field is open.
 
 use ratatui::{DefaultTerminal, Terminal, backend::CrosstermBackend};
 
@@ -26,8 +33,8 @@ pub struct TerminalGuard {
 
 /// Installs the panic hook and takes the terminal over.
 ///
-/// Panics if the terminal cannot be put into raw mode, cannot be given the alternate screen, or
-/// cannot be measured: the three `expect`s below. That is [`ratatui::init()`]'s contract — it is
+/// Panics if the terminal cannot be put into raw mode, cannot be given the alternate screen and
+/// bracketed paste, or cannot be measured: the three `expect`s below. That is [`ratatui::init()`]'s contract — it is
 /// `try_init().expect(...)` — now covering the two steps this crate performs itself. There is no
 /// usable TUI in any of the three cases and `lib.rs::run` has no error path for one.
 ///
@@ -43,8 +50,12 @@ pub fn init() -> TerminalGuard {
     // crate back where MOD-56 found it, with the predicate right and the terminal gone anyway.
     // `tests/panic_hook_order.rs` is what keeps this shape.
     crossterm::terminal::enable_raw_mode().expect("htui cannot put the terminal into raw mode");
-    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)
-        .expect("htui cannot enter the alternate screen");
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste
+    )
+    .expect("htui cannot enter the alternate screen");
     let backend = CrosstermBackend::new(std::io::stdout());
     TerminalGuard {
         terminal: Terminal::new(backend).expect("htui cannot measure the terminal"),
@@ -57,12 +68,20 @@ pub fn init() -> TerminalGuard {
 /// Without it a panic leaves the alternate screen up and raw mode on, and the backtrace is drawn
 /// over the TUI's last frame.
 pub fn install_panic_hook() {
-    install_panic_hook_restoring(ratatui::restore);
+    install_panic_hook_restoring(restore_terminal);
+}
+
+/// Gives the terminal back: bracketed paste off (MOD-22 review M-1), then `ratatui::restore` —
+/// raw mode off and the alternate screen left. Best effort, as `ratatui::restore` is: a stdout
+/// that cannot take the one escape sequence is not a reason to stop giving the rest back.
+pub fn restore_terminal() {
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+    ratatui::restore();
 }
 
 /// The hook, with the restore it performs as a parameter.
 ///
-/// [`install_panic_hook`] is this with `ratatui::restore`, which is the only restore this crate
+/// [`install_panic_hook`] is this with [`restore_terminal`], which is the only restore this crate
 /// ever wants. The seam is public for one reason: the test that has to prove the *decision*
 /// reaches the restore runs the real chain, and it is an integration test in another binary that
 /// cannot see a private function (MOD-56 D218). Before the seam it could only assert
@@ -105,17 +124,19 @@ impl TerminalGuard {
     /// Gives the terminal back. Idempotent: [`Drop`] calls it again and it does nothing.
     pub fn restore(&mut self) {
         if !self.restored {
-            ratatui::restore();
+            restore_terminal();
             self.restored = true;
         }
     }
 }
 
 impl crate::editor::Suspend for TerminalGuard {
-    /// Show the cursor (every draw hid it), then `ratatui::try_restore` (MOD-9 D22). `restored` is
-    /// not touched: this is a pause, not the end.
+    /// Show the cursor (every draw hid it), bracketed paste off so the editor gets its own paste
+    /// (MOD-22 review M-1), then `ratatui::try_restore` (MOD-9 D22). `restored` is not touched:
+    /// this is a pause, not the end.
     fn leave(&mut self) -> std::io::Result<()> {
         self.terminal.show_cursor()?;
+        crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste)?;
         ratatui::try_restore()
     }
 
@@ -127,7 +148,11 @@ impl crate::editor::Suspend for TerminalGuard {
     /// defect this file just closed (D221).
     fn enter(&mut self) -> std::io::Result<()> {
         crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+        crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableBracketedPaste
+        )?;
         self.terminal.clear()
     }
 }
@@ -135,5 +160,61 @@ impl crate::editor::Suspend for TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         self.restore();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// This file with its comments removed, as `tests/panic_hook_order.rs` reads it.
+    fn code() -> String {
+        include_str!("terminal.rs")
+            .lines()
+            .map(|line| line.find("//").map_or(line, |at| &line[..at]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The body of the item that starts at `head`, up to the next item at the same indent.
+    fn body<'a>(code: &'a str, head: &str) -> &'a str {
+        let start = code
+            .find(head)
+            .unwrap_or_else(|| panic!("`{head}` is in terminal.rs"));
+        let rest = &code[start..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .into_iter()
+            .chain(rest[1..].find("\npub fn "))
+            .min()
+            .map_or(rest.len(), |at| at + 1);
+        &rest[..end]
+    }
+
+    /// MOD-22 review M-1: bracketed paste is on wherever the alternate screen is taken and off
+    /// wherever the terminal is given back. A paste replayed as keystrokes runs as commands, so a
+    /// path that forgot either half is the credential leak this closes.
+    #[test]
+    fn every_path_that_takes_the_terminal_enables_bracketed_paste_and_every_restore_disables_it() {
+        let code = code();
+        for taking in ["pub fn init()", "fn enter(&mut self)"] {
+            assert!(
+                body(&code, taking).contains("EnableBracketedPaste"),
+                "`{taking}` takes the screen without bracketed paste"
+            );
+        }
+        for giving in ["pub fn restore_terminal()", "fn leave(&mut self)"] {
+            let body = body(&code, giving);
+            assert!(
+                body.contains("DisableBracketedPaste"),
+                "`{giving}` gives the terminal back with bracketed paste still on"
+            );
+        }
+        assert!(
+            body(&code, "pub fn install_panic_hook()").contains("restore_terminal"),
+            "the panic hook restores through `restore_terminal`"
+        );
+        assert!(
+            body(&code, "pub fn restore(&mut self)").contains("restore_terminal()"),
+            "the guard restores through `restore_terminal`"
+        );
     }
 }

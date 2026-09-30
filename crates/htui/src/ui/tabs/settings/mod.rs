@@ -151,6 +151,12 @@ pub trait SettingsSection {
     }
     /// A key the tab did not use for section navigation.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled;
+    /// A bracketed paste, offered only while [`captures_input`](SettingsSection::captures_input)
+    /// is true (MOD-22 review M-1): the focused field takes it whole. Defaulted to `Pass`, which
+    /// the shell drops.
+    fn on_paste(&mut self, _text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        Handled::Pass
+    }
     /// A reply addressed to the Settings tab. Sections that do not care ignore it.
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
     /// Draws below the section strip.
@@ -341,6 +347,15 @@ impl Tab for SettingsTab {
             _ => {}
         }
         self.delegate(key, ctx)
+    }
+
+    /// Only to a section that is taking text (MOD-22 review M-1); anywhere else a paste is not
+    /// a key and is not a cycle, it is nothing.
+    fn on_paste(&mut self, text: &str, ctx: &mut Ctx<'_>) -> Handled {
+        match self.sections.sections.get_mut(self.sections.active) {
+            Some(section) if section.captures_input() => section.on_paste(text, ctx),
+            _ => Handled::Pass,
+        }
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {

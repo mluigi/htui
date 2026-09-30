@@ -1975,6 +1975,29 @@ impl SettingsSection for AgentsSection {
             || matches!(self.auth, AuthState::Running { paste: Some(_), .. })
     }
 
+    /// MOD-22 review M-1: a bracketed paste lands in the open paste field — masked, whole, and
+    /// only within the [`PASTE_MAX`] the field was opened with, so a longer one is refused by
+    /// `validate`'s own sentence rather than reallocating the buffer — or in the registry form's
+    /// focused field. Anywhere else it is not this section's.
+    fn on_paste(&mut self, text: &str, ctx: &mut Ctx<'_>) -> Handled {
+        if let AuthState::Running {
+            paste: Some(field), ..
+        } = &mut self.auth
+        {
+            if !field.on_paste(text) {
+                ctx.emit(Action::Error(loopback::PasteError::TooLong.to_string()));
+            }
+            return Handled::Consumed;
+        }
+        if let Mode::Editing(editor) = &mut self.mode {
+            if let Some(field) = editor.fields.get_mut(editor.focus) {
+                field.input.on_paste(text);
+            }
+            return Handled::Consumed;
+        }
+        Handled::Pass
+    }
+
     fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
         // Unscoped: `agent` is global, so the read does not change with the workspace.
         vec![StoreRequest::Agents]

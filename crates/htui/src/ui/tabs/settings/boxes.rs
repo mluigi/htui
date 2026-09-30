@@ -438,6 +438,18 @@ impl SettingsSection for BoxesSection {
         !matches!(self.mode, Mode::Browse)
     }
 
+    /// MOD-22 review M-1: a bracketed paste into the open tags field or quirks editor.
+    fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        match &mut self.mode {
+            Mode::Browse => return Handled::Pass,
+            Mode::Tags(editor) => {
+                editor.input.on_paste(text);
+            }
+            Mode::Quirks(editor) => editor.input.on_paste(text),
+        }
+        Handled::Consumed
+    }
+
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         if !matches!(self.mode, Mode::Browse) {
             return self.on_editor_key(key, ctx);

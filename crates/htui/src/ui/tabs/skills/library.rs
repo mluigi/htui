@@ -491,6 +491,36 @@ impl LibraryView {
             || self.attach.as_ref().is_some_and(AttachPane::captures_input)
     }
 
+    /// A bracketed paste into the open prompt, form or editor (MOD-22 review M-1); `false` when
+    /// nothing here is taking text.
+    pub(super) fn on_paste(&mut self, text: &str) -> bool {
+        if let Some(attach) = &mut self.attach {
+            return attach.on_paste(text);
+        }
+        match &mut self.mode {
+            Mode::Browse | Mode::Report { .. } => return false,
+            Mode::Naming { field }
+            | Mode::Describing { field, .. }
+            | Mode::ImportPath { field } => {
+                field.on_paste(text);
+            }
+            Mode::Info(form) => {
+                let field = if form.focus == 0 {
+                    &mut form.name
+                } else {
+                    &mut form.description
+                };
+                field.on_paste(text);
+            }
+            Mode::Editing(editor) => {
+                editor.area.on_paste(text);
+                editor.esc_armed = false;
+                self.notice = None;
+            }
+        }
+        true
+    }
+
     /// The scope changed: the library, the editor, the pane, the pending handoff and the write in
     /// flight all belong to the workspace that was left. The notice survives, as in the Templates
     /// view.

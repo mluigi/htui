@@ -252,6 +252,26 @@ impl AttachPane {
         self.skill
     }
 
+    /// A bracketed paste into the form's focused text field (MOD-22 review M-1); `false` when the
+    /// pane is not taking text. The activation toggle, the picker and the detach question are not
+    /// fields: a paste there is swallowed, so its letters answer nothing.
+    pub(super) fn on_paste(&mut self, text: &str) -> bool {
+        let form = match &mut self.mode {
+            AttachMode::Browse => return false,
+            AttachMode::Form(form) => form,
+            _ => return true,
+        };
+        let field = match form.focus {
+            FormField::Activation => return true,
+            FormField::Pin => &mut form.pin,
+            FormField::Position => &mut form.position,
+            FormField::Languages => &mut form.languages,
+            FormField::Globs => &mut form.globs,
+        };
+        field.on_paste(text);
+        true
+    }
+
     /// Whether the form, the picker or the detach question is taking every key.
     pub(super) fn captures_input(&self) -> bool {
         !matches!(self.mode, AttachMode::Browse)

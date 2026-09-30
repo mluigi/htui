@@ -44,6 +44,11 @@ pub trait Overlay {
     fn wants_requests(&self, scope: &Scope) -> Vec<StoreRequest>;
     /// A key reached this overlay: it is the first stop of the propagation chain.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled;
+    /// A bracketed paste reached this overlay, whole (MOD-22 review M-1): its field takes it, or
+    /// `Pass` — the default — and it goes no further than a modal overlay would let a key go.
+    fn on_paste(&mut self, _text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        Handled::Pass
+    }
     /// A reply addressed to this overlay arrived and is not stale.
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
     /// Draws over the whole frame. Use [`centered`](crate::ui::layout::centered) for the box.

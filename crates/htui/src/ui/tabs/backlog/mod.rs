@@ -222,6 +222,12 @@ impl Tab for BacklogTab {
     /// A capturing sub-tab (a typed note, a typed-back key, a `y`/`n`) gets every key first: the
     /// guard names no action (ANA-2 `:1694-1697`), it only stops the list from eating the letters
     /// the sub-tab is waiting for (MOD-4 plan OQ-7).
+    /// MOD-22 review M-1: a bracketed paste reaches a capturing sub-tab's field and nothing else;
+    /// the list never takes one.
+    fn on_paste(&mut self, text: &str, ctx: &mut Ctx<'_>) -> Handled {
+        self.detail.on_paste(text, ctx)
+    }
+
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         if self.detail.captures_input() {
             return self.detail.on_key(key, ctx);

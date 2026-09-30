@@ -17,7 +17,7 @@ use htui::ui::tabs::settings::{
 use htui_agent::acp::Handshake;
 use htui_agent::auth::loopback::{
     self, Advertised, DELIVERY_IN_FLIGHT, DeliverError, ListenerReply, NO_LOOPBACK_REDIRECT,
-    PasteError,
+    PASTE_MAX, PasteError,
 };
 use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::install::InstallRecord;
@@ -865,6 +865,8 @@ async fn h_and_l_move_between_sections() {
 #[derive(Debug, Default)]
 struct CapturingProbe {
     seen: Vec<KeyCode>,
+    /// Every bracketed paste it was handed, whole (MOD-22 review M-1).
+    pasted: Vec<String>,
 }
 
 impl SettingsSection for CapturingProbe {
@@ -891,10 +893,21 @@ impl SettingsSection for CapturingProbe {
         Handled::Consumed
     }
 
+    fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        self.pasted.push(text.to_owned());
+        Handled::Consumed
+    }
+
     fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        message(frame, area, &format!("seen {}", self.seen.len()), ctx.theme);
+        let pasted = self.pasted.join("|").replace('\n', "\\n");
+        message(
+            frame,
+            area,
+            &format!("seen {} pasted [{pasted}]", self.seen.len()),
+            ctx.theme,
+        );
     }
 }
 
@@ -941,6 +954,76 @@ async fn a_capturing_section_receives_l_and_a_plain_one_cycles() {
     assert!(
         !harness.app().should_quit,
         "`q` is a letter while a section is taking text"
+    );
+}
+
+/// MOD-22 review M-1: a bracketed paste while nothing captures input is dropped whole. Before the
+/// terminal's paste mode it was replayed as keys, so the `2` of a pasted redirect switched tabs, a
+/// `/` opened an unmasked filter and the code after it was echoed there in clear; as one
+/// `Event::Paste` it reaches no keymap at all.
+#[tokio::test]
+async fn a_bracketed_paste_with_nothing_capturing_input_does_nothing() {
+    let mut harness = Harness::demo()
+        .with_tab(Box::new(SettingsTab::with_sections(vec![
+            Box::new(AgentsSection::new()),
+            Box::new(CapturingProbe::default()),
+        ])))
+        .with_tab(Box::new(htui::ui::tabs::RequirementsTab::new()));
+    harness.settle().await;
+    let before = harness.render();
+
+    harness.paste(&format!("2/?code={CODE}&state={STATE}\nq"));
+    harness.settle().await;
+    let after = harness.render();
+    assert_eq!(after, before, "no tab, section or state moved");
+    assert!(!after.contains(CODE), "and nothing drew the pasted text");
+    assert!(!harness.app().should_quit, "its `q` quit nothing");
+}
+
+/// MOD-22 review M-1: a section that is taking text gets the paste whole, as one event — the
+/// tab's `l` and the shell's `q` inside it are characters, not a cycle and a quit.
+#[tokio::test]
+async fn a_bracketed_paste_reaches_a_capturing_section_whole() {
+    let mut harness = Harness::demo().with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(AgentsSection::new()),
+        Box::new(CapturingProbe::default()),
+    ])));
+    harness.settle().await;
+    harness.key("l");
+    harness.settle().await;
+
+    harness.paste("l2q\n");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("seen 0 pasted [l2q\\n]"),
+        "one paste, whole, and no key: {frame}"
+    );
+    assert!(!harness.app().should_quit);
+}
+
+/// MOD-22 review M-1: a paste into an open unmasked field lands there as typed text would, and
+/// its trailing newline does not submit the form.
+#[tokio::test]
+async fn a_bracketed_paste_fills_an_unmasked_form_field() {
+    let mut harness = Harness::demo().with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(AgentsSection::new()),
+        Box::new(ProbeSection),
+    ])));
+    harness.settle().await;
+    harness.key("n");
+    harness.paste("pasted-agent\n");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains("pasted-agent"), "the paste landed: {frame}");
+
+    // Still open: `l` is a letter, not a cycle to the next section.
+    harness.key("l");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("pasted-agentl"),
+        "the form is still open: {frame}"
     );
 }
 
@@ -3016,6 +3099,66 @@ async fn a_paste_for_the_right_host_and_port_is_sent_for_the_worker_to_judge() {
         assert!(bench.drained().is_empty(), "p opens again");
         assert!(section.captures_input());
     }
+}
+
+/// MOD-22 review M-1: a bracketed paste into the open field lands whole, masked — dots and a
+/// count, never a byte of it — and `Enter` sends it as typed text would be sent.
+#[tokio::test]
+async fn a_bracketed_paste_lands_in_the_open_paste_field_as_dots() {
+    let bench = SectionBench::new().await;
+    let mut section = pasting_over(&bench);
+    assert_eq!(
+        bench.paste(&mut section, &format!("{PASTE}\n")),
+        Handled::Consumed
+    );
+    assert!(bench.drained().is_empty(), "a paste asks nothing");
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        !rendered.contains(CODE),
+        "the code is never drawn: {rendered}"
+    );
+    let field = field_line(&rendered).unwrap_or_else(|| panic!("the field is drawn: {rendered}"));
+    assert!(
+        field.contains(&format!("({})", PASTE.chars().count())),
+        "every pasted character counted, the newline dropped: {field}"
+    );
+    assert!(
+        field
+            .chars()
+            .all(|c| "\u{203a}\u{2022}\u{2026} ()0123456789".contains(c)),
+        "nothing but dots and the count: {field}"
+    );
+
+    assert_eq!(bench.key(&mut section, "Enter"), Handled::Consumed);
+    let emitted = bench.drained();
+    let [Action::Store(StoreRequest::AuthDeliver { url })] = &emitted[..] else {
+        panic!("exactly one AuthDeliver");
+    };
+    let advertised = Advertised::from_auth_url(LOOPBACK_LINK).expect("a loopback redirect");
+    assert!(loopback::validate(url, &advertised).is_ok());
+}
+
+/// MOD-22 review M-1: a paste past `PASTE_MAX` does not fit the field's reservation, so it is
+/// refused whole by `validate`'s own sentence instead of reallocating the masked buffer; and a
+/// paste with no field open is not the section's.
+#[tokio::test]
+async fn a_bracketed_paste_too_long_or_with_no_field_open_is_not_taken() {
+    let bench = SectionBench::new().await;
+    let mut section = pasting_over(&bench);
+    assert_eq!(
+        bench.paste(&mut section, &"a".repeat(PASTE_MAX + 1)),
+        Handled::Consumed
+    );
+    let emitted = bench.drained();
+    assert_eq!(errors_of(&emitted), vec![PasteError::TooLong.to_string()]);
+    let rendered = render_section(&section, &bench.ctx());
+    let field = field_line(&rendered).unwrap_or_else(|| panic!("the field is drawn: {rendered}"));
+    assert!(field.contains("(0)"), "nothing went in: {field}");
+
+    let mut section = running_over(&bench, LOOPBACK_LINK);
+    assert_eq!(bench.paste(&mut section, PASTE), Handled::Pass);
+    assert!(bench.drained().is_empty());
+    assert!(!section.captures_input(), "and it opened nothing");
 }
 
 /// D270: `Esc` closes the field and nothing else — the login, its link and its keys stay.
