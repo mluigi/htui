@@ -8,10 +8,11 @@
 
 use std::collections::HashMap;
 use std::mem::Discriminant;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use futures::future::BoxFuture;
+use futures::FutureExt as _;
+use futures::future::{BoxFuture, Shared};
 use htui_core::model::Scope;
 use htui_core::store::StoreError;
 use htui_store::embed::FastEmbedder;
@@ -19,7 +20,7 @@ use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::vector::{Hit, QdrantStore, SearchQuery, VectorStore as _};
 use htui_store::vector_sync::{Indexer, SyncReport};
 use htui_store::{Backend, secret};
-use tokio::sync::{OnceCell, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::store_worker::{Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest};
@@ -55,13 +56,43 @@ pub trait ConceptIndex: Send + Sync {
     fn sync(&self, backend: Backend, scope: Scope) -> BoxFuture<'_, Result<SyncReport, String>>;
 }
 
+/// How the embedding model is loaded: [`load_model`] in production, a counter in a test.
+type Loader = Arc<dyn Fn() -> BoxFuture<'static, Result<FastEmbedder, String>> + Send + Sync>;
+
+/// `FastEmbedder::new` on the blocking pool (D238).
+fn load_model() -> BoxFuture<'static, Result<FastEmbedder, String>> {
+    Box::pin(async {
+        tokio::task::spawn_blocking(FastEmbedder::new)
+            .await
+            .map_err(|e| format!("the embedding model's loader stopped: {e}"))?
+            .map_err(|e| e.to_string())
+    })
+}
+
 /// The production index (D238): settings re-read from the keyring and Qdrant re-connected per
 /// request, so a URL changed in Settings > Qdrant applies to the next search; the embedding model
 /// loaded once, on the blocking pool, and shared.
-#[derive(Debug, Default)]
 pub struct QdrantIndex {
-    /// Filled by the first load that succeeds; a failed load leaves it empty (D238).
-    embedder: Arc<OnceCell<FastEmbedder>>,
+    /// The model's load: in flight, done, or failed. One at a time (review 2): a failed one is
+    /// replaced by the next search's, a done one answers every later search (D238).
+    load: Mutex<Option<Load>>,
+    /// What loads the model.
+    loader: Loader,
+}
+
+/// One load of the model, awaited by every search that overlaps it.
+type Load = Shared<BoxFuture<'static, Result<FastEmbedder, String>>>;
+
+impl core::fmt::Debug for QdrantIndex {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("QdrantIndex").finish_non_exhaustive()
+    }
+}
+
+impl Default for QdrantIndex {
+    fn default() -> Self {
+        Self::with_loader(load_model)
+    }
 }
 
 impl QdrantIndex {
@@ -71,24 +102,39 @@ impl QdrantIndex {
         Self::default()
     }
 
+    /// An index whose model comes from `loader` (review 2: the seam a test counts loads through).
+    fn with_loader(
+        loader: impl Fn() -> BoxFuture<'static, Result<FastEmbedder, String>> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            load: Mutex::new(None),
+            loader: Arc::new(loader),
+        }
+    }
+
     /// The model, loading it on first use (F9, blueprint D245).
     async fn embedder(&self) -> Result<FastEmbedder, String> {
-        let cell = Arc::clone(&self.embedder);
-        // Its own task: a superseded search that is aborted mid-load must not cancel the load, or
-        // the next search starts a second download (F9). A concurrent search waits on this init,
-        // and a failed one leaves the cell empty for the next search to retry.
-        tokio::spawn(async move {
-            cell.get_or_try_init(|| async {
-                tokio::task::spawn_blocking(FastEmbedder::new)
-                    .await
-                    .map_err(|e| format!("the embedding model's loader stopped: {e}"))?
-                    .map_err(|e| e.to_string())
-            })
-            .await
-            .cloned()
-        })
-        .await
-        .map_err(|e| format!("the embedding model's loader stopped: {e}"))?
+        self.load().await
+    }
+
+    /// The load to await: the one in flight or done, else a new one (review 2).
+    ///
+    /// A new load is driven by a task of its own, so a superseded search aborted mid-load cancels
+    /// only its wait, never the load (F9), and a load nobody awaits any more still finishes, so a
+    /// failure is seen by the next search, which starts exactly one more. `tokio::sync::OnceCell`
+    /// cannot say that: on a failed init it hands the init to the next queued waiter, so every
+    /// search that overlapped a failing load retried it, one download after another.
+    fn load(&self) -> Load {
+        let mut slot = self.load.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(load) = slot.as_ref()
+            && !matches!(load.peek(), Some(Err(_)))
+        {
+            return load.clone();
+        }
+        let load = (self.loader)().shared();
+        tokio::spawn(load.clone().map(drop));
+        *slot = Some(load.clone());
+        load
     }
 
     /// Qdrant at `settings`, over the shared model.
@@ -370,6 +416,7 @@ mod tests {
     use htui_core::fixtures::ids;
     use htui_core::store::{MemStore, ReadStore as _};
     use htui_store::vector::PointType;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const PROBE: Origin = Origin::Overlay(OverlayId("probe"));
 
@@ -705,7 +752,14 @@ mod tests {
     async fn qdrant_index_without_a_stored_url_names_where_to_set_it() {
         let _keyring = htui_store::testkit::mock_keyring().await;
         let (backend, scope) = platform().await;
-        let index = QdrantIndex::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let index = QdrantIndex::with_loader({
+            let attempts = Arc::clone(&attempts);
+            move || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                load_model()
+            }
+        });
         let query = concepts::query("anything", scope.project_ids.clone(), false, 10);
 
         let searched = index.search(query).await.expect_err("no URL is stored");
@@ -715,9 +769,54 @@ mod tests {
             .await
             .expect_err("no URL is stored");
         assert!(synced.contains("Settings > Qdrant"), "{synced}");
-        assert!(
-            index.embedder.get().is_none(),
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
             "the settings are read before the model: nothing was loaded"
+        );
+    }
+
+    /// Review 2: every search that overlaps a load waits on that one load, superseded ones
+    /// included, and a failed load is retried once, by the next search, not once per waiter.
+    #[tokio::test(start_paused = true)]
+    async fn superseded_searches_share_one_failing_load_and_the_next_search_retries_once() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let index = Arc::new(QdrantIndex::with_loader({
+            let attempts = Arc::clone(&attempts);
+            move || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Err("no network".to_owned())
+                })
+            }
+        }));
+
+        // Five searches, each superseded (aborted) while the model loads, then one that waits.
+        for _ in 0..5 {
+            let index = Arc::clone(&index);
+            let search = tokio::spawn(async move { index.embedder().await.map(drop) });
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            search.abort();
+        }
+        let waited = index.embedder().await.map(drop);
+        assert_eq!(waited, Err("no network".to_owned()));
+        // Long past any load a waiter could still start.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "one load for every search that overlapped it"
+        );
+
+        let again = index.embedder().await.map(drop);
+        assert_eq!(again, Err("no network".to_owned()));
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "the search after the failure retried, once"
         );
     }
 
