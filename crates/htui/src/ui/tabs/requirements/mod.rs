@@ -637,7 +637,7 @@ impl RequirementsTab {
     /// here searches the snapshot: the form closes, the notice says what landed, and the cursor
     /// goes to the row it landed on, whose detail is re-read, when the tree drawn holds it.
     /// `unread` is the re-read's failure (D5): the tree is the one held before the write, which may
-    /// not hold a new row yet.
+    /// not hold a new row yet, and no detail is read (review L4).
     fn land(&mut self, outcome: &RequirementWrite, unread: Option<&str>, ctx: &Ctx<'_>) {
         let (landed, row) = match outcome {
             RequirementWrite::Area { id, code } => (format!("added area {code}"), Row::Area(*id)),
@@ -663,8 +663,20 @@ impl RequirementsTab {
             Row::Requirement(id) => snapshot.requirement(id).is_some(),
             Row::Project(id) => snapshot.project(id).is_some(),
         });
-        if held {
-            self.select_row(row, ctx);
+        if !held {
+            return;
+        }
+        match unread {
+            None => self.select_row(row, ctx),
+            // The store has just failed a read, and the detail's would most likely fail too
+            // (MOD-59 review L4): the pane says why rather than show the row before the write.
+            Some(why) => {
+                self.put_cursor(row, ctx);
+                if matches!(row, Row::Requirement(_)) {
+                    self.detail = None;
+                    self.detail_error = Some(why.to_owned());
+                }
+            }
         }
     }
 
@@ -686,6 +698,15 @@ impl RequirementsTab {
     /// with a reveal (MOD-64 D235). The detail is re-read even when `row` was already selected —
     /// `land` needs that, the row having just been written.
     fn select_row(&mut self, row: Row, ctx: &Ctx<'_>) {
+        self.put_cursor(row, ctx);
+        if let Row::Requirement(id) = row {
+            ctx.request(StoreRequest::RequirementDetail(id));
+        }
+    }
+
+    /// Makes `row` visible and puts the cursor on it, reading nothing: `select_row` without the
+    /// detail read.
+    fn put_cursor(&mut self, row: Row, ctx: &Ctx<'_>) {
         self.unhide(row, ctx);
         if self.selected != Some(row) {
             self.detail = None;
@@ -693,9 +714,6 @@ impl RequirementsTab {
         }
         self.selected = Some(row);
         self.detail_error = None;
-        if let Row::Requirement(id) = row {
-            ctx.request(StoreRequest::RequirementDetail(id));
-        }
     }
 
     /// Whether the last read holds requirement `id` (MOD-64 D235).
@@ -1813,6 +1831,37 @@ mod tests {
             "nothing was read to decide it"
         );
         assert!(requests(&bench.emit.take()).is_empty(), "nothing was sent");
+    }
+
+    /// MOD-59 review L4: an amend whose re-read failed lands on the row the tree holds, but its
+    /// detail is not read: the store has just failed a read, and the detail's would most likely
+    /// fail too. The pane says why instead of the version before the amend; `r` reads both again.
+    #[tokio::test]
+    async fn an_amend_whose_reread_failed_reads_no_detail() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot);
+        amend(&bench, &mut tab);
+
+        bench.reply(
+            &mut tab,
+            &StoreReply::RequirementWritten {
+                snapshot: Err("store unreachable: gone".to_owned()),
+                outcome: RequirementWrite::Amended {
+                    id: ids::REQ_ENT_1,
+                    key: "R-ENT-1".to_owned(),
+                    version: 3,
+                },
+            },
+        );
+
+        assert_eq!(tab.busy, None);
+        assert!(matches!(tab.mode, Mode::Browse), "the form closed");
+        assert_eq!(tab.selected, Some(Row::Requirement(ids::REQ_ENT_1)));
+        let sent = bench.emit.take();
+        assert!(requests(&sent).is_empty(), "no detail read: {sent:?}");
+        assert_eq!(tab.detail, None, "not the version before the amend");
+        assert_eq!(tab.detail_error.as_deref(), Some("store unreachable: gone"));
     }
 
     /// MOD-59 D5: a mint whose re-read failed has landed all the same. The form closes, the notice
