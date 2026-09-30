@@ -1865,7 +1865,10 @@ mod tests {
         assert!(matches!(view.mode, Mode::Browse), "{:?}", view.mode);
         assert_eq!(view.busy, None);
         assert!(
-            matches!(&view.notice, Some(Notice::Info(text)) if text.starts_with("saved v3 \u{b7} ~")),
+            matches!(
+                &view.notice,
+                Some(Notice::Info(text)) if text.starts_with("saved v3 \u{b7} ~")
+            ),
             "{:?}",
             view.notice
         );
@@ -2118,8 +2121,8 @@ mod tests {
 
     /// HANDOFF MOD-59 (a): another session re-describes the skill between our `EditSkill` (a
     /// re-describe too) and the worker's re-read, so the re-read holds their description, not ours.
-    /// The edit's own `SkillWritten` still closes the form; before MOD-59 the content match never held and the
-    /// form refused `Esc` until the workspace changed.
+    /// The edit's own `SkillWritten` still closes the form; before MOD-59 the content match never
+    /// held and the form refused `Esc` until the workspace changed.
     #[tokio::test]
     async fn an_edit_lands_although_another_session_redescribed_the_skill_before_the_reread() {
         let backend = Backend::memory(MemStore::demo());
@@ -2406,7 +2409,10 @@ mod tests {
         assert!(matches!(view.mode, Mode::Browse), "{:?}", view.mode);
         assert_eq!(view.busy, None);
         assert!(
-            matches!(&view.notice, Some(Notice::Info(text)) if text.starts_with("saved v3 \u{b7} ~")),
+            matches!(
+                &view.notice,
+                Some(Notice::Info(text)) if text.starts_with("saved v3 \u{b7} ~")
+            ),
             "{:?}",
             view.notice
         );

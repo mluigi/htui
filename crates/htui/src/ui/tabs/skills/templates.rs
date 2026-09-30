@@ -1421,7 +1421,10 @@ mod tests {
         );
         let save = bench.one();
         assert!(
-            matches!(&save, StoreRequest::SaveTemplate { name, expected: Some(1), .. } if name == "implement"),
+            matches!(
+                &save,
+                StoreRequest::SaveTemplate { name, expected: Some(1), .. } if name == "implement"
+            ),
             "{save:?}"
         );
         assert_eq!(view.busy, Some("save_template"));
@@ -1572,7 +1575,10 @@ mod tests {
         );
         let create = bench.one();
         assert!(
-            matches!(&create, StoreRequest::SaveTemplate { name, expected: None, .. } if name == "release-notes"),
+            matches!(
+                &create,
+                StoreRequest::SaveTemplate { name, expected: None, .. } if name == "release-notes"
+            ),
             "{create:?}"
         );
         view.on_reply(
@@ -1587,7 +1593,10 @@ mod tests {
         assert!(matches!(view.mode, Mode::Browse), "{:?}", view.mode);
         assert_eq!(view.busy, None);
         assert!(
-            matches!(&view.notice, Some(Notice::Error(text)) if text.starts_with("saved v1 \u{2014}")),
+            matches!(
+                &view.notice,
+                Some(Notice::Error(text)) if text.starts_with("saved v1 \u{2014}")
+            ),
             "{:?}",
             view.notice
         );

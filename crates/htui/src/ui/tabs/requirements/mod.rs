@@ -1735,9 +1735,10 @@ mod tests {
         );
         let sent = bench.emit.take();
         assert!(
-            requests(&sent)
-                .iter()
-                .any(|request| matches!(request, StoreRequest::RequirementDetail(id) if *id == ids::REQ_ENT_1)),
+            requests(&sent).iter().any(|request| matches!(
+                request,
+                StoreRequest::RequirementDetail(id) if *id == ids::REQ_ENT_1
+            )),
             "{sent:?}"
         );
     }
