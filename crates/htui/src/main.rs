@@ -21,9 +21,18 @@ fn main() -> ExitCode {
         .enable_all()
         .build()
         .expect("the tokio runtime builds");
-    let code = runtime.block_on(body());
-    runtime.shutdown_timeout(SHUTDOWN_GRACE);
-    code
+    run_bounded(runtime, SHUTDOWN_GRACE, body())
+}
+
+/// Runs `future` to its end on `runtime`, then tears the runtime down within `grace`.
+fn run_bounded<T>(
+    runtime: tokio::runtime::Runtime,
+    grace: Duration,
+    future: impl Future<Output = T>,
+) -> T {
+    let out = runtime.block_on(future);
+    runtime.shutdown_timeout(grace);
+    out
 }
 
 /// `main` inside the runtime. The Sentry guard lives here, so it flushes before the runtime's
@@ -63,5 +72,51 @@ async fn body() -> ExitCode {
             eprintln!("htui: {error:#}");
             ExitCode::from(code)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::run_bounded;
+
+    /// MOD-41 review RF-4: a body that panics while a blocking task never ends still leaves
+    /// within the grace, so the panic reaches its exit (101) and a unit's `Restart=on-failure`.
+    #[test]
+    fn a_panicking_body_still_bounds_the_teardown() {
+        let (release, blocked) = mpsc::channel::<()>();
+        let (done, finished) = mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("the tokio runtime builds");
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                run_bounded(runtime, Duration::from_millis(100), async move {
+                    let (started, running) = tokio::sync::oneshot::channel();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = started.send(());
+                        // Held until the case releases it: a blocking task that does not end.
+                        let _ = blocked.recv();
+                    });
+                    running.await.expect("the blocking task starts");
+                    panic!("the scripted body panics");
+                })
+            }));
+            let _ = done.send(outcome.is_err());
+        });
+
+        let panicked = finished.recv_timeout(Duration::from_secs(10));
+        drop(release);
+        runner.join().expect("the runner thread ends");
+        assert_eq!(
+            panicked,
+            Ok(true),
+            "the panic leaves within the grace instead of waiting on the blocking task"
+        );
     }
 }
