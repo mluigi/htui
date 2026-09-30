@@ -119,6 +119,19 @@ fn an_off_switch_never_refuses_over_the_hostname() {
     assert!(!off.digest_text.contains("sk-ant-"));
 }
 
+#[test]
+fn a_body_that_places_no_box_never_refuses_over_the_hostname() {
+    let mut spec = with_host(CREDENTIAL_HOST);
+    assert!(spec.body.contains("{{box}}"), "the fixture places the box");
+    spec.body = spec.body.replace("{{box}}", "");
+    assert!(spec.box_hostname, "the switch stays on");
+    let prompt = ok(&spec);
+    assert!(!prompt.text.contains("sk-ant-"));
+    assert!(!prompt.text.contains("hostname:"));
+    assert_eq!(prompt.text, prompt.digest_text);
+    assert!(prompt.trim.undigested.is_empty());
+}
+
 /// Masks the one secret `SECRET` and fails closed on the prefix rules.
 fn secret_scrubber() -> MinimalScrubber {
     MinimalScrubber::new(["SECRET".to_owned()])

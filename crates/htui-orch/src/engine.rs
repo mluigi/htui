@@ -4437,8 +4437,9 @@ where
             documents: Vec::new(),
             upstream: Vec::new(),
             box_profile: self.parts.box_profile.clone(),
-            // MOD-33 D267, D272: the judge body cannot place `{{box}}`, so the switch only decides
-            // whether the hostname is masked; the replayed task keeps whatever the candidate saw.
+            // MOD-33 D267, D272: the judge body cannot place `{{box}}`, so the switch decides
+            // nothing here — the hostname is neither rendered nor masked (it is masked only where
+            // `{{box}}` is placed); the replayed task keeps whatever the candidate saw.
             box_hostname: settings::resolve_box_hostname(Some(&project.settings)),
             // MOD-9 D44, D48: the judged phase's candidates, the same list for both orders.
             skills: skills.clone(),

@@ -99,7 +99,8 @@ pub struct PromptSpec {
     pub box_profile: BoxProfile,
     /// `project.settings.box_hostname`, resolved by the caller (MOD-33 D267, D268): whether the box
     /// section names the hostname. `true` renders it and keeps it out of the digest (D263);
-    /// `false` omits the line and neither masks nor scans the value (D269).
+    /// `false` omits the line and neither masks nor scans the value (D269), as does a body that
+    /// places no `{{box}}` whatever the switch says.
     pub box_hostname: bool,
     /// The step's skill candidates, resolved by `model::skill::resolve`: global, project and phase
     /// attachments, most specific winning, inactive ones included. The assembler collapses and
@@ -833,10 +834,11 @@ fn scrubbed_inputs(
 
     // `box` and `skills` are protected and never re-rendered by the trimmer; `assemble` re-renders
     // the box once more after the trim, in its sent form, from these same masked inputs (MOD-33
-    // D263). They are masked here rather than in two places. The hostname is masked only when the
-    // switch renders it: a value the model never sees must not refuse a prompt (D269).
+    // D263). They are masked here rather than in two places. The hostname is masked only when it is
+    // sent — the switch is on **and** the body places `{{box}}`, the same condition `assemble`
+    // renders the sent box under: a value the model never sees must not refuse a prompt (D269).
     let box_name = SectionName::Box.render();
-    let shown = spec.box_hostname;
+    let shown = spec.box_hostname && parsed.used.contains(&Placeholder::Box);
     let profile = &mut spec.box_profile;
     if shown {
         mask(scrubber, &mut profile.hostname, &box_name)?;
