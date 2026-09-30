@@ -4885,17 +4885,24 @@ pub(crate) mod tests {
         );
     }
 
-    /// MOD-41 blueprint F-6 (plan D5's P-4): the generic runtime's futures are `Send` for any host
-    /// and sink. `sweep_with` spawns the sweep, and with it every task kind the runtime spawns, so
-    /// this compiles only if each of them is `Send`.
+    /// MOD-41 blueprint F-6 (plan D5's P-4): the runtime instantiates for the TUI's
+    /// `(Backend, TuiReplies)` and the headless `(PgStore, Unaddressed)`, through both of its
+    /// entry points: `sweep_with` (the sweep, `resumed`, `reclaim`, the retried claims) and
+    /// `serve_request` (the verdicts and, through `spawn_task`, every command). That each spawned
+    /// future is `Send` needs no test: the generic bodies of `sweep_with`, `serve_request` and
+    /// `spawn_supervised` already prove it for any `H: WorkerHost` and `P: ReplySink`, or the
+    /// library does not compile.
     #[test]
     fn a_generic_runtime_future_spawns() {
         fn generic<H: htui_core::store::WorkerHost, P: super::ReplySink>(
             runtime: &mut RunRuntime<H, P>,
             host: &H,
             sink: &P,
+            addr: P::Addr,
+            request: RunRequest,
         ) {
             runtime.sweep_with(host, sink);
+            drop(runtime.serve_request(host, sink, addr, request, &LiveChats::default()));
         }
         let _ = generic::<Backend, TuiReplies>;
         let _ = generic::<PgStore, super::Unaddressed>;
