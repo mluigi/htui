@@ -33,11 +33,6 @@ Templates or Requirements write answers its own reply (`SkillWritten`, `Template
 `RequirementWritten`, as MOD-23's `AgentWritten`), so a form lands on its write and never stays "in
 flight" when another session changed the row or a read arrived first; a write whose re-read failed
 still lands, and a failed mint is hedged and re-reads the tree.
-Before it, **MOD-14 done** (`docs/decisions/mod/mod-14.md`): the Backlog's
-Graph sub-tab draws the selected item's link neighbourhood as a tree, 1-3 hops (`+`/`-`, default 2,
-fetched at 3), across projects, with link kind and status per row; `J`/`K` move, `Enter` re-roots the
-Backlog selection through MOD-64's reveal, a node outside the workspace refuses on the status line,
-and `m` opens the sub-tab (`R-TUI-2` `open graph`).
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -46,8 +41,8 @@ comment only) `0009_agent_box_user_off` (MOD-23) and `0010_prompt_digest_undiges
 cache: `0001`..`0004`), so **the next migration is `0011`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
 (done, all four milestones), MOD-38, MOD-9 (done, all five milestones), MOD-40, MOD-39, MOD-64,
-MOD-23, MOD-22 and MOD-41 (re-counted 2026-10-01): store conformance `CASES` 104, `READ_CASES` 14, `htui-orch` `CASES` 86,
-`GraphSource` 7 methods, `StoreRequest` 91, `StoreReply` 49, `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
+MOD-23, MOD-22, MOD-41 and MOD-59 (re-counted 2026-10-01; `StoreReply` 2026-09-30): store conformance `CASES` 104, `READ_CASES` 14, `htui-orch` `CASES` 86,
+`GraphSource` 7 methods, `StoreRequest` 91, `StoreReply` 52, `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
 `skills::REQUEST_NAMES` 6, `TABLES` 39, 291 `.sqlx` files, 121
 `crates/htui/tests/snapshots`, six workspace members (`htui-worker` since MOD-41),
 `MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 35 pinned commented
@@ -97,7 +92,7 @@ ANA-17 (`docs/decisions/ana/ana-17.md`) settling its block separator and keeping
 every model;
 ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set status tables,
 `htui-orch`, now built (MOD-4, `docs/decisions/mod/mod-4.md`). MOD-11, MOD-12 and MOD-13
-can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
+can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
 `docs/decisions/mod/mod-7.md`; MOD-9 is done, `docs/decisions/mod/mod-9.md`).
 
 ---
@@ -213,8 +208,10 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   - **R-53**: `ItemActions` is as of the last `Runs` reply, so a verdict can flip before the key is
     pressed. The engine re-checks with the same admission function (D184) and the pane re-reads
     (D171) (drive blueprint §18).
-  - **R-55**: `box.settings.command_limits` is read once per process, per server, so an edit does not
-    reach a running process's verifier until a restart or a server switch. Nothing edits it today;
+  - **R-55**: the TUI reads `box.settings.command_limits` once per process, per server, so an edit
+    does not reach its verifier until a restart or a server switch. `htui worker` re-reads them at a
+    sweep with no live walk after a repo or checkout change, and a change to the limits alone at
+    restart (`docs/htui-worker.md`). Nothing edits it today;
     whoever adds an editor re-reads the limits or rebuilds the verifier when no walk is live (drive
     blueprint §21.3).
   - **T7's residual window**: a promoted chat first streams at the promotion's `Orch` address and
@@ -239,8 +236,8 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   **ANA-17 note (2026-09-25, `docs/decisions/ana/ana-17.md`):** the section framing is one frame for
   every model, so the estimator is the only thing a mixed-family group can diverge on. The function is
   `TokenEstimator::for_model` (keyed on a model id), not `for_agent`, and every production
-  `PromptSpec` passes `TokenEstimator::DEFAULT` today (`htui-orch/src/engine.rs:4323`, `:4945`,
-  `htui/src/preview.rs:252`), so choosing it per group or per candidate is new wiring.
+  `PromptSpec` passes `TokenEstimator::DEFAULT` today (`htui-orch/src/engine.rs:4652`, `:5374`,
+  `htui/src/preview.rs:306`), so choosing it per group or per candidate is new wiring.
   **MOD-23 note (2026-09-30, `docs/decisions/mod/mod-23.md`):** ANA-21 item 8's "MOD-23's editor
   surfaces `settings.weights`" moved here: the Settings > Agents edit form carries `settings`
   untouched, and a weights field is one more entry in its field list (plan D231).
@@ -262,7 +259,8 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   Not blocked; MOD-54 is done (`docs/decisions/mod/mod-54.md`). MOD-39 added two more `char`
   counters: the Requirements tab's `tree::pad`/`clip` (on a narrow pane `pad` cuts the
   ` · read-only` marker before the project name) and the Reqs sub-tab's `cut`
-  (`docs/decisions/mod/mod-39.md`, "Carried").
+  (`docs/decisions/mod/mod-39.md`, "Carried"), and `chars().count()` counters in
+  `crates/htui/src/ui/tabs/requirements/detail.rs` and `forms.rs`.
 - [ ] **MOD-49 - Interactive path picker for repo and workspace roots** (from MOD-7). `R-BOX-4`,
   `R-TUI-8`. MOD-7 D5 infers each repo's path on a box and falls back to a typed path in a text box
   when inference fails; as built, the typed fallback is Settings > Hierarchy's `b` (MOD-7 milestone
@@ -301,12 +299,12 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   htui's own process environment (plan D30) and scrubs its output. A test pinning that the verify
   child does not see a resolved secret belongs to this item.
   **Run engine scrubber (MOD-61, folded in 2026-09-29):** the run engine's `MinimalScrubber` is
-  built with an empty secret list (`crates/htui/src/run_worker.rs:1253`), so `scrub`'s masking half
+  built with an empty secret list (`crates/htui-worker/src/runtime.rs:764`, since MOD-41), so `scrub`'s masking half
   is inert on the run path and a `trim_record` string equal to a secret would be stored verbatim.
   When this item resolves a run's secrets, build that scrubber from the **same** map that fills the
-  step's `SessionSpec.env` (`htui-orch` `drive_once`, `engine.rs:5349`), so the two cannot drift;
-  the chat path already does this from `spec.env` (`agent_worker.rs:3176`) and needs the same map.
-  The verifier's scrubber (`run_worker.rs:935`) stays pattern-only: handing it the map would put
+  step's `SessionSpec.env` (`htui-orch` `drive_once`, `engine.rs:5656`), so the two cannot drift;
+  the chat path already does this from `spec.env` (`agent_worker.rs:3599`) and needs the same map.
+  The verifier's scrubber (`crates/htui-worker/src/runtime.rs:411`) stays pattern-only: handing it the map would put
   the resolved secrets inside `verify.rs`. A test pinning that a record string equal to a resolved
   secret is stored as `[REDACTED]` belongs to this item.
 - [ ] **MOD-11 - htui MCP server.** `R-MCP-1..4`. Tools `item_link`, `item_status`,
@@ -331,7 +329,11 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   `write_document` is still unfenced; fence it with the step's `StepFence` when this item adds the
   first production author.
   **MOD-34 left the `search_concepts` tool here** (`docs/decisions/mod/mod-34.md`): expose
-  `htui_store::vector::VectorStore::search` (`R-STO-8`), scoped to the step's projects.
+  `htui_store::vector::VectorStore::search` (`R-STO-8`), scoped to the step's projects. Since MOD-50
+  (`docs/decisions/mod/mod-50.md`) it also returns requirement hits; `Hit.owner` says which kind each
+  hit is.
+  **MOD-33 left one decision here** (`docs/decisions/mod/mod-33.md`, D277): the `box_profile` tool
+  returns `BoxProfile`, and this item decides whether it honours the project's hostname switch.
 - [ ] **MOD-12 - Auto mode queue runner** (from ANA-2). `R-ORCH-6`, `R-ORCH-9`, `R-ORCH-2` hard
   gates, `R-AGT-7..8` caps, `R-TUI-8`. Ready-item selection, capability filter, concurrency with
   overlap rule, queue overlay, escalation, Settings tab caps and scheduler window section. The
@@ -431,6 +433,10 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   (documented, turned off by `{"tools":{"bash":{"disabled":true}}}` in `box_probe_spec`; a code fix
   that names no tool is this item's call), and the Microsoft Store `python3` stub, which the probe now
   skips by trying each name until one prints a version (verify it holds).
+  **MOD-22 and MOD-41 added two more** (`docs/decisions/mod/mod-22.md`, `docs/decisions/mod/mod-41.md`):
+  whether MOD-22's loopback paste-back completes a login from a Windows box, and whether
+  `htui worker`'s Windows stop path (Ctrl-Break, closing the console, a system shutdown;
+  `docs/htui-worker.md`) cancels its walks and gives their leases back as it does on SIGTERM.
 
 - [ ] **MOD-66 - Per-box manual tool path editor in Settings > Agents** (from MOD-23, plan OQ-3).
   `R-AGT-6`. ANA-4 §4.6 (`docs/ANA-4.md:796-798`) describes a per-box manual entry: write
@@ -461,11 +467,13 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   MOD-37 carries it) on the unreset tree; it would need an ANA-2 §4.9 amendment, works only on the
   box that holds the agent's transcript, and can be raised again after MOD-37. Continuing across a
   worker-to-TUI re-attach of a live agent is MOD-46/MOD-47 territory, not this item's.
+  MOD-53 left one more case here (`docs/decisions/mod/mod-53.md`): a chat that panics mid-turn
+  leaves its run row open, and closing it is recovery work.
   Not blocked (MOD-41 is done). Relates to ANA-16 (`docs/ANA-16.md` §8), which flagged the
   conflict this decision settles.
 
 - [ ] **MOD-42 - Permission and control relay through Postgres** (from ANA-16, §8 item 3).
-  `R-AGT-1`, `R-HIS-1`, `R-TUI-6`. The engine's `pump` (`record.rs:1684-1703`) cannot answer a
+  `R-AGT-1`, `R-HIS-1`, `R-TUI-6`. The engine's `pump` (`crates/htui-agent/src/record.rs:1854-1873`) cannot answer a
   parked ACP request, so engine-driven ACP steps fail on their first permission request today. The
   worker records `permission_request`, waits on a `permission_answer` row, then answers the session;
   cancel and follow-up become command rows. Answers from another box go through the relay, never
@@ -473,8 +481,8 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   hand-back is the in-box half of its command rows, and cancelling a live worker walk is refused
   until this item (`docs/htui-worker.md`).
   **MOD-4 M6 landed without closing this gap** (MOD-4 done, `docs/decisions/mod/mod-4.md`): the
-  engine still drives a graph step through `pump` (`crates/htui-orch/src/engine.rs:5146`, `pump` now
-  at `crates/htui-agent/src/record.rs:1725-1743`) with the default `PermissionPolicy`, so engine-driven
+  engine still drives a graph step through `pump` (`crates/htui-orch/src/engine.rs:5666`, `pump` at
+  `crates/htui-agent/src/record.rs:1854-1873`) with the default `PermissionPolicy`, so engine-driven
   ACP steps still fail on their first permission request. The MOD-4 (M6) dependency is met.
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
@@ -490,6 +498,8 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   via MOD-16). **Open question for the maintainer:** `R-NF-2` amendment (`dockerd` as an opt-in,
   per-box dependency). The MOD-7 dependency is met (done, `docs/decisions/mod/mod-7.md`: id-keyed
   registration, the box probe, capability tags); survives TUI exit through `htui worker` (MOD-41, done: `docs/decisions/mod/mod-41.md`).
+  A child box's hostname never moves a digest, and the project's hostname switch covers it by
+  construction (MOD-33 D275, `docs/decisions/mod/mod-33.md`).
 - [ ] **MOD-45 - Remote box provisioning over SSH** (from ANA-16, §8 item 6). `R-BOX-1`, `R-BOX-4`,
   `R-AGT-9`, `R-STO-1`. System `ssh` to install the matching `htui` build and a user service running
   `htui worker`; credential passed on the worker's stdin, never argv or a file; the worker
