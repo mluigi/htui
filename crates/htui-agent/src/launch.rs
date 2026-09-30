@@ -1020,8 +1020,8 @@ impl Drop for ChildGuard {
 /// the type system enforce that rather than the caller's memory.
 ///
 /// The rest of the work stays on the caller's thread on purpose: `tokio::process::Command::spawn`
-/// is non-blocking, and the stderr reader is a `tokio::spawn`ed task, so this function must be
-/// called from within a runtime.
+/// is non-blocking, and the stderr reader is a task started with
+/// [`crate::contained::spawn`], so this function must be called from within a runtime.
 ///
 /// # Errors
 /// [`DriverError::Spawn`] when the command cannot be found or the operating system refuses the

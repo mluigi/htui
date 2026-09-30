@@ -27,15 +27,37 @@
 //! The future is boxed rather than pin-projected (`unsafe_code` is forbidden and there is no
 //! `pin-project`); one allocation is nothing next to a process or an ACP session.
 //!
-//! **Kept that way by the lint.** This crate's `clippy.toml` refuses the raw tokio spawns
-//! (`disallowed-methods`), so a new one fails the workspace clippy gate instead of reopening the
-//! hole silently. The three raw calls below are the only ones it allows. The excerpt provider
-//! thread is a plain `std::thread` outside the lint, because it opens its own window in
-//! [`run_providers`](crate::excerpt::run_providers) (D7).
+//! **Kept that way by the lint.** This crate's `clippy.toml` refuses the raw tokio spawns and the
+//! raw `std::thread` spawns (`disallowed-methods`), so a new one fails the workspace clippy gate
+//! instead of reopening the hole silently. The three raw calls below are the only ones in `src`
+//! it allows, apart from the excerpt provider thread in
+//! [`run_providers`](crate::excerpt::run_providers), which opens its own window in
+//! `propose_caught`. The integration tests' fake agents and `tests/contained_spawn.rs`'s control
+//! calls are allowed too, each by an `expect` that names why. One door the lint cannot see:
+//! `JoinSet`'s `Extend` and `FromIterator` impls spawn from inside tokio, so collecting or
+//! extending futures into a `JoinSet` starts raw tasks. Do not do that in this crate; call
+//! [`spawn_in`] once per future instead.
 //!
-//! What is covered is what the closure or future does while it runs. Dropping a future that tokio
-//! cancels happens outside any poll, so a panicking `Drop` there is not covered (MOD-53's
-//! "Not done").
+//! **What is not covered.** The window covers what the closure or future does while it runs.
+//! - A task that tokio cancels (an abort, or the runtime shutting down) has its future dropped
+//!   outside any poll, so outside the window. A `Drop` that panics there is still caught by tokio
+//!   and the process survives it, but the hook finds no window and gives the terminal back under a
+//!   running event loop. Deferred by the maintainer, not fixed here.
+//! - A `Drop` that panics **during the unwind** of a contained panic makes the process abort,
+//!   and the terminal is left raw. MOD-53 had this case for `answering`'s tasks, and MOD-65 widens
+//!   it to every spawn in this crate. Before MOD-65 a panic in, say, the ACP `run_session` was
+//!   outside any window, so the hook's first call restored the terminal before the abort. Now the
+//!   first call skips the restore because tokio is expected to catch the panic, and the abort
+//!   that follows leaves the terminal raw.
+
+// D1's soundness argument is that tokio catches every panic in a spawned closure or future. Under
+// `panic = "abort"` nothing unwinds and nothing is caught, so an open window would only suppress
+// the one restore the process ever gets.
+#[cfg(panic = "abort")]
+compile_error!(
+    "htui_agent::contained needs `panic = \"unwind\"`: the contain window is only sound when tokio \
+     can catch the panic it vouches for (MOD-65 D1)"
+);
 
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
