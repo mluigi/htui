@@ -25,7 +25,7 @@ use futures::future::Either;
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposure};
 use htui_agent::event::{DoneEvent, StopReason};
-use htui_agent::excerpt::{PassInput, excerpt_roots, excerpts_for, touched_prefixes};
+use htui_agent::excerpt::{PassInput, excerpt_roots, step_pass, touched_prefixes};
 use htui_agent::record::{Recorder, RunCap, pump};
 use htui_core::model::{
     BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus, Document, DocumentId,
@@ -35,7 +35,9 @@ use htui_core::model::{
     SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOutcome,
     StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome, missing_tags_failure,
 };
-use htui_core::prompt::excerpt::{BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoRoot, RootSource};
+use htui_core::prompt::excerpt::{
+    BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
+};
 use htui_core::prompt::{
     AssembledPrompt, DiffBlock, InputDocument, JudgeCandidate, PromptSpec, SectionName,
     TemplateRef, TemplateRole, TokenEstimator, TrimStrategy, VerifyFailure, assemble, settings,
@@ -4439,6 +4441,9 @@ where
             // No pass for a judge (plan D109): its placeholder set cannot place `{{excerpts}}`
             // (`template.rs:188-215`), so a file read here could only reach the audit.
             excerpts: no_excerpts(caps),
+            // MOD-9 D123: a judge runs in no tree (`prepare(…, &[], Isolation::Local, None)`) and
+            // gets no pass, so a placed `glob` winner records `no_path` truthfully; the default
+            // judge body places no `{{skills}}` and records `not_placed`.
             step_files: StepFiles::default(),
             command_queue: false,
             verify_failure: None,
@@ -4960,15 +4965,17 @@ where
     }
 
     /// ANA-5 §4.5 for a phase prompt (MOD-7 milestone 4, plan D107–D109, D125): the roots, then
-    /// the shared pass, into `spec.excerpts`.
+    /// the shared pass, into `spec.excerpts` and `spec.step_files` (MOD-9 D120, D122).
     ///
     /// The scope is `run.repo_scope` joined to the names of `repos(run.project_id)`. An id with no
     /// row there is left out with a note. The roots are this step's `run_step_tree` rows, else
     /// this box's `repo_box_path` rows, else `no_path` (`excerpt_roots`). A step with no tree rows
     /// at all, which is a fan-out group before its candidates are prepared (`drive_group`, OQ-32),
     /// that read a root from `repo_box_path` says so (D108). The item is re-read for
-    /// `touched_paths`, with the same read `phase_spec` uses. Everything else, the placeholder
-    /// test, the residual, the blocking read and the scrub filter, is `excerpts_for`'s.
+    /// `touched_paths`, with the same read `phase_spec` uses. From attempt 2 a phase step also
+    /// reads the previous attempt's winner's changed paths (MOD-9 D122), for excerpt tier 2 and the
+    /// `glob` file set. Everything else, the placeholder test, the walk, the residual, the blocking
+    /// read and the scrub filters, is `step_pass`'s.
     ///
     /// # Errors
     /// A store read's failure. Nothing about the excerpts themselves is an error: §4.5 fails open.
@@ -5008,14 +5015,21 @@ where
                     .to_owned(),
             );
         }
+        // MOD-9 D122: a judge or a first attempt has no previous attempt to read.
+        let changed = if matches!(spec.role, TemplateRole::Phase) && step.attempt > 1 {
+            self.changed_paths(run, step, &scope, &mut notes).await?
+        } else {
+            Vec::new()
+        };
         let input = PassInput {
             roots,
             touched_prefixes: touched_prefixes(&row.touched_paths, &repos),
             notes,
-            changed_paths: Vec::new(),
+            changed_paths: changed,
         };
-        let excerpts = excerpts_for(spec, input, &self.parts.app, self.parts.scrubber).await;
-        spec.excerpts = excerpts;
+        let pass = step_pass(spec, input, &self.parts.app, self.parts.scrubber).await;
+        spec.excerpts = pass.excerpts;
+        spec.step_files = pass.files;
         Ok(())
     }
 
@@ -5249,6 +5263,48 @@ where
             }
         };
         Ok((verify_failure, previous_diff))
+    }
+
+    /// MOD-9 D122: the previous attempt's winner's changed paths, by scope name, for excerpt
+    /// tier 2 and the `glob` file set. An isolator error is a note and an empty list (the
+    /// `previous_diff unavailable` shape); no winner is empty with no note (`forwarded` notes it).
+    /// A path in a repo outside `scope` is dropped.
+    async fn changed_paths(
+        &self,
+        run: &Run,
+        step: &RunStep,
+        scope: &[(RepoId, String)],
+        notes: &mut Vec<String>,
+    ) -> Result<Vec<RepoPath>, EngineError> {
+        let steps = self.parts.store.run_steps(run.id).await?;
+        let Some(previous) = winner_at(&steps, step.position, step.attempt - 1) else {
+            return Ok(Vec::new());
+        };
+        let trees = self.parts.store.step_trees(previous.id).await?;
+        let commits = self.parts.store.step_commits(previous.id).await?;
+        let changed = match self.parts.isolator.changed_paths(&trees, &commits).await {
+            Ok(changed) => changed,
+            Err(err) => {
+                notes.push(format!("changed paths unavailable: {err}"));
+                return Ok(Vec::new());
+            }
+        };
+        if changed.truncated {
+            notes.push("changed paths: the list was cut at 64 KiB".to_owned());
+        }
+        Ok(changed
+            .paths
+            .into_iter()
+            .filter_map(|(id, path)| {
+                scope
+                    .iter()
+                    .find(|(scoped, _)| *scoped == id)
+                    .map(|(_, name)| RepoPath {
+                        repo: name.clone(),
+                        path,
+                    })
+            })
+            .collect())
     }
 
     /// **Stage 4 — session.** One driver, one session, one turn, one recorder.
