@@ -63,7 +63,7 @@ pub async fn run(args: WorkerArgs, log: Option<&Path>) -> Result<(), WorkerExit>
 }
 
 /// [`run`] once logging is up. The signal handlers go in first, and the startup (the DSN read,
-/// the keyring, the connect) races them: installing a handler replaces the default termination,
+/// the keyring, the connect, the index job's keyring read) races them: installing a handler replaces the default termination,
 /// so a signal the startup did not watch would be swallowed until the loop began. A signal during
 /// the startup is a clean exit 0, with nothing written after it.
 async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
@@ -86,9 +86,18 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
     };
     // Wiped here: nothing after the connect needs it.
     drop(dsn);
+    // Plan D19: the keyring's Qdrant URL, read once; the job shares the pool, never the runtime.
+    let index_job = tokio::select! {
+        biased;
+        () = &mut shutdown => return stopped_before_ready(),
+        job = concepts::spawn_index_job(pg.clone()) => job,
+    };
     let runtime = RunRuntime::<PgStore, Unaddressed>::production().with_role(Role::Worker);
     tracing::info!(box_id = %pg.this_box(), pool = pool.get(), "htui worker ready");
     htui_worker::worker::run(pg, runtime, WorkerConfig::PRODUCTION, shutdown).await;
+    if let Some(job) = index_job {
+        job.abort();
+    }
     tracing::info!("htui worker stopped");
     Ok(())
 }
