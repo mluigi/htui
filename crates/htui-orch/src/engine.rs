@@ -379,7 +379,7 @@ impl RunFence for NoFence {
 /// cannot compile until every one of them is named.
 pub struct EngineParts<'a, S, G, I, V, C, A, K>
 where
-    S: WriteStore,
+    S: WriteStore + htui_core::store::RecorderStore,
     G: GraphSource,
     I: Isolator + ?Sized,
     V: Verifier + ?Sized,
@@ -428,7 +428,7 @@ where
 /// `SessionSpec` uses (`crates/htui-agent/src/driver.rs:281-298`), for the same reason.
 impl<S, G, I, V, C, A, K> core::fmt::Debug for EngineParts<'_, S, G, I, V, C, A, K>
 where
-    S: WriteStore,
+    S: WriteStore + htui_core::store::RecorderStore,
     G: GraphSource,
     I: Isolator + ?Sized,
     V: Verifier + ?Sized,
@@ -454,7 +454,7 @@ where
 #[derive(Debug)]
 pub struct Engine<'a, S, G, I, V, C, A, K>
 where
-    S: WriteStore,
+    S: WriteStore + htui_core::store::RecorderStore,
     G: GraphSource,
     I: Isolator + ?Sized,
     V: Verifier + ?Sized,
@@ -524,7 +524,7 @@ pub enum Next {
 
 impl<'a, S, G, I, V, C, A, K> Engine<'a, S, G, I, V, C, A, K>
 where
-    S: WriteStore,
+    S: WriteStore + htui_core::store::RecorderStore,
     G: GraphSource,
     I: Isolator + ?Sized,
     V: Verifier + ?Sized,

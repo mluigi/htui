@@ -363,7 +363,7 @@ async fn rows_re_recorded_from_their_envelopes_are_the_same_rows() {
 }
 
 /// Re-records one of the two `htui`-authored rows through the call that wrote it.
-async fn replay_authored<S: WriteStore>(
+async fn replay_authored<S: htui_core::store::RecorderStore>(
     recorder: &mut Recorder<'_, S>,
     other: &OtherEvent,
     at: DateTime<Utc>,

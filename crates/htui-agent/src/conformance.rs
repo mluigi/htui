@@ -202,7 +202,11 @@ pub const CASES: &[&str] = &[
 /// On the first failed assertion, naming the case, and on an unknown `name`. `()` and not
 /// `Result<(), String>` for the reason the store suite gives: the cases are `assert_eq!` chains
 /// that carry their own messages, and a binding gets per-case reporting from its loop.
-pub async fn run_case<H: CaseHarness, S: WriteStore>(name: &str, harness: &H, store: &S) {
+pub async fn run_case<H: CaseHarness, S: WriteStore + htui_core::store::RecorderStore>(
+    name: &str,
+    harness: &H,
+    store: &S,
+) {
     match name {
         "coalesce_across_message_id" => coalesce_across_message_id(harness, store).await,
         "seq_gapless_and_turns" => seq_gapless_and_turns(harness, store).await,
@@ -244,7 +248,7 @@ pub async fn run_case<H: CaseHarness, S: WriteStore>(name: &str, harness: &H, st
 pub async fn run_all<H, S, F, Fut>(harness: &H, make: F)
 where
     H: CaseHarness,
-    S: WriteStore,
+    S: WriteStore + htui_core::store::RecorderStore,
     F: Fn() -> Fut,
     Fut: Future<Output = S>,
 {
@@ -481,7 +485,7 @@ fn park(request: &str, call: &str) -> ScriptEvent {
 /// # Panics
 ///
 /// When the stream ends, errors, or reaches its `done` without one.
-async fn pump_to_permission<S: WriteStore>(
+async fn pump_to_permission<S: htui_core::store::RecorderStore>(
     session: &mut dyn AgentSession,
     recorder: &mut Recorder<'_, S>,
 ) -> PermissionRequestId {
@@ -515,7 +519,7 @@ async fn pump_to_permission<S: WriteStore>(
 /// # Panics
 ///
 /// When the stream ends, errors, or reaches its `done` without one.
-async fn pump_to_kind<S: WriteStore>(
+async fn pump_to_kind<S: htui_core::store::RecorderStore>(
     session: &mut dyn AgentSession,
     recorder: &mut Recorder<'_, S>,
     kind: EventKind,
@@ -1339,7 +1343,13 @@ fn coalescing_script() -> Script {
 /// Twenty chunks across two `message_id` groups, interleaved with one `tool_call`, persist as
 /// exactly three `assistant_text` rows and one `tool_call` row in `seq` order; the same script
 /// replayed yields an identical row set (`docs/ANA-4.md` §11 criterion 2).
-async fn coalesce_across_message_id<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+async fn coalesce_across_message_id<
+    H: CaseHarness,
+    S: WriteStore + htui_core::store::RecorderStore,
+>(
+    harness: &H,
+    store: &S,
+) {
     let scrubber = scrubber();
 
     let (first, mut session, _caps) = open_case(harness, store, coalescing_script(), false).await;
@@ -1418,7 +1428,10 @@ async fn coalesce_across_message_id<H: CaseHarness, S: WriteStore>(harness: &H, 
 /// `seq = 0` / `turn = 0` / `role = htui` carrying the digest of its own text
 /// (`docs/ANA-4.md` §11 criterion 3; that the digest also reaches `run_step.prompt_digest` is
 /// `usage_deltas_sum_to_step_usage`, which can see the write).
-async fn seq_gapless_and_turns<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+async fn seq_gapless_and_turns<H: CaseHarness, S: WriteStore + htui_core::store::RecorderStore>(
+    harness: &H,
+    store: &S,
+) {
     let script = Script::turns(vec![
         vec![chunk("first answer", "m1"), done(StopReason::EndTurn)],
         vec![chunk("second answer", "m2"), done(StopReason::EndTurn)],
@@ -1507,7 +1520,10 @@ async fn seq_gapless_and_turns<H: CaseHarness, S: WriteStore>(harness: &H, store
 
 /// `retain_raw = false` leaves every `raw` NULL; the same script with `retain_raw = true` produces
 /// the same rows with `raw` populated (`docs/ANA-4.md` §11 criterion 4).
-async fn raw_iff_retain<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+async fn raw_iff_retain<H: CaseHarness, S: WriteStore + htui_core::store::RecorderStore>(
+    harness: &H,
+    store: &S,
+) {
     let script = || {
         Script::one_turn(vec![
             chunk("hello ", "m1"),
@@ -1584,7 +1600,13 @@ async fn raw_iff_retain<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
 /// every clause of criterion 5 that does not mention a permission, which is most of it. Skipping
 /// instead would keep the name in `CASES` and drop the coverage; this way `CASES` stays at fifteen
 /// and a transport that claims no permission channel but writes a permission row still fails.
-async fn cancel_answers_parked_permissions<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+async fn cancel_answers_parked_permissions<
+    H: CaseHarness,
+    S: WriteStore + htui_core::store::RecorderStore,
+>(
+    harness: &H,
+    store: &S,
+) {
     if !harness.caps().permission_requests {
         cancel_without_a_permission_channel(harness, store).await;
         return;
@@ -1700,7 +1722,10 @@ async fn cancel_answers_parked_permissions<H: CaseHarness, S: WriteStore>(harnes
 /// criterion 5 is everything else it says: a cancel still closes every open tool call with a
 /// synthesized `failed` result naming `cancelled`, and the turn still ends with exactly one
 /// `done { stop_reason: "cancelled" }` as the log's last row.
-async fn cancel_without_a_permission_channel<H: CaseHarness, S: WriteStore>(
+async fn cancel_without_a_permission_channel<
+    H: CaseHarness,
+    S: WriteStore + htui_core::store::RecorderStore,
+>(
     harness: &H,
     store: &S,
 ) {
@@ -1801,7 +1826,13 @@ async fn cancel_without_a_permission_channel<H: CaseHarness, S: WriteStore>(
 /// about a *refusal* settling a call, and both transports have refusals — one asks `htui` and is
 /// told no, the other is told no by its own `--permission-mode` and reports it. The second arm is
 /// the same sentence with the refusal arriving already decided.
-async fn rejected_tool_gets_failed_result<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+async fn rejected_tool_gets_failed_result<
+    H: CaseHarness,
+    S: WriteStore + htui_core::store::RecorderStore,
+>(
+    harness: &H,
+    store: &S,
+) {
     if !harness.caps().permission_requests {
         policy_denial_gets_failed_result(harness, store).await;
         return;
@@ -1900,7 +1931,13 @@ async fn rejected_tool_gets_failed_result<H: CaseHarness, S: WriteStore>(harness
 /// - the denial is **in the log**, as `by: policy`, `role: htui`, no option, `denied: true`, and
 ///   joinable to the call from either side. That row is the whole reason the degradation is
 ///   visible in a transcript at all (D85), and `driver_rows` no longer filters the kind out.
-async fn policy_denial_gets_failed_result<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+async fn policy_denial_gets_failed_result<
+    H: CaseHarness,
+    S: WriteStore + htui_core::store::RecorderStore,
+>(
+    harness: &H,
+    store: &S,
+) {
     let script = Script::one_turn(vec![
         tool_call("call-9"),
         ScriptEvent::PolicyDenied("call-9".to_owned()),
@@ -1991,7 +2028,13 @@ async fn policy_denial_gets_failed_result<H: CaseHarness, S: WriteStore>(harness
 
 /// Exactly one `done` per turn precedes the next accepted follow-up (`docs/ANA-4.md` §4.1): a
 /// follow-up sent before it is a protocol error, not a queued prompt.
-async fn done_precedes_next_follow_up<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+async fn done_precedes_next_follow_up<
+    H: CaseHarness,
+    S: WriteStore + htui_core::store::RecorderStore,
+>(
+    harness: &H,
+    store: &S,
+) {
     let script = Script::turns(vec![
         vec![chunk("still working", "m1"), done(StopReason::EndTurn)],
         vec![chunk("second turn", "m2"), done(StopReason::EndTurn)],
@@ -2092,7 +2135,13 @@ async fn done_precedes_next_follow_up<H: CaseHarness, S: WriteStore>(harness: &H
 /// criterion in its strongest form, because with one row the sum has nowhere to hide: the row's
 /// own `cost_micros` *is* the total, and `cost_micros_total` must agree with it. Everything about
 /// `run_step.usage` and the digest is shared, which is the point: criterion 7 is one statement.
-async fn usage_deltas_sum_to_step_usage<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+async fn usage_deltas_sum_to_step_usage<
+    H: CaseHarness,
+    S: WriteStore + htui_core::store::RecorderStore,
+>(
+    harness: &H,
+    store: &S,
+) {
     // **The script reports no token counts, on purpose** (amended in milestone 3). ANA-4 §7 is
     // explicit that ACP carries no per-turn token fields — `usage_update` has `used`, `size` and
     // `cost`, and nothing else — so a script asking for `input_tokens` would be asking one
@@ -2248,7 +2297,13 @@ fn rate_limit_blob() -> Value {
 /// still asserts is everything that makes the latch a latch: the blob reaches the row verbatim,
 /// the document carries the turn's whole spend, and `quota_at` is the capture time of the row that
 /// produced it.
-async fn quota_blob_latches_agent_box<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+async fn quota_blob_latches_agent_box<
+    H: CaseHarness,
+    S: WriteStore + htui_core::store::RecorderStore,
+>(
+    harness: &H,
+    store: &S,
+) {
     // The row the latch writes into. `quota` is NULL on a fresh row and is the narrow setter's
     // alone (plan D74), so there is nothing to plant: what this case pins is that the latch puts
     // §7's document where there was none.
@@ -2549,7 +2604,7 @@ struct Played {
 /// it is for: a suite that waited out a real cancel window would pay for it once per case, and the
 /// fake owns no child process to wait for (`cancel_answers_parked_permissions` passes zero for the
 /// same reason).
-async fn play_capped<H: CaseHarness, S: WriteStore>(
+async fn play_capped<H: CaseHarness, S: WriteStore + htui_core::store::RecorderStore>(
     harness: &H,
     store: &S,
     cap: Option<i64>,
@@ -2613,7 +2668,10 @@ async fn play_capped<H: CaseHarness, S: WriteStore>(
 /// whole point of the arm: the transport's own `end_turn` is **withheld** by
 /// [`enforce_breach`](crate::record::enforce_breach) rather than recorded beside the cap's
 /// (milestone 7 H-4), and this is where a real transport exercises it.
-async fn run_cap_breach_cancels_within_one_event<H: CaseHarness, S: WriteStore>(
+async fn run_cap_breach_cancels_within_one_event<
+    H: CaseHarness,
+    S: WriteStore + htui_core::store::RecorderStore,
+>(
     harness: &H,
     store: &S,
 ) {
@@ -2803,7 +2861,13 @@ async fn run_cap_breach_cancels_within_one_event<H: CaseHarness, S: WriteStore>(
 /// A protocol update this event model does not map lands as kind `other` with its body verbatim,
 /// which is what makes "every event" hold without a schema change per protocol revision
 /// (`docs/ANA-4.md` §6.1).
-async fn unknown_update_lands_in_other<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+async fn unknown_update_lands_in_other<
+    H: CaseHarness,
+    S: WriteStore + htui_core::store::RecorderStore,
+>(
+    harness: &H,
+    store: &S,
+) {
     let body = json!({ "commands": ["compact", "review"], "n": 7 });
     let script = Script::one_turn(vec![
         ScriptEvent::Emit(DriverEvent::Other(OtherEvent {
@@ -2865,7 +2929,10 @@ async fn unknown_update_lands_in_other<H: CaseHarness, S: WriteStore>(harness: &
 /// the same file written twice is two things that happened, where two *proposals* for one file are
 /// one pending change. A transport that deduped its calls to look like it had passed the first arm
 /// would be losing a row the user needs.
-async fn edit_proposal_deduped_per_call_and_path<H: CaseHarness, S: WriteStore>(
+async fn edit_proposal_deduped_per_call_and_path<
+    H: CaseHarness,
+    S: WriteStore + htui_core::store::RecorderStore,
+>(
     harness: &H,
     store: &S,
 ) {
@@ -3055,7 +3122,10 @@ fn edits_surface_as_post_hoc_tool_calls(log: &[SessionEvent]) {
 /// Flush trigger 4: a coalesced run is cut at [`CHUNK_FLUSH_BYTES`] rather than buffered
 /// unboundedly, and the cut is a function of byte counts alone - no timer, so replay stays
 /// deterministic (`docs/ANA-4.md` §4.1, §11 criterion 2).
-async fn chunk_flush_at_16kib<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+async fn chunk_flush_at_16kib<H: CaseHarness, S: WriteStore + htui_core::store::RecorderStore>(
+    harness: &H,
+    store: &S,
+) {
     let piece = "x".repeat(1024);
     let mut events: Vec<ScriptEvent> = (0..17).map(|_| chunk(&piece, "m1")).collect();
     events.push(done(StopReason::EndTurn));
@@ -3100,7 +3170,13 @@ async fn chunk_flush_at_16kib<H: CaseHarness, S: WriteStore>(harness: &H, store:
 /// querying exactly this row, because the id has no column in ANA-9 and MOD-2 chose a row over a
 /// migration (`docs/ANA-4.md` §4.4). The payload nests the banner under `body` because
 /// `OtherEvent` is `{ update, body }`; ANA-4 §4.4 writes the same keys flat.
-async fn session_banner_is_first_other_row<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+async fn session_banner_is_first_other_row<
+    H: CaseHarness,
+    S: WriteStore + htui_core::store::RecorderStore,
+>(
+    harness: &H,
+    store: &S,
+) {
     let script = Script::one_turn(vec![
         chunk("hello", "m1"),
         ScriptEvent::Emit(DriverEvent::Other(OtherEvent {
@@ -3176,7 +3252,13 @@ async fn session_banner_is_first_other_row<H: CaseHarness, S: WriteStore>(harnes
 
 /// A value from `SessionSpec.env` that reaches a payload or a `raw` blob is `[REDACTED]` in the
 /// persisted row (`R-SEC-3`, `docs/ANA-4.md` §9: scrub before either write path).
-async fn env_values_masked_in_rows<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+async fn env_values_masked_in_rows<
+    H: CaseHarness,
+    S: WriteStore + htui_core::store::RecorderStore,
+>(
+    harness: &H,
+    store: &S,
+) {
     let script = Script::one_turn(vec![
         chunk(&format!("the token is {SECRET}"), "m1"),
         tool_call("call-1"),
@@ -3230,7 +3312,13 @@ async fn env_values_masked_in_rows<H: CaseHarness, S: WriteStore>(harness: &H, s
 /// Fail-closed (`R-SEC-3`, plan D6): a credential the scrubber could not mask blocks that row's
 /// write entirely, leaves one `error { code: "scrub_residue" }` in its place with no gap in `seq`,
 /// and makes `finish` report [`RecordError::Unmasked`].
-async fn scrub_residue_refuses_write<H: CaseHarness, S: WriteStore>(harness: &H, store: &S) {
+async fn scrub_residue_refuses_write<
+    H: CaseHarness,
+    S: WriteStore + htui_core::store::RecorderStore,
+>(
+    harness: &H,
+    store: &S,
+) {
     let script = Script::one_turn(vec![
         chunk("before", "m1"),
         tool_call("call-1"),
