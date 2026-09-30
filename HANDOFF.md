@@ -14,12 +14,19 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-30):** **MOD-14 done** (`docs/decisions/mod/mod-14.md`): the Backlog's
+**Current status (2026-09-30):** **CLEAN-4 done** (`docs/decisions/clean/clean-4.md`): the
+review loop's `no_progress_review` stop is reachable. The predicate's review half compares the
+reviews of the loop's last two turns (review rows answered `Rejected`, each read through its newest
+`output_kind` document from `documents()` heads) instead of reading the latest-per-kind
+`documents_of_kinds`, which never held two. A loop whose two rejected reviews repeat each other now
+escalates at that attempt; the hash half is still asked first. `runs_pg`'s escalation case now stops
+on `no_progress_review`, and the stop is pinned in that test (MOD-4 R-9 closed).
+Before it, **MOD-14 done** (`docs/decisions/mod/mod-14.md`): the Backlog's
 Graph sub-tab draws the selected item's link neighbourhood as a tree, 1-3 hops (`+`/`-`, default 2,
 fetched at 3), across projects, with link kind and status per row; `J`/`K` move, `Enter` re-roots the
 Backlog selection through MOD-64's reveal, a node outside the workspace refuses on the status line,
 and `m` opens the sub-tab (`R-TUI-2` `open graph`).
-Before it, **MOD-22 done** (`docs/decisions/mod/mod-22.md`): a login whose
+Before that, **MOD-22 done** (`docs/decisions/mod/mod-22.md`): a login whose
 browser cannot reach the box completes from the TUI. While a login runs, `p` in Settings > Agents
 opens a masked field for the `http://127.0.0.1:<port>/?code=…&state=…` address the browser could
 not open; it is checked against the `redirect_uri` the login link advertised and sent as one raw
@@ -27,19 +34,6 @@ loopback `GET` from the login's own task, the listener's answer is shown, and MO
 the login. The URL is a credential for one request (`R-AGT-9` amended). Bracketed paste is now on
 app-wide and reaches only a field that captures input. Live proof on the server-plus-laptop setup
 is the maintainer's (OQ-6).
-Before that, **ANA-26 concluded** (`docs/ANA-26.md`,
-`docs/decisions/ana/ana-26.md`): every key outside text entry becomes a named action in one
-compiled-in catalogue; a user overrides only what they change in a local `<config_root>/keys.toml`
-(never the store), an invalid file refuses to start with `path:line` errors, `ctrl-c` always quits
-(MOD-57's terminal pane excepted), and every hint and the `?` box are generated. New requirement
-`R-TUI-10`; `R-TUI-1` and `R-STO-1` amended. Implemented by **MOD-67**.
-Before it, **MOD-33 was done** (`docs/decisions/mod/mod-33.md`): the box
-hostname is rendered but not digested. `prompt_digest` is `sha256` of a digest text in which the box
-section's hostname value is the stand-in `[hostname]`; the model still sees the real value, the
-recorder hashes the digest text (`record_prompt_digesting`), and `trim_record` `v 4` lists
-`undigested: ["box.hostname"]`. A per-project switch, `project.settings.box_hostname` (default on,
-Settings > Prompt), omits the line entirely. Migration `0010` restates the two column comments.
-Amends ANA-5 §4.2/§4.7 (recorded in the write-up, not in `docs/ANA-5.md`).
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -598,14 +592,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
 
 ### Deferred backlog
 
-- [ ] **CLEAN-4 - `LoopStop::NoProgressReview` is unreachable** (from MOD-4, risk R-9). `R-ORCH-3`.
-  The review loop's no-progress predicate has two halves, and only the `after_hash` half can fire.
-  `gate::reviews_are_identical` reads through the latest-only `documents_of_kinds`, so it can never
-  hold two review documents to compare, and `LoopStop::NoProgressReview` has been unreachable since
-  milestone 2. No test reaches it; only its `Display` is tested. Fix it through `documents()` heads,
-  in a change that first pins which stop reason each shipped loop case reaches, because the fix can
-  change that. Source: `.claude/plans/mod-4-orch-fanout.blueprint.md` F-B and §11, carried unchanged
-  through milestones 5 and 6 (`docs/decisions/mod/mod-4.md`, "Carried").
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
@@ -625,5 +611,5 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
 | MOD-N   | 30 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                              |
+| CLEAN-N | 0 |
 | TOOL-N  | 0 |

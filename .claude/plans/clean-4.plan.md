@@ -3,7 +3,9 @@
 Routed as **plan** (CLEAN default; C1–C4 ✗), ultracode not needed. The maintainer accepted on
 2026-09-30. Sandbox run on `hr/CLEAN-4`. `R-ORCH-3`, risk R-9 (MOD-4 blueprint F-B, §11).
 
-**Status: approved 2026-09-30 — implementation in progress.**
+**Status: done 2026-09-30** (`docs/decisions/clean/clean-4.md`). Review M-1 narrowed D1's "two
+latest review documents" to the reviews of the loop's last two turns (rows answered `Rejected`),
+`d43ab17`.
 
 ## Goal
 

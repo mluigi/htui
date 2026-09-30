@@ -449,7 +449,7 @@ Where every risk MOD-4 did not close now lives.
 
 | Risk | Owner | What |
 |---|---|---|
-| R-9 | **CLEAN-4** | `NoProgressReview` is unreachable (fan-out blueprint F-B). |
+| R-9 | **CLEAN-4** | `NoProgressReview` is unreachable (fan-out blueprint F-B). Resolved 2026-09-30, `docs/decisions/clean/clean-4.md`. |
 | R-3, R-5, R-29, R-30, R-31 (the rejected-crash remainder), R-32, R-37, R-38, R-40, R-41, R-44, R-46, R-48, R-49, R-51, R-53, R-55, and T7's `ChatAccepted`/`ChatFollow` window | **MOD-37** | Each has a bullet there with its source. |
 | R-50 | **MOD-11** | Production `approve`/`accept` are greyed until an agent can write its `output_kind` document. Every production judge fails until the same tool exists (M4 OQ-4). |
 | R-10 | **MOD-16** | A SIGKILLed orchestrator's agent survives. The child leads its own process group, and `ChildGuard::drop` cannot run in a killed process. Signalling a stale pid needs `unsafe` or a dependency. |
