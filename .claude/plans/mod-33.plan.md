@@ -1,6 +1,6 @@
 # Plan: MOD-33 — the box hostname leaves the digest and gains a settings switch
 
-**Status: CONFIRMED by the maintainer 2026-09-30** (fact-checked: 40 claims, three parallel
+**Status: DONE 2026-09-30** (write-up `docs/decisions/mod/mod-33.md`). CONFIRMED by the maintainer 2026-09-30 (fact-checked: 40 claims, three parallel
 checkers). At CONFIRM: Q-1 answered *hostname only*; D272 kept (the judge digests its replayed
 task); D273/T3 included. The pass falsified no design decision. It corrected: a missed third digest
 snapshot (`prompt_preview__preview_ana_2.snap`); T3's pin list (asserts, not only messages, plus

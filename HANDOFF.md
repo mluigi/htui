@@ -14,7 +14,14 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-30):** **MOD-23 done** (`docs/decisions/mod/mod-23.md`): Settings > Agents
+**Current status (2026-09-30):** **MOD-33 done** (`docs/decisions/mod/mod-33.md`): the box
+hostname is rendered but not digested. `prompt_digest` is `sha256` of a digest text in which the box
+section's hostname value is the stand-in `[hostname]`; the model still sees the real value, the
+recorder hashes the digest text (`record_prompt_digesting`), and `trim_record` `v 4` lists
+`undigested: ["box.hostname"]`. A per-project switch, `project.settings.box_hostname` (default on,
+Settings > Prompt), omits the line entirely. Migration `0010` restates the two column comments.
+Amends ANA-5 §4.2/§4.7 (recorded in the write-up, not in `docs/ANA-5.md`).
+Before it, **MOD-23 was done** (`docs/decisions/mod/mod-23.md`): Settings > Agents
 edits the registry. `n` creates a row, `e` edits one (transport, command and shell-word args, models,
 default model, billing, enabled; `name` is create-only; a launch edit merges and never touches `env`),
 and `t` switches an agent off on this box. The switch is the new `agent_box.user_off` (migration
@@ -27,28 +34,12 @@ offline chat buffer's leftovers are gone — the rebuild confirmation no longer 
 buffer survives, `writer_label` left `ChatAccepted`, `RefreshSettings::this_user` and the chat
 helpers' unused `_writer` went, every chat latches a plain `QuotaLatch`, and the upload/buffered
 test wording was renamed. No behaviour change beyond that one line of copy.
-Before it, **MOD-9 was done** (`docs/decisions/mod/mod-9.md`): templates and
-skills are edited, versioned and diffed in the Skills tab, skills are attached at global, project
-or phase level with `always`, `glob` or `off`, SKILL.md files import, and phase steps, judges and
-the preview carry the winners. Its fifth and last milestone makes a `glob` attachment fire over the
-step's file set (the excerpt walk's listing narrowed to `touched_paths`, plus the previous
-attempt's changed paths, which now feed excerpt tier 2 too), recorded as `matched <repo:path>` or
-`no_match` in `trim_record` `v 3` (migration `0008`, comment only). MOD-55, MOD-57 and MOD-59
-carry on from it.
-Before it, **MOD-64 was done** (`docs/decisions/mod/mod-64.md`): `Ctrl+F`
-opens a concepts search overlay from every tab (scope: the workspace or one project, `Ctrl+D`
-decisions, `Ctrl+R` re-index), served off the store worker's loop by `ConceptsRuntime`; `Enter`
-selects the hit in the Backlog or the Requirements tab, and a Qdrant error stays inside the box.
-Before it, **TOOL-7 shipped** (`docs/decisions/tool/tool-7.md`): `scripts/hr` runs
-3–4 `/handoff-run` lifecycles side by side, each in its own container set (fresh clone on
-`hr/<ITEM>`, private Postgres/Qdrant, no git credentials), with cross-run ID leases through
-`scripts/hr-mint`; guide `docs/hr-sandbox.md`.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
 (MOD-38), `0007_skill_attachments` (MOD-9 milestone 2), `0008_trim_record_v3` (MOD-9 milestone 5,
-comment only) and `0009_agent_box_user_off` (MOD-23; cache: `0001`..`0004`), so **the next
-migration is `0010`** (cache: `0005`).
+comment only) `0009_agent_box_user_off` (MOD-23) and `0010_prompt_digest_undigested` (MOD-33, comment only;
+cache: `0001`..`0004`), so **the next migration is `0011`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
 (done, all four milestones), MOD-38, MOD-9 (done, all five milestones), MOD-40, MOD-39, MOD-64 and
 MOD-23 (re-counted 2026-09-30): store conformance `CASES` 97, `READ_CASES` 14, `htui-orch` `CASES` 73,
@@ -56,12 +47,13 @@ MOD-23 (re-counted 2026-09-30): store conformance `CASES` 97, `READ_CASES` 14, `
 `skills::REQUEST_NAMES` 6, `TABLES` 39, 289 `.sqlx` files, 115
 `crates/htui/tests/snapshots`,
 `MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 35 pinned commented
-columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 3` with `skill_choices` (a
+columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 4` (MOD-33 `undigested`) with `skill_choices` (a
 `matched` choice carries `path`, `<repo>:<path>`); `Isolator` gained `changed_paths` (MOD-9 D119).
 Excerpts reach phase prompts since MOD-7 milestone 4, so a phase-prompt digest recorded before
 2026-09-26 does not compare with a later one; since MOD-9 milestone 5 (2026-09-30) a matched `glob`
 skill renders and a retry's excerpts rank the previous attempt's changed paths, so those digests
-move too; handoff digests are unchanged.
+move too; handoff digests are unchanged. Since MOD-33 (2026-09-30) a phase prompt digests
+`[hostname]` in place of the box's hostname, so every box-bearing phase digest moved once more.
 `cargo doc --workspace --no-deps --keep-going` shows exactly six baseline errors (`htui-core`
 `MIRRORED_TABLES`; `htui-store` `step_exists`, `HashEmbedder` in `embed.rs`, and three private
 links MOD-38 added in `pg/write.rs`: `set_requirement_spec` to `cas_miss`, `amend_requirement` and
@@ -270,28 +262,6 @@ can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
   **MOD-23 note (2026-09-30, `docs/decisions/mod/mod-23.md`):** ANA-21 item 8's "MOD-23's editor
   surfaces `settings.weights`" moved here: the Settings > Agents edit form carries `settings`
   untouched, and a weights field is one more entry in its field list (plan D231).
-- [ ] **MOD-33 - The box hostname leaves the digest and gains a settings switch** (from MOD-2,
-  finding L-5; maintainer-decided 2026-09-16). `R-PRM-1`, `R-PRM-3`, `R-TUI-8`. Two changes to the
-  box section (`prompt/render.rs`, the §4.2 projection over `BoxProfile`):
-  **(1) the hostname stops being a digest input.** Today an identical `PromptSpec` assembled on two
-  boxes produces different bytes and therefore a different `prompt_digest`, so a digest can only be
-  compared within one machine — which defeats MOD-4's criterion 11 (comparing a real step's digest
-  against the preview's; MOD-4 is done, `docs/decisions/mod/mod-4.md`) the moment the two run on
-  different boxes. The hostname stays *in the text the model sees*; it is excluded from the bytes
-  that are hashed. That split does not exist yet:
-  §4.7's pipeline hashes exactly what it renders, so this needs a "rendered but not digested" span
-  concept, and the `trim_record` must say the prompt carried one.
-  **(2) a setting decides whether it is rendered at all.** The maintainer's case for keeping it:
-  building a graphics engine across several machines, where the agent must know which box it is
-  building on. The case against: it is a machine identifier in text sent to a model. So it becomes a
-  per-project switch (`app_setting`/`project.settings`, defaulting to on to preserve today's
-  behaviour), surfaced in Settings, with the box section omitting the field entirely when off.
-  **This amends ANA-5 §4.2** (the closed box field list gains a conditional field) **and §4.7**
-  (rule 8's "no machine identifier" becomes true of the digest rather than of the prompt) — the
-  amendment is maintainer-approved and recorded here per the milestone-5 precedent that an ANA edit
-  is maintainer-only. Its write-up should carry the ANA-5 sections it touches.
-  **Relates to ANA-16** (`docs/ANA-16.md` §5.3, §8): a container child box has its own hostname,
-  distinct from its parent's (MOD-44), so the switch and the digest split also cover child boxes.
 - [ ] **MOD-28 - rataflow execution view (from ANA-12).** Add `rataflow` dependency, implement `ExecutionGraph` widget mapping `RunStep` and `SessionEvent` lists to a node graph, add view toggle to Runs tab (`R-TUI-4`), and wire mouse/keyboard events for standard run actions.
 - [ ] **MOD-26 - Declarative Agent Personas (from ANA-13).** Build Markdown/Frontmatter parser in `htui-core`, discover from `~/.config/htui/agents.d/`, map to `SessionSpec` overrides (model, tools).
   **Relates to ANA-16** (`docs/ANA-16.md` §6.2, §8): personas should be registry rows rather than a
@@ -695,6 +665,6 @@ can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 4 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-26 configurable hotkeys) |
-| MOD-N   | 33 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-33 hostname out of the digest, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 32 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-65 blocking-thread panics, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                              |
 | TOOL-N  | 0 |
