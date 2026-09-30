@@ -9,7 +9,7 @@
 //! the body is the canonical text verbatim, so a `</section>` inside a document body is inert
 //! (blueprint H-28).
 
-use htui_core::model::{ItemId, SkillChoice};
+use htui_core::model::{ChoiceReason, ItemId, SkillChoice};
 use htui_core::prompt::{Section, TrimRecord};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -209,16 +209,18 @@ fn render_lines(preview: &PromptPreview) -> Vec<Row> {
 }
 
 /// One skill choice as the pane lists it: `<name> v<N|?> · <level> · <activation> → <outcome>`,
-/// where the outcome is `active` or the reason. CR and LF in a name become spaces, so one choice
-/// is one row.
+/// where the outcome is `active` for `always`, `matched <repo:path>` for `matched` (MOD-9 D125),
+/// the reason otherwise. CR and LF in a name or a path become spaces, so one choice is one row.
 fn choice_line(choice: &SkillChoice) -> String {
     let version = choice
         .version
         .map_or_else(|| "?".to_owned(), |version| version.to_string());
-    let outcome = if choice.active {
-        "active"
-    } else {
-        choice.reason.as_str()
+    let outcome = match (choice.reason, &choice.path) {
+        (ChoiceReason::Always, _) => "active".to_owned(),
+        (ChoiceReason::Matched, Some(path)) => {
+            format!("matched {}", path.replace(['\n', '\r'], " "))
+        }
+        (reason, _) => reason.as_str().to_owned(),
     };
     format!(
         "{} v{version} \u{b7} {} \u{b7} {} \u{2192} {outcome}",
@@ -411,7 +413,7 @@ impl DetailTab for PromptTab {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use htui_core::model::{Activation, ChoiceReason, SkillLevel};
+    use htui_core::model::{Activation, SkillLevel};
     use ratatui::buffer::Buffer;
     use ratatui::widgets::Widget as _;
 
