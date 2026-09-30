@@ -622,8 +622,10 @@ mod tests {
         form.on_key(key(KeyCode::Char('l')));
         form.on_key(key(KeyCode::Char('l')));
         assert_eq!(form.project_at, 0, "two projects: `l` twice wraps");
-        form.on_key(key(KeyCode::Char('j')));
-        form.on_key(key(KeyCode::Char('j')));
+        // `Down`, not `j`: on the Tags row `j` is text (blueprint E7, review L3).
+        form.on_key(key(KeyCode::Down));
+        form.on_key(key(KeyCode::Down));
+        assert_eq!(form.row(), FilterRow::Ready);
         form.on_key(key(KeyCode::Char('l')));
         assert_eq!(
             (form.status_at, form.project_at),

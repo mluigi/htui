@@ -2796,16 +2796,61 @@ mod tests {
         assert!(done.is_empty(), "a done item is never ready: {done:?}");
     }
 
-    /// MOD-13 D2: without `ready_here` the read is the store's, unchanged, and needs no box row.
+    /// MOD-13 D2: without `ready_here` the read is the store's plain `items`, row for row, even
+    /// over a store with no box row.
     #[tokio::test]
-    async fn ready_here_false_never_reads_the_box() {
+    async fn ready_here_false_is_the_plain_read() {
         let backend = Backend::memory(MemStore::from_demo(DemoData {
             this_box: None,
             ..demo_data()
         }));
         let scope = platform_scope(&backend).await;
         let items = items_of(&backend, &scope, ItemFilter::default(), false).await;
-        assert_eq!(items.len(), 11, "the same rows as the unfiltered read");
+        assert_eq!(
+            items,
+            backend
+                .items(&scope, &ItemFilter::default())
+                .await
+                .expect("the memory store never fails")
+        );
+        assert_eq!(items.len(), 11, "the whole Platform scope");
+    }
+
+    /// MOD-13 D2's reason for not calling `Backend::ready_items`: offline, that refuses, while an
+    /// `Items` read with `ready_here` answers from the mirror (MOD-25: an offline box still
+    /// browses). `seed_mirror` mirrors this box's row but no item, so the answer is an empty
+    /// list — an answer, not `Failed`.
+    #[tokio::test]
+    async fn ready_here_answers_offline_where_ready_items_refuses() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "ready-here-offline", 1)
+            .await
+            .expect("open a throwaway mirror");
+        htui_store::testkit::seed_mirror(&cache, &demo_data())
+            .await
+            .expect("the mirror is seeded");
+        let backend = Backend::Offline { cache, since: None };
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI, ids::PROJECT_AGY],
+        };
+        assert!(
+            backend.ready_items(&scope, ids::BOX).await.is_err(),
+            "`ready_items` is refused offline"
+        );
+        let reply = serve(
+            &backend,
+            &StoreRequest::Items {
+                scope,
+                filter: ItemFilter::default(),
+                ready_here: true,
+            },
+        )
+        .await;
+        assert!(
+            matches!(&reply, StoreReply::Items(rows) if rows.is_empty()),
+            "answered from the mirror: {reply:?}"
+        );
     }
 
     /// MOD-13 D2: the capability half keeps the store's order, and no box row means no tags.
