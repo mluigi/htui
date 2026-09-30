@@ -684,6 +684,7 @@ where
     /// [`EngineError`] the walk raises.
     pub async fn claim(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
         let now = self.now();
+        let sent = tokio::time::Instant::now();
         let ttl = self.lease_times().ttl;
         // Anything but `Admitted` is a refusal. `MissingTags` is `R-ORCH-10`'s: `claim_run`
         // already failed the run and blocked its item, and the engine adds the note (D78). The
@@ -715,10 +716,11 @@ where
             }
         }
 
-        // `now` was read before the claim was sent, so `now + ttl` is a fence the store's expiry
-        // cannot precede (MOD-40 plan OQ-2, blueprint F-38).
+        // `sent` was read before the claim was sent, so `sent + ttl` is a fence the store's
+        // expiry cannot precede (MOD-40 plan OQ-2), on tokio's monotonic clock, which no
+        // wall-clock step moves (MOD-41 plan D3). `now` only stamps the rows.
         let rest = self
-            .walk_leased(run, now + ttl, self.run_to_rest(run))
+            .walk_leased(run, self.lease_until(sent), self.run_to_rest(run))
             .await?;
         Ok(CommandOutcome::Started { run, rest })
     }
@@ -1655,9 +1657,9 @@ where
 
     /// Plan D86/D107: `walk` raced against [`crate::recover::heartbeat`] in this task.
     ///
-    /// `until` is the local instant the caller's lease take (`claim_run`, `take_lease` or the
-    /// sweep's renewal) lapses by at the earliest: the instant it was sent plus the TTL (MOD-40
-    /// plan D10, OQ-2). The heartbeat's first fence is that `until` less one refresh (plan D143),
+    /// `until` is tokio's monotonic instant the caller's lease take (`claim_run`, `take_lease` or
+    /// the sweep's renewal) lapses by at the earliest: the instant it was sent plus the TTL (MOD-40
+    /// plan D10, OQ-2; MOD-41 plan D3). The heartbeat's first fence is that `until` less one refresh (plan D143),
     /// not a lease the heartbeat assumes from its own start.
     ///
     /// On the walk's answer, the lease is released when the run rests anywhere but `running`
@@ -1684,7 +1686,7 @@ where
     async fn walk_leased<T, F>(
         &self,
         run: RunId,
-        until: DateTime<Utc>,
+        until: tokio::time::Instant,
         walk: F,
     ) -> Result<T, EngineError>
     where
@@ -1713,7 +1715,7 @@ where
     async fn heartbeaten<T, F>(
         &self,
         run: RunId,
-        until: DateTime<Utc>,
+        until: tokio::time::Instant,
         walk: F,
     ) -> Result<Result<T, EngineError>, EngineError>
     where
@@ -1721,12 +1723,7 @@ where
     {
         let times = self.lease_times();
         let (store, owner) = (self.parts.store, self.parts.owner);
-        let beat = recover::heartbeat(
-            |ttl| store.refresh_lease(run, owner, ttl),
-            until,
-            self.parts.clock,
-            times,
-        );
+        let beat = recover::heartbeat(|ttl| store.refresh_lease(run, owner, ttl), until, times);
         // Both boxed: `select` needs `Unpin`, and dropping `select`'s output does not drop a
         // stack-pinned walk (blueprint H-11). A boxed one goes when its box does.
         match futures::future::select(Box::pin(walk), Box::pin(beat)).await {
@@ -1782,15 +1779,16 @@ where
 
     /// Plan D87/D108: `take_lease(run, box, owner, ttl)`, after a command's pure guard and before
     /// its first write.
-    /// Answers the local instant its lease lapses by at the earliest (the send instant plus the
-    /// TTL), which the command's [`Self::walk_leased`] fences from (plan D143).
+    /// Answers tokio's monotonic instant its lease lapses by at the earliest (the send instant
+    /// plus the TTL), which the command's [`Self::walk_leased`] fences from (plan D143; MOD-41
+    /// plan D3).
     ///
     /// Plan D130: a zero-row answer re-reads the run to say why. Not `running` or
     /// `awaiting_approval` → [`EngineError::RunStatus`] naming the status; a run on this box →
     /// [`EngineError::LeaseHeld`] (the store's only remaining refusal is a live foreign lease;
     /// never this process's, which the take would have renewed); a run on another box →
     /// [`EngineError::RunStatus`] saying so, whatever its lease (MOD-40 blueprint B26).
-    async fn take_lease(&self, run: RunId) -> Result<DateTime<Utc>, EngineError> {
+    async fn take_lease(&self, run: RunId) -> Result<tokio::time::Instant, EngineError> {
         if let Some(until) = self.renew_lease(run).await? {
             return Ok(until);
         }
@@ -1816,9 +1814,9 @@ where
         })
     }
 
-    /// The store's `take_lease(run, box, owner, ttl)` and its bare answer: the local instant the
-    /// lease lapses by at the earliest, `now + ttl` with `now` read before the take (plan D143),
-    /// `None` for "not takeable here", which [`Self::take_lease`] words and the sweep skips (plan
+    /// The store's `take_lease(run, box, owner, ttl)` and its bare answer: tokio's monotonic
+    /// instant the lease lapses by at the earliest, `sent + ttl` with `sent` read before the take
+    /// (plan D143; MOD-41 plan D3), `None` for "not takeable here", which [`Self::take_lease`] words and the sweep skips (plan
     /// D126).
     ///
     /// Plan D140: a run taken here is about to be walked, so it leaves [`DeadWalks`]. The sweep
@@ -1828,8 +1826,8 @@ where
     /// first, best-effort (a `warn`), since no later pre-pass will. Every caller holds the run's
     /// lock (a command, MOD-4 plan D157) or the sweep's fence (plan D189), so no walk of the run is
     /// live in this process and the guards are a dead walk's.
-    async fn renew_lease(&self, run: RunId) -> Result<Option<DateTime<Utc>>, EngineError> {
-        let now = self.now();
+    async fn renew_lease(&self, run: RunId) -> Result<Option<tokio::time::Instant>, EngineError> {
+        let sent = tokio::time::Instant::now();
         let ttl = self.lease_times().ttl;
         let taken = self
             .parts
@@ -1840,7 +1838,7 @@ where
             self.release_guards(run, "releasing a dead walk's guards at a lease take failed")
                 .await;
         }
-        Ok(taken.then_some(now + ttl))
+        Ok(taken.then(|| self.lease_until(sent)))
     }
 
     /// `Isolator::release(run)`, best-effort: a failure is a `warn` saying `what`, and nothing
@@ -1876,8 +1874,8 @@ where
     /// The `until` a lease taken at this instant runs to: what a test hands
     /// [`Self::walk_leased`] as the lease its caller has just written.
     #[cfg(test)]
-    fn fresh_until(&self) -> DateTime<Utc> {
-        self.now() + self.lease_times().ttl
+    fn fresh_until(&self) -> tokio::time::Instant {
+        self.lease_until(tokio::time::Instant::now())
     }
 
     /// MOD-4 plan D188 (blueprint F-D): a walk the worker dropped mid-flight — a preempting
@@ -5448,6 +5446,19 @@ where
         LeaseTimes::from_app(&self.parts.app)
     }
 
+    /// The instant a lease sent at `sent` lapses by at the earliest, on tokio's monotonic clock
+    /// (MOD-41 plan D3): `sent` plus the TTL. A TTL that is not a positive span adds nothing, and
+    /// one past the platform's last instant answers `sent`, so the heartbeat fences at once
+    /// rather than panicking (blueprint F-4).
+    fn lease_until(&self, sent: tokio::time::Instant) -> tokio::time::Instant {
+        let ttl = self
+            .lease_times()
+            .ttl
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO);
+        sent.checked_add(ttl).unwrap_or(sent)
+    }
+
     /// The `GateContext` stage 6 and the review loop share.
     const fn gate_context<'r>(
         &'r self,
@@ -8785,6 +8796,53 @@ mod tests {
             ttl - times.refresh,
             "the fence stands one refresh before the lease lapses, on tokio's clock alone"
         );
+    }
+
+    /// MOD-41 plan D3, the forward half: a wall clock stepped a day ahead while every refresh
+    /// succeeds does not expire the live lease. Three whole intervals later the walk is still
+    /// running, and the store's lease was renewed from its stepped clock.
+    ///
+    /// A regression pin, not a red case (blueprint F-3): it held before D3 too, because
+    /// `MemStore::refresh_lease` answers at the first poll, before the wall-clock fence's zero
+    /// `timeout` could trip.
+    #[tokio::test(start_paused = true)]
+    async fn a_forward_step_does_not_expire_a_live_lease() {
+        let harness = Harness::new().await;
+        harness_engine!(harness.orch, engine);
+        let times = crate::recover::LeaseTimes::from_app(&BTreeMap::new());
+        let run = leased_run(&harness).await;
+
+        let clock = &harness.orch.clock;
+        let walk = async move {
+            for second in 1_u32.. {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                clock.advance(TimeDelta::seconds(1));
+                if second == 10 {
+                    clock.advance(TimeDelta::days(1));
+                }
+            }
+            Ok::<(), EngineError>(())
+        };
+        let still = tokio::time::timeout(
+            times.refresh * 3 + std::time::Duration::from_secs(1),
+            engine.walk_leased(run, engine.fresh_until(), walk),
+        )
+        .await;
+        assert!(
+            still.is_err(),
+            "the walk still holds its lease three intervals after a +1 day step"
+        );
+        let expires = harness
+            .orch
+            .run(run)
+            .await
+            .lease_expires_at
+            .expect("a running run carries its lease");
+        assert!(
+            expires > harness.orch.clock.now(),
+            "the last refresh renewed the lease from the stepped clock: {expires}"
+        );
+        assert!(!harness.orch.dead_walks.contains(run), "no fence tripped");
     }
 
     /// Plan D140: a release that fails puts the run in the dead-walk set, and the sweep retries

@@ -18,7 +18,6 @@ use htui_core::store::StoreError;
 use serde_json::Value;
 
 use crate::gate::{Settle, SettleInput, settle};
-use crate::isolate::Clock;
 use crate::verify::VERIFY_CLASS;
 
 /// `app_setting` key of the lease's time to live, in seconds (`0003_orchestration.sql:135`).
@@ -42,8 +41,8 @@ const MAX_LEASE_TTL_SECONDS: i64 = htui_core::store::MAX_LEASE_TTL.num_seconds()
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaseTimes {
     /// The TTL this process hands every lease write. The store adds it to its own clock (MOD-40
-    /// plan D10); the heartbeat adds it to the local instant it sent the write at, which is where
-    /// its self-fence is measured from.
+    /// plan D10); the heartbeat adds it to tokio's monotonic instant it sent the write at, which
+    /// is where its self-fence is measured from (MOD-41 plan D3).
     pub ttl: TimeDelta,
     /// How long the heartbeat sleeps between two refreshes; at most a third of `ttl` (D124).
     pub refresh: Duration,
@@ -96,75 +95,79 @@ pub enum Heartbeat {
 /// Plan D123's floor on the sooner retry after a failed refresh.
 const MIN_RETRY: Duration = Duration::from_secs(1);
 
-/// Sleep, then `refresh(times.ttl)`: `Ok(true)` → the lease runs at least to `clock.now() +
-/// times.ttl` as read **before** the refresh was sent, sleep `times.refresh`, loop; `Ok(false)` →
-/// `Abandoned`; `Err(e)` → `tracing::warn!`, sleep `times.refresh / 4` (at least 1 s, D123) and
-/// loop (D86, D103). Never returns otherwise.
+/// Sleep, then `refresh(times.ttl)`: `Ok(true)` → the lease runs at least to the instant the
+/// refresh was sent plus `times.ttl`, sleep `times.refresh`, loop; `Ok(false)` → `Abandoned`;
+/// `Err(e)` → `tracing::warn!`, sleep `times.refresh / 4` (at least 1 s, D123) and loop (D86,
+/// D103). Never returns otherwise.
 ///
 /// **The self-fence (plan D122; MOD-40 plan OQ-2).** The store stamps a lease with its own clock
-/// and does not say what it wrote (plan D10). The heartbeat instead tracks, on its **own** clock,
-/// the instant by which the last lease it wrote successfully lapses at the earliest: the instant
-/// it sent that write plus the TTL. The store read its clock after that send, so its expiry is no
-/// earlier, and a span measured on one clock does not care how far apart two hosts' clocks are.
-/// It starts from `written`, the same instant for the caller's `claim_run`, `take_lease` or the
-/// sweep's `renew_lease` (plan D143), which may lie before `clock.now() + times.ttl` at this call
-/// when the caller wrote other rows in between. Once refreshes have failed until
-/// `clock.now() >= last - times.refresh`, it returns `Expired`: the walk cannot prove its
-/// lease, and one `refresh` before it lapses is where it stops, so no other box's sweep adopts a
-/// run this walk still writes to. Neither the first beat nor a retry sleeps past that fence, and
-/// a refresh still pending at the fence (a stuck connection) is dropped there and read as
-/// `Expired` too.
+/// and does not say what it wrote (plan D10). The heartbeat instead tracks, on **tokio's
+/// monotonic clock** (MOD-41 plan D3, MOD-40 blueprint F-38), the instant by which the last lease
+/// it wrote successfully lapses at the earliest: the instant it sent that write plus the TTL. The
+/// store read its clock after that send, so its expiry is no earlier, and a span measured on one
+/// clock does not care how far apart two hosts' clocks are. It starts from `written`, the instant
+/// the caller's `claim_run`, `take_lease` or the sweep's `renew_lease` was sent plus the TTL
+/// (plan D143), which may lie before `now + times.ttl` at this call when the caller wrote other
+/// rows in between; each successful refresh moves it to its own send instant plus the TTL. Once
+/// refreshes have failed until tokio's `now >= last - times.refresh`, it returns `Expired`: the
+/// walk cannot prove its lease, and one `refresh` before it lapses is where it stops, so no other
+/// box's sweep adopts a run this walk still writes to. Neither the first beat nor a retry sleeps
+/// past that fence, and a refresh still pending at the fence (a stuck connection) is dropped
+/// there and read as `Expired` too. A wall-clock step while a lease is held can neither extend
+/// nor cut the fence.
 ///
 /// A single store error is not a taken lease: offline, the lease is left to expire and the
 /// reconnect sweep adjudicates (`docs/ANA-2.md:1325-1336`). Needs a runtime with the time driver
 /// (H-3).
-///
-/// The clock is the wall clock in production, so a wall-clock step while a lease is held moves
-/// the fence with it (MOD-40 blueprint F-38); a monotonic clock is MOD-41's.
-pub async fn heartbeat<F, Fut, C>(
+pub async fn heartbeat<F, Fut>(
     mut refresh: F,
-    written: DateTime<Utc>,
-    clock: &C,
+    written: tokio::time::Instant,
     times: LeaseTimes,
 ) -> Heartbeat
 where
     F: FnMut(TimeDelta) -> Fut,
     Fut: Future<Output = Result<bool, StoreError>>,
-    C: Clock + ?Sized,
 {
+    use tokio::time::Instant;
+
     let retry = (times.refresh / 4).max(MIN_RETRY);
-    let margin = TimeDelta::from_std(times.refresh).unwrap_or(times.ttl);
-    let mut fence = written - margin;
+    let ttl = times.ttl.to_std().unwrap_or(Duration::ZERO);
+    // Blueprint F-4: an instant cannot go below the platform's origin, nor past its end; either
+    // failure fences now, so the first check reads `Expired` rather than panicking.
+    let fence_of = |until: Instant| {
+        until
+            .checked_sub(times.refresh)
+            .unwrap_or_else(Instant::now)
+    };
+    let mut fence = fence_of(written);
     // Plan D143: a lease written well before this call fences sooner than one `refresh` away, and
     // the first beat must not sleep past it.
     let mut interval = times
         .refresh
-        .min((fence - clock.now()).to_std().unwrap_or(Duration::ZERO));
+        .min(fence.saturating_duration_since(Instant::now()));
     loop {
         tokio::time::sleep(interval).await;
-        let now = clock.now();
-        let until = now + times.ttl;
+        let sent = Instant::now();
         // Plan D122: a refresh that hangs is given up at the fence, not waited on past it.
-        let left = (fence - now).to_std().unwrap_or(Duration::ZERO);
+        let left = fence.saturating_duration_since(sent);
         let Ok(answer) = tokio::time::timeout(left, refresh(times.ttl)).await else {
             tracing::warn!("lease refresh still pending at the fence; the walk stops");
             return Heartbeat::Expired;
         };
         match answer {
             Ok(true) => {
-                fence = until - margin;
+                fence = sent.checked_add(ttl).map_or_else(Instant::now, fence_of);
                 interval = times.refresh;
             }
             Ok(false) => return Heartbeat::Abandoned,
             Err(error) => {
-                let now = clock.now();
+                let now = Instant::now();
                 if now >= fence {
                     tracing::warn!(%error, "lease refresh failed at the fence; the walk stops");
                     return Heartbeat::Expired;
                 }
                 tracing::warn!(%error, "lease refresh failed; retrying sooner");
-                let left = (fence - now).to_std().unwrap_or(Duration::ZERO);
-                interval = retry.min(left);
+                interval = retry.min(fence - now);
             }
         }
     }
@@ -385,8 +388,10 @@ mod tests {
     use std::time::Duration;
 
     use chrono::{DateTime, TimeDelta, TimeZone as _, Utc};
+    use htui_core::clock::{Clock as _, TestClock, epoch};
     use htui_core::store::StoreError;
     use serde_json::{Value, json};
+    use tokio::time::Instant;
 
     use htui_core::fixtures::{demo_data, ids};
     use htui_core::model::{
@@ -396,7 +401,6 @@ mod tests {
     };
 
     use crate::gate::{Settle, StepFailure};
-    use crate::isolate::Clock;
     use crate::recover::{
         Adjudication, Heartbeat, LeaseTimes, StepKind, classify, frontier, heartbeat, resettle,
         verify_of,
@@ -497,52 +501,30 @@ mod tests {
     // Heartbeat
     // -----------------------------------------------------------------------------------------
 
-    /// A [`Clock`] that reads tokio's paused time, so `clock.now()` moves exactly as far as the
-    /// heartbeat's `sleep` did.
-    struct PausedClock {
-        origin: DateTime<Utc>,
-        start: tokio::time::Instant,
-    }
-
-    impl PausedClock {
-        fn new() -> Self {
-            Self {
-                origin: Utc.with_ymd_and_hms(2026, 9, 23, 12, 0, 0).unwrap(),
-                start: tokio::time::Instant::now(),
-            }
-        }
-
-        fn elapsed(&self) -> Duration {
-            self.start.elapsed()
-        }
-    }
-
-    impl Clock for PausedClock {
-        fn now(&self) -> DateTime<Utc> {
-            self.origin + TimeDelta::from_std(self.elapsed()).expect("a test's elapsed time fits")
-        }
-    }
-
     /// The default 120 s TTL, and its refresh clamped to 40 s (D124).
     fn default_times() -> LeaseTimes {
         LeaseTimes::from_app(&BTreeMap::new())
     }
 
+    /// `times.ttl` as the span a lease written at a tokio instant runs for (plan D3).
+    fn ttl_of(times: LeaseTimes) -> Duration {
+        times.ttl.to_std().expect("a test's TTL is positive")
+    }
+
     /// A refresh closure answering `script` in order (then `Ok(true)` for ever), recording each
-    /// TTL beside the clock's instant at the call.
+    /// TTL beside tokio's instant at the call.
     #[allow(clippy::type_complexity)]
     fn scripted(
-        clock: &PausedClock,
         script: Vec<Result<bool, StoreError>>,
     ) -> (
-        Arc<Mutex<Vec<(DateTime<Utc>, TimeDelta)>>>,
-        impl FnMut(TimeDelta) -> std::future::Ready<Result<bool, StoreError>> + '_,
+        Arc<Mutex<Vec<(Instant, TimeDelta)>>>,
+        impl FnMut(TimeDelta) -> std::future::Ready<Result<bool, StoreError>>,
     ) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&calls);
         let mut script = script.into_iter();
         let refresh = move |ttl| {
-            seen.lock().unwrap().push((clock.now(), ttl));
+            seen.lock().unwrap().push((Instant::now(), ttl));
             std::future::ready(script.next().unwrap_or(Ok(true)))
         };
         (calls, refresh)
@@ -555,24 +537,24 @@ mod tests {
             .collect()
     }
 
-    /// The seconds after the clock's origin of every recorded call.
-    fn beats(calls: &Mutex<Vec<(DateTime<Utc>, TimeDelta)>>, origin: DateTime<Utc>) -> Vec<i64> {
+    /// The whole seconds after `start` of every recorded call.
+    fn beats(calls: &Mutex<Vec<(Instant, TimeDelta)>>, start: Instant) -> Vec<u64> {
         calls
             .lock()
             .unwrap()
             .iter()
-            .map(|(now, _)| (*now - origin).num_seconds())
+            .map(|(at, _)| (*at - start).as_secs())
             .collect()
     }
 
     #[tokio::test(start_paused = true)]
     async fn heartbeat_refreshes_every_interval() {
-        let clock = PausedClock::new();
+        let start = Instant::now();
         let times = default_times();
-        let (calls, refresh) = scripted(&clock, vec![Ok(true), Ok(true), Ok(true)]);
+        let (calls, refresh) = scripted(vec![Ok(true), Ok(true), Ok(true)]);
         let outcome = tokio::time::timeout(
             Duration::from_secs(125),
-            heartbeat(refresh, clock.now() + times.ttl, &clock, times),
+            heartbeat(refresh, start + ttl_of(times), times),
         )
         .await;
         assert!(
@@ -581,8 +563,8 @@ mod tests {
         );
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 3, "a beat at 40 s, 80 s and 120 s");
-        for (beat, (now, ttl)) in (1..).zip(calls.iter()) {
-            assert_eq!(*now, clock.origin + TimeDelta::seconds(40 * beat));
+        for (beat, (at, ttl)) in (1..).zip(calls.iter()) {
+            assert_eq!(*at, start + Duration::from_secs(40 * beat));
             assert_eq!(
                 *ttl, times.ttl,
                 "beat {beat}: every refresh asks for the configured TTL"
@@ -592,17 +574,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn heartbeat_returns_abandoned_on_a_zero_row_refresh() {
-        let clock = PausedClock::new();
-        let (calls, refresh) = scripted(&clock, vec![Ok(true), Ok(false)]);
-        let outcome = heartbeat(
-            refresh,
-            clock.now() + default_times().ttl,
-            &clock,
-            default_times(),
-        )
-        .await;
+        let start = Instant::now();
+        let (calls, refresh) = scripted(vec![Ok(true), Ok(false)]);
+        let outcome = heartbeat(refresh, start + ttl_of(default_times()), default_times()).await;
         assert_eq!(outcome, Heartbeat::Abandoned);
-        assert_eq!(clock.elapsed(), Duration::from_secs(80));
+        assert_eq!(start.elapsed(), Duration::from_secs(80));
         assert_eq!(calls.lock().unwrap().len(), 2);
     }
 
@@ -610,25 +586,16 @@ mod tests {
     /// answer inside the fence is still `Abandoned`.
     #[tokio::test(start_paused = true)]
     async fn heartbeat_survives_a_store_error() {
-        let clock = PausedClock::new();
-        let (calls, refresh) = scripted(
-            &clock,
-            vec![
-                Err(StoreError::Unreachable("socket closed".to_owned())),
-                Err(StoreError::Backend("deadlock".to_owned())),
-                Ok(false),
-            ],
-        );
-        let outcome = heartbeat(
-            refresh,
-            clock.now() + default_times().ttl,
-            &clock,
-            default_times(),
-        )
-        .await;
+        let start = Instant::now();
+        let (calls, refresh) = scripted(vec![
+            Err(StoreError::Unreachable("socket closed".to_owned())),
+            Err(StoreError::Backend("deadlock".to_owned())),
+            Ok(false),
+        ]);
+        let outcome = heartbeat(refresh, start + ttl_of(default_times()), default_times()).await;
         assert_eq!(outcome, Heartbeat::Abandoned);
         assert_eq!(
-            beats(&calls, clock.origin),
+            beats(&calls, start),
             [40, 50, 60],
             "abandoned on the third beat"
         );
@@ -639,22 +606,22 @@ mod tests {
     /// and the TTL is never reached.
     #[tokio::test(start_paused = true)]
     async fn heartbeat_expires_before_the_lease_lapses_when_every_refresh_fails() {
-        let clock = PausedClock::new();
+        let start = Instant::now();
         let times = default_times();
-        let (calls, refresh) = scripted(&clock, unreachable(100));
+        let (calls, refresh) = scripted(unreachable(100));
         let outcome = tokio::time::timeout(
             Duration::from_millis(600_500),
-            heartbeat(refresh, clock.now() + times.ttl, &clock, times),
+            heartbeat(refresh, start + ttl_of(times), times),
         )
         .await
         .expect("the heartbeat fences itself instead of beating for ever");
         assert_eq!(outcome, Heartbeat::Expired);
-        assert_eq!(clock.elapsed(), Duration::from_secs(80));
+        assert_eq!(start.elapsed(), Duration::from_secs(80));
         assert!(
-            clock.now() < clock.origin + times.ttl,
+            Instant::now() < start + ttl_of(times),
             "stopped before the lease lapsed"
         );
-        assert_eq!(beats(&calls, clock.origin), [40, 50, 60, 70, 80]);
+        assert_eq!(beats(&calls, start), [40, 50, 60, 70, 80]);
     }
 
     /// Plan D143 (review L-a): the fence starts from the lease the caller actually wrote, not
@@ -662,23 +629,23 @@ mod tests {
     /// it lapses at 90 s and the fence stands at 50 s, where every refresh failing stops the walk.
     #[tokio::test(start_paused = true)]
     async fn heartbeat_fences_from_the_until_its_caller_wrote() {
-        let clock = PausedClock::new();
+        let start = Instant::now();
         let times = default_times();
-        let written = clock.now() + times.ttl - TimeDelta::seconds(30);
-        let (calls, refresh) = scripted(&clock, unreachable(100));
+        let written = start + ttl_of(times) - Duration::from_secs(30);
+        let (calls, refresh) = scripted(unreachable(100));
         let outcome = tokio::time::timeout(
             Duration::from_millis(600_500),
-            heartbeat(refresh, written, &clock, times),
+            heartbeat(refresh, written, times),
         )
         .await
         .expect("the heartbeat fences itself instead of beating for ever");
         assert_eq!(outcome, Heartbeat::Expired);
-        assert_eq!(clock.elapsed(), Duration::from_secs(50));
+        assert_eq!(start.elapsed(), Duration::from_secs(50));
         assert!(
-            clock.now() < written,
+            Instant::now() < written,
             "stopped before the written lease lapsed"
         );
-        assert_eq!(beats(&calls, clock.origin), [40, 50]);
+        assert_eq!(beats(&calls, start), [40, 50]);
     }
 
     /// Plan D143: a lease written long before the heartbeat began has its fence sooner than one
@@ -686,19 +653,19 @@ mod tests {
     /// 50 s, the fence stands at 10 s, and a first refresh that fails there stops the walk.
     #[tokio::test(start_paused = true)]
     async fn heartbeat_first_beat_never_sleeps_past_the_fence() {
-        let clock = PausedClock::new();
+        let start = Instant::now();
         let times = default_times();
-        let written = clock.now() + TimeDelta::seconds(50);
-        let (calls, refresh) = scripted(&clock, unreachable(100));
+        let written = start + Duration::from_secs(50);
+        let (calls, refresh) = scripted(unreachable(100));
         let outcome = tokio::time::timeout(
             Duration::from_millis(600_500),
-            heartbeat(refresh, written, &clock, times),
+            heartbeat(refresh, written, times),
         )
         .await
         .expect("the heartbeat fences itself instead of beating for ever");
         assert_eq!(outcome, Heartbeat::Expired);
-        assert_eq!(clock.elapsed(), Duration::from_secs(10));
-        assert_eq!(beats(&calls, clock.origin), [10]);
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+        assert_eq!(beats(&calls, start), [10]);
     }
 
     /// Plan D122: a refresh that neither answers nor fails (a stuck connection) is raced against
@@ -707,7 +674,7 @@ mod tests {
     /// 40 s and is given up at the 80 s fence.
     #[tokio::test(start_paused = true)]
     async fn heartbeat_expires_at_the_fence_while_a_refresh_hangs() {
-        let clock = PausedClock::new();
+        let start = Instant::now();
         let times = default_times();
         let calls = Mutex::new(0_u32);
         let refresh = |_ttl| {
@@ -716,12 +683,12 @@ mod tests {
         };
         let outcome = tokio::time::timeout(
             Duration::from_millis(600_500),
-            heartbeat(refresh, clock.now() + times.ttl, &clock, times),
+            heartbeat(refresh, start + ttl_of(times), times),
         )
         .await
         .expect("the heartbeat gives up a hung refresh at the fence");
         assert_eq!(outcome, Heartbeat::Expired);
-        assert_eq!(clock.elapsed(), Duration::from_secs(80));
+        assert_eq!(start.elapsed(), Duration::from_secs(80));
         assert_eq!(*calls.lock().unwrap(), 1, "the one refresh never answered");
     }
 
@@ -729,56 +696,43 @@ mod tests {
     /// writes 170 s, so the next run of failures fences at 130 s.
     #[tokio::test(start_paused = true)]
     async fn heartbeat_a_successful_refresh_moves_the_fence() {
-        let clock = PausedClock::new();
+        let start = Instant::now();
         let mut script = unreachable(1);
         script.push(Ok(true));
         script.extend(unreachable(100));
-        let (calls, refresh) = scripted(&clock, script);
+        let (calls, refresh) = scripted(script);
         let outcome = tokio::time::timeout(
             Duration::from_millis(600_500),
-            heartbeat(
-                refresh,
-                clock.now() + default_times().ttl,
-                &clock,
-                default_times(),
-            ),
+            heartbeat(refresh, start + ttl_of(default_times()), default_times()),
         )
         .await
         .expect("the heartbeat fences itself instead of beating for ever");
         assert_eq!(outcome, Heartbeat::Expired);
-        assert_eq!(clock.elapsed(), Duration::from_secs(130));
-        assert_eq!(
-            beats(&calls, clock.origin),
-            [40, 50, 90, 100, 110, 120, 130]
-        );
+        assert_eq!(start.elapsed(), Duration::from_secs(130));
+        assert_eq!(beats(&calls, start), [40, 50, 90, 100, 110, 120, 130]);
     }
 
     /// Plan D123: after an error the next beat comes `refresh / 4` later (10 s of 40 s), and after
     /// a success the interval is the full `refresh` again.
     #[tokio::test(start_paused = true)]
     async fn heartbeat_retries_sooner_after_a_store_error() {
-        let clock = PausedClock::new();
+        let start = Instant::now();
         let mut script = unreachable(1);
         script.push(Ok(true));
-        let (calls, refresh) = scripted(&clock, script);
+        let (calls, refresh) = scripted(script);
         let outcome = tokio::time::timeout(
             Duration::from_secs(95),
-            heartbeat(
-                refresh,
-                clock.now() + default_times().ttl,
-                &clock,
-                default_times(),
-            ),
+            heartbeat(refresh, start + ttl_of(default_times()), default_times()),
         )
         .await;
         assert!(outcome.is_err(), "the lease is held again");
-        assert_eq!(beats(&calls, clock.origin), [40, 50, 90]);
+        assert_eq!(beats(&calls, start), [40, 50, 90]);
     }
 
     /// Plan D123's floor: a refresh whose quarter is under a second retries after one second.
     #[tokio::test(start_paused = true)]
     async fn heartbeat_retries_after_at_least_a_second() {
-        let clock = PausedClock::new();
+        let start = Instant::now();
         let times = LeaseTimes::from_app(&app(&[
             ("lease_ttl_seconds", json!(9)),
             ("lease_refresh_seconds", json!(2)),
@@ -786,14 +740,49 @@ mod tests {
         assert_eq!(times.refresh, Duration::from_secs(2));
         let mut script = unreachable(1);
         script.push(Ok(true));
-        let (calls, refresh) = scripted(&clock, script);
+        let (calls, refresh) = scripted(script);
         let outcome = tokio::time::timeout(
             Duration::from_secs(4),
-            heartbeat(refresh, clock.now() + times.ttl, &clock, times),
+            heartbeat(refresh, start + ttl_of(times), times),
         )
         .await;
         assert!(outcome.is_err(), "the lease is held again");
-        assert_eq!(beats(&calls, clock.origin), [2, 3]);
+        assert_eq!(beats(&calls, start), [2, 3]);
+    }
+
+    /// MOD-41 plan D3: the fence is measured on tokio's monotonic clock alone. Every refresh
+    /// fails, and each one steps a wall clock the heartbeat is never handed by a day forward; the
+    /// heartbeat still returns `Expired` at exactly `written - refresh` of paused time, as if no
+    /// wall clock existed.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_fences_on_tokio_time_alone() {
+        let start = Instant::now();
+        let times = default_times();
+        let written = start + ttl_of(times);
+        let wall = TestClock::new();
+        let refresh = |_ttl| {
+            wall.advance(TimeDelta::days(1));
+            std::future::ready(Err::<bool, _>(StoreError::Unreachable(
+                "socket closed".to_owned(),
+            )))
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(600_500),
+            heartbeat(refresh, written, times),
+        )
+        .await
+        .expect("the heartbeat fences itself instead of beating for ever");
+        assert_eq!(outcome, Heartbeat::Expired);
+        assert_eq!(
+            Instant::now(),
+            written - times.refresh,
+            "the fence is `written - refresh` on tokio's clock"
+        );
+        assert_eq!(
+            wall.now(),
+            epoch() + TimeDelta::days(5),
+            "five failed beats (40, 50, 60, 70, 80 s) each stepped the wall clock a day"
+        );
     }
 
     // -----------------------------------------------------------------------------------------
