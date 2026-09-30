@@ -41,6 +41,7 @@ use htui_core::prompt::excerpt::{
 use htui_core::prompt::{
     AssembledPrompt, DiffBlock, InputDocument, JudgeCandidate, PromptSpec, SectionName,
     TemplateRef, TemplateRole, TokenEstimator, TrimStrategy, VerifyFailure, assemble, settings,
+    withhold_unmaskable_notes,
 };
 use htui_core::scrub::Scrubber;
 use htui_core::store::{StepFence, StoreError, WriteStore};
@@ -5258,7 +5259,12 @@ where
         let previous_diff = match self.parts.isolator.diff(&trees, &commits).await {
             Ok(diff) => diff,
             Err(err) => {
-                notes.push(format!("previous_diff unavailable: {err}"));
+                // MOD-9 D132: `err` carries git's stderr, which can name a checkout path, and this
+                // note joins the record through the spec's own notes, which `step_pass` never
+                // sees; the record is scrubbed fail-closed, so it is withheld here.
+                let mut note = [format!("previous_diff unavailable: {err}")];
+                withhold_unmaskable_notes(&mut note, self.parts.scrubber);
+                notes.extend(note);
                 None
             }
         };
@@ -13236,6 +13242,37 @@ mod tests {
             .orch
             .isolator
             .fail_changed_paths("cannot lock /srv/sk-live-checkout/.git/index.lock");
+
+        let (_, second) = run_two_attempts(&harness).await;
+
+        assert_eq!(second.status, StepStatus::Done);
+        let notes = stored_notes(&second);
+        assert!(
+            notes.contains(
+                &"excerpt: a note was withheld; it named a string the scrubber masks or refuses"
+                    .to_owned()
+            ),
+            "{notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|note| note.contains("sk-live")),
+            "{notes:?}"
+        );
+    }
+
+    /// MOD-9 D132 (review finding 4 residue): the `previous_diff unavailable` note carries the
+    /// isolator's error too, and joins the record through the spec's own notes rather than
+    /// `step_pass`, so a credential-shaped path in it is withheld where it is written, not left to
+    /// refuse the record and fail the step.
+    #[tokio::test]
+    async fn an_unmaskable_previous_diff_error_is_withheld_not_a_failure() {
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        glob_retry_prologue(&harness, dir.path()).await;
+        harness
+            .orch
+            .isolator
+            .fail_diff("cannot lock /srv/sk-live-checkout/.git/index.lock");
 
         let (_, second) = run_two_attempts(&harness).await;
 
