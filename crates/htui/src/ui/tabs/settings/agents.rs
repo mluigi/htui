@@ -1146,6 +1146,11 @@ impl AgentsSection {
             ctx.emit(Action::Error("no agent row is selected".to_owned()));
             return;
         };
+        // Review L-4: a stored model name with a comma would not survive the form's `models`.
+        if let Err(refusal) = agent_settings::editable(&summary.agent) {
+            ctx.emit(Action::Error(refusal.to_string()));
+            return;
+        }
         self.mode = Mode::Editing(Editor::edit(summary));
         self.notice = None;
     }

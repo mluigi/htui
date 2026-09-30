@@ -424,6 +424,25 @@ pub fn draft_of(agent: &Agent) -> AgentDraft {
     }
 }
 
+/// Whether the edit form can open over `agent` (review L-4): `models` is comma-separated
+/// ([`parse_models`]), so a stored model name holding a comma would come back from the form split
+/// in two. Such a row is refused rather than silently rewritten, by the section when `e` is
+/// pressed and by [`serve`]'s edit path before it writes. Names no model: the sentence is the
+/// rule, and the table already shows the row.
+///
+/// # Errors
+///
+/// A [`Refusal`] on `models` when any stored model name contains a comma.
+pub fn editable(agent: &Agent) -> Result<(), Refusal> {
+    if agent.models.iter().any(|model| model.contains(',')) {
+        return Err(Refusal::new(
+            MODELS,
+            "a stored model name contains a comma; edit it with SQL",
+        ));
+    }
+    Ok(())
+}
+
 /// Whether the draft changes what a probe checked (plan D246): `transport`, `command` or `args`.
 #[must_use]
 pub fn launch_changed(stored: &Agent, draft: &AgentDraft) -> bool {
@@ -576,6 +595,11 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             match stored {
                 None => AgentWrite::Gone { id: *agent_id },
                 Some(stored) => {
+                    // Review L-4, defensively: the section refuses to open this form, and a draft
+                    // over such a row would have split the name on its way here.
+                    if let Err(refusal) = editable(&stored.agent) {
+                        return Ok(refused(request, &refusal));
+                    }
                     let merged = match apply_draft(&stored.agent, draft) {
                         Ok(merged) => merged,
                         Err(refusal) => return Ok(refused(request, &refusal)),
@@ -1224,6 +1248,26 @@ mod tests {
             ..same
         };
         assert!(launch_changed(&stored, &transport));
+    }
+
+    /// Review L-4: `models` is comma-separated, so a stored name holding a comma cannot survive
+    /// the form's round trip; the form refuses to open over it rather than split it on save.
+    #[test]
+    fn a_stored_model_name_with_a_comma_is_not_editable() {
+        assert_eq!(editable(&stored_agent()), Ok(()));
+        let mut agent = stored_agent();
+        agent.models = strings(&["m1", "vendor,model"]);
+        let refusal = editable(&agent).expect_err("a comma does not round-trip");
+        assert_eq!(refusal.field, MODELS);
+        assert_eq!(
+            refusal.to_string(),
+            "`models`: a stored model name contains a comma; edit it with SQL"
+        );
+        assert_ne!(
+            parse_models(&format_models(&agent.models)).ok(),
+            Some(agent.models),
+            "which is the round trip this guards"
+        );
     }
 
     #[test]

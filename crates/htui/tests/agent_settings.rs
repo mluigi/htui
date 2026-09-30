@@ -450,6 +450,53 @@ async fn edit_agent_with_an_invalid_draft_is_failed_by_field() {
     );
 }
 
+/// Review L-4: an edit over a stored row whose model name holds a comma is refused by `models`
+/// before anything is written: the form's comma-separated `models` would split it.
+#[tokio::test]
+async fn edit_agent_over_a_model_name_with_a_comma_is_failed_by_models() {
+    let store = MemStore::demo();
+    let backend = Backend::memory(store.clone());
+    let mut seeded = row(&registry(&backend).await, ids::AGENT_CLAUDE)
+        .agent
+        .clone();
+    seeded.models = vec!["vendor,model".to_owned()];
+    seeded.default_model = None;
+    let applied = store
+        .upsert_agent(&seeded, Some(seeded.updated_at))
+        .await
+        .expect("the memory store never fails");
+    assert!(matches!(applied, CasOutcome::Applied(_)), "the seed edit");
+    let before = row(&registry(&backend).await, ids::AGENT_CLAUDE)
+        .agent
+        .clone();
+
+    let edit = AgentDraft {
+        billing: Billing::PerToken,
+        ..agent_settings::draft_of(&before)
+    };
+    let (request, message) = refusal(
+        serve(
+            &backend,
+            &StoreRequest::EditAgent {
+                agent_id: ids::AGENT_CLAUDE,
+                expected: before.updated_at,
+                draft: edit,
+            },
+        )
+        .await,
+    );
+
+    assert_eq!(request, "edit_agent");
+    assert_eq!(
+        message,
+        "`models`: a stored model name contains a comma; edit it with SQL"
+    );
+    assert!(
+        row(&registry(&backend).await, ids::AGENT_CLAUDE).agent == before,
+        "nothing was written"
+    );
+}
+
 /// Plan D242: off, then on. The demo holds no `agent_box` row, so the switch writes a bare one;
 /// switching on with no probe document is `enabled`.
 #[tokio::test]

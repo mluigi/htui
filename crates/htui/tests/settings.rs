@@ -3007,6 +3007,26 @@ async fn e_prefills_the_highlighted_row_without_a_name_field_and_sends_its_token
     }
 }
 
+/// Review L-4: `e` over a row whose stored model name holds a comma opens nothing and says why:
+/// the form's comma-separated `models` would split the name on save.
+#[tokio::test]
+async fn e_refuses_a_row_whose_model_name_holds_a_comma() {
+    let bench = SectionBench::new().await;
+    let mut row = editable_row("alpha");
+    row.agent.models = vec!["m1".to_owned(), "vendor,model".to_owned()];
+    let mut section = section_over(&bench, vec![row]);
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(
+        errors_of(&emitted),
+        vec!["`models`: a stored model name contains a comma; edit it with SQL".to_owned()]
+    );
+    assert!(!asked_anything(&emitted), "{emitted:?}");
+    assert!(!section.captures_input(), "no form opened");
+}
+
 /// Plan D239's "unchanged closes": `e` then `Enter` writes nothing.
 #[tokio::test]
 async fn an_unchanged_edit_closes_without_a_write() {
