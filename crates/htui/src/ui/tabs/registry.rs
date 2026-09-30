@@ -49,6 +49,15 @@ pub trait Tab {
     fn on_scope_change(&mut self, scope: &Scope);
     /// A key reached this tab (propagation order: `docs` blueprint C.4).
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled;
+    /// A bracketed paste reached this tab, whole (MOD-22 review M-1).
+    ///
+    /// Only a view that is capturing input takes one, into its focused field; everything else
+    /// answers `Pass` and the shell drops it — no keymap ever sees a paste, so text pasted before
+    /// a field is open never runs as commands. Defaulted to `Pass` so a tab with no field changes
+    /// nothing.
+    fn on_paste(&mut self, _text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        Handled::Pass
+    }
     /// A reply addressed to this tab arrived and is not stale.
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
     /// Draws into the body region.

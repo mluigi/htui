@@ -72,6 +72,12 @@ pub trait DetailTab {
     /// A key the Backlog tab did not use for navigation, or every key while
     /// [`captures_input`](DetailTab::captures_input) says so.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled;
+    /// A bracketed paste, offered only while [`captures_input`](DetailTab::captures_input) is true
+    /// (MOD-22 review M-1): a typed field takes it; a modal answer is not a field, and the
+    /// default `Pass` drops it so its letters answer nothing.
+    fn on_paste(&mut self, _text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        Handled::Pass
+    }
     /// Whether this sub-tab is taking typed text or a modal answer right now, so the Backlog tab
     /// must hand it every key before its own navigation (MOD-4 plan OQ-7). Derived from a mode,
     /// never a flag.
@@ -196,6 +202,14 @@ impl DetailRegistry {
     #[must_use]
     pub fn captures_input(&self) -> bool {
         self.active().is_some_and(DetailTab::captures_input)
+    }
+
+    /// Offers a bracketed paste to the active sub-tab while it captures input (MOD-22 review M-1).
+    pub fn on_paste(&mut self, text: &str, ctx: &mut Ctx<'_>) -> Handled {
+        match self.tabs.get_mut(self.active) {
+            Some(tab) if tab.captures_input() => tab.on_paste(text, ctx),
+            _ => Handled::Pass,
+        }
     }
 
     /// Offers a key to the active sub-tab.

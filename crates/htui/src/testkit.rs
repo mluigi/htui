@@ -291,6 +291,7 @@ impl Harness {
                         | StoreRequest::AuthStart { .. }
                         | StoreRequest::AuthChoose { .. }
                         | StoreRequest::AuthOpen { .. }
+                        | StoreRequest::AuthDeliver { .. }
                         | StoreRequest::AuthCancel,
                         _,
                     ) => match self.runtime.as_mut() {
@@ -564,6 +565,13 @@ impl Harness {
         self.app.on_key(parsed.to_event());
     }
 
+    /// Feeds one bracketed paste, as the terminal reports it: one `Event::Paste` through the
+    /// same entry point the event loop uses (MOD-22 review M-1).
+    pub fn paste(&mut self, text: &str) {
+        self.app
+            .on_terminal_event(crossterm::event::Event::Paste(text.to_owned()));
+    }
+
     /// Draws a frame and returns the buffer as text, one line per row, trailing blanks trimmed.
     ///
     /// # Panics
@@ -673,6 +681,13 @@ impl SectionBench {
         let parsed = KeyChord::parse(chord).unwrap_or_else(|| panic!("`{chord}` is not a chord"));
         let mut ctx = self.ctx();
         section.on_key(parsed.to_event(), &mut ctx)
+    }
+
+    /// Feeds one bracketed paste to a section, as the Settings tab forwards it (MOD-22 review
+    /// M-1).
+    pub fn paste(&self, section: &mut dyn SettingsSection, text: &str) -> Handled {
+        let mut ctx = self.ctx();
+        section.on_paste(text, &mut ctx)
     }
 
     /// Hands one reply to a section.

@@ -1166,6 +1166,18 @@ impl DetailTab for RunsTab {
         !matches!(self.mode, Mode::Browse)
     }
 
+    /// MOD-22 review M-1: a bracketed paste into the rejection note or the typed-back key. The
+    /// `y`/`n` questions are not fields: a paste there is dropped, so its `y` confirms nothing.
+    fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        match &mut self.mode {
+            Mode::RejectNote { field, .. } | Mode::CloseOut(CloseOutStage::Typed { field, .. }) => {
+                field.on_paste(text);
+                Handled::Consumed
+            }
+            _ => Handled::Pass,
+        }
+    }
+
     /// The pane's replies (blueprint §9.5): its rows, its verdicts, the stream's invalidations,
     /// the answers to what it sent, and the document it opened.
     ///

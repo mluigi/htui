@@ -14,7 +14,12 @@ use htui::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection, PromptSection,
     QdrantSection, SectionId, SettingsSection, SettingsTab, message,
 };
+use htui::ui::text_field::PASTE_DOES_NOT_FIT;
 use htui_agent::acp::Handshake;
+use htui_agent::auth::loopback::{
+    self, Advertised, DELIVERY_IN_FLIGHT, DeliverError, ListenerReply, NO_LOOPBACK_REDIRECT,
+    PASTE_MAX, PasteError,
+};
 use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::install::InstallRecord;
 use htui_agent::probe::{CredentialTier, ProbeSnapshot, ProbeSource, ProbeStatus};
@@ -861,6 +866,8 @@ async fn h_and_l_move_between_sections() {
 #[derive(Debug, Default)]
 struct CapturingProbe {
     seen: Vec<KeyCode>,
+    /// Every bracketed paste it was handed, whole (MOD-22 review M-1).
+    pasted: Vec<String>,
 }
 
 impl SettingsSection for CapturingProbe {
@@ -887,10 +894,21 @@ impl SettingsSection for CapturingProbe {
         Handled::Consumed
     }
 
+    fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        self.pasted.push(text.to_owned());
+        Handled::Consumed
+    }
+
     fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        message(frame, area, &format!("seen {}", self.seen.len()), ctx.theme);
+        let pasted = self.pasted.join("|").replace('\n', "\\n");
+        message(
+            frame,
+            area,
+            &format!("seen {} pasted [{pasted}]", self.seen.len()),
+            ctx.theme,
+        );
     }
 }
 
@@ -937,6 +955,121 @@ async fn a_capturing_section_receives_l_and_a_plain_one_cycles() {
     assert!(
         !harness.app().should_quit,
         "`q` is a letter while a section is taking text"
+    );
+}
+
+/// MOD-22 review M-1: a bracketed paste while nothing captures input is dropped whole. Before the
+/// terminal's paste mode it was replayed as keys, so the `2` of a pasted redirect switched tabs, a
+/// `/` opened an unmasked filter and the code after it was echoed there in clear; as one
+/// `Event::Paste` it reaches no keymap at all.
+#[tokio::test]
+async fn a_bracketed_paste_with_nothing_capturing_input_does_nothing() {
+    let mut harness = Harness::demo()
+        .with_tab(Box::new(SettingsTab::with_sections(vec![
+            Box::new(AgentsSection::new()),
+            Box::new(CapturingProbe::default()),
+        ])))
+        .with_tab(Box::new(htui::ui::tabs::RequirementsTab::new()));
+    harness.settle().await;
+    let before = harness.render();
+
+    harness.paste(&format!("2/?code={CODE}&state={STATE}\nq"));
+    harness.settle().await;
+    let after = harness.render();
+    assert_eq!(after, before, "no tab, section or state moved");
+    assert!(!after.contains(CODE), "and nothing drew the pasted text");
+    assert!(!harness.app().should_quit, "its `q` quit nothing");
+}
+
+/// MOD-22 review M-1: a section that is taking text gets the paste whole, as one event — the
+/// tab's `l` and the shell's `q` inside it are characters, not a cycle and a quit.
+#[tokio::test]
+async fn a_bracketed_paste_reaches_a_capturing_section_whole() {
+    let mut harness = Harness::demo().with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(AgentsSection::new()),
+        Box::new(CapturingProbe::default()),
+    ])));
+    harness.settle().await;
+    harness.key("l");
+    harness.settle().await;
+
+    harness.paste("l2q\n");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("seen 0 pasted [l2q\\n]"),
+        "one paste, whole, and no key: {frame}"
+    );
+    assert!(!harness.app().should_quit);
+}
+
+/// MOD-22 review M-1: a paste into an open unmasked field lands there as typed text would, and
+/// its trailing newline does not submit the form.
+#[tokio::test]
+async fn a_bracketed_paste_fills_an_unmasked_form_field() {
+    let mut harness = Harness::demo().with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(AgentsSection::new()),
+        Box::new(ProbeSection),
+    ])));
+    harness.settle().await;
+    harness.key("n");
+    harness.paste("pasted-agent\n");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains("pasted-agent"), "the paste landed: {frame}");
+
+    // Still open: `l` is a letter, not a cycle to the next section.
+    harness.key("l");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("pasted-agentl"),
+        "the form is still open: {frame}"
+    );
+}
+
+/// Review round 2, test gap: a modal overlay over an open field takes a paste the way it takes a
+/// key it has no use for — it swallows it. The paste is dropped, never reaches the field under
+/// the overlay, and nothing renders it, before or after the overlay closes.
+#[tokio::test]
+async fn a_bracketed_paste_under_a_modal_overlay_reaches_no_field() {
+    let mut harness = Harness::demo().with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(AgentsSection::new()),
+        Box::new(ProbeSection),
+    ])));
+    harness.settle().await;
+    harness.key("n");
+    harness.settle().await;
+    let form = harness.render();
+    harness
+        .app()
+        .push_overlay(Box::new(htui::ui::overlay::WorkspaceSwitcher::new()));
+    harness.settle().await;
+    assert_ne!(harness.render(), form, "the overlay is up");
+
+    harness.paste("pasted-under-overlay");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("pasted-under-overlay"),
+        "the overlay swallowed it: {frame}"
+    );
+
+    harness.key("esc");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("pasted-under-overlay"),
+        "and the field under it never got it: {frame}"
+    );
+    for key in ["z", "q", "x"] {
+        harness.key(key);
+    }
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("zqx"),
+        "the form is still open under where the overlay was, and empty before: {frame}"
     );
 }
 
@@ -2020,7 +2153,7 @@ async fn a_on_an_unauthenticated_row_sends_auth_start_and_the_cell_reads_startin
     let rendered = render_section(&section, &bench.ctx());
     assert_eq!(on_box_cell(&rendered, "loginable"), "starting\u{2026}");
     assert!(
-        rendered.contains("o open link \u{b7} x cancel"),
+        rendered.contains("o open link \u{b7} p paste redirect \u{b7} x cancel"),
         "and the hint offers the keys a live flow binds: {rendered}"
     );
 }
@@ -2578,7 +2711,7 @@ async fn an_agents_reply_during_a_login_does_not_clear_the_state() {
         "its link is still on screen: {rendered}"
     );
     assert!(
-        rendered.contains("o open link \u{b7} x cancel"),
+        rendered.contains("o open link \u{b7} p paste redirect \u{b7} x cancel"),
         "and it can still be stopped: {rendered}"
     );
 }
@@ -2653,6 +2786,807 @@ async fn a_failed_or_idle_flow_leaves_a_notice_and_an_idle_section() {
         "the notice says what happened rather than implying the user did it: {rendered}"
     );
     assert!(rendered.contains("a authenticate"), "{rendered}");
+}
+
+// -------------------------------------------------------------------------------------------
+// MOD-22 T3: p, the paste field and the delivery (plan D270-D272; blueprint §4)
+// -------------------------------------------------------------------------------------------
+
+/// The authorization code every paste here carries: a sentinel, so that its **absence** can be
+/// asserted from every render and every emitted request (the credential rule, plan D273). No
+/// assertion message in this block prints a pasted text or a request that carries one.
+const CODE: &str = "CODE-SENTINEL-4f1c";
+
+/// The `state` the link advertises and a good paste repeats.
+const STATE: &str = "STATE-SENTINEL-9a2e";
+
+/// A link advertising a loopback redirect. The port is fixed so the snapshot is deterministic;
+/// nothing in this block connects to it.
+const LOOPBACK_LINK: &str =
+    "https://h.invalid/o?redirect_uri=http%3A%2F%2F127.0.0.1%3A39879%2F&state=STATE-SENTINEL-9a2e";
+
+/// The address the browser could not open: the advertised redirect, a code and the link's state.
+const PASTE: &str = "http://127.0.0.1:39879/?code=CODE-SENTINEL-4f1c&state=STATE-SENTINEL-9a2e";
+
+/// The pane's line while a redirect is advertised and nothing is open (D270), written out as the
+/// pin.
+const REDIRECT_LINE: &str =
+    "redirect: 127.0.0.1:39879 \u{b7} p pastes the address if the browser cannot reach it";
+
+/// The prompt over the open field (D270).
+const PASTE_PROMPT: &str = "paste the address the browser could not open (127.0.0.1:39879):";
+
+/// The pane's line while a delivery is unanswered (D270).
+const DELIVERING: &str = "delivering to 127.0.0.1:39879\u{2026}";
+
+/// What `p` says while the login is being cancelled (blueprint D282). The section's constant is
+/// private, so the pin is spelled here.
+const PASTE_CANCELLING: &str = "this login is being cancelled; there is nothing to paste into";
+
+/// The keys line while a login is spawning or running (D270).
+const HINT_AUTH_RUNNING: &str = "o open link \u{b7} p paste redirect \u{b7} x cancel";
+
+/// The keys line while the paste field is open (D270).
+const HINT_PASTING: &str = "Enter sends \u{b7} Esc cancels";
+
+/// A section past `a`, the method list and `Enter`, whose flow has printed `link`.
+fn running_over(bench: &SectionBench, link: &str) -> AgentsSection {
+    let mut section = chooser_over(bench, false, 0);
+    bench.key(&mut section, "Enter");
+    bench.reply(
+        &mut section,
+        &StoreReply::Auth(AuthFrame::Url(link.to_owned())),
+    );
+    let _ = bench.drained();
+    section
+}
+
+/// The same, with the paste field open over [`LOOPBACK_LINK`].
+fn pasting_over(bench: &SectionBench) -> AgentsSection {
+    let mut section = running_over(bench, LOOPBACK_LINK);
+    assert_eq!(bench.key(&mut section, "p"), Handled::Consumed);
+    let _ = bench.drained();
+    section
+}
+
+/// The same, with [`PASTE`] sent and its answer outstanding.
+fn delivering_over(bench: &SectionBench) -> AgentsSection {
+    let mut section = pasting_over(bench);
+    typed(bench, &mut section, PASTE);
+    assert_eq!(bench.key(&mut section, "Enter"), Handled::Consumed);
+    let _ = bench.drained();
+    section
+}
+
+/// The one line of a render the field is drawn on, found by its `› ` prefix.
+fn field_line(rendered: &str) -> Option<&str> {
+    rendered.lines().find(|line| line.starts_with("\u{203a} "))
+}
+
+/// D270, D282: `p` opens a masked field, and from then on the section's letters, the shell's `q`,
+/// `?` and digits and the tab's `h`/`l` are all characters. Only a `CONTROL` chord gets out.
+#[tokio::test]
+async fn p_with_a_loopback_redirect_opens_a_masked_field_that_captures_input() {
+    let bench = SectionBench::new().await;
+    let mut section = running_over(&bench, LOOPBACK_LINK);
+    assert!(
+        !section.captures_input(),
+        "a running login alone captures nothing"
+    );
+
+    assert_eq!(bench.key(&mut section, "p"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert!(
+        emitted.is_empty(),
+        "opening the field asks nothing: {emitted:?}"
+    );
+    assert!(
+        section.captures_input(),
+        "the open field takes `h` and `l` from the tab"
+    );
+
+    for chord in ["q", "h", "l", "x", "o", "?", "1"] {
+        assert_eq!(
+            bench.key(&mut section, chord),
+            Handled::Consumed,
+            "`{chord}` is typed, not acted on"
+        );
+        let emitted = bench.drained();
+        assert!(emitted.is_empty(), "`{chord}` asked nothing: {emitted:?}");
+    }
+    let rendered = render_section(&section, &bench.ctx());
+    let field = field_line(&rendered).unwrap_or_else(|| panic!("the field is drawn: {rendered}"));
+    assert_eq!(
+        field.matches('\u{2022}').count(),
+        7,
+        "every key landed in the field: {rendered}"
+    );
+    assert!(field.contains("(7)"), "{rendered}");
+
+    assert_eq!(
+        bench.key(&mut section, "ctrl-c"),
+        Handled::Pass,
+        "a CONTROL chord still reaches the shell, so ctrl-c quits"
+    );
+    assert!(bench.drained().is_empty());
+    assert!(section.captures_input(), "and the field is still open");
+}
+
+/// D282: with no loopback redirect advertised there is nothing to paste into, and `p` says so by
+/// name, in `Running` and in `Starting` alike.
+#[tokio::test]
+async fn p_without_a_loopback_redirect_is_refused_by_name_and_opens_nothing() {
+    let bench = SectionBench::new().await;
+    let mut section = running_over(&bench, "https://h.invalid/o");
+    assert_eq!(bench.key(&mut section, "p"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(errors_of(&emitted), vec![NO_LOOPBACK_REDIRECT.to_owned()]);
+    assert!(!asked_anything(&emitted), "{emitted:?}");
+    assert!(!section.captures_input());
+
+    // `a` pressed, the method list not answered yet.
+    let mut section = section_over(
+        &bench,
+        vec![login_row(
+            "loginable",
+            ProbeStatus::Unauthenticated,
+            &[METHOD],
+        )],
+    );
+    bench.key(&mut section, "a");
+    let _ = bench.drained();
+    assert_eq!(bench.key(&mut section, "p"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(errors_of(&emitted), vec![NO_LOOPBACK_REDIRECT.to_owned()]);
+    assert!(!asked_anything(&emitted), "{emitted:?}");
+    assert!(!section.captures_input());
+}
+
+/// `p` is `o`'s kind of key: bound while a login is in flight and a free letter otherwise.
+#[tokio::test]
+async fn p_is_not_bound_outside_a_running_login() {
+    let bench = SectionBench::new().await;
+    let mut section = section_over(
+        &bench,
+        vec![login_row(
+            "loginable",
+            ProbeStatus::Unauthenticated,
+            &[METHOD],
+        )],
+    );
+    let _ = bench.drained();
+    assert_eq!(bench.key(&mut section, "p"), Handled::Pass);
+    let emitted = bench.drained();
+    assert!(emitted.is_empty(), "{emitted:?}");
+    assert!(!section.captures_input());
+}
+
+/// D282: a login on its way out has nothing to paste into, and a second paste while the first is
+/// unanswered would make the first's answer stale (plan D263), so both are refused by name.
+#[tokio::test]
+async fn p_while_cancelling_or_delivering_is_refused_by_name() {
+    let bench = SectionBench::new().await;
+    let mut section = running_over(&bench, LOOPBACK_LINK);
+    bench.key(&mut section, "x");
+    let _ = bench.drained();
+    assert_eq!(bench.key(&mut section, "p"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(errors_of(&emitted), vec![PASTE_CANCELLING.to_owned()]);
+    assert!(!asked_anything(&emitted), "{emitted:?}");
+    assert!(!section.captures_input());
+
+    let mut section = pasting_over(&bench);
+    typed(&bench, &mut section, PASTE);
+    bench.key(&mut section, "Enter");
+    let sent = requests_of(&bench);
+    assert_eq!(sent.len(), 1, "one request for one paste");
+    assert!(
+        matches!(&sent[0], StoreRequest::AuthDeliver { .. }),
+        "and it is the delivery"
+    );
+    assert_eq!(bench.key(&mut section, "p"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(errors_of(&emitted), vec![DELIVERY_IN_FLIGHT.to_owned()]);
+    assert!(
+        !asked_anything(&emitted),
+        "still exactly one AuthDeliver: {emitted:?}"
+    );
+    assert!(!section.captures_input());
+}
+
+/// D272: the field is masked. What is drawn is one dot per character and the count, and the prompt
+/// names the advertised redirect rather than anything that was pasted.
+#[tokio::test]
+async fn the_field_draws_dots_and_a_count_and_never_the_text() {
+    let bench = SectionBench::new().await;
+    let mut section = pasting_over(&bench);
+    typed(&bench, &mut section, PASTE);
+    assert!(bench.drained().is_empty(), "typing asks nothing");
+
+    let rendered = render_section(&section, &bench.ctx());
+    let count = format!("({})", PASTE.chars().count());
+    assert_eq!(count, "(73)");
+    assert!(!rendered.contains(CODE), "the code is never drawn");
+    assert!(
+        !rendered.contains("127.0.0.1:39879/?"),
+        "nor any of the pasted address"
+    );
+    let field = field_line(&rendered).unwrap_or_else(|| panic!("the field is drawn: {rendered}"));
+    assert!(field.contains(&count), "{rendered}");
+    assert!(field.contains('\u{2022}'), "{rendered}");
+    assert!(rendered.contains(PASTE_PROMPT), "{rendered}");
+    assert!(
+        !rendered.contains(REDIRECT_LINE),
+        "the prompt replaces the redirect line: {rendered}"
+    );
+}
+
+/// D270: `Enter` sends the paste once, as a `RedirectUrl` that `validate` accepts, and closes the
+/// field; the pane says where it is delivering to and nothing else.
+#[tokio::test]
+async fn enter_with_a_valid_paste_sends_auth_deliver_and_closes_the_field() {
+    let bench = SectionBench::new().await;
+    let mut section = pasting_over(&bench);
+    typed(&bench, &mut section, PASTE);
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "Enter"), Handled::Consumed);
+    let emitted = bench.drained();
+    let printed = format!("{emitted:?}");
+    assert!(
+        !printed.contains(CODE),
+        "the request's Debug is redacted: {printed}"
+    );
+    let [Action::Store(StoreRequest::AuthDeliver { url })] = &emitted[..] else {
+        panic!("exactly one AuthDeliver: {printed}");
+    };
+    let advertised =
+        Advertised::from_auth_url(LOOPBACK_LINK).expect("the link advertises a loopback redirect");
+    assert!(
+        loopback::validate(url, &advertised).is_ok(),
+        "what was sent is the paste the worker will accept"
+    );
+
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(!rendered.contains(CODE), "the code is never drawn");
+    assert!(rendered.contains(DELIVERING), "{rendered}");
+    assert!(!rendered.contains(PASTE_PROMPT), "{rendered}");
+    assert!(!section.captures_input(), "the field closed with the send");
+}
+
+/// D270, review L-8: the pane's courtesy check reads the host and the port only. A paste for
+/// another port or host is refused with `validate`'s own sentence, sends nothing, and leaves a
+/// fresh empty field for the re-paste.
+#[tokio::test]
+async fn enter_with_a_wrong_port_or_host_is_refused_locally_and_sends_nothing() {
+    let bench = SectionBench::new().await;
+    let mut section = pasting_over(&bench);
+    let cases = [
+        (
+            format!("http://127.0.0.1:39880/?code={CODE}&state={STATE}"),
+            PasteError::WrongPort {
+                pasted: 39880,
+                advertised: 39879,
+            },
+        ),
+        (
+            format!("127.0.0.1/?code={CODE}&state={STATE}"),
+            PasteError::WrongPort {
+                pasted: 80,
+                advertised: 39879,
+            },
+        ),
+        (
+            format!("http://192.168.1.5:39879/?code={CODE}&state={STATE}"),
+            PasteError::WrongHost {
+                advertised: "127.0.0.1:39879".to_owned(),
+            },
+        ),
+    ];
+    for (paste, refusal) in cases {
+        typed(&bench, &mut section, &paste);
+        assert_eq!(bench.key(&mut section, "Enter"), Handled::Consumed);
+        let emitted = bench.drained();
+        assert_eq!(errors_of(&emitted), vec![refusal.to_string()]);
+        assert!(!asked_anything(&emitted), "{refusal:?} sends nothing");
+        assert!(
+            section.captures_input(),
+            "{refusal:?}: the field is still open"
+        );
+        let rendered = render_section(&section, &bench.ctx());
+        assert!(!rendered.contains(CODE), "the code is never drawn");
+        let field =
+            field_line(&rendered).unwrap_or_else(|| panic!("the field is drawn: {rendered}"));
+        assert!(field.contains("(0)"), "{refusal:?}: and empty: {rendered}");
+    }
+}
+
+/// Review L-8: everything past the host and the port is the worker's to judge — it runs the full
+/// `validate` and is the authority — so a stale state or a missing code is sent, and its refusal
+/// comes back as a failed `auth_deliver` that leaves the login and `p` as they were.
+#[tokio::test]
+async fn a_paste_for_the_right_host_and_port_is_sent_for_the_worker_to_judge() {
+    let bench = SectionBench::new().await;
+    for (paste, refusal) in [
+        (
+            format!("http://127.0.0.1:39879/?code={CODE}&state=STATE-EARLIER-0000"),
+            PasteError::StaleState,
+        ),
+        (
+            format!("http://127.0.0.1:39879/?state={STATE}"),
+            PasteError::MissingCode,
+        ),
+    ] {
+        let mut section = pasting_over(&bench);
+        typed(&bench, &mut section, &paste);
+        assert_eq!(bench.key(&mut section, "Enter"), Handled::Consumed);
+        let emitted = bench.drained();
+        assert!(errors_of(&emitted).is_empty(), "{refusal:?}: {emitted:?}");
+        assert!(
+            matches!(
+                &emitted[..],
+                [Action::Store(StoreRequest::AuthDeliver { .. })]
+            ),
+            "{refusal:?} is sent: {emitted:?}"
+        );
+        assert!(!section.captures_input(), "the field closed with the send");
+
+        bench.reply(
+            &mut section,
+            &StoreReply::Failed {
+                request: "auth_deliver",
+                message: refusal.to_string(),
+            },
+        );
+        // Review R2-L1: the worker's refusal reopens the field for the re-paste.
+        let rendered = render_section(&section, &bench.ctx());
+        assert!(rendered.contains(PASTE_PROMPT), "{rendered}");
+        assert!(!rendered.contains(DELIVERING), "{rendered}");
+        assert!(section.captures_input(), "the field is open again");
+    }
+}
+
+/// MOD-22 review M-1: a bracketed paste into the open field lands whole, masked — dots and a
+/// count, never a byte of it — and `Enter` sends it as typed text would be sent.
+#[tokio::test]
+async fn a_bracketed_paste_lands_in_the_open_paste_field_as_dots() {
+    let bench = SectionBench::new().await;
+    let mut section = pasting_over(&bench);
+    assert_eq!(
+        bench.paste(&mut section, &format!("{PASTE}\n")),
+        Handled::Consumed
+    );
+    assert!(bench.drained().is_empty(), "a paste asks nothing");
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        !rendered.contains(CODE),
+        "the code is never drawn: {rendered}"
+    );
+    let field = field_line(&rendered).unwrap_or_else(|| panic!("the field is drawn: {rendered}"));
+    assert!(
+        field.contains(&format!("({})", PASTE.chars().count())),
+        "every pasted character counted, the newline dropped: {field}"
+    );
+    assert!(
+        field
+            .chars()
+            .all(|c| "\u{203a}\u{2022}\u{2026} ()0123456789".contains(c)),
+        "nothing but dots and the count: {field}"
+    );
+
+    assert_eq!(bench.key(&mut section, "Enter"), Handled::Consumed);
+    let emitted = bench.drained();
+    let [Action::Store(StoreRequest::AuthDeliver { url })] = &emitted[..] else {
+        panic!("exactly one AuthDeliver");
+    };
+    let advertised = Advertised::from_auth_url(LOOPBACK_LINK).expect("a loopback redirect");
+    assert!(loopback::validate(url, &advertised).is_ok());
+}
+
+/// MOD-22 review M-1, R2-L3: a paste that alone is past `PASTE_MAX` is refused whole by
+/// `validate`'s own `TooLong`; one that is short enough itself but does not fit beside what was
+/// already typed is refused with `PASTE_DOES_NOT_FIT`. Either way nothing goes in and the buffer
+/// never reallocates.
+#[tokio::test]
+async fn a_bracketed_paste_that_does_not_fit_is_refused_by_the_right_sentence() {
+    let bench = SectionBench::new().await;
+    let mut section = pasting_over(&bench);
+    assert_eq!(
+        bench.paste(&mut section, &"a".repeat(PASTE_MAX + 1)),
+        Handled::Consumed
+    );
+    let emitted = bench.drained();
+    assert_eq!(errors_of(&emitted), vec![PasteError::TooLong.to_string()]);
+    let rendered = render_section(&section, &bench.ctx());
+    let field = field_line(&rendered).unwrap_or_else(|| panic!("the field is drawn: {rendered}"));
+    assert!(field.contains("(0)"), "nothing went in: {field}");
+
+    typed(&bench, &mut section, "abc");
+    let _ = bench.drained();
+    assert_eq!(
+        bench.paste(&mut section, &"a".repeat(PASTE_MAX - 1)),
+        Handled::Consumed
+    );
+    let emitted = bench.drained();
+    assert_eq!(errors_of(&emitted), vec![PASTE_DOES_NOT_FIT.to_owned()]);
+    let rendered = render_section(&section, &bench.ctx());
+    let field = field_line(&rendered).unwrap_or_else(|| panic!("the field is drawn: {rendered}"));
+    assert!(field.contains("(3)"), "only what was typed: {field}");
+}
+
+/// Review R2-L3: a paste made before `p`, while the login is running with a redirect and nothing
+/// is in flight, opens the masked field and lands in it — through the Settings tab too, which
+/// otherwise offers a paste only to a section that is taking text.
+#[tokio::test]
+async fn a_bracketed_paste_before_p_opens_the_field_and_lands_in_it() {
+    let bench = SectionBench::new().await;
+    let mut section = running_over(&bench, LOOPBACK_LINK);
+    assert!(!section.captures_input());
+    assert_eq!(bench.paste(&mut section, PASTE), Handled::Consumed);
+    assert!(bench.drained().is_empty(), "no refusal, no request");
+    assert!(section.captures_input(), "the field is open");
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(!rendered.contains(CODE), "{rendered}");
+    let field = field_line(&rendered).unwrap_or_else(|| panic!("the field is drawn: {rendered}"));
+    assert!(
+        field.contains(&format!("({})", PASTE.chars().count())),
+        "the paste is in it: {field}"
+    );
+    assert_eq!(bench.key(&mut section, "Enter"), Handled::Consumed);
+    assert!(matches!(
+        &requests_of(&bench)[..],
+        [StoreRequest::AuthDeliver { .. }]
+    ));
+
+    // Through the tab.
+    let mut tab = SettingsTab::with_sections(vec![Box::new(running_over(&bench, LOOPBACK_LINK))]);
+    assert_eq!(
+        htui::ui::tabs::Tab::on_paste(&mut tab, PASTE, &mut bench.ctx()),
+        Handled::Consumed,
+        "the tab offers it to the running login"
+    );
+    assert!(bench.drained().is_empty());
+}
+
+/// Review R2-L3: with no redirect advertised, a delivery in flight or the login being cancelled,
+/// a paste before `p` is dropped with the sentence `p` itself would give, and opens nothing.
+#[tokio::test]
+async fn a_bracketed_paste_before_p_is_refused_as_p_would_be() {
+    let bench = SectionBench::new().await;
+    let mut no_redirect = running_over(&bench, "https://h.invalid/o");
+    let mut delivering = delivering_over(&bench);
+    let mut cancelling = running_over(&bench, LOOPBACK_LINK);
+    bench.key(&mut cancelling, "x");
+    let _ = bench.drained();
+    for (section, refusal) in [
+        (&mut no_redirect, NO_LOOPBACK_REDIRECT),
+        (&mut delivering, DELIVERY_IN_FLIGHT),
+        (&mut cancelling, PASTE_CANCELLING),
+    ] {
+        assert_eq!(bench.paste(section, PASTE), Handled::Consumed);
+        let emitted = bench.drained();
+        assert_eq!(errors_of(&emitted), vec![refusal.to_owned()]);
+        assert!(!asked_anything(&emitted), "{emitted:?}");
+        assert!(!section.captures_input(), "{refusal}: nothing opened");
+    }
+}
+
+/// D270: `Esc` closes the field and nothing else — the login, its link and its keys stay.
+#[tokio::test]
+async fn esc_closes_the_field() {
+    let bench = SectionBench::new().await;
+    let mut section = pasting_over(&bench);
+    typed(&bench, &mut section, "http://127");
+
+    assert_eq!(bench.key(&mut section, "Esc"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert!(!asked_anything(&emitted), "{emitted:?}");
+    assert!(!section.captures_input());
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(rendered.contains(REDIRECT_LINE), "{rendered}");
+    assert!(!rendered.contains(PASTE_PROMPT), "{rendered}");
+    assert_eq!(on_box_cell(&rendered, "loginable"), "logging in\u{2026}");
+
+    assert_eq!(bench.key(&mut section, "x"), Handled::Consumed);
+    assert!(
+        matches!(&requests_of(&bench)[..], [StoreRequest::AuthCancel]),
+        "the login is still running and `x` still stops it"
+    );
+}
+
+/// D268, D270: what the listener said lands on the note line, and the login it was said to keeps
+/// running: the verdict is still the probe's (`R-AGT-6`).
+#[tokio::test]
+async fn a_delivered_frame_notes_what_the_listener_said_and_the_login_keeps_running() {
+    let bench = SectionBench::new().await;
+    let mut section = delivering_over(&bench);
+    let reply = ListenerReply {
+        target: "127.0.0.1:39879".to_owned(),
+        status: 200,
+        reason: "OK".to_owned(),
+        said: Some("signed in".to_owned()),
+        location_host: None,
+    };
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Auth(AuthFrame::Delivered(reply.clone())),
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        rendered.lines().last(),
+        Some(reply.summary().as_str()),
+        "{rendered}"
+    );
+    assert_eq!(on_box_cell(&rendered, "loginable"), "logging in\u{2026}");
+    assert!(rendered.contains(REDIRECT_LINE), "{rendered}");
+    assert!(!rendered.contains(DELIVERING), "{rendered}");
+
+    assert_eq!(bench.key(&mut section, "p"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert!(emitted.is_empty(), "p opens again: {emitted:?}");
+    assert!(section.captures_input());
+}
+
+/// D270: a refused or failed delivery is one request answered no, as a refused `auth_open` is. The
+/// login, its link and its redirect stay, and `p` works again.
+#[tokio::test]
+async fn a_refused_auth_deliver_keeps_the_login_pane_and_its_link() {
+    let bench = SectionBench::new().await;
+    let mut section = delivering_over(&bench);
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "auth_deliver",
+            message: DeliverError::NothingListening {
+                target: "127.0.0.1:39879".to_owned(),
+            }
+            .to_string(),
+        },
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        rendered.contains(&format!("link: {LOOPBACK_LINK}")),
+        "{rendered}"
+    );
+    assert_eq!(on_box_cell(&rendered, "loginable"), "logging in\u{2026}");
+    // Review R2-L1: the field is back for the re-paste; `Esc` closes it onto the redirect line,
+    // and `p` opens it again.
+    assert!(section.captures_input(), "{rendered}");
+    assert_eq!(bench.key(&mut section, "Esc"), Handled::Consumed);
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(rendered.contains(REDIRECT_LINE), "{rendered}");
+
+    assert_eq!(bench.key(&mut section, "p"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert!(emitted.is_empty(), "p opens again: {emitted:?}");
+    assert!(section.captures_input());
+}
+
+/// Review R2-L1: the pane checks host and port only, so a stale state, a missing code or a wrong
+/// path is refused by the worker after the field has closed. That refusal reopens a fresh, empty,
+/// masked field for the re-paste — the sentence itself is the shell's, from the same reply — as
+/// long as the login is still running with a redirect and is not being cancelled.
+#[tokio::test]
+async fn a_refused_delivery_reopens_an_empty_masked_field() {
+    let bench = SectionBench::new().await;
+    for refusal in [
+        PasteError::StaleState.to_string(),
+        PasteError::MissingCode.to_string(),
+        DeliverError::NothingListening {
+            target: "127.0.0.1:39879".to_owned(),
+        }
+        .to_string(),
+    ] {
+        let mut section = delivering_over(&bench);
+        assert!(!section.captures_input());
+        bench.reply(
+            &mut section,
+            &StoreReply::Failed {
+                request: "auth_deliver",
+                message: refusal.clone(),
+            },
+        );
+        assert!(
+            section.captures_input(),
+            "{refusal}: the field is open again"
+        );
+        let rendered = render_section(&section, &bench.ctx());
+        assert!(rendered.contains(PASTE_PROMPT), "{refusal}: {rendered}");
+        assert!(!rendered.contains(DELIVERING), "{refusal}: {rendered}");
+        let field =
+            field_line(&rendered).unwrap_or_else(|| panic!("the field is drawn: {rendered}"));
+        assert!(field.contains("(0)"), "{refusal}: fresh and empty: {field}");
+        assert!(bench.drained().is_empty(), "{refusal}: and it asks nothing");
+    }
+
+    // A login on its way out has nothing to paste into.
+    let mut section = delivering_over(&bench);
+    bench.key(&mut section, "x");
+    bench.reply(&mut section, &StoreReply::Auth(AuthFrame::Cancelling));
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "auth_deliver",
+            message: PasteError::StaleState.to_string(),
+        },
+    );
+    assert!(!section.captures_input(), "cancelling: no field");
+}
+
+/// The refusal of an `auth_deliver` that means no login is held at all clears the pane, as it does
+/// for `auth_choose` (review L-4's rule): there is no login left to paste into or to cancel.
+#[tokio::test]
+async fn a_deliver_refused_because_no_login_is_running_clears_the_pane() {
+    let bench = SectionBench::new().await;
+    let mut section = delivering_over(&bench);
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "auth_deliver",
+            message: "no login is running".to_owned(),
+        },
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        on_box_cell(&rendered, "loginable"),
+        as_drawn("unauthenticated"),
+        "a state a second `a` can start from"
+    );
+    assert!(!rendered.contains(DELIVERING), "{rendered}");
+    assert!(!rendered.contains("link: "), "{rendered}");
+}
+
+/// Review L-2: `this login has ended` is a delivery the flow's end overtook. The flow is on its way
+/// out — draining, re-probing — and the worker guarantees its own terminal frame follows, so the
+/// pane only stops waiting for the delivery and stays until that frame: `cancelling…` after an `x`,
+/// `logging in…` otherwise. An `a` meanwhile is the pane's own "already running" rather than an
+/// `AuthStart` the worker would refuse while the old flow holds its claim, and that would make the
+/// flow's own last frame stale.
+#[tokio::test]
+async fn a_deliver_overtaken_by_the_logins_end_waits_for_the_flows_last_frame() {
+    let bench = SectionBench::new().await;
+    let ended = || StoreReply::Failed {
+        request: "auth_deliver",
+        message: "this login has ended".to_owned(),
+    };
+
+    // `x` during a delivery.
+    let mut section = delivering_over(&bench);
+    assert_eq!(bench.key(&mut section, "x"), Handled::Consumed);
+    let _ = bench.drained();
+    bench.reply(&mut section, &StoreReply::Auth(AuthFrame::Cancelling));
+    bench.reply(&mut section, &ended());
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        on_box_cell(&rendered, "loginable"),
+        "cancelling\u{2026}",
+        "the pane is still the flow's until its last frame: {rendered}"
+    );
+    assert!(!rendered.contains(DELIVERING), "{rendered}");
+
+    assert_eq!(bench.key(&mut section, "a"), Handled::Consumed);
+    let emitted = bench.drained();
+    assert_eq!(
+        errors_of(&emitted),
+        vec!["a login is already running".to_owned()]
+    );
+    assert!(!asked_anything(&emitted), "no AuthStart: {emitted:?}");
+
+    bench.reply(&mut section, &StoreReply::Auth(AuthFrame::Cancelled));
+    let _ = bench.drained();
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        on_box_cell(&rendered, "loginable"),
+        as_drawn("unauthenticated")
+    );
+    assert_eq!(bench.key(&mut section, "a"), Handled::Consumed);
+    assert!(
+        matches!(&requests_of(&bench)[..], [StoreRequest::AuthStart { .. }]),
+        "after the flow's own last frame, `a` starts the next login"
+    );
+
+    // No `x`: the login completed under the delivery, and its re-probe is still to come.
+    let mut section = delivering_over(&bench);
+    bench.reply(&mut section, &ended());
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(on_box_cell(&rendered, "loginable"), "logging in\u{2026}");
+    assert!(!rendered.contains(DELIVERING), "{rendered}");
+    assert!(rendered.contains(REDIRECT_LINE), "{rendered}");
+    bench.reply(
+        &mut section,
+        &StoreReply::Auth(AuthFrame::Done {
+            call: AuthCall::Authenticate(METHOD.to_owned()),
+            status: ProbeStatus::Ready,
+        }),
+    );
+    assert!(
+        matches!(&requests_of(&bench)[..], [StoreRequest::Agents]),
+        "the flow's own Done re-reads the row"
+    );
+}
+
+/// D282: the runtime acknowledging a cancel closes an open field; there is nothing left to send it
+/// to.
+#[tokio::test]
+async fn a_cancelling_frame_closes_an_open_field() {
+    let bench = SectionBench::new().await;
+    let mut section = pasting_over(&bench);
+    typed(&bench, &mut section, "http://127");
+
+    bench.reply(&mut section, &StoreReply::Auth(AuthFrame::Cancelling));
+    assert!(!section.captures_input());
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(!rendered.contains(PASTE_PROMPT), "{rendered}");
+    assert_eq!(on_box_cell(&rendered, "loginable"), "cancelling\u{2026}");
+}
+
+/// D270: every way a flow ends drops the field with the state, so its buffer is wiped and the
+/// section's keys are its own again.
+#[tokio::test]
+async fn a_flow_that_ends_while_the_field_is_open_closes_it_and_releases_input() {
+    let bench = SectionBench::new().await;
+    let ends = [
+        AuthFrame::Done {
+            call: AuthCall::Authenticate(METHOD.to_owned()),
+            status: ProbeStatus::Ready,
+        },
+        AuthFrame::Refused {
+            message: "set the key first".to_owned(),
+        },
+        AuthFrame::Cancelled,
+        AuthFrame::Idle {
+            after: std::time::Duration::from_secs(600),
+        },
+        AuthFrame::Failed {
+            message: "the adapter exited".to_owned(),
+        },
+    ];
+    for end in ends {
+        let mut section = pasting_over(&bench);
+        typed(&bench, &mut section, "http://127");
+        bench.reply(&mut section, &StoreReply::Auth(end.clone()));
+        let _ = bench.drained();
+        assert!(!section.captures_input(), "{end:?} releases input");
+        let rendered = render_section(&section, &bench.ctx());
+        assert!(!rendered.contains(PASTE_PROMPT), "{end:?}: {rendered}");
+        assert!(field_line(&rendered).is_none(), "{end:?}: {rendered}");
+    }
+}
+
+/// D270: the running hint names `p`, and the open field's hint names the two keys it answers.
+#[tokio::test]
+async fn the_running_hint_offers_p_and_the_pasting_hint_offers_enter_and_esc() {
+    let bench = SectionBench::new().await;
+    let mut section = running_over(&bench, LOOPBACK_LINK);
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(rendered.contains(HINT_AUTH_RUNNING), "{rendered}");
+
+    bench.key(&mut section, "p");
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(rendered.contains(HINT_PASTING), "{rendered}");
+    assert!(!rendered.contains(HINT_AUTH_RUNNING), "{rendered}");
+}
+
+/// The login pane with the paste field open, half a paste in: the link, the prompt naming the
+/// advertised redirect, and dots with a count — never a character that was typed.
+#[tokio::test]
+async fn the_paste_field_renders_under_the_link() {
+    let bench = SectionBench::new().await;
+    let mut section = pasting_over(&bench);
+    typed(&bench, &mut section, "http://127.0.0.1:39879/?code=");
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(!rendered.contains(CODE), "the code is never drawn");
+    assert!(
+        !rendered.contains("39879/?code="),
+        "nor anything that was typed"
+    );
+    let field = field_line(&rendered).unwrap_or_else(|| panic!("the field is drawn: {rendered}"));
+    assert_eq!(field.matches('\u{2022}').count(), 29, "{rendered}");
+    assert!(field.contains("(29)"), "{rendered}");
+    insta::assert_snapshot!("agents_paste_redirect", rendered);
 }
 
 // -------------------------------------------------------------------------------------------

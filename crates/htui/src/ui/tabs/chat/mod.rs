@@ -532,6 +532,16 @@ impl Tab for ChatTab {
         handled
     }
 
+    /// MOD-22 review M-1: a bracketed paste into the open composer. A replay has no command path
+    /// and a closed composer takes nothing, so both drop it.
+    fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        if self.replay.is_some() || !self.composer.on_paste(text) {
+            return Handled::Pass;
+        }
+        self.refusal = None;
+        Handled::Consumed
+    }
+
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::Agents(agents) => {

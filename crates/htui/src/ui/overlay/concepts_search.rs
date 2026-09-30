@@ -337,6 +337,13 @@ impl Overlay for ConceptsSearch {
         }
     }
 
+    /// MOD-22 review M-1: a bracketed paste is query text, as typing it would be.
+    fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        self.field.on_paste(text);
+        self.notice = None;
+        Handled::Consumed
+    }
+
     fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
         let StoreReply::Concepts(reply) = reply else {
             return;

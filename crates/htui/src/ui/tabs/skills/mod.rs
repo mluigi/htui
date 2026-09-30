@@ -87,6 +87,19 @@ impl Tab for SkillsTab {
         self.library.on_scope_change();
     }
 
+    /// MOD-22 review M-1: a bracketed paste into the active view's open prompt, form or editor.
+    fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        let taken = match self.view {
+            View::Skills => self.library.on_paste(text),
+            View::Templates => self.templates.on_paste(text),
+        };
+        if taken {
+            Handled::Consumed
+        } else {
+            Handled::Pass
+        }
+    }
+
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         // An open editor, form or name prompt owns every key it uses: `l` is a letter there, not
         // a view switch (the chat composer's and the Settings sections' rule).

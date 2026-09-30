@@ -14,7 +14,15 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-09-30):** **ANA-26 concluded** (`docs/ANA-26.md`,
+**Current status (2026-09-30):** **MOD-22 done** (`docs/decisions/mod/mod-22.md`): a login whose
+browser cannot reach the box completes from the TUI. While a login runs, `p` in Settings > Agents
+opens a masked field for the `http://127.0.0.1:<port>/?code=…&state=…` address the browser could
+not open; it is checked against the `redirect_uri` the login link advertised and sent as one raw
+loopback `GET` from the login's own task, the listener's answer is shown, and MOD-21's path finishes
+the login. The URL is a credential for one request (`R-AGT-9` amended). Bracketed paste is now on
+app-wide and reaches only a field that captures input. Live proof on the server-plus-laptop setup
+is the maintainer's (OQ-6).
+Before it, **ANA-26 concluded** (`docs/ANA-26.md`,
 `docs/decisions/ana/ana-26.md`): every key outside text entry becomes a named action in one
 compiled-in catalogue; a user overrides only what they change in a local `<config_root>/keys.toml`
 (never the store), an invalid file refuses to start with `path:line` errors, `ctrl-c` always quits
@@ -27,10 +35,6 @@ recorder hashes the digest text (`record_prompt_digesting`), and `trim_record` `
 `undigested: ["box.hostname"]`. A per-project switch, `project.settings.box_hostname` (default on,
 Settings > Prompt), omits the line entirely. Migration `0010` restates the two column comments.
 Amends ANA-5 §4.2/§4.7 (recorded in the write-up, not in `docs/ANA-5.md`).
-Before it, **MOD-65 was done** (`docs/decisions/mod/mod-65.md`): every
-thread and task `htui-agent` starts (12 blocking threads, 9 async tasks) now opens the panic-hook
-contain window through `htui_agent::contained`, so a panic tokio survives no longer gives the
-terminal back under the running UI; a crate-local `clippy.toml` lints every raw spawn.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -38,10 +42,10 @@ Earlier completions are in `DECISIONS.md`.
 comment only) `0009_agent_box_user_off` (MOD-23) and `0010_prompt_digest_undigested` (MOD-33, comment only;
 cache: `0001`..`0004`), so **the next migration is `0011`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
-(done, all four milestones), MOD-38, MOD-9 (done, all five milestones), MOD-40, MOD-39, MOD-64 and
-MOD-23 (re-counted 2026-09-30): store conformance `CASES` 97, `READ_CASES` 14, `htui-orch` `CASES` 73,
-`GraphSource` 7 methods, `StoreRequest` 88, `StoreReply` 48, `hierarchy::REQUEST_NAMES` 13,
-`skills::REQUEST_NAMES` 6, `TABLES` 39, 289 `.sqlx` files, 115
+(done, all four milestones), MOD-38, MOD-9 (done, all five milestones), MOD-40, MOD-39, MOD-64,
+MOD-23 and MOD-22 (re-counted 2026-09-30): store conformance `CASES` 97, `READ_CASES` 14, `htui-orch` `CASES` 73,
+`GraphSource` 7 methods, `StoreRequest` 91, `StoreReply` 49, `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
+`skills::REQUEST_NAMES` 6, `TABLES` 39, 289 `.sqlx` files, 116
 `crates/htui/tests/snapshots`,
 `MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 35 pinned commented
 columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 4` (MOD-33 `undigested`) with `skill_choices` (a
@@ -438,37 +442,6 @@ can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
   that names no tool is this item's call), and the Microsoft Store `python3` stub, which the probe now
   skips by trying each name until one prints a version (verify it holds).
 
-- [ ] **MOD-22 - Complete a loopback OAuth login from a box the browser cannot reach** (from MOD-21).
-  `R-AGT-9`, `R-TUI-8`, `R-NF-3`, `R-SEC-2`, `R-ID-7`. An agent's own login flow redirects to a
-  listener **inside the adapter process**, on that box's loopback: `agy_acp_server`'s URL carries
-  `redirect_uri=http://127.0.0.1:<ephemeral port>/`, a different port per attempt (39879, then
-  50651, measured live on 2026-09-09). When `htui` runs on the same machine as the browser this is
-  invisible. When it runs on a **server**, the browser resolves `127.0.0.1` to the *user's* machine,
-  nothing is listening, and the flow cannot be completed from the app at all - which is `R-AGT-9`'s
-  own sentence left unfinished. Confirmed on this maintainer's setup 2026-09-10: of the two
-  workarounds, **`ssh -L` port forwarding did not work and pasting the redirect back did** -
-  copying the failed `http://127.0.0.1:<port>/?code=…&state=…` out of the browser's address bar and
-  re-issuing it on the box (`curl`) hands the code to the adapter and `authenticate` returns.
-  Scope: that paste-back, performed **in the TUI** rather than in a second terminal - a field in
-  MOD-21's login pane that accepts the redirect URL the browser could not reach, validates it
-  (loopback host, the port the flow actually advertised, `code`/`state` present), issues the request
-  to that port **on the box `htui` runs on**, and reports what the listener said; the login then
-  completes through MOD-21's existing path, so nothing here re-implements `authenticate`, the
-  re-probe, or the outcome. Needs a text-input widget the Settings tab does not have yet
-  (`R-TUI-8`), off the UI task like every other request (`R-NF-3`).
-  **The URL is a credential-bearing value for the length of one request** - it carries an
-  authorization `code` - so `R-SEC-2`/`R-ID-7` bind: it is never logged, never persisted, never put
-  on a frame that outlives the request, and the pane must not echo it back after use. This is the
-  one rule this item can most easily break, and MOD-21's `auth_live.rs` module doc is the precedent
-  for stating it where the code is.
-  Out of scope: changing what the agent binds (the vendor's, not `htui`'s), a `redirect_uri`
-  override (not offered by ACP v1), and any general port-forwarding feature. Cross-links: **MOD-21**
-  owns the login flow, its pane and its frames and is the shape to extend rather than duplicate;
-  **MOD-16** owns whether the same paste-back works from a Windows box; **MOD-7**'s box registry (done,
-  `docs/decisions/mod/mod-7.md`) is where "this box is remote" would eventually be a recorded fact
-  rather than a guess; it records no such fact yet. **Not
-  blocked** — MOD-21 landed (`docs/decisions/mod/mod-21.md`). Found while running its live proof on
-  2026-09-10.
 - [ ] **MOD-66 - Per-box manual tool path editor in Settings > Agents** (from MOD-23, plan OQ-3).
   `R-AGT-6`. ANA-4 §4.6 (`docs/ANA-4.md:796-798`) describes a per-box manual entry: write
   `agent_box.path` and `probe.resolved` by hand and set `probe.status = "ready"`, protected by MOD-2
@@ -554,8 +527,8 @@ can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
   `R-AGT-9`, `R-STO-1`. System `ssh` to install the matching `htui` build and a user service running
   `htui worker`; credential passed on the worker's stdin, never argv or a file; the worker
   self-registers (through MOD-7's id-keyed `register_box` and box probe, done,
-  `docs/decisions/mod/mod-7.md`). Agent login via MOD-22's paste-back. SSH is not used after provisioning. Under
-  phase 2 (MOD-47) it installs an enrolment token instead of a DSN. Blocked on MOD-41, MOD-22.
+  `docs/decisions/mod/mod-7.md`). Agent login via MOD-22's paste-back (done, `docs/decisions/mod/mod-22.md`). SSH is not used after provisioning. Under
+  phase 2 (MOD-47) it installs an enrolment token instead of a DSN. Blocked on MOD-41.
 - [ ] **MOD-46 - Live streaming via `NOTIFY` (optional)** (from ANA-16, §8 item 7). `R-HIS-1`,
   `R-NF-3`. Transient `NOTIFY` deltas under 8000 bytes between recorder flushes, droppable, superseded
   by durable `session_event` rows. Start only if 16 KiB flush bursts prove unusable; replaced by
@@ -650,6 +623,6 @@ can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 32 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-22 loopback paste-back, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 31 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-14 graph, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-41 headless worker, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-59 write replies name themselves, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-4 unreachable `NoProgressReview`)                                              |
 | TOOL-N  | 0 |

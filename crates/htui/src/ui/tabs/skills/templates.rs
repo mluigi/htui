@@ -302,6 +302,24 @@ fn plain(key: &KeyEvent) -> bool {
 }
 
 impl TemplatesView {
+    /// A bracketed paste into the name prompt or the editor (MOD-22 review M-1); `false` when
+    /// nothing here is taking text.
+    pub(super) fn on_paste(&mut self, text: &str) -> bool {
+        match &mut self.mode {
+            Mode::Browse => return false,
+            Mode::Naming { field, .. } => {
+                field.on_paste(text);
+            }
+            Mode::Editing(editor) => {
+                editor.area.on_paste(text);
+                editor.confirm_item = false;
+                editor.esc_armed = false;
+                self.notice = None;
+            }
+        }
+        true
+    }
+
     /// Whether an editor or the name prompt is taking every key.
     pub(super) fn captures_input(&self) -> bool {
         !matches!(self.mode, Mode::Browse)

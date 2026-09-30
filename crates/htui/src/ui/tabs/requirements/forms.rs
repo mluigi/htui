@@ -67,6 +67,14 @@ impl AreaForm {
         }
     }
 
+    /// A bracketed paste into the focused field (MOD-22 review M-1).
+    pub(super) fn on_paste(&mut self, text: &str) {
+        match self.focus {
+            AreaFocus::Code => self.code.on_paste(text),
+            AreaFocus::Title => self.title.on_paste(text),
+        };
+    }
+
     /// A key that is not a `CONTROL` chord: `Tab`/`Shift+Tab`/`Up`/`Down` switch field, `Enter`
     /// on the code moves to the title and on the title submits, `Esc` cancels.
     pub(super) fn on_key(&mut self, key: KeyEvent) -> FormOutcome {
@@ -277,6 +285,19 @@ impl RequirementForm {
     }
 
     /// A key that is not a `CONTROL` chord (the tab took `Ctrl+S`): `Tab`/`Shift+Tab` cycle
+    /// A bracketed paste into the focused field (MOD-22 review M-1). The priority toggle is not a
+    /// field: a paste there is dropped, so its `m` and `l` toggle nothing.
+    pub(super) fn on_paste(&mut self, text: &str) {
+        match self.focus {
+            FormFocus::Body => self.body.on_paste(text),
+            FormFocus::Rationale => self.rationale.on_paste(text),
+            FormFocus::Priority => {}
+            FormFocus::Deciding => {
+                self.deciding.on_paste(text);
+            }
+        }
+    }
+
     /// `Body → Rationale → Priority (→ Deciding)`; on the priority `m` is must, `l` later and
     /// `Space`/`←`/`→` toggle; `Enter` on the deciding key submits; `Esc` anywhere cancels.
     pub(super) fn on_key(&mut self, key: KeyEvent) -> FormOutcome {
@@ -475,6 +496,13 @@ impl WithdrawForm {
                 expected_version, ..
             } => *expected_version = head,
         }
+    }
+
+    /// A bracketed paste into the stage's field (MOD-22 review M-1).
+    pub(super) fn on_paste(&mut self, text: &str) {
+        match self {
+            Self::Deciding { field, .. } | Self::Typed { field, .. } => field.on_paste(text),
+        };
     }
 
     /// A key that is not a `CONTROL` chord: the stage's field takes it; `Enter` submits the

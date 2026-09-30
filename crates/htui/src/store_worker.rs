@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
+use htui_agent::auth::loopback::{ListenerReply, RedirectUrl};
 use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, PermissionRequestId};
 use htui_agent::event::{DriverEnvelope, StopReason};
@@ -329,6 +330,20 @@ pub enum StoreRequest {
     AuthOpen {
         /// The link, as the adapter printed it.
         url: String,
+    },
+    /// Relay the address the browser could not open to the running login's own loopback
+    /// listener (MOD-22 D263, D269).
+    ///
+    /// Served **inside the live flow's task**, never on the loop: one plain `GET` to the port the
+    /// flow's link advertised, while the flow keeps serving its wire, its stderr and `x`.
+    /// Answered exactly once at its own `seq`: [`AuthFrame::Delivered`] with what the listener
+    /// said, or [`StoreReply::Failed`] naming the rule the paste broke or why nothing answered.
+    /// The flow then ends through MOD-21's own path. The address carries an authorization code,
+    /// so it travels as a [`RedirectUrl`], whose `Debug` is `RedirectUrl(<redacted>)`; the rule it
+    /// is held to is the credential rule of `htui_agent::auth::loopback`.
+    AuthDeliver {
+        /// The pasted address.
+        url: RedirectUrl,
     },
     /// Stop the running login (MOD-21 D3, D13).
     ///
@@ -833,6 +848,7 @@ impl StoreRequest {
             Self::AuthStart { .. } => "auth_start",
             Self::AuthChoose { .. } => "auth_choose",
             Self::AuthOpen { .. } => "auth_open",
+            Self::AuthDeliver { .. } => "auth_deliver",
             Self::AuthCancel => "auth_cancel",
             Self::StoreState => "store_state",
             Self::ApplyMigrations => "apply_migrations",
@@ -1209,9 +1225,10 @@ pub enum InstallFrame {
 /// section's in-flight state.
 ///
 /// **Nothing here can hold a credential** (`R-SEC-2`, `R-ID-7`): every field is an id the agent
-/// advertised, a sentence the agent itself wrote to its own stderr, a link it printed, or a status
-/// the probe decided. `htui` never reads the credential a login leaves behind — it asks the probe
-/// whether one exists.
+/// advertised, a sentence the agent itself wrote to its own stderr, a link it printed, a status the
+/// probe decided, or what a loopback listener answered a delivered paste, with the pasted `code`
+/// and `state` blanked out of it (MOD-22 D268). `htui` never reads the credential a login leaves
+/// behind — it asks the probe whether one exists.
 #[derive(Debug, Clone)]
 pub enum AuthFrame {
     /// The agent's own `initialize` answer, once, before the user is asked anything (MOD-21 D7).
@@ -1231,6 +1248,13 @@ pub enum AuthFrame {
     /// The opener was **spawned**. Not "the browser opened": `htui` does not own that tree and
     /// cannot say (MOD-21 D17).
     Opened,
+    /// What the login's loopback listener answered a delivered paste (MOD-22 D268).
+    ///
+    /// An **answer**, not an outcome: a `4xx` or `5xx` is reported here too, and the adapter
+    /// decides what it means. The flow keeps running either way, and ends with its own terminal
+    /// frame. Carries a status, a reason, a host and an excerpt with the pasted `code` and `state`
+    /// blanked. Not a terminal frame.
+    Delivered(ListenerReply),
     /// The call returned, the row was **re-probed and written**, and this is the probe's verdict —
     /// never the flow's (MOD-21 D6, `R-AGT-6`).
     Done {
@@ -1337,9 +1361,9 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             events: backend.step_events(*step).await?,
         },
         // The five chat requests need the worker loop's own state (the live sessions), and the
-        // two probes, the preview, the three install requests and MOD-21's four login ones need
-        // the runtime that owns their tasks, so all fifteen are served ahead of this function,
-        // exactly as `ApplyMigrations` is. One of them that reaches here at all belongs to a caller
+        // two probes, the preview, the three install requests, MOD-21's four login ones and
+        // MOD-22's delivery need the runtime that owns their tasks, so all sixteen are served
+        // ahead of this function, exactly as `ApplyMigrations` is. One of them that reaches here at all belongs to a caller
         // with no runtime — the test harness without one — and saying so is more use than a panic.
         StoreRequest::PromptPreview { .. }
         | StoreRequest::ChatStart { .. }
@@ -1355,6 +1379,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::AuthStart { .. }
         | StoreRequest::AuthChoose { .. }
         | StoreRequest::AuthOpen { .. }
+        | StoreRequest::AuthDeliver { .. }
         | StoreRequest::AuthCancel => StoreReply::Failed {
             request: request.name(),
             message: "no agent runtime in this build".to_owned(),
@@ -1970,6 +1995,7 @@ pub(crate) fn spawn_with_concepts(
                         | StoreRequest::AuthStart { .. }
                         | StoreRequest::AuthChoose { .. }
                         | StoreRequest::AuthOpen { .. }
+                        | StoreRequest::AuthDeliver { .. }
                         | StoreRequest::AuthCancel => {
                             match runtime.serve(&backend, &tx, &envelope).await {
                                 Served::Reply(reply) => reply,
@@ -3475,6 +3501,13 @@ mod tests {
         );
         assert_eq!(StoreRequest::AuthCancel.name(), "auth_cancel");
         assert_eq!(
+            StoreRequest::AuthDeliver {
+                url: RedirectUrl::new("http://127.0.0.1:1/".to_owned())
+            }
+            .name(),
+            "auth_deliver"
+        );
+        assert_eq!(
             StoreRequest::ChatFollow {
                 step_id: StepId::new()
             }
@@ -3563,6 +3596,47 @@ mod tests {
                 }
                 other => panic!("a login with no runtime is refused, not served: {other:?}"),
             }
+        }
+    }
+
+    /// MOD-22 D266: the pasted address carries an authorization code, so neither the request's
+    /// `Debug` nor its envelope's prints it.
+    #[test]
+    fn an_auth_deliver_request_debugs_without_its_url() {
+        let pasted = "http://127.0.0.1:39879/?code=CODE-SENTINEL-4f1c&state=STATE-SENTINEL-9a2e";
+        let request = StoreRequest::AuthDeliver {
+            url: RedirectUrl::new(pasted.to_owned()),
+        };
+        let envelope = RequestEnvelope {
+            seq: 7,
+            origin: Origin::App,
+            request: request.clone(),
+        };
+        for shown in [
+            format!("{request:?}"),
+            format!("{request:#?}"),
+            format!("{envelope:?}"),
+            format!("{envelope:#?}"),
+        ] {
+            assert!(shown.contains("RedirectUrl(<redacted>)"), "{shown}");
+            assert!(!shown.contains("CODE-SENTINEL-4f1c"), "the code leaked");
+            assert!(!shown.contains("STATE-SENTINEL-9a2e"), "the state leaked");
+        }
+    }
+
+    /// MOD-22's delivery joins MOD-21's four: a build with no agent runtime refuses it by name,
+    /// exactly once, rather than dropping it (D283).
+    #[tokio::test]
+    async fn auth_deliver_without_a_runtime_is_refused_by_name() {
+        let request = StoreRequest::AuthDeliver {
+            url: RedirectUrl::new("http://127.0.0.1:1/?code=c&state=s".to_owned()),
+        };
+        match serve(&demo(), &request).await {
+            StoreReply::Failed { request, message } => {
+                assert_eq!(request, "auth_deliver");
+                assert_eq!(message, "no agent runtime in this build");
+            }
+            other => panic!("a delivery with no runtime is refused, not served: {other:?}"),
         }
     }
 

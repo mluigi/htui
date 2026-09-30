@@ -749,6 +749,20 @@ impl SettingsSection for ConnectionSection {
         !matches!(self.mode, Mode::Browse)
     }
 
+    /// MOD-22 review M-1: a bracketed paste into the open DSN field, whole, within its masked
+    /// reservation or refused by name.
+    fn on_paste(&mut self, text: &str, ctx: &mut Ctx<'_>) -> Handled {
+        let Mode::Editing(editor) = &mut self.mode else {
+            return Handled::Pass;
+        };
+        if !editor.input.on_paste(text) {
+            ctx.emit(crate::app::Action::Error(
+                crate::ui::text_field::PASTE_DOES_NOT_FIT.to_owned(),
+            ));
+        }
+        Handled::Consumed
+    }
+
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         match self.mode {
             Mode::Editing(_) => return self.on_editor_key(key, ctx),

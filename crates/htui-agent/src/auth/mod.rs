@@ -5,10 +5,11 @@
 //! transport that one day grows a login of its own produces the same [`AuthEvent`]s without
 //! touching `acp/`.
 //!
-//! Nothing here can carry a credential: every field is an id, a sentence the agent already wrote
-//! to its own stderr, or a status (`R-SEC-2`, `R-ID-7`). Nothing here names an agent, a method id
-//! or a host (`R-AGT-5`): the method list is the agent's own `initialize` answer and the outcome
-//! is the probe's.
+//! Nothing here can carry a credential but [`loopback`]: every other field is an id, a sentence
+//! the agent already wrote to its own stderr, or a status (`R-SEC-2`, `R-ID-7`). `loopback` holds a
+//! pasted authorization code for the length of one request, and states its own rule (MOD-22 D273).
+//! Nothing here names an agent, a method id or a host (`R-AGT-5`): the method list is the agent's
+//! own `initialize` answer and the outcome is the probe's.
 //!
 //! [`run`] is the one submodule that names a transport, and it names exactly one thing about it:
 //! which driver it is resolving a launch out of. Everything it then does between the spawn and the
@@ -16,6 +17,7 @@
 //! same for any transport that ever grows a login.
 
 pub mod browser;
+pub mod loopback;
 pub mod run;
 pub mod url;
 

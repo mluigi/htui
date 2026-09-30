@@ -1380,6 +1380,18 @@ impl SettingsSection for KindsSection {
         !matches!(self.mode, Mode::Browse)
     }
 
+    /// MOD-22 review M-1: a bracketed paste into the open form's focused field. A delete question
+    /// is not a field: a paste there is dropped, so its `y` confirms nothing.
+    fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
+        let Mode::Editing(editor) = &mut self.mode else {
+            return Handled::Pass;
+        };
+        if let Some(field) = editor.fields.get_mut(editor.focus) {
+            field.input.on_paste(text);
+        }
+        Handled::Consumed
+    }
+
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         if matches!(self.mode, Mode::Editing(_)) {
             return self.on_editor_key(key, ctx);
