@@ -164,7 +164,7 @@ running `htui` process below your server's `max_connections`.
 |---|---|
 | `0` | Clean shutdown on a signal. |
 | `1` | A failure after the worker started. |
-| `2` | A startup refusal: no DSN, a connection that could not be made, or a schema or build the database refuses. Nothing was written. |
+| `2` | A startup refusal: no DSN, a connection that could not be made, a schema or build the database refuses, a `--log` file that cannot be opened, a signal handler that cannot be installed, or a command line `htui` refuses (a usage error, such as `htui --log PATH worker`). A schema or build refusal writes nothing to the database. Other refusals may not be clean: a first start mints `box.toml` before it connects, and a refusal while seeding or registering this box comes after some of those rows are written, as the TUI's start would write them. |
 
 A store outage while running is not an exit: the worker logs it and carries on, and its walks fence
 themselves until the next poll succeeds.
