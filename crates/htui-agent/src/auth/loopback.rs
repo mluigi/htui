@@ -79,7 +79,7 @@ pub const DELIVERY_IN_FLIGHT: &str =
 ///
 /// A credential for the length of one request (see the module's credential rule): its `Debug` is
 /// `RedirectUrl(<redacted>)`, it has no `Display`, no `Serialize`, no `Deref` and no `PartialEq`,
-/// its buffer is wiped on drop, and only [`validate`] reads it.
+/// its buffer is wiped on drop, and only [`validate`] and [`precheck`] read it.
 #[derive(Clone)]
 pub struct RedirectUrl(Zeroizing<String>);
 
@@ -90,7 +90,8 @@ impl RedirectUrl {
         Self(Zeroizing::new(text))
     }
 
-    /// The text. Private to this module: only [`validate`] reads it (D280).
+    /// The text. Private to this module: only [`validate`] and the pane's [`precheck`] read it
+    /// (D280, review L-8).
     fn as_str(&self) -> &str {
         &self.0
     }
@@ -553,6 +554,76 @@ fn secrets_of(values: [&str; 4]) -> Vec<Zeroizing<String>> {
     }
     secrets.sort_by_key(|secret| Reverse(secret.len()));
     secrets
+}
+
+/// Review L-8: the pane's courtesy check before `Enter` sends a paste — rule (1), the scheme of
+/// rule (4) when one is named, and the host and the port of rules (6)–(7), read off the text by
+/// hand. No URL parse: everything else, and the authority on all of it, is [`validate`]'s, which
+/// the worker runs on the paste it is sent. Refuses with `validate`'s own sentences, so a paste
+/// the pane refuses is one the worker would have refused the same way.
+///
+/// # Errors
+///
+/// [`PasteError::Empty`], [`PasteError::TooLong`], [`PasteError::NotHttp`],
+/// [`PasteError::NotAUrl`] for a port that is not one, [`PasteError::WrongHost`] or
+/// [`PasteError::WrongPort`].
+pub fn precheck(url: &RedirectUrl, advertised: &Advertised) -> Result<(), PasteError> {
+    let text = url.as_str().trim();
+    if text.is_empty() {
+        return Err(PasteError::Empty);
+    }
+    if text.len() > PASTE_MAX {
+        return Err(PasteError::TooLong);
+    }
+    let rest = match text.split_once("://") {
+        Some((scheme, rest)) if has_scheme(text) => {
+            if !scheme.eq_ignore_ascii_case("http") {
+                return Err(PasteError::NotHttp);
+            }
+            rest
+        }
+        _ => text,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // A user name is `validate`'s refusal; the host is what follows it.
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_port)| host_port);
+    let (host, port) = split_host_port(host_port);
+    if !host.eq_ignore_ascii_case(advertised.host()) {
+        return Err(PasteError::WrongHost {
+            advertised: advertised.target(),
+        });
+    }
+    let pasted = match port {
+        None | Some("") => 80,
+        Some(port) => port.parse().map_err(|_| PasteError::NotAUrl)?,
+    };
+    if pasted != advertised.port() {
+        return Err(PasteError::WrongPort {
+            pasted,
+            advertised: advertised.port(),
+        });
+    }
+    Ok(())
+}
+
+/// `host:port` split as an authority is: a bracketed IPv6 literal keeps its brackets, and the
+/// port is what follows the host's `:`, if anything does.
+fn split_host_port(authority: &str) -> (&str, Option<&str>) {
+    if authority.starts_with('[') {
+        return match authority.find(']') {
+            Some(close) => {
+                let (host, rest) = authority.split_at(close + 1);
+                (host, rest.strip_prefix(':'))
+            }
+            None => (authority, None),
+        };
+    }
+    match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    }
 }
 
 /// Whether `text` starts with an RFC 3986 scheme and `://`: a letter, then letters, digits, `+`,

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use htui_agent::auth::loopback::{
     Advertised, DeliverError, DeliverLimits, EXCERPT_WIDTH, ListenerReply, PASTE_MAX, PasteError,
-    RESPONSE_CAP, RedirectUrl, deliver, validate,
+    RESPONSE_CAP, RedirectUrl, deliver, precheck, validate,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -260,6 +260,61 @@ fn a_stateless_paste_for_a_stateless_link_says_the_link_carried_no_state() {
         .expect_err("no state"),
         PasteError::MissingState
     );
+}
+
+/// Review L-8: the pane's courtesy check reads the host and the port and nothing else — no URL
+/// parse — and refuses with `validate`'s own sentences.
+#[test]
+fn precheck_reads_the_host_and_the_port_only() {
+    let at = advertised(39879);
+    for fine in [
+        good(39879),
+        format!("  127.0.0.1:39879/?code={CODE}&state=earlier\n"),
+        "http://127.0.0.1:39879".to_owned(),
+        "HTTP://127.0.0.1:39879/x#y".to_owned(),
+        format!("http://127.0.0.1:39879?state={STATE}"),
+        "127.0.0.1:39879/?next=http://example.com:1/".to_owned(),
+    ] {
+        assert_eq!(precheck(&paste(&fine), &at), Ok(()), "{fine}");
+    }
+    let refused = |text: &str, at: &Advertised| precheck(&paste(text), at).expect_err(text);
+    assert_eq!(refused(" ", &at), PasteError::Empty);
+    assert_eq!(
+        refused(&"a".repeat(PASTE_MAX + 1), &at),
+        PasteError::TooLong
+    );
+    assert_eq!(
+        refused(&good(50651), &at),
+        PasteError::WrongPort {
+            pasted: 50651,
+            advertised: 39879
+        }
+    );
+    assert_eq!(
+        refused("http://127.0.0.1/?code=c", &at),
+        PasteError::WrongPort {
+            pasted: 80,
+            advertised: 39879
+        }
+    );
+    assert_eq!(
+        refused("http://localhost:39879/", &at),
+        PasteError::WrongHost {
+            advertised: "127.0.0.1:39879".to_owned()
+        }
+    );
+
+    let v6 = Advertised::from_auth_url(&link("[::1]:39879", STATE)).expect("v6");
+    assert_eq!(precheck(&paste("http://[::1]:39879/?code=c"), &v6), Ok(()));
+    assert_eq!(
+        refused("http://[::1]:39880/", &v6),
+        PasteError::WrongPort {
+            pasted: 39880,
+            advertised: 39879
+        }
+    );
+    let named = Advertised::from_auth_url(&link("localhost:39879", STATE)).expect("localhost");
+    assert_eq!(precheck(&paste("LocalHost:39879/?x"), &named), Ok(()));
 }
 
 #[test]

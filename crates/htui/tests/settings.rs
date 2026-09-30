@@ -2925,10 +2925,11 @@ async fn enter_with_a_valid_paste_sends_auth_deliver_and_closes_the_field() {
     assert!(!section.captures_input(), "the field closed with the send");
 }
 
-/// D270: a paste the pane can already tell is wrong is refused with `validate`'s own sentence,
-/// sends nothing, and leaves a fresh empty field for the re-paste.
+/// D270, review L-8: the pane's courtesy check reads the host and the port only. A paste for
+/// another port or host is refused with `validate`'s own sentence, sends nothing, and leaves a
+/// fresh empty field for the re-paste.
 #[tokio::test]
-async fn enter_with_a_wrong_port_a_stale_state_or_no_code_is_refused_locally_and_sends_nothing() {
+async fn enter_with_a_wrong_port_or_host_is_refused_locally_and_sends_nothing() {
     let bench = SectionBench::new().await;
     let mut section = pasting_over(&bench);
     let cases = [
@@ -2940,12 +2941,17 @@ async fn enter_with_a_wrong_port_a_stale_state_or_no_code_is_refused_locally_and
             },
         ),
         (
-            format!("http://127.0.0.1:39879/?code={CODE}&state=STATE-EARLIER-0000"),
-            PasteError::StaleState,
+            format!("127.0.0.1/?code={CODE}&state={STATE}"),
+            PasteError::WrongPort {
+                pasted: 80,
+                advertised: 39879,
+            },
         ),
         (
-            format!("http://127.0.0.1:39879/?state={STATE}"),
-            PasteError::MissingCode,
+            format!("http://192.168.1.5:39879/?code={CODE}&state={STATE}"),
+            PasteError::WrongHost {
+                advertised: "127.0.0.1:39879".to_owned(),
+            },
         ),
     ];
     for (paste, refusal) in cases {
@@ -2963,6 +2969,52 @@ async fn enter_with_a_wrong_port_a_stale_state_or_no_code_is_refused_locally_and
         let field =
             field_line(&rendered).unwrap_or_else(|| panic!("the field is drawn: {rendered}"));
         assert!(field.contains("(0)"), "{refusal:?}: and empty: {rendered}");
+    }
+}
+
+/// Review L-8: everything past the host and the port is the worker's to judge — it runs the full
+/// `validate` and is the authority — so a stale state or a missing code is sent, and its refusal
+/// comes back as a failed `auth_deliver` that leaves the login and `p` as they were.
+#[tokio::test]
+async fn a_paste_for_the_right_host_and_port_is_sent_for_the_worker_to_judge() {
+    let bench = SectionBench::new().await;
+    for (paste, refusal) in [
+        (
+            format!("http://127.0.0.1:39879/?code={CODE}&state=STATE-EARLIER-0000"),
+            PasteError::StaleState,
+        ),
+        (
+            format!("http://127.0.0.1:39879/?state={STATE}"),
+            PasteError::MissingCode,
+        ),
+    ] {
+        let mut section = pasting_over(&bench);
+        typed(&bench, &mut section, &paste);
+        assert_eq!(bench.key(&mut section, "Enter"), Handled::Consumed);
+        let emitted = bench.drained();
+        assert!(errors_of(&emitted).is_empty(), "{refusal:?}: {emitted:?}");
+        assert!(
+            matches!(
+                &emitted[..],
+                [Action::Store(StoreRequest::AuthDeliver { .. })]
+            ),
+            "{refusal:?} is sent: {emitted:?}"
+        );
+        assert!(!section.captures_input(), "the field closed with the send");
+
+        bench.reply(
+            &mut section,
+            &StoreReply::Failed {
+                request: "auth_deliver",
+                message: refusal.to_string(),
+            },
+        );
+        let rendered = render_section(&section, &bench.ctx());
+        assert!(rendered.contains(REDIRECT_LINE), "{rendered}");
+        assert!(!rendered.contains(DELIVERING), "{rendered}");
+        assert_eq!(bench.key(&mut section, "p"), Handled::Consumed);
+        assert!(bench.drained().is_empty(), "p opens again");
+        assert!(section.captures_input());
     }
 }
 

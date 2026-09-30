@@ -48,7 +48,8 @@
 //!
 //! Since MOD-22 a login can be **finished from another machine**. When the adapter's link advertises
 //! a loopback `redirect_uri`, the pane names it and `p` opens a masked field. The address the
-//! browser could not open is pasted there, checked here against that redirect, and sent as one
+//! browser could not open is pasted there, its host and port checked here against that redirect,
+//! and sent as one
 //! [`StoreRequest::AuthDeliver`]. The login's own task relays it to the listener on this box and
 //! answers with what the listener said. The pasted address is a credential for the length of that
 //! request; the rule it is held to is `htui_agent::auth::loopback`'s (MOD-22 D273).
@@ -739,9 +740,10 @@ impl AgentsSection {
     /// `CONTROL` chords excepted so `ctrl-c` still quits.
     ///
     /// `Enter` **moves** the buffer into a [`RedirectUrl`], so there is one copy of what was pasted
-    /// and it is wiped when the request that carries it is dropped. The local `validate` is a
-    /// courtesy — the worker runs it again and is the authority (MOD-23 D247's rule) — and what it
-    /// refuses is answered with its fixed sentence and a fresh empty field for the re-paste.
+    /// and it is wiped when the request that carries it is dropped. The local check is a courtesy
+    /// and reads the host and the port only ([`loopback::precheck`], review L-8): the worker runs
+    /// the full `validate` and is the authority (MOD-23 D247's rule). What the check refuses is
+    /// answered with `validate`'s own sentence and a fresh empty field for the re-paste.
     fn on_paste_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let AuthState::Running {
             advertised,
@@ -768,10 +770,9 @@ impl AgentsSection {
                 let url = RedirectUrl::new(field.take());
                 match advertised
                     .as_ref()
-                    .map(|advertised| loopback::validate(&url, advertised))
+                    .map(|advertised| loopback::precheck(&url, advertised))
                 {
-                    // The `Delivery` is dropped unused: the worker builds its own.
-                    Some(Ok(_)) => {
+                    Some(Ok(())) => {
                         *paste = None;
                         *delivering = true;
                         ctx.request(StoreRequest::AuthDeliver { url });
