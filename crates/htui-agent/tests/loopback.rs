@@ -317,6 +317,37 @@ fn precheck_reads_the_host_and_the_port_only() {
     assert_eq!(precheck(&paste("LocalHost:39879/?x"), &named), Ok(()));
 }
 
+/// Review R2-L2: extra or backward slashes before the host are read the way `validate`'s URL
+/// parser reads them, so the pane's courtesy check refuses exactly what the worker would, and
+/// lets through exactly what it would take.
+#[test]
+fn precheck_and_validate_agree_on_slashes_before_the_host() {
+    let at = advertised(39879);
+    let query = format!("?code={CODE}&state={STATE}");
+    for (spelling, accepted) in [
+        ("//127.0.0.1:39879/", true),
+        ("\\\\127.0.0.1:39879/", true),
+        ("/\\127.0.0.1:39879/", true),
+        ("http:///127.0.0.1:39879/", true),
+        ("http://\\127.0.0.1:39879/", true),
+        ("HTTP:////127.0.0.1:39879\\", true),
+        ("//127.0.0.1:1/", false),
+        ("http:///127.0.0.2:39879/", false),
+        ("http:/127.0.0.1:39879/", false),
+        ("http:\\\\127.0.0.1:39879\\", false),
+    ] {
+        let text = format!("{spelling}{query}");
+        let worker = validate(&paste(&text), &at).map(|_| ());
+        let pane = precheck(&paste(&text), &at);
+        assert_eq!(
+            worker.is_ok(),
+            accepted,
+            "{spelling}: validate said {worker:?}"
+        );
+        assert_eq!(pane, worker, "{spelling}: precheck and validate disagree");
+    }
+}
+
 #[test]
 fn wrong_port_names_both_ports_and_nothing_else() {
     let err = validate(&paste(&good(50651)), &advertised(39879)).expect_err("another port");

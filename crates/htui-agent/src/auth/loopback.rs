@@ -592,7 +592,11 @@ pub fn precheck(url: &RedirectUrl, advertised: &Advertised) -> Result<(), PasteE
         }
         _ => text,
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // Review R2-L2: extra slashes before the host, either way round, are what `url` skips for an
+    // `http` address — `//host`, `http:///host`, `http://\\host` — and a `\\` ends the host as a
+    // `/` does. Read the same way here, so this check and `validate` agree.
+    let rest = rest.trim_start_matches(['/', '\\']);
+    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or_default();
     // A user name is `validate`'s refusal; the host is what follows it.
     let host_port = authority
         .rsplit_once('@')
