@@ -1164,7 +1164,7 @@ impl Tab for RequirementsTab {
 
 #[cfg(test)]
 mod tests {
-    use super::{HINT_WRITES, Mode, Notice, RequirementsTab, Row};
+    use super::{HINT_WRITES, Mode, Notice, RequirementsTab, Row, SAVING};
     use crate::app::{Action, Ctx, Emit, Handled, TopBarState};
     use crate::keymap::Keymap;
     use crate::requirements::{
@@ -1747,6 +1747,72 @@ mod tests {
         assert!(matches!(tab.mode, Mode::Browse), "the form closed");
         assert_eq!(tab.notice, Some(Notice::Info("minted R-ENT-3".to_owned())));
         assert_eq!(tab.selected, Some(Row::Requirement(id)));
+    }
+
+    /// Opens the amend form on R-ENT-1, appends to its body, names ANA-2 and saves: the amend in
+    /// flight.
+    fn amend(bench: &Bench, tab: &mut RequirementsTab) -> &'static str {
+        bench.key(tab, KeyCode::Char('e'));
+        bench.key(tab, KeyCode::End);
+        bench.typed(tab, " Mine.");
+        for _ in 0..3 {
+            bench.key(tab, KeyCode::Tab);
+        }
+        bench.typed(tab, "ANA-2");
+        bench.key(tab, KeyCode::Enter);
+        let sent = bench.emit.take();
+        let [request @ StoreRequest::AmendRequirement { .. }] = requests(&sent)[..] else {
+            panic!("the amend went out: {sent:?}")
+        };
+        request.name()
+    }
+
+    /// MOD-59 H-10 (review M2): a `RequirementWritten` for another write than the one in flight
+    /// lands nothing. With a snapshot it is a read like any other, so a pending reveal is decided
+    /// by it; with only a failed re-read it has no scope to check, so it changes nothing.
+    #[tokio::test]
+    async fn a_requirement_written_for_another_write_is_a_read_or_nothing() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot.clone());
+        let name = amend(&bench, &mut tab);
+        tab.pending_reveal = Some((ids::REQ_STO_1, "R-STO-1".to_owned()));
+        let minted = RequirementWrite::Minted {
+            id: RequirementId::new(),
+            key: "R-ENT-3".to_owned(),
+        };
+
+        bench.reply(
+            &mut tab,
+            &StoreReply::RequirementWritten {
+                snapshot: Ok(Box::new(snapshot)),
+                outcome: minted.clone(),
+            },
+        );
+        assert_eq!(tab.busy, Some(name), "not the amend's answer");
+        assert!(matches!(tab.mode, Mode::Requirement(_)), "the form stays");
+        assert_eq!(tab.notice, Some(Notice::Info(SAVING.to_owned())));
+        assert_eq!(tab.pending_reveal, None, "the read decided the reveal");
+        assert_eq!(tab.selected, Some(Row::Requirement(ids::REQ_STO_1)));
+        let _ = bench.emit.take();
+
+        tab.pending_reveal = Some((ids::REQ_STO_1, "R-STO-1".to_owned()));
+        bench.reply(
+            &mut tab,
+            &StoreReply::RequirementWritten {
+                snapshot: Err("store unreachable: gone".to_owned()),
+                outcome: minted,
+            },
+        );
+        assert_eq!(tab.busy, Some(name), "still in flight");
+        assert!(matches!(tab.mode, Mode::Requirement(_)), "the form stays");
+        assert_eq!(tab.unavailable, None);
+        assert_eq!(tab.notice, Some(Notice::Info(SAVING.to_owned())));
+        assert!(
+            tab.pending_reveal.is_some(),
+            "nothing was read to decide it"
+        );
+        assert!(requests(&bench.emit.take()).is_empty(), "nothing was sent");
     }
 
     /// MOD-59 D5: a mint whose re-read failed has landed all the same. The form closes, the notice
