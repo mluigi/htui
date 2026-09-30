@@ -685,6 +685,12 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   **Phase 2 landed (`b2532ab`..`d72a235`, 2026-09-30):** milestone 2: run supervision moved into the
   UI-free crate `crates/htui-worker` (no `ratatui`/`crossterm`, pinned by `tests/deps.rs`), behind
   `RecorderStore`/`WorkerStore`/`WorkerHost` in `htui-core`; the engine is generic over `WorkerStore`.
+  **Phase 3 landed (`c79945f`..`c9add2b`, 2026-09-30):** milestone 3: `htui worker` (headless
+  connect, keyring / systemd credential / `--dsn-stdin`, `--pool-size`, exit 0/1/2), the
+  `box.settings.executor` setting edited in Settings > Boxes (`w`), I-1 (only the matching process
+  claims, adopts or sweeps), the TUI's hand-back on a worker box, the queued-cancel CAS, and a 5 s
+  Runs poll. Guide: `docs/htui-worker.md`. Open for the maintainer: the demo-only exception to
+  OQ-5 (T9-C5).
 - [ ] **MOD-42 - Permission and control relay through Postgres** (from ANA-16, §8 item 3).
   `R-AGT-1`, `R-HIS-1`, `R-TUI-6`. The engine's `pump` (`record.rs:1684-1703`) cannot answer a
   parked ACP request, so engine-driven ACP steps fail on their first permission request today. The

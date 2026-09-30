@@ -178,7 +178,7 @@ the worker owns, and MOD-47 can later swap Postgres for a client without touchin
 |---|---|---|---|---|
 | 1 | Fence completion | A stale lease holder writes nothing to its old step through any engine step write; the heartbeat's self-fence ignores wall-clock steps. | complete | [plan](../plans/mod-41-headless-worker.plan.md) |
 | 2 | Supervision library | Run supervision lives in a UI-free crate behind the worker-store trait; the TUI behaves exactly as before. | complete | [plan](../plans/mod-41-headless-worker.plan.md) |
-| 3 | `htui worker` | A headless process on a box claims, drives and recovers that box's runs; a TUI-started run on a worker box survives TUI exit. | in-progress | [plan](../plans/mod-41-headless-worker.plan.md) |
+| 3 | `htui worker` | A headless process on a box claims, drives and recovers that box's runs; a TUI-started run on a worker box survives TUI exit. | complete | [plan](../plans/mod-41-headless-worker.plan.md) |
 | 4 | Background index sync | The worker keeps the concepts index current without `htui --index-items`. | in-progress | [plan](../plans/mod-41-headless-worker.plan.md) |
 
 Milestone 1 is store/orch-only and makes a second writer process safe before one exists. Milestone 2
