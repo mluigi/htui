@@ -1007,14 +1007,13 @@ pub struct StepPass {
 /// 2. `spec.body` parsed in `spec.role`: whether it places `{{excerpts}}` and `{{skills}}` (a
 ///    parse error places neither). The walk is wanted for excerpts when `{{excerpts}}` is placed,
 ///    and for skills when `{{skills}}` is placed and a collapsed winner is a versioned `glob`
-///    ([`needs_files`](htui_core::model::needs_files)).
+///    ([`needs_files`]).
 /// 3. Neither: no walk. The roots are recorded unscanned with the note
 ///    ``excerpt: template `name` places no {{excerpts}}; nothing was read``, and the file set
 ///    holds only `input.changed_paths`.
 /// 4. Otherwise the roots are listed once — under `tokio::task::spawn_blocking` when one is
 ///    readable, inline (no I/O) when none is — and the file set is built from that listing,
-///    `input.touched_prefixes` and `input.changed_paths`
-///    ([`step_files`](htui_core::prompt::excerpt::step_files)).
+///    `input.touched_prefixes` and `input.changed_paths` ([`step_files`]).
 /// 5. `drop_unmaskable_files` runs on the file set on **every** branch, before the residual, and
 ///    its note is the last of `excerpts.notes`.
 /// 6. `{{excerpts}}` not placed: no file is read. The set records the listing's roots and
