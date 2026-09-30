@@ -2152,8 +2152,14 @@ async fn run_probe(args: ProbeArgs) {
 /// promotion alike, with this one sentence.
 ///
 /// Read off the [`AgentSummary`](htui_core::model::AgentSummary) both paths already hold, so it
-/// costs no read and refuses before any row is written. A row with no `agent_box` row is
-/// `user_off: false` and passes. Reads the switch, never the name (`R-AGT-5`).
+/// costs no read. A row with no `agent_box` row is `user_off: false` and passes. Reads the switch,
+/// never the name (`R-AGT-5`).
+///
+/// What a refusal leaves differs by path (MOD-23 re-review Low-3). For `ChatStart` it refuses
+/// before this runtime writes any row. For a promotion it does **not**: the engine has already
+/// written the promotion by the time `bind_promoted` runs, so a refused promotion leaves the step
+/// `awaiting_approval` with `promoted_at` set and no chat, exactly as the `agent is disabled`
+/// refusal beside it does. Promoting again once the switch is on opens the chat.
 fn refuse_switched_off(summary: &htui_core::model::AgentSummary) -> Result<(), StoreError> {
     if summary.user_off {
         return Err(StoreError::Constraint(switched_off(&summary.agent.name)));

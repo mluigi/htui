@@ -1169,16 +1169,23 @@ async fn promotion_opens_the_chat_on_the_same_step() {
 
 /// Review L-3: promoting a step whose agent is switched off on this box (`agent_box.user_off`) is
 /// refused with the chat-start sentence, and no session is started.
+///
+/// Re-review Low-3 pins what the refusal leaves, which is the `agent is disabled` refusal's state:
+/// the engine wrote the promotion before the chat runtime refused it, so the step stays
+/// `awaiting_approval` **with** `promoted_at` set, the run stays parked with no failure, and the
+/// step's log gains nothing. Switching the agent back on and promoting again opens the chat.
 #[tokio::test]
 async fn promoting_onto_a_row_switched_off_on_this_box_is_refused() {
     let (mut harness, store) =
         promotion_harness(Script::one_turn(vec![chunk("Here."), done()])).await;
     let (run, step) = parked(&mut harness, &store).await;
     // After the walk, so the switch gates the promotion and not the run's own agent choice.
+    let agent = scripted_id(&store).await;
     store
-        .set_agent_box_enabled(scripted_id(&store).await, ids::BOX, false)
+        .set_agent_box_enabled(agent, ids::BOX, false)
         .await
         .expect("the switch lands");
+    let logged = log_of(&store, step.id).await.len();
 
     promote(&mut harness, run, step.id).await;
 
@@ -1190,6 +1197,40 @@ async fn promoting_onto_a_row_switched_off_on_this_box_is_refused() {
         )
     );
     assert!(harness.chat_steps().is_empty(), "no session was started");
+    let after = step_at(&store, run, step.position).await;
+    assert_eq!(after.id, step.id, "no new attempt");
+    assert_eq!(after.status, StepStatus::AwaitingApproval);
+    assert!(
+        after.promoted_at.is_some(),
+        "the engine's promotion write stands: the step is promoted with no chat"
+    );
+    let row = store
+        .run(run)
+        .await
+        .expect("the read answers")
+        .expect("the run exists");
+    assert_eq!(
+        row.status,
+        RunStatus::AwaitingApproval,
+        "the run stays parked"
+    );
+    assert_eq!(row.failure, None);
+    assert_eq!(
+        log_of(&store, step.id).await.len(),
+        logged,
+        "no opening was written to the step's log"
+    );
+
+    store
+        .set_agent_box_enabled(agent, ids::BOX, true)
+        .await
+        .expect("the switch lands");
+    promote(&mut harness, run, step.id).await;
+    assert_eq!(
+        harness.chat_steps(),
+        vec![step.id],
+        "switched back on, the same step promotes into a chat"
+    );
 }
 
 /// Review L-3: a row switched off and back on promotes as before.
