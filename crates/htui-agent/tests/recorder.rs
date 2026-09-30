@@ -1353,8 +1353,12 @@ async fn a_split_prompt_stores_the_sent_text_and_digests_the_digest_text() {
     );
 }
 
-/// `record_prompt(t, …)` is `record_prompt_digesting(t, t, …)`: the chat path's rows and digest
-/// are unchanged by MOD-33, including a prompt whose text the scrubber masks.
+/// `record_prompt(t, …)` and `record_prompt_digesting(t, t, …)` write the same row and the same
+/// digest, and that digest is the fixed `sha256` over the **masked** text
+/// (`use [REDACTED] for the backlog`), so a prompt whose text the scrubber masks still digests as
+/// the chat path always did. What this pins is the observable output; that `record_prompt`
+/// *delegates* to `record_prompt_digesting` is structural (`record.rs`), and a copy with the same
+/// output would pass too.
 #[tokio::test]
 async fn record_prompt_is_the_split_with_one_string() {
     let text = format!("use {SECRET} for the backlog");
