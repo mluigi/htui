@@ -3,7 +3,8 @@
 //! `htui-orch` never names `htui-store` (ANA-2 invariant 10), so everything that joins the two
 //! lives here:
 //!
-//! - [`BackendGraphs`], the graph source over a [`Backend`] (D155);
+//! - [`HostGraphs`], the graph source over any [`WorkerHost`](htui_core::store::WorkerHost)
+//!   (D155; MOD-41 plan D7);
 //! - the request and reply shapes the views speak — [`OrchRequest`], [`OrchReply`], [`RunFrame`],
 //!   [`ItemActions`] — and [`actions`], every verdict from the engine's own admission functions
 //!   (D182, D184);
@@ -17,10 +18,16 @@
 //!   retried once a walk rests (M5 D84). Progress reaches the Runs pane as `RunStream` frames at
 //!   each subscriber's own `seq` (D172, blueprint §0a point 3).
 //!
+//! MOD-41 plan D7: [`RunRuntime`] is generic over its host (a
+//! [`WorkerHost`](htui_core::store::WorkerHost)) and where its answers go (a [`ReplySink`]).
+//! Bare `RunRuntime` and `RunServed` are the TUI's — over a [`Backend`] and the store loop's
+//! channel ([`TuiReplies`]) — and [`TuiRuns`] keeps the loop's `serve`/`sweep` calls.
+//!
 //! Off the server every command is refused with MOD-25's sentence and nothing is spawned (D174).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
+use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError};
@@ -38,7 +45,7 @@ use htui_core::model::{
     UserId,
 };
 use htui_core::scrub::MinimalScrubber;
-use htui_core::store::{ReadStore as _, Result as StoreResult, StoreError, WriteStore as _};
+use htui_core::store::{Result as StoreResult, StoreError};
 use htui_orch::command::{answer_gate_enabled, cancel_enabled, select_enabled};
 use htui_orch::status::group_at;
 use htui_orch::{
@@ -49,7 +56,7 @@ use htui_orch::{
     cleanup_enabled, close_out_enabled, cursor, phase_at, promote_enabled, retry_admitted,
     snapshot_of, start_enabled, unblock_enabled,
 };
-use htui_store::{Backend, DATABASE_UNREACHABLE, Writer, identity};
+use htui_store::{Backend, DATABASE_UNREACHABLE, identity};
 use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -57,7 +64,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agent_worker::ReplyAddr;
-use crate::store_worker::{Origin, ReplyEnvelope, RequestEnvelope, Seq, StoreReply, StoreRequest};
+use crate::store_worker::{Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest};
 
 /// Blueprint D209: the [`StoreRequest::name`](crate::store_worker::StoreRequest::name) of each
 /// [`OrchRequest`], in [`OrchRequest`]'s order — the nine commands of [`Command`], then the
@@ -283,16 +290,19 @@ impl LiveChats {
 /// rows still come from the mirror, but no command can run (D174). A snapshot that does not decode
 /// refuses every step verdict of its run with that sentence.
 ///
+/// MOD-41 plan D7: over any [`WorkerHost`](htui_core::store::WorkerHost); the TUI passes its
+/// [`Backend`].
+///
 /// # Errors
 /// The store's own read failures, and [`StoreError::NotFound`] for an item a reachable server does
 /// not hold.
-pub async fn actions(
-    backend: &Backend,
+pub async fn actions<H: htui_core::store::WorkerHost>(
+    host: &H,
     item: ItemId,
     live: &LiveChats,
 ) -> StoreResult<ItemActions> {
-    let online = backend.writer().is_some();
-    let row = backend.item(item).await?;
+    let online = host.writer().is_some();
+    let row = host.item(item).await?;
     let row = match row {
         Some(row) => row,
         None if online => {
@@ -303,13 +313,13 @@ pub async fn actions(
         }
         None => return Ok(unreachable_actions(item, String::new())),
     };
-    let heads = backend.documents(item).await?;
+    let heads = host.documents(item).await?;
     let mut runs = Vec::new();
-    for summary in backend.runs(item).await? {
-        let Some(run) = backend.run(summary.id).await? else {
+    for summary in host.runs(item).await? {
+        let Some(run) = host.run(summary.id).await? else {
             continue;
         };
-        let steps = backend.run_steps(run.id).await?;
+        let steps = host.run_steps(run.id).await?;
         runs.push((run, steps));
     }
 
@@ -667,18 +677,21 @@ impl ReplySink for TuiReplies {
     }
 }
 
-/// What `RunRuntime::serve` (and the runtime's event channel) decided about one request.
+/// What [`RunRuntime::serve_request`] (and the runtime's event channel) decided about one request.
+///
+/// MOD-41 plan D7: `A` is the sink's address ([`ReplySink::Addr`]); bare `RunServed` is the TUI's,
+/// at a [`ReplyAddr`].
 #[derive(Debug)]
-pub enum RunServed {
+pub enum RunServed<A = ReplyAddr> {
     /// Answer with this reply, now.
-    Reply(StoreReply),
+    Reply(RunReply),
     /// A task this runtime owns answers the request, exactly once.
     Deferred,
     /// D165/D181: a promotion's engine writes are done; the loop hands `promoted` to
     /// `AgentRuntime::attach_promoted` (T7) and answers at `addr`.
     Attach {
         /// The promotion request's address.
-        addr: ReplyAddr,
+        addr: A,
         /// What the chat binds to.
         promoted: Box<Promoted>,
         /// What the chat's end publishes: the loop wraps the session task in it (D212).
@@ -695,7 +708,7 @@ pub enum RunServed {
 /// and run once the task has returned.
 #[derive(Debug, Clone)]
 pub struct ChatEnd {
-    publisher: Publisher,
+    publisher: Arc<dyn Publish>,
     tag: Arc<Tag>,
 }
 
@@ -704,18 +717,21 @@ impl ChatEnd {
     /// receiver dies with `task`, so by the time the frame is out
     /// `AgentRuntime::live_steps` no longer names the step and the verdicts the pane reads next
     /// are the chat-free ones.
-    #[must_use]
-    pub fn after(self, task: crate::agent_worker::ChatTask) -> crate::agent_worker::ChatTask {
-        Box::pin(async move {
-            task.await;
-            if let Some(item) = self.tag.item.get() {
-                self.publisher.publish(&RunFrame {
-                    item: *item,
-                    run: self.tag.run.get().copied(),
-                    kind: FrameKind::Changed,
-                });
-            }
-        })
+    ///
+    /// MOD-41 plan D7: any task, so the runtime names no chat type of the TUI's. The future owns
+    /// `self` and `task`, so it is `'static`, and `Send` whenever `task` is.
+    pub async fn after<F>(self, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        task.await;
+        if let Some(item) = self.tag.item.get() {
+            self.publisher.publish(&RunFrame {
+                item: *item,
+                run: self.tag.run.get().copied(),
+                kind: FrameKind::Changed,
+            });
+        }
     }
 }
 
@@ -741,14 +757,16 @@ pub trait StepAuthor: Send + Sync + core::fmt::Debug {
 
 /// D172, D203: `after_done` publishes `SessionDone` for the item and, in a test, writes the step's
 /// output document. Production `author` is `None` (MOD-11 writes documents; R-50).
+///
+/// MOD-41 plan D7: `S` is the host's store ([`WorkerHost::Store`](htui_core::store::WorkerHost)).
 #[derive(Debug, Clone)]
-pub struct ProgressSink {
-    publisher: Publisher,
-    writer: Writer,
+pub struct ProgressSink<S> {
+    publisher: Arc<dyn Publish>,
+    writer: S,
     author: Option<Arc<dyn StepAuthor>>,
 }
 
-impl SessionSink for ProgressSink {
+impl<S: htui_core::store::WorkerStore> SessionSink for ProgressSink<S> {
     async fn after_done(
         &self,
         item: ItemId,
@@ -795,63 +813,87 @@ impl AgentDriver for RefusedDriver {
     }
 }
 
-/// Plan D172, blueprint §0a point 3: who is subscribed to which item's runs, and at which `seq`.
+/// Plan D172, blueprint §0a point 3: who is subscribed to which item's runs, and at which address.
 ///
-/// One subscription per origin: a later `RunStream` from the same origin replaces the earlier one,
-/// whose `seq` `App::latest` already treats as stale. Every frame for `item` goes to each
-/// subscriber of it at **its** subscription's `seq`, the only one `App::is_fresh` passes.
-#[derive(Debug, Clone, Default)]
-struct Publisher(Arc<StdMutex<Subscribers>>);
+/// One subscription per subscriber ([`ReplySink::Subscriber`], the TUI's origin): a later
+/// `RunStream` from the same subscriber replaces the earlier one, whose `seq` `App::latest` already
+/// treats as stale. Every frame for `item` goes to each subscriber of it at **its** subscription's
+/// address, the only one `App::is_fresh` passes.
+struct Publisher<P: ReplySink>(Arc<StdMutex<Subscribers<P>>>);
 
-#[derive(Debug, Default)]
-struct Subscribers {
-    subs: HashMap<Origin, Subscription>,
-    replies: Option<mpsc::UnboundedSender<ReplyEnvelope>>,
+struct Subscribers<P: ReplySink> {
+    subs: HashMap<P::Subscriber, (P::Addr, ItemId)>,
+    sink: Option<P>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Subscription {
-    seq: Seq,
-    item: ItemId,
+impl<P: ReplySink> Clone for Publisher<P> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
 }
 
-impl Publisher {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Subscribers> {
+impl<P: ReplySink> Default for Publisher<P> {
+    fn default() -> Self {
+        Self(Arc::new(StdMutex::new(Subscribers {
+            subs: HashMap::new(),
+            sink: None,
+        })))
+    }
+}
+
+/// MOD-41 blueprint F-9: hand-written, so no `P: Debug` is asked of a sink. It never waits for the
+/// map, as the derived `Mutex` one never did.
+impl<P: ReplySink> core::fmt::Debug for Publisher<P> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut debug = f.debug_struct("Publisher");
+        match self.0.try_lock() {
+            Ok(state) => debug
+                .field("subscribers", &state.subs.len())
+                .field("wired", &state.sink.is_some())
+                .finish(),
+            Err(_) => debug.finish_non_exhaustive(),
+        }
+    }
+}
+
+impl<P: ReplySink> Publisher<P> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Subscribers<P>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The channel frames go out on: the loop's reply sender.
-    fn wire(&self, replies: &mpsc::UnboundedSender<ReplyEnvelope>) {
-        let mut state = self.lock();
-        if state
-            .replies
-            .as_ref()
-            .is_none_or(mpsc::UnboundedSender::is_closed)
-        {
-            state.replies = Some(replies.clone());
-        }
+    /// The sink frames go out on: the loop's reply channel.
+    ///
+    /// MOD-41 blueprint F-10: the last wire wins. Every caller wires the one sink of its runtime
+    /// (the loop's channel, or a test's one channel per runtime), so replacing it unconditionally
+    /// is the same as keeping the first live one.
+    fn wire(&self, sink: &P) {
+        self.lock().sink = Some(sink.clone());
     }
 
-    /// `origin` now follows `item`, at `seq`.
-    fn subscribe(&self, origin: Origin, seq: Seq, item: ItemId) {
-        self.lock().subs.insert(origin, Subscription { seq, item });
+    /// `addr`'s subscriber now follows `item`, at `addr`.
+    fn subscribe(&self, addr: P::Addr, item: ItemId) {
+        self.lock().subs.insert(P::subscriber(&addr), (addr, item));
     }
+}
 
+/// MOD-41 blueprint F-9: what [`ChatEnd`] and [`ProgressSink`] publish through, so neither names
+/// the sink's type.
+trait Publish: Send + Sync + core::fmt::Debug {
     /// One frame to every subscriber of its item.
+    fn publish(&self, frame: &RunFrame);
+}
+
+impl<P: ReplySink> Publish for Publisher<P> {
     fn publish(&self, frame: &RunFrame) {
         let state = self.lock();
-        let Some(replies) = state.replies.as_ref() else {
+        let Some(sink) = state.sink.as_ref() else {
             return;
         };
-        for (origin, sub) in &state.subs {
-            if sub.item != frame.item {
+        for (addr, item) in state.subs.values() {
+            if *item != frame.item {
                 continue;
             }
-            let _ = replies.send(ReplyEnvelope {
-                seq: sub.seq,
-                origin: origin.clone(),
-                reply: StoreReply::RunStream(frame.clone()),
-            });
+            sink.send(addr, RunReply::Frame(frame.clone()));
         }
     }
 }
@@ -894,16 +936,16 @@ struct Built {
     verifier: Option<Arc<dyn Verifier>>,
 }
 
-/// Everything the runtime's tasks share.
-struct Shared {
+/// Everything the runtime's tasks share. `P` is where the runtime's answers go (MOD-41 plan D7).
+struct Shared<P: ReplySink> {
     parts: Parts,
     drivers: Arc<DriverFactory>,
     clock: Arc<dyn Clock>,
     author: Option<Arc<dyn StepAuthor>>,
     owner: Uuid,
     dead_walks: Arc<DeadWalks>,
-    publisher: Publisher,
-    events: mpsc::UnboundedSender<RunServed>,
+    publisher: Publisher<P>,
+    events: mpsc::UnboundedSender<RunServed<P::Addr>>,
     tasks: StdMutex<Vec<Tracked>>,
     isolator_builds: AtomicUsize,
     locks: RunLocks,
@@ -937,7 +979,7 @@ struct Tag {
     item: OnceLock<ItemId>,
 }
 
-impl Shared {
+impl<P: ReplySink> Shared<P> {
     /// M5 D84: a run a claim refused waits in `queued_at` order.
     fn queue(&self, queued_at: DateTime<Utc>, run: RunId) {
         self.queued
@@ -973,10 +1015,10 @@ impl Shared {
     /// The process's isolator and verifier (D156, D202). A `StartRun` re-reads the repo map and
     /// rebuilds the production isolator when it moved and no walk of this process is live, and is
     /// refused with [`REPOS_MOVED`] when one is (R-39).
-    async fn singletons(
+    async fn singletons<H: htui_core::store::WorkerHost>(
         &self,
-        backend: &Backend,
-        writer: &Writer,
+        host: &H,
+        writer: &H::Store,
         start_run: bool,
     ) -> Result<(Arc<dyn Isolator>, Arc<dyn Verifier>), String> {
         let (scratch_root, built) = match &self.parts {
@@ -1000,10 +1042,8 @@ impl Shared {
         if !start_run && let (Some(isolator), Some(verifier)) = (&built.isolator, &built.verifier) {
             return Ok((Arc::clone(isolator), Arc::clone(verifier)));
         }
-        let box_id = registered_box(backend)
-            .await
-            .map_err(|err| err.to_string())?;
-        let repos = repo_map(backend, writer, box_id)
+        let box_id = registered_box(host).await.map_err(|err| err.to_string())?;
+        let repos = repo_map(host, writer, box_id)
             .await
             .map_err(|err| err.to_string())?;
         let rebuild = built.repos.as_ref() != Some(&repos);
@@ -1011,10 +1051,7 @@ impl Shared {
             if built.isolator.is_some() && self.any_live() {
                 return Err(REPOS_MOVED.to_owned());
             }
-            let app = backend
-                .app_settings()
-                .await
-                .map_err(|err| err.to_string())?;
+            let app = host.app_settings().await.map_err(|err| err.to_string())?;
             let scratch_root = match scratch_root {
                 Some(root) => root.clone(),
                 None => identity::config_root()
@@ -1044,7 +1081,7 @@ impl Shared {
             self.isolator_builds.fetch_add(1, Ordering::SeqCst);
         }
         if built.verifier.is_none() {
-            let limits = command_limits(backend, box_id)
+            let limits = command_limits(host, box_id)
                 .await
                 .map_err(|err| err.to_string())?;
             built.verifier = Some(Arc::new(ShellVerifier::new(
@@ -1231,8 +1268,8 @@ impl Walks {
 }
 
 /// This box's id, or the refusal that says it has never been registered.
-async fn registered_box(backend: &Backend) -> StoreResult<BoxId> {
-    Ok(backend
+async fn registered_box<H: htui_core::store::WorkerHost>(host: &H) -> StoreResult<BoxId> {
+    Ok(host
         .box_info()
         .await?
         .ok_or_else(|| StoreError::NotFound {
@@ -1244,24 +1281,24 @@ async fn registered_box(backend: &Backend) -> StoreResult<BoxId> {
 
 /// Blueprint D202: every repo of every project of every workspace, joined on this box's checkout
 /// paths. A repo with no checkout here is not isolatable here and is left out.
-async fn repo_map(
-    backend: &Backend,
-    writer: &Writer,
+async fn repo_map<H: htui_core::store::WorkerHost>(
+    host: &H,
+    writer: &H::Store,
     box_id: BoxId,
 ) -> StoreResult<BTreeMap<RepoId, RepoCheckout>> {
-    let paths: BTreeMap<RepoId, String> = backend
+    let paths: BTreeMap<RepoId, String> = host
         .repo_paths(box_id)
         .await?
         .into_iter()
         .map(|path| (path.repo_id, path.local_path))
         .collect();
     let mut projects = BTreeSet::new();
-    for workspace in backend.workspaces().await? {
+    for workspace in host.workspaces().await? {
         projects.extend(workspace.projects.iter().map(|project| project.project_id));
     }
     let mut repos = BTreeMap::new();
     for project in projects {
-        for repo in writer.repos(project).await? {
+        for repo in htui_core::store::WorkerStore::repos(writer, project).await? {
             if let Some(path) = paths.get(&repo.id) {
                 repos.insert(
                     repo.id,
@@ -1286,9 +1323,12 @@ async fn repo_map(
 ///
 /// # Errors
 /// The store's own read failure.
-async fn command_limits(backend: &Backend, box_id: BoxId) -> StoreResult<BTreeMap<String, u32>> {
+async fn command_limits<H: htui_core::store::WorkerHost>(
+    host: &H,
+    box_id: BoxId,
+) -> StoreResult<BTreeMap<String, u32>> {
     let default = || BTreeMap::from([("verify".to_owned(), 1)]);
-    let Some(stored) = backend
+    let Some(stored) = host
         .box_row(box_id)
         .await?
         .and_then(|row| row.settings.get("command_limits").cloned())
@@ -1301,27 +1341,28 @@ async fn command_limits(backend: &Backend, box_id: BoxId) -> StoreResult<BTreeMa
     }))
 }
 
-/// The engine every task builds, per step of work, over [`Kit`]'s parts.
-type WorkerEngine<'a> = Engine<
+/// The engine every task builds, per step of work, over [`Kit`]'s parts: over the host's store
+/// (MOD-41 plan D7).
+type WorkerEngine<'a, H> = Engine<
     'a,
-    Writer,
-    BackendGraphs,
+    <H as htui_core::store::WorkerHost>::Store,
+    HostGraphs<H>,
     dyn Isolator,
     dyn Verifier,
     dyn Clock,
     FirstCandidate,
-    ProgressSink,
+    ProgressSink<<H as htui_core::store::WorkerHost>::Store>,
 >;
 
 /// Everything one task's engine borrows, owned (D156): the writer, the graph source, the two
 /// singletons, the clock, the sink, the identities, and the agent registry read once per task.
-struct Kit {
-    writer: Writer,
-    graphs: BackendGraphs,
+struct Kit<H: htui_core::store::WorkerHost> {
+    writer: H::Store,
+    graphs: HostGraphs<H>,
     isolator: Arc<dyn Isolator>,
     verifier: Arc<dyn Verifier>,
     clock: Arc<dyn Clock>,
-    sink: ProgressSink,
+    sink: ProgressSink<H::Store>,
     scrubber: MinimalScrubber,
     app: BTreeMap<String, Value>,
     box_profile: BoxProfile,
@@ -1333,23 +1374,27 @@ struct Kit {
     drivers: Arc<DriverFactory>,
 }
 
-impl Kit {
+impl<H: htui_core::store::WorkerHost> Kit<H> {
     /// Reads the parts. `start_run` asks the singletons to re-check the repo map (D202).
-    async fn read(shared: &Shared, backend: &Backend, start_run: bool) -> Result<Self, String> {
-        let writer = backend
+    async fn read<P: ReplySink>(
+        shared: &Shared<P>,
+        host: &H,
+        start_run: bool,
+    ) -> Result<Self, String> {
+        let writer = host
             .writer()
             .ok_or_else(|| DATABASE_UNREACHABLE.to_owned())?;
-        let (isolator, verifier) = shared.singletons(backend, &writer, start_run).await?;
+        let (isolator, verifier) = shared.singletons(host, &writer, start_run).await?;
         let sentence = |err: StoreError| err.to_string();
-        let box_id = registered_box(backend).await.map_err(sentence)?;
-        let user = backend.this_user().await.map_err(sentence)?;
-        let app = backend.app_settings().await.map_err(sentence)?;
-        let box_profile = backend
+        let box_id = registered_box(host).await.map_err(sentence)?;
+        let user = host.this_user().await.map_err(sentence)?;
+        let app = host.app_settings().await.map_err(sentence)?;
+        let box_profile = host
             .box_profile(box_id)
             .await
             .map_err(sentence)?
             .ok_or_else(|| "this box has no profile row".to_owned())?;
-        let agents = backend
+        let agents = host
             .agents()
             .await
             .map_err(sentence)?
@@ -1358,12 +1403,12 @@ impl Kit {
             .collect();
         Ok(Self {
             sink: ProgressSink {
-                publisher: shared.publisher.clone(),
+                publisher: Arc::new(shared.publisher.clone()),
                 writer: writer.clone(),
                 author: shared.author.clone(),
             },
             writer,
-            graphs: BackendGraphs(backend.clone()),
+            graphs: HostGraphs(host.clone()),
             isolator,
             verifier,
             clock: Arc::clone(&shared.clock),
@@ -1397,7 +1442,7 @@ impl Kit {
     }
 
     /// One engine over these parts.
-    fn engine<'a>(&'a self, driver: DriverFor<'a>) -> WorkerEngine<'a> {
+    fn engine<'a>(&'a self, driver: DriverFor<'a>) -> WorkerEngine<'a, H> {
         Engine::new(EngineParts {
             store: &self.writer,
             graphs: &self.graphs,
@@ -1447,12 +1492,21 @@ fn lease_period(app: &BTreeMap<String, Value>) -> Duration {
 /// request's `seq` (`R-NF-3`, R-41); the loop never awaits a walk. A run's commands are serialised
 /// by [`RunLocks`] (R-27), and `CancelRun` and `PromoteStep` preempt a live walk through its token
 /// (D157, D187).
-pub struct RunRuntime {
-    shared: Arc<Shared>,
-    events: Option<mpsc::UnboundedReceiver<RunServed>>,
+///
+/// MOD-41 plan D7: generic over its host `H` (every store read and write goes through it) and its
+/// sink `P` (every answer and frame goes to it). Bare `RunRuntime` is the TUI's: over its
+/// [`Backend`] and the store loop's channel ([`TuiReplies`]), driven through [`TuiRuns`].
+pub struct RunRuntime<H = Backend, P = TuiReplies>
+where
+    H: htui_core::store::WorkerHost,
+    P: ReplySink,
+{
+    shared: Arc<Shared<P>>,
+    events: Option<mpsc::UnboundedReceiver<RunServed<P::Addr>>>,
+    host: PhantomData<fn() -> H>,
 }
 
-impl core::fmt::Debug for RunRuntime {
+impl<H: htui_core::store::WorkerHost, P: ReplySink> core::fmt::Debug for RunRuntime<H, P> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RunRuntime")
             .field("parts", &self.shared.parts)
@@ -1463,7 +1517,7 @@ impl core::fmt::Debug for RunRuntime {
     }
 }
 
-impl RunRuntime {
+impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
     /// A runtime over this transport registry, whose isolator and verifier are the production
     /// ones, built at the first command (D156).
     #[must_use]
@@ -1517,6 +1571,7 @@ impl RunRuntime {
                 sweeping: AtomicBool::new(false),
             }),
             events: Some(receiver),
+            host: PhantomData,
         }
     }
 
@@ -1543,9 +1598,11 @@ impl RunRuntime {
     ///
     /// Every tick first prunes what nothing uses any longer (D214): finished task handles, idle
     /// run parents and free run locks.
-    pub fn sweep(&mut self, backend: &Backend, replies: &mpsc::UnboundedSender<ReplyEnvelope>) {
+    ///
+    /// MOD-41 blueprint B-3: named `sweep_with`, so it never shadows [`TuiRuns::sweep`].
+    pub fn sweep_with(&mut self, host: &H, sink: &P) {
         self.shared.prune();
-        if backend.writer().is_none() || self.shared.walks.closed() {
+        if host.writer().is_none() || self.shared.walks.closed() {
             return;
         }
         if self
@@ -1556,11 +1613,11 @@ impl RunRuntime {
         {
             return;
         }
-        self.shared.publisher.wire(replies);
+        self.shared.publisher.wire(sink);
         let ctx = TaskCtx {
             shared: Arc::clone(&self.shared),
-            backend: backend.clone(),
-            replies: replies.clone(),
+            host: host.clone(),
+            sink: sink.clone(),
             addr: None,
             name: "sweep",
             tag: Arc::default(),
@@ -1569,8 +1626,8 @@ impl RunRuntime {
         let tag = Arc::clone(&ctx.tag);
         let handle = tokio::spawn(async move {
             /// Frees the one-sweep-at-a-time claim however the sweep ends.
-            struct Swept(Arc<Shared>);
-            impl Drop for Swept {
+            struct Swept<P: ReplySink>(Arc<Shared<P>>);
+            impl<P: ReplySink> Drop for Swept<P> {
                 fn drop(&mut self) {
                     self.0.sweeping.store(false, Ordering::SeqCst);
                 }
@@ -1583,7 +1640,7 @@ impl RunRuntime {
 
     /// The shared state, while nothing else holds it: configuration happens before the first
     /// request.
-    fn configure(&mut self) -> &mut Shared {
+    fn configure(&mut self) -> &mut Shared<P> {
         Arc::get_mut(&mut self.shared).expect("a run runtime is configured before it serves")
     }
 
@@ -1621,7 +1678,7 @@ impl RunRuntime {
 
     /// D181: the receiver of the runtime's events — today only `RunServed::Attach` — which the
     /// loop owns. Called once, before the loop; a second call hands out a fresh channel.
-    pub fn take_events(&mut self) -> mpsc::UnboundedReceiver<RunServed> {
+    pub fn take_events(&mut self) -> mpsc::UnboundedReceiver<RunServed<P::Addr>> {
         self.events.take().unwrap_or_else(|| {
             let (events, receiver) = mpsc::unbounded_channel();
             self.configure().events = events;
@@ -1664,55 +1721,52 @@ impl RunRuntime {
             .len()
     }
 
-    /// Serves one `Orch`, `RunStream` or `RunActions` request (§8.5). Awaits nothing: every
-    /// command, and every verdict read (D215), is a task that answers at the request's `seq`.
-    pub async fn serve(
+    /// Serves one `Orch`, `RunStream` or `RunActions` request (§8.5), answered at `addr`. Awaits
+    /// nothing: every command, and every verdict read (D215), is a task that answers at `addr`.
+    ///
+    /// MOD-41 blueprint B-3: named `serve_request`, so it never shadows [`TuiRuns::serve`].
+    pub async fn serve_request(
         &mut self,
-        backend: &Backend,
-        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
-        envelope: &RequestEnvelope,
+        host: &H,
+        sink: &P,
+        addr: P::Addr,
+        request: RunRequest,
         live: &LiveChats,
-    ) -> RunServed {
+    ) -> RunServed<P::Addr> {
         self.shared.prune_tasks();
-        self.shared.publisher.wire(replies);
-        match &envelope.request {
-            StoreRequest::RunStream { item } => {
-                self.shared
-                    .publisher
-                    .subscribe(envelope.origin.clone(), envelope.seq, *item);
-                RunServed::Reply(StoreReply::RunStream(RunFrame::subscribed(*item)))
+        self.shared.publisher.wire(sink);
+        let name = request.name();
+        match request {
+            RunRequest::Stream { item } => {
+                self.shared.publisher.subscribe(addr, item);
+                RunServed::Reply(RunReply::Frame(RunFrame::subscribed(item)))
             }
             // D215: the verdicts read the item, its documents, its runs and each run's row and
             // steps, so they are a tracked task like a command and answer at the request's own
             // `seq`; `App::is_fresh` drops a reply a later one overtook.
-            StoreRequest::RunActions(item) => {
-                let (backend, replies, live, item) =
-                    (backend.clone(), replies.clone(), live.clone(), *item);
-                let (seq, origin) = (envelope.seq, envelope.origin.clone());
-                let request = envelope.request.name();
+            RunRequest::Actions(item) => {
+                let (host, sink, live) = (host.clone(), sink.clone(), live.clone());
                 let handle = tokio::spawn(async move {
-                    let reply = match actions(&backend, item, &live).await {
-                        Ok(actions) => StoreReply::RunActions(Box::new(actions)),
-                        Err(err) => StoreReply::Failed {
-                            request,
+                    let reply = match actions(&host, item, &live).await {
+                        Ok(actions) => RunReply::Actions(Box::new(actions)),
+                        Err(err) => RunReply::Failed {
+                            request: name,
                             message: err.to_string(),
                         },
                     };
-                    let _ = replies.send(ReplyEnvelope { seq, origin, reply });
+                    sink.send(&addr, reply);
                 });
                 self.shared.track(Arc::default(), handle);
                 RunServed::Deferred
             }
-            StoreRequest::Orch(request) => {
-                let name = request.name();
+            RunRequest::Orch(mut request) => {
                 // D174: nothing is built and nothing is spawned without a server.
-                if backend.writer().is_none() {
-                    return RunServed::Reply(StoreReply::Failed {
+                if host.writer().is_none() {
+                    return RunServed::Reply(RunReply::Failed {
                         request: name,
                         message: DATABASE_UNREACHABLE.to_owned(),
                     });
                 }
-                let mut request = request.clone();
                 // D185: the facts only this process knows, whatever the view sent.
                 if let OrchRequest::Command(command) = &mut request {
                     match command {
@@ -1725,22 +1779,15 @@ impl RunRuntime {
                 }
                 let ctx = TaskCtx {
                     shared: Arc::clone(&self.shared),
-                    backend: backend.clone(),
-                    replies: replies.clone(),
-                    addr: Some(ReplyAddr {
-                        seq: envelope.seq,
-                        origin: envelope.origin.clone(),
-                    }),
+                    host: host.clone(),
+                    sink: sink.clone(),
+                    addr: Some(addr),
                     name,
                     tag: Arc::default(),
                 };
                 spawn_task(ctx, request, live.clone());
                 RunServed::Deferred
             }
-            other => RunServed::Reply(StoreReply::Failed {
-                request: other.name(),
-                message: "not an orchestrator request".to_owned(),
-            }),
         }
     }
 
@@ -1800,28 +1847,74 @@ impl RunRuntime {
     }
 }
 
-/// One task's context: what it answers through and what it works on.
+/// The store loop's `serve` and `sweep` over the TUI's runtime (MOD-41 blueprint B-3): today's
+/// signatures, over [`RunRuntime::serve_request`] and [`RunRuntime::sweep_with`].
+pub trait TuiRuns {
+    /// One `Orch`, `RunStream` or `RunActions` envelope, answered at its `seq` and origin; any
+    /// other request is refused with `not an orchestrator request`.
+    fn serve(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        envelope: &RequestEnvelope,
+        live: &LiveChats,
+    ) -> impl Future<Output = RunServed> + Send;
+
+    /// One sweep tick.
+    fn sweep(&mut self, backend: &Backend, replies: &mpsc::UnboundedSender<ReplyEnvelope>);
+}
+
+impl TuiRuns for RunRuntime {
+    async fn serve(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        envelope: &RequestEnvelope,
+        live: &LiveChats,
+    ) -> RunServed {
+        let request = match &envelope.request {
+            StoreRequest::Orch(request) => RunRequest::Orch(request.clone()),
+            StoreRequest::RunStream { item } => RunRequest::Stream { item: *item },
+            StoreRequest::RunActions(item) => RunRequest::Actions(*item),
+            other => {
+                return RunServed::Reply(RunReply::Failed {
+                    request: other.name(),
+                    message: "not an orchestrator request".to_owned(),
+                });
+            }
+        };
+        let addr = ReplyAddr {
+            seq: envelope.seq,
+            origin: envelope.origin.clone(),
+        };
+        self.serve_request(backend, &TuiReplies(replies.clone()), addr, request, live)
+            .await
+    }
+
+    fn sweep(&mut self, backend: &Backend, replies: &mpsc::UnboundedSender<ReplyEnvelope>) {
+        self.sweep_with(backend, &TuiReplies(replies.clone()));
+    }
+}
+
+/// One task's context: what it answers through and what it works on (MOD-41 plan D7: its host
+/// and its sink).
 #[derive(Clone)]
-struct TaskCtx {
-    shared: Arc<Shared>,
-    backend: Backend,
-    replies: mpsc::UnboundedSender<ReplyEnvelope>,
+struct TaskCtx<H: htui_core::store::WorkerHost, P: ReplySink> {
+    shared: Arc<Shared<P>>,
+    host: H,
+    sink: P,
     /// The request the task answers; `None` for a sweep's resume or a claim retry, which answer
     /// nobody and only publish.
-    addr: Option<ReplyAddr>,
+    addr: Option<P::Addr>,
     name: &'static str,
     tag: Arc<Tag>,
 }
 
-impl TaskCtx {
+impl<H: htui_core::store::WorkerHost, P: ReplySink> TaskCtx<H, P> {
     /// The one answer to the request.
-    fn answer(&self, reply: StoreReply) {
+    fn answer(&self, reply: RunReply) {
         if let Some(addr) = &self.addr {
-            let _ = self.replies.send(ReplyEnvelope {
-                seq: addr.seq,
-                origin: addr.origin.clone(),
-                reply,
-            });
+            self.sink.send(addr, reply);
         }
     }
 
@@ -1829,8 +1922,8 @@ impl TaskCtx {
     fn unaddressed(&self, name: &'static str) -> Self {
         Self {
             shared: Arc::clone(&self.shared),
-            backend: self.backend.clone(),
-            replies: self.replies.clone(),
+            host: self.host.clone(),
+            sink: self.sink.clone(),
             addr: None,
             name,
             tag: Arc::default(),
@@ -1843,7 +1936,7 @@ impl TaskCtx {
             self.tag.run.get().copied(),
             FrameKind::Error(message.clone()),
         );
-        self.answer(StoreReply::Failed {
+        self.answer(RunReply::Failed {
             request: self.name,
             message,
         });
@@ -1865,23 +1958,26 @@ impl TaskCtx {
     fn done(&self, outcome: CommandOutcome) {
         let kind = rest_of(&outcome).map_or(FrameKind::Changed, FrameKind::Rested);
         self.publish(self.tag.run.get().copied(), kind);
-        self.answer(StoreReply::Orch(OrchReply::Done(Box::new(outcome))));
+        self.answer(RunReply::Orch(OrchReply::Done(Box::new(outcome))));
     }
 
     /// Records the run (and, from its row, the item) the task works on.
-    async fn tag_run(&self, writer: &Writer, run: RunId) -> Option<Run> {
+    async fn tag_run(&self, writer: &H::Store, run: RunId) -> Option<Run> {
         let _ = self.tag.run.set(run);
-        let row = writer.run(run).await.ok().flatten();
+        let row = htui_core::store::WorkerStore::run(writer, run)
+            .await
+            .ok()
+            .flatten();
         self.tag_item(row.as_ref());
         row
     }
 
-    /// [`Self::tag_run`] through the task's backend, before the task waits for its lock or reads
+    /// [`Self::tag_run`] through the task's host, before the task waits for its lock or reads
     /// its parts, so a refusal that comes before either still reaches the item's subscribers
     /// (D200).
     async fn tag(&self, run: RunId) -> Option<Run> {
         let _ = self.tag.run.set(run);
-        let row = self.backend.run(run).await.ok().flatten();
+        let row = self.host.run(run).await.ok().flatten();
         self.tag_item(row.as_ref());
         row
     }
@@ -1918,7 +2014,11 @@ async fn walked<T>(walk: &WalkToken, work: impl Future<Output = T>) -> Option<T>
 
 /// Spawns one request's task, supervised and tracked. `live` is the loop's [`LiveChats`] when the
 /// request was served (D212).
-fn spawn_task(ctx: TaskCtx, request: OrchRequest, live: LiveChats) {
+fn spawn_task<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: TaskCtx<H, P>,
+    request: OrchRequest,
+    live: LiveChats,
+) {
     let work = run_request(ctx.clone(), request, live);
     spawn_supervised(ctx, work);
 }
@@ -1931,7 +2031,10 @@ fn spawn_task(ctx: TaskCtx, request: OrchRequest, live: LiveChats) {
 /// Only the supervisor is tracked, and dropping a `JoinHandle` detaches its task rather than
 /// cancelling it: the supervisor therefore aborts the work when it is itself aborted, so
 /// `settle` and `shutdown` stop the walk and not only the task watching it.
-fn spawn_supervised(ctx: TaskCtx, work: impl Future<Output = ()> + Send + 'static) {
+fn spawn_supervised<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: TaskCtx<H, P>,
+    work: impl Future<Output = ()> + Send + 'static,
+) {
     /// Aborts the work's task when the supervisor is dropped; a no-op once the work has ended.
     struct AbortOnDrop(tokio::task::AbortHandle);
     impl Drop for AbortOnDrop {
@@ -1967,7 +2070,7 @@ fn spawn_supervised(ctx: TaskCtx, work: impl Future<Output = ()> + Send + 'stati
 
 /// M5 D84: once a task's run no longer walks — parked, finished, or gone — every run a refused
 /// claim left `queued` in this process is claimed again ([`claim_queued`]).
-async fn retry_claims(ctx: &TaskCtx) {
+async fn retry_claims<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P>) {
     let Some(run) = ctx.tag.run.get().copied() else {
         return;
     };
@@ -1982,7 +2085,7 @@ async fn retry_claims(ctx: &TaskCtx) {
     }
     // Only a run read to be resting frees anything. A failed read proves nothing, and treating it
     // as a rest would have a queued run's own failed retry retrigger itself for a whole outage.
-    match ctx.backend.run(run).await {
+    match ctx.host.run(run).await {
         Ok(Some(Run {
             status: RunStatus::Running | RunStatus::Queued,
             ..
@@ -2001,7 +2104,7 @@ const CLAIM_POLL: Duration = Duration::from_millis(20);
 /// ended, or its run read to be no longer `queued` — before the next one is tried, so an earlier
 /// run is never overtaken for the scope a rested walk freed; the admitted run walks on its own
 /// task. `Admitted` or a terminal run leaves the set; a second refusal puts it back.
-async fn claim_queued(ctx: &TaskCtx) {
+async fn claim_queued<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P>) {
     let queued = std::mem::take(
         &mut *ctx
             .shared
@@ -2015,17 +2118,17 @@ async fn claim_queued(ctx: &TaskCtx) {
         spawn_supervised(retry.clone(), reclaim(retry, run, queued_at, decided));
         tokio::select! {
             _ = undecided => {}
-            () = left_the_queue(&ctx.backend, run) => {}
+            () = left_the_queue(&ctx.host, run) => {}
         }
     }
 }
 
 /// Returns once `run` is read to be anything but `queued`, or cannot be read.
-async fn left_the_queue(backend: &Backend, run: RunId) {
+async fn left_the_queue<H: htui_core::store::WorkerHost>(host: &H, run: RunId) {
     while let Ok(Some(Run {
         status: RunStatus::Queued,
         ..
-    })) = backend.run(run).await
+    })) = host.run(run).await
     {
         tokio::time::sleep(CLAIM_POLL).await;
     }
@@ -2033,14 +2136,19 @@ async fn left_the_queue(backend: &Backend, run: RunId) {
 
 /// One claim retry: the run's lock, then `claim` and its walk. Dropping `decided` — when the task
 /// ends — tells [`claim_queued`] this claim no longer holds up the next.
-async fn reclaim(ctx: TaskCtx, run: RunId, queued_at: DateTime<Utc>, decided: oneshot::Sender<()>) {
+async fn reclaim<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: TaskCtx<H, P>,
+    run: RunId,
+    queued_at: DateTime<Utc>,
+    decided: oneshot::Sender<()>,
+) {
     let _decided = decided;
     ctx.tag(run).await;
     let walk = ctx.shared.walks.child(run);
     let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
         return;
     };
-    let kit = match Kit::read(&ctx.shared, &ctx.backend, false).await {
+    let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {
         Ok(kit) => kit,
         Err(message) => {
             ctx.shared.queue(queued_at, run);
@@ -2069,24 +2177,24 @@ async fn reclaim(ctx: TaskCtx, run: RunId, queued_at: DateTime<Utc>, decided: on
 
 /// D158, D189: one sweep. Nothing is built when there is nothing to adopt: no dead walk of this
 /// process and no run holding a slot on this box.
-async fn sweep_once(ctx: TaskCtx) {
-    let backend = &ctx.backend;
+async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, P>) {
+    let host = &ctx.host;
     if !ctx.shared.sweep_fixed
-        && let Ok(app) = backend.app_settings().await
+        && let Ok(app) = host.app_settings().await
     {
         ctx.shared
             .sweep_every
             .store(millis(lease_period(&app)), Ordering::SeqCst);
     }
-    let Ok(box_id) = registered_box(backend).await else {
+    let Ok(box_id) = registered_box(host).await else {
         return;
     };
     if ctx.shared.dead_walks.runs().is_empty()
-        && matches!(backend.active_runs_on_box(box_id).await, Ok(0))
+        && matches!(host.active_runs_on_box(box_id).await, Ok(0))
     {
         return;
     }
-    let kit = match Kit::read(&ctx.shared, backend, false).await {
+    let kit = match Kit::read(&ctx.shared, host, false).await {
         Ok(kit) => kit,
         Err(message) => {
             tracing::warn!(%message, "the sweep could not build its engine");
@@ -2103,9 +2211,7 @@ async fn sweep_once(ctx: TaskCtx) {
         }
     };
     for Adopted { run, next } in adopted {
-        let item = kit
-            .writer
-            .run(run)
+        let item = htui_core::store::WorkerStore::run(&kit.writer, run)
             .await
             .ok()
             .flatten()
@@ -2132,13 +2238,13 @@ async fn sweep_once(ctx: TaskCtx) {
 }
 
 /// D158: an adopted run's walk, resumed on its own task under its lock.
-async fn resumed(ctx: TaskCtx, run: RunId) {
+async fn resumed<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, P>, run: RunId) {
     ctx.tag(run).await;
     let walk = ctx.shared.walks.child(run);
     let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
         return;
     };
-    let kit = match Kit::read(&ctx.shared, &ctx.backend, false).await {
+    let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {
         Ok(kit) => kit,
         Err(message) => {
             // The sweep made this process the run's lease owner, and plan D88 keeps every later
@@ -2163,7 +2269,11 @@ async fn resumed(ctx: TaskCtx, run: RunId) {
 }
 
 /// §8.6: one request, start to answer.
-async fn run_request(ctx: TaskCtx, request: OrchRequest, live: LiveChats) {
+async fn run_request<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: TaskCtx<H, P>,
+    request: OrchRequest,
+    live: LiveChats,
+) {
     match request {
         OrchRequest::Command(Command::StartRun {
             item,
@@ -2173,7 +2283,7 @@ async fn run_request(ctx: TaskCtx, request: OrchRequest, live: LiveChats) {
         OrchRequest::Command(Command::Unblock { item }) => unblock(ctx, item).await,
         OrchRequest::Command(command @ Command::CloseOut { item, .. }) => {
             let _ = ctx.tag.item.set(item);
-            let kit = match Kit::read(&ctx.shared, &ctx.backend, false).await {
+            let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {
                 Ok(kit) => kit,
                 Err(message) => return ctx.refuse(message),
             };
@@ -2200,17 +2310,17 @@ async fn run_request(ctx: TaskCtx, request: OrchRequest, live: LiveChats) {
         }
         OrchRequest::CloseOutPreview { item } => {
             let _ = ctx.tag.item.set(item);
-            let kit = match Kit::read(&ctx.shared, &ctx.backend, false).await {
+            let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {
                 Ok(kit) => kit,
                 Err(message) => return ctx.refuse(message),
             };
             let driver =
                 |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
             match kit.engine(&driver).close_out_preview(item).await {
-                Ok(preview) => ctx.answer(StoreReply::Orch(OrchReply::CloseOutPreview(Box::new(
+                Ok(preview) => ctx.answer(RunReply::Orch(OrchReply::CloseOutPreview(Box::new(
                     preview,
                 )))),
-                Err(err) => ctx.answer(StoreReply::Failed {
+                Err(err) => ctx.answer(RunReply::Failed {
                     request: ctx.name,
                     message: err.to_string(),
                 }),
@@ -2232,14 +2342,14 @@ enum Preempt {
 }
 
 /// `StartRun` (D186): enqueue, then — under the run's lock and token — claim and walk.
-async fn start_run(
-    ctx: TaskCtx,
+async fn start_run<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: TaskCtx<H, P>,
     item: ItemId,
     mode: htui_core::model::RunMode,
     repo_scope: Option<Vec<RepoId>>,
 ) {
     let _ = ctx.tag.item.set(item);
-    let kit = match Kit::read(&ctx.shared, &ctx.backend, true).await {
+    let kit = match Kit::read(&ctx.shared, &ctx.host, true).await {
         Ok(kit) => kit,
         Err(message) => return ctx.refuse(message),
     };
@@ -2256,9 +2366,7 @@ async fn start_run(
     let _ = ctx.tag.run.set(run);
     ctx.publish(Some(run), FrameKind::Started);
     // M5 D84: read now, so a refused claim joins the queue with no await after the refusal.
-    let queued_at = kit
-        .writer
-        .run(run)
+    let queued_at = htui_core::store::WorkerStore::run(&kit.writer, run)
         .await
         .ok()
         .flatten()
@@ -2296,10 +2404,16 @@ async fn start_run(
 /// D212 (review H3): a verb that would move the run under a live chat ([`moves_the_run`]) is
 /// refused first, before it preempts or waits, with [`chat_free`]'s sentence — published for the
 /// item, because the task is tagged (D200).
-async fn on_run(ctx: TaskCtx, run: RunId, command: Command, preempt: Preempt, live: &LiveChats) {
+async fn on_run<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: TaskCtx<H, P>,
+    run: RunId,
+    command: Command,
+    preempt: Preempt,
+    live: &LiveChats,
+) {
     let early = ctx.tag(run).await;
     if moves_the_run(&command) && !live.is_empty() {
-        let refusal = match ctx.backend.run_steps(run).await {
+        let refusal = match ctx.host.run_steps(run).await {
             Ok(steps) => chat_free(&steps, live).err().map(|err| err.to_string()),
             Err(err) => Some(err.to_string()),
         };
@@ -2319,7 +2433,7 @@ async fn on_run(ctx: TaskCtx, run: RunId, command: Command, preempt: Preempt, li
     let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
         return ctx.refuse(PREEMPTED.to_owned());
     };
-    let kit = match Kit::read(&ctx.shared, &ctx.backend, false).await {
+    let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {
         Ok(kit) => kit,
         Err(message) => return ctx.refuse(message),
     };
@@ -2341,7 +2455,7 @@ async fn on_run(ctx: TaskCtx, run: RunId, command: Command, preempt: Preempt, li
                 OpeningPath::Resume { .. } => Via::Resumed,
                 OpeningPath::Handoff { .. } => Via::Handoff,
             };
-            ctx.answer(StoreReply::Orch(OrchReply::Promoted {
+            ctx.answer(RunReply::Orch(OrchReply::Promoted {
                 step,
                 run,
                 phase: opening.phase.clone(),
@@ -2355,13 +2469,15 @@ async fn on_run(ctx: TaskCtx, run: RunId, command: Command, preempt: Preempt, li
             // promotion whose chat cannot be bound is answered, never left waiting.
             let project = match row {
                 Some(row) => Ok(row.project_id),
-                None => kit.writer.run(run).await.and_then(|row| {
-                    row.map(|row| row.project_id)
-                        .ok_or_else(|| StoreError::NotFound {
-                            entity: "run",
-                            id: run.to_string(),
-                        })
-                }),
+                None => htui_core::store::WorkerStore::run(&kit.writer, run)
+                    .await
+                    .and_then(|row| {
+                        row.map(|row| row.project_id)
+                            .ok_or_else(|| StoreError::NotFound {
+                                entity: "run",
+                                id: run.to_string(),
+                            })
+                    }),
             };
             if let Some(addr) = ctx.addr.clone() {
                 match project {
@@ -2375,12 +2491,12 @@ async fn on_run(ctx: TaskCtx, run: RunId, command: Command, preempt: Preempt, li
                                 opening: *opening,
                             }),
                             ended: ChatEnd {
-                                publisher: ctx.shared.publisher.clone(),
+                                publisher: Arc::new(ctx.shared.publisher.clone()),
                                 tag: Arc::clone(&ctx.tag),
                             },
                         });
                     }
-                    Err(err) => ctx.answer(StoreReply::Failed {
+                    Err(err) => ctx.answer(RunReply::Failed {
                         request: ctx.name,
                         message: format!(
                             "the step was promoted, but its run could not be read to bind its chat: {err}"
@@ -2397,9 +2513,9 @@ async fn on_run(ctx: TaskCtx, run: RunId, command: Command, preempt: Preempt, li
 
 /// `Unblock` (D161): a reopen needs no run; the other two cases lock the run they name and check
 /// the case again under the lock (§8.6).
-async fn unblock(ctx: TaskCtx, item: ItemId) {
+async fn unblock<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, P>, item: ItemId) {
     let _ = ctx.tag.item.set(item);
-    let kit = match Kit::read(&ctx.shared, &ctx.backend, false).await {
+    let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {
         Ok(kit) => kit,
         Err(message) => return ctx.refuse(message),
     };
@@ -2438,13 +2554,13 @@ async fn unblock(ctx: TaskCtx, item: ItemId) {
 }
 
 /// D177 (R-25): a terminal run's cleanup, again, under the run's lock.
-async fn cleanup(ctx: TaskCtx, run: RunId) {
+async fn cleanup<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, P>, run: RunId) {
     ctx.tag(run).await;
     let walk = ctx.shared.walks.child(run);
     let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
         return ctx.refuse(PREEMPTED.to_owned());
     };
-    let kit = match Kit::read(&ctx.shared, &ctx.backend, false).await {
+    let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {
         Ok(kit) => kit,
         Err(message) => return ctx.refuse(message),
     };
@@ -2464,7 +2580,7 @@ async fn cleanup(ctx: TaskCtx, run: RunId) {
     match kit.engine(&driver).cleanup_run(run).await {
         Ok(()) => {
             ctx.publish(Some(run), FrameKind::Changed);
-            ctx.answer(StoreReply::Orch(OrchReply::CleanedUp { run }));
+            ctx.answer(RunReply::Orch(OrchReply::CleanedUp { run }));
         }
         Err(err) => ctx.refuse(err.to_string()),
     }
@@ -2475,12 +2591,13 @@ async fn cleanup(ctx: TaskCtx, run: RunId) {
 /// for Backend` here is E0117 (proven: plan Verified claims). A local newtype is the answer, and it
 /// keeps invariant 10 (the orchestrator never names `htui-store`).
 ///
-/// Every read delegates to the `Backend`-inherent read of the same name; `agent` filters
-/// [`Backend::agents`] exactly as the `MemStore` implementation in `htui-orch`'s fake does.
+/// MOD-41 plan D7: over any [`WorkerHost`](htui_core::store::WorkerHost) (it was `BackendGraphs`).
+/// Every read delegates to the host's read of the same name; `agent` filters the host's `agents`
+/// exactly as the `MemStore` implementation in `htui-orch`'s fake does.
 #[derive(Debug, Clone)]
-pub struct BackendGraphs(pub Backend);
+pub struct HostGraphs<H>(pub H);
 
-impl GraphSource for BackendGraphs {
+impl<H: htui_core::store::WorkerHost> GraphSource for HostGraphs<H> {
     async fn resolve_graph(&self, item: ItemId) -> StoreResult<Option<ResolvedGraph>> {
         self.0.resolve_graph(item).await
     }
@@ -2561,9 +2678,9 @@ pub(crate) mod tests {
     use tokio::sync::{Notify, mpsc};
 
     use super::{
-        BackendGraphs, FrameKind, LiveChats, ORCH_NAMES, OrchReply, OrchRequest, PREEMPTED,
+        FrameKind, HostGraphs, LiveChats, ORCH_NAMES, OrchReply, OrchRequest, PREEMPTED,
         ReplySink as _, RunReply, RunRequest, RunRuntime, RunServed, StepAuthor, TuiReplies,
-        WALK_PANICKED,
+        TuiRuns as _, WALK_PANICKED,
     };
     use crate::agent_worker::AgentRuntime;
     use crate::store_worker::{
@@ -2786,8 +2903,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Blueprint H-2: `base + (tokio now - start)`, so a `start_paused` test moves the lease
-    /// fence with the heartbeat's own sleeps.
+    /// Blueprint H-2: `base + (tokio now - start)`, so a `start_paused` test moves the rows'
+    /// timestamps with the heartbeat's own sleeps. It moves no lease fence: since MOD-41 T2 (plan
+    /// D3) the heartbeat fences on tokio's monotonic clock, never on a `Clock`.
     #[derive(Debug)]
     struct TokioClock {
         base: DateTime<Utc>,
@@ -3582,7 +3700,7 @@ pub(crate) mod tests {
         let app = fixture.store.app_settings().await.expect("the settings");
         let resolved = htui_orch::resolve(
             &fixture.store,
-            &BackendGraphs(backend),
+            &HostGraphs(backend),
             &row,
             RunMode::Manual,
             &app,
@@ -3894,8 +4012,8 @@ pub(crate) mod tests {
         let (replies, _answers) = mpsc::unbounded_channel();
         let ctx = super::TaskCtx {
             shared: Arc::clone(&runtime.shared),
-            backend: Backend::memory(fixture.store.clone()),
-            replies,
+            host: Backend::memory(fixture.store.clone()),
+            sink: TuiReplies(replies),
             addr: None,
             name: "stuck",
             tag: Arc::default(),
@@ -3925,20 +4043,23 @@ pub(crate) mod tests {
         // A scratch root under a regular file cannot be created, so the production isolator,
         // and with it every part the resume reads, is refused.
         let scratch = tempfile::NamedTempFile::new().expect("a regular file");
-        let runtime = RunRuntime::new(fixture.factory())
+        let runtime: RunRuntime = RunRuntime::new(fixture.factory())
             .with_clock(Arc::new(TokioClock::new()))
             .with_scratch_root(scratch.path().join("trees"));
         let (replies, mut answers) = mpsc::unbounded_channel();
         let backlog = Origin::Tab(TabId("backlog"));
-        runtime.shared.publisher.wire(&replies);
-        runtime
-            .shared
-            .publisher
-            .subscribe(backlog.clone(), 3, ids::HTUI_ANA_2);
+        runtime.shared.publisher.wire(&TuiReplies(replies.clone()));
+        runtime.shared.publisher.subscribe(
+            crate::agent_worker::ReplyAddr {
+                seq: 3,
+                origin: backlog.clone(),
+            },
+            ids::HTUI_ANA_2,
+        );
         let ctx = super::TaskCtx {
             shared: Arc::clone(&runtime.shared),
-            backend: Backend::memory(fixture.store.clone()),
-            replies,
+            host: Backend::memory(fixture.store.clone()),
+            sink: TuiReplies(replies),
             addr: None,
             name: "resume",
             tag: Arc::default(),
@@ -3986,8 +4107,8 @@ pub(crate) mod tests {
         let (replies, _answers) = mpsc::unbounded_channel();
         let ctx = super::TaskCtx {
             shared: Arc::clone(&runtime.shared),
-            backend,
-            replies,
+            host: backend,
+            sink: TuiReplies(replies),
             addr: None,
             name: "walk",
             tag: Arc::default(),
@@ -4438,7 +4559,7 @@ pub(crate) mod tests {
             let name = request.name();
             let served = serve(&mut runtime, seq, StoreRequest::Orch(request)).await;
             assert!(
-                matches!(&served, RunServed::Reply(StoreReply::Failed { request, message })
+                matches!(&served, RunServed::Reply(RunReply::Failed { request, message })
                     if *request == name && message == DATABASE_UNREACHABLE),
                 "{served:?}"
             );
@@ -4456,7 +4577,7 @@ pub(crate) mod tests {
         .await;
         assert!(matches!(
             served,
-            RunServed::Reply(StoreReply::RunStream(super::RunFrame {
+            RunServed::Reply(RunReply::Frame(super::RunFrame {
                 kind: FrameKind::Subscribed,
                 ..
             }))
@@ -4560,7 +4681,7 @@ pub(crate) mod tests {
     async fn backend_graphs_delegates_each_read() {
         let (store, agent) = seeded_store().await;
         let backend = Backend::memory(store);
-        let graphs = BackendGraphs(backend.clone());
+        let graphs = HostGraphs(backend.clone());
 
         let resolved = GraphSource::resolve_graph(&graphs, ids::HTUI_ANA_2)
             .await
@@ -4762,6 +4883,22 @@ pub(crate) mod tests {
             "{:?}",
             got[3]
         );
+    }
+
+    /// MOD-41 blueprint F-6 (plan D5's P-4): the generic runtime's futures are `Send` for any host
+    /// and sink. `sweep_with` spawns the sweep, and with it every task kind the runtime spawns, so
+    /// this compiles only if each of them is `Send`.
+    #[test]
+    fn a_generic_runtime_future_spawns() {
+        fn generic<H: htui_core::store::WorkerHost, P: super::ReplySink>(
+            runtime: &mut RunRuntime<H, P>,
+            host: &H,
+            sink: &P,
+        ) {
+            runtime.sweep_with(host, sink);
+        }
+        let _ = generic::<Backend, TuiReplies>;
+        let _ = generic::<PgStore, super::Unaddressed>;
     }
 
     /// Blueprint D183: with no runtime, the stream is acknowledged, the verdicts are read and the
