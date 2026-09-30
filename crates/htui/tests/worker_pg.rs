@@ -386,13 +386,11 @@ impl Stack {
     }
 
     async fn last_seen(&self, id: BoxId) -> chrono::DateTime<Utc> {
-        sqlx::query_scalar::<_, chrono::DateTime<Utc>>(
-            "SELECT last_seen_at FROM box WHERE id = $1",
-        )
-        .bind(id.as_uuid())
-        .fetch_one(&self.db.pool)
-        .await
-        .expect("read box.last_seen_at")
+        sqlx::query_scalar::<_, chrono::DateTime<Utc>>("SELECT last_seen_at FROM box WHERE id = $1")
+            .bind(id.as_uuid())
+            .fetch_one(&self.db.pool)
+            .await
+            .expect("read box.last_seen_at")
     }
 
     /// Polls until `run` rests: not `queued` or `running`, and no step `running`.
@@ -459,7 +457,7 @@ fn shape(steps: &[RunStep]) -> Vec<(i32, i32, i32, String, StepStatus)> {
             )
         })
         .collect();
-    shape.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+    shape.sort_by_key(|step| (step.0, step.1, step.2));
     shape
 }
 
@@ -477,7 +475,11 @@ async fn a_headless_worker_drives_a_queued_run_to_rest() {
     stack.ungate_feat().await;
     stack.set_executor(Executor::Worker).await;
     let (run, rest) = stack.start(ids::HTUI_FEAT_3).await;
-    assert_eq!(rest.run, RunStatus::Queued, "the TUI only queues (plan D12)");
+    assert_eq!(
+        rest.run,
+        RunStatus::Queued,
+        "the TUI only queues (plan D12)"
+    );
     let seen = stack.last_seen(ids::BOX).await;
 
     let worker = stack.spawn_worker();
@@ -490,9 +492,17 @@ async fn a_headless_worker_drives_a_queued_run_to_rest() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let row = stack.rested(run).await;
-    assert_eq!(row.status, RunStatus::Done, "the worker walked it to the end");
+    assert_eq!(
+        row.status,
+        RunStatus::Done,
+        "the worker walked it to the end"
+    );
     assert_eq!(row.lease_box_id, Some(ids::BOX));
-    assert_eq!(stack.lease_owner(run).await, None, "the lease was given back");
+    assert_eq!(
+        stack.lease_owner(run).await,
+        None,
+        "the lease was given back"
+    );
     let steps = stack.steps(run).await;
     assert!(
         !steps.is_empty() && steps.iter().all(|step| step.status == StepStatus::Done),
@@ -525,7 +535,11 @@ async fn a_tui_exit_does_not_interrupt_a_worker_run() {
     stack.exit_tui().await;
     let row = stack.rested(run).await;
     assert_eq!(row.status, RunStatus::Done, "the worker settled the run");
-    assert_eq!(stack.lease_owner(run).await, None, "the lease was given back");
+    assert_eq!(
+        stack.lease_owner(run).await,
+        None,
+        "the lease was given back"
+    );
     worker.stop().await;
     stack.finish().await;
 }
@@ -537,7 +551,10 @@ async fn walk_to_review(stack: &mut Stack) -> (RunId, RunStep) {
     assert_eq!(rest.run, RunStatus::AwaitingApproval, "the TUI walked it");
     for _ in 0..3 {
         let parked = stack.parked_step(run).await;
-        assert_ne!(parked.phase_name, "review", "three phases before the review");
+        assert_ne!(
+            parked.phase_name, "review",
+            "three phases before the review"
+        );
         let answered = stack
             .command(Command::AnswerGate {
                 run,
@@ -602,7 +619,11 @@ async fn an_answer_handed_back_is_finished_by_the_worker() {
     };
     assert_eq!(rest.run, RunStatus::Running, "handed back, not walked");
     assert_eq!(stack.run_row(run).await.status, RunStatus::Running);
-    assert_eq!(stack.lease_owner(run).await, None, "the lease was given back");
+    assert_eq!(
+        stack.lease_owner(run).await,
+        None,
+        "the lease was given back"
+    );
 
     let worker = stack.spawn_worker();
     let row = stack.rested(run).await;
@@ -642,8 +663,7 @@ async fn the_worker_refuses_a_pending_schema_and_writes_nothing() {
         .expect("drop the bookkeeping table");
     let root = tempfile::tempdir().expect("a throwaway config root");
 
-    let refused = match worker_cmd::connect(&db.url, root.path(), PoolSize::WORKER_DEFAULT).await
-    {
+    let refused = match worker_cmd::connect(&db.url, root.path(), PoolSize::WORKER_DEFAULT).await {
         Ok(_) => panic!("a pending schema must be refused"),
         Err(refused) => refused,
     };
@@ -686,10 +706,7 @@ fn with_sentinel(dsn: &str) -> (String, String) {
         return (dsn.to_owned(), dsn[colon + 1..at].to_owned());
     }
     let sentinel = format!("sentinel-{}", uuid::Uuid::now_v7().simple());
-    (
-        format!("{}:{sentinel}{}", &dsn[..at], &dsn[at..]),
-        sentinel,
-    )
+    (format!("{}:{sentinel}{}", &dsn[..at], &dsn[at..]), sentinel)
 }
 
 /// The `htui` binary as `htui worker --dsn-stdin --log <home>/w.log`, with a cleared environment:
@@ -722,10 +739,7 @@ fn spawn_binary(home: &std::path::Path, dsn: &str) -> std::process::Child {
 
 /// The child's exit status within `limit`, polled.
 #[cfg(target_os = "linux")]
-async fn exit_within(
-    child: &mut std::process::Child,
-    limit: Duration,
-) -> std::process::ExitStatus {
+async fn exit_within(child: &mut std::process::Child, limit: Duration) -> std::process::ExitStatus {
     let deadline = Instant::now() + limit;
     loop {
         if let Some(status) = child.try_wait().expect("poll the child") {
@@ -798,13 +812,12 @@ async fn the_worker_binary_never_exposes_its_dsn() {
         .expect("the worker minted box.toml under the throwaway home");
     let deadline = Instant::now() + PATIENCE;
     loop {
-        let beat: Option<bool> = sqlx::query_scalar(
-            "SELECT last_seen_at > registered_at FROM box WHERE id = $1",
-        )
-        .bind(identity.box_id.as_uuid())
-        .fetch_optional(&db.pool)
-        .await
-        .expect("read the worker's box row");
+        let beat: Option<bool> =
+            sqlx::query_scalar("SELECT last_seen_at > registered_at FROM box WHERE id = $1")
+                .bind(identity.box_id.as_uuid())
+                .fetch_optional(&db.pool)
+                .await
+                .expect("read the worker's box row");
         if beat == Some(true) {
             break;
         }
@@ -824,8 +837,14 @@ async fn the_worker_binary_never_exposes_its_dsn() {
     let stderr = stderr_of(&mut child);
     assert_eq!(status.code(), Some(0), "a clean shutdown: {stderr}");
     let text = std::fs::read_to_string(&log).expect("read the log");
-    assert!(!text.contains(&sentinel), "the DSN's password is in the log");
-    assert!(!stderr.contains(&sentinel), "the DSN's password is on stderr");
+    assert!(
+        !text.contains(&sentinel),
+        "the DSN's password is in the log"
+    );
+    assert!(
+        !stderr.contains(&sentinel),
+        "the DSN's password is on stderr"
+    );
     db.drop_db().await;
 }
 
@@ -851,8 +870,17 @@ async fn the_worker_binary_refuses_a_dsn_it_cannot_use_without_echoing_it() {
     let status = exit_within(&mut child, Duration::from_secs(60)).await;
     let stderr = stderr_of(&mut child);
     assert_eq!(status.code(), Some(2), "a startup refusal: {stderr}");
-    assert!(stderr.starts_with("htui: "), "the refusal is printed: {stderr}");
-    assert!(!stderr.contains(&sentinel), "the DSN's password is on stderr");
+    assert!(
+        stderr.starts_with("htui: "),
+        "the refusal is printed: {stderr}"
+    );
+    assert!(
+        !stderr.contains(&sentinel),
+        "the DSN's password is on stderr"
+    );
     let text = std::fs::read_to_string(home.path().join("w.log")).unwrap_or_default();
-    assert!(!text.contains(&sentinel), "the DSN's password is in the log");
+    assert!(
+        !text.contains(&sentinel),
+        "the DSN's password is in the log"
+    );
 }

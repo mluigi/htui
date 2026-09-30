@@ -43,7 +43,6 @@ pub mod testkit;
 /// agent cannot hold the terminal hostage after `q`.
 const SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(5);
 
-use std::io::BufRead as _;
 use std::path::Path;
 
 use htui_core::store::MemStore;
@@ -74,11 +73,11 @@ use crate::keymap::Keymap;
 /// the terminal fails. The terminal is restored on every path out of here, error included
 /// (MOD-1 plan D8).
 pub async fn run(args: cli::Args) -> anyhow::Result<()> {
-    if let Some(cli::Command::Worker(_worker)) = &args.command {
-        return Err(worker_cmd::WorkerExit::Refused(
-            "`htui worker` is not built yet (MOD-41 T12)".to_owned(),
-        )
-        .into());
+    if let Some(cli::Command::Worker(worker)) = args.command.clone() {
+        // The worker installs its own subscriber (stderr without `--log`), MOD-41 plan D14.
+        return worker_cmd::run(worker, args.log.as_deref())
+            .await
+            .map_err(anyhow::Error::from);
     }
     init_tracing(args.log.as_deref())?;
 
@@ -157,11 +156,12 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
 /// in should still see the confirmation.
 fn set_dsn_from_stdin() -> anyhow::Result<()> {
     eprintln!("paste the DSN and press Enter (it will be visible):");
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
-    let dsn = line.trim();
-    anyhow::ensure!(!dsn.is_empty(), "no DSN on stdin; nothing was stored");
-    secret::set_dsn(dsn)?;
+    // MOD-41 blueprint F-25: the line is read into a wiped buffer, as `htui worker --dsn-stdin`.
+    let dsn = secret::read_dsn_line(&mut std::io::stdin().lock())?;
+    let Some(dsn) = dsn else {
+        anyhow::bail!("no DSN on stdin; nothing was stored");
+    };
+    secret::set_dsn(&dsn)?;
     eprintln!(
         "DSN stored in the OS keyring ({}/{}).",
         secret::SERVICE,
