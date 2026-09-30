@@ -1175,6 +1175,15 @@ EOF
         == '"cargo-src"' ]]
 }
 
+@test "40b. compose: the dev container shares the host's clock zone, read-only" {
+    local cfg f
+    cfg="$(compose_config)"
+    for f in /etc/localtime /etc/timezone; do
+        [[ "$(jq -c --arg t "$f" '.services.dev.volumes[] | select(.target == $t) | [.type, .source, .read_only]' <<<"$cfg")" \
+            == "[\"bind\",\"$f\",true]" ]]
+    done
+}
+
 @test "41. up and attach refuse a tampered cargo-volume mount point (3), naming it; a clean volume passes" {
     local vol="$HR_TEST_DOCKER_VOLUMES/htui-hr-cargo"
     run --separate-stderr "$HR" up MOD-5
