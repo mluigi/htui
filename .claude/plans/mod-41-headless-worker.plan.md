@@ -141,6 +141,20 @@ relative to the repo root.
     as is. A crash between them leaves the item `queued`; this is documented in
     `docs/htui-worker.md`, and no transactional 43rd `WorkerStore` method is added.
 
+- **Implementation rulings, 2026-09-30 ("all recomm"):**
+  - **T9-C5:** the in-memory demo backend (`htui --demo`) runs its production runtime without the
+    OQ-5 claim scan (`RunRuntime::without_claim_scan`, `run_worker::production_for`), so the demo's
+    seeded queued run is never walked with production parts. Postgres-backed TUIs keep OQ-5. The
+    off-list edits to `crates/htui/src/store_worker.rs` (one line) and `crates/htui/tests/chat.rs`
+    (fixture) are accepted.
+  - **Review gate (`rust-reviewer`, each finding verified adversarially):** fix R-1 (the worker
+    refreshes its parts once per sweep when no walk is live; `REPOS_MOVED` skips that tick's claim
+    scan), R-2 (a panic steps that run's backoff; the backoff scope of blueprint B-10 is unchanged),
+    R-3 (docs: exit 1 reserved, 101 on a panic), R-4 (`main` bounds runtime teardown with
+    `shutdown_timeout`), R-5 (doc reworded, buffer pre-sized), R-6 (the TUI skips the isolator
+    rebuild when it hands back) and R-8 (stale backoff entries pruned); R-9 documented, its
+    cross-process `flock` deferred; R-7 dropped (refuted: contradicts the blueprint).
+
 ## Summary
 
 Four milestones on one branch, each ending green and committed, pushed only with the maintainer's
