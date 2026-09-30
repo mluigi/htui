@@ -33,10 +33,13 @@ pub struct TerminalGuard {
 
 /// Installs the panic hook and takes the terminal over.
 ///
-/// Panics if the terminal cannot be put into raw mode, cannot be given the alternate screen and
-/// bracketed paste, or cannot be measured: the three `expect`s below. That is [`ratatui::init()`]'s contract — it is
-/// `try_init().expect(...)` — now covering the two steps this crate performs itself. There is no
-/// usable TUI in any of the three cases and `lib.rs::run` has no error path for one.
+/// Panics if the terminal cannot be put into raw mode, cannot be given the alternate screen, cannot
+/// take bracketed paste for a reason other than not supporting it, or cannot be measured: the
+/// four `expect`s below. That is [`ratatui::init()`]'s contract — it is `try_init().expect(...)`
+/// — now covering the steps this crate performs itself. There is no usable TUI in any of these
+/// cases and `lib.rs::run` has no error path for one. A terminal that does not support bracketed
+/// paste (crossterm's legacy Windows console answers `Unsupported`) is not one of them: the TUI
+/// runs without paste mode there (review R2-L6).
 ///
 /// The panic is safe because of the order, which is the whole of MOD-56 (D217): the hook goes in
 /// before the first `expect`, so it is already the outermost one in the process when any of the
@@ -50,12 +53,9 @@ pub fn init() -> TerminalGuard {
     // crate back where MOD-56 found it, with the predicate right and the terminal gone anyway.
     // `tests/panic_hook_order.rs` is what keeps this shape.
     crossterm::terminal::enable_raw_mode().expect("htui cannot put the terminal into raw mode");
-    crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableBracketedPaste
-    )
-    .expect("htui cannot enter the alternate screen");
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)
+        .expect("htui cannot enter the alternate screen");
+    enable_bracketed_paste().expect("htui cannot enable bracketed paste");
     let backend = CrosstermBackend::new(std::io::stdout());
     TerminalGuard {
         terminal: Terminal::new(backend).expect("htui cannot measure the terminal"),
@@ -75,7 +75,7 @@ pub fn install_panic_hook() {
 /// raw mode off and the alternate screen left. Best effort, as `ratatui::restore` is: a stdout
 /// that cannot take the one escape sequence is not a reason to stop giving the rest back.
 pub fn restore_terminal() {
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+    let _ = disable_bracketed_paste();
     ratatui::restore();
 }
 
@@ -136,7 +136,7 @@ impl crate::editor::Suspend for TerminalGuard {
     /// this is a pause, not the end.
     fn leave(&mut self) -> std::io::Result<()> {
         self.terminal.show_cursor()?;
-        crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste)?;
+        disable_bracketed_paste()?;
         ratatui::try_restore()
     }
 
@@ -148,11 +148,8 @@ impl crate::editor::Suspend for TerminalGuard {
     /// defect this file just closed (D221).
     fn enter(&mut self) -> std::io::Result<()> {
         crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::EnterAlternateScreen,
-            crossterm::event::EnableBracketedPaste
-        )?;
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+        enable_bracketed_paste()?;
         self.terminal.clear()
     }
 }
@@ -160,6 +157,40 @@ impl crate::editor::Suspend for TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         self.restore();
+    }
+}
+
+/// Bracketed paste on, in its own `execute!` (review R2-L6): a terminal that does not support it
+/// runs without it rather than failing the TUI. Without paste mode a paste is replayed as keys,
+/// as it was before MOD-22's review M-1 — so the one thing said is that, and nothing of the
+/// terminal's own error text.
+fn enable_bracketed_paste() -> std::io::Result<()> {
+    let enabled = tolerate_unsupported(crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableBracketedPaste
+    ))?;
+    if !enabled {
+        tracing::info!("this terminal has no bracketed paste; a paste arrives as keystrokes");
+    }
+    Ok(())
+}
+
+/// Bracketed paste off, in its own `execute!`, `Unsupported` tolerated as on the way in.
+fn disable_bracketed_paste() -> std::io::Result<()> {
+    tolerate_unsupported(crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableBracketedPaste
+    ))
+    .map(|_| ())
+}
+
+/// `Ok(true)` when the command ran, `Ok(false)` when the terminal does not support it, and every
+/// other error as it came.
+fn tolerate_unsupported(result: std::io::Result<()>) -> std::io::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::Unsupported => Ok(false),
+        Err(err) => Err(err),
     }
 }
 
@@ -180,10 +211,9 @@ mod tests {
             .find(head)
             .unwrap_or_else(|| panic!("`{head}` is in terminal.rs"));
         let rest = &code[start..];
-        let end = rest[1..]
-            .find("\n    fn ")
-            .into_iter()
-            .chain(rest[1..].find("\npub fn "))
+        let end = ["\n    fn ", "\npub fn ", "\nfn ", "\nimpl "]
+            .iter()
+            .filter_map(|next| rest[1..].find(next))
             .min()
             .map_or(rest.len(), |at| at + 1);
         &rest[..end]
@@ -197,15 +227,31 @@ mod tests {
         let code = code();
         for taking in ["pub fn init()", "fn enter(&mut self)"] {
             assert!(
-                body(&code, taking).contains("EnableBracketedPaste"),
+                body(&code, taking).contains("enable_bracketed_paste()"),
                 "`{taking}` takes the screen without bracketed paste"
             );
         }
         for giving in ["pub fn restore_terminal()", "fn leave(&mut self)"] {
-            let body = body(&code, giving);
             assert!(
-                body.contains("DisableBracketedPaste"),
+                body(&code, giving).contains("disable_bracketed_paste()"),
                 "`{giving}` gives the terminal back with bracketed paste still on"
+            );
+        }
+        // Review R2-L6: each in its own `execute!`, so an unsupported paste mode cannot take the
+        // alternate screen down with it.
+        for (helper, command) in [
+            ("fn enable_bracketed_paste()", "EnableBracketedPaste"),
+            ("fn disable_bracketed_paste()", "DisableBracketedPaste"),
+        ] {
+            let body = body(&code, helper);
+            assert!(body.contains(command), "`{helper}` issues `{command}`");
+            assert!(
+                body.contains("tolerate_unsupported("),
+                "`{helper}` tolerates an unsupported terminal"
+            );
+            assert!(
+                !body.contains("AlternateScreen"),
+                "`{helper}` issues nothing else"
             );
         }
         assert!(
@@ -215,6 +261,23 @@ mod tests {
         assert!(
             body(&code, "pub fn restore(&mut self)").contains("restore_terminal()"),
             "the guard restores through `restore_terminal`"
+        );
+    }
+
+    /// Review R2-L6: crossterm's legacy Windows console answers `Unsupported` for bracketed paste;
+    /// that is a terminal without paste mode, not a failure. Any other error still is one.
+    #[test]
+    fn an_unsupported_paste_mode_is_tolerated_and_nothing_else_is() {
+        use std::io::{Error, ErrorKind};
+        assert!(matches!(super::tolerate_unsupported(Ok(())), Ok(true)));
+        assert!(matches!(
+            super::tolerate_unsupported(Err(Error::new(ErrorKind::Unsupported, "legacy console"))),
+            Ok(false)
+        ));
+        let other = super::tolerate_unsupported(Err(Error::new(ErrorKind::BrokenPipe, "gone")));
+        assert_eq!(
+            other.map_err(|err| err.kind()).err(),
+            Some(ErrorKind::BrokenPipe)
         );
     }
 }
