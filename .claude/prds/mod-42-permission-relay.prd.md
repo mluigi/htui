@@ -130,9 +130,9 @@ worker walk reaches a terminal state within the grace window plus one poll inter
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Relay core | Engine ACP steps evaluate policy, park durably and resume on a relayed answer, on both executors and across box ids (proven by tests) | pending | — |
-| 2 | Runs-pane answering | The user sees and answers a pending permission for an engine/worker step from any TUI (`R-TUI-6`) | pending | — |
-| 3 | Durable graceful cancel | Cancel of any live walk, from any box, answers parked requests `cancelled` and ends the step with grace; worker refusal removed; R-38 closed | pending | — |
+| 1 | Relay core | Engine ACP steps evaluate policy, park durably and resume on a relayed answer, on both executors and across box ids (proven by tests) | in-progress | `.claude/plans/mod-42-permission-relay.plan.md` (T0-T3) |
+| 2 | Runs-pane answering | The user sees and answers a pending permission for an engine/worker step from any TUI (`R-TUI-6`) | in-progress | `.claude/plans/mod-42-permission-relay.plan.md` (T5) |
+| 3 | Durable graceful cancel | Cancel of any live walk, from any box, answers parked requests `cancelled` and ends the step with grace; worker refusal removed; R-38 closed | in-progress | `.claude/plans/mod-42-permission-relay.plan.md` (T4, T6) |
 
 ## Open Questions
 
