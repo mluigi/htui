@@ -1,7 +1,8 @@
 # Plan: MOD-33 — the box hostname leaves the digest and gains a settings switch
 
-**Status: FACT-CHECKED (40 claims, three parallel checkers, 2026-09-30), awaiting the
-maintainer's CONFIRM.** The pass falsified no design decision. It corrected: a missed third digest
+**Status: CONFIRMED by the maintainer 2026-09-30** (fact-checked: 40 claims, three parallel
+checkers). At CONFIRM: Q-1 answered *hostname only*; D272 kept (the judge digests its replayed
+task); D273/T3 included. The pass falsified no design decision. It corrected: a missed third digest
 snapshot (`prompt_preview__preview_ana_2.snap`); T3's pin list (asserts, not only messages, plus
 four `Pending(9)` sites and three chain sites); D266's collapse (per-character, so CRLF needs its
 own rule); the sent-form box must be *masked*, not only scanned; T1's list of test adaptations
