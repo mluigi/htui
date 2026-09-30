@@ -151,9 +151,16 @@ pub trait SettingsSection {
     }
     /// A key the tab did not use for section navigation.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled;
-    /// A bracketed paste, offered only while [`captures_input`](SettingsSection::captures_input)
-    /// is true (MOD-22 review M-1): the focused field takes it whole. Defaulted to `Pass`, which
-    /// the shell drops.
+    /// Whether a bracketed paste is offered to this section now. Defaulted to
+    /// [`captures_input`](SettingsSection::captures_input); a section that opens its own field for
+    /// a paste — the login pane's redirect (MOD-22 review R2-L3) — says so here without claiming
+    /// `h`/`l`.
+    fn takes_paste(&self) -> bool {
+        self.captures_input()
+    }
+    /// A bracketed paste, offered only while [`takes_paste`](SettingsSection::takes_paste) is true
+    /// (MOD-22 review M-1): the focused field takes it whole. Defaulted to `Pass`, which the shell
+    /// drops.
     fn on_paste(&mut self, _text: &str, _ctx: &mut Ctx<'_>) -> Handled {
         Handled::Pass
     }
@@ -353,7 +360,7 @@ impl Tab for SettingsTab {
     /// a key and is not a cycle, it is nothing.
     fn on_paste(&mut self, text: &str, ctx: &mut Ctx<'_>) -> Handled {
         match self.sections.sections.get_mut(self.sections.active) {
-            Some(section) if section.captures_input() => section.on_paste(text, ctx),
+            Some(section) if section.takes_paste() => section.on_paste(text, ctx),
             _ => Handled::Pass,
         }
     }

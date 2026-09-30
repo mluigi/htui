@@ -82,6 +82,7 @@ use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
     is_error, message,
 };
+use crate::ui::text_field::PASTE_DOES_NOT_FIT;
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -1979,14 +1980,53 @@ impl SettingsSection for AgentsSection {
     /// only within the [`PASTE_MAX`] the field was opened with, so a longer one is refused by
     /// `validate`'s own sentence rather than reallocating the buffer — or in the registry form's
     /// focused field. Anywhere else it is not this section's.
+    ///
+    /// Review R2-L3: a paste made before `p` while a login runs is `p` and the paste at once — the
+    /// field opens and takes it — or, where `p` would be refused (no redirect, a delivery in
+    /// flight, a login being cancelled), the same refusal and nothing opened.
+    fn takes_paste(&self) -> bool {
+        self.captures_input()
+            || matches!(
+                self.auth,
+                AuthState::Starting { .. } | AuthState::Running { .. }
+            )
+    }
+
     fn on_paste(&mut self, text: &str, ctx: &mut Ctx<'_>) -> Handled {
+        if matches!(
+            self.auth,
+            AuthState::Starting { .. } | AuthState::Running { paste: None, .. }
+        ) && matches!(self.mode, Mode::Browse)
+        {
+            self.open_paste(ctx);
+        }
         if let AuthState::Running {
             paste: Some(field), ..
         } = &mut self.auth
         {
             if !field.on_paste(text) {
-                ctx.emit(Action::Error(loopback::PasteError::TooLong.to_string()));
+                // R2-L3: `TooLong` is the paste's own length; a shorter one that does not fit
+                // beside what was already typed is the field's.
+                let alone: usize = text
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .map(char::len_utf8)
+                    .sum();
+                let refusal = if alone > PASTE_MAX {
+                    loopback::PasteError::TooLong.to_string()
+                } else {
+                    PASTE_DOES_NOT_FIT.to_owned()
+                };
+                ctx.emit(Action::Error(refusal));
             }
+            return Handled::Consumed;
+        }
+        if matches!(
+            self.auth,
+            AuthState::Starting { .. } | AuthState::Running { .. }
+        ) && matches!(self.mode, Mode::Browse)
+        {
+            // `open_paste` refused by name; the paste is dropped with that sentence.
             return Handled::Consumed;
         }
         if let Mode::Editing(editor) = &mut self.mode {

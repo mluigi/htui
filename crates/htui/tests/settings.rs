@@ -14,6 +14,7 @@ use htui::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection, PromptSection,
     QdrantSection, SectionId, SettingsSection, SettingsTab, message,
 };
+use htui::ui::text_field::PASTE_DOES_NOT_FIT;
 use htui_agent::acp::Handshake;
 use htui_agent::auth::loopback::{
     self, Advertised, DELIVERY_IN_FLIGHT, DeliverError, ListenerReply, NO_LOOPBACK_REDIRECT,
@@ -3137,11 +3138,12 @@ async fn a_bracketed_paste_lands_in_the_open_paste_field_as_dots() {
     assert!(loopback::validate(url, &advertised).is_ok());
 }
 
-/// MOD-22 review M-1: a paste past `PASTE_MAX` does not fit the field's reservation, so it is
-/// refused whole by `validate`'s own sentence instead of reallocating the masked buffer; and a
-/// paste with no field open is not the section's.
+/// MOD-22 review M-1, R2-L3: a paste that alone is past `PASTE_MAX` is refused whole by
+/// `validate`'s own `TooLong`; one that is short enough itself but does not fit beside what was
+/// already typed is refused with `PASTE_DOES_NOT_FIT`. Either way nothing goes in and the buffer
+/// never reallocates.
 #[tokio::test]
-async fn a_bracketed_paste_too_long_or_with_no_field_open_is_not_taken() {
+async fn a_bracketed_paste_that_does_not_fit_is_refused_by_the_right_sentence() {
     let bench = SectionBench::new().await;
     let mut section = pasting_over(&bench);
     assert_eq!(
@@ -3154,10 +3156,74 @@ async fn a_bracketed_paste_too_long_or_with_no_field_open_is_not_taken() {
     let field = field_line(&rendered).unwrap_or_else(|| panic!("the field is drawn: {rendered}"));
     assert!(field.contains("(0)"), "nothing went in: {field}");
 
+    typed(&bench, &mut section, "abc");
+    let _ = bench.drained();
+    assert_eq!(
+        bench.paste(&mut section, &"a".repeat(PASTE_MAX - 1)),
+        Handled::Consumed
+    );
+    let emitted = bench.drained();
+    assert_eq!(errors_of(&emitted), vec![PASTE_DOES_NOT_FIT.to_owned()]);
+    let rendered = render_section(&section, &bench.ctx());
+    let field = field_line(&rendered).unwrap_or_else(|| panic!("the field is drawn: {rendered}"));
+    assert!(field.contains("(3)"), "only what was typed: {field}");
+}
+
+/// Review R2-L3: a paste made before `p`, while the login is running with a redirect and nothing
+/// is in flight, opens the masked field and lands in it — through the Settings tab too, which
+/// otherwise offers a paste only to a section that is taking text.
+#[tokio::test]
+async fn a_bracketed_paste_before_p_opens_the_field_and_lands_in_it() {
+    let bench = SectionBench::new().await;
     let mut section = running_over(&bench, LOOPBACK_LINK);
-    assert_eq!(bench.paste(&mut section, PASTE), Handled::Pass);
+    assert!(!section.captures_input());
+    assert_eq!(bench.paste(&mut section, PASTE), Handled::Consumed);
+    assert!(bench.drained().is_empty(), "no refusal, no request");
+    assert!(section.captures_input(), "the field is open");
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(!rendered.contains(CODE), "{rendered}");
+    let field = field_line(&rendered).unwrap_or_else(|| panic!("the field is drawn: {rendered}"));
+    assert!(
+        field.contains(&format!("({})", PASTE.chars().count())),
+        "the paste is in it: {field}"
+    );
+    assert_eq!(bench.key(&mut section, "Enter"), Handled::Consumed);
+    assert!(matches!(
+        &requests_of(&bench)[..],
+        [StoreRequest::AuthDeliver { .. }]
+    ));
+
+    // Through the tab.
+    let mut tab = SettingsTab::with_sections(vec![Box::new(running_over(&bench, LOOPBACK_LINK))]);
+    assert_eq!(
+        htui::ui::tabs::Tab::on_paste(&mut tab, PASTE, &mut bench.ctx()),
+        Handled::Consumed,
+        "the tab offers it to the running login"
+    );
     assert!(bench.drained().is_empty());
-    assert!(!section.captures_input(), "and it opened nothing");
+}
+
+/// Review R2-L3: with no redirect advertised, a delivery in flight or the login being cancelled,
+/// a paste before `p` is dropped with the sentence `p` itself would give, and opens nothing.
+#[tokio::test]
+async fn a_bracketed_paste_before_p_is_refused_as_p_would_be() {
+    let bench = SectionBench::new().await;
+    let mut no_redirect = running_over(&bench, "https://h.invalid/o");
+    let mut delivering = delivering_over(&bench);
+    let mut cancelling = running_over(&bench, LOOPBACK_LINK);
+    bench.key(&mut cancelling, "x");
+    let _ = bench.drained();
+    for (section, refusal) in [
+        (&mut no_redirect, NO_LOOPBACK_REDIRECT),
+        (&mut delivering, DELIVERY_IN_FLIGHT),
+        (&mut cancelling, PASTE_CANCELLING),
+    ] {
+        assert_eq!(bench.paste(section, PASTE), Handled::Consumed);
+        let emitted = bench.drained();
+        assert_eq!(errors_of(&emitted), vec![refusal.to_owned()]);
+        assert!(!asked_anything(&emitted), "{emitted:?}");
+        assert!(!section.captures_input(), "{refusal}: nothing opened");
+    }
 }
 
 /// D270: `Esc` closes the field and nothing else — the login, its link and its keys stay.
