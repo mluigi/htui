@@ -69,10 +69,14 @@ impl Stack {
     }
 }
 
-/// The snapshot a tab write answered with; panics on anything else.
+/// The snapshot a tab write answered with, re-read after it applied (MOD-59 D1); panics on
+/// anything else.
 fn applied(reply: StoreReply) -> RequirementsSnapshot {
     match reply {
-        StoreReply::Requirements(snapshot) => *snapshot,
+        StoreReply::RequirementWritten {
+            snapshot: Ok(snapshot),
+            ..
+        } => *snapshot,
         other => panic!("the write answered {other:?}"),
     }
 }

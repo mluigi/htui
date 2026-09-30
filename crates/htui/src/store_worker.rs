@@ -47,7 +47,7 @@ use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, InferReport, MirrorAfterDelete};
 use crate::prompt_settings::{self, SettingsSnapshot};
 use crate::requirements::{
-    self, ItemCitations, RequirementDetail, RequirementText, RequirementsSnapshot,
+    self, ItemCitations, RequirementDetail, RequirementText, RequirementWrite, RequirementsSnapshot,
 };
 use crate::run_worker::{LiveChats, RunRuntime, RunServed};
 use crate::skill_import::SkillImports;
@@ -1166,6 +1166,16 @@ pub enum StoreReply {
     /// An amend or withdraw missed its version (plan P3): the snapshot as it is now. The form keeps
     /// its text and retries only by hand.
     RequirementsStale(Box<RequirementsSnapshot>),
+    /// The answer to every tab write that applied (MOD-59 D1): the scope re-read after it, and
+    /// what the write did. Self-naming: the Requirements tab lands a write on this variant alone,
+    /// and a plain [`StoreReply::Requirements`] never closes its form.
+    RequirementWritten {
+        /// The requirements as they are now; or, when only the re-read failed, its `StoreError`
+        /// rendered through `Display`. The write landed either way (D5).
+        snapshot: Result<Box<RequirementsSnapshot>, String>,
+        /// What the write did.
+        outcome: RequirementWrite,
+    },
     /// Answer to [`StoreRequest::RequirementDetail`].
     RequirementDetail(Box<RequirementDetail>),
     /// Answer to [`StoreRequest::ItemRequirements`] and to every citation write that applied.

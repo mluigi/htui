@@ -380,6 +380,56 @@ pub async fn citations(backend: &Backend, item: ItemId) -> Result<ItemCitations>
     })
 }
 
+/// What one tab write did (MOD-59 D2), carried by [`StoreReply::RequirementWritten`] beside the
+/// scope re-read. Ids, codes, keys and versions only: a body stays in the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequirementWrite {
+    /// [`StoreRequest::CreateRequirementArea`]: the area landed.
+    Area {
+        /// The area's id.
+        id: RequirementAreaId,
+        /// Its code, as stored (trimmed).
+        code: String,
+    },
+    /// [`StoreRequest::MintRequirement`]: the requirement landed at version 1.
+    Minted {
+        /// The id the worker minted.
+        id: RequirementId,
+        /// Its key, `R-<code>-<number>`.
+        key: String,
+    },
+    /// [`StoreRequest::AmendRequirement`] at the head: the new head.
+    Amended {
+        /// The requirement.
+        id: RequirementId,
+        /// Its key.
+        key: String,
+        /// The version written.
+        version: i32,
+    },
+    /// [`StoreRequest::WithdrawRequirement`] at the head.
+    Withdrawn {
+        /// The requirement.
+        id: RequirementId,
+        /// Its key.
+        key: String,
+    },
+}
+
+impl RequirementWrite {
+    /// The [`StoreRequest::name`] of the write this answers: what the tab's `busy` holds while it
+    /// is in flight, so only that write lands on it (MOD-59 D4).
+    #[must_use]
+    pub const fn request_name(&self) -> &'static str {
+        match self {
+            Self::Area { .. } => REQUEST_NAMES[3],
+            Self::Minted { .. } => REQUEST_NAMES[4],
+            Self::Amended { .. } => REQUEST_NAMES[5],
+            Self::Withdrawn { .. } => REQUEST_NAMES[6],
+        }
+    }
+}
+
 /// Serves one requirement request, off the UI task.
 ///
 /// # Errors
@@ -755,9 +805,9 @@ mod tests {
     use super::{
         BLANK_AREA_TITLE, BLANK_BODY, CITATIONS_NAME, DECIDING_KEY_NEEDED, DETAIL_NAME,
         ItemCitations, READ_NAME, REQUEST_NAMES, RequirementDetail, RequirementText,
-        RequirementsSnapshot, decision_citation_not_cited, decision_citation_stays,
-        gate_after_read, is_citation_write, is_tab_write, matches_filter, no_deciding_item,
-        not_the_maintainer, requirement_of_another_project, serve,
+        RequirementWrite, RequirementsSnapshot, decision_citation_not_cited,
+        decision_citation_stays, gate_after_read, is_citation_write, is_tab_write, matches_filter,
+        no_deciding_item, not_the_maintainer, requirement_of_another_project, serve,
     };
     use crate::store_worker::{self, StoreReply, StoreRequest};
     use chrono::TimeDelta;
@@ -982,6 +1032,8 @@ mod tests {
         assert_eq!(read(&backend, &scope).await, before, "nothing is written");
     }
 
+    /// MOD-59 D1, D2 too: an applied area create answers `RequirementWritten`, naming the area as
+    /// stored.
     #[tokio::test]
     async fn the_first_gated_write_claims_a_project_without_a_spec() {
         let backend = demo();
@@ -993,9 +1045,14 @@ mod tests {
         )
         .await;
 
-        let Ok(StoreReply::Requirements(after)) = reply else {
-            panic!("an applied area create answers `Requirements`, got {reply:?}")
+        let Ok(StoreReply::RequirementWritten {
+            snapshot: Ok(after),
+            outcome: RequirementWrite::Area { id, code },
+        }) = reply
+        else {
+            panic!("an applied area create answers `RequirementWritten`, got {reply:?}")
         };
+        assert_eq!(code, "API", "the code as stored, trimmed");
         let agy = after.project(ids::PROJECT_AGY).expect("agy");
         let spec = agy.spec.as_ref().expect("the write claimed a spec");
         assert_eq!(spec.owner_id, ids::USER, "owned by this user");
@@ -1009,15 +1066,21 @@ mod tests {
             ("API", "Interface")
         );
         assert_eq!(area.position, 0, "the first area of a project");
+        assert_eq!(area.id, id, "the outcome names the area written");
 
         let second = serve(
             &backend,
             &create_area(&scope, ids::PROJECT_HTUI, "UI", "Screens"),
         )
         .await;
-        let Ok(StoreReply::Requirements(after)) = second else {
+        let Ok(StoreReply::RequirementWritten {
+            snapshot: Ok(after),
+            outcome: RequirementWrite::Area { code, .. },
+        }) = second
+        else {
             panic!("a second area applies, got {second:?}")
         };
+        assert_eq!(code, "UI");
         let htui = after.project(ids::PROJECT_HTUI).expect("htui");
         let placed: Vec<(&str, i32)> = htui
             .areas
@@ -1068,8 +1131,10 @@ mod tests {
         );
     }
 
+    /// MOD-59 D1, D2: an applied mint answers `RequirementWritten`, naming the id the worker minted
+    /// and the key the store gave it.
     #[tokio::test]
-    async fn mint_answers_the_snapshot_with_the_next_key() {
+    async fn mint_answers_requirement_written_with_the_next_key() {
         let backend = demo();
         let scope = platform_scope(&backend).await;
 
@@ -1084,8 +1149,12 @@ mod tests {
         )
         .await;
 
-        let Ok(StoreReply::Requirements(after)) = reply else {
-            panic!("an applied mint answers `Requirements`, got {reply:?}")
+        let Ok(StoreReply::RequirementWritten {
+            snapshot: Ok(after),
+            outcome,
+        }) = reply
+        else {
+            panic!("an applied mint answers `RequirementWritten`, got {reply:?}")
         };
         let minted = after
             .project(ids::PROJECT_HTUI)
@@ -1100,6 +1169,13 @@ mod tests {
         assert_eq!(minted.priority, Priority::Must);
         assert_eq!(minted.state, RequirementState::Active);
         assert_eq!(minted.created_by, ids::USER, "the worker fills the author");
+        assert_eq!(
+            outcome,
+            RequirementWrite::Minted {
+                id: minted.id,
+                key: "R-ENT-3".to_owned(),
+            }
+        );
     }
 
     #[tokio::test]
@@ -1135,9 +1211,22 @@ mod tests {
 
         let reply = serve(&backend, &amend(&scope, ids::REQ_ENT_1, 2, " ana-2 ")).await;
 
-        let Ok(StoreReply::Requirements(after)) = reply else {
-            panic!("an applied amend answers `Requirements`, got {reply:?}")
+        let Ok(StoreReply::RequirementWritten {
+            snapshot: Ok(after),
+            outcome,
+        }) = reply
+        else {
+            panic!("an applied amend answers `RequirementWritten`, got {reply:?}")
         };
+        assert_eq!(
+            outcome,
+            RequirementWrite::Amended {
+                id: ids::REQ_ENT_1,
+                key: "R-ENT-1".to_owned(),
+                version: 3,
+            },
+            "the new head (MOD-59 D2)"
+        );
         let head = after.requirement(ids::REQ_ENT_1).expect("R-ENT-1");
         assert_eq!(head.version, 3);
         assert_eq!(
@@ -1219,9 +1308,21 @@ mod tests {
 
         let reply = serve(&backend, &withdraw(&scope, ids::REQ_STO_1, 1, "ANA-2")).await;
 
-        let Ok(StoreReply::Requirements(after)) = reply else {
-            panic!("an applied withdraw answers `Requirements`, got {reply:?}")
+        let Ok(StoreReply::RequirementWritten {
+            snapshot: Ok(after),
+            outcome,
+        }) = reply
+        else {
+            panic!("an applied withdraw answers `RequirementWritten`, got {reply:?}")
         };
+        assert_eq!(
+            outcome,
+            RequirementWrite::Withdrawn {
+                id: ids::REQ_STO_1,
+                key: "R-STO-1".to_owned(),
+            },
+            "MOD-59 D2"
+        );
         let row = after.requirement(ids::REQ_STO_1).expect("still listed");
         assert_eq!(row.state, RequirementState::Withdrawn);
         assert_eq!(row.version, 2);
@@ -1624,7 +1725,11 @@ mod tests {
 
         let reply = serve(&backend, &amend(&agy_only, ids::REQ_ENT_1, 2, "ANA-2")).await;
 
-        let Ok(StoreReply::Requirements(after)) = reply else {
+        let Ok(StoreReply::RequirementWritten {
+            snapshot: Ok(after),
+            ..
+        }) = reply
+        else {
             panic!("the amend applies, got {reply:?}")
         };
         assert!(after.is_for(&agy_only), "the answer is the request's scope");
@@ -1708,6 +1813,30 @@ mod tests {
             assert_eq!(is_citation_write(name), (7..10).contains(&index), "{name}");
         }
         assert!(!is_tab_write("templates") && !is_citation_write("templates"));
+
+        // MOD-59 D4: each outcome names the write it answers, the name the tab's `busy` holds.
+        let outcomes = [
+            RequirementWrite::Area {
+                id: ids::AREA_ENT,
+                code: "ENT".to_owned(),
+            },
+            RequirementWrite::Minted {
+                id: ids::REQ_ENT_1,
+                key: "R-ENT-1".to_owned(),
+            },
+            RequirementWrite::Amended {
+                id: ids::REQ_ENT_1,
+                key: "R-ENT-1".to_owned(),
+                version: 3,
+            },
+            RequirementWrite::Withdrawn {
+                id: ids::REQ_ENT_1,
+                key: "R-ENT-1".to_owned(),
+            },
+        ];
+        for (outcome, request) in outcomes.iter().zip(&samples[3..7]) {
+            assert_eq!(outcome.request_name(), request.name(), "{outcome:?}");
+        }
     }
 
     /// Offline there is no writer: the read answers from the mirror, which a fresh one holds no

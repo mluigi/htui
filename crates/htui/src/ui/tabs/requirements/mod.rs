@@ -1287,7 +1287,9 @@ mod tests {
     use super::{HINT_WRITES, Mode, Notice, RequirementsTab, Row};
     use crate::app::{Action, Ctx, Emit, Handled, TopBarState};
     use crate::keymap::Keymap;
-    use crate::requirements::{self, READ_NAME, RequirementsSnapshot, not_the_maintainer};
+    use crate::requirements::{
+        self, READ_NAME, RequirementWrite, RequirementsSnapshot, not_the_maintainer,
+    };
     use crate::store_worker::{Origin, StoreReply, StoreRequest};
     use crate::ui::Theme;
     use crate::ui::tabs::registry::Tab as _;
@@ -1549,9 +1551,9 @@ mod tests {
         assert_eq!(tab.unavailable, None);
     }
 
-    /// Blueprint F-16 by content: a read showing another session's amend (the version moved, the
-    /// text is theirs) is not this amend landing. The form stays, and the stale answer that
-    /// follows moves its token.
+    /// MOD-59 D4: a read showing another session's amend (the version moved, the text is theirs)
+    /// is not this amend landing; no plain `Requirements` is. The form stays, and the stale answer
+    /// that follows moves its token.
     #[tokio::test]
     async fn another_sessions_amend_does_not_land_this_one() {
         let (snapshot, projects, scope) = platform().await;
@@ -1758,28 +1760,71 @@ mod tests {
         request.name()
     }
 
-    /// MOD-39 review #2: a refused mint may have applied with only its re-read failing, so the
-    /// tab reads again before offering a retry, and a mint the read shows landed closes the form.
+    /// HANDOFF (a), MOD-59 D4: another session amends again between this amend and its re-read,
+    /// so the snapshot the reply carries holds their v4, not the text sent. The amend still lands
+    /// on its own reply, at the version the store says it wrote, and that row's detail is re-read.
     #[tokio::test]
-    async fn a_refused_mint_that_landed_anyway_is_not_offered_again() {
+    async fn an_amend_lands_on_its_own_reply_although_another_session_amended_again() {
         let (snapshot, projects, scope) = platform().await;
-        let bench = Bench::new(scope.clone(), projects);
+        let bench = Bench::new(scope, projects);
         let mut tab = tab_on(snapshot.clone());
-        let name = mint(&bench, &mut tab, "Twice is too many.");
+        bench.key(&mut tab, KeyCode::Char('e'));
+        bench.key(&mut tab, KeyCode::End);
+        bench.typed(&mut tab, " Mine.");
+        for _ in 0..3 {
+            bench.key(&mut tab, KeyCode::Tab);
+        }
+        bench.typed(&mut tab, "ANA-2");
+        bench.key(&mut tab, KeyCode::Enter);
+        let sent = bench.emit.take();
+        let [request @ StoreRequest::AmendRequirement { .. }] = requests(&sent)[..] else {
+            panic!("the amend went out: {sent:?}")
+        };
+        assert_eq!(tab.busy, Some(request.name()));
 
+        let mut theirs = with_ent_1(snapshot, 4, RequirementState::Active);
+        for entry in &mut theirs.projects {
+            for row in &mut entry.requirements {
+                if row.id == ids::REQ_ENT_1 {
+                    "Theirs.".clone_into(&mut row.body);
+                }
+            }
+        }
         bench.reply(
             &mut tab,
-            &StoreReply::Failed {
-                request: name,
-                message: "the re-read failed".to_owned(),
+            &StoreReply::RequirementWritten {
+                snapshot: Ok(Box::new(theirs)),
+                outcome: RequirementWrite::Amended {
+                    id: ids::REQ_ENT_1,
+                    key: "R-ENT-1".to_owned(),
+                    version: 3,
+                },
             },
         );
-        assert_eq!(tab.busy, Some(name), "still waiting to know");
+
+        assert_eq!(tab.busy, None);
+        assert!(matches!(tab.mode, Mode::Browse), "the form closed");
+        assert_eq!(
+            tab.notice,
+            Some(Notice::Info("amended R-ENT-1 to v3".to_owned()))
+        );
         let sent = bench.emit.take();
         assert!(
-            matches!(requests(&sent).as_slice(), [StoreRequest::Requirements(read)] if *read == scope),
+            requests(&sent)
+                .iter()
+                .any(|request| matches!(request, StoreRequest::RequirementDetail(id) if *id == ids::REQ_ENT_1)),
             "{sent:?}"
         );
+    }
+
+    /// MOD-59 D4: a read that already shows the mint is not its answer. It refreshes the tree and
+    /// leaves the form and `busy` alone; the mint's own `RequirementWritten` lands it.
+    #[tokio::test]
+    async fn a_read_that_shows_the_mint_does_not_land_it() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot.clone());
+        let name = mint(&bench, &mut tab, "Twice is too many.");
 
         let mut landed = snapshot;
         let entry = landed
@@ -1798,26 +1843,78 @@ mod tests {
         "R-ENT-3".clone_into(&mut row.key);
         "Twice is too many.".clone_into(&mut row.body);
         row.version = 1;
+        let id = row.id;
         entry.requirements.push(row);
-        bench.reply(&mut tab, &StoreReply::Requirements(Box::new(landed)));
+
+        bench.reply(
+            &mut tab,
+            &StoreReply::Requirements(Box::new(landed.clone())),
+        );
+        assert_eq!(tab.busy, Some(name), "a read never lands the mint");
+        assert!(matches!(tab.mode, Mode::Requirement(_)), "the form stays");
+
+        bench.reply(
+            &mut tab,
+            &StoreReply::RequirementWritten {
+                snapshot: Ok(Box::new(landed)),
+                outcome: RequirementWrite::Minted {
+                    id,
+                    key: "R-ENT-3".to_owned(),
+                },
+            },
+        );
+        assert_eq!(tab.busy, None);
+        assert!(matches!(tab.mode, Mode::Browse), "the form closed");
+        assert_eq!(tab.notice, Some(Notice::Info("minted R-ENT-3".to_owned())));
+        assert_eq!(tab.selected, Some(Row::Requirement(id)));
+    }
+
+    /// MOD-59 D5: a mint whose re-read failed has landed all the same. The form closes, the notice
+    /// says it landed and that the tree is the one held, and nothing more is read: no re-check of
+    /// the mint, and no detail of a row the tree does not hold yet.
+    #[tokio::test]
+    async fn a_mint_whose_reread_failed_lands_and_reads_nothing_more() {
+        let (snapshot, projects, scope) = platform().await;
+        let bench = Bench::new(scope, projects);
+        let mut tab = tab_on(snapshot);
+        mint(&bench, &mut tab, "Twice is too many.");
+        let before = tab.snapshot.clone();
+
+        bench.reply(
+            &mut tab,
+            &StoreReply::RequirementWritten {
+                snapshot: Err("store unreachable: gone".to_owned()),
+                outcome: RequirementWrite::Minted {
+                    id: RequirementId::new(),
+                    key: "R-ENT-3".to_owned(),
+                },
+            },
+        );
 
         assert_eq!(tab.busy, None);
         assert!(matches!(tab.mode, Mode::Browse), "the form closed");
         assert!(
-            matches!(&tab.notice, Some(Notice::Info(text)) if text.contains("R-ENT-3")),
+            matches!(&tab.notice, Some(Notice::Error(text))
+                if text.starts_with("minted R-ENT-3 \u{2014} the re-read failed")
+                    && text.ends_with("store unreachable: gone")),
             "{:?}",
             tab.notice
         );
+        let sent = bench.emit.take();
+        assert!(requests(&sent).is_empty(), "nothing is read: {sent:?}");
+        assert_eq!(tab.snapshot, before, "the held tree stays drawn");
+        assert_eq!(tab.unavailable, None, "a tree was held");
     }
 
-    /// MOD-39 review #2, the other way: the read shows no such requirement, so the refusal stands
-    /// and the form keeps its text for a retry.
+    /// MOD-59 D5: a refused mint is a refusal. Nothing was written, so the form keeps its text and
+    /// nothing is read to check.
     #[tokio::test]
-    async fn a_refused_mint_the_read_does_not_show_stays_refused() {
+    async fn a_refused_mint_frees_the_form_without_a_read() {
         let (snapshot, projects, scope) = platform().await;
         let bench = Bench::new(scope, projects);
-        let mut tab = tab_on(snapshot.clone());
+        let mut tab = tab_on(snapshot);
         let name = mint(&bench, &mut tab, "Never written.");
+
         bench.reply(
             &mut tab,
             &StoreReply::Failed {
@@ -1825,9 +1922,6 @@ mod tests {
                 message: "refused".to_owned(),
             },
         );
-        let _ = bench.emit.take();
-
-        bench.reply(&mut tab, &StoreReply::Requirements(Box::new(snapshot)));
 
         assert_eq!(tab.busy, None);
         assert_eq!(tab.notice, Some(Notice::Error("refused".to_owned())));
@@ -1835,6 +1929,8 @@ mod tests {
             matches!(tab.mode, Mode::Requirement(_)),
             "the form keeps its text"
         );
+        let sent = bench.emit.take();
+        assert!(requests(&sent).is_empty(), "nothing is read: {sent:?}");
     }
 
     /// MOD-39 review #4: an amend form a stale answer kept open over a head withdrawn elsewhere
