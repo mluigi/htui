@@ -984,9 +984,17 @@ pub fn drop_unmaskable_excerpts(set: &mut ExcerptSet, scrubber: &dyn Scrubber) {
 #[must_use]
 pub fn drop_unmaskable_files(files: &mut StepFiles, scrubber: &dyn Scrubber) -> Option<String> {
     let mut withheld = 0usize;
+    // MOD-9 D116: a repo slug is scrubbed once, not once per path under it.
+    let mut slugs: BTreeMap<String, bool> = BTreeMap::new();
     files.retain(|repo, path| {
-        let refused =
-            refused_rule(scrubber, repo).is_some() || refused_rule(scrubber, path).is_some();
+        let repo_refused = if let Some(refused) = slugs.get(repo) {
+            *refused
+        } else {
+            let refused = refused_rule(scrubber, repo).is_some();
+            slugs.insert(repo.to_owned(), refused);
+            refused
+        };
+        let refused = repo_refused || refused_rule(scrubber, path).is_some();
         withheld += usize::from(refused);
         !refused
     });
@@ -1245,6 +1253,44 @@ mod tests {
             "nothing left to withhold"
         );
         assert_eq!(files, kept);
+    }
+
+    /// MOD-9 D116 (review finding 1): a repo slug is scrubbed once, however many paths it holds.
+    #[test]
+    fn drop_unmaskable_files_scrubs_each_repo_slug_once() {
+        /// Counts the scrubs of one exact string, and delegates.
+        #[derive(Debug)]
+        struct Counting {
+            inner: crate::scrub::MinimalScrubber,
+            of: &'static str,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl Scrubber for Counting {
+            fn scrub(&self, value: &mut Value) -> Result<(), crate::scrub::Unmasked> {
+                if value.as_str() == Some(self.of) {
+                    self.calls
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.inner.scrub(value)
+            }
+        }
+        let scrubber = Counting {
+            inner: crate::scrub::MinimalScrubber::new([]),
+            of: "htui",
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut files = StepFiles::default();
+        for path in ["src/a.rs", "src/b.rs", "src/c.rs", "src/sk-live.rs"] {
+            files.insert("htui", path);
+        }
+        files.insert("docs", "guide.md");
+
+        assert!(drop_unmaskable_files(&mut files, &scrubber).is_some());
+        assert_eq!(
+            scrubber.calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "`htui` holds four paths and is scrubbed once"
+        );
     }
 }
 

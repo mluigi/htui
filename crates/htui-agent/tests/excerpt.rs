@@ -1564,14 +1564,11 @@ async fn step_pass_feeds_changed_paths_to_tier_2() {
         repo: "htui".to_owned(),
         path: "src/other.rs".to_owned(),
     }];
+    // A placed `glob` winner, so the file set is built from the listing (MOD-9 D120).
+    let mut spec = phase_spec();
+    spec.skills = vec![glob_skill(&["**/*.rs"])];
 
-    let pass = step_pass(
-        &phase_spec(),
-        input,
-        &BTreeMap::new(),
-        &MinimalScrubber::new([]),
-    )
-    .await;
+    let pass = step_pass(&spec, input, &BTreeMap::new(), &MinimalScrubber::new([])).await;
 
     assert!(
         pass.excerpts
@@ -1620,5 +1617,51 @@ async fn step_pass_withholds_an_unmaskable_path_from_files() {
     );
     for note in &pass.excerpts.notes {
         assert!(!note.contains("sk-live"), "a note names the path: {note}");
+    }
+}
+
+/// MOD-9 D120 (review finding 1): with no placed, versioned `glob` winner, `select` never reads the
+/// file set, so none is built from the listing: it holds the changed paths alone, scrub-filtered,
+/// and no `skills:` withheld note is left — whether the body places `{{excerpts}}` or not.
+#[tokio::test]
+async fn step_pass_builds_no_listing_file_set_without_a_glob_winner() {
+    let dir = tempfile::tempdir().expect("a throwaway root");
+    write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
+    write(dir.path(), "src/other.rs", b"pub fn other() {}\n");
+    write(dir.path(), "src/sk-live.rs", b"pub fn live() {}\n");
+    let changed = vec![
+        RepoPath {
+            repo: "htui".to_owned(),
+            path: "src/other.rs".to_owned(),
+        },
+        RepoPath {
+            repo: "htui".to_owned(),
+            path: "src/sk-live.rs".to_owned(),
+        },
+    ];
+
+    for spec in [phase_spec(), verdict_spec(Vec::new())] {
+        let mut input = readable_input(dir.path());
+        input.touched_prefixes = Vec::new();
+        input.changed_paths = changed.clone();
+
+        let pass = step_pass(&spec, input, &BTreeMap::new(), &MinimalScrubber::new([])).await;
+
+        assert_eq!(
+            file_rows(&pass.files),
+            vec![("htui".to_owned(), "src/other.rs".to_owned())],
+            "`{}`: the changed paths alone, the refused one withheld",
+            spec.template.name
+        );
+        assert!(
+            !pass
+                .excerpts
+                .notes
+                .iter()
+                .any(|note| note.starts_with("skills:")),
+            "`{}`: no glob winner, so no withheld note: {:?}",
+            spec.template.name,
+            pass.excerpts.notes
+        );
     }
 }

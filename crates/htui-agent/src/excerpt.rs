@@ -1012,10 +1012,12 @@ pub struct StepPass {
 ///    ``excerpt: template `name` places no {{excerpts}}; nothing was read``, and the file set
 ///    holds only `input.changed_paths`.
 /// 4. Otherwise the roots are listed once — under `tokio::task::spawn_blocking` when one is
-///    readable, inline (no I/O) when none is — and the file set is built from that listing,
-///    `input.touched_prefixes` and `input.changed_paths` ([`step_files`]).
-/// 5. `drop_unmaskable_files` runs on the file set on **every** branch, before the residual, and
-///    its note is the last of `excerpts.notes`.
+///    readable, inline (no I/O) when none is. When the walk is wanted for skills, the file set is
+///    built in the same hop from that listing, `input.touched_prefixes` and `input.changed_paths`
+///    ([`step_files`]); when it is not, `select` never reads the set, so it holds only
+///    `input.changed_paths`.
+/// 5. `drop_unmaskable_files` runs on the file set on **every** branch, before the residual. Its
+///    note is the last of `excerpts.notes`, and is left only when the walk is wanted for skills.
 /// 6. `{{excerpts}}` not placed: no file is read. The set records the listing's roots and
 ///    nothing considered, with the note
 ///    ``excerpt: template `name` places no {{excerpts}}; the walk listed files for glob skills
@@ -1061,8 +1063,12 @@ pub async fn step_pass(
             "excerpt: template `{}` places no {{{{excerpts}}}}; nothing was read",
             spec.template.name
         ));
-        let files = step_files(&Listing::default(), &touched_prefixes, &changed_paths);
-        return with_files(unscanned(&roots, caps, notes), files, scrubber);
+        return with_files(
+            unscanned(&roots, caps, notes),
+            changed_only(&changed_paths),
+            scrubber,
+            false,
+        );
     }
 
     let readable = roots.iter().any(|root| root.source != RootSource::NoPath);
@@ -1088,13 +1094,14 @@ pub async fn step_pass(
     let est = spec.estimator;
 
     // MOD-9 D114: one walk, for the excerpts and the file set both.
-    let (mut request, mut listing) = if readable {
+    let (mut request, mut listing, mut files) = if readable {
         let roots = request.roots.clone();
-        let touched = request.touched_prefixes.clone();
         let changed = request.changed_paths.clone();
         let walked = tokio::task::spawn_blocking(move || {
             let listing = walk_pass(&request);
-            (request, listing)
+            // MOD-9 D120: the file set is built off the runtime too, from the same listing.
+            let files = file_set(wants_files, &listing, &request);
+            (request, listing, files)
         })
         .await;
         match walked {
@@ -1103,20 +1110,26 @@ pub async fn step_pass(
                 // MOD-9 D132: no listing, so the file set is the changed paths alone.
                 let mut notes = notes;
                 notes.push(join_note(&error));
-                let files = step_files(&Listing::default(), &touched, &changed);
-                return with_files(unscanned(&roots, caps, notes), files, scrubber);
+                return with_files(
+                    unscanned(&roots, caps, notes),
+                    changed_only(&changed),
+                    scrubber,
+                    wants_files,
+                );
             }
         }
     } else {
         // No readable root: the walk records each `NoPath` and lists nothing, so there is no I/O
         // to move off the runtime (H-9).
         let listing = walk_pass(&request);
-        (request, listing)
+        let files = file_set(wants_files, &listing, &request);
+        (request, listing, files)
     };
 
-    let mut files = step_files(&listing, &request.touched_prefixes, &request.changed_paths);
-    // MOD-9 D132: before the residual, which assembles the spec with this file set.
-    let withheld = drop_unmaskable_files(&mut files, scrubber);
+    // MOD-9 D132: before the residual, which assembles the spec with this file set. It stays on
+    // the runtime: `scrubber` is a borrow, and `spawn_blocking` takes only `'static` data. Without
+    // a `glob` winner the set is the changed paths alone, so this costs nothing per listed file.
+    let withheld = withhold_files(&mut files, scrubber, wants_files);
 
     let mut excerpts = if places_excerpts {
         let residual = if readable {
@@ -1209,11 +1222,42 @@ fn join_note(error: &tokio::task::JoinError) -> String {
 
 /// MOD-9 D132: a branch that skipped the listing's file filter runs it here, and its note goes
 /// last.
-fn with_files(mut excerpts: ExcerptSet, mut files: StepFiles, scrubber: &dyn Scrubber) -> StepPass {
-    if let Some(note) = drop_unmaskable_files(&mut files, scrubber) {
+fn with_files(
+    mut excerpts: ExcerptSet,
+    mut files: StepFiles,
+    scrubber: &dyn Scrubber,
+    wants_files: bool,
+) -> StepPass {
+    if let Some(note) = withhold_files(&mut files, scrubber, wants_files) {
         excerpts.notes.push(note);
     }
     StepPass { excerpts, files }
+}
+
+/// MOD-9 D115, D120: the step's file set. From the listing only when a placed, versioned `glob`
+/// winner will read it ([`needs_files`]); otherwise `select` never reads it, so the listing is
+/// not copied and the set is the changed paths alone ([`changed_only`]).
+fn file_set(wants_files: bool, listing: &Listing, request: &OwnedExcerptRequest) -> StepFiles {
+    if wants_files {
+        step_files(listing, &request.touched_prefixes, &request.changed_paths)
+    } else {
+        changed_only(&request.changed_paths)
+    }
+}
+
+/// MOD-9 D132: the file set with no listing — `changed`, under the listing's own path rules.
+fn changed_only(changed: &[RepoPath]) -> StepFiles {
+    step_files(&Listing::default(), &[], changed)
+}
+
+/// MOD-9 D116, D132: `drop_unmaskable_files` on `files`, whose note is kept only when a `glob`
+/// winner reads the set; with none, a withheld path changed nothing a reader could see.
+fn withhold_files(
+    files: &mut StepFiles,
+    scrubber: &dyn Scrubber,
+    wants_files: bool,
+) -> Option<String> {
+    drop_unmaskable_files(files, scrubber).filter(|_| wants_files)
 }
 
 /// The set a pass that read nothing records: the built-in registered, every root as given and
