@@ -1,5 +1,12 @@
 //! `htui worker` (MOD-41 plan D14, D15): the headless connect, then `htui_worker::worker::run`.
 
+use std::path::Path;
+
+use htui_store::pg::{CONNECT_TIMEOUT, PoolSize};
+use htui_store::{PgStore, connect, identity};
+
+use crate::concepts;
+
 /// How `htui worker` ends (plan D14): `main` maps it to the exit code.
 #[derive(Debug)]
 pub enum WorkerExit {
@@ -30,6 +37,23 @@ impl core::fmt::Display for WorkerExit {
 }
 
 impl std::error::Error for WorkerExit {}
+
+/// The headless connect and the registration write-back (plan D14): every refusal before any
+/// write, with `concepts::headless_refusal`'s sentences. `pub` for `worker_pg.rs` case 4.
+///
+/// # Errors
+///
+/// [`WorkerExit::Refused`].
+pub async fn connect(dsn: &str, root: &Path, pool: PoolSize) -> Result<PgStore, WorkerExit> {
+    let presented =
+        identity::load_or_mint(root).map_err(|err| WorkerExit::Refused(err.to_string()))?;
+    let pg = PgStore::connect_headless(dsn, &presented, CONNECT_TIMEOUT, pool)
+        .await
+        .map_err(|err| WorkerExit::Refused(format!("{:#}", concepts::headless_refusal(err))))?;
+    connect::persist_registration(root, &presented, &pg)
+        .map_err(|err| WorkerExit::Refused(err.to_string()))?;
+    Ok(pg)
+}
 
 #[cfg(test)]
 mod tests {

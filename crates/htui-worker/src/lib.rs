@@ -30,12 +30,16 @@
 //! `test-support` feature compiles `testing`, the runtime's white-box surface for `htui`'s
 //! `run_worker` tests (MOD-41 plan D8); it is named in plain text, not linked, because a link to a
 //! feature-gated module is a `broken_intra_doc_links` error in any build without the feature.
+//!
+//! [`worker`] is `htui worker`'s loop (MOD-41 plan D14): a [`RunRuntime`] over a `PgStore` with
+//! [`Role::Worker`] and the [`Unaddressed`] sink, polled, with the box heartbeat beside it.
 #![warn(missing_docs)]
 
 mod address;
 mod graphs;
 mod runtime;
 mod views;
+pub mod worker;
 
 pub use address::{ChatEnd, Promoted, ReplySink, RunReply, RunRequest, RunServed, Unaddressed};
 pub use graphs::HostGraphs;
