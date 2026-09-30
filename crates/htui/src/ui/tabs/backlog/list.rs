@@ -97,6 +97,22 @@ pub fn rows(
     out
 }
 
+/// The rows the list draws **and** navigates (MOD-13 review M2): [`rows`], except that a filter
+/// nothing matches has none. Its project headers would still be rows, so the cursor would sit on,
+/// fold and step over headers the pane does not draw.
+#[must_use]
+pub fn visible(
+    items: &[ItemSummary],
+    projects: &[ProjectRef],
+    folded: &[ProjectId],
+    filtered: bool,
+) -> Vec<Selection> {
+    if filtered && items.is_empty() {
+        return Vec::new();
+    }
+    rows(items, projects, folded)
+}
+
 /// The list pane's title: the count, then the active filter's summary when there is one
 /// (MOD-13 D5). Without a filter it is byte-for-byte the pre-MOD-13 title.
 #[must_use]
@@ -115,11 +131,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &ListView<'_>, theme: &Th
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let mut lines = lines(view, theme, usize::from(inner.width));
-    // MOD-13 blueprint E3: every scope project has a header row even with no item under it, so
-    // an empty filtered result is told by its items, not by its lines. Unfiltered, the check is
-    // the pre-MOD-13 one.
-    if lines.is_empty() || (view.filter.is_some() && view.items.is_empty()) {
+    // MOD-13 blueprint E3, review M2: every scope project has a header row even with no item
+    // under it, so an empty filtered result is told by `visible`, the rule the tab navigates by.
+    // Unfiltered, it is the pre-MOD-13 check: no project, no row.
+    let visible = visible(
+        view.items,
+        view.projects,
+        view.folded,
+        view.filter.is_some(),
+    );
+    if visible.is_empty() {
         let empty = if view.filter.is_some() {
             NO_MATCH
         } else {
@@ -129,7 +150,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &ListView<'_>, theme: &Th
         return;
     }
 
-    let cursor = rows(view.items, view.projects, view.folded)
+    let mut lines = lines(view, theme, usize::from(inner.width));
+    let cursor = visible
         .iter()
         .position(|row| Some(*row) == view.selected)
         .unwrap_or(0);

@@ -68,8 +68,14 @@ pub struct BacklogTab {
     /// The shell's refreshes this tab has seen while active; every
     /// [`REFRESHES_PER_RUNS_POLL`]th is a `Runs` poll (MOD-41 plan D16).
     refreshes: u32,
-    /// MOD-13 D1: the active filter; `default()` = the whole scope (D5).
+    /// MOD-13 D1: the active filter, the one the next `Items` read goes out under;
+    /// `default()` = the whole scope (D5).
     filter: BacklogFilter,
+    /// The filter `items` were read under (MOD-13 review M1): what the title names and what
+    /// decides "no match". It catches up with `filter` when an `Items` reply lands (the
+    /// staleness gate delivers only the newest read's), and `filter` rolls back to it when that
+    /// read is refused.
+    shown: BacklogFilter,
     /// The open filter form, capturing every key while `Some`.
     form: Option<FilterForm>,
 }
@@ -104,6 +110,7 @@ impl BacklogTab {
             pending_reveal: None,
             refreshes: 0,
             filter: BacklogFilter::default(),
+            shown: BacklogFilter::default(),
             form: None,
         }
     }
@@ -161,9 +168,17 @@ impl BacklogTab {
         ctx.request(StoreRequest::ItemRequirements(id));
     }
 
+    /// The rows the list pane draws, which are the only rows the cursor may reach: the one rule
+    /// [`list::visible`] gives both (MOD-13 review M2). "Filtered" is the title's own test, a
+    /// summary to show.
+    fn rows(&self, ctx: &Ctx<'_>) -> Vec<Selection> {
+        let filtered = self.shown.summary(ctx.projects).is_some();
+        list::visible(&self.items, ctx.projects, &self.folded, filtered)
+    }
+
     /// Moves the cursor `delta` rows, clamped to the ends of the list.
     fn step(&mut self, delta: isize, ctx: &Ctx<'_>) {
-        let rows = list::rows(&self.items, ctx.projects, &self.folded);
+        let rows = self.rows(ctx);
         let Some(last) = rows.len().checked_sub(1) else {
             return;
         };
@@ -174,7 +189,7 @@ impl BacklogTab {
 
     /// Moves the cursor to the first or the last row (`g` / `G`).
     fn jump(&mut self, to_end: bool, ctx: &Ctx<'_>) {
-        let rows = list::rows(&self.items, ctx.projects, &self.folded);
+        let rows = self.rows(ctx);
         let target = if to_end { rows.last() } else { rows.first() };
         self.go(target.copied(), ctx);
     }
@@ -184,11 +199,14 @@ impl BacklogTab {
         rows.iter().position(|row| Some(*row) == self.selected)
     }
 
-    /// Folds or unfolds the selected group. Only a project header row folds.
-    fn fold(&mut self) -> Handled {
+    /// Folds or unfolds the selected group. Only a project header row the pane draws folds.
+    fn fold(&mut self, ctx: &Ctx<'_>) -> Handled {
         let Some(Selection::Project(id)) = self.selected else {
             return Handled::Pass;
         };
+        if self.index(&self.rows(ctx)).is_none() {
+            return Handled::Pass;
+        }
         if let Some(at) = self.folded.iter().position(|folded| *folded == id) {
             self.folded.remove(at);
         } else {
@@ -199,8 +217,10 @@ impl BacklogTab {
 
     /// Keeps the cursor on a row that still exists after a new `Items` reply, preferring the
     /// first item over the project header it sits under.
+    /// A filter nothing matches has no row, so the cursor goes to `None` and the detail resets
+    /// (MOD-13 review M2).
     fn reselect(&mut self, ctx: &Ctx<'_>) {
-        let rows = list::rows(&self.items, ctx.projects, &self.folded);
+        let rows = self.rows(ctx);
         if self.index(&rows).is_some() {
             return;
         }
@@ -277,6 +297,7 @@ impl Tab for BacklogTab {
         self.detail.on_item_change(None);
         self.pending_reveal = None;
         self.filter.retain_projects(scope);
+        self.shown.retain_projects(scope);
         self.form = None;
     }
 
@@ -336,7 +357,7 @@ impl Tab for BacklogTab {
             // the detail pane's — the Runs pane replays the step under its cursor with it
             // (MOD-2 D39). Without this the pane would never see the key at all.
             KeyCode::Enter => {
-                return match self.fold() {
+                return match self.fold(ctx) {
                     Handled::Consumed => Handled::Consumed,
                     Handled::Pass => self.detail.on_key(key, ctx),
                 };
@@ -349,8 +370,16 @@ impl Tab for BacklogTab {
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         if let StoreReply::Items(items) = reply {
             self.items.clone_from(items);
-            let live: Vec<ProjectId> = self.items.iter().map(|item| item.project_id).collect();
-            self.folded.retain(|project| live.contains(project));
+            // MOD-13 review M1: the newest read is the only one delivered, and it went out under
+            // `filter`.
+            self.shown.clone_from(&self.filter);
+            // MOD-13 review L5: a fold is the scope's project's, not the reply's, so a filter
+            // that hides a project's items keeps its fold. A scope change clears it (D6).
+            self.folded.retain(|project| {
+                ctx.projects
+                    .iter()
+                    .any(|scoped| scoped.project_id == *project)
+            });
             // MOD-64 D251: a reveal of an item that was not loaded is decided by this list.
             if let Some((id, key)) = self.pending_reveal.take() {
                 match self.items.iter().find(|item| item.id == id) {
@@ -366,6 +395,9 @@ impl Tab for BacklogTab {
             && *request == ITEMS_READ
         {
             self.pending_reveal = None;
+            // MOD-13 review M1: the rows on screen are still the ones `shown` read, so the next
+            // `f` opens on them rather than on a filter that never arrived.
+            self.filter.clone_from(&self.shown);
         }
         self.detail.on_reply(reply, ctx);
     }
@@ -401,7 +433,8 @@ impl Tab for BacklogTab {
             None => (left, None),
         };
 
-        let summary = self.filter.summary(ctx.projects);
+        // MOD-13 review M1: the filter the rows were read under, not the one still in flight.
+        let summary = self.shown.summary(ctx.projects);
         let view = ListView {
             items: &self.items,
             projects: ctx.projects,
@@ -554,6 +587,7 @@ mod tests {
             pending_reveal: None,
             refreshes: 0,
             filter: BacklogFilter::default(),
+            shown: BacklogFilter::default(),
             form: None,
         };
 
@@ -726,6 +760,7 @@ mod tests {
             pending_reveal: None,
             refreshes: 0,
             filter: BacklogFilter::default(),
+            shown: BacklogFilter::default(),
             form: None,
         };
         let (top_bar, keymap, theme, emit) = (
@@ -773,6 +808,7 @@ mod tests {
             pending_reveal: None,
             refreshes: 0,
             filter: BacklogFilter::default(),
+            shown: BacklogFilter::default(),
             form: None,
         };
         let (top_bar, keymap, theme, emit) = (
@@ -1232,6 +1268,145 @@ mod tests {
         );
         press(&mut tab, &bench, KeyCode::Enter);
         assert_eq!(tab.filter.tags, ["gpu", "rust"]);
+    }
+
+    /// The tab drawn at the harness's size, as snapshot text.
+    fn drawn(tab: &BacklogTab, bench: &Bench) -> String {
+        let (width, height) = DEFAULT_SIZE;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("a test terminal");
+        terminal
+            .draw(|frame| tab.render(frame, frame.area(), &bench.ctx()))
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The rows of `bench` with `status`.
+    fn with_status(bench: &Bench, status: htui_core::model::Status) -> Vec<ItemSummary> {
+        bench
+            .items
+            .iter()
+            .filter(|item| item.status == status)
+            .cloned()
+            .collect()
+    }
+
+    /// MOD-13 review M1: the title names the filter the rows were read under. A refused read
+    /// leaves the old rows under the old title, and the filter rolls back to it, so the next `f`
+    /// opens on what is on screen.
+    #[tokio::test]
+    async fn a_refused_filtered_read_keeps_the_title_and_rolls_the_filter_back() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        tab.apply(done_only(), &bench.ctx());
+        let pending = drawn(&tab, &bench);
+        assert!(
+            pending.contains("Backlog (11) ") && !pending.contains("status:done"),
+            "the reply has not arrived, so the title is the whole list's:\n{pending}"
+        );
+
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: ITEMS_READ,
+                message: "the server went away".to_owned(),
+            },
+            &mut bench.ctx(),
+        );
+        let refused = drawn(&tab, &bench);
+        assert!(
+            refused.contains("Backlog (11) ") && !refused.contains("status:done"),
+            "{refused}"
+        );
+        assert_eq!(tab.filter, tab.shown, "the filter is what is shown");
+        assert!(tab.filter.is_empty());
+    }
+
+    /// MOD-13 review M1: the reply to a filtered read brings its filter into the title.
+    #[tokio::test]
+    async fn a_filtered_reply_names_its_filter_in_the_title() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        tab.apply(done_only(), &bench.ctx());
+        tab.on_reply(
+            &StoreReply::Items(with_status(&bench, htui_core::model::Status::Done)),
+            &mut bench.ctx(),
+        );
+        assert_eq!(tab.shown, done_only());
+        let frame = drawn(&tab, &bench);
+        assert!(frame.contains("Backlog (2) · status:done "), "{frame}");
+    }
+
+    /// MOD-13 review M2: a filter nothing matches draws no row, so there is no row to select,
+    /// fold or step over; `F` then brings the whole list back with nothing folded.
+    #[tokio::test]
+    async fn a_filter_nothing_matches_leaves_no_row_to_move_or_fold() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        let cuda = BacklogFilter {
+            tags: vec!["cuda".to_owned()],
+            ..BacklogFilter::default()
+        };
+        tab.apply(cuda, &bench.ctx());
+        tab.on_reply(&StoreReply::Items(Vec::new()), &mut bench.ctx());
+        assert_eq!(tab.selected, None, "no row, no cursor");
+        assert!(drawn(&tab, &bench).contains(list::NO_MATCH));
+        let _ = bench.actions();
+
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Char('G'),
+            KeyCode::Char('g'),
+        ] {
+            press(&mut tab, &bench, code);
+            assert_eq!(tab.selected, None, "{code:?} found no row");
+        }
+        assert!(tab.folded.is_empty(), "`Enter` folded nothing");
+        assert!(bench.actions().is_empty(), "and nothing was read");
+
+        press(&mut tab, &bench, KeyCode::Char('F'));
+        tab.on_reply(&StoreReply::Items(bench.items.clone()), &mut bench.ctx());
+        assert!(tab.folded.is_empty(), "no project comes back folded");
+        assert_eq!(tab.selected, Some(bench.first));
+    }
+
+    /// MOD-13 review L5: a fold belongs to the scope's project, not to the rows one read holds,
+    /// so a filter that hides the project's items does not forget it.
+    #[tokio::test]
+    async fn a_fold_survives_a_filter_that_hides_its_project() {
+        use htui_core::fixtures::ids::{PROJECT_AGY, PROJECT_HTUI};
+        let bench = Bench::new().await;
+        let mut tab = BacklogTab {
+            folded: vec![PROJECT_AGY],
+            ..bench.tab()
+        };
+        let htui_only = BacklogFilter {
+            projects: vec![PROJECT_HTUI],
+            ..BacklogFilter::default()
+        };
+        tab.apply(htui_only, &bench.ctx());
+        let htui: Vec<ItemSummary> = bench
+            .items
+            .iter()
+            .filter(|item| item.project_id == PROJECT_HTUI)
+            .cloned()
+            .collect();
+        tab.on_reply(&StoreReply::Items(htui), &mut bench.ctx());
+        assert_eq!(tab.folded, [PROJECT_AGY]);
+
+        press(&mut tab, &bench, KeyCode::Char('F'));
+        tab.on_reply(&StoreReply::Items(bench.items.clone()), &mut bench.ctx());
+        assert_eq!(tab.folded, [PROJECT_AGY], "still folded after `F`");
     }
 
     /// The sub-tab strip fits inside the detail pane at the harness's pinned size, so a longer title, another sub-tab or a narrower pane fails here
