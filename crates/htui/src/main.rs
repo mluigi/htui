@@ -1,11 +1,13 @@
 //! The `htui` binary: parse, run, map the outcome to an exit code.
 
 use clap::Parser;
+use std::panic::AssertUnwindSafe;
 use std::process::ExitCode;
 use std::time::Duration;
 
 /// MOD-41 review R-4: how long the runtime's teardown may wait for its tasks once `main`'s body
-/// has returned (and the Sentry guard has flushed). A task still running then is left behind.
+/// has returned or panicked (and the Sentry guard has flushed). A task still running then is left
+/// behind.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Parses the command line and runs the shell, or `htui worker`.
@@ -15,7 +17,8 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// readable instead of being drawn over the last frame.
 ///
 /// MOD-41 review R-4: the runtime is built by hand, not by `#[tokio::main]`, so its teardown is
-/// bounded by [`SHUTDOWN_GRACE`]: a blocking task that never ends cannot hold the exit.
+/// bounded by [`SHUTDOWN_GRACE`], whether the body returns or panics: a blocking task that never
+/// ends cannot hold the exit.
 fn main() -> ExitCode {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -25,14 +28,21 @@ fn main() -> ExitCode {
 }
 
 /// Runs `future` to its end on `runtime`, then tears the runtime down within `grace`.
+///
+/// MOD-41 review RF-4: a panic out of `future` is caught, the runtime is torn down within
+/// `grace`, and the panic resumes: unwinding past a live runtime would drop it, and its drop
+/// waits for every blocking task with no bound.
 fn run_bounded<T>(
     runtime: tokio::runtime::Runtime,
     grace: Duration,
     future: impl Future<Output = T>,
 ) -> T {
-    let out = runtime.block_on(future);
+    let out = std::panic::catch_unwind(AssertUnwindSafe(|| runtime.block_on(future)));
     runtime.shutdown_timeout(grace);
-    out
+    match out {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 /// `main` inside the runtime. The Sentry guard lives here, so it flushes before the runtime's
