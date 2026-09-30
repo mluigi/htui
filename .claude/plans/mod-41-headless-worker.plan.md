@@ -134,6 +134,13 @@ relative to the repo root.
   topology gate. That needs a way to tell a hand-back from a crash, which is new state (a column
   would be migration `0008`), and makes the two recoveries differ.
 
+- **Blueprint escalations, answered 2026-09-30 ("accept both"):**
+  - **E-1:** startup refusals (exit 2: no DSN, connect failure, any `HeadlessError`) are not sent to
+    Sentry. They are configuration states, not crashes; they still go to stderr and the log.
+  - **E-2:** the queued cancel's two statements (run CAS, then item `queued → open`) are accepted
+    as is. A crash between them leaves the item `queued`; this is documented in
+    `docs/htui-worker.md`, and no transactional 43rd `WorkerStore` method is added.
+
 ## Summary
 
 Four milestones on one branch, each ending green and committed, pushed only with the maintainer's
