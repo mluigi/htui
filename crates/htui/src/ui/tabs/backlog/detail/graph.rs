@@ -20,6 +20,7 @@ use ratatui::widgets::Paragraph;
 use crate::app::{Action, Ctx, Handled, RevealTarget};
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
+use crate::ui::cells::{cell_width, graphemes};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, PAGE, message};
 use crate::ui::tabs::backlog::list;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -463,12 +464,78 @@ fn in_workspace(node: &LinkNode, projects: &[ProjectRef]) -> bool {
         .any(|project| project.project_id == node.project_id)
 }
 
-/// One row as a line at most `width` columns wide (§1.5 of the blueprint).
+/// Every row as a line at most `width` cells wide, the cursor on row `cursor`.
+///
+/// The kind column is padded to [`KIND_WIDTH`] for every row or for none (L6): padded when every
+/// row still fits with it, so a narrow pane drops the padding uniformly rather than row by row.
+fn lines(
+    rows: &[GraphRow<'_>],
+    cursor: usize,
+    projects: &[ProjectRef],
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let Some(root) = rows.first() else {
+        return Vec::new();
+    };
+    let root_project = root.node.project_id;
+    let pad_kind = rows.iter().all(|row| match row.link {
+        None => true,
+        Some(link) => {
+            let kind = cell_width(link.kind.as_str()).max(KIND_WIDTH);
+            fixed_cells(row, link) + kind + label_cells(row.node, root_project) <= width
+        }
+    });
+    rows.iter()
+        .enumerate()
+        .map(|(at, row)| {
+            line(
+                row,
+                at == cursor,
+                root_project,
+                in_workspace(row.node, projects),
+                pad_kind,
+                width,
+                theme,
+            )
+        })
+        .collect()
+}
+
+/// Columns a row at `level` indents by, capped at [`GraphTab::MAX_HOPS`] levels.
+fn indent(level: u8) -> usize {
+    (INDENT * usize::from(level.saturating_sub(1))).min(INDENT * usize::from(GraphTab::MAX_HOPS))
+}
+
+/// The slug a node is labelled with: its project's, unless that is the root's.
+fn slug(node: &LinkNode, root_project: ProjectId) -> Option<&str> {
+    (node.project_id != root_project).then_some(node.project_slug.as_str())
+}
+
+/// Cells of a non-root row but its kind, label and title: cursor, space, indent, arrow, three
+/// separators, the status and the repeat mark.
+fn fixed_cells(row: &GraphRow<'_>, link: Link) -> usize {
+    let repeat = if link.repeat { cell_width(REPEAT) } else { 0 };
+    2 + indent(row.level)
+        + cell_width(link.arrow.glyph())
+        + 3
+        + cell_width(row.node.status.as_str())
+        + repeat
+}
+
+/// Cells of `node`'s whole `[slug:]KEY` label.
+fn label_cells(node: &LinkNode, root_project: ProjectId) -> usize {
+    slug(node, root_project).map_or(0, |slug| cell_width(slug) + 1) + cell_width(&node.key)
+}
+
+/// One row as a line at most `width` cells wide (§1.5 of the blueprint), its kind padded to
+/// [`KIND_WIDTH`] when `pad_kind` says the whole column is.
 fn line(
     row: &GraphRow<'_>,
     on_cursor: bool,
     root_project: ProjectId,
     in_workspace: bool,
+    pad_kind: bool,
     width: usize,
     theme: &Theme,
 ) -> Line<'static> {
@@ -490,29 +557,19 @@ fn line(
         spans.push(Span::raw(" "));
         spans.push(Span::styled(status, status_style));
         push_title(&mut spans, &node.title, width, title_style);
-        return Line::from(spans);
+        return Line::from(cut(spans, width));
     };
 
-    let indent = (INDENT * usize::from(row.level.saturating_sub(1)))
-        .min(INDENT * usize::from(GraphTab::MAX_HOPS));
     let kind = link.kind.as_str();
-    let key = node.key.as_str();
-    let slug = (node.project_id != root_project).then_some(node.project_slug.as_str());
-    let label_width = slug.map_or(0, |slug| slug.chars().count() + 1) + key.chars().count();
-    let repeat = if link.repeat { REPEAT } else { "" };
-    // Everything but the kind and the label: cursor, space, indent, arrow, three separators,
-    // the status and the repeat mark.
-    let fixed = 2 + indent + 1 + 3 + status.len() + repeat.chars().count();
-
-    let padded = format!("{kind:<KIND_WIDTH$}");
-    let kind = if fixed + padded.len() + label_width <= width {
-        padded
+    let kind = if pad_kind {
+        format!("{kind:<KIND_WIDTH$}")
     } else {
         kind.to_owned()
     };
-    let label = fit_label(key, slug, width.saturating_sub(fixed + kind.len()));
+    let room = width.saturating_sub(fixed_cells(row, link) + cell_width(&kind));
+    let label = fit_label(&node.key, slug(node, root_project), room);
 
-    spans.push(Span::raw(" ".repeat(indent)));
+    spans.push(Span::raw(" ".repeat(indent(row.level))));
     spans.push(Span::styled(link.arrow.glyph(), theme.dim));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(kind, theme.base));
@@ -526,19 +583,19 @@ fn line(
     } else {
         push_title(&mut spans, &node.title, width, title_style);
     }
-    Line::from(spans)
+    Line::from(cut(spans, width))
 }
 
-/// The `[slug:]KEY` label in at most `room` columns (§1.5 steps 3-4, L5).
+/// The `[slug:]KEY` label in at most `room` cells (§1.5 steps 3-4, L5).
 ///
-/// Whole when it fits; then the slug clipped, while it keeps two columns; then the key alone,
+/// Whole when it fits; then the slug clipped, while it keeps two cells; then the key alone,
 /// clipped if it must be. The slug gives way first: the key is what names the item.
 fn fit_label(key: &str, slug: Option<&str>, room: usize) -> String {
-    let key_width = key.chars().count();
+    let key_width = cell_width(key);
     let Some(slug) = slug else {
         return clip(key, room);
     };
-    if slug.chars().count() + 1 + key_width <= room {
+    if cell_width(slug) + 1 + key_width <= room {
         return format!("{slug}:{key}");
     }
     match room.checked_sub(key_width + 1) {
@@ -547,25 +604,66 @@ fn fit_label(key: &str, slug: Option<&str>, room: usize) -> String {
     }
 }
 
-/// `text` in at most `room` columns, `…`-clipped: [`list::clip`], except that no room is no text
-/// (`list::clip` answers a lone `…` there, one column over).
+/// `text` in at most `room` cells, cut at a grapheme boundary and ended with `…` when it is cut.
+/// No room is no text: a lone `…` would be a cell over.
 fn clip(text: &str, room: usize) -> String {
-    if room == 0 {
-        String::new()
-    } else {
-        list::clip(text, room)
+    if cell_width(text) <= room {
+        return text.to_owned();
     }
+    let Some(room) = room.checked_sub(1) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let mut used = 0;
+    for grapheme in graphemes(text) {
+        used += cell_width(grapheme);
+        if used > room {
+            break;
+        }
+        out.push_str(grapheme);
+    }
+    out.push('\u{2026}');
+    out
 }
 
 /// Appends `' ' + title`, clipped to what is left of `width`, when at least [`TITLE_MIN`]
-/// columns are left for it: titles are the first thing a narrow pane drops.
+/// cells are left for it: titles are the first thing a narrow pane drops.
 fn push_title(spans: &mut Vec<Span<'static>>, title: &str, width: usize, style: Style) {
-    let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+    let used: usize = spans.iter().map(|span| cell_width(&span.content)).sum();
     let room = width.saturating_sub(used + 1);
     if room >= TITLE_MIN {
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(list::clip(title, room), style));
+        spans.push(Span::styled(clip(title, room), style));
     }
+}
+
+/// `spans` cut at `width` cells, as the pane edge would cut them: below the width of a row's
+/// fixed parts nothing else gives, and a line must still never be wider than the pane.
+fn cut(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let mut left = width;
+    let mut out = Vec::with_capacity(spans.len());
+    for span in spans {
+        let cells = cell_width(&span.content);
+        if cells <= left {
+            left -= cells;
+            out.push(span);
+            continue;
+        }
+        let mut kept = String::new();
+        for grapheme in graphemes(&span.content) {
+            let cells = cell_width(grapheme);
+            if cells > left {
+                break;
+            }
+            left -= cells;
+            kept.push_str(grapheme);
+        }
+        if !kept.is_empty() {
+            out.push(Span::styled(kept, span.style));
+        }
+        break;
+    }
+    out
 }
 
 impl DetailTab for GraphTab {
@@ -647,29 +745,21 @@ impl DetailTab for GraphTab {
             return;
         }
         let rows = self.visible();
-        let Some(root) = rows.first().filter(|_| rows.len() > 1) else {
+        if rows.len() <= 1 {
             message(frame, area, "No links for this item.", ctx.theme);
             return;
-        };
+        }
 
         let [tree, footer] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
         let cursor = self.cursor.min(rows.len() - 1);
-        let width = usize::from(tree.width);
-        let mut lines: Vec<Line<'static>> = rows
-            .iter()
-            .enumerate()
-            .map(|(at, row)| {
-                line(
-                    row,
-                    at == cursor,
-                    root.node.project_id,
-                    in_workspace(row.node, ctx.projects),
-                    width,
-                    ctx.theme,
-                )
-            })
-            .collect();
+        let mut lines = lines(
+            &rows,
+            cursor,
+            ctx.projects,
+            usize::from(tree.width),
+            ctx.theme,
+        );
         let offset = list::window(cursor, lines.len(), usize::from(tree.height));
         // No `Wrap`: a wrapped row would break the row-to-cursor mapping.
         frame.render_widget(
@@ -701,6 +791,7 @@ mod tests {
     use crate::app::{Emit, TopBarState};
     use crate::keymap::Keymap;
     use crate::store_worker::Origin;
+    use crate::ui::cells::cell_width;
     use crate::ui::tabs::BacklogTab;
     use htui_core::model::LinkEdge;
 
@@ -1285,16 +1376,7 @@ mod tests {
             let graph = demo(root).await;
             for depth in 1..=GraphTab::MAX_HOPS {
                 let rows = rows(&graph, depth);
-                let root_project = rows[0].node.project_id;
-                for (at, row) in rows.iter().enumerate() {
-                    let drawn = line(
-                        row,
-                        at == 0,
-                        root_project,
-                        in_workspace(row.node, &shell.projects),
-                        PANE,
-                        &shell.theme,
-                    );
+                for drawn in lines(&rows, 0, &shell.projects, PANE, &shell.theme) {
                     assert!(
                         drawn.width() <= PANE,
                         "{:?} is {} columns",
@@ -1306,20 +1388,9 @@ mod tests {
         }
 
         let graph = demo(ids::AGY_FIX_1).await;
-        let rows = rows(&graph, 2);
-        let drawn: Vec<String> = rows
+        let drawn: Vec<String> = lines(&rows(&graph, 2), 0, &shell.projects, PANE, &shell.theme)
             .iter()
-            .enumerate()
-            .map(|(at, row)| {
-                text(&line(
-                    row,
-                    at == 0,
-                    rows[0].node.project_id,
-                    in_workspace(row.node, &shell.projects),
-                    PANE,
-                    &shell.theme,
-                ))
-            })
+            .map(text)
             .collect();
         assert_eq!(
             drawn,
@@ -1338,20 +1409,9 @@ mod tests {
     async fn feat_1_draws_the_worked_rows() {
         let shell = Shell::platform().await;
         let graph = demo(ids::HTUI_FEAT_1).await;
-        let rows = rows(&graph, 2);
-        let drawn: Vec<String> = rows
+        let drawn: Vec<String> = lines(&rows(&graph, 2), 0, &shell.projects, PANE, &shell.theme)
             .iter()
-            .enumerate()
-            .map(|(at, row)| {
-                text(&line(
-                    row,
-                    at == 0,
-                    rows[0].node.project_id,
-                    true,
-                    PANE,
-                    &shell.theme,
-                ))
-            })
+            .map(text)
             .collect();
         assert_eq!(
             drawn,
@@ -1435,6 +1495,7 @@ mod tests {
                 false,
                 fix_1[0].node.project_id,
                 false,
+                false,
                 width,
                 &shell.theme,
             );
@@ -1454,6 +1515,7 @@ mod tests {
             false,
             feat_1[0].node.project_id,
             true,
+            false,
             18,
             &shell.theme,
         );
@@ -1520,6 +1582,120 @@ mod tests {
         assert_eq!(request.name(), LINKS);
     }
 
+    /// L4: widths are terminal cells, not chars, so a wide title, slug or key never pushes a
+    /// line past the pane.
+    #[tokio::test]
+    async fn a_wide_title_never_overflows_the_pane() {
+        let shell = Shell::platform().await;
+        let mut r = node(1, "R", 0);
+        r.title = "图形视图".repeat(8);
+        let mut x = node(2, "键-1", 1);
+        x.title = "宽字符标题".repeat(8);
+        x.project_id = ProjectId::from_uuid(Uuid::from_u128(101));
+        x.project_slug = "项目".to_owned();
+        let graph = LinkGraph {
+            root: r.item_id,
+            edges: vec![edge(&r, LinkKind::Relates, &x)],
+            nodes: vec![r, x],
+        };
+        let rows = rows(&graph, 3);
+        for width in 0..=PANE {
+            for drawn in lines(&rows, 0, &shell.projects, width, &shell.theme) {
+                assert!(
+                    cell_width(&text(&drawn)) <= width,
+                    "{:?} is {} cells at {width}",
+                    text(&drawn),
+                    cell_width(&text(&drawn))
+                );
+            }
+        }
+        let drawn: Vec<String> = lines(&rows, 0, &shell.projects, PANE, &shell.theme)
+            .iter()
+            .map(text)
+            .collect();
+        assert_eq!(
+            drawn,
+            [
+                "▸ R open 图形视图图形视图图形视图图形视图…",
+                "  → relates    项目:键-1 open 宽字符标题宽…",
+            ]
+        );
+    }
+
+    /// L7: no width, down to nothing, panics or draws a line wider than the pane.
+    #[tokio::test]
+    async fn every_width_up_to_the_pane_fits_and_draws() {
+        let shell = Shell::platform().await;
+        for root in [ids::HTUI_FEAT_1, ids::AGY_FIX_1, ids::HTUI_ANA_1] {
+            let graph = demo(root).await;
+            for depth in 1..=GraphTab::MAX_HOPS {
+                let rows = rows(&graph, depth);
+                for width in 0..=PANE {
+                    for drawn in lines(&rows, 1, &shell.projects, width, &shell.theme) {
+                        assert!(
+                            cell_width(&text(&drawn)) <= width,
+                            "{:?} at {width}",
+                            text(&drawn)
+                        );
+                    }
+                }
+            }
+            let mut tab = pane(graph);
+            tab.depth = GraphTab::MAX_HOPS;
+            tab.rebuild();
+            tab.cursor = 1;
+            for width in 0..=u16::try_from(PANE).expect("43 fits") {
+                for height in [0, 1, 2, 5] {
+                    for drawn in draw(&tab, &shell, width, height) {
+                        assert!(cell_width(&drawn) <= usize::from(width), "{drawn:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// L6: the kind column is padded for every row or for none, so it never goes ragged.
+    #[tokio::test]
+    async fn the_kind_column_is_padded_for_all_rows_or_none() {
+        let shell = Shell::platform().await;
+        let r = node(1, "R", 0);
+        let x = node(2, "X", 1);
+        let mut y = node(3, "Y", 1);
+        y.project_id = ProjectId::from_uuid(Uuid::from_u128(101));
+        y.project_slug = "long-project".to_owned();
+        let graph = LinkGraph {
+            root: r.item_id,
+            edges: vec![
+                edge(&r, LinkKind::Relates, &x),
+                edge(&r, LinkKind::Origin, &y),
+            ],
+            nodes: vec![r, x, y],
+        };
+        let rows = rows(&graph, 3);
+        let at = |width| -> Vec<String> {
+            lines(&rows, 0, &shell.projects, width, &shell.theme)
+                .iter()
+                .map(text)
+                .collect()
+        };
+        // `long-project:Y` fits 34 columns padded, so both rows are.
+        assert_eq!(
+            at(34)[1..],
+            [
+                "  → relates    X open X title",
+                "  → origin     long-project:Y open",
+            ]
+        );
+        // At 32 it fits only unpadded, so neither row is, though `X` alone would be.
+        assert_eq!(
+            at(32)[1..],
+            [
+                "  → relates X open X title",
+                "  → origin long-project:Y open",
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn an_out_of_workspace_node_is_dim() {
         let shell = Shell::platform().await;
@@ -1534,6 +1710,7 @@ mod tests {
             vulkan,
             false,
             rows[0].node.project_id,
+            false,
             false,
             PANE,
             &shell.theme,
