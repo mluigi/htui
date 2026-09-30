@@ -105,14 +105,14 @@ D2 (max 3 / default 2), D7 (status-line refusal vs graph-local re-root), D8 (the
 - Out of workspace: agy `FIX-1` → vulkan node → `Enter` → status line error, list cursor unchanged.
 - `m` from Body lands on Graph; `+`/`-` snapshots at depth 1 and 3.
 - Regenerate `detail_graph` / `empty_graph` and review the diffs by eye.
-- **Validate**: `cargo test -p htui --test backlog`, then `cargo insta pending-snapshots` is empty.
+- **Validate**: `cargo test -p htui --features testkit --test backlog`, then `cargo insta pending-snapshots` is empty.
 
 ## Validation (gates)
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace -- --test-threads=1   # scheduling-dependent suite, see memory
+cargo test --workspace --all-features -- --test-threads=1   # scheduling-dependent suite; `tests/backlog.rs` is `#![cfg(feature = "testkit")]`
 bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 ```
 
@@ -164,4 +164,5 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 | Demo has a triangle (FEAT-1/ANA-1/FEAT-3), a tombstoned edge (TOOL-1→FEAT-1), a cross-project edge inside Platform (agy FEAT-1 → htui FEAT-2) and one leaving it (agy FIX-1 → vulkan FEAT-1) | true | `htui-core/src/fixtures.rs:1130-1178`; Platform = htui + agy (`tests/backlog.rs:46`) |
 | Snapshots pinning today's Graph are `backlog__detail_graph` and `backlog__empty_graph` only | true | `tests/backlog.rs:164`, `:184`; `tests/snapshots/` listing |
 | `harness.key("+")` / `("-")` parse as plain chars | true | `KeyChord::parse`: a one-character spec is that character (`keymap.rs`) |
+| `tests/backlog.rs` only compiles with `--features testkit` (without it: 0 tests, silently green) | true | `tests/backlog.rs:6`; `crates/htui/Cargo.toml:25`; baseline 20 passed at `e38a5ab` |
 | Tasks are independent | **false — serial** | T2 uses T1's `GraphTab` API and T3 exercises both; all three touch `crates/htui` only. No fan-out. |
