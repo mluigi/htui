@@ -29,8 +29,10 @@ const LIST_PERCENT: u16 = 55;
 /// Width of the detail pane, as a percentage of the body region.
 const DETAIL_PERCENT: u16 = 45;
 
-/// How far the link traversal of the Graph sub-tab reaches (plan D11).
-const HOPS: u8 = 1;
+/// How far the link traversal behind the Graph sub-tab reaches: its deepest view (MOD-14 D2).
+/// Fetched once per selection and filtered by `+`/`-` locally, so a depth change costs no read and
+/// each of the seven reads stays one reply per selection (blueprint C.2).
+const HOPS: u8 = GraphTab::MAX_HOPS;
 
 /// `StoreRequest::Items`' name: what a refused list read is answered `Failed` under.
 const ITEMS_READ: &str = "items";
