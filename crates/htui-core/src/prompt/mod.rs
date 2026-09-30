@@ -977,9 +977,10 @@ pub fn drop_unmaskable_excerpts(set: &mut ExcerptSet, scrubber: &dyn Scrubber) {
     set.files = kept;
 }
 
-/// MOD-9 D116: withholds from `glob` matching every file whose repo slug or path the scrubber
-/// refuses (`refused_rule`), so a refused path can never be the recorded match (the record is
-/// scrubbed fail-closed, `TrimRecord::to_value`). Count only — the note names no repo and no
+/// MOD-9 D116: withholds from `glob` matching every file whose repo slug, path or joined
+/// `repo:path` the scrubber refuses (`refused_rule`), so a refused path can never be the recorded
+/// match — `assemble` masks it joined (D117), and the record is scrubbed fail-closed
+/// (`TrimRecord::to_value`). Count only — the note names no repo and no
 /// path, stricter than `drop_unmaskable_excerpts`. `None` when nothing was withheld.
 #[must_use]
 pub fn drop_unmaskable_files(files: &mut StepFiles, scrubber: &dyn Scrubber) -> Option<String> {
@@ -994,7 +995,11 @@ pub fn drop_unmaskable_files(files: &mut StepFiles, scrubber: &dyn Scrubber) -> 
             slugs.insert(repo.to_owned(), refused);
             refused
         };
-        let refused = repo_refused || refused_rule(scrubber, path).is_some();
+        // MOD-9 D117: `assemble` masks the recorded match as the joined `repo:path`, and a secret
+        // can span the `:`, so the join is checked as well as its halves.
+        let refused = repo_refused
+            || refused_rule(scrubber, path).is_some()
+            || refused_rule(scrubber, &format!("{repo}:{path}")).is_some();
         withheld += usize::from(refused);
         !refused
     });
@@ -1253,6 +1258,39 @@ mod tests {
             "nothing left to withhold"
         );
         assert_eq!(files, kept);
+    }
+
+    /// MOD-9 D116, D117 (review finding 2): `assemble` masks the joined `repo:path`, so a path
+    /// whose repo and path each scrub clean but whose join the scrubber refuses is withheld too.
+    /// A secret `i:X` spans the separator: `htui:Xsk-1.rs` masks to `htu[REDACTED]sk-1.rs`, where
+    /// `sk-` now starts a token.
+    #[test]
+    fn drop_unmaskable_files_withholds_a_path_whose_join_the_scrubber_refuses() {
+        let scrubber = crate::scrub::MinimalScrubber::new(["i:X".to_owned()]);
+        assert_eq!(refused_rule(&scrubber, "htui"), None);
+        assert_eq!(refused_rule(&scrubber, "Xsk-1.rs"), None);
+        assert!(
+            refused_rule(&scrubber, "htui:Xsk-1.rs").is_some(),
+            "the joined form trips a prefix rule once masked"
+        );
+        let mut files = StepFiles::default();
+        files.insert("htui", "Xsk-1.rs");
+        files.insert("htui", "src/a.rs");
+
+        assert_eq!(
+            drop_unmaskable_files(&mut files, &scrubber).as_deref(),
+            Some("skills: 1 path(s) withheld from glob matching; the scrubber refused them")
+        );
+        let mut kept = StepFiles::default();
+        kept.insert("htui", "src/a.rs");
+        assert_eq!(files, kept);
+
+        // What `assemble` would have done with it as the recorded match.
+        let mut matched = "htui:Xsk-1.rs".to_owned();
+        assert!(
+            mask(&scrubber, &mut matched, "skills").is_err(),
+            "`assemble` refuses the joined path"
+        );
     }
 
     /// MOD-9 D116 (review finding 1): a repo slug is scrubbed once, however many paths it holds.
