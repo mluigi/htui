@@ -725,7 +725,15 @@ impl AgentsSection {
                 *paste = Some(TextField::masked_with_capacity(PASTE_MAX));
                 return;
             }
-            _ => NO_LOOPBACK_REDIRECT,
+            // Named rather than wildcarded (review L-7), so a new state has to say what `p` does
+            // in it. `Idle` and `Choosing` do not reach here (`p` is bound only in flight, and the
+            // chooser answers every key first); they are answered rather than assumed.
+            AuthState::Running {
+                advertised: None, ..
+            }
+            | AuthState::Starting { .. }
+            | AuthState::Choosing { .. }
+            | AuthState::Idle => NO_LOOPBACK_REDIRECT,
         };
         ctx.emit(Action::Error(refusal.to_owned()));
     }
