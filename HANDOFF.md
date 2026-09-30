@@ -678,6 +678,10 @@ MOD-14 can start now (MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is d
   **MOD-34 left the concepts-index sync here** (`docs/decisions/mod/mod-34.md`, `R-STO-8`):
   run `htui_store::vector_sync::Indexer::sync` as a background job; until then it is
   `htui --index-items`.
+  **Phase 1 landed (`ae6065e`..`4649df4`, 2026-09-30):** milestone 1 of
+  `.claude/prds/mod-41-headless-worker.prd.md` (plan `.claude/plans/mod-41-headless-worker.plan.md`,
+  confirmed 2026-09-30): `set_step_prompt`, `upsert_step_tree` and `record_commits` take a
+  `StepFence` on both stores, and the lease heartbeat fences on tokio's monotonic clock.
 - [ ] **MOD-42 - Permission and control relay through Postgres** (from ANA-16, §8 item 3).
   `R-AGT-1`, `R-HIS-1`, `R-TUI-6`. The engine's `pump` (`record.rs:1684-1703`) cannot answer a
   parked ACP request, so engine-driven ACP steps fail on their first permission request today. The
