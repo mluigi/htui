@@ -211,8 +211,13 @@ pub enum DsnSourceError {
     },
 }
 
-/// One DSN line, trimmed, in a wiped buffer; `None` for a blank line or end of input. `htui
-/// --set-dsn` and `htui worker --dsn-stdin` share it.
+/// One DSN line, trimmed, in a buffer wiped when dropped; `None` for a blank line or end of
+/// input. `htui --set-dsn` and `htui worker --dsn-stdin` share it.
+///
+/// The read buffer starts at 4 KiB, so a line shorter than that is never reallocated, which would
+/// leave an unwiped copy behind (MOD-41 review R-5). This covers the copy htui reads, wiped once
+/// the connection is open; the Postgres driver keeps the password in memory for the life of the
+/// process so it can reconnect.
 ///
 /// # Errors
 ///
@@ -220,7 +225,7 @@ pub enum DsnSourceError {
 pub fn read_dsn_line(
     reader: &mut dyn std::io::BufRead,
 ) -> std::io::Result<Option<Zeroizing<String>>> {
-    let mut line = Zeroizing::new(String::new());
+    let mut line = Zeroizing::new(String::with_capacity(4096));
     reader.read_line(&mut line)?;
     let dsn = line.trim();
     Ok((!dsn.is_empty()).then(|| Zeroizing::new(dsn.to_owned())))
