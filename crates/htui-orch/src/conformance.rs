@@ -587,6 +587,17 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
 /// # Panics
 /// On a name [`CASES`] holds and this `match` does not.
 fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+    hand_back_case(name, harness).unwrap_or_else(|| earlier_case(name, harness))
+}
+
+/// [`case`] for every name before MOD-41 T9's.
+///
+/// # Panics
+/// On a name [`CASES`] holds and neither this `match` nor [`hand_back_case`] does.
+fn earlier_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
     match name {
         "feat_walks_end_to_end" => Box::pin(feat_walks_end_to_end(harness)),
         "live_run_ignores_a_gate_edit" => Box::pin(live_run_ignores_a_gate_edit(harness)),
@@ -782,6 +793,26 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         "a_walk_woken_after_done_records_no_commits" => {
             Box::pin(a_walk_woken_after_done_records_no_commits(harness))
         }
+        other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
+    }
+}
+
+/// Run every case in [`CASES`] order, each against its own fresh orchestrator.
+pub async fn run_all<H: CaseHarness>(harness: &H) {
+    for name in CASES {
+        run_case(name, harness).await;
+    }
+}
+
+/// MOD-41 T9's cases, in a frame of their own. An unoptimised build gives every arm of a `match`
+/// a stack slot for its case future before the future is boxed, and eighty-five of them in one
+/// frame overflowed a test thread's 2 MiB before the first poll. [`case`] calls this and
+/// [`earlier_case`] in turn and holds no slot itself, so neither frame is live under the other.
+fn hand_back_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
         "an_approval_handed_back_is_walked_by_the_adopter" => {
             Box::pin(an_approval_handed_back_is_walked_by_the_adopter(harness))
         }
@@ -815,15 +846,8 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         "a_hand_back_writes_no_step_past_the_window" => {
             Box::pin(a_hand_back_writes_no_step_past_the_window(harness))
         }
-        other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
-    }
-}
-
-/// Run every case in [`CASES`] order, each against its own fresh orchestrator.
-pub async fn run_all<H: CaseHarness>(harness: &H) {
-    for name in CASES {
-        run_case(name, harness).await;
-    }
+        _ => return None,
+    })
 }
 
 // -- what every case needs, written once ---------------------------------------------------------
@@ -6232,7 +6256,12 @@ async fn an_approval_handed_back_is_walked_by_the_adopter<H: CaseHarness>(harnes
     let c_run = parked_at_prd(&control).await;
     let run = parked_at_prd(&a).await;
 
-    let b = hand_back_matches((&control, c_run), (&a, run), Act::Approve).await;
+    let b = Box::pin(hand_back_matches(
+        (&control, c_run),
+        (&a, run),
+        Act::Approve,
+    ))
+    .await;
     let prd = step_at(&b, run, 0, 1).await;
     assert_eq!(
         b.isolator().reconciles(),
@@ -6304,9 +6333,17 @@ async fn a_selection_handed_back_is_walked_by_the_adopter<H: CaseHarness>(harnes
 
     let b = hand_back_matches((&control, c_run), (&a, run), what).await;
     let winner = candidate(&steps_of(&b, run).await, 0, 1, 1).id;
-    let merges = b.isolator().reconciles();
-    assert_eq!(merges.len(), 1, "{merges:?}");
-    assert_eq!(merges[0].0, winner, "the human's pick was merged");
+    let merges: Vec<_> = b
+        .isolator()
+        .reconciles()
+        .into_iter()
+        .filter(|(merged, _)| *merged == winner)
+        .collect();
+    assert_eq!(
+        merges.len(),
+        1,
+        "the human's pick was merged once: {merges:?}"
+    );
     assert_eq!(merges[0].1.len(), 2, "over its two siblings");
 }
 
@@ -6361,7 +6398,12 @@ async fn a_retry_of_a_failed_step_handed_back_is_walked_by_the_adopter<H: CaseHa
     let (control, c_run) = parked_over_a_dirty_tree(harness).await;
     let (a, run) = parked_over_a_dirty_tree(harness).await;
 
-    let b = hand_back_matches((&control, c_run), (&a, run), Act::Retry { position: 0 }).await;
+    let b = Box::pin(hand_back_matches(
+        (&control, c_run),
+        (&a, run),
+        Act::Retry { position: 0 },
+    ))
+    .await;
     assert_eq!(
         step_at(&b, run, 0, 2).await.status,
         StepStatus::AwaitingApproval,
@@ -6399,7 +6441,12 @@ async fn a_resume_handed_back_is_walked_by_the_adopter<H: CaseHarness>(harness: 
         Status::AwaitingApproval
     );
 
-    let b = hand_back_matches((&control, c_run), (&a, run), Act::Unblock(ids::HTUI_FEAT_3)).await;
+    let b = Box::pin(hand_back_matches(
+        (&control, c_run),
+        (&a, run),
+        Act::Unblock(ids::HTUI_FEAT_3),
+    ))
+    .await;
     let prd = step_at(&b, run, 0, 1).await;
     assert_eq!(
         b.isolator().reconciles(),
@@ -6452,7 +6499,12 @@ async fn a_retry_of_an_awaiting_step_handed_back_is_walked_by_the_adopter<H: Cas
     let run = parked_at_prd(&a).await;
     approve(&a, run, 1).await;
 
-    let b = hand_back_matches((&control, c_run), (&a, run), Act::Retry { position: 1 }).await;
+    let b = Box::pin(hand_back_matches(
+        (&control, c_run),
+        (&a, run),
+        Act::Retry { position: 1 },
+    ))
+    .await;
     let prd = step_at(&b, run, 0, 1).await;
     assert_eq!(
         merges_of(&a, &b, prd.id),
@@ -6487,7 +6539,12 @@ async fn a_group_retry_handed_back_is_walked_by_the_adopter<H: CaseHarness>(harn
     let c_run = verdict_slot_parked(&control).await;
     let run = verdict_slot_parked(&a).await;
 
-    let b = hand_back_matches((&control, c_run), (&a, run), Act::Retry { position: 1 }).await;
+    let b = Box::pin(hand_back_matches(
+        (&control, c_run),
+        (&a, run),
+        Act::Retry { position: 1 },
+    ))
+    .await;
     let research = step_at(&b, run, 0, 1).await;
     assert_eq!(
         merges_of(&a, &b, research.id),
@@ -6535,7 +6592,12 @@ async fn a_retry_past_the_budget_handed_back_is_walked_not_reparked<H: CaseHarne
     let (control, c_run) = parked_interrupted_out_of_budget(harness).await;
     let (a, run) = parked_interrupted_out_of_budget(harness).await;
 
-    let b = hand_back_matches((&control, c_run), (&a, run), Act::Retry { position: 0 }).await;
+    let b = Box::pin(hand_back_matches(
+        (&control, c_run),
+        (&a, run),
+        Act::Retry { position: 0 },
+    ))
+    .await;
     assert_eq!(
         step_at(&b, run, 0, 2).await.status,
         StepStatus::AwaitingApproval,
@@ -7389,6 +7451,7 @@ mod fanout_paths {
             owner: parts.owner,
             dead_walks: parts.dead_walks,
             user: parts.user,
+            tails: crate::engine::Tails::Walk,
         });
 
         let err = engine

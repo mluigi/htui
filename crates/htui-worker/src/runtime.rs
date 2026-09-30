@@ -666,6 +666,7 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             owner: self.owner,
             dead_walks: &self.dead_walks,
             user: self.user,
+            tails: Tails::Walk,
         })
     }
 }

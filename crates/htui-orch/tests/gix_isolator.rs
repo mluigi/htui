@@ -105,6 +105,7 @@ macro_rules! engine_as {
             owner: $owner,
             dead_walks: &dead_walks,
             user: fix.orch.user(),
+            tails: htui_orch::Tails::Walk,
         });
         $body
     }};

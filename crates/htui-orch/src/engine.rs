@@ -431,6 +431,8 @@ where
     pub dead_walks: &'a DeadWalks,
     /// `run.started_by` and `item_note.created_by`.
     pub user: UserId,
+    /// Plan D12 (MOD-41): walk command tails, or hand them back to the box's worker.
+    pub tails: Tails,
 }
 
 /// `Debug` is hand written for one field: a driver factory is a `dyn Fn` and `dyn Fn` is not
@@ -456,6 +458,7 @@ where
             .field("box_id", &self.box_id)
             .field("owner", &self.owner)
             .field("user", &self.user)
+            .field("tails", &self.tails)
             .finish_non_exhaustive()
     }
 }
@@ -850,6 +853,11 @@ where
             Ok(())
         })
         .await?;
+        // MOD-41 plan D12: on a `worker` box the TUI hands the tail back. The adopter finishes an
+        // approval by the frontier reconcile (plan D97) and a rejection by D131's `settle_failed`.
+        if self.parts.tails == Tails::HandBack {
+            return self.hand_back(run.id).await;
+        }
 
         // Blueprint F-M: everything after the unpark writes to a `running` run, so all of it —
         // the review loop or the reconcile, not only `run_to_rest` — runs under the heartbeat.
@@ -1026,6 +1034,26 @@ where
             Ok(())
         })
         .await?;
+        // MOD-41 plan D12: the hand-back admits the next attempt in a window of its own, so the
+        // adopter walks a `pending` row rather than reading D131's unfinished failure or
+        // reconciling the previous winner again. Blueprint F-34: that window runs without the
+        // heartbeat; `admit` is bounded (stage-1 reads and `create_step`s), and any error of it
+        // gives the lease back (plan D149).
+        if self.parts.tails == Tails::HandBack {
+            let admitted = self
+                .leased_window(run.id, async {
+                    let run = self.run(run.id).await?;
+                    let steps = self.parts.store.run_steps(run.id).await?;
+                    let attempt = next_attempt(&steps, row.position);
+                    self.admit(&run, snapshot, phase, attempt).await
+                })
+                .await?;
+            let handed = self.hand_back(run.id).await?;
+            return Ok(CommandOutcome::Retried {
+                step: row.id,
+                rest: admitted.unwrap_or(handed),
+            });
+        }
 
         // Admitted rather than created outright, so the next attempt passes through the capability
         // interlock like any other — a phase whose only candidate lost its inline-approval
@@ -1065,6 +1093,20 @@ where
             Ok(())
         })
         .await?;
+        // MOD-41 plan D12: as `retry_guarded`'s hand-back, the whole next group admitted.
+        if self.parts.tails == Tails::HandBack {
+            let admitted = self
+                .leased_window(run.id, async {
+                    let run = self.run(run.id).await?;
+                    self.admit(&run, snapshot, phase, attempt + 1).await
+                })
+                .await?;
+            let handed = self.hand_back(run.id).await?;
+            return Ok(CommandOutcome::Retried {
+                step: row.id,
+                rest: admitted.unwrap_or(handed),
+            });
+        }
 
         let tail = async {
             let run = self.run(run.id).await?;
@@ -1130,6 +1172,13 @@ where
             Ok(())
         })
         .await?;
+        // MOD-41 plan D12: the adopter's frontier reconcile merges the same siblings
+        // (`group_at(&steps, position, attempt)` minus the winner).
+        if self.parts.tails == Tails::HandBack {
+            return Ok(CommandOutcome::Selected {
+                rest: self.hand_back(run.id).await?,
+            });
+        }
 
         let tail = async {
             let run = self.run(run.id).await?;
@@ -1546,8 +1595,11 @@ where
             UnblockCase::Resume(run) => {
                 self.note(item, format!("unblocked: resuming run {run}"), None, now)
                     .await?;
-                Some(match self.resume(run).await? {
-                    Resume::Walked(rest) | Resume::TopologyChanged { rest, .. } => rest,
+                Some(match self.parts.tails {
+                    Tails::Walk => match self.resume(run).await? {
+                        Resume::Walked(rest) | Resume::TopologyChanged { rest, .. } => rest,
+                    },
+                    Tails::HandBack => self.hand_back_resume(run).await?,
                 })
             }
         };
@@ -1610,7 +1662,9 @@ where
     /// walk of the run before it cancels (MOD-4 plan D157).
     ///
     /// Since MOD-4 plan D179 (R-28) a `running` or parked run's lease is taken first, as every
-    /// other command's is, and given back once the run is cancelled and cleaned up.
+    /// other command's is, and given back once the run is cancelled and cleaned up. Since MOD-41
+    /// OQ-4 a `queued` run's cancel is a compare-and-set on `queued` (another process's worker may
+    /// claim it at any time), which falls back to the leased path when the claim won.
     ///
     /// # Errors
     /// [`EngineError::RunStatus`] for a run that has already finished; [`EngineError::LeaseHeld`]
@@ -1631,27 +1685,32 @@ where
         self.cancel_leased(&row).await
     }
 
-    /// OQ-4, B-6: a `queued` run's cancel. A `queued` run was never claimed and has no lease to
-    /// take. `None` when the run left `queued` first.
+    /// OQ-4, B-6: `queued → cancelled` as a compare-and-set, then the item `queued → open` that
+    /// `finish_run` would have mirrored, then plan D36's cleanup. `None` when the run left
+    /// `queued` first: another process claimed it, and nothing is written. A `queued` run was
+    /// never claimed, so it has no step and no lease to take.
+    ///
+    /// E-2 (accepted): the run's move and the item's are two statements, so a crash between them
+    /// leaves the item `queued` beside a cancelled run.
     async fn cancel_queued(&self, row: &Run) -> Result<Option<CommandOutcome>, EngineError> {
-        let run = row.id;
         let position = self.resting(row).await?.position;
         let now = self.now();
-        let steps = self.parts.store.run_steps(run).await?;
-        for step in &steps {
-            if step.status.is_terminal() {
-                continue;
-            }
+        if !self
+            .parts
+            .store
+            .transition_run(row.id, RunStatus::Queued, RunStatus::Cancelled, now)
+            .await?
+        {
+            return Ok(None);
+        }
+        if let Some(item) = row.item_id {
+            // `Ok(false)`: the item was moved by another writer; the run is cancelled either way.
             self.parts
                 .store
-                .transition_step(step.id, step.status, StepStatus::Cancelled, now)
+                .transition(item, Status::Queued, Status::Open)
                 .await?;
         }
-        self.parts
-            .store
-            .finish_run(run, RunStatus::Cancelled, None, now)
-            .await?;
-        self.cleanup_run(run).await?;
+        self.cleanup_run(row.id).await?;
         Ok(Some(CommandOutcome::Cancelled {
             rest: Rest {
                 run: RunStatus::Cancelled,
@@ -1938,6 +1997,40 @@ where
             tracing::warn!(%run, %err, "releasing an abandoned walk's guards failed");
         }
         self.release_lease(run).await;
+    }
+
+    /// MOD-41 plan D12: the command's window is written; the lease goes back, and the answer is
+    /// the run's rest as read now (the box's worker adopts it at its next poll). A release that
+    /// fails puts the run in [`DeadWalks`], and the worker adopts it once the lease lapses.
+    async fn hand_back(&self, run: RunId) -> Result<Rest, EngineError> {
+        self.release_lease(run).await;
+        self.resting(&self.run(run).await?).await
+    }
+
+    /// MOD-41 plan D12's `u` on a worker box: the lease, then only `walk_resumed_from`'s unpark
+    /// (MOD-4 plan D180's compare-and-set), then the lease back. The adopter's `resume` runs
+    /// `resume_window` once; running it here too would resolve the live graph twice (plan D12).
+    async fn hand_back_resume(&self, run: RunId) -> Result<Rest, EngineError> {
+        self.take_lease(run).await?;
+        self.leased_window(run, async {
+            let row = self.run(run).await?;
+            if row.status == RunStatus::AwaitingApproval {
+                let snapshot = Self::snapshot_of(&row)?;
+                let steps = self.parts.store.run_steps(run).await?;
+                if resumable_park(&cursor(&snapshot, &steps))
+                    && !self.unpark(&row, self.now()).await?
+                {
+                    return Err(stale_run(
+                        run,
+                        RunStatus::AwaitingApproval,
+                        RunStatus::Running,
+                    ));
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        self.hand_back(run).await
     }
 
     /// Plan D87/D139: the store's `release_lease(run, owner)`. The lease reads as expired at once,
@@ -6203,6 +6296,7 @@ pub(crate) async fn fake_parts<'a>(
         owner: orch.owner(),
         dead_walks: &orch.dead_walks,
         user: orch.user(),
+        tails: orch.tails(),
     })
 }
 
@@ -6544,6 +6638,7 @@ mod tests {
             owner: orch.owner(),
             dead_walks: &orch.dead_walks,
             user: orch.user(),
+            tails: super::Tails::Walk,
         });
 
         let CommandOutcome::Started { run, .. } = engine
@@ -6631,6 +6726,7 @@ mod tests {
             owner: orch.owner(),
             dead_walks: &orch.dead_walks,
             user: orch.user(),
+            tails: super::Tails::Walk,
         });
 
         let CommandOutcome::Started { run, rest } = engine
@@ -9317,6 +9413,7 @@ mod tests {
             owner: parts.owner,
             dead_walks: parts.dead_walks,
             user: parts.user,
+            tails: super::Tails::Walk,
         });
 
         let refused = engine
@@ -11696,6 +11793,7 @@ mod tests {
             owner: parts.owner,
             dead_walks: parts.dead_walks,
             user: parts.user,
+            tails: super::Tails::Walk,
         });
 
         let refused = engine
@@ -12605,6 +12703,7 @@ mod tests {
             owner: parts.owner,
             dead_walks: parts.dead_walks,
             user: parts.user,
+            tails: super::Tails::Walk,
         });
 
         assert_send(&engine.dispatch(Command::CancelRun { run: ids::RUN_2 }));
