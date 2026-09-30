@@ -1,6 +1,6 @@
 # Plan: MOD-59 - A write's reply names itself, so a form never stays "in flight"
 
-**Status: DRAFT, awaiting maintainer CONFIRM.**
+**Status: CONFIRMED by the maintainer 2026-09-30.**
 
 **Source**: `HANDOFF.md:268-279` (MOD-59, from MOD-9 milestone 3 review, finding 3; found
 2026-09-26; MOD-39 addendum). Requirements `R-TUI-7`, `R-NF-3`.
