@@ -47,19 +47,43 @@ impl std::error::Error for WorkerExit {}
 /// `htui worker`: logging, the signal handlers, the DSN, the headless connect, then the loop
 /// until SIGINT or SIGTERM (plan D14). Everything before the loop is a startup refusal.
 ///
+/// A refusal is logged too, at `warn` (MOD-41 E-1): `main` prints it on stderr, and an `error`
+/// line would become a GlitchTip report, which a refusal must not.
+///
 /// # Errors
 ///
 /// [`WorkerExit`]; a clean signal shutdown is `Ok`.
 pub async fn run(args: WorkerArgs, log: Option<&Path>) -> Result<(), WorkerExit> {
     init_worker_tracing(log).map_err(|err| WorkerExit::Refused(format!("{err:#}")))?;
+    let ended = serve(args).await;
+    if let Err(WorkerExit::Refused(sentence)) = &ended {
+        tracing::warn!("{sentence}");
+    }
+    ended
+}
+
+/// [`run`] once logging is up. The signal handlers go in first, and the startup (the DSN read,
+/// the keyring, the connect) races them: installing a handler replaces the default termination,
+/// so a signal the startup did not watch would be swallowed until the loop began. A signal during
+/// the startup is a clean exit 0, with nothing written after it.
+async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
     let shutdown = shutdown_signal().map_err(|err| {
         WorkerExit::Refused(format!("the signal handlers could not be installed: {err}"))
     })?;
+    let mut shutdown = std::pin::pin!(shutdown);
     // Before any setting is read (PRD D7): the pool is the flag's, clamped.
     let pool = PoolSize::clamped(args.pool_size);
-    let dsn = read_dsn(args.dsn_stdin)?;
+    let dsn = tokio::select! {
+        biased;
+        () = &mut shutdown => return stopped_before_ready(),
+        dsn = read_dsn_apart(args.dsn_stdin) => dsn?,
+    };
     let root = identity::config_root().map_err(|err| WorkerExit::Refused(err.to_string()))?;
-    let pg = connect(&dsn, &root, pool).await?;
+    let pg = tokio::select! {
+        biased;
+        () = &mut shutdown => return stopped_before_ready(),
+        pg = connect(&dsn, &root, pool) => pg?,
+    };
     // Wiped here: nothing after the connect needs it.
     drop(dsn);
     let runtime = RunRuntime::<PgStore, Unaddressed>::production().with_role(Role::Worker);
@@ -67,6 +91,32 @@ pub async fn run(args: WorkerArgs, log: Option<&Path>) -> Result<(), WorkerExit>
     htui_worker::worker::run(pg, runtime, WorkerConfig::PRODUCTION, shutdown).await;
     tracing::info!("htui worker stopped");
     Ok(())
+}
+
+/// A signal won the race against the startup: a clean exit.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the startup's `return`, beside its `?`"
+)]
+fn stopped_before_ready() -> Result<(), WorkerExit> {
+    tracing::info!("htui worker stopped before it was ready");
+    Ok(())
+}
+
+/// [`read_dsn`] on a thread of its own, so the startup can race it against a signal. Not
+/// `spawn_blocking`: the runtime waits for its blocking tasks when it is dropped, and a read of a
+/// stdin nobody closes never ends. The thread is left behind on a signal and dies with the process.
+async fn read_dsn_apart(dsn_stdin: bool) -> Result<Zeroizing<String>, WorkerExit> {
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("htui-worker-dsn".to_owned())
+        .spawn(move || drop(answer.send(read_dsn(dsn_stdin))))
+        .map_err(|err| WorkerExit::Refused(format!("the DSN could not be read: {err}")))?;
+    answered.await.unwrap_or_else(|_| {
+        Err(WorkerExit::Refused(
+            "the DSN could not be read: its reader stopped".to_owned(),
+        ))
+    })
 }
 
 /// PRD D3's sources, in order. The prompt goes to stderr, and only when stdin is a terminal.
@@ -136,8 +186,8 @@ fn init_worker_tracing(log: Option<&Path>) -> anyhow::Result<()> {
 }
 
 /// SIGINT or SIGTERM on unix; Ctrl-C, Ctrl-Break, Ctrl-Close and Ctrl-Shutdown on Windows
-/// (uncompiled here, R-8). Installed before connecting, so a refusal to install is a startup
-/// refusal, and a signal that arrives during the connect is not lost.
+/// (uncompiled here, R-8). Installed before the DSN read, so a refusal to install is a startup
+/// refusal, and `serve` races the startup against it.
 fn shutdown_signal() -> std::io::Result<impl Future<Output = ()> + Send + 'static> {
     #[cfg(unix)]
     {
