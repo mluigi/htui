@@ -1,6 +1,6 @@
 # Plan: MOD-14 - Graph tab
 
-**Status: CONFIRMED by the maintainer 2026-09-30 with the defaults (D2 max 3 / default 2, D7 status-line refusal, D8 `m`).**
+**Status: CONFIRMED by the maintainer 2026-09-30 with the defaults (D2 max 3 / default 2, D7 status-line refusal, D8 `m`); implemented and closed out 2026-09-30 (`docs/decisions/mod/mod-14.md`).**
 
 **Source**: `HANDOFF.md:408-411` (MOD-14, from MOD-1). Requirements `R-TUI-5` ("Graph tab: the item
 and everything connected, one to N hops, across projects, with status and link kind, navigable"),

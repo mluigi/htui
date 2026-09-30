@@ -1,5 +1,7 @@
 # MOD-14 blueprint: Graph sub-tab traversal
 
+> **Superseded detail (review, 2026-09-30):** widths are measured in terminal cells (`ui::cells::cell_width`) with a grapheme clip, not `chars().count()` / `list::clip` as written below; the label yields title → kind padding → slug → status, the key last. See `docs/decisions/mod/mod-14.md` § Review.
+
 Plan: `.claude/plans/mod-14-graph-tab.plan.md` (CONFIRMED, D1-D8 with defaults; gate fix `2c1a783`).
 Base `2c1a783` on `hr/MOD-14`. The plan's decisions stand as written. Where the code contradicts the
 plan's prose, the difference is listed under **Plan deviations** (§6) and resolved there without
