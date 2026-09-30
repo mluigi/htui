@@ -26,7 +26,10 @@
 //! - **Never on a frame that outlives the request.** It crosses the store worker once, inside
 //!   `StoreRequest::AuthDeliver`, is moved into the running flow's task, and is dropped when the
 //!   one `GET` resolves. What comes back, [`ListenerReply`], holds a status, a reason, a host and
-//!   an excerpt with the pasted `code` and `state` blanked.
+//!   an excerpt with the pasted `code` and `state` blanked — as pasted, decoded, percent-encoded
+//!   in either case, as HTML character references, and as the trailing prefix an answer cut at
+//!   [`RESPONSE_CAP`] ends on — and with every control and Unicode format character (the bidi
+//!   overrides among them) stripped.
 //! - **Never echoed.** The pane's field is masked, is emptied on submit, on cancel and when the
 //!   flow ends, and nothing it draws afterwards names more than `127.0.0.1:<port>`.
 //! - **Sent to one place.** The loopback port the running flow advertised, over a plain socket no
@@ -753,7 +756,8 @@ fn classify(
     let Some((status, reason)) = status_line(&bytes[..line_end]) else {
         return Err(DeliverError::NotHttp { target });
     };
-    Ok(reply(target, status, reason, bytes, secrets))
+    let truncated = matches!(answer.ended, Ended::Cap);
+    Ok(reply(target, status, reason, bytes, secrets, truncated))
 }
 
 /// What every HTTP/1 status line starts with.
@@ -913,13 +917,15 @@ fn dechunk(mut body: &[u8]) -> (Zeroizing<Vec<u8>>, bool) {
     }
 }
 
-/// D268, D289: what the listener said, blanked of every secret.
+/// D268, D289: what the listener said, blanked of every secret. `truncated`: the read stopped at
+/// [`RESPONSE_CAP`], so the body may end part-way through an echo (review L-5).
 fn reply(
     target: String,
     status: u16,
     reason: String,
     answer: &[u8],
     secrets: &[Zeroizing<String>],
+    truncated: bool,
 ) -> ListenerReply {
     let reason = Zeroizing::new(reason);
     let (head, body): (&[u8], Zeroizing<Vec<u8>>) = match split_head(answer) {
@@ -930,18 +936,19 @@ fn reply(
     let body = blank(
         Zeroizing::new(String::from_utf8_lossy(&body).into_owned()),
         secrets,
+        truncated,
     );
 
     let location_host = if (300..=399).contains(&status) {
         header(head, "location")
-            .map(|location| blank(Zeroizing::new(location), secrets))
+            .map(|location| blank(Zeroizing::new(location), secrets, false))
             .and_then(|location| Url::parse(&location).ok())
             .and_then(|location| location.host_str().map(str::to_owned))
-            .map(|host| cut(&blank(Zeroizing::new(host), secrets), EXCERPT_WIDTH))
+            .map(|host| cut(&blank(Zeroizing::new(host), secrets, false), EXCERPT_WIDTH))
     } else {
         None
     };
-    let reason = cut(&tidy(&blank(reason, secrets), secrets), 40);
+    let reason = cut(&tidy(&blank(reason, secrets, false), secrets), 40);
     let said = excerpt(&body)
         .map(|said| cut(&tidy(&said, secrets), EXCERPT_WIDTH))
         .filter(|said| !said.is_empty());
@@ -987,18 +994,128 @@ fn strip_tags(text: &str) -> String {
     out
 }
 
-/// D268 (1)/(4): every secret replaced by `…`.
-fn blank(mut text: Zeroizing<String>, secrets: &[Zeroizing<String>]) -> Zeroizing<String> {
+/// D268 (1)/(4), review L-5: every secret replaced by `…`, however the listener spells it — as
+/// pasted, percent-encoded with either case of hex (whole or in part), with `+` for a space, or
+/// as HTML character references (`&#67;`, `&#x43;`, `&amp;` and the other four XML names).
+///
+/// With `truncated` — an answer the read cut at [`RESPONSE_CAP`] — a text that **ends** part-way
+/// through a spelling of a secret, even inside an escape, has that trailing prefix blanked too.
+fn blank(
+    mut text: Zeroizing<String>,
+    secrets: &[Zeroizing<String>],
+    truncated: bool,
+) -> Zeroizing<String> {
     for secret in secrets {
-        if text.contains(secret.as_str()) {
-            text = Zeroizing::new(text.replace(secret.as_str(), "…"));
-        }
+        text = blank_one(&text, secret.as_bytes(), truncated);
     }
     text
 }
 
-/// D268 (3)/(4): control characters dropped, whitespace runs collapsed to one space, trimmed,
-/// and the secrets blanked again.
+/// [`blank`] for one secret, into a buffer sized so it never reallocates: a one-byte secret
+/// spelled as itself is the worst case, three bytes of `…` for each byte of text.
+fn blank_one(text: &str, secret: &[u8], truncated: bool) -> Zeroizing<String> {
+    let bytes = text.as_bytes();
+    let mut out = Zeroizing::new(String::with_capacity(text.len().saturating_mul(3)));
+    let mut copied = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        match spelled_at(bytes, at, secret, truncated) {
+            Some(end) if text.is_char_boundary(at) && text.is_char_boundary(end) => {
+                out.push_str(&text[copied..at]);
+                out.push('…');
+                copied = end;
+                at = end;
+            }
+            _ => at += 1,
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Where a spelling of `secret` that starts at `at` ends. With `to_the_end`, also the end of the
+/// text when it runs out — or stops inside an escape — after at least one byte of the secret.
+///
+/// Each step tries the escaped spellings of the secret's next byte before the byte itself, so a
+/// `%` in a secret still matches a literal `%` when what follows is not its escape.
+fn spelled_at(text: &[u8], at: usize, secret: &[u8], to_the_end: bool) -> Option<usize> {
+    let mut j = at;
+    let mut k = 0;
+    while k < secret.len() {
+        if j == text.len() || (to_the_end && is_cut_escape(&text[j..])) {
+            return (to_the_end && k > 0).then_some(text.len());
+        }
+        let (read, matched) = step(&text[j..], &secret[k..])?;
+        j += read;
+        k += matched;
+    }
+    Some(j)
+}
+
+/// One spelling of the start of `secret` at the start of `text`: how many bytes of each it
+/// covers, or `None` when `text` does not start with any spelling of it.
+fn step(text: &[u8], secret: &[u8]) -> Option<(usize, usize)> {
+    let hex = |at: usize| text.get(at).and_then(|b| char::from(*b).to_digit(16));
+    match text.first()? {
+        b'%' => {
+            if let (Some(high), Some(low)) = (hex(1), hex(2))
+                // Two hex digits are at most 255.
+                && secret.first() == Some(&((high * 16 + low) as u8))
+            {
+                return Some((3, 1));
+            }
+        }
+        b'+' if secret.first() == Some(&b' ') => return Some((1, 1)),
+        b'&' => {
+            if let Some((c, read)) = reference(text) {
+                let mut utf8 = [0u8; 4];
+                let spelled = c.encode_utf8(&mut utf8).as_bytes();
+                if secret.starts_with(spelled) {
+                    return Some((read, spelled.len()));
+                }
+            }
+        }
+        _ => {}
+    }
+    (text.first() == secret.first()).then_some((1, 1))
+}
+
+/// An HTML character reference at the start of `text` — `&#NN;`, `&#xHH;` (either case of `x`
+/// and of hex) or one of the five XML names — and its length.
+fn reference(text: &[u8]) -> Option<(char, usize)> {
+    let end = text.iter().take(12).position(|b| *b == b';')?;
+    let name = core::str::from_utf8(text.get(1..end)?).ok()?;
+    let c = match name.strip_prefix('#') {
+        Some(number) => char::from_u32(match number.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => number.parse().ok()?,
+        })?,
+        None => match name {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "quot" => '"',
+            "apos" => '\'',
+            _ => return None,
+        },
+    };
+    Some((c, end + 1))
+}
+
+/// Whether `rest` — the end of a cut text — is the start of an escape the cut split: a `%` and at
+/// most one hex digit, or a `&` and at most ten more reference characters with no `;`.
+fn is_cut_escape(rest: &[u8]) -> bool {
+    match rest.split_first() {
+        Some((b'%', tail)) => tail.len() < 2 && tail.iter().all(u8::is_ascii_hexdigit),
+        Some((b'&', tail)) => {
+            tail.len() <= 10 && tail.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'#')
+        }
+        _ => false,
+    }
+}
+
+/// D268 (3)/(4), review L-5: control characters and Unicode format characters dropped,
+/// whitespace runs collapsed to one space, trimmed, and the secrets blanked again.
 fn tidy(text: &str, secrets: &[Zeroizing<String>]) -> Zeroizing<String> {
     let mut out = Zeroizing::new(String::with_capacity(text.len()));
     for c in text.chars() {
@@ -1006,13 +1123,43 @@ fn tidy(text: &str, secrets: &[Zeroizing<String>]) -> Zeroizing<String> {
             if !out.is_empty() && !out.ends_with(' ') {
                 out.push(' ');
             }
-        } else if !c.is_control() {
+        } else if !c.is_control() && !is_format(c) {
             out.push(c);
         }
     }
     let trimmed = out.trim_end().len();
     out.truncate(trimmed);
-    blank(out, secrets)
+    blank(out, secrets, false)
+}
+
+/// Unicode general category `Cf` (Unicode 15.1): the bidi embeddings, overrides and isolates
+/// (U+202A–202E, U+2066–2069), the marks (U+200E/F, U+061C), the zero-width characters, the BOM,
+/// the soft hyphen and the rest — invisible, and able to reorder or hide what a line reads.
+fn is_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61c}'
+            | '\u{6dd}'
+            | '\u{70f}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
 }
 
 /// D268 (5): at most `width` chars, the last one `…` when cut.

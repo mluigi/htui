@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use htui_agent::auth::loopback::{
     Advertised, DeliverError, DeliverLimits, EXCERPT_WIDTH, ListenerReply, PASTE_MAX, PasteError,
-    RedirectUrl, deliver, validate,
+    RESPONSE_CAP, RedirectUrl, deliver, validate,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -581,6 +581,115 @@ async fn deliver_blanks_an_echoed_code_and_state_in_the_excerpt() {
     }
     assert!(said.contains('…'), "the echo is blanked, not dropped");
     assert!(summary.contains('…'));
+}
+
+/// Delivers [`good`] to a listener whose `<title>` is `title` and returns what it said.
+async fn said_of_title(title: &str) -> Option<String> {
+    let body = format!("<title>{title}</title>");
+    let answer = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let (port, _head) = answering(answer.into_bytes()).await;
+    deliver_good(port, DeliverLimits::default())
+        .await
+        .expect("an answer")
+        .said
+}
+
+/// Review L-5: an echo is blanked however the listener spells it — percent-encoded in either
+/// case of hex, in whole or in part, and as HTML character references, decimal, hex or named.
+#[tokio::test]
+async fn deliver_blanks_percent_encoded_and_html_escaped_echoes() {
+    let every_byte = |text: &str, upper: bool| -> String {
+        text.bytes()
+            .map(|b| {
+                if upper {
+                    format!("%{b:02X}")
+                } else {
+                    format!("%{b:02x}")
+                }
+            })
+            .collect()
+    };
+    let decimal: String = CODE
+        .chars()
+        .map(|c| format!("&#{};", u32::from(c)))
+        .collect();
+    let hex: String = CODE
+        .chars()
+        .map(|c| format!("&#X{:x};", u32::from(c)))
+        .collect();
+    let echoes = [
+        CODE.replace('-', "%2d"),
+        CODE.replace('-', "%2D"),
+        every_byte(CODE, false),
+        every_byte(CODE, true),
+        every_byte(STATE, false),
+        decimal,
+        hex,
+        CODE.replacen('C', "&#67;", 1).replace('-', "&#x2d;"),
+        STATE.replacen('S', "&#83;", 1),
+    ];
+    for echo in echoes {
+        let said = said_of_title(&format!("got {echo}!")).await;
+        assert_eq!(said.as_deref(), Some("got …!"), "{echo}");
+    }
+}
+
+/// Review L-5: an answer cut at [`RESPONSE_CAP`] part-way through an echoed code leaves no prefix
+/// of it standing, spelled as is or percent-encoded, even when the cut splits an escape.
+#[tokio::test]
+async fn deliver_blanks_a_code_cut_at_the_response_cap() {
+    let head = "HTTP/1.1 200 OK\r\n\r\n";
+    let cut_escaped = CODE.replace('-', "%2D");
+    let tails = [
+        CODE[..9].to_owned(),
+        cut_escaped[..6].to_owned(),
+        cut_escaped[..5].to_owned(),
+    ];
+    for tail in tails {
+        let mut answer = head.to_owned();
+        answer.push_str(&"\n".repeat(RESPONSE_CAP - head.len() - tail.len()));
+        answer.push_str(&tail);
+        assert_eq!(answer.len(), RESPONSE_CAP);
+        answer.push_str("-the-rest-of-it\n");
+        let (port, _server) = listening(move |mut stream| async move {
+            let _ = stream.write_all(answer.as_bytes()).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(stream);
+        })
+        .await;
+        let reply = deliver_good(port, DeliverLimits::default())
+            .await
+            .expect("an answer");
+        let said = reply.said.expect("the cut line is the first non-blank one");
+        assert!(!said.contains("CODE"), "{tail} left {said:?}");
+        assert_eq!(said, "…", "{tail}");
+    }
+}
+
+/// Review L-5: control characters and Unicode format characters — the bidi overrides and
+/// isolates, the marks, zero-width spaces, the BOM and the soft hyphen — are stripped from the
+/// excerpt and the reason, so a listener cannot reorder or hide what the note line reads.
+#[tokio::test]
+async fn deliver_strips_bidi_and_other_format_characters() {
+    let said = said_of_title(
+        "ok\u{202e}evil\u{2066}x\u{2069}\u{200b}y\u{200e}\u{200f}\u{feff}z\u{ad}\u{7}!",
+    )
+    .await;
+    assert_eq!(said.as_deref(), Some("okevilxyz!"));
+
+    let (port, _head) = answering(
+        "HTTP/1.1 200 O\u{202a}K\u{202c}\u{61c}\r\nContent-Length: 0\r\n\r\n"
+            .as_bytes()
+            .to_vec(),
+    )
+    .await;
+    let reply = deliver_good(port, DeliverLimits::default())
+        .await
+        .expect("an answer");
+    assert_eq!(reply.reason, "OK");
 }
 
 #[tokio::test]
