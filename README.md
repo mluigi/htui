@@ -83,7 +83,8 @@ checkable is the one everybody actually builds with. Keep all three in step when
 | `--project <SLUG>` | With `--index-items` or `--search-items`: only this project. |
 | `--decisions` | With `--search-items`: only decisions, meaning items closed as done, concluded or rejected, and their documents. |
 | `--limit <N>` | With `--search-items`: how many results to print, from 1 to 1000 (default 10). |
-| `--log <PATH>` | Append logs to a file. Also read from `HTUI_LOG`; `HTUI_LOG_FILTER` changes the level (default `info`). Logs never go to the terminal, since the terminal is the app. |
+| `--log <PATH>` | Append logs to a file. Also read from `HTUI_LOG`; `HTUI_LOG_FILTER` changes the level (default `info`). Logs never go to the terminal, since the terminal is the app (`htui worker`, which has none, logs to standard error without it). |
+| `worker [--pool-size N] [--dsn-stdin] [--log PATH]` | Run this machine's runs with no terminal, so they outlive the TUI: `htui worker`. Needs the box's executor set to `worker` in **Settings › Boxes**; no other option may be given beside it, and `--log` goes after `worker`. See [`docs/htui-worker.md`](docs/htui-worker.md). |
 | `--help`, `--version` | Print usage or the version and exit. |
 
 ## Connecting to your database
@@ -293,7 +294,7 @@ conversation exactly as it was.
 | **Prompt** | Prompt settings such as the token budget. |
 | **Connection** | The database connection string (`e` edit, `c` clear) and rebuilding the local copy (`R`). |
 | **Qdrant** | The search server's address and API key (`e` edit, `c` clear). |
-| **Boxes** | This machine's profile: tags (`t`), quirks (`e`) and a fresh check of its tools (`p`). |
+| **Boxes** | This machine's profile: tags (`t`), quirks (`e`), who runs its runs, the TUI or [`htui worker`](docs/htui-worker.md) (`w`), and a fresh check of its tools (`p`). |
 
 Deleting in **Hierarchy** shows what would be removed and asks you to type a confirmation, because
 it cannot be undone.

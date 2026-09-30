@@ -1,7 +1,7 @@
 # CONCEPTS - htui
 
 **Owner:** Luigi Marrandino
-**Reviewed:** 2026-09-03
+**Reviewed:** 2026-09-30
 
 Standing architectural intent for `htui`. Governed by `.claude/rules/concept-docs.md`. Distilled
 from `docs/REQUIREMENTS.md`, which is the authority; requirement IDs in brackets.
@@ -13,12 +13,15 @@ backlog of work items through configurable step graphs across projects, reposito
 [R-ID-1]. Single developer today, teams later without redesign [R-USR-1..3].
 
 It is **not** an IDE, not a code editor, not a terminal multiplexer, and not a cloud service. It is
-a local-first, developer-guided harness [R-ID-2].
+a local-first, developer-guided harness. A headless `htui worker` per box, started by you and
+talking only to your Postgres, is part of `htui` [R-ID-2].
 
 ## Single source of truth
 
 - **Postgres holds everything**: items, documents, runs, full transcripts, skills, templates, box
-  profiles, agent registry, settings [R-ID-3]. Credentials live in the OS keyring [R-STO-1].
+  profiles, agent registry, settings [R-ID-3]. Credentials live in the OS keyring; a headless
+  worker without one reads its DSN from a systemd credential or its stdin, never argv, the
+  environment or a plain file [R-STO-1].
 - **Repos stay clean.** `htui` writes no files into managed repositories; only agents doing an
   item's work touch a working tree [R-ID-4]. Rejected: per-repo `items.json` snapshots, they were a
   second source of truth with merge exposure.

@@ -1,0 +1,284 @@
+# `htui worker`: running runs without a terminal
+
+`htui worker` is the headless half of `htui`. It runs on a box (a machine with its own `box.toml`),
+connects to your Postgres, and walks that box's runs with no terminal attached, so a run outlives
+the TUI session that started it. It is part of `htui`, started by you and talking only to your
+Postgres; it is not a hosted service (`docs/REQUIREMENTS.md` R-ID-2, R-ORCH-12).
+
+```
+htui worker [--pool-size N] [--dsn-stdin] [--log PATH]
+```
+
+- [What it does, and what it does not do yet](#what-it-does-and-what-it-does-not-do-yet)
+- [Who executes on a box: the executor setting](#who-executes-on-a-box-the-executor-setting)
+- [The TUI on a worker box](#the-tui-on-a-worker-box)
+- [Where the DSN comes from](#where-the-dsn-comes-from)
+- [Pool size](#pool-size)
+- [Logs](#logs)
+- [Exit codes](#exit-codes)
+- [A run whose resume keeps failing](#a-run-whose-resume-keeps-failing)
+- [A queued cancel interrupted halfway](#a-queued-cancel-interrupted-halfway)
+- [Error reports](#error-reports)
+- [Running it as a systemd service](#running-it-as-a-systemd-service)
+
+## What it does, and what it does not do yet
+
+What it does:
+
+- Connects headless: it never upgrades the database and never asks anything. A pending, newer or
+  dirty schema, or an `htui` build older than the database requires, is refused before anything is
+  written. Start the TUI once to apply migrations, or upgrade the binary.
+- Uses the same `box.toml` as the TUI (see [Where htui keeps its files](../README.md#where-htui-keeps-its-files)),
+  so it **is** the TUI's box. Run it as the same OS user, with the same configuration directory,
+  as the TUI whose runs it should take over. A worker that mints its own `box.toml` is another box,
+  and never sees the TUI's runs.
+- Every 5 seconds, when the box's executor is `worker`: claims the box's queued runs in the order
+  they were queued, adopts the box's `running` runs that nobody holds (a lease given back or
+  lapsed), and walks them. It refreshes each walk's lease and fences itself before its lease can
+  lapse, exactly as the TUI does.
+- Marks the box as seen (`box.last_seen_at`) once at start and then every minute, whatever the
+  executor.
+- Logs `htui worker ready` once connected, with the box id and the pool size.
+- Stops on SIGINT or SIGTERM (Ctrl-C, Ctrl-Break, closing the console or a system shutdown on
+  Windows): it cancels its walks with a short grace period and gives their leases back, then exits
+  0. A step it interrupted is reset and retried by the next sweep on the box.
+
+What it does not do yet:
+
+- **No permission answers until MOD-42.** An engine-driven ACP step fails on its first permission
+  request, exactly as it does under the TUI today. Cancelling a run the worker is walking also
+  waits for MOD-42 (see [`c` below](#the-tui-on-a-worker-box)).
+- **No remote targeting until MOD-43.** A run targets the box that started it, and a worker only
+  takes runs targeted at its own box. The TUI cannot yet send a run to another machine's worker,
+  and nothing in the TUI tells you whether a worker is running.
+- It does not install itself as a service. The [sample unit](#running-it-as-a-systemd-service)
+  below is documentation only.
+
+## Who executes on a box: the executor setting
+
+Each box has an **executor**, `tui` (the default) or `worker`, stored in the box's settings in
+Postgres. Change it in **Settings › Boxes** with `w`, then `y` to confirm (`n` or `Esc` cancels).
+`w` proposes the other value; on a value this build does not know, it proposes `tui`.
+
+**The rule (I-1):** on a box, only the process whose role matches the executor claims queued runs,
+adopts runs nobody holds, or sweeps. With `tui`, the TUI does; with `worker`, `htui worker` does.
+Leases and fences, not this rule, are what keep the store correct: if two processes ever act on one
+box (during a flip, or on a misconfigured box), the second one's writes are still refused. The rule
+makes ownership single, so a TUI exit never interrupts a worker's run.
+
+The executor is read on its own, so a malformed neighbouring setting never turns a `worker` box
+back into a `tui` box. A value neither `tui` nor `worker` (written by a newer build, or by hand)
+fails closed: **neither** process executes there. The TUI refuses `R` and the walking commands with
+"box executor `…` is not known to htui <version>", and the worker idles.
+
+**A worker on a `tui` box idles.** It keeps marking the box as seen, logs the executor once each
+time it changes, re-checks it at every poll and exits 0 on a signal. So you can start the worker
+before you flip the setting, and a flip in either direction needs no restart.
+
+**Flipping never moves a live lease.**
+
+- **`tui` → `worker`.** Walks the TUI already started keep their leases and heartbeats and run to
+  their next rest in the TUI. The TUI's next sweep skips the box, its next command hands back (see
+  below), and a run it had queued but not yet claimed stays queued for the worker. When the TUI
+  exits, it gives its walks' leases back, and the worker adopts those runs at its next poll; a step
+  that was interrupted is reset and retried.
+- **`worker` → `tui`.** At its next poll the worker stops claiming and sweeping. Walks it already
+  started keep heartbeating until they rest, then it idles. From its next sweep the TUI adopts runs
+  whose lease was given back or has lapsed, and claims the box's queued rows, including those it
+  queued for the worker, so nothing is stranded.
+
+## The TUI on a worker box
+
+On a box whose executor is `worker`, the TUI still records every decision you make, under the
+run's lease, but it no longer walks what comes after. It gives the lease back instead (a
+**hand-back**), and the worker adopts the run at its next poll, within about 5 seconds. The worker
+finishes it exactly as it would finish a run whose process crashed at that point.
+
+| Key | What the TUI does on a worker box | What the worker then does |
+|---|---|---|
+| `R` start | Creates the run `queued` for this box. The Runs pane shows `queued`. | Claims it and walks it. |
+| `a` approve, `x` reject | Records the answer, gives the lease back. | An approval merges the step's work and walks on; a rejection loops back or fails the run, as the graph says. |
+| `A` accept | Runs the verification in the TUI, records the acceptance, then as `a`. | As `a`. |
+| `r` retry | Records the retry and creates the new attempt, gives the lease back. | Walks the new attempt. |
+| `s` select | Records the chosen fan-out result, gives the lease back. | Merges the chosen result and walks on. |
+| `u` unblock (resume) | Lifts the park only, gives the lease back. | Re-checks the live graph and walks on. `u` that reopens an item or follows a run is unchanged. |
+| `p` promote | Unchanged. A parked step promotes and its chat runs in the TUI; a step the worker is walking refuses, because its lease is held. | — |
+| `c` cancel | A `queued` or parked run cancels as before. A run the worker is walking is refused: "the worker on this box is walking run …; cancelling a live run needs MOD-42's cancel command". Nothing is written. | Keeps walking. |
+| `C`, `T`, `o` | Unchanged. | — |
+
+Two consequences of recovering "as after a crash":
+
+- **A graph changed mid-run.** The worker re-checks the item's **live** step graph before it walks
+  on. If the graph's shape was edited after the run started, the run parks with a
+  "topology mismatch" note instead of walking on its original snapshot, as the TUI would have done
+  in process. An approval or selection has already been merged by then. The park is sticky: `u`
+  goes through the same check. Cancel the run (`c`) and start a new one.
+- **A lost hand-back.** If giving the lease back fails (the database dropped at that moment), the
+  worker cannot adopt the run until the lease lapses on its own, after the lease's full
+  time-to-live instead of at its next poll. Nothing is lost; the run is just late.
+
+**The Runs pane refreshes itself** every 5 seconds while the selected item has a `queued`,
+`running` or `awaiting_approval` run, so a worker's progress shows up without re-selecting the
+item. This is a re-read, not a liveness signal: a run queued on a worker box with no worker running
+stays `queued`, and the pane cannot tell you why (MOD-43).
+
+## Where the DSN comes from
+
+The worker reads the Postgres connection string from exactly one of these, in this order:
+
+1. **`--dsn-stdin`:** one line from standard input, and no other source. A blank line or end of
+   input is a refusal (exit 2), never a fall-through to the others. When standard input is a
+   terminal, a prompt goes to standard error; the pasted text is visible.
+2. **Otherwise the OS keyring entry the TUI uses**, the one `htui --set-dsn` and
+   **Settings › Connection** write. A keyring that cannot be reached (a Linux host with no Secret
+   Service session, typically a service) counts as "no keyring", not as an error.
+3. **Otherwise, on Linux, the systemd credential `htui-dsn`:** the file
+   `$CREDENTIALS_DIRECTORY/htui-dsn` that systemd decrypts for the unit (see
+   [below](#running-it-as-a-systemd-service)). `CREDENTIALS_DIRECTORY` names the directory, never
+   the secret.
+
+With none of them, the worker exits 2 with a sentence naming all three. The DSN is **never** read
+from `argv`, from any other environment variable or from a plain file, and it is never written to a
+log or an error report. It is held in a buffer that is wiped once the connection is open.
+
+## Pool size
+
+`--pool-size N` sets how many Postgres connections the worker may hold. The default is 4; any value
+is clamped to 2 through 8, with a warning in the log when it was moved. The pool is sized before
+any setting is read from the database. The TUI keeps its own pool of 8, so keep the sum over every
+running `htui` process below your server's `max_connections`.
+
+## Logs
+
+- `--log PATH` appends the log to that file, exactly as the TUI does. The directory must exist.
+- Without it the worker, unlike the TUI, logs to standard error (in colour only on a terminal), so
+  a systemd unit's journal has it.
+- `HTUI_LOG` is read too, and `HTUI_LOG_FILTER` sets the level (default `info`).
+- **`--log` goes after `worker`:** `htui worker --log PATH` works, `htui --log PATH worker` is
+  refused. `HTUI_LOG` works either way. Beside `worker`, no flag of the TUI may be given
+  (`htui --demo worker` is refused).
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Clean shutdown on a signal. |
+| `1` | A failure after the worker started. |
+| `2` | A startup refusal: no DSN, a connection that could not be made, or a schema or build the database refuses. Nothing was written. |
+
+A store outage while running is not an exit: the worker logs it and carries on, and its walks fence
+themselves until the next poll succeeds.
+
+## A run whose resume keeps failing
+
+When the worker adopts a run whose live graph no longer resolves (the graph, a prompt template or
+an agent row it needs is gone), the resume fails, the lease goes back, and the next poll would
+adopt it again. So the worker backs off **per run**: it still adopts the run, but waits before
+resuming it, first 5 seconds, then twice as long each time, up to 5 minutes. It logs
+"a run's resume keeps failing; the worker waits before resuming it again" at `warn` once per step
+up. A resume that succeeds clears the delay; the delays are kept in memory, so a restart starts
+over. A failing database is not backed off this way. Fix what the run needs, or cancel it.
+
+## A queued cancel interrupted halfway
+
+Cancelling a `queued` run is a compare-and-set on every box: if a worker claims the run first, the
+cancel falls back to the leased path, which refuses a live walk and writes nothing. When the cancel
+wins, it takes two writes: the run becomes `cancelled`, then the item goes back from `queued` to
+`open`. If the process or the database dies between the two, the item is left `queued` with no
+active run. No command recovers that: `R` needs the item `open` or `failed`, and `u` needs it
+`blocked`.
+
+**How to notice:** the item stays `queued` in the Backlog while its Runs pane shows its latest run
+`cancelled`, and nothing is `queued`, `running` or `awaiting_approval`. **How to fix it**, in
+`psql`, with the item's key and project slug:
+
+```sql
+UPDATE item SET status = 'open', closed_at = NULL
+ WHERE key = 'FEAT-12'
+   AND project_id = (SELECT id FROM project WHERE slug = 'my-project')
+   AND status = 'queued'
+   AND NOT EXISTS (SELECT 1 FROM run
+                    WHERE run.item_id = item.id
+                      AND run.status IN ('queued', 'running', 'awaiting_approval'));
+```
+
+This is the same write the cancel's second half makes; `UPDATE 1` means it applied.
+
+## Error reports
+
+The `htui` binary sends crash and error reports to the maintainer's GlitchTip (Sentry-compatible)
+server; this build has no setting to turn that off. For the worker:
+
+- An exit 1, a panic or a log line at `error` level is reported, with the recent `info` and `warn`
+  lines as breadcrumbs.
+- A startup refusal (exit 2) is **not** sent as a report: it is a configuration state, and it goes
+  to standard error and the log only.
+- The DSN is never in a log line, so never in a report either.
+
+If you self-host and do not want reports to leave your network, block outbound traffic to
+`glitchtip.sette.mluigi.it` for the worker's host.
+
+## Running it as a systemd service
+
+This is a sample; nothing installs it for you (MOD-45). It is a **system** unit that runs as your
+user, because user units can load an encrypted credential only from systemd 256 on, and Ubuntu
+24.04 ships 255. Check yours with `systemctl --version`.
+
+**1. Encrypt the DSN** (as root). The credential is encrypted at rest and bound to this host (to its
+TPM too, when it has one), and systemd decrypts it only for the unit:
+
+```
+sudo install -d -m 0700 /etc/credstore.encrypted
+sudo systemd-creds encrypt --name=htui-dsn - /etc/credstore.encrypted/htui-dsn
+```
+
+Paste the DSN, press `Enter`, then `Ctrl-D`. Reading it from standard input keeps it out of your
+shell history and the process list.
+
+**2. Create the log directory** as your user: `mkdir -p ~/.local/state/htui`.
+
+**3. The unit**, `/etc/systemd/system/htui-worker.service`, with `<you>` replaced by your user name:
+
+```ini
+[Unit]
+Description=htui worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=<you>
+ExecStart=/home/<you>/.cargo/bin/htui worker --log /home/<you>/.local/state/htui/worker.log
+LoadCredentialEncrypted=htui-dsn:/etc/credstore.encrypted/htui-dsn
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```
+sudo systemctl daemon-reload
+sudo systemctl enable --now htui-worker.service
+```
+
+Notes:
+
+- `User=` gives the service your home directory, so it reads the same `~/.config/htui/box.toml`
+  as your TUI. If your shell sets `XDG_CONFIG_HOME`, add the same value as an
+  `Environment=XDG_CONFIG_HOME=…` line.
+- The unit's `PATH` is systemd's default, not your shell's. If `git` or your agents live elsewhere
+  (for example `~/.local/bin`), add an `Environment=PATH=…` line.
+- The service has no Secret Service session, so the keyring counts as absent and the credential is
+  used. The DSN never appears in the unit file, the environment or the process list.
+- `Restart=on-failure` restarts on exit 1 and on exit 2, which also covers a database that is not
+  up yet at boot; `RestartSec=` spaces the attempts. A clean stop (exit 0) is not restarted, and
+  `systemctl stop` sends SIGTERM, which the worker handles.
+- Then flip the box's executor to `worker` in **Settings › Boxes**.
+
+**User unit, systemd 256 or later only.** User-scoped encrypted credentials need systemd 256. On
+such a host, encrypt as your user with `systemd-creds --user encrypt --name=htui-dsn - <path>`,
+point `LoadCredentialEncrypted=htui-dsn:<path>` at it from a unit in `~/.config/systemd/user/`,
+drop `User=`, use `WantedBy=default.target`, and run `loginctl enable-linger <you>` so it starts
+without a login. On an older host, use the system unit above, run the worker in the foreground with
+`--dsn-stdin`, or rely on the keyring from a desktop session.
