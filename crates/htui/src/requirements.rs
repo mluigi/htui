@@ -59,7 +59,7 @@ use htui_core::store::{
 };
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 
-use crate::store_worker::{StoreReply, StoreRequest};
+use crate::store_worker::{StoreReply, StoreRequest, WriteOutcome};
 
 /// A body or rationale on its way to the store. `StoreRequest` derives `Debug`, and this is user
 /// prose, so it prints its length only ([`crate::templates::TemplateBody`]'s rule).
@@ -513,7 +513,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 id: area.id,
                 code: area.code,
             };
-            answer(backend, scope, Some(landed)).await
+            answer(backend, scope, WriteOutcome::Applied(landed)).await
         }
         StoreRequest::MintRequirement {
             scope,
@@ -558,7 +558,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 id: row.id,
                 key: row.key,
             };
-            answer(backend, scope, Some(landed)).await
+            answer(backend, scope, WriteOutcome::Applied(landed)).await
         }
         StoreRequest::AmendRequirement {
             scope,
@@ -588,12 +588,14 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 .amend_requirement(*id, *expected_version, patch, deciding)
                 .await?
             {
-                RequirementUpdate::Updated(row) => Some(RequirementWrite::Amended {
-                    id: row.id,
-                    key: row.key,
-                    version: row.version,
-                }),
-                RequirementUpdate::Diverged { .. } => None,
+                RequirementUpdate::Updated(row) => {
+                    WriteOutcome::Applied(RequirementWrite::Amended {
+                        id: row.id,
+                        key: row.key,
+                        version: row.version,
+                    })
+                }
+                RequirementUpdate::Diverged { .. } => WriteOutcome::Stale(()),
             };
             answer(backend, scope, landed).await
         }
@@ -613,11 +615,13 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 .withdraw_requirement(*id, *expected_version, deciding, me, box_id)
                 .await?
             {
-                RequirementUpdate::Updated(row) => Some(RequirementWrite::Withdrawn {
-                    id: row.id,
-                    key: row.key,
-                }),
-                RequirementUpdate::Diverged { .. } => None,
+                RequirementUpdate::Updated(row) => {
+                    WriteOutcome::Applied(RequirementWrite::Withdrawn {
+                        id: row.id,
+                        key: row.key,
+                    })
+                }
+                RequirementUpdate::Diverged { .. } => WriteOutcome::Stale(()),
             };
             answer(backend, scope, landed).await
         }
@@ -823,7 +827,7 @@ async fn gate_after_read(
 }
 
 /// The scope re-read after a tab write (MOD-59 D1, D5): `RequirementWritten` naming what `landed`
-/// wrote, or `RequirementsStale` when an amend or withdraw missed its version (`None`). The worker
+/// wrote, or `RequirementsStale` when an amend or withdraw missed its version. The worker
 /// re-reads rather than handing the view the row the outcome carries: the view renders a tree, and
 /// a row patched in locally would be a second source of truth. A re-read that fails after an
 /// applied write still answers `RequirementWritten`, because the write landed; after a missed one
@@ -831,13 +835,12 @@ async fn gate_after_read(
 async fn answer(
     backend: &Backend,
     scope: &Scope,
-    landed: Option<RequirementWrite>,
+    landed: WriteOutcome<RequirementWrite>,
 ) -> Result<StoreReply> {
     let fresh = snapshot(backend, scope).await;
-    match landed {
-        Some(outcome) => Ok(written(fresh, outcome)),
-        None => Ok(StoreReply::RequirementsStale(Box::new(fresh?))),
-    }
+    landed.answer(fresh, written, |snapshot, ()| {
+        StoreReply::RequirementsStale(Box::new(snapshot))
+    })
 }
 
 /// MOD-59 D5: the reply to a tab write that applied, whatever its re-read came to. A failed

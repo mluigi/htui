@@ -868,7 +868,9 @@ impl TemplatesView {
     /// answer, so nothing here searches the snapshot for the body sent; every plain `Templates`
     /// read leaves the editor, the token and `busy` alone. `unread` is the re-read's failure (D5):
     /// the version was appended, and the notice says the tree drawn is the one held, which may not
-    /// show a new name yet (the cursor then stays where it was).
+    /// show a new name yet (the cursor then stays where it was). A `TemplateSaved` answers
+    /// `SaveTemplate` alone, so the request name `busy` must hold for it to land is `SAVE_NAME`
+    /// (review L3: every view's landing checks `busy` itself).
     ///
     /// Keys typed while the save was in flight still edit the draft. When they did, the editor
     /// stays open on them with the token at the saved version, so the next `Ctrl+S` appends them.

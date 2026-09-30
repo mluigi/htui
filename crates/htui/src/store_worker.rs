@@ -1195,6 +1195,43 @@ pub enum StoreReply {
     },
 }
 
+/// What one self-naming write did, before the re-read that answers it (MOD-59 review L3): the
+/// skills, templates and requirements writers each hand their `answer` one of these. Only
+/// [`WriteOutcome::answer`] turns it into a reply, so the three keep one rule: an applied write
+/// answers its self-naming reply whatever the re-read came to (D5), and a stale one answers its
+/// stale reply, whose failed re-read stays an error (D3).
+///
+/// Not [`htui_core::store::CasOutcome`]: its `Stale` carries the row as it is now, of the applied
+/// row's own type, where a stale write here carries only which write missed and the re-read is
+/// the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteOutcome<T, S = ()> {
+    /// The write applied: what the store says it wrote.
+    Applied(T),
+    /// The write missed its token, or its row is gone: which write, when the reply says.
+    Stale(S),
+}
+
+impl<T, S> WriteOutcome<T, S> {
+    /// The reply, given the re-read after the write: `written` for an applied write, handed the
+    /// re-read whatever it came to; `stale` for a stale one, handed the snapshot, or the re-read's
+    /// error in its place.
+    ///
+    /// # Errors
+    /// The re-read's, after a stale write only.
+    pub fn answer<R>(
+        self,
+        reread: StoreResult<R>,
+        written: impl FnOnce(StoreResult<R>, T) -> StoreReply,
+        stale: impl FnOnce(R, S) -> StoreReply,
+    ) -> StoreResult<StoreReply> {
+        match self {
+            Self::Applied(outcome) => Ok(written(reread, outcome)),
+            Self::Stale(what) => Ok(stale(reread?, what)),
+        }
+    }
+}
+
 /// One frame of a chat stream.
 #[derive(Debug, Clone)]
 pub enum ChatFrame {

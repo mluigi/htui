@@ -637,8 +637,12 @@ impl RequirementsTab {
     /// here searches the snapshot: the form closes, the notice says what landed, and the cursor
     /// goes to the row it landed on, whose detail is re-read, when the tree drawn holds it.
     /// `unread` is the re-read's failure (D5): the tree is the one held before the write, which may
-    /// not hold a new row yet, and no detail is read (review L4).
-    fn land(&mut self, outcome: &RequirementWrite, unread: Option<&str>, ctx: &Ctx<'_>) {
+    /// not hold a new row yet, and no detail is read (review L4). A reply for any other write than
+    /// the one `busy` names lands nothing, and the answer is `false` (review L3).
+    fn land(&mut self, outcome: &RequirementWrite, unread: Option<&str>, ctx: &Ctx<'_>) -> bool {
+        if self.busy != Some(outcome.request_name()) {
+            return false;
+        }
         let (landed, row) = match outcome {
             RequirementWrite::Area { id, code } => (format!("added area {code}"), Row::Area(*id)),
             RequirementWrite::Minted { id, key } => {
@@ -664,7 +668,7 @@ impl RequirementsTab {
             Row::Project(id) => snapshot.project(id).is_some(),
         });
         if !held {
-            return;
+            return true;
         }
         match unread {
             None => self.select_row(row, ctx),
@@ -678,6 +682,7 @@ impl RequirementsTab {
                 }
             }
         }
+        true
     }
 
     /// A read's tail, shared by a `Requirements` reply and a `RequirementWritten` that lands
@@ -1047,9 +1052,7 @@ impl Tab for RequirementsTab {
                     }
                     self.snapshot = Some((**snapshot).clone());
                     self.recovered();
-                    if self.busy == Some(outcome.request_name()) {
-                        self.land(outcome, None, ctx);
-                    } else {
+                    if !self.land(outcome, None, ctx) {
                         // Not this tab's write in flight: a read like any other (H-10).
                         self.after_read(ctx);
                     }

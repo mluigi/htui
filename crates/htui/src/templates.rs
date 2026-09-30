@@ -16,7 +16,7 @@ use htui_core::model::{NewPromptTemplate, ProjectId, PromptTemplate, PromptTempl
 use htui_core::store::{CasOutcome, Result, StoreError, WriteStore};
 use htui_store::{Backend, DATABASE_UNREACHABLE};
 
-use crate::store_worker::{StoreReply, StoreRequest};
+use crate::store_worker::{StoreReply, StoreRequest, WriteOutcome};
 
 /// Every scope project's templates, every version.
 ///
@@ -164,15 +164,11 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                     *expected,
                 )
                 .await?;
-            // The worker re-reads rather than handing the view the one row the outcome carries:
-            // the view renders a tree, and a row patched in locally would be a second source of
-            // truth (the `cas` shape of `catalogue.rs` and `prompt_settings.rs`).
-            Ok(match outcome {
-                CasOutcome::Applied(row) => saved(snapshot(backend, scope).await, &row),
-                CasOutcome::Stale(_) => {
-                    StoreReply::TemplatesStale(Box::new(snapshot(backend, scope).await?))
-                }
-            })
+            let landed = match outcome {
+                CasOutcome::Applied(row) => WriteOutcome::Applied(row),
+                CasOutcome::Stale(_) => WriteOutcome::Stale(()),
+            };
+            answer(backend, scope, landed).await
         }
         // `try_serve` routes exactly this module's two variants here, so the last arm is
         // unreachable from the shell; a caller that reached it anyway is better told which request
@@ -182,6 +178,25 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             other.name()
         ))),
     }
+}
+
+/// The re-read after a save (MOD-59 D1, D5): `TemplateSaved` naming the row `landed` appended, or
+/// `TemplatesStale` when its token was spent. The worker re-reads rather than handing the view the
+/// one row the outcome carries: the view renders a tree, and a row patched in locally would be a
+/// second source of truth (the `cas` shape of `catalogue.rs` and `prompt_settings.rs`). A re-read
+/// that fails after an applied save still answers `TemplateSaved`, because the version was
+/// appended; after a stale one it stays an error (D3).
+async fn answer(
+    backend: &Backend,
+    scope: &Scope,
+    landed: WriteOutcome<PromptTemplate>,
+) -> Result<StoreReply> {
+    let fresh = snapshot(backend, scope).await;
+    landed.answer(
+        fresh,
+        |fresh, row| saved(fresh, &row),
+        |snapshot, ()| StoreReply::TemplatesStale(Box::new(snapshot)),
+    )
 }
 
 /// MOD-59 D5: the reply to a save that applied, whatever its re-read came to. The project, name

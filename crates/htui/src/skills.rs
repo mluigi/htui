@@ -26,7 +26,7 @@ use htui_core::store::{CasOutcome, Result, StoreError, WriteStore as _};
 use htui_store::{Backend, DATABASE_UNREACHABLE, PROMPT_ON_SERVER_ONLY, Writer};
 
 use crate::skill_import::{self, SkillImports};
-use crate::store_worker::{StoreReply, StoreRequest};
+use crate::store_worker::{StoreReply, StoreRequest, WriteOutcome};
 
 /// The whole Skills view in one read (D81): the library, the global attachments, and each scope
 /// project's attachments, graphs and repo names.
@@ -319,7 +319,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                     created_by,
                 })
                 .await?;
-            let landed = Ok(SkillWrite::Created {
+            let landed = WriteOutcome::Applied(SkillWrite::Created {
                 skill: skill.id,
                 name: skill.name,
             });
@@ -333,14 +333,14 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
         } => {
             let writer = write_access(backend)?;
             let landed = match writer.update_skill(*skill, *expected, patch.clone()).await {
-                Ok(CasOutcome::Applied(row)) => Ok(SkillWrite::Edited {
+                Ok(CasOutcome::Applied(row)) => WriteOutcome::Applied(SkillWrite::Edited {
                     skill: row.id,
                     name: row.name,
                 }),
                 Ok(CasOutcome::Stale(_))
                 | Err(StoreError::NotFound {
                     entity: "skill", ..
-                }) => Err(StaleWhat::Skill(*skill)),
+                }) => WriteOutcome::Stale(StaleWhat::Skill(*skill)),
                 Err(other) => return Err(other),
             };
             answer(backend, &writer, scope, landed).await
@@ -359,7 +359,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 created_by,
             };
             let landed = match writer.add_skill_version(*skill, *expected, new).await {
-                Ok(CasOutcome::Applied(row)) => Ok(SkillWrite::Versioned {
+                Ok(CasOutcome::Applied(row)) => WriteOutcome::Applied(SkillWrite::Versioned {
                     skill: *skill,
                     version: row.version,
                 }),
@@ -367,7 +367,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 | Err(StoreError::NotFound {
                     entity: "skill" | "skill_version",
                     ..
-                }) => Err(StaleWhat::Version(*skill)),
+                }) => WriteOutcome::Stale(StaleWhat::Version(*skill)),
                 Err(other) => return Err(other),
             };
             answer(backend, &writer, scope, landed).await
@@ -383,16 +383,18 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 .set_skill_binding(*key, *expected, change.clone())
                 .await
             {
-                Ok(CasOutcome::Applied(Some(row))) => Ok(SkillWrite::Attached {
+                Ok(CasOutcome::Applied(Some(row))) => WriteOutcome::Applied(SkillWrite::Attached {
                     key: *key,
                     updated_at: row.updated_at,
                 }),
-                Ok(CasOutcome::Applied(None)) => Ok(SkillWrite::Detached { key: *key }),
+                Ok(CasOutcome::Applied(None)) => {
+                    WriteOutcome::Applied(SkillWrite::Detached { key: *key })
+                }
                 Ok(CasOutcome::Stale(_))
                 | Err(StoreError::NotFound {
                     entity: "skill" | "project" | "step_graph_phase",
                     ..
-                }) => Err(StaleWhat::Binding(*key)),
+                }) => WriteOutcome::Stale(StaleWhat::Binding(*key)),
                 Err(other) => return Err(other),
             };
             answer(backend, &writer, scope, landed).await
@@ -448,16 +450,13 @@ async fn answer(
     backend: &Backend,
     writer: &Writer,
     scope: &Scope,
-    landed: core::result::Result<SkillWrite, StaleWhat>,
+    landed: WriteOutcome<SkillWrite, StaleWhat>,
 ) -> Result<StoreReply> {
     let fresh = reread(backend, writer, scope).await;
-    match landed {
-        Ok(outcome) => Ok(written(fresh, outcome)),
-        Err(what) => Ok(StoreReply::SkillsStale {
-            snapshot: Box::new(fresh?),
-            what,
-        }),
-    }
+    landed.answer(fresh, written, |snapshot, what| StoreReply::SkillsStale {
+        snapshot: Box::new(snapshot),
+        what,
+    })
 }
 
 /// The snapshot after a write. Its callers are past `write_access`, so this box's paths are read
