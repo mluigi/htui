@@ -132,10 +132,15 @@ const NEEDS_CLI_BLOCK: &str =
     " \u{b7} a `cli` row needs a settings.cli block to chat (adapter id `cli` is not registered)";
 
 /// What a spent token says when fields the user changed were changed elsewhere too (review M-1),
-/// before their labels: shorter than [`CHANGED_ELSEWHERE`] so two labels still fit the bordered 98.
-/// Labels only, never a value. Opens like [`CHANGED_ELSEWHERE`], so [`is_error`] draws it the same.
+/// before their labels ([`clash_notice`]): shorter than [`CHANGED_ELSEWHERE`] so labels fit the
+/// bordered 98. Labels only, never a value. Opens like [`CHANGED_ELSEWHERE`], so [`is_error`] draws
+/// it the same.
 const CHANGED_ON_BOTH_SIDES: &str =
     "changed elsewhere \u{2014} reloaded; Enter retries \u{b7} also changed elsewhere: ";
+
+/// The widest note line the running app draws (MOD-23 re-review Low-2): the Settings pane's
+/// border costs two of the harness's 100, and the note is one line with no wrap.
+const NOTE_WIDTH: usize = 98;
 
 /// What `Edited` adds when the save changed what a probe checked (plan D246): the stored verdict is
 /// now older than the row, so the next chat re-probes by itself.
@@ -1330,7 +1335,7 @@ impl AgentsSection {
                         self.notice = Some(if clashes.is_empty() {
                             CHANGED_ELSEWHERE.to_owned()
                         } else {
-                            format!("{CHANGED_ON_BOTH_SIDES}{}", clashes.join(", "))
+                            clash_notice(&clashes)
                         });
                     }
                     None => {
@@ -1698,6 +1703,37 @@ impl Field {
     fn text(&self) -> &str {
         self.input.text().unwrap_or_default()
     }
+}
+
+/// [`CHANGED_ON_BOTH_SIDES`] with the clashing labels in form order, as many as fit
+/// [`NOTE_WIDTH`], then ` +N more` for the rest (MOD-23 re-review Low-2). Greedy and
+/// deterministic: a label is shown only if it and the count still owed after it fit, so the
+/// line never passes the width.
+fn clash_notice(clashes: &[&str]) -> String {
+    let mut notice = CHANGED_ON_BOTH_SIDES.to_owned();
+    let mut shown = 0;
+    for (index, label) in clashes.iter().enumerate() {
+        let separator = if index == 0 { "" } else { ", " };
+        let after = clashes.len() - index - 1;
+        let owed = if after == 0 {
+            String::new()
+        } else {
+            format!(" +{after} more")
+        };
+        let width =
+            notice.chars().count() + separator.len() + label.chars().count() + owed.chars().count();
+        if width > NOTE_WIDTH {
+            break;
+        }
+        notice.push_str(separator);
+        notice.push_str(label);
+        shown += 1;
+    }
+    let hidden = clashes.len() - shown;
+    if hidden > 0 {
+        notice.push_str(&format!(" +{hidden} more"));
+    }
+    notice
 }
 
 /// The edit form's text for `draft`, in `FIELD_LABELS[1..]` order: what the form prefills, and

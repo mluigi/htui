@@ -3321,6 +3321,103 @@ async fn agent_written_stale_names_the_fields_changed_on_both_sides() {
     );
 }
 
+/// Opens the edit form over `row`, fills its seven fields with `mine`, sends it, and answers it
+/// `Stale` with `theirs` as the re-read: the note line the rebase leaves.
+fn stale_note(
+    bench: &SectionBench,
+    row: &AgentSummary,
+    mine: &[&str; 7],
+    theirs: AgentSummary,
+) -> String {
+    let mut section = section_over(bench, vec![row.clone()]);
+    bench.key(&mut section, "e");
+    filled(bench, &mut section, mine);
+    bench.key(&mut section, "enter");
+    assert!(
+        matches!(
+            requests_of(bench).as_slice(),
+            [StoreRequest::EditAgent { .. }]
+        ),
+        "the edit is sent"
+    );
+    bench.reply(
+        &mut section,
+        &written(vec![theirs], AgentWrite::Stale { id: row.agent.id }),
+    );
+    note_line(&render_section_at(&section, &bench.ctx(), 200))
+}
+
+/// MOD-23 re-review Low-2: three clashing fields whose labels do not all fit are listed as many
+/// as fit, then counted, and the notice fits the bordered 98.
+#[tokio::test]
+async fn a_stale_with_three_clashes_counts_what_does_not_fit() {
+    let bench = SectionBench::new().await;
+    let row = editable_row("alpha");
+    let mut theirs = row.clone();
+    theirs.agent.updated_at = htui_core::fixtures::demo_at(2, 0);
+    theirs.agent.launch["command"] = json!("/opt/theirs/bin/agent");
+    theirs.agent.models = vec!["m1".to_owned(), "m7".to_owned()];
+    theirs.agent.default_model = Some("m7".to_owned());
+    let note = stale_note(
+        &bench,
+        &row,
+        &[
+            "acp",
+            "/opt/mine/bin/agent",
+            "--flag 'a b'",
+            "m1, m2, m9",
+            "m2",
+            "subscription",
+            "y",
+        ],
+        theirs,
+    );
+    assert_eq!(
+        note,
+        "changed elsewhere \u{2014} reloaded; Enter retries \u{b7} also changed elsewhere: command, \
+         models +1 more"
+    );
+    assert!(note.chars().count() <= SECTION_BORDERED as usize, "{note}");
+}
+
+/// MOD-23 re-review Low-2: all seven fields clashing still fit, with the count of the rest.
+#[tokio::test]
+async fn a_stale_with_all_seven_clashes_fits_and_counts_the_rest() {
+    let bench = SectionBench::new().await;
+    let row = editable_row("alpha");
+    let mut theirs = row.clone();
+    theirs.agent.updated_at = htui_core::fixtures::demo_at(2, 0);
+    theirs.agent.transport = Transport::Cli;
+    theirs.agent.launch["command"] = json!("/opt/theirs/bin/agent");
+    theirs.agent.launch["args"] = json!(["--theirs"]);
+    theirs.agent.models = vec!["m1".to_owned(), "m7".to_owned()];
+    theirs.agent.default_model = Some("m7".to_owned());
+    theirs.agent.billing = Billing::PerToken;
+    theirs.agent.enabled = false;
+    // Each of the user's texts differs from the prefill and from the re-read's, `CLI`, `PER_TOKEN`
+    // and `N` included: the comparison is of the text, as the form holds it.
+    let note = stale_note(
+        &bench,
+        &row,
+        &[
+            "CLI",
+            "/opt/mine/bin/agent",
+            "--mine",
+            "m1, m2, m9",
+            "m9",
+            "PER_TOKEN",
+            "N",
+        ],
+        theirs,
+    );
+    assert_eq!(
+        note,
+        "changed elsewhere \u{2014} reloaded; Enter retries \u{b7} also changed elsewhere: \
+         transport, command +5 more"
+    );
+    assert!(note.chars().count() <= SECTION_BORDERED as usize, "{note}");
+}
+
 /// `Gone` closes the form with the section's deleted sentence.
 #[tokio::test]
 async fn agent_written_gone_closes_with_deleted_elsewhere() {
