@@ -149,6 +149,10 @@ format or `htui-store`'s public API beyond `FastEmbedder: Clone`.
   the move MOD-34's review deferred (`docs/decisions/mod/mod-34.md:98-99`). A failed load is not
   cached; the next search retries. Settings are re-read from the keyring and Qdrant re-connected
   per request, so a URL changed in Settings > Qdrant applies to the next search.
+  *Amended at review (MOD-64 reviews 2, 3): settings are still re-read from the keyring per
+  request, but the connected `QdrantStore` is cached keyed by (URL, API key) and reconnected only
+  when they change or after a failed call; the model load is one shared future at a time rather
+  than a `OnceCell`, so a failed load is retried once, by the next search.*
 - **D239 — `concepts.rs` owns the query and the line formats for both front ends.**
   `concepts::query(text, projects, decisions, limit) -> SearchQuery` (the `--decisions` →
   `DECISION_RESOLUTIONS` rule, today inline in `search_items`) and `concepts::report_line`; the

@@ -69,15 +69,66 @@ fn load_model() -> BoxFuture<'static, Result<FastEmbedder, String>> {
     })
 }
 
-/// The production index (D238): settings re-read from the keyring and Qdrant re-connected per
-/// request, so a URL changed in Settings > Qdrant applies to the next search; the embedding model
-/// loaded once, on the blocking pool, and shared.
+/// The production index (D238, amended at review 3): settings re-read from the keyring per
+/// request, so a URL changed in Settings > Qdrant applies to the next search; the Qdrant connection
+/// reused while the URL and key stay the same; the embedding model loaded once, on the blocking
+/// pool, and shared.
 pub struct QdrantIndex {
     /// The model's load: in flight, done, or failed. One at a time (review 2): a failed one is
     /// replaced by the next search's, a done one answers every later search (D238).
     load: Mutex<Option<Load>>,
     /// What loads the model.
     loader: Loader,
+    /// The last connection made, for the settings it was made with (review 3).
+    connections: Connections<QdrantStore<FastEmbedder>>,
+}
+
+/// One cached connection, keyed by the URL and key it was made with (review 3).
+///
+/// `QdrantStore::connect` is a round trip and five waited payload-index writes, too much to pay per
+/// search. The lock is never held across an `await`: two requests that miss together both connect,
+/// and the later `put` wins, which costs one spare connection and nothing else.
+struct Connections<T> {
+    /// The settings and the connection made with them.
+    slot: Mutex<Option<(QdrantSettings, Arc<T>)>>,
+}
+
+impl<T> Default for Connections<T> {
+    fn default() -> Self {
+        Self {
+            slot: Mutex::new(None),
+        }
+    }
+}
+
+impl<T> Connections<T> {
+    /// The cached connection, when it was made with `settings`' URL and key.
+    fn get(&self, settings: &QdrantSettings) -> Option<Arc<T>> {
+        let slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.as_ref()
+            .filter(|(made_for, _)| {
+                made_for.url == settings.url
+                    && made_for.api_key.as_deref() == settings.api_key.as_deref()
+            })
+            .map(|(_, connection)| Arc::clone(connection))
+    }
+
+    /// Caches `connection` as the one for `settings`.
+    fn put(&self, settings: QdrantSettings, connection: Arc<T>) {
+        *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = Some((settings, connection));
+    }
+
+    /// A call on `connection` failed: the next request reconnects. A connection another request
+    /// has cached since is left alone.
+    fn forget(&self, connection: &Arc<T>) {
+        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot
+            .as_ref()
+            .is_some_and(|(_, cached)| Arc::ptr_eq(cached, connection))
+        {
+            *slot = None;
+        }
+    }
 }
 
 /// One load of the model, awaited by every search that overlaps it.
@@ -109,6 +160,7 @@ impl QdrantIndex {
         Self {
             load: Mutex::new(None),
             loader: Arc::new(loader),
+            connections: Connections::default(),
         }
     }
 
@@ -137,15 +189,22 @@ impl QdrantIndex {
         load
     }
 
-    /// Qdrant at `settings`, over the shared model.
+    /// Qdrant at `settings`, over the shared model: the cached connection when it was made with
+    /// the same URL and key, else a new one, cached (review 3).
     async fn connect(
         &self,
-        settings: &QdrantSettings,
-    ) -> Result<QdrantStore<FastEmbedder>, String> {
+        settings: QdrantSettings,
+    ) -> Result<Arc<QdrantStore<FastEmbedder>>, String> {
+        if let Some(store) = self.connections.get(&settings) {
+            return Ok(store);
+        }
         let embedder = self.embedder().await?;
-        QdrantStore::connect(settings, embedder)
+        let store = QdrantStore::connect(&settings, embedder)
             .await
-            .map_err(|e| format!("cannot reach Qdrant: {e}"))
+            .map(Arc::new)
+            .map_err(|e| format!("cannot reach Qdrant: {e}"))?;
+        self.connections.put(settings, Arc::clone(&store));
+        Ok(store)
     }
 }
 
@@ -162,23 +221,29 @@ async fn qdrant_settings() -> Result<QdrantSettings, String> {
 }
 
 // Settings before the model, in both: a box with no URL fails in microseconds without downloading
-// anything.
+// anything. Any failure drops the connection it used, so the next request reconnects: telling a
+// dropped connection from a refused query would mean parsing the client's errors, and a spare
+// reconnect after a refusal costs what every request cost before the cache (review 3).
 impl ConceptIndex for QdrantIndex {
     fn search(&self, query: SearchQuery) -> BoxFuture<'_, Result<Vec<Hit>, String>> {
         Box::pin(async move {
             let settings = qdrant_settings().await?;
-            let store = self.connect(&settings).await?;
-            store.search(&query).await.map_err(|e| e.to_string())
+            let store = self.connect(settings).await?;
+            store.search(&query).await.map_err(|e| {
+                self.connections.forget(&store);
+                e.to_string()
+            })
         })
     }
 
     fn sync(&self, backend: Backend, scope: Scope) -> BoxFuture<'_, Result<SyncReport, String>> {
         Box::pin(async move {
             let settings = qdrant_settings().await?;
-            let store = self.connect(&settings).await?;
-            Indexer::sync(&backend, &scope, &store)
-                .await
-                .map_err(|e| e.to_string())
+            let store = self.connect(settings).await?;
+            Indexer::sync(&backend, &scope, &*store).await.map_err(|e| {
+                self.connections.forget(&store);
+                e.to_string()
+            })
         })
     }
 }
@@ -773,6 +838,48 @@ mod tests {
             attempts.load(Ordering::SeqCst),
             0,
             "the settings are read before the model: nothing was loaded"
+        );
+    }
+
+    fn settings(url: &str, key: Option<&str>) -> QdrantSettings {
+        QdrantSettings::new(url.to_owned(), key.map(str::to_owned)).expect("a valid URL")
+    }
+
+    /// Review 3: a connection is reused for the URL and key it was made with, and only for them.
+    #[test]
+    fn a_connection_is_reused_for_its_own_settings_until_it_is_forgotten() {
+        let connections = Connections::<u32>::default();
+        let made_for = settings("http://qdrant:6334", Some("key"));
+        assert!(
+            connections.get(&made_for).is_none(),
+            "nothing connected yet"
+        );
+
+        let first = Arc::new(1);
+        connections.put(made_for.clone(), Arc::clone(&first));
+        let reused = connections
+            .get(&made_for)
+            .expect("the same settings reuse it");
+        assert!(Arc::ptr_eq(&reused, &first));
+        for moved in [
+            settings("http://qdrant:6334", Some("other")),
+            settings("http://qdrant:6334", None),
+            settings("http://elsewhere:6334", Some("key")),
+        ] {
+            assert!(connections.get(&moved).is_none(), "{moved:?}");
+        }
+
+        // An error on a connection another request has already replaced leaves the new one.
+        let second = Arc::new(2);
+        connections.put(made_for.clone(), Arc::clone(&second));
+        connections.forget(&first);
+        let kept = connections.get(&made_for).expect("the replacement stays");
+        assert!(Arc::ptr_eq(&kept, &second));
+
+        connections.forget(&second);
+        assert!(
+            connections.get(&made_for).is_none(),
+            "after an error the next request reconnects"
         );
     }
 
