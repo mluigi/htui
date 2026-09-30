@@ -8740,6 +8740,53 @@ mod tests {
         );
     }
 
+    /// MOD-41 plan D3: the self-fence is measured on tokio's monotonic clock, so a wall-clock
+    /// step while a walk holds its lease moves it neither way. Every refresh fails
+    /// (`MemFault::RefreshLease`, plan D152), and the walk mirrors tokio's paused time onto the
+    /// harness clock, which also steps +1 h at 10 s and -2 h at 20 s. The walk still ends
+    /// `LeaseLost` exactly `ttl - refresh` (80 s) after the lease was taken, as with no step.
+    #[tokio::test(start_paused = true)]
+    async fn a_stepped_wall_clock_moves_no_fence() {
+        let harness = Harness::new().await;
+        harness_engine!(harness.orch, engine);
+        let times = crate::recover::LeaseTimes::from_app(&BTreeMap::new());
+        let run = leased_run(&harness).await;
+        harness.orch.store.set_fault(MemFault::RefreshLease, true);
+
+        let clock = &harness.orch.clock;
+        let walk = async move {
+            for second in 1_u32.. {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                clock.advance(TimeDelta::seconds(1));
+                match second {
+                    10 => clock.advance(TimeDelta::hours(1)),
+                    20 => clock.advance(TimeDelta::hours(-2)),
+                    _ => {}
+                }
+            }
+            Ok::<(), EngineError>(())
+        };
+        let taken = tokio::time::Instant::now();
+        let walked = tokio::time::timeout(
+            std::time::Duration::from_millis(600_500),
+            engine.walk_leased(run, engine.fresh_until(), walk),
+        )
+        .await
+        .expect("the walk stops itself at its fence, whatever the wall clock did");
+
+        let refused = walked.expect_err("no refresh ever succeeded");
+        assert!(
+            matches!(refused, EngineError::LeaseLost { run: lost } if lost == run),
+            "{refused}"
+        );
+        let ttl = times.ttl.to_std().expect("the default TTL is positive");
+        assert_eq!(
+            taken.elapsed(),
+            ttl - times.refresh,
+            "the fence stands one refresh before the lease lapses, on tokio's clock alone"
+        );
+    }
+
     /// Plan D140: a release that fails puts the run in the dead-walk set, and the sweep retries
     /// it until the store answers. `MemFault::ReleaseLease` makes every release `Unreachable` at
     /// first (plan D152), so the sweep's retry fails too and plan D88 keeps it off the run, whose
