@@ -8489,7 +8489,7 @@ mod tests {
     #[tokio::test]
     async fn edit_box_refuses_a_non_object_settings_blob_in_memory() {
         use crate::model::{BoxEdit, Executor};
-        use crate::store::BOX_SETTINGS_NOT_AN_OBJECT;
+        use crate::store::traits::BOX_SETTINGS_NOT_AN_OBJECT;
 
         for blob in [json!([]), json!("x")] {
             let store = demo_with_box_settings(blob.clone());

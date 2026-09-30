@@ -4723,7 +4723,11 @@ async fn edit_box_refuses_a_non_object_settings_blob() {
             .await;
         match refused {
             Err(htui_core::store::StoreError::Constraint(said)) => {
-                assert_eq!(said, htui_core::store::BOX_SETTINGS_NOT_AN_OBJECT, "{blob}")
+                assert_eq!(
+                    said,
+                    htui_core::store::traits::BOX_SETTINGS_NOT_AN_OBJECT,
+                    "{blob}"
+                )
             }
             other => panic!("{blob}: a non-object blob is a Constraint, got {other:?}"),
         }
