@@ -148,6 +148,22 @@ is clamped to 2 through 8, with a warning in the log when it was moved. The pool
 any setting is read from the database. The TUI keeps its own pool of 8, so keep the sum over every
 running `htui` process below your server's `max_connections`.
 
+## The concepts index
+
+When the OS keyring holds a Qdrant URL (set in Settings > Qdrant, as for `htui --index-items`), the
+worker keeps the concepts index in step with every project: once at start, then every
+`concepts_sync_minutes` minutes. That is an `app_setting` key holding a positive whole number,
+read again after every sync; without it, or with any other value, the interval is 15 minutes.
+
+- The keyring is read **once**, at start. Without a URL there, or with a keyring that cannot be
+  read, the worker logs one `info` line saying why and never indexes; a URL stored later is
+  picked up at the next start. A host without a keyring, which is the systemd case, never indexes.
+- The embedding model loads in the background, downloaded on first use exactly as for
+  `--index-items`; runs never wait for it.
+- A Qdrant that does not answer, a model that does not load or a sync that fails is a `warn` line,
+  and the next interval tries again. None of it touches runs.
+- The sync shares the worker's pool, one query at a time, and is stopped on shutdown.
+
 ## Logs
 
 - `--log PATH` appends the log to that file, exactly as the TUI does. The directory must exist.
