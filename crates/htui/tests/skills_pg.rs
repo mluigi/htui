@@ -195,6 +195,11 @@ async fn a_skill_with_no_version_is_edited_into_v1_on_postgres() {
 
     harness.key("e");
     type_text(harness, "Bare.");
+    let frame = harness.render();
+    assert!(
+        frame.contains("bare-skill \u{b7} no version yet, saves v1"),
+        "the editor's title names no version to edit from: {frame}"
+    );
     harness.key("ctrl-s");
     harness.settle().await;
 
