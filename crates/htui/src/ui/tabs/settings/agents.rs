@@ -47,7 +47,9 @@
 //! branches on an agent's name (`R-AGT-5`).
 
 use chrono::{DateTime, Utc};
-use htui_agent::auth::loopback::Advertised;
+use htui_agent::auth::loopback::{
+    self, Advertised, DELIVERY_IN_FLIGHT, NO_LOOPBACK_REDIRECT, PASTE_MAX, RedirectUrl,
+};
 use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::install::PlanError;
 use htui_agent::probe::{ProbeSnapshot, ProbeStatus};
@@ -161,6 +163,15 @@ const HINT_CHOOSING: &str = "j/k choose \u{b7} Enter select \u{b7} Esc cancel";
 
 /// The hint line while a login is spawning or running.
 const HINT_AUTH_RUNNING: &str = "o open link \u{b7} x cancel";
+
+/// What `p` says while the login is being cancelled (MOD-22 D282).
+const PASTE_CANCELLING: &str = "this login is being cancelled; there is nothing to paste into";
+
+/// The two refusals of a request into a login that mean the flow is **gone** rather than that the
+/// one request was answered no: `agent_worker`'s `auth_command` answers the first when no login is
+/// held and the second when the flow's task has already closed its queue (MOD-22 D287). Spelled
+/// here because the worker's second constant is private to it; the section tests pin both.
+const LOGIN_GONE: [&str; 2] = ["no login is running", "this login has ended"];
 
 /// What the `on this box` column reads between `a` and the flow's own method list.
 const STARTING: &str = "starting\u{2026}";
@@ -681,6 +692,95 @@ impl AgentsSection {
         }
     }
 
+    /// `p`: open the masked paste field, or say by name why there is nothing to paste into
+    /// (MOD-22 D270, D282). The first matching row wins: a login on its way out, then a delivery
+    /// still unanswered, then a redirect to paste for, else none advertised (which covers
+    /// `Starting`).
+    ///
+    /// The field opens at [`PASTE_MAX`] (D275): every paste `validate` would accept fits its first
+    /// allocation, so no prefix of a pasted code is ever freed unwiped on the way.
+    fn open_paste(&mut self, ctx: &mut Ctx<'_>) {
+        let refusal = match &mut self.auth {
+            AuthState::Running {
+                cancelling: true, ..
+            } => PASTE_CANCELLING,
+            AuthState::Running {
+                delivering: true, ..
+            } => DELIVERY_IN_FLIGHT,
+            AuthState::Running {
+                advertised: Some(_),
+                paste,
+                ..
+            } => {
+                *paste = Some(TextField::masked_with_capacity(PASTE_MAX));
+                return;
+            }
+            _ => NO_LOOPBACK_REDIRECT,
+        };
+        ctx.emit(Action::Error(refusal.to_owned()));
+    }
+
+    /// One key while the paste field is open: `connection.rs`'s editor shape (MOD-22 D270).
+    ///
+    /// The field answers first, so the section's letters, the shell's `q`, `?` and digits and the
+    /// tab's `h`/`l` are characters of the address; everything it passes on is swallowed, with
+    /// `CONTROL` chords excepted so `ctrl-c` still quits.
+    ///
+    /// `Enter` **moves** the buffer into a [`RedirectUrl`], so there is one copy of what was pasted
+    /// and it is wiped when the request that carries it is dropped. The local `validate` is a
+    /// courtesy — the worker runs it again and is the authority (MOD-23 D247's rule) — and what it
+    /// refuses is answered with its fixed sentence and a fresh empty field for the re-paste.
+    fn on_paste_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let AuthState::Running {
+            advertised,
+            paste,
+            delivering,
+            ..
+        } = &mut self.auth
+        else {
+            return Handled::Pass;
+        };
+        let Some(field) = paste.as_mut() else {
+            return Handled::Pass;
+        };
+        match field.on_key(key) {
+            FieldOutcome::Consumed => Handled::Consumed,
+            // The field drops, and its buffer is wiped on the way out (D272).
+            FieldOutcome::Cancel => {
+                *paste = None;
+                Handled::Consumed
+            }
+            FieldOutcome::Pass if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
+            FieldOutcome::Pass => Handled::Consumed,
+            FieldOutcome::Submit => {
+                let url = RedirectUrl::new(field.take());
+                match advertised
+                    .as_ref()
+                    .map(|advertised| loopback::validate(&url, advertised))
+                {
+                    // The `Delivery` is dropped unused: the worker builds its own.
+                    Some(Ok(_)) => {
+                        *paste = None;
+                        *delivering = true;
+                        ctx.request(StoreRequest::AuthDeliver { url });
+                    }
+                    // The old buffer was moved into `url` and dies with it.
+                    Some(Err(refusal)) => {
+                        *paste = Some(TextField::masked_with_capacity(PASTE_MAX));
+                        ctx.emit(Action::Error(refusal.to_string()));
+                    }
+                    // Unreachable through `open_paste`, which opens the field only with a
+                    // redirect; answered rather than assumed.
+                    None => {
+                        *paste = None;
+                        ctx.emit(Action::Error(NO_LOOPBACK_REDIRECT.to_owned()));
+                    }
+                }
+                Handled::Consumed
+            }
+        }
+    }
+
     /// One frame of a login stream (MOD-21 D18, D20).
     ///
     /// Every terminal frame lands on [`AuthState::Idle`] with a notice, and exactly one of them —
@@ -722,16 +822,33 @@ impl AgentsSection {
                     }
                 }
             }
+            // MOD-22 D264: the newest link that advertises a loopback redirect is the one a paste
+            // is checked against, as the worker does; a link that advertises none leaves the last
+            // one standing.
             AuthFrame::Url(url) => {
-                if let AuthState::Running { url: shown, .. } = &mut self.auth {
+                if let AuthState::Running {
+                    url: shown,
+                    advertised,
+                    ..
+                } = &mut self.auth
+                {
                     *shown = Some(url.clone());
+                    if let Some(found) = Advertised::from_auth_url(url) {
+                        *advertised = Some(found);
+                    }
                 }
             }
             // The opener was spawned. Not the end of anything: the flow is still waiting on the
             // human this link was for.
             AuthFrame::Opened => self.notice = Some(OPENED.to_owned()),
-            // MOD-22 D268: what the listener said, on the note line. T3 adds the rest.
-            AuthFrame::Delivered(reply) => self.notice = Some(reply.summary()),
+            // MOD-22 D268, D270: what the listener said, on the note line, and `p` free again. Not
+            // the end of anything: the login's verdict is still the probe's (`R-AGT-6`).
+            AuthFrame::Delivered(reply) => {
+                if let AuthState::Running { delivering, .. } = &mut self.auth {
+                    *delivering = false;
+                }
+                self.notice = Some(reply.summary());
+            }
             AuthFrame::Done { call, status } => {
                 let what = match call {
                     AuthCall::Authenticate(_) => "logged in",
@@ -747,9 +864,15 @@ impl AgentsSection {
                 self.auth = AuthState::Idle;
                 self.notice = Some(message.clone());
             }
+            // MOD-22 D282: a login on its way out has nothing to paste into, so an open field
+            // closes with the acknowledgement, and its buffer is wiped as it drops.
             AuthFrame::Cancelling => {
-                if let AuthState::Running { cancelling, .. } = &mut self.auth {
+                if let AuthState::Running {
+                    cancelling, paste, ..
+                } = &mut self.auth
+                {
                     *cancelling = true;
+                    *paste = None;
                 }
             }
             AuthFrame::Cancelled => {
@@ -1821,7 +1944,12 @@ impl SettingsSection for AgentsSection {
         if matches!(self.auth, AuthState::Choosing { .. }) {
             return self.answer_chooser(key, ctx);
         }
-        // `a`, `e`, `i`, `j`, `k`, `n`, `o`, `r`, `t` and `x` are free: the global keymap binds `q`,
+        // Then an open paste field (MOD-22 D270), which takes every key but a `CONTROL` chord:
+        // `q`, `x`, `o`, `?` and the digits are characters of the address being pasted.
+        if matches!(self.auth, AuthState::Running { paste: Some(_), .. }) {
+            return self.on_paste_key(key, ctx);
+        }
+        // `a`, `e`, `i`, `j`, `k`, `n`, `o`, `p`, `r`, `t` and `x` are free: the global keymap binds `q`,
         // `Tab`/`BackTab`, the digits, `?`, `ctrl-c` and `w`, and the tab itself consumes
         // `h`/`l`/`[`/`]`/arrows before a section is offered the key. `n` is also the consent and
         // chooser modals' "no", and they answer above, before this match.
@@ -1872,6 +2000,12 @@ impl SettingsSection for AgentsSection {
             // section that swallowed it everywhere would be claiming a key it does nothing with.
             KeyCode::Char('o') if self.auth_in_flight() => {
                 self.open_link(ctx);
+                Handled::Consumed
+            }
+            // `o`'s kind of key (MOD-22 D282): bound while a flow is in flight, and a refusal names
+            // itself rather than the key doing nothing.
+            KeyCode::Char('p') if self.auth_in_flight() => {
+                self.open_paste(ctx);
                 Handled::Consumed
             }
             // `x` cancels a running install **and** a pre-flight. Planning is one `GET` and one
@@ -1993,6 +2127,19 @@ impl SettingsSection for AgentsSection {
             // request answered no, not the end of a login. The pane stays exactly as it was, and
             // the link is still there to try again with.
             StoreReply::Failed { request, .. } if *request == "auth_open" => {}
+            // MOD-22 D270: the same for a refused or failed delivery — one request answered no;
+            // the login and its link stay, and `p` works again. Unless the refusal says the flow
+            // itself is gone, which is `auth_choose`'s rule: a state a second `a` can start from.
+            StoreReply::Failed { request, message }
+                if *request == "auth_deliver" && LOGIN_GONE.contains(&message.as_str()) =>
+            {
+                self.auth = AuthState::Idle;
+            }
+            StoreReply::Failed { request, .. } if *request == "auth_deliver" => {
+                if let AuthState::Running { delivering, .. } = &mut self.auth {
+                    *delivering = false;
+                }
+            }
             // `agent` is mirrored since MOD-2 milestone 4 (plan D31), so an offline backend
             // answers this read from the mirror; `agent_box` is not, which is why every offline
             // row's `on this box` column reads `not probed`. A refusal is therefore a store that

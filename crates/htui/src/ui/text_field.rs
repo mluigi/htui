@@ -11,8 +11,9 @@
 //!
 //! **`Zeroizing` arrived with milestone 6** (D3), and it covers exactly this much: the buffer is
 //! wiped when the field drops, when [`clear`](TextField::clear) is called, and — because
-//! [`masked`](TextField::masked) reserves 256 bytes — without a trail of half-typed reallocations
-//! behind it. What it does not reach is priced rather than claimed: the terminal's own input
+//! [`masked`](TextField::masked) reserves 256 bytes (or what
+//! [`masked_with_capacity`](TextField::masked_with_capacity) was given) — without a trail of
+//! half-typed reallocations behind it. What it does not reach is priced rather than claimed: the terminal's own input
 //! buffering, the kernel's, and any allocation a `with_text` field outgrew before this. The one
 //! secret this widget ever holds leaves it through [`take`](TextField::take), which **moves** the
 //! allocation to a caller that wraps it in `Zeroizing` on the same line.
@@ -89,11 +90,7 @@ impl TextField {
     /// travels as [`htui_store::Dsn`], whose `Debug` is `Dsn(<redacted>)`.
     #[must_use]
     pub fn masked() -> Self {
-        Self {
-            masked: true,
-            text: Zeroizing::new(String::with_capacity(256)),
-            ..Self::default()
-        }
+        Self::masked_with_capacity(256)
     }
 
     /// An empty masked field reserving `bytes` up front (MOD-22 D275).
@@ -104,8 +101,11 @@ impl TextField {
     /// that caller could use.
     #[must_use]
     pub fn masked_with_capacity(bytes: usize) -> Self {
-        let _ = bytes;
-        todo!("MOD-22 T3 (b)")
+        Self {
+            masked: true,
+            text: Zeroizing::new(String::with_capacity(bytes)),
+            ..Self::default()
+        }
     }
 
     /// An unmasked field holding `text`, cursor at the end — how an editor prefills a row.
