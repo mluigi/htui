@@ -3,8 +3,9 @@
 //!
 //! An `agent` row is **box-independent**: it says `${node}`, not `C:/Program Files/nodejs/node.exe`.
 //! [`resolve`] turns a row plus a per-box [`ToolMap`] into a [`ResolvedLaunch`], which is what a
-//! transport actually spawns. The map is an *input* here — filling it from `agent_box.probe.tools`
-//! is milestone 5's probe, and nothing in this module touches `PATH` looking for agents.
+//! transport actually spawns. The map is an *input* here — it is filled by the probe
+//! (`ToolReport::tool_map`) or by `tools::resolve`, and nothing in this module touches `PATH`
+//! looking for agents.
 //!
 //! The one thing this module does consult `PATH` for is the resolved command itself, through the
 //! `which` crate rather than `Command::new`: `std::process::Command` does not read `PATHEXT`, so
@@ -55,8 +56,7 @@ pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Per-box tool paths, keyed by the `${name}` a launch row writes.
 ///
-/// Milestone 5's probe fills this from `agent_box.probe.tools`; until then a caller supplies it
-/// (a test, or a hand-written box profile).
+/// Filled by the probe (`ToolReport::tool_map`) or by `tools::resolve`; a test supplies its own.
 pub type ToolMap = BTreeMap<String, String>;
 
 // ---------------------------------------------------------------------------------------------
@@ -520,6 +520,11 @@ pub fn resolve(launch: &AgentLaunch, tools: &ToolMap) -> Result<ResolvedLaunch> 
 /// transport that applied only three of them would spawn something the probe never measured. The
 /// environment is the row's, exactly as it resolved; a caller with more to add — a session's
 /// `spec.env`, a login's browser policy — adds it to the value it is handed.
+///
+/// **No manual tier here** (MOD-66 D2, D12). A box's manual paths reach a spawn through the
+/// recording, which the probe made over them. When the recording is gone or no longer a file, the
+/// fallback is `tools::resolve`, which walks the `HTUI_TOOL_*` override and the discovery tiers
+/// only. A recording that vanished usually means the manual path vanished too.
 ///
 /// # Errors
 /// [`DriverError::Unresolved`] naming the first tool that resolves nowhere or the first placeholder
