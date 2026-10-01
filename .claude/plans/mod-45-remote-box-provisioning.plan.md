@@ -7,8 +7,7 @@ split cleanly from milestone 1.
 **Complexity**: Medium
 **Base**: `de177dd` (`main`), branch `hr/MOD-45`. Decision IDs D291–D314 (the highest in the tree and
 on the host is D290, MOD-22).
-**Status**: fact-checked (both passes below). Amended before CONFIRM; open questions OQ-1 and OQ-2
-await the maintainer.
+**Status**: fact-checked (both passes below), CONFIRMED 2026-10-01 (OQ-1 (a), OQ-2 accepted).
 
 ## Summary
 
@@ -328,6 +327,10 @@ htui provision host
   `htui-store` changes only `identity.rs` (`parse_box_toml`) and `dsn.rs` (`host_class`).
 
 ## Open questions for the maintainer (answer at CONFIRM)
+
+**Answered 2026-10-01 at CONFIRM ("confirm" over the recommendations): OQ-1 → (a), OQ-2 → accept.**
+The plan implements both. The `R-STO-1` amendment text is written by the main thread at close-out:
+"…or be read once from the worker's or a TUI session's stdin and held only in memory."
 
 - **OQ-1 — Agent login on the new box.** PRD D4 and the item text say "agent login via MOD-22's
   paste-back". But MOD-22's pane lives in the TUI, and a TUI started over `ssh -t` on the new box
