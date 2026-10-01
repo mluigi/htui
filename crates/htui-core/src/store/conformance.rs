@@ -35,8 +35,9 @@ use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::store::error::StoreError;
 use crate::store::traits::{
-    CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL, ReadStore,
-    SettingRung, StepFence, UpdateOutcome, WriteStore, already_exists, citation_key, illegal_move,
+    BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, CasOutcome, DeleteReach,
+    DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL, ReadStore, SettingRung, StepFence,
+    StoredSetting, UpdateOutcome, WriteStore, already_exists, citation_key, illegal_move,
     invalid_area_code, requirement_withdrawn, resolution_not_closable, withdrawn_requirement_cited,
 };
 
@@ -146,6 +147,8 @@ pub const CASES: &[&str] = &[
     "edit_box_writes_the_executor_and_keeps_every_other_setting",
     "an_unknown_executor_is_refused_and_writes_nothing",
     "an_executor_edit_is_a_compare_and_set",
+    "box_probe_spec_is_cas_on_updated_at",
+    "set_box_probe_spec_refuses_a_non_object_and_a_clear_without_a_token",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -360,6 +363,12 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "an_executor_edit_is_a_compare_and_set" => {
             an_executor_edit_is_a_compare_and_set(store).await;
+        }
+        "box_probe_spec_is_cas_on_updated_at" => {
+            box_probe_spec_is_cas_on_updated_at(store).await;
+        }
+        "set_box_probe_spec_refuses_a_non_object_and_a_clear_without_a_token" => {
+            set_box_probe_spec_refuses_a_non_object_and_a_clear_without_a_token(store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -8754,6 +8763,267 @@ async fn an_executor_edit_is_a_compare_and_set<S: WriteStore>(store: &S) {
         Executor::of(&demo_box_settings(store, CASE).await),
         Executor::Worker,
         "{CASE}: the blob holds the first edit's executor only"
+    );
+}
+
+/// The terraform overlay the two `box_probe_spec` cases store first: an object the probe accepts.
+fn terraform_overlay() -> Value {
+    json!({"tools": {"terraform": {"kind": "path", "names": ["terraform"]}}})
+}
+
+/// MOD-51 plan D2, D7: [`WriteStore::set_box_probe_spec`] is a compare-and-set on the row's
+/// `updated_at`. "Expect no row" inserts once and is `Stale` over a row; a token updates once and
+/// is spent after; a delete under the current token clears; a token whose row is gone is
+/// `Stale(None)`, never `NotFound`; and no `SettingKey` row moves.
+///
+/// The second overlay (`{"nope": 1}`) is an object the probe refuses (unknown key), and the store
+/// stores it: the store checks only the shape (plan requirement 4). No fixture holds a float or a
+/// duplicate key, because Postgres' `JSONB` would round-trip neither byte for byte.
+async fn box_probe_spec_is_cas_on_updated_at<S: WriteStore>(store: &S) {
+    const CASE: &str = "box_probe_spec_is_cas_on_updated_at";
+    let a = terraform_overlay();
+    let b = json!({"nope": 1});
+    let c = json!({"gpu_vendors": []});
+
+    // (0) Postgres' `0002` seeds only `SettingKey` rows, and `MemStore` loads none.
+    assert_eq!(
+        store.box_probe_spec().await.expect(CASE),
+        None,
+        "{CASE}: the fixture holds no box_probe_spec row"
+    );
+    let before = store
+        .setting(SettingRung::App, SettingKey::TokenBudget)
+        .await
+        .expect(CASE);
+
+    // (1) "Expect no row" over no row inserts.
+    let row1 = applied(
+        CASE,
+        store
+            .set_box_probe_spec(Some(a.clone()), None)
+            .await
+            .expect(CASE),
+    )
+    .expect("an applied insert carries the row");
+    assert_eq!(
+        row1.value,
+        Some(a.clone()),
+        "{CASE}: the insert answers the value as stored"
+    );
+    assert_eq!(
+        store.box_probe_spec().await.expect(CASE),
+        Some(row1.clone()),
+        "{CASE}: the read-back is the row the insert returned"
+    );
+
+    // (2) "Expect no row" over a row is a miss carrying the row, never an overwrite.
+    assert_eq!(
+        stale(
+            CASE,
+            store
+                .set_box_probe_spec(Some(b.clone()), None)
+                .await
+                .expect(CASE)
+        ),
+        Some(row1.clone()),
+        "{CASE}: an insert over a row is Stale carrying it"
+    );
+    assert_eq!(
+        store.box_probe_spec().await.expect(CASE),
+        Some(row1.clone()),
+        "{CASE}: the missed insert wrote nothing"
+    );
+
+    // (3) The current token updates, even to an object the probe would refuse.
+    let row2 = applied(
+        CASE,
+        store
+            .set_box_probe_spec(Some(b.clone()), Some(row1.updated_at))
+            .await
+            .expect(CASE),
+    )
+    .expect("an applied update carries the row");
+    assert_eq!(
+        row2.value,
+        Some(b.clone()),
+        "{CASE}: the update answers the new value"
+    );
+    assert!(
+        row2.updated_at > row1.updated_at,
+        "{CASE}: the update moves the token forward ({} then {}); a clock that cannot tell two \
+         back-to-back writes apart cannot run this case",
+        row1.updated_at,
+        row2.updated_at
+    );
+    assert_eq!(
+        store.box_probe_spec().await.expect(CASE),
+        Some(row2.clone()),
+        "{CASE}: the read-back is the row the update returned"
+    );
+
+    // (4) The spent token misses, for an update and for a delete alike.
+    for (label, overlay) in [("an update", Some(c.clone())), ("a delete", None)] {
+        assert_eq!(
+            stale(
+                CASE,
+                store
+                    .set_box_probe_spec(overlay, Some(row1.updated_at))
+                    .await
+                    .expect(CASE)
+            ),
+            Some(row2.clone()),
+            "{CASE}: {label} under a spent token is Stale carrying the row as it is now"
+        );
+    }
+    assert_eq!(
+        store.box_probe_spec().await.expect(CASE),
+        Some(row2.clone()),
+        "{CASE}: the spent token wrote nothing"
+    );
+
+    // (5) A delete under the current token clears the row.
+    assert_eq!(
+        applied(
+            CASE,
+            store
+                .set_box_probe_spec(None, Some(row2.updated_at))
+                .await
+                .expect(CASE)
+        ),
+        None,
+        "{CASE}: a delete under the current token is Applied(None)"
+    );
+    assert_eq!(
+        store.box_probe_spec().await.expect(CASE),
+        None,
+        "{CASE}: the cleared row is gone"
+    );
+
+    // (6) A token whose row is gone is a miss like a spent one (MOD-7 D48), not `NotFound`.
+    for (label, overlay) in [("an update", Some(c.clone())), ("a delete", None)] {
+        let gone = store
+            .set_box_probe_spec(overlay, Some(row2.updated_at))
+            .await;
+        assert!(
+            matches!(gone, Ok(CasOutcome::Stale(None))),
+            "{CASE}: {label} under the token of a deleted row is Stale(None), got {gone:?}"
+        );
+    }
+    assert_eq!(
+        store.box_probe_spec().await.expect(CASE),
+        None,
+        "{CASE}: a miss over no row wrote nothing"
+    );
+
+    // (7) "Expect no row" inserts again after the clear.
+    let row3 = applied(
+        CASE,
+        store
+            .set_box_probe_spec(Some(c.clone()), None)
+            .await
+            .expect(CASE),
+    )
+    .expect("an applied insert carries the row");
+    assert_eq!(
+        row3.value,
+        Some(c),
+        "{CASE}: the insert after a clear stores its value"
+    );
+    assert_eq!(
+        store.box_probe_spec().await.expect(CASE),
+        Some(row3),
+        "{CASE}: the read-back is the re-inserted row"
+    );
+
+    // (8) The overlay row is not a `SettingKey` row, and none of those moved.
+    assert_eq!(
+        store
+            .setting(SettingRung::App, SettingKey::TokenBudget)
+            .await
+            .expect(CASE),
+        before,
+        "{CASE}: no SettingKey row moved"
+    );
+}
+
+/// MOD-51 plan D2, D7: [`WriteStore::set_box_probe_spec`]'s two refusals, decided before any
+/// read. An overlay that is not a JSON object is [`BOX_PROBE_SPEC_NOT_AN_OBJECT`] whatever the
+/// token says, current or spent; a clear with no token is [`BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN`]
+/// whether a row exists or not. Neither writes anything.
+async fn set_box_probe_spec_refuses_a_non_object_and_a_clear_without_a_token<S: WriteStore>(
+    store: &S,
+) {
+    const CASE: &str = "set_box_probe_spec_refuses_a_non_object_and_a_clear_without_a_token";
+    let refused =
+        |label: &str, outcome: Result<CasOutcome<Option<StoredSetting>>, StoreError>| match outcome
+        {
+            Err(StoreError::Constraint(said)) => said,
+            other => panic!("{CASE}: {label} is a Constraint, got {other:?}"),
+        };
+
+    // Over no row.
+    for (label, value) in [("a number", json!(42)), ("an array", json!(["x"]))] {
+        assert_eq!(
+            refused(label, store.set_box_probe_spec(Some(value), None).await),
+            BOX_PROBE_SPEC_NOT_AN_OBJECT,
+            "{CASE}: {label} over no row is refused with the shape sentence"
+        );
+    }
+    assert_eq!(
+        refused(
+            "a clear with no token over no row",
+            store.set_box_probe_spec(None, None).await
+        ),
+        BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN,
+        "{CASE}: a clear with no token over no row is refused with the token sentence"
+    );
+    assert_eq!(
+        store.box_probe_spec().await.expect(CASE),
+        None,
+        "{CASE}: no refusal over no row wrote anything"
+    );
+
+    // Over a row: the refusals win over a current token and over a spent one.
+    let row = applied(
+        CASE,
+        store
+            .set_box_probe_spec(Some(terraform_overlay()), None)
+            .await
+            .expect(CASE),
+    )
+    .expect("an applied insert carries the row");
+    assert_eq!(
+        refused(
+            "a string under the current token",
+            store
+                .set_box_probe_spec(Some(json!("x")), Some(row.updated_at))
+                .await
+        ),
+        BOX_PROBE_SPEC_NOT_AN_OBJECT,
+        "{CASE}: the shape refusal wins over a current token"
+    );
+    assert_eq!(
+        refused(
+            "a number under a spent token",
+            store
+                .set_box_probe_spec(Some(json!(1)), Some(row.updated_at - TimeDelta::seconds(1)))
+                .await
+        ),
+        BOX_PROBE_SPEC_NOT_AN_OBJECT,
+        "{CASE}: the shape refusal wins over a spent token"
+    );
+    assert_eq!(
+        refused(
+            "a clear with no token over a row",
+            store.set_box_probe_spec(None, None).await
+        ),
+        BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN,
+        "{CASE}: a clear with no token is refused even though a row exists"
+    );
+    assert_eq!(
+        store.box_probe_spec().await.expect(CASE),
+        Some(row),
+        "{CASE}: no refusal over the row wrote anything, the token included"
     );
 }
 

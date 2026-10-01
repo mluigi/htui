@@ -1612,6 +1612,19 @@ impl WriteStore for PgStore {
         }
     }
 
+    async fn box_probe_spec(&self) -> Result<Option<StoredSetting>> {
+        todo!("MOD-51 T2: the App-rung SELECT, next commit")
+    }
+
+    async fn set_box_probe_spec(
+        &self,
+        overlay: Option<Value>,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Option<StoredSetting>>> {
+        let _ = (overlay, expected);
+        todo!("MOD-51 T2: the App-rung INSERT / UPDATE / DELETE, next commit")
+    }
+
     /// The `run` / `run_step` pair of a free-standing chat, in one transaction, both
     /// `ON CONFLICT (id) DO NOTHING` (plan D4).
     ///

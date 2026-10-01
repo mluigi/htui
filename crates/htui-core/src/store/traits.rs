@@ -511,6 +511,50 @@ pub trait WriteStore: ReadStore {
     async fn edit_box(&self, id: BoxId, expected: i32, edit: BoxEdit)
     -> Result<CasOutcome<BoxRow>>;
 
+    /// The stored `app_setting` row keyed
+    /// [`BOX_PROBE_SPEC_KEY`](crate::model::BOX_PROBE_SPEC_KEY) and its compare-and-set token
+    /// (MOD-51 D2, MOD-7 D52), **unvalidated**: whether the probe would accept the value is
+    /// `htui-agent`'s question (`htui_agent::box_probe::spec::effective`), not the store's.
+    ///
+    /// `None` when there is no row; a row always answers `value: Some`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the backend's read fails with.
+    async fn box_probe_spec(&self) -> Result<Option<StoredSetting>>;
+
+    /// Sets, replaces or clears the `box_probe_spec` overlay, a compare-and-set on the row's
+    /// `updated_at` (MOD-51 D2, `docs/ANA-16.md` C7). The narrow typed writer beside the `App` rung
+    /// of [`set_setting`](WriteStore::set_setting), whose keys are the closed `SettingKey` enum.
+    ///
+    /// - `overlay: Some(v)`, `expected: None` ("I expect no row"): inserts. A row already there is
+    ///   [`CasOutcome::Stale`] carrying it, never an overwrite.
+    /// - `overlay: Some(v)`, `expected: Some(t)`: replaces the value where `updated_at = t`.
+    /// - `overlay: None`, `expected: Some(t)`: deletes the row where `updated_at = t`, answering
+    ///   `Applied(None)`.
+    ///
+    /// `Applied(Some(row))` carries the value as written and the store's new token. A miss is
+    /// `Stale` with the row as it is now, and **`Stale(None)` when the row is gone**. That differs
+    /// from `set_setting`'s `NotFound` on purpose: a row deleted under an open editor is a miss
+    /// like a spent token (MOD-7 D48), and the editor retries with `expected: None`. Nothing is
+    /// written on a miss.
+    ///
+    /// The store checks only what it can know without the probe. Whether the keys, tools and
+    /// patterns mean anything is checked by the caller first (`htui::box_settings::serve`, through
+    /// `htui_agent::box_probe::spec::check`).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) carrying
+    /// [`BOX_PROBE_SPEC_NOT_AN_OBJECT`] for a `Some(v)` that is not a JSON object, or
+    /// [`BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN`] for `None` with `expected: None`. Both are decided
+    /// before any read, so they win over `Stale`, and a refusal writes nothing.
+    async fn set_box_probe_spec(
+        &self,
+        overlay: Option<Value>,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Option<StoredSetting>>>;
+
     /// Mints the `run` / `run_step` pair of a free-standing chat, both `ON CONFLICT (id) DO
     /// NOTHING` (MOD-2 plan D4).
     ///
@@ -1721,6 +1765,15 @@ pub const EXECUTOR_MUST_BE_KNOWN: &str = "executor must be tui or worker";
 /// blob that is not a JSON object (Postgres' `jsonb_set` errors on a scalar or an array).
 pub const BOX_SETTINGS_NOT_AN_OBJECT: &str = "box.settings is not a JSON object";
 
+/// MOD-51 D2: [`WriteStore::set_box_probe_spec`]'s refusal of an overlay that is not a JSON
+/// object. The probe would ignore one too; the store refuses it without the probe's help.
+pub const BOX_PROBE_SPEC_NOT_AN_OBJECT: &str = "box_probe_spec is not a JSON object";
+
+/// MOD-51 D2: [`WriteStore::set_box_probe_spec`]'s refusal of a clear with no token: a delete is
+/// a compare-and-set on the row it deletes, and "expect no row" has nothing to delete.
+pub const BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN: &str =
+    "box_probe_spec clear needs the updated_at of the row it clears";
+
 /// MOD-9 D71: a name [`validate_name`] refuses.
 #[must_use]
 pub fn invalid_skill_name(name: &str) -> String {
@@ -2297,8 +2350,8 @@ impl SettingRung {
     }
 }
 
-/// One setting as stored, with the token a later [`WriteStore::set_setting`] or
-/// [`WriteStore::clear_setting`] must present.
+/// One setting as stored, with the token a later [`WriteStore::set_setting`],
+/// [`WriteStore::clear_setting`] or [`WriteStore::set_box_probe_spec`] must present.
 ///
 /// `value: None` is "the rung's row exists but holds no value for this key", which is a different
 /// fact from the row not existing at all — the first means the rung below answers, the second
