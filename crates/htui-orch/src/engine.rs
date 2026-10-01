@@ -3723,28 +3723,7 @@ where
             })
         }))
         .await;
-        // Every candidate settled, so every failure is reported: the first is raised, and the
-        // rest — which `?` alone would drop — are logged against the run.
-        let mut first = None;
-        let mut cancelled = None;
-        for err in settled.into_iter().filter_map(Result::err) {
-            // MOD-42 I-6: a cancel is raised in preference to any failure write's error, so the
-            // caller sees `Cancelled` and settles nothing.
-            if matches!(err, EngineError::Cancelled { .. }) {
-                cancelled.get_or_insert(err);
-            } else if first.is_none() {
-                first = Some(err);
-            } else {
-                tracing::warn!(run = %run.id, %err, "a further candidate's failure write failed; the first is raised");
-            }
-        }
-        if let Some(cancelled) = cancelled {
-            if let Some(err) = first {
-                tracing::warn!(run = %run.id, %err, "a candidate's error is dropped for the run's cancel");
-            }
-            return Err(cancelled);
-        }
-        first.map_or(Ok(None), Err)
+        group_error(run.id, settled).map_or(Ok(None), Err)
     }
 
     /// The group's base per repo (plan D54(b)): the `before_hash`es a candidate of the slot already
@@ -6126,6 +6105,38 @@ const fn is_fenced(err: &EngineError) -> bool {
             | EngineError::Record(htui_agent::RecordError::Store(StoreError::Fenced { .. }))
             | EngineError::Driver(DriverError::Store(StoreError::Fenced { .. }))
     )
+}
+
+/// The error a group's `join_all` raises, if any of its candidates answered one.
+///
+/// Every candidate settled, so every failure is reported: one is raised, and the rest — which `?`
+/// alone would drop — are logged against the run. MOD-42 I-6: a cancel is raised in preference
+/// to any other error, so the caller sees `Cancelled` and settles nothing; D4: a lost fence next,
+/// so the caller writes nothing on a stranger's run; otherwise the first failure write's error.
+fn group_error(
+    run: RunId,
+    settled: impl IntoIterator<Item = Result<(), EngineError>>,
+) -> Option<EngineError> {
+    let (mut cancelled, mut fenced, mut first) = (None, None, None);
+    for err in settled.into_iter().filter_map(Result::err) {
+        let slot = if matches!(err, EngineError::Cancelled { .. }) {
+            &mut cancelled
+        } else if is_fenced(&err) {
+            &mut fenced
+        } else {
+            &mut first
+        };
+        if slot.is_none() {
+            *slot = Some(err);
+        } else {
+            tracing::warn!(run = %run, %err, "a further candidate's error is dropped; the first of its kind is raised");
+        }
+    }
+    let raised = cancelled.or_else(|| fenced.take()).or_else(|| first.take());
+    for err in [fenced, first].into_iter().flatten() {
+        tracing::warn!(run = %run, %err, "a candidate's error is dropped for the run's cancel or lost fence");
+    }
+    raised
 }
 
 /// The `fanout_index` of a candidate the judge prompt's trimmer dropped outright (plan D53).
@@ -15264,6 +15275,41 @@ mod tests {
                 notes,
                 "no note"
             );
+        }
+
+        /// I-6 and D4 at a group's `join_all`: whatever order the candidates settled in, a cancel
+        /// is raised over a lost fence and both over a failure write's error, so the walk's
+        /// catch-all settles nothing; with neither, the first error is raised.
+        #[test]
+        fn a_group_raises_a_cancel_then_a_lost_fence_then_the_first_error() {
+            use htui_core::store::StoreError;
+
+            let run = RunId::new();
+            let cancel = || Err(EngineError::Cancelled { run });
+            let fence = || {
+                Err(EngineError::Store(StoreError::Fenced {
+                    step: StepId::new(),
+                }))
+            };
+            let failed = |reason: &str| Err(EngineError::Store(StoreError::Backend(reason.into())));
+
+            assert!(crate::engine::group_error(run, [Ok(()), Ok(())]).is_none());
+            assert!(matches!(
+                crate::engine::group_error(run, [failed("write"), cancel()]),
+                Some(EngineError::Cancelled { run: raised }) if raised == run
+            ));
+            assert!(matches!(
+                crate::engine::group_error(run, [fence(), Ok(()), cancel()]),
+                Some(EngineError::Cancelled { .. })
+            ));
+            assert!(matches!(
+                crate::engine::group_error(run, [failed("write"), fence()]),
+                Some(EngineError::Store(StoreError::Fenced { .. }))
+            ));
+            assert!(matches!(
+                crate::engine::group_error(run, [Ok(()), failed("first"), failed("second")]),
+                Some(EngineError::Store(StoreError::Backend(reason))) if reason == "first"
+            ));
         }
 
         /// B-17: a cancel that reached the walk before its session spawns nothing.
