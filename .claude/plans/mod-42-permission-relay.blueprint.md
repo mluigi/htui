@@ -2241,3 +2241,12 @@ binding where they differ from §2-§9 above.
 - **A-6 · Offline harness test dispatches `RelayView` directly (T5).** `seed_mirror` seeds no
   items, so the offline Runs pane is unreachable in the harness; the pane's empty-view path is
   pinned by a `runs.rs` unit case instead. (T5 `a339e4d`, `cbbc061`.)
+- **A-7 · A lost fence settles nothing (T3, amends F-16).** F-16 recorded the fenced road through
+  `fail_hard` as pre-existing; the relay's fenced apply (D4) is a **new** source of `Fenced`, and a
+  probe showed the stale walk writing `failed` on a run another process held — and, for a fan-out
+  candidate and a judge call, swallowing the error or parking the run. `walk_step`,
+  `run_candidate` and `run_judge` now return before any failure write when `is_fenced(&err)`, as
+  they do for `Cancelled`; the group fold `group_error` prefers cancel, then a lost fence, then the
+  first error. Pinned by the single-step, candidate and judge "applied after the lease moved"
+  cases. (T3 `b855ac6`, `46d12af`.) Kit's production policy lookup is `policy_lookup` with its own
+  unit tests (`7ab5a8a`). Stack: `every_case_name_dispatches` still passes at 1.6 MiB (`9d65f73`).
