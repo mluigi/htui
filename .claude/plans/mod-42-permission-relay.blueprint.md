@@ -2250,3 +2250,19 @@ binding where they differ from §2-§9 above.
   first error. Pinned by the single-step, candidate and judge "applied after the lease moved"
   cases. (T3 `b855ac6`, `46d12af`.) Kit's production policy lookup is `policy_lookup` with its own
   unit tests (`7ab5a8a`). Stack: `every_case_name_dispatches` still passes at 1.6 MiB (`9d65f73`).
+- **A-8 · A queued/terminal cancel preempts live work gracefully (T4, amends B-20).** `cancel_run`'s
+  fallback calls `on_run(…, Preempt::IfLive)`, not `Never`: with `Never`, a cancel of a run whose
+  own start or claim task is live would wait behind that task's whole walk; MOD-41's
+  `Preempt::Always` stopped it, and `IfLive` keeps that stop, now graceful. Still no row. Pinned by
+  `a_cancel_of_a_queued_run_stops_its_live_claim_first`. (T4 `37c5884`, `f17aece`.)
+- **A-9 · A lock wait honours the run's `Cancel` signal (T4, extends §8.2).** `WalkToken` carries a
+  receiver of its parent's signal and `lock_unless_cancelled` returns on `Cancel`, so a command
+  queued behind a cancelled walk leaves (refused `PREEMPTED`) instead of holding `live > 0` for
+  `grace + 1 s` and then walking the run. Pinned by
+  `a_command_queued_behind_a_cancelled_walk_leaves_at_the_signal`. (T4 `37c5884`, `f17aece`.)
+- **A-10 · Polled cancels are silent; a cancelled run resolves `applied` (T4, extends B-5/B-10).**
+  Every refusal of a cancel picked up by the poll (not only the live-chat one) is logged at `debug`
+  and publishes nothing; inline cancels still answer their requester. Two processes on one box can
+  both pick up a row (the poll's read can predate the other's claim); the loser finding the run
+  already `cancelled` resolves the row `applied`, not `refused`. (T4 `f17aece`, `58d372a`,
+  `7d377d6`.)
