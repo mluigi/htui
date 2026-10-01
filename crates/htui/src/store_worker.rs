@@ -21,19 +21,21 @@ use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, Permissi
 use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
-    AgentId, AgentSummary, BindingChange, BoxEdit, BoxId, BoxInfo, CitationKind, Document,
-    DocumentHead, DocumentId, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemSummary,
-    LinkGraph, Note, PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, RepoId, RepoPatch,
-    RequirementAreaId, RequirementId, RunSummary, Scope, SessionEvent, SkillBindingKey, SkillId,
-    SkillPatch, StepGraphId, StepGraphPatch, StepId, WorkspaceId, WorkspacePatch, WorkspaceSummary,
+    AgentId, AgentSummary, AnswerOutcome, BindingChange, BoxEdit, BoxId, BoxInfo, CitationKind,
+    Document, DocumentHead, DocumentId, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch,
+    ItemSummary, LinkGraph, Note, PermissionId, PhaseId, PhasePatch, Priority, ProjectId,
+    ProjectPatch, RelayView, RepoId, RepoPatch, RequirementAreaId, RequirementId, RunSummary,
+    Scope, SessionEvent, SkillBindingKey, SkillId, SkillPatch, StepGraphId, StepGraphPatch, StepId,
+    WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::store::{
     DeleteReach, DeleteTarget, ReadStore, Result as StoreResult, SettingRung, StoreError,
+    WriteStore,
 };
 use htui_store::cache::refresh::{RefreshSettings, Refresher};
 use htui_store::vector::SearchQuery;
-use htui_store::{Backend, ConnEvent, Dsn, PgStore, Started, connect};
+use htui_store::{Backend, ConnEvent, DATABASE_UNREACHABLE, Dsn, PgStore, Started, connect};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
@@ -722,6 +724,20 @@ pub enum StoreRequest {
     Document(DocumentId),
     /// Blueprint D182: every action's enabling verdict for the item, from the engine's own guards.
     RunActions(ItemId),
+    /// MOD-42 plan D14: the item's pending permission requests and pending cancels. Served from
+    /// the writer; offline, an **empty** view — never `Failed` or `Unreachable` (OQ-4).
+    RelayView {
+        /// The item the Runs pane shows.
+        item: ItemId,
+    },
+    /// MOD-42 plan D14: one answer to a pending request (D3). Refused offline with
+    /// `DATABASE_UNREACHABLE`.
+    AnswerPermission {
+        /// The request.
+        permission: PermissionId,
+        /// The chosen option's id.
+        option_id: String,
+    },
     /// MOD-39 plan P2: the scope's specs, areas and requirements, answered with
     /// [`StoreReply::Requirements`].
     Requirements(Scope),
@@ -917,6 +933,9 @@ impl StoreRequest {
             Self::RunStream { .. } => "run_stream",
             Self::Document(_) => "document",
             Self::RunActions(_) => "run_actions",
+            // MOD-42 plan D14.
+            Self::RelayView { .. } => "relay_view",
+            Self::AnswerPermission { .. } => "answer_permission",
             // The ten of `requirements::REQUEST_NAMES`, in that order (MOD-39 plan P2).
             Self::Requirements(..) => "requirements",
             Self::RequirementDetail(..) => "requirement_detail",
@@ -1146,6 +1165,19 @@ pub enum StoreReply {
     Document(Box<Option<Document>>),
     /// Answer to [`StoreRequest::RunActions`].
     RunActions(Box<crate::run_worker::ItemActions>),
+    /// Answer to [`StoreRequest::RelayView`] for `item` (MOD-42 blueprint B-13).
+    RelayView {
+        /// The item asked about.
+        item: ItemId,
+        /// What it holds.
+        view: Box<RelayView>,
+    },
+    /// [`StoreRequest::AnswerPermission`] won its compare-and-set; a refusal is
+    /// [`StoreReply::Failed`] with the refusal's sentence (MOD-42 blueprint B-13).
+    PermissionAnswered {
+        /// The answered request.
+        permission: PermissionId,
+    },
     /// What one box probe did (MOD-7 D13): one per box probe, at the requester's address or
     /// [`UNSOLICITED`].
     BoxProbed(crate::agent_worker::BoxProbeReport),
@@ -1590,6 +1622,46 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::RunActions(item) => StoreReply::RunActions(Box::new(
             crate::run_worker::actions(backend, *item, &LiveChats::default()).await?,
         )),
+        // MOD-42 D14: a display read; offline (no writer) the view is empty, never `Failed` or
+        // `Unreachable` (OQ-4): a `Failed` lands on the status line (`app/update.rs`) and an
+        // `Unreachable` drops the backend through `go_offline`.
+        StoreRequest::RelayView { item } => StoreReply::RelayView {
+            item: *item,
+            view: Box::new(match backend.writer() {
+                Some(writer) => WriteStore::relay_view(&writer, *item).await?,
+                None => RelayView::default(),
+            }),
+        },
+        // MOD-42 D3, D14: refused offline before anything is sent (the `requirements.rs`
+        // pattern); a lost compare-and-set is the refusal's sentence on the status line (B-13).
+        StoreRequest::AnswerPermission {
+            permission,
+            option_id,
+        } => {
+            let writer = backend
+                .writer()
+                .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
+            let user = backend.this_user().await?;
+            let box_id = backend
+                .box_info()
+                .await?
+                .map(|info| info.box_id)
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "box",
+                    id: "this box".to_owned(),
+                })?;
+            match WriteStore::answer_permission(&writer, *permission, option_id, user, box_id)
+                .await?
+            {
+                AnswerOutcome::Answered => StoreReply::PermissionAnswered {
+                    permission: *permission,
+                },
+                AnswerOutcome::Refused(why) => StoreReply::Failed {
+                    request: request.name(),
+                    message: why.to_string(),
+                },
+            }
+        }
         // A command needs the runtime that owns its task, and the loop serves every one of them
         // ahead of this function; one that reaches here belongs to a caller with no runtime.
         StoreRequest::Orch(_) => StoreReply::Failed {
@@ -3501,7 +3573,7 @@ mod tests {
         let store = MemStore::demo();
         let agent_id = AgentId::new();
         let agent = crate::agent_worker::tests::install_row(agent_id, "demo", true);
-        htui_core::store::WriteStore::upsert_agent(&store, &agent, None)
+        WriteStore::upsert_agent(&store, &agent, None)
             .await
             .expect("the row lands");
         let tmp = tempfile::tempdir().expect("a temporary install root");
@@ -3879,6 +3951,45 @@ mod tests {
             "the chat is bound to the promoted step: {:?}",
             second.reply
         );
+    }
+
+    /// MOD-42 plan D14, OQ-4: offline the Runs pane's relay read is an **empty** view, never a
+    /// `Failed` (the status line) or an `Unreachable` (`go_offline`), and an answer is refused with
+    /// `DATABASE_UNREACHABLE` before anything is sent.
+    #[tokio::test]
+    async fn relay_reads_are_empty_offline_and_answers_are_refused() {
+        // A non-`Memory` backend: nothing here may reach the developer's own OS keyring.
+        let _keyring = htui_store::testkit::mock_keyring().await;
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "worker-relay-offline", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let backend = Backend::Offline {
+            cache: cache.clone(),
+            since: Some(Utc::now()),
+        };
+
+        let item = ids::HTUI_FEAT_3;
+        match try_serve(&backend, &StoreRequest::RelayView { item }).await {
+            Ok(StoreReply::RelayView { item: asked, view }) => {
+                assert_eq!(asked, item);
+                assert_eq!(*view, RelayView::default(), "offline the view is empty");
+            }
+            other => panic!("an offline relay read is an empty view: {other:?}"),
+        }
+        assert_eq!(StoreRequest::RelayView { item }.name(), "relay_view");
+
+        let answer = StoreRequest::AnswerPermission {
+            permission: PermissionId::new(),
+            option_id: "allow".to_owned(),
+        };
+        assert_eq!(answer.name(), "answer_permission");
+        match try_serve(&backend, &answer).await {
+            Err(StoreError::Unreachable(message)) => assert_eq!(message, DATABASE_UNREACHABLE),
+            other => panic!("an offline answer is refused before anything is sent: {other:?}"),
+        }
+
+        cache.close().await;
     }
 
     /// `go_offline` disarms the `lost_the_server` arm whatever the backend was.
