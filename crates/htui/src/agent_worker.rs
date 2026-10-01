@@ -66,7 +66,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent_settings::{AgentWrite, SET_TOOL_PATHS, parse_tool_path};
+use crate::agent_settings::{AgentWrite, LITERAL_LAUNCH, SET_TOOL_PATHS, parse_tool_path};
 use crate::store_worker::{
     AuthFrame, ChatFrame, InstallFrame, Origin, ReplyEnvelope, RequestEnvelope, Seq, StoreReply,
     StoreRequest, UNSOLICITED,
@@ -1404,8 +1404,9 @@ impl AgentRuntime {
     /// The [`StoreRequest::SetToolPaths`] path (MOD-66 D7–D9). Every refusal but one comes
     /// **before anything is spawned**, in `auth_start`'s order (B6): writer (offline:
     /// `REGISTRY_ON_SERVER_ONLY`), registered box, the box claim, this row's re-probe claim, the
-    /// row exists, it is `enabled`, its `launch` parses, every key is a tool its
-    /// `discovery.tools` declares, and every value passes [`parse_tool_path`]. A store refusal is
+    /// row exists, it is `enabled`, its `launch` parses and declares a tool ([`LITERAL_LAUNCH`],
+    /// the form's sentence), every key is a tool its `discovery.tools` declares, and every value
+    /// passes [`parse_tool_path`]. A store refusal is
     /// an `Err`. A refused field is `Ok(Served::Reply(Failed))` carrying its own sentence, never
     /// behind a `StoreError` prefix (MOD-23 D250's precedent).
     ///
@@ -1453,6 +1454,10 @@ impl AgentRuntime {
             .discovery
             .map(|discovery| discovery.tools)
             .unwrap_or_default();
+        // D10: no `${tool}` to give a path, so not even an empty map is written (review N4).
+        if declared.is_empty() {
+            return refuse_tool_paths(LITERAL_LAUNCH.to_owned());
+        }
         // `BTreeMap` order, so the first refusal is the same one every time.
         let mut checked = BTreeMap::new();
         for (tool, text) in paths {
@@ -10958,6 +10963,57 @@ done
         );
         assert_eq!(message, "`third` is not a tool `paths-fixture` declares");
         assert_eq!(runtime.background_len(), 0);
+    }
+
+    /// D10 on the worker's side (review N4): a row whose launch declares no tool, with no
+    /// `discovery` or an empty `tools`, is refused with the form's own sentence, even for an
+    /// empty map, which would otherwise be written.
+    #[tokio::test]
+    async fn set_tool_paths_refuses_a_literal_launch_with_the_forms_sentence() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let store = unresolvable_registry().await;
+        let no_discovery = AgentId::new();
+        let no_tools = AgentId::new();
+        for (id, name, launch) in [
+            (
+                no_discovery,
+                "no-discovery",
+                json!({ "command": "/bin/true", "args": [], "env": {} }),
+            ),
+            (
+                no_tools,
+                "no-tools",
+                json!({
+                    "command": "/bin/true",
+                    "args": [],
+                    "env": {},
+                    "discovery": { "tools": {}, "handshake": false }
+                }),
+            ),
+        ] {
+            store
+                .upsert_agent(
+                    &Agent {
+                        name: name.to_owned(),
+                        launch,
+                        ..paths_row(id)
+                    },
+                    None,
+                )
+                .await
+                .expect("the row lands");
+        }
+        let backend = Backend::memory(store.clone());
+        let mut runtime = AgentRuntime::new(DriverFactory::new())
+            .with_probe_env(fake_env(tmp.path()), fake_hardware());
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        for (seq, agent_id) in [(1, no_discovery), (2, no_tools)] {
+            let message = refused(set_paths(&mut runtime, &backend, &tx, seq, agent_id, &[]).await);
+            assert_eq!(message, "this row's launch is literal; e edits its command");
+            assert_eq!(runtime.background_len(), 0, "nothing was spawned");
+            assert!(summary_of(&store, agent_id).await.on_box.is_none());
+        }
     }
 
     /// D9, `R-SEC-2` (review L3): a `launch` that does not parse is refused by name, and the

@@ -487,6 +487,11 @@ pub const REQUEST_NAMES: [&str; 3] = ["create_agent", "edit_agent", "set_agent_o
 /// is the agent runtime's. The section's `Failed` match accepts it beside them.
 pub const SET_TOOL_PATHS: &str = "set_tool_paths";
 
+/// A tool-paths write on a row whose launch declares no tool, no `discovery` or no `tools`
+/// (MOD-66 D10): there is no `${tool}` to give a path. The Agents section's `m` refuses with it,
+/// and so does the worker's `SetToolPaths` (review N4).
+pub const LITERAL_LAUNCH: &str = "this row's launch is literal; e edits its command";
+
 /// One manual path as the form and the worker check it (MOD-66 D9, D10): trimmed, non-empty and
 /// absolute. The refusal is one sentence naming the tool, `` `<tool>`: <reason> `` (the
 /// [`Refusal`] shape, with a runtime name, D11). Pure: whether the path is a **file** is the

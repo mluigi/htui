@@ -82,7 +82,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 
 use crate::agent_settings::{
-    self, AgentDraft, AgentWrite, DraftFields, FIELD_LABELS, REQUEST_NAMES, Refusal,
+    self, AgentDraft, AgentWrite, DraftFields, FIELD_LABELS, LITERAL_LAUNCH, REQUEST_NAMES, Refusal,
 };
 use crate::agent_worker::{AUTH_ALREADY_CHOSEN, LOGIN_ENDED, NO_LOGIN_RUNNING};
 use crate::app::{Action, Ctx, Handled};
@@ -152,9 +152,6 @@ const MANUAL_SUFFIX: &str = "*";
 /// [`MANUAL_SUFFIX`] (MOD-66, the amendment to blueprint §5). 60 of the 98 columns with
 /// [`QUOTA_NOTE`].
 const MANUAL_NOTE: &str = " \u{b7} * manual path";
-
-/// `m` on a row whose launch declares no tool (MOD-66 D10): there is no `${tool}` to give a path.
-const LITERAL_LAUNCH: &str = "this row's launch is literal; e edits its command";
 
 /// `m` on a row whose launch does not parse (MOD-66 B14): "literal" would misdescribe it.
 const LAUNCH_UNREADABLE: &str = "this row's launch does not parse; nothing declares a tool";
