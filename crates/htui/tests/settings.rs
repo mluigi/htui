@@ -5025,10 +5025,11 @@ async fn m_opens_the_tool_paths_form_with_one_field_per_declared_tool() {
         paths_focused_on(&section, &bench, "alpha_tool"),
         "the first field holds the focus"
     );
-    let lines: Vec<&str> = rendered.lines().collect();
+    // The last drawn line: the note line under it is empty while a form is open, and `lines`
+    // does not yield a trailing empty line.
     assert_eq!(
-        lines[lines.len() - 2],
-        "Tab next field \u{b7} Enter saves \u{b7} Esc cancels",
+        rendered.lines().last(),
+        Some("Tab next field \u{b7} Enter saves \u{b7} Esc cancels"),
         "the form's keys line: {rendered}"
     );
 
