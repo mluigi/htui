@@ -9,6 +9,12 @@
 //! answer. The two runtimes share one fake isolator and verifier, as two processes on one box
 //! share its filesystem.
 //!
+//! MOD-42 T6 (blueprint §9.2) adds two relay cases to the loop in process: a worker walk whose
+//! session parks on a permission request is answered by a second `PgStore` client registered as
+//! **another box** (as a TUI elsewhere holding the DSN would), and a cancel that client requests
+//! ends a live worker walk through the worker loop's own command poll. Their worker sessions play
+//! [`ParksOnce`] through [`Parts::runtime_with`]; the relay polls at its production interval.
+//!
 //! Case 4 is the headless connect's refusal, and cases 5 to 8 spawn the `htui` binary with a
 //! cleared environment whose `HOME` and `XDG_CONFIG_HOME` are a temporary directory, so nothing
 //! reaches the developer's `~/.config/htui` (blueprint F-22). No case walks a run with production
@@ -18,6 +24,7 @@
 //! instead when `CI` is set, like every other Postgres-backed suite.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -25,14 +32,18 @@ use htui::run_worker::{LiveChats, OrchReply, OrchRequest, RunServed, StepAuthor,
 use htui::store_worker::{Origin, RequestEnvelope, StoreReply, StoreRequest};
 use htui::worker_cmd::{self, WorkerExit};
 use htui_agent::conformance::{Script, ScriptEvent};
-use htui_agent::driver::{AgentDriver, DriverCaps};
-use htui_agent::event::{DoneEvent, DriverEvent, StopReason};
+use htui_agent::driver::{AgentDriver, DriverCaps, PermissionRequestId};
+use htui_agent::event::{
+    DoneEvent, DriverEvent, PermissionOption, PermissionOptionKind, PermissionRequestEvent,
+    StopReason, ToolCallEvent, ToolKind,
+};
 use htui_agent::fake::FakeDriver;
 use htui_agent::registry::{DriverFactory, TransportBuilder};
 use htui_core::fixtures::{edit_agent, ids};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxEdit, BoxId, DocumentId, Executor, ItemId, NewDocument,
-    NewRepo, RepoId, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepStatus,
+    Agent, AgentBox, AgentId, AnswerOutcome, Billing, BoxEdit, BoxId, DocumentId, EventKind,
+    Executor, ItemId, NewDocument, NewRepo, PermissionStatus, RepoId, RunCommandStatus, RunId,
+    RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepPermission, StepStatus,
     Transport,
 };
 use htui_core::store::{CasOutcome, ReadStore as _, WriteStore as _};
@@ -40,8 +51,8 @@ use htui_orch::fake::{FakeIsolator, FakeVerifier};
 use htui_orch::{Command, CommandOutcome, GateAnswer, Isolator, Verifier};
 use htui_store::pg::PoolSize;
 use htui_store::{Backend, CacheStore, PgStore, testkit};
-use htui_worker::worker::{self, WorkerConfig};
-use htui_worker::{Role, RunRuntime, Unaddressed};
+use htui_worker::worker::{self, COMMAND_POLL, WorkerConfig};
+use htui_worker::{CANCEL_GRACE, Role, RunRuntime, Unaddressed};
 use serde_json::json;
 use tokio::sync::oneshot;
 
@@ -116,6 +127,57 @@ impl TransportBuilder for Walks {
     }
 }
 
+/// MOD-42 T6: the first session a runtime builds plays a gated `execute` call and parks on its
+/// permission request (one allow and one reject option), then ends its turn once answered; every
+/// later session plays [`Walks`]'s one turn, so an ungated walk reaches `done` after the answer.
+#[derive(Debug, Default)]
+struct ParksOnce(AtomicBool);
+
+impl TransportBuilder for ParksOnce {
+    fn build(
+        &self,
+        agent: &Agent,
+        on_box: Option<&AgentBox>,
+        caps: DriverCaps,
+    ) -> Result<Box<dyn AgentDriver>, htui_agent::error::DriverError> {
+        if self.0.swap(true, Ordering::SeqCst) {
+            return Walks.build(agent, on_box, caps);
+        }
+        Ok(Box::new(FakeDriver::new(
+            agent.name.clone(),
+            caps,
+            Script::one_turn(vec![
+                ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
+                    tool_call_id: "call-1".to_owned(),
+                    title: "run the suite".to_owned(),
+                    tool_kind: ToolKind::Execute,
+                    input: json!({ "command": "cargo test" }),
+                    locations: Vec::new(),
+                })),
+                ScriptEvent::ParkPermission(PermissionRequestEvent {
+                    request_id: PermissionRequestId::new("request-1"),
+                    tool_call_id: Some("call-1".to_owned()),
+                    options: vec![
+                        PermissionOption {
+                            id: "allow-once".to_owned(),
+                            label: "Allow".to_owned(),
+                            kind: PermissionOptionKind::AllowOnce,
+                        },
+                        PermissionOption {
+                            id: "reject-once".to_owned(),
+                            label: "Reject".to_owned(),
+                            kind: PermissionOptionKind::RejectOnce,
+                        },
+                    ],
+                }),
+                ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                })),
+            ]),
+        )))
+    }
+}
+
 /// The fake isolator and verifier one box's processes share.
 #[derive(Clone)]
 struct Parts {
@@ -135,8 +197,16 @@ impl Parts {
     fn runtime<H: htui_core::store::WorkerHost, P: htui_worker::ReplySink>(
         &self,
     ) -> RunRuntime<H, P> {
+        self.runtime_with(Box::new(Walks))
+    }
+
+    /// A run runtime over these parts, whose `acp` sessions `transport` builds (MOD-42 T6).
+    fn runtime_with<H: htui_core::store::WorkerHost, P: htui_worker::ReplySink>(
+        &self,
+        transport: Box<dyn TransportBuilder>,
+    ) -> RunRuntime<H, P> {
         let mut factory = DriverFactory::new();
-        factory.register("acp", Box::new(Walks));
+        factory.register("acp", transport);
         RunRuntime::with_parts(
             Arc::clone(&self.isolator) as Arc<dyn Isolator>,
             Arc::clone(&self.verifier) as Arc<dyn Verifier>,
@@ -305,8 +375,17 @@ impl Stack {
 
     /// `htui worker`'s loop over this database, sharing the TUI's parts.
     fn spawn_worker(&self, config: WorkerConfig) -> Running {
+        self.spawn_worker_with(config, Box::new(Walks))
+    }
+
+    /// [`Stack::spawn_worker`], whose `acp` sessions `transport` builds (MOD-42 T6).
+    fn spawn_worker_with(
+        &self,
+        config: WorkerConfig,
+        transport: Box<dyn TransportBuilder>,
+    ) -> Running {
         let runtime: RunRuntime<PgStore, Unaddressed> =
-            self.parts.runtime().with_role(Role::Worker);
+            self.parts.runtime_with(transport).with_role(Role::Worker);
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(worker::run(
             self.db.store.clone(),
@@ -655,6 +734,256 @@ async fn an_answer_handed_back_is_finished_by_the_worker() {
         (row.status, shape(&stack.steps(run).await), item),
         expected,
         "the worker's walk rests where the TUI's in-process walk does"
+    );
+    worker.stop().await;
+    stack.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-42 T6: the relay across boxes
+// ---------------------------------------------------------------------------------------------
+
+/// PRD metric "answer → resume ≤ ~2 s": asserted below 3 s at the production relay poll.
+const ANSWER_TO_DONE: Duration = Duration::from_secs(3);
+const _: () = assert!(
+    htui_agent::RELAY_POLL.as_secs() == 1,
+    "the answer case runs at the production 1 s relay poll (plan D8)"
+);
+
+/// Plan T6: a cancel ends a live worker walk within the grace, one command poll, and a margin.
+const CANCEL_BOUND: Duration =
+    Duration::from_secs(CANCEL_GRACE.as_secs() + COMMAND_POLL.as_secs() + 2);
+
+/// A second store client registered as **another box** (blueprint §9.2), as a TUI elsewhere
+/// holding the DSN; its `box.toml` lives in the returned directory, never the real home.
+async fn another_box(db: &testkit::TestDb) -> (PgStore, tempfile::TempDir) {
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let identity = htui_store::identity::load_or_mint(root.path()).expect("mint box.toml");
+    let client = PgStore::connect(&db.url, &identity)
+        .await
+        .expect("the second client connects")
+        .store;
+    assert_ne!(
+        client.this_box(),
+        ids::BOX,
+        "the second client is another box"
+    );
+    (client, root)
+}
+
+/// The first pending request the second client's Runs pane would show for `item` (D14).
+async fn pending_request(client: &PgStore, item: ItemId) -> StepPermission {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let view = client.relay_view(item).await.expect("the relay view reads");
+        if let Some(row) = view.permissions.into_iter().next() {
+            return row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no request parked within {PATIENCE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The `permission_answer` payloads in `step`'s log.
+async fn permission_answers(store: &PgStore, step: StepId) -> Vec<serde_json::Value> {
+    store
+        .step_events(step)
+        .await
+        .expect("the log reads")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|row| row.kind == EventKind::PermissionAnswer)
+        .map(|row| row.payload)
+        .collect()
+}
+
+/// `run_command.status` of every command of `run`, in issue order: no store method lists them.
+async fn command_statuses(stack: &Stack, run: RunId) -> Vec<RunCommandStatus> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT status FROM run_command WHERE run_id = $1 ORDER BY issued_at, id",
+    )
+    .bind(run.as_uuid())
+    .fetch_all(&stack.db.pool)
+    .await
+    .expect("read run_command")
+    .iter()
+    .map(|status| status.parse().expect("a known command status"))
+    .collect()
+}
+
+/// Polls until `step` is `want`; the time it took.
+async fn step_reaches(stack: &Stack, run: RunId, step: StepId, want: StepStatus) -> Duration {
+    let started = Instant::now();
+    loop {
+        let status = stack
+            .steps(run)
+            .await
+            .into_iter()
+            .find(|row| row.id == step)
+            .expect("the step exists")
+            .status;
+        if status == want {
+            return started.elapsed();
+        }
+        assert!(
+            started.elapsed() < PATIENCE,
+            "step {step} is `{status}`, not `{want}`, after {PATIENCE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// MOD-42 PRD metrics "cross-box answer" and "answer → resume": the worker walks a queued run
+/// whose session parks on a permission request; a client on another box sees it in its relay
+/// view and answers it; the worker applies the answer and the step is `done` within
+/// [`ANSWER_TO_DONE`] of the answer, at the production 1 s relay poll. The executor, not the
+/// answerer, echoes the answer into the step's log (I-1), as the user's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_parked_step_resumes_on_an_answer_from_another_box() {
+    let Some(mut stack) = Stack::new().await else {
+        return;
+    };
+    stack.ungate_feat().await;
+    stack.set_executor(Executor::Worker).await;
+    let (run, rest) = stack.start(ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::Queued, "the TUI only queues");
+    let worker = stack.spawn_worker_with(CONFIG, Box::new(ParksOnce::default()));
+    let (client, _client_root) = another_box(&stack.db).await;
+
+    let parked = pending_request(&client, ids::HTUI_FEAT_3).await;
+    assert_eq!(parked.run_id, run);
+    assert_eq!(parked.status, PermissionStatus::Pending);
+    assert_eq!(
+        parked
+            .options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect::<Vec<_>>(),
+        ["allow-once", "reject-once"]
+    );
+    let answered = client
+        .answer_permission(
+            parked.id,
+            "allow-once",
+            client.this_user(),
+            client.this_box(),
+        )
+        .await
+        .expect("the answer is written");
+    assert_eq!(answered, AnswerOutcome::Answered);
+    let took = step_reaches(&stack, run, parked.run_step_id, StepStatus::Done).await;
+    assert!(
+        took < ANSWER_TO_DONE,
+        "the step resumed {took:?} after the answer, not within {ANSWER_TO_DONE:?}"
+    );
+
+    let row = client
+        .permission(parked.id)
+        .await
+        .expect("the read answers")
+        .expect("the row exists");
+    assert_eq!(
+        (row.status, row.option_id.as_deref(), row.answered_box),
+        (
+            PermissionStatus::Applied,
+            Some("allow-once"),
+            Some(client.this_box())
+        ),
+        "applied by the worker, answered from the other box"
+    );
+    let answers = permission_answers(&stack.db.store, parked.run_step_id).await;
+    assert_eq!(answers.len(), 1, "the executor echoed it once: {answers:?}");
+    assert_eq!(
+        (&answers[0]["option_id"], &answers[0]["by"]),
+        (&json!("allow-once"), &json!("user")),
+        "{answers:?}"
+    );
+    assert_eq!(stack.rested(run).await.status, RunStatus::Done);
+    stack.released(run).await;
+    let view = client
+        .relay_view(ids::HTUI_FEAT_3)
+        .await
+        .expect("the view reads");
+    assert!(
+        view.permissions.is_empty() && view.cancels.is_empty(),
+        "{view:?}"
+    );
+    worker.stop().await;
+    stack.finish().await;
+}
+
+/// MOD-42 PRD metric "worker-walk cancel within grace + poll", and the worker loop's own
+/// command-poll arm (T4 covers it only here): a client on another box requests a cancel of a run
+/// the worker is walking while its session is parked. The worker's poll picks the row up and
+/// cancels gracefully: the parked request answered `cancelled` and recorded (I-7), the step and
+/// the run `cancelled`, the command `applied`, all within [`CANCEL_BOUND`] of the request.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_from_another_box_ends_a_live_worker_walk() {
+    let Some(mut stack) = Stack::new().await else {
+        return;
+    };
+    stack.ungate_feat().await;
+    stack.set_executor(Executor::Worker).await;
+    let (run, _) = stack.start(ids::HTUI_FEAT_3).await;
+    let worker = stack.spawn_worker_with(CONFIG, Box::new(ParksOnce::default()));
+    let (client, _client_root) = another_box(&stack.db).await;
+    let parked = pending_request(&client, ids::HTUI_FEAT_3).await;
+
+    let asked = Instant::now();
+    let requested = client
+        .request_cancel(run, client.this_user(), client.this_box())
+        .await
+        .expect("the cancel is written");
+    assert!(
+        matches!(requested, htui_core::model::CancelRequest::Inserted(_)),
+        "{requested:?}"
+    );
+    let deadline = asked + PATIENCE;
+    while stack.run_row(run).await.status != RunStatus::Cancelled {
+        assert!(Instant::now() < deadline, "the run was never cancelled");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let took = asked.elapsed();
+    assert!(
+        took < CANCEL_BOUND,
+        "the walk ended {took:?} after the request, not within {CANCEL_BOUND:?}"
+    );
+
+    let row = client
+        .permission(parked.id)
+        .await
+        .expect("the read answers")
+        .expect("the row exists");
+    assert_eq!(
+        row.status,
+        PermissionStatus::Cancelled,
+        "I-7: answered `cancelled`"
+    );
+    let answers = permission_answers(&stack.db.store, parked.run_step_id).await;
+    assert_eq!(answers.len(), 1, "I-7's row exactly once: {answers:?}");
+    assert_eq!(answers[0]["cancelled"], true, "{answers:?}");
+    // `cancel_leased` settled the step; the walk settled nothing (I-6).
+    step_reaches(&stack, run, parked.run_step_id, StepStatus::Cancelled).await;
+    let deadline = Instant::now() + PATIENCE;
+    while command_statuses(&stack, run).await != [RunCommandStatus::Applied] {
+        assert!(
+            Instant::now() < deadline,
+            "the command was not applied: {:?}",
+            command_statuses(&stack, run).await
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    stack.released(run).await;
+    let view = client
+        .relay_view(ids::HTUI_FEAT_3)
+        .await
+        .expect("the view reads");
+    assert!(
+        view.permissions.is_empty() && view.cancels.is_empty(),
+        "{view:?}"
     );
     worker.stop().await;
     stack.finish().await;
