@@ -181,11 +181,10 @@ pub(crate) mod tests {
     use htui_core::fixtures::{demo_at, edit_agent, ids};
     use htui_core::model::{
         Agent, AgentBox, AgentId, Billing, BoxEdit, BoxId, CancelRequest, ChatRunSpec, DocumentId,
-        EventKind,
-        Executor, Gate, Item, ItemId, NewDocument, NewRepo, NewRun, NewRunStep, PermissionId,
-        PermissionStatus, RepoId, Resolution, Run, RunCommand, RunCommandId, RunCommandKind,
-        RunCommandStatus, RunId, RunMode, RunStatus, RunStep, RunStepCommit, SnapshotPhase, Status,
-        StepId, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
+        EventKind, Executor, Gate, Item, ItemId, NewDocument, NewRepo, NewRun, NewRunStep,
+        PermissionId, PermissionStatus, RepoId, Resolution, Run, RunCommand, RunCommandId,
+        RunCommandKind, RunCommandStatus, RunId, RunMode, RunStatus, RunStep, RunStepCommit,
+        SnapshotPhase, Status, StepId, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
     };
     use htui_core::store::mem::MemFault;
     use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
