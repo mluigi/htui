@@ -79,6 +79,21 @@ checked on connect. fastembed's vectors are recorded as goldens before fastembed
 - **D10 - The Windows/macOS gate is a cross `cargo check`** of the embedder stack, run in the
   sandbox before T5. A real Windows/macOS run stays with MOD-16 and the host (see OQ-1).
 
+## Blueprint amendments (code-architect, 2026-10-01)
+
+`.claude/plans/mod-68-rten-embedder.blueprint.md` §0 records hazards H-1..H-23 and amends this plan.
+Where the two disagree, the blueprint wins:
+- **A-1** dev-profile `opt-level = 3` for `rten*` and `sha2` (debug rten is ~118x slower).
+- **A-2** the tokenizer only truncates; padding is done per sub-batch by hand.
+- **A-3** a `.part` older than 10 min is swept.
+- **A-4** `open_index` keeps the loaded model across retries.
+- **A-5** `openssl-sys` stays because of `sentry` alone, and `docker/hr/Dockerfile:15` is updated.
+- **A-6** the D10 cross-check runs in a scratch crate after `rustup target add`.
+- **A-7** `model.rs` is born in T2 (constants, `ModelFiles`).
+- **A-8** an ignored `real_download_from_huggingface` test runs in the gate.
+- **A-9** every pin carries its byte size, and an oversize download is refused.
+- **A-10** the `dense` size is checked before the identity.
+
 ## Patterns to Mirror
 
 | Category | Source | Pattern |
