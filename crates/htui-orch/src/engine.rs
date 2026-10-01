@@ -26,14 +26,15 @@ use chrono::{DateTime, TimeDelta, Utc};
 use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposure};
 use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::excerpt::{PassInput, excerpt_roots, step_pass, touched_prefixes};
-use htui_agent::record::{Recorder, RunCap, pump};
+use htui_agent::record::{Control, Recorder, RunCap, pump};
 use htui_core::model::{
-    BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus, Document, DocumentId,
-    EventKind, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote,
-    NewRun, NewRunStep, NoteId, Project, ProjectId, ProjectSettings, PromptScope, Repo, RepoId,
-    Resolution, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary,
-    SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOutcome,
-    StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome, missing_tags_failure,
+    AgentId, BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus, Document,
+    DocumentId, EventKind, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId,
+    NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectId, ProjectSettings,
+    PromptScope, Repo, RepoId, Resolution, Run, RunId, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, RunSummary, SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepFiles,
+    StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
+    missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
@@ -271,6 +272,26 @@ type SessionResult = Result<DoneEvent, htui_agent::error::DriverError>;
 pub type DriverFor<'a> =
     &'a (dyn Fn(&SnapshotCandidate, &SessionKey<'_>) -> Box<dyn AgentDriver> + Sync);
 
+/// MOD-42 plan D9: the permission policy of an agent, for the session spec and the relay.
+/// `+ Sync` is load-bearing: walks are spawned (`a_dispatch_future_is_send`, probe A2).
+pub type PolicyFor<'a> = &'a (dyn Fn(AgentId) -> PermissionPolicy + Sync);
+
+/// MOD-42 plan D10: a run's [`Control`], looked up per session (the run's walk token may not exist
+/// when the engine is built, `runtime.rs:1849` vs `:1860`).
+pub type ControlFor<'a> = &'a (dyn Fn(RunId) -> Control + Sync);
+
+/// [`PolicyFor`] for an engine with no registry (tests, harness literals): every agent asks.
+#[must_use]
+pub fn ask_policy(_agent: AgentId) -> PermissionPolicy {
+    PermissionPolicy::default()
+}
+
+/// [`ControlFor`] for an engine no cancel reaches.
+#[must_use]
+pub fn never_cancelled(_run: RunId) -> Control {
+    Control::never()
+}
+
 // ---------------------------------------------------------------------------------------------
 // The engine
 // ---------------------------------------------------------------------------------------------
@@ -418,6 +439,10 @@ where
     pub sink: &'a K,
     /// One driver per session (see [`DriverFor`]).
     pub driver: DriverFor<'a>,
+    /// MOD-42 plan D9: each agent's own permission policy.
+    pub policy: PolicyFor<'a>,
+    /// MOD-42 plan D10: each run's control.
+    pub control: ControlFor<'a>,
     /// `R-SEC-3`'s masker, handed to both the assembler and the recorder so they cannot disagree
     /// about what two identical prompts are (blueprint H-13).
     pub scrubber: &'a dyn Scrubber,
@@ -4740,7 +4765,7 @@ where
         run: &Run,
         phase: &SnapshotPhase,
         attempt: i32,
-        agent_id: Option<htui_core::model::AgentId>,
+        agent_id: Option<AgentId>,
         model: Option<String>,
     ) -> Result<RunStep, EngineError> {
         Ok(self
@@ -6380,6 +6405,8 @@ pub(crate) async fn fake_parts<'a>(
         selector: &FirstCandidate,
         sink: orch,
         driver,
+        policy: orch.policy_for(),
+        control: orch.control_for(),
         scrubber,
         app,
         box_profile,
@@ -6713,6 +6740,8 @@ mod tests {
             selector: &selector,
             sink: &orch,
             driver: &driver,
+            policy: &super::ask_policy,
+            control: &super::never_cancelled,
             scrubber: &scrubber,
             app: orch
                 .store
@@ -6801,6 +6830,8 @@ mod tests {
             selector: &selector,
             sink: orch,
             driver: &driver,
+            policy: &super::ask_policy,
+            control: &super::never_cancelled,
             scrubber: &scrubber,
             app: orch
                 .store
@@ -9498,6 +9529,8 @@ mod tests {
             selector: parts.selector,
             sink: &stranger,
             driver: parts.driver,
+            policy: &super::ask_policy,
+            control: &super::never_cancelled,
             scrubber: parts.scrubber,
             app: parts.app,
             box_profile: parts.box_profile,
@@ -11878,6 +11911,8 @@ mod tests {
             selector: parts.selector,
             sink: parts.sink,
             driver: parts.driver,
+            policy: &super::ask_policy,
+            control: &super::never_cancelled,
             scrubber: parts.scrubber,
             app: parts.app,
             box_profile: parts.box_profile,
@@ -12788,6 +12823,8 @@ mod tests {
             selector: parts.selector,
             sink: &NoSink,
             driver: parts.driver,
+            policy: &super::ask_policy,
+            control: &super::never_cancelled,
             scrubber: parts.scrubber,
             app: parts.app,
             box_profile: parts.box_profile,
@@ -14456,6 +14493,609 @@ mod tests {
         .snapshot
         .phases
         .remove(0)
+    }
+
+    /// MOD-42 T3 (blueprint §7.6): the engine over `drive` — the agent's own policy (D9), the
+    /// relay of a stage-3 request to another client (D3, D4), and a run's control (D10, I-6),
+    /// end to end over the fake harness. Every case runs on paused time: `drive` polls a parked
+    /// row every `RELAY_POLL` (B-18), and the second client polls `relay_view` every 100 ms.
+    mod relay {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use chrono::TimeDelta;
+        use htui_agent::driver::{PermissionDefault, PermissionPolicy, PermissionRequestId};
+        use htui_agent::event::{PermissionOption, PermissionOptionKind, PermissionRequestEvent};
+        use htui_core::fixtures::ids;
+        use htui_core::model::{
+            EventKind, Gate, ItemId, PermissionStatus, RunId, RunMode, RunStatus, SessionEvent,
+            SnapshotCandidate, StepId, StepPermission, StepStatus,
+        };
+        use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+        use serde_json::Value;
+
+        use super::Harness;
+        use crate::command::{Command, CommandOutcome, EngineError};
+        use crate::engine::{Engine, SessionKey, fake_parts};
+        use crate::fake::{FakeOrchestrator, ScriptedStep};
+        use crate::isolate::Clock as _;
+
+        /// How long a client waits, in paused time, for a row that never comes.
+        const CLIENT_LIMIT: Duration = Duration::from_secs(30);
+        /// The grace a case's cancel carries.
+        const GRACE: Duration = Duration::from_secs(2);
+
+        /// The request every parked script asks: one allow and one reject option over `call-1`.
+        fn request() -> PermissionRequestEvent {
+            PermissionRequestEvent {
+                request_id: PermissionRequestId::new("req-1"),
+                tool_call_id: Some("call-1".to_owned()),
+                options: vec![
+                    PermissionOption {
+                        id: "allow-once".to_owned(),
+                        label: "Allow".to_owned(),
+                        kind: PermissionOptionKind::AllowOnce,
+                    },
+                    PermissionOption {
+                        id: "reject-once".to_owned(),
+                        label: "Reject".to_owned(),
+                        kind: PermissionOptionKind::RejectOnce,
+                    },
+                ],
+            }
+        }
+
+        fn parks(body: &str) -> ScriptedStep {
+            ScriptedStep::parks(request(), body)
+        }
+
+        /// The first row `relay_view(item)` lists, polled every 100 ms; `None` after
+        /// [`CLIENT_LIMIT`].
+        async fn parked_row(store: &MemStore, item: ItemId) -> Option<StepPermission> {
+            let poll = async {
+                loop {
+                    let view = store.relay_view(item).await.expect("the relay view reads");
+                    if let Some(row) = view.permissions.into_iter().next() {
+                        return row;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            tokio::time::timeout(CLIENT_LIMIT, poll).await.ok()
+        }
+
+        /// The first `pending` relay row of any item, polled every 100 ms; `None` after
+        /// [`CLIENT_LIMIT`].
+        async fn pending_row(store: &MemStore) -> Option<StepPermission> {
+            let poll = async {
+                loop {
+                    if let Some(row) = store
+                        .relay_rows()
+                        .into_iter()
+                        .find(|row| row.status == PermissionStatus::Pending)
+                    {
+                        return row;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            tokio::time::timeout(CLIENT_LIMIT, poll).await.ok()
+        }
+
+        /// The second client: a spawned task over the same rows that answers the first parked
+        /// request of `item` with its first (allow) option, as the demo user from the demo box.
+        fn answering_client(
+            store: MemStore,
+            item: ItemId,
+        ) -> tokio::task::JoinHandle<Option<StepPermission>> {
+            tokio::spawn(async move {
+                let row = parked_row(&store, item).await?;
+                let answered = store
+                    .answer_permission(row.id, &row.options[0].id, ids::USER, ids::BOX)
+                    .await
+                    .expect("the answer is read");
+                assert_eq!(
+                    answered,
+                    htui_core::model::AnswerOutcome::Answered,
+                    "the client's answer wins"
+                );
+                Some(row)
+            })
+        }
+
+        /// A client that cancels every walk of `orch` once a request is parked.
+        async fn cancelling_client(orch: &FakeOrchestrator) -> Option<StepPermission> {
+            let row = pending_row(&orch.store).await?;
+            orch.cancel_walks(GRACE);
+            Some(row)
+        }
+
+        async fn log(store: &MemStore, step: StepId) -> Vec<SessionEvent> {
+            store
+                .step_events(step)
+                .await
+                .expect("MemStore never fails a read")
+                .unwrap_or_default()
+        }
+
+        fn answers_in(log: &[SessionEvent]) -> Vec<Value> {
+            log.iter()
+                .filter(|row| row.kind == EventKind::PermissionAnswer)
+                .map(|row| row.payload.clone())
+                .collect()
+        }
+
+        async fn note_count(orch: &FakeOrchestrator, item: ItemId) -> usize {
+            orch.store
+                .notes(item)
+                .await
+                .expect("MemStore never fails a read")
+                .len()
+        }
+
+        /// `FEAT-3` freed, with `prd` ungated so its step settles `done` and the walk parks at
+        /// `plan`'s `always` gate.
+        async fn feat_3_with_prd_ungated(harness: &Harness) {
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.gate = Gate::Never;
+                    }
+                })
+                .await;
+        }
+
+        fn start_feat_3() -> Command {
+            Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            }
+        }
+
+        /// The one step at `(position, fanout_index)` of `run`'s first attempt.
+        async fn step_at(
+            orch: &FakeOrchestrator,
+            run: RunId,
+            position: i32,
+            fanout_index: i32,
+        ) -> htui_core::model::RunStep {
+            orch.steps(run)
+                .await
+                .into_iter()
+                .find(|step| step.position == position && step.fanout_index == fanout_index)
+                .expect("the walk created the step")
+        }
+
+        /// D3/D4 end to end: stage 3 relays the request, another client answers it, the walk
+        /// applies the answer under its lease and walks on.
+        #[tokio::test(start_paused = true)]
+        async fn a_parked_step_resumes_on_an_answer_from_another_client() {
+            let harness = Harness::new().await;
+            feat_3_with_prd_ungated(&harness).await;
+            harness.orch.script("prd", 1, parks("the prd"));
+            let client = answering_client(harness.orch.store.clone(), ids::HTUI_FEAT_3);
+
+            let walked = harness.dispatch(start_feat_3()).await;
+            let parked = client.await.expect("the client task ends");
+
+            let Ok(CommandOutcome::Started { run, rest }) = walked else {
+                panic!("the walk resumed and started: {walked:?}");
+            };
+            assert!(parked.is_some(), "the client saw the parked request");
+            assert_eq!(
+                (rest.run, rest.position),
+                (RunStatus::AwaitingApproval, Some(1)),
+                "the claim walked on to `plan`'s gate"
+            );
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(
+                prd.status,
+                StepStatus::Done,
+                "the answered step settled `done`"
+            );
+            let log = log(&harness.orch.store, prd.id).await;
+            let request = log
+                .iter()
+                .position(|row| row.kind == EventKind::PermissionRequest)
+                .expect("the request is recorded");
+            let answer = log
+                .iter()
+                .position(|row| row.kind == EventKind::PermissionAnswer)
+                .expect("the answer is recorded");
+            assert!(request < answer, "the echo follows its request");
+            let answers = answers_in(&log);
+            assert_eq!(answers.len(), 1, "one recorded answer: {answers:?}");
+            assert_eq!(answers[0]["by"], "user");
+            assert_eq!(answers[0]["option_id"], "allow-once");
+            let rows = harness.orch.store.relay_rows();
+            assert_eq!(
+                rows.iter().map(|row| row.status).collect::<Vec<_>>(),
+                [PermissionStatus::Applied],
+                "one row, applied by the executor (D4)"
+            );
+        }
+
+        /// D9 stages 1-2 and R-7: the agent's own policy answers at once — no relay row, the
+        /// recorded answer is `by: policy`.
+        #[tokio::test(start_paused = true)]
+        async fn an_allow_policy_answers_without_a_relay_row() {
+            let harness = Harness::new().await;
+            feat_3_with_prd_ungated(&harness).await;
+            harness.orch.script("prd", 1, parks("the prd"));
+            harness.orch.set_policy(
+                ids::AGENT_CLAUDE,
+                PermissionPolicy {
+                    default: PermissionDefault::Allow,
+                    ..PermissionPolicy::default()
+                },
+            );
+
+            let walked = harness.dispatch(start_feat_3()).await;
+
+            let Ok(CommandOutcome::Started { run, .. }) = walked else {
+                panic!("the walk started: {walked:?}");
+            };
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(
+                prd.agent_id,
+                Some(ids::AGENT_CLAUDE),
+                "the policy's agent drove"
+            );
+            assert_eq!(
+                prd.status,
+                StepStatus::Done,
+                "the policy's answer resumed the turn"
+            );
+            assert!(
+                harness.orch.store.relay_rows().is_empty(),
+                "a policy answer is never relayed"
+            );
+            let answers = answers_in(&log(&harness.orch.store, prd.id).await);
+            assert_eq!(answers.len(), 1, "one recorded answer: {answers:?}");
+            assert_eq!(answers[0]["by"], "policy");
+            assert_eq!(answers[0]["option_id"], "allow-once");
+        }
+
+        /// D10, I-6, I-7: a cancel reaching a parked single step ends the walk with
+        /// `Cancelled`, answers the parked request `cancelled` once, and settles nothing:
+        /// `cancel_run` owns every terminal status.
+        #[tokio::test(start_paused = true)]
+        async fn a_cancel_reaches_a_parked_single_step_and_settles_nothing() {
+            let harness = Harness::new().await;
+            feat_3_with_prd_ungated(&harness).await;
+            harness.orch.script("prd", 1, parks("the prd"));
+            let notes = note_count(&harness.orch, ids::HTUI_FEAT_3).await;
+
+            let (walked, parked) = tokio::join!(
+                harness.dispatch(start_feat_3()),
+                cancelling_client(&harness.orch)
+            );
+
+            let parked = parked.expect("the request was relayed before the cancel");
+            let run = parked.run_id;
+            assert!(
+                matches!(walked, Err(EngineError::Cancelled { run: stopped }) if stopped == run),
+                "the walk answers `Cancelled`: {walked:?}"
+            );
+            let row = harness.orch.run(run).await;
+            assert_eq!(row.status, RunStatus::Running, "the run is not settled");
+            assert_eq!(row.failure, None);
+            assert_eq!(
+                row.lease_expires_at,
+                Some(harness.orch.clock.now()),
+                "the lease is given back"
+            );
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(prd.id, parked.run_step_id);
+            assert_eq!(
+                prd.status,
+                StepStatus::Running,
+                "no `fail_hard` for a cancel"
+            );
+            assert_eq!(prd.finished_at, None, "no `finish_step`");
+            assert_eq!(
+                note_count(&harness.orch, ids::HTUI_FEAT_3).await,
+                notes,
+                "no failure note"
+            );
+            let answers = answers_in(&log(&harness.orch.store, prd.id).await);
+            assert_eq!(answers.len(), 1, "I-7's row exactly once: {answers:?}");
+            assert_eq!(answers[0]["cancelled"], true);
+            assert_eq!(
+                harness
+                    .orch
+                    .store
+                    .relay_rows()
+                    .iter()
+                    .map(|row| row.status)
+                    .collect::<Vec<_>>(),
+                [PermissionStatus::Cancelled]
+            );
+
+            let cancelled = harness
+                .dispatch(Command::CancelRun { run })
+                .await
+                .expect("the cancel takes the released lease");
+            assert!(
+                matches!(cancelled, CommandOutcome::Cancelled { .. }),
+                "{cancelled:?}"
+            );
+            assert_eq!(harness.orch.run(run).await.status, RunStatus::Cancelled);
+            assert!(
+                harness
+                    .orch
+                    .steps(run)
+                    .await
+                    .iter()
+                    .all(|step| step.status == StepStatus::Cancelled),
+                "`cancel_run` settles every step"
+            );
+        }
+
+        /// I-6 across a group: the parked candidate is not failed, the group is not selected,
+        /// and `cancel_run` settles both members afterwards.
+        #[tokio::test(start_paused = true)]
+        async fn a_cancel_reaches_a_parked_fanout_candidate_and_settles_nothing() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.fan_out = 2;
+                        phase.gate = Gate::Never;
+                    }
+                })
+                .await;
+            harness
+                .orch
+                .script_candidate("prd", 1, 0, 0, parks("candidate 0"));
+            harness.orch.script_candidate(
+                "prd",
+                1,
+                1,
+                0,
+                ScriptedStep::done_with_output("candidate 1"),
+            );
+            let notes = note_count(&harness.orch, ids::HTUI_FEAT_3).await;
+
+            let (walked, parked) = tokio::join!(
+                harness.dispatch(start_feat_3()),
+                cancelling_client(&harness.orch)
+            );
+
+            let parked = parked.expect("candidate 0's request was relayed");
+            let run = parked.run_id;
+            assert!(
+                matches!(walked, Err(EngineError::Cancelled { run: stopped }) if stopped == run),
+                "the walk answers `Cancelled`: {walked:?}"
+            );
+            let first = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(first.id, parked.run_step_id);
+            assert_eq!(
+                (first.status, first.finished_at),
+                (StepStatus::Running, None),
+                "no `fail_candidate` for a cancel"
+            );
+            let second = step_at(&harness.orch, run, 0, 1).await;
+            assert_eq!(second.selected, None, "no `select_fanout`");
+            let steps = harness.orch.steps(run).await;
+            assert!(
+                steps.iter().all(|step| step.position == 0),
+                "the walk never went past the group: {steps:?}"
+            );
+            assert_eq!(harness.orch.run(run).await.status, RunStatus::Running);
+            assert_eq!(
+                note_count(&harness.orch, ids::HTUI_FEAT_3).await,
+                notes,
+                "no failure note"
+            );
+
+            let cancelled = harness
+                .dispatch(Command::CancelRun { run })
+                .await
+                .expect("the cancel takes the released lease");
+            assert!(
+                matches!(cancelled, CommandOutcome::Cancelled { .. }),
+                "{cancelled:?}"
+            );
+            assert_eq!(harness.orch.run(run).await.status, RunStatus::Cancelled);
+            assert_eq!(
+                step_at(&harness.orch, run, 0, 0).await.status,
+                StepStatus::Cancelled,
+                "`cancel_run` settles the parked candidate"
+            );
+            assert!(
+                harness
+                    .orch
+                    .steps(run)
+                    .await
+                    .iter()
+                    .all(|step| !matches!(step.status, StepStatus::Running | StepStatus::Pending)),
+                "no member is left live"
+            );
+        }
+
+        /// I-6 at the judge (F-4): a cancel reaching a parked judge call fails no judge and
+        /// parks nothing for a human.
+        #[tokio::test(start_paused = true)]
+        async fn a_cancel_reaches_a_parked_judge_call_and_settles_nothing() {
+            let harness = Harness::new().await;
+            harness
+                .repoint(ids::HTUI_ANA_2, |phase| {
+                    if phase.name == "research" {
+                        phase.fan_out = 2;
+                    }
+                    phase.gate = Gate::Never;
+                })
+                .await;
+            let project = harness.orch.item(ids::HTUI_ANA_2).await.project_id;
+            let mut settings = harness
+                .orch
+                .store
+                .project_settings(project)
+                .await
+                .expect("MemStore never fails a read")
+                .filter(Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            settings["judge_agent_id"] = serde_json::json!(ids::AGENT_AGY);
+            harness.orch.store.set_project_settings(project, settings);
+            for index in 0..2 {
+                harness.orch.script_candidate(
+                    "research",
+                    1,
+                    index,
+                    0,
+                    ScriptedStep::done_with_output(&format!("research by candidate {index}")),
+                );
+            }
+            harness.orch.script_candidate(
+                "research:judge",
+                1,
+                -1,
+                0,
+                ScriptedStep::parks(request(), "candidate 0 wins"),
+            );
+            let notes = note_count(&harness.orch, ids::HTUI_ANA_2).await;
+
+            let (walked, parked) = tokio::join!(
+                harness.dispatch(Command::StartRun {
+                    item: ids::HTUI_ANA_2,
+                    mode: RunMode::Manual,
+                    repo_scope: None,
+                }),
+                cancelling_client(&harness.orch)
+            );
+
+            let parked = parked.expect("the judge's request was relayed");
+            let run = parked.run_id;
+            assert!(
+                matches!(walked, Err(EngineError::Cancelled { run: stopped }) if stopped == run),
+                "the walk answers `Cancelled`: {walked:?}"
+            );
+            let judge = step_at(&harness.orch, run, 0, -1).await;
+            assert_eq!(judge.id, parked.run_step_id, "the judge call parked");
+            assert_eq!(
+                (judge.status, judge.gate_note.as_deref()),
+                (StepStatus::Running, None),
+                "no `fail_judge` for a cancel"
+            );
+            let row = harness.orch.run(run).await;
+            assert_eq!(
+                (row.status, row.failure),
+                (RunStatus::Running, None),
+                "nothing parked for a human"
+            );
+            assert_eq!(
+                note_count(&harness.orch, ids::HTUI_ANA_2).await,
+                notes,
+                "no note"
+            );
+        }
+
+        /// D4: an answer the client gave while the executor still held the lease, applied after
+        /// the lease moved, is a lost lease — the session gets no answer and the row stays
+        /// `answered` (A-2).
+        #[tokio::test(start_paused = true)]
+        async fn an_answer_applied_after_the_lease_moved_is_lease_lost() {
+            let harness = Harness::new().await;
+            feat_3_with_prd_ungated(&harness).await;
+            harness.orch.script("prd", 1, parks("the prd"));
+            let store = harness.orch.store.clone();
+            let owner = harness.orch.owner();
+            let stranger = uuid::Uuid::now_v7();
+            let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
+            let client = tokio::spawn(async move {
+                let row = parked_row(&store, ids::HTUI_FEAT_3).await?;
+                store
+                    .answer_permission(row.id, &row.options[0].id, ids::USER, ids::BOX)
+                    .await
+                    .expect("the answer is read");
+                // Before the walk's next poll: the lease lapses and a stranger takes it.
+                assert!(
+                    store
+                        .refresh_lease(row.run_id, owner, TimeDelta::zero())
+                        .await
+                        .expect("the refresh is read"),
+                    "the executor's lease is refreshed to lapse now"
+                );
+                assert!(
+                    store
+                        .take_lease(row.run_id, ids::BOX, stranger, ttl)
+                        .await
+                        .expect("the take is read"),
+                    "a stranger takes the lapsed lease"
+                );
+                Some(row)
+            });
+
+            let walked = harness.dispatch(start_feat_3()).await;
+            let parked = client
+                .await
+                .expect("the client task ends")
+                .expect("the client saw the parked request");
+
+            assert!(
+                matches!(walked, Err(EngineError::LeaseLost { run }) if run == parked.run_id),
+                "the fenced apply is a lost lease: {walked:?}"
+            );
+            assert!(
+                answers_in(&log(&harness.orch.store, parked.run_step_id).await).is_empty(),
+                "the session got no answer"
+            );
+            assert_eq!(
+                harness
+                    .orch
+                    .store
+                    .relay_rows()
+                    .iter()
+                    .map(|row| row.status)
+                    .collect::<Vec<_>>(),
+                [PermissionStatus::Answered],
+                "a fenced executor writes nothing more"
+            );
+        }
+
+        /// B-17: a cancel that reached the walk before its session spawns nothing.
+        #[tokio::test(start_paused = true)]
+        async fn a_cancel_before_the_session_spawns_nothing() {
+            let harness = Harness::new().await;
+            feat_3_with_prd_ungated(&harness).await;
+            let orch = &harness.orch;
+            let built = Arc::new(AtomicUsize::new(0));
+            let graphs = orch.graphs();
+            let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| {
+                built.fetch_add(1, Ordering::SeqCst);
+                orch.driver_for_key(key)
+            };
+            let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+            let engine = Engine::new(
+                fake_parts(orch, &graphs, &driver, &scrubber)
+                    .await
+                    .expect("the harness has a box"),
+            );
+            let run = engine
+                .enqueue(ids::HTUI_FEAT_3, RunMode::Manual, None)
+                .await
+                .expect("the graph resolves");
+
+            orch.cancel_walks(GRACE);
+            let claimed = engine.claim(run).await;
+
+            assert!(
+                matches!(claimed, Err(EngineError::Cancelled { run: stopped }) if stopped == run),
+                "the walk answers `Cancelled`: {claimed:?}"
+            );
+            assert_eq!(
+                built.load(Ordering::SeqCst),
+                0,
+                "no driver was built or started"
+            );
+            assert!(orch.store.relay_rows().is_empty());
+        }
     }
 }
 

@@ -10,8 +10,10 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use htui_agent::driver::AgentDriver;
+use htui_agent::AgentSettings;
+use htui_agent::driver::{AgentDriver, PermissionPolicy};
 use htui_agent::error::DriverError;
+use htui_agent::record::Control;
 use htui_agent::registry::DriverFactory;
 use htui_core::model::{
     AgentId, AgentSummary, BoxId, BoxProfile, Executor, ItemId, RepoId, Run, RunId, RunStatus,
@@ -709,6 +711,11 @@ struct Kit<H: htui_core::store::WorkerHost> {
     executor: Executor,
     /// Plan D12: [`Role::tails`] over [`Self::executor`].
     tails: Tails,
+    /// MOD-42 plan D9: each agent's `agent.settings.permission`, parsed once per task as chat
+    /// parses it (`agent_worker.rs:968-969`: a row that does not parse asks).
+    policy: Box<dyn Fn(AgentId) -> PermissionPolicy + Send + Sync>,
+    /// MOD-42 plan D10: each run's control. T3: never signalled; T4: the run's `Walks` parent.
+    control: Box<dyn Fn(RunId) -> Control + Send + Sync>,
 }
 
 impl<H: htui_core::store::WorkerHost> Kit<H> {
@@ -743,12 +750,20 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             .await
             .map_err(sentence)?
             .ok_or_else(|| "this box has no profile row".to_owned())?;
-        let agents = host
+        let agents: HashMap<AgentId, AgentSummary> = host
             .agents()
             .await
             .map_err(sentence)?
             .into_iter()
             .map(|summary| (summary.agent.id, summary))
+            .collect();
+        let policies: HashMap<AgentId, PermissionPolicy> = agents
+            .values()
+            .map(|summary| {
+                let settings: AgentSettings =
+                    serde_json::from_value(summary.agent.settings.clone()).unwrap_or_default();
+                (summary.agent.id, settings.permission)
+            })
             .collect();
         Ok(Self {
             sink: ProgressSink {
@@ -773,6 +788,8 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             role: shared.role,
             executor,
             tails,
+            policy: Box::new(move |agent| policies.get(&agent).cloned().unwrap_or_default()),
+            control: Box::new(htui_orch::never_cancelled),
         })
     }
 
@@ -835,6 +852,8 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             selector: &FirstCandidate,
             sink: &self.sink,
             driver,
+            policy: &*self.policy,
+            control: &*self.control,
             scrubber: &self.scrubber,
             app: self.app.clone(),
             box_profile: self.box_profile.clone(),

@@ -19,10 +19,16 @@ use std::sync::{Arc, Mutex};
 
 use chrono::TimeDelta;
 use htui_agent::conformance::{Script, ScriptEvent, epoch};
-use htui_agent::driver::{AgentDriver, AgentSession, DriverCaps, DriverFuture, SessionSpec};
+use htui_agent::driver::{
+    AgentDriver, AgentSession, DriverCaps, DriverFuture, PermissionPolicy, SessionSpec,
+};
 use htui_agent::error::DriverError;
-use htui_agent::event::{DoneEvent, DriverEvent, ErrorEvent, StopReason, UsageEvent};
+use htui_agent::event::{
+    DoneEvent, DriverEvent, ErrorEvent, PermissionRequestEvent, StopReason, ToolCallEvent,
+    ToolKind, UsageEvent,
+};
 use htui_agent::fake::{FAKE_AGENT_NAME, FakeDriver};
+use htui_agent::record::{Control, Signal};
 use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, BoundSkill, BoxId, Document, DocumentId, Isolation, Item, ItemId,
@@ -31,13 +37,13 @@ use htui_core::model::{
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::store::{MemStore, ReadStore, Result, WriteStore};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use uuid::Uuid;
 
 pub use htui_core::clock::TestClock;
 
 use crate::command::{Command, CommandOutcome, EngineError};
-use crate::engine::{DeadWalks, SessionKey, Tails};
+use crate::engine::{ControlFor, DeadWalks, PolicyFor, SessionKey, Tails};
 use crate::graph::GraphSource;
 use crate::isolate::{
     ChangedPaths, Clock, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared,
@@ -1084,6 +1090,34 @@ impl ScriptedStep {
         }
     }
 
+    /// MOD-42: one turn that asks for `request`'s call and parks on it — `ToolCall`, then
+    /// `ParkPermission(request)`, then `Done { EndTurn }` once answered — and a document with
+    /// `body`. The `ToolCall` (an `execute`) carries `request.tool_call_id`, or `call-1`.
+    #[must_use]
+    pub fn parks(request: PermissionRequestEvent, body: &str) -> Self {
+        let call = request
+            .tool_call_id
+            .clone()
+            .unwrap_or_else(|| "call-1".to_owned());
+        Self {
+            script: Script::one_turn(vec![
+                ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
+                    tool_call_id: call,
+                    title: "run the suite".to_owned(),
+                    tool_kind: ToolKind::Execute,
+                    input: serde_json::json!({ "command": "cargo test" }),
+                    locations: Vec::new(),
+                })),
+                ScriptEvent::ParkPermission(request),
+                ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                })),
+            ]),
+            output: Some(body.to_owned()),
+            spawn_failure: None,
+        }
+    }
+
     /// The happy path with a price: one `usage` report of `cost_micros` USD micros, then `Done {
     /// EndTurn }`, and a document with `body`.
     ///
@@ -1252,6 +1286,44 @@ type ScriptKey = (String, i32, Option<(i32, u32)>);
 /// signal raised when the session stalls, and, for a suspend, the signal that wakes it.
 type Stall = (bool, Arc<Notify>, Option<Arc<Notify>>);
 
+/// MOD-42: the engines' policy and control lookups (plan D9, D10), owned so `fake_parts` can lend
+/// them for `'a`.
+struct Relays {
+    signal: watch::Sender<Signal>,
+    policies: Arc<Mutex<BTreeMap<AgentId, PermissionPolicy>>>,
+    policy: Box<dyn Fn(AgentId) -> PermissionPolicy + Send + Sync>,
+    control: Box<dyn Fn(RunId) -> Control + Send + Sync>,
+}
+
+impl Relays {
+    /// One process's lookups over `policies`, with no signal sent.
+    fn new(policies: Arc<Mutex<BTreeMap<AgentId, PermissionPolicy>>>) -> Self {
+        let (signal, receiver) = watch::channel(Signal::Run);
+        let read = Arc::clone(&policies);
+        Self {
+            signal,
+            policies,
+            policy: Box::new(move |agent| {
+                read.lock()
+                    .expect("no panic holds the fake orchestrator's lock")
+                    .get(&agent)
+                    .cloned()
+                    .unwrap_or_default()
+            }),
+            control: Box::new(move |_run| Control::new(receiver.clone())),
+        }
+    }
+}
+
+impl core::fmt::Debug for Relays {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Relays")
+            .field("signal", &*self.signal.borrow())
+            .field("policies", &self.policies)
+            .finish_non_exhaustive()
+    }
+}
+
 /// `MemStore` + `FakeDriver` + [`FakeIsolator`] + [`TestClock`] + [`FakeGraphSource`], which is
 /// ANA-2's own description of the fake orchestrator (`docs/ANA-2.md:1764-1766`).
 ///
@@ -1298,6 +1370,10 @@ pub struct FakeOrchestrator {
     box_id: BoxId,
     user: UserId,
     owner: Uuid,
+    /// MOD-42 plan D9, D10: the policy and control lookups every engine over this harness
+    /// borrows. A [`restarted`](Self::restarted) process carries the policies (they are the
+    /// agents') and none of the signal (it is the process's).
+    relays: Relays,
 }
 
 impl FakeOrchestrator {
@@ -1333,6 +1409,7 @@ impl FakeOrchestrator {
             box_id: ids::BOX,
             user,
             owner: Uuid::now_v7(),
+            relays: Relays::new(Arc::new(Mutex::new(BTreeMap::new()))),
         }
     }
 
@@ -1388,7 +1465,35 @@ impl FakeOrchestrator {
             box_id: self.box_id,
             user: self.user,
             owner: Uuid::now_v7(),
+            relays: Relays::new(Arc::clone(&self.relays.policies)),
         }
+    }
+
+    /// MOD-42 plan D9: `agent`'s policy in every engine built over this harness.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    pub fn set_policy(&self, agent: AgentId, policy: PermissionPolicy) {
+        self.relays
+            .policies
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .insert(agent, policy);
+    }
+
+    /// MOD-42 plan D10: every walk of this harness is asked to stop gracefully.
+    pub fn cancel_walks(&self, grace: std::time::Duration) {
+        self.relays.signal.send_replace(Signal::Cancel { grace });
+    }
+
+    /// The policy lookup `fake_parts` lends.
+    pub fn policy_for(&self) -> PolicyFor<'_> {
+        &*self.relays.policy
+    }
+
+    /// The control lookup `fake_parts` lends.
+    pub fn control_for(&self) -> ControlFor<'_> {
+        &*self.relays.control
     }
 
     /// Script one `(phase name, attempt)`: every session of that attempt that has no script of

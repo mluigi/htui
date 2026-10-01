@@ -98,6 +98,8 @@ macro_rules! engine_as {
             selector: &FirstCandidate,
             sink: $sink,
             driver: &driver,
+            policy: &htui_orch::ask_policy,
+            control: &htui_orch::never_cancelled,
             scrubber: &scrubber,
             app,
             box_profile,
