@@ -2579,7 +2579,7 @@ mod tests {
     use super::*;
     use htui_core::fixtures::{DemoData, demo_data, ids};
     use htui_core::model::{BoxId, NewItem, OsFamily, Status};
-    use htui_core::store::{MemStore, WriteStore as _};
+    use htui_core::store::MemStore;
     use htui_store::{CacheStore, Identity};
 
     fn demo() -> Backend {
