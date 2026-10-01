@@ -12,7 +12,7 @@
 //! [`WriteStore`] method of the same name by path (UFCS): this module defines the new traits, so
 //! both families are in scope here and a method-call body would be ambiguous.
 //!
-//! `WorkerStore` is 45 methods: 13 [`ReadStore`] reads, 5 [`WriteStore`] reads, 23 writes,
+//! `WorkerStore` is 46 methods: 13 [`ReadStore`] reads, 6 [`WriteStore`] reads, 23 writes,
 //! `write_document` and MOD-42's three command methods; [`RelayStore`] is four (MOD-42 plan D2).
 //! `WorkerHost` is `writer` plus 20 reads (blueprint F-5); MOD-41 T7 adds the 22nd,
 //! `queued_runs_on_box`.
@@ -159,6 +159,12 @@ pub trait WorkerStore: RecorderStore + RelayStore {
     ) -> impl Future<Output = Result<Vec<StepGraphPhase>>> + Send;
     /// [`WriteStore::command_runs`].
     fn command_runs(&self, step: StepId) -> impl Future<Output = Result<Vec<CommandRun>>> + Send;
+    /// [`WriteStore::relay_view`]: the engine stales a dropped walk's parked requests with it
+    /// (MOD-42 L-1).
+    fn relay_view(
+        &self,
+        item: ItemId,
+    ) -> impl Future<Output = Result<crate::model::RelayView>> + Send;
 
     // -- 23 writes
     /// [`WriteStore::transition`].
@@ -526,6 +532,9 @@ impl WorkerStore for MemStore {
     }
     async fn command_runs(&self, step: StepId) -> Result<Vec<CommandRun>> {
         WriteStore::command_runs(self, step).await
+    }
+    async fn relay_view(&self, item: ItemId) -> Result<crate::model::RelayView> {
+        WriteStore::relay_view(self, item).await
     }
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
         WriteStore::transition(self, id, from, to).await

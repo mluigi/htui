@@ -1980,6 +1980,8 @@ where
         if taken && self.parts.dead_walks.remove(run) {
             self.release_guards(run, "releasing a dead walk's guards at a lease take failed")
                 .await;
+            // MOD-42 L-1: the dead walk's parked requests, under the lease just taken.
+            self.stale_dropped_requests_of(run).await;
         }
         Ok(taken.then(|| self.lease_until(sent)))
     }
@@ -2032,7 +2034,73 @@ where
         if let Err(err) = self.parts.isolator.release(run).await {
             tracing::warn!(%run, %err, "releasing an abandoned walk's guards failed");
         }
+        // MOD-42 L-1: only while the lease is provably this owner's, since `relay_view` lists the
+        // rows of whoever holds it; a refresh that answers `false` leaves a stranger's rows alone.
+        match self
+            .parts
+            .store
+            .refresh_lease(run, self.parts.owner, self.lease_times().ttl)
+            .await
+        {
+            Ok(true) => self.stale_dropped_requests_of(run).await,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(%run, %err, "checking an abandoned walk's lease before staling its relay rows failed");
+            }
+        }
         self.release_lease(run).await;
+    }
+
+    /// MOD-42 L-1 (extends plan D5): every `pending` relay row of `run` that this owner's lease
+    /// shows goes `stale`. Called only where this process holds the run's lease and no walk of the
+    /// run is live here — a lease just taken under the run's lock or the sweep's fence, or an
+    /// abandoned walk's before its release — so every such row is a dropped session's: its walk
+    /// was hard-dropped while parked (a panic, a preempt past its grace) and nothing will ever
+    /// apply an answer to it. The owner is fixed per process, so without this the row would be
+    /// listed and answerable again the moment this process holds the lease once more. D5's
+    /// `open_permission` staling only reaches it if a new session parks on the same step, and
+    /// recovery opens none.
+    ///
+    /// Best-effort: a failure is a `warn`, and the row stays the ghost it was.
+    async fn stale_dropped_requests(&self, run: RunId, item: ItemId) {
+        let view = match self.parts.store.relay_view(item).await {
+            Ok(view) => view,
+            Err(err) => {
+                tracing::warn!(%run, %err, "reading a dropped walk's relay rows failed; they stay pending");
+                return;
+            }
+        };
+        let mut sessions: Vec<RelaySessionId> = Vec::new();
+        for row in view.permissions {
+            if row.run_id == run && !sessions.contains(&row.session) {
+                sessions.push(row.session);
+            }
+        }
+        for session in sessions {
+            if let Err(err) = self
+                .parts
+                .store
+                .settle_permissions(session, htui_core::model::PermissionStatus::Stale)
+                .await
+            {
+                tracing::warn!(%run, %err, "staling a dropped session's relay rows failed");
+            }
+        }
+    }
+
+    /// [`Self::stale_dropped_requests`] for a run known only by its id: its item is read first.
+    async fn stale_dropped_requests_of(&self, run: RunId) {
+        match self.run(run).await {
+            Ok(Run {
+                item_id: Some(item),
+                ..
+            }) => self.stale_dropped_requests(run, item).await,
+            // A chat run never parks a walk's request (MOD-2).
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(%run, %err, "reading a dropped walk's run before staling its relay rows failed");
+            }
+        }
     }
 
     /// MOD-41 plan D12: the command's window is written; the lease goes back, and the answer is
@@ -2195,6 +2263,12 @@ where
                     continue;
                 }
             };
+            // MOD-42 L-1: the fence holds the run, so no session of this process is live on it,
+            // and the lease just renewed is this owner's: any request it lists is a dropped
+            // walk's (a dead walk the pre-pass released, re-adopted under the same owner).
+            if let Some(item) = run.item_id {
+                self.stale_dropped_requests(run.id, item).await;
+            }
             // Blueprint A-7: under the heartbeat, so a stranger taking the lease mid-recovery
             // abandons it like any walk. `walk_leased` releases the lease of a run it leaves
             // anywhere but `running`, which is every `Parked` and `Finished`.
@@ -8495,8 +8569,8 @@ mod tests {
             let driver =
                 |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| $orch.driver_for_key(key);
             let scrubber = htui_core::scrub::MinimalScrubber::new([]);
-            let $engine = super::Engine::new(
-                super::fake_parts(&$orch, &graphs, &driver, &scrubber)
+            let $engine = crate::engine::Engine::new(
+                crate::engine::fake_parts(&$orch, &graphs, &driver, &scrubber)
                     .await
                     .expect("the harness has a box"),
             );
@@ -15266,6 +15340,112 @@ mod tests {
                 (RunStatus::Running, None),
                 "the stranger's run is not failed"
             );
+        }
+
+        /// `FEAT-3` started with `prd` parked, and its walk dropped there — neither `drive`'s
+        /// settle nor any release arm runs, as after a panic or a preempt past its grace. Answers
+        /// the parked row, still `pending`.
+        async fn dropped_while_parked(harness: &Harness) -> StepPermission {
+            feat_3_with_prd_ungated(harness).await;
+            harness.orch.script("prd", 1, parks("the prd"));
+            let walk = harness.dispatch(start_feat_3());
+            let parked = pending_row(&harness.orch.store);
+            match futures::future::select(Box::pin(walk), Box::pin(parked)).await {
+                futures::future::Either::Left((outcome, _)) => {
+                    panic!("the walk ended instead of parking: {outcome:?}")
+                }
+                futures::future::Either::Right((row, walk)) => {
+                    drop(walk);
+                    row.expect("the request was relayed")
+                }
+            }
+        }
+
+        /// L-1: the dropped session's row is `stale`, unlisted and unanswerable once this
+        /// process holds the run's lease again.
+        async fn assert_ghost_staled(orch: &FakeOrchestrator, ghost: &StepPermission) {
+            assert!(
+                orch.store
+                    .relay_view(ids::HTUI_FEAT_3)
+                    .await
+                    .expect("the relay view reads")
+                    .permissions
+                    .is_empty(),
+                "no relay row of a dropped session is listed"
+            );
+            assert_eq!(
+                orch.store
+                    .relay_rows()
+                    .iter()
+                    .map(|row| row.status)
+                    .collect::<Vec<_>>(),
+                [PermissionStatus::Stale],
+                "the dropped session's row is staled"
+            );
+            let answered = orch
+                .store
+                .answer_permission(ghost.id, &ghost.options[0].id, ids::USER, ids::BOX)
+                .await
+                .expect("the answer is read");
+            assert_ne!(
+                answered,
+                htui_core::model::AnswerOutcome::Answered,
+                "no client answers a request no session will apply"
+            );
+        }
+
+        /// L-1 (extends D5): a walk dropped while parked whose run this process's own sweep
+        /// re-adopts — the dead-walk pre-pass gives the lease back and `adopt_runs` hands it to
+        /// the same owner — leaves no answerable ghost behind.
+        #[tokio::test(start_paused = true)]
+        async fn a_dead_walks_parked_request_is_staled_when_its_sweep_readopts_the_run() {
+            let harness = Harness::new().await;
+            let ghost = dropped_while_parked(&harness).await;
+            harness.orch.dead_walks.mark(ghost.run_id);
+            harness_engine!(harness.orch, engine);
+
+            let swept = engine.sweep().await.expect("the sweep runs");
+
+            assert_eq!(
+                swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
+                [ghost.run_id],
+                "the same owner re-adopted the run"
+            );
+            assert_ghost_staled(&harness.orch, &ghost).await;
+        }
+
+        /// L-1 at a command's take: a dead walk's run taken back by a command of this process
+        /// before any sweep.
+        #[tokio::test(start_paused = true)]
+        async fn a_dead_walks_parked_request_is_staled_when_a_command_retakes_the_lease() {
+            let harness = Harness::new().await;
+            let ghost = dropped_while_parked(&harness).await;
+            harness.orch.dead_walks.mark(ghost.run_id);
+            harness_engine!(harness.orch, engine);
+
+            engine
+                .take_lease(ghost.run_id)
+                .await
+                .expect("this owner's lease renews");
+
+            assert_ghost_staled(&harness.orch, &ghost).await;
+        }
+
+        /// L-1 at `abandoned`: a walk the worker dropped while parked (a preempt past its grace)
+        /// leaves no ghost for the preempting command's take of the released lease.
+        #[tokio::test(start_paused = true)]
+        async fn an_abandoned_walks_parked_request_is_staled_before_the_lease_goes_back() {
+            let harness = Harness::new().await;
+            let ghost = dropped_while_parked(&harness).await;
+            harness_engine!(harness.orch, engine);
+
+            engine.abandoned(ghost.run_id).await;
+            engine
+                .take_lease(ghost.run_id)
+                .await
+                .expect("the released lease is takeable");
+
+            assert_ghost_staled(&harness.orch, &ghost).await;
         }
 
         /// I-6 at the judge (F-4): a cancel reaching a parked judge call fails no judge and

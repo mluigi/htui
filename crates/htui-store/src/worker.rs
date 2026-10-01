@@ -141,6 +141,9 @@ impl htui_core::store::WorkerStore for PgStore {
     async fn command_runs(&self, step: StepId) -> Result<Vec<CommandRun>> {
         WriteStore::command_runs(self, step).await
     }
+    async fn relay_view(&self, item: ItemId) -> Result<htui_core::model::RelayView> {
+        WriteStore::relay_view(self, item).await
+    }
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
         WriteStore::transition(self, id, from, to).await
     }
@@ -416,6 +419,9 @@ impl htui_core::store::WorkerStore for Writer {
     }
     async fn command_runs(&self, step: StepId) -> Result<Vec<CommandRun>> {
         WriteStore::command_runs(self, step).await
+    }
+    async fn relay_view(&self, item: ItemId) -> Result<htui_core::model::RelayView> {
+        WriteStore::relay_view(self, item).await
     }
     async fn transition(&self, id: ItemId, from: Status, to: Status) -> Result<bool> {
         WriteStore::transition(self, id, from, to).await
