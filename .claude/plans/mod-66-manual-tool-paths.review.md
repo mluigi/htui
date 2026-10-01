@@ -54,4 +54,19 @@ It recorded one accepted behaviour change (D6): existing hand-written ANA-4 manu
 
 ## Fixes
 
-To be filled in at close-out: the commit hashes per finding.
+All of them were applied on 2026-10-01. Each was test-first, and M1, M2 and L3 were also
+mutation-checked: each new test fails against a deliberately broken implementation.
+
+| Finding | Commit | Change |
+|---|---|---|
+| M1 | `2b2f730` | `a_tool_paths_write_holds_the_reprobe_claim_while_in_flight`: a real `SetToolPaths` is held in flight by a fixture adapter. The row claim is held while it runs and free after it answers. Mutation: `drop(claim)` early fails it. |
+| M2 | `2b2f730` | `a_running_tool_paths_write_refuses_a_probe_and_a_second_write_by_name`. Mutation: `Background::writing(..)` fails only this test of the 19. |
+| L1 | `01278aa` | The `is_file` loop moved into `run_tool_paths` (both claims held). A bad path answers `Failed` from the task and writes nothing. |
+| L2 | `af6cb59` | Backspace `alpha.chars().count()` times. |
+| L3 | `5239c9b` | `SECRET-SENTINEL` test. The fixture also makes `args` a string, so that serde's own error would quote the sentinel. Mutation: appending the serde error fails it. |
+| L4 | `d8db686` | `BOX_WRITE_RUNNING`: "…already writing this box; try again once it has finished". Three pins compare with `ends_with`, because the refusal carries the store-error prefix. |
+| N1 | `d363e87` | The note shows only while not probing and when a manual row is not switched off. Both guards are pinned. |
+| N2 | `6cb08b8` | The routing tests also assert `contains("not found")`. |
+| N3 | `0bd2311` | `PathsForm`'s hand-written `Debug` prints `opened.len()`. |
+| N4 | `85b98c8` | `LITERAL_LAUNCH` moved to `agent_settings.rs`. The worker refuses a row with no `discovery` or an empty `tools`. |
+| N5 | `e873476` | The map is moved, not cloned. `AgentLaunch::deserialize(&launch)` is used in the worker and in `PathsForm::open`. This needed `serde` as a direct dependency of `htui` (workspace version, one `Cargo.lock` line, nothing new compiled). |

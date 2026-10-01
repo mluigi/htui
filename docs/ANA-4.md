@@ -795,7 +795,10 @@ handshake) runs on registration, on demand, and lazily before the first session 
 `agy update`, so a recorded version can go stale without `htui` doing anything, and the failure mode
 that matters (spawn fails) already triggers a re-probe. Manual entries are supported by writing
 `agent_box.path` and `probe.resolved` by hand in the Settings tab and setting
-`probe.status = "ready"`; a manual entry is never overwritten by a probe that finds nothing.
+`probe.status = "ready"`; a manual entry is never overwritten by a probe that finds nothing. *(As
+built by MOD-66: the human gives a path per `${tool}` in Settings > Agents (`m`), stored as
+`probe.manual`; the probe resolves through it after the `HTUI_TOOL_<NAME>` override, vets it with the
+usual handshake, and records `source: manual`, which `recorded_launch` honours.)*
 
 *Windows shim handling, as a rule.* Resolve with the `which` crate rather than trusting
 `Command::new` (`std::process::Command` does not consult `PATHEXT`, and handing a `.cmd` to

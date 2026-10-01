@@ -5,7 +5,7 @@
 **Complexity**: Medium
 **Decision numbering**: local, `D1`..: parallel sandbox runs share the global sequence, and a
 local range cannot collide with theirs (the MOD-31 convention). Cited elsewhere as "MOD-66 D3".
-**Status**: fact-checked (amended, see the verified-claims table) → awaiting CONFIRM
+**Status**: done (2026-10-01). Confirmed, implemented and reviewed; write-up `docs/decisions/mod/mod-66.md`.
 
 ## Summary
 

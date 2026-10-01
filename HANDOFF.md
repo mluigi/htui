@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-01):** **ANA-23 is concluded** (`docs/ANA-23.md`,
+**Current status (2026-10-01):** **MOD-66 is done** (`docs/decisions/mod/mod-66.md`): a box can
+be given an explicit path for any `${tool}` an agent row declares. `m` in Settings > Agents opens a
+tool-paths form; the paths live in `agent_box.probe.manual` and are a probe tier between the
+`HTUI_TOOL_<NAME>` override and discovery, so the same handshake and status mapping vet them, and
+`recorded_launch` now honours `source: manual` so they reach every spawn. A manual row reads `*`.
+No migration, no `.sqlx` change.
+Before it, **ANA-23 was concluded** (`docs/ANA-23.md`,
 `docs/decisions/ana/ana-23.md`): `fastembed`/`ort` gives way to `rten`, a pure-Rust ONNX runtime
 that runs the same BGE-small ONNX file with no native runtime fetched at build time and no C
 compiler for the embedder, at 1.29x fastembed's time on htui's per-item calls. The stored Qdrant
@@ -28,12 +34,6 @@ Four ssh sessions (preflight, prepare, install, verify) ship the local build, en
 wait for the box to check in and set its executor to `worker`. The TUI gained `--dsn-stdin` for
 agent login over `ssh -t`; `R-STO-1` was amended. No migration. **The live check on a real host is
 the maintainer's** (write-up § Not done here).
-Before it, **MOD-51 was done** (`docs/decisions/mod/mod-51.md`): Settings >
-Boxes edits the `box_probe_spec` overlay. `s` opens a JSON editor and `ctrl-s` saves it as a
-compare-and-set on `app_setting.updated_at` through `WriteStore::set_box_probe_spec`. The worker
-refuses any overlay the probe would ignore (`spec::check`, the probe's own merge) before it writes,
-a blank save clears the row, and the next `p` or connect re-probes under the new digest. No
-migration, no `.sqlx` change.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -440,16 +440,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   `htui worker`'s Windows stop path (Ctrl-Break, closing the console, a system shutdown;
   `docs/htui-worker.md`) cancels its walks and gives their leases back as it does on SIGTERM.
 
-- [ ] **MOD-66 - Per-box manual tool path editor in Settings > Agents** (from MOD-23, plan OQ-3).
-  `R-AGT-6`. ANA-4 §4.6 (`docs/ANA-4.md:796-798`) describes a per-box manual entry: write
-  `agent_box.path` and `probe.resolved` by hand and set `probe.status = "ready"`, protected by MOD-2
-  D45/D51's `probe.source = manual` (a probe that finds nothing keeps it). In the tree that record
-  never reaches a spawn: `ProbeSnapshot::recorded_launch` answers `None` for any `source` other than
-  `probe` (`crates/htui-agent/src/probe.rs:1174-1177`), and the driver resolves `agent.launch`
-  against `probe.tools`. So this item is the resolution rule plus a second form in the Agents section
-  (beside MOD-23's create/edit pane, `docs/decisions/mod/mod-23.md`) writing `probe.tools` with
-  `source: manual` for this box. MOD-23 already covers the common case, a registry row whose
-  `launch.command` is a literal path, which needs no probe. **Not blocked.**
 - [ ] **MOD-24 - Crash recovery of runs under the headless worker.** `R-HIS-1`, `R-ORCH-11`.
   **Rescoped by maintainer decision, 2026-09-25:** a run survives a crash through ANA-2 §4.9's
   reset-and-retry resume, not by re-hydrating the agent's context and continuing the exact step. The
@@ -603,6 +593,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-27 OpenRig survey) |
-| MOD-N   | 27 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys, MOD-68 rten embedder; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 26 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-68 rten embedder; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |
