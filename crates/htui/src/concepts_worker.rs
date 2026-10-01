@@ -15,7 +15,8 @@ use futures::FutureExt as _;
 use futures::future::{BoxFuture, Shared};
 use htui_core::model::Scope;
 use htui_core::store::StoreError;
-use htui_store::embed::FastEmbedder;
+use htui_store::embed::RtenEmbedder;
+use htui_store::model;
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::vector::{Hit, QdrantStore, SearchQuery, VectorStore as _};
 use htui_store::vector_sync::{Indexer, SyncReport};
@@ -57,12 +58,14 @@ pub trait ConceptIndex: Send + Sync {
 }
 
 /// How the embedding model is loaded: [`load_model`] in production, a counter in a test.
-type Loader = Arc<dyn Fn() -> BoxFuture<'static, Result<FastEmbedder, String>> + Send + Sync>;
+type Loader = Arc<dyn Fn() -> BoxFuture<'static, Result<RtenEmbedder, String>> + Send + Sync>;
 
-/// `FastEmbedder::new` on the blocking pool (D238).
-fn load_model() -> BoxFuture<'static, Result<FastEmbedder, String>> {
+/// The pinned files (fetched or adopted, on this task), then `RtenEmbedder::load` on the blocking
+/// pool (D238, MOD-68 D7).
+fn load_model() -> BoxFuture<'static, Result<RtenEmbedder, String>> {
     Box::pin(async {
-        tokio::task::spawn_blocking(FastEmbedder::new)
+        let files = model::ensure_model().await.map_err(|e| e.to_string())?;
+        tokio::task::spawn_blocking(move || RtenEmbedder::load(&files))
             .await
             .map_err(|e| format!("the embedding model's loader stopped: {e}"))?
             .map_err(|e| e.to_string())
@@ -80,7 +83,7 @@ pub struct QdrantIndex {
     /// What loads the model.
     loader: Loader,
     /// The last connection made, for the settings it was made with (review 3).
-    connections: Connections<QdrantStore<FastEmbedder>>,
+    connections: Connections<QdrantStore<RtenEmbedder>>,
 }
 
 /// One cached connection, keyed by the URL and key it was made with (review 3).
@@ -132,7 +135,7 @@ impl<T> Connections<T> {
 }
 
 /// One load of the model, awaited by every search that overlaps it.
-type Load = Shared<BoxFuture<'static, Result<FastEmbedder, String>>>;
+type Load = Shared<BoxFuture<'static, Result<RtenEmbedder, String>>>;
 
 impl core::fmt::Debug for QdrantIndex {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -155,7 +158,7 @@ impl QdrantIndex {
 
     /// An index whose model comes from `loader` (review 2: the seam a test counts loads through).
     fn with_loader(
-        loader: impl Fn() -> BoxFuture<'static, Result<FastEmbedder, String>> + Send + Sync + 'static,
+        loader: impl Fn() -> BoxFuture<'static, Result<RtenEmbedder, String>> + Send + Sync + 'static,
     ) -> Self {
         Self {
             load: Mutex::new(None),
@@ -165,7 +168,7 @@ impl QdrantIndex {
     }
 
     /// The model, loading it on first use (F9, blueprint D245).
-    async fn embedder(&self) -> Result<FastEmbedder, String> {
+    async fn embedder(&self) -> Result<RtenEmbedder, String> {
         self.load().await
     }
 
@@ -194,7 +197,7 @@ impl QdrantIndex {
     async fn connect(
         &self,
         settings: QdrantSettings,
-    ) -> Result<Arc<QdrantStore<FastEmbedder>>, String> {
+    ) -> Result<Arc<QdrantStore<RtenEmbedder>>, String> {
         if let Some(store) = self.connections.get(&settings) {
             return Ok(store);
         }

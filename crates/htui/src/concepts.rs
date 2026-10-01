@@ -19,7 +19,8 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use htui_core::model::{ProjectId, RequirementState, Resolution, Scope};
 use htui_core::store::{MemStore, ReadStore, StoreError};
-use htui_store::embed::FastEmbedder;
+use htui_store::embed::RtenEmbedder;
+use htui_store::model;
 use htui_store::pg::{CONNECT_TIMEOUT, PoolSize};
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::vector::{Hit, PointType, QdrantStore, SearchQuery, VectorStore};
@@ -87,7 +88,7 @@ pub fn settings_from(
     Ok(QdrantSettings::new(url, api_key)?)
 }
 
-async fn open() -> anyhow::Result<(PgStore, QdrantStore<FastEmbedder>)> {
+async fn open() -> anyhow::Result<(PgStore, QdrantStore<RtenEmbedder>)> {
     let settings = settings_from(secret::get_qdrant_url()?, secret::get_qdrant_api_key()?)?;
     let Some(dsn) = secret::get_dsn()? else {
         bail!("no Postgres DSN is stored; run `htui --set-dsn` first");
@@ -96,7 +97,13 @@ async fn open() -> anyhow::Result<(PgStore, QdrantStore<FastEmbedder>)> {
     let pg = PgStore::connect_headless(&dsn, &identity, CONNECT_TIMEOUT, PoolSize::TUI)
         .await
         .map_err(headless_refusal)?;
-    let embedder = FastEmbedder::new()?;
+    let files = model::ensure_model()
+        .await
+        .context("cannot load the embedding model")?;
+    let embedder = tokio::task::spawn_blocking(move || RtenEmbedder::load(&files))
+        .await
+        .context("the embedding model's loader stopped")?
+        .context("cannot load the embedding model")?;
     let store = QdrantStore::connect(&settings, embedder)
         .await
         .context("cannot reach Qdrant")?;
@@ -308,17 +315,18 @@ fn keyring_settings() -> Result<QdrantSettings, String> {
         .map_err(|err| format!("the stored Qdrant URL is not usable: {err}"))
 }
 
-/// The model on a thread of its own, then the collection; a failure is a `warn` and another
-/// attempt after the interval, forever (plan D19). Rebuilds the model each attempt:
-/// `QdrantStore::connect` takes it by value and `FastEmbedder` is not `Clone`.
-async fn open_index(pg: &PgStore, settings: &QdrantSettings) -> QdrantStore<FastEmbedder> {
+/// The model, then the collection; a failure is a `warn` and another attempt after the interval,
+/// forever (plan D19). The model is fetched on this task and loaded on a thread of its own
+/// (`apart`), once: `RtenEmbedder` is `Clone`, so a retry after an unreachable Qdrant reuses it
+/// (MOD-68 A-4).
+async fn open_index(pg: &PgStore, settings: &QdrantSettings) -> QdrantStore<RtenEmbedder> {
+    let mut loaded: Option<RtenEmbedder> = None;
     loop {
-        let opened = match apart("htui-index-model", FastEmbedder::new).await {
-            Some(Ok(embedder)) => QdrantStore::connect(settings, embedder)
+        let opened = match index_model(&mut loaded).await {
+            Ok(embedder) => QdrantStore::connect(settings, embedder)
                 .await
                 .map_err(|err| format!("cannot reach Qdrant: {err}")),
-            Some(Err(err)) => Err(err.to_string()),
-            None => Err("the model loader stopped".to_owned()),
+            Err(err) => Err(err),
         };
         match opened {
             Ok(store) => return store,
@@ -329,8 +337,24 @@ async fn open_index(pg: &PgStore, settings: &QdrantSettings) -> QdrantStore<Fast
     }
 }
 
+/// The loaded model, or a fetch (on this task: `apart` threads have no runtime) and a load (on a
+/// thread of its own), kept in `loaded` for the next attempt.
+async fn index_model(loaded: &mut Option<RtenEmbedder>) -> Result<RtenEmbedder, String> {
+    if let Some(embedder) = loaded {
+        return Ok(embedder.clone());
+    }
+    let files = model::ensure_model().await.map_err(|err| err.to_string())?;
+    let embedder = match apart("htui-index-model", move || RtenEmbedder::load(&files)).await {
+        Some(Ok(embedder)) => embedder,
+        Some(Err(err)) => return Err(err.to_string()),
+        None => return Err("the model loader stopped".to_owned()),
+    };
+    *loaded = Some(embedder.clone());
+    Ok(embedder)
+}
+
 /// `work` on a named thread of its own, awaited. Not `spawn_blocking`: the runtime waits for its
-/// blocking tasks when it is dropped, and a keyring prompt nobody answers or a model download
+/// blocking tasks when it is dropped, and a keyring prompt nobody answers or a model load
 /// must not hold `htui worker`'s exit (`worker_cmd::read_dsn_apart`'s reason). The thread is
 /// left behind on an abort and dies with the process. `None` when the thread cannot be spawned
 /// or ends without answering.
@@ -555,12 +579,13 @@ mod tests {
         );
     }
 
-    /// The search runtime shares one loaded model between its tasks (MOD-64 D238); `htui-store`'s
-    /// own tests build without `local-embed`, so the check lives here (D258).
+    /// The search runtime shares one loaded model between its tasks (MOD-64 D238), the index job
+    /// keeps one across retries, and both move it across tasks; `htui-store`'s own tests build
+    /// without `local-embed`, so the check lives here (D258).
     #[test]
-    fn fast_embedder_is_clone() {
-        fn clone_of<T: Clone>() {}
-        clone_of::<FastEmbedder>();
+    fn rten_embedder_is_clone_send_and_sync() {
+        fn shared<T: Clone + Send + Sync + 'static>() {}
+        shared::<RtenEmbedder>();
     }
 
     /// The worker's index job (MOD-41 plan D19, blueprint §16) over `MemStore` and
