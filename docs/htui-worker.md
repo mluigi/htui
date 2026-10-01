@@ -19,6 +19,7 @@ htui worker [--pool-size N] [--dsn-stdin] [--log PATH]
 - [A run whose resume keeps failing](#a-run-whose-resume-keeps-failing)
 - [A queued cancel interrupted halfway](#a-queued-cancel-interrupted-halfway)
 - [Error reports](#error-reports)
+- [Provisioning a remote box](#provisioning-a-remote-box)
 - [Running it as a systemd service](#running-it-as-a-systemd-service)
 
 ## What it does, and what it does not do yet
@@ -59,14 +60,17 @@ What it does not do yet:
 - **No remote targeting until MOD-43.** A run targets the box that started it, and a worker only
   takes runs targeted at its own box. The TUI cannot yet send a run to another machine's worker,
   and nothing in the TUI tells you whether a worker is running.
-- It does not install itself as a service. The [sample unit](#running-it-as-a-systemd-service)
-  below is documentation only.
+- It does not install itself; `htui provision <host>` installs it on another Linux machine (see
+  [Provisioning a remote box](#provisioning-a-remote-box)). The
+  [sample unit](#running-it-as-a-systemd-service) is for doing it by hand.
 
 ## Who executes on a box: the executor setting
 
 Each box has an **executor**, `tui` (the default) or `worker`, stored in the box's settings in
 Postgres. Change it in **Settings › Boxes** with `w`, then `y` to confirm (`n` or `Esc` cancels).
 `w` proposes the other value; on a value this build does not know, it proposes `tui`.
+`htui provision` sets it to `worker` for the box it installs, once that box checks in (see
+[Provisioning a remote box](#provisioning-a-remote-box)).
 
 **The rule (I-1):** on a box, only the process whose role matches the executor claims queued runs,
 adopts runs nobody holds, or sweeps. With `tui`, the TUI does; with `worker`, `htui worker` does.
@@ -250,11 +254,191 @@ server; this build has no setting to turn that off. For the worker:
 If you self-host and do not want reports to leave your network, block outbound traffic to
 `glitchtip.sette.mluigi.it` for the worker's host.
 
+## Provisioning a remote box
+
+```
+htui provision <destination> [--dsn-stdin] [--replace-credential] [--log PATH]
+```
+
+`htui provision` installs this `htui` build as the `htui-worker` system service on another Linux
+machine, with the [unit below](#running-it-as-a-systemd-service), and sets the new box's executor to
+`worker`. The destination is anything `ssh` accepts: a host, `user@host` or a `~/.ssh/config`
+alias. It runs your own `ssh`, so `~/.ssh/config`, `ProxyJump` and your agent apply. It opens four
+short sessions; with password logins you are asked once per session, so use a key or
+`ControlMaster`. Progress goes to standard error and the result to standard output. As for
+`worker`, `--log` goes after `provision`. Each session is bounded: `ssh` keepalives end one whose
+host has gone silent for about a minute, and `htui` closes the preflight after 120 s, the upload
+after 120 s plus 2 s per MiB, the install after 300 s, and the wait for the worker after its own
+minute plus 120 s. The bounds count the time `ssh` spends asking for a password or passphrase; a
+session past its bound is asked to stop before it is killed, so a prompt left waiting gives your
+terminal back with echo on. Text from the remote host (error lines, journal lines, the hostname) is printed
+with its control characters escaped.
+
+**What the remote host needs.**
+
+- Linux, with the same CPU architecture as this machine: x86_64 or aarch64 (`arm64` counts as
+  aarch64). Provisioning ships the binary you run, so this machine must run a Linux build too. The
+  binary is uploaded unless the host already has the same build, and its size is printed; a
+  release build is much smaller than a debug one.
+- systemd 250 or later, with `systemd-creds` on the `PATH`.
+- `sha256sum` (coreutils) on the `PATH`: the upload is checked with it, and a host without it is
+  refused before anything is written.
+- sudo (a password prompt is fine). When sudo wants a password, `htui` asks for it here, on your
+  terminal, with no echo: `[sudo] password for <user> on <destination>:`. `Esc` or `Ctrl-C`
+  cancels before anything is written. A sudo that asks a second question (a one-time code) or
+  insists on a tty (`requiretty`) fails safely: exit 1, and nothing privileged is written. Give a
+  host that asks for a one-time code NOPASSWD. NOPASSWD does not get around `requiretty`; turn it
+  off for that user instead (`Defaults:<user> !requiretty`).
+- With a password sudo, a remote `sh` with `printf` built in (dash, bash, busybox and ksh93 have
+  it; posh and mksh do not). The password is handed to sudo through `printf`, and an external one
+  would show it in the process list, so such a host is refused: give that user NOPASSWD.
+- A POSIX login shell on the remote user (sh, bash, zsh, ksh); csh and tcsh are refused. fish is
+  untested and likely works, since every command is a plain `sh -c '…'`.
+- No `htui-worker` service already running from a unit `htui` did not write (one that is not
+  `/etc/systemd/system/htui-worker.service`): such a host is refused; stop and remove that unit
+  first.
+- A user and group name matching `[a-z_][a-z0-9_-]{0,31}`, and a home directory whose path uses
+  only `A-Z a-z 0-9 _ . / -` with no `..`. The user and the home are written into the unit file;
+  the group is only checked, and written nowhere.
+
+**What is written where.** On the remote host, for the user you log in as:
+
+| What | Path | Written by |
+|---|---|---|
+| Binary | `~/.local/bin/htui` | you |
+| Log | `~/.local/state/htui/worker.log` | you (the directory); the worker writes the file |
+| Unit | `/etc/systemd/system/htui-worker.service` | root, through sudo |
+| Credential | `/etc/credstore.encrypted/htui-dsn` | root, through sudo |
+
+The unit is the [sample below](#running-it-as-a-systemd-service) with that user's name and home
+filled in and the binary in `~/.local/bin`. The worker mints its `box.toml` in `~/.config/htui/` at
+its first start, so the new box belongs to that user. The DSN is encrypted by `systemd-creds` on
+that host and is never in a command line, the environment, a log or a plain file on either
+machine. The sudo password, likewise, travels only on `ssh`'s standard input. The notes under the
+sample apply to this unit too; to add an `Environment=` line (`PATH`, say), use a drop-in
+(`sudo systemctl edit htui-worker.service`), which a re-run leaves alone. Do not set
+`XDG_CONFIG_HOME` there: provisioning assumes `~/.config`, and a worker that reads another
+`box.toml` is another box, with its executor still `tui`, and a later re-run would wait on the
+wrong file.
+
+**The DSN.** From your OS keyring, or one line of stdin with `--dsn-stdin` when the remote host
+reaches Postgres at another address. A DSN whose host is `localhost`, a loopback address or a Unix
+socket is refused, including through a `host=` or `hostaddr=` parameter: the remote host would
+reach itself, not your server. With `--dsn-stdin` on a terminal, `htui` asks for the line; the
+pasted text is visible.
+
+**Do not provision through a sudo configured with `log_input`.** The DSN reaches `systemd-creds` on
+sudo's standard input, so such a sudo would record it in its I/O log (`/var/log/sudo-io`). It is
+off by default; `sudo -l` and `/etc/sudoers` show it when it is set.
+
+**Verification and the executor.** After the install, the service must be active with a
+`box.toml` within about a minute. The box is then checked in Postgres from this machine, which
+registers or refreshes this machine's own box, as `htui --index-items` does. When the new box shows
+up, or its `last_seen_at` moves past what it was once the install had returned, its executor is set
+to `worker` and `htui` prints, on standard output:
+
+```
+box <id> (<hostname>) provisioned on <destination>
+```
+
+Otherwise the same line is printed, the exit is still 0, and a warning says what was not done:
+
+- `warning: service active, box <id>; not verified in Postgres from here: <reason>`, followed by
+  `set box <id>'s executor to worker in Settings › Boxes`. The reason is either why this machine
+  could not use the DSN (it reaches Postgres only from the remote network, say), or
+  `box <id> did not check in within 90 s; see journalctl -u htui-worker and
+  ~/.local/state/htui/worker.log on <destination>`.
+- `warning: box <id>'s executor is not set to worker: <reason>; set it in Settings › Boxes`, when
+  the box checked in but the write did not apply.
+
+When the box is already in Postgres once the install has returned (a re-run with
+`--replace-credential`, say, or a new worker that connected at once), only a later `last_seen_at`
+counts, and an `htui` TUI on that host with the same `box.toml` moves it too. The check is then
+best-effort, and a line on standard error says so: `note: box <id> was already in Postgres when the
+install returned, so the check-in is best-effort: an htui TUI on <destination> with the same
+box.toml would also count`.
+
+An active service with a `box.toml` does not prove the worker connected: it writes `box.toml`
+before it connects, and a worker refused at start (exit 2) is restarted every 10 seconds and looks
+active in between. When the box did not check in, read the worker's log on the host
+(`journalctl -u htui-worker` may need sudo; `~/.local/state/htui/worker.log` does not), fix the
+cause, and flip the executor in **Settings › Boxes** once the box shows up there.
+
+**Re-running.** On a host already provisioned with this build and running, nothing is installed
+or restarted, and no sudo password is asked: `htui` reads the box's `box.toml` there (one more
+unprivileged session), sets that box's executor to `worker` when it is not already, and prints
+`<destination> is already provisioned with this build; box <id> (<hostname>)`, ending in
+`; executor set to worker` when it changed it. When the box cannot be read there, the line is
+`<destination> is already provisioned with this build; nothing was changed`; when this machine
+cannot use the DSN, or the write does not apply, the same warnings as above say so. The exit is 0
+either way. `--replace-credential` re-encrypts the DSN and restarts the service. A host with a
+different build, or one set up by hand, is refused: upgrading is not supported yet. The binary in
+`~/.local/bin/htui` is replaced on a host without the unit. A run that failed partway is completed
+by running it again: the binary is not sent twice, an existing credential is kept unless you pass
+`--replace-credential`, and a unit that is installed but not running is written again and started.
+A run that failed while waiting for the worker may leave the service running; the re-run then
+finds it already provisioned and sets the executor.
+
+**Exit codes.**
+
+| Code | Meaning |
+|---|---|
+| `0` | Provisioned, or already provisioned. A warning on standard error may still ask you to set the executor by hand. |
+| `2` | Refused; nothing was written on the remote host. The sentence starts `not provisioning <destination>:` and names the reason, among them: a destination that is empty, starts with `-` or contains whitespace, no DSN, a keyring that could not be read, a DSN the remote host cannot use, a local `htui` binary that cannot be read or is not a Linux build, `ssh` that could not be run (`cannot run ssh: …`) or could not connect (`ssh to <destination> failed (exit 255): …`), a preflight that did not finish (`the preflight on <destination> did not finish within 120 s; its ssh session was closed`), a login shell that did not run the preflight, the host's OS, architecture, systemd, `systemd-creds`, `sha256sum` or sudo, a password sudo whose `sh` has no `printf` builtin, an `htui-worker` already running from a unit `htui` did not write, a different build already installed, a user, group or home that cannot go into a unit file, or a cancelled password prompt. |
+| `1` | Failed after a remote write; re-running completes it, the executor included (see **Re-running**). The sentence starts `provisioning <destination> failed:`. |
+
+The failures:
+
+- **The binary does not run there** (often an older glibc):
+  `the htui binary does not run on <destination>: <its last error line>`. The uploaded copy is
+  removed; a binary already installed stays.
+- **The upload arrived altered:** `the upload to <destination> was corrupted (its sha256 is not
+  this build's); nothing was replaced`. The uploaded copy is checked before it runs, and removed.
+- **sudo refused:** with a password, `sudo refused the password (or needs a tty or a second
+  factor) on <destination> (<sudo's last line>); nothing privileged was written`; with NOPASSWD,
+  `sudo refused to run the installer as root (or needs a tty) on <destination> (<sudo's last
+  line>); nothing privileged was written`. The DSN was not read.
+- **ssh dropped before the privileged part:** `the ssh session to <destination> dropped before the
+  privileged part (exit <code>); nothing privileged was written: <its last line>`.
+- **The service did not start:** `the htui-worker service on <destination> did not start with a
+  box.toml within 58 s (systemctl says <state>); if the worker cannot use its DSN, fix it and re-run
+  with --replace-credential; its last journal and log lines follow:`, then the last lines of
+  `journalctl -u htui-worker` and of `~/.local/state/htui/worker.log`. A plain re-run keeps the
+  credential already there.
+- **A session did not finish in time:** `preparing <destination> did not finish within <bound>;
+  its ssh session was closed`, and likewise `installing the service on <destination>` and
+  `waiting for the worker on <destination>`.
+- **ssh dropped later**, or a step failed for another reason: `preparing <destination> failed (exit
+  <code>): …`, `installing the service on <destination> failed (exit <code>): …` or
+  `waiting for the worker on <destination> failed (exit <code>): …`, with the last lines the
+  session printed. `ssh`'s own failures are exit 255.
+
+When sudo wants a password and no terminal can be opened, the run is refused (exit 2) instead:
+`sudo needs a password and there is no terminal; configure NOPASSWD or run interactively`.
+
+**Agent login on the new box.** After a success, `htui` prints the way in on standard error:
+`ssh -t <host> '~/.local/bin/htui' --dsn-stdin`, paste the DSN, then **Settings › Agents**. Keep
+the quotes: without them your own shell expands `~` to your home on this machine, which is the
+wrong path when the login on `<host>` is another user. The DSN is held in memory for that session
+only; it is neither read from nor written to a keyring, and systemd decrypts the service's
+credential only for the unit. The TUI runs as the same user with the same `box.toml` (unless that
+login sets `XDG_CONFIG_HOME`), so it is the same box (see
+[The TUI on a worker box](#the-tui-on-a-worker-box)). **Settings › Connection** there shows the
+keyring's state, not this session's DSN, and saving a DSN from it tries a keyring the box does not
+have. `--dsn-stdin` cannot be combined with `--set-dsn`, `--clear-dsn`, `--demo`, `--offline`,
+`--index-items` or `--search-items`.
+
+**Not done.** Upgrades (a host with a different build is refused), uninstalling
+(`sudo systemctl disable --now htui-worker.service`, then remove the four paths above by hand),
+non-Linux targets on either end, and user units. The concepts index is not built on the box: the
+service has no keyring, so no Qdrant URL (see [The concepts index](#the-concepts-index)).
+
 ## Running it as a systemd service
 
-This is a sample; nothing installs it for you (MOD-45). It is a **system** unit that runs as your
-user, because user units can load an encrypted credential only from systemd 256 on, and Ubuntu
-24.04 ships 255. Check yours with `systemctl --version`.
+This is the unit `htui provision` writes (with the binary in `~/.local/bin`); use it by hand on a
+host where sudo over ssh is not available. It is a **system** unit that runs as your user, because
+user units can load an encrypted credential only from systemd 256 on, and Ubuntu 24.04 ships 255.
+Check yours with `systemctl --version`.
 
 **1. Encrypt the DSN** (as root). The credential is encrypted at rest and bound to this host (to its
 TPM too, when it has one), and systemd decrypts it only for the unit:

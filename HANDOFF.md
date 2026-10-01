@@ -14,7 +14,15 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-01):** **MOD-51 is done** (`docs/decisions/mod/mod-51.md`): Settings >
+**Current status (2026-10-01):** **MOD-45 is done** (`docs/decisions/mod/mod-45.md`):
+`htui provision <destination> [--dsn-stdin] [--replace-credential]` turns an ssh-reachable Linux
+host into a worker box in one command (guide `docs/htui-worker.md` § Provisioning a remote box).
+Four ssh sessions (preflight, prepare, install, verify) ship the local build, encrypt the DSN with
+`systemd-creds` from stdin (never argv or a file), install the `htui-worker` system unit, then
+wait for the box to check in and set its executor to `worker`. The TUI gained `--dsn-stdin` for
+agent login over `ssh -t`; `R-STO-1` was amended. No migration. **The live check on a real host is
+the maintainer's** (write-up § Not done here).
+Before it, **MOD-51 is done** (`docs/decisions/mod/mod-51.md`): Settings >
 Boxes edits the `box_probe_spec` overlay. `s` opens a JSON editor and `ctrl-s` saves it as a
 compare-and-set on `app_setting.updated_at` through `WriteStore::set_box_probe_spec`. The worker
 refuses any overlay the probe would ignore (`spec::check`, the probe's own merge) before it writes,
@@ -499,14 +507,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   registration, the box probe, capability tags); survives TUI exit through `htui worker` (MOD-41, done: `docs/decisions/mod/mod-41.md`).
   A child box's hostname never moves a digest, and the project's hostname switch covers it by
   construction (MOD-33 D275, `docs/decisions/mod/mod-33.md`).
-- [ ] **MOD-45 - Remote box provisioning over SSH** (from ANA-16, §8 item 6). `R-BOX-1`, `R-BOX-4`,
-  `R-AGT-9`, `R-STO-1`. System `ssh` to install the matching `htui` build and a user service running
-  `htui worker`; credential passed on the worker's stdin, never argv or a file; the worker
-  self-registers (through MOD-7's id-keyed `register_box` and box probe, done,
-  `docs/decisions/mod/mod-7.md`). Agent login via MOD-22's paste-back (done, `docs/decisions/mod/mod-22.md`). SSH is not used after provisioning. Under
-  phase 2 (MOD-47) it installs an enrolment token instead of a DSN. Not blocked: MOD-41 is done (`docs/decisions/mod/mod-41.md`; the sample unit in
-  `docs/htui-worker.md` is a system unit with `User=`, since user-scoped encrypted credentials need
-  systemd 256).
 - [ ] **MOD-46 - Live streaming via `NOTIFY` (optional)** (from ANA-16, §8 item 7). `R-HIS-1`,
   `R-NF-3`. Transient `NOTIFY` deltas under 8000 bytes between recorder flushes, droppable, superseded
   by durable `session_event` rows. Start only if 16 KiB flush bursts prove unusable; replaced by
@@ -595,6 +595,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 27 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 26 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

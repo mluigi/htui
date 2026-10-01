@@ -196,9 +196,12 @@ impl core::fmt::Debug for Applied {
 }
 
 /// How the shell wants to start.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is written by hand: it shows `dsn` only as `Some(<redacted>)` or `None` (MOD-45).
+#[derive(Clone)]
 pub struct StartOptions {
-    /// Overrides the keyring DSN. `None` in the binary; the tests set it.
+    /// Overrides the keyring DSN: `None` reads the keyring; `htui --dsn-stdin` (MOD-45 OQ-1) and
+    /// the tests set it. Never formatted: the hand-written `Debug` redacts it.
     pub dsn: Option<String>,
     /// `--offline`: open the cache, never attempt a connection, no reconnect ticker.
     pub offline: bool,
@@ -210,6 +213,27 @@ pub struct StartOptions {
     /// Threaded down to [`PgStore::connect_with`]. The tests dial a port nothing listens on and
     /// shorten it, so an unreachable-server case answers in a second rather than in ten.
     pub connect_timeout: Duration,
+}
+
+impl core::fmt::Debug for StartOptions {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StartOptions")
+            .field(
+                "dsn",
+                &format_args!(
+                    "{}",
+                    if self.dsn.is_some() {
+                        "Some(<redacted>)"
+                    } else {
+                        "None"
+                    }
+                ),
+            )
+            .field("offline", &self.offline)
+            .field("config_root", &self.config_root)
+            .field("connect_timeout", &self.connect_timeout)
+            .finish()
+    }
 }
 
 impl StartOptions {
@@ -679,6 +703,23 @@ mod tests {
         if let Some(cache) = started.backend.cache() {
             cache.close().await;
         }
+    }
+
+    #[test]
+    fn start_options_debug_never_prints_the_dsn() {
+        let dsn = "postgres://worker:hunter2-secret@db.example:5432/htui";
+        let opts = StartOptions {
+            dsn: Some(dsn.to_owned()),
+            ..StartOptions::new(std::path::PathBuf::from("/tmp/htui-root"))
+        };
+        let printed = format!("{opts:?}");
+        assert!(!printed.contains(dsn), "{printed}");
+        assert!(!printed.contains("hunter2"), "{printed}");
+        assert!(printed.contains("Some(<redacted>)"), "{printed}");
+        assert!(printed.contains("/tmp/htui-root"), "{printed}");
+
+        let none = format!("{:?}", StartOptions::new(std::path::PathBuf::from("/r")));
+        assert!(none.contains("dsn: None"), "{none}");
     }
 
     #[tokio::test]

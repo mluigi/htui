@@ -78,6 +78,7 @@ checkable is the one everybody actually builds with. Keep all three in step when
 | `--offline` | Open from the local copy only and never try to connect. |
 | `--set-dsn` | Read a Postgres connection string from standard input, save it in the OS keyring and exit. |
 | `--clear-dsn` | Remove the saved connection string from the OS keyring and exit. |
+| `--dsn-stdin` | Read the connection string for this session from standard input; it is never stored. For a TUI over `ssh -t` on a machine with no keyring. |
 | `--index-items` | Update the search index from the database, then exit. See [Search](#search). |
 | `--search-items <QUERY>` | Search items, their documents and requirements, print the results and exit. |
 | `--project <SLUG>` | With `--index-items` or `--search-items`: only this project. |
@@ -85,6 +86,7 @@ checkable is the one everybody actually builds with. Keep all three in step when
 | `--limit <N>` | With `--search-items`: how many results to print, from 1 to 1000 (default 10). |
 | `--log <PATH>` | Append logs to a file. Also read from `HTUI_LOG`; `HTUI_LOG_FILTER` changes the level (default `info`). Logs never go to the terminal, since the terminal is the app (`htui worker`, which has none, logs to standard error without it). |
 | `worker [--pool-size N] [--dsn-stdin] [--log PATH]` | Run this machine's runs with no terminal, so they outlive the TUI: `htui worker`. Needs the box's executor set to `worker` in **Settings › Boxes**; no other option may be given beside it, and `--log` goes after `worker`. See [`docs/htui-worker.md`](docs/htui-worker.md). |
+| `provision <DESTINATION> [--dsn-stdin] [--replace-credential] [--log PATH]` | Install this build as the `htui-worker` service on another Linux machine over `ssh`, with the DSN encrypted there by `systemd-creds`, and set that box's executor to `worker`. See [`docs/htui-worker.md`](docs/htui-worker.md#provisioning-a-remote-box). |
 | `--help`, `--version` | Print usage or the version and exit. |
 
 ## Connecting to your database
