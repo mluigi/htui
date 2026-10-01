@@ -38,6 +38,21 @@ impl fmt::Debug for Dsn {
     }
 }
 
+/// Where a DSN's server is, as another machine would read the DSN (MOD-45 D306).
+///
+/// Carries no text. `htui provision` refuses `Loopback` and `Socket`: the remote host would reach
+/// itself, not this server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsnHost {
+    /// A host name or an address another machine can mean the same server by.
+    Remote,
+    /// `localhost` (any case, trailing dot, `*.localhost`), `127.0.0.0/8`, `::1`, an IPv4-mapped
+    /// loopback, or the unspecified `0.0.0.0` / `::`, which also reach this machine.
+    Loopback,
+    /// A Unix-socket directory (`?host=/…` or a percent-encoded `/` host).
+    Socket,
+}
+
 /// Why a string is not a DSN this build stores (D2).
 ///
 /// Five sentences and nothing else: no sqlx text, no fragment of what was typed. sqlx's own
@@ -154,6 +169,20 @@ impl Dsn {
         identity::db_fingerprint(&self.0)
     }
 
+    /// The class of the host sqlx would dial (E-2): the URL authority's host, unless a later
+    /// `host=` or `hostaddr=` query parameter replaces it, and `Socket` once any `host=/…` set a
+    /// socket.
+    ///
+    /// Re-parses with `PgConnectOptions::from_str`, as [`Dsn::summary`] does. That is safe because
+    /// `scan` already refused every parameter sqlx would log. It is never an environment default
+    /// (`PGHOST`, a socket probe): `scan` refused a DSN without an authority host
+    /// ([`DsnError::NoHost`]) before this value existed. The unreachable parse failure answers
+    /// `Loopback`, the refusing direction.
+    #[must_use]
+    pub fn host_class(&self) -> DsnHost {
+        todo!("MOD-45 T1")
+    }
+
     /// The text, for this crate's keyring write, dial and fingerprint. Deliberately not `pub`.
     ///
     /// Four callers, all inside `htui-store`: [`crate::connect::apply_dsn`]'s keyring write,
@@ -239,6 +268,12 @@ fn split_host_port(hostport: &str) -> Result<(&str, Option<&str>), DsnError> {
     }
 }
 
+/// `host` as sqlx holds it: brackets stripped, then the name and address rules of [`DsnHost`].
+fn classify_host(host: &str) -> DsnHost {
+    let _ = host;
+    todo!("MOD-45 T1")
+}
+
 /// Whether sqlx's `match` has an arm for `key`, including the `options[<name>]` family.
 fn is_known(key: &str) -> bool {
     KNOWN_PARAMETERS.contains(&key) || (key.starts_with("options[") && key.ends_with(']'))
@@ -254,5 +289,97 @@ fn ssl_mode_name(mode: PgSslMode) -> &'static str {
         PgSslMode::Require => "require",
         PgSslMode::VerifyCa => "verify-ca",
         PgSslMode::VerifyFull => "verify-full",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Dsn, DsnError, DsnHost, classify_host};
+
+    /// What `htui provision` reads off a DSN (MOD-45 D306; E-1, E-2).
+    #[test]
+    fn host_class_reads_the_host_sqlx_would_dial() {
+        let cases: [(&str, Result<DsnHost, DsnError>); 15] = [
+            ("postgres://u:p@localhost/db", Ok(DsnHost::Loopback)),
+            ("postgres://u:p@LOCALHOST./db", Ok(DsnHost::Loopback)),
+            ("postgres://u:p@127.0.0.5/db", Ok(DsnHost::Loopback)),
+            ("postgres://u:p@[::1]:5432/db", Ok(DsnHost::Loopback)),
+            ("postgres://u:p@0.0.0.0/db", Ok(DsnHost::Loopback)),
+            (
+                "postgres://u:p@localhost/db?host=/var/run/postgresql",
+                Ok(DsnHost::Socket),
+            ),
+            (
+                "postgres://u:p@%2Fvar%2Frun%2Fpostgresql/db",
+                Ok(DsnHost::Socket),
+            ),
+            (
+                "postgres://u:p@/db?host=/var/run/postgresql",
+                Err(DsnError::NoHost),
+            ),
+            ("postgres:///db", Err(DsnError::NoHost)),
+            ("postgres://u:p@db.example/db", Ok(DsnHost::Remote)),
+            ("postgres://u:p@10.0.0.3/db", Ok(DsnHost::Remote)),
+            ("postgres://u:p@[fd00::3]/db", Ok(DsnHost::Remote)),
+            (
+                "postgres://u:p@db.example/db?hostaddr=127.0.0.1",
+                Ok(DsnHost::Loopback),
+            ),
+            (
+                "postgres://u:p@db.example/db?host=localhost",
+                Ok(DsnHost::Loopback),
+            ),
+            (
+                "postgres://u:p@localhost/db?host=db.example",
+                Ok(DsnHost::Remote),
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                Dsn::parse(text).map(|dsn| dsn.host_class()),
+                expected,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_prints_the_password() {
+        const SENTINEL: &str = "SENTINEL-DSN-PW";
+        let dsn = Dsn::parse("postgres://u:SENTINEL-DSN-PW@localhost/db").expect("a DSN");
+        assert!(!format!("{dsn:?}").contains(SENTINEL));
+        assert!(!format!("{:?}", dsn.host_class()).contains(SENTINEL));
+
+        let err = Dsn::parse("postgres://u:SENTINEL-DSN-PW@/db").expect_err("no host");
+        assert!(!err.to_string().contains(SENTINEL));
+        assert!(!format!("{err:?}").contains(SENTINEL));
+    }
+
+    #[test]
+    fn classify_host_strips_brackets_and_the_trailing_dot() {
+        let cases = [
+            ("localhost", DsnHost::Loopback),
+            ("localhost.", DsnHost::Loopback),
+            ("LocalHost", DsnHost::Loopback),
+            ("db.localhost", DsnHost::Loopback),
+            ("DB.LOCALHOST.", DsnHost::Loopback),
+            ("notlocalhost", DsnHost::Remote),
+            ("localhost.example", DsnHost::Remote),
+            ("127.0.0.1", DsnHost::Loopback),
+            ("127.255.255.254", DsnHost::Loopback),
+            ("0.0.0.0", DsnHost::Loopback),
+            ("[::1]", DsnHost::Loopback),
+            ("::1", DsnHost::Loopback),
+            ("[::]", DsnHost::Loopback),
+            ("[::ffff:127.0.0.1]", DsnHost::Loopback),
+            ("[::ffff:10.0.0.3]", DsnHost::Remote),
+            ("[fd00::3]", DsnHost::Remote),
+            ("10.0.0.3", DsnHost::Remote),
+            ("db.example.", DsnHost::Remote),
+            ("db.example", DsnHost::Remote),
+        ];
+        for (host, expected) in cases {
+            assert_eq!(classify_host(host), expected, "{host}");
+        }
     }
 }

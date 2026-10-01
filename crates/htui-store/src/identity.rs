@@ -98,6 +98,19 @@ pub fn load_or_mint(root: &Path) -> Result<Identity> {
     }
 }
 
+/// `box.toml`'s text as an [`Identity`], with the hostname the file records (MOD-45 D305).
+///
+/// `htui provision` reads a remote box's file over ssh and has no path to name, so the error is
+/// path-free. [`load_or_mint`] shares the parser and keeps its own sentence, which names the path.
+///
+/// # Errors
+///
+/// [`StoreError::Backend`]: `not valid box.toml: <the parser's reason>`.
+pub fn parse_box_toml(text: &str) -> Result<Identity> {
+    let _ = text;
+    todo!("MOD-45 T1")
+}
+
 /// Overwrites `<root>/box.toml`; used when registration minted a new id for a copied `box.toml`
 /// ([`crate::Registration::Copied`], [`crate::connect::try_connect`]).
 ///
@@ -338,8 +351,8 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Fingerprint, Identity, db_fingerprint, ioreg_platform_uuid, load_or_mint, machine_id_under,
-        store,
+        BOX_FILE, Fingerprint, Identity, db_fingerprint, ioreg_platform_uuid, load_or_mint,
+        machine_id_under, parse_box_toml, store,
     };
     use htui_core::model::BoxId;
 
@@ -494,6 +507,48 @@ mod tests {
         };
         store(root.path(), &written).expect("write");
         assert_eq!(load_or_mint(root.path()).expect("read"), written);
+    }
+
+    #[test]
+    fn parse_box_toml_reads_what_store_writes() {
+        let root = tempfile::tempdir().expect("temp root");
+        let written = Identity {
+            box_id: BoxId::new(),
+            hostname: "remote-host".to_owned(),
+        };
+        store(root.path(), &written).expect("write");
+        let text = std::fs::read_to_string(root.path().join(BOX_FILE)).expect("read");
+
+        let parsed = parse_box_toml(&text).expect("parse");
+        assert_eq!(parsed, written, "the hostname comes from the file");
+        assert_ne!(
+            parsed.hostname,
+            super::hostname(),
+            "not this machine's hostname"
+        );
+    }
+
+    #[test]
+    fn parse_box_toml_refuses_malformed_text_without_a_path() {
+        let err = parse_box_toml("box_id = 7\n")
+            .expect_err("malformed")
+            .to_string();
+        assert!(err.contains("not valid box.toml"), "{err}");
+        assert!(!err.contains('/'), "no path in {err}");
+    }
+
+    #[test]
+    fn load_or_mint_still_names_the_path() {
+        let root = tempfile::tempdir().expect("temp root");
+        std::fs::write(root.path().join(BOX_FILE), "box_id = 7\n").expect("write");
+        let err = load_or_mint(root.path())
+            .expect_err("malformed")
+            .to_string();
+        assert!(
+            err.contains(&root.path().display().to_string()),
+            "names the root: {err}"
+        );
+        assert!(err.contains("is not valid box.toml"), "{err}");
     }
 
     #[test]
