@@ -746,7 +746,7 @@ async fn an_answer_handed_back_is_finished_by_the_worker() {
 /// PRD metric "answer → resume ≤ ~2 s": asserted below 3 s at the production relay poll.
 const ANSWER_TO_DONE: Duration = Duration::from_secs(3);
 const _: () = assert!(
-    htui_agent::RELAY_POLL.as_secs() == 1,
+    htui_agent::RELAY_POLL.as_millis() == 1000,
     "the answer case runs at the production 1 s relay poll (plan D8)"
 );
 
@@ -964,7 +964,15 @@ async fn a_cancel_from_another_box_ends_a_live_worker_walk() {
     );
     let answers = permission_answers(&stack.db.store, parked.run_step_id).await;
     assert_eq!(answers.len(), 1, "I-7's row exactly once: {answers:?}");
-    assert_eq!(answers[0]["cancelled"], true, "{answers:?}");
+    assert_eq!(
+        (
+            &answers[0]["option_id"],
+            &answers[0]["by"],
+            &answers[0]["cancelled"]
+        ),
+        (&serde_json::Value::Null, &json!("policy"), &json!(true)),
+        "I-7: `{{option_id: null, by: \"policy\", cancelled: true}}`: {answers:?}"
+    );
     // `cancel_leased` settled the step; the walk settled nothing (I-6).
     step_reaches(&stack, run, parked.run_step_id, StepStatus::Cancelled).await;
     let deadline = Instant::now() + PATIENCE;
