@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-01):** **MOD-45 is done** (`docs/decisions/mod/mod-45.md`):
+**Current status (2026-10-01):** **ANA-23 is concluded** (`docs/ANA-23.md`,
+`docs/decisions/ana/ana-23.md`): `fastembed`/`ort` gives way to `rten`, a pure-Rust ONNX runtime
+that runs the same BGE-small ONNX file with no native runtime fetched at build time and no C
+compiler for the embedder, at 1.29x fastembed's time on htui's per-item calls. The stored Qdrant
+vectors stay valid (identical top 10), so nothing is re-embedded. It also found that a fresh install
+cannot load the model today (`hf-hub` 0.3.2 and HuggingFace's relative redirects). Spawned MOD-68.
+Before it, **MOD-45 was done** (`docs/decisions/mod/mod-45.md`):
 `htui provision <destination> [--dsn-stdin] [--replace-credential]` turns an ssh-reachable Linux
 host into a worker box in one command (guide `docs/htui-worker.md` § Provisioning a remote box).
 Four ssh sessions (preflight, prepare, install, verify) ship the local build, encrypt the DSN with
@@ -22,26 +28,12 @@ Four ssh sessions (preflight, prepare, install, verify) ship the local build, en
 wait for the box to check in and set its executor to `worker`. The TUI gained `--dsn-stdin` for
 agent login over `ssh -t`; `R-STO-1` was amended. No migration. **The live check on a real host is
 the maintainer's** (write-up § Not done here).
-Before it, **MOD-51 is done** (`docs/decisions/mod/mod-51.md`): Settings >
+Before it, **MOD-51 was done** (`docs/decisions/mod/mod-51.md`): Settings >
 Boxes edits the `box_probe_spec` overlay. `s` opens a JSON editor and `ctrl-s` saves it as a
 compare-and-set on `app_setting.updated_at` through `WriteStore::set_box_probe_spec`. The worker
 refuses any overlay the probe would ignore (`spec::check`, the probe's own merge) before it writes,
 a blank save clears the row, and the next `p` or connect re-probes under the new digest. No
 migration, no `.sqlx` change.
-Before it, **MOD-41 is done** (`docs/decisions/mod/mod-41.md`): `htui worker`
-runs a box's runs with no terminal (guide `docs/htui-worker.md`). Run supervision lives in the
-UI-free crate `crates/htui-worker` behind `RecorderStore`/`WorkerStore`/`WorkerHost`;
-`box.settings.executor` (Settings > Boxes, `w`) decides whether the TUI or the worker claims, adopts
-and sweeps on a box, and on a worker box the TUI hands answered runs back. The remaining step writes
-are lease-fenced, the heartbeat fences on a monotonic clock, and the worker re-syncs the concepts
-index. `R-ORCH-12` is now must; `R-ID-2` and `R-STO-1` were amended. No migration.
-Before that, **CLEAN-4 was done** (`docs/decisions/clean/clean-4.md`): the
-review loop's `no_progress_review` stop is reachable. The predicate's review half compares the
-reviews of the loop's last two turns (review rows answered `Rejected`, each read through its newest
-`output_kind` document from `documents()` heads) instead of reading the latest-per-kind
-`documents_of_kinds`, which never held two. A loop whose two rejected reviews repeat each other now
-escalates at that attempt; the hash half is still asked first. `runs_pg`'s escalation case now stops
-on `no_progress_review`, and the stop is pinned in that test (MOD-4 R-9 closed).
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -111,17 +103,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 ### Analyses
 
 
-- [ ] **ANA-23 - Pure-Rust local embedder to replace `ort`/`fastembed`** (maintainer-requested
-  2026-09-26, during MOD-9 milestone 3). `htui-store`'s `local-embed` feature
-  (`embed::FastEmbedder`, BGE-small-en-v1.5, MOD-34, `docs/decisions/mod/mod-34.md`) pulls `ort`,
-  whose `ort-sys` build script downloads ONNX Runtime from `parcel.pyke.io` or needs
-  `ORT_LIB_LOCATION` pointing at a native `libonnxruntime`; sandboxes that block the host can only
-  build `htui-store` and `htui` with a hand-fetched library. The maintainer wants no native runtime
-  fetched at build time. Compare **`candle`** (with `tokenizers` on its `fancy-regex` feature, no
-  `onig`) and **`tract-onnx`** (runs the same ONNX file): offline build, binary size, embedding
-  speed on the demo corpus, how and when model weights are fetched at run time, and whether the
-  vectors equal the ones already stored in qdrant within a tolerance or force a re-embed. Deliver a
-  verdict and the `MOD-N` that implements it.
 - [ ] **ANA-24 - A licensed, effort-separated coding benchmark source for the weight map** (from
   ANA-21; ANA-21 is done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`, `R-ORCH-7`.
   ANA-21's refresh is a source registry, and exactly one entry in it can be fetched today: Epoch
@@ -574,6 +555,19 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   passes `Tab` to the tab bar. Six milestones (ANA-26 §8): M1 catalogue and resolver, M2 the file,
   M3 Settings and overlays, M4 Skills and Requirements, M5 Backlog and Chat, M6 close-out; M3-M5
   are independent but share snapshots. Not blocked.
+- [ ] **MOD-68 - Replace `fastembed`/`ort` with an `rten` embedder and a pinned weight fetch** (from
+  ANA-23, `docs/ANA-23.md`, `docs/decisions/ana/ana-23.md`). `R-STO-8`, `R-NF-1`, `R-NF-2`, `R-NF-3`.
+  `rten` 0.26 runs the same `Xenova/bge-small-en-v1.5` `onnx/model.onnx` behind `DenseEmbedder`,
+  with `tokenizers` 0.23 on `fancy-regex`: no native runtime fetched at build time, no C compiler
+  for the embedder. The stored vectors stay valid (1 - 4e-13 cosine, identical top 10), so nothing
+  is re-embedded. Weights come over the existing `reqwest`, pinned to commit `ea104dac`, sha256 per
+  file, written by temp-and-rename, and an existing `~/.cache/htui/fastembed` snapshot is reused.
+  Every failure is a `StoreError`, never a panic. This also fixes a live defect: `hf-hub` 0.3.2
+  cannot follow HuggingFace's relative redirects, so a fresh install cannot load the model today
+  (ANA-23 §2.4). One milestone (ANA-23 §8): record fastembed goldens first, then the embedder (an
+  explicit thread pool, `i32` inputs, padded tokens capped per call), the fetch, the model identity
+  recorded and checked on connect, and the removal of `fastembed`. Build the embedder on Windows and
+  macOS before removing fastembed; tract-onnx is the fallback. Not blocked.
 
 ### Deferred backlog
 
@@ -594,7 +588,7 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 26 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 2 (ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
+| MOD-N   | 27 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys, MOD-68 rten embedder; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |
