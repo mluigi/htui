@@ -169,16 +169,15 @@ enum Mode {
     Spec(SpecEditor),
 }
 
-/// An open probe spec editor: the token and the value it opened on, and the widget.
+/// An open probe spec editor: the token it holds, and the widget.
 ///
-/// `TextArea` redacts its `Debug`; `opened_on` is stored data (a tool list, not a secret).
+/// `TextArea` redacts its `Debug`, so the derived one prints no typed text.
 #[derive(Debug)]
 struct SpecEditor {
     /// `SpecView.stored`'s `updated_at` at open, `None` for no row; replaced only by a
-    /// `BoxesStale` (D48), never by a plain `Boxes`.
+    /// `BoxesStale` (D48), never by a plain `Boxes`. The blank rule reads it (D6, F-4; amended
+    /// at review (MOD-51 LOW-1): the live token decides).
     expected: Option<DateTime<Utc>>,
-    /// `SpecView.stored`'s value at open. Never refreshed: the blank rule reads it (D6, F-4).
-    opened_on: Option<Value>,
     /// The overlay pretty-printed (`serde_json::to_string_pretty`), or empty; the cursor at the
     /// end, as the quirks editor's.
     input: TextArea,
@@ -458,16 +457,14 @@ impl BoxesSection {
             return;
         };
         let stored = snapshot.spec.stored.as_ref();
-        let opened_on = stored.and_then(|row| row.value.clone());
-        let text = opened_on
-            .as_ref()
+        let text = stored
+            .and_then(|row| row.value.as_ref())
             .map(|value| serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()))
             .unwrap_or_default();
         let mut input = TextArea::with_text(&text);
         input.set_cursor(usize::MAX);
         self.mode = Mode::Spec(SpecEditor {
             expected: stored.map(|row| row.updated_at),
-            opened_on,
             input,
         });
         self.notice = None;
@@ -605,16 +602,15 @@ impl BoxesSection {
             Mode::Spec(editor) => {
                 let text = editor.input.text();
                 if text.trim().is_empty() {
-                    // D6, F-4: with no row, or no token for the row (it vanished under the
-                    // editor), there is nothing to clear and the editor just closes; a row under
-                    // a token is cleared.
-                    match (&editor.opened_on, editor.expected) {
-                        (None, _) | (_, None) => None,
-                        (Some(_), Some(token)) => Some(StoreRequest::SetProbeSpec {
-                            overlay: None,
-                            expected: Some(token),
-                        }),
-                    }
+                    // D6, F-4, amended at review (MOD-51 LOW-1): the live token decides. With
+                    // no token (no row at open, or the row vanished under the editor) there is
+                    // nothing to clear and the editor just closes; under a token, the row it
+                    // names is cleared, including one a `BoxesStale` brought in after an open
+                    // over no row.
+                    editor.expected.map(|token| StoreRequest::SetProbeSpec {
+                        overlay: None,
+                        expected: Some(token),
+                    })
                 } else {
                     match serde_json::from_str::<Value>(text) {
                         // Parsed on the render side; nothing is sent until it parses.
@@ -828,8 +824,18 @@ impl SettingsSection for BoxesSection {
                     body,
                 ),
                 (None, None) => message(frame, body, NOT_READ, theme),
+                // MOD-51 LOW-6: the spec is app-wide, so it is drawn with no box listed too: a
+                // save over an empty list shows the new source and digest, and an ignored
+                // overlay says why.
                 (None, Some(snapshot)) if snapshot.boxes.is_empty() => {
-                    message(frame, body, NO_BOXES, theme);
+                    let width = usize::from(body.width).max(1);
+                    let mut lines: Vec<Line<'static>> = wrapped(NO_BOXES, width)
+                        .into_iter()
+                        .map(|line| Line::styled(line, theme.dim))
+                        .collect();
+                    lines.push(Line::default());
+                    lines.extend(spec_lines(&snapshot.spec, width, theme));
+                    frame.render_widget(Paragraph::new(lines), body);
                 }
                 (None, Some(snapshot)) => self.render_body(frame, body, snapshot, theme),
             }

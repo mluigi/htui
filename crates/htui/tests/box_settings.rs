@@ -1485,6 +1485,43 @@ async fn s_with_no_box_listed_still_opens_the_spec_editor() {
     );
 }
 
+/// MOD-51 LOW-6: over a read list with no box in it the body still says what the next probe runs
+/// under, so a save over an empty list shows the new source, and an ignored overlay says why.
+#[tokio::test]
+async fn the_empty_list_shows_the_spec_in_force() {
+    let (bench, mut section) = bench_with(&no_boxes().await).await;
+    bench.key(&mut section, "s");
+    bench.paste(&mut section, "{}");
+    bench.key(&mut section, "ctrl-s");
+    only_spec(&requests(&bench));
+    let mut saved = snap_of(terraform_store()).await;
+    saved.boxes.clear();
+    bench.reply(&mut section, &StoreReply::Boxes(Box::new(saved)));
+
+    assert!(!section.captures_input(), "the reply closes the editor");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("no box is registered for this user yet"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("probe spec: seed + stored overlay \u{b7} "),
+        "the saved overlay is in force: {frame}"
+    );
+
+    let store = MemStore::demo();
+    store.set_app_setting(spec::SETTING_KEY, json!(42));
+    let mut ignored = snap_of(store).await;
+    ignored.boxes.clear();
+    feed(&bench, &mut section, &ignored);
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("probe spec: seed \u{b7} "), "{frame}");
+    assert!(
+        frame.contains(spec::SPEC_IGNORED),
+        "the ignored overlay's sentence: {frame}"
+    );
+}
+
 /// MOD-51 D6, F-3: before the first read and over a refused one `s` opens nothing, and the hint
 /// offers only `r`.
 #[tokio::test]
@@ -1686,6 +1723,31 @@ async fn blank_after_the_row_vanished_closes_without_a_request() {
     bench.key(&mut section, "ctrl-s");
     assert!(requests(&bench).is_empty(), "nothing left to clear");
     assert!(!section.captures_input(), "back to browse");
+}
+
+/// MOD-51 LOW-1 (amended at review: the live token decides the blank rule): an editor opened
+/// over no row whose save met a row written meanwhile holds that row's token, so blank text
+/// clears it under the token rather than closing.
+#[tokio::test]
+async fn blank_after_a_stale_reload_over_a_new_row_clears_under_its_token() {
+    let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+    let later = snap_of(terraform_store()).await;
+    let token = spec_token(&later);
+
+    bench.key(&mut section, "s");
+    type_at(&bench, &mut section, "{}");
+    bench.key(&mut section, "ctrl-s");
+    assert_eq!(only_spec(&requests(&bench)), (Some(json!({})), None));
+
+    bench.reply(&mut section, &StoreReply::BoxesStale(Box::new(later)));
+    assert!(section.captures_input(), "the stale reply keeps the editor");
+    clear_editor(&bench, &mut section, "{}");
+    bench.key(&mut section, "ctrl-s");
+    assert_eq!(
+        only_spec(&requests(&bench)),
+        (None, Some(token)),
+        "the row the stale reply carried is cleared under its token"
+    );
 }
 
 /// MOD-51 D6: a refused spec save keeps the editor over its text with the worker's sentence and
@@ -2013,5 +2075,23 @@ async fn the_spec_editor_renders() {
 
     insta::with_settings!({ filters => vec![DIGEST_FILTER] }, {
         insta::assert_snapshot!("spec_editor", frame);
+    });
+}
+
+/// MOD-51 LOW-6: Browse over a read list with no box in it: the message, the spec lines under
+/// it, and the keys that still work.
+#[tokio::test]
+async fn the_empty_list_renders() {
+    let (bench, section) = bench_with(&no_boxes().await).await;
+
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("no box is registered for this user yet"),
+        "{frame}"
+    );
+    assert!(frame.contains("probe spec: seed \u{b7} "), "{frame}");
+
+    insta::with_settings!({ filters => vec![DIGEST_FILTER] }, {
+        insta::assert_snapshot!("no_boxes", frame);
     });
 }
