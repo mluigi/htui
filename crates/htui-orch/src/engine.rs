@@ -24,16 +24,17 @@ use futures::future::Either;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposure};
+use htui_agent::error::DriverError;
 use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::excerpt::{PassInput, excerpt_roots, step_pass, touched_prefixes};
-use htui_agent::record::{Control, Recorder, RunCap, pump};
+use htui_agent::record::{Control, RELAY_GRACE, RELAY_POLL, Recorder, Relay, RunCap, drive};
 use htui_core::model::{
     AgentId, BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus, Document,
     DocumentId, EventKind, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId,
     NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectId, ProjectSettings,
-    PromptScope, Repo, RepoId, Resolution, Run, RunId, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, RunSummary, SnapshotCandidate, SnapshotPhase, SnapshotTemplate, Status, StepFiles,
-    StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
+    PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, RunSummary, SnapshotCandidate, SnapshotPhase, SnapshotTemplate,
+    Status, StepFiles, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
     missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
@@ -256,7 +257,7 @@ impl<'a> SessionKey<'a> {
 }
 
 /// What one pumped session answered: its `done`, or the driver error a closed stream is.
-type SessionResult = Result<DoneEvent, htui_agent::error::DriverError>;
+type SessionResult = Result<DoneEvent, DriverError>;
 
 /// How the walk gets a driver for one session.
 ///
@@ -409,7 +410,7 @@ pub enum Tails {
 
 /// Everything [`Engine::new`] borrows, as a struct literal rather than a builder.
 ///
-/// A builder would let a caller forget one of sixteen fields and find out at run time; a literal
+/// A builder would let a caller forget one of eighteen fields and find out at run time; a literal
 /// cannot compile until every one of them is named.
 pub struct EngineParts<'a, S, G, I, V, C, A, K>
 where
@@ -3278,6 +3279,11 @@ where
         match self.walk_live_step(run, snapshot, &step, phase, now).await {
             Ok(rest) => Ok(rest),
             Err(err) => {
+                // MOD-42 I-6 (plan D10): a graceful cancel settles nothing; `cancel_leased` owns
+                // every terminal status. The walk ends and `walk_leased` gives the lease back.
+                if matches!(err, EngineError::Cancelled { .. }) {
+                    return Err(err);
+                }
                 // `?` and not "report the original": if the settle write itself refused, the step
                 // is *still* `running`, and a caller handed the original error would believe a row
                 // that does not exist.
@@ -3717,12 +3723,23 @@ where
         // Every candidate settled, so every failure is reported: the first is raised, and the
         // rest — which `?` alone would drop — are logged against the run.
         let mut first = None;
+        let mut cancelled = None;
         for err in settled.into_iter().filter_map(Result::err) {
-            if first.is_none() {
+            // MOD-42 I-6: a cancel is raised in preference to any failure write's error, so the
+            // caller sees `Cancelled` and settles nothing.
+            if matches!(err, EngineError::Cancelled { .. }) {
+                cancelled.get_or_insert(err);
+            } else if first.is_none() {
                 first = Some(err);
             } else {
                 tracing::warn!(run = %run.id, %err, "a further candidate's failure write failed; the first is raised");
             }
+        }
+        if let Some(cancelled) = cancelled {
+            if let Some(err) = first {
+                tracing::warn!(run = %run.id, %err, "a candidate's error is dropped for the run's cancel");
+            }
+            return Err(cancelled);
         }
         first.map_or(Ok(None), Err)
     }
@@ -3871,8 +3888,14 @@ where
         match self.candidate_live(&stage, &mut trees, &mut captured).await {
             Ok(()) => Ok(()),
             Err(err) => {
+                // Plan D78's capture still runs: it releases a `shared_serialized` guard a sibling
+                // in this `join_all` may be waiting on (it records commits; it settles nothing).
                 if let (Some(trees), false) = (&trees, captured) {
                     self.release_trees(stage.step, trees).await;
+                }
+                // MOD-42 I-6: no `fail_candidate` for a cancel.
+                if matches!(err, EngineError::Cancelled { .. }) {
+                    return Err(err);
                 }
                 self.fail_candidate(stage.run, stage.phase, stage.step, &err.to_string())
                     .await
@@ -4425,6 +4448,9 @@ where
         {
             Ok(Ok(documents)) => decide(&documents, &indices),
             Ok(Err(failure)) => Err(failure),
+            // MOD-42 I-6: no `fail_judge` for a cancel; the judge stays `running` for
+            // `cancel_leased`.
+            Err(err @ EngineError::Cancelled { .. }) => return Err(err),
             Err(err) => Err(JudgeFailure::SessionFailed(err.to_string())),
         };
         let (winner, reason) = match verdict {
@@ -4884,6 +4910,8 @@ where
                 .await?
             {
                 Ok(done) => done,
+                // MOD-42 I-6 (F-4): `Cancelled` and a lost fence leave `drive_once` as its outer
+                // `Err`, through the `?` above; this arm sees only the session's own errors.
                 Err(err) => return Ok(Err(JudgeFailure::SessionFailed(err.to_string()))),
             };
             self.parts
@@ -5641,12 +5669,16 @@ where
         Ok(recorder)
     }
 
-    /// One driver session under `recorder`: the driver for `key`, `start` with `text`, and the
-    /// pump to its `done`.
+    /// One driver session under `recorder`: the driver for `key`, `start` with `text`, and
+    /// `drive` to its `done` (MOD-42 plan D6), with the agent's own policy (D9), the permission
+    /// relay and the run's control (D10).
     ///
     /// The outer `Err` is a driver that refused to **start** ([`EngineError::Driver`]) or a
-    /// read that failed before it; the inner `Result` is what the pump answered, which is a settle
-    /// input and not an engine fault. The recorder is the caller's to finish on either path.
+    /// read that failed before it; the inner `Result` is what the session answered, which is a
+    /// settle input and not an engine fault. The recorder is the caller's to finish on either
+    /// path. MOD-42 D10: the outer `Err` is also a graceful cancel ([`EngineError::Cancelled`],
+    /// read before the driver is built too, B-17) and a lost fence (`Driver(Store(Fenced))`, which
+    /// `is_fenced` makes [`EngineError::LeaseLost`]); both leave before settle can read them.
     #[allow(
         clippy::too_many_arguments,
         reason = "the session's four coordinates and its three per-call inputs; a struct would be \
@@ -5666,6 +5698,14 @@ where
         let project = self.project(run.project_id).await?;
         let settings = Self::project_settings(&project);
         let candidate = Self::candidate_of(step, phase)?;
+        // MOD-42 D10, B-17: a cancel that reached the walk between sessions spawns nothing.
+        let mut control = (self.parts.control)(run.id);
+        if control.signal().is_cancel() {
+            return Err(EngineError::Cancelled { run: run.id });
+        }
+        // MOD-42 D9: the agent's own policy (a judge call's is the judge agent's: `candidate_of`
+        // over the judge phase).
+        let policy = (self.parts.policy)(candidate.agent_id);
         let driver = (self.parts.driver)(&candidate, key);
 
         let spec = SessionSpec {
@@ -5682,13 +5722,36 @@ where
             model: Some(candidate.model.clone()),
             tools: ToolExposure::default(),
             mcp: Vec::new(),
-            permission: PermissionPolicy::default(),
+            permission: policy.clone(),
             retain_raw: settings.keep_raw_events,
             resume: None,
             budget_micros: settings.per_token_cap_run,
         };
         let mut session = driver.start(spec, text.to_owned()).await?;
-        Ok(pump(&mut *session, recorder).await)
+        let now = || self.now();
+        let relay = Relay {
+            store: self.parts.store,
+            owner: self.parts.owner,
+            run: run.id,
+            step: step.id,
+            session: RelaySessionId::new(),
+            policy: &policy,
+            poll: RELAY_POLL,
+            grace: RELAY_GRACE,
+            now: &now,
+        };
+        // Boxed, as `pump` boxes it (`record.rs`): `drive`'s state machine inline would grow
+        // every walk future past the debug test stack (`every_case_name_dispatches`).
+        let driven = Box::pin(drive(&mut *session, recorder, Some(&relay), &mut control)).await;
+        // MOD-42 D4, D10: two answers leave the session result before settle can read them.
+        match driven {
+            Err(DriverError::Cancelled) => Err(EngineError::Cancelled { run: run.id }),
+            // `is_fenced` makes it `LeaseLost` in `heartbeaten`.
+            Err(fenced @ DriverError::Store(StoreError::Fenced { .. })) => {
+                Err(EngineError::Driver(fenced))
+            }
+            result => Ok(result),
+        }
     }
 
     // -- helpers -------------------------------------------------------------------------------
@@ -6052,9 +6115,7 @@ const fn is_fenced(err: &EngineError) -> bool {
         err,
         EngineError::Store(StoreError::Fenced { .. })
             | EngineError::Record(htui_agent::RecordError::Store(StoreError::Fenced { .. }))
-            | EngineError::Driver(htui_agent::error::DriverError::Store(
-                StoreError::Fenced { .. }
-            ))
+            | EngineError::Driver(DriverError::Store(StoreError::Fenced { .. }))
     )
 }
 
@@ -6121,7 +6182,7 @@ struct VerifyStage<'a> {
     /// Stage 2's `cwd`, the `command_run.cwd` fallback when there is no primary tree (H-23).
     session_cwd: &'a std::path::Path,
     /// Stage 4's answer: a verify runs only on `Ok` (blueprint A-3).
-    result: &'a Result<DoneEvent, htui_agent::error::DriverError>,
+    result: &'a Result<DoneEvent, DriverError>,
 }
 
 /// Which of a phase's `input_kinds` are **required** (blueprint H-8, plan D21).
@@ -6297,7 +6358,7 @@ pub fn truncated(now: DateTime<Utc>) -> DateTime<Utc> {
 /// rather than in `fake.rs` for the reason the file itself gives: every part is already public on
 /// the orchestrator, and what was missing was `engine.rs`. Putting it beside the `Engine` keeps
 /// `fake.rs` exactly as T3 shipped it, and lets `conformance.rs`'s `impl Orchestrate for
-/// FakeOrchestrator` call one function instead of re-deciding sixteen fields per case.
+/// FakeOrchestrator` call one function instead of re-deciding eighteen fields per case.
 ///
 /// A fresh `Engine` per command is not a concession to the test: the engine holds nothing across a
 /// call (plan D16), so this is the shape milestone 6's Runs tab has too.
@@ -6362,7 +6423,7 @@ pub async fn sweep_fake(orch: &crate::fake::FakeOrchestrator) -> Result<Vec<Adop
     engine.sweep().await
 }
 
-/// The sixteen fields, filled from the harness.
+/// The eighteen fields, filled from the harness.
 ///
 /// `app` is read here rather than cached because `MemStore::set_app_setting` (`mem.rs:430`) is the
 /// only writer a case can reach for `step_deadline_seconds` — `SettingKey` is a closed enum of
