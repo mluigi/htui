@@ -127,6 +127,10 @@ pub enum SpecError {
     /// The graph is not one of the context's non-override graphs.
     #[error("that step graph is not one of this project's graphs")]
     Graph(StepGraphId),
+    /// The title or the body holds U+0000, which Postgres `text` cannot store (`22021`). The
+    /// column is named as `has_nul` names it, so both stores refuse it before any write.
+    #[error("{0} must not contain a NUL character")]
+    Nul(&'static str),
     /// One `touched_paths` entry is refused.
     #[error("touched path `{entry}` {why}")]
     Path {
@@ -140,10 +144,11 @@ pub enum SpecError {
 /// The title as stored: trimmed.
 ///
 /// # Errors
-/// [`SpecError::BlankTitle`] when nothing is left.
+/// [`SpecError::BlankTitle`] when nothing is left, then [`SpecError::Nul`] for a NUL.
 pub fn parse_title(text: &str) -> Result<String, SpecError> {
     match text.trim() {
         "" => Err(SpecError::BlankTitle),
+        title if title.contains('\0') => Err(SpecError::Nul("item.title")),
         title => Ok(title.to_owned()),
     }
 }
@@ -204,12 +209,13 @@ pub fn check_paths(paths: &[String], repos: &[Repo]) -> Result<Vec<String>, Spec
     Ok(paths)
 }
 
-/// A new item's spec, checked and canonical. The order is title, kind, tags, graph, paths.
+/// A new item's spec, checked and canonical. The order is title, body, kind, tags, graph, paths.
 ///
 /// # Errors
 /// The first [`SpecError`] in that order.
 pub fn check_spec(spec: &ItemSpec, ctx: &SpecContext<'_>) -> Result<ItemSpec, SpecError> {
     let title = parse_title(&spec.title)?;
+    let body = check_body(&spec.body)?;
     let kind_id = check_kind(spec.kind_id, ctx)?;
     let required_tags = check_tags(&spec.required_tags)?;
     let step_graph_id = check_graph(spec.step_graph_id, ctx)?;
@@ -217,7 +223,7 @@ pub fn check_spec(spec: &ItemSpec, ctx: &SpecContext<'_>) -> Result<ItemSpec, Sp
     Ok(ItemSpec {
         kind_id,
         title,
-        body: spec.body.clone(),
+        body,
         priority: spec.priority,
         required_tags,
         touched_paths,
@@ -235,6 +241,7 @@ pub fn check_changes(
     ctx: &SpecContext<'_>,
 ) -> Result<SpecChanges, SpecError> {
     let title = changes.title.as_deref().map(parse_title).transpose()?;
+    let body = changes.body.as_deref().map(check_body).transpose()?;
     let kind_id = changes.kind_id.map(|id| check_kind(id, ctx)).transpose()?;
     let required_tags = changes
         .required_tags
@@ -253,12 +260,21 @@ pub fn check_changes(
     Ok(SpecChanges {
         kind_id,
         title,
-        body: changes.body.clone(),
+        body,
         priority: changes.priority,
         required_tags,
         touched_paths,
         step_graph_id,
     })
+}
+
+/// The body as given, unless it holds a NUL.
+fn check_body(body: &str) -> Result<String, SpecError> {
+    if body.contains('\0') {
+        Err(SpecError::Nul("item.body"))
+    } else {
+        Ok(body.to_owned())
+    }
 }
 
 /// The kind is one of the context's.
@@ -673,6 +689,66 @@ mod tests {
             why("nope:\0", &[]),
             "contains a NUL character",
             "the NUL rule fires first"
+        );
+    }
+
+    /// D4: Postgres `text` cannot hold U+0000 (`22021`), so a NUL in the title or the body is
+    /// refused by rule, not left to fail as a store error on `PgStore` only (`has_nul`).
+    #[test]
+    fn a_nul_in_the_title_or_body_is_refused() {
+        let ours = kind(ProjectId::new());
+        let kinds = [ours.clone()];
+        let repos = [repo("htui", true)];
+        let context = ctx(&kinds, &[], &repos);
+        let title = SpecError::Nul("item.title");
+        let body = SpecError::Nul("item.body");
+        assert_eq!(
+            title.to_string(),
+            "item.title must not contain a NUL character"
+        );
+        assert_eq!(parse_title("Fix\0it"), Err(title.clone()));
+        assert_eq!(
+            parse_title("\0"),
+            Err(title.clone()),
+            "a lone NUL is not blank"
+        );
+        let spec_with = |title: &str, body: &str| ItemSpec {
+            title: title.to_owned(),
+            body: body.to_owned(),
+            ..spec(&ours)
+        };
+        assert_eq!(
+            check_spec(&spec_with("a\0b", "ok"), &context),
+            Err(title.clone())
+        );
+        assert_eq!(
+            check_spec(&spec_with("ok", "a\0b"), &context),
+            Err(body.clone())
+        );
+        assert_eq!(
+            check_spec(&spec_with("a\0b", "a\0b"), &context),
+            Err(title.clone()),
+            "the title is checked first"
+        );
+        assert_eq!(
+            check_changes(
+                &SpecChanges {
+                    title: Some("a\0b".to_owned()),
+                    ..SpecChanges::default()
+                },
+                &context
+            ),
+            Err(title)
+        );
+        assert_eq!(
+            check_changes(
+                &SpecChanges {
+                    body: Some("a\0b".to_owned()),
+                    ..SpecChanges::default()
+                },
+                &context
+            ),
+            Err(body)
         );
     }
 
