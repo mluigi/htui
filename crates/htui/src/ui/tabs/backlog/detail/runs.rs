@@ -37,6 +37,8 @@
 //! plan P13).
 
 use core::cell::Cell;
+use std::collections::BTreeSet;
+
 use htui_agent::event::{PermissionOption, PermissionOptionKind};
 use htui_core::model::{
     Document, DocumentId, ItemId, PermissionId, RelayOption, RelayOptionKind, RelayView,
@@ -95,6 +97,9 @@ const ANSWER_PERMISSION: &str = "answer_permission";
 /// The line under a run with a pending cancel (MOD-42 plan D14). The pane's own label: the
 /// runtime's sentence is longer than the pane is wide.
 const CANCEL_REQUESTED_LINE: &str = "cancel requested";
+
+/// The line under a run a command is queued behind (R-51).
+const WAITING_LINE: &str = "waiting for the walk";
 
 /// What a relayed request with no summary asks for (MOD-42 blueprint B-14: the transport named no
 /// call, or the scrubber refused it).
@@ -183,6 +188,9 @@ pub struct RunsTab {
     /// `already answered` refusal on the status line; and a relay view read before the answer
     /// landed may still list it as pending. Ids are never reused, so a stale entry matches nothing.
     answering: Option<PermissionId>,
+    /// R-51: the runs a command is queued behind a live walk of, from a `Waiting` frame until the
+    /// next frame that invalidates.
+    waiting: BTreeSet<RunId>,
 }
 
 /// One place the cursor can be (blueprint D198): a step, or the header of a run with no step.
@@ -1369,8 +1377,19 @@ impl DetailTab for RunsTab {
                 self.actions = Some((**actions).clone());
             }
             StoreReply::RunStream(frame)
+                if Some(frame.item) == self.item && matches!(frame.kind, FrameKind::Waiting) =>
+            {
+                self.waiting.extend(frame.run);
+            }
+            StoreReply::RunStream(frame)
                 if Some(frame.item) == self.item && invalidates(&frame.kind) =>
             {
+                match frame.run {
+                    Some(run) => {
+                        self.waiting.remove(&run);
+                    }
+                    None => self.waiting.clear(),
+                }
                 self.re_read(ctx);
             }
             StoreReply::Orch(reply) => {
@@ -1467,6 +1486,9 @@ impl RunsTab {
         let mut cursor_end = 0;
         for (at, run) in self.runs.iter().enumerate().skip(self.first_visible()) {
             let mut header = run_lines(run, self.cancel_requested(run.id), theme);
+            if self.waiting.contains(&run.id) {
+                header.push(Line::styled(fit(WAITING_LINE, PANE), theme.accent));
+            }
             if cursor == Some(Entry::Run { run: at }) {
                 // A run with no step is its own entry (D198); the run grid has no cursor column,
                 // so its kind cell takes the accent instead.
@@ -3983,6 +4005,59 @@ mod tests {
             "one more line, under the grid: {after:#?}"
         );
         assert_eq!(after[5..], before[4..before.len() - 1], "{after:#?}");
+    }
+
+    /// R-51: a `Waiting` frame shows the run waiting without a re-read, and the next frame that
+    /// invalidates clears it.
+    #[tokio::test]
+    async fn a_waiting_frame_shows_the_run_waiting_and_a_later_frame_clears_it() {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        let before = lines(&pane, &shell);
+        assert!(
+            !before
+                .iter()
+                .any(|line| line.contains("waiting for the walk"))
+        );
+        pane.on_reply(
+            &StoreReply::RunStream(RunFrame {
+                item: ids::HTUI_FEAT_1,
+                run: Some(ids::RUN_1),
+                kind: FrameKind::Waiting,
+            }),
+            &mut shell.ctx(),
+        );
+        assert!(shell.emit.is_empty(), "a wait is not a re-read");
+        let waiting = lines(&pane, &shell);
+        assert!(
+            waiting
+                .iter()
+                .any(|line| line.trim() == "waiting for the walk"),
+            "{waiting:#?}"
+        );
+        assert!(waiting.iter().all(|line| line.chars().count() <= PANE));
+        pane.on_reply(
+            &StoreReply::RunStream(RunFrame {
+                item: ids::HTUI_FEAT_1,
+                run: Some(ids::RUN_1),
+                kind: FrameKind::Rested(Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(1),
+                    failure: None,
+                }),
+            }),
+            &mut shell.ctx(),
+        );
+        assert!(
+            is_one_re_read(&requests(shell.emit.take()), ids::HTUI_FEAT_1),
+            "the rest re-reads once"
+        );
+        let after = lines(&pane, &shell);
+        assert!(
+            !after
+                .iter()
+                .any(|line| line.contains("waiting for the walk"))
+        );
     }
 
     /// D14, B-13: an answer, applied or refused, re-reads the runs; the refusal's sentence is on
