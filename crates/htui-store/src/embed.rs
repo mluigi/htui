@@ -133,6 +133,69 @@ mod tests {
         a.iter().zip(b).map(|(x, y)| x * y).sum()
     }
 
+    /// fastembed's vectors for six texts, recorded once (MOD-68 D1) and read back by every
+    /// golden check.
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct Goldens {
+        provenance: Provenance,
+        texts: Vec<String>,
+        vectors: Vec<Vec<f32>>,
+    }
+
+    /// Where the goldens came from.
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct Provenance {
+        recorder: String,
+        model: String,
+        revision: String,
+        onnx_sha256: String,
+        tokenizer_sha256: String,
+        recorded: String,
+        tolerance: String,
+    }
+
+    /// Read at run time, not `include_str!`, so this module compiles before the recorder has run.
+    fn goldens_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("bge_small_goldens.json")
+    }
+
+    fn read_goldens() -> Goldens {
+        let path = goldens_path();
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("cannot parse {}: {e}", path.display()))
+    }
+
+    #[test]
+    fn goldens_fixture_is_six_unit_vectors_of_384() {
+        let g = read_goldens();
+        assert_eq!(g.texts.len(), 6);
+        assert_eq!(g.vectors.len(), 6);
+        for (i, v) in g.vectors.iter().enumerate() {
+            assert_eq!(v.len(), DENSE_DIM, "vector {i}");
+            let norm = v
+                .iter()
+                .map(|&x| f64::from(x) * f64::from(x))
+                .sum::<f64>()
+                .sqrt();
+            assert!((norm - 1.0).abs() <= 1e-6, "vector {i} has norm {norm}");
+        }
+        assert_eq!(g.texts[4], "");
+        assert_eq!(g.texts[5], "MOD-34");
+        assert_eq!(
+            g.provenance.revision,
+            "ea104dacec62c0de699686887e3f920caeb4f3e3"
+        );
+        assert_eq!(
+            g.provenance.onnx_sha256,
+            "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35"
+        );
+    }
+
     #[tokio::test]
     async fn hash_embedder_is_deterministic_and_sized() {
         let e = HashEmbedder::new(DENSE_DIM);
@@ -173,5 +236,61 @@ mod tests {
         let e = FastEmbedder::new().expect("model loads");
         let v = e.embed(vec!["hello world".into()]).await.expect("embeds");
         assert_eq!(v[0].len(), DENSE_DIM);
+    }
+
+    /// The six golden texts: short, a typical item point, one past 512 tokens, Unicode, empty and
+    /// the exact key. Only the recorder builds them; every check reads them from the fixture.
+    #[cfg(feature = "local-embed")]
+    fn golden_texts() -> Vec<String> {
+        vec![
+            "hello world".to_owned(),
+            "MOD-68 Replace fastembed/ort with an rten embedder and a pinned weight fetch. The \
+             dense embedder moves to rten plus tokenizers, so a fresh install can load the model \
+             and the stored Qdrant vectors stay valid."
+                .to_owned(),
+            "The store worker serialises every request and answers on its own task. ".repeat(60),
+            "検索とベクトル: Qdrant 🦀 naïve café — 数据库 ✅".to_owned(),
+            String::new(),
+            "MOD-34".to_owned(),
+        ]
+    }
+
+    #[cfg(feature = "local-embed")]
+    #[tokio::test]
+    #[ignore = "records the goldens from fastembed; needs the BGE model and HTUI_RECORD_GOLDENS=1"]
+    async fn record_fastembed_goldens() {
+        if std::env::var("HTUI_RECORD_GOLDENS").as_deref() != Ok("1") {
+            eprintln!("HTUI_RECORD_GOLDENS is not 1: the goldens fixture is left as it is");
+            return;
+        }
+        let texts = golden_texts();
+        let vectors = FastEmbedder::new()
+            .expect("model loads")
+            .embed(texts.clone())
+            .await
+            .expect("embeds");
+        assert_eq!(vectors.len(), 6);
+        assert!(vectors.iter().all(|v| v.len() == DENSE_DIM));
+        let goldens = Goldens {
+            provenance: Provenance {
+                recorder: "fastembed 3.14.1 (ONNX Runtime via ort), FastEmbedder::embed, one call"
+                    .to_owned(),
+                model: "Xenova/bge-small-en-v1.5".to_owned(),
+                revision: "ea104dacec62c0de699686887e3f920caeb4f3e3".to_owned(),
+                onnx_sha256: "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35"
+                    .to_owned(),
+                tokenizer_sha256:
+                    "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66".to_owned(),
+                recorded: chrono::Utc::now().date_naive().to_string(),
+                tolerance: "1e-5 per element, cosine >= 1 - 1e-9 (ANA-23 §8.1)".to_owned(),
+            },
+            texts,
+            vectors,
+        };
+        let path = goldens_path();
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("fixtures dir");
+        let mut json = serde_json::to_string_pretty(&goldens).expect("serialises");
+        json.push('\n');
+        std::fs::write(&path, json).expect("writes the fixture");
     }
 }
