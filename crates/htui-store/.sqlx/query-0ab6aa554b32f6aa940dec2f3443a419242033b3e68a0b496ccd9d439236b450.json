@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE step_permission SET status = $2, resolved_at = clock_timestamp() WHERE session = $1 AND status IN ('pending', 'answered')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0ab6aa554b32f6aa940dec2f3443a419242033b3e68a0b496ccd9d439236b450"
+}

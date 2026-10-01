@@ -1,0 +1,46 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS (SELECT 1 FROM run WHERE id = $1) AS \"run_known!\",\n                      EXISTS (SELECT 1 FROM app_user WHERE id = $2) AS \"user_known!\",\n                      EXISTS (SELECT 1 FROM box WHERE id = $3) AS \"box_known!\",\n                      (SELECT id FROM run_command\n                        WHERE run_id = $1 AND kind = 'cancel' AND status = 'pending')\n                          AS \"pending?: RunCommandId\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "run_known!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_known!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "box_known!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "pending?: RunCommandId",
+        "type_info": "Uuid",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "f6a8054ef62723c7a46443f97bf9c73148c8f22416c5bf5494140abf152e0a2a"
+}

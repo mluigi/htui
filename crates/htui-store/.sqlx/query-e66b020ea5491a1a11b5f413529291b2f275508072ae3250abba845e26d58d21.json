@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE step_permission p\n              SET status = 'applied', resolved_at = clock_timestamp()\n             FROM run r\n            WHERE p.id = $1 AND p.status = 'answered' AND p.owner = $2\n              AND r.id = p.run_id AND r.lease_owner = $2\n        RETURNING p.option_id AS \"option_id!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "option_id!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "option_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "e66b020ea5491a1a11b5f413529291b2f275508072ae3250abba845e26d58d21"
+}

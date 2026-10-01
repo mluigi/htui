@@ -6,6 +6,7 @@
 #[cfg(feature = "demo")]
 mod demo;
 mod read;
+mod relay;
 mod rows;
 mod write;
 

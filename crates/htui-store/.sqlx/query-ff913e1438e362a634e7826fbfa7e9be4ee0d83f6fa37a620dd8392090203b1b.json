@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT p.status AS \"status: PermissionStatus\",\n                  p.options @> jsonb_build_array(jsonb_build_object('id', $2::text)) AS \"offered!\",\n                  EXISTS (SELECT 1 FROM app_user WHERE id = $3) AS \"user_known!\",\n                  EXISTS (SELECT 1 FROM box WHERE id = $4) AS \"box_known!\"\n             FROM step_permission p JOIN run r ON r.id = p.run_id\n            WHERE p.id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status: PermissionStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "offered!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "user_known!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "box_known!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "ff913e1438e362a634e7826fbfa7e9be4ee0d83f6fa37a620dd8392090203b1b"
+}

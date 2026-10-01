@@ -5839,67 +5839,67 @@ impl WriteStore for PgStore {
         Ok(row)
     }
 
-    // -- MOD-42: the permission and control relay (plan D1-D5, D12-D14). T1 replaces each body
-    // with a delegation to `pg/relay.rs`.
+    // -- MOD-42: the permission and control relay (plan D1-D5, D12-D14); the bodies are
+    // `pg/relay.rs`'s (blueprint §2.10).
 
-    async fn open_permission(&self, _open: OpenPermission) -> Result<PermissionId> {
-        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+    async fn open_permission(&self, open: OpenPermission) -> Result<PermissionId> {
+        super::relay::open_permission(self, open).await
     }
 
-    async fn permission(&self, _id: PermissionId) -> Result<Option<StepPermission>> {
-        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+    async fn permission(&self, id: PermissionId) -> Result<Option<StepPermission>> {
+        super::relay::permission(self, id).await
     }
 
     async fn apply_permission(
         &self,
-        _id: PermissionId,
-        _owner: Uuid,
+        id: PermissionId,
+        owner: Uuid,
     ) -> Result<Option<PermissionChoice>> {
-        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+        super::relay::apply_permission(self, id, owner).await
     }
 
     async fn settle_permissions(
         &self,
-        _session: RelaySessionId,
-        _to: PermissionStatus,
+        session: RelaySessionId,
+        to: PermissionStatus,
     ) -> Result<u64> {
-        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+        super::relay::settle_permissions(self, session, to).await
     }
 
     async fn request_cancel(
         &self,
-        _run: RunId,
-        _user: UserId,
-        _box_id: BoxId,
+        run: RunId,
+        user: UserId,
+        box_id: BoxId,
     ) -> Result<CancelRequest> {
-        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+        super::relay::request_cancel(self, run, user, box_id).await
     }
 
-    async fn pending_commands(&self, _owner: Uuid, _box_id: BoxId) -> Result<Vec<RunCommand>> {
-        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+    async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> Result<Vec<RunCommand>> {
+        super::relay::pending_commands(self, owner, box_id).await
     }
 
     async fn resolve_command(
         &self,
-        _id: RunCommandId,
-        _to: RunCommandStatus,
-        _resolution: Option<String>,
+        id: RunCommandId,
+        to: RunCommandStatus,
+        resolution: Option<String>,
     ) -> Result<bool> {
-        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+        super::relay::resolve_command(self, id, to, resolution).await
     }
 
-    async fn relay_view(&self, _item: ItemId) -> Result<RelayView> {
-        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+    async fn relay_view(&self, item: ItemId) -> Result<RelayView> {
+        super::relay::relay_view(self, item).await
     }
 
     async fn answer_permission(
         &self,
-        _id: PermissionId,
-        _option_id: &str,
-        _user: UserId,
-        _box_id: BoxId,
+        id: PermissionId,
+        option_id: &str,
+        user: UserId,
+        box_id: BoxId,
     ) -> Result<AnswerOutcome> {
-        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+        super::relay::answer_permission(self, id, option_id, user, box_id).await
     }
 }
 
