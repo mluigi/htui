@@ -79,3 +79,189 @@ impl Facts {
         todo!()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A complete answer, as `(key, value)` pairs in [`KEYS`] order.
+    fn pairs() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("os", "Linux"),
+            ("arch", "x86_64"),
+            ("systemd", "255"),
+            ("creds", "yes"),
+            ("user", "alice"),
+            ("group", "staff"),
+            ("home", "/home/alice"),
+            ("bin_sha", "none"),
+            ("unit", "no"),
+            ("active", "inactive"),
+            ("sudo", "password"),
+        ]
+    }
+
+    fn render(pairs: &[(&str, &str)]) -> String {
+        pairs
+            .iter()
+            .map(|(k, v)| format!("htui.{k}={v}\n"))
+            .collect()
+    }
+
+    fn with(key: &str, value: &'static str) -> String {
+        let mut all = pairs();
+        for pair in &mut all {
+            if pair.0 == key {
+                pair.1 = value;
+            }
+        }
+        render(&all)
+    }
+
+    fn expected() -> Facts {
+        Facts {
+            os: "Linux".into(),
+            arch: "x86_64".into(),
+            systemd: Some(255),
+            creds: true,
+            user: "alice".into(),
+            group: "staff".into(),
+            home: "/home/alice".into(),
+            bin_sha: None,
+            unit: false,
+            active: "inactive".into(),
+            sudo: Some(SudoMode::Password),
+        }
+    }
+
+    #[test]
+    fn the_keys_are_the_fields_in_order() {
+        let keys: Vec<&str> = pairs().iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, KEYS);
+    }
+
+    #[test]
+    fn a_complete_answer_parses() {
+        assert_eq!(Facts::parse(&render(&pairs())), Ok(expected()));
+
+        let facts = Facts::parse(&render(&[
+            ("os", "Linux"),
+            ("arch", "aarch64"),
+            ("systemd", "none"),
+            ("creds", "no"),
+            ("user", "bob"),
+            ("group", "bob"),
+            ("home", ""),
+            ("bin_sha", "unknown"),
+            ("unit", "yes"),
+            ("active", "active"),
+            ("sudo", "nopasswd"),
+        ]))
+        .expect("parses");
+        assert_eq!(facts.systemd, None);
+        assert!(!facts.creds);
+        assert_eq!(facts.home, "");
+        assert_eq!(facts.bin_sha.as_deref(), Some("unknown"));
+        assert!(facts.unit);
+        assert_eq!(facts.sudo, Some(SudoMode::NoPassword));
+    }
+
+    #[test]
+    fn the_value_is_everything_after_the_first_equals() {
+        let facts = Facts::parse(&with("active", "a=b")).expect("parses");
+        assert_eq!(facts.active, "a=b");
+    }
+
+    #[test]
+    fn noise_is_ignored() {
+        let mut text = String::from("Welcome to host\r\nhtui-motd: hi\r\n\r\n\n");
+        for (k, v) in pairs() {
+            text.push_str(&format!("htui.{k}={v}\r\n"));
+            text.push_str("  \r\n");
+        }
+        text.push_str("bye");
+        assert_eq!(Facts::parse(&text), Ok(expected()));
+    }
+
+    #[test]
+    fn an_unknown_key_is_ignored() {
+        let text = format!("htui.extra=1\n{}htui.extra=2\n", render(&pairs()));
+        assert_eq!(Facts::parse(&text), Ok(expected()));
+    }
+
+    #[test]
+    fn each_missing_key_is_named() {
+        for key in KEYS {
+            let rest: Vec<(&str, &str)> = pairs().into_iter().filter(|(k, _)| *k != key).collect();
+            assert_eq!(
+                Facts::parse(&render(&rest)),
+                Err(FactsError::Missing(key)),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_twice_is_named() {
+        let text = format!("{}htui.home=\n", render(&pairs()));
+        assert_eq!(Facts::parse(&text), Err(FactsError::Duplicate("home")));
+        // Duplicates come before absences.
+        let text = "htui.home=/a\nhtui.home=/b\n";
+        assert_eq!(Facts::parse(text), Err(FactsError::Duplicate("home")));
+    }
+
+    #[test]
+    fn no_preflight_line_is_no_preflight() {
+        assert_eq!(Facts::parse(""), Err(FactsError::NoPreflight));
+        assert_eq!(
+            Facts::parse("fish: Unknown command\nWelcome to host\n"),
+            Err(FactsError::NoPreflight)
+        );
+    }
+
+    #[test]
+    fn unreadable_values_are_named() {
+        for (key, value) in [
+            ("systemd", "25x"),
+            ("systemd", ""),
+            ("systemd", "99999999999"),
+            ("creds", "maybe"),
+            ("unit", "maybe"),
+            ("sudo", "sometimes"),
+        ] {
+            let key: &'static str = KEYS.iter().find(|k| **k == key).expect("a key");
+            assert_eq!(
+                Facts::parse(&with(key, value)),
+                Err(FactsError::Unreadable(key)),
+                "{key}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn sudo_none_is_none() {
+        let facts = Facts::parse(&with("sudo", "none")).expect("parses");
+        assert_eq!(facts.sudo, None);
+    }
+
+    #[test]
+    fn errors_read_as_sentences() {
+        assert!(
+            FactsError::NoPreflight
+                .to_string()
+                .contains("POSIX login shell")
+        );
+        assert_eq!(
+            FactsError::Missing("os").to_string(),
+            "the preflight did not report `os`"
+        );
+        assert_eq!(
+            FactsError::Duplicate("home").to_string(),
+            "the preflight reported `home` twice"
+        );
+        assert_eq!(
+            FactsError::Unreadable("sudo").to_string(),
+            "the preflight reported an unreadable `sudo`"
+        );
+    }
+}
