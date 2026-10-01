@@ -158,7 +158,14 @@ impl Verifier for PgVerifier {
 /// Whether `records` show `id` new against `baseline` or checked in since. Pure.
 #[must_use]
 pub fn seen_against(records: &[BoxRecord], id: BoxId, baseline: &Baseline) -> bool {
-    todo!("MOD-45 T3 red")
+    records
+        .iter()
+        .find(|record| record.row.id == id)
+        .is_some_and(|record| {
+            baseline
+                .get(&id)
+                .is_none_or(|before| record.row.last_seen_at > *before)
+        })
 }
 
 #[cfg(test)]

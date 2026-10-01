@@ -84,7 +84,26 @@ pub enum KeyStep {
 /// pops, `Enter` is `Done`, `Esc` and `Ctrl-C` are `Abort`.
 #[must_use]
 pub fn apply_key(buffer: &mut Zeroizing<String>, key: &KeyEvent) -> KeyStep {
-    todo!("MOD-45 T3 red")
+    if key.kind != KeyEventKind::Press {
+        return KeyStep::More;
+    }
+    match key.code {
+        KeyCode::Enter => KeyStep::Done,
+        KeyCode::Esc => KeyStep::Abort,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyStep::Abort,
+        KeyCode::Char(c) => {
+            if buffer.len() + c.len_utf8() > PASSWORD_MAX {
+                return KeyStep::Abort;
+            }
+            buffer.push(c);
+            KeyStep::More
+        }
+        KeyCode::Backspace => {
+            buffer.pop();
+            KeyStep::More
+        }
+        _ => KeyStep::More,
+    }
 }
 
 #[cfg(test)]

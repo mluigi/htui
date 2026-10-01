@@ -96,7 +96,10 @@ impl Remote for SshRemote {
 /// after the destination). Pure.
 #[must_use]
 pub fn ssh_argv(destination: &str, command: &str) -> Vec<OsString> {
-    todo!("MOD-45 T3 red")
+    ["-T", "-o", "ConnectTimeout=15", "--", destination, command]
+        .into_iter()
+        .map(OsString::from)
+        .collect()
 }
 
 /// Spawns `command` with all three streams piped and `kill_on_drop(true)`, then joins
@@ -110,7 +113,37 @@ pub async fn run_piped(
     mut command: tokio::process::Command,
     stdin: &[u8],
 ) -> std::io::Result<RemoteOutput> {
-    todo!("MOD-45 T3 red")
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let input = child.stdin.take();
+    let out = child.stdout.take();
+    let err = child.stderr.take();
+    let write = async move {
+        let Some(mut input) = input else {
+            return Ok(());
+        };
+        let written = match input.write_all(stdin).await {
+            Ok(()) => input.shutdown().await,
+            Err(err) => Err(err),
+        };
+        drop(input);
+        match written {
+            Err(err) if err.kind() != std::io::ErrorKind::BrokenPipe => Err(err),
+            _ => Ok(()),
+        }
+    };
+    let (written, stdout, stderr) = tokio::join!(write, drain(out), drain(err));
+    written?;
+    let status = child.wait().await?;
+    Ok(RemoteOutput {
+        code: status.code(),
+        stdout: stdout?,
+        stderr: stderr?,
+    })
 }
 
 /// Reads `stream` to its end, keeping the first [`OUTPUT_CAP`] bytes.
