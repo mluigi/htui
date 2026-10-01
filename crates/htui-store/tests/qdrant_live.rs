@@ -18,6 +18,7 @@ use htui_store::embed::{DENSE_DIM, DenseEmbedder, EmbedderIdentity, HashEmbedder
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::vector::{
     DENSE, EMBEDDER_KEY, Owner, PointType, QdrantStore, SPARSE, SearchQuery, VectorStore as _,
+    is_embedder_mismatch,
 };
 use htui_store::vector_sync::Indexer;
 use qdrant_client::Qdrant;
@@ -442,9 +443,9 @@ async fn another_identity_is_refused_naming_both() {
     let client = raw(&url);
     let stored = stored_identity(&client, &name).await;
     client.delete_collection(&name).await.expect("drop");
-    let err = refused
-        .expect_err("another embedder is refused")
-        .to_string();
+    let err = refused.expect_err("another embedder is refused");
+    assert!(is_embedder_mismatch(&err), "{err}");
+    let err = err.to_string();
     assert!(err.contains("embedder mismatch"), "{err}");
     assert!(err.contains("hash/384"), "{err}");
     assert!(err.contains("test/other/384"), "{err}");
@@ -468,7 +469,9 @@ async fn another_dense_width_is_refused_and_not_stamped() {
     let refused = connect(&url, HashEmbedder::new(DENSE_DIM), &name).await;
     let stored = stored_identity(&client, &name).await;
     client.delete_collection(&name).await.expect("drop");
-    let err = refused.expect_err("another width is refused").to_string();
+    let err = refused.expect_err("another width is refused");
+    assert!(is_embedder_mismatch(&err), "{err}");
+    let err = err.to_string();
     assert!(err.contains("8-wide"), "{err}");
     assert!(err.contains("384-wide"), "{err}");
     assert_eq!(stored, None, "a wrong-width collection is never stamped");

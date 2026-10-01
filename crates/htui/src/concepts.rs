@@ -23,7 +23,9 @@ use htui_store::embed::RtenEmbedder;
 use htui_store::model;
 use htui_store::pg::{CONNECT_TIMEOUT, PoolSize};
 use htui_store::qdrant_settings::QdrantSettings;
-use htui_store::vector::{Hit, PointType, QdrantStore, SearchQuery, VectorStore};
+use htui_store::vector::{
+    Hit, PointType, QdrantStore, SearchQuery, VectorStore, is_embedder_mismatch,
+};
 use htui_store::vector_sync::{Indexer, SyncReport};
 use htui_store::{HeadlessError, PgStore, identity, secret};
 use serde_json::Value;
@@ -106,8 +108,19 @@ async fn open() -> anyhow::Result<(PgStore, QdrantStore<RtenEmbedder>)> {
         .context("cannot load the embedding model")?;
     let store = QdrantStore::connect(&settings, embedder)
         .await
-        .context("cannot reach Qdrant")?;
+        .map_err(qdrant_refusal)?;
     Ok((pg, store))
+}
+
+/// A failed `QdrantStore::connect` as the error a user reads, at all three sites that connect
+/// (review L3): "cannot reach Qdrant" above everything but an embedder mismatch, which Qdrant
+/// answered and which names its own remedy.
+pub(crate) fn qdrant_refusal(err: StoreError) -> anyhow::Error {
+    if is_embedder_mismatch(&err) {
+        anyhow::Error::new(err)
+    } else {
+        anyhow::Error::new(err).context("cannot reach Qdrant")
+    }
 }
 
 /// A headless connect's refusal as the line a user reads (MOD-40 plan D8's sentences, byte for
@@ -315,25 +328,54 @@ fn keyring_settings() -> Result<QdrantSettings, String> {
         .map_err(|err| format!("the stored Qdrant URL is not usable: {err}"))
 }
 
-/// The model, then the collection; a failure is a `warn` and another attempt after the interval,
-/// forever (plan D19). The model is fetched on this task and loaded on a thread of its own
-/// (`apart`), once: `RtenEmbedder` is `Clone`, so a retry after an unreachable Qdrant reuses it
-/// (MOD-68 A-4).
+/// The model, then the collection; a failure is logged and another attempt follows after the
+/// interval, forever (plan D19). The model is fetched on this task and loaded on a thread of its
+/// own (`apart`), once: `RtenEmbedder` is `Clone`, so a retry after an unreachable Qdrant reuses
+/// it (MOD-68 A-4).
+///
+/// An embedder mismatch is an `error` once, then `debug` (review L3), and is still re-checked
+/// every interval rather than ending the job: its remedy (delete the collection, run `htui
+/// --index-items`) happens outside this process, and a job that had ended would leave the worker
+/// never syncing again until restarted. A check is two Qdrant round trips per interval, not a
+/// hot loop.
 async fn open_index(pg: &PgStore, settings: &QdrantSettings) -> QdrantStore<RtenEmbedder> {
     let mut loaded: Option<RtenEmbedder> = None;
+    let mut reported = false;
     loop {
-        let opened = match index_model(&mut loaded).await {
-            Ok(embedder) => QdrantStore::connect(settings, embedder)
-                .await
-                .map_err(|err| format!("cannot reach Qdrant: {err}")),
-            Err(err) => Err(err),
+        let (err, mismatch) = match index_model(&mut loaded).await {
+            Ok(embedder) => match QdrantStore::connect(settings, embedder).await {
+                Ok(store) => return store,
+                Err(err) => {
+                    let mismatch = is_embedder_mismatch(&err);
+                    (format!("{:#}", qdrant_refusal(err)), mismatch)
+                }
+            },
+            Err(err) => (err, false),
         };
-        match opened {
-            Ok(store) => return store,
-            Err(err) => tracing::warn!(%err, "concepts index not opened; next cycle"),
+        match open_failure_level(mismatch, &mut reported) {
+            tracing::Level::ERROR => tracing::error!(
+                %err,
+                "concepts index refused by Qdrant; no sync until the collection is rebuilt (checked \
+                 again every interval, logged once)"
+            ),
+            tracing::Level::DEBUG => tracing::debug!(%err, "concepts index still refused"),
+            _ => tracing::warn!(%err, "concepts index not opened; next cycle"),
         }
         let app = pg.index_settings().await.unwrap_or_default();
         tokio::time::sleep(sync_interval(&app)).await;
+    }
+}
+
+/// The level `open_index` logs one failed open at: an embedder mismatch is `ERROR` the first time
+/// and `DEBUG` after, since it says the same until someone rebuilds the collection; anything else
+/// is `WARN` every time (review L3).
+fn open_failure_level(mismatch: bool, reported: &mut bool) -> tracing::Level {
+    if !mismatch {
+        tracing::Level::WARN
+    } else if std::mem::replace(reported, true) {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::ERROR
     }
 }
 
@@ -481,6 +523,39 @@ mod tests {
             store_context(&StoreError::Backend("the schema is newer".into())),
             "Postgres refused this htui"
         );
+    }
+
+    /// Review L3: Qdrant answered and refused, so the line says that, not "cannot reach".
+    #[test]
+    fn an_embedder_mismatch_is_not_cannot_reach_qdrant() {
+        use htui_store::vector::EMBEDDER_MISMATCH;
+        let mismatch = StoreError::Backend(format!(
+            "{EMBEDDER_MISMATCH}: collection `c` holds vectors from hash/384; delete collection \
+             `c` and run `htui --index-items` to rebuild it"
+        ));
+        let text = format!("{:#}", qdrant_refusal(mismatch));
+        assert!(text.contains(EMBEDDER_MISMATCH), "{text}");
+        assert!(!text.contains("cannot reach"), "{text}");
+        let down = StoreError::Backend("qdrant: collection exists: transport error".into());
+        let text = format!("{:#}", qdrant_refusal(down));
+        assert!(text.starts_with("cannot reach Qdrant: "), "{text}");
+        assert!(
+            text.ends_with("qdrant: collection exists: transport error"),
+            "{text}"
+        );
+    }
+
+    /// Review L3: the index job says a mismatch once, at `error`, and a Qdrant that does not
+    /// answer every cycle, at `warn`.
+    #[test]
+    fn a_mismatch_is_an_error_once_then_debug_and_anything_else_a_warning() {
+        use tracing::Level;
+        let mut reported = false;
+        assert_eq!(open_failure_level(false, &mut reported), Level::WARN);
+        assert_eq!(open_failure_level(true, &mut reported), Level::ERROR);
+        assert_eq!(open_failure_level(true, &mut reported), Level::DEBUG);
+        assert_eq!(open_failure_level(false, &mut reported), Level::WARN);
+        assert_eq!(open_failure_level(true, &mut reported), Level::DEBUG);
     }
 
     #[test]

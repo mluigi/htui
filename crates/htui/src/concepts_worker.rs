@@ -205,7 +205,7 @@ impl QdrantIndex {
         let store = QdrantStore::connect(&settings, embedder)
             .await
             .map(Arc::new)
-            .map_err(|e| format!("cannot reach Qdrant: {e}"))?;
+            .map_err(|e| format!("{:#}", crate::concepts::qdrant_refusal(e)))?;
         self.connections.put(settings, Arc::clone(&store));
         Ok(store)
     }

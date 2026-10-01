@@ -41,6 +41,10 @@ pub const DENSE: &str = "dense";
 pub const SPARSE: &str = "sparse";
 /// The collection metadata key the embedder's identity is stored under (MOD-68 D8).
 pub const EMBEDDER_KEY: &str = "embedder";
+/// How the message of every refusal of an existing collection begins, before `: ` and what is
+/// wrong with which collection and how to rebuild it (MOD-68 D8, review L3). The one spelling
+/// [`is_embedder_mismatch`] reads.
+pub const EMBEDDER_MISMATCH: &str = "qdrant: embedder mismatch";
 /// Longest snippet a point carries in its payload, in characters.
 pub const SNIPPET_CHARS: usize = 280;
 
@@ -359,6 +363,19 @@ fn backend(context: &str, e: impl std::fmt::Display) -> StoreError {
     StoreError::Backend(format!("qdrant: {context}: {e}"))
 }
 
+/// Whether `err` is [`QdrantStore::connect`]'s refusal of a collection holding another width or
+/// another embedder's vectors (review L3): Qdrant answered, so it is not "cannot reach", and only
+/// rebuilding the collection clears it, so retrying sooner does not help.
+///
+/// Read from the message, not a variant: `StoreError` is `htui-core`'s, shared by every store and
+/// matched across the workspace, and this is the one error of one backend that needs telling
+/// apart. [`EMBEDDER_MISMATCH`] is the single spelling both sides use.
+#[must_use]
+pub fn is_embedder_mismatch(err: &StoreError) -> bool {
+    matches!(err, StoreError::Backend(message)
+        if message.strip_prefix(EMBEDDER_MISMATCH).is_some_and(|rest| rest.starts_with(": ")))
+}
+
 /// What `ensure_collection` does with a collection that already exists.
 #[derive(Debug, PartialEq, Eq)]
 enum Existing {
@@ -381,13 +398,10 @@ fn check_existing(
     dim: usize,
 ) -> Result<Existing, StoreError> {
     let refuse = |what: String| {
-        backend(
-            "embedder mismatch",
-            format_args!(
-                "collection `{collection}` {what}; delete collection `{collection}` and run \
-                 `htui --index-items` to rebuild it"
-            ),
-        )
+        StoreError::Backend(format!(
+            "{EMBEDDER_MISMATCH}: collection `{collection}` {what}; delete collection \
+             `{collection}` and run `htui --index-items` to rebuild it"
+        ))
     };
     match dense_size {
         None => return Err(refuse("has no `dense` vector".to_owned())),
@@ -1317,6 +1331,26 @@ mod tests {
             )),
             "{err}"
         );
+    }
+
+    /// Review L3: the front ends tell a refusal from a Qdrant that does not answer.
+    #[test]
+    fn every_refusal_is_an_embedder_mismatch_and_nothing_else_is() {
+        let hash = EmbedderIdentity::hash(384);
+        for err in [
+            check_existing(C, Some(8), None, &bge(), 384).unwrap_err(),
+            check_existing(C, None, None, &bge(), 384).unwrap_err(),
+            check_existing(C, Some(384), stored(&hash), &bge(), 384).unwrap_err(),
+        ] {
+            assert!(is_embedder_mismatch(&err), "{err}");
+        }
+        for err in [
+            backend("collection info", "transport error"),
+            StoreError::Backend("qdrant: embedder mismatches nothing".into()),
+            StoreError::Unreachable(format!("{EMBEDDER_MISMATCH}: not a backend error")),
+        ] {
+            assert!(!is_embedder_mismatch(&err), "{err}");
+        }
     }
 
     #[test]
