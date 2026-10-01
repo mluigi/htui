@@ -25,15 +25,23 @@
 //! | `T` | run | a retry of the run's cleanup |
 //! | `u` / `R` | item | `Unblock` / `StartRun` |
 //! | `C` | item | close-out: the counts, a picked resolution, a `y`, the key typed back (D167) |
+//! | `1`-`9` | step with a pending request | `AnswerPermission` with that option (MOD-42 D14) |
+//!
+//! MOD-42 plan D14: every `Runs` reply also asks for the item's `RelayView`. A step whose session
+//! parked a stage-3 permission request takes two more lines, the scrubbed summary and the strip,
+//! and while the cursor is on it every digit is the pane's; anywhere else a digit passes on to the
+//! global tab select. A run with a pending cancel says `cancel requested` under its grid.
 //!
 //! At the close-out's counts `←`/`→` (and `h`/`l`) pick the resolution among the legal ones for
 //! the item's status (`Resolution::closes_from`), starting on `Resolution::default_for` (MOD-39
 //! plan P13).
 
 use core::cell::Cell;
+use htui_agent::event::{PermissionOption, PermissionOptionKind};
 use htui_core::model::{
-    Document, DocumentId, ItemId, Resolution, RunId, RunMode, RunStatus, RunStepSummary,
-    RunSummary, Status, StepId, StepPermission, StepStatus, UsageTotals,
+    Document, DocumentId, ItemId, RelayOption, RelayOptionKind, RelayView, Resolution, RunId,
+    RunMode, RunStatus, RunStepSummary, RunSummary, Status, StepId, StepPermission, StepStatus,
+    UsageTotals,
 };
 use htui_orch::closeout::Preview;
 use htui_orch::{Command, CommandOutcome, GateAnswer};
@@ -49,6 +57,7 @@ use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, 
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
+use crate::ui::tabs::chat::permission::PermissionStrip;
 use crate::ui::text_field::{FieldOutcome, TextField};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -78,6 +87,18 @@ pub const NOT_ON_BOX: &str = "the document is not on this box";
 
 /// `StoreRequest::Document`'s name, which a refused read is answered under.
 const DOCUMENT: &str = "document";
+
+/// `StoreRequest::AnswerPermission`'s name, which a refused answer is answered under (MOD-42
+/// blueprint B-13).
+const ANSWER_PERMISSION: &str = "answer_permission";
+
+/// The line under a run with a pending cancel (MOD-42 plan D14). The pane's own label: the
+/// runtime's sentence is longer than the pane is wide.
+const CANCEL_REQUESTED_LINE: &str = "cancel requested";
+
+/// What a relayed request with no summary asks for (MOD-42 blueprint B-14: the transport named no
+/// call, or the scrubber refused it).
+const NO_SUMMARY: &str = "a permission";
 
 /// The width of a detail pane at 100x30, which every step line fills exactly (MOD-4 plan D169,
 /// blueprint D197).
@@ -153,6 +174,8 @@ pub struct RunsTab {
     subscribed: Option<ItemId>,
     /// What the pane is doing: browsing, or waiting on typed text or an answer.
     mode: Mode,
+    /// MOD-42 plan D14: the last `RelayView` for [`RunsTab::item`]; `None` until the first one.
+    relay: Option<RelayView>,
 }
 
 /// One place the cursor can be (blueprint D198): a step, or the header of a run with no step.
@@ -346,6 +369,28 @@ impl RunsTab {
             self.subscribed = Some(item);
         }
         ctx.request(StoreRequest::RunActions(item));
+        ctx.request(StoreRequest::RelayView { item });
+    }
+
+    /// MOD-42 plan D14: the pending request on `step`, as the last `RelayView` had it.
+    fn pending_on(&self, step: StepId) -> Option<&StepPermission> {
+        self.relay
+            .as_ref()?
+            .permissions
+            .iter()
+            .find(|pending| pending.run_step_id == step)
+    }
+
+    /// The pending request on the step under the cursor, which the digits answer.
+    fn pending_under_cursor(&self) -> Option<&StepPermission> {
+        self.pending_on(self.selected_step()?)
+    }
+
+    /// Whether the last `RelayView` lists a pending cancel of `run`.
+    fn cancel_requested(&self, run: RunId) -> bool {
+        self.relay
+            .as_ref()
+            .is_some_and(|relay| relay.cancels.contains(&run))
     }
 
     /// Asks for this item's runs again.
@@ -929,9 +974,10 @@ fn stamp(at: Option<chrono::DateTime<chrono::Utc>>) -> String {
     at.map_or_else(|| PENDING.to_owned(), |at| at.format(STAMP).to_string())
 }
 
-/// One run's lines: `kind status box started`, `mode … finished`, and the failure when there is
-/// one, fitted to the pane.
-fn run_lines(run: &RunSummary, theme: &Theme) -> Vec<Line<'static>> {
+/// One run's lines: `kind status box started`, `mode … finished`, `cancel requested` while a
+/// cancel of it is pending (MOD-42 plan D14), and the failure when there is one, fitted to the
+/// pane.
+fn run_lines(run: &RunSummary, cancel_requested: bool, theme: &Theme) -> Vec<Line<'static>> {
     let started = stamp(run.started_at);
     let finished = stamp(run.finished_at);
     let mut lines = vec![
@@ -948,6 +994,12 @@ fn run_lines(run: &RunSummary, theme: &Theme) -> Vec<Line<'static>> {
             (&finished, theme.dim),
         ]),
     ];
+    if cancel_requested {
+        lines.push(Line::from(Span::styled(
+            fit(CANCEL_REQUESTED_LINE, PANE),
+            theme.accent,
+        )));
+    }
     if let Some(failure) = &run.failure {
         lines.push(Line::from(Span::styled(fit(failure, PANE), theme.error)));
     }
@@ -1038,10 +1090,81 @@ fn step_lines(
     [first, second]
 }
 
-/// MOD-42 T5 red: the two lines a step with a pending request takes; drawn by nothing yet.
-#[allow(dead_code)]
-fn permission_lines(_pending: &StepPermission, _theme: &Theme) -> [Line<'static>; 2] {
-    [Line::default(), Line::default()]
+/// A relayed request's options as the strip takes them (MOD-42 blueprint F-19: the orphan rule
+/// forbids a `From` between core's and the agent crate's types).
+fn strip_options(options: &[RelayOption]) -> Vec<PermissionOption> {
+    options
+        .iter()
+        .map(|option| PermissionOption {
+            id: option.id.clone(),
+            label: option.label.clone(),
+            kind: match option.kind {
+                RelayOptionKind::AllowOnce => PermissionOptionKind::AllowOnce,
+                RelayOptionKind::AllowAlways => PermissionOptionKind::AllowAlways,
+                RelayOptionKind::RejectOnce => PermissionOptionKind::RejectOnce,
+                RelayOptionKind::RejectAlways => PermissionOptionKind::RejectAlways,
+            },
+        })
+        .collect()
+}
+
+/// `line` in exactly `width` characters, its spans' styles kept: padded with a blank span, or cut
+/// with [`CUT`] as its last character, as [`fit`] does to a string.
+fn fit_line(line: Line<'static>, width: usize) -> Line<'static> {
+    let flat: Vec<(String, Style)> = line
+        .spans
+        .iter()
+        .map(|span| {
+            let text = span
+                .content
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            (text, span.style)
+        })
+        .collect();
+    let total: usize = flat.iter().map(|(text, _)| text.chars().count()).sum();
+    let mut spans = Vec::with_capacity(flat.len() + 1);
+    if total <= width {
+        spans.extend(
+            flat.into_iter()
+                .map(|(text, style)| Span::styled(text, style)),
+        );
+        spans.push(Span::raw(blank(width - total)));
+    } else if width > 0 {
+        let mut room = width - 1;
+        for (text, style) in flat {
+            let count = text.chars().count();
+            if count <= room {
+                room -= count;
+                spans.push(Span::styled(text, style));
+            } else {
+                let mut head: String = text.chars().take(room).collect();
+                head.push(CUT);
+                spans.push(Span::styled(head, style));
+                break;
+            }
+        }
+    }
+    Line::from(spans)
+}
+
+/// MOD-42 plan D14: the two lines under a step with a pending request, each exactly [`PANE`]
+/// wide: `asks: <summary>` from the status column, then the answer strip.
+fn permission_lines(pending: &StepPermission, theme: &Theme) -> [Line<'static>; 2] {
+    let summary = pending.summary.as_deref().unwrap_or(NO_SUMMARY);
+    let asks = Line::from(vec![
+        Span::raw(blank(INDENT)),
+        Span::styled(
+            fit(&format!("asks: {summary}"), PANE - INDENT),
+            theme.accent,
+        ),
+    ]);
+    let strip = fit_line(
+        PermissionStrip::line(&strip_options(&pending.options), theme),
+        PANE,
+    );
+    [asks, strip]
 }
 
 /// D170's usage cell: dollars when the usage document carries a cost, else tokens, else `—`. At
@@ -1131,6 +1254,7 @@ impl DetailTab for RunsTab {
         self.scroll.reset();
         self.selected = None;
         self.actions = None;
+        self.relay = None;
         self.mode = Mode::Browse;
     }
 
@@ -1150,6 +1274,22 @@ impl DetailTab for RunsTab {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
             return Handled::Pass;
+        }
+        // MOD-42 D14: while the step under the cursor has a pending request, every digit is this
+        // pane's, as the chat's parked strip takes them (`chat/mod.rs`); otherwise digits pass to
+        // the global tab select (`keymap.rs`).
+        if let KeyCode::Char(digit @ '1'..='9') = key.code
+            && let Some(pending) = self.pending_under_cursor()
+        {
+            if let Some(option) =
+                PermissionStrip::pick_from(&strip_options(&pending.options), digit)
+            {
+                ctx.request(StoreRequest::AnswerPermission {
+                    permission: pending.id,
+                    option_id: option.id,
+                });
+            }
+            return Handled::Consumed;
         }
         match key.code {
             KeyCode::Char('J') => self.move_cursor(1),
@@ -1229,6 +1369,16 @@ impl DetailTab for RunsTab {
                 self.mode = Mode::Browse;
             }
             StoreReply::Document(doc) => self.on_document(doc.as_ref().as_ref(), ctx),
+            // MOD-42 D14, B-13: the relay view of this item; an answer, applied or refused,
+            // re-reads the runs (a refusal's sentence is on the status line already), and the
+            // re-read brings a fresh view.
+            StoreReply::RelayView { item, view } if Some(*item) == self.item => {
+                self.relay = Some((**view).clone());
+            }
+            StoreReply::PermissionAnswered { .. } => self.re_read(ctx),
+            StoreReply::Failed { request, .. } if *request == ANSWER_PERMISSION => {
+                self.re_read(ctx);
+            }
             _ => {}
         }
     }
@@ -1288,7 +1438,7 @@ impl RunsTab {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut cursor_end = 0;
         for (at, run) in self.runs.iter().enumerate().skip(self.first_visible()) {
-            let mut header = run_lines(run, theme);
+            let mut header = run_lines(run, self.cancel_requested(run.id), theme);
             if cursor == Some(Entry::Run { run: at }) {
                 // A run with no step is its own entry (D198); the run grid has no cursor column,
                 // so its kind cell takes the accent instead.
@@ -1301,6 +1451,11 @@ impl RunsTab {
             for step in &run.steps {
                 let on_cursor = step_cursor == Some(step.id);
                 lines.extend(step_lines(step, &run.steps, on_cursor, theme));
+                // MOD-42 D14: the request's two lines belong to the step, so the cursor's end
+                // counts them and the scroll keeps them in view.
+                if let Some(pending) = self.pending_on(step.id) {
+                    lines.extend(permission_lines(pending, theme));
+                }
                 if on_cursor {
                     cursor_end = lines.len();
                 }
@@ -1363,8 +1518,7 @@ mod tests {
     use crossterm::event::KeyModifiers;
     use htui_core::fixtures::{demo_at, ids};
     use htui_core::model::{
-        GateOutcome, PermissionId, PermissionStatus, ProjectRef, RelayOption, RelayOptionKind,
-        RelaySessionId, RelayView, Scope, WorkspaceId,
+        GateOutcome, PermissionId, PermissionStatus, ProjectRef, RelaySessionId, Scope, WorkspaceId,
     };
     use htui_core::store::{MemStore, ReadStore};
     use htui_orch::Rest;
@@ -1804,7 +1958,11 @@ mod tests {
     async fn a_run_with_a_failure_gets_a_third_line_that_fits() {
         let theme = Theme::default();
         let run = feat_1_runs().await.remove(0);
-        assert_eq!(run_lines(&run, &theme).len(), 2, "no failure, two lines");
+        assert_eq!(
+            run_lines(&run, false, &theme).len(),
+            2,
+            "no failure, two lines"
+        );
 
         let failed = RunSummary {
             status: RunStatus::Failed,
@@ -1814,7 +1972,7 @@ mod tests {
             )),
             ..run
         };
-        let lines = run_lines(&failed, &theme);
+        let lines = run_lines(&failed, false, &theme);
         assert_eq!(lines.len(), 3);
         let third = text(&lines[2]);
         assert_eq!(lines[2].width(), PANE, "{third:?}");
@@ -1840,7 +1998,7 @@ mod tests {
         );
 
         let run = feat_1_runs().await.remove(0);
-        let lines = run_lines(&run, &theme);
+        let lines = run_lines(&run, false, &theme);
         assert_eq!(
             text(&lines[0]).trim_end(),
             "graph  done      DESKTOP-HTUI 09-02 08:00"
@@ -1855,7 +2013,7 @@ mod tests {
             finished_at: None,
             ..run
         };
-        let lines = run_lines(&parked, &theme);
+        let lines = run_lines(&parked, false, &theme);
         assert!(text(&lines[0]).starts_with("graph  awaiting  DESKTOP-HTUI"));
         assert_eq!(
             text(&lines[1]).trim_end(),

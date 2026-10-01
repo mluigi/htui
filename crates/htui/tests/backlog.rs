@@ -1311,7 +1311,11 @@ async fn a_refused_answer_lands_on_the_status_line() {
     );
     harness.key("1");
     harness.drive().await;
-    assert_eq!(harness.app().status.as_deref(), Some(EXECUTOR_GONE));
+    assert_eq!(
+        harness.app().status,
+        Some(format!("answer_permission: {EXECUTOR_GONE}")),
+        "the refusal's own sentence, under the request's name"
+    );
     assert_eq!(store.relay_rows()[0].status, PermissionStatus::Pending);
 }
 
