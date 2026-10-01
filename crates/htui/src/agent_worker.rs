@@ -10956,6 +10956,52 @@ done
         assert_eq!(runtime.background_len(), 0);
     }
 
+    /// D9, `R-SEC-2` (review L3): a `launch` that does not parse is refused by name, and the
+    /// sentence carries no serde text, which would quote the document, `env` included.
+    #[tokio::test]
+    async fn set_tool_paths_refuses_an_unparsable_launch_without_quoting_it() {
+        const SENTINEL: &str = "SECRET-SENTINEL";
+        let tmp = tempfile::tempdir().expect("temp box");
+        let store = unresolvable_registry().await;
+        let agent_id = AgentId::new();
+        // `args` as a string: serde's own text quotes the offending value.
+        let launch = json!({
+            "command": "${first}",
+            "args": SENTINEL,
+            "env": { "K": SENTINEL },
+            "discovery": { "tools": {}, "handshake": false }
+        });
+        let serde_text = serde_json::from_value::<AgentLaunch>(launch.clone())
+            .expect_err("the launch is malformed")
+            .to_string();
+        assert!(
+            serde_text.contains(SENTINEL),
+            "the case is only worth having if serde would leak: {serde_text}"
+        );
+        store
+            .upsert_agent(
+                &Agent {
+                    launch,
+                    ..paths_row(agent_id)
+                },
+                None,
+            )
+            .await
+            .expect("the row lands");
+        let backend = Backend::memory(store);
+        let mut runtime = AgentRuntime::new(DriverFactory::new())
+            .with_probe_env(fake_env(tmp.path()), fake_hardware());
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let message = refused(set_paths(&mut runtime, &backend, &tx, 1, agent_id, &[]).await);
+        assert_eq!(
+            message,
+            "`paths-fixture`'s launch does not parse; nothing declares a tool"
+        );
+        assert!(!message.contains(SENTINEL), "{message}");
+        assert_eq!(runtime.background_len(), 0);
+    }
+
     /// D9: every value is absolute (`parse_tool_path`) and a file on this box (`is_file`), and
     /// the refusal names the tool. The shape is checked on the arm; `is_file` is I/O and runs in
     /// the task, so a hung mount cannot stall the store loop (review L1). Its refusal is the
