@@ -1394,17 +1394,19 @@ impl AgentRuntime {
         Ok(Served::Deferred)
     }
 
-    /// The [`StoreRequest::SetToolPaths`] path (MOD-66 D7–D9). Every refusal comes **before
-    /// anything is spawned**, in `auth_start`'s order (B6): writer (offline:
+    /// The [`StoreRequest::SetToolPaths`] path (MOD-66 D7–D9). Every refusal but one comes
+    /// **before anything is spawned**, in `auth_start`'s order (B6): writer (offline:
     /// `REGISTRY_ON_SERVER_ONLY`), registered box, the box claim, this row's re-probe claim, the
     /// row exists, it is `enabled`, its `launch` parses, every key is a tool its
-    /// `discovery.tools` declares, and every value passes [`parse_tool_path`] and `is_file`. A
-    /// store refusal is an `Err`. A refused field is `Ok(Served::Reply(Failed))` carrying its own
-    /// sentence, never behind a `StoreError` prefix (MOD-23 D250's precedent).
+    /// `discovery.tools` declares, and every value passes [`parse_tool_path`]. A store refusal is
+    /// an `Err`. A refused field is `Ok(Served::Reply(Failed))` carrying its own sentence, never
+    /// behind a `StoreError` prefix (MOD-23 D250's precedent).
     ///
-    /// Awaited on the loop's arm: `box_info()`, `agents()` and one `metadata` per path, which is
-    /// the same class of cost the probe's and the login's arms already pay (`R-NF-3`). The probe
-    /// runs in the task, which holds the row's re-probe claim to its end (D8, H-10).
+    /// Awaited on the loop's arm: `box_info()` and `agents()`, the same class of cost the probe's
+    /// and the login's arms already pay (`R-NF-3`). The one refusal that is not here is `is_file`:
+    /// it is filesystem I/O that a hung mount can stall, so [`run_tool_paths`] makes it, with the
+    /// claims already held, and answers the same `Failed` (review L1). The probe runs in that
+    /// task too, which holds the row's re-probe claim to its end (D8, H-10).
     async fn set_tool_paths(
         &mut self,
         backend: &Backend,
@@ -1457,9 +1459,6 @@ impl AgentRuntime {
                 Ok(path) => path,
                 Err(sentence) => return refuse_tool_paths(sentence),
             };
-            if !htui_agent::probe::is_file(std::path::Path::new(&path)).await {
-                return refuse_tool_paths(format!("`{tool}`: `{path}` is not a file on this box"));
-            }
             checked.insert(tool.clone(), path);
         }
         // Blueprint D35: the injected env when a test gave one, else this process's own.
@@ -2778,7 +2777,10 @@ impl core::fmt::Debug for ToolPathsArgs {
     }
 }
 
-/// One probe of one row over the requested map, written whatever it found (MOD-66 D9):
+/// First D9's `is_file` check of every path: a path that is not a file is the task's one answer,
+/// `Failed` with the tool-naming sentence the arm's refusals use, and nothing is written.
+///
+/// Then one probe of one row over the requested map, written whatever it found (MOD-66 D9):
 /// [`probe_snapshot`], never `probe_agent`, so D51's `Kept` cannot swallow the edit (B1). Exactly
 /// one reply at the request's address: `AgentWritten { agents, ToolPaths { id, name, status } }`,
 /// or `Failed { "set_tool_paths" }` when the write fails. A re-read that fails after an applied
@@ -2797,6 +2799,22 @@ async fn run_tool_paths(args: ToolPathsArgs) {
         frames,
         claim,
     } = args;
+    // D9's last check, here rather than on the arm: `metadata` on a hung mount would stall every
+    // tab's store requests (review L1). `BTreeMap` order, so the first refusal is the same one
+    // every time.
+    for (tool, path) in &paths {
+        if !htui_agent::probe::is_file(std::path::Path::new(path)).await {
+            drop(claim);
+            frames.reply(
+                &frames.addr(),
+                StoreReply::Failed {
+                    request: SET_TOOL_PATHS,
+                    message: format!("`{tool}`: `{path}` is not a file on this box"),
+                },
+            );
+            return;
+        }
+    }
     let ctx = ProbeContext {
         env,
         now: Utc::now(),
@@ -10939,13 +10957,15 @@ done
     }
 
     /// D9: every value is absolute (`parse_tool_path`) and a file on this box (`is_file`), and
-    /// the refusal names the tool.
+    /// the refusal names the tool. The shape is checked on the arm; `is_file` is I/O and runs in
+    /// the task, so a hung mount cannot stall the store loop (review L1). Its refusal is the
+    /// task's one answer, nothing is written, and the row's claim is free after.
     #[tokio::test]
     async fn set_tool_paths_refuses_a_relative_path_a_directory_and_a_missing_file_naming_the_tool()
     {
         let tmp = tempfile::tempdir().expect("temp box");
-        let (_store, backend, mut runtime, agent_id) = paths_fixture(tmp.path()).await;
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (store, backend, mut runtime, agent_id) = paths_fixture(tmp.path()).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
 
         let message = refused(
             set_paths(
@@ -10959,34 +10979,47 @@ done
             .await,
         );
         assert_eq!(message, "`first`: the path must be absolute");
+        assert_eq!(runtime.background_len(), 0, "nothing was spawned");
 
         let dir = tmp.path().join("a-directory");
         std::fs::create_dir_all(&dir).expect("the directory");
         let dir = dir.to_string_lossy().into_owned();
-        let message =
-            refused(set_paths(&mut runtime, &backend, &tx, 2, agent_id, &[("first", &dir)]).await);
-        assert_eq!(
-            message,
-            format!("`first`: `{dir}` is not a file on this box")
-        );
-
         let absent = tmp.path().join("absent").to_string_lossy().into_owned();
-        let message = refused(
-            set_paths(
+        for (seq, path) in [(2, &dir), (3, &absent)] {
+            let served = set_paths(
                 &mut runtime,
                 &backend,
                 &tx,
-                3,
+                seq,
                 agent_id,
-                &[("first", &absent)],
+                &[("first", path)],
             )
-            .await,
+            .await;
+            assert!(
+                matches!(served, Served::Deferred),
+                "`is_file` is the task's check: {served:?}"
+            );
+            let reply = one_reply(&mut runtime, &mut rx).await;
+            assert_eq!(reply.seq, seq);
+            match reply.reply {
+                StoreReply::Failed { request, message } => {
+                    assert_eq!(request, SET_TOOL_PATHS);
+                    assert_eq!(
+                        message,
+                        format!("`first`: `{path}` is not a file on this box")
+                    );
+                }
+                other => panic!("a path that is not a file answers Failed: {other:?}"),
+            }
+            assert!(
+                runtime.reprobe_claims.claim((agent_id, ids::BOX)).is_some(),
+                "the refusal released the row's claim"
+            );
+        }
+        assert!(
+            summary_of(&store, agent_id).await.on_box.is_none(),
+            "a refused map writes nothing"
         );
-        assert_eq!(
-            message,
-            format!("`first`: `{absent}` is not a file on this box")
-        );
-        assert_eq!(runtime.background_len(), 0, "nothing was spawned");
     }
 
     /// D8: a writing background task, a box probe and another tool-paths write each hold the box.
