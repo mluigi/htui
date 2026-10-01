@@ -13,11 +13,11 @@ use chrono::{DateTime, Utc};
 use htui_agent::AgentSettings;
 use htui_agent::driver::{AgentDriver, PermissionPolicy};
 use htui_agent::error::DriverError;
-use htui_agent::record::Control;
+use htui_agent::record::{Control, Signal};
 use htui_agent::registry::DriverFactory;
 use htui_core::model::{
-    AgentId, AgentSummary, BoxId, BoxProfile, Executor, ItemId, RepoId, Run, RunCommandId, RunId,
-    RunStatus, SnapshotCandidate, UserId,
+    AgentId, AgentSummary, BoxId, BoxProfile, CancelRequest, Executor, ItemId, RepoId, Run,
+    RunCommandId, RunCommandStatus, RunId, RunStatus, SnapshotCandidate, UserId,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{Result as StoreResult, StoreError};
@@ -29,7 +29,7 @@ use htui_orch::{
 };
 use htui_store::{DATABASE_UNREACHABLE, identity};
 use serde_json::Value;
-use tokio::sync::{OwnedMutexGuard, mpsc, oneshot};
+use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -91,14 +91,6 @@ pub fn unknown_executor(executor: &Executor) -> String {
     format!(
         "box executor `{executor}` is not known to htui {}",
         htui_store::HTUI_VERSION
-    )
-}
-
-/// OQ-4: `c` on a run the box's worker is walking.
-#[must_use]
-pub fn worker_walks(run: RunId) -> String {
-    format!(
-        "the worker on this box is walking run {run}; cancelling a live run needs MOD-42's cancel command"
     )
 }
 
@@ -452,16 +444,67 @@ impl<P: ReplySink> Shared<P> {
 
     /// The run's lock, unless the task's token is cancelled first (H-6): a task cancelled while
     /// it waits walks nothing.
+    ///
+    /// MOD-42 plan D11: a graceful preempt's `Cancel` is a cancel here too. A task queued for the
+    /// lock under the signalled parent would otherwise take it the moment the stopping walk
+    /// rests, and walk a run its preemptor is waiting to own; it is refused instead, and its
+    /// token's drop is what lets the preempt stop waiting.
     async fn lock_unless_cancelled(
         &self,
         run: RunId,
         walk: &WalkToken,
     ) -> Option<OwnedMutexGuard<()>> {
+        let mut signal = walk.signal.clone();
         tokio::select! {
             biased;
             () = walk.token.cancelled() => None,
+            () = cancel_signalled(&mut signal) => None,
             guard = self.locks.lock(run) => Some(guard),
         }
+    }
+
+    /// MOD-42 B-5: `id` claimed for this task until the guard drops; `None` while another task of
+    /// this process applies it.
+    fn applying(&self, id: RunCommandId) -> Option<Applying<'_>> {
+        self.applying
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id)
+            .then_some(Applying {
+                set: &self.applying,
+                id,
+            })
+    }
+
+    /// MOD-42 B-5: whether a task of this process applies `id` now.
+    fn is_applying(&self, id: RunCommandId) -> bool {
+        self.applying
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&id)
+    }
+}
+
+/// MOD-42 B-5: one run command a task is applying; dropping it frees the id for the next poll.
+struct Applying<'a> {
+    set: &'a StdMutex<HashSet<RunCommandId>>,
+    id: RunCommandId,
+}
+
+impl Drop for Applying<'_> {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
+/// Resolves once `signal` reads [`Signal::Cancel`]; pending for ever once its sender is gone (a
+/// dropped parent is not a cancel: its token says so).
+async fn cancel_signalled(signal: &mut watch::Receiver<Signal>) {
+    if signal.wait_for(|signal| signal.is_cancel()).await.is_err() {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -524,11 +567,15 @@ struct Walks {
     root: CancellationToken,
 }
 
-/// A run's parent token and how many tasks work under it.
+/// A run's parent token, how many tasks work under it, and its signal (MOD-42 plan D11).
 #[derive(Debug, Clone)]
 struct Parent {
     token: CancellationToken,
     live: Arc<AtomicUsize>,
+    /// D11: `Cancel` asks every walk of the run to stop gracefully before the token drops it.
+    signal: Arc<watch::Sender<Signal>>,
+    /// The channel's own receiver; the control lookup hands out clones (F-17).
+    control: watch::Receiver<Signal>,
 }
 
 /// One task's child token; dropping it is the task no longer working on the run.
@@ -536,6 +583,8 @@ struct Parent {
 pub struct WalkToken {
     token: CancellationToken,
     live: Arc<AtomicUsize>,
+    /// MOD-42 plan D11: the run's signal, which a task queued for the run's lock honours.
+    signal: watch::Receiver<Signal>,
 }
 
 impl Drop for WalkToken {
@@ -553,15 +602,49 @@ impl Walks {
     /// runtime is closed.
     fn child(&self, run: RunId) -> WalkToken {
         let mut walks = self.lock();
-        let parent = walks.entry(run).or_insert_with(|| Parent {
-            token: self.root.child_token(),
-            live: Arc::new(AtomicUsize::new(0)),
+        let parent = walks.entry(run).or_insert_with(|| {
+            let (signal, control) = watch::channel(Signal::Run);
+            Parent {
+                token: self.root.child_token(),
+                live: Arc::new(AtomicUsize::new(0)),
+                signal: Arc::new(signal),
+                control,
+            }
         });
         parent.live.fetch_add(1, Ordering::SeqCst);
         WalkToken {
             token: parent.token.child_token(),
             live: Arc::clone(&parent.live),
+            signal: parent.control.clone(),
         }
+    }
+
+    /// MOD-42 plan D10: the run's control: its live parent's receiver, else one no signal reaches.
+    fn control(&self, run: RunId) -> Control {
+        self.lock().get(&run).map_or_else(Control::never, |parent| {
+            Control::new(parent.control.clone())
+        })
+    }
+
+    /// MOD-42 plan D11 (R-38): `Cancel { grace }` to every walk of `run`; wait until none is live
+    /// or `grace + 1 s`; then [`Self::preempt`] as before (a walk still live is dropped hard). The
+    /// parent stays in the map while this waits, so a walk that looks its control up meanwhile
+    /// reads the cancel, and a task queued for the run's lock is refused. Whether there was a
+    /// parent.
+    async fn preempt_gracefully(&self, run: RunId, grace: Duration) -> bool {
+        let live = {
+            let walks = self.lock();
+            let Some(parent) = walks.get(&run) else {
+                return false;
+            };
+            parent.signal.send_replace(Signal::Cancel { grace });
+            Arc::clone(&parent.live)
+        };
+        let deadline = tokio::time::Instant::now() + grace + Duration::from_secs(1);
+        while live.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        self.preempt(run)
     }
 
     /// Whether a task of this process works on `run`.
@@ -739,7 +822,7 @@ struct Kit<H: htui_core::store::WorkerHost> {
     /// MOD-42 plan D9: each agent's `agent.settings.permission`, parsed once per task as chat
     /// parses it (`agent_worker.rs:968-969`: a row that does not parse asks).
     policy: Box<dyn Fn(AgentId) -> PermissionPolicy + Send + Sync>,
-    /// MOD-42 plan D10: each run's control. T3: never signalled; T4: the run's `Walks` parent.
+    /// MOD-42 plan D10: each run's control: its live `Walks` parent's, else never signalled.
     control: Box<dyn Fn(RunId) -> Control + Send + Sync>,
 }
 
@@ -783,6 +866,7 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             .map(|summary| (summary.agent.id, summary))
             .collect();
         let policy = policy_lookup(&agents);
+        let walks = shared.walks.clone();
         Ok(Self {
             sink: ProgressSink {
                 publisher: Arc::new(shared.publisher.clone()),
@@ -807,7 +891,7 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             executor,
             tails,
             policy,
-            control: Box::new(htui_orch::never_cancelled),
+            control: Box::new(move |run| walks.control(run)),
         })
     }
 
@@ -912,7 +996,9 @@ fn lease_period(app: &BTreeMap<String, Value>) -> Duration {
 /// Every `Orch` command runs on a task this runtime owns and answers its request once, at the
 /// request's `seq` (`R-NF-3`, R-41); the loop never awaits a walk. A run's commands are serialised
 /// by [`RunLocks`] (R-27), and `CancelRun` and `PromoteStep` preempt a live walk through its token
-/// (D157, D187).
+/// (D157, D187) — gracefully since MOD-42 (plan D11): the walk's control is signalled first and
+/// its session cancelled with grace, and a cancel is a durable `run_command` row its executor
+/// applies (D12), which [`Self::poll_commands_with`] picks up (D13).
 ///
 /// MOD-41 plan D7: generic over its host `H` (every store read and write goes through it) and its
 /// sink `P` (every answer and frame goes to it). The TUI's is `htui::run_worker::RunRuntime`: over
@@ -1072,8 +1158,43 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
     /// already being applied (B-5), runs as an internal cancel (D12 steps 3-5, no second row).
     /// `live` is the loop's [`LiveChats`]: a cancel a live chat refuses stays pending, silently.
     pub fn poll_commands_with(&mut self, host: &H, sink: &P, live: LiveChats) {
-        // MOD-42 T4: red — the poll does nothing yet.
-        let _ = (host, sink, live);
+        // Every tick, like a sweep's: the poll's own finished handles never pile up between the
+        // sweeps (the TUI's sweep period is the lease TTL).
+        self.shared.prune_tasks();
+        if host.writer().is_none() || self.shared.walks.closed() {
+            return;
+        }
+        if self
+            .shared
+            .polling
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        self.shared.publisher.wire(sink);
+        let ctx = TaskCtx {
+            shared: Arc::clone(&self.shared),
+            host: host.clone(),
+            sink: sink.clone(),
+            addr: None,
+            name: "cancel_run",
+            tag: Arc::default(),
+        };
+        let shared = Arc::clone(&self.shared);
+        let tag = Arc::clone(&ctx.tag);
+        let handle = tokio::spawn(async move {
+            /// Frees the one-poll-at-a-time claim however the poll ends.
+            struct Polled<P: ReplySink>(Arc<Shared<P>>);
+            impl<P: ReplySink> Drop for Polled<P> {
+                fn drop(&mut self) {
+                    self.0.polling.store(false, Ordering::SeqCst);
+                }
+            }
+            let _polled = Polled(Arc::clone(&ctx.shared));
+            poll_once(ctx, live).await;
+        });
+        shared.track(tag, handle);
     }
 
     /// B-19: the grace [`CANCEL_GRACE`] stands for, fixed by a test.
@@ -1375,6 +1496,22 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> TaskCtx<H, P> {
         });
     }
 
+    /// MOD-42 B-12 (D12 step 6): a cancel left for the run's executor. A `Changed` frame for the
+    /// run, so every watching pane re-reads its pending cancels, and a `Failed` answer, so the
+    /// sentence reaches the status line.
+    fn requested(&self, already: bool) {
+        self.publish(self.tag.run.get().copied(), FrameKind::Changed);
+        let message = if already {
+            CANCEL_ALREADY_REQUESTED
+        } else {
+            CANCEL_REQUESTED
+        };
+        self.answer(RunReply::Failed {
+            request: self.name,
+            message: message.to_owned(),
+        });
+    }
+
     /// A frame for the task's item, when it knows one.
     fn publish(&self, run: Option<RunId>, kind: FrameKind) {
         if let Some(item) = self.tag.item.get() {
@@ -1610,6 +1747,11 @@ async fn reclaim<H: htui_core::store::WorkerHost, P: ReplySink>(
             ctx.refuse(PREEMPTED.to_owned());
         }
         Some(Ok(outcome)) => ctx.done(outcome),
+        // MOD-42 B-3: a walk that stopped on its control was preempted, gracefully.
+        Some(Err(EngineError::Cancelled { .. })) => {
+            engine.abandoned(run).await;
+            ctx.refuse(PREEMPTED.to_owned());
+        }
         Some(Err(err @ EngineError::ClaimRefused { .. })) => {
             ctx.shared.queue(queued_at, run);
             tracing::debug!(%run, %err, "a queued run's claim was refused again");
@@ -1807,6 +1949,11 @@ async fn resumed<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, 
             ctx.shared.clear_backoff(run);
             ctx.publish(Some(run), FrameKind::Rested(rest));
         }
+        // MOD-42 B-3: a walk that stopped on its control was preempted, gracefully.
+        Some(Err(EngineError::Cancelled { .. })) => {
+            engine.abandoned(run).await;
+            ctx.refuse(PREEMPTED.to_owned());
+        }
         Some(Err(err)) => {
             if ctx.shared.role == Role::Worker && backs_off(&err) {
                 ctx.shared.step_backoff(run);
@@ -1843,15 +1990,21 @@ async fn run_request<H: htui_core::store::WorkerHost, P: ReplySink>(
                 Err(err) => ctx.refuse(err.to_string()),
             }
         }
+        // MOD-42 B-20: every cancel of a live run is a durable command (D12).
+        OrchRequest::Command(Command::CancelRun { run }) => {
+            cancel_run(ctx, run, &live, None).await;
+        }
         OrchRequest::Command(command) => {
             let (run, preempt) = match &command {
-                Command::CancelRun { run } => (*run, Preempt::Always),
                 Command::PromoteStep { run, .. } => (*run, Preempt::IfLive),
                 Command::AnswerGate { run, .. }
                 | Command::RetryStep { run, .. }
                 | Command::SelectFanout { run, .. }
                 | Command::AcceptArtifact { run, .. } => (*run, Preempt::Never),
-                Command::StartRun { .. } | Command::Unblock { .. } | Command::CloseOut { .. } => {
+                Command::StartRun { .. }
+                | Command::Unblock { .. }
+                | Command::CloseOut { .. }
+                | Command::CancelRun { .. } => {
                     unreachable!("matched above")
                 }
             };
@@ -1880,11 +2033,11 @@ async fn run_request<H: htui_core::store::WorkerHost, P: ReplySink>(
 }
 
 /// Whether a command stops a live walk of its run before it waits for the lock (D157, D187).
+/// MOD-42 plan D11: the stop is graceful ([`Walks::preempt_gracefully`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Preempt {
-    /// `CancelRun`.
-    Always,
-    /// `PromoteStep`: only a walk of this process that is live.
+    /// `PromoteStep`, and `CancelRun` of a queued run (B-20): only a walk of this process that
+    /// is live.
     IfLive,
     /// Every other verb waits for the walk to rest.
     Never,
@@ -1949,6 +2102,11 @@ async fn start_run<H: htui_core::store::WorkerHost, P: ReplySink>(
             ctx.refuse(PREEMPTED.to_owned());
         }
         Some(Ok(outcome)) => ctx.done(outcome),
+        // MOD-42 B-3: a walk that stopped on its control was preempted, gracefully.
+        Some(Err(EngineError::Cancelled { .. })) => {
+            engine.abandoned(run).await;
+            ctx.refuse(PREEMPTED.to_owned());
+        }
         Some(Err(err @ EngineError::ClaimRefused { .. })) => {
             ctx.shared.queue(queued_at, run);
             // A task that ended during the claim may have found the queue still empty and
@@ -1986,13 +2144,11 @@ async fn on_run<H: htui_core::store::WorkerHost, P: ReplySink>(
             return ctx.refuse(refusal);
         }
     }
-    let stop = match preempt {
-        Preempt::Always => true,
-        Preempt::IfLive => ctx.shared.walks.is_live(run),
-        Preempt::Never => false,
-    };
-    if stop {
-        ctx.shared.walks.preempt(run);
+    if preempt == Preempt::IfLive && ctx.shared.walks.is_live(run) {
+        ctx.shared
+            .walks
+            .preempt_gracefully(run, ctx.shared.cancel_grace)
+            .await;
     }
     let walk = ctx.shared.walks.child(run);
     let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
@@ -2009,9 +2165,10 @@ async fn on_run<H: htui_core::store::WorkerHost, P: ReplySink>(
     let row = ctx.tag_run(&kit.writer, run).await.or(early);
     let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
     let engine = kit.engine(&driver);
-    let cancelling = matches!(command, Command::CancelRun { .. });
+    let promoting = matches!(command, Command::PromoteStep { .. });
     match walked(&walk, engine.dispatch(command)).await {
-        None => {
+        // MOD-42 B-3: a walk that stopped on its control was preempted, gracefully.
+        None | Some(Err(EngineError::Cancelled { .. })) => {
             engine.abandoned(run).await;
             ctx.refuse(PREEMPTED.to_owned());
         }
@@ -2075,15 +2232,173 @@ async fn on_run<H: htui_core::store::WorkerHost, P: ReplySink>(
             }
         }
         Some(Ok(outcome)) => ctx.done(outcome),
-        // OQ-4: on a `worker` box a live lease elsewhere is the box's worker walking the run.
+        // MOD-42 OQ-3: on a `worker` box a live lease elsewhere is the box's worker walking the
+        // run, and its live session cannot be handed to this process's chat.
         Some(Err(EngineError::LeaseHeld { run: held }))
-            if cancelling && kit.tails == Tails::HandBack =>
+            if promoting && kit.tails == Tails::HandBack =>
         {
-            ctx.refuse(worker_walks(held));
+            ctx.refuse(promote_needs_the_walker(held));
         }
         Some(Err(err)) => ctx.refuse(err.to_string()),
     }
     drop(guard);
+}
+
+/// MOD-42 plan D12: every cancel of a live run is a durable command its executor applies.
+///
+/// D212's chat check first, as [`on_run`]'s. A `queued` or terminal run (read before anything is
+/// written) takes today's path and writes no row (B-20). Otherwise the `run_command` row is
+/// written first (D12 step 2), then: this process walks the run → a graceful preempt (D11) and
+/// `cancel_leased` (step 3); the run executes on another box → left to that box, decided before
+/// `cancel_leased` (step 4); else `cancel_leased`, whose `LeaseHeld` leaves the row to the lease's
+/// holder (step 5). A row left pending is answered with [`CANCEL_REQUESTED`] (B-12).
+///
+/// `existing` is a polled row (D13): no second row is written for it, and a live chat's refusal
+/// leaves it pending, logged at `debug` and never published (B-10).
+async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: TaskCtx<H, P>,
+    run: RunId,
+    live: &LiveChats,
+    existing: Option<RunCommandId>,
+) {
+    let row = ctx.tag(run).await;
+    let command = Command::CancelRun { run };
+    if moves_the_run(&command) && !live.is_empty() {
+        let refusal = match ctx.host.run_steps(run).await {
+            Ok(steps) => chat_free(&steps, live).err().map(|err| err.to_string()),
+            Err(err) => Some(err.to_string()),
+        };
+        if let Some(refusal) = refusal {
+            if existing.is_some() {
+                tracing::debug!(%run, %refusal, "a polled cancel waits for the chat on its run");
+                return;
+            }
+            return ctx.refuse(refusal);
+        }
+    }
+    let Some(row) = row else {
+        return ctx.refuse(
+            StoreError::NotFound {
+                entity: "run",
+                id: run.to_string(),
+            }
+            .to_string(),
+        );
+    };
+    // B-20: a queued or terminal run takes today's path and writes no row. A queued run's own
+    // start task in this process is still stopped first (as `CancelRun` always did), gracefully.
+    if existing.is_none() && (row.status == RunStatus::Queued || row.status.is_terminal()) {
+        return on_run(ctx, run, command, Preempt::IfLive, live).await;
+    }
+    let Some(writer) = ctx.host.writer() else {
+        return ctx.refuse(DATABASE_UNREACHABLE.to_owned());
+    };
+    let (box_id, user) = match (registered_box(&ctx.host).await, ctx.host.this_user().await) {
+        (Ok(box_id), Ok(user)) => (box_id, user),
+        (Err(err), _) | (_, Err(err)) => return ctx.refuse(err.to_string()),
+    };
+    // D12 step 2: the row first.
+    let (id, already) = match existing {
+        Some(id) => (id, false),
+        None => {
+            match htui_core::store::WorkerStore::request_cancel(&writer, run, user, box_id).await {
+                Ok(CancelRequest::Inserted(id)) => (id, false),
+                Ok(CancelRequest::AlreadyPending(id)) => (id, true),
+                Err(err) => return ctx.refuse(err.to_string()),
+            }
+        }
+    };
+    // B-5: one task per row at a time.
+    let Some(_applying) = ctx.shared.applying(id) else {
+        return ctx.requested(true);
+    };
+    if ctx.shared.walks.is_live(run) {
+        // D12 step 3: this process walks it.
+        ctx.shared
+            .walks
+            .preempt_gracefully(run, ctx.shared.cancel_grace)
+            .await;
+    } else if row.executing_box_id != Some(box_id) {
+        // D12 step 4, decided before `cancel_leased` (whose refusal there is `RunStatus`).
+        return ctx.requested(already);
+    }
+    let walk = ctx.shared.walks.child(run);
+    let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
+        return ctx.refuse(PREEMPTED.to_owned());
+    };
+    let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {
+        Ok(kit) => kit,
+        Err(message) => return ctx.refuse(message),
+    };
+    let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
+    let engine = kit.engine(&driver);
+    let resolve = async |to: RunCommandStatus, why: Option<String>| {
+        match htui_core::store::WorkerStore::resolve_command(&kit.writer, id, to, why).await {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(%run, %id, "the cancel's row was resolved elsewhere"),
+            Err(err) => tracing::warn!(%run, %id, %err, "the cancel's row was not resolved"),
+        }
+    };
+    match walked(&walk, engine.dispatch(command)).await {
+        None => {
+            engine.abandoned(run).await;
+            ctx.refuse(PREEMPTED.to_owned());
+        }
+        Some(Ok(outcome)) => {
+            resolve(RunCommandStatus::Applied, None).await;
+            ctx.done(outcome);
+        }
+        // D12 step 5: a live lease elsewhere on this box (the worker): its poll applies it.
+        Some(Err(EngineError::LeaseHeld { .. })) => ctx.requested(already),
+        // D13, B-4: already terminal → refused with the actual status.
+        Some(Err(err @ EngineError::RunStatus { status, .. })) if status.is_terminal() => {
+            let sentence = err.to_string();
+            resolve(RunCommandStatus::Refused, Some(sentence.clone())).await;
+            ctx.refuse(sentence);
+        }
+        // Anything else is transient: the row stays pending and the next poll retries.
+        Some(Err(err)) => ctx.refuse(err.to_string()),
+    }
+    drop(guard);
+}
+
+/// MOD-42 plan D13: one command poll. Every pending row this process may apply
+/// (`pending_commands(owner, box)`, B-4), unless a task of this process is applying it already
+/// (B-5), runs as an internal cancel on a supervised task of its own.
+async fn poll_once<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: TaskCtx<H, P>,
+    live: LiveChats,
+) {
+    let Some(writer) = ctx.host.writer() else {
+        return;
+    };
+    let box_id = match registered_box(&ctx.host).await {
+        Ok(box_id) => box_id,
+        Err(err) => {
+            tracing::debug!(%err, "the command poll could not read this box");
+            return;
+        }
+    };
+    let rows =
+        match htui_core::store::WorkerStore::pending_commands(&writer, ctx.shared.owner, box_id)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(%err, "reading the pending run commands failed");
+                return;
+            }
+        };
+    for row in rows {
+        if ctx.shared.is_applying(row.id) {
+            continue;
+        }
+        let task = ctx.unaddressed("cancel_run");
+        let live = live.clone();
+        spawn_supervised(task.clone(), async move {
+            cancel_run(task, row.run_id, &live, Some(row.id)).await;
+        });
+    }
 }
 
 /// `Unblock` (D161): a reopen needs no run; the other two cases lock the run they name and check
@@ -2124,7 +2439,8 @@ async fn unblock<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, 
         return ctx.refuse(UNBLOCK_MOVED.to_owned());
     }
     match walked(&walk, engine.dispatch(Command::Unblock { item })).await {
-        None => {
+        // MOD-42 B-3: a walk that stopped on its control was preempted, gracefully.
+        None | Some(Err(EngineError::Cancelled { .. })) => {
             engine.abandoned(run).await;
             ctx.refuse(PREEMPTED.to_owned());
         }
