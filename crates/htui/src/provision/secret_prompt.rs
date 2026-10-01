@@ -80,18 +80,33 @@ pub enum KeyStep {
     Abort,
 }
 
-/// Applies `key` (press events only; release and repeat are `More`): a character pushes, Backspace
-/// pops, `Enter` is `Done`, `Esc` and `Ctrl-C` are `Abort`.
+/// Applies `key` (press events only; release and repeat are `More`): a character typed with at most
+/// `Shift` pushes, Backspace pops, `Enter` is `Done`, `Esc` is `Abort`. Raw mode delivers control
+/// bytes as `Ctrl`+letter, which are read like sudo's own prompt: `Ctrl-H` erases, `Ctrl-U` kills
+/// the line, `Ctrl-J` (a raw newline) ends it, `Ctrl-C` and `Ctrl-D` abort; any other `Ctrl`- or
+/// `Alt`-modified key is ignored, never typed.
 #[must_use]
 pub fn apply_key(buffer: &mut Zeroizing<String>, key: &KeyEvent) -> KeyStep {
     if key.kind != KeyEventKind::Press {
         return KeyStep::More;
     }
+    let typed = KeyModifiers::SHIFT.contains(key.modifiers);
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Enter => KeyStep::Done,
         KeyCode::Esc => KeyStep::Abort,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyStep::Abort,
-        KeyCode::Char(c) => {
+        KeyCode::Char('c' | 'd') if ctrl => KeyStep::Abort,
+        KeyCode::Char('j') if ctrl => KeyStep::Done,
+        KeyCode::Char('h') if ctrl => {
+            buffer.pop();
+            KeyStep::More
+        }
+        KeyCode::Char('u') if ctrl => {
+            // Wipes the bytes in place; the capacity stays.
+            zeroize::Zeroize::zeroize(&mut **buffer);
+            KeyStep::More
+        }
+        KeyCode::Char(c) if typed => {
             if buffer.len() + c.len_utf8() > PASSWORD_MAX {
                 return KeyStep::Abort;
             }
@@ -170,6 +185,47 @@ mod tests {
             capacity,
             "the cap keeps the buffer in place"
         );
+    }
+
+    /// Raw mode turns control bytes into `Ctrl`+letter (crossterm 0.29): `^H` erases, `^U` kills
+    /// the line, `^D` and `^J` end it like sudo's own prompt, and no other modified key is typed.
+    #[test]
+    fn apply_key_never_types_a_ctrl_or_alt_key() {
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let mut typed = buffer();
+        for c in ['p', 'w', 'x'] {
+            assert_eq!(
+                apply_key(&mut typed, &press(KeyCode::Char(c))),
+                KeyStep::More
+            );
+        }
+        assert_eq!(apply_key(&mut typed, &ctrl('h')), KeyStep::More);
+        assert_eq!(typed.as_str(), "pw", "Ctrl-H erases like Backspace");
+        for c in ['w', 'z', 'a', '4', ' '] {
+            assert_eq!(apply_key(&mut typed, &ctrl(c)), KeyStep::More);
+        }
+        let alt = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
+        assert_eq!(apply_key(&mut typed, &alt), KeyStep::More);
+        let ctrl_shift = KeyEvent::new(
+            KeyCode::Char('W'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(apply_key(&mut typed, &ctrl_shift), KeyStep::More);
+        assert_eq!(typed.as_str(), "pw", "no modified key is typed");
+
+        let capacity = typed.capacity();
+        assert_eq!(apply_key(&mut typed, &ctrl('u')), KeyStep::More);
+        assert!(typed.is_empty(), "Ctrl-U kills the line");
+        assert_eq!(typed.capacity(), capacity, "in place");
+        assert_eq!(
+            apply_key(&mut typed, &press(KeyCode::Char('q'))),
+            KeyStep::More
+        );
+        assert_eq!(apply_key(&mut typed, &ctrl('j')), KeyStep::Done);
+        assert_eq!(typed.as_str(), "q", "Ctrl-J (a raw newline) ends it");
+
+        let mut typed = buffer();
+        assert_eq!(apply_key(&mut typed, &ctrl('d')), KeyStep::Abort);
     }
 
     #[test]
