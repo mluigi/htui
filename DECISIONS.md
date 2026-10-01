@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[ANA-27](docs/decisions/ana/ana-27.md)** - OpenRig survey: ideas and concepts to assimilate (concluded, 2026-10-01)
 - **[ANA-23](docs/decisions/ana/ana-23.md)** - Pure-Rust local embedder to replace `ort`/`fastembed` (concluded, 2026-10-01)
 - **[MOD-45](docs/decisions/mod/mod-45.md)** - Remote box provisioning over SSH (done, 2026-10-01)
 - **[MOD-51](docs/decisions/mod/mod-51.md)** - `box_probe_spec` editor in the Settings box section (done, 2026-10-01)

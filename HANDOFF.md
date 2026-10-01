@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-01):** **ANA-23 is concluded** (`docs/ANA-23.md`,
+**Current status (2026-10-01):** **ANA-27 is concluded** (`docs/ANA-27.md`,
+`docs/decisions/ana/ana-27.md`): OpenRig's LLM lead, durable specialist sessions and tmux
+transport are rejected on recorded decisions (`R-ID-6`, `R-PRM-1`, `R-ID-2`); the discipline around
+its durable rows is taken as ANA-27 notes on MOD-42, MOD-43, MOD-37, MOD-27, MOD-26, MOD-16 and
+MOD-24. Spawned MOD-69 (waiting-on-you list across items; proposed `R-TUI-11` awaits the
+maintainer).
+Before it, **ANA-23 was concluded** (`docs/ANA-23.md`,
 `docs/decisions/ana/ana-23.md`): `fastembed`/`ort` gives way to `rten`, a pure-Rust ONNX runtime
 that runs the same BGE-small ONNX file with no native runtime fetched at build time and no C
 compiler for the embedder, at 1.29x fastembed's time on htui's per-item calls. The stored Qdrant
@@ -28,12 +34,6 @@ Four ssh sessions (preflight, prepare, install, verify) ship the local build, en
 wait for the box to check in and set its executor to `worker`. The TUI gained `--dsn-stdin` for
 agent login over `ssh -t`; `R-STO-1` was amended. No migration. **The live check on a real host is
 the maintainer's** (write-up § Not done here).
-Before it, **MOD-51 was done** (`docs/decisions/mod/mod-51.md`): Settings >
-Boxes edits the `box_probe_spec` overlay. `s` opens a JSON editor and `ctrl-s` saves it as a
-compare-and-set on `app_setting.updated_at` through `WriteStore::set_box_probe_spec`. The worker
-refuses any overlay the probe would ignore (`spec::check`, the probe's own merge) before it writes,
-a blank save clears the row, and the next `p` or connect re-probes under the new digest. No
-migration, no `.sqlx` change.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -138,20 +138,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   automatically. The fit is deterministic arithmetic over rows, so it is allowed under `R-ID-6`.
   Judge choice itself is out of scope: ANA-21 §2.2 established the judge is never asked of the
   selector, and MOD-36 owns the judge-identity hardening.
-- [ ] **ANA-27 - OpenRig survey: ideas and concepts to assimilate.** Survey OpenRig
-  (https://openrig.dev/, `@openrig/cli`), a Node/tmux CLI where a team of Claude Code and Codex
-  agents is declared in a file: one lead agent delegates to durable specialists that own tasks
-  (`rig queue`), consults them directly without creating a task (`rig send`), and spawns
-  temporary subagents for bounded work, all inside a "pod", with a TUI for workspace visibility.
-  1. Pin down its model from the source and docs: licence and repo, the team-definition file
-     format, how the lead/specialist/subagent lifecycle and task ownership work, the transport
-     (tmux panes, queue, messages), and how it reports progress and recovers from crashes.
-  2. Compare each concept with what htui already has or has planned: the orchestrator and
-     run_step fan-out, weighted agent assignment (MOD-36), personas (MOD-26), swarm (MOD-27), the
-     permission relay (MOD-42), worker crash recovery (MOD-24), and the Runs pane.
-  3. Verdict: list the ideas worth taking, each with a fit note and either a proposed MOD item or
-     an amendment to an existing open item, and list the ideas rejected, with reasons. Blocked on
-     nothing.
 ### Next features
 - [ ] **MOD-37 - Orchestrator hardening follow-ups** (from MOD-4). `R-ORCH-3`, `R-ORCH-5`,
   `R-ORCH-8`, `R-ORCH-9`, `R-TUI-4`, `R-HIS-1`, `R-NF-3`. MOD-4 closed with these risks carried and
@@ -203,6 +189,13 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
     promoted ACP step always gets the handoff prompt and a fresh model context. It needs ACP
     `session/load`. The blueprint named "a MOD-2 follow-up" as the owner, and MOD-2 is closed (drive
     blueprint §18).
+    ANA-27 (`docs/ANA-27.md` §5.1 T5): until ACP `session/load` lands, a promotion that was not
+    resumed says so. When `promote::opening_kind` chooses `Handoff`, or when the CLI driver's
+    `--resume` fails, the step gets a note ("context not carried; handoff prompt only") that the
+    Runs pane and the Chat tab show, so a fresh context is never mistaken for a resumed one. A
+    failed CLI `--resume` is reported, never silently replaced by a fresh session. Do not key the
+    note on `DriverCaps.resume`: for ACP rows it comes from `settings.acp.session.resume`, which
+    defaults to `true` (`crates/htui-agent/src/registry.rs:165`).
   - **R-49**: a promoted chat works in the step's tree without the `shared_serialized` `(box, repo)`
     guard. The guard was released at `capture` or by `abandoned`, so another run may `prepare` the
     same checkout meanwhile. The fix is to take the guard again in `attach_promoted` (drive
@@ -224,6 +217,12 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
     frames sent in between are dropped from the view as stale while the store keeps recording them.
     A promotion refused at the bind is already handed the stream (blueprint D185); the interval
     before the follow is served is not covered (T7 repair `9f7cc5c`, `agent_worker.rs` `Stream`).
+  - **Deadline (from ANA-27, `docs/ANA-27.md` §5.1 T4)**: `deadline_seconds` limits the verify
+    command (which gets what is left of the step deadline) and is checked when a step settles
+    (`crates/htui-orch/src/gate.rs` `deadline_elapsed`), but nothing times the agent session:
+    `drive_once` starts no timer, so a hung session holds its slot until the per-run cap or a human
+    cancel. The fix is a timer in the walk that cancels through R-38's seam and settles the step as
+    `DeadlineElapsed`.
 - [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
   OQ-7; ANA-21 is done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`,
   `R-ORCH-7`. Milestone 4 runs every candidate of a group on the
@@ -249,7 +248,31 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 - [ ] **MOD-26 - Declarative Agent Personas (from ANA-13).** Build Markdown/Frontmatter parser in `htui-core`, discover from `~/.config/htui/agents.d/`, map to `SessionSpec` overrides (model, tools).
   **Relates to ANA-16** (`docs/ANA-16.md` §6.2, §8): personas should be registry rows rather than a
   per-box directory, so they are distributed like the rest of the config (MOD-48).
+  **ANA-27 note (2026-10-01, `docs/ANA-27.md` §5.1 T9):** taking its cue from OpenRig's AgentSpec
+  rule that profiles "filter. They never inject", htui goes further and makes a persona narrow-only:
+  its tool allow-list is a subset of the exposure the step would get, and its permission rules are
+  no looser than the default. Unknown frontmatter keys are refused at save. Precedence is fixed and
+  written down: agent row, then persona, then the phase candidate's `model`. The body is a block
+  htui inlines into the step prompt (`R-ID-5`, `R-PRM-1`), not a file handed to the agent. ANA-13
+  §3.1's "`DriverCaps` overrides" reads as `SessionSpec` overrides, since `DriverCaps` are transport
+  facts. Cites `R-AGT-4`, `R-ID-3`, `R-ID-5`, `R-PRM-1`.
 - [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`); the MCP half needs MOD-11.
+  **ANA-27 note (2026-10-01, `docs/ANA-27.md` §5.1 T6-T7):** settle in the PRD, from OpenRig's queue
+  and workflow runtime: (1) **The swarm baton is a typed exit.** An agent yields with one exit from
+  a closed set the step declares (`handoff` to a named persona, `done`, `blocked` on an item,
+  `failed`), validated by code. The orchestrator closes the step and creates the next step row in
+  one transaction, and a per-run hop cap stops cycles. The agent proposes, the code records
+  (`R-ID-6`, ANA-2 invariant 3). Each yield starts a new step with its own fresh session fed by
+  documents (`R-PRM-1`). This overrides ANA-13 §3.3's "the orchestrator maintains a single shared
+  context window" (`docs/ANA-13.md:59`), and the PRD must settle that conflict explicitly. (2)
+  **`spawn_subagent` has a consult mode.** A read-only child, with no tree and no output document,
+  returns its answer as the tool result. It is still its own `run_step` with `parent_step_id`,
+  recorded and replayable (`R-HIS-1`, `R-HIS-2`), and draws on its own agent's quota (`R-AGT-7`).
+  This is htui's form of OpenRig's `rig send`, without a bus (ANA-13 §3.3). (3) Open for the PRD:
+  depth and breadth limits against `max_agents_per_run`; how a child fits `UNIQUE (run_id, position,
+  attempt, fanout_index)`; crash recovery of a child under ANA-2 §4.9; and whether graph steps deny
+  the harness's own subagent tool, whose sessions htui never sees. Cites `R-MCP-2`, which already
+  lists the tool.
 - [ ] **MOD-60 - Display width in every hand-laid-out row** (from MOD-54, plan D18). `R-TUI-1`,
   `R-NF-1`. MOD-54 made `TextField` and `TextArea` count cells instead of code points through
   `crate::ui::cells`; every other place that lays text out in `char`s has the identical class of
@@ -439,6 +462,13 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   whether MOD-22's loopback paste-back completes a login from a Windows box, and whether
   `htui worker`'s Windows stop path (Ctrl-Break, closing the console, a system shutdown;
   `docs/htui-worker.md`) cancels its walks and gives their leases back as it does on SIGTERM.
+  **ANA-27 note on R-10 (2026-10-01, `docs/ANA-27.md` §5.1 T10):** if R-10 picks the pid-and-signal
+  design, record the agent child's pid **and its start time** in `session_started`, and signal on
+  adoption only when both still match. A reused pid then fails the match instead of receiving the
+  signal. This does not remove the need for `unsafe` or a dependency to send the signal, and the
+  death-signal alternative avoids the reused-pid hazard entirely. OpenRig treats pid plus start time
+  as a process's identity in the same way (an argv token match, then a lineage fingerprint including
+  `lstart` compared across two `ps` observations).
 
 - [ ] **MOD-66 - Per-box manual tool path editor in Settings > Agents** (from MOD-23, plan OQ-3).
   `R-AGT-6`. ANA-4 §4.6 (`docs/ANA-4.md:796-798`) describes a per-box manual entry: write
@@ -473,6 +503,11 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   leaves its run row open, and closing it is recovery work.
   Not blocked (MOD-41 is done). Relates to ANA-16 (`docs/ANA-16.md` §8), which flagged the
   conflict this decision settles.
+  **ANA-27 note (2026-10-01, `docs/ANA-27.md` §5.1 T11):** run (2) at fixed kill points reached
+  through a `testkit` hook, not after a sleep: after the session starts and before its first flush;
+  after a flush; after capture and before the output document; and after the document. Once MOD-42
+  lands, add a kill between a command row's commit and its notification, which the poll backstop
+  must still apply.
 
 - [ ] **MOD-42 - Permission and control relay through Postgres** (from ANA-16, §8 item 3).
   `R-AGT-1`, `R-HIS-1`, `R-TUI-6`. The engine's `pump` (`crates/htui-agent/src/record.rs:1854-1873`) cannot answer a
@@ -486,11 +521,35 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   engine still drives a graph step through `pump` (`crates/htui-orch/src/engine.rs:5666`, `pump` at
   `crates/htui-agent/src/record.rs:1854-1873`) with the default `PermissionPolicy`, so engine-driven
   ACP steps still fail on their first permission request. The MOD-4 (M6) dependency is met.
+  **ANA-27 note (2026-10-01, `docs/ANA-27.md` §5.1 T1-T2):** OpenRig's queue and prompt rules settle
+  three points for the PRD. (1) A command or answer row is the obligation, and a `NOTIFY` carries
+  only its id. The worker applies each row at most once, keyed by id and stamped when applied. The
+  poll backstop picks up any row whose notification was lost, including one committed just before a
+  crash. (2) A `permission_answer` names the `permission_request` it answers. An answer to a request
+  that is already answered, or whose session is gone, is refused and recorded. It is never applied
+  to whatever request is open now. (3) A request is answered only by a person (a TUI-written row),
+  by a configured `PermissionPolicy` rule or remembered answer, or by a code-issued cancellation
+  (`AgentSession::cancel` answers every outstanding request `cancelled`, which MOD-37 R-38 relies
+  on). The existing `permission_answer.by` column says which (`record.rs:207-220`); a cancellation
+  is recorded as `Policy` today (`record.rs:217`), and the PRD decides whether it gets its own
+  variant. No agent answers another session's request, including a MOD-27 parent answering its
+  child. A timeout never allows an unanswered request. The sources do not say what happens to a
+  request nobody answers; whether it fails the step after a window is the PRD's call. Open requests
+  are counted from the rows (requests without an answer, with the tool as the reason) rather than
+  added as a step status; MOD-43 and MOD-69 read that count.
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
   until its worker claims it; the Runs view follows `session_event` by `seq` with `LISTEN`/`NOTIFY`
   hints and a poll backstop, and shows worker liveness. Blocked on MOD-42, and MOD-12 for
   auto mode.
+  **ANA-27 note (2026-10-01, `docs/ANA-27.md` §5.1 T3):** the liveness the Runs view shows is
+  derived from rows at read time, never reported by the agent, and "unknown" is a value. Per running
+  step: *working* (a `session_event` within a window), *quiet* (none within it), *waiting on you*
+  (MOD-42's open permission requests, with count and tool), *overdue* (past `deadline_seconds`;
+  display only until MOD-37's deadline entry lands), and *unknown* (the run's lease holder has not
+  refreshed within the TTL). Per run: *queued, no worker* when the target box's worker has not
+  checked in (`docs/htui-worker.md`, "the pane cannot tell you why"). The windows are settings, and
+  each label shows the age of the evidence behind it.
 - [ ] **MOD-44 - Container execution environment** (from ANA-16, §8 item 5). `R-BOX-1..3`,
   `R-AGT-5`, `R-AGT-6`, `R-AGT-9`, `R-SEC-2`, `R-MCP-1`, `R-NF-1`, `R-NF-2`. A child `box` of kind
   `container` with its own id and hostname; probe, install and auth inside the image; one container
@@ -582,6 +641,18 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   explicit thread pool, `i32` inputs, padded tokens capped per call), the fetch, the model identity
   recorded and checked on connect, and the removal of `fastembed`. Build the embedder on Windows and
   macOS before removing fastembed; tract-onnx is the fallback. Not blocked.
+- [ ] **MOD-69 - Waiting-on-you list across items** (from ANA-27, `docs/ANA-27.md` §5.1 T8,
+  `docs/decisions/ana/ana-27.md`). `R-TUI-1`, `R-TUI-4`, `R-ORCH-2`, `R-ORCH-4`, `R-NF-3`. The Runs
+  pane shows what waits on a person only for the selected item, and the top bar counts active runs,
+  so with several items running a parked gate, a fan-out awaiting selection, a judge park or a
+  blocked run is found by visiting items one by one. Add an overlay, opened from every screen, that
+  lists every run in the active workspace waiting on a person, one row per reason (gate, selection,
+  judge failure, unblock, and, once MOD-42 lands, each open permission request with its tool), read
+  by one store query. `Enter` opens the item's Runs pane on that step, and the top bar gains the
+  count. The list is derived at read time and keeps no state of its own; MOD-12's planned escalation
+  list can reuse the query, and the opening key is a MOD-67 action. **Open question for the
+  maintainer:** it needs the proposed `R-TUI-11` and the matching `R-TUI-1` top-bar line (ANA-27
+  §7), not yet applied. Not blocked; the permission rows are added after MOD-42.
 
 ### Deferred backlog
 
@@ -602,7 +673,7 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 3 (ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-27 OpenRig survey) |
-| MOD-N   | 27 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys, MOD-68 rten embedder; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 2 (ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
+| MOD-N   | 28 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys, MOD-68 rten embedder, MOD-69 waiting-on-you list; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |
