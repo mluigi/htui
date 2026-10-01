@@ -109,7 +109,8 @@ which                 = "8.0.6"
 # (`regex 1.13.1`, `semver 1.0.28`), so declaring them adds no compiled crate.
 regex                 = "1.13"
 semver                = "1.0"
-# MOD-20 (plan D9): the installer's HTTP client. `default-features = false` is load-bearing
+# MOD-20 (plan D9): the installer's HTTP client, and since MOD-68 (D6) `htui-store`'s first-use
+# model fetch (`model::ensure_model`) too. `default-features = false` is load-bearing
 # (`default` = default-tls + charset + http2 + system-proxy). `rustls-no-provider` keeps ring —
 # sqlx's provider — the only one in the process; `install/http.rs` installs it explicitly, because
 # reqwest does **not** infer the single enabled provider and `Client::build` panics without one.
@@ -141,8 +142,6 @@ rten                  = { version = "0.26.0", default-features = false, features
 rten-tensor           = "0.26.0"
 # `fancy-regex`, not the default `onig`: no C build (ANA-23 §5.2).
 tokenizers            = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
-fastembed             = "3.14.1"
-ureq                  = { version = "2.12.1", features = ["tls"] }
 walkdir               = "2"
 # MOD-4 milestone 3 (plan D22, D47): every read and every ref write of the isolator. No default
 # features: `sha1` is the only one of them we need and is named explicitly. The five that remain
