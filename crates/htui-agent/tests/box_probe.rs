@@ -27,8 +27,8 @@ use htui_agent::box_probe::hardware::{
 #[cfg(target_os = "linux")]
 use htui_agent::box_probe::hardware::{HardwareSource, SystemHardware};
 use htui_agent::box_probe::spec::{
-    EffectiveSpec, Fact, GpuVendor, SETTING_KEY, SPEC_IGNORED, Spec, TagRule, digest, effective,
-    seed, validate,
+    EffectiveSpec, Fact, GpuVendor, SETTING_KEY, SPEC_IGNORED, SPEC_REFUSED, Spec, TagRule, check,
+    digest, effective, seed, validate,
 };
 // `tags_from_presence` is called by path: the blueprint names its test after it.
 #[cfg(unix)]
@@ -140,6 +140,18 @@ fn assert_refused(stored: &Value, needle: &str) {
         "the sentence starts with the prefix: {error}"
     );
     assert!(error.contains(needle), "`{error}` names `{needle}`");
+}
+
+/// The fault [`effective`] reports for `stored`, without its [`SPEC_IGNORED`] prefix: the text
+/// [`check`] must answer for the same overlay (MOD-51 D3).
+fn same_fault(stored: &Value) -> String {
+    let error = effective(seed(), Some(stored))
+        .error
+        .expect("`effective` ignores the overlay");
+    error
+        .strip_prefix(&format!("{SPEC_IGNORED}: "))
+        .unwrap_or_else(|| panic!("`{error}` starts with the ignore prefix"))
+        .to_owned()
 }
 
 /// Asserts `stored` merged cleanly and returns the merged spec.
@@ -948,6 +960,73 @@ fn the_digest_is_stable_and_changes_with_the_spec() {
             .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
         "{hex}"
     );
+}
+
+/// MOD-51 D3: `check` accepts exactly what `effective` merges, answering the digest the next
+/// probe records.
+#[test]
+fn check_accepts_what_effective_merges_with_the_same_digest() {
+    assert_eq!(check(&json!({})), Ok(digest(seed())));
+    let accepted = [
+        json!({}),
+        json!({"tools": {"terraform": {
+            "kind": "path",
+            "names": ["terraform"],
+            "version": {"args": ["version"], "pattern": "^Terraform v(\\S+)$"}
+        }}}),
+        json!({"tools": {"cmake": {"disabled": true}}}),
+        json!({"tags": [
+            {"tag": "docker", "any_tool": ["podman"]},
+            {"tag": "zig", "any_tool": ["zig"]}
+        ]}),
+    ];
+    for overlay in &accepted {
+        let effective = effective(seed(), Some(overlay));
+        assert_eq!(effective.error, None, "`effective` merges {overlay}");
+        assert_eq!(check(overlay), Ok(effective.digest), "for {overlay}");
+    }
+}
+
+/// MOD-51 D3: `check` refuses exactly what `effective` ignores, with the fault `effective` puts
+/// after [`SPEC_IGNORED`], and the fault names its key.
+#[test]
+fn check_refuses_what_effective_ignores_with_the_same_fault() {
+    let refused = [
+        (json!(42), "not a JSON object"),
+        (json!({"nope": 1}), "`nope`"),
+        (
+            json!({"tools": {"x": {"kind": "path", "names": ["bin/x"]}}}),
+            "bin/x",
+        ),
+        (
+            json!({"tools": {"x": {
+                "kind": "path", "names": ["x"], "version": {"args": [], "pattern": "("}
+            }}}),
+            "tools.x.version.pattern",
+        ),
+        (
+            json!({"tags": [{"tag": "t", "any_tool": ["nosuch"]}]}),
+            "nosuch",
+        ),
+        (
+            json!({"tools": {"myglob": {"kind": "glob", "patterns": ["~/bin/x"]}}}),
+            "myglob",
+        ),
+    ];
+    for (overlay, needle) in &refused {
+        let fault = check(overlay).expect_err("`check` refuses it");
+        assert_eq!(fault, same_fault(overlay), "for {overlay}");
+        assert!(fault.contains(needle), "`{fault}` names `{needle}`");
+    }
+}
+
+/// MOD-51 D3: a refused edit and an ignored overlay start differently, both with the key.
+#[test]
+fn the_refusal_prefix_is_not_the_ignore_prefix() {
+    assert_eq!(SPEC_REFUSED, "box_probe_spec refused");
+    assert_ne!(SPEC_REFUSED, SPEC_IGNORED);
+    assert!(SPEC_REFUSED.starts_with(SETTING_KEY));
+    assert!(SPEC_IGNORED.starts_with(SETTING_KEY));
 }
 
 // ---------------------------------------------------------------------------------------------

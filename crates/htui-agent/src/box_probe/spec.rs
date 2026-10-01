@@ -10,7 +10,7 @@
 //! a vendor. The overlay is all or nothing: one fault and the seed is probed alone, with a sentence
 //! saying why (blueprint D23).
 //!
-//! Milestone 1's edit path is SQL. Add a tool:
+//! Milestone 1's edit path was SQL, and still works. Add a tool:
 //!
 //! ```sql
 //! INSERT INTO app_setting (key, value) VALUES ('box_probe_spec', '{"tools": {"terraform": {"kind": "path", "names": ["terraform"], "version": {"args": ["version"], "pattern": "^Terraform v(\\S+)$"}}}}'::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
@@ -22,6 +22,10 @@
 //! ```sql
 //! DELETE FROM app_setting WHERE key = 'box_probe_spec';
 //! ```
+//!
+//! Since MOD-51 the maintainer's path is `Settings > Boxes`, `s`: a JSON editor over this row,
+//! saved as a compare-and-set on its `updated_at`, refusing (through [`check`]) every overlay the
+//! probe would ignore.
 //!
 //! An overlay may add only `kind: "path"` tools whose `names` are bare file names (no separator,
 //! no `..`): `node_package` and `glob` stay agent-row mechanisms (plan D9, R-11).
@@ -49,6 +53,11 @@ pub const SETTING_KEY: &str = htui_core::model::BOX_PROBE_SPEC_KEY;
 
 /// The first words of every overlay refusal (blueprint D23).
 pub const SPEC_IGNORED: &str = "box_probe_spec ignored";
+
+/// The first words of an overlay the `Settings > Boxes` editor tried to store and the worker
+/// refused before any write (MOD-51 D3). [`SPEC_IGNORED`] is the probe-time twin: the same
+/// fault sentence follows either prefix.
+pub const SPEC_REFUSED: &str = "box_probe_spec refused";
 
 /// The probe spec: tools, tag rules and the GPU vendor map (plan D9). The compiled `spec.json` is
 /// the seed; a stored overlay is merged into it by name ([`effective`]).
@@ -163,6 +172,22 @@ pub fn effective(seed: &Spec, stored: Option<&Value>) -> EffectiveSpec {
             }
         }
     }
+}
+
+/// Whether the probe would run under `overlay` (MOD-51 D3): the same `merge` into the seed
+/// that [`effective`] runs, so the editor refuses exactly the overlays the probe would ignore,
+/// with the probe's own sentence. Pure and **silent**: unlike [`effective`] it logs nothing,
+/// because a refused edit is not a probe event.
+///
+/// Answers the merged spec's [`digest`], which is what the next probe records.
+///
+/// # Errors
+///
+/// The first fault, as one sentence naming its key, **without** a prefix: the worker puts
+/// [`SPEC_REFUSED`] in front of it, and [`effective`] puts [`SPEC_IGNORED`] in front of the
+/// same text.
+pub fn check(overlay: &Value) -> Result<String, String> {
+    merge(seed(), overlay).map(|spec| digest(&spec))
 }
 
 /// `htui_core::prompt::digest::sha256_hex(&serde_json::to_string(spec))` (D24): over the merged
