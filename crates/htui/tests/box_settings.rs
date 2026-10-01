@@ -387,6 +387,24 @@ async fn clearing_under_the_token_answers_boxes_with_no_stored_overlay() {
     assert_eq!(cleared.spec.digest, spec::digest(spec::seed()));
 }
 
+/// MOD-51 D2, D4, review LOW-2: an update under the token of a row cleared meanwhile answers
+/// `BoxesStale` with no stored row, so the editor retries as an insert; nothing is written.
+#[tokio::test]
+async fn set_probe_spec_on_a_vanished_row_answers_boxes_stale_with_no_stored_overlay() {
+    let backend = demo();
+    let inserted = boxes(serve(&backend, &set_spec(Some(terraform_spec()), None)).await);
+    let token = spec_token(&inserted);
+    let cleared = boxes(serve(&backend, &set_spec(None, Some(token))).await);
+    assert_eq!(cleared.spec.stored, None);
+
+    let snapshot = stale(serve(&backend, &set_spec(Some(json!({})), Some(token))).await);
+    assert_eq!(snapshot.spec.stored, None, "the row is gone");
+    assert!(!snapshot.spec.overlay);
+
+    let read = boxes(serve(&backend, &StoreRequest::Boxes).await);
+    assert_eq!(read.spec.stored, None, "nothing was written");
+}
+
 /// MOD-51 D2: a clear with no token is the store's `Constraint`, bubbled to `Failed` under the
 /// request's name (the checker has nothing to check in a clear).
 #[tokio::test]
@@ -439,8 +457,9 @@ async fn a_stored_overlay_the_probe_ignores_carries_its_token_and_clears() {
 }
 
 /// Offline, all three are refused by their own names with MOD-25's sentence: `Backend::writer()`
-/// is `None`, so `serve` never reaches the seam (nor, for `SetProbeSpec`, the checker), the read
-/// included. The length assertion keeps the `zip` from dropping a request (MOD-51 F-7).
+/// is `None`, so `serve` never reaches the seam (nor, for `SetProbeSpec`, the checker: the overlay
+/// sent is one the checker refuses, review LOW-3), the read included. The length assertion keeps
+/// the `zip` from dropping a request (MOD-51 F-7).
 #[tokio::test]
 async fn offline_every_box_request_is_refused_with_the_database_sentence() {
     let root = tempfile::tempdir().expect("a throwaway config root");
@@ -459,8 +478,12 @@ async fn offline_every_box_request_is_refused_with_the_database_sentence() {
     let requests = [
         StoreRequest::Boxes,
         edit(ids::BOX, 0, Some(&["gpu"]), None),
-        set_spec(Some(terraform_spec()), None),
+        set_spec(Some(json!({ "nope": 1 })), None),
     ];
+    assert!(
+        spec::check(&json!({ "nope": 1 })).is_err(),
+        "the overlay sent offline is one the checker refuses"
+    );
     assert_eq!(requests.len(), REQUEST_NAMES.len(), "one request per name");
     for (request, name) in requests.into_iter().zip(REQUEST_NAMES) {
         let (refused, message) = refusal(serve(&backend, &request).await);
@@ -468,6 +491,10 @@ async fn offline_every_box_request_is_refused_with_the_database_sentence() {
         assert!(
             message.contains(DATABASE_UNREACHABLE),
             "`{name}` is refused with MOD-25's sentence: {message}"
+        );
+        assert!(
+            !message.contains(spec::SPEC_REFUSED),
+            "`{name}` is refused offline before the checker: {message}"
         );
     }
 }
@@ -1437,8 +1464,7 @@ async fn s_opens_the_spec_editor_over_the_pretty_printed_overlay() {
     for expected in [
         "\"terraform\": {",
         "\"kind\": \"path\"",
-        "stored overlay (app_setting.box_probe_spec), merged into the seed by name; \
-         blank clears it",
+        "stored overlay box_probe_spec, merged into the seed by name; blank clears it",
         "probe spec: seed + stored overlay \u{b7} ",
     ] {
         assert!(frame.contains(expected), "`{expected}` in {frame}");
@@ -1833,7 +1859,7 @@ async fn no_editor_opens_across_the_two_writes() {
     bench.key(&mut section, "ctrl-s");
     only_spec(&requests(&bench));
     bench.key(&mut section, "esc");
-    for key in ["t", "e", "w"] {
+    for key in ["t", "e", "w", "s"] {
         bench.key(&mut section, key);
         assert!(!section.captures_input(), "{key} opened nothing");
         let frame = bench.render_section(&section, 100);

@@ -1169,7 +1169,8 @@ pub enum StoreReply {
     /// or probe spec write that applied (MOD-7 milestone 2, D46; MOD-51 D4).
     Boxes(Box<BoxesSnapshot>),
     /// A box edit or a probe spec write missed its token, or its row is gone (D46, D48; MOD-51
-    /// D4): the boxes as they are now, for the editor to reload against. The editor keeps its typed text and retries only on save.
+    /// D4): the boxes as they are now, for the editor to reload against. The editor keeps its
+    /// typed text and retries only on save.
     BoxesStale(Box<BoxesSnapshot>),
     /// The answer to every agent registry write (MOD-23 D240): the registry re-read after the
     /// write, and what the write did. Self-naming (MOD-59): the Settings section lands a write on

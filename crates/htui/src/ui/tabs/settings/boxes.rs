@@ -18,7 +18,9 @@
 //! nothing was written and how to retry. For a probe spec save the early close also shows
 //! `SPEC_SAVED` and loses the typed text, as for `edit_box`; the real reply's notice then
 //! replaces it (`CHANGED_ELSEWHERE_CLOSED`, or the refusal's sentence), and nothing is written
-//! wrongly (MOD-51 F-11, blueprint R-1).
+//! wrongly (MOD-51 F-11, blueprint R-1). The same race can also land a tags or quirks save's
+//! `BoxesStale` in the probe spec editor's branch (opened after the early close), refreshing the
+//! spec token; nothing is written wrongly either (MOD-51 LOW-5).
 
 use htui_core::model::{
     BoxId, BoxRecord, Executor, Scope, canonical_declared_tags, declared_tags_from_text,
@@ -81,8 +83,9 @@ const HINT_SPEC: &str =
     "ctrl-s saves \u{b7} Esc cancels \u{b7} Enter breaks the line \u{b7} blank clears";
 
 /// The dim line above the probe spec editor: what the text is, and what blank does (MOD-51 D6).
+/// It fits a 78-column body unclipped.
 const SPEC_TITLE: &str =
-    "stored overlay (app_setting.box_probe_spec), merged into the seed by name; blank clears it";
+    "stored overlay box_probe_spec, merged into the seed by name; blank clears it";
 
 /// A probe spec save applied (MOD-51 D6, D8): nothing re-probes now; the next `p` or connect does.
 const SPEC_SAVED: &str =
@@ -749,13 +752,11 @@ impl SettingsSection for BoxesSection {
                 self.unavailable = Some(message.clone());
             }
             // A refused write: the editor stays open over its text, and a second save retries.
-            StoreReply::Failed { request, message } if *request == EDIT_NAME => {
-                self.busy = None;
-                self.notice = Some(message.clone());
-            }
-            // A refused probe spec save (MOD-51 D6): the same, with the probe's own sentence when
-            // the overlay was refused (D3) or the store's when the write was.
-            StoreReply::Failed { request, message } if *request == SPEC_NAME => {
+            // For a probe spec save (MOD-51 D6) the sentence is the probe's own when the overlay
+            // was refused (D3), the store's when the write was.
+            StoreReply::Failed { request, message }
+                if *request == EDIT_NAME || *request == SPEC_NAME =>
+            {
                 self.busy = None;
                 self.notice = Some(message.clone());
             }

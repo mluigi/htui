@@ -51,7 +51,7 @@ async fn demo_store_loads_the_fixture() {
          six for the step fence (plan D1), MOD-40 milestone 2's three for the quota order \
          (plan D4) and three for the agent compare-and-set (plan D5), and one for the lease \
          TTL's range (MOD-40 plan D10), MOD-23's one for the per-box switch (plan D242), MOD-41 T1's four fence cases for the prompt, tree \
-          and commit writes (plan D1), MOD-41 T7's three for the executor edit (plan D10), \
+         and commit writes (plan D1), MOD-41 T7's three for the executor edit (plan D10), \
          and MOD-51's two for the `box_probe_spec` writer (plan D7)"
     );
     assert_eq!(
