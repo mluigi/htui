@@ -269,7 +269,9 @@ short sessions; with password logins you are asked once per session, so use a ke
 `worker`, `--log` goes after `provision`. Each session is bounded: `ssh` keepalives end one whose
 host has gone silent for about a minute, and `htui` closes the preflight after 120 s, the upload
 after 120 s plus 2 s per MiB, the install after 300 s, and the wait for the worker after its own
-minute plus 120 s. Text from the remote host (error lines, journal lines, the hostname) is printed
+minute plus 120 s. The bounds count the time `ssh` spends asking for a password or passphrase; a
+session past its bound is asked to stop before it is killed, so a prompt left waiting gives your
+terminal back with echo on. Text from the remote host (error lines, journal lines, the hostname) is printed
 with its control characters escaped.
 
 **What the remote host needs.**

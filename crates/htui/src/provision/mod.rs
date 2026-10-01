@@ -740,8 +740,10 @@ async fn verify_session<R: Remote>(
     .await
 }
 
-/// One session, given at most `limit` (review finding 2). On the timeout the session's future is
-/// dropped, and with it the local `ssh`, which `run_piped`'s `kill_on_drop` kills. `Err` is the
+/// One session, given at most `limit` (review finding 2), `ssh`'s own prompts included. On the
+/// timeout the session's future is dropped, and with it the local `ssh`, which `run_piped` sends
+/// SIGTERM (so a prompt it was showing restores the terminal), then SIGKILL after
+/// [`remote::TERM_GRACE`]. `Err` is the
 /// sentence: `cannot run ssh: …`, or `<what> did not finish within …`.
 async fn bounded<R: Remote>(
     remote: &R,
