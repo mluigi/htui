@@ -51,9 +51,10 @@ You need:
   on your first build.
 - **On Linux:** the D-Bus development files and `pkg-config`, which the keyring integration builds
   against (`sudo apt install libdbus-1-dev pkg-config` on Debian and Ubuntu).
-- **Network access on the first build.** The embedding model runtime (ONNX Runtime) is downloaded
-  while building. On a machine without that access, see
-  [Building without network access](#building-without-network-access).
+- **Network access on first use of the concepts index.** Nothing is downloaded while building.
+  The embedding model (about 134 MB) is downloaded into your user cache directory the first time
+  you index or search, and checked against a pinned hash. An existing download from an earlier
+  htui is reused.
 - **`git`** on your `PATH`, for running work in repositories.
 
 Then build:
@@ -382,7 +383,8 @@ also starts.
    htui --index-items
    ```
 
-   The first run downloads a small embedding model into your user cache directory.
+   The first run downloads the embedding model (about 134 MB) into your user cache directory and
+   checks it against a pinned hash.
 3. Search:
 
    ```
@@ -399,6 +401,10 @@ requirements, the first `--index-items` rebuilds the whole index into a new coll
 `htui_concepts_v2`. The old `htui_concepts_v1` collection is no longer read; you can drop it with
 `curl -X DELETE http://localhost:6333/collections/htui_concepts_v1` (Qdrant's HTTP port, not the
 gRPC one).
+
+If a later htui embeds with another model, it refuses the old index and says so; delete it with
+`curl -X DELETE http://localhost:6333/collections/htui_concepts_v2` and run `htui --index-items`
+again.
 
 ## Where htui keeps its files
 
@@ -492,11 +498,6 @@ DATABASE_URL=postgres://postgres:htui@localhost:5439/htui_sqlx cargo sqlx prepar
 
 Keep `--all-targets --all-features`: without them, the queries used only by tests and the demo are
 dropped. `cargo sqlx prepare --check` verifies the data is current.
-
-### Building without network access
-
-The ONNX Runtime download at build time can be skipped by pointing `ORT_LIB_LOCATION` at a local
-copy of onnxruntime 1.18 (and adding its `lib/` folder to `LD_LIBRARY_PATH` on Linux).
 
 ### Keeping raw agent messages
 
