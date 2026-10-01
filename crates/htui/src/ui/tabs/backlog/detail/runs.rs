@@ -1390,6 +1390,9 @@ impl DetailTab for RunsTab {
                     }
                     None => self.waiting.clear(),
                 }
+                if let FrameKind::Error(sentence) = &frame.kind {
+                    ctx.emit(Action::Error(sentence.clone()));
+                }
                 self.re_read(ctx);
             }
             StoreReply::Orch(reply) => {
@@ -3405,6 +3408,37 @@ mod tests {
         assert!(
             shell.emit.is_empty(),
             "another item's frame is not this pane's"
+        );
+    }
+
+    /// R-41: the sentence of a dropped failure rides the stream's `Error` frame, which keeps the
+    /// subscription's `seq` and so survives the staleness check an `Orch` `Failed` does not.
+    #[tokio::test]
+    async fn a_run_stream_error_frame_reaches_the_status_line() {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        pane.on_reply(
+            &frame(
+                ids::HTUI_FEAT_1,
+                FrameKind::Error("the walk failed".to_owned()),
+            ),
+            &mut shell.ctx(),
+        );
+        let emitted = shell.emit.take();
+        assert!(
+            emitted
+                .iter()
+                .any(|action| matches!(action, Action::Error(s) if s == "the walk failed")),
+            "{emitted:?}"
+        );
+        assert!(is_one_re_read(&requests(emitted), ids::HTUI_FEAT_1));
+        pane.on_reply(
+            &frame(ids::HTUI_ANA_2, FrameKind::Error("not mine".to_owned())),
+            &mut shell.ctx(),
+        );
+        assert!(
+            shell.emit.is_empty(),
+            "another item's error is not reported"
         );
     }
 
