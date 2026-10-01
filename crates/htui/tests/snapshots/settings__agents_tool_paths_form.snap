@@ -1,0 +1,33 @@
+---
+source: crates/htui/tests/settings.rs
+expression: rendered
+---
+name         transport billing      models default               enabled quota         on this box
+manual       acp       subscription 0      —                     yes     —             0.48.0*
+paths        acp       subscription 0      —                     yes     —             0.48.0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+tool paths for paths · empty = no manual path
+alpha_tool       :
+demo_agent_server:
+Tab next field · Enter saves · Esc cancels

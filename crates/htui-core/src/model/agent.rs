@@ -39,7 +39,9 @@ pub struct Agent {
     /// `docs/ANA-4.md` §5.1 and typed by `htui_agent::launch::AgentLaunch`.
     ///
     /// `command` and every `args` element and `env` **value** may hold a `${tool}` placeholder,
-    /// resolved per box from `agent_box.probe.tools`; a row with no placeholder needs no probe.
+    /// resolved per box: a spawn uses the launch the probe recorded in `agent_box.probe.resolved`
+    /// (the box's manual paths included, MOD-66), else resolves the row's tools then and there. A
+    /// row with no placeholder needs no probe.
     /// Held here as a [`Value`] because `htui-core` does not depend on the driver crate — the
     /// column's shape is ANA-4's, and this crate only stores it.
     pub launch: Value,

@@ -25,9 +25,10 @@ use htui_agent::launch::{
 };
 use htui_agent::probe::{
     CredentialTier, GlobMatch, INSTALL_ROOT_VAR, ProbeContext, ProbeEnv, ProbeOutcome,
-    ProbeSnapshot, ProbeSource, ProbeStatus, Tier2, below_min, capture_version,
+    ProbeSnapshot, ProbeSource, ProbeStatus, Tier2, agent_box_row, below_min, capture_version,
     default_install_root, expand, extract_version, glob_first, install_root, platform_key,
-    probe_agent, probe_tools, resolve_credential, resolve_tool, segment_matches, status_for, walk,
+    probe_agent, probe_snapshot, probe_tools, probe_tools_with, resolve_credential, resolve_tool,
+    segment_matches, status_for, walk,
 };
 use htui_core::model::{Agent, AgentBox, AgentId, Billing, BoxId, Transport};
 use serde_json::{Value, json};
@@ -2413,7 +2414,7 @@ fn the_seeded_agy_row_declares_the_token_candidates_and_the_api_key_variable() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 20. `recorded_launch`: D58's three row-side rules (T31)
+// 20. `recorded_launch`: D58's two row-side rules (T31; MOD-66 D6)
 // ---------------------------------------------------------------------------------------------
 
 /// A snapshot carrying only what D58 reads. Everything else is what a probe that got no further
@@ -2432,6 +2433,7 @@ fn snapshot(
         status,
         stderr_tail: None,
         source,
+        manual: BTreeMap::new(),
     }
 }
 
@@ -2450,7 +2452,7 @@ fn recorded() -> ResolvedLaunch {
 /// alone. The fourth rule — the command still exists — is I/O and belongs to
 /// `AcpDriver::launch_for`, which is why this case can be a `#[test]` and stay one.
 #[test]
-fn recorded_launch_applies_d58s_three_row_side_rules() {
+fn recorded_launch_applies_d58s_row_side_rules() {
     let ready = snapshot(ProbeSource::Probe, ProbeStatus::Ready, Some(recorded()));
     assert_eq!(
         ready.recorded_launch(),
@@ -2488,9 +2490,8 @@ fn recorded_launch_applies_d58s_three_row_side_rules() {
     let manual = snapshot(ProbeSource::Manual, ProbeStatus::Ready, Some(recorded()));
     assert_eq!(
         manual.recorded_launch(),
-        None,
-        "a `manual` row is a human's path, and `launch::resolve` already honours it through the \
-         row itself (blueprint H-5)"
+        Some(&recorded()),
+        "MOD-66 D6: a manual snapshot is the probe's own, over a human's path"
     );
 
     let empty = snapshot(ProbeSource::Probe, ProbeStatus::Ready, None);
@@ -2498,5 +2499,448 @@ fn recorded_launch_applies_d58s_three_row_side_rules() {
         empty.recorded_launch(),
         None,
         "`ready` with nothing resolved is not a launch, whatever the status says"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 21. MOD-66: the manual tier
+// ---------------------------------------------------------------------------------------------
+
+/// [`synthetic_row`] whose command is `${first}`, over a `discovery` of `tools`. `handshake: false`
+/// makes a resolved `acp` row `ready` with **nothing spawned**, so a case here is about tier 1.
+fn manual_row(tools: Value, handshake: bool) -> Agent {
+    Agent {
+        launch: json!({
+            "command": "${first}",
+            "args": [],
+            "env": {},
+            "discovery": { "tools": tools, "handshake": handshake },
+        }),
+        ..synthetic_row("manual-fixture", "unused", Transport::Acp)
+    }
+}
+
+/// `${first}` on no `PATH` anywhere: only a manual path or an override can answer for it.
+fn unresolvable_first() -> Value {
+    json!({ "first": { "kind": "path", "names": ["htui-no-such-binary-66"] } })
+}
+
+/// A manual map, as `probe.manual` holds it: tool name → absolute path text.
+fn map(pairs: &[(&str, &Path)]) -> BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(tool, path)| ((*tool).to_owned(), path.to_string_lossy().into_owned()))
+        .collect()
+}
+
+/// A file that exists and is not a tool: the manual tier is a `metadata` call and never runs it.
+fn plain_file(path: &Path) -> PathBuf {
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+    std::fs::write(path, "not a tool, just a path that exists").expect("write");
+    path.to_path_buf()
+}
+
+/// `existing` for `agent` on `box_id`: a stored snapshot carrying `manual`, through the same
+/// projection the probe writes.
+fn stored_with(
+    agent: &Agent,
+    box_id: BoxId,
+    source: ProbeSource,
+    manual: BTreeMap<String, String>,
+) -> AgentBox {
+    let stored = ProbeSnapshot {
+        manual,
+        ..snapshot(source, ProbeStatus::Missing, None)
+    };
+    agent_box_row(agent, box_id, &stored, Utc::now() - TimeDelta::days(1))
+}
+
+#[tokio::test]
+async fn a_manual_path_resolves_a_tool_nothing_else_finds() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let env = env(tmp.path());
+    let discovery = discovery("node", path_probe(&["htui-no-such-binary-66"], None));
+    let file = plain_file(&tmp.path().join("opt/node"));
+
+    let report = probe_tools_with(Some(&discovery), &map(&[("node", &file)]), &env)
+        .await
+        .expect("the tiers ran");
+
+    let found = report
+        .found
+        .get("node")
+        .expect("the manual path answered for a tool PATH does not hold");
+    assert_eq!(found.path, file);
+    assert_eq!(found.version, None, "a manual path records no version (D3)");
+    assert!(found.args.is_empty(), "a path tool has no platform args");
+    assert!(!found.below_min, "a manual path checks no floor (D3)");
+    assert_eq!(report.manual, vec!["node".to_owned()]);
+    assert!(report.missing.is_empty(), "{:?}", report.missing);
+}
+
+#[tokio::test]
+async fn the_env_override_beats_a_manual_path() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let mut env = env(tmp.path());
+    let overridden = plain_file(&tmp.path().join("override/node"));
+    let manual = plain_file(&tmp.path().join("manual/node"));
+    env.vars.insert(
+        "HTUI_TOOL_NODE".to_owned(),
+        overridden.to_string_lossy().into_owned(),
+    );
+    let discovery = discovery("node", path_probe(&["htui-no-such-binary-66"], None));
+
+    let report = probe_tools_with(Some(&discovery), &map(&[("node", &manual)]), &env)
+        .await
+        .expect("the tiers ran");
+
+    assert_eq!(
+        report.found.get("node").map(|found| found.path.clone()),
+        Some(overridden),
+        "MOD-66 D2: the env override is the outermost escape hatch"
+    );
+    assert!(
+        report.manual.is_empty(),
+        "the manual path decided nothing: {:?}",
+        report.manual
+    );
+    assert!(report.missing.is_empty());
+}
+
+#[tokio::test]
+async fn a_manual_path_that_is_gone_a_directory_or_relative_is_missing_and_never_falls_through() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let env = env(tmp.path());
+    let on_path = tmp.path().join("bin").join(tool_name("node"));
+    executable(&on_path, "#!/bin/sh\nexit 0\n");
+    let discovery = discovery("node", path_probe(&["node"], None));
+
+    let unaided = probe_tools(Some(&discovery), &env)
+        .await
+        .expect("the tiers ran");
+    assert_eq!(
+        unaided.found.get("node").map(|found| found.path.clone()),
+        Some(on_path),
+        "the discovery tier would find `node`, so a fall-through below would be visible"
+    );
+
+    let directory = tmp.path().join("opt/node-dir");
+    std::fs::create_dir_all(&directory).expect("mkdir");
+    let cases = [
+        (
+            "gone",
+            tmp.path()
+                .join("opt/no-such-node")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        ("a directory", directory.to_string_lossy().into_owned()),
+        ("relative", "bin/node".to_owned()),
+    ];
+    for (what, path) in cases {
+        let manual = BTreeMap::from([("node".to_owned(), path)]);
+        let report = probe_tools_with(Some(&discovery), &manual, &env)
+            .await
+            .expect("the tiers ran");
+        assert_eq!(
+            report.missing,
+            vec!["node".to_owned()],
+            "a manual path that is {what} is missing (MOD-66 D2, B3)"
+        );
+        assert!(
+            !report.found.contains_key("node"),
+            "a manual path that is {what} never falls through to discovery: {:?}",
+            report.found
+        );
+        assert!(report.manual.is_empty(), "{what}: {:?}", report.manual);
+    }
+}
+
+#[tokio::test]
+async fn a_manual_glob_tool_keeps_its_platform_args() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let linux = env(tmp.path());
+    let darwin = ProbeEnv {
+        platform: "darwin-aarch64".to_owned(),
+        ..linux.clone()
+    };
+    let server = plain_file(&tmp.path().join("elsewhere/server.par"));
+    let manual = map(&[("agy_acp_server", &server)]);
+
+    let report = probe_tools_with(Some(&agy_discovery()), &manual, &linux)
+        .await
+        .expect("the tiers ran");
+    let found = report
+        .found
+        .get("agy_acp_server")
+        .expect("the manual path answered for the glob tool");
+    assert_eq!(found.path, server);
+    assert_eq!(
+        found.args,
+        vec!["--uid=".to_owned()],
+        "MOD-66 D3: the platform's args are a fact about the adapter, not the search"
+    );
+    assert_eq!(report.manual, vec!["agy_acp_server".to_owned()]);
+
+    let report = probe_tools_with(Some(&agy_discovery()), &manual, &darwin)
+        .await
+        .expect("the tiers ran");
+    assert_eq!(
+        report
+            .found
+            .get("agy_acp_server")
+            .map(|found| found.args.clone()),
+        Some(Vec::new()),
+        "a platform entry with no args appends none"
+    );
+}
+
+#[tokio::test]
+async fn probe_tools_is_probe_tools_with_no_manual_paths() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let env = env(tmp.path());
+    let server = tmp
+        .path()
+        .join("agents/antigravity-acp/1.1.1/agy_acp_server.par");
+    executable(&server, "binary");
+
+    let plain = probe_tools(Some(&agy_discovery()), &env)
+        .await
+        .expect("the tiers ran");
+    let with = probe_tools_with(Some(&agy_discovery()), &BTreeMap::new(), &env)
+        .await
+        .expect("the tiers ran");
+    assert_eq!(plain, with);
+    assert!(
+        !plain.found.is_empty() && !plain.missing.is_empty(),
+        "the comparison covers a found and a missing tool: {plain:?}"
+    );
+}
+
+#[tokio::test]
+async fn probe_agent_carries_the_stored_map_and_marks_the_row_manual() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let ctx = context(env(tmp.path()));
+    let agent = manual_row(unresolvable_first(), false);
+    let box_id = BoxId::new();
+    let file = plain_file(&tmp.path().join("opt/first"));
+    let manual = map(&[("first", &file)]);
+    // Stored as `probe`: the new row's `source` is the walk's verdict, not the old row's.
+    let existing = stored_with(&agent, box_id, ProbeSource::Probe, manual.clone());
+
+    let row = row_of(
+        probe_agent(
+            &agent,
+            box_id,
+            Some(&existing),
+            &ctx,
+            &CannedTier2(Canned::Never),
+        )
+        .await,
+    );
+
+    let snapshot = ProbeSnapshot::from_row(&row).expect("the snapshot parses back");
+    assert_eq!(snapshot.status, ProbeStatus::Ready);
+    assert_eq!(
+        snapshot.source,
+        ProbeSource::Manual,
+        "MOD-66 D4: a manual path decided the launch"
+    );
+    assert_eq!(
+        snapshot.manual, manual,
+        "every new snapshot carries the map"
+    );
+    assert_eq!(
+        snapshot
+            .resolved
+            .as_ref()
+            .map(|launch| launch.command.clone()),
+        Some(file.to_string_lossy().into_owned())
+    );
+    assert!(row.enabled, "a ready box is enabled");
+}
+
+#[tokio::test]
+async fn source_is_manual_only_when_a_manual_path_decided_a_tool() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let file = plain_file(&tmp.path().join("opt/first"));
+    let manual = map(&[("first", &file)]);
+
+    // The override answers first, so the map decided nothing: `probe`, and the map rides along.
+    let mut overridden = env(tmp.path());
+    let override_file = plain_file(&tmp.path().join("override/first"));
+    overridden.vars.insert(
+        "HTUI_TOOL_FIRST".to_owned(),
+        override_file.to_string_lossy().into_owned(),
+    );
+    let agent = manual_row(unresolvable_first(), false);
+    let snapshot = probe_snapshot(
+        &agent,
+        &manual,
+        &context(overridden),
+        &CannedTier2(Canned::Never),
+    )
+    .await;
+    assert_eq!(snapshot.source, ProbeSource::Probe);
+    assert_eq!(
+        snapshot.manual, manual,
+        "the map is carried even when unused"
+    );
+    assert_eq!(
+        snapshot
+            .resolved
+            .as_ref()
+            .map(|launch| launch.command.clone()),
+        Some(override_file.to_string_lossy().into_owned())
+    );
+
+    // No map over a row discovery resolves: `probe`, and no `manual` key at all.
+    let resolvable_env = env(tmp.path());
+    executable(
+        &tmp.path().join("bin").join(tool_name("htui-fake-66")),
+        "#!/bin/sh\nexit 0\n",
+    );
+    let resolvable = manual_row(
+        json!({ "first": { "kind": "path", "names": ["htui-fake-66"] } }),
+        false,
+    );
+    let snapshot = probe_snapshot(
+        &resolvable,
+        &BTreeMap::new(),
+        &context(resolvable_env),
+        &CannedTier2(Canned::Never),
+    )
+    .await;
+    assert_eq!(snapshot.status, ProbeStatus::Ready);
+    assert_eq!(snapshot.source, ProbeSource::Probe);
+    assert!(
+        snapshot.to_value().get("manual").is_none(),
+        "an empty map adds no key: {}",
+        snapshot.to_value()
+    );
+
+    // The map decided `first`: `manual`.
+    let snapshot = probe_snapshot(
+        &agent,
+        &manual,
+        &context(env(tmp.path())),
+        &CannedTier2(Canned::Never),
+    )
+    .await;
+    assert_eq!(snapshot.status, ProbeStatus::Ready);
+    assert_eq!(snapshot.source, ProbeSource::Manual);
+    assert_eq!(snapshot.manual, manual);
+}
+
+#[tokio::test]
+async fn a_vanished_manual_path_with_nothing_else_resolving_is_kept() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let ctx = context(env(tmp.path()));
+    let agent = manual_row(unresolvable_first(), false);
+    let box_id = BoxId::new();
+    let path = tmp.path().join("opt/first");
+    let existing = stored_with(
+        &agent,
+        box_id,
+        ProbeSource::Manual,
+        map(&[("first", &path)]),
+    );
+
+    match probe_agent(
+        &agent,
+        box_id,
+        Some(&existing),
+        &ctx,
+        &CannedTier2(Canned::Never),
+    )
+    .await
+    {
+        ProbeOutcome::Kept { reason } => assert!(reason.contains("manual"), "{reason}"),
+        ProbeOutcome::Row(row) => {
+            panic!("MOD-66 D5: a vanished manual path keeps the last good row, got {row:?}")
+        }
+    }
+
+    plain_file(&path);
+    let row = row_of(
+        probe_agent(
+            &agent,
+            box_id,
+            Some(&existing),
+            &ctx,
+            &CannedTier2(Canned::Never),
+        )
+        .await,
+    );
+    let snapshot = ProbeSnapshot::from_row(&row).expect("the snapshot parses back");
+    assert_eq!(snapshot.status, ProbeStatus::Ready);
+    assert_eq!(snapshot.source, ProbeSource::Manual);
+}
+
+#[tokio::test]
+async fn probe_snapshot_never_keeps() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let ctx = context(env(tmp.path()));
+    let agent = manual_row(unresolvable_first(), false);
+    let gone = plain_file(&tmp.path().join("opt/first"));
+    std::fs::remove_file(&gone).expect("delete");
+    let manual = map(&[("first", &gone)]);
+
+    let snapshot = probe_snapshot(&agent, &manual, &ctx, &CannedTier2(Canned::Never)).await;
+
+    assert_eq!(
+        snapshot.status,
+        ProbeStatus::Missing,
+        "B1: with no stored row there is nothing to keep, so the answer is the probe's"
+    );
+    assert_eq!(snapshot.resolved, None);
+    assert_eq!(
+        snapshot.manual, manual,
+        "a missing snapshot carries the map too"
+    );
+    assert_eq!(
+        snapshot.source,
+        ProbeSource::Probe,
+        "D4: no manual path resolved anything"
+    );
+}
+
+#[test]
+fn a_snapshot_without_manual_round_trips_byte_for_byte() {
+    let text = concat!(
+        r#"{"transport":"acp","#,
+        r#""resolved":{"command":"/usr/bin/node","args":["--flag"],"env":{}},"#,
+        r#""tools":{"node":"22.19.0"},"handshake":null,"credential":null,"status":"ready","#,
+        r#""stderr_tail":null,"source":"probe"}"#,
+    );
+
+    let snapshot: ProbeSnapshot = serde_json::from_str(text).expect("the document parses");
+    assert!(snapshot.manual.is_empty(), "no key reads as no manual path");
+    assert_eq!(
+        serde_json::to_string(&snapshot).expect("the snapshot serialises"),
+        text,
+        "MOD-66 H-1: a row with no manual path keeps its exact bytes"
+    );
+}
+
+#[test]
+fn an_empty_map_adds_no_key_and_a_full_one_sorts_last() {
+    let empty = snapshot(ProbeSource::Probe, ProbeStatus::Ready, Some(recorded()));
+    let text = serde_json::to_string(&empty).expect("the snapshot serialises");
+    assert!(
+        !text.contains("\"manual\""),
+        "an empty map adds no key: {text}"
+    );
+
+    let full = ProbeSnapshot {
+        manual: BTreeMap::from([("first".to_owned(), "/opt/first".to_owned())]),
+        ..empty
+    };
+    let text = serde_json::to_string(&full).expect("the snapshot serialises");
+    let source = text.find("\"source\":").expect("`source` is written");
+    let manual = text.find("\"manual\":").expect("`manual` is written");
+    assert!(
+        manual > source,
+        "MOD-66 H-1: `manual` is the last key, after `source`: {text}"
     );
 }

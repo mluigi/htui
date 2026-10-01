@@ -246,10 +246,10 @@ impl Harness {
     /// the state a snapshot wants to photograph.
     ///
     /// The runtime-served list below is written out by hand rather than derived, so every request
-    /// the runtime owns has to be added to it deliberately. The three MOD-20 install requests and
-    /// MOD-21's four login ones are on it for that reason: without them, `Settings > i` or
-    /// `Settings > a` in a harness test would be answered "no agent runtime in this harness" by a
-    /// harness that has one.
+    /// the runtime owns has to be added to it deliberately. The three MOD-20 install requests,
+    /// MOD-21's four login ones and MOD-66's tool-paths write are on it for that reason: without
+    /// them, `Settings > i`, `Settings > a` or `Settings > m` in a harness test would be answered
+    /// "no agent runtime in this harness" by a harness that has one.
     ///
     /// A login is the one of them that can be `Pending` on a **human** rather than on work: the
     /// flow's task makes progress only between drives, and a case that is waiting for a frame
@@ -292,7 +292,8 @@ impl Harness {
                         | StoreRequest::AuthChoose { .. }
                         | StoreRequest::AuthOpen { .. }
                         | StoreRequest::AuthDeliver { .. }
-                        | StoreRequest::AuthCancel,
+                        | StoreRequest::AuthCancel
+                        | StoreRequest::SetToolPaths { .. },
                         _,
                     ) => match self.runtime.as_mut() {
                         Some(runtime) => {
@@ -803,6 +804,53 @@ mod tests {
         assert_eq!(
             harness.app().status.as_deref(),
             Some("start_run: no run runtime in this build")
+        );
+    }
+
+    /// MOD-66 D7, blueprint H-4 and B13: `drive`'s runtime list is a wildcard match, so a
+    /// forgotten line would fall through to `store_worker::serve`'s "no agent runtime in this
+    /// build". The harness's own sentence proves the tool-paths write is on the list.
+    #[tokio::test]
+    async fn a_harness_without_an_agent_runtime_refuses_set_tool_paths_by_name() {
+        let mut harness = Harness::demo();
+        harness.drive().await;
+        harness
+            .app()
+            .update(Action::Store(StoreRequest::SetToolPaths {
+                agent_id: htui_core::model::AgentId::new(),
+                paths: std::collections::BTreeMap::new(),
+            }));
+        harness.drive().await;
+        assert_eq!(
+            harness.app().status.as_deref(),
+            Some("set_tool_paths: no agent runtime in this harness")
+        );
+    }
+
+    /// The other half of B13: with an agent runtime installed, the runtime answers the write
+    /// itself, with whatever it says about an unknown agent, never a "no runtime" sentence.
+    #[tokio::test]
+    async fn a_harness_with_an_agent_runtime_serves_set_tool_paths() {
+        let mut harness = Harness::demo()
+            .with_agent_runtime(AgentRuntime::new(htui_agent::registry::DriverFactory::new()));
+        harness.drive().await;
+        harness
+            .app()
+            .update(Action::Store(StoreRequest::SetToolPaths {
+                agent_id: htui_core::model::AgentId::new(),
+                paths: std::collections::BTreeMap::new(),
+            }));
+        harness.drive().await;
+        let status = harness
+            .app()
+            .status
+            .clone()
+            .expect("the runtime refuses an unknown agent");
+        assert!(status.starts_with("set_tool_paths: "), "{status}");
+        assert!(!status.contains("no agent runtime in this"), "{status}");
+        assert!(
+            status.contains("not found"),
+            "the handler's own refusal of an unknown agent (review N2): {status}"
         );
     }
 

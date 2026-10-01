@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-01):** **MOD-42 is done** (`docs/decisions/mod/mod-42.md`): engine-driven
+**Current status (2026-10-01):** **MOD-66 is done** (`docs/decisions/mod/mod-66.md`): a box can
+be given an explicit path for any `${tool}` an agent row declares. `m` in Settings > Agents opens a
+tool-paths form; the paths live in `agent_box.probe.manual` and are a probe tier between the
+`HTUI_TOOL_<NAME>` override and discovery, so the same handshake and status mapping vet them, and
+`recorded_launch` now honours `source: manual` so they reach every spawn. A manual row reads `*`.
+No migration, no `.sqlx` change.
+Before it, **MOD-42 is done** (`docs/decisions/mod/mod-42.md`): engine-driven
 ACP steps no longer fail at their first permission request. The engine applies the agent's own
 permission policy; a request that still needs a human is a pending `step_permission` row (migration
 `0011`) that any TUI answers from the Runs pane (digits `1`-`9`), on any box, by a compare-and-set
@@ -467,16 +473,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   as a process's identity in the same way (an argv token match, then a lineage fingerprint including
   `lstart` compared across two `ps` observations).
 
-- [ ] **MOD-66 - Per-box manual tool path editor in Settings > Agents** (from MOD-23, plan OQ-3).
-  `R-AGT-6`. ANA-4 §4.6 (`docs/ANA-4.md:796-798`) describes a per-box manual entry: write
-  `agent_box.path` and `probe.resolved` by hand and set `probe.status = "ready"`, protected by MOD-2
-  D45/D51's `probe.source = manual` (a probe that finds nothing keeps it). In the tree that record
-  never reaches a spawn: `ProbeSnapshot::recorded_launch` answers `None` for any `source` other than
-  `probe` (`crates/htui-agent/src/probe.rs:1174-1177`), and the driver resolves `agent.launch`
-  against `probe.tools`. So this item is the resolution rule plus a second form in the Agents section
-  (beside MOD-23's create/edit pane, `docs/decisions/mod/mod-23.md`) writing `probe.tools` with
-  `source: manual` for this box. MOD-23 already covers the common case, a registry row whose
-  `launch.command` is a literal path, which needs no probe. **Not blocked.**
 - [ ] **MOD-24 - Crash recovery of runs under the headless worker.** `R-HIS-1`, `R-ORCH-11`.
   **Rescoped by maintainer decision, 2026-09-25:** a run survives a crash through ANA-2 §4.9's
   reset-and-retry resume, not by re-hydrating the agent's context and continuing the exact step. The
@@ -652,6 +648,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 28 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys, MOD-68 rten embedder, MOD-69 waiting-on-you list; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 27 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-68 rten embedder, MOD-69 waiting-on-you list; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

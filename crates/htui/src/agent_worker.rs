@@ -15,7 +15,7 @@
 //! harness awaits it inline, which is what keeps chat-tab snapshots byte-stable with no sleeps —
 //! the same trade `Harness::settle` makes for store requests.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -44,9 +44,10 @@ use htui_agent::install::{
     InstallConfig, InstallError, InstallJob, InstallOutcome, InstallPlan, InstallProgress,
     Installer, PlanError, install, plan as plan_install,
 };
-use htui_agent::launch::AgentSettings;
+use htui_agent::launch::{AgentLaunch, AgentSettings};
 use htui_agent::probe::{
-    ProbeContext, ProbeEnv, ProbeOutcome, ProbeSnapshot, ProbeStatus, SpawnTier2, probe_agent,
+    ProbeContext, ProbeEnv, ProbeOutcome, ProbeSnapshot, ProbeStatus, SpawnTier2, agent_box_row,
+    probe_agent, probe_snapshot,
 };
 use htui_agent::record::{
     AnsweredBy, CapBreach, QuotaLatch, Recorder, RunCap, enforce_breach as enforce_cap_breach,
@@ -60,11 +61,13 @@ use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{ReadStore as _, StoreError, WriteStore};
 use htui_orch::OpeningPath;
 use htui_store::{Backend, Writer};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent_settings::{AgentWrite, LITERAL_LAUNCH, SET_TOOL_PATHS, parse_tool_path};
 use crate::store_worker::{
     AuthFrame, ChatFrame, InstallFrame, Origin, ReplyEnvelope, RequestEnvelope, Seq, StoreReply,
     StoreRequest, UNSOLICITED,
@@ -96,6 +99,12 @@ pub const KEEP_RAW_ENV: &str = "HTUI_KEEP_RAW_EVENTS";
 /// (MOD-7 blueprint D27).
 pub const BOX_PROBE_RUNNING: &str =
     "a box probe is running on this box; try again once it has finished";
+
+/// What `claim_is_free` refuses with while a probe or a chat's staleness re-probe writes this
+/// box. Verb-neutral, because every claim-taking request reads it: an install, a login, a
+/// `ProbeBox` and a `SetToolPaths` (MOD-66 review L4).
+const BOX_WRITE_RUNNING: &str =
+    "a probe or a re-probe is already writing this box; try again once it has finished";
 
 /// What one box probe did (MOD-7 D13, blueprint D25): the only thing the box probe task ever
 /// sends.
@@ -379,7 +388,8 @@ pub enum Served {
     /// Answer with this reply, now.
     Reply(StoreReply),
     /// A task the runtime owns answers this request itself, exactly once — the session task for a
-    /// chat command, the probe task for [`StoreRequest::ProbeAgents`].
+    /// chat command, the probe task for [`StoreRequest::ProbeAgents`], the tool-paths task for
+    /// [`StoreRequest::SetToolPaths`] (MOD-66 D7).
     Deferred,
     /// A chat is starting; the caller spawns (or polls) the future and attaches the handle.
     Start {
@@ -409,7 +419,8 @@ pub struct AgentRuntime {
     started: Vec<StepId>,
     grace: Duration,
     /// Tasks this runtime spawned that answer a request of their own: today the probe's (MOD-2
-    /// D53), a chat's staleness re-probe's (plan D55) and the prompt preview's (plan D102). Swept
+    /// D53), a chat's staleness re-probe's (plan D55), the prompt preview's (plan D102) and a
+    /// `SetToolPaths` write's (MOD-66 D8, tagged [`Writes::ToolPaths`]). Swept
     /// when finished, awaited by [`finish_background`](Self::finish_background), aborted by
     /// [`shutdown`](Self::shutdown).
     ///
@@ -531,6 +542,10 @@ enum Writes {
     AgentBox,
     /// The task reaches no write method: it reads, and answers on the reply channel.
     Nothing,
+    /// A `SetToolPaths` task for this agent (MOD-66 D8): it writes `agent_box`, so it holds the
+    /// claim exactly as [`Writes::AgentBox`] does, **and** `ProbeAgents` refuses beside it. The
+    /// agent is named so the refusal can say whose write to wait for.
+    ToolPaths(AgentId),
 }
 
 impl Background {
@@ -560,6 +575,24 @@ impl Background {
         }
     }
 
+    /// A `SetToolPaths` task (MOD-66 D8, B4). In `background`, not in a slot of its own, so the
+    /// sweep, [`finish_background`](AgentRuntime::finish_background),
+    /// [`shutdown`](AgentRuntime::shutdown) and `writing_background_len` all cover it unchanged.
+    fn writing_tool_paths(task: JoinHandle<()>, agent_id: AgentId) -> Self {
+        Self {
+            task,
+            writes: Writes::ToolPaths(agent_id),
+        }
+    }
+
+    /// The agent of a running `SetToolPaths`, or `None` for every other task.
+    fn tool_paths(&self) -> Option<AgentId> {
+        match self.writes {
+            Writes::ToolPaths(agent_id) => Some(agent_id),
+            Writes::AgentBox | Writes::Nothing => None,
+        }
+    }
+
     /// The task, borrowed: for the sweep, which looks at every entry and keeps most of them.
     fn task(&self) -> &JoinHandle<()> {
         &self.task
@@ -573,8 +606,15 @@ impl Background {
     /// Whether this task writes `agent_box`, which is the one question
     /// [`claim_is_free`](AgentRuntime::claim_is_free) asks of the collection.
     fn writes_agent_box(&self) -> bool {
-        matches!(self.writes, Writes::AgentBox)
+        matches!(self.writes, Writes::AgentBox | Writes::ToolPaths(_))
     }
+}
+
+/// What `claim_is_free` and `ProbeAgents` refuse with while a `SetToolPaths` write runs (MOD-66
+/// B5): its own sentence, naming the write and the row, where the generic
+/// [`BOX_WRITE_RUNNING`] names a probe (F-7).
+fn tool_paths_running(agent_id: AgentId) -> String {
+    format!("a tool-paths write is running for agent {agent_id}; try again once it has finished")
 }
 
 impl AgentRuntime {
@@ -986,7 +1026,7 @@ impl AgentRuntime {
             step_id,
             cwd: opening.cwd,
             extra_dirs: opening.extra_dirs,
-            env: std::collections::BTreeMap::new(),
+            env: BTreeMap::new(),
             model: opening
                 .model
                 .or_else(|| summary.agent.default_model.clone()),
@@ -1115,6 +1155,15 @@ impl AgentRuntime {
                 Ok(served) => served,
                 Err(err) => Served::Reply(failed("probe_box", &err)),
             },
+            StoreRequest::SetToolPaths { agent_id, paths } => {
+                match self
+                    .set_tool_paths(backend, replies, addr, *agent_id, paths)
+                    .await
+                {
+                    Ok(served) => served,
+                    Err(err) => Served::Reply(failed(SET_TOOL_PATHS, &err)),
+                }
+            }
             StoreRequest::PromptPreview {
                 item,
                 template_name,
@@ -1308,6 +1357,12 @@ impl AgentRuntime {
                 live.agent_id
             )));
         }
+        // MOD-66 D8: a tool-paths write is probing and writing one row, and this probe writes
+        // every row. It is the one background writer consulted here: `r` beside a chat's
+        // staleness re-probe stays allowed, as before.
+        if let Some(agent_id) = self.background.iter().find_map(Background::tool_paths) {
+            return Err(StoreError::Backend(tool_paths_running(agent_id)));
+        }
         // MOD-7 D27: a box probe is already probing every row on this box.
         if self.box_probe_running() {
             return Err(StoreError::Backend(BOX_PROBE_RUNNING.to_owned()));
@@ -1344,6 +1399,103 @@ impl AgentRuntime {
                 }),
                 Some(answer),
             ))));
+        Ok(Served::Deferred)
+    }
+
+    /// The [`StoreRequest::SetToolPaths`] path (MOD-66 D7–D9). Every refusal but one comes
+    /// **before anything is spawned**, in `auth_start`'s order (B6): writer (offline:
+    /// `REGISTRY_ON_SERVER_ONLY`), registered box, the box claim, this row's re-probe claim, the
+    /// row exists, it is `enabled`, its `launch` parses and declares a tool ([`LITERAL_LAUNCH`],
+    /// the form's sentence), every key is a tool its `discovery.tools` declares, and every value
+    /// passes [`parse_tool_path`]. A store refusal is
+    /// an `Err`. A refused field is `Ok(Served::Reply(Failed))` carrying its own sentence, never
+    /// behind a `StoreError` prefix (MOD-23 D250's precedent).
+    ///
+    /// Awaited on the loop's arm: `box_info()` and `agents()`, the same class of cost the probe's
+    /// and the login's arms already pay (`R-NF-3`). The one refusal that is not here is `is_file`:
+    /// it is filesystem I/O that a hung mount can stall, so [`run_tool_paths`] makes it, with the
+    /// claims already held, and answers the same `Failed` (review L1). The probe runs in that
+    /// task too, which holds the row's re-probe claim to its end (D8, H-10).
+    async fn set_tool_paths(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        addr: ReplyAddr,
+        agent_id: AgentId,
+        paths: &BTreeMap<String, String>,
+    ) -> Result<Served, StoreError> {
+        let writer = recording_writer(backend)?;
+        let box_id = registered_box(backend).await?;
+        self.claim_is_free()?;
+        // D8: `claim_is_free` cannot see a chat's D60 re-probe, which runs inside the chat task.
+        // The row's claim can, and it is moved into the task so it is held until the write lands.
+        let claim = self
+            .reprobe_claims
+            .claim((agent_id, box_id))
+            .ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "a re-probe is running for agent {agent_id}; try again in a moment"
+                ))
+            })?;
+        let agent = row_for(backend, agent_id).await?.agent;
+        if !agent.enabled {
+            return refuse_tool_paths(format!(
+                "`{}` is disabled in the registry; nothing to set a path for",
+                agent.name
+            ));
+        }
+        // No serde text: it can quote an `env` value (`R-SEC-2`, the `checked_launch` rule).
+        let Ok(launch) = AgentLaunch::deserialize(&agent.launch) else {
+            return refuse_tool_paths(format!(
+                "`{}`'s launch does not parse; nothing declares a tool",
+                agent.name
+            ));
+        };
+        let declared = launch
+            .discovery
+            .map(|discovery| discovery.tools)
+            .unwrap_or_default();
+        // D10: no `${tool}` to give a path, so not even an empty map is written (review N4).
+        if declared.is_empty() {
+            return refuse_tool_paths(LITERAL_LAUNCH.to_owned());
+        }
+        // `BTreeMap` order, so the first refusal is the same one every time.
+        let mut checked = BTreeMap::new();
+        for (tool, text) in paths {
+            if !declared.contains_key(tool) {
+                return refuse_tool_paths(format!(
+                    "`{tool}` is not a tool `{}` declares",
+                    agent.name
+                ));
+            }
+            let path = match parse_tool_path(tool, text) {
+                Ok(path) => path,
+                Err(sentence) => return refuse_tool_paths(sentence),
+            };
+            checked.insert(tool.clone(), path);
+        }
+        // Blueprint D35: the injected env when a test gave one, else this process's own.
+        let (env, _) = self.probe_env()?;
+
+        let frames = Frames::new(replies.clone(), addr);
+        let answer = frames.answer(tool_paths_failed);
+        self.background.push(Background::writing_tool_paths(
+            tokio::spawn(answering(
+                "tool paths",
+                run_tool_paths(ToolPathsArgs {
+                    backend: backend.clone(),
+                    writer,
+                    box_id,
+                    agent,
+                    paths: checked,
+                    env,
+                    frames,
+                    claim,
+                }),
+                Some(answer),
+            )),
+            agent_id,
+        ));
         Ok(Served::Deferred)
     }
 
@@ -1719,8 +1871,8 @@ impl AgentRuntime {
             .ok_or_else(|| StoreError::Backend("this runtime has no installer".to_owned()))
     }
 
-    /// `Ok` when no box probe, install, probe or login holds the claim (hazard H-10, MOD-21 D19,
-    /// MOD-7 D27).
+    /// `Ok` when no box probe, install, probe, login or tool-paths write holds the claim (hazard
+    /// H-10, MOD-21 D19, MOD-7 D27, MOD-66 D8).
     fn claim_is_free(&self) -> Result<(), StoreError> {
         // MOD-7 D27, the fourth holder: a box probe ends by probing every agent row on this box,
         // so it writes `agent_box` for every row, exactly as `ProbeAgents` does.
@@ -1757,11 +1909,15 @@ impl AgentRuntime {
         // `StoreReply::Agents` clears it (`ui/tabs/settings/agents.rs`, module doc), and
         // `wants_requests` re-issues `Agents` on every activation, so `r` → switch tab → back → `i`
         // reaches here with `run_probe` still running.
+        //
+        // MOD-66 D8, the fifth holder: a `SetToolPaths` task writes its row and is a writing
+        // background entry, so the check below would refuse beside it too, but with a sentence
+        // about a probe and an install. It names itself first (B5).
+        if let Some(agent_id) = self.background.iter().find_map(Background::tool_paths) {
+            return Err(StoreError::Backend(tool_paths_running(agent_id)));
+        }
         if self.background.iter().any(Background::writes_agent_box) {
-            return Err(StoreError::Backend(
-                "a probe or a re-probe is already writing this box; install once it has finished"
-                    .to_owned(),
-            ));
+            return Err(StoreError::Backend(BOX_WRITE_RUNNING.to_owned()));
         }
         Ok(())
     }
@@ -1908,7 +2064,7 @@ impl AgentRuntime {
             extra_dirs: Vec::new(),
             // MOD-10 fills this from the secret provider; until then a session carries none, and
             // the scrubber below therefore masks the credential prefixes only.
-            env: std::collections::BTreeMap::new(),
+            env: BTreeMap::new(),
             model: model.clone(),
             tools: htui_agent::driver::ToolExposure::default(),
             mcp: Vec::new(),
@@ -2595,6 +2751,109 @@ async fn run_reprobe(args: ReprobeArgs) {
             tracing::debug!(agent = %agent.name, reason, "the re-probe left a row alone");
         }
     }
+}
+
+/// A `SetToolPaths` field refusal (MOD-66 D9): `Failed` with its own sentence, answered on the
+/// arm.
+fn refuse_tool_paths(message: String) -> Result<Served, StoreError> {
+    Ok(Served::Reply(StoreReply::Failed {
+        request: SET_TOOL_PATHS,
+        message,
+    }))
+}
+
+/// Everything a `SetToolPaths` task owns (MOD-66 D7). Reads go through a [`Backend`] clone
+/// (`BoxProbeArgs`'s precedent: the reply carries the registry re-read), and the write through
+/// the [`Writer`] taken at spawn. `claim` is the row's re-probe claim, **held to the end** and
+/// released by its `Drop`, aborted or not (D8, H-10).
+struct ToolPathsArgs {
+    backend: Backend,
+    writer: Writer,
+    box_id: BoxId,
+    agent: Agent,
+    paths: BTreeMap<String, String>,
+    env: ProbeEnv,
+    frames: Frames,
+    claim: ReprobeClaim,
+}
+
+impl core::fmt::Debug for ToolPathsArgs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ToolPathsArgs")
+            .field("writer", &self.writer.label())
+            .field("agent", &self.agent.name)
+            .field("paths", &self.paths.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// First D9's `is_file` check of every path: a path that is not a file is the task's one answer,
+/// `Failed` with the tool-naming sentence the arm's refusals use, and nothing is written.
+///
+/// Then one probe of one row over the requested map, written whatever it found (MOD-66 D9):
+/// [`probe_snapshot`], never `probe_agent`, so D51's `Kept` cannot swallow the edit (B1). Exactly
+/// one reply at the request's address: `AgentWritten { agents, ToolPaths { id, name, status } }`,
+/// or `Failed { "set_tool_paths" }` when the write fails. A re-read that fails after an applied
+/// write also answers `Failed` (`agent_settings::serve`'s known residue, B15).
+///
+/// `upsert_agent_box` applies `enabled AND NOT user_off`, so a row switched off on this box stays
+/// off with no code here (MOD-23 D243).
+async fn run_tool_paths(args: ToolPathsArgs) {
+    let ToolPathsArgs {
+        backend,
+        writer,
+        box_id,
+        agent,
+        paths,
+        env,
+        frames,
+        claim,
+    } = args;
+    // D9's last check, here rather than on the arm: `metadata` on a hung mount would stall every
+    // tab's store requests (review L1). `BTreeMap` order, so the first refusal is the same one
+    // every time.
+    for (tool, path) in &paths {
+        if !htui_agent::probe::is_file(std::path::Path::new(path)).await {
+            drop(claim);
+            frames.reply(
+                &frames.addr(),
+                StoreReply::Failed {
+                    request: SET_TOOL_PATHS,
+                    message: format!("`{tool}`: `{path}` is not a file on this box"),
+                },
+            );
+            return;
+        }
+    }
+    let ctx = ProbeContext {
+        env,
+        now: Utc::now(),
+    };
+    let snapshot = probe_snapshot(&agent, &paths, &ctx, &SpawnTier2::default()).await;
+    let row = agent_box_row(&agent, box_id, &snapshot, ctx.now);
+    let reply = match writer.upsert_agent_box(&row).await {
+        Err(err) => failed(SET_TOOL_PATHS, &err),
+        Ok(_) => match backend.agents().await {
+            Ok(agents) => {
+                let name = agents
+                    .iter()
+                    .find(|summary| summary.agent.id == agent.id)
+                    .map_or_else(|| agent.name.clone(), |summary| summary.agent.name.clone());
+                StoreReply::AgentWritten {
+                    agents,
+                    outcome: AgentWrite::ToolPaths {
+                        id: agent.id,
+                        name,
+                        status: snapshot.status,
+                    },
+                }
+            }
+            Err(err) => failed(SET_TOOL_PATHS, &err),
+        },
+    };
+    // Before the answer: a request the reply prompts finds the row's claim free.
+    drop(claim);
+    frames.reply(&frames.addr(), reply);
 }
 
 /// The writer of a backend that can hold an `agent_box` row, or the refusal that names why not.
@@ -3442,6 +3701,15 @@ impl Frames {
 fn probe_agents_failed(message: String) -> Vec<StoreReply> {
     vec![StoreReply::Failed {
         request: "probe_agents",
+        message,
+    }]
+}
+
+/// A panicked `SetToolPaths`'s last word: the failure that clears the Agents section's `busy`
+/// (MOD-53's shape, MOD-66 D10).
+fn tool_paths_failed(message: String) -> Vec<StoreReply> {
+    vec![StoreReply::Failed {
+        request: SET_TOOL_PATHS,
         message,
     }]
 }
@@ -4321,7 +4589,7 @@ pub(crate) mod tests {
             sha256: None,
             cmd: format!("./{INSTALL_TOOL}"),
             args: Vec::new(),
-            env: std::collections::BTreeMap::new(),
+            env: BTreeMap::new(),
             license: None,
             license_url: None,
             install_dir: root.join(INSTALL_ID).join(INSTALL_VERSION),
@@ -6423,7 +6691,7 @@ pub(crate) mod tests {
             Served::Reply(StoreReply::Failed { request, message }) => {
                 assert_eq!(request, "install_plan");
                 assert!(
-                    message.contains("is already writing this box"),
+                    message.ends_with(BOX_WRITE_RUNNING),
                     "the refusal names what holds the box: {message}"
                 );
             }
@@ -6622,7 +6890,7 @@ pub(crate) mod tests {
             Served::Reply(StoreReply::Failed { request, message }) => {
                 assert_eq!(request, "install_plan");
                 assert!(
-                    message.contains("is already writing this box"),
+                    message.ends_with(BOX_WRITE_RUNNING),
                     "the refusal names the re-probe as well as the probe (MOD-31 D6): {message}"
                 );
             }
@@ -7241,7 +7509,7 @@ done
             let snapshot = ProbeSnapshot {
                 transport: Transport::Acp,
                 resolved: None,
-                tools: std::collections::BTreeMap::new(),
+                tools: BTreeMap::new(),
                 handshake: Some(Handshake {
                     at: now,
                     protocol_version: 1,
@@ -7254,6 +7522,7 @@ done
                 status: ProbeStatus::Unauthenticated,
                 stderr_tail: None,
                 source: ProbeSource::Probe,
+                manual: BTreeMap::new(),
             };
             AgentBox {
                 agent_id,
@@ -7739,6 +8008,29 @@ done
                 }
                 other => panic!("a probe may not run under a login: {other:?}"),
             }
+            assert_eq!(runtime.background_len(), 0, "and it spawned nothing");
+
+            runtime.shutdown(Duration::from_millis(500)).await;
+        }
+
+        /// MOD-66 D8: a login writes its row at the end of the flow, so a tool-paths write for
+        /// any row is refused while one runs.
+        #[tokio::test]
+        async fn set_tool_paths_while_a_login_runs_is_refused() {
+            let tmp = tempfile::tempdir().expect("a throwaway directory");
+            let (store, agent_id) =
+                login_store(tmp.path(), &[("FIXTURE_KEY", "set"), ("FIXTURE_HOLD", "1")]).await;
+            let backend = Backend::memory(store);
+            let mut runtime = login_runtime(tmp.path());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            start_login(&mut runtime, &backend, &tx, &mut rx, 1, agent_id).await;
+
+            let message = refused(set_paths(&mut runtime, &backend, &tx, 2, agent_id, &[]).await);
+            assert!(
+                message.contains("a login is already running"),
+                "the refusal says what holds the claim: {message}"
+            );
             assert_eq!(runtime.background_len(), 0, "and it spawned nothing");
 
             runtime.shutdown(Duration::from_millis(500)).await;
@@ -9279,7 +9571,7 @@ done
     /// `home` is `None`, so no `~` pattern reaches the maintainer's home (blueprint F-T).
     pub(crate) fn fake_env(tmp: &std::path::Path) -> ProbeEnv {
         std::fs::create_dir_all(tmp.join("bin")).expect("the fixture bin");
-        let mut vars = std::collections::BTreeMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert(
             "PATH".to_owned(),
             tmp.join("bin").to_string_lossy().into_owned(),
@@ -10406,5 +10698,1017 @@ done
             "the status line says so: {}",
             report.status_line()
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-66: SetToolPaths (blueprint §4.5; D7–D9, B1, B4–B6, H-10, H-11)
+    //
+    // Every case runs over `fake_env`, whose `PATH` holds neither tool the fixture row declares,
+    // over a registry whose other rows resolve nowhere (H-7), and the fixture row says
+    // `handshake: false`: a row that resolves is `ready` and **nothing is spawned**.
+    // -----------------------------------------------------------------------------------------
+
+    /// The fixture row's name.
+    const PATHS_ROW: &str = "paths-fixture";
+
+    /// An `acp` row declaring two tools that resolve nowhere except through a manual path.
+    fn paths_row(id: AgentId) -> Agent {
+        Agent {
+            name: PATHS_ROW.to_owned(),
+            transport: Transport::Acp,
+            launch: json!({
+                "command": "${first}",
+                "args": ["${second}"],
+                "env": {},
+                "discovery": {
+                    "tools": {
+                        "first": { "kind": "path", "names": ["htui-no-such-binary-66a"] },
+                        "second": { "kind": "path", "names": ["htui-no-such-binary-66b"] }
+                    },
+                    "handshake": false
+                }
+            }),
+            settings: json!({}),
+            ..fake_row(id)
+        }
+    }
+
+    /// The unresolvable demo registry plus [`paths_row`], and a runtime over the fake env.
+    async fn paths_fixture(tmp: &std::path::Path) -> (MemStore, Backend, AgentRuntime, AgentId) {
+        let store = unresolvable_registry().await;
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&paths_row(agent_id), None)
+            .await
+            .expect("the row lands");
+        let backend = Backend::memory(store.clone());
+        let runtime =
+            AgentRuntime::new(DriverFactory::new()).with_probe_env(fake_env(tmp), fake_hardware());
+        (store, backend, runtime, agent_id)
+    }
+
+    /// Writes a plain file at `path`: a manual path only has to be a file, and nothing runs it.
+    fn plain_file(path: &std::path::Path) -> String {
+        std::fs::write(path, "not a real tool\n").expect("write the file");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// `pairs` as the request's map.
+    fn tool_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(tool, path)| ((*tool).to_owned(), (*path).to_owned()))
+            .collect()
+    }
+
+    /// `SetToolPaths { agent_id, pairs }` at `seq`.
+    async fn set_paths(
+        runtime: &mut AgentRuntime,
+        backend: &Backend,
+        tx: &mpsc::UnboundedSender<ReplyEnvelope>,
+        seq: Seq,
+        agent_id: AgentId,
+        pairs: &[(&str, &str)],
+    ) -> Served {
+        runtime
+            .serve(
+                backend,
+                tx,
+                &envelope(
+                    seq,
+                    StoreRequest::SetToolPaths {
+                        agent_id,
+                        paths: tool_map(pairs),
+                    },
+                ),
+            )
+            .await
+    }
+
+    /// The message of the `Failed { "set_tool_paths" }` a refusal answers on the arm.
+    fn refused(served: Served) -> String {
+        match served {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, SET_TOOL_PATHS);
+                message
+            }
+            other => panic!("a refused SetToolPaths answers Failed on the arm: {other:?}"),
+        }
+    }
+
+    /// Waits for every background task, then the one reply they sent.
+    async fn one_reply(
+        runtime: &mut AgentRuntime,
+        rx: &mut mpsc::UnboundedReceiver<ReplyEnvelope>,
+    ) -> ReplyEnvelope {
+        runtime.finish_background(Duration::from_secs(5)).await;
+        let mut replies = Vec::new();
+        while let Ok(reply) = rx.try_recv() {
+            replies.push(reply);
+        }
+        assert_eq!(replies.len(), 1, "exactly one reply: {replies:?}");
+        replies.remove(0)
+    }
+
+    /// The `ToolPaths` outcome of `reply`.
+    fn tool_paths_outcome(reply: ReplyEnvelope) -> AgentWrite {
+        match reply.reply {
+            StoreReply::AgentWritten { outcome, .. } => outcome,
+            other => panic!("a SetToolPaths that ran answers AgentWritten: {other:?}"),
+        }
+    }
+
+    /// `agent_id`'s registry row and this box's `agent_box` for it, as stored now.
+    async fn summary_of(store: &MemStore, agent_id: AgentId) -> htui_core::model::AgentSummary {
+        store
+            .agents()
+            .await
+            .expect("the memory store never fails")
+            .into_iter()
+            .find(|summary| summary.agent.id == agent_id)
+            .expect("the row is listed")
+    }
+
+    /// The stored snapshot of `agent_id` on this box.
+    async fn stored_snapshot(store: &MemStore, agent_id: AgentId) -> (AgentBox, ProbeSnapshot) {
+        let on_box = summary_of(store, agent_id)
+            .await
+            .on_box
+            .expect("an agent_box row was written");
+        let snapshot = ProbeSnapshot::from_row(&on_box).expect("the stored probe parses");
+        (on_box, snapshot)
+    }
+
+    /// A stored `source: manual` row over `manual`, probed long ago (`demo_at(0, 0)`).
+    async fn stage_manual_row(
+        store: &MemStore,
+        agent_id: AgentId,
+        manual: BTreeMap<String, String>,
+    ) {
+        let snapshot = ProbeSnapshot {
+            transport: Transport::Acp,
+            resolved: None,
+            tools: BTreeMap::new(),
+            handshake: None,
+            credential: None,
+            status: ProbeStatus::Ready,
+            stderr_tail: None,
+            source: htui_agent::probe::ProbeSource::Manual,
+            manual,
+        };
+        let row = agent_box_row(
+            &paths_row(agent_id),
+            ids::BOX,
+            &snapshot,
+            htui_core::fixtures::demo_at(0, 0),
+        );
+        store
+            .upsert_agent_box(&row)
+            .await
+            .expect("the stored row lands");
+    }
+
+    /// Takes every staged background task out and aborts it.
+    fn abort_background(runtime: &mut AgentRuntime) {
+        for entry in runtime.background.drain(..) {
+            entry.into_task().abort();
+        }
+    }
+
+    /// D9's first check: with no writable registry the request is refused before any spawn.
+    #[tokio::test]
+    async fn set_tool_paths_offline_refuses_before_spawning_anything() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = htui_store::CacheStore::open(root.path(), "paths-test", 1)
+            .await
+            .expect("mirror");
+        let backend = Backend::Offline {
+            cache: cache.clone(),
+            since: None,
+        };
+        let mut runtime = AgentRuntime::new(DriverFactory::new())
+            .with_probe_env(fake_env(root.path()), fake_hardware());
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let message = refused(set_paths(&mut runtime, &backend, &tx, 1, AgentId::new(), &[]).await);
+        assert!(
+            message.contains(htui_store::REGISTRY_ON_SERVER_ONLY),
+            "the offline backend's own sentence: {message}"
+        );
+        assert_eq!(runtime.background_len(), 0, "nothing was spawned");
+        cache.close().await;
+    }
+
+    /// D9: a box that is not registered has no `agent_box` primary key to write against.
+    #[tokio::test]
+    async fn set_tool_paths_on_an_unregistered_box_is_refused() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let backend = Backend::memory(MemStore::new());
+        let mut runtime = AgentRuntime::new(DriverFactory::new())
+            .with_probe_env(fake_env(tmp.path()), fake_hardware());
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let message = refused(set_paths(&mut runtime, &backend, &tx, 1, AgentId::new(), &[]).await);
+        assert!(message.contains("not registered"), "{message}");
+        assert_eq!(runtime.background_len(), 0);
+    }
+
+    /// D9: the row must exist and be enabled in the registry.
+    #[tokio::test]
+    async fn set_tool_paths_refuses_an_unknown_agent_and_a_disabled_one() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let (store, backend, mut runtime, agent_id) = paths_fixture(tmp.path()).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let message = refused(set_paths(&mut runtime, &backend, &tx, 1, AgentId::new(), &[]).await);
+        assert!(message.contains("not found"), "{message}");
+        assert_eq!(runtime.background_len(), 0);
+
+        // An update carries the stored `updated_at` as its token (MOD-23's CAS).
+        let mut disabled = summary_of(&store, agent_id).await.agent;
+        let token = disabled.updated_at;
+        disabled.enabled = false;
+        assert!(
+            matches!(
+                store.upsert_agent(&disabled, Some(token)).await,
+                Ok(htui_core::store::CasOutcome::Applied(_))
+            ),
+            "the row is switched off in the registry"
+        );
+        let message = refused(set_paths(&mut runtime, &backend, &tx, 2, agent_id, &[]).await);
+        assert_eq!(
+            message,
+            "`paths-fixture` is disabled in the registry; nothing to set a path for"
+        );
+        assert_eq!(runtime.background_len(), 0);
+    }
+
+    /// D9: every key is a tool the row's `discovery.tools` declares.
+    #[tokio::test]
+    async fn set_tool_paths_refuses_a_tool_the_row_does_not_declare() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let (_store, backend, mut runtime, agent_id) = paths_fixture(tmp.path()).await;
+        let file = plain_file(&tmp.path().join("third-tool"));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let message = refused(
+            set_paths(
+                &mut runtime,
+                &backend,
+                &tx,
+                1,
+                agent_id,
+                &[("third", &file)],
+            )
+            .await,
+        );
+        assert_eq!(message, "`third` is not a tool `paths-fixture` declares");
+        assert_eq!(runtime.background_len(), 0);
+    }
+
+    /// D10 on the worker's side (review N4): a row whose launch declares no tool, with no
+    /// `discovery` or an empty `tools`, is refused with the form's own sentence, even for an
+    /// empty map, which would otherwise be written.
+    #[tokio::test]
+    async fn set_tool_paths_refuses_a_literal_launch_with_the_forms_sentence() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let store = unresolvable_registry().await;
+        let no_discovery = AgentId::new();
+        let no_tools = AgentId::new();
+        for (id, name, launch) in [
+            (
+                no_discovery,
+                "no-discovery",
+                json!({ "command": "/bin/true", "args": [], "env": {} }),
+            ),
+            (
+                no_tools,
+                "no-tools",
+                json!({
+                    "command": "/bin/true",
+                    "args": [],
+                    "env": {},
+                    "discovery": { "tools": {}, "handshake": false }
+                }),
+            ),
+        ] {
+            store
+                .upsert_agent(
+                    &Agent {
+                        name: name.to_owned(),
+                        launch,
+                        ..paths_row(id)
+                    },
+                    None,
+                )
+                .await
+                .expect("the row lands");
+        }
+        let backend = Backend::memory(store.clone());
+        let mut runtime = AgentRuntime::new(DriverFactory::new())
+            .with_probe_env(fake_env(tmp.path()), fake_hardware());
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        for (seq, agent_id) in [(1, no_discovery), (2, no_tools)] {
+            let message = refused(set_paths(&mut runtime, &backend, &tx, seq, agent_id, &[]).await);
+            assert_eq!(message, "this row's launch is literal; e edits its command");
+            assert_eq!(runtime.background_len(), 0, "nothing was spawned");
+            assert!(summary_of(&store, agent_id).await.on_box.is_none());
+        }
+    }
+
+    /// D9, `R-SEC-2` (review L3): a `launch` that does not parse is refused by name, and the
+    /// sentence carries no serde text, which would quote the document, `env` included.
+    #[tokio::test]
+    async fn set_tool_paths_refuses_an_unparsable_launch_without_quoting_it() {
+        const SENTINEL: &str = "SECRET-SENTINEL";
+        let tmp = tempfile::tempdir().expect("temp box");
+        let store = unresolvable_registry().await;
+        let agent_id = AgentId::new();
+        // `args` as a string: serde's own text quotes the offending value.
+        let launch = json!({
+            "command": "${first}",
+            "args": SENTINEL,
+            "env": { "K": SENTINEL },
+            "discovery": { "tools": {}, "handshake": false }
+        });
+        let serde_text = serde_json::from_value::<AgentLaunch>(launch.clone())
+            .expect_err("the launch is malformed")
+            .to_string();
+        assert!(
+            serde_text.contains(SENTINEL),
+            "the case is only worth having if serde would leak: {serde_text}"
+        );
+        store
+            .upsert_agent(
+                &Agent {
+                    launch,
+                    ..paths_row(agent_id)
+                },
+                None,
+            )
+            .await
+            .expect("the row lands");
+        let backend = Backend::memory(store);
+        let mut runtime = AgentRuntime::new(DriverFactory::new())
+            .with_probe_env(fake_env(tmp.path()), fake_hardware());
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let message = refused(set_paths(&mut runtime, &backend, &tx, 1, agent_id, &[]).await);
+        assert_eq!(
+            message,
+            "`paths-fixture`'s launch does not parse; nothing declares a tool"
+        );
+        assert!(!message.contains(SENTINEL), "{message}");
+        assert_eq!(runtime.background_len(), 0);
+    }
+
+    /// D9: every value is absolute (`parse_tool_path`) and a file on this box (`is_file`), and
+    /// the refusal names the tool. The shape is checked on the arm; `is_file` is I/O and runs in
+    /// the task, so a hung mount cannot stall the store loop (review L1). Its refusal is the
+    /// task's one answer, nothing is written, and the row's claim is free after.
+    #[tokio::test]
+    async fn set_tool_paths_refuses_a_relative_path_a_directory_and_a_missing_file_naming_the_tool()
+    {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let (store, backend, mut runtime, agent_id) = paths_fixture(tmp.path()).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let message = refused(
+            set_paths(
+                &mut runtime,
+                &backend,
+                &tx,
+                1,
+                agent_id,
+                &[("first", "bin/x")],
+            )
+            .await,
+        );
+        assert_eq!(message, "`first`: the path must be absolute");
+        assert_eq!(runtime.background_len(), 0, "nothing was spawned");
+
+        let dir = tmp.path().join("a-directory");
+        std::fs::create_dir_all(&dir).expect("the directory");
+        let dir = dir.to_string_lossy().into_owned();
+        let absent = tmp.path().join("absent").to_string_lossy().into_owned();
+        for (seq, path) in [(2, &dir), (3, &absent)] {
+            let served = set_paths(
+                &mut runtime,
+                &backend,
+                &tx,
+                seq,
+                agent_id,
+                &[("first", path)],
+            )
+            .await;
+            assert!(
+                matches!(served, Served::Deferred),
+                "`is_file` is the task's check: {served:?}"
+            );
+            let reply = one_reply(&mut runtime, &mut rx).await;
+            assert_eq!(reply.seq, seq);
+            match reply.reply {
+                StoreReply::Failed { request, message } => {
+                    assert_eq!(request, SET_TOOL_PATHS);
+                    assert_eq!(
+                        message,
+                        format!("`first`: `{path}` is not a file on this box")
+                    );
+                }
+                other => panic!("a path that is not a file answers Failed: {other:?}"),
+            }
+            assert!(
+                runtime.reprobe_claims.claim((agent_id, ids::BOX)).is_some(),
+                "the refusal released the row's claim"
+            );
+        }
+        assert!(
+            summary_of(&store, agent_id).await.on_box.is_none(),
+            "a refused map writes nothing"
+        );
+    }
+
+    /// D8: a writing background task, a box probe and another tool-paths write each hold the box.
+    #[tokio::test]
+    async fn set_tool_paths_is_refused_while_a_writer_holds_the_box() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let (_store, backend, mut runtime, agent_id) = paths_fixture(tmp.path()).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        runtime
+            .background
+            .push(Background::writing(tokio::spawn(std::future::pending())));
+        let message = refused(set_paths(&mut runtime, &backend, &tx, 1, agent_id, &[]).await);
+        assert!(
+            message.ends_with(BOX_WRITE_RUNNING),
+            "verb-neutral, not \"install\" (review L4): {message}"
+        );
+        assert_eq!(runtime.background_len(), 1, "the refusal spawned nothing");
+        abort_background(&mut runtime);
+
+        runtime.box_probe = Some(tokio::spawn(std::future::pending()));
+        let message = refused(set_paths(&mut runtime, &backend, &tx, 2, agent_id, &[]).await);
+        assert!(message.contains(BOX_PROBE_RUNNING), "{message}");
+        assert_eq!(runtime.background_len(), 0);
+        runtime.box_probe.take().expect("still staged").abort();
+
+        let other = AgentId::new();
+        runtime.background.push(Background::writing_tool_paths(
+            tokio::spawn(std::future::pending()),
+            other,
+        ));
+        let message = refused(set_paths(&mut runtime, &backend, &tx, 3, agent_id, &[]).await);
+        assert!(
+            message.contains(&tool_paths_running(other)),
+            "B5: its own sentence, not the install one: {message}"
+        );
+        assert_eq!(runtime.background_len(), 1);
+        abort_background(&mut runtime);
+    }
+
+    /// D8: an install writes this row at its end, so a tool-paths write may not run beside it.
+    #[tokio::test]
+    async fn set_tool_paths_while_an_install_runs_is_refused() {
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&install_row(agent_id, "demo", true), None)
+            .await
+            .expect("the row lands");
+        let backend = Backend::memory(store);
+        let fixture = Fixture::start().await;
+        fixture.route(
+            "/registry.json",
+            Route {
+                status: 200,
+                delay: Duration::from_secs(30),
+                ..Route::default()
+            },
+        );
+        let tmp = tempfile::tempdir().expect("a temporary install root");
+        let mut runtime = installing_runtime(&fixture, &tmp.path().join("agents"));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let planning = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(1, StoreRequest::InstallPlan { agent_id }),
+            )
+            .await;
+        assert!(matches!(planning, Served::Deferred), "{planning:?}");
+        let message = refused(set_paths(&mut runtime, &backend, &tx, 2, agent_id, &[]).await);
+        assert!(
+            message.contains("an install is already running"),
+            "the refusal names what holds the box: {message}"
+        );
+        assert_eq!(runtime.background_len(), 0, "and it spawned nothing");
+        runtime.shutdown(Duration::ZERO).await;
+    }
+
+    /// D8: `claim_is_free` cannot see a D60 re-probe (it runs inside a chat task), so the row's
+    /// re-probe claim is taken too, and a held one refuses.
+    #[tokio::test]
+    async fn set_tool_paths_is_refused_while_a_re_probe_holds_the_row() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let (_store, backend, mut runtime, agent_id) = paths_fixture(tmp.path()).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let _held = runtime
+            .reprobe_claims
+            .claim((agent_id, ids::BOX))
+            .expect("the row is free");
+        let message = refused(set_paths(&mut runtime, &backend, &tx, 1, agent_id, &[]).await);
+        assert!(
+            message.contains(&format!("a re-probe is running for agent {agent_id}")),
+            "{message}"
+        );
+        assert_eq!(runtime.background_len(), 0);
+    }
+
+    /// D8, H-11: `ProbeAgents` writes every row, so it refuses while a tool-paths write runs.
+    #[tokio::test]
+    async fn probe_agents_is_refused_while_a_tool_paths_write_runs() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let (_store, backend, mut runtime, agent_id) = paths_fixture(tmp.path()).await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        runtime.background.push(Background::writing_tool_paths(
+            tokio::spawn(std::future::pending()),
+            agent_id,
+        ));
+        match runtime
+            .serve(&backend, &tx, &envelope(1, StoreRequest::ProbeAgents))
+            .await
+        {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "probe_agents");
+                assert!(message.contains(&tool_paths_running(agent_id)), "{message}");
+            }
+            other => panic!("a probe may not run beside a tool-paths write: {other:?}"),
+        }
+        assert_eq!(runtime.background_len(), 1, "nothing was added");
+        abort_background(&mut runtime);
+    }
+
+    /// A row like [`paths_row`] whose one tool, `hold`, is the script `/bin/sh` runs, with
+    /// `handshake: true`: a `SetToolPaths` over it is in flight until the script exits.
+    #[cfg(unix)]
+    fn holding_row(id: AgentId) -> Agent {
+        Agent {
+            launch: json!({
+                "command": "/bin/sh",
+                "args": ["${hold}"],
+                "env": {},
+                "discovery": {
+                    "tools": {
+                        "hold": { "kind": "path", "names": ["htui-no-such-binary-66h"] }
+                    },
+                    "handshake": true
+                }
+            }),
+            ..paths_row(id)
+        }
+    }
+
+    /// A `SetToolPaths` the real handler accepted over [`holding_row`], still in flight.
+    #[cfg(unix)]
+    struct InFlight {
+        backend: Backend,
+        runtime: AgentRuntime,
+        agent_id: AgentId,
+        tx: mpsc::UnboundedSender<ReplyEnvelope>,
+        rx: mpsc::UnboundedReceiver<ReplyEnvelope>,
+        /// The manual path the write was sent with.
+        script: String,
+        /// The file whose existence lets the script exit.
+        release: std::path::PathBuf,
+    }
+
+    /// Sends `SetToolPaths` (seq 1) over [`holding_row`], whose script marks `started`, never
+    /// answers `initialize`, and exits once `release` exists. Returns once the script runs, so
+    /// the task is inside its handshake.
+    ///
+    /// The script is read by `/bin/sh` rather than executed (the `ETXTBSY` rule of
+    /// `login_row`'s helper), and it names `/bin/sleep` because `fake_env`'s `PATH` holds nothing.
+    #[cfg(unix)]
+    async fn in_flight_tool_paths(tmp: &std::path::Path) -> InFlight {
+        let store = unresolvable_registry().await;
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&holding_row(agent_id), None)
+            .await
+            .expect("the row lands");
+        let backend = Backend::memory(store);
+        let mut runtime =
+            AgentRuntime::new(DriverFactory::new()).with_probe_env(fake_env(tmp), fake_hardware());
+        let started = tmp.join("started");
+        let release = tmp.join("release");
+        let script = tmp.join("hold.sh");
+        std::fs::write(
+            &script,
+            format!(
+                ": > '{}'\nwhile [ ! -e '{}' ]; do /bin/sleep 0.05; done\n",
+                started.display(),
+                release.display()
+            ),
+        )
+        .expect("write the script");
+        let script = script.to_string_lossy().into_owned();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let served = set_paths(
+            &mut runtime,
+            &backend,
+            &tx,
+            1,
+            agent_id,
+            &[("hold", &script)],
+        )
+        .await;
+        assert!(matches!(served, Served::Deferred), "{served:?}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !started.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the task never reached its handshake"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        InFlight {
+            backend,
+            runtime,
+            agent_id,
+            tx,
+            rx,
+            script,
+            release,
+        }
+    }
+
+    #[cfg(unix)]
+    impl InFlight {
+        /// Lets the script exit and returns the write's one answer.
+        async fn finish(&mut self) -> ReplyEnvelope {
+            std::fs::write(&self.release, "").expect("release the script");
+            one_reply(&mut self.runtime, &mut self.rx).await
+        }
+    }
+
+    /// H-10 (review M1): the row's re-probe claim is moved into the task, so a staleness re-probe
+    /// of the row is refused for as long as the write is in flight, and is free once it answered.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tool_paths_write_holds_the_reprobe_claim_while_in_flight() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let mut flight = in_flight_tool_paths(tmp.path()).await;
+        let agent_id = flight.agent_id;
+
+        assert!(
+            flight
+                .runtime
+                .reprobe_claims
+                .claim((agent_id, ids::BOX))
+                .is_none(),
+            "a staleness re-probe of this row waits for the write"
+        );
+        assert!(
+            flight
+                .runtime
+                .reprobe_claims
+                .claim((AgentId::new(), ids::BOX))
+                .is_some(),
+            "another row on this box is not excluded"
+        );
+
+        let reply = flight.finish().await;
+        assert!(
+            matches!(
+                tool_paths_outcome(reply),
+                AgentWrite::ToolPaths {
+                    status: ProbeStatus::Failed,
+                    ..
+                }
+            ),
+            "a handshake the script never answered"
+        );
+        assert!(
+            flight
+                .runtime
+                .reprobe_claims
+                .claim((agent_id, ids::BOX))
+                .is_some(),
+            "and the claim goes with the task"
+        );
+    }
+
+    /// H-11, B5 (review M2): the real handler tags its task `Writes::ToolPaths`, so a
+    /// `ProbeAgents` and a second `SetToolPaths` beside it are refused with B5's sentence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_running_tool_paths_write_refuses_a_probe_and_a_second_write_by_name() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let mut flight = in_flight_tool_paths(tmp.path()).await;
+        let agent_id = flight.agent_id;
+
+        match flight
+            .runtime
+            .serve(
+                &flight.backend,
+                &flight.tx,
+                &envelope(2, StoreRequest::ProbeAgents),
+            )
+            .await
+        {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "probe_agents");
+                assert!(
+                    message.ends_with(&tool_paths_running(agent_id)),
+                    "{message}"
+                );
+            }
+            other => panic!("a probe may not run beside a tool-paths write: {other:?}"),
+        }
+        let script = flight.script.clone();
+        let message = refused(
+            set_paths(
+                &mut flight.runtime,
+                &flight.backend,
+                &flight.tx,
+                3,
+                agent_id,
+                &[("hold", &script)],
+            )
+            .await,
+        );
+        assert!(
+            message.ends_with(&tool_paths_running(agent_id)),
+            "B5: its own sentence: {message}"
+        );
+        assert_eq!(flight.runtime.background_len(), 1, "nothing was added");
+
+        let reply = flight.finish().await;
+        assert_eq!(reply.seq, 1, "the one answer is the first write's");
+    }
+
+    /// D7, D9: a valid map is probed over, written as a `manual` snapshot carrying the map, and
+    /// answered once at the request's address. The row's re-probe claim is released after (H-10).
+    #[tokio::test]
+    async fn a_valid_map_writes_a_manual_snapshot_and_answers_tool_paths() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let (store, backend, mut runtime, agent_id) = paths_fixture(tmp.path()).await;
+        let first = plain_file(&tmp.path().join("first-tool"));
+        let second = plain_file(&tmp.path().join("second-tool"));
+        let map = tool_map(&[("first", &first), ("second", &second)]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let request = RequestEnvelope {
+            seq: 7,
+            origin: Origin::Tab(crate::ui::tabs::TabId("settings")),
+            request: StoreRequest::SetToolPaths {
+                agent_id,
+                paths: map.clone(),
+            },
+        };
+
+        let served = runtime.serve(&backend, &tx, &request).await;
+        assert!(matches!(served, Served::Deferred), "{served:?}");
+        assert_eq!(runtime.writing_background_len(), 1, "a writing task (B4)");
+
+        let reply = one_reply(&mut runtime, &mut rx).await;
+        assert_eq!(reply.seq, 7, "the request's own address");
+        assert_eq!(reply.origin, request.origin);
+        match reply.reply {
+            StoreReply::AgentWritten { agents, outcome } => {
+                assert_eq!(
+                    outcome,
+                    AgentWrite::ToolPaths {
+                        id: agent_id,
+                        name: PATHS_ROW.to_owned(),
+                        status: ProbeStatus::Ready,
+                    }
+                );
+                assert!(
+                    agents
+                        .iter()
+                        .any(|summary| summary.agent.id == agent_id && summary.on_box.is_some()),
+                    "the reply carries the registry re-read"
+                );
+            }
+            other => panic!("a SetToolPaths that ran answers AgentWritten: {other:?}"),
+        }
+
+        let (on_box, snapshot) = stored_snapshot(&store, agent_id).await;
+        assert!(on_box.enabled, "a ready row is enabled");
+        assert!(on_box.probed_at.is_some());
+        assert_eq!(snapshot.source, htui_agent::probe::ProbeSource::Manual);
+        assert_eq!(snapshot.manual, map);
+        let resolved = snapshot.resolved.expect("the launch resolved");
+        assert_eq!(resolved.command, first);
+        assert_eq!(resolved.args, vec![second]);
+        assert!(
+            runtime.reprobe_claims.claim((agent_id, ids::BOX)).is_some(),
+            "the task released the row's re-probe claim"
+        );
+    }
+
+    /// Plan amendment 7: a stored manual row plus a report that stays incomplete is **written**
+    /// (`probe_agent` would have kept it, D51; B1 bypasses that).
+    #[tokio::test]
+    async fn a_stored_manual_row_with_an_incomplete_report_is_still_written() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let (store, backend, mut runtime, agent_id) = paths_fixture(tmp.path()).await;
+        let first = plain_file(&tmp.path().join("first-tool"));
+        let second = plain_file(&tmp.path().join("second-tool"));
+        stage_manual_row(
+            &store,
+            agent_id,
+            tool_map(&[("first", &first), ("second", &second)]),
+        )
+        .await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let served = set_paths(
+            &mut runtime,
+            &backend,
+            &tx,
+            1,
+            agent_id,
+            &[("first", &first)],
+        )
+        .await;
+        assert!(matches!(served, Served::Deferred), "{served:?}");
+        assert_eq!(
+            tool_paths_outcome(one_reply(&mut runtime, &mut rx).await),
+            AgentWrite::ToolPaths {
+                id: agent_id,
+                name: PATHS_ROW.to_owned(),
+                status: ProbeStatus::Missing,
+            }
+        );
+
+        let (on_box, snapshot) = stored_snapshot(&store, agent_id).await;
+        assert!(
+            on_box
+                .probed_at
+                .is_some_and(|at| at > htui_core::fixtures::demo_at(0, 0)),
+            "the row was written, not kept: {:?}",
+            on_box.probed_at
+        );
+        assert_eq!(snapshot.status, ProbeStatus::Missing);
+        assert_eq!(snapshot.manual, tool_map(&[("first", &first)]));
+        assert_eq!(
+            snapshot.source,
+            htui_agent::probe::ProbeSource::Manual,
+            "`first` was decided by a manual path (D4)"
+        );
+    }
+
+    /// D9 / B1: a row with no `agent_box` row yet is written, with no synthesized `existing`.
+    #[tokio::test]
+    async fn a_row_with_no_agent_box_row_is_written() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let (store, backend, mut runtime, agent_id) = paths_fixture(tmp.path()).await;
+        assert!(
+            summary_of(&store, agent_id).await.on_box.is_none(),
+            "the fixture starts with no agent_box row"
+        );
+        let first = plain_file(&tmp.path().join("first-tool"));
+        let second = plain_file(&tmp.path().join("second-tool"));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let served = set_paths(
+            &mut runtime,
+            &backend,
+            &tx,
+            1,
+            agent_id,
+            &[("first", &first), ("second", &second)],
+        )
+        .await;
+        assert!(matches!(served, Served::Deferred), "{served:?}");
+        assert_eq!(
+            tool_paths_outcome(one_reply(&mut runtime, &mut rx).await),
+            AgentWrite::ToolPaths {
+                id: agent_id,
+                name: PATHS_ROW.to_owned(),
+                status: ProbeStatus::Ready,
+            }
+        );
+        let (_on_box, snapshot) = stored_snapshot(&store, agent_id).await;
+        assert_eq!(snapshot.status, ProbeStatus::Ready);
+    }
+
+    /// D9: an empty map clears every manual path, and the row is written even when `missing`.
+    #[tokio::test]
+    async fn an_empty_map_clears_to_a_probe_snapshot_even_when_missing() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let (store, backend, mut runtime, agent_id) = paths_fixture(tmp.path()).await;
+        let first = plain_file(&tmp.path().join("first-tool"));
+        stage_manual_row(&store, agent_id, tool_map(&[("first", &first)])).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let served = set_paths(&mut runtime, &backend, &tx, 1, agent_id, &[]).await;
+        assert!(matches!(served, Served::Deferred), "{served:?}");
+        assert_eq!(
+            tool_paths_outcome(one_reply(&mut runtime, &mut rx).await),
+            AgentWrite::ToolPaths {
+                id: agent_id,
+                name: PATHS_ROW.to_owned(),
+                status: ProbeStatus::Missing,
+            }
+        );
+
+        let (on_box, snapshot) = stored_snapshot(&store, agent_id).await;
+        assert_eq!(snapshot.source, htui_agent::probe::ProbeSource::Probe);
+        assert!(
+            on_box
+                .probe
+                .as_ref()
+                .expect("a probe document")
+                .get("manual")
+                .is_none(),
+            "an empty map adds no key"
+        );
+        assert!(
+            on_box
+                .probed_at
+                .is_some_and(|at| at > htui_core::fixtures::demo_at(0, 0)),
+            "written, not kept"
+        );
+    }
+
+    /// MOD-23 D243: a row switched off on this box stays off whatever the probe says.
+    #[tokio::test]
+    async fn a_switched_off_row_stays_off_under_set_tool_paths() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let (store, backend, mut runtime, agent_id) = paths_fixture(tmp.path()).await;
+        store
+            .set_agent_box_enabled(agent_id, ids::BOX, false)
+            .await
+            .expect("the switch lands");
+        let first = plain_file(&tmp.path().join("first-tool"));
+        let second = plain_file(&tmp.path().join("second-tool"));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let served = set_paths(
+            &mut runtime,
+            &backend,
+            &tx,
+            1,
+            agent_id,
+            &[("first", &first), ("second", &second)],
+        )
+        .await;
+        assert!(matches!(served, Served::Deferred), "{served:?}");
+        assert_eq!(
+            tool_paths_outcome(one_reply(&mut runtime, &mut rx).await),
+            AgentWrite::ToolPaths {
+                id: agent_id,
+                name: PATHS_ROW.to_owned(),
+                status: ProbeStatus::Ready,
+            }
+        );
+        let summary = summary_of(&store, agent_id).await;
+        assert!(summary.user_off, "the switch is untouched");
+        assert!(
+            !summary.on_box.expect("the written row").enabled,
+            "the store kept the veto"
+        );
+    }
+
+    /// D4: every probe path carries the map, so a `ProbeAgents` after the write keeps it.
+    #[tokio::test]
+    async fn a_probe_after_set_tool_paths_keeps_the_map() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let (store, backend, mut runtime, agent_id) = paths_fixture(tmp.path()).await;
+        let first = plain_file(&tmp.path().join("first-tool"));
+        let second = plain_file(&tmp.path().join("second-tool"));
+        let map = tool_map(&[("first", &first), ("second", &second)]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let served = set_paths(
+            &mut runtime,
+            &backend,
+            &tx,
+            1,
+            agent_id,
+            &[("first", &first), ("second", &second)],
+        )
+        .await;
+        assert!(matches!(served, Served::Deferred), "{served:?}");
+        let _ = one_reply(&mut runtime, &mut rx).await;
+
+        let probing = runtime
+            .serve(&backend, &tx, &envelope(2, StoreRequest::ProbeAgents))
+            .await;
+        assert!(matches!(probing, Served::Deferred), "{probing:?}");
+        runtime.finish_background(Duration::from_secs(10)).await;
+
+        let (on_box, snapshot) = stored_snapshot(&store, agent_id).await;
+        assert_eq!(snapshot.source, htui_agent::probe::ProbeSource::Manual);
+        assert_eq!(snapshot.manual, map);
+        assert_eq!(snapshot.status, ProbeStatus::Ready);
+        assert!(on_box.enabled);
     }
 }

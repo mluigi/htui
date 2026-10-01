@@ -1224,6 +1224,7 @@ done
             status: ProbeStatus::Unauthenticated,
             stderr_tail: None,
             source: ProbeSource::Probe,
+            manual: std::collections::BTreeMap::new(),
         };
         agent_box_row(agent, BoxId::new(), &snapshot, Utc::now())
     }

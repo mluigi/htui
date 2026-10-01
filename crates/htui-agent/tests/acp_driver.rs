@@ -40,22 +40,27 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
 use std::time::Duration;
 
 use chrono::Utc;
 use htui_agent::acp::AcpDriver;
+use htui_agent::acp::Handshake;
 #[cfg(unix)]
 use htui_agent::acp::{AcpIo, SessionOptions, Stamp, open_session};
+use htui_agent::driver::DriverFuture;
 #[cfg(unix)]
 use htui_agent::driver::{AgentDriver, AgentSession};
 use htui_agent::driver::{PermissionPolicy, SessionSpec, ToolExposure};
 #[cfg(unix)]
 use htui_agent::error::DriverError;
+use htui_agent::launch::AcpSettings;
 use htui_agent::launch::ResolvedLaunch;
 #[cfg(unix)]
 use htui_agent::launch::{AgentSettings, spawn};
-use htui_agent::probe::{ProbeSnapshot, ProbeSource, ProbeStatus, agent_box_row};
+use htui_agent::probe::{
+    ProbeContext, ProbeEnv, ProbeSnapshot, ProbeSource, ProbeStatus, Tier2, agent_box_row,
+    probe_snapshot,
+};
 #[cfg(unix)]
 use htui_agent::registry::DriverFactory;
 use htui_agent::registry::caps_for;
@@ -535,6 +540,7 @@ fn snapshot(source: ProbeSource, status: ProbeStatus, resolved: ResolvedLaunch) 
         status,
         stderr_tail: None,
         source,
+        manual: BTreeMap::new(),
     }
 }
 
@@ -774,22 +780,24 @@ async fn a_recorded_command_that_is_now_a_directory_falls_back_to_resolution() {
     );
 }
 
-/// Blueprint H-5: a `manual` row's hand-written `probe.resolved` is a human's note, not a launch.
+/// MOD-66 D6: a `manual` snapshot is the probe's own recording over a human's path, so it is
+/// spawned exactly as a `probe` one is. Before MOD-66 this case pinned the refusal (MOD-2
+/// blueprint H-5, now superseded).
 ///
-/// The recorded command exists on disk here on purpose — the disk check passes, so `source` is the
-/// only rule left that can refuse, and the case cannot pass for the wrong reason.
+/// The row resolves for itself, to a different file, so the case cannot pass for the wrong
+/// reason: a launch carrying the marker came from the recording.
 #[tokio::test]
-async fn a_manual_snapshot_is_not_used_as_a_launch() {
+async fn a_manual_snapshot_is_used_as_a_launch() {
     let tmp = tempfile::tempdir().expect("temp box");
     let agent = resolvable_row(tmp.path());
     let recorded = ResolvedLaunch {
-        command: plain_file(&tmp.path().join("bin/hand-written")),
+        command: plain_file(&tmp.path().join("bin/hand-picked")),
         args: vec![MARKER.to_owned()],
         env: BTreeMap::new(),
     };
     let row_on_box = on_box(
         &agent,
-        &snapshot(ProbeSource::Manual, ProbeStatus::Ready, recorded),
+        &snapshot(ProbeSource::Manual, ProbeStatus::Ready, recorded.clone()),
     );
 
     let driver = AcpDriver::from_row_with_probe(&agent, Some(&row_on_box), caps_for(&agent))
@@ -797,17 +805,81 @@ async fn a_manual_snapshot_is_not_used_as_a_launch() {
     let launch = driver
         .launch_for(&spec(tmp.path().to_path_buf()))
         .await
-        .expect("the row resolves for itself");
+        .expect("a manual snapshot is usable");
 
     assert_eq!(
-        launch.command,
-        entry_point(tmp.path()).to_string_lossy(),
-        "a manual row is honoured through `agent.launch`, which is where the human wrote it"
+        launch.command, recorded.command,
+        "MOD-66 D6: the recording made over the human's path is the launch"
     );
     assert!(
-        !launch.args.contains(&MARKER.to_owned()),
-        "the hand-written snapshot was not spawned: {:?}",
+        launch.args.contains(&MARKER.to_owned()),
+        "the manual snapshot was spawned as recorded: {:?}",
         launch.args
+    );
+}
+
+/// The plan's acceptance criterion "a per-box manual path reaches a spawn", end to end at the
+/// seam: the probe walks the manual tier, tier 2 answers, the row is projected, and the driver
+/// spawns what the probe recorded. The row's one tool is on no `PATH`, so nothing but the manual
+/// path can have produced the command.
+#[tokio::test]
+async fn a_manual_path_reaches_the_launch_through_the_probe() {
+    /// A tier 2 that completes `initialize` with no auth methods, without a process.
+    struct Answers;
+
+    impl Tier2 for Answers {
+        fn handshake<'a>(
+            &'a self,
+            _launch: &'a ResolvedLaunch,
+            _settings: &'a AcpSettings,
+            _env: &'a ProbeEnv,
+        ) -> DriverFuture<'a, Handshake> {
+            Box::pin(async move {
+                Ok(Handshake {
+                    at: Utc::now(),
+                    protocol_version: 1,
+                    agent_name: Some("manual-fixture".to_owned()),
+                    agent_version: Some("0.0.0".to_owned()),
+                    capabilities: json!({}),
+                    auth_methods: vec![],
+                })
+            })
+        }
+    }
+
+    let tmp = tempfile::tempdir().expect("temp box");
+    let agent = unresolvable_row();
+    let tool = plain_file(&tmp.path().join("opt/htui-fake-adapter"));
+    let ctx = ProbeContext {
+        env: ProbeEnv {
+            cwd: tmp.path().to_path_buf(),
+            platform: "linux-x86_64".to_owned(),
+            home: None,
+            vars: BTreeMap::from([(
+                "PATH".to_owned(),
+                tmp.path().join("bin").to_string_lossy().into_owned(),
+            )]),
+            versions: false,
+            version_timeout: Duration::from_secs(5),
+        },
+        now: Utc::now(),
+    };
+    let manual = BTreeMap::from([("tool".to_owned(), tool.clone())]);
+
+    let snapshot = probe_snapshot(&agent, &manual, &ctx, &Answers).await;
+    assert_eq!(snapshot.status, ProbeStatus::Ready, "{snapshot:?}");
+    assert_eq!(snapshot.source, ProbeSource::Manual);
+    let row_on_box = agent_box_row(&agent, BoxId::new(), &snapshot, ctx.now);
+
+    let driver = AcpDriver::from_row_with_probe(&agent, Some(&row_on_box), caps_for(&agent))
+        .expect("the row's launch parses");
+    let launch = driver
+        .launch_for(&spec(tmp.path().to_path_buf()))
+        .await
+        .expect("the manual recording is usable");
+    assert_eq!(
+        launch.command, tool,
+        "the human's path reached the spawn through the probe's recording"
     );
 }
 
@@ -819,8 +891,7 @@ async fn a_manual_snapshot_is_not_used_as_a_launch() {
 /// which transport it was probed for, so the two disagreeing is the one case where the recording
 /// is not merely stale but wrong — and the row's own `launch` is what the edit was asking for.
 ///
-/// The recorded command exists on disk here, as in the `manual` case above, so the disk check
-/// cannot be what refuses.
+/// The recorded command exists on disk here, so the disk check cannot be what refuses.
 #[tokio::test]
 async fn a_snapshot_probed_for_another_transport_is_not_used_as_a_launch() {
     let tmp = tempfile::tempdir().expect("temp box");

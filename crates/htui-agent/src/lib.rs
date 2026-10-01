@@ -173,7 +173,8 @@ pub use permission::{PolicyAnswer, PolicyStage, evaluate as evaluate_permission}
 pub use probe::{
     CredentialTier, INSTALL_ROOT_VAR, ProbeContext, ProbeEnv, ProbeOutcome, ProbeSnapshot,
     ProbeSource, ProbeStatus, SpawnTier2, Tier2, ToolReport, ToolResolution, default_install_root,
-    install_root, platform_key, probe_agent, probe_tools, resolve_credential,
+    install_root, platform_key, probe_agent, probe_snapshot, probe_tools, probe_tools_with,
+    resolve_credential,
 };
 pub use record::{
     AnsweredBy, CHUNK_FLUSH_BYTES, Control, NoRelay, RELAY_GRACE, RELAY_POLL, RecordError,

@@ -245,6 +245,10 @@ pub struct ToolReport {
     /// Names that resolved nowhere or below their floor, in `BTreeMap` order. A name below its
     /// floor is in **both** maps: it was found, and it does not count.
     pub missing: Vec<String>,
+    /// Names that resolved through this box's **manual path** (MOD-66 D2), in `BTreeMap` order:
+    /// a subset of `found`'s keys. Non-empty makes the snapshot's `source`
+    /// [`ProbeSource::Manual`] (D4): a human decided at least part of this launch.
+    pub manual: Vec<String>,
 }
 
 impl ToolReport {
@@ -316,14 +320,16 @@ wire_enum!(
 );
 
 wire_enum!(
-    /// `probe.source` (plan D45): who wrote the row. A `manual` row survives a probe that finds
-    /// nothing (plan D51, ANA-4 §4.6).
+    /// `probe.source` (plan D45): who decided the launch. `manual` when at least one tool resolved
+    /// through this box's manual path (MOD-66 D4), or in a row a human wrote by hand (ANA-4
+    /// §4.6's recipe, honoured by the same rules). A `manual` row survives a probe that finds
+    /// nothing (plan D51; MOD-66 D5).
     #[derive(Default)]
     ProbeSource {
         /// Written by the probe itself.
         #[default]
         Probe => "probe",
-        /// Hand-written in Settings (the editor is a later milestone's; the rule is honoured now).
+        /// At least one tool came from `probe.manual`, or the row was hand-written.
         Manual => "manual",
     }
 );
@@ -428,6 +434,29 @@ pub async fn resolve_tool(probe: &ToolProbe, env: &ProbeEnv) -> Result<Option<To
 /// # Errors
 /// As [`resolve_tool`].
 pub async fn probe_tools(discovery: Option<&Discovery>, env: &ProbeEnv) -> Result<ToolReport> {
+    probe_tools_with(discovery, &BTreeMap::new(), env).await
+}
+
+/// [`probe_tools`] with this box's manual paths (MOD-66 D2, D3). Per tool, in this order:
+///
+/// 1. `HTUI_TOOL_<NAME>`, unchanged: checked with `exists`, recorded with no version, no args.
+/// 2. `manual[name]`, when present: it must be an **absolute** path (B3) to a **file**
+///    ([`is_file`]). Then it is found with `version: None`, `below_min: false`, and, for a
+///    [`ToolProbe::Glob`] tool, the matching platform's `args` (D3). Otherwise it is
+///    **missing**, with a `warn!` naming the tool. It never falls through to step 3, because
+///    that would silently replace the human's choice.
+/// 3. The tool's own `discovery` probe ([`resolve_tool`]), unchanged.
+///
+/// A key of `manual` that `discovery.tools` does not declare is ignored here, and carried by the
+/// snapshot as-is (D4).
+///
+/// # Errors
+/// As [`resolve_tool`].
+pub async fn probe_tools_with(
+    discovery: Option<&Discovery>,
+    manual: &BTreeMap<String, String>,
+    env: &ProbeEnv,
+) -> Result<ToolReport> {
     let mut report = ToolReport::default();
     let Some(discovery) = discovery else {
         return Ok(report);
@@ -453,6 +482,38 @@ pub async fn probe_tools(discovery: Option<&Discovery>, env: &ProbeEnv) -> Resul
                     override_key = key,
                     path = value,
                     "the tool override names a path that does not exist"
+                );
+                report.missing.push(name.clone());
+            }
+            continue;
+        }
+
+        if let Some(value) = manual.get(name) {
+            let path = PathBuf::from(value);
+            if path.is_absolute() && is_file(&path).await {
+                // Exhaustive on purpose: a fourth probe kind has to decide its args here.
+                let args = match probe {
+                    ToolProbe::Glob { platform, .. } => platform
+                        .get(&env.platform)
+                        .map(|entry| entry.args.clone())
+                        .unwrap_or_default(),
+                    ToolProbe::Path { .. } | ToolProbe::NodePackage { .. } => Vec::new(),
+                };
+                report.found.insert(
+                    name.clone(),
+                    ToolResolution {
+                        path,
+                        version: None,
+                        args,
+                        below_min: false,
+                    },
+                );
+                report.manual.push(name.clone());
+            } else {
+                warn!(
+                    tool = name,
+                    path = value,
+                    "the manual path is not an absolute path to a file on this box"
                 );
                 report.missing.push(name.clone());
             }
@@ -575,18 +636,22 @@ async fn exists(path: &Path) -> bool {
 
 /// Whether `path` is a **file**, off the runtime's worker.
 ///
-/// [`exists`]'s stricter sibling, `pub(crate)` for [`crate::acp::AcpDriver::launch_for`], which
-/// applies D58's fourth rule — the recorded command is still on disk — and is asking a narrower
-/// question than the tiers above. It is about to hand the path to `execve`, and the self-update
-/// ANA-4 §4.6 describes rearranges version-numbered *directories*: a recorded path that has become
-/// one exists, is not a launch, and would fail the chat with a `Spawn` error and earn the row a
-/// D60 re-probe it does not need. One `is_file` on the same `metadata` call turns that into the
-/// fallback the rule already has.
+/// `exists`'s stricter sibling. `pub` for its three callers: D58's disk check in `launch_from`,
+/// the manual tier of [`probe_tools_with`] (MOD-66 D2), and the `SetToolPaths` worker check in
+/// `htui` (MOD-66 D9).
+///
+/// D58's check applies its fourth rule — the recorded command is still on disk — and is asking a
+/// narrower question than the tiers above. It is about to hand the path to `execve`, and the
+/// self-update ANA-4 §4.6 describes rearranges version-numbered *directories*: a recorded path
+/// that has become one exists, is not a launch, and would fail the chat with a `Spawn` error and
+/// earn the row a D60 re-probe it does not need. One `is_file` on the same `metadata` call turns
+/// that into the fallback the rule already has. A manual path is held to the same standard, for
+/// the same reason: a directory is not spawnable.
 ///
 /// A path that cannot be `stat`ed at all — gone, or a directory this process may not traverse — is
 /// `false` for the same reason: the answer to "can this be spawned" is no either way, and
 /// resolution is the honest second attempt.
-pub(crate) async fn is_file(path: &Path) -> bool {
+pub async fn is_file(path: &Path) -> bool {
     tokio::fs::metadata(path)
         .await
         .is_ok_and(|meta| meta.is_file())
@@ -1115,6 +1180,12 @@ pub struct ProbeSnapshot {
     /// nobody marked `manual` may be refreshed.
     #[serde(default)]
     pub source: ProbeSource,
+    /// MOD-66 D1: `${tool}` name → the absolute path a human gave this box for it. Written by
+    /// `SetToolPaths`, read by every probe as a resolution tier ([`probe_tools_with`]), and
+    /// carried forward by every snapshot the probe writes. Absent in older documents, and absent
+    /// when empty, so a row with no manual path keeps its exact bytes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub manual: BTreeMap<String, String>,
 }
 
 impl ProbeSnapshot {
@@ -1145,11 +1216,13 @@ impl ProbeSnapshot {
     /// itself launches the adapter without it (blueprint H-3). The recording does carry them,
     /// because [`resolve_tool`] appended them when it walked the glob.
     ///
-    /// Three rules, all readable from the document:
+    /// `source` is either. Since MOD-66 (D6) a `manual` snapshot is one the probe wrote over a
+    /// human's path. It resolved, and, where tier 2 ran, it answered, exactly as a `probe` one did.
+    /// A hand-written `manual` row (ANA-4 §4.6's recipe) is honoured by the same two rules below.
+    /// MOD-2 blueprint H-5 is superseded.
     ///
-    /// - `source` is `probe`. A [`ProbeSource::Manual`] row is a human's path, and
-    ///   `launch::resolve` already honours it through `agent.launch` itself — spawning the note
-    ///   instead of the row would make the two disagree silently (blueprint H-5).
+    /// Two rules, both readable from the document:
+    ///
     /// - `status` is `ready` **or** `unauthenticated`. The `unauthenticated` half is not a
     ///   tolerance, it is the point: that status certifies the recording *is* the right binary —
     ///   it resolved, it spawned, it completed `initialize` — and that the only thing wrong with
@@ -1172,9 +1245,6 @@ impl ProbeSnapshot {
     /// [`AcpDriver::launch_for`]: crate::acp::AcpDriver::launch_for
     #[must_use]
     pub fn recorded_launch(&self) -> Option<&ResolvedLaunch> {
-        if self.source != ProbeSource::Probe {
-            return None;
-        }
         if !matches!(
             self.status,
             ProbeStatus::Ready | ProbeStatus::Unauthenticated
@@ -1293,6 +1363,10 @@ pub enum ProbeOutcome {
     /// Plan D51: the stored row is `source: manual` and this probe **resolved nothing**. Write
     /// nothing — not even `probed_at`, because a bump on a no-op would make a hand-written row look
     /// freshly verified, which is the one reading the rule exists to prevent.
+    ///
+    /// Since MOD-66 such a row is usually one `SetToolPaths` wrote, so a manual path that
+    /// vanished, with nothing else resolving, keeps the last good row and its map (D5).
+    /// `SetToolPaths` itself never reaches this arm, because it calls [`probe_snapshot`] (B1).
     Kept {
         /// For the caller's log.
         reason: &'static str,
@@ -1310,8 +1384,9 @@ const MANUAL_KEPT: &str = "manual entry kept: the probe resolved nothing";
 ///    only the parsed launch and `ctx.env` and costs a `stat` and a map lookup: running it here
 ///    means **every** snapshot with a parsed launch records the tier, so a `missing` box still says
 ///    whether it holds a token. A transport fault is `failed`, as step 3's is.
-/// 3. [`probe_tools`]. A transport fault is `failed`, not `missing`: a box whose lookup could not
-///    run has not been shown to be missing anything.
+/// 3. [`probe_tools_with`] (over `existing`'s `manual`, MOD-66 D4). A transport fault is
+///    `failed`, not `missing`: a box whose lookup could not run has not been shown to be missing
+///    anything.
 /// 4. An incomplete report is `missing`, `resolved: None`, and **nothing is spawned**.
 /// 5. [`launch::resolve`](crate::launch::resolve) over the report's tool map; an unresolved
 ///    placeholder — a row that names a `${tool}` its `discovery` never declared — is `missing`
@@ -1320,13 +1395,14 @@ const MANUAL_KEPT: &str = "manual entry kept: the probe resolved nothing";
 ///    `initialize` to complete, so resolution is the whole probe and the status is `ready`.
 /// 7. The handshake's answer and step 2's tier map through [`status_for`]; a handshake failure is
 ///    `failed` with the error text line by line.
-/// 8. A snapshot with **no `resolved`** over a stored `source: manual` row is
-///    [`ProbeOutcome::Kept`]. ANA-4 §4.6 says "a probe that finds nothing", which is `missing` *and*
-///    the three `failed`s that never got as far as a launch — an `agent.launch` that does not parse
-///    (step 1), a credential fault (step 2) and a `probe_tools` transport fault (step 3). Anything
-///    the probe *did* resolve refreshes a manual row like any other, including a `failed`
-///    handshake: that one found the binary and is a fact about this box. A refreshed row says
-///    `source: probe`.
+/// 8. A snapshot with **no `resolved`** (over `existing`'s `manual`, MOD-66 D4) over a stored
+///    `source: manual` row is [`ProbeOutcome::Kept`]. ANA-4 §4.6 says "a probe that finds
+///    nothing", which is `missing` *and* the three `failed`s that never got as far as a launch —
+///    an `agent.launch` that does not parse (step 1), a credential fault (step 2) and a
+///    `probe_tools` transport fault (step 3). Anything the probe *did* resolve refreshes a manual
+///    row like any other, including a `failed` handshake: that one found the binary and is a fact
+///    about this box. A refreshed row says `source: probe`, or `manual` when a manual path decided
+///    a tool.
 /// 9. Otherwise [`agent_box_row`].
 ///
 /// Nothing here writes a store row: the caller owns the `Writer`, and `R-NF-3` keeps that caller
@@ -1338,17 +1414,19 @@ pub async fn probe_agent(
     ctx: &ProbeContext,
     tier2: &dyn Tier2,
 ) -> ProbeOutcome {
-    let snapshot = snapshot_for(agent, ctx, tier2).await;
+    // The stored source is all that is kept of the stored snapshot, so its map is moved out.
+    let (stored_is_manual, manual) = existing
+        .and_then(ProbeSnapshot::from_row)
+        .map_or((false, BTreeMap::new()), |stored| {
+            (stored.source == ProbeSource::Manual, stored.manual)
+        });
+    let snapshot = probe_snapshot(agent, &manual, ctx, tier2).await;
     // `resolved.is_none()`, not `status == Missing`: ANA-4:795-798's rule is "a probe that finds
     // nothing", and two `failed` outcomes also find nothing — an `agent.launch` that does not parse
     // and a `probe_tools` transport fault, neither of which learned anything about this box. Keying
     // on the status would let either of them overwrite a hand-written row with
     // `enabled = false, source: probe`. A `failed` that *did* resolve refreshes, as before.
-    if snapshot.resolved.is_none()
-        && existing
-            .and_then(ProbeSnapshot::from_row)
-            .is_some_and(|stored| stored.source == ProbeSource::Manual)
-    {
+    if snapshot.resolved.is_none() && stored_is_manual {
         return ProbeOutcome::Kept {
             reason: MANUAL_KEPT,
         };
@@ -1356,12 +1434,26 @@ pub async fn probe_agent(
     ProbeOutcome::Row(agent_box_row(agent, box_id, &snapshot, ctx.now))
 }
 
-/// Steps 1–7 of [`probe_agent`]: everything that decides the snapshot, with no knowledge of what
-/// was stored before.
-async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> ProbeSnapshot {
+/// Steps 1–7 of [`probe_agent`] over `manual`, with no stored row: the whole answer, and never
+/// [`ProbeOutcome::Kept`]. A caller that was **asked** to write gets a row
+/// ([`agent_box_row`]): `htui`'s `SetToolPaths` (MOD-66 D9). Every snapshot carries `manual`
+/// verbatim. `source` is [`ProbeSource::Manual`] exactly when the tool walk used a manual path
+/// (D4), and [`ProbeSource::Probe`] for the three failures that end before the walk.
+pub async fn probe_snapshot(
+    agent: &Agent,
+    manual: &BTreeMap<String, String>,
+    ctx: &ProbeContext,
+    tier2: &dyn Tier2,
+) -> ProbeSnapshot {
     // `credential` is a parameter rather than a capture: the step-1 failure below happens before
     // there is a launch to read one from, and that snapshot has to say `None` rather than guess.
-    let blank = |status: ProbeStatus, tools: BTreeMap<String, Option<String>>, credential, tail| {
+    // `source` too: a `missing` snapshot that used a manual path is still the human's (D4), and
+    // the three failures before the walk are the probe's.
+    let blank = |status: ProbeStatus,
+                 tools: BTreeMap<String, Option<String>>,
+                 credential,
+                 tail,
+                 source: ProbeSource| {
         ProbeSnapshot {
             transport: agent.transport,
             resolved: None,
@@ -1370,7 +1462,8 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
             credential,
             status,
             stderr_tail: tail,
-            source: ProbeSource::Probe,
+            source,
+            manual: manual.clone(),
         }
     };
 
@@ -1383,6 +1476,7 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
                 BTreeMap::new(),
                 None,
                 Some(lines(&format!("agent.launch does not parse: {error}"))),
+                ProbeSource::Probe,
             );
         }
     };
@@ -1405,6 +1499,7 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
                 BTreeMap::new(),
                 None,
                 Some(lines(&error.to_string())),
+                ProbeSource::Probe,
             );
         }
     };
@@ -1414,7 +1509,7 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
         debug!(agent = agent.name, tier = %tier, "a credential tier answered");
     }
 
-    let report = match probe_tools(launch.discovery.as_ref(), &ctx.env).await {
+    let report = match probe_tools_with(launch.discovery.as_ref(), manual, &ctx.env).await {
         Ok(report) => report,
         Err(error) => {
             return blank(
@@ -1422,8 +1517,14 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
                 BTreeMap::new(),
                 credential,
                 Some(lines(&error.to_string())),
+                ProbeSource::Probe,
             );
         }
+    };
+    let source = if report.manual.is_empty() {
+        ProbeSource::Probe
+    } else {
+        ProbeSource::Manual
     };
     if !report.is_complete() {
         debug!(
@@ -1431,7 +1532,13 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
             missing = ?report.missing,
             "a required tool resolved nowhere; nothing is spawned"
         );
-        return blank(ProbeStatus::Missing, report.versions(), credential, None);
+        return blank(
+            ProbeStatus::Missing,
+            report.versions(),
+            credential,
+            None,
+            source,
+        );
     }
 
     let mut resolved = match crate::launch::resolve(&launch, &report.tool_map()) {
@@ -1440,7 +1547,13 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
             // A placeholder with no `discovery` entry: the row names a tool it never told the
             // probe how to find, which from this box's side is the same fact as "not installed".
             debug!(agent = agent.name, %error, "the launch names a tool the discovery does not");
-            return blank(ProbeStatus::Missing, report.versions(), credential, None);
+            return blank(
+                ProbeStatus::Missing,
+                report.versions(),
+                credential,
+                None,
+                source,
+            );
         }
     };
     resolved.args.extend(report.extra_args());
@@ -1459,7 +1572,8 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
             credential,
             status: ProbeStatus::Ready,
             stderr_tail: None,
-            source: ProbeSource::Probe,
+            source,
+            manual: manual.clone(),
         };
     }
 
@@ -1472,7 +1586,8 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
             handshake: Some(handshake),
             credential,
             stderr_tail: None,
-            source: ProbeSource::Probe,
+            source,
+            manual: manual.clone(),
         },
         Err(error) => ProbeSnapshot {
             transport: agent.transport,
@@ -1489,7 +1604,8 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
                 DriverError::Transport(text) => text.clone(),
                 other => other.to_string(),
             })),
-            source: ProbeSource::Probe,
+            source,
+            manual: manual.clone(),
         },
     }
 }
