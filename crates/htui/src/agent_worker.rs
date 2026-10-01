@@ -61,6 +61,7 @@ use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{ReadStore as _, StoreError, WriteStore};
 use htui_orch::OpeningPath;
 use htui_store::{Backend, Writer};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -1444,7 +1445,7 @@ impl AgentRuntime {
             ));
         }
         // No serde text: it can quote an `env` value (`R-SEC-2`, the `checked_launch` rule).
-        let Ok(launch) = serde_json::from_value::<AgentLaunch>(agent.launch.clone()) else {
+        let Ok(launch) = AgentLaunch::deserialize(&agent.launch) else {
             return refuse_tool_paths(format!(
                 "`{}`'s launch does not parse; nothing declares a tool",
                 agent.name

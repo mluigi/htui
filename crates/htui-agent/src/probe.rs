@@ -1414,20 +1414,19 @@ pub async fn probe_agent(
     ctx: &ProbeContext,
     tier2: &dyn Tier2,
 ) -> ProbeOutcome {
-    let stored = existing.and_then(ProbeSnapshot::from_row);
-    let manual = stored
-        .as_ref()
-        .map(|stored| stored.manual.clone())
-        .unwrap_or_default();
+    // The stored source is all that is kept of the stored snapshot, so its map is moved out.
+    let (stored_is_manual, manual) = existing
+        .and_then(ProbeSnapshot::from_row)
+        .map_or((false, BTreeMap::new()), |stored| {
+            (stored.source == ProbeSource::Manual, stored.manual)
+        });
     let snapshot = probe_snapshot(agent, &manual, ctx, tier2).await;
     // `resolved.is_none()`, not `status == Missing`: ANA-4:795-798's rule is "a probe that finds
     // nothing", and two `failed` outcomes also find nothing — an `agent.launch` that does not parse
     // and a `probe_tools` transport fault, neither of which learned anything about this box. Keying
     // on the status would let either of them overwrite a hand-written row with
     // `enabled = false, source: probe`. A `failed` that *did* resolve refreshes, as before.
-    if snapshot.resolved.is_none()
-        && stored.is_some_and(|stored| stored.source == ProbeSource::Manual)
-    {
+    if snapshot.resolved.is_none() && stored_is_manual {
         return ProbeOutcome::Kept {
             reason: MANUAL_KEPT,
         };

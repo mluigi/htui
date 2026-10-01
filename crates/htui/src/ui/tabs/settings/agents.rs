@@ -77,6 +77,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
@@ -2060,8 +2061,8 @@ impl PathsForm {
     /// B14). Fields in `discovery.tools` order, prefilled from the stored `probe.manual`. An
     /// unreadable snapshot prefills nothing (blueprint H-21).
     fn open(summary: &AgentSummary) -> Result<Self, &'static str> {
-        let launch = serde_json::from_value::<AgentLaunch>(summary.agent.launch.clone())
-            .map_err(|_| LAUNCH_UNREADABLE)?;
+        let launch =
+            AgentLaunch::deserialize(&summary.agent.launch).map_err(|_| LAUNCH_UNREADABLE)?;
         let tools: Vec<String> = launch
             .discovery
             .map(|discovery| discovery.tools.into_keys().collect())

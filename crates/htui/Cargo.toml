@@ -33,6 +33,9 @@ htui-worker        = { workspace = true }
 htui-core          = { workspace = true, features = ["demo"] }
 chrono             = { workspace = true }
 serde_json         = { workspace = true }
+# MOD-66 review N5: `AgentLaunch::deserialize(&launch)` reads a stored launch without cloning the
+# document. Already in htui's graph through every workspace crate, so nothing new is compiled.
+serde              = { workspace = true }
 htui-store         = { workspace = true, features = ["demo", "local-embed"] }
 anyhow             = { workspace = true }
 clap               = { workspace = true }
