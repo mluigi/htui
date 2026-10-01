@@ -11109,6 +11109,206 @@ done
         abort_background(&mut runtime);
     }
 
+    /// A row like [`paths_row`] whose one tool, `hold`, is the script `/bin/sh` runs, with
+    /// `handshake: true`: a `SetToolPaths` over it is in flight until the script exits.
+    #[cfg(unix)]
+    fn holding_row(id: AgentId) -> Agent {
+        Agent {
+            launch: json!({
+                "command": "/bin/sh",
+                "args": ["${hold}"],
+                "env": {},
+                "discovery": {
+                    "tools": {
+                        "hold": { "kind": "path", "names": ["htui-no-such-binary-66h"] }
+                    },
+                    "handshake": true
+                }
+            }),
+            ..paths_row(id)
+        }
+    }
+
+    /// A `SetToolPaths` the real handler accepted over [`holding_row`], still in flight.
+    #[cfg(unix)]
+    struct InFlight {
+        backend: Backend,
+        runtime: AgentRuntime,
+        agent_id: AgentId,
+        tx: mpsc::UnboundedSender<ReplyEnvelope>,
+        rx: mpsc::UnboundedReceiver<ReplyEnvelope>,
+        /// The manual path the write was sent with.
+        script: String,
+        /// The file whose existence lets the script exit.
+        release: std::path::PathBuf,
+    }
+
+    /// Sends `SetToolPaths` (seq 1) over [`holding_row`], whose script marks `started`, never
+    /// answers `initialize`, and exits once `release` exists. Returns once the script runs, so
+    /// the task is inside its handshake.
+    ///
+    /// The script is read by `/bin/sh` rather than executed (the `ETXTBSY` rule of
+    /// `login_row`'s helper), and it names `/bin/sleep` because `fake_env`'s `PATH` holds nothing.
+    #[cfg(unix)]
+    async fn in_flight_tool_paths(tmp: &std::path::Path) -> InFlight {
+        let store = unresolvable_registry().await;
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&holding_row(agent_id), None)
+            .await
+            .expect("the row lands");
+        let backend = Backend::memory(store);
+        let mut runtime =
+            AgentRuntime::new(DriverFactory::new()).with_probe_env(fake_env(tmp), fake_hardware());
+        let started = tmp.join("started");
+        let release = tmp.join("release");
+        let script = tmp.join("hold.sh");
+        std::fs::write(
+            &script,
+            format!(
+                ": > '{}'\nwhile [ ! -e '{}' ]; do /bin/sleep 0.05; done\n",
+                started.display(),
+                release.display()
+            ),
+        )
+        .expect("write the script");
+        let script = script.to_string_lossy().into_owned();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let served = set_paths(
+            &mut runtime,
+            &backend,
+            &tx,
+            1,
+            agent_id,
+            &[("hold", &script)],
+        )
+        .await;
+        assert!(matches!(served, Served::Deferred), "{served:?}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !started.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the task never reached its handshake"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        InFlight {
+            backend,
+            runtime,
+            agent_id,
+            tx,
+            rx,
+            script,
+            release,
+        }
+    }
+
+    #[cfg(unix)]
+    impl InFlight {
+        /// Lets the script exit and returns the write's one answer.
+        async fn finish(&mut self) -> ReplyEnvelope {
+            std::fs::write(&self.release, "").expect("release the script");
+            one_reply(&mut self.runtime, &mut self.rx).await
+        }
+    }
+
+    /// H-10 (review M1): the row's re-probe claim is moved into the task, so a staleness re-probe
+    /// of the row is refused for as long as the write is in flight, and is free once it answered.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tool_paths_write_holds_the_reprobe_claim_while_in_flight() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let mut flight = in_flight_tool_paths(tmp.path()).await;
+        let agent_id = flight.agent_id;
+
+        assert!(
+            flight
+                .runtime
+                .reprobe_claims
+                .claim((agent_id, ids::BOX))
+                .is_none(),
+            "a staleness re-probe of this row waits for the write"
+        );
+        assert!(
+            flight
+                .runtime
+                .reprobe_claims
+                .claim((AgentId::new(), ids::BOX))
+                .is_some(),
+            "another row on this box is not excluded"
+        );
+
+        let reply = flight.finish().await;
+        assert!(
+            matches!(
+                tool_paths_outcome(reply),
+                AgentWrite::ToolPaths {
+                    status: ProbeStatus::Failed,
+                    ..
+                }
+            ),
+            "a handshake the script never answered"
+        );
+        assert!(
+            flight
+                .runtime
+                .reprobe_claims
+                .claim((agent_id, ids::BOX))
+                .is_some(),
+            "and the claim goes with the task"
+        );
+    }
+
+    /// H-11, B5 (review M2): the real handler tags its task `Writes::ToolPaths`, so a
+    /// `ProbeAgents` and a second `SetToolPaths` beside it are refused with B5's sentence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_running_tool_paths_write_refuses_a_probe_and_a_second_write_by_name() {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let mut flight = in_flight_tool_paths(tmp.path()).await;
+        let agent_id = flight.agent_id;
+
+        match flight
+            .runtime
+            .serve(
+                &flight.backend,
+                &flight.tx,
+                &envelope(2, StoreRequest::ProbeAgents),
+            )
+            .await
+        {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "probe_agents");
+                assert!(
+                    message.ends_with(&tool_paths_running(agent_id)),
+                    "{message}"
+                );
+            }
+            other => panic!("a probe may not run beside a tool-paths write: {other:?}"),
+        }
+        let script = flight.script.clone();
+        let message = refused(
+            set_paths(
+                &mut flight.runtime,
+                &flight.backend,
+                &flight.tx,
+                3,
+                agent_id,
+                &[("hold", &script)],
+            )
+            .await,
+        );
+        assert!(
+            message.ends_with(&tool_paths_running(agent_id)),
+            "B5: its own sentence: {message}"
+        );
+        assert_eq!(flight.runtime.background_len(), 1, "nothing was added");
+
+        let reply = flight.finish().await;
+        assert_eq!(reply.seq, 1, "the one answer is the first write's");
+    }
+
     /// D7, D9: a valid map is probed over, written as a `manual` snapshot carrying the map, and
     /// answered once at the request's address. The row's re-probe claim is released after (H-10).
     #[tokio::test]
