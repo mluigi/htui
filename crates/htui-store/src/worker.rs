@@ -1,9 +1,10 @@
 //! `htui_core::store`'s MOD-41 worker traits for the server-side stores (plan D4, D5).
 //!
-//! `RecorderStore`, `RelayStore` (MOD-42) and `WorkerStore` for [`PgStore`] and [`Writer`], `WorkerHost` for [`PgStore`]
-//! (the headless worker's host) and [`Backend`] (the TUI's). Every body forwards by path (UFCS) to
-//! the [`ReadStore`]/[`WriteStore`] method or the inherent read of the same name, and the traits
-//! are named by path, never imported (plan D5: a receiver that sees both families is E0034).
+//! `RecorderStore`, `RelayStore` (MOD-42) and `WorkerStore` for [`PgStore`] and [`Writer`],
+//! `WorkerHost` for [`PgStore`] (the headless worker's host) and [`Backend`] (the TUI's). Every
+//! body forwards by path (UFCS) to the [`ReadStore`]/[`WriteStore`] method or the inherent read of
+//! the same name, and the traits are named by path, never imported (plan D5: a receiver that sees
+//! both families is E0034).
 //! Nothing here is `pub`: the impls are the whole content.
 
 use std::collections::BTreeMap;

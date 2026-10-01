@@ -13315,6 +13315,11 @@ async fn an_answer_after_the_owner_changed_is_refused_executor_gone<S: WriteStor
     .await;
     taken_by(CASE, store, run, a, b).await;
     assert_eq!(
+        answer(CASE, store, first, "nope").await,
+        AnswerOutcome::Refused(AnswerRefusal::NotOffered),
+        "{CASE}: an option the request did not offer is refused before the executor is asked"
+    );
+    assert_eq!(
         answer(CASE, store, first, "allow-once").await,
         AnswerOutcome::Refused(AnswerRefusal::ExecutorGone),
         "{CASE}: A no longer holds the run"
@@ -13378,6 +13383,29 @@ async fn an_option_the_request_did_not_offer_is_refused<S: WriteStore>(store: &S
         before,
         "{CASE}: the refusal wrote nothing; the row is still pending"
     );
+    // Blueprint B-7: the actor columns reference `app_user` and `box`. Only on a row the answer
+    // would otherwise win (pending, offered, live) do both stores agree on the `Constraint`.
+    constraint_with(
+        CASE,
+        store
+            .answer_permission(id, "allow-once", UserId::new(), ids::BOX)
+            .await,
+        "",
+        "an answer by an unknown user",
+    );
+    constraint_with(
+        CASE,
+        store
+            .answer_permission(id, "allow-once", ids::USER, BoxId::new())
+            .await,
+        "",
+        "an answer from an unknown box",
+    );
+    assert_eq!(
+        permission_row(CASE, store, id).await,
+        before,
+        "{CASE}: an unknown actor wrote nothing; the row is still pending"
+    );
     not_found_on(
         CASE,
         store
@@ -13421,6 +13449,11 @@ async fn apply_is_fenced_on_the_lease_owner<S: WriteStore>(store: &S) {
     let applied = permission_row(CASE, store, second).await;
     assert_eq!(applied.status, PermissionStatus::Applied, "{CASE}: status");
     assert!(applied.resolved_at.is_some(), "{CASE}: resolved_at is set");
+    assert_eq!(
+        answer(CASE, store, second, "allow-once").await,
+        AnswerOutcome::Refused(AnswerRefusal::Applied),
+        "{CASE}: an answer to an applied request is told so"
+    );
     assert_eq!(
         store.apply_permission(second, a).await.expect(CASE),
         None,
@@ -13498,6 +13531,27 @@ async fn opening_a_permission_stales_older_sessions_of_the_step<S: WriteStore>(s
         PermissionStatus::Pending,
         "{CASE}: the old session's row on another step is untouched"
     );
+    let r1_stale = permission_row(CASE, store, r1).await;
+    assert_eq!(
+        answer(CASE, store, r1, "nope").await,
+        AnswerOutcome::Refused(AnswerRefusal::Stale),
+        "{CASE}: a stale request is refused by its status before its options are read"
+    );
+    assert_eq!(
+        permission_row(CASE, store, r1).await,
+        r1_stale,
+        "{CASE}: the refusal wrote nothing"
+    );
+
+    // A third session's live row: a refused open of s2 must not stale it (one transaction).
+    let s3 = RelaySessionId::new();
+    let r4 = parked(CASE, store, open_request(run, step, s3, "req-1", a)).await;
+    let r4_before = permission_row(CASE, store, r4).await;
+    assert_eq!(
+        r4_before.status,
+        PermissionStatus::Pending,
+        "{CASE}: precondition: r4 is pending"
+    );
 
     let again = open_request(run, step, s2, "req-1", a);
     let again_id = again.id;
@@ -13520,6 +13574,11 @@ async fn opening_a_permission_stales_older_sessions_of_the_step<S: WriteStore>(s
         "",
         "a repeated id",
     );
+    assert_eq!(
+        permission_row(CASE, store, r4).await,
+        r4_before,
+        "{CASE}: a refused open staled no other session's row"
+    );
 }
 
 /// MOD-42 blueprint B-9: `open_permission` is fenced like a step write. An unknown step is
@@ -13529,6 +13588,14 @@ async fn opening_a_permission_is_fenced_on_the_lease<S: WriteStore>(store: &S) {
     const CASE: &str = "opening_a_permission_is_fenced_on_the_lease";
     let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
     let (run, step) = leased_step(CASE, store, a, seam_clock()).await;
+    // A's own live row on the step, of an older session: a refused open must not stale it.
+    let parked_id = parked(
+        CASE,
+        store,
+        open_request(run, step, RelaySessionId::new(), "req-0", a),
+    )
+    .await;
+    let parked_before = permission_row(CASE, store, parked_id).await;
     let session = RelaySessionId::new();
 
     let unknown = open_request(run, StepId::new(), session, "req-1", a);
@@ -13561,6 +13628,15 @@ async fn opening_a_permission_is_fenced_on_the_lease<S: WriteStore>(store: &S) {
             "{CASE}: a refused open wrote no row"
         );
     }
+    assert_eq!(
+        permission_row(CASE, store, parked_id).await,
+        parked_before,
+        "{CASE}: a refused open staled no row; A's request is still pending"
+    );
+    assert!(
+        parked_before.status == PermissionStatus::Pending && parked_before.resolved_at.is_none(),
+        "{CASE}: precondition: the parked row is pending, got {parked_before:?}"
+    );
 }
 
 /// MOD-42 plan D5, I-7: settling a session moves its pending and answered rows, and only those,
@@ -13615,6 +13691,17 @@ async fn settle_moves_only_pending_and_answered_rows<S: WriteStore>(store: &S) {
         assert_eq!(row.status, PermissionStatus::Cancelled, "{CASE}: {id}");
         assert!(row.resolved_at.is_some(), "{CASE}: {id} is resolved");
     }
+    let cancelled = permission_row(CASE, store, pending).await;
+    assert_eq!(
+        answer(CASE, store, pending, "allow-once").await,
+        AnswerOutcome::Refused(AnswerRefusal::Cancelled),
+        "{CASE}: an answer to a cancelled request is told so"
+    );
+    assert_eq!(
+        permission_row(CASE, store, pending).await,
+        cancelled,
+        "{CASE}: the refusal wrote nothing"
+    );
     assert_eq!(
         permission_row(CASE, store, applied).await,
         applied_before,
@@ -13650,6 +13737,24 @@ async fn a_run_has_at_most_one_pending_cancel<S: WriteStore>(store: &S) {
     const CASE: &str = "a_run_has_at_most_one_pending_cancel";
     let a = Uuid::now_v7();
     let (run, _) = leased_step(CASE, store, a, seam_clock()).await;
+    // Blueprint B-7: the actor columns reference `app_user` and `box`; with no cancel pending,
+    // both stores refuse an unknown actor with a `Constraint` and write nothing.
+    constraint_with(
+        CASE,
+        store.request_cancel(run, UserId::new(), ids::BOX).await,
+        "",
+        "a cancel by an unknown user",
+    );
+    constraint_with(
+        CASE,
+        store.request_cancel(run, ids::USER, BoxId::new()).await,
+        "",
+        "a cancel from an unknown box",
+    );
+    assert!(
+        pending_ids(CASE, store, a, ids::BOX).await.is_empty(),
+        "{CASE}: an unknown actor wrote no row"
+    );
     let CancelRequest::Inserted(x) = cancel_of(CASE, store, run).await else {
         panic!("{CASE}: the first request writes a row");
     };
@@ -13922,7 +14027,17 @@ async fn deleting_a_project_takes_its_relay_rows<S: WriteStore>(store: &S) {
     );
     assert!(
         pending_ids(CASE, store, a, ids::BOX).await.is_empty(),
-        "{CASE}: the cancel went with its run"
+        "{CASE}: the cancel is listed no more"
+    );
+    // `pending_commands` joins the run, so it cannot see a leftover row; the compare-and-set
+    // reads `run_command` by id and so can.
+    not_found_on(
+        CASE,
+        store
+            .resolve_command(x, RunCommandStatus::Applied, None)
+            .await,
+        "run_command",
+        "resolving the cancel of a deleted run",
     );
 }
 

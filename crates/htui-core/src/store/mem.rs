@@ -6914,9 +6914,9 @@ mod tests {
         NewRequirementArea, NewRun, NewRunStep, NoteId, OpenPermission, OverlapRule, PermissionId,
         Priority, ProbedTool, ProjectId, ProjectPatch, RelayOption, RelayOptionKind,
         RelaySessionId, RepoId, RequirementAreaId, RequirementId, RequirementPatch,
-        RequirementUpdate, Resolution, RunId, RunKind, RunMode, RunStatus, RunStepCommit,
-        RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome,
-        StepStatus, UserId, VerifyOutcome,
+        RequirementUpdate, Resolution, RunCommandStatus, RunId, RunKind, RunMode, RunStatus,
+        RunStepCommit, RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status, StepId,
+        StepOutcome, StepStatus, UserId, VerifyOutcome,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -8619,6 +8619,38 @@ mod tests {
             commands.iter().map(|row| row.issued_at).collect::<Vec<_>>(),
             vec![t],
             "issued_at is the handle's clock"
+        );
+
+        // No trait method reads a resolved command back, so the stored outcome is read here.
+        let cancel = commands[0].id;
+        assert!(
+            store
+                .resolve_command(
+                    cancel,
+                    RunCommandStatus::Refused,
+                    Some("the run is already done".to_owned())
+                )
+                .await
+                .expect("the resolve lands"),
+            "the pending cancel is refused"
+        );
+        let resolved = store
+            .command_rows()
+            .into_iter()
+            .find(|row| row.id == cancel)
+            .expect("the command row survives its resolution");
+        assert_eq!(
+            (
+                resolved.status,
+                resolved.resolution.as_deref(),
+                resolved.resolved_at
+            ),
+            (
+                RunCommandStatus::Refused,
+                Some("the run is already done"),
+                Some(t)
+            ),
+            "the resolution is stored, and resolved_at is the handle's clock"
         );
     }
 
