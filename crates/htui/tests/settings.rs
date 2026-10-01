@@ -5189,7 +5189,9 @@ async fn clearing_every_field_sends_an_empty_map() {
     );
     let mut section = section_over(&bench, vec![row]);
     bench.key(&mut section, "m");
-    pressed(&bench, &mut section, "backspace", 64);
+    // As many as the prefill has characters: a fixed count leaves `/` behind under a long
+    // `$TMPDIR` (review L2).
+    pressed(&bench, &mut section, "backspace", alpha.chars().count());
     let _ = bench.drained();
 
     bench.key(&mut section, "enter");
