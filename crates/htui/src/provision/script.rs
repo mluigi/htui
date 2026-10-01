@@ -19,36 +19,198 @@ pub const BOX_END: &str = "htui.box.end";
 
 /// Read-only facts about the host (D299): `htui.<key>=<value>` lines, nothing else written.
 /// `$1` root. Never fails on a missing tool: a missing tool is a value (`none`, `no`, `unknown`).
-pub const PREFLIGHT: &str = "";
+pub const PREFLIGHT: &str = r#"set -eu
+root=$1
+say() {
+  printf "htui.%s=%s" "$1" "$2"
+  echo
+}
+home=${HOME:-}
+say os "$(uname -s)"
+say arch "$(uname -m)"
+v=
+if command -v systemctl >/dev/null 2>&1; then
+  v=$(systemctl --version 2>/dev/null || true)
+  v=${v#"systemd "}
+  v=${v%%[!0-9]*}
+fi
+say systemd "${v:-none}"
+if command -v systemd-creds >/dev/null 2>&1; then
+  say creds yes
+else
+  say creds no
+fi
+say user "$(id -un)"
+say group "$(id -gn)"
+say home "$home"
+sha=none
+if [ -n "$home" ] && [ -f "$home/.local/bin/htui" ]; then
+  sha=$(sha256sum < "$home/.local/bin/htui" 2>/dev/null || true)
+  sha=${sha%% *}
+fi
+say bin_sha "${sha:-unknown}"
+if [ -e "$root/etc/systemd/system/htui-worker.service" ]; then
+  say unit yes
+else
+  say unit no
+fi
+a=
+if command -v systemctl >/dev/null 2>&1; then
+  a=$(systemctl is-active htui-worker.service 2>/dev/null || true)
+fi
+say active "${a:-unknown}"
+if ! command -v sudo >/dev/null 2>&1; then
+  say sudo none
+elif sudo -k -n true >/dev/null 2>&1; then
+  say sudo nopasswd
+else
+  say sudo password
+fi
+"#;
 
 /// Unprivileged (D304): the log directory, then, with `send=1`, the binary on stdin, which must
 /// run `--version` before it replaces anything. `$1` root (unused), `$2` home, `$3` send (`0`|`1`).
 /// Exit 3: the uploaded binary does not run here; the temporary file is removed.
-pub const PREPARE: &str = "";
+pub const PREPARE: &str = r#"set -eu
+home=$2
+send=$3
+bin="$home/.local/bin"
+tmp="$bin/.htui.provision.$$"
+cleanup() {
+  rm -f -- "$tmp"
+}
+trap cleanup EXIT
+mkdir -p "$home/.local/state/htui" "$bin"
+if [ "$send" = 1 ]; then
+  cat > "$tmp"
+  chmod 0755 "$tmp"
+  if ! "$tmp" --version; then
+    exit 3
+  fi
+  mv -f -- "$tmp" "$bin/htui"
+fi
+"#;
 
 /// Unprivileged wrapper around the privileged part (D301; E-3, E-4, E-7, E-8). `$1` root, `$2`
 /// user, `$3` home, `$4` replace (`0`|`1`), `$5` mode (`password`|`nopasswd`), `$6` the text of
 /// [`INSTALL_ROOT`]. Stdin: with `mode=password`, the password line, then the DSN line; otherwise
 /// the DSN line alone. Exit 4: sudo refused the password; the DSN was never read.
-pub const INSTALL: &str = "";
+pub const INSTALL: &str = r#"set -eu
+root=$1
+user=$2
+home=$3
+replace=$4
+mode=$5
+installer=$6
+nl="
+"
+if [ "$mode" = password ]; then
+  IFS= read -r pw || exit 4
+  sudo -k || exit 4
+  printf "%s%s" "$pw" "$nl" | sudo -S -p "" -v || exit 4
+  unset pw
+fi
+rc=0
+sudo -n sh -c "$installer" htui-provision-root "$root" "$user" "$home" "$replace" || rc=$?
+exit "$rc"
+"#;
 
 /// Runs as root under `sudo -n` (D303; E-7). `$1` root, `$2` user, `$3` home, `$4` replace. Stdin:
 /// the DSN line, encrypted when the credential is absent or `replace=1`, otherwise discarded.
 /// Credential, then unit, then start. Its first line of output is the marker `htui.root=start`.
-pub const INSTALL_ROOT: &str = "";
+pub const INSTALL_ROOT: &str = r#"set -eu
+root=$1
+user=$2
+home=$3
+replace=$4
+echo htui.root=start
+umask 022
+creds="$root/etc/credstore.encrypted"
+cred="$creds/htui-dsn"
+units="$root/etc/systemd/system"
+unit="$units/htui-worker.service"
+tmp="$unit.htui-provision.$$"
+cleanup() {
+  rm -f -- "$tmp" "$cred.new"
+}
+trap cleanup EXIT
+install -d -m 0700 "$creds"
+if [ ! -e "$cred" ] || [ "$replace" = 1 ]; then
+  rm -f -- "$cred.new"
+  systemd-creds encrypt --name=htui-dsn - "$cred.new"
+  mv -f -- "$cred.new" "$cred"
+else
+  cat > /dev/null
+fi
+mkdir -p "$units"
+cat > "$tmp" <<EOF
+[Unit]
+Description=htui worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=$user
+ExecStart=$home/.local/bin/htui worker --log $home/.local/state/htui/worker.log
+LoadCredentialEncrypted=htui-dsn:/etc/credstore.encrypted/htui-dsn
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+chmod 0644 "$tmp"
+mv -f -- "$tmp" "$unit"
+systemctl daemon-reload
+systemctl enable --now htui-worker.service
+if [ "$replace" = 1 ]; then
+  systemctl restart htui-worker.service
+fi
+"#;
 
 /// Waits inside one session (D305; E-10): up to `tries` checks, `pause` seconds apart, until the
 /// service is `active` and `box.toml` exists, then prints both between markers. `$1` root
 /// (unused), `$2` home, `$3` tries, `$4` pause. Exit 5: it never did; the journal and log tails
 /// go to stderr.
-pub const VERIFY: &str = "";
+pub const VERIFY: &str = r#"set -eu
+home=$2
+tries=$3
+pause=$4
+box="$home/.config/htui/box.toml"
+n=0
+a=
+while [ "$n" -lt "$tries" ]; do
+  a=$(systemctl is-active htui-worker.service 2>/dev/null || true)
+  if [ "$a" = active ] && [ -f "$box" ]; then
+    echo htui.active=active
+    echo htui.box.begin
+    cat -- "$box"
+    echo
+    echo htui.box.end
+    exit 0
+  fi
+  n=$((n + 1))
+  if [ "$n" -lt "$tries" ]; then
+    sleep "$pause"
+  fi
+done
+echo "htui.active=${a:-unknown}"
+journalctl -u htui-worker.service -n 20 --no-pager >&2 || true
+tail -n 20 -- "$home/.local/state/htui/worker.log" >&2 || true
+exit 5
+"#;
 
 /// `sh -c '<script>' htui-provision '<arg>'…`, every piece through `shell_words::quote`. The
 /// remote login shell parses it once (D297, V-7).
 #[must_use]
 pub fn remote_command(script: &str, args: &[&str]) -> String {
-    let _ = (script, args);
-    todo!()
+    ["sh", "-c", script, ARG0]
+        .into_iter()
+        .chain(args.iter().copied())
+        .map(shell_words::quote)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
