@@ -7,8 +7,8 @@ use std::time::Duration;
 
 /// Parses the command line and runs the shell, or `htui worker`.
 ///
-/// Exit codes: 0 on success; 2 for `htui worker`'s startup refusals (and clap's usage errors);
-/// 1 for every other failure (MOD-41 plan D14). The error is printed after [`run`](htui::run) has restored the terminal, so a failure is
+/// Exit codes: 0 on success; 2 for `htui worker`'s startup refusals, `htui provision`'s
+/// refusals (MOD-45 D292) and clap's usage errors; 1 for every other failure (MOD-41 plan D14). The error is printed after [`run`](htui::run) has restored the terminal, so a failure is
 /// readable instead of being drawn over the last frame.
 ///
 /// MOD-41 review R-4: the runtime is built by hand, not by `#[tokio::main]`, so its teardown is
@@ -64,11 +64,18 @@ async fn body() -> ExitCode {
     match htui::run(args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            // MOD-41 plan D14: `htui worker` exits 2 on a startup refusal, 1 on a failure; every
-            // other error is 1 as before. Never `process::exit`: the `_sentry` guard must flush.
+            // MOD-41 plan D14: `htui worker` exits 2 on a startup refusal, 1 on a failure, and
+            // `htui provision` (MOD-45 D292) likewise; every other error is 1 as before. Never
+            // `process::exit`: the `_sentry` guard must flush.
             let code = error
                 .downcast_ref::<htui::worker_cmd::WorkerExit>()
-                .map_or(1, htui::worker_cmd::WorkerExit::code);
+                .map(htui::worker_cmd::WorkerExit::code)
+                .or_else(|| {
+                    error
+                        .downcast_ref::<htui::provision::ProvisionExit>()
+                        .map(htui::provision::ProvisionExit::code)
+                })
+                .unwrap_or(1);
             // MOD-41 E-1: a startup refusal is a configuration state the user reads on stderr
             // and in the log, not a crash report.
             if code != 2 {

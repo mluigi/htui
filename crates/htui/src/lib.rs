@@ -62,7 +62,9 @@ use crate::keymap::Keymap;
 /// Startup order (blueprint D.4), and it matters: logging, then the two keyring flags — which exit
 /// **before** any terminal work, so the DSN is typed into a normal shell and never into a raw-mode
 /// terminal — then the two concepts-index flags (MOD-34), which also print to the shell and exit,
-/// then the backend, then the worker, then the shell, then the terminal.
+/// then the backend, then the worker, then the shell, then the terminal. `htui provision`
+/// (MOD-45) comes right after logging, before the keyring flags; it prints to the shell and exits.
+/// With `--dsn-stdin`, the session's DSN is read from stdin before the backend starts.
 ///
 /// The backend is always available immediately: `connect::start` opens the local mirror and hands
 /// back an offline backend, and the connection runs on its own task (ANA-9 §4.4). A missing DSN, an
@@ -85,6 +87,10 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     }
     init_tracing(args.log.as_deref())?;
 
+    if let Some(cli::Command::Provision(provision)) = args.command.clone() {
+        // MOD-45 D307: after `init_tracing`, so `--log` works the ordinary way.
+        return provision::run(provision).await.map_err(anyhow::Error::from);
+    }
     if args.set_dsn {
         return set_dsn_from_stdin();
     }
@@ -109,8 +115,22 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     let started = if args.demo {
         Started::detached(Backend::memory(MemStore::demo()))
     } else {
+        // MOD-45 OQ-1 (a): read before `terminal::init`, so the shell's cooked line editing
+        // applies, as for `--set-dsn`.
+        let dsn = if args.dsn_stdin {
+            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                eprintln!(
+                    "paste the DSN for this session and press Enter (it will be visible; it is \
+                     not stored):"
+                );
+            }
+            Some(session_dsn(&mut std::io::stdin().lock())?)
+        } else {
+            None
+        };
         connect::start(StartOptions {
             offline: args.offline,
+            dsn,
             ..StartOptions::new(identity::config_root()?)
         })
         .await?
@@ -174,6 +194,19 @@ fn set_dsn_from_stdin() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `--dsn-stdin` for the TUI (MOD-45 OQ-1 (a), `R-STO-1` as amended): one line, validated by
+/// `Dsn::parse` before sqlx can log a parameter of it, held for this session only. The keyring is
+/// neither read nor written. The line's buffer moves into `StartOptions` without a copy, and
+/// `connect::start` wraps it in `Zeroizing` again. Reconnects reuse its own zeroizing copy and never
+/// re-read the keyring (`connect.rs` `reconnect_over`).
+///
+/// # Errors
+///
+/// A blank line or end of input, a read error, or a DSN `Dsn::parse` refuses; never the DSN's text.
+fn session_dsn(reader: &mut dyn std::io::BufRead) -> anyhow::Result<String> {
+    todo!("MOD-45 T3 red")
+}
+
 /// Sends `tracing` to a file, or nowhere at all.
 ///
 /// Never to stdout: stdout is the TUI (plan Patterns/Logging). `HTUI_LOG_FILTER` overrides the
@@ -200,4 +233,40 @@ fn init_tracing(path: Option<&Path>) -> anyhow::Result<()> {
         .with(sentry_tracing::layer())
         .try_init()
         .map_err(|err| anyhow::anyhow!("could not install the log subscriber: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_dsn;
+
+    /// MOD-45 OQ-1 (a): one line, trimmed; the rest of stdin is left unread.
+    #[test]
+    fn session_dsn_reads_one_validated_line() {
+        let mut input = std::io::Cursor::new("  postgres://u:p@db.example/htui  \nnext\n");
+        let dsn = session_dsn(&mut input).expect("a DSN");
+        assert_eq!(dsn, "postgres://u:p@db.example/htui");
+        let mut rest = String::new();
+        std::io::Read::read_to_string(&mut input, &mut rest).expect("read");
+        assert_eq!(rest, "next\n");
+    }
+
+    #[test]
+    fn session_dsn_refuses_a_blank_line() {
+        for input in ["\n", "   \n", ""] {
+            let err = session_dsn(&mut std::io::Cursor::new(input)).expect_err("blank");
+            assert_eq!(err.to_string(), "no DSN on stdin; nothing was read");
+        }
+    }
+
+    /// E-13: refused by the scan, before sqlx could log the parameter's value.
+    #[test]
+    fn session_dsn_refuses_an_unusable_dsn_without_echoing_it() {
+        let mut input = std::io::Cursor::new(
+            "postgres://u:SENTINEL-DSN-PW@db.example/htui?bogus=SENTINEL-DSN-PW\n",
+        );
+        let err = session_dsn(&mut input).expect_err("refused");
+        let text = format!("{err:#} {err:?}");
+        assert!(text.contains("unrecognised parameter"), "{text}");
+        assert!(!text.contains("SENTINEL"), "the error echoes the DSN");
+    }
 }
