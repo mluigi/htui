@@ -85,6 +85,7 @@ pub mod frontmatter;
 pub mod hierarchy;
 pub mod ids;
 pub mod item;
+pub mod item_spec;
 pub mod kind;
 pub mod link;
 pub mod note;
@@ -121,6 +122,7 @@ pub use ids::{
 pub use item::{
     Item, ItemFilter, ItemPatch, ItemRevision, ItemSummary, NewItem, Resolution, Status,
 };
+pub use item_spec::{ItemSpec, SpecChanges, SpecContext, SpecError};
 pub use kind::{
     CommandQueue, Gate, Isolation, ItemKind, ItemKindPatch, NewItemKind, NewPromptTemplate,
     NewStepGraph, PhaseAgent, PhasePatch, ProjectSettings, PromptTemplate, ResolvedGraph,
