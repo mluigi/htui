@@ -1912,7 +1912,9 @@ async fn adopt<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P
 /// MOD-24 D3 (OQ-2): before the sweep recovers anything, every pending cancel this process may
 /// apply (`pending_commands(owner, box)`, B-4) whose run is `running` and not walked here is
 /// applied, through the poll's own `cancel_run`, and then awaited under B-5's guard: a row the
-/// poll took first is waited for, never applied twice. Such a run is cancelled without recovery
+/// poll took first is waited for, never applied twice. A row the poll holds is awaited before the
+/// walked-run skip (H-16): the poll's `cancel_run` mints a walk child on the run before it awaits
+/// the run lock, so its run reads as walked here. Such a run is cancelled without recovery
 /// (`cancel_leased` takes the lapsed lease) instead of being walked on, or finished by the
 /// recovery itself, which used to lose the user's cancel to the crash.
 ///
@@ -1949,6 +1951,13 @@ async fn cancels_first<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &Task
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
     for row in rows {
+        // H-16: the poll's `cancel_run` takes B-5's guard and then a walk child on the run before
+        // it awaits the run lock, so a row it holds reads as a walked run's below. Waited for
+        // first: skipped, `sweep_fenced` could recover the run before the poll's cancel lands.
+        if ctx.shared.is_applying(row.id) {
+            ctx.shared.until_applied(row.id).await;
+            continue;
+        }
         if ctx.shared.walks.is_live(row.run_id) {
             continue;
         }
@@ -2692,6 +2701,19 @@ pub mod testing {
     /// A handle on a runtime's shared state (MOD-41 plan D8).
     pub struct Probe<P: ReplySink>(Arc<Shared<P>>);
 
+    /// B-5's guard held by a case ([`Probe::hold_applying`]); dropping it frees the row and wakes
+    /// whoever awaits it.
+    #[must_use = "the guard frees the row when dropped"]
+    pub struct Held<'a> {
+        _guard: super::Applying<'a>,
+    }
+
+    impl core::fmt::Debug for Held<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("Held").finish_non_exhaustive()
+        }
+    }
+
     /// MOD-41 blueprint F-12: hand-written, so no `P: Debug` is asked of a sink.
     impl<P: ReplySink> core::fmt::Debug for Probe<P> {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -2724,6 +2746,13 @@ pub mod testing {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .contains(&id)
+        }
+
+        /// B-5's guard on the run command `id`, as a task applying it holds it (MOD-24 H-16);
+        /// `None` while a task of this process applies it already.
+        #[must_use]
+        pub fn hold_applying(&self, id: htui_core::model::RunCommandId) -> Option<Held<'_>> {
+            self.0.applying(id).map(|guard| Held { _guard: guard })
         }
 
         /// `run`'s lock when nobody holds it.

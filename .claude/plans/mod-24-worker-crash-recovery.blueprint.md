@@ -888,9 +888,14 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 - **H-16 D3 versus the poll (B-5).**
   - `until_applied` enables its `Notified` before re-checking, so no wakeup is lost.
   - `Applying::drop` notifies after removing the id.
-  - A row the poll holds is awaited, and the poll's `cancel_run` takes its run lock in the same
-    poll that took the guard. So `sweep_fenced`'s `try_lock` fence either sees the lock held or
-    sees a cancelled run.
+  - A row the poll holds is awaited before anything else is checked: the poll's `cancel_run`
+    takes B-5's guard, then a walk child on the run (`walks.child`), and only then awaits the run
+    lock, so a held row's run reads as walked here. `cancels_first` checks `is_applying` before
+    the `walks.is_live` skip and awaits `until_applied`; skipped instead, `sweep_fenced` could
+    take the lock first and recover the run, losing the cancel. Once the guard drops, the poll's
+    `cancel_run` has released the run lock with the run cancelled (or the row refused and left
+    pending), so `sweep_fenced` sees a cancelled run or a recovery as before
+    (`a_sweep_waits_for_a_cancel_the_poll_holds_under_a_walk_child`).
 - **H-17 D212 under D3.** `cancels_first` must pass `last_live`, never `LiveChats::default()`, in
   the TUI. The worker's poll always stores an empty set (`worker.rs:71`).
 - **H-18 D3b and the rest of the suite.**

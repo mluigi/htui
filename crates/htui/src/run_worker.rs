@@ -3655,6 +3655,69 @@ pub(crate) mod tests {
         assert!(!probe.is_applying(id));
     }
 
+    /// MOD-24 D3 versus the poll (H-16), the deterministic shape: the poll's `cancel_run` takes
+    /// B-5's guard and then a walk child on the run before it awaits the run lock, so the run reads
+    /// live here while the poll holds the row. The sweep must wait for that row instead of
+    /// skipping it as a walked run's: it stays pending, adopting and stepping nothing, until the
+    /// guard drops, and the poll's cancel (played here by hand) is what ends the run.
+    #[tokio::test]
+    async fn a_sweep_waits_for_a_cancel_the_poll_holds_under_a_walk_child() {
+        let fixture = Fixture::new().await;
+        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+        set_executor(&fixture, Executor::Worker).await;
+        let mut runtime = fixture.runtime().with_role(Role::Worker);
+        let probe = testing::probe(&runtime);
+        let id = requested(&fixture, run).await;
+        let lapsed = fixture.run(run).await.lease_expires_at;
+        // The poll's `cancel_run` between B-5's guard and its run lock.
+        let held = probe.hold_applying(id).expect("nobody applies the row yet");
+        let walk = probe.walk_child(run);
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, _answers) = mpsc::unbounded_channel();
+
+        runtime.sweep(&backend, &replies);
+        let finished = tokio::time::timeout(Duration::from_millis(500), async {
+            while !probe.all_tasks_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(finished.is_err(), "the sweep waits for the poll's row");
+        let row = fixture.run(run).await;
+        assert_eq!(row.status, RunStatus::Running);
+        assert_eq!(row.lease_expires_at, lapsed, "nothing adopted the run");
+        assert!(fixture.steps(run).await.is_empty(), "nothing stepped it");
+        assert_eq!(
+            command_states(&fixture, run),
+            [(id, RunCommandStatus::Pending)]
+        );
+
+        // The poll applies its cancel and lets go: the run lock, the walk child, then the row.
+        fixture
+            .store
+            .finish_run(run, RunStatus::Cancelled, None, Utc::now())
+            .await
+            .expect("the cancel lands");
+        assert!(
+            fixture
+                .store
+                .resolve_command(id, RunCommandStatus::Applied, None)
+                .await
+                .expect("the resolve answers"),
+            "the row was pending"
+        );
+        drop(walk);
+        drop(held);
+        assert!(runtime.settle(PATIENCE).await.is_empty(), "the sweep ends");
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
+        assert_eq!(
+            command_states(&fixture, run),
+            [(id, RunCommandStatus::Applied)]
+        );
+        assert!(fixture.steps(run).await.is_empty(), "nothing recovered");
+        assert!(!probe.is_applying(id));
+    }
+
     /// MOD-24 D3, regression guard: a run whose lease is live elsewhere is its holder's. Its
     /// pending cancel is not in `pending_commands(owner, box)`, and `adopt_runs` skips it too, so
     /// the sweep leaves the row `pending`, the run `running`, and walks nothing.
