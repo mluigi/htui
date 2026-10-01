@@ -616,3 +616,28 @@ Each commit passes `cargo fmt --all --check` and `cargo clippy --workspace --all
 3. **The project picker re-reads per project (E7).** The alternative is to fix the project at open (the selected one) and drop the picker.
 4. **The kind default on `N`** is the selected item's kind, else the first kind (§4 `open_new`). The alternative is always the first kind.
 5. **Editing any path re-checks the whole path list** (A4 works per field, not per entry). An item with one legacy path must fix it to change any path.
+
+## 10. Maintainer decisions (2026-10-01): these override §9's defaults and the sections above
+1. **Mint hedge: hedge store errors only (adopts MOD-59 re-review L2; amends D11).** Add
+   `item_writes::mint_refused(message: &str) -> bool`, mirroring `requirements.rs:292-303`
+   `mint_refused`. It returns true for offline (`DATABASE_UNREACHABLE`), for `NOTHING_TO_SAVE`, and
+   for any `StoreError::Constraint` rendering. Before relying on the prefix, verify the exact
+   `Display` of `StoreError::Constraint` in the tree; a store `Constraint` never follows a COMMIT.
+   The tab works as follows:
+   - **Refused mint** (`mint_refused` is true): the notice is the plain message, the form keeps its
+     text, nothing is re-read, and the filter is not touched.
+   - **Any other mint `Failed`:** the notice is the `mint_may_have_landed` hedge, the form keeps its
+     text, and the list is re-read.
+
+   Tests:
+   - T3 adds `mint_refused_tells_a_refusal_from_a_store_failure`: a spec refusal, `NOTHING_TO_SAVE`
+     and offline give true; `Backend`/`Unreachable`-other give false.
+   - T4 test 12 splits into 12a `a_store_failed_mint_keeps_the_text_hedges_and_re_reads_unfiltered`
+     and 12b `a_refused_mint_keeps_the_text_and_says_why_without_hedging_or_re_reading`.
+2. **The hedge re-read clears the filter (amends D11).** It resets the filter to default and
+   re-reads `Items` unfiltered, the same as the reveal path of a successful mint (A5). The notice
+   asks the user to look for the item, and the filter must not hide it. Test 12a asserts
+   `filter.is_empty()` and exactly one default `Items`.
+3. **E7 project picker re-reads per project: accepted as written.**
+4. **`N` kind default (the selected item's kind, else the first kind): accepted as written.**
+5. **Path edits re-check the whole list: accepted as written.**
