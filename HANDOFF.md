@@ -14,26 +14,24 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-01):** **MOD-51 is done** (`docs/decisions/mod/mod-51.md`): Settings >
+**Current status (2026-10-01):** **ANA-24 is concluded** (`docs/decisions/ana/ana-24.md`): the
+weight map's implement axis gains two sources that may be both fetched and shipped, Epoch's own
+MirrorCode run (primary) and Arena's CC BY 4.0 Hugging Face leaderboard dataset, which also
+separates effort levels. tbench.ai stays blocked on its results licence, and no permissible
+Terminal-Bench 4.0 mirror exists. The registry entries and parsers land in MOD-36.
+Before it, **MOD-51 is done** (`docs/decisions/mod/mod-51.md`): Settings >
 Boxes edits the `box_probe_spec` overlay. `s` opens a JSON editor and `ctrl-s` saves it as a
 compare-and-set on `app_setting.updated_at` through `WriteStore::set_box_probe_spec`. The worker
 refuses any overlay the probe would ignore (`spec::check`, the probe's own merge) before it writes,
 a blank save clears the row, and the next `p` or connect re-probes under the new digest. No
 migration, no `.sqlx` change.
-Before it, **MOD-41 is done** (`docs/decisions/mod/mod-41.md`): `htui worker`
+Before that, **MOD-41 is done** (`docs/decisions/mod/mod-41.md`): `htui worker`
 runs a box's runs with no terminal (guide `docs/htui-worker.md`). Run supervision lives in the
 UI-free crate `crates/htui-worker` behind `RecorderStore`/`WorkerStore`/`WorkerHost`;
 `box.settings.executor` (Settings > Boxes, `w`) decides whether the TUI or the worker claims, adopts
 and sweeps on a box, and on a worker box the TUI hands answered runs back. The remaining step writes
 are lease-fenced, the heartbeat fences on a monotonic clock, and the worker re-syncs the concepts
 index. `R-ORCH-12` is now must; `R-ID-2` and `R-STO-1` were amended. No migration.
-Before that, **CLEAN-4 was done** (`docs/decisions/clean/clean-4.md`): the
-review loop's `no_progress_review` stop is reachable. The predicate's review half compares the
-reviews of the loop's last two turns (review rows answered `Rejected`, each read through its newest
-`output_kind` document from `documents()` heads) instead of reading the latest-per-kind
-`documents_of_kinds`, which never held two. A loop whose two rejected reviews repeat each other now
-escalates at that attempt; the hash half is still asked first. `runs_pg`'s escalation case now stops
-on `no_progress_review`, and the stop is pinned in that test (MOD-4 R-9 closed).
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -114,27 +112,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   speed on the demo corpus, how and when model weights are fetched at run time, and whether the
   vectors equal the ones already stored in qdrant within a tolerance or force a re-embed. Deliver a
   verdict and the `MOD-N` that implements it.
-- [ ] **ANA-24 - A licensed, effort-separated coding benchmark source for the weight map** (from
-  ANA-21; ANA-21 is done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`, `R-ORCH-7`.
-  ANA-21's refresh is a source registry, and exactly one entry in it can be fetched today: Epoch
-  (CC BY 4.0), which covers the **analysis** axis only. The implement axis has no
-  dynamically-permissible source at all, so its weights are the maintainer's, entered by hand and
-  dated, and an undated entry resolves to 0 rather than to a stale number. Research the gap:
-  1. Find a machine-readable, redistribution-licensed source of agentic **coding** benchmark
-     results. The prize is Harbor's tbench.ai: it is the official Terminal-Bench 4.0 board and the
-     only source found that publishes `reasoning_effort` per row, so it would close the
-     effort-separation gap that forced ANA-21 to flatten every `-medium`/`-low` string onto its
-     family's `-high` value. Its results sit behind an undocumented tRPC endpoint and carry no
-     licence grant; the harness repo is Apache-2.0. Establish whether the results are separately
-     licensed, and by what terms.
-  2. Establish whether any Terminal-Bench 4.0 results mirror exists with terms that permit fetching
-     them into a product that gives model-selection guidance. Artificial Analysis's API is
-     explicitly out of scope: it is internal-use only and bars exactly this use.
-  3. Re-probe the sources ANA-21 recorded as blocked, since licences and endpoints move: Vals, Scale
-     SEAL, Arena, SWE-bench/experiments, SWE-rebench, LiveBench, epoch-research/eci-public.
-  4. Deliver a verdict naming which sources are `dynamic: true` and which `redistributable: true`,
-     so ANA-21's `weights.sources` registry (§5.4) can be extended as a data edit. Blocked on
-     nothing; do it whenever.
 - [ ] **ANA-25 - Learn per-model weights from htui's own judge verdicts** (from ANA-21; ANA-21 is
   done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`, `R-ORCH-7`, `R-ID-6`.
   ANA-21 deferred learned weights behind a volume trigger but the maintainer asked for it to be
@@ -242,6 +219,11 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   **MOD-23 note (2026-09-30, `docs/decisions/mod/mod-23.md`):** ANA-21 item 8's "MOD-23's editor
   surfaces `settings.weights`" moved here: the Settings > Agents edit form carries `settings`
   untouched, and a weights field is one more entry in its field list (plan D231).
+  **ANA-24 note (2026-10-01, `docs/decisions/ana/ana-24.md`):** the seed `weights.sources` registry
+  takes `docs/ANA-24.md` §5: `epoch-mirrorcode` (primary) and `arena-webdev`/`arena-agent` join the
+  implement axis, `epoch-eci` is narrowed to `eci_scores.csv`, `tbench-4-0` stays blocked. Each
+  dynamic source needs a parser under the fetch conditions of §6 (Arena from Hugging Face only, with
+  a per-fetch licence check; Epoch keyed on `benchmark_metadata.csv`, never `*_external.csv`).
 - [ ] **MOD-28 - rataflow execution view (from ANA-12).** Add `rataflow` dependency, implement `ExecutionGraph` widget mapping `RunStep` and `SessionEvent` lists to a node graph, add view toggle to Runs tab (`R-TUI-4`), and wire mouse/keyboard events for standard run actions.
 - [ ] **MOD-26 - Declarative Agent Personas (from ANA-13).** Build Markdown/Frontmatter parser in `htui-core`, discover from `~/.config/htui/agents.d/`, map to `SessionSpec` overrides (model, tools).
   **Relates to ANA-16** (`docs/ANA-16.md` §6.2, §8): personas should be registry rows rather than a
@@ -594,7 +576,7 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
+| ANA-N   | 2 (ANA-23 pure-Rust embedder, ANA-25 learned weights) |
 | MOD-N   | 27 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |
