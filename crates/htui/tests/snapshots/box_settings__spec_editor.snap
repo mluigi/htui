@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/box_settings.rs
+expression: frame
+---
+probe spec: seed + stored overlay · <digest>
+stored overlay (app_setting.box_probe_spec), merged into the seed by name; blank clears it
+{
+  "tools": {
+    "terraform": {
+      "kind": "path",
+      "names": [
+        "terraform"
+      ],
+      "version": {
+        "args": [
+          "version"
+        ],
+        "pattern": "^Terraform v(\\S+)"
+      }
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+ctrl-s saves · Esc cancels · Enter breaks the line · blank clears

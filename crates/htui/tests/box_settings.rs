@@ -1553,7 +1553,7 @@ async fn a_parse_error_keeps_the_spec_editor_open_and_sends_nothing() {
     assert!(section.captures_input(), "the editor stays open");
     let frame = bench.render_section(&section, 100);
     assert!(frame.contains("the overlay is not JSON: "), "{frame}");
-    assert!(frame.contains(r#"{"tools": "#), "the text is kept: {frame}");
+    assert!(frame.contains(r#"{"tools":"#), "the text is kept: {frame}");
     assert!(!frame.contains("saving\u{2026}"), "{frame}");
 }
 
