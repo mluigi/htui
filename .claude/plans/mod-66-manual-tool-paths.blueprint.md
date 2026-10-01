@@ -680,6 +680,20 @@ cargo clippy -p htui --all-features --all-targets -- -D warnings
 `crates/htui/tests/snapshots/settings__agents_{switched_off,unknown_row,empty,probed,demo,quota}.snap`,
 `probe__agents_probed_missing.snap` (moved), and `settings__agents_tool_paths_form.snap` (new).
 
+> **Amendment, maintainer 2026-10-01 (F-3 answered: "short marker `*`").** This replaces
+> ` (manual)` everywhere in §5. The rest of §5 is unchanged.
+>
+> - `MANUAL_SUFFIX` is `"*"`. A manual row's cell reads `ready*`, `missing*`, `failed*` or
+>   `0.48.0*`. `unauthenticated*` (16 characters) is clipped like `unauthenticated` already is.
+>   B17's scope is unchanged: no marker on install, login, probing, switched-off or not-probed
+>   cells.
+> - When **any** row's `probe.source` is `manual`, the note line under the keys (the line carrying
+>   `QUOTA_NOTE`) gains ``" · * manual path"`` (`MANUAL_NOTE`), within `NOTE_WIDTH` 98.
+> - The test `a_manual_row_reads_manual_in_the_on_this_box_cell` expects `0.48.0*`, `missing*` and
+>   `0.48.0` (no `as_drawn` clipping needed), and asserts the note appears only when a manual row
+>   exists.
+> - The module doc and the `on_box_cell` doc say `*`, not ` (manual)`.
+
 ### 5.1 Constants (after `UNCHANGED`, `agents.rs:132`)
 
 ```rust
