@@ -122,7 +122,25 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             })
         }
         StoreRequest::SetProbeSpec { overlay, expected } => {
-            todo!("MOD-51 T3: {overlay:?} {expected:?}")
+            // MOD-51 D3: the probe's own merge, without its warning; nothing is written on a
+            // refusal. A clear has nothing to check, and the store refuses one with no token.
+            if let Some(overlay) = overlay {
+                spec::check(overlay).map_err(|fault| {
+                    StoreError::Constraint(format!("{}: {fault}", spec::SPEC_REFUSED))
+                })?;
+            }
+            // A row gone under the editor is `Stale(None)`, a miss like a spent token (MOD-51
+            // D2), so it answers `BoxesStale` like one.
+            let outcome = writer
+                .set_box_probe_spec(overlay.clone(), *expected)
+                .await?;
+            let applied = matches!(outcome, CasOutcome::Applied(_));
+            let fresh = Box::new(snapshot(backend, &writer).await?);
+            Ok(if applied {
+                StoreReply::Boxes(fresh)
+            } else {
+                StoreReply::BoxesStale(fresh)
+            })
         }
         // `try_serve` routes exactly this module's three variants here, so the last arm is
         // unreachable from the shell; a caller that reached it anyway is better told which request
