@@ -69,19 +69,29 @@ pub fn identity() -> crate::embed::EmbedderIdentity {
     }
 }
 
-/// The two files the embedder loads.
+/// The two files the embedder loads, both verified against their pins.
+///
+/// Only [`ensure_model`] makes one, after hashing both files (review L2): that is what lets
+/// `RtenEmbedder` report the pinned [`identity`] without hashing what it loaded, and it keeps a
+/// caller from loading some other `model.onnx` and stamping a collection with BGE's name.
+///
+/// ```compile_fail,E0451
+/// let forged = htui_store::model::ModelFiles {
+///     onnx: "other.onnx".into(),
+///     tokenizer: "tokenizer.json".into(),
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelFiles {
     /// The ONNX graph and weights (`onnx/model.onnx` in [`REPO`]).
-    pub onnx: PathBuf,
+    pub(crate) onnx: PathBuf,
     /// The tokenizer (`tokenizer.json` in [`REPO`]).
-    pub tokenizer: PathBuf,
+    pub(crate) tokenizer: PathBuf,
 }
 
 impl ModelFiles {
-    /// `dir/model.onnx` and `dir/tokenizer.json`.
-    #[must_use]
-    pub fn in_dir(dir: &Path) -> Self {
+    /// `dir/model.onnx` and `dir/tokenizer.json`, for [`ModelSource::ensure`] once both verify.
+    pub(crate) fn in_dir(dir: &Path) -> Self {
         Self {
             onnx: dir.join("model.onnx"),
             tokenizer: dir.join("tokenizer.json"),

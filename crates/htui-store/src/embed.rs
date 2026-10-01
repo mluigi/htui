@@ -140,6 +140,9 @@ impl fmt::Debug for RtenEmbedder {
 impl RtenEmbedder {
     /// Loads the model and tokenizer from `files`. CPU only; never touches the network.
     ///
+    /// `files` comes only from [`model::ensure_model`], which verified both against their pins,
+    /// so what loads is the pinned model and [`identity`](DenseEmbedder::identity) says so.
+    ///
     /// # Errors
     /// [`StoreError::Backend`] naming the file that would not load.
     pub fn load(files: &ModelFiles) -> Result<Self, StoreError> {
@@ -280,6 +283,8 @@ impl DenseEmbedder for RtenEmbedder {
         DENSE_DIM
     }
 
+    /// The pinned identity: measured, not asserted, because a [`ModelFiles`] is made only once
+    /// both files hash to their pins (review L2).
     fn identity(&self) -> EmbedderIdentity {
         model::identity()
     }
