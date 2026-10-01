@@ -138,6 +138,20 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   automatically. The fit is deterministic arithmetic over rows, so it is allowed under `R-ID-6`.
   Judge choice itself is out of scope: ANA-21 §2.2 established the judge is never asked of the
   selector, and MOD-36 owns the judge-identity hardening.
+- [ ] **ANA-27 - OpenRig survey: ideas and concepts to assimilate.** Survey OpenRig
+  (https://openrig.dev/, `@openrig/cli`), a Node/tmux CLI where a team of Claude Code and Codex
+  agents is declared in a file: one lead agent delegates to durable specialists that own tasks
+  (`rig queue`), consults them directly without creating a task (`rig send`), and spawns
+  temporary subagents for bounded work, all inside a "pod", with a TUI for workspace visibility.
+  1. Pin down its model from the source and docs: licence and repo, the team-definition file
+     format, how the lead/specialist/subagent lifecycle and task ownership work, the transport
+     (tmux panes, queue, messages), and how it reports progress and recovers from crashes.
+  2. Compare each concept with what htui already has or has planned: the orchestrator and
+     run_step fan-out, weighted agent assignment (MOD-36), personas (MOD-26), swarm (MOD-27), the
+     permission relay (MOD-42), worker crash recovery (MOD-24), and the Runs pane.
+  3. Verdict: list the ideas worth taking, each with a fit note and either a proposed MOD item or
+     an amendment to an existing open item, and list the ideas rejected, with reasons. Blocked on
+     nothing.
 ### Next features
 - [ ] **MOD-37 - Orchestrator hardening follow-ups** (from MOD-4). `R-ORCH-3`, `R-ORCH-5`,
   `R-ORCH-8`, `R-ORCH-9`, `R-TUI-4`, `R-HIS-1`, `R-NF-3`. MOD-4 closed with these risks carried and
@@ -588,7 +602,7 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 2 (ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
+| ANA-N   | 3 (ANA-24 licensed coding benchmark source, ANA-25 learned weights, ANA-27 OpenRig survey) |
 | MOD-N   | 27 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys, MOD-68 rten embedder; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |
