@@ -164,6 +164,7 @@ pub const CASES: &[&str] = &[
     "pending_commands_are_the_owners_and_the_boxs_free_runs",
     "relay_view_lists_live_pending_requests_and_pending_cancels",
     "deleting_a_project_takes_its_relay_rows",
+    "update_spec_columns_roundtrip",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -415,6 +416,7 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "deleting_a_project_takes_its_relay_rows" => {
             deleting_a_project_takes_its_relay_rows(store).await
         }
+        "update_spec_columns_roundtrip" => update_spec_columns_roundtrip(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -824,6 +826,126 @@ async fn update_cas_diverged<S: WriteStore>(store: &S) {
     assert_eq!(
         ancestor.title, before.title,
         "update_cas_diverged: ancestor is the pre-edit title"
+    );
+}
+
+/// MOD-13 milestone 2 D10 (A10): the four spec columns the item form edits beyond title and body
+/// land on the head, and an explicit `Some(None)` clears the graph back to the kind default (§4.2,
+/// §7.2). Asserted on the head: `item_revision` keeps title, body and tags only.
+async fn update_spec_columns_roundtrip<S: WriteStore>(store: &S) {
+    const CASE: &str = "update_spec_columns_roundtrip";
+    let before = store
+        .item(ids::HTUI_ANA_2)
+        .await
+        .expect("update_spec_columns_roundtrip: read must not fail")
+        .expect("update_spec_columns_roundtrip: the fixture item exists");
+    let paths = vec!["src/**".to_owned(), "web:docs/*.md".to_owned()];
+    // Already canonical (sorted, deduplicated), so neither store has anything to rewrite.
+    let tags = vec!["docker".to_owned(), "rust".to_owned()];
+    assert!(
+        before.priority != 7
+            && before.touched_paths != paths
+            && before.required_tags != tags
+            && before.step_graph_id.is_none(),
+        "{CASE}: fixture precondition, every column starts somewhere else"
+    );
+
+    let set = ItemPatch {
+        priority: Some(7),
+        touched_paths: Some(paths.clone()),
+        required_tags: Some(tags.clone()),
+        // A `htui` graph that is not the kind's own override, so Postgres's foreign key holds.
+        step_graph_id: Some(Some(ids::GRAPH_HTUI_FEAT)),
+        author_id: ids::USER,
+        box_id: Some(ids::BOX),
+        reason: "edited".to_owned(),
+        ..ItemPatch::default()
+    };
+    let outcome = store
+        .update_item(before.id, before.version, set)
+        .await
+        .expect("update_spec_columns_roundtrip: the setting edit must not fail");
+    let UpdateOutcome::Updated(head) = outcome else {
+        panic!("{CASE}: the setting edit must match at the head version")
+    };
+    assert_eq!(head.version, before.version + 1, "{CASE}: version");
+    assert_eq!(head.priority, 7, "{CASE}: priority is a covered column");
+    assert_eq!(
+        head.touched_paths, paths,
+        "{CASE}: touched_paths is a covered column"
+    );
+    assert_eq!(
+        head.required_tags, tags,
+        "{CASE}: required_tags is a covered column"
+    );
+    assert_eq!(
+        head.step_graph_id,
+        Some(ids::GRAPH_HTUI_FEAT),
+        "{CASE}: step_graph_id is a covered column"
+    );
+    assert_eq!(head.title, before.title, "{CASE}: title untouched");
+    assert_eq!(head.body, before.body, "{CASE}: body untouched");
+    assert_eq!(head.kind_id, before.kind_id, "{CASE}: kind_id untouched");
+    assert_eq!(
+        head.key, before.key,
+        "{CASE}: the key is never rewritten (§4.1)"
+    );
+    assert_eq!(
+        head.project_id, before.project_id,
+        "{CASE}: an edit never moves an item between projects"
+    );
+
+    let reread = store
+        .item(before.id)
+        .await
+        .expect("update_spec_columns_roundtrip: re-read must not fail")
+        .expect("update_spec_columns_roundtrip: the item still exists");
+    assert_eq!(reread.version, head.version, "{CASE}: re-read version");
+    assert_eq!(reread.priority, head.priority, "{CASE}: re-read priority");
+    assert_eq!(
+        reread.touched_paths, head.touched_paths,
+        "{CASE}: re-read touched_paths"
+    );
+    assert_eq!(
+        reread.required_tags, head.required_tags,
+        "{CASE}: re-read required_tags"
+    );
+    assert_eq!(
+        reread.step_graph_id, head.step_graph_id,
+        "{CASE}: re-read step_graph_id"
+    );
+
+    let clear = ItemPatch {
+        step_graph_id: Some(None),
+        author_id: ids::USER,
+        box_id: Some(ids::BOX),
+        reason: "edited".to_owned(),
+        ..ItemPatch::default()
+    };
+    let outcome = store
+        .update_item(head.id, head.version, clear)
+        .await
+        .expect("update_spec_columns_roundtrip: the clearing edit must not fail");
+    let UpdateOutcome::Updated(cleared) = outcome else {
+        panic!("{CASE}: the clearing edit must match at the head version")
+    };
+    assert_eq!(
+        cleared.step_graph_id, None,
+        "{CASE}: Some(None) clears the graph back to the kind default"
+    );
+    assert_eq!(
+        cleared.version,
+        head.version + 1,
+        "{CASE}: clearing version"
+    );
+    assert_eq!(cleared.priority, 7, "{CASE}: priority survives the clear");
+    assert_eq!(
+        cleared.touched_paths, paths,
+        "{CASE}: touched_paths survives the clear"
+    );
+    assert_eq!(
+        cleared.required_tags, tags,
+        "{CASE}: required_tags survives the clear"
     );
 }
 
