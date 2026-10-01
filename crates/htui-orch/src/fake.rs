@@ -1487,11 +1487,13 @@ impl FakeOrchestrator {
     }
 
     /// The policy lookup `fake_parts` lends.
+    #[must_use = "the lookup is lent to an engine's parts; dropping it lends nothing"]
     pub fn policy_for(&self) -> PolicyFor<'_> {
         &*self.relays.policy
     }
 
     /// The control lookup `fake_parts` lends.
+    #[must_use = "the lookup is lent to an engine's parts; dropping it lends nothing"]
     pub fn control_for(&self) -> ControlFor<'_> {
         &*self.relays.control
     }
