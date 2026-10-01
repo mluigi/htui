@@ -4129,15 +4129,15 @@ mod tests {
             FrameKind::Started,
         ] {
             pane.on_reply(&frame(kind.clone()), &mut shell.ctx());
-            shell.emit.take();
+            let _ = shell.emit.take();
             assert!(shown(&pane), "{kind:?} keeps the line");
         }
         pane.on_reply(&frame(FrameKind::Adopted), &mut shell.ctx());
-        shell.emit.take();
+        let _ = shell.emit.take();
         assert!(!shown(&pane), "Adopted ends the wait");
         pane.on_reply(&frame(FrameKind::Waiting), &mut shell.ctx());
         pane.on_reply(&frame(FrameKind::Error("x".into())), &mut shell.ctx());
-        shell.emit.take();
+        let _ = shell.emit.take();
         assert!(!shown(&pane), "Error ends the wait");
     }
 
