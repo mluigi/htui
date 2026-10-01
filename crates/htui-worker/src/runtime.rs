@@ -2309,9 +2309,6 @@ pub mod testing {
     }
 }
 
-/// MOD-41 plan D8: the parts only the library owns, over `Backend::memory(MemStore::demo())`. The
-/// runtime is reached through its generic API alone, so no case imports `WorkerHost` beside the
-/// `ReadStore` that `Backend` also implements (blueprint F-33).
 /// MOD-42 plan D9: [`Kit`]'s policy lookup over `agents`, each agent's
 /// `agent.settings.permission` parsed once per task as chat parses it
 /// (`agent_worker.rs:968-969`): a row that does not parse, and an agent the task did not read,
@@ -2330,6 +2327,9 @@ fn policy_lookup(
     Box::new(move |agent| policies.get(&agent).cloned().unwrap_or_default())
 }
 
+/// MOD-41 plan D8: the parts only the library owns, over `Backend::memory(MemStore::demo())`. The
+/// runtime is reached through its generic API alone, so no case imports `WorkerHost` beside the
+/// `ReadStore` that `Backend` also implements (blueprint F-33).
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex as StdMutex, PoisonError};
