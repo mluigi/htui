@@ -181,13 +181,13 @@ pub(crate) mod tests {
     use htui_core::fixtures::{demo_at, edit_agent, ids};
     use htui_core::model::{
         Agent, AgentBox, AgentId, Billing, BoxEdit, BoxId, CancelRequest, DocumentId, EventKind,
-        Executor, Item, ItemId, NewDocument, NewRepo, NewRun, NewRunStep, PermissionId,
+        Executor, Gate, Item, ItemId, NewDocument, NewRepo, NewRun, NewRunStep, PermissionId,
         PermissionStatus, RepoId, Resolution, Run, RunCommand, RunCommandId, RunCommandKind,
-        RunCommandStatus, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId,
-        StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
+        RunCommandStatus, RunId, RunMode, RunStatus, RunStep, RunStepCommit, SnapshotPhase, Status,
+        StepId, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
     };
     use htui_core::store::mem::MemFault;
-    use htui_core::store::{CasOutcome, MemStore, ReadStore as _, WriteStore as _};
+    use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
     use htui_orch::fake::{FakeIsolator, FakeVerifier};
     use htui_orch::{
         Clock, Command, CommandOutcome, EngineError, GateAnswer, GraphSource, Isolator,
@@ -3424,6 +3424,254 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             [(id, RunCommandStatus::Applied)]
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-24 D3: commands before recovery (OQ-2)
+    // -----------------------------------------------------------------------------------------
+
+    /// `run`'s commands as `(id, status)` pairs.
+    fn command_states(fixture: &Fixture, run: RunId) -> Vec<(RunCommandId, RunCommandStatus)> {
+        commands_of(fixture, run)
+            .iter()
+            .map(|row| (row.id, row.status))
+            .collect()
+    }
+
+    /// MOD-24 D3: a worker's sweep that finds a free (lapsed) run with a pending cancel applies
+    /// the cancel before it recovers anything. The run is cancelled by `cancel_leased`, its row is
+    /// `applied`, and no session is started: nothing was recovered or walked on.
+    #[tokio::test]
+    async fn a_sweep_applies_a_pending_cancel_before_it_recovers_a_free_run() {
+        let fixture = Fixture::new().await;
+        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+        set_executor(&fixture, Executor::Worker).await;
+        let mut runtime = fixture.runtime().with_role(Role::Worker);
+        let probe = testing::probe(&runtime);
+        let id = requested(&fixture, run).await;
+
+        swept(&mut runtime, &fixture).await;
+        assert_eq!(
+            fixture.run(run).await.status,
+            RunStatus::Cancelled,
+            "the cancel was applied before any recovery"
+        );
+        assert_eq!(
+            command_states(&fixture, run),
+            [(id, RunCommandStatus::Applied)]
+        );
+        assert!(
+            fixture.steps(run).await.is_empty(),
+            "no session started, nothing recovered"
+        );
+        assert!(!probe.is_applying(id), "B-5's guard is free again");
+    }
+
+    /// MOD-24 D3, plan fact 5: the deterministic loss. The walk crashes (its lease fenced) inside
+    /// the last, ungated phase, with that phase's document written and its commits captured, so a
+    /// recovery would classify the step `Finished` and land the run `done` itself, refusing the
+    /// user's pending cancel at the next poll. The sweep applies the cancel first instead: the run
+    /// is cancelled, the last step is cancelled by `cancel_leased` (never `done`), and the row is
+    /// `applied`.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_beats_the_recovery_that_would_finish_the_run() {
+        let mut data = htui_core::fixtures::demo_data();
+        let mut last_kind = None;
+        let mut phases = 0;
+        let mut ana: Vec<_> = data
+            .phases
+            .iter_mut()
+            .filter(|phase| phase.graph_id == ids::GRAPH_HTUI_ANA)
+            .collect();
+        ana.sort_by_key(|phase| phase.position);
+        for phase in ana {
+            assert_eq!(phase.fan_out, 1, "one session per phase: {}", phase.name);
+            phase.gate = Gate::Never;
+            phase.gate_hard = false;
+            last_kind = Some(phase.output_kind.clone());
+            phases += 1;
+        }
+        let last_kind = last_kind.expect("the graph has phases");
+        assert!(phases > 1, "the crash is in a later phase");
+        let fixture = Fixture::over(MemStore::from_demo(data)).await;
+        fixture
+            .store
+            .set_app_setting("lease_ttl_seconds", json!(30));
+        for _ in 1..phases {
+            fixture.sessions.push(Play::Done);
+        }
+        let stall = Stall::default();
+        fixture.sessions.push(Play::Stall(stall.clone()));
+        let mut runtime = fixture.runtime();
+        let probe = testing::probe(&runtime);
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, _answers) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq: 1,
+                    origin: Origin::App,
+                    request: start_run(ids::HTUI_ANA_2),
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(matches!(served, RunServed::Deferred), "{served:?}");
+        within(
+            "the last phase's session starting",
+            stall.reached.notified(),
+        )
+        .await;
+        let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+        let steps = fixture.steps(run).await;
+        assert_eq!(steps.len(), phases, "{steps:?}");
+        let last = steps
+            .iter()
+            .max_by_key(|step| step.position)
+            .expect("a step")
+            .clone();
+        assert_eq!(last.status, StepStatus::Running);
+        assert!(
+            steps
+                .iter()
+                .filter(|step| step.id != last.id)
+                .all(|step| step.status == StepStatus::Done),
+            "every earlier phase finished: {steps:?}"
+        );
+
+        // H-21: the last phase's work, written while the walk's lease is live.
+        fixture
+            .store
+            .write_document(NewDocument {
+                id: DocumentId::new(),
+                item_id: ids::HTUI_ANA_2,
+                kind: last_kind,
+                title: "the last phase's output".to_owned(),
+                body: "authored".to_owned(),
+                produced_by_step_id: Some(last.id),
+                created_by: ids::USER,
+                created_at: Utc::now(),
+            })
+            .await
+            .expect("the document lands");
+        let before = fixture
+            .store
+            .step_commits(last.id)
+            .await
+            .expect("the read answers");
+        let captured: Vec<RunStepCommit> = fixture
+            .run(run)
+            .await
+            .repo_scope
+            .iter()
+            .map(|repo| RunStepCommit {
+                run_step_id: last.id,
+                repo_id: *repo,
+                before_hash: before
+                    .iter()
+                    .find(|row| row.repo_id == *repo)
+                    .map_or_else(|| "0".repeat(40), |row| row.before_hash.clone()),
+                after_hash: Some("a".repeat(40)),
+            })
+            .collect();
+        assert!(!captured.is_empty(), "the run has a repo to capture");
+        fixture
+            .store
+            .record_commits(StepFence::Lease(probe.owner()), last.id, &captured)
+            .await
+            .expect("the capture lands under the walk's lease");
+
+        // The crash: the store stops renewing the lease, so the walk is fenced and dropped.
+        fixture.store.set_fault(MemFault::RefreshLease, true);
+        tokio::time::timeout(Duration::from_secs(600), async {
+            while !probe.is_dead_walk(run) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the walk was fenced");
+        assert!(runtime.settle(PATIENCE).await.is_empty(), "no task stuck");
+        fixture.store.set_fault(MemFault::RefreshLease, false);
+        assert!(stall.dropped.load(Ordering::SeqCst), "the walk was dropped");
+        let id = requested(&fixture, run).await;
+
+        swept(&mut runtime, &fixture).await;
+        assert_eq!(
+            fixture.run(run).await.status,
+            RunStatus::Cancelled,
+            "the cancel, not the recovery, ended the run"
+        );
+        assert_eq!(
+            command_states(&fixture, run),
+            [(id, RunCommandStatus::Applied)]
+        );
+        let steps = fixture.steps(run).await;
+        let crashed = steps
+            .iter()
+            .find(|step| step.id == last.id)
+            .expect("the crashed step");
+        assert_eq!(
+            crashed.status,
+            StepStatus::Cancelled,
+            "`cancel_leased` settled it, no recovery finished it"
+        );
+        assert!(
+            !steps
+                .iter()
+                .any(|step| step.position == last.position && step.status == StepStatus::Done),
+            "nothing at the last position is done: {steps:?}"
+        );
+        assert!(!probe.is_dead_walk(run), "the cancel took the run back");
+    }
+
+    /// MOD-24 D3 versus the poll (B-5, H-16): a sweep and a command poll started in one tick both
+    /// find the same pending cancel of a free run. The row is applied once, by whichever task
+    /// takes B-5's guard first; the other waits for it (the sweep) or skips it (the poll), and no
+    /// recovery overtakes it. Not TDD-red: before D3 the outcome depended on the interleaving, so
+    /// this pins the guard rather than the fix.
+    #[tokio::test]
+    async fn a_sweep_and_a_poll_in_one_tick_apply_one_cancel_once() {
+        let fixture = Fixture::new().await;
+        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+        set_executor(&fixture, Executor::Worker).await;
+        let mut runtime = fixture.runtime().with_role(Role::Worker);
+        let probe = testing::probe(&runtime);
+        let id = requested(&fixture, run).await;
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, _answers) = mpsc::unbounded_channel();
+
+        runtime.sweep(&backend, &replies);
+        runtime.poll_commands(&backend, &replies, &LiveChats::default());
+        assert!(runtime.settle(PATIENCE).await.is_empty(), "no task stuck");
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
+        assert_eq!(
+            command_states(&fixture, run),
+            [(id, RunCommandStatus::Applied)],
+            "one row, applied once"
+        );
+        assert!(fixture.steps(run).await.is_empty(), "nothing recovered");
+        assert!(!probe.is_applying(id));
+    }
+
+    /// MOD-24 D3, regression guard: a run whose lease is live elsewhere is its holder's. Its
+    /// pending cancel is not in `pending_commands(owner, box)`, and `adopt_runs` skips it too, so
+    /// the sweep leaves the row `pending`, the run `running`, and walks nothing.
+    #[tokio::test]
+    async fn a_sweep_leaves_a_live_leases_cancel_to_its_holder() {
+        let fixture = Fixture::new().await;
+        let run = walked_by_a_stranger(&fixture, ids::HTUI_ANA_2).await;
+        let id = requested(&fixture, run).await;
+        let mut runtime = fixture.runtime();
+
+        swept(&mut runtime, &fixture).await;
+        assert_eq!(
+            command_states(&fixture, run),
+            [(id, RunCommandStatus::Pending)]
+        );
+        assert_eq!(fixture.run(run).await.status, RunStatus::Running);
+        assert!(fixture.steps(run).await.is_empty(), "nothing walked");
     }
 
     /// B-20 with `Preempt::IfLive` (plan D11, D12 step 1): `c` on a `queued` run whose claim this
