@@ -6,6 +6,9 @@
 //! or branches on an agent's name (`R-AGT-5`): a name is only ever checked against the character
 //! rule of [`valid_name`]. Nothing here prints `launch.env` (`R-SEC-2`): the form never holds it,
 //! [`AgentDraft`] has no field for it, and no [`Refusal`] quotes a stored `launch` document.
+//!
+//! MOD-66 adds `SetToolPaths`'s outcome ([`AgentWrite::ToolPaths`]) and its one pure rule
+//! ([`parse_tool_path`]). The request is served by the agent runtime, not by [`serve`].
 
 use chrono::{DateTime, Utc};
 use htui_agent::launch::AgentLaunch;
@@ -479,8 +482,32 @@ fn checked_launch(launch: Value) -> Result<Value, Refusal> {
 /// request cannot be named in one place and matched in the other.
 pub const REQUEST_NAMES: [&str; 3] = ["create_agent", "edit_agent", "set_agent_on_box"];
 
+/// `StoreRequest::SetToolPaths`'s name (MOD-66 D7, D10). **Not** in [`REQUEST_NAMES`]: those three
+/// are served by [`serve`] in the store loop and pinned by `store_worker`'s naming test. This one
+/// is the agent runtime's. The section's `Failed` match accepts it beside them.
+pub const SET_TOOL_PATHS: &str = "set_tool_paths";
+
+/// One manual path as the form and the worker check it (MOD-66 D9, D10): trimmed, non-empty and
+/// absolute. The refusal is one sentence naming the tool, `` `<tool>`: <reason> `` (the
+/// [`Refusal`] shape, with a runtime name, D11). Pure: whether the path is a **file** is the
+/// worker's check, because it is I/O.
+///
+/// # Errors
+/// `` `<tool>`: the path is empty `` or `` `<tool>`: the path must be absolute ``.
+pub fn parse_tool_path(tool: &str, text: &str) -> Result<String, String> {
+    let path = text.trim();
+    if path.is_empty() {
+        return Err(format!("`{tool}`: the path is empty"));
+    }
+    if !std::path::Path::new(path).is_absolute() {
+        return Err(format!("`{tool}`: the path must be absolute"));
+    }
+    Ok(path.to_owned())
+}
+
 /// What one registry write did (plan D240), carried by `StoreReply::AgentWritten` beside the
-/// registry re-read. Ids, names and the switch only: no `launch`, so no `env` (`R-SEC-2`).
+/// registry re-read. Ids, names, the switch and the probe's status word only: no `launch`, so no
+/// `env` (`R-SEC-2`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentWrite {
     /// A new row landed.
@@ -516,6 +543,16 @@ pub enum AgentWrite {
         /// The switch as written: `false` is switched off on this box, `true` is the probe's
         /// verdict again.
         enabled: bool,
+    },
+    /// This box's manual tool paths for the agent were written, and the row was probed over them
+    /// (MOD-66 D7). No path here (`R-SEC-2` in spirit: the reply carries no launch).
+    ToolPaths {
+        /// The agent.
+        id: AgentId,
+        /// The agent's name, from the re-read.
+        name: String,
+        /// The probe's verdict over the new paths (`agent_box.probe.status`).
+        status: htui_agent::probe::ProbeStatus,
     },
 }
 
@@ -1276,5 +1313,35 @@ mod tests {
         let printed = format!("{prefill:?}");
         assert!(!printed.contains("TOKEN"), "{printed}");
         assert!(!printed.contains("${tok}"), "{printed}");
+    }
+
+    // MOD-66: one manual tool path (D9, D10; blueprint B10).
+
+    /// The text is trimmed and kept: `temp_dir()` is absolute on every platform, where `/opt/x`
+    /// would not be on Windows (blueprint H-17).
+    #[test]
+    fn parse_tool_path_trims_and_keeps_an_absolute_path() {
+        let abs = std::env::temp_dir()
+            .join("x")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(parse_tool_path("t", &format!("  {abs}  ")), Ok(abs));
+    }
+
+    /// Both refusals are one sentence naming the tool, the `Refusal` shape with a runtime name
+    /// (D11).
+    #[test]
+    fn parse_tool_path_refuses_empty_and_relative_naming_the_tool() {
+        for empty in ["", "   "] {
+            assert_eq!(
+                parse_tool_path("demo_server", empty),
+                Err("`demo_server`: the path is empty".to_owned()),
+                "{empty:?}"
+            );
+        }
+        assert_eq!(
+            parse_tool_path("demo_server", "bin/x"),
+            Err("`demo_server`: the path must be absolute".to_owned())
+        );
     }
 }

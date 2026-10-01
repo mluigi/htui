@@ -11,6 +11,7 @@
 //! deferred until `PgStore` read latency has actually been measured against a populated database;
 //! until then the queue depth is bounded in practice by the keystrokes a user can produce.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -289,6 +290,19 @@ pub enum StoreRequest {
         agent_id: AgentId,
         /// `false` switches it off here; `true` returns it to the probe's verdict.
         enabled: bool,
+    },
+    /// Set this box's manual tool paths for one agent (MOD-66 D7): `agent_box.probe.manual`, by a
+    /// probe of the row over them. Served by the **agent runtime's own task**, because the probe
+    /// may spawn tier 2. Answered exactly once, with [`StoreReply::AgentWritten`] (`ToolPaths`),
+    /// or with [`StoreReply::Failed`] before anything is spawned. The write always lands: no
+    /// manual-row rule can swallow it (D9). An empty map clears every manual path. Offline:
+    /// `REGISTRY_ON_SERVER_ONLY`.
+    SetToolPaths {
+        /// The agent.
+        agent_id: AgentId,
+        /// `${tool}` name → an absolute path to a file on this box, for names the row's
+        /// `discovery.tools` declares. Paths, not secrets (`R-SEC-2`).
+        paths: BTreeMap<String, String>,
     },
     /// Pre-flight an adapter install for one registry row (MOD-20 D13, D18).
     ///
@@ -871,6 +885,8 @@ impl StoreRequest {
             Self::CreateAgent { .. } => "create_agent",
             Self::EditAgent { .. } => "edit_agent",
             Self::SetAgentOnBox { .. } => "set_agent_on_box",
+            // Served by the agent runtime, not `agent_settings::serve` (MOD-66 D7).
+            Self::SetToolPaths { .. } => agent_settings::SET_TOOL_PATHS,
             Self::InstallPlan { .. } => "install_plan",
             Self::InstallConfirm { .. } => "install_confirm",
             Self::InstallCancel => "install_cancel",
@@ -1176,10 +1192,10 @@ pub enum StoreReply {
     /// D4): the boxes as they are now, for the editor to reload against. The editor keeps its
     /// typed text and retries only on save.
     BoxesStale(Box<BoxesSnapshot>),
-    /// The answer to every agent registry write (MOD-23 D240): the registry re-read after the
-    /// write, and what the write did. Self-naming (MOD-59): the Settings section lands a write on
-    /// this variant alone, and a plain [`StoreReply::Agents`] never closes its form or moves its
-    /// token.
+    /// The answer to every agent registry write (MOD-23 D240) and to `SetToolPaths` (MOD-66 D7):
+    /// the registry re-read after the write, and what the write did. Self-naming (MOD-59): the
+    /// Settings section lands a write on this variant alone, and a plain [`StoreReply::Agents`]
+    /// never closes its form or moves its token.
     AgentWritten {
         /// The registry as it is now, ordered by name, whatever the outcome.
         agents: Vec<AgentSummary>,
@@ -1468,10 +1484,11 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             events: backend.step_events(*step).await?,
         },
         // The five chat requests need the worker loop's own state (the live sessions), and the
-        // two probes, the preview, the three install requests, MOD-21's four login ones and
-        // MOD-22's delivery need the runtime that owns their tasks, so all sixteen are served
-        // ahead of this function, exactly as `ApplyMigrations` is. One of them that reaches here at all belongs to a caller
-        // with no runtime — the test harness without one — and saying so is more use than a panic.
+        // two probes, the preview, the three install requests, MOD-21's four login ones,
+        // MOD-22's delivery and MOD-66's tool-paths write need the runtime that owns their tasks,
+        // so all seventeen are served ahead of this function, exactly as `ApplyMigrations` is. One
+        // of them that reaches here at all belongs to a caller with no runtime — the test harness
+        // without one — and saying so is more use than a panic.
         StoreRequest::PromptPreview { .. }
         | StoreRequest::ChatStart { .. }
         | StoreRequest::ChatSend { .. }
@@ -1487,7 +1504,8 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::AuthChoose { .. }
         | StoreRequest::AuthOpen { .. }
         | StoreRequest::AuthDeliver { .. }
-        | StoreRequest::AuthCancel => StoreReply::Failed {
+        | StoreRequest::AuthCancel
+        | StoreRequest::SetToolPaths { .. } => StoreReply::Failed {
             request: request.name(),
             message: "no agent runtime in this build".to_owned(),
         },
@@ -2119,13 +2137,13 @@ pub(crate) fn spawn_with_concepts(
                             }
                         }
                         // The chat requests need this loop's own state - the live sessions - and
-                        // the probes, the installs and the logins need the runtime that owns their
-                        // tasks, so all of them go to the runtime before `try_serve`, like
-                        // `ApplyMigrations` above. An install reads the registry over the network
-                        // and streams hundreds of megabytes, and a login waits on a human in a
-                        // browser, so `Served::Deferred => continue` is the whole of `R-NF-3` for
-                        // both: the arm returns having spawned a task and awaited nothing longer
-                        // than `box_info()` (blueprint H-9).
+                        // the probes, the tool-paths write, the installs and the logins need the
+                        // runtime that owns their tasks, so all of them go to the runtime before
+                        // `try_serve`, like `ApplyMigrations` above. An install reads the registry
+                        // over the network and streams hundreds of megabytes, and a login waits on
+                        // a human in a browser, so `Served::Deferred => continue` is the whole of
+                        // `R-NF-3` for both: the arm returns having spawned a task and awaited
+                        // nothing longer than `box_info()` (blueprint H-9).
                         StoreRequest::PromptPreview { .. }
                         | StoreRequest::ChatStart { .. }
                         | StoreRequest::ChatSend { .. }
@@ -2141,7 +2159,8 @@ pub(crate) fn spawn_with_concepts(
                         | StoreRequest::AuthChoose { .. }
                         | StoreRequest::AuthOpen { .. }
                         | StoreRequest::AuthDeliver { .. }
-                        | StoreRequest::AuthCancel => {
+                        | StoreRequest::AuthCancel
+                        | StoreRequest::SetToolPaths { .. } => {
                             match runtime.serve(&backend, &tx, &envelope).await {
                                 Served::Reply(reply) => reply,
                                 // The session task answers this request itself, once.
@@ -3964,6 +3983,78 @@ mod tests {
             ],
             agent_settings::REQUEST_NAMES
         );
+    }
+
+    /// MOD-66 D7, blueprint B12: the tool-paths write is named by its own const, outside
+    /// `agent_settings::REQUEST_NAMES`, and a build with no agent runtime refuses it by name. This
+    /// pins `try_serve`'s arm.
+    #[tokio::test]
+    async fn set_tool_paths_is_named_and_refused_without_a_runtime() {
+        let request = StoreRequest::SetToolPaths {
+            agent_id: AgentId::new(),
+            paths: BTreeMap::new(),
+        };
+        assert_eq!(request.name(), agent_settings::SET_TOOL_PATHS);
+        assert_eq!(agent_settings::SET_TOOL_PATHS, "set_tool_paths");
+        match serve(&demo(), &request).await {
+            StoreReply::Failed { request, message } => {
+                assert_eq!(request, "set_tool_paths");
+                assert_eq!(message, "no agent runtime in this build");
+            }
+            other => panic!("a tool-paths write with no runtime is refused, not served: {other:?}"),
+        }
+    }
+
+    /// MOD-66 D7, blueprint H-4 and B13: the store loop's runtime list is a wildcard match, so a
+    /// forgotten line would compile and fall through to `try_serve`'s "no agent runtime in this
+    /// build". The loop hands the request to the runtime instead, which answers it exactly once
+    /// at its address, with its own sentence: "not a chat request" before the handler lands (T2),
+    /// the handler's refusal of an unknown agent after it (T3).
+    #[tokio::test]
+    async fn the_loop_hands_set_tool_paths_to_the_agent_runtime() {
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let worker = spawn_with(
+            Started::detached(Backend::memory(MemStore::demo())),
+            req_rx,
+            rep_tx,
+            AgentRuntime::new(htui_agent::registry::DriverFactory::new()),
+        );
+        req_tx
+            .send(RequestEnvelope {
+                seq: 7,
+                origin: Origin::App,
+                request: StoreRequest::SetToolPaths {
+                    agent_id: AgentId::new(),
+                    paths: BTreeMap::new(),
+                },
+            })
+            .expect("the worker is alive");
+        drop(req_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+            .await
+            .expect("the worker stops with its channel")
+            .expect("the worker does not panic");
+
+        // The loop has stopped, so everything it answered is queued.
+        let mut replies = Vec::new();
+        while let Ok(envelope) = rep_rx.try_recv() {
+            replies.push(envelope);
+        }
+        let [envelope] = replies.as_slice() else {
+            panic!("exactly one reply: {replies:?}")
+        };
+        assert_eq!(envelope.seq, 7);
+        match &envelope.reply {
+            StoreReply::Failed { request, message } => {
+                assert_eq!(*request, "set_tool_paths");
+                assert_ne!(
+                    message, "no agent runtime in this build",
+                    "the loop routed the request to try_serve, not to the agent runtime"
+                );
+            }
+            other => panic!("an unknown agent is refused: {other:?}"),
+        }
     }
 
     /// A shell with no agent runtime answers each of the four by name, exactly once, rather than
