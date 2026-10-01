@@ -360,8 +360,8 @@ enum Mode {
 }
 
 /// The tool-paths form (MOD-66 D10, B7). It holds its own row identity (MOD-23 F-14), never an
-/// index into the table.
-#[derive(Debug)]
+/// index into the table. Its `Debug` is written by hand: it prints how many paths were
+/// `opened`, never the paths, as [`PathField`]'s buffer never prints its text (review N3).
 struct PathsForm {
     /// The row.
     agent_id: AgentId,
@@ -374,6 +374,18 @@ struct PathsForm {
     fields: Vec<PathField>,
     /// Index into `fields`.
     focus: usize,
+}
+
+impl core::fmt::Debug for PathsForm {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PathsForm")
+            .field("agent_id", &self.agent_id)
+            .field("name", &self.name)
+            .field("opened", &self.opened.len())
+            .field("fields", &self.fields)
+            .field("focus", &self.focus)
+            .finish()
+    }
 }
 
 /// One input of the tool-paths form, labelled with a tool name: a runtime string (MOD-66 D11).
