@@ -12,7 +12,8 @@
 //! - [`RunRuntime`] and [`RunServed`], the library's types over the TUI's [`Backend`] and
 //!   [`ReplyAddr`];
 //! - [`TuiRuns`], the loop's `serve` and `sweep` with the signatures they always had, over the
-//!   library's `serve_request` and `sweep_with`;
+//!   library's `serve_request` and `sweep_with`, and its `poll_commands` (MOD-42 plan D13) over
+//!   `poll_commands_with`;
 //! - the re-exports, so every `crate::run_worker::X` path the views and tests name still resolves.
 //!
 //! The test module stays too: it drives the runtime through the TUI's store loop, and its
@@ -104,6 +105,14 @@ pub trait TuiRuns {
 
     /// One sweep tick.
     fn sweep(&mut self, backend: &Backend, replies: &mpsc::UnboundedSender<ReplyEnvelope>);
+
+    /// MOD-42 plan D13: one command-poll tick over [`RunRuntime::poll_commands_with`].
+    fn poll_commands(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        live: &LiveChats,
+    );
 }
 
 impl TuiRuns for RunRuntime {
@@ -136,6 +145,15 @@ impl TuiRuns for RunRuntime {
     fn sweep(&mut self, backend: &Backend, replies: &mpsc::UnboundedSender<ReplyEnvelope>) {
         self.sweep_with(backend, &TuiReplies(replies.clone()));
     }
+
+    fn poll_commands(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        live: &LiveChats,
+    ) {
+        self.poll_commands_with(backend, &TuiReplies(replies.clone()), live.clone());
+    }
 }
 
 /// The walk fixture is shared with `store_worker`'s promotion case (blueprint §8.10).
@@ -154,15 +172,19 @@ pub(crate) mod tests {
         PermissionRequestId, SessionSpec,
     };
     use htui_agent::error::DriverError;
-    use htui_agent::event::{DoneEvent, DriverEnvelope, DriverEvent, StopReason};
+    use htui_agent::event::{
+        DoneEvent, DriverEnvelope, DriverEvent, PermissionOption, PermissionOptionKind,
+        PermissionRequestEvent, StopReason, ToolCallEvent, ToolKind,
+    };
     use htui_agent::fake::FakeDriver;
     use htui_agent::registry::{DriverFactory, TransportBuilder};
     use htui_core::fixtures::{demo_at, edit_agent, ids};
     use htui_core::model::{
-        Agent, AgentBox, AgentId, Billing, BoxEdit, DocumentId, Executor, Item, ItemId,
-        NewDocument, NewRepo, NewRun, NewRunStep, RepoId, Resolution, Run, RunId, RunMode,
-        RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus, TIMESTAMPTZ_DIGITS,
-        Transport,
+        Agent, AgentBox, AgentId, Billing, BoxEdit, BoxId, CancelRequest, DocumentId, EventKind,
+        Executor, Item, ItemId, NewDocument, NewRepo, NewRun, NewRunStep, PermissionId,
+        PermissionStatus, RepoId, Resolution, Run, RunCommand, RunCommandId, RunCommandKind,
+        RunCommandStatus, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId,
+        StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
     };
     use htui_core::store::mem::MemFault;
     use htui_core::store::{CasOutcome, MemStore, ReadStore as _, WriteStore as _};
@@ -174,7 +196,10 @@ pub(crate) mod tests {
     use serde_json::json;
     use tokio::sync::{Notify, mpsc};
 
-    use htui_worker::{Role, testing, unknown_executor, worker_walks};
+    use htui_worker::{
+        CANCEL_ALREADY_REQUESTED, CANCEL_GRACE, CANCEL_REQUESTED, Role, promote_needs_the_walker,
+        testing, unknown_executor,
+    };
 
     use super::{
         FrameKind, HostGraphs, LiveChats, ORCH_NAMES, OrchReply, OrchRequest, PREEMPTED, ReplySink,
@@ -282,6 +307,63 @@ pub(crate) mod tests {
         Stall(Stall),
         /// The session's start panics.
         Panic,
+        /// MOD-42 T4: `ToolCall`, `ParkPermission(request)`, then `Done`; the grace its session's
+        /// `cancel` received is kept in the [`Park`]'s cell.
+        Park(Park),
+    }
+
+    /// A parking session's request and the grace its `cancel` was given, if it was cancelled.
+    #[derive(Debug, Clone)]
+    struct Park {
+        request: PermissionRequestEvent,
+        grace: Arc<StdMutex<Option<Duration>>>,
+    }
+
+    impl Park {
+        /// A request over one `execute` call, offering one allow and one reject option.
+        fn new() -> Self {
+            Self {
+                request: PermissionRequestEvent {
+                    request_id: PermissionRequestId::new("request-1"),
+                    tool_call_id: Some("call-1".to_owned()),
+                    options: vec![
+                        PermissionOption {
+                            id: "allow-once".to_owned(),
+                            label: "Allow".to_owned(),
+                            kind: PermissionOptionKind::AllowOnce,
+                        },
+                        PermissionOption {
+                            id: "reject-once".to_owned(),
+                            label: "Reject".to_owned(),
+                            kind: PermissionOptionKind::RejectOnce,
+                        },
+                    ],
+                },
+                grace: Arc::default(),
+            }
+        }
+
+        /// The grace the session's `cancel` received; `None` while it was never cancelled.
+        fn grace(&self) -> Option<Duration> {
+            *self.grace.lock().expect("the cell")
+        }
+
+        /// The script: the gated call, the parked request, then `done`.
+        fn script(&self) -> Script {
+            Script::one_turn(vec![
+                ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
+                    tool_call_id: "call-1".to_owned(),
+                    title: "run the suite".to_owned(),
+                    tool_kind: ToolKind::Execute,
+                    input: json!({ "command": "cargo test" }),
+                    locations: Vec::new(),
+                })),
+                ScriptEvent::ParkPermission(self.request.clone()),
+                ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                })),
+            ])
+        }
     }
 
     /// A stalled session's three signals.
@@ -320,11 +402,16 @@ pub(crate) mod tests {
                 .expect("the queue")
                 .pop_front()
                 .unwrap_or(Play::Done);
-            let done = Script::one_turn(vec![ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
-                stop_reason: StopReason::EndTurn,
-            }))]);
+            let script = match &play {
+                Play::Park(park) => park.script(),
+                Play::Done | Play::Stall(_) | Play::Panic => {
+                    Script::one_turn(vec![ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                        stop_reason: StopReason::EndTurn,
+                    }))])
+                }
+            };
             Ok(Box::new(ScriptedDriver {
-                inner: FakeDriver::new(agent.name.clone(), caps, done),
+                inner: FakeDriver::new(agent.name.clone(), caps, script),
                 play,
             }))
         }
@@ -362,8 +449,46 @@ pub(crate) mod tests {
                         released: false,
                     }) as Box<dyn AgentSession>),
                     Play::Panic => panic!("a scripted session panics"),
+                    Play::Park(park) => Ok(Box::new(Graced {
+                        inner: session,
+                        grace: park.grace,
+                    }) as Box<dyn AgentSession>),
                 }
             })
+        }
+    }
+
+    /// A session that keeps the grace its `cancel` was given (MOD-42 B-19).
+    #[derive(Debug)]
+    struct Graced {
+        inner: Box<dyn AgentSession>,
+        grace: Arc<StdMutex<Option<Duration>>>,
+    }
+
+    impl AgentSession for Graced {
+        fn session_ref(&self) -> Option<&AgentSessionRef> {
+            self.inner.session_ref()
+        }
+
+        fn next_event<'a>(&'a mut self) -> DriverFuture<'a, Option<DriverEnvelope>> {
+            self.inner.next_event()
+        }
+
+        fn send_follow_up<'a>(&'a mut self, text: String) -> DriverFuture<'a, ()> {
+            self.inner.send_follow_up(text)
+        }
+
+        fn answer_permission<'a>(
+            &'a mut self,
+            request_id: PermissionRequestId,
+            answer: PermissionAnswer,
+        ) -> DriverFuture<'a, ()> {
+            self.inner.answer_permission(request_id, answer)
+        }
+
+        fn cancel<'a>(&'a mut self, grace: Duration) -> DriverFuture<'a, ()> {
+            *self.grace.lock().expect("the cell") = Some(grace);
+            self.inner.cancel(grace)
         }
     }
 
@@ -410,6 +535,9 @@ pub(crate) mod tests {
         }
 
         fn cancel<'a>(&'a mut self, grace: Duration) -> DriverFuture<'a, ()> {
+            // MOD-42 B-11: a cancelled session stalls no longer, so the graceful drain that
+            // follows a cancel reads the turn's `done` at once instead of waiting out its bound.
+            self.released = true;
             self.inner.cancel(grace)
         }
     }
@@ -1190,7 +1318,7 @@ pub(crate) mod tests {
         };
         let memory = Backend::memory(MemStore::demo());
         assert_eq!(
-            testing::command_limits(&memory, htui_core::model::BoxId::new())
+            testing::command_limits(&memory, BoxId::new())
                 .await
                 .expect("the read answers"),
             default,
@@ -1212,6 +1340,11 @@ pub(crate) mod tests {
     /// A run of `item` another process claimed an hour ago (`started_at`) under a lease that
     /// lapsed at once: `running`, its lease expired, its owner not this one. No step was created.
     async fn stranded(fixture: &Fixture, item: ItemId) -> RunId {
+        stranded_on(fixture, item, ids::BOX).await
+    }
+
+    /// [`stranded`] on `box_id`: targeted at it and claimed there (MOD-42 D12 step 4).
+    async fn stranded_on(fixture: &Fixture, item: ItemId, box_id: BoxId) -> RunId {
         let backend = Backend::memory(fixture.store.clone());
         let row = fixture.item(item).await;
         let app = fixture.store.app_settings().await.expect("the settings");
@@ -1235,7 +1368,7 @@ pub(crate) mod tests {
                 project_id: row.project_id,
                 item_id: row.id,
                 mode: RunMode::Manual,
-                target_box_id: ids::BOX,
+                target_box_id: box_id,
                 started_by: ids::USER,
                 graph_snapshot: resolved.snapshot,
                 repo_scope: resolved.repo_scope,
@@ -1245,7 +1378,7 @@ pub(crate) mod tests {
             .expect("the run lands");
         let claim = fixture
             .store
-            .claim_run(run, ids::BOX, Uuid::now_v7(), past, TimeDelta::zero())
+            .claim_run(run, box_id, Uuid::now_v7(), past, TimeDelta::zero())
             .await
             .expect("the claim answers");
         assert!(claim.is_admitted(), "{claim}");
@@ -2739,12 +2872,28 @@ pub(crate) mod tests {
         assert!(fixture.steps(run).await.is_empty(), "nothing walked");
     }
 
-    /// OQ-4: `c` on a run whose live lease is another process's is refused on a `worker` box with
-    /// the sentence naming the worker, and nothing is written.
-    #[tokio::test]
-    async fn on_a_worker_box_a_live_walk_refuses_cancel_naming_the_worker() {
-        let fixture = Fixture::new().await;
-        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+    // -----------------------------------------------------------------------------------------
+    // MOD-42 T4: the durable, graceful cancel (plan D11-D13, OQ-3, OQ-5)
+    // -----------------------------------------------------------------------------------------
+
+    /// `c` on `run`.
+    fn cancel(run: RunId) -> StoreRequest {
+        StoreRequest::Orch(OrchRequest::Command(Command::CancelRun { run }))
+    }
+
+    /// `p` on `step` of `run`, no chat open.
+    fn promote(run: RunId, step: StepId) -> StoreRequest {
+        StoreRequest::Orch(OrchRequest::Command(Command::PromoteStep {
+            run,
+            step,
+            chat_open: false,
+        }))
+    }
+
+    /// A [`stranded`] run of `item` whose live lease a stranger took for a day: the box's worker
+    /// walking it.
+    async fn walked_by_a_stranger(fixture: &Fixture, item: ItemId) -> RunId {
+        let run = stranded(fixture, item).await;
         assert!(
             fixture
                 .store
@@ -2753,28 +2902,841 @@ pub(crate) mod tests {
                 .expect("the take answers"),
             "the box's worker walks it, for a day"
         );
+        run
+    }
+
+    /// The run commands of `run` (MemStore's test-support reader: no trait method lists them).
+    fn commands_of(fixture: &Fixture, run: RunId) -> Vec<RunCommand> {
+        fixture
+            .store
+            .command_rows()
+            .into_iter()
+            .filter(|row| row.run_id == run)
+            .collect()
+    }
+
+    /// A pending cancel of `run`, written as a TUI on this box would (D12 step 2).
+    async fn requested(fixture: &Fixture, run: RunId) -> RunCommandId {
+        match fixture
+            .store
+            .request_cancel(run, ids::USER, ids::BOX)
+            .await
+            .expect("the request answers")
+        {
+            CancelRequest::Inserted(id) => id,
+            other @ CancelRequest::AlreadyPending(_) => panic!("a first cancel inserts: {other:?}"),
+        }
+    }
+
+    /// The relay row `id`.
+    fn relay_row(fixture: &Fixture, id: PermissionId) -> StepPermission {
+        fixture
+            .store
+            .relay_rows()
+            .into_iter()
+            .find(|row| row.id == id)
+            .expect("the relay row exists")
+    }
+
+    /// The first `pending` relay row, once a walk parked one.
+    async fn a_pending_request(fixture: &Fixture) -> StepPermission {
+        within("a request parking", async {
+            loop {
+                if let Some(row) = fixture
+                    .store
+                    .relay_rows()
+                    .into_iter()
+                    .find(|row| row.status == PermissionStatus::Pending)
+                {
+                    return row;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+    }
+
+    /// The `permission_answer` payloads in `step`'s log.
+    async fn permission_answers(fixture: &Fixture, step: StepId) -> Vec<serde_json::Value> {
+        fixture
+            .store
+            .step_events(step)
+            .await
+            .expect("the read answers")
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| row.kind == EventKind::PermissionAnswer)
+            .map(|row| row.payload)
+            .collect()
+    }
+
+    /// I-7 after a graceful cancel reached `parked`: its row reads `cancelled` and its step's
+    /// log holds one `permission_answer {cancelled: true}`.
+    async fn assert_answered_cancelled_once(fixture: &Fixture, parked: &StepPermission) {
+        assert_eq!(
+            relay_row(fixture, parked.id).status,
+            PermissionStatus::Cancelled,
+            "the parked request was answered `cancelled`"
+        );
+        let answers = permission_answers(fixture, parked.run_step_id).await;
+        assert_eq!(answers.len(), 1, "I-7's row exactly once: {answers:?}");
+        assert_eq!(answers[0]["cancelled"], true, "{answers:?}");
+    }
+
+    /// One command poll of `runtime`, settled.
+    async fn polled(runtime: &mut RunRuntime, fixture: &Fixture) {
+        let (replies, _answers) = mpsc::unbounded_channel();
+        runtime.poll_commands(
+            &Backend::memory(fixture.store.clone()),
+            &replies,
+            &LiveChats::default(),
+        );
+        assert!(runtime.settle(PATIENCE).await.is_empty(), "no task stuck");
+    }
+
+    /// D11, D12 step 3, I-7: `c` on a run this process walks while its session is parked on a
+    /// relayed request is durable and graceful: the cancel row is written and applied, the parked
+    /// request is answered `cancelled` once, the session's cancel gets the runtime's grace, the
+    /// step is cancelled by `cancel_leased` (never failed), and the walk's own requester hears
+    /// that it was preempted.
+    #[tokio::test]
+    async fn an_in_process_cancel_answers_the_parked_request_and_ends_gracefully() {
+        let fixture = Fixture::new().await;
+        let park = Park::new();
+        fixture.sessions.push(Play::Park(park.clone()));
+        let runtime = fixture.runtime().with_cancel_grace(Duration::from_secs(3));
+        let mut worker = Worker::spawn(&fixture.store, runtime);
+
+        let start = worker.send(Origin::App, start_run(ids::HTUI_ANA_2));
+        let parked = a_pending_request(&fixture).await;
+        let run = parked.run_id;
+        let asked = worker.send(Origin::App, cancel(run));
+
+        assert!(matches!(
+            outcome(worker.reply(asked).await),
+            CommandOutcome::Cancelled { .. }
+        ));
+        assert!(
+            matches!(worker.reply(start).await, StoreReply::Failed { request: "start_run", ref message } if message == PREEMPTED),
+            "the walk's own requester is answered once, as preempted"
+        );
+        assert_answered_cancelled_once(&fixture, &parked).await;
+        assert_eq!(
+            park.grace(),
+            Some(Duration::from_secs(3)),
+            "the session's cancel was given the runtime's grace"
+        );
+        let step = fixture
+            .steps(run)
+            .await
+            .into_iter()
+            .find(|step| step.id == parked.run_step_id)
+            .expect("the parked step");
+        assert_eq!(
+            step.status,
+            StepStatus::Cancelled,
+            "cancel_leased settled it; the walk settled nothing (I-6)"
+        );
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
+        assert_eq!(
+            commands_of(&fixture, run)
+                .iter()
+                .map(|row| row.status)
+                .collect::<Vec<_>>(),
+            [RunCommandStatus::Applied],
+            "one cancel row, applied"
+        );
+    }
+
+    /// D11 (R-38), I-7: `p` on a step whose session is parked on a relayed request preempts the
+    /// walk gracefully: the request is answered `cancelled` before the promotion lands, and the
+    /// promotion answers as it always has.
+    #[tokio::test]
+    async fn a_promote_preempt_is_graceful() {
+        let fixture = Fixture::new().await;
+        let park = Park::new();
+        fixture.sessions.push(Play::Park(park.clone()));
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+
+        let start = worker.send(Origin::App, start_run(ids::HTUI_ANA_2));
+        let parked = a_pending_request(&fixture).await;
+        let asked = worker.send(
+            Origin::Tab(TabId("chat")),
+            promote(parked.run_id, parked.run_step_id),
+        );
+
+        let reply = worker.reply(asked).await;
+        assert!(
+            matches!(&reply, StoreReply::Orch(OrchReply::Promoted { step, .. }) if *step == parked.run_step_id),
+            "{reply:?}"
+        );
+        assert!(
+            matches!(worker.reply(start).await, StoreReply::Failed { request: "start_run", ref message } if message == PREEMPTED),
+            "the preempted walk's requester is answered once"
+        );
+        assert_answered_cancelled_once(&fixture, &parked).await;
+        assert_eq!(park.grace(), Some(CANCEL_GRACE), "a graceful cancel");
+        let step = step_at(&fixture, parked.run_id, 0).await;
+        assert_eq!(step.id, parked.run_step_id);
+        assert_eq!(step.status, StepStatus::AwaitingApproval);
+        assert!(step.promoted_at.is_some(), "promoted");
+        assert!(
+            commands_of(&fixture, parked.run_id).is_empty(),
+            "a promotion writes no cancel row"
+        );
+    }
+
+    /// D12 steps 2 and 5 (replaces MOD-41's OQ-4 refusal): `c` on a `worker` box under the
+    /// worker's live lease writes one pending cancel and answers that it was requested; the run
+    /// itself is untouched until its executor applies the row.
+    #[tokio::test]
+    async fn on_a_worker_box_cancel_writes_a_pending_command_and_says_requested() {
+        let fixture = Fixture::new().await;
+        let run = walked_by_a_stranger(&fixture, ids::HTUI_ANA_2).await;
         let before = fixture.run(run).await;
         set_executor(&fixture, Executor::Worker).await;
         let mut runtime = fixture.runtime();
 
-        let reply = served(
-            &mut runtime,
-            &fixture,
-            1,
-            StoreRequest::Orch(OrchRequest::Command(Command::CancelRun { run })),
-        )
-        .await;
+        let reply = served(&mut runtime, &fixture, 1, cancel(run)).await;
         assert!(
-            matches!(&reply, StoreReply::Failed { request: "cancel_run", message } if *message == worker_walks(run)),
+            matches!(&reply, StoreReply::Failed { request: "cancel_run", message } if message == CANCEL_REQUESTED),
             "{reply:?}"
+        );
+        let commands = commands_of(&fixture, run);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert_eq!(
+            (
+                commands[0].kind,
+                commands[0].status,
+                commands[0].issued_by,
+                commands[0].issued_box
+            ),
+            (
+                RunCommandKind::Cancel,
+                RunCommandStatus::Pending,
+                ids::USER,
+                ids::BOX
+            )
         );
         let row = fixture.run(run).await;
         assert_eq!(
             (row.status, row.lease_expires_at),
             (RunStatus::Running, before.lease_expires_at),
-            "nothing written"
+            "the run is untouched"
         );
         assert!(fixture.steps(run).await.is_empty());
+    }
+
+    /// D1's one pending cancel per run: a second `c` answers that a cancel is already requested,
+    /// and writes nothing.
+    #[tokio::test]
+    async fn a_second_cancel_says_already_requested() {
+        let fixture = Fixture::new().await;
+        let run = walked_by_a_stranger(&fixture, ids::HTUI_ANA_2).await;
+        set_executor(&fixture, Executor::Worker).await;
+        let mut runtime = fixture.runtime();
+
+        let first = served(&mut runtime, &fixture, 1, cancel(run)).await;
+        assert!(
+            matches!(&first, StoreReply::Failed { message, .. } if message == CANCEL_REQUESTED),
+            "{first:?}"
+        );
+        let second = served(&mut runtime, &fixture, 2, cancel(run)).await;
+        assert!(
+            matches!(&second, StoreReply::Failed { request: "cancel_run", message } if message == CANCEL_ALREADY_REQUESTED),
+            "{second:?}"
+        );
+        assert_eq!(commands_of(&fixture, run).len(), 1, "still one row");
+    }
+
+    /// D13: the worker's command poll applies a pending cancel of a run whose lease it holds: the
+    /// run is cancelled and the row `applied`.
+    #[tokio::test]
+    async fn the_workers_command_poll_applies_a_pending_cancel() {
+        let fixture = Fixture::new().await;
+        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+        set_executor(&fixture, Executor::Worker).await;
+        let mut runtime = fixture.runtime().with_role(Role::Worker);
+        let owner = testing::probe(&runtime).owner();
+        assert!(
+            fixture
+                .store
+                .take_lease(run, ids::BOX, owner, TimeDelta::days(1))
+                .await
+                .expect("the take answers"),
+            "the worker holds the run"
+        );
+        let id = requested(&fixture, run).await;
+
+        polled(&mut runtime, &fixture).await;
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
+        let commands = commands_of(&fixture, run);
+        assert_eq!(
+            commands
+                .iter()
+                .map(|row| (row.id, row.status))
+                .collect::<Vec<_>>(),
+            [(id, RunCommandStatus::Applied)]
+        );
+    }
+
+    /// D13: the TUI's store loop ticks the command poll beside its sweeper, so a pending cancel
+    /// of a run this process holds is applied without any request.
+    #[tokio::test]
+    async fn the_store_loop_applies_a_pending_cancel_on_its_own() {
+        let fixture = Fixture::new().await;
+        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+        let runtime = fixture.runtime();
+        let owner = testing::probe(&runtime).owner();
+        assert!(
+            fixture
+                .store
+                .take_lease(run, ids::BOX, owner, TimeDelta::days(1))
+                .await
+                .expect("the take answers"),
+            "this process holds the run"
+        );
+        let id = requested(&fixture, run).await;
+
+        let _worker = Worker::spawn(&fixture.store, runtime);
+        rests_at(&fixture, run, RunStatus::Cancelled).await;
+        within("the row being resolved", async {
+            while commands_of(&fixture, run)
+                .iter()
+                .any(|row| row.status != RunCommandStatus::Applied)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert_eq!(
+            commands_of(&fixture, run)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            [id]
+        );
+    }
+
+    /// D12 step 4: a run executing on another box is that box's to cancel. The row stays
+    /// `pending` and the answer says it was requested, with no `RunStatus` refusal.
+    #[tokio::test]
+    async fn a_cancel_of_a_run_on_another_box_stays_pending() {
+        let mut data = htui_core::fixtures::demo_data();
+        let mut elsewhere = data.boxes[0].clone();
+        elsewhere.id = BoxId::new();
+        elsewhere.hostname = "elsewhere".to_owned();
+        let other = elsewhere.id;
+        data.boxes.push(elsewhere);
+        let fixture = Fixture::over(MemStore::from_demo(data)).await;
+        let run = stranded_on(&fixture, ids::HTUI_ANA_2, other).await;
+        let mut runtime = fixture.runtime();
+
+        let reply = served(&mut runtime, &fixture, 1, cancel(run)).await;
+        assert!(
+            matches!(&reply, StoreReply::Failed { request: "cancel_run", message } if message == CANCEL_REQUESTED),
+            "{reply:?}"
+        );
+        assert_eq!(
+            commands_of(&fixture, run)
+                .iter()
+                .map(|row| row.status)
+                .collect::<Vec<_>>(),
+            [RunCommandStatus::Pending]
+        );
+        assert_eq!(fixture.run(run).await.status, RunStatus::Running);
+    }
+
+    /// B-4, D13: a pending cancel of a run that finished before its executor saw it is refused
+    /// with the run's actual status at the next poll.
+    #[tokio::test]
+    async fn a_pending_cancel_of_a_finished_run_is_refused_with_its_status() {
+        let fixture = Fixture::new().await;
+        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+        let id = requested(&fixture, run).await;
+        fixture
+            .store
+            .finish_run(run, RunStatus::Done, None, Utc::now())
+            .await
+            .expect("the run finishes");
+        let mut runtime = fixture.runtime();
+
+        let frames = polled_watching(
+            &mut runtime,
+            &fixture,
+            ids::HTUI_ANA_2,
+            &LiveChats::default(),
+        )
+        .await;
+        let commands = commands_of(&fixture, run);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            (commands[0].id, commands[0].status),
+            (id, RunCommandStatus::Refused)
+        );
+        let resolution = commands[0].resolution.clone().unwrap_or_default();
+        assert!(resolution.contains("done"), "{resolution}");
+        assert_eq!(fixture.run(run).await.status, RunStatus::Done);
+        assert!(
+            !frames
+                .iter()
+                .any(|kind| matches!(kind, FrameKind::Error(_))),
+            "B-10: a polled refusal is recorded on its row, never published: {frames:?}"
+        );
+    }
+
+    /// D12 steps 3 and 5: a pending cancel whose run is already `cancelled` — another process on
+    /// this box applied it and is still in `cancel_leased`'s cleanup, its row not yet resolved —
+    /// is `applied` at the next poll, never `refused`, whichever process resolves the row first.
+    #[tokio::test]
+    async fn a_pending_cancel_of_a_cancelled_run_is_applied() {
+        let fixture = Fixture::new().await;
+        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+        let id = requested(&fixture, run).await;
+        fixture
+            .store
+            .finish_run(run, RunStatus::Cancelled, None, Utc::now())
+            .await
+            .expect("another process cancels the run");
+        let mut runtime = fixture.runtime();
+
+        let frames = polled_watching(
+            &mut runtime,
+            &fixture,
+            ids::HTUI_ANA_2,
+            &LiveChats::default(),
+        )
+        .await;
+        let commands = commands_of(&fixture, run);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            (commands[0].id, commands[0].status),
+            (id, RunCommandStatus::Applied)
+        );
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
+        assert!(
+            !frames
+                .iter()
+                .any(|kind| matches!(kind, FrameKind::Error(_))),
+            "a polled cancel publishes nothing: {frames:?}"
+        );
+    }
+
+    /// One command poll of `runtime` under `live`, settled, while a pane watches `item`: the kinds
+    /// of the frames published for it meanwhile.
+    async fn polled_watching(
+        runtime: &mut RunRuntime,
+        fixture: &Fixture,
+        item: ItemId,
+        live: &LiveChats,
+    ) -> Vec<FrameKind> {
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, mut answers) = mpsc::unbounded_channel();
+        runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq: 1,
+                    origin: Origin::Tab(TabId("backlog")),
+                    request: StoreRequest::RunStream { item },
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        while answers.try_recv().is_ok() {}
+        runtime.poll_commands(&backend, &replies, live);
+        assert!(runtime.settle(PATIENCE).await.is_empty(), "no task stuck");
+        drop(replies);
+        let mut frames = Vec::new();
+        while let Ok(envelope) = answers.try_recv() {
+            if let StoreReply::RunStream(frame) = envelope.reply {
+                frames.push(frame.kind);
+            }
+        }
+        frames
+    }
+
+    /// B-10 (F-12): a polled cancel of a run one of whose steps a live chat drives stays
+    /// `pending`, moves nothing and publishes nothing; the first poll after the chat closed
+    /// applies it.
+    #[tokio::test]
+    async fn a_polled_cancel_under_a_live_chat_stays_pending_and_silent() {
+        let fixture = Fixture::new().await;
+        let mut runtime = fixture.runtime();
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, _answers) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq: 1,
+                    origin: Origin::App,
+                    request: start_run(ids::HTUI_ANA_2),
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(matches!(served, RunServed::Deferred));
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+        let research = step_at(&fixture, run, 0).await;
+        assert_eq!(research.status, StepStatus::AwaitingApproval);
+        let id = requested(&fixture, run).await;
+
+        let frames = polled_watching(
+            &mut runtime,
+            &fixture,
+            ids::HTUI_ANA_2,
+            &LiveChats::of([research.id]),
+        )
+        .await;
+        assert!(
+            !frames
+                .iter()
+                .any(|kind| matches!(kind, FrameKind::Error(_))),
+            "the chat's refusal of a polled cancel is not published: {frames:?}"
+        );
+        assert_eq!(
+            commands_of(&fixture, run)
+                .iter()
+                .map(|row| (row.id, row.status))
+                .collect::<Vec<_>>(),
+            [(id, RunCommandStatus::Pending)]
+        );
+        assert_eq!(
+            fixture.run(run).await.status,
+            RunStatus::AwaitingApproval,
+            "nothing moved under the chat"
+        );
+
+        polled(&mut runtime, &fixture).await;
+        assert_eq!(
+            fixture.run(run).await.status,
+            RunStatus::Cancelled,
+            "the row was this poll's to apply all along"
+        );
+        assert_eq!(
+            commands_of(&fixture, run)
+                .iter()
+                .map(|row| (row.id, row.status))
+                .collect::<Vec<_>>(),
+            [(id, RunCommandStatus::Applied)]
+        );
+    }
+
+    /// B-20 with `Preempt::IfLive` (plan D11, D12 step 1): `c` on a `queued` run whose claim this
+    /// process is making stops that claim first, gracefully, then takes today's path: the run is
+    /// cancelled from `queued`, with no cancel row and nothing walked.
+    #[tokio::test]
+    async fn a_cancel_of_a_queued_run_stops_its_live_claim_first() {
+        let fixture = Fixture::new().await;
+        let run = queued_by_another(&fixture, ids::HTUI_ANA_2).await;
+        let mut runtime = fixture.runtime().with_cancel_grace(Duration::from_secs(60));
+        let probe = testing::probe(&runtime);
+        // This process's claim of the run, live.
+        let claim = probe.walk_child(run);
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, mut answers) = mpsc::unbounded_channel();
+
+        let served = runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq: 1,
+                    origin: Origin::App,
+                    request: cancel(run),
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(matches!(served, RunServed::Deferred), "{served:?}");
+        within("the claim being asked to stop", async {
+            while !testing::signalled(&claim) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        drop(claim);
+        assert!(runtime.settle(PATIENCE).await.is_empty(), "no task stuck");
+        drop(replies);
+        let mut reply = None;
+        while let Ok(envelope) = answers.try_recv() {
+            if envelope.seq == 1 && !matches!(envelope.reply, StoreReply::RunStream(_)) {
+                reply = Some(envelope.reply);
+            }
+        }
+        let reply = reply.expect("the cancel was answered");
+        assert!(
+            matches!(&reply, StoreReply::Orch(OrchReply::Done(_))),
+            "{reply:?}"
+        );
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
+        assert!(commands_of(&fixture, run).is_empty(), "no cancel row");
+        assert!(fixture.steps(run).await.is_empty(), "nothing walked");
+    }
+
+    /// D12 steps 1 and 2 (review L-4): `c` read the run `queued`, but another process on this box
+    /// claimed it before the queued CAS. The run is no longer queued, so the cancel is durable: one
+    /// pending row and the `requested` answer, not the engine's raw `LeaseHeld` sentence.
+    #[tokio::test]
+    async fn a_cancel_whose_queued_run_is_claimed_meanwhile_is_requested() {
+        let fixture = Fixture::new().await;
+        let run = queued_by_another(&fixture, ids::HTUI_ANA_2).await;
+        let mut runtime = fixture.runtime();
+        let probe = testing::probe(&runtime);
+        // Hold the run's lock so the cancel parks after its snapshot read, before the CAS.
+        let held = probe.try_lock(run).expect("nobody holds it");
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, mut answers) = mpsc::unbounded_channel();
+
+        let served = runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq: 1,
+                    origin: Origin::App,
+                    request: cancel(run),
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(matches!(served, RunServed::Deferred), "{served:?}");
+        within("the cancel waiting for the run's lock", async {
+            while probe.live_walks(run) < 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        // The box's worker claims the run, for a day.
+        let claim = fixture
+            .store
+            .claim_run(
+                run,
+                ids::BOX,
+                Uuid::now_v7(),
+                Utc::now(),
+                TimeDelta::days(1),
+            )
+            .await
+            .expect("the claim answers");
+        assert!(claim.is_admitted(), "{claim}");
+        let before = fixture.run(run).await;
+        drop(held);
+
+        assert!(runtime.settle(PATIENCE).await.is_empty(), "no task stuck");
+        drop(replies);
+        let mut reply = None;
+        while let Ok(envelope) = answers.try_recv() {
+            if envelope.seq == 1 && !matches!(envelope.reply, StoreReply::RunStream(_)) {
+                reply = Some(envelope.reply);
+            }
+        }
+        let reply = reply.expect("the cancel was answered");
+        assert!(
+            matches!(&reply, StoreReply::Failed { request: "cancel_run", message } if message == CANCEL_REQUESTED),
+            "{reply:?}"
+        );
+        assert_eq!(
+            commands_of(&fixture, run)
+                .iter()
+                .map(|row| (row.kind, row.status))
+                .collect::<Vec<_>>(),
+            [(RunCommandKind::Cancel, RunCommandStatus::Pending)],
+            "one durable cancel row, left for the claimant"
+        );
+        let row = fixture.run(run).await;
+        assert_eq!(
+            (row.status, row.lease_expires_at),
+            (RunStatus::Running, before.lease_expires_at),
+            "the claimant's run is untouched"
+        );
+    }
+
+    /// D11: a command queued for the lock of a run being cancelled gracefully is refused at the
+    /// cancel's signal, not at the token's drop, so the cancel ends as soon as the walk rests —
+    /// well inside its grace — and the queued command is answered `PREEMPTED`.
+    #[tokio::test]
+    async fn a_command_queued_behind_a_cancelled_walk_leaves_at_the_signal() {
+        let fixture = Fixture::new().await;
+        let park = Park::new();
+        fixture.sessions.push(Play::Park(park.clone()));
+        let grace = Duration::from_secs(60);
+        let runtime = fixture.runtime().with_cancel_grace(grace);
+        let probe = testing::probe(&runtime);
+        let mut worker = Worker::spawn(&fixture.store, runtime);
+
+        let start = worker.send(Origin::App, start_run(ids::HTUI_ANA_2));
+        let parked = a_pending_request(&fixture).await;
+        let run = parked.run_id;
+        let queued = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::AnswerGate {
+                run,
+                step: parked.run_step_id,
+                answer: GateAnswer::Approved,
+            })),
+        );
+        within("the gate answer queued for the run's lock", async {
+            while probe.live_walks(run) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let began = std::time::Instant::now();
+        let asked = worker.send(Origin::App, cancel(run));
+
+        assert!(matches!(
+            outcome(worker.reply(asked).await),
+            CommandOutcome::Cancelled { .. }
+        ));
+        assert!(
+            began.elapsed() < grace / 2,
+            "the cancel waited on the queued command: {:?}",
+            began.elapsed()
+        );
+        assert!(
+            matches!(worker.reply(queued).await, StoreReply::Failed { ref message, .. } if message == PREEMPTED),
+            "the queued command is refused as preempted"
+        );
+        assert!(
+            matches!(worker.reply(start).await, StoreReply::Failed { request: "start_run", ref message } if message == PREEMPTED),
+            "the walk's own requester is answered once, as preempted"
+        );
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
+    }
+
+    /// D13, B-5: a tick while a poll is in flight starts none, and a later tick skips a row a
+    /// task is still applying — one cancel task, the row applied once.
+    #[tokio::test]
+    async fn overlapping_command_polls_run_one_poll() {
+        let fixture = Fixture::new().await;
+        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+        let id = requested(&fixture, run).await;
+        let mut runtime = fixture.runtime();
+        let probe = testing::probe(&runtime);
+        let held = probe.try_lock(run).expect("nobody holds it");
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, _answers) = mpsc::unbounded_channel();
+        let live = LiveChats::default();
+
+        runtime.poll_commands(&backend, &replies, &live);
+        runtime.poll_commands(&backend, &replies, &live);
+        assert_eq!(
+            runtime.tasks_len(),
+            1,
+            "the second tick found the first poll in flight"
+        );
+        within("the cancel task taking the row", async {
+            while !probe.is_applying(id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        runtime.poll_commands(&backend, &replies, &live);
+        within("the third tick's poll ending", async {
+            while probe.unfinished_tasks() > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert_eq!(
+            runtime.tasks_len(),
+            2,
+            "the blocked cancel and the third poll: the row being applied was skipped"
+        );
+
+        drop(held);
+        assert!(runtime.settle(PATIENCE).await.is_empty(), "no task stuck");
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
+        assert_eq!(
+            commands_of(&fixture, run)
+                .iter()
+                .map(|row| row.status)
+                .collect::<Vec<_>>(),
+            [RunCommandStatus::Applied]
+        );
+    }
+
+    /// OQ-3: `p` on a step the box's worker walks is refused with the sentence naming the
+    /// walker: a live session cannot be handed to this TUI's chat across processes.
+    #[tokio::test]
+    async fn promote_of_a_worker_walked_step_names_the_worker() {
+        let fixture = Fixture::new().await;
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+        let (run, research) = parked(&fixture, &mut worker).await;
+        assert!(
+            fixture
+                .store
+                .take_lease(run, ids::BOX, Uuid::now_v7(), TimeDelta::days(1))
+                .await
+                .expect("the take answers"),
+            "the box's worker walks it, for a day"
+        );
+        set_executor(&fixture, Executor::Worker).await;
+
+        let asked = worker.send(Origin::Tab(TabId("chat")), promote(run, research.id));
+        let reply = worker.reply(asked).await;
+        assert!(
+            matches!(&reply, StoreReply::Failed { message, .. } if *message == promote_needs_the_walker(run)),
+            "{reply:?}"
+        );
+        let step = step_at(&fixture, run, 0).await;
+        assert!(step.promoted_at.is_none(), "nothing promoted");
+    }
+
+    /// OQ-5 pin: shutdown stays a hard drop. A parked walk ends within `2 × grace` with no
+    /// graceful cancel; `Engine::abandoned` marks its relay row `stale` before the lease goes back
+    /// (review L-1, blueprint A-11), so `relay_view` never lists it again.
+    #[tokio::test]
+    async fn shutdown_still_drops_a_parked_walk() {
+        let fixture = Fixture::new().await;
+        let park = Park::new();
+        fixture.sessions.push(Play::Park(park.clone()));
+        let mut runtime = fixture.runtime();
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, _answers) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq: 1,
+                    origin: Origin::App,
+                    request: start_run(ids::HTUI_ANA_2),
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(matches!(served, RunServed::Deferred));
+        let parked = a_pending_request(&fixture).await;
+
+        let grace = Duration::from_millis(500);
+        let began = tokio::time::Instant::now();
+        runtime.shutdown(grace).await;
+        assert!(
+            began.elapsed() <= grace * 2,
+            "the walk ended within the window: {:?}",
+            began.elapsed()
+        );
+        assert_eq!(park.grace(), None, "no graceful cancel on shutdown (OQ-5)");
+        assert_eq!(
+            relay_row(&fixture, parked.id).status,
+            PermissionStatus::Stale,
+            "a hard-dropped walk's request is staled, never answered `cancelled` (OQ-5, A-11)"
+        );
+        let view = fixture
+            .store
+            .relay_view(ids::HTUI_ANA_2)
+            .await
+            .expect("the view answers");
+        assert!(
+            view.permissions.is_empty(),
+            "the released lease hides the row: {view:?}"
+        );
     }
 
     /// Plan D9: an executor this build does not know fails closed. The TUI refuses `R` and the

@@ -13,7 +13,9 @@
 //! - [`RunRuntime`], which runs every command on a task of its own that answers its request once,
 //!   at the request's address (`R-NF-3`, R-41). One [`RunLocks`] entry per run serialises a run's
 //!   commands, walks and recoveries (R-27, D157); `CancelRun` and `PromoteStep` preempt a live
-//!   walk through its cancellation token and give its lease and guards back (D187, D188); the
+//!   walk — gracefully first, through its run's control (MOD-42 plan D11), then through its
+//!   cancellation token — and give its lease and guards back (D187, D188); a cancel is a durable
+//!   `run_command` row its executor applies, read by a command poll (MOD-42 plan D12, D13); the
 //!   sweep runs at start, at every `Online` and on a ticker, fenced by the same locks (D158,
 //!   D189, D190); every task is supervised, so a panicked walk is adopted by the next sweep
 //!   (R-12) and a refused claim is retried once a walk rests (M5 D84). Progress reaches each
@@ -47,8 +49,9 @@ pub use graphs::HostGraphs;
 #[doc(hidden)]
 pub use runtime::testing;
 pub use runtime::{
-    PREEMPTED, REPOS_MOVED, Role, RunLocks, RunRuntime, UNBLOCK_MOVED, WALK_PANICKED, switched_off,
-    unknown_executor, worker_walks,
+    CANCEL_ALREADY_REQUESTED, CANCEL_GRACE, CANCEL_REQUESTED, PREEMPTED, REPOS_MOVED, Role,
+    RunLocks, RunRuntime, UNBLOCK_MOVED, WALK_PANICKED, promote_needs_the_walker, switched_off,
+    unknown_executor,
 };
 pub use views::{
     Enabled, FrameKind, ItemActions, LiveChats, ORCH_NAMES, OrchReply, OrchRequest, ProgressSink,

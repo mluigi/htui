@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE step_permission p SET status = 'answered', option_id = $2, answered_by = $3, answered_box = $4, answered_at = clock_timestamp() WHERE p.id = $1 AND p.status = 'pending' AND p.options @> jsonb_build_array(jsonb_build_object('id', $2::text)) AND p.owner = (SELECT r.lease_owner FROM run r WHERE r.id = p.run_id AND r.lease_expires_at > clock_timestamp())",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "522428bff845acc5934daaeae1afe22aece7a09146372e4d7ec864c5e8e892ec"
+}

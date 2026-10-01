@@ -118,6 +118,10 @@ use crate::driver::{AgentSession, PermissionRequestId};
 use crate::error::DriverError;
 use crate::event::{DoneEvent, DriverEnvelope, DriverEvent, ErrorEvent, StopReason};
 
+mod relay;
+
+pub use relay::{Control, NoRelay, RELAY_GRACE, RELAY_POLL, Relay, Signal, control_channel, drive};
+
 /// Flush trigger 4: the accumulated text a coalesced run may reach before it is cut.
 ///
 /// A bound, not a target - one pathological turn cannot buffer unboundedly - and a byte count
@@ -162,8 +166,8 @@ pub struct QuotaLatch {
 /// cost; an *absent* cap is [`Recorder::with_run_cap`] never being called.
 ///
 /// The grace rides here rather than on [`pump`] so that seam keeps its signature (blueprint H-9):
-/// the worker passes its own `CANCEL_GRACE`, the conformance suite passes zero, and eighteen call
-/// sites do not move to carry a value only one of them has an opinion about.
+/// the worker passes its own `CANCEL_GRACE`, the conformance suite passes zero, and its call sites
+/// do not move to carry a value only one of them has an opinion about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunCap {
     /// The cap in USD micros.
@@ -1855,21 +1859,22 @@ pub async fn pump<S: htui_core::store::RecorderStore>(
     session: &mut dyn AgentSession,
     recorder: &mut Recorder<'_, S>,
 ) -> Result<DoneEvent, DriverError> {
-    loop {
-        let Some(envelope) = session.next_event().await? else {
-            return Err(DriverError::Closed);
-        };
-        let done = match &envelope.event {
-            DriverEvent::Done(done) => Some(*done),
-            _ => None,
-        };
-        if let Some(breach) = recorder.record(envelope).await? {
-            return enforce_breach(session, recorder, breach).await;
-        }
-        if let Some(done) = done {
-            return Ok(done);
-        }
-    }
+    // MOD-42 plan D6: `drive` with no relay and a control nothing signals is today's loop: no
+    // policy evaluation, no row, and a parked request is pulled past exactly as before, so the
+    // transport still answers "is parked" (I-8).
+    //
+    // Boxed: `drive`'s state machine (the relay wait, the cancel sequence, its `select!`s) is
+    // large, and awaiting it inline embeds it in every caller's future. The engine nests this
+    // future several levels deep, and the debug build's 2 MiB test and worker stacks overflowed
+    // on it (`htui-orch` `every_case_name_dispatches`, MOD-42 wave gate). One allocation per
+    // session.
+    Box::pin(drive(
+        session,
+        recorder,
+        None::<&Relay<'_, NoRelay>>,
+        &mut Control::never(),
+    ))
+    .await
 }
 
 /// The per-run cap's cancel-and-close sequence, performed by the layer that holds the session
@@ -1893,7 +1898,7 @@ pub async fn pump<S: htui_core::store::RecorderStore>(
 /// says the last row says `cancelled`.
 ///
 /// The grace comes off [`Recorder::run_cap`] rather than a parameter, which is what keeps `pump`'s
-/// signature and its eighteen call sites unchanged (blueprint H-9).
+/// signature and its call sites unchanged (blueprint H-9).
 ///
 /// A **failed cancel is logged, not returned**: the kill path has already ended the session by
 /// then, and the rows still have to be written. Returning here would leave a log whose last row is

@@ -1,4 +1,5 @@
-//! `htui worker`'s loop (MOD-41 plan D14): poll, box heartbeat, shutdown.
+//! `htui worker`'s loop (MOD-41 plan D14): poll, command poll (MOD-42 plan D13), box heartbeat,
+//! shutdown.
 
 use std::future::Future;
 use std::time::Duration;
@@ -7,10 +8,14 @@ use htui_store::PgStore;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::{RunRuntime, Unaddressed};
+use crate::{LiveChats, RunRuntime, Unaddressed};
 
 /// How often the worker sweeps and scans (plan D14): hand-back latency is bounded by this.
 pub const WORKER_POLL: Duration = Duration::from_secs(5);
+
+/// MOD-42 plan D13: how often pending run commands are read (a `const`, so `WorkerConfig`
+/// literals stay as they are).
+pub const COMMAND_POLL: Duration = Duration::from_secs(1);
 
 /// A cancelled walk's graceful window on shutdown, as the TUI's `CANCEL_GRACE`.
 pub const WALK_GRACE: Duration = Duration::from_secs(2);
@@ -38,9 +43,10 @@ impl WorkerConfig {
 /// The loop until `shutdown` resolves, then the runtime's shutdown (walks cancelled, leases
 /// given back). A store outage is logged by each arm and the loop carries on (plan D14).
 ///
-/// Both tickers fire at once (blueprint B-11): the first sweep and the first box beat are at
-/// start, not one period out. One beat is in flight at a time, on its own task, so a slow server
-/// never delays a sweep; a beat still in flight at shutdown is aborted.
+/// Every ticker fires at once (blueprint B-11): the first sweep, the first command poll (MOD-42
+/// plan D13, every [`COMMAND_POLL`]) and the first box beat are at start, not one period out.
+/// One beat is in flight at a time, on its own task, so a slow server never delays a sweep; a
+/// beat still in flight at shutdown is aborted.
 pub async fn run(
     host: PgStore,
     mut runtime: RunRuntime<PgStore, Unaddressed>,
@@ -51,6 +57,8 @@ pub async fn run(
     poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut beat = tokio::time::interval(config.box_beat);
     beat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut commands = tokio::time::interval(COMMAND_POLL);
+    commands.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut beating: Option<JoinHandle<()>> = None;
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
@@ -58,6 +66,10 @@ pub async fn run(
             biased;
             () = &mut shutdown => break,
             _ = poll.tick() => runtime.sweep_with(&host, &Unaddressed),
+            // MOD-42 plan D13: the worker has no chat, so no live chat refuses a cancel.
+            _ = commands.tick() => {
+                runtime.poll_commands_with(&host, &Unaddressed, LiveChats::default());
+            }
             _ = beat.tick(), if beating.is_none() => {
                 beating = Some(tokio::spawn(beat_once(host.clone())));
             }

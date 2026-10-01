@@ -20,19 +20,21 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::{
-    Activation, Agent, AgentBox, AgentId, BOX_PROBE_SPEC_KEY, BindingChange, BoxEdit, BoxId,
-    BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec, CitationKind, Claim,
-    CommandRun, CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor,
-    GateOutcome, Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
-    ItemRequirement, ItemRevision, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
-    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Priority,
-    Project, ProjectId, ProjectPatch, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId,
-    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
-    RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Skill,
-    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
+    Activation, Agent, AgentBox, AgentId, AnswerOutcome, BOX_PROBE_SPEC_KEY, BindingChange,
+    BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec,
+    CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS,
+    Document, Executor, GateOutcome, Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch,
+    ItemPatch, ItemRequirement, ItemRevision, NewCommandRun, NewDocument, NewItem, NewItemKind,
+    NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
+    NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission,
+    PermissionChoice, PermissionId, PermissionStatus, PhaseId, PhasePatch, Priority, Project,
+    ProjectId, ProjectPatch, PromptTemplate, PromptTemplateId, RelaySessionId, RelayView, Repo,
+    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
+    Resolution, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Skill, SkillBinding,
+    SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
     UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
     WorkspaceProject, canonical_declared_tags, missing_tags_failure, overlaps, scope_of,
 };
@@ -5929,6 +5931,69 @@ impl WriteStore for PgStore {
 
         tx.commit().await.map_err(map_sqlx)?;
         Ok(row)
+    }
+
+    // -- MOD-42: the permission and control relay (plan D1-D5, D12-D14); the bodies are
+    // `pg/relay.rs`'s (blueprint §2.10).
+
+    async fn open_permission(&self, open: OpenPermission) -> Result<PermissionId> {
+        super::relay::open_permission(self, open).await
+    }
+
+    async fn permission(&self, id: PermissionId) -> Result<Option<StepPermission>> {
+        super::relay::permission(self, id).await
+    }
+
+    async fn apply_permission(
+        &self,
+        id: PermissionId,
+        owner: Uuid,
+    ) -> Result<Option<PermissionChoice>> {
+        super::relay::apply_permission(self, id, owner).await
+    }
+
+    async fn settle_permissions(
+        &self,
+        session: RelaySessionId,
+        to: PermissionStatus,
+    ) -> Result<u64> {
+        super::relay::settle_permissions(self, session, to).await
+    }
+
+    async fn request_cancel(
+        &self,
+        run: RunId,
+        user: UserId,
+        box_id: BoxId,
+    ) -> Result<CancelRequest> {
+        super::relay::request_cancel(self, run, user, box_id).await
+    }
+
+    async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> Result<Vec<RunCommand>> {
+        super::relay::pending_commands(self, owner, box_id).await
+    }
+
+    async fn resolve_command(
+        &self,
+        id: RunCommandId,
+        to: RunCommandStatus,
+        resolution: Option<String>,
+    ) -> Result<bool> {
+        super::relay::resolve_command(self, id, to, resolution).await
+    }
+
+    async fn relay_view(&self, item: ItemId) -> Result<RelayView> {
+        super::relay::relay_view(self, item).await
+    }
+
+    async fn answer_permission(
+        &self,
+        id: PermissionId,
+        option_id: &str,
+        user: UserId,
+        box_id: BoxId,
+    ) -> Result<AnswerOutcome> {
+        super::relay::answer_permission(self, id, option_id, user, box_id).await
     }
 }
 

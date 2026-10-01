@@ -24,12 +24,17 @@
 //! `db.store` (blueprint F-O). The Harness answers `ConnectionInfo` at start, which over a
 //! non-`Memory` backend reaches the keyring, so every case holds a `testkit::mock_keyring` guard.
 //!
+//! MOD-42 T6 (blueprint §9.2) adds the relay across boxes for an in-process walk: the TUI's
+//! runtime walks a session that parks on a permission request, and a second `PgStore` client
+//! registered as another box answers it from its own relay view.
+//!
 //! Each case prints `testkit::SKIP` and returns with `HTUI_TEST_DATABASE_URL` unset, and panics
 //! instead when `CI` is set (plan D13), like every other Postgres-backed suite.
 #![cfg(feature = "testkit")]
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -40,16 +45,19 @@ use htui::store_worker::StoreRequest;
 use htui::testkit::Harness;
 use htui::ui::tabs::ChatTab;
 use htui_agent::conformance::{Script, ScriptEvent};
-use htui_agent::driver::{AgentDriver, DriverCaps};
-use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk, UsageEvent};
+use htui_agent::driver::{AgentDriver, DriverCaps, PermissionRequestId};
+use htui_agent::event::{
+    DoneEvent, DriverEvent, PermissionOption, PermissionOptionKind, PermissionRequestEvent,
+    StopReason, TextChunk, ToolCallEvent, ToolKind, UsageEvent,
+};
 use htui_agent::fake::{FakeAdapter, FakeDriver};
 use htui_agent::registry::{DriverFactory, TransportBuilder};
 use htui_core::fixtures::{edit_agent, ids};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxEdit, DocumentHead, DocumentId, EventKind, EventRole,
-    Item, ItemId, ItemPatch, NewDocument, NewRepo, RepoId, Resolution, Run, RunId, RunMode,
-    RunStatus, RunStep, RunStepCommit, SessionEvent, SnapshotPhase, Status, StepId, StepStatus,
-    Transport, UsageTotals,
+    Agent, AgentBox, AgentId, AnswerOutcome, Billing, BoxEdit, DocumentHead, DocumentId, EventKind,
+    EventRole, Item, ItemId, ItemPatch, NewDocument, NewRepo, PermissionStatus, RepoId, Resolution,
+    Run, RunId, RunMode, RunStatus, RunStep, RunStepCommit, SessionEvent, SnapshotPhase, Status,
+    StepId, StepPermission, StepStatus, Transport, UsageTotals,
 };
 use htui_core::store::{CasOutcome, ReadStore as _, StepFence, StoreError, WriteStore as _};
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
@@ -125,6 +133,55 @@ impl TransportBuilder for Walks {
             caps,
             Script::one_turn(vec![
                 ScriptEvent::Emit(DriverEvent::Usage(walk_usage())),
+                done(),
+            ]),
+        )))
+    }
+}
+
+/// MOD-42 T6: the first session plays a gated `execute` call and parks on its permission request
+/// (one allow and one reject option), then ends its turn once answered; every later session plays
+/// [`Walks`].
+#[derive(Debug, Default)]
+struct ParksOnce(AtomicBool);
+
+impl TransportBuilder for ParksOnce {
+    fn build(
+        &self,
+        agent: &Agent,
+        on_box: Option<&AgentBox>,
+        caps: DriverCaps,
+    ) -> Result<Box<dyn AgentDriver>, htui_agent::error::DriverError> {
+        if self.0.swap(true, Ordering::SeqCst) {
+            return Walks.build(agent, on_box, caps);
+        }
+        Ok(Box::new(FakeDriver::new(
+            agent.name.clone(),
+            caps,
+            Script::one_turn(vec![
+                ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
+                    tool_call_id: "call-1".to_owned(),
+                    title: "run the suite".to_owned(),
+                    tool_kind: ToolKind::Execute,
+                    input: json!({ "command": "cargo test" }),
+                    locations: Vec::new(),
+                })),
+                ScriptEvent::ParkPermission(PermissionRequestEvent {
+                    request_id: PermissionRequestId::new("request-1"),
+                    tool_call_id: Some("call-1".to_owned()),
+                    options: vec![
+                        PermissionOption {
+                            id: "allow-once".to_owned(),
+                            label: "Allow".to_owned(),
+                            kind: PermissionOptionKind::AllowOnce,
+                        },
+                        PermissionOption {
+                            id: "reject-once".to_owned(),
+                            label: "Reject".to_owned(),
+                            kind: PermissionOptionKind::RejectOnce,
+                        },
+                    ],
+                }),
                 done(),
             ]),
         )))
@@ -226,10 +283,10 @@ async fn seed(store: &PgStore) {
         .expect("the demo project has no repo yet");
 }
 
-/// The run runtime over the fakes, whose sessions play [`Walks`].
-fn run_runtime() -> RunRuntime {
+/// The run runtime over the fakes, whose `acp` sessions `transport` builds.
+fn run_runtime(transport: Box<dyn TransportBuilder>) -> RunRuntime {
     let mut factory = DriverFactory::new();
-    factory.register("acp", Box::new(Walks));
+    factory.register("acp", transport);
     RunRuntime::with_parts(
         Arc::new(FakeIsolator::new()),
         Arc::new(FakeVerifier::new()),
@@ -252,8 +309,14 @@ impl Stack {
     /// The stack over a seeded demo database, or `None` (after `testkit::SKIP`) without a server.
     ///
     /// `chat` is the promoted chat's script; `None` builds a shell with no chat runtime and no
-    /// Chat tab, which the close-out and unblock cases need no more of.
+    /// Chat tab, which the close-out and unblock cases need no more of. The walk's sessions play
+    /// [`Walks`].
     async fn new(chat: Option<Script>) -> Option<Self> {
+        Self::over(chat, Box::new(Walks)).await
+    }
+
+    /// [`Stack::new`], whose walk sessions `transport` builds (MOD-42 T6).
+    async fn over(chat: Option<Script>, transport: Box<dyn TransportBuilder>) -> Option<Self> {
         let db = testkit::demo_db().await?;
         seed(&db.store).await;
         let root = tempfile::tempdir().expect("a throwaway config root");
@@ -265,7 +328,7 @@ impl Stack {
             pg: db.store.clone(),
             cache: cache.clone(),
         };
-        let mut harness = Harness::over_backend(backend).with_run_runtime(run_runtime());
+        let mut harness = Harness::over_backend(backend).with_run_runtime(run_runtime(transport));
         if let Some(chat) = chat {
             let adapter = Arc::new(FakeAdapter::new());
             adapter.load(chat);
@@ -1327,6 +1390,125 @@ async fn a_claim_time_refusal_is_not_requeued_on_postgres() {
             "no run of the item is back at `queued`: {id}"
         );
     }
+
+    stack.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-42 T6: the relay across boxes
+// ---------------------------------------------------------------------------------------------
+
+/// A second store client registered as **another box** (blueprint §9.2), as a TUI elsewhere
+/// holding the DSN; its `box.toml` lives in the returned directory, never the real home.
+async fn another_box(db: &testkit::TestDb) -> (PgStore, tempfile::TempDir) {
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let identity = htui_store::identity::load_or_mint(root.path()).expect("mint box.toml");
+    let client = PgStore::connect(&db.url, &identity)
+        .await
+        .expect("the second client connects")
+        .store;
+    assert_ne!(
+        client.this_box(),
+        ids::BOX,
+        "the second client is another box"
+    );
+    (client, root)
+}
+
+/// The first pending request `client`'s Runs pane would show for `item` (D14).
+async fn pending_request(client: &PgStore, item: ItemId) -> StepPermission {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let view = client.relay_view(item).await.expect("the relay view reads");
+        if let Some(row) = view.permissions.into_iter().next() {
+            return row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no request parked within {PATIENCE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// MOD-42 PRD metric "cross-box answer" for an in-process walk (executor `tui`): the TUI's runtime
+/// walks a session that parks on a permission request; a client on another box answers it from
+/// its relay view while the shell waits on the walk; the TUI applies the answer, echoes it into
+/// the step's log as the user's (I-1), the session ends its turn and the step reaches its gate;
+/// afterwards the TUI's own relay view of the item is empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_process_walk_resumes_on_an_answer_from_another_box() {
+    let Some(mut stack) = Stack::over(None, Box::new(ParksOnce::default())).await else {
+        return;
+    };
+    let item = ids::HTUI_ANA_2;
+    let (client, _client_root) = another_box(&stack.db).await;
+    // The shell's drive awaits the walk to its rest, which the answer releases: answer meanwhile.
+    let answerer = tokio::spawn(async move {
+        let parked = pending_request(&client, item).await;
+        let outcome = client
+            .answer_permission(
+                parked.id,
+                "allow-once",
+                client.this_user(),
+                client.this_box(),
+            )
+            .await
+            .expect("the answer is written");
+        (client, parked, outcome)
+    });
+
+    let run = stack.start(item).await;
+    let (client, parked, outcome) = tokio::time::timeout(PATIENCE, answerer)
+        .await
+        .expect("the answerer ends within the patience window")
+        .expect("the answerer did not panic");
+    assert_eq!(outcome, AnswerOutcome::Answered);
+    assert_eq!(parked.run_id, run);
+    assert_eq!(stack.run(run).await.status, RunStatus::AwaitingApproval);
+    let step = stack.step_at(run, 0).await;
+    assert_eq!(
+        (step.id, step.status),
+        (parked.run_step_id, StepStatus::AwaitingApproval),
+        "the answered session ended its turn and the step reached its gate"
+    );
+    let row = client
+        .permission(parked.id)
+        .await
+        .expect("the read answers")
+        .expect("the row exists");
+    assert_eq!(
+        (row.status, row.option_id.as_deref(), row.answered_box),
+        (
+            PermissionStatus::Applied,
+            Some("allow-once"),
+            Some(client.this_box())
+        ),
+        "applied by the TUI, answered from the other box"
+    );
+    let answers: Vec<Value> = stack
+        .log(parked.run_step_id)
+        .await
+        .into_iter()
+        .filter(|event| event.kind == EventKind::PermissionAnswer)
+        .map(|event| event.payload)
+        .collect();
+    assert_eq!(answers.len(), 1, "the executor echoed it once: {answers:?}");
+    assert_eq!(
+        (&answers[0]["option_id"], &answers[0]["by"]),
+        (&json!("allow-once"), &json!("user")),
+        "{answers:?}"
+    );
+    let view = stack
+        .db
+        .store
+        .relay_view(item)
+        .await
+        .expect("the view reads");
+    assert!(
+        view.permissions.is_empty() && view.cancels.is_empty(),
+        "the TUI's own relay view is empty afterwards: {view:?}"
+    );
 
     stack.finish().await;
 }

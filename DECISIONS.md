@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-42](docs/decisions/mod/mod-42.md)** - Permission and control relay through Postgres (done, 2026-10-01)
 - **[ANA-24](docs/decisions/ana/ana-24.md)** - A licensed, effort-separated coding benchmark source for the weight map (concluded, 2026-10-01)
 - **[ANA-27](docs/decisions/ana/ana-27.md)** - OpenRig survey: ideas and concepts to assimilate (concluded, 2026-10-01)
 - **[ANA-23](docs/decisions/ana/ana-23.md)** - Pure-Rust local embedder to replace `ort`/`fastembed` (concluded, 2026-10-01)

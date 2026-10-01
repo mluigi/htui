@@ -90,6 +90,7 @@ pub mod link;
 pub mod note;
 pub mod overlap;
 pub mod quota;
+pub mod relay;
 pub mod requirement;
 pub mod run;
 pub mod scope;
@@ -113,9 +114,9 @@ pub use hierarchy::{
     RepoPatch, Workspace, WorkspaceBoxPath, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
 };
 pub use ids::{
-    AgentId, BoxId, CommandRunId, DocumentId, ItemId, ItemKindId, NoteId, PhaseId, ProjectId,
-    PromptTemplateId, RepoId, RequirementAreaId, RequirementId, RunId, SkillBindingId, SkillId,
-    StepGraphId, StepId, UserId, WorkspaceId,
+    AgentId, BoxId, CommandRunId, DocumentId, ItemId, ItemKindId, NoteId, PermissionId, PhaseId,
+    ProjectId, PromptTemplateId, RelaySessionId, RepoId, RequirementAreaId, RequirementId,
+    RunCommandId, RunId, SkillBindingId, SkillId, StepGraphId, StepId, UserId, WorkspaceId,
 };
 pub use item::{
     Item, ItemFilter, ItemPatch, ItemRevision, ItemSummary, NewItem, Resolution, Status,
@@ -133,6 +134,12 @@ pub use overlap::{
 pub use quota::{
     Availability, CapError, PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN, ProjectCaps, Quota,
     QuotaSource, QuotaWindow, SkipReason, Spend, available, normalize,
+};
+pub use relay::{
+    ALREADY_ANSWERED, ALREADY_APPLIED, AnswerOutcome, AnswerRefusal, CancelRequest, EXECUTOR_GONE,
+    NOT_OFFERED, OpenPermission, PermissionChoice, PermissionStatus, REQUEST_CANCELLED,
+    REQUEST_STALE, RelayOption, RelayOptionKind, RelayView, RunCommand, RunCommandKind,
+    RunCommandStatus, StepPermission,
 };
 pub use requirement::{
     CitationKind, CoverageRow, ItemCitation, ItemRequirement, NewRequirement, NewRequirementArea,
@@ -332,6 +339,36 @@ mod tests {
         check_enum(CommandQueue::ALL, &["off", "fan_out_only", "always"]);
     }
 
+    /// `0011_permission_relay.sql`'s `chk_step_permission_status` (MOD-42 plan D1).
+    #[test]
+    fn permission_status_matches_check_list() {
+        check_enum(
+            PermissionStatus::ALL,
+            &["pending", "answered", "applied", "cancelled", "stale"],
+        );
+    }
+
+    /// `0011_permission_relay.sql`'s `chk_run_command_status` (MOD-42 plan D1).
+    #[test]
+    fn run_command_status_matches_check_list() {
+        check_enum(RunCommandStatus::ALL, &["pending", "applied", "refused"]);
+    }
+
+    /// `0011_permission_relay.sql`'s `chk_run_command_kind` (MOD-42 plan D1).
+    #[test]
+    fn run_command_kind_matches_check_list() {
+        check_enum(RunCommandKind::ALL, &["cancel"]);
+    }
+
+    /// `step_permission.options[].kind` (MOD-42 plan D6-ids): the agent's four option kinds.
+    #[test]
+    fn relay_option_kind_round_trips() {
+        check_enum(
+            RelayOptionKind::ALL,
+            &["allow_once", "allow_always", "reject_once", "reject_always"],
+        );
+    }
+
     #[test]
     fn unknown_enum_text_is_rejected() {
         let err = Status::from_str("archived").expect_err("not a CHECK value");
@@ -410,6 +447,9 @@ mod tests {
         check_id(CommandRunId::from_uuid(u), u);
         check_id(RequirementAreaId::from_uuid(u), u);
         check_id(RequirementId::from_uuid(u), u);
+        check_id(PermissionId::from_uuid(u), u);
+        check_id(RunCommandId::from_uuid(u), u);
+        check_id(RelaySessionId::from_uuid(u), u);
     }
 
     #[test]

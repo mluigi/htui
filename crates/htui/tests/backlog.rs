@@ -13,6 +13,7 @@ use htui::app::{Action, RevealKind};
 use htui::keymap::KeyScope;
 use htui::requirements::decision_citation_stays;
 use htui::run_worker::{self, LiveChats, RunRuntime, StepAuthor};
+use htui::store_worker::StoreRequest;
 use htui::testkit::Harness;
 use htui::ui::tabs::backlog::BacklogTab;
 use htui_agent::conformance::{Script, ScriptEvent};
@@ -21,14 +22,15 @@ use htui_agent::fake::FakeAdapter;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::{demo_at, edit_agent, ids};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, CitationKind, DocumentId, ItemId, NewDocument, NewItem,
-    NewRunStep, Resolution, RunStatus, RunStep, Scope, SnapshotPhase, Status, StepId, Transport,
-    WorkspaceSummary,
+    Agent, AgentBox, AgentId, Billing, CitationKind, Claim, DocumentId, EXECUTOR_GONE, ItemId,
+    NewDocument, NewItem, NewRunStep, OpenPermission, PermissionId, PermissionStatus, RelayOption,
+    RelayOptionKind, RelaySessionId, Resolution, RunStatus, RunStep, Scope, SnapshotPhase, Status,
+    StepId, Transport, WorkspaceSummary,
 };
-use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+use htui_core::store::{MAX_LEASE_TTL, MemStore, ReadStore as _, WriteStore as _};
 use htui_orch::Clock;
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
-use htui_store::Backend;
+use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use serde_json::json;
 
 /// The workspace of the demo fixture with this slug.
@@ -1405,4 +1407,180 @@ async fn a_filter_nothing_matches_says_so() {
     let frame = harness.render();
     assert!(frame.contains("No items match the filter."), "{frame}");
     insta::assert_snapshot!("filter_no_match", frame);
+}
+
+// MOD-42 plan D14: answering a relayed permission request from the Runs pane.
+// ---------------------------------------------------------------------------------------------
+
+/// The demo with `FEAT-3`'s queued run claimed on the demo box by `owner` for
+/// [`MAX_LEASE_TTL`], and one request parked on its `prd` step, as a walk on another process
+/// would have opened it.
+async fn relayed_store(owner: uuid::Uuid) -> (MemStore, PermissionId) {
+    let store = MemStore::demo();
+    assert_eq!(
+        store
+            .claim_run(ids::RUN_2, ids::BOX, owner, demo_at(2, 9), MAX_LEASE_TTL)
+            .await
+            .expect("the claim reads"),
+        Claim::Admitted,
+        "`RUN_2` was queued on the demo box"
+    );
+    let id = store
+        .open_permission(OpenPermission {
+            id: PermissionId::new(),
+            run_id: ids::RUN_2,
+            run_step_id: ids::STEP_R2_PRD,
+            session: RelaySessionId::new(),
+            request_id: "req-1".to_owned(),
+            tool_call_id: Some("call-1".to_owned()),
+            summary: Some("execute: cargo test".to_owned()),
+            options: vec![
+                RelayOption {
+                    id: "allow".to_owned(),
+                    label: "Allow once".to_owned(),
+                    kind: RelayOptionKind::AllowOnce,
+                },
+                RelayOption {
+                    id: "reject".to_owned(),
+                    label: "Reject once".to_owned(),
+                    kind: RelayOptionKind::RejectOnce,
+                },
+            ],
+            owner,
+        })
+        .await
+        .expect("the owner parks the request");
+    (store, id)
+}
+
+/// The Backlog over `store`, on `FEAT-3`'s Runs pane.
+async fn on_feat_3_runs(store: MemStore) -> Harness {
+    let mut harness = polled(store).await;
+    down(&mut harness, TO_FEAT_3).await;
+    sub_tab(&mut harness, 1);
+    harness.drive().await;
+    harness
+}
+
+/// D14: the step's pending request is drawn under it: the scrubbed summary and the strip.
+#[tokio::test]
+async fn runs_pane_shows_a_pending_permission() {
+    let (store, _) = relayed_store(uuid::Uuid::new_v4()).await;
+    let mut harness = on_feat_3_runs(store).await;
+    let frame = harness.render();
+    let pane = detail_pane(&frame);
+    assert!(
+        pane.contains("asks: execute: cargo test"),
+        "the summary is shown:\n{frame}"
+    );
+    assert!(
+        pane.contains("[1] Allow once  [2] Reject once"),
+        "and the strip:\n{frame}"
+    );
+    assert_eq!(harness.app().status, None);
+    insta::assert_snapshot!("runs_pending_permission", frame);
+}
+
+/// D3, D14: a digit answers through the store, and the re-read drops the answered request.
+#[tokio::test]
+async fn a_digit_on_the_runs_pane_answers_through_the_store() {
+    let (store, id) = relayed_store(uuid::Uuid::new_v4()).await;
+    let mut harness = on_feat_3_runs(store.clone()).await;
+    assert!(harness.render().contains("[1] Allow once"));
+
+    harness.key("1");
+    harness.drive().await;
+    let rows = store.relay_rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, id);
+    assert_eq!(rows[0].status, PermissionStatus::Answered);
+    assert_eq!(rows[0].option_id.as_deref(), Some("allow"));
+    assert_eq!(rows[0].answered_by, Some(ids::USER));
+    assert_eq!(rows[0].answered_box, Some(ids::BOX));
+    assert_eq!(harness.app().status, None, "nothing failed");
+    let frame = harness.render();
+    assert!(
+        !frame.contains("[1] Allow once") && !frame.contains("asks:"),
+        "the re-read dropped the strip:\n{frame}"
+    );
+}
+
+/// D3, B-13: an answer the store refuses puts the refusal's sentence on the status line.
+#[tokio::test]
+async fn a_refused_answer_lands_on_the_status_line() {
+    let owner = uuid::Uuid::new_v4();
+    let (store, _) = relayed_store(owner).await;
+    let mut harness = on_feat_3_runs(store.clone()).await;
+    assert!(
+        harness.render().contains("[1] Allow once"),
+        "the strip is up"
+    );
+
+    assert!(
+        store
+            .release_lease(ids::RUN_2, owner)
+            .await
+            .expect("the run exists"),
+        "the executor lets go of the run"
+    );
+    harness.key("1");
+    harness.drive().await;
+    assert_eq!(
+        harness.app().status,
+        Some(format!("answer_permission: {EXECUTOR_GONE}")),
+        "the refusal's own sentence, under the request's name"
+    );
+    assert_eq!(store.relay_rows()[0].status, PermissionStatus::Pending);
+}
+
+/// D14, OQ-4: offline the relay read is an empty view, so the Runs pane's every refresh raises
+/// nothing; an answer, the one write, is refused onto the status line.
+///
+/// The mirror holds no item (`seed_mirror` writes the hierarchy and the registry only), so the
+/// read is dispatched as the pane sends it, the `testkit.rs` pattern for the Runs pane's reads.
+#[tokio::test]
+async fn offline_the_runs_pane_asks_for_no_error() {
+    // `App::start` issues `ConnectionInfo`, which over a non-`Memory` backend reaches the OS
+    // keyring without this guard.
+    let _keyring = htui_store::testkit::mock_keyring().await;
+    // The mirror outlives the harness: dropping the directory deletes it mid-test.
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let cache = CacheStore::open(root.path(), "runs-relay-offline", PgStore::schema_version())
+        .await
+        .expect("a fresh mirror");
+    htui_store::testkit::seed_mirror(&cache, &htui_core::fixtures::demo_data())
+        .await
+        .expect("the mirror is seeded");
+    let mut harness = Harness::over_backend(Backend::Offline {
+        cache,
+        since: Some(Utc::now()),
+    })
+    .with_tab(Box::new(BacklogTab::new()))
+    // `offline · 3s` would age between the render and the next tick.
+    .with_store_state("offline \u{b7} 0s", None);
+    harness.drive().await;
+    assert_eq!(harness.app().status, None, "the shell started clean");
+
+    harness.app().update(Action::Store(StoreRequest::RelayView {
+        item: ids::HTUI_FEAT_3,
+    }));
+    harness.drive().await;
+    assert_eq!(
+        harness.app().status,
+        None,
+        "the empty relay view raised nothing"
+    );
+
+    harness
+        .app()
+        .update(Action::Store(StoreRequest::AnswerPermission {
+            permission: PermissionId::new(),
+            option_id: "allow".to_owned(),
+        }));
+    harness.drive().await;
+    let status = harness.app().status.clone().unwrap_or_default();
+    assert!(
+        status.starts_with("answer_permission: ") && status.ends_with(DATABASE_UNREACHABLE),
+        "an answer offline is refused before anything is sent: {status:?}"
+    );
 }

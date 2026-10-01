@@ -1,0 +1,196 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT p.id           AS \"id: PermissionId\",\n                  p.run_id       AS \"run_id: RunId\",\n                  p.run_step_id  AS \"run_step_id: StepId\",\n                  p.session      AS \"session: RelaySessionId\",\n                  p.request_id,\n                  p.tool_call_id,\n                  p.summary,\n                  p.options      AS \"options: Json<Vec<RelayOption>>\",\n                  p.status       AS \"status: PermissionStatus\",\n                  p.option_id,\n                  p.answered_by  AS \"answered_by: UserId\",\n                  p.answered_box AS \"answered_box: BoxId\",\n                  p.created_at,\n                  p.answered_at,\n                  p.resolved_at\n             FROM step_permission p JOIN run r ON r.id = p.run_id\n            WHERE r.item_id = $1 AND p.status = 'pending'\n              AND r.lease_owner = p.owner AND r.lease_expires_at > clock_timestamp()\n            ORDER BY p.created_at, p.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: PermissionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "run_id: RunId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "run_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "run_step_id: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "run_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "session: RelaySessionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "session"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "request_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "request_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "tool_call_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "tool_call_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "summary",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "summary"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "options: Json<Vec<RelayOption>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "options"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "status: PermissionStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "option_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "option_id"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "answered_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "answered_by"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "answered_box: BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "answered_box"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "answered_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "answered_at"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "resolved_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "resolved_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "a29276f849137c78da4284c7d5b2d5aed6982b20fa95838aef816599b7f95aa9"
+}

@@ -47,8 +47,9 @@ pub use command::{
     snapshot_of, start_enabled, unblock_enabled,
 };
 pub use engine::{
-    Adopted, AgentSelector, DeadWalks, DriverFor, Engine, EngineParts, FirstCandidate, Next,
-    NoSink, Resume, RunFence, SessionKey, SessionSink, Tails, live_step_at, required_inputs,
+    Adopted, AgentSelector, ControlFor, DeadWalks, DriverFor, Engine, EngineParts, FirstCandidate,
+    Next, NoSink, PolicyFor, Resume, RunFence, SessionKey, SessionSink, Tails, ask_policy,
+    live_step_at, never_cancelled, required_inputs,
 };
 #[cfg(feature = "test-support")]
 pub use engine::{claim_fake, dispatch_fake, resume_fake, sweep_fake};

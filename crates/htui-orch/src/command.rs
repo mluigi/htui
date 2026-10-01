@@ -415,6 +415,15 @@ pub enum EngineError {
         /// The run whose walk was abandoned.
         run: RunId,
     },
+    /// MOD-42 plan D10, I-6: the walk was asked to stop gracefully (a cancel, or a promote's
+    /// preempt). Its session was cancelled with grace and every parked request answered
+    /// `cancelled`; nothing was settled, so `cancel_leased` (or the promotion) owns every
+    /// terminal status.
+    #[error("run {run}: the walk was cancelled while it drove a session")]
+    Cancelled {
+        /// The run whose walk stopped.
+        run: RunId,
+    },
     /// Plan D87 (and blueprint A-1's resume): the run's lease is live and this process does not
     /// hold it, so nothing was written. A lease this process took before a write that then failed
     /// stays live until its TTL (blueprint H-7), and reads the same way meanwhile. Only a **live**

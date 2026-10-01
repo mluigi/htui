@@ -7531,6 +7531,8 @@ mod fanout_paths {
             selector: parts.selector,
             sink: &sink,
             driver: parts.driver,
+            policy: parts.policy,
+            control: parts.control,
             scrubber: parts.scrubber,
             app: parts.app,
             box_profile: parts.box_profile,

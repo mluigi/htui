@@ -22,8 +22,9 @@ use sqlx::Row as _;
 /// The `connect_timeout` every headless connect here passes.
 const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The 39 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
-/// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5).
+/// The 41 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
+/// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5), then
+/// the two of `0011_permission_relay.sql` (MOD-42 plan D1).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -66,6 +67,9 @@ const TABLES: &[&str] = &[
     "requirement",
     "requirement_revision",
     "item_requirement",
+    // 0011_permission_relay.sql (MOD-42)
+    "step_permission",
+    "run_command",
 ];
 
 #[tokio::test]
@@ -86,13 +90,13 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
          MOD-7 milestone 1's 0005_box_identity.sql, MOD-38's 0006_requirements.sql, MOD-9 \
          milestone 2's 0007_skill_attachments.sql, MOD-9 milestone 5's 0008_trim_record_v3.sql, \
-         MOD-23's 0009_agent_box_user_off.sql and MOD-33's 0010_prompt_digest_undigested.sql, \
-         in ordinal order"
+         MOD-23's 0009_agent_box_user_off.sql, MOD-33's 0010_prompt_digest_undigested.sql \
+         and MOD-42's 0011_permission_relay.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -110,16 +114,17 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        39,
+        41,
         "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
-         0003_orchestration.sql adds run_step_tree and 0006_requirements.sql adds ANA-11 §5's six"
+         0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six \
+         and MOD-42's 0011_permission_relay.sql adds step_permission and run_command"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migrations create the 39 tables of B.1 as amended by ANA-2 §9 and ANA-11 §5 and \
-         nothing else, got {present:?}"
+        "the migrations create the 41 tables of B.1 as amended by ANA-2 §9, ANA-11 §5 and \
+         MOD-42's 0011_permission_relay.sql and nothing else, got {present:?}"
     );
 
     db.drop_db().await;
@@ -914,8 +919,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(10),
-        "ten embedded migrations, none applied"
+        MigrationState::Pending(11),
+        "eleven embedded migrations, none applied (through MOD-42's 0011_permission_relay.sql)"
     );
 
     db.drop_db().await;
@@ -1013,12 +1018,12 @@ async fn a_headless_connect_never_migrates() {
     let Some(db) = common::bare_db().await else {
         return;
     };
-    assert_eq!(db.migrations_at_connect, MigrationState::Pending(10));
+    assert_eq!(db.migrations_at_connect, MigrationState::Pending(11));
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
         .await
         .expect_err("a pending schema is refused");
-    assert_eq!(refused, HeadlessError::MigrationsPending(10));
+    assert_eq!(refused, HeadlessError::MigrationsPending(11));
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
         0,
@@ -1037,7 +1042,7 @@ async fn a_headless_connect_never_migrates() {
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
         .await
         .expect_err("no migrations table is every migration pending");
-    assert_eq!(refused, HeadlessError::MigrationsPending(10));
+    assert_eq!(refused, HeadlessError::MigrationsPending(11));
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
         .await
@@ -1187,9 +1192,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        10,
-        "the later applies migrate nothing: the ten embedded migrations (through MOD-33's \
-         0010_prompt_digest_undigested.sql) are applied once"
+        11,
+        "the later applies migrate nothing: the eleven embedded migrations (through MOD-42's \
+         0011_permission_relay.sql) are applied once"
     );
 
     db.drop_db().await;

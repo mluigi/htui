@@ -12,6 +12,9 @@ htui worker [--pool-size N] [--dsn-stdin] [--log PATH]
 - [What it does, and what it does not do yet](#what-it-does-and-what-it-does-not-do-yet)
 - [Who executes on a box: the executor setting](#who-executes-on-a-box-the-executor-setting)
 - [The TUI on a worker box](#the-tui-on-a-worker-box)
+- [Permission requests on worker steps](#permission-requests-on-worker-steps)
+- [Cancelling a run the worker walks](#cancelling-a-run-the-worker-walks)
+- [Upgrading: migrate from a TUI first](#upgrading-migrate-from-a-tui-first)
 - [Where the DSN comes from](#where-the-dsn-comes-from)
 - [Pool size](#pool-size)
 - [Logs](#logs)
@@ -28,7 +31,8 @@ What it does:
 
 - Connects headless: it never upgrades the database and never asks anything. A pending, newer or
   dirty schema, or an `htui` build older than the database requires, is refused before anything is
-  written. Start the TUI once to apply migrations, or upgrade the binary.
+  written. Start the TUI once to apply migrations, or upgrade the binary (see
+  [Upgrading](#upgrading-migrate-from-a-tui-first)).
 - Uses the same `box.toml` as the TUI (see [Where htui keeps its files](../README.md#where-htui-keeps-its-files)),
   so it **is** the TUI's box. Run it as the same OS user, with the same configuration directory,
   as the TUI whose runs it should take over. A worker that mints its own `box.toml` is another box,
@@ -48,15 +52,19 @@ What it does:
 - Marks the box as seen (`box.last_seen_at`) once at start and then every minute, whatever the
   executor.
 - Logs `htui worker ready` once connected, with the box id and the pool size.
+- Parks a step whose agent asks for a permission its policy does not settle, until someone
+  answers it from the **Runs** pane of any TUI that holds the DSN (see
+  [Permission requests](#permission-requests-on-worker-steps)).
+- Applies a cancel requested from any TUI: it reads requests every second and stops the walk
+  gracefully (see [Cancelling](#cancelling-a-run-the-worker-walks)).
 - Stops on SIGINT or SIGTERM (Ctrl-C, Ctrl-Break, closing the console or a system shutdown on
-  Windows): it cancels its walks with a short grace period and gives their leases back, then exits
-  0. A step it interrupted is reset and retried by the next sweep on the box.
+  Windows): it drops its walks at once, waits a short grace period for their tasks to end and
+  gives their leases back, then exits 0. A step it interrupted is reset and retried by the next sweep on the box. This stop is a hard
+  drop, not a graceful cancel: a step parked on a permission request is not answered first (see
+  [below](#permission-requests-on-worker-steps)).
 
 What it does not do yet:
 
-- **No permission answers until MOD-42.** An engine-driven ACP step fails on its first permission
-  request, exactly as it does under the TUI today. Cancelling a run the worker is walking also
-  waits for MOD-42 (see [`c` below](#the-tui-on-a-worker-box)).
 - **No remote targeting until MOD-43.** A run targets the box that started it, and a worker only
   takes runs targeted at its own box. The TUI cannot yet send a run to another machine's worker,
   and nothing in the TUI tells you whether a worker is running.
@@ -114,8 +122,9 @@ finishes it exactly as it would finish a run whose process crashed at that point
 | `r` retry | Records the retry and creates the new attempt, gives the lease back. | Walks the new attempt. |
 | `s` select | Records the chosen fan-out result, gives the lease back. | Merges the chosen result and walks on. |
 | `u` unblock (resume) | Lifts the park only, gives the lease back. | Re-checks the live graph and walks on. `u` that reopens an item or follows a run is unchanged. |
-| `p` promote | Unchanged. A parked step promotes and its chat runs in the TUI; a step the worker is walking refuses, because its lease is held. | — |
-| `c` cancel | A `queued` or parked run cancels as before. A run the worker is walking is refused: "the worker on this box is walking run …; cancelling a live run needs MOD-42's cancel command". Nothing is written. | Keeps walking. |
+| `p` promote | Unchanged. A parked step promotes and its chat runs in the TUI. A step the worker is walking is refused: "the worker on this box is walking run …; a live step is promoted only by the process that walks it". A live session cannot move between processes. | Keeps walking. |
+| `c` cancel | A `queued` run, or one nobody holds, cancels at once as before. A run the worker is walking gets a **cancel request**: the status line says "cancel requested: the run's executor applies it", the Runs pane shows `cancel requested` under the run, and a second `c` says "a cancel is already requested". | Applies it within about a second, gracefully (see [Cancelling](#cancelling-a-run-the-worker-walks)). |
+| `1` … `9` | On a step whose session asks for a permission: answers it with that option (see [Permission requests](#permission-requests-on-worker-steps)). | Applies the answer within about a second and the step goes on. |
 | `C`, `T`, `o` | Unchanged. | — |
 
 **Cleanup is not serialised with the worker.** The TUI's cleanup (`c` on a run that has rested,
@@ -139,6 +148,84 @@ Two consequences of recovering "as after a crash":
 `running` or `awaiting_approval` run, so a worker's progress shows up without re-selecting the
 item. This is a re-read, not a liveness signal: a run queued on a worker box with no worker running
 stays `queued`, and the pane cannot tell you why (MOD-43).
+
+## Permission requests on worker steps
+
+An ACP agent may ask for permission before it runs a tool. On a step the worker walks, as on one
+the TUI walks:
+
+1. **The agent's own policy decides first**, the same policy its chat uses: a rule that allows or
+   rejects the call answers at once, and the answer is recorded in the step's log as the policy's.
+2. **Otherwise the step parks and waits for a person.** The worker writes the request to Postgres
+   (the tool and its title, scrubbed of secrets like the rest of the log, and the options the agent
+   offers) and keeps the session open. The **Runs** pane of any TUI connected to the same database,
+   on this box or another, shows it under the step: `asks: <what>`, then the options numbered as
+   in a chat. Put the cursor on the step and press the option's digit. The worker reads the answer
+   within about a second, hands it to the agent, records it in the step's log as yours, and the
+   step goes on. The pane refreshes itself every 5 seconds, so a new request shows up within that.
+
+Things to know:
+
+- **One answer wins.** If two people answer the same request, the first is applied; the second is
+  told what happened on the status line (for example "this permission request was already
+  answered") and nothing of it is kept.
+- **A parked step waits for ever.** There is no timeout. It holds its run's lease and its slot on
+  the box meanwhile; cancel the run (`c`) to give both back.
+- **Offline there is nothing to answer.** A TUI without a database connection shows no requests,
+  and no error either.
+- **Only the process walking the step can apply an answer.** A request whose process stopped or
+  lost the run can no longer be answered ("the process that asked no longer holds the run") and
+  drops out of the pane. When the step is walked again, its new session asks again.
+- **Stopping the worker does not answer a parked request.** SIGINT or SIGTERM drops every walk at
+  once, a parked one included; the request is left unanswerable and disappears from the pane once
+  the lease is given back. The next sweep resets the step and retries it, and its session asks
+  again. Cancel the run first if you want it to end as `cancelled` instead.
+
+## Cancelling a run the worker walks
+
+`c` on a run the worker is walking (on a `worker` box, or from a TUI on another box) does not stop
+it from the TUI: a live session cannot be reached from another process. Instead the TUI writes a
+**cancel request** to Postgres, which survives the TUI exiting, and the process that walks the run
+applies it:
+
+- **The worker reads cancel requests every second.** It stops the run's walk **gracefully**: a
+  permission request the step is parked on is answered `cancelled` (and recorded in the step's
+  log), the agent is asked to cancel its turn and given 2 seconds to wind down, and the walk is
+  then dropped. The run and its live steps become `cancelled`, as an in-process cancel would make
+  them, so a cancel usually takes effect within about 3 seconds (the 2-second grace plus one
+  poll), and at most a second later if the agent does not wind down.
+- **A request whose executor is not running waits.** It stays pending, with no timeout, and the
+  Runs pane keeps showing `cancel requested`. If the worker died holding the run, the request waits
+  until the run's lease lapses; from then on the next process on the run's box that reads cancel
+  requests applies it: the worker when it starts again, or a TUI open on that box. A run walked on
+  another box is cancelled only by a process on that box.
+- **A run that ended first is not cancelled.** If the run reached `done` (or failed) before its
+  executor read the request, the request is refused with the run's actual status and the run is
+  left as it ended.
+- **Shutdown is not a cancel.** Stopping the worker drops its walks at once (see above); a pending
+  cancel request is applied by the next process on the box that reads cancel requests.
+
+A `c` on a run the TUI itself walks takes the same graceful path, at once, in the TUI.
+
+## Upgrading: migrate from a TUI first
+
+The worker never changes the database schema (it has no one to ask). So when a new `htui` brings a
+migration, upgrade in this order:
+
+1. **Upgrade the TUI and start it once.** It shows the pending migrations and applies them when you
+   confirm.
+2. **Then start (or restart) the upgraded worker.** Until the database is migrated, a worker built
+   with the new migration refuses to start with exit 2 ("… schema migration(s) are pending, and a
+   headless process never migrates; start `htui` once to apply them") and writes nothing. Under
+   the [systemd unit](#running-it-as-a-systemd-service) below it is simply restarted every 10
+   seconds and comes up once the TUI has migrated.
+
+Upgrade the worker's binary too: a worker older than the database's schema refuses it ("schema is
+newer than this htui") with the same exit 2.
+
+For example, the permission and cancel relay above needs the migration
+`0011_permission_relay.sql`: a worker built with it waits, refusing, until a TUI of the same
+version has applied it.
 
 ## Where the DSN comes from
 
@@ -218,10 +305,11 @@ over. A failing database is not backed off this way. Fix what the run needs, or 
 ## A queued cancel interrupted halfway
 
 Cancelling a `queued` run is a compare-and-set on every box: if a worker claims the run first, the
-cancel falls back to the leased path, which refuses a live walk and writes nothing. When the cancel
-wins, it takes two writes: the run becomes `cancelled`, then the item goes back from `queued` to
-`open`. If the process or the database dies between the two, the item is left `queued` with no
-active run. No command recovers that: `R` needs the item `open` or `failed`, and `u` needs it
+cancel is refused ("another orchestrator holds a live lease") and writes nothing; press `c`
+again, which now [requests a cancel](#cancelling-a-run-the-worker-walks) the worker applies. When
+the cancel wins, it takes two writes: the run becomes `cancelled`, then the item goes back from
+`queued` to `open`. If the process or the database dies between the two, the item is left `queued`
+with no active run. No command recovers that: `R` needs the item `open` or `failed`, and `u` needs it
 `blocked`.
 
 **How to notice:** the item stays `queued` in the Backlog while its Runs pane shows its latest run

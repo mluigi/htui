@@ -30,4 +30,4 @@ pub use traits::{
     step_slot_is_taken, summary_names_another_item, winner_is_not_settled,
     withdrawn_requirement_cited,
 };
-pub use worker::{RecorderStore, WorkerHost, WorkerStore};
+pub use worker::{RecorderStore, RelayStore, WorkerHost, WorkerStore};

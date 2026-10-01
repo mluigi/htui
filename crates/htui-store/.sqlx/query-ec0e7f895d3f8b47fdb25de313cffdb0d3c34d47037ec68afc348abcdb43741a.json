@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT c.run_id AS \"run_id: RunId\"\n             FROM run_command c JOIN run r ON r.id = c.run_id\n            WHERE r.item_id = $1 AND c.kind = 'cancel' AND c.status = 'pending'\n              AND r.status NOT IN ('done', 'failed', 'cancelled')\n            ORDER BY c.run_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "run_id: RunId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_command",
+            "name": "run_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ec0e7f895d3f8b47fdb25de313cffdb0d3c34d47037ec68afc348abcdb43741a"
+}

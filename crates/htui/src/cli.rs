@@ -80,7 +80,7 @@ pub enum Command {
     /// Run this box's runs with no terminal: claim queued runs targeted at this box, walk them,
     /// heartbeat, recover, and stop on SIGINT/SIGTERM. The DSN comes from the OS keyring, the
     /// systemd credential `htui-dsn`, or `--dsn-stdin`; never argv or the environment.
-    /// Engine-driven ACP steps still fail on their first permission request (MOD-42).
+    /// A step whose agent asks for a permission waits for an answer from a TUI's Runs pane.
     Worker(WorkerArgs),
     /// Install this htui build as the `htui-worker` service on a Linux host over your own `ssh`
     /// (system unit, sudo), with the DSN encrypted on that host by `systemd-creds`; then set the
