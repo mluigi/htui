@@ -160,8 +160,9 @@ pub(crate) mod tests {
     use htui_core::fixtures::{demo_at, edit_agent, ids};
     use htui_core::model::{
         Agent, AgentBox, AgentId, Billing, BoxEdit, DocumentId, Executor, Item, ItemId,
-        NewDocument, NewRepo, NewRun, NewRunStep, RepoId, Resolution, Run, RunId, RunMode, RunStatus, RunStep,
-        SnapshotPhase, Status, StepId, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
+        NewDocument, NewRepo, NewRun, NewRunStep, RepoId, Resolution, Run, RunId, RunMode,
+        RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus, TIMESTAMPTZ_DIGITS,
+        Transport,
     };
     use htui_core::store::mem::MemFault;
     use htui_core::store::{CasOutcome, MemStore, ReadStore as _, WriteStore as _};
