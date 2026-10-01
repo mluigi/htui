@@ -1787,7 +1787,9 @@ async fn on_run_served(
 ///
 /// Beyond [`spawn_with`]'s three sources, the loop owns the run runtime's event receiver and a
 /// sweep ticker of `runs.sweep_every()` (D190), guarded on a writer; it sweeps at start when the
-/// backend has one and after every `Online` swap.
+/// backend has one and after every `Online` swap. A command-poll ticker of
+/// `htui_worker::worker::COMMAND_POLL` (MOD-42 plan D13) sits beside the sweeper, guarded the
+/// same way.
 pub fn spawn_with_runtimes(
     started: Started,
     rx: mpsc::UnboundedReceiver<RequestEnvelope>,
@@ -1862,6 +1864,9 @@ pub(crate) fn spawn_with_concepts(
         let mut run_events = runs.take_events();
         let mut sweep_every = runs.sweep_every();
         let mut sweeper = sweep_ticker(sweep_every);
+        // MOD-42 plan D13: the command poll's ticker, beside the sweeper; first tick at once.
+        let mut commands = tokio::time::interval(htui_worker::worker::COMMAND_POLL);
+        commands.set_missed_tick_behavior(MissedTickBehavior::Delay);
         if backend.writer().is_some() {
             runs.sweep(&backend, &tx);
         }
@@ -2270,6 +2275,12 @@ pub(crate) fn spawn_with_concepts(
 
                 _ = sweeper.tick(), if backend.writer().is_some() => {
                     runs.sweep(&backend, &tx);
+                }
+
+                // MOD-42 plan D13 (B-10): a cancel a live chat refuses stays pending, silently.
+                _ = commands.tick(), if backend.writer().is_some() => {
+                    let live = live_chats(&runtime);
+                    runs.poll_commands(&backend, &tx, &live);
                 }
 
                 // D7: only a backend with a server to beat against, and never a second beat

@@ -12,7 +12,8 @@
 //! - [`RunRuntime`] and [`RunServed`], the library's types over the TUI's [`Backend`] and
 //!   [`ReplyAddr`];
 //! - [`TuiRuns`], the loop's `serve` and `sweep` with the signatures they always had, over the
-//!   library's `serve_request` and `sweep_with`;
+//!   library's `serve_request` and `sweep_with`, and its `poll_commands` (MOD-42 plan D13) over
+//!   `poll_commands_with`;
 //! - the re-exports, so every `crate::run_worker::X` path the views and tests name still resolves.
 //!
 //! The test module stays too: it drives the runtime through the TUI's store loop, and its
@@ -3176,6 +3177,44 @@ pub(crate) mod tests {
                 .map(|row| (row.id, row.status))
                 .collect::<Vec<_>>(),
             [(id, RunCommandStatus::Applied)]
+        );
+    }
+
+    /// D13: the TUI's store loop ticks the command poll beside its sweeper, so a pending cancel
+    /// of a run this process holds is applied without any request.
+    #[tokio::test]
+    async fn the_store_loop_applies_a_pending_cancel_on_its_own() {
+        let fixture = Fixture::new().await;
+        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+        let runtime = fixture.runtime();
+        let owner = testing::probe(&runtime).owner();
+        assert!(
+            fixture
+                .store
+                .take_lease(run, ids::BOX, owner, TimeDelta::days(1))
+                .await
+                .expect("the take answers"),
+            "this process holds the run"
+        );
+        let id = requested(&fixture, run).await;
+
+        let _worker = Worker::spawn(&fixture.store, runtime);
+        rests_at(&fixture, run, RunStatus::Cancelled).await;
+        within("the row being resolved", async {
+            while commands_of(&fixture, run)
+                .iter()
+                .any(|row| row.status != RunCommandStatus::Applied)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert_eq!(
+            commands_of(&fixture, run)
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            [id]
         );
     }
 
