@@ -63,6 +63,7 @@ use crate::fanout::{
 use crate::gate::{self, GateContext, Landing, LoopOutcome, Settle, SettleInput};
 use crate::graph::{self, GraphSource, ResolveError};
 use crate::isolate::{Clock, FanoutSlot, Isolator};
+use crate::kill_point::{KillPoint, Site};
 use crate::promote::{self, OpeningKind};
 use crate::recover::{self, Adjudication, Heartbeat, LeaseTimes, StepKind};
 use crate::select::{self, SelectInput, Skipped, Walk};
@@ -3468,6 +3469,8 @@ where
                 .sink
                 .after_done(item, step, phase, &SessionKey::of(step), done)
                 .await?;
+            // MOD-24 D1 (K3): the output document is written; the trees are not captured.
+            crate::kill_point::reached(KillPoint::Documented, Site::step(step));
         }
 
         // -- between stage 4 and stage 5: verify (plan D30, blueprint A-3) ---------------------
@@ -3489,6 +3492,8 @@ where
             .store
             .record_commits(StepFence::Lease(self.parts.owner), step.id, &after)
             .await?;
+        // MOD-24 D1 (K4): the `after` commits are recorded; `finish_step` is not.
+        crate::kill_point::reached(KillPoint::Captured, Site::step(step));
         let output = self.output_of(item, phase, step.id).await?;
         let now = self.now();
         let settled = gate::settle(&SettleInput {

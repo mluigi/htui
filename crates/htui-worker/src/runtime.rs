@@ -21,6 +21,7 @@ use htui_core::model::{
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{Result as StoreResult, StoreError};
+use htui_orch::kill_point::{KillPoint, Site};
 use htui_orch::{
     Adopted, Clock, Command, CommandOutcome, DeadWalks, DriverFor, Engine, EngineError,
     EngineParts, FirstCandidate, GixIsolator, Isolator, IsolatorConfig, LeaseTimes, Next,
@@ -2476,6 +2477,8 @@ async fn poll_once<H: htui_core::store::WorkerHost, P: ReplySink>(
         if ctx.shared.is_applying(row.id) {
             continue;
         }
+        // MOD-24 D1 (K5): this process will apply the row; nothing has applied it yet.
+        htui_orch::kill_point::reached(KillPoint::CommandPicked, Site::NONE);
         let task = ctx.unaddressed("cancel_run");
         let live = live.clone();
         spawn_supervised(task.clone(), async move {
