@@ -182,6 +182,14 @@ fn the_spec_parses_and_every_tag_rule_names_a_listed_tool() {
     assert_eq!(SETTING_KEY, "box_probe_spec");
 }
 
+/// MOD-51 D1: the probe's key is `htui_core`'s, so the store's typed writer cannot spell it
+/// differently.
+#[test]
+fn the_setting_key_is_the_core_constant() {
+    assert_eq!(SETTING_KEY, htui_core::model::BOX_PROBE_SPEC_KEY);
+    assert_eq!(SETTING_KEY, "box_probe_spec");
+}
+
 #[test]
 fn the_seed_lists_thirty_nine_path_tools() {
     let spec = seed();

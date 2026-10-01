@@ -42,8 +42,10 @@ use tracing::warn;
 
 use crate::launch::ToolProbe;
 
-/// The `app_setting` key of the stored overlay (plan D17).
-pub const SETTING_KEY: &str = "box_probe_spec";
+/// The `app_setting` key of the stored overlay (plan D17): `htui_core`'s
+/// [`BOX_PROBE_SPEC_KEY`](htui_core::model::BOX_PROBE_SPEC_KEY), aliased so every reader of
+/// this name keeps compiling and the store cannot spell it differently (MOD-51 D1).
+pub const SETTING_KEY: &str = htui_core::model::BOX_PROBE_SPEC_KEY;
 
 /// The first words of every overlay refusal (blueprint D23).
 pub const SPEC_IGNORED: &str = "box_probe_spec ignored";
