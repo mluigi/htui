@@ -14,30 +14,21 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-01):** **MOD-41 is done** (`docs/decisions/mod/mod-41.md`): `htui worker`
-runs a box's runs with no terminal (guide `docs/htui-worker.md`). Run supervision lives in the
-UI-free crate `crates/htui-worker` behind `RecorderStore`/`WorkerStore`/`WorkerHost`;
-`box.settings.executor` (Settings > Boxes, `w`) decides whether the TUI or the worker claims, adopts
-and sweeps on a box, and on a worker box the TUI hands answered runs back. The remaining step writes
-are lease-fenced, the heartbeat fences on a monotonic clock, and the worker re-syncs the concepts
-index. `R-ORCH-12` is now must; `R-ID-2` and `R-STO-1` were amended. No migration.
-Before it, **CLEAN-4 was done** (`docs/decisions/clean/clean-4.md`): the
-review loop's `no_progress_review` stop is reachable. The predicate's review half compares the
-reviews of the loop's last two turns (review rows answered `Rejected`, each read through its newest
-`output_kind` document from `documents()` heads) instead of reading the latest-per-kind
-`documents_of_kinds`, which never held two. A loop whose two rejected reviews repeat each other now
-escalates at that attempt; the hash half is still asked first. `runs_pg`'s escalation case now stops
-on `no_progress_review`, and the stop is pinned in that test (MOD-4 R-9 closed).
-Before that, **MOD-59 done** (`docs/decisions/mod/mod-59.md`): an applied Skills,
-Templates or Requirements write answers its own reply (`SkillWritten`, `TemplateSaved`,
-`RequirementWritten`, as MOD-23's `AgentWritten`), so a form lands on its write and never stays "in
-flight" when another session changed the row or a read arrived first; a write whose re-read failed
-still lands, and a failed mint is hedged and re-reads the tree.
-Before it, **MOD-14 done** (`docs/decisions/mod/mod-14.md`): the Backlog's
-Graph sub-tab draws the selected item's link neighbourhood as a tree, 1-3 hops (`+`/`-`, default 2,
-fetched at 3), across projects, with link kind and status per row; `J`/`K` move, `Enter` re-roots the
-Backlog selection through MOD-64's reveal, a node outside the workspace refuses on the status line,
-and `m` opens the sub-tab (`R-TUI-2` `open graph`).
+**Current status (2026-10-01):** **MOD-45 is done** (`docs/decisions/mod/mod-45.md`):
+`htui provision <destination> [--dsn-stdin] [--replace-credential]` turns an ssh-reachable Linux
+host into a worker box in one command (guide `docs/htui-worker.md` § Provisioning a remote box).
+Four ssh sessions (preflight, prepare, install, verify) ship the local build, encrypt the DSN with
+`systemd-creds` from stdin (never argv or a file), install the `htui-worker` system unit, then
+wait for the box to check in and set its executor to `worker`. The TUI gained `--dsn-stdin` for
+agent login over `ssh -t`; `R-STO-1` was amended. No migration. **The live check on a real host is
+the maintainer's** (write-up § Not done here).
+Before it, **MOD-41 was done** (`docs/decisions/mod/mod-41.md`): `htui worker`
+runs a box's runs with no terminal. Run supervision lives in the UI-free crate
+`crates/htui-worker`; `box.settings.executor` (Settings > Boxes, `w`) decides whether the TUI or
+the worker claims, adopts and sweeps on a box. `R-ORCH-12` is now must; `R-ID-2` and `R-STO-1` were
+amended. No migration.
+Before that, **CLEAN-4 was done** (`docs/decisions/clean/clean-4.md`): the review loop's
+`no_progress_review` stop is reachable (MOD-4 R-9 closed).
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -490,14 +481,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   via MOD-16). **Open question for the maintainer:** `R-NF-2` amendment (`dockerd` as an opt-in,
   per-box dependency). The MOD-7 dependency is met (done, `docs/decisions/mod/mod-7.md`: id-keyed
   registration, the box probe, capability tags); survives TUI exit through `htui worker` (MOD-41, done: `docs/decisions/mod/mod-41.md`).
-- [ ] **MOD-45 - Remote box provisioning over SSH** (from ANA-16, §8 item 6). `R-BOX-1`, `R-BOX-4`,
-  `R-AGT-9`, `R-STO-1`. System `ssh` to install the matching `htui` build and a user service running
-  `htui worker`; credential passed on the worker's stdin, never argv or a file; the worker
-  self-registers (through MOD-7's id-keyed `register_box` and box probe, done,
-  `docs/decisions/mod/mod-7.md`). Agent login via MOD-22's paste-back (done, `docs/decisions/mod/mod-22.md`). SSH is not used after provisioning. Under
-  phase 2 (MOD-47) it installs an enrolment token instead of a DSN. Not blocked: MOD-41 is done (`docs/decisions/mod/mod-41.md`; the sample unit in
-  `docs/htui-worker.md` is a system unit with `User=`, since user-scoped encrypted credentials need
-  systemd 256).
 - [ ] **MOD-46 - Live streaming via `NOTIFY` (optional)** (from ANA-16, §8 item 7). `R-HIS-1`,
   `R-NF-3`. Transient `NOTIFY` deltas under 8000 bytes between recorder flushes, droppable, superseded
   by durable `session_event` rows. Start only if 16 KiB flush bursts prove unusable; replaced by
@@ -586,6 +569,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 28 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 27 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

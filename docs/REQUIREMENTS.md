@@ -30,6 +30,8 @@ R-AGT-9 amended in place (the loopback paste-back relays one authorization code 
 amended 2026-09-29 by maintainer decision on MOD-41 (`.claude/prds/mod-41-headless-worker.prd.md`
 D1-D3, `docs/ANA-16.md` §7) — R-ID-2, R-STO-1 and R-ORCH-12 amended in place (a per-box headless
 worker; its DSN source; remote dispatch promoted to must), R-LATER-4 narrowed to scheduling.
+amended 2026-10-01 by maintainer decision on MOD-45 (`docs/decisions/mod/mod-45.md`, plan OQ-1) —
+R-STO-1 amended in place (a TUI session may read the DSN once from stdin, held only in memory).
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -155,8 +157,9 @@ conflict. Their verdicts survive only where restated here.
   R-TUI-10) are not a store. One exception, for a headless worker (R-ORCH-12) on
   a Linux host with no secret service: the DSN may be a systemd credential encrypted at rest and
   bound to the host (`systemd-creds encrypt`, read from `$CREDENTIALS_DIRECTORY`), or be read once
-  from the worker's stdin and held only in memory. Never in `argv`, the environment, or a plaintext
-  file. Amended by maintainer decision on MOD-41, 2026-09-29.
+  from the worker's or a TUI session's stdin (`--dsn-stdin`) and held only in memory. Never in
+  `argv`, the environment, or a plaintext file. Amended by maintainer decision on MOD-41,
+  2026-09-29, and on MOD-45, 2026-10-01 (a TUI session's stdin).
 - **R-STO-2 (must).** TLS to Postgres is supported and optional.
 - **R-STO-3 (must).** Each box keeps a read-only cache of the projects it has opened under the
   user's config directory, refreshed on every successful connection. Contents: items, links,

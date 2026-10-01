@@ -137,8 +137,8 @@ one command. Agent login (MOD-22) is the only manual step left.**
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Provision a host | One command takes a reachable Linux host with sudo to a running, self-registered `htui worker`, with the DSN encrypted on the host and nowhere else. | in-progress | [plan](../plans/mod-45-remote-box-provisioning.plan.md) |
-| 2 | Safe re-run and refusals | Re-running on a provisioned host changes nothing and says so. Every preflight failure refuses before a remote write, with the reason. The guide covers provisioning and agent login. | in-progress | [plan](../plans/mod-45-remote-box-provisioning.plan.md) |
+| 1 | Provision a host | One command takes a reachable Linux host with sudo to a running, self-registered `htui worker`, with the DSN encrypted on the host and nowhere else. | complete | [plan](../plans/mod-45-remote-box-provisioning.plan.md) |
+| 2 | Safe re-run and refusals | Re-running on a provisioned host changes nothing and says so. Every preflight failure refuses before a remote write, with the reason. The guide covers provisioning and agent login. | complete | [plan](../plans/mod-45-remote-box-provisioning.plan.md) |
 
 Milestone 1 is the happy path end to end. Milestone 2 hardens it and can ship with it or right after
 it.
@@ -188,4 +188,4 @@ decisions, not proposals: the plan implements them.
 | An end-to-end test that needs a systemd host can't run in the sandbox | High | Medium | Split the tests. Command construction and preflight logic are tested locally with a fake `ssh`; the real-host run is manual and recorded in the write-up |
 
 ---
-*Status: DRAFT — requirements only. Implementation planning pending via /plan.*
+*Status: COMPLETE 2026-10-01 — both milestones shipped; write-up `docs/decisions/mod/mod-45.md`.*

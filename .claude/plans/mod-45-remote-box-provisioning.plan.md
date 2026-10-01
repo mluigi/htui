@@ -7,7 +7,8 @@ split cleanly from milestone 1.
 **Complexity**: Medium
 **Base**: `de177dd` (`main`), branch `hr/MOD-45`. Decision IDs D291–D314 (the highest in the tree and
 on the host is D290, MOD-22).
-**Status**: fact-checked (both passes below), CONFIRMED 2026-10-01 (OQ-1 (a), OQ-2 accepted).
+**Status**: COMPLETE 2026-10-01 (write-up `docs/decisions/mod/mod-45.md`). Fact-checked, CONFIRMED
+2026-10-01 (OQ-1 (a), OQ-2 accepted).
 
 ## Summary
 
