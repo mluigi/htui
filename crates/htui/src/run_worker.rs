@@ -3718,6 +3718,36 @@ pub(crate) mod tests {
         assert!(!probe.is_applying(id));
     }
 
+    /// B-5's guard, claimed a second time while a task holds it (the sweep's `cancel_run` behind
+    /// the poll's, MOD-24 D3): the claim answers `None` at once and the holder keeps the row. The
+    /// claim runs on its own thread, so a claim that never returns (the guard built eagerly and
+    /// dropped under the set's own lock) fails the case instead of hanging it.
+    #[tokio::test]
+    async fn a_second_claim_of_a_held_row_is_refused_and_frees_nothing() {
+        let fixture = Fixture::new().await;
+        let runtime = fixture.runtime();
+        let probe = testing::probe(&runtime);
+        let id = RunCommandId::new();
+        let held = probe
+            .hold_applying(id)
+            .expect("the first claim takes the row");
+        let second = testing::probe(&runtime);
+        let (answer, answered) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let refused = second.hold_applying(id).is_none();
+            let _ = answer.send((refused, second.is_applying(id)));
+        });
+        let Ok((refused, still_held)) = answered.recv_timeout(Duration::from_secs(5)) else {
+            // The stuck claim holds the set's lock for ever: dropping `held` would block too.
+            std::mem::forget(held);
+            panic!("a second claim of a held row never answered: B-5's guard deadlocked");
+        };
+        assert!(refused, "the row is held, so the second claim is refused");
+        assert!(still_held, "the refused claim freed nothing");
+        drop(held);
+        assert!(!probe.is_applying(id), "the holder's drop frees the row");
+    }
+
     /// MOD-24 D3 (review L4): the sweep's cancels apply to graph runs only. A chat run on this box
     /// reads `running` with no lease, so its pending cancel is in `pending_commands`, but the
     /// sweep never adopts a chat (D3b): there is no recovery to beat, and the row stays the poll's.

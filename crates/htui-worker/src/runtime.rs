@@ -472,16 +472,21 @@ impl<P: ReplySink> Shared<P> {
 
     /// MOD-42 B-5: `id` claimed for this task until the guard drops; `None` while another task of
     /// this process applies it.
+    ///
+    /// The set's lock is released before any guard exists: a guard built under it (an eager
+    /// `then_some`) and dropped on a refusal would lock the set again in its `Drop`, deadlocking
+    /// the thread, and free the holder's id besides.
     fn applying(&self, id: RunCommandId) -> Option<Applying<'_>> {
-        self.applying
+        let inserted = self
+            .applying
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(id)
-            .then_some(Applying {
-                set: &self.applying,
-                done: &self.applied,
-                id,
-            })
+            .insert(id);
+        inserted.then(|| Applying {
+            set: &self.applying,
+            done: &self.applied,
+            id,
+        })
     }
 
     /// MOD-42 B-5: whether a task of this process applies `id` now.
