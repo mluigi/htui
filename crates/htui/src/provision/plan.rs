@@ -40,8 +40,10 @@ pub enum Decision {
 /// `LoadCredentialEncrypted=` and `systemd-creds` arrived in 250 (V-1).
 pub const MIN_SYSTEMD: u32 = 250;
 
-/// D300, in order: refusals (OS, architecture, systemd, `systemd-creds`, sudo), the
-/// different-build refusal, already provisioned, else the steps.
+/// D300, in order: refusals (OS, architecture, systemd, `systemd-creds`, sudo), a running
+/// `htui-worker` from a unit htui did not write (review finding 6), the different-build refusal,
+/// already provisioned, a password sudo whose `sh` has no `printf` builtin (review finding 5),
+/// else the steps.
 #[must_use]
 pub fn decide(facts: &Facts, local: &LocalFacts, replace_credential: bool) -> Decision {
     let refuse = Decision::Refuse;
@@ -80,6 +82,13 @@ pub fn decide(facts: &Facts, local: &LocalFacts, replace_credential: bool) -> De
                 .to_owned(),
         );
     };
+    if !facts.unit && facts.active == "active" {
+        return refuse(
+            "an htui-worker service is already running from a unit htui did not write (not \
+             /etc/systemd/system/htui-worker.service); stop and remove it first"
+                .to_owned(),
+        );
+    }
     let same_build = facts.bin_sha.as_deref() == Some(local.sha.as_str());
     if facts.unit {
         if facts.bin_sha.is_none() {
@@ -98,6 +107,14 @@ pub fn decide(facts: &Facts, local: &LocalFacts, replace_credential: bool) -> De
         if facts.active == "active" && !replace_credential {
             return Decision::AlreadyProvisioned;
         }
+    }
+    if sudo == SudoMode::Password && !facts.printf_builtin {
+        return refuse(
+            "the remote sh has no printf builtin (as in posh or mksh), so sending the sudo \
+             password would put it in a process's arguments; configure NOPASSWD for this user \
+             instead"
+                .to_owned(),
+        );
     }
     Decision::Steps {
         upload: !same_build,
@@ -181,6 +198,16 @@ mod tests {
 
     const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+    /// Review finding 6.
+    const UNIT_ELSEWHERE: &str = "an htui-worker service is already running from a unit htui did \
+                                  not write (not /etc/systemd/system/htui-worker.service); stop \
+                                  and remove it first";
+
+    /// Review finding 5.
+    const PRINTF_EXTERNAL: &str = "the remote sh has no printf builtin (as in posh or mksh), so \
+                                   sending the sudo password would put it in a process's \
+                                   arguments; configure NOPASSWD for this user instead";
+
     /// A fresh host: nothing installed, a password sudo.
     fn fresh() -> Facts {
         Facts {
@@ -195,6 +222,7 @@ mod tests {
             unit: false,
             active: "inactive".into(),
             sudo: Some(SudoMode::Password),
+            printf_builtin: true,
         }
     }
 
@@ -421,6 +449,78 @@ mod tests {
                 x86.clone(),
                 false,
                 steps(true, SudoMode::Password),
+            ),
+            (
+                "a running unit htui did not write",
+                Facts {
+                    active: "active".into(),
+                    ..fresh()
+                },
+                x86.clone(),
+                false,
+                refuse(UNIT_ELSEWHERE),
+            ),
+            (
+                "a running unit htui did not write, this build",
+                Facts {
+                    bin_sha: Some(SHA.into()),
+                    active: "active".into(),
+                    ..fresh()
+                },
+                x86.clone(),
+                true,
+                refuse(UNIT_ELSEWHERE),
+            ),
+            (
+                "no running unit, failed elsewhere",
+                Facts {
+                    active: "failed".into(),
+                    ..fresh()
+                },
+                x86.clone(),
+                false,
+                steps(true, SudoMode::Password),
+            ),
+            (
+                "external printf, password sudo",
+                Facts {
+                    printf_builtin: false,
+                    ..fresh()
+                },
+                x86.clone(),
+                false,
+                refuse(PRINTF_EXTERNAL),
+            ),
+            (
+                "external printf, nopasswd",
+                Facts {
+                    printf_builtin: false,
+                    sudo: Some(SudoMode::NoPassword),
+                    ..fresh()
+                },
+                x86.clone(),
+                false,
+                steps(true, SudoMode::NoPassword),
+            ),
+            (
+                "external printf, already provisioned",
+                Facts {
+                    printf_builtin: false,
+                    ..provisioned()
+                },
+                x86.clone(),
+                false,
+                Decision::AlreadyProvisioned,
+            ),
+            (
+                "external printf, replace credential",
+                Facts {
+                    printf_builtin: false,
+                    ..provisioned()
+                },
+                x86.clone(),
+                true,
+                refuse(PRINTF_EXTERNAL),
             ),
             (
                 "no unit, this build",

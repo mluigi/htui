@@ -999,6 +999,7 @@ mod tests {
             ("unit", "no"),
             ("active", "inactive"),
             ("sudo", "password"),
+            ("printf", "builtin"),
         ];
         let mut text = "Welcome to box1\n".to_owned();
         for (key, value) in defaults {

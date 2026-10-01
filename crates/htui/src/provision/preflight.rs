@@ -6,9 +6,10 @@ use std::fmt;
 
 use crate::provision::plan::SudoMode;
 
-/// The eleven keys, in the order [`crate::provision::script::PREFLIGHT`] prints them.
-pub const KEYS: [&str; 11] = [
+/// The twelve keys, in the order [`crate::provision::script::PREFLIGHT`] prints them.
+pub const KEYS: [&str; 12] = [
     "os", "arch", "systemd", "creds", "user", "group", "home", "bin_sha", "unit", "active", "sudo",
+    "printf",
 ];
 
 /// What the remote host said about itself. Holds no secret.
@@ -37,6 +38,9 @@ pub struct Facts {
     pub active: String,
     /// `None` for `none`: sudo is not installed (E-9).
     pub sudo: Option<SudoMode>,
+    /// `printf=builtin`: the remote `sh` has `printf` built in, so INSTALL's `printf` of the sudo
+    /// password is no process of its own (review finding 5). `external` is `false`.
+    pub printf_builtin: bool,
 }
 
 /// Why the answer is not a preflight. Each variant names its key; none carries a value.
@@ -123,6 +127,11 @@ impl Facts {
             "none" => None,
             _ => return Err(FactsError::Unreadable("sudo")),
         };
+        let printf_builtin = match get("printf") {
+            "builtin" => true,
+            "external" => false,
+            _ => return Err(FactsError::Unreadable("printf")),
+        };
         let bin_sha = match get("bin_sha") {
             "none" => None,
             v => Some(v.to_owned()),
@@ -139,6 +148,7 @@ impl Facts {
             unit: yes_no("unit")?,
             active: get("active").to_owned(),
             sudo,
+            printf_builtin,
         })
     }
 }
@@ -161,6 +171,7 @@ mod tests {
             ("unit", "no"),
             ("active", "inactive"),
             ("sudo", "password"),
+            ("printf", "builtin"),
         ]
     }
 
@@ -194,6 +205,7 @@ mod tests {
             unit: false,
             active: "inactive".into(),
             sudo: Some(SudoMode::Password),
+            printf_builtin: true,
         }
     }
 
@@ -219,8 +231,10 @@ mod tests {
             ("unit", "yes"),
             ("active", "active"),
             ("sudo", "nopasswd"),
+            ("printf", "external"),
         ]))
         .expect("parses");
+        assert!(!facts.printf_builtin);
         assert_eq!(facts.systemd, None);
         assert!(!facts.creds);
         assert_eq!(facts.home, "");
@@ -291,6 +305,8 @@ mod tests {
             ("creds", "maybe"),
             ("unit", "maybe"),
             ("sudo", "sometimes"),
+            ("printf", "maybe"),
+            ("printf", ""),
         ] {
             let key: &'static str = KEYS.iter().find(|k| **k == key).expect("a key");
             assert_eq!(

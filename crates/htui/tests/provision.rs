@@ -796,6 +796,80 @@ async fn a_host_whose_sh_is_bash_keeps_the_sudo_timestamp() {
     sweep_run(&world, &shell, &run);
 }
 
+/// Review finding 5: an external `printf` that logs every call's arguments, as a `ps` on the host
+/// would see them.
+const STUB_PRINTF: &str = r##"#!/bin/sh
+# MOD-45 review finding 5: an external printf that logs its arguments.
+d=$STUB_DIR
+echo "printf $*" >> "$d/argv.log"
+exec /usr/bin/printf "$@"
+"##;
+
+/// A `sh` with no `printf` builtin, like posh or mksh: bash with the builtin disabled, so `printf`
+/// resolves through `PATH` to [`STUB_PRINTF`].
+fn stub_sh_without_printf(bash: &Path) -> String {
+    format!(
+        "#!{bash}\nif [ \"${{1:-}}\" = -c ]; then\n  s=$2\n  shift 2\n  exec {bash} -c \"enable -n \
+         printf\n$s\" \"$@\"\nfi\nexec {bash} \"$@\"\n",
+        bash = bash.display()
+    )
+}
+
+/// A world whose `sh` has no `printf` builtin; `None` without bash or `/usr/bin/printf`.
+fn world_without_printf_builtin(sudo_mode: &str) -> Option<World> {
+    let bash = bash_path()?;
+    if !Path::new("/usr/bin/printf").exists() {
+        return None;
+    }
+    let world = World::new(sudo_mode);
+    for (name, text) in [
+        ("sh", stub_sh_without_printf(&bash)),
+        ("printf", STUB_PRINTF.to_owned()),
+    ] {
+        let path = world.stub.join(name);
+        std::fs::write(&path, text).expect("write a stub");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make a stub executable");
+    }
+    Some(world)
+}
+
+#[tokio::test]
+async fn a_password_host_without_a_printf_builtin_is_refused_before_the_prompt() {
+    let Some(world) = world_without_printf_builtin("password") else {
+        println!("no bash or /usr/bin/printf; skipping the review finding 5 scenario");
+        return;
+    };
+    let shell = LocalShell::new(&world);
+    let run = provision(&world, &shell, Setup::default()).await;
+    let (code, sentence) = run.exit();
+    assert!(matches!(run.result, Err(ProvisionExit::Refused(_))));
+    assert_eq!(code, 2, "{sentence}");
+    assert!(
+        sentence.contains("the remote sh has no printf builtin"),
+        "{sentence}"
+    );
+    assert_eq!(run.prompt_calls, 0, "the password is never asked for");
+    assert_eq!(shell.commands().len(), 1, "the preflight only");
+    assert!(
+        world
+            .argv_log()
+            .iter()
+            .any(|line| line.starts_with("printf htui.")),
+        "the preflight's own printf was the external stub"
+    );
+    assert!(!world.home.join(".local").exists());
+    sweep_run(&world, &shell, &run);
+
+    // NOPASSWD needs no printf of a secret, so the same host is provisioned.
+    let world = world_without_printf_builtin("nopasswd").expect("the same tools");
+    let shell = LocalShell::new(&world);
+    let run = provision(&world, &shell, Setup::default()).await;
+    assert_fresh_install(&world, &run);
+    assert_eq!(run.prompt_calls, 0);
+    sweep_run(&world, &shell, &run);
+}
+
 #[tokio::test]
 async fn a_re_run_changes_nothing() {
     let world = World::new("nopasswd");
