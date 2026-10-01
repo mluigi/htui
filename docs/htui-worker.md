@@ -381,10 +381,12 @@ When sudo wants a password and no terminal can be opened, the run is refused (ex
 `sudo needs a password and there is no terminal; configure NOPASSWD or run interactively`.
 
 **Agent login on the new box.** After a success, `htui` prints the way in on standard error:
-`ssh -t <host> ~/.local/bin/htui --dsn-stdin`, paste the DSN, then **Settings › Agents**. The DSN is
-held in memory for that session only; it is neither read from nor written to a keyring, and
-systemd decrypts the service's credential only for the unit. The TUI runs as the same user with
-the same `box.toml` (unless that login sets `XDG_CONFIG_HOME`), so it is the same box (see
+`ssh -t <host> '~/.local/bin/htui' --dsn-stdin`, paste the DSN, then **Settings › Agents**. Keep
+the quotes: without them your own shell expands `~` to your home on this machine, which is the
+wrong path when the login on `<host>` is another user. The DSN is held in memory for that session
+only; it is neither read from nor written to a keyring, and systemd decrypts the service's
+credential only for the unit. The TUI runs as the same user with the same `box.toml` (unless that
+login sets `XDG_CONFIG_HOME`), so it is the same box (see
 [The TUI on a worker box](#the-tui-on-a-worker-box)). **Settings › Connection** there shows the
 keyring's state, not this session's DSN, and saving a DSN from it tries a keyring the box does not
 have. `--dsn-stdin` cannot be combined with `--set-dsn`, `--clear-dsn`, `--demo`, `--offline`,
