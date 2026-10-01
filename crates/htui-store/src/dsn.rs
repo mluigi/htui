@@ -12,6 +12,7 @@
 //! [`Dsn::fingerprint`] — is derived here.
 
 use core::fmt;
+use core::net::IpAddr;
 use core::str::FromStr as _;
 
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
@@ -180,7 +181,13 @@ impl Dsn {
     /// `Loopback`, the refusing direction.
     #[must_use]
     pub fn host_class(&self) -> DsnHost {
-        todo!("MOD-45 T1")
+        let Ok(options) = PgConnectOptions::from_str(&self.0) else {
+            return DsnHost::Loopback;
+        };
+        if options.get_socket().is_some() {
+            return DsnHost::Socket;
+        }
+        classify_host(options.get_host())
     }
 
     /// The text, for this crate's keyring write, dial and fingerprint. Deliberately not `pub`.
@@ -270,8 +277,26 @@ fn split_host_port(hostport: &str) -> Result<(&str, Option<&str>), DsnError> {
 
 /// `host` as sqlx holds it: brackets stripped, then the name and address rules of [`DsnHost`].
 fn classify_host(host: &str) -> DsnHost {
-    let _ = host;
-    todo!("MOD-45 T1")
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        return DsnHost::Loopback;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) if v4.is_loopback() || v4.is_unspecified() => DsnHost::Loopback,
+        Ok(IpAddr::V6(v6))
+            if v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()) =>
+        {
+            DsnHost::Loopback
+        }
+        _ => DsnHost::Remote,
+    }
 }
 
 /// Whether sqlx's `match` has an arm for `key`, including the `options[<name>]` family.

@@ -71,7 +71,7 @@ pub fn load_or_mint(root: &Path) -> Result<Identity> {
 
     match std::fs::read_to_string(&path) {
         Ok(text) => {
-            let parsed: BoxToml = toml::from_str(&text).map_err(|e| {
+            let parsed = parse_toml(&text).map_err(|e| {
                 StoreError::Backend(format!("{} is not valid box.toml: {e}", path.display()))
             })?;
             let identity = Identity {
@@ -107,8 +107,17 @@ pub fn load_or_mint(root: &Path) -> Result<Identity> {
 ///
 /// [`StoreError::Backend`]: `not valid box.toml: <the parser's reason>`.
 pub fn parse_box_toml(text: &str) -> Result<Identity> {
-    let _ = text;
-    todo!("MOD-45 T1")
+    let parsed =
+        parse_toml(text).map_err(|e| StoreError::Backend(format!("not valid box.toml: {e}")))?;
+    Ok(Identity {
+        box_id: BoxId::from_uuid(parsed.box_id),
+        hostname: parsed.hostname,
+    })
+}
+
+/// The one parser both readers share. Private: `BoxToml` stays private.
+fn parse_toml(text: &str) -> core::result::Result<BoxToml, toml::de::Error> {
+    toml::from_str(text)
 }
 
 /// Overwrites `<root>/box.toml`; used when registration minted a new id for a copied `box.toml`
