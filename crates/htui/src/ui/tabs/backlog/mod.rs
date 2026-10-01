@@ -11,6 +11,7 @@
 
 pub mod detail;
 pub mod filter;
+pub mod item_form;
 pub mod list;
 
 use htui_core::model::{ItemId, ItemSummary, ProjectId, Scope};
