@@ -590,12 +590,14 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
             Ok(()) => {
                 if baseline.contains_key(&id) {
                     // Review finding 3: no new row, only a later last_seen_at, which any htui on
-                    // the host with the same box.toml (a TUI over ssh) also moves.
+                    // the host with the same box.toml (a TUI over ssh) also moves. The row may be
+                    // a re-provision's or a new worker's that connected before the baseline was
+                    // read, so the note states only what was observed.
                     let _ = writeln!(
                         err,
-                        "note: box {id} was registered before this install, so the check-in is \
-                         best-effort: an htui TUI on {dest} with the same box.toml would also \
-                         count"
+                        "note: box {id} was already in Postgres when the install returned, so the \
+                         check-in is best-effort: an htui TUI on {dest} with the same box.toml \
+                         would also count"
                     );
                 }
                 (true, set_executor(verifier, id, dest, err).await.is_some())
@@ -1887,7 +1889,7 @@ mod tests {
         let remote = fresh(true, vec![ok(""), ok("htui.root=start\n"), verified()]);
         let prompt = FakePrompt::new(Ok(PASSWORD));
         let verifier = FakeVerifier {
-            seen: Err(format!("box {BOX} did not check in within 60 s")),
+            seen: Err(format!("box {BOX} did not check in within 90 s")),
             ..FakeVerifier::new()
         };
         let ran = drive(DEST, DSN, false, &remote, &prompt, &verifier).await;
@@ -1901,7 +1903,7 @@ mod tests {
         ));
         assert!(ran.err.contains(&format!(
             "warning: service active, box {BOX}; not verified in Postgres from here: box {BOX} \
-             did not check in within 60 s; see journalctl -u htui-worker and \
+             did not check in within 90 s; see journalctl -u htui-worker and \
              ~/.local/state/htui/worker.log on alice@box1\n"
         )));
         assert!(ran.err.contains(&format!(
@@ -2030,8 +2032,9 @@ mod tests {
         assert!(verifier.log().is_empty());
     }
 
-    /// Review finding 3: a box already in the baseline (a re-provision) is verified only by a
-    /// later last_seen_at, and the run says that is best-effort.
+    /// Review finding 3: a box already in the baseline (a re-provision, or a new worker that
+    /// connected before the baseline was read) is verified only by a later last_seen_at, and the
+    /// run says that is best-effort without claiming when the box was registered.
     #[tokio::test]
     async fn a_box_already_in_the_baseline_is_verified_best_effort() {
         let remote = fresh(true, vec![ok(""), ok("htui.root=start\n"), verified()]);
@@ -2052,12 +2055,14 @@ mod tests {
         ));
         assert!(
             ran.err.contains(&format!(
-                "note: box {BOX} was registered before this install, so the check-in is \
-                 best-effort: an htui TUI on alice@box1 with the same box.toml would also count\n"
+                "note: box {BOX} was already in Postgres when the install returned, so the \
+                 check-in is best-effort: an htui TUI on alice@box1 with the same box.toml would \
+                 also count\n"
             )),
             "{}",
             ran.err
         );
+        assert!(!ran.err.contains("before this install"), "{}", ran.err);
     }
 
     /// Review finding 2: a session that never ends is closed at its bound: a refusal for the

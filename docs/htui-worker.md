@@ -347,11 +347,12 @@ Otherwise the same line is printed, the exit is still 0, and a warning says what
 - `warning: box <id>'s executor is not set to worker: <reason>; set it in Settings › Boxes`, when
   the box checked in but the write did not apply.
 
-When the box was already in Postgres before the install (a re-run with `--replace-credential`,
-say), only a later `last_seen_at` counts, and an `htui` TUI on that host with the same `box.toml`
-moves it too. The check is then best-effort, and a line on standard error says so:
-`note: box <id> was registered before this install, so the check-in is best-effort: an htui TUI on
-<destination> with the same box.toml would also count`.
+When the box is already in Postgres once the install has returned (a re-run with
+`--replace-credential`, say, or a new worker that connected at once), only a later `last_seen_at`
+counts, and an `htui` TUI on that host with the same `box.toml` moves it too. The check is then
+best-effort, and a line on standard error says so: `note: box <id> was already in Postgres when the
+install returned, so the check-in is best-effort: an htui TUI on <destination> with the same
+box.toml would also count`.
 
 An active service with a `box.toml` does not prove the worker connected: it writes `box.toml`
 before it connects, and a worker refused at start (exit 2) is restarted every 10 seconds and looks
