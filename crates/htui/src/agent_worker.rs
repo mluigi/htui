@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -1893,6 +1894,8 @@ impl AgentRuntime {
 
         let chat = ChatRunSpec::mint(project_id, box_id, user, Some(agent_id), model.clone());
         writer.start_chat_run(&chat).await?;
+        #[cfg(test)]
+        tests::minted(&chat);
 
         let spec = SessionSpec {
             agent_id,
@@ -1981,14 +1984,17 @@ impl AgentRuntime {
 
         let step_id = chat.step_id;
         // MOD-24 D4: copies of the pair and the writer, because the panicked task is dropped with
-        // the originals before its answer is sent.
-        let answer = frames
-            .answer(chat_failed)
-            .closing(writer.clone(), chat.clone());
+        // the originals before its answer is sent. Review L3: one closed flag between the two, so
+        // a panic after the session's own close never closes the run a second time.
+        let closed = Arc::new(AtomicBool::new(false));
+        let answer =
+            frames
+                .answer(chat_failed)
+                .closing(writer.clone(), chat.clone(), Arc::clone(&closed));
         let args = ChatArgs {
             driver,
             writer,
-            binding: ChatBinding::Fresh(chat),
+            binding: ChatBinding::Fresh(chat, closed),
             spec,
             prompt,
             policy: settings.permission,
@@ -2010,8 +2016,10 @@ impl AgentRuntime {
 /// Blueprint D205: what a chat session records against.
 #[derive(Debug)]
 enum ChatBinding {
-    /// MOD-2's own chat: a `run(kind='chat')` minted at start, closed at the end.
-    Fresh(ChatRunSpec),
+    /// MOD-2's own chat: a `run(kind='chat')` minted at start, closed at the end. The flag is
+    /// raised once that close has landed, and shared with the task's panic answer (MOD-24 review
+    /// L3), which then leaves the run alone.
+    Fresh(ChatRunSpec, Arc<AtomicBool>),
     /// MOD-4 plan D165: a promoted graph step. No run is minted and none is closed: the step's
     /// status is the engine's (`awaiting_approval`, promoted) and stays so when the session ends.
     Promoted {
@@ -2027,7 +2035,7 @@ impl ChatBinding {
     /// The step every row of the session is recorded against.
     const fn step_id(&self) -> StepId {
         match self {
-            Self::Fresh(chat) => chat.step_id,
+            Self::Fresh(chat, _) => chat.step_id,
             Self::Promoted { step_id, .. } => *step_id,
         }
     }
@@ -2035,16 +2043,22 @@ impl ChatBinding {
     /// The request a failed start is answered as: the one that opened the session.
     const fn request(&self) -> &'static str {
         match self {
-            Self::Fresh(_) => "chat_start",
+            Self::Fresh(..) => "chat_start",
             Self::Promoted { .. } => PROMOTE_STEP,
         }
     }
 
     /// Closes what the session opened when it ends with `status`. A promoted step's session
-    /// opened nothing: `finish_chat_run` is never called for a graph step.
+    /// opened nothing: `finish_chat_run` is never called for a graph step. A fresh chat's close
+    /// that landed raises its closed flag (MOD-24 review L3); one that failed leaves it down, so a
+    /// later panic's answer still tries.
     async fn close(&self, writer: &Writer, status: RunStatus) {
         match self {
-            Self::Fresh(chat) => close_run(writer, chat, status).await,
+            Self::Fresh(chat, closed) => {
+                if close_run(writer, chat, status).await {
+                    closed.store(true, Ordering::Release);
+                }
+            }
             Self::Promoted { .. } => {}
         }
     }
@@ -3411,9 +3425,14 @@ struct Answer {
     last_word: LastWord,
     /// MOD-24 D4: a fresh chat's `run(kind='chat')` pair, closed `failed` before the last word is
     /// sent, so a tab that re-reads runs on `Ended` finds it closed. `None` for every other task,
-    /// and for a promoted step's chat, which opened no run (MOD-4 D165).
-    closes: Option<(Writer, ChatRunSpec)>,
+    /// and for a promoted step's chat, which opened no run (MOD-4 D165). The flag is the
+    /// binding's (review L3): raised, the session closed the run itself and it is left alone.
+    closes: Option<(Writer, ChatRunSpec, Arc<AtomicBool>)>,
 }
+
+/// MOD-24 review L2: how long a panicked chat's answer waits for its run's close before its last
+/// word goes out anyway. A stalled store must not leave the tab's pending start set for ever.
+const PANICKED_CHAT_CLOSE: Duration = Duration::from_secs(5);
 
 impl Answer {
     /// An answer at a fixed `addr`, for a task that sends through something other than [`Frames`].
@@ -3421,20 +3440,40 @@ impl Answer {
         Frames::new(tx, addr).answer(last_word)
     }
 
-    /// MOD-24 D4: this answer closes `chat`'s run first. Copies, not the task's state: the task
-    /// is dropped before the answer is sent.
-    fn closing(mut self, writer: Writer, chat: ChatRunSpec) -> Self {
-        self.closes = Some((writer, chat));
+    /// MOD-24 D4: this answer closes `chat`'s run first, unless `closed` says the session already
+    /// did (review L3). Copies, not the task's state: the task is dropped before the answer is
+    /// sent.
+    fn closing(mut self, writer: Writer, chat: ChatRunSpec, closed: Arc<AtomicBool>) -> Self {
+        self.closes = Some((writer, chat, closed));
         self
     }
 
-    /// Closes the run this answer owns, if any, then sends the last word for `message` at the
-    /// stream's address as it is now.
+    /// Closes the run this answer owns, if any and if the session has not, within
+    /// [`PANICKED_CHAT_CLOSE`]; then sends the last word for `message` at the stream's address as
+    /// it is now.
     async fn send(self, message: String) {
         // Awaited before the frames go out: a tab that re-reads runs on `Ended` must find the run
-        // closed. `close_run` logs its own failure.
-        if let Some((writer, chat)) = &self.closes {
-            close_run(writer, chat, RunStatus::Failed).await;
+        // closed. Bounded, so a stalled store delays the last word but never withholds it (review
+        // L2). `close_run` logs its own failure.
+        if let Some((writer, chat, closed)) = &self.closes {
+            if closed.load(Ordering::Acquire) {
+                tracing::debug!(
+                    run = %chat.run_id,
+                    "a chat panicked after its run was closed; the close stands"
+                );
+            } else if tokio::time::timeout(
+                PANICKED_CHAT_CLOSE,
+                close_run(writer, chat, RunStatus::Failed),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!(
+                    run = %chat.run_id,
+                    limit_secs = PANICKED_CHAT_CLOSE.as_secs(),
+                    "closing a panicked chat's run timed out; its last word goes out regardless"
+                );
+            }
         }
         let addr = self.stream.lock().addr.clone();
         for reply in (self.last_word)(message) {
@@ -3537,9 +3576,12 @@ fn chat_failed(message: String) -> Vec<StoreReply> {
 /// So each poll runs inside [`contain`](htui_agent::excerpt::contain) and `catch_unwind`. On an
 /// unwind the task is dropped, which runs whatever guards it still held (a `ChildGuard` kills its
 /// child, a `ReprobeClaim` releases its row), the panic is logged, a fresh chat's run is closed
-/// (MOD-24 D4), and `answer`, when the task owes one, is sent. The reply goes out at once, not at the next sweep, because the sweep only runs
-/// when another request arrives. Cancelling is untouched: an aborted task is dropped at an await
-/// and never reaches the catch, so a superseded preview or a shutdown still answers nothing.
+/// unless its session already closed it (MOD-24 D4, review L3), and `answer`, when the task owes
+/// one, is sent. The reply goes out as soon as that close has answered, or after
+/// [`PANICKED_CHAT_CLOSE`] at the latest (review L2), and not at the next sweep, because the
+/// sweep only runs when another request arrives. Cancelling is untouched: an aborted task is
+/// dropped at an await and never reaches the catch, so a superseded preview or a shutdown still
+/// answers nothing.
 ///
 /// A panic on a thread the task starts (a blocking thread, a spawned task, a provider thread) is
 /// not caught here; it comes back to the task as an error, as it always did. It does not reach the
@@ -3661,7 +3703,7 @@ pub async fn run_chat(args: ChatArgs) {
     let (ui_tx, mut ui_rx) = mpsc::channel(UI_FRAMES);
     let retain_raw = std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1");
     let mut recorder = match &binding {
-        ChatBinding::Fresh(_) => {
+        ChatBinding::Fresh(..) => {
             Recorder::new(&writer, &scrubber, step_id, retain_raw, Some(ui_tx))
         }
         // Plan D164: the step's log goes on past its last row, at its next turn, with its
@@ -3680,7 +3722,7 @@ pub async fn run_chat(args: ChatArgs) {
 
     let now = Utc::now();
     match &binding {
-        ChatBinding::Fresh(_) => {
+        ChatBinding::Fresh(..) => {
             if let Err(err) = recorder
                 .record_prompt(&prompt, prompt_sections(), now)
                 .await
@@ -4116,13 +4158,18 @@ fn prompt_sections() -> Value {
     json!([{ "name": "chat", "tokens": Value::Null, "trimmed": false }])
 }
 
-/// Closes the chat's `run` / `run_step` pair, so it stops counting as an active run.
-async fn close_run(writer: &Writer, chat: &ChatRunSpec, status: RunStatus) {
-    if let Err(err) = writer
+/// Closes the chat's `run` / `run_step` pair, so it stops counting as an active run. Whether the
+/// close landed; a failure is logged here.
+async fn close_run(writer: &Writer, chat: &ChatRunSpec, status: RunStatus) -> bool {
+    match writer
         .finish_chat_run(chat.run_id, chat.step_id, status, Utc::now())
         .await
     {
-        tracing::error!(%err, "the chat run could not be closed");
+        Ok(()) => true,
+        Err(err) => {
+            tracing::error!(%err, "the chat run could not be closed");
+            false
+        }
     }
 }
 
@@ -4156,7 +4203,9 @@ pub(crate) mod tests {
     };
     use htui_agent::fake::FakeAdapter;
     use htui_core::fixtures::{edit_agent, ids};
-    use htui_core::model::{Agent, AgentId, EventKind, EventRole, Scope, Transport};
+    use htui_core::model::{
+        Agent, AgentId, EventKind, EventRole, RunId, Scope, StepStatus, Transport,
+    };
     use htui_core::store::MemStore;
     use std::sync::Arc;
 
@@ -10354,6 +10403,75 @@ done
         runtime.finish_background(Duration::from_secs(10)).await;
     }
 
+    thread_local! {
+        /// MOD-24 review L1: the run of every chat `serve` minted on this thread, by its step.
+        /// No store read goes from a step to its run, and a case only learns the step
+        /// (`Served::Start { step_id }`).
+        static MINTED: std::cell::RefCell<HashMap<StepId, RunId>> =
+            std::cell::RefCell::default();
+    }
+
+    /// Records `chat`'s pair for [`run_of`]; called by `serve` in test builds only.
+    pub(crate) fn minted(chat: &ChatRunSpec) {
+        MINTED.with(|minted| minted.borrow_mut().insert(chat.step_id, chat.run_id));
+    }
+
+    /// The chat run `serve` minted for `step` on this thread.
+    fn run_of(step: StepId) -> RunId {
+        MINTED
+            .with(|minted| minted.borrow().get(&step).copied())
+            .expect("serve minted this step's run on this thread")
+    }
+
+    /// MOD-24 review L1: `task` spawned, its stream received up to and including its `Failed`
+    /// frame, and at that moment the chat's run already closed: `run` `failed` with `finished_at`
+    /// set, and `step` with it. Then the task's end and the rest of its stream; every reply.
+    async fn closed_before_failed(
+        store: &MemStore,
+        rx: &mut mpsc::UnboundedReceiver<ReplyEnvelope>,
+        task: ChatTask,
+        step: StepId,
+    ) -> Vec<ReplyEnvelope> {
+        let run = run_of(step);
+        let handle = tokio::spawn(task);
+        let mut replies = Vec::new();
+        loop {
+            let reply = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("the stream's `Failed` arrives")
+                .expect("the stream stays open until its last word");
+            let failed = matches!(reply.reply, StoreReply::Chat(ChatFrame::Failed { .. }));
+            replies.push(reply);
+            if failed {
+                break;
+            }
+        }
+        let row = store
+            .run(run)
+            .await
+            .expect("the read answers")
+            .expect("the chat's run");
+        assert_eq!(
+            row.status,
+            RunStatus::Failed,
+            "the run was closed before the `Failed` frame went out"
+        );
+        assert!(row.finished_at.is_some(), "and its `finished_at` is set");
+        let steps = store.run_steps(run).await.expect("the read answers");
+        let chat_step = steps
+            .iter()
+            .find(|row| row.id == step)
+            .expect("the run's step is the chat's");
+        assert_eq!(
+            chat_step.status,
+            StepStatus::Failed,
+            "the step closed with it"
+        );
+        handle.await.expect("the wrapper caught the panic");
+        replies.extend(sent(rx));
+        replies
+    }
+
     /// A chat whose session panics ends its stream with a `Failed` frame, which is what clears the
     /// chat tab's pending start, and closes the run it opened first (MOD-24 D4).
     #[tokio::test]
@@ -10371,15 +10489,14 @@ done
         let (tx, mut rx) = mpsc::unbounded_channel();
         let before = store.active_runs(&scope()).await.expect("count");
 
-        let Served::Start { task, .. } = runtime
+        let Served::Start { step_id, task } = runtime
             .serve(&backend, &tx, &envelope(7, start(agent_id, "hi")))
             .await
         else {
             panic!("a chat start opens a session")
         };
-        task.await;
+        let replies = closed_before_failed(&store, &mut rx, task, step_id).await;
 
-        let replies = sent(&mut rx);
         let [.., failed, ended] = &replies[..] else {
             panic!("the stream ends with two frames: {replies:?}")
         };
@@ -10531,7 +10648,7 @@ done
         let before = store.active_runs(&scope()).await.expect("count");
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let Served::Start { task, .. } = runtime
+        let Served::Start { step_id, task } = runtime
             .serve(&backend, &tx, &envelope(7, start(agent_id, "hi")))
             .await
         else {
@@ -10542,9 +10659,8 @@ done
             before + 1,
             "the start opened the chat's run"
         );
-        task.await;
+        let replies = closed_before_failed(&store, &mut rx, task, step_id).await;
 
-        let replies = sent(&mut rx);
         assert!(
             replies
                 .iter()
@@ -10557,6 +10673,53 @@ done
             before,
             "the panicked chat's run is closed"
         );
+    }
+
+    /// MOD-24 review L3 (blueprint H-19): a chat task that panics **after** its session closed its
+    /// run normally (`run_chat`'s last `binding.close`) leaves the run as that close left it. The
+    /// binding and the answer share one closed flag, so the answer's own close is skipped and
+    /// `done` is never rewritten as `failed`; the last word still goes out. No transport can panic
+    /// past that close today (only `frames.ended` follows it), so the case drives the two halves
+    /// directly: the binding's close, then the answer a panic would send.
+    #[tokio::test]
+    async fn a_panic_after_a_normal_close_leaves_the_chat_run_as_closed() {
+        let store = MemStore::demo();
+        let backend = Backend::memory(store.clone());
+        let writer = backend
+            .writer()
+            .expect("a memory backend hands out a writer");
+        let chat = ChatRunSpec::mint(ids::PROJECT_HTUI, ids::BOX, ids::USER, None, None);
+        writer
+            .start_chat_run(&chat)
+            .await
+            .expect("the chat's run lands");
+        let closed = Arc::new(AtomicBool::new(false));
+        let binding = ChatBinding::Fresh(chat.clone(), Arc::clone(&closed));
+        binding.close(&writer, RunStatus::Done).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        Frames::new(tx, promote_addr())
+            .answer(chat_failed)
+            .closing(writer, chat.clone(), closed)
+            .send("the chat task panicked: past its close".to_owned())
+            .await;
+
+        let row = store
+            .run(chat.run_id)
+            .await
+            .expect("the read answers")
+            .expect("the chat's run");
+        assert_eq!(row.status, RunStatus::Done, "the normal close stands");
+        let steps = store
+            .run_steps(chat.run_id)
+            .await
+            .expect("the read answers");
+        assert_eq!(
+            steps.iter().map(|step| step.status).collect::<Vec<_>>(),
+            [StepStatus::Done],
+            "and so does its step's"
+        );
+        ends_failed_then_ended(&sent(&mut rx), "past its close");
     }
 
     /// MOD-24 D4 leaves MOD-4 D165 alone: a promoted step's chat opened no run, so its panic closes
