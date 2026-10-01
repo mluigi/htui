@@ -1,25 +1,33 @@
 //! MOD-42 plan D6: one turn of a session, with the permission relay and the run's control.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    OpenPermission, PermissionChoice, PermissionId, PermissionStatus, RelaySessionId, RunId,
-    StepId, StepPermission,
+    OpenPermission, PermissionChoice, PermissionId, PermissionStatus, RelayOption, RelayOptionKind,
+    RelaySessionId, RunId, StepId, StepPermission,
 };
-use htui_core::store::Result as StoreResult;
+use htui_core::scrub::Scrubber;
+use htui_core::store::{Result as StoreResult, StoreError};
+use serde_json::{Value, json};
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use super::{Recorder, enforce_breach};
-use crate::driver::{AgentSession, PermissionPolicy};
+use super::{AnsweredBy, RecordError, Recorder, enforce_breach};
+use crate::driver::{AgentSession, PermissionAnswer, PermissionPolicy, PermissionRequestId};
 use crate::error::DriverError;
-use crate::event::{DoneEvent, DriverEvent};
+use crate::event::{
+    DoneEvent, DriverEvent, PermissionOption, PermissionOptionKind, PermissionRequestEvent,
+    ToolCallEvent,
+};
 
 /// D8: how often a parked request's row is read. One primary-key read per tick, only while parked.
 pub const RELAY_POLL: Duration = Duration::from_secs(1);
 /// B-16: the grace a cancel `drive` discovers itself (a `stale`/`cancelled` row) is given.
 pub const RELAY_GRACE: Duration = Duration::from_secs(2);
+/// B-11: how long past the grace the post-cancel drain may run.
+const DRAIN_SLACK: Duration = Duration::from_secs(1);
 
 /// What a walk is asked to do (D10, D11). `Copy`, read with [`Control::signal`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -155,9 +163,27 @@ impl htui_core::store::RelayStore for NoRelay {
 
 /// D6: one turn of `session` into `recorder`, ending at its `done`, a graceful cancel, or an error.
 ///
-/// MOD-42 T2 red: today's pump loop; the relay and the control are not read yet.
+/// Without a relay it behaves exactly as `pump` always has: a `permission_request` is recorded
+/// and the pull goes on, so the transport raises "is parked". With one: stage 1-2 policy answers
+/// at once (`by: policy`); stage 3 flushes the recorder, opens a scrubbed row (I-5) and polls it
+/// at `relay.poll` until it is answered (applied under the lease, D4, echoed `by: user`), read
+/// back `stale`/`cancelled` (a cancel), or `control` signals a cancel. The control is read at the
+/// top of every iteration and selected against every pull (B-2).
+///
+/// **Rows (B-15).** A graceful cancel settles the session's rows `cancelled` inside its sequence
+/// (I-7). Every other exit that opened a row marks the leftovers `stale` (D5), best-effort: a
+/// failure there is a `warn`, never the returned error. A fenced exit is the one exception: the
+/// lease is another process's, and a fenced writer writes nothing more (MOD-40 D1), so an
+/// answered row it could not apply stays `answered`.
+///
+/// **The cancel (I-7).** `session.cancel(grace)` first — ACP answers every parked responder
+/// `cancelled` itself, the fake drops it — then the parked request's `permission_answer {option_id:
+/// null, by: "policy", cancelled: true}`, which no transport writes, then the rows, then a drain of
+/// what the cancel produced up to the turn's `done`, bounded by `grace` plus one second (B-11).
 ///
 /// # Errors
+/// [`DriverError::Cancelled`] after a graceful cancel (I-7); [`DriverError::Store`]
+/// `(Fenced { step })` when an answer can no longer be applied under the lease (D4);
 /// [`DriverError::Closed`] for a stream that ended without `done`; the recorder's failures.
 pub async fn drive<S: htui_core::store::RecorderStore, R: htui_core::store::RelayStore>(
     session: &mut dyn AgentSession,
@@ -165,14 +191,68 @@ pub async fn drive<S: htui_core::store::RecorderStore, R: htui_core::store::Rela
     relay: Option<&Relay<'_, R>>,
     control: &mut Control,
 ) -> Result<DoneEvent, DriverError> {
-    let _ = (relay, control);
+    let mut opened = false;
+    let out = turn(session, recorder, relay, control, &mut opened).await;
+    if let Some(relay) = relay
+        && opened
+        && settles_stale(&out)
+        && let Err(err) = htui_core::store::RelayStore::settle_permissions(
+            relay.store,
+            relay.session,
+            PermissionStatus::Stale,
+        )
+        .await
+    {
+        tracing::warn!(%err, "the session's leftover permission rows were not marked stale");
+    }
+    out
+}
+
+/// B-15: whether an exit marks the session's leftover rows `stale`. Not a cancel (it settled them
+/// `cancelled` itself) and not a fence (the run is no longer this process's to write).
+const fn settles_stale(out: &Result<DoneEvent, DriverError>) -> bool {
+    !matches!(
+        out,
+        Err(DriverError::Cancelled | DriverError::Store(StoreError::Fenced { .. }))
+    )
+}
+
+/// The loop of [`drive`]; `opened` says whether a relay row of this session was written.
+async fn turn<S: htui_core::store::RecorderStore, R: htui_core::store::RelayStore>(
+    session: &mut dyn AgentSession,
+    recorder: &mut Recorder<'_, S>,
+    relay: Option<&Relay<'_, R>>,
+    control: &mut Control,
+    opened: &mut bool,
+) -> Result<DoneEvent, DriverError> {
+    // The calls seen so far, by id: what a policy rule matches on and what the summary names.
+    let mut calls: HashMap<String, ToolCallEvent> = HashMap::new();
     loop {
-        let Some(envelope) = session.next_event().await? else {
+        // R-8, B-2: a cancel sent before this call, or while the last event was being recorded.
+        if let Signal::Cancel { grace } = control.signal() {
+            return cancel(session, recorder, relay, *opened, None, grace).await;
+        }
+        // Both transports' `next_event` is cancel-safe (an mpsc `recv`; the fake resolves at its
+        // first poll), so a cancel that wins drops nothing.
+        let pulled = tokio::select! {
+            biased;
+            () = control.changed() => None,
+            pulled = session.next_event() => Some(pulled),
+        };
+        // The control changed: the loop top reads the new value.
+        let Some(pulled) = pulled else { continue };
+        let Some(envelope) = pulled? else {
             return Err(DriverError::Closed);
         };
         let done = match &envelope.event {
             DriverEvent::Done(done) => Some(*done),
             _ => None,
+        };
+        // Only with a relay: the call (for policy matching and the summary) and the request.
+        let (call, request) = match (&envelope.event, relay.is_some()) {
+            (DriverEvent::ToolCall(call), true) => (Some(call.clone()), None),
+            (DriverEvent::PermissionRequest(request), true) => (None, Some(request.clone())),
+            _ => (None, None),
         };
         if let Some(breach) = recorder.record(envelope).await? {
             return enforce_breach(session, recorder, breach).await;
@@ -180,5 +260,254 @@ pub async fn drive<S: htui_core::store::RecorderStore, R: htui_core::store::Rela
         if let Some(done) = done {
             return Ok(done);
         }
+        // `pump`: pull on, and the transport says "parked".
+        let Some(relay) = relay else { continue };
+        if let Some(call) = call {
+            calls.insert(call.tool_call_id.clone(), call);
+        }
+        if let Some(request) = request {
+            match park(session, recorder, relay, control, &calls, &request, opened).await? {
+                Parked::Resumed => {}
+                Parked::Cancel { grace } => {
+                    return cancel(
+                        session,
+                        recorder,
+                        Some(relay),
+                        *opened,
+                        Some(&request.request_id),
+                        grace,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+}
+
+/// How a request [`park`] handled left the turn.
+enum Parked {
+    /// Answered (by policy or by a client): pull on.
+    Resumed,
+    /// Cancel the session with this grace.
+    Cancel {
+        /// The window `AgentSession::cancel` is given.
+        grace: Duration,
+    },
+}
+
+/// One request: stages 1-2 answer at once (D9); stage 3 is relayed and waited on (D3-D5, D8).
+async fn park<S: htui_core::store::RecorderStore, R: htui_core::store::RelayStore>(
+    session: &mut dyn AgentSession,
+    recorder: &mut Recorder<'_, S>,
+    relay: &Relay<'_, R>,
+    control: &mut Control,
+    calls: &HashMap<String, ToolCallEvent>,
+    request: &PermissionRequestEvent,
+    opened: &mut bool,
+) -> Result<Parked, DriverError> {
+    let call = request.tool_call_id.as_ref().and_then(|id| calls.get(id));
+    // Stages 1-2 (D9): the agent's own policy, as chat's `run_turn` does.
+    if let Some(answer) = crate::permission::evaluate(relay.policy, call, &request.options) {
+        session
+            .answer_permission(
+                request.request_id.clone(),
+                PermissionAnswer::Selected(answer.option_id.clone()),
+            )
+            .await?;
+        recorder
+            .record_permission_answer(
+                &request.request_id,
+                Some(&answer.option_id),
+                AnsweredBy::Policy,
+                false,
+                (relay.now)(),
+            )
+            .await?;
+        tracing::info!(
+            stage = ?answer.stage,
+            reason = %answer.reason,
+            "a permission request was answered by policy"
+        );
+        return Ok(Parked::Resumed);
+    }
+
+    // Stage 3: the request row is durable before a relay row names it.
+    recorder.flush().await?;
+    let (summary, options) = scrubbed(recorder.scrubber, call, &request.options);
+    let id = PermissionId::new();
+    htui_core::store::RelayStore::open_permission(
+        relay.store,
+        OpenPermission {
+            id,
+            run_id: relay.run,
+            run_step_id: relay.step,
+            session: relay.session,
+            request_id: request.request_id.as_str().to_owned(),
+            tool_call_id: request.tool_call_id.clone(),
+            summary,
+            options,
+            owner: relay.owner,
+        },
+    )
+    .await?;
+    *opened = true;
+
+    loop {
+        if let Signal::Cancel { grace } = control.signal() {
+            return Ok(Parked::Cancel { grace });
+        }
+        let row = htui_core::store::RelayStore::permission(relay.store, id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "step_permission",
+                id: id.to_string(),
+            })?;
+        match row.status {
+            PermissionStatus::Pending => {}
+            PermissionStatus::Answered => {
+                // D4: apply under the lease, answer the live session, echo through the recorder.
+                // `None` right after the row read `answered` is the lease gone (B-16).
+                let Some(choice) =
+                    htui_core::store::RelayStore::apply_permission(relay.store, id, relay.owner)
+                        .await?
+                else {
+                    return Err(StoreError::Fenced { step: relay.step }.into());
+                };
+                session
+                    .answer_permission(
+                        request.request_id.clone(),
+                        PermissionAnswer::Selected(choice.option_id.clone()),
+                    )
+                    .await?;
+                recorder
+                    .record_permission_answer(
+                        &request.request_id,
+                        Some(&choice.option_id),
+                        AnsweredBy::User,
+                        false,
+                        (relay.now)(),
+                    )
+                    .await?;
+                return Ok(Parked::Resumed);
+            }
+            // B-16: superseded by a newer session of the step, or cancelled by someone else.
+            PermissionStatus::Stale | PermissionStatus::Cancelled => {
+                return Ok(Parked::Cancel { grace: relay.grace });
+            }
+            // Applied, and not by this call: the row is no longer this session's to apply.
+            PermissionStatus::Applied => {
+                return Err(StoreError::Fenced { step: relay.step }.into());
+            }
+        }
+        tokio::select! {
+            biased;
+            () = control.changed() => {}
+            () = tokio::time::sleep(relay.poll) => {}
+        }
+    }
+}
+
+/// The graceful cancel (D6, I-7; see [`drive`]'s doc for the order).
+async fn cancel<S: htui_core::store::RecorderStore, R: htui_core::store::RelayStore>(
+    session: &mut dyn AgentSession,
+    recorder: &mut Recorder<'_, S>,
+    relay: Option<&Relay<'_, R>>,
+    opened: bool,
+    parked: Option<&PermissionRequestId>,
+    grace: Duration,
+) -> Result<DoneEvent, DriverError> {
+    if let Err(err) = session.cancel(grace).await {
+        tracing::warn!(%err, "the cancel took the kill path; the closing rows are written anyway");
+    }
+    if let Some(relay) = relay {
+        if let Some(request_id) = parked {
+            recorder
+                .record_permission_answer(request_id, None, AnsweredBy::Policy, true, (relay.now)())
+                .await?;
+        }
+        if opened {
+            htui_core::store::RelayStore::settle_permissions(
+                relay.store,
+                relay.session,
+                PermissionStatus::Cancelled,
+            )
+            .await?;
+        }
+    }
+    let drained = async {
+        while let Ok(Some(envelope)) = session.next_event().await {
+            let done = matches!(envelope.event, DriverEvent::Done(_));
+            // A breach verdict here is spent: the session is already closing.
+            recorder.record(envelope).await?;
+            if done {
+                break;
+            }
+        }
+        Ok::<(), RecordError>(())
+    };
+    match tokio::time::timeout(grace + DRAIN_SLACK, drained).await {
+        Ok(recorded) => recorded?,
+        Err(_) => {
+            tracing::warn!("the cancelled session did not end its turn within the grace");
+        }
+    }
+    Err(DriverError::Cancelled)
+}
+
+/// B-14: `"<tool_kind>: <title>"` and the labels, scrubbed together as one document by the
+/// recorder's scrubber. Fail-closed on [`Unmasked`](htui_core::scrub::Unmasked): no summary, and
+/// each label becomes its kind's text. Option ids are never scrubbed: they are sent back verbatim.
+fn scrubbed(
+    scrubber: &dyn Scrubber,
+    call: Option<&ToolCallEvent>,
+    options: &[PermissionOption],
+) -> (Option<String>, Vec<RelayOption>) {
+    let summary = call.map(|call| format!("{}: {}", call.tool_kind.as_str(), call.title));
+    let mut document = json!({
+        "summary": summary,
+        "labels": options.iter().map(|option| option.label.as_str()).collect::<Vec<_>>(),
+    });
+    let masked = match scrubber.scrub(&mut document) {
+        Ok(()) => Some(document),
+        Err(unmasked) => {
+            tracing::warn!(%unmasked, "a relayed request's summary and labels were not persisted");
+            None
+        }
+    };
+    let summary = masked
+        .as_ref()
+        .and_then(|document| document.get("summary"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let labels = masked
+        .as_ref()
+        .and_then(|document| document.get("labels"))
+        .and_then(Value::as_array);
+    let options = options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| {
+            let kind = relay_kind(option.kind);
+            let label = labels
+                .and_then(|labels| labels.get(index))
+                .and_then(Value::as_str)
+                .map_or_else(|| kind.as_str().to_owned(), str::to_owned);
+            RelayOption {
+                id: option.id.clone(),
+                label,
+                kind,
+            }
+        })
+        .collect();
+    (summary, options)
+}
+
+/// `PermissionOptionKind` → `RelayOptionKind`, one arm per variant.
+const fn relay_kind(kind: PermissionOptionKind) -> RelayOptionKind {
+    match kind {
+        PermissionOptionKind::AllowOnce => RelayOptionKind::AllowOnce,
+        PermissionOptionKind::AllowAlways => RelayOptionKind::AllowAlways,
+        PermissionOptionKind::RejectOnce => RelayOptionKind::RejectOnce,
+        PermissionOptionKind::RejectAlways => RelayOptionKind::RejectAlways,
     }
 }

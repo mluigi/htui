@@ -166,8 +166,8 @@ pub struct QuotaLatch {
 /// cost; an *absent* cap is [`Recorder::with_run_cap`] never being called.
 ///
 /// The grace rides here rather than on [`pump`] so that seam keeps its signature (blueprint H-9):
-/// the worker passes its own `CANCEL_GRACE`, the conformance suite passes zero, and eighteen call
-/// sites do not move to carry a value only one of them has an opinion about.
+/// the worker passes its own `CANCEL_GRACE`, the conformance suite passes zero, and its call sites
+/// do not move to carry a value only one of them has an opinion about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunCap {
     /// The cap in USD micros.
@@ -1892,7 +1892,7 @@ pub async fn pump<S: htui_core::store::RecorderStore>(
 /// says the last row says `cancelled`.
 ///
 /// The grace comes off [`Recorder::run_cap`] rather than a parameter, which is what keeps `pump`'s
-/// signature and its eighteen call sites unchanged (blueprint H-9).
+/// signature and its call sites unchanged (blueprint H-9).
 ///
 /// A **failed cancel is logged, not returned**: the kill path has already ended the session by
 /// then, and the rows still have to be written. Returning here would leave a log whose last row is
