@@ -2364,9 +2364,12 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
         // another process on this box applied this very row and is still in `cancel_leased`'s
         // cleanup, where B-4's terminal clause hands the pending row to this poll too. The row is
         // `applied` whichever process resolves it first; a TUI's own `c` still hears the status.
-        Some(Err(err @ EngineError::RunStatus { status, .. }))
-            if status == RunStatus::Cancelled =>
-        {
+        Some(Err(
+            err @ EngineError::RunStatus {
+                status: RunStatus::Cancelled,
+                ..
+            },
+        )) => {
             resolve(RunCommandStatus::Applied, None).await;
             refuse(&ctx, err.to_string());
         }
