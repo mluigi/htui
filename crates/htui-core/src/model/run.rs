@@ -746,6 +746,8 @@ pub struct RunStepSummary {
     /// `agent.name` of `agent_id`, denormalised for the Runs pane; `None` when `agent_id` is
     /// `None` or names no row.
     pub agent_name: Option<String>,
+    /// `run_step.gate_note`.
+    pub gate_note: Option<String>,
 }
 
 /// Plan D106's derivation of [`RunStepSummary::prompt_tokens`] and [`RunStepSummary::trimmed`]

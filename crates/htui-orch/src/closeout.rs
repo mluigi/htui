@@ -289,6 +289,7 @@ mod tests {
             verify_outcome: None,
             promoted_at: None,
             agent_name: None,
+            gate_note: None,
         }
     }
 

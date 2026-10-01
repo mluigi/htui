@@ -9555,6 +9555,22 @@ async fn gate_answers_write_their_outcome<S: WriteStore>(store: &S) {
         Some("looks right"),
         "{CASE}: so is the note"
     );
+    let listed = store
+        .runs(ids::HTUI_FEAT_3)
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|run| run.id == ids::RUN_2)
+        .unwrap_or_else(|| panic!("{CASE}: FEAT-3 owns RUN_2"))
+        .steps
+        .into_iter()
+        .find(|step| step.id == approved)
+        .unwrap_or_else(|| panic!("{CASE}: RUN_2 lists the approved step"));
+    assert_eq!(
+        listed.gate_note.as_deref(),
+        Some("looks right"),
+        "{CASE}: the summary carries the note the row does"
+    );
     assert_eq!(row.finished_at, Some(at), "{CASE}: and the caller's clock");
     assert!(
         !store

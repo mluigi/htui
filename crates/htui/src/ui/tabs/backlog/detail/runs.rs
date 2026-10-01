@@ -2146,6 +2146,7 @@ mod tests {
             verify_outcome: None,
             promoted_at: None,
             agent_name: None,
+            gate_note: None,
         };
         let span = |seconds: i64| RunStepSummary {
             finished_at: Some(demo_at(0, 0) + TimeDelta::seconds(seconds)),

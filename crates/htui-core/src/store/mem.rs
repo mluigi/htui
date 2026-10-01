@@ -1295,6 +1295,7 @@ impl State {
                         .agent_id
                         .and_then(|id| self.agents.get(&id))
                         .map(|agent| agent.name.clone()),
+                    gate_note: step.gate_note.clone(),
                 }
             })
             .collect()

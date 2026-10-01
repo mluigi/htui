@@ -397,7 +397,9 @@ impl ReadStore for PgStore {
                    s.exit_code,
                    s.verify_outcome AS "verify_outcome: htui_core::model::VerifyOutcome",
                    s.promoted_at,
-                   a.name                                           AS "agent_name?"
+                   a.name                                           AS "agent_name?",
+                   -- Appended, positional: `run_step.gate_note`.
+                   s.gate_note
               FROM run_step s
               LEFT JOIN agent a ON a.id = s.agent_id
              WHERE s.run_id = ANY($1)
