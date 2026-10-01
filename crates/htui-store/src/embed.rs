@@ -6,6 +6,11 @@
 //! model nor a network. The sparse half of hybrid search is not a model at all: see
 //! [`crate::bm25`].
 use htui_core::store::StoreError;
+#[cfg(feature = "local-embed")]
+use std::{fmt, sync::Arc};
+
+#[cfg(feature = "local-embed")]
+use crate::model::{self, ModelFiles};
 
 /// Width of BGE-small-en-v1.5's vectors, and so of the index's `dense` vector.
 pub const DENSE_DIM: usize = 384;
@@ -20,17 +25,223 @@ pub trait DenseEmbedder {
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, StoreError>;
 }
 
+/// Most padded tokens (rows × longest row) one forward pass may hold: 16 rows of 512 (MOD-68 D5).
+#[cfg(any(test, feature = "local-embed"))]
+pub(crate) const MAX_BATCH_TOKENS: usize = 16 * 512;
+
+/// Splits texts of token lengths `lens`, in input order, into consecutive ranges whose
+/// `rows × longest` stays within `cap`. A single text longer than `cap` is a range of its own.
+#[cfg(any(test, feature = "local-embed"))]
+pub(crate) fn sub_batches(lens: &[usize], cap: usize) -> Vec<std::ops::Range<usize>> {
+    let cap = cap.max(1);
+    let mut ranges = Vec::new();
+    let (mut start, mut longest) = (0, 0);
+    for (i, &len) in lens.iter().enumerate() {
+        let widest = longest.max(len);
+        if i > start && (i - start + 1) * widest > cap {
+            ranges.push(start..i);
+            start = i;
+            longest = len;
+        } else {
+            longest = widest;
+        }
+    }
+    if start < lens.len() {
+        ranges.push(start..lens.len());
+    }
+    ranges
+}
+
+/// BGE-small-en-v1.5 on `rten`, run on the blocking pool (MOD-68 D3). Cheap to clone: the model,
+/// the tokenizer and the thread pool are shared (MOD-64 D238).
+#[cfg(feature = "local-embed")]
+#[derive(Clone)]
+pub struct RtenEmbedder {
+    inner: Arc<Rten>,
+}
+
+/// What one loaded model holds: the graph, its tokenizer, a thread pool and the graph's node ids.
+#[cfg(feature = "local-embed")]
+struct Rten {
+    model: rten::Model,
+    tokenizer: tokenizers::Tokenizer,
+    pool: Arc<rten::ThreadPool>,
+    input_ids: rten::NodeId,
+    attention_mask: rten::NodeId,
+    token_type_ids: rten::NodeId,
+    output: rten::NodeId,
+}
+
+#[cfg(feature = "local-embed")]
+impl fmt::Debug for RtenEmbedder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RtenEmbedder").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "local-embed")]
+impl RtenEmbedder {
+    /// Loads the model and tokenizer from `files`. CPU only; never touches the network.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`] naming the file that would not load.
+    pub fn load(files: &ModelFiles) -> Result<Self, StoreError> {
+        use tokenizers::{AddedToken, Tokenizer, TruncationParams};
+
+        let cannot = |path: &std::path::Path, e: &dyn fmt::Display| {
+            StoreError::Backend(format!(
+                "embedding model: cannot load {}: {e}",
+                path.display()
+            ))
+        };
+        // The tokenizer first: it is cheap, and it fails fast on a wrong directory.
+        let mut tokenizer =
+            Tokenizer::from_file(&files.tokenizer).map_err(|e| cannot(&files.tokenizer, &e))?;
+        // Truncation only: padding is per sub-batch, by hand, in `embed_blocking` (MOD-68 A-2).
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: model::MAX_TOKENS,
+                ..Default::default()
+            }))
+            .map_err(|e| cannot(&files.tokenizer, &e))?;
+        // fastembed's own call, from constants: it re-added `special_tokens_map.json`'s tokens.
+        tokenizer
+            .add_special_tokens(model::SPECIAL_TOKENS.map(|t| AddedToken {
+                content: t.into(),
+                special: true,
+                ..Default::default()
+            }))
+            .map_err(|e| cannot(&files.tokenizer, &e))?;
+
+        let graph = rten::Model::load_file(&files.onnx).map_err(|e| cannot(&files.onnx, &e))?;
+        let node = |name: &str| graph.node_id(name).map_err(|e| cannot(&files.onnx, &e));
+        let input_ids = node("input_ids")?;
+        let attention_mask = node("attention_mask")?;
+        let token_type_ids = node("token_type_ids")?;
+        let output = *graph.output_ids().first().ok_or_else(|| {
+            StoreError::Backend(format!(
+                "embedding model: {} has no output",
+                files.onnx.display()
+            ))
+        })?;
+        let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        Ok(Self {
+            inner: Arc::new(Rten {
+                model: graph,
+                tokenizer,
+                pool: Arc::new(rten::ThreadPool::with_num_threads(threads)),
+                input_ids,
+                attention_mask,
+                token_type_ids,
+                output,
+            }),
+        })
+    }
+
+    /// One vector per text, in input order, at most `cap` padded tokens per forward pass.
+    fn embed_blocking(&self, texts: &[String], cap: usize) -> Result<Vec<Vec<f32>>, StoreError> {
+        use rten_tensor::NdTensor;
+        use rten_tensor::prelude::*;
+
+        let failed = |e: &dyn fmt::Display| StoreError::Backend(format!("embedding failed: {e}"));
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rten = &*self.inner;
+        let encodings = rten
+            .tokenizer
+            .encode_batch(texts.iter().map(String::as_str).collect::<Vec<_>>(), true)
+            .map_err(|e| failed(&e))?;
+        let lens: Vec<usize> = encodings.iter().map(|e| e.get_ids().len()).collect();
+
+        let mut vectors = Vec::with_capacity(texts.len());
+        for range in sub_batches(&lens, cap) {
+            let rows = range.len();
+            let longest = lens[range.clone()].iter().copied().max().unwrap_or(0);
+            // Right-side padding to this sub-batch's longest row: `[PAD]` (`model::PAD_ID`, 0),
+            // mask 0, type 0, exactly what `PaddingStrategy::BatchLongest` makes of it.
+            let mut ids = vec![model::PAD_ID as i32; rows * longest];
+            let mut mask = vec![0_i32; rows * longest];
+            let mut types = vec![0_i32; rows * longest];
+            for (row, encoding) in encodings[range].iter().enumerate() {
+                let at = row * longest;
+                for (k, ((&id, &m), &t)) in encoding
+                    .get_ids()
+                    .iter()
+                    .zip(encoding.get_attention_mask())
+                    .zip(encoding.get_type_ids())
+                    .enumerate()
+                {
+                    ids[at + k] = id as i32;
+                    mask[at + k] = m as i32;
+                    types[at + k] = t as i32;
+                }
+            }
+            let ids = NdTensor::from_data([rows, longest], ids);
+            let mask = NdTensor::from_data([rows, longest], mask);
+            let types = NdTensor::from_data([rows, longest], types);
+
+            let mut opts = rten::RunOptions::default();
+            opts.thread_pool = Some(Arc::clone(&rten.pool));
+            let mut outputs = rten
+                .model
+                .run(
+                    vec![
+                        (rten.input_ids, ids.view().into()),
+                        (rten.attention_mask, mask.view().into()),
+                        (rten.token_type_ids, types.view().into()),
+                    ],
+                    &[rten.output],
+                    Some(opts),
+                )
+                .map_err(|e| failed(&e))?;
+            let hidden: NdTensor<f32, 3> = outputs
+                .pop()
+                .ok_or_else(|| failed(&"the model answered nothing"))?
+                .try_into()
+                .map_err(|e| failed(&e))?;
+            let width = hidden.shape()[2];
+            if width != DENSE_DIM {
+                return Err(failed(&format_args!(
+                    "the model answered {width}-wide vectors, expected {DENSE_DIM}"
+                )));
+            }
+            for row in 0..rows {
+                // The `[CLS]` token's hidden state, then fastembed's normalisation exactly.
+                let v: Vec<f32> = hidden.slice((row, 0)).iter().copied().collect();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                vectors.push(v.iter().map(|x| x / (norm + 1e-12)).collect());
+            }
+        }
+        Ok(vectors)
+    }
+}
+
+#[cfg(feature = "local-embed")]
+impl DenseEmbedder for RtenEmbedder {
+    fn dim(&self) -> usize {
+        DENSE_DIM
+    }
+
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, StoreError> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.embed_blocking(&texts, MAX_BATCH_TOKENS))
+            .await
+            .map_err(|e| StoreError::Backend(format!("embedding task failed: {e}")))?
+    }
+}
+
 /// BGE-small-en-v1.5 through `fastembed-rs`, run on the blocking pool. Cheap to clone: the
 /// model is shared (MOD-64 D238).
 #[cfg(feature = "local-embed")]
 #[derive(Clone)]
 pub struct FastEmbedder {
-    model: std::sync::Arc<fastembed::TextEmbedding>,
+    model: Arc<fastembed::TextEmbedding>,
 }
 
 #[cfg(feature = "local-embed")]
-impl std::fmt::Debug for FastEmbedder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for FastEmbedder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FastEmbedder").finish_non_exhaustive()
     }
 }
@@ -53,7 +264,7 @@ impl FastEmbedder {
         let model = TextEmbedding::try_new(options)
             .map_err(|e| StoreError::Backend(format!("failed to load the embedding model: {e}")))?;
         Ok(Self {
-            model: std::sync::Arc::new(model),
+            model: Arc::new(model),
         })
     }
 }
@@ -292,5 +503,171 @@ mod tests {
         let mut json = serde_json::to_string_pretty(&goldens).expect("serialises");
         json.push('\n');
         std::fs::write(&path, json).expect("writes the fixture");
+    }
+
+    /// Every range's padded size, or a lone oversize text.
+    fn assert_within_cap(lens: &[usize], cap: usize) {
+        for r in sub_batches(lens, cap) {
+            let longest = lens[r.clone()].iter().copied().max().unwrap_or(0);
+            assert!(
+                r.len() * longest <= cap || r.len() == 1,
+                "{r:?} pads {} tokens past the cap {cap}",
+                r.len() * longest
+            );
+        }
+    }
+
+    /// The ANA-23 §9 shape: a full requirement chunk of short texts and one long one.
+    fn chunk_with_one_long_text() -> Vec<usize> {
+        let mut lens = vec![20; 255];
+        lens.push(512);
+        lens
+    }
+
+    #[test]
+    fn sub_batches_of_nothing_is_nothing() {
+        assert!(sub_batches(&[], MAX_BATCH_TOKENS).is_empty());
+    }
+
+    #[test]
+    fn sub_batches_that_fit_are_one_range() {
+        assert_eq!(sub_batches(&[3, 9, 4], 100), vec![0..3]);
+    }
+
+    #[test]
+    fn sub_batches_honour_the_cap() {
+        assert_within_cap(&chunk_with_one_long_text(), MAX_BATCH_TOKENS);
+        assert_within_cap(&[512; 40], MAX_BATCH_TOKENS);
+        assert_within_cap(&[1, 512, 1, 512, 3, 7, 200], 1024);
+        assert_within_cap(&[5, 5, 5, 5, 5], 10);
+        assert_within_cap(&[5, 5, 5], 0);
+    }
+
+    #[test]
+    fn sub_batches_keep_input_order() {
+        for (lens, cap) in [
+            (chunk_with_one_long_text(), MAX_BATCH_TOKENS),
+            (vec![512; 40], MAX_BATCH_TOKENS),
+            (vec![1, 512, 1, 512, 3, 7, 200], 1024),
+            (vec![7; 3], 0),
+        ] {
+            let ranges = sub_batches(&lens, cap);
+            let mut next = 0;
+            for r in &ranges {
+                assert_eq!(r.start, next, "{ranges:?}");
+                assert!(!r.is_empty(), "{ranges:?}");
+                next = r.end;
+            }
+            assert_eq!(next, lens.len(), "{ranges:?}");
+        }
+    }
+
+    #[test]
+    fn an_oversize_text_is_alone() {
+        assert_eq!(sub_batches(&[10, 600, 10], 512), vec![0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn a_long_text_does_not_pad_the_whole_chunk() {
+        let ranges = sub_batches(&chunk_with_one_long_text(), MAX_BATCH_TOKENS);
+        let holding = ranges
+            .iter()
+            .find(|r| r.contains(&255))
+            .expect("a range holds the long text");
+        assert!(holding.len() <= 16, "{holding:?} of {ranges:?}");
+    }
+
+    /// The seeded fastembed snapshot (T2); T3 swaps this for `model::ensure_model()`.
+    #[cfg(feature = "local-embed")]
+    async fn golden_model() -> ModelFiles {
+        let snap = dirs::cache_dir()
+            .expect("a cache dir")
+            .join("htui/fastembed/models--Xenova--bge-small-en-v1.5/snapshots")
+            .join(model::REVISION);
+        ModelFiles {
+            onnx: snap.join("onnx/model.onnx"),
+            tokenizer: snap.join("tokenizer.json"),
+        }
+    }
+
+    /// Each vector within 1e-5 per element and cosine ≥ 1 - 1e-9 of its golden (D2).
+    #[cfg(feature = "local-embed")]
+    fn assert_matches_goldens(got: &[Vec<f32>], goldens: &Goldens) {
+        assert_eq!(got.len(), goldens.vectors.len());
+        let (mut worst_diff, mut worst_cos) = (0.0_f32, 1.0_f64);
+        for (i, (a, b)) in got.iter().zip(&goldens.vectors).enumerate() {
+            assert_eq!(a.len(), DENSE_DIM, "text {i}");
+            let (at, diff) = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .enumerate()
+                .fold((0, 0.0_f32), |w, (j, d)| if d > w.1 { (j, d) } else { w });
+            assert!(
+                diff <= 1e-5,
+                "text {i}: element {at} is {} against the golden {} (|diff| {diff})",
+                a[at],
+                b[at]
+            );
+            let dot: f64 = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| f64::from(*x) * f64::from(*y))
+                .sum();
+            let na = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+            let nb = b.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+            let cos = dot / (na * nb);
+            assert!(cos >= 1.0 - 1e-9, "text {i}: cosine {cos}");
+            worst_diff = worst_diff.max(diff);
+            worst_cos = worst_cos.min(cos);
+        }
+        eprintln!("goldens: max element diff {worst_diff:e}, min cosine {worst_cos}");
+    }
+
+    #[cfg(feature = "local-embed")]
+    #[tokio::test]
+    #[ignore = "needs the BGE model (133 MB)"]
+    async fn rten_matches_fastembed_goldens() {
+        let goldens = read_goldens();
+        let e = RtenEmbedder::load(&golden_model().await).expect("model loads");
+        let got = e.embed(goldens.texts.clone()).await.expect("embeds");
+        assert_matches_goldens(&got, &goldens);
+    }
+
+    #[cfg(feature = "local-embed")]
+    #[tokio::test]
+    #[ignore = "needs the BGE model (133 MB)"]
+    async fn rten_matches_goldens_one_text_per_pass() {
+        let goldens = read_goldens();
+        let e = RtenEmbedder::load(&golden_model().await).expect("model loads");
+        let texts = goldens.texts.clone();
+        let got = tokio::task::spawn_blocking(move || e.embed_blocking(&texts, model::MAX_TOKENS))
+            .await
+            .expect("the task ran")
+            .expect("embeds");
+        assert_matches_goldens(&got, &goldens);
+    }
+
+    #[cfg(feature = "local-embed")]
+    #[tokio::test]
+    #[ignore = "needs the BGE model (133 MB)"]
+    async fn rten_embeds_nothing_as_nothing() {
+        let e = RtenEmbedder::load(&golden_model().await).expect("model loads");
+        assert_eq!(
+            e.embed(vec![]).await.expect("embeds"),
+            Vec::<Vec<f32>>::new()
+        );
+    }
+
+    #[cfg(feature = "local-embed")]
+    #[test]
+    fn rten_load_names_a_missing_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let err = RtenEmbedder::load(&ModelFiles {
+            onnx: tmp.path().join("absent.onnx"),
+            tokenizer: tmp.path().join("absent.json"),
+        })
+        .expect_err("nothing to load");
+        assert!(err.to_string().contains("absent.json"), "{err}");
     }
 }
