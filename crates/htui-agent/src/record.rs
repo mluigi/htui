@@ -118,6 +118,10 @@ use crate::driver::{AgentSession, PermissionRequestId};
 use crate::error::DriverError;
 use crate::event::{DoneEvent, DriverEnvelope, DriverEvent, ErrorEvent, StopReason};
 
+mod relay;
+
+pub use relay::{Control, NoRelay, RELAY_GRACE, RELAY_POLL, Relay, Signal, control_channel, drive};
+
 /// Flush trigger 4: the accumulated text a coalesced run may reach before it is cut.
 ///
 /// A bound, not a target - one pathological turn cannot buffer unboundedly - and a byte count
@@ -1855,21 +1859,16 @@ pub async fn pump<S: htui_core::store::RecorderStore>(
     session: &mut dyn AgentSession,
     recorder: &mut Recorder<'_, S>,
 ) -> Result<DoneEvent, DriverError> {
-    loop {
-        let Some(envelope) = session.next_event().await? else {
-            return Err(DriverError::Closed);
-        };
-        let done = match &envelope.event {
-            DriverEvent::Done(done) => Some(*done),
-            _ => None,
-        };
-        if let Some(breach) = recorder.record(envelope).await? {
-            return enforce_breach(session, recorder, breach).await;
-        }
-        if let Some(done) = done {
-            return Ok(done);
-        }
-    }
+    // MOD-42 plan D6: `drive` with no relay and a control nothing signals is today's loop: no
+    // policy evaluation, no row, and a parked request is pulled past exactly as before, so the
+    // transport still answers "is parked" (I-8).
+    drive(
+        session,
+        recorder,
+        None::<&Relay<'_, NoRelay>>,
+        &mut Control::never(),
+    )
+    .await
 }
 
 /// The per-run cap's cancel-and-close sequence, performed by the layer that holds the session

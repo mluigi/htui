@@ -38,6 +38,12 @@ pub enum DriverError {
     /// rather than matching on a message.
     #[error("this transport has no `{0}` operation")]
     Unsupported(&'static str),
+    /// MOD-42 plan D6: the session was cancelled on request (a run cancel or a promote's
+    /// preempt) and closed gracefully: every parked request was answered `cancelled` and
+    /// recorded (I-7). Not a transport failure; the engine lifts it to `EngineError::Cancelled`
+    /// and settles nothing (I-6).
+    #[error("the session was cancelled on request")]
+    Cancelled,
     /// A store write the driver had to make failed.
     #[error(transparent)]
     Store(#[from] StoreError),
