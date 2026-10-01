@@ -19,7 +19,7 @@ test-support = ["demo"]
 # MOD-34 D2: the production embedder (`embed::FastEmbedder`). Off by default because `ort`
 # downloads onnxruntime at build time; the `htui` binary turns it on. Offline builds can point
 # `ORT_LIB_LOCATION` at a local onnxruntime 1.18 instead.
-local-embed = ["dep:fastembed"]
+local-embed = ["dep:fastembed", "dep:rten", "dep:rten-tensor", "dep:tokenizers"]
 
 [dependencies]
 htui-core   = { workspace = true, features = ["sqlx"] }
@@ -43,6 +43,10 @@ tokio       = { workspace = true }
 tracing     = { workspace = true }
 qdrant-client      = { workspace = true }
 fastembed          = { workspace = true, optional = true }
+# MOD-68: `RtenEmbedder` (ANA-23 §7.1).
+rten               = { workspace = true, optional = true }
+rten-tensor        = { workspace = true, optional = true }
+tokenizers         = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # MOD-7 D1: the fingerprint's Windows machine identity, `HKLM\SOFTWARE\Microsoft\Cryptography`

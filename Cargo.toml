@@ -20,6 +20,31 @@ publish      = false
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
 
+# MOD-68: the embedder's numeric crates at full optimisation in dev and test builds. Measured on
+# 2026-10-01: one 512-token text takes 10.6 s at opt-level 0 and 90 ms at 3; hashing the 133 MB
+# model takes 2.5 s against 69 ms. Only these crates are affected; everything else keeps the fast
+# debug build.
+[profile.dev.package.rten]
+opt-level = 3
+[profile.dev.package.rten-base]
+opt-level = 3
+[profile.dev.package.rten-gemm]
+opt-level = 3
+[profile.dev.package.rten-onnx]
+opt-level = 3
+[profile.dev.package.rten-parallel]
+opt-level = 3
+[profile.dev.package.rten-shape-inference]
+opt-level = 3
+[profile.dev.package.rten-simd]
+opt-level = 3
+[profile.dev.package.rten-tensor]
+opt-level = 3
+[profile.dev.package.rten-vecmath]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+
 [workspace.dependencies]
 htui-core          = { path = "crates/htui-core" }
 htui-store         = { path = "crates/htui-store" }
@@ -110,6 +135,12 @@ sentry                = "0.49.2"
 sentry-anyhow         = "0.49.2"
 sentry-tracing        = "0.49.2"
 qdrant-client         = "1.19.0"
+# MOD-68 (ANA-23 §7.1): the embedder. `onnx_format` only: the `.rten` loader and the contrib ops
+# are not needed. Pure Rust, no build script needing a C compiler.
+rten                  = { version = "0.26.0", default-features = false, features = ["onnx_format"] }
+rten-tensor           = "0.26.0"
+# `fancy-regex`, not the default `onig`: no C build (ANA-23 §5.2).
+tokenizers            = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 fastembed             = "3.14.1"
 ureq                  = { version = "2.12.1", features = ["tls"] }
 walkdir               = "2"
