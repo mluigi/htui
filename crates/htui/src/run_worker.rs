@@ -3261,7 +3261,13 @@ pub(crate) mod tests {
             .expect("the run finishes");
         let mut runtime = fixture.runtime();
 
-        polled(&mut runtime, &fixture).await;
+        let frames = polled_watching(
+            &mut runtime,
+            &fixture,
+            ids::HTUI_ANA_2,
+            &LiveChats::default(),
+        )
+        .await;
         let commands = commands_of(&fixture, run);
         assert_eq!(commands.len(), 1);
         assert_eq!(
@@ -3271,6 +3277,221 @@ pub(crate) mod tests {
         let resolution = commands[0].resolution.clone().unwrap_or_default();
         assert!(resolution.contains("done"), "{resolution}");
         assert_eq!(fixture.run(run).await.status, RunStatus::Done);
+        assert!(
+            !frames
+                .iter()
+                .any(|kind| matches!(kind, FrameKind::Error(_))),
+            "B-10: a polled refusal is recorded on its row, never published: {frames:?}"
+        );
+    }
+
+    /// One command poll of `runtime` under `live`, settled, while a pane watches `item`: the kinds
+    /// of the frames published for it meanwhile.
+    async fn polled_watching(
+        runtime: &mut RunRuntime,
+        fixture: &Fixture,
+        item: ItemId,
+        live: &LiveChats,
+    ) -> Vec<FrameKind> {
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, mut answers) = mpsc::unbounded_channel();
+        runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq: 1,
+                    origin: Origin::Tab(TabId("backlog")),
+                    request: StoreRequest::RunStream { item },
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        while answers.try_recv().is_ok() {}
+        runtime.poll_commands(&backend, &replies, live);
+        assert!(runtime.settle(PATIENCE).await.is_empty(), "no task stuck");
+        drop(replies);
+        let mut frames = Vec::new();
+        while let Ok(envelope) = answers.try_recv() {
+            if let StoreReply::RunStream(frame) = envelope.reply {
+                frames.push(frame.kind);
+            }
+        }
+        frames
+    }
+
+    /// B-10 (F-12): a polled cancel of a run one of whose steps a live chat drives stays
+    /// `pending`, moves nothing and publishes nothing; the first poll after the chat closed
+    /// applies it.
+    #[tokio::test]
+    async fn a_polled_cancel_under_a_live_chat_stays_pending_and_silent() {
+        let fixture = Fixture::new().await;
+        let mut runtime = fixture.runtime();
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, _answers) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq: 1,
+                    origin: Origin::App,
+                    request: start_run(ids::HTUI_ANA_2),
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(matches!(served, RunServed::Deferred));
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+        let research = step_at(&fixture, run, 0).await;
+        assert_eq!(research.status, StepStatus::AwaitingApproval);
+        let id = requested(&fixture, run).await;
+
+        let frames = polled_watching(
+            &mut runtime,
+            &fixture,
+            ids::HTUI_ANA_2,
+            &LiveChats::of([research.id]),
+        )
+        .await;
+        assert!(
+            !frames
+                .iter()
+                .any(|kind| matches!(kind, FrameKind::Error(_))),
+            "the chat's refusal of a polled cancel is not published: {frames:?}"
+        );
+        assert_eq!(
+            commands_of(&fixture, run)
+                .iter()
+                .map(|row| (row.id, row.status))
+                .collect::<Vec<_>>(),
+            [(id, RunCommandStatus::Pending)]
+        );
+        assert_eq!(
+            fixture.run(run).await.status,
+            RunStatus::AwaitingApproval,
+            "nothing moved under the chat"
+        );
+
+        polled(&mut runtime, &fixture).await;
+        assert_eq!(
+            fixture.run(run).await.status,
+            RunStatus::Cancelled,
+            "the row was this poll's to apply all along"
+        );
+        assert_eq!(
+            commands_of(&fixture, run)
+                .iter()
+                .map(|row| (row.id, row.status))
+                .collect::<Vec<_>>(),
+            [(id, RunCommandStatus::Applied)]
+        );
+    }
+
+    /// B-20 with `Preempt::IfLive` (plan D11, D12 step 1): `c` on a `queued` run whose claim this
+    /// process is making stops that claim first, gracefully, then takes today's path: the run is
+    /// cancelled from `queued`, with no cancel row and nothing walked.
+    #[tokio::test]
+    async fn a_cancel_of_a_queued_run_stops_its_live_claim_first() {
+        let fixture = Fixture::new().await;
+        let run = queued_by_another(&fixture, ids::HTUI_ANA_2).await;
+        let mut runtime = fixture.runtime().with_cancel_grace(Duration::from_secs(60));
+        let probe = testing::probe(&runtime);
+        // This process's claim of the run, live.
+        let claim = probe.walk_child(run);
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, mut answers) = mpsc::unbounded_channel();
+
+        let served = runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq: 1,
+                    origin: Origin::App,
+                    request: cancel(run),
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(matches!(served, RunServed::Deferred), "{served:?}");
+        within("the claim being asked to stop", async {
+            while !testing::signalled(&claim) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        drop(claim);
+        assert!(runtime.settle(PATIENCE).await.is_empty(), "no task stuck");
+        drop(replies);
+        let mut reply = None;
+        while let Ok(envelope) = answers.try_recv() {
+            if envelope.seq == 1 && !matches!(envelope.reply, StoreReply::RunStream(_)) {
+                reply = Some(envelope.reply);
+            }
+        }
+        let reply = reply.expect("the cancel was answered");
+        assert!(
+            matches!(&reply, StoreReply::Orch(OrchReply::Done(_))),
+            "{reply:?}"
+        );
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
+        assert!(commands_of(&fixture, run).is_empty(), "no cancel row");
+        assert!(fixture.steps(run).await.is_empty(), "nothing walked");
+    }
+
+    /// D11: a command queued for the lock of a run being cancelled gracefully is refused at the
+    /// cancel's signal, not at the token's drop, so the cancel ends as soon as the walk rests —
+    /// well inside its grace — and the queued command is answered `PREEMPTED`.
+    #[tokio::test]
+    async fn a_command_queued_behind_a_cancelled_walk_leaves_at_the_signal() {
+        let fixture = Fixture::new().await;
+        let park = Park::new();
+        fixture.sessions.push(Play::Park(park.clone()));
+        let grace = Duration::from_secs(60);
+        let runtime = fixture.runtime().with_cancel_grace(grace);
+        let probe = testing::probe(&runtime);
+        let mut worker = Worker::spawn(&fixture.store, runtime);
+
+        let start = worker.send(Origin::App, start_run(ids::HTUI_ANA_2));
+        let parked = a_pending_request(&fixture).await;
+        let run = parked.run_id;
+        let queued = worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::AnswerGate {
+                run,
+                step: parked.run_step_id,
+                answer: GateAnswer::Approved,
+            })),
+        );
+        within("the gate answer queued for the run's lock", async {
+            while probe.live_walks(run) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let began = std::time::Instant::now();
+        let asked = worker.send(Origin::App, cancel(run));
+
+        assert!(matches!(
+            outcome(worker.reply(asked).await),
+            CommandOutcome::Cancelled { .. }
+        ));
+        assert!(
+            began.elapsed() < grace / 2,
+            "the cancel waited on the queued command: {:?}",
+            began.elapsed()
+        );
+        assert!(
+            matches!(worker.reply(queued).await, StoreReply::Failed { ref message, .. } if message == PREEMPTED),
+            "the queued command is refused as preempted"
+        );
+        assert!(
+            matches!(worker.reply(start).await, StoreReply::Failed { request: "start_run", ref message } if message == PREEMPTED),
+            "the walk's own requester is answered once, as preempted"
+        );
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
     }
 
     /// D13, B-5: a tick while a poll is in flight starts none, and a later tick skips a row a

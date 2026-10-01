@@ -2253,8 +2253,9 @@ async fn on_run<H: htui_core::store::WorkerHost, P: ReplySink>(
 /// `cancel_leased` (step 4); else `cancel_leased`, whose `LeaseHeld` leaves the row to the lease's
 /// holder (step 5). A row left pending is answered with [`CANCEL_REQUESTED`] (B-12).
 ///
-/// `existing` is a polled row (D13): no second row is written for it, and a live chat's refusal
-/// leaves it pending, logged at `debug` and never published (B-10).
+/// `existing` is a polled row (D13): no second row is written for it, and a refusal it meets —
+/// a live chat's (B-10), a transient failure's, or a terminal status's once the row is resolved —
+/// is logged at `debug` and never published.
 async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: TaskCtx<H, P>,
     run: RunId,
@@ -2263,21 +2264,28 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
 ) {
     let row = ctx.tag(run).await;
     let command = Command::CancelRun { run };
+    // B-10 (F-12): a polled row answers nobody, and its row stays for the next poll, so a refusal
+    // published from here would repeat an error frame every `COMMAND_POLL` while it lasts, or
+    // follow a cancel another task already applied (B-5's race): it is logged instead.
+    let refuse = move |ctx: &TaskCtx<H, P>, message: String| {
+        if existing.is_some() {
+            tracing::debug!(%run, %message, "a polled cancel was refused");
+        } else {
+            ctx.refuse(message);
+        }
+    };
     if moves_the_run(&command) && !live.is_empty() {
         let refusal = match ctx.host.run_steps(run).await {
             Ok(steps) => chat_free(&steps, live).err().map(|err| err.to_string()),
             Err(err) => Some(err.to_string()),
         };
         if let Some(refusal) = refusal {
-            if existing.is_some() {
-                tracing::debug!(%run, %refusal, "a polled cancel waits for the chat on its run");
-                return;
-            }
-            return ctx.refuse(refusal);
+            return refuse(&ctx, refusal);
         }
     }
     let Some(row) = row else {
-        return ctx.refuse(
+        return refuse(
+            &ctx,
             StoreError::NotFound {
                 entity: "run",
                 id: run.to_string(),
@@ -2285,17 +2293,19 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
             .to_string(),
         );
     };
-    // B-20: a queued or terminal run takes today's path and writes no row. A queued run's own
-    // start task in this process is still stopped first (as `CancelRun` always did), gracefully.
+    // B-20: a queued or terminal run takes today's path and writes no row. Plan D11 and D12 step
+    // 1 (not B-20's `Preempt::Never`): a queued run's own start or claim task in this process is
+    // still stopped first, as MOD-41's `Preempt::Always` did, now gracefully; with `Never` the
+    // cancel would wait behind that task's whole walk.
     if existing.is_none() && (row.status == RunStatus::Queued || row.status.is_terminal()) {
         return on_run(ctx, run, command, Preempt::IfLive, live).await;
     }
     let Some(writer) = ctx.host.writer() else {
-        return ctx.refuse(DATABASE_UNREACHABLE.to_owned());
+        return refuse(&ctx, DATABASE_UNREACHABLE.to_owned());
     };
     let (box_id, user) = match (registered_box(&ctx.host).await, ctx.host.this_user().await) {
         (Ok(box_id), Ok(user)) => (box_id, user),
-        (Err(err), _) | (_, Err(err)) => return ctx.refuse(err.to_string()),
+        (Err(err), _) | (_, Err(err)) => return refuse(&ctx, err.to_string()),
     };
     // D12 step 2: the row first.
     let (id, already) = match existing {
@@ -2304,7 +2314,7 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
             match htui_core::store::WorkerStore::request_cancel(&writer, run, user, box_id).await {
                 Ok(CancelRequest::Inserted(id)) => (id, false),
                 Ok(CancelRequest::AlreadyPending(id)) => (id, true),
-                Err(err) => return ctx.refuse(err.to_string()),
+                Err(err) => return refuse(&ctx, err.to_string()),
             }
         }
     };
@@ -2324,11 +2334,11 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
     }
     let walk = ctx.shared.walks.child(run);
     let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
-        return ctx.refuse(PREEMPTED.to_owned());
+        return refuse(&ctx, PREEMPTED.to_owned());
     };
     let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {
         Ok(kit) => kit,
-        Err(message) => return ctx.refuse(message),
+        Err(message) => return refuse(&ctx, message),
     };
     let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
     let engine = kit.engine(&driver);
@@ -2342,7 +2352,7 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
     match walked(&walk, engine.dispatch(command)).await {
         None => {
             engine.abandoned(run).await;
-            ctx.refuse(PREEMPTED.to_owned());
+            refuse(&ctx, PREEMPTED.to_owned());
         }
         Some(Ok(outcome)) => {
             resolve(RunCommandStatus::Applied, None).await;
@@ -2354,10 +2364,10 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
         Some(Err(err @ EngineError::RunStatus { status, .. })) if status.is_terminal() => {
             let sentence = err.to_string();
             resolve(RunCommandStatus::Refused, Some(sentence.clone())).await;
-            ctx.refuse(sentence);
+            refuse(&ctx, sentence);
         }
         // Anything else is transient: the row stays pending and the next poll retries.
-        Some(Err(err)) => ctx.refuse(err.to_string()),
+        Some(Err(err)) => refuse(&ctx, err.to_string()),
     }
     drop(guard);
 }
@@ -2493,6 +2503,7 @@ async fn cleanup<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, 
 pub mod testing {
     use std::collections::BTreeMap;
     use std::future::Future;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, PoisonError};
 
     use chrono::{DateTime, Utc};
@@ -2568,6 +2579,16 @@ pub mod testing {
         #[must_use]
         pub fn walk_child(&self, run: RunId) -> WalkToken {
             self.0.walks.child(run)
+        }
+
+        /// How many tasks hold a child token on `run`'s parent; 0 with no parent.
+        #[must_use]
+        pub fn live_walks(&self, run: RunId) -> usize {
+            self.0
+                .walks
+                .lock()
+                .get(&run)
+                .map_or(0, |parent| parent.live.load(Ordering::SeqCst))
         }
 
         /// Whether `run` is one of this process's dead walks (D158).
@@ -2668,6 +2689,12 @@ pub mod testing {
         work: impl Future<Output = ()> + Send + 'static,
     ) {
         super::spawn_supervised(ctx, work);
+    }
+
+    /// Whether a graceful preempt (MOD-42 plan D11) reached the task holding `walk`.
+    #[must_use]
+    pub fn signalled(walk: &WalkToken) -> bool {
+        walk.signal.borrow().is_cancel()
     }
 
     /// `resumed`: an adopted run's walk, resumed under its lock.
