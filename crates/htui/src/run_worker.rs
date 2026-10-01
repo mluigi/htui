@@ -3674,6 +3674,52 @@ pub(crate) mod tests {
         assert!(fixture.steps(run).await.is_empty(), "nothing walked");
     }
 
+    /// MOD-24 D3 (B5, D212): the sweep's cancels honour the live chats the last poll was handed.
+    /// A free run one of whose steps a live chat drives keeps its pending cancel through the
+    /// poll that refused it and through the sweep after it.
+    #[tokio::test]
+    async fn a_sweep_does_not_cancel_under_a_chat_the_poll_refused() {
+        let fixture = Fixture::new().await;
+        let agent = scripted_agent(&fixture).await;
+        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+        let step = fixture
+            .store
+            .create_step(NewRunStep {
+                id: StepId::new(),
+                run_id: run,
+                position: 0,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "research".to_owned(),
+                agent_id: Some(agent),
+                model: Some("sonnet".to_owned()),
+            })
+            .await
+            .expect("the step lands");
+        let id = requested(&fixture, run).await;
+        let mut runtime = fixture.runtime();
+
+        polled_watching(
+            &mut runtime,
+            &fixture,
+            ids::HTUI_ANA_2,
+            &LiveChats::of([step.id]),
+        )
+        .await;
+        assert_eq!(
+            command_states(&fixture, run),
+            [(id, RunCommandStatus::Pending)],
+            "the poll refused it under the chat"
+        );
+        swept(&mut runtime, &fixture).await;
+        assert_eq!(
+            command_states(&fixture, run),
+            [(id, RunCommandStatus::Pending)],
+            "and so did the sweep"
+        );
+        assert_ne!(fixture.run(run).await.status, RunStatus::Cancelled);
+    }
+
     /// B-20 with `Preempt::IfLive` (plan D11, D12 step 1): `c` on a `queued` run whose claim this
     /// process is making stops that claim first, gracefully, then takes today's path: the run is
     /// cancelled from `queued`, with no cancel row and nothing walked.
