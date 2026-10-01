@@ -187,6 +187,40 @@ pub async fn demo_db() -> Option<TestDb> {
     Some(db)
 }
 
+/// A second process's store on `url`, a [`demo_db`] database, registered as the fixture's box
+/// `ids::BOX`: the box `db.store` stands for after `load_demo` repointed it (MOD-24 D2). A
+/// `PgStore::connect(url, &db.identity)` would name the minted box `demo_db` deleted.
+///
+/// The fixture box belongs to the fixture user, the only `app_user` left and therefore the oldest,
+/// and its row carries no fingerprint, so registration answers `Known` for any machine. The first
+/// connect records this machine's fingerprint, and a later one from the same machine is `Known`
+/// again. Registration also refreshes the row's display columns (`os_family`, `arch`). The
+/// hostname is kept as the fixture's.
+///
+/// # Panics
+/// When the headless connect fails, or registration answers any box but `ids::BOX`.
+pub async fn fixture_box_store(url: &str) -> PgStore {
+    let identity = Identity {
+        box_id: htui_core::fixtures::ids::BOX,
+        hostname: "DESKTOP-HTUI".to_owned(),
+    };
+    let store = PgStore::connect_headless(
+        url,
+        &identity,
+        crate::pg::CONNECT_TIMEOUT,
+        crate::pg::PoolSize::WORKER_DEFAULT,
+    )
+    .await
+    .expect("the fixture box connects headless");
+    assert_eq!(
+        store.this_box(),
+        htui_core::fixtures::ids::BOX,
+        "registered as the fixture box, not a copy: {:?}",
+        store.registration()
+    );
+    store
+}
+
 impl TestDb {
     /// Closes the pool and drops the database. Every test calls this on its last line.
     ///
