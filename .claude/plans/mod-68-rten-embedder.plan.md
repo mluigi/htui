@@ -5,7 +5,7 @@
 **Selected Milestone**: the only one (ANA-23 §8)
 **Requirements**: `R-STO-8`, `R-NF-1`, `R-NF-2`, `R-NF-3`
 **Complexity**: Medium
-**Status**: draft, awaiting CONFIRM
+**Status**: CONFIRMED by the maintainer 2026-10-01 (OQ-1 and OQ-2 defaults accepted)
 
 ## Summary
 
@@ -194,7 +194,7 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 - [ ] `fastembed`, `ort`, `onig_sys`, `hf-hub` 0.3 gone from the lock; no build-time download
 - [ ] Validation passes; reviewer (`rust-reviewer`) findings applied or deferred with the maintainer
 
-## Open questions (maintainer)
+## Open questions (maintainer) - resolved 2026-10-01: both defaults accepted
 
 - **OQ-1 - Windows/macOS gate.** HANDOFF says "build the embedder on Windows and macOS before
   removing fastembed". This Linux sandbox can only cross `cargo check` (no linker or runtime for
