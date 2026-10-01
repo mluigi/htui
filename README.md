@@ -54,7 +54,12 @@ You need:
 - **Network access on first use of the concepts index.** Nothing is downloaded while building.
   The embedding model (about 134 MB) is downloaded into your user cache directory the first time
   you index or search, and checked against a pinned hash. An existing download from an earlier
-  htui is reused.
+  htui is reused. On a machine without network access, place `onnx/model.onnx` (saved as
+  `model.onnx`) and `tokenizer.json` from `Xenova/bge-small-en-v1.5` at commit
+  `ea104dacec62c0de699686887e3f920caeb4f3e3` in
+  `<user cache>/htui/model/bge-small-en-v1.5-ea104dac/` (`~/.cache` on Linux,
+  `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows): files whose sha256 matches the pins
+  in `crates/htui-store/src/model.rs` are used and nothing is downloaded.
 - **`git`** on your `PATH`, for running work in repositories.
 
 Then build:

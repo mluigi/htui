@@ -99,7 +99,9 @@ async fn open() -> anyhow::Result<(PgStore, QdrantStore<RtenEmbedder>)> {
     let pg = PgStore::connect_headless(&dsn, &identity, CONNECT_TIMEOUT, PoolSize::TUI)
         .await
         .map_err(headless_refusal)?;
-    let files = model::ensure_model()
+    // Said on stderr only when a download happens: this command's log goes nowhere without
+    // `--log`, and 133 MB is otherwise a silent pause (review L4).
+    let files = model::ensure_model_noting(|line| eprintln!("{line}"))
         .await
         .context("cannot load the embedding model")?;
     let embedder = tokio::task::spawn_blocking(move || RtenEmbedder::load(&files))

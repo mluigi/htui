@@ -150,7 +150,21 @@ fn hex(digest: &[u8]) -> String {
 /// [`StoreError::Backend`] naming the file and the URL (and both hashes on a mismatch); never
 /// panics.
 pub async fn ensure_model() -> Result<ModelFiles, StoreError> {
-    ModelSource::production()?.ensure().await
+    ensure_model_noting(|_| {}).await
+}
+
+/// As [`ensure_model`], calling `notice` once with a line for a person (which files, how large,
+/// from where, into which directory) just before the first download, and not at all when nothing
+/// is downloaded (review L4). `htui --index-items` prints it: the command line's log goes nowhere
+/// without `--log`, so the `info` line each download logs is not seen there.
+///
+/// # Errors
+///
+/// As [`ensure_model`].
+pub async fn ensure_model_noting(
+    notice: impl FnOnce(&str) + Send,
+) -> Result<ModelFiles, StoreError> {
+    ModelSource::production()?.ensure_noting(notice).await
 }
 
 /// One pinned file: where it lives in [`REPO`], its name in the model directory, and its pin.
@@ -229,7 +243,16 @@ impl ModelSource {
     }
 
     /// See [`ensure_model`].
+    #[cfg(test)]
     pub(crate) async fn ensure(&self) -> Result<ModelFiles, StoreError> {
+        self.ensure_noting(|_| {}).await
+    }
+
+    /// See [`ensure_model_noting`].
+    pub(crate) async fn ensure_noting(
+        &self,
+        notice: impl FnOnce(&str) + Send,
+    ) -> Result<ModelFiles, StoreError> {
         let dir = self.model_dir();
         let missing = {
             let dir = dir.clone();
@@ -238,6 +261,7 @@ impl ModelSource {
             blocking(move || find_local(&dir, &snapshots, pins)).await??
         };
         if !missing.is_empty() {
+            notice(&self.download_notice(&missing, &dir));
             // Built only when there is something to download (B10).
             let client = http_client()?;
             for pin in &missing {
@@ -245,6 +269,22 @@ impl ModelSource {
             }
         }
         Ok(ModelFiles::in_dir(&dir))
+    }
+
+    /// `downloading the embedding model, once: model.onnx (133.1 MB), tokenizer.json (0.7 MB) from
+    /// <base>/<REPO> at ea104dac into <dir>`.
+    fn download_notice(&self, missing: &[Pin], dir: &Path) -> String {
+        let files = missing
+            .iter()
+            .map(|pin| format!("{} ({:.1} MB)", pin.local, pin.bytes as f64 / 1e6))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "downloading the embedding model, once: {files} from {}/{REPO} at {} into {}",
+            self.base_url.trim_end_matches('/'),
+            REVISION.get(..8).unwrap_or(REVISION),
+            dir.display()
+        )
     }
 
     /// Streams one pinned file into a unique `.part`, hashing as it arrives, and renames it onto
@@ -262,6 +302,7 @@ impl ModelSource {
                 "embedding model: cannot download {local} from {url}: {e}"
             ))
         };
+        tracing::info!(file = local, %url, bytes = pin.bytes, "downloading the embedding model file");
         let mut response = client.get(&url).send().await.map_err(|e| transport(&e))?;
         let status = response.status();
         if !status.is_success() {
@@ -773,6 +814,48 @@ mod tests {
             vec![path_of("onnx/model.onnx"), path_of("tokenizer.json")]
         );
         assert!(parts_in(&model_dir(root.path())).is_empty());
+    }
+
+    /// Review L4: one line before the first download says what comes from where; nothing is said
+    /// when nothing is downloaded.
+    #[tokio::test]
+    async fn the_notice_comes_once_before_a_download_and_never_without_one() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let stub = Stub::start(both_routes());
+        let src = source(&stub, root.path(), fake_pins(ONNX, TOK));
+        let mut lines = Vec::new();
+        src.ensure_noting(|line| lines.push(line.to_owned()))
+            .await
+            .expect("downloads");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        for part in [
+            "model.onnx (0.0 MB)".to_owned(),
+            "tokenizer.json (0.0 MB)".to_owned(),
+            format!("{}/Xenova/bge-small-en-v1.5", stub.base()),
+            "ea104dac".to_owned(),
+            model_dir(root.path()).display().to_string(),
+        ] {
+            assert!(line.contains(&part), "{part} in {line}");
+        }
+        assert!(stub.seen().len() == 2, "said before downloading");
+        let mut again = Vec::new();
+        src.ensure_noting(|line| again.push(line.to_owned()))
+            .await
+            .expect("present");
+        assert!(again.is_empty(), "{again:?}");
+    }
+
+    #[test]
+    fn the_notice_names_the_production_sizes_in_mb() {
+        let src = ModelSource::new(BASE_URL, "/cache/htui", pins());
+        let line = src.download_notice(&pins(), &src.model_dir());
+        assert!(line.contains("model.onnx (133.1 MB)"), "{line}");
+        assert!(line.contains("tokenizer.json (0.7 MB)"), "{line}");
+        assert!(
+            line.contains("https://huggingface.co/Xenova/bge-small-en-v1.5 at ea104dac"),
+            "{line}"
+        );
     }
 
     #[tokio::test]
