@@ -1844,6 +1844,113 @@ async fn promoting_a_running_step_preempts_its_walk() {
     assert!(after.promoted_at.is_some());
 }
 
+/// T7 residual window: the `ChatFollow` the tab sends when its promotion answers can be served
+/// before the bind has opened the chat. It must be kept for the bind, so that every chat frame,
+/// the acceptance included, carries the follow's `seq` and survives the `Orch` requests that
+/// supersede the promotion's own.
+#[tokio::test]
+async fn a_follow_served_before_the_bind_keeps_every_chat_frame_fresh() {
+    let store = graph_store().await;
+    let walks = Arc::new(Walks::default());
+    let stall = Stall::default();
+    walks.stall_next(stall.clone());
+    let (requests, requests_rx) = mpsc::unbounded_channel();
+    let (replies_tx, mut replies) = mpsc::unbounded_channel();
+    let _worker = htui::store_worker::spawn_with_runtimes(
+        htui_store::Started::detached(htui_store::Backend::memory(store.clone())),
+        requests_rx,
+        replies_tx,
+        chat_runtime(Script::one_turn(vec![chunk("Taking over."), done()])),
+        run_runtime(&walks),
+    );
+    let send = |seq, origin, request| {
+        requests
+            .send(RequestEnvelope {
+                seq,
+                origin,
+                request,
+            })
+            .expect("the worker is running");
+    };
+
+    send(1, Origin::App, start_run());
+    tokio::time::timeout(Duration::from_secs(20), stall.reached.notified())
+        .await
+        .expect("the walk's session started");
+    let runs = store.runs(ids::HTUI_ANA_2).await.expect("the read answers");
+    let run = runs[0].id;
+    let step = step_at(&store, run, 0).await;
+
+    let chat = Origin::Tab(ChatTab::ID);
+    send(
+        2,
+        chat.clone(),
+        StoreRequest::Orch(OrchRequest::Command(Command::PromoteStep {
+            run,
+            step: step.id,
+            chat_open: false,
+        })),
+    );
+    // The window, held open: the tab follows the moment its promotion answers, and two more
+    // `Orch` requests from it supersede the promotion's own address. The loop serves all three
+    // while the promotion is still preempting the walk, so each is served ahead of the bind.
+    send(
+        3,
+        chat.clone(),
+        StoreRequest::ChatFollow { step_id: step.id },
+    );
+    for seq in [4, 5] {
+        send(
+            seq,
+            chat.clone(),
+            StoreRequest::Orch(OrchRequest::CloseOutPreview {
+                item: ids::HTUI_ANA_2,
+            }),
+        );
+    }
+    let mut chat_replies = Vec::new();
+    let mut accepted = false;
+    let mut idle = 0;
+    while idle < 2 {
+        // The promotion preempts a walk, which takes its time; after it, quiet means done.
+        let wait = if accepted {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(20)
+        };
+        let Ok(Some(envelope)) = tokio::time::timeout(wait, replies.recv()).await else {
+            idle += 1;
+            continue;
+        };
+        accepted |= matches!(envelope.reply, StoreReply::ChatAccepted { .. });
+        if matches!(
+            envelope.reply,
+            StoreReply::ChatAccepted { .. } | StoreReply::Chat(_)
+        ) {
+            chat_replies.push(envelope);
+        }
+    }
+
+    assert!(
+        chat_replies
+            .iter()
+            .any(|envelope| matches!(envelope.reply, StoreReply::ChatAccepted { .. })),
+        "the chat was accepted: {chat_replies:?}"
+    );
+    assert!(
+        chat_replies
+            .iter()
+            .any(|envelope| matches!(envelope.reply, StoreReply::Chat(_))),
+        "and streamed: {chat_replies:?}"
+    );
+    for envelope in &chat_replies {
+        assert_eq!(
+            envelope.seq, 3,
+            "every chat frame follows the follow's address: {envelope:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_harness_without_a_runtime_renders_the_refusal() {
     let store = MemStore::demo();

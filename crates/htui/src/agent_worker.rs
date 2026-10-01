@@ -416,6 +416,10 @@ impl core::fmt::Debug for Served {
 pub struct AgentRuntime {
     factory: DriverFactory,
     live: HashMap<StepId, LiveChat>,
+    /// A [`StoreRequest::ChatFollow`] served before the bind opened its chat (T7): the Chat tab
+    /// follows when its promotion answers, which can be before `bind_promoted` has run. One slot,
+    /// so memory is bounded; `bind_promoted` takes it on every path, so none outlives a promotion.
+    pending_follow: Option<(StepId, ReplyAddr)>,
     started: Vec<StepId>,
     grace: Duration,
     /// Tasks this runtime spawned that answer a request of their own: today the probe's (MOD-2
@@ -624,6 +628,7 @@ impl AgentRuntime {
         Self {
             factory,
             live: HashMap::new(),
+            pending_follow: None,
             started: Vec::new(),
             grace: CANCEL_GRACE,
             background: Vec::new(),
@@ -947,6 +952,13 @@ impl AgentRuntime {
         addr: ReplyAddr,
         promoted: crate::run_worker::Promoted,
     ) -> Result<Served, StoreError> {
+        // A follow served ahead of this bind (T7) is this promotion's only if it names its step;
+        // taken on every path, so a refusal leaves no stale slot.
+        let follow = self
+            .pending_follow
+            .take()
+            .filter(|(step, _)| *step == promoted.step)
+            .map(|(_, follow)| follow);
         // A chat that ended on this step before must not make the new one a second entry.
         self.live.retain(|_, chat| !chat.commands.is_closed());
         // Blueprint D185, for the race the run runtime's guard cannot see: two promotions served
@@ -1040,7 +1052,9 @@ impl AgentRuntime {
 
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let caps = driver.caps();
-        let frames = Frames::new(replies.clone(), addr);
+        // The stream opens at the follow's address when one arrived first: the promotion's own
+        // is an `Orch` one, which any later `Orch` request from the tab supersedes.
+        let frames = Frames::new(replies.clone(), follow.unwrap_or(addr));
         self.live.insert(
             step_id,
             LiveChat {
@@ -1926,14 +1940,13 @@ impl AgentRuntime {
     /// (blueprint D185).
     ///
     /// Nothing is answered: the stream is the answer, and a chat that is already over has sent its
-    /// last frame to the address it had.
-    fn follow(&self, step_id: StepId, addr: ReplyAddr) {
-        if let Some(chat) = self
-            .live
-            .get(&step_id)
-            .filter(|chat| !chat.commands.is_closed())
-        {
-            chat.stream.follow(addr);
+    /// last frame to the address it had. A follow for a step with no entry yet is kept for the
+    /// bind that is about to open it (T7), in the runtime's one slot.
+    fn follow(&mut self, step_id: StepId, addr: ReplyAddr) {
+        match self.live.get(&step_id) {
+            Some(chat) if !chat.commands.is_closed() => chat.stream.follow(addr),
+            Some(_) => {}
+            None => self.pending_follow = Some((step_id, addr)),
         }
     }
 

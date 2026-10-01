@@ -209,7 +209,8 @@ pub enum StoreRequest {
     /// refuses included — supersedes it in the shell's staleness index (`App::is_fresh`), which
     /// would drop every frame after it. Nothing else from the tab supersedes this one while the
     /// chat is live. Answered by the stream itself: no reply of its own, and none for a chat that
-    /// is already over.
+    /// is already over. Served before the promotion's bind has opened the chat, it is kept for
+    /// the bind (T7), so the chat's first frame already goes to this request's address.
     ChatFollow {
         /// The step the chat records against.
         step_id: StepId,
