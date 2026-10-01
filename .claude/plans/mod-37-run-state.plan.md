@@ -123,4 +123,18 @@ cargo sqlx prepare --check -- --all-targets --all-features   # after Task 1; mig
 - [ ] HANDOFF R-lines updated: closed, or re-deferred with a reason
 
 ---
-*Status: PLAN, awaiting maintainer CONFIRM.*
+*Status: DONE (2026-10-02), commits `19ca229`..`151c87e`.*
+
+## As built
+- **T1 to T6** landed as planned. T6 took option (a): the spike confirmed all three of the
+  blueprint's checks against option (b).
+- **R-44 and R-53** are re-deferred, with their reasons on the HANDOFF line.
+- **Review** (rust-reviewer) found no BLOCKER and no HIGH, and raised four findings. Each was
+  checked by an adversarial verifier.
+  - **F1** (MEDIUM) was confirmed and fixed (`409aced`, `151c87e`): the waiting line now clears
+    only on `Rested`, `Error` or `Adopted`, because a walk's own `Changed` and `SessionDone` frames
+    arrive while the command is still queued.
+  - **F2** was refuted: binds run in promotion order, and the slot is taken before every return.
+  - **F3** was refuted: a stale slot is overwritten or corrected by the next follow.
+  - **F4** (LOW, `ChatTab::followed` stale after a failed bind) is deferred as harmless, since the
+    next `Promoted` overwrites it.

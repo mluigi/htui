@@ -49,7 +49,7 @@ window, and the ANA-27 agent-session deadline. Cites `R-ORCH-3`, `R-ORCH-5`, `R-
 ## Delivery Milestones
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Run state and visibility | A parked run shows its reason; the Runs pane no longer drops, delays or hides step state (R-3, R-40, R-41, R-44, R-51, R-53, T7) | in-progress | `.claude/plans/mod-37-run-state.plan.md` |
+| 1 | Run state and visibility | A parked run shows its reason; the Runs pane no longer drops, delays or hides step state (R-3, R-40, R-41, R-44, R-51, R-53, T7); R-44 and R-53 re-deferred | complete | `.claude/plans/mod-37-run-state.plan.md` |
 | 2 | Store and engine correctness | Crash and store-parity windows closed; override copies record their agent (R-5, R-6, R-29, R-30, R-31 remainder, R-32) | pending | — |
 | 3 | Git cost | Reconciling a diff opens the repository once (R-37) | pending | — |
 | 4 | Deadline and sessions | A hung agent session is cancelled at the step deadline; a promoted chat holds the checkout guard; an offline swap no longer strands a walk (deadline, R-49, R-46) | pending | — |
