@@ -2,7 +2,8 @@
 
 Base: `hr/MOD-24` @ f3c5b8b (main after the MOD-42 merge). Sandbox run (TOOL-7, `HR_SANDBOX=1`).
 Requirements: `R-HIS-1`, `R-ORCH-11`. No migration expected (the next one stays `0012`).
-**Status:** fact-checked (see Verified claims), awaiting CONFIRM.
+**Status:** fact-checked (see Verified claims); **CONFIRMED by the maintainer 2026-10-01** with
+OQ-1..OQ-4 as recommended (all (a)).
 
 ## Routing verdict
 
