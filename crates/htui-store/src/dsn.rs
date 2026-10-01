@@ -407,4 +407,48 @@ mod tests {
             assert_eq!(classify_host(host), expected, "{host}");
         }
     }
+
+    /// The shorthand IPv4 spellings `inet_aton` accepts. sqlx hands the host to the resolver
+    /// verbatim, and glibc's `getaddrinfo` reads `127.1`, `2130706433` and `0x7f.1` as
+    /// `127.0.0.1` and `0` as `0.0.0.0`, so they reach this machine.
+    #[test]
+    fn classify_host_reads_the_inet_aton_spellings() {
+        let cases = [
+            ("127.1", DsnHost::Loopback),
+            ("127.0.1", DsnHost::Loopback),
+            ("2130706433", DsnHost::Loopback),
+            ("0x7f000001", DsnHost::Loopback),
+            ("0X7F.1", DsnHost::Loopback),
+            ("0177.0.0.1", DsnHost::Loopback),
+            ("127.000.000.001", DsnHost::Loopback),
+            ("0", DsnHost::Loopback),
+            ("0.0", DsnHost::Loopback),
+            ("127.1.", DsnHost::Loopback),
+            ("10.3", DsnHost::Remote),
+            ("167772163", DsnHost::Remote),
+            ("08.1", DsnHost::Remote),
+            ("127.0.0.256", DsnHost::Remote),
+            ("127.16777216", DsnHost::Remote),
+            ("1.2.3.4.5", DsnHost::Remote),
+            ("127..1", DsnHost::Remote),
+            ("0x", DsnHost::Remote),
+            ("deadbeef", DsnHost::Remote),
+            ("4294967296", DsnHost::Remote),
+        ];
+        for (host, expected) in cases {
+            assert_eq!(classify_host(host), expected, "{host}");
+        }
+
+        for text in [
+            "postgres://u:p@127.1/db",
+            "postgres://u:p@2130706433:5432/db",
+            "postgres://u:p@db.example/db?host=0x7f.1",
+        ] {
+            assert_eq!(
+                Dsn::parse(text).map(|dsn| dsn.host_class()),
+                Ok(DsnHost::Loopback),
+                "{text}"
+            );
+        }
+    }
 }
