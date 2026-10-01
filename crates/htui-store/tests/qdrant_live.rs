@@ -348,6 +348,16 @@ async fn stored_identity(client: &Qdrant, name: &str) -> Option<EmbedderIdentity
 /// A collection laid out as `create_collection` makes one, `dense` `dense_size` wide, with no
 /// metadata: what every pre-MOD-68 collection looks like.
 async fn create_bare(client: &Qdrant, name: &str, dense_size: u64) {
+    create_unstamped(client, name, dense_size, None).await;
+}
+
+/// As [`create_bare`], holding `metadata` but no embedder.
+async fn create_unstamped(
+    client: &Qdrant,
+    name: &str,
+    dense_size: u64,
+    metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
+) {
     let mut dense = VectorsConfigBuilder::default();
     dense.add_named_vector_params(
         DENSE,
@@ -358,12 +368,14 @@ async fn create_bare(client: &Qdrant, name: &str, dense_size: u64) {
         SPARSE,
         SparseVectorParamsBuilder::default().modifier(Modifier::Idf),
     );
+    let mut create = CreateCollectionBuilder::new(name)
+        .vectors_config(dense)
+        .sparse_vectors_config(sparse);
+    if let Some(metadata) = metadata {
+        create = create.metadata(metadata);
+    }
     client
-        .create_collection(
-            CreateCollectionBuilder::new(name)
-                .vectors_config(dense)
-                .sparse_vectors_config(sparse),
-        )
+        .create_collection(create)
         .await
         .expect("create a bare collection");
 }
@@ -421,6 +433,37 @@ async fn an_unrecorded_collection_is_stamped_once() {
     assert_eq!(stamped, Some(EmbedderIdentity::hash(DENSE_DIM)));
     second.expect("a stamped collection is accepted");
     assert_eq!(after, stamped);
+}
+
+/// Qdrant merges an update's metadata into the collection's (observed on 1.19.1, over gRPC here
+/// and over REST): the stamp adds its key and leaves the others.
+#[tokio::test]
+async fn stamping_keeps_the_collections_other_metadata() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let client = raw(&url);
+    let other = std::collections::HashMap::from([("other".to_owned(), serde_json::json!("kept"))]);
+    create_unstamped(&client, &name, DENSE_DIM as u64, Some(other)).await;
+    let stamped = connect(&url, HashEmbedder::new(DENSE_DIM), &name).await;
+    let identity = stored_identity(&client, &name).await;
+    let info = client
+        .collection_info(&name)
+        .await
+        .expect("collection info")
+        .result
+        .expect("a result");
+    client.delete_collection(&name).await.expect("drop");
+    stamped.expect("an unrecorded collection is accepted");
+    assert_eq!(identity, Some(EmbedderIdentity::hash(DENSE_DIM)));
+    let kept = info
+        .config
+        .expect("a config")
+        .metadata
+        .remove("other")
+        .map(serde_json::Value::from);
+    assert_eq!(kept, Some(serde_json::json!("kept")));
 }
 
 #[tokio::test]

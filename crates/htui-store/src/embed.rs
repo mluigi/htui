@@ -19,6 +19,11 @@ pub const DENSE_DIM: usize = 384;
 /// Which model made a collection's dense vectors (MOD-68 D8), as stored under the `embedder` key
 /// of the Qdrant collection's metadata. Two embedders with equal identities make the same vectors
 /// for the same text, so one may search what the other indexed.
+///
+/// Every field is required when read back, deliberately: a stamp missing one is shown whole as
+/// unreadable rather than parsed into a partial identity. A field added later should carry its own
+/// `#[serde(default)]`, so the stamps of older builds still parse, and its default should say
+/// whether such a stamp still matches. Neither changes the stored JSON.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EmbedderIdentity {
     /// The model's name: a Hugging Face repository, or `hash` for [`HashEmbedder`].
@@ -158,6 +163,9 @@ impl RtenEmbedder {
         let mut tokenizer =
             Tokenizer::from_file(&files.tokenizer).map_err(|e| cannot(&files.tokenizer, &e))?;
         // Truncation only: padding is per sub-batch, by hand, in `embed_blocking` (MOD-68 A-2).
+        // Said explicitly, whatever `tokenizer.json` carries: a padding set there would pad every
+        // row of a batch to the batch's longest, past the sub-batch cap.
+        tokenizer.with_padding(None);
         tokenizer
             .with_truncation(Some(TruncationParams {
                 max_length: model::MAX_TOKENS,
@@ -178,12 +186,8 @@ impl RtenEmbedder {
         let input_ids = node("input_ids")?;
         let attention_mask = node("attention_mask")?;
         let token_type_ids = node("token_type_ids")?;
-        let output = *graph.output_ids().first().ok_or_else(|| {
-            StoreError::Backend(format!(
-                "embedding model: {} has no output",
-                files.onnx.display()
-            ))
-        })?;
+        // By name, not position: the `[CLS]` row is taken from this output's hidden states.
+        let output = node("last_hidden_state")?;
         let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         Ok(Self {
             inner: Arc::new(Rten {
@@ -260,7 +264,12 @@ impl RtenEmbedder {
                 .ok_or_else(|| failed(&"the model answered nothing"))?
                 .try_into()
                 .map_err(|e| failed(&e))?;
-            let width = hidden.shape()[2];
+            let [answered, tokens, width] = hidden.shape();
+            if answered != rows || tokens == 0 {
+                return Err(failed(&format_args!(
+                    "the model answered {answered} row(s) of {tokens} token(s) for {rows} text(s)"
+                )));
+            }
             if width != DENSE_DIM {
                 return Err(failed(&format_args!(
                     "the model answered {width}-wide vectors, expected {DENSE_DIM}"
@@ -618,18 +627,47 @@ mod tests {
         assert_matches_goldens(&got, &goldens);
     }
 
+    /// The token lengths `embed_blocking` splits `texts` by.
     #[cfg(feature = "local-embed")]
-    #[tokio::test]
-    #[ignore = "needs the BGE model (133 MB)"]
-    async fn rten_matches_goldens_one_text_per_pass() {
+    fn token_lens(e: &RtenEmbedder, texts: &[String]) -> Vec<usize> {
+        e.inner
+            .tokenizer
+            .encode_batch(texts.iter().map(String::as_str).collect::<Vec<_>>(), true)
+            .expect("tokenizes")
+            .iter()
+            .map(|enc| enc.get_ids().len())
+            .collect()
+    }
+
+    /// The goldens through `embed_blocking` at `cap`, after checking `cap` splits them into
+    /// `passes`.
+    #[cfg(feature = "local-embed")]
+    async fn assert_goldens_in_passes(cap: usize, passes: &[std::ops::Range<usize>]) {
         let goldens = read_goldens();
         let e = RtenEmbedder::load(&golden_model().await).expect("model loads");
         let texts = goldens.texts.clone();
-        let got = tokio::task::spawn_blocking(move || e.embed_blocking(&texts, model::MAX_TOKENS))
+        assert_eq!(sub_batches(&token_lens(&e, &texts), cap), passes);
+        let got = tokio::task::spawn_blocking(move || e.embed_blocking(&texts, cap))
             .await
             .expect("the task ran")
             .expect("embeds");
         assert_matches_goldens(&got, &goldens);
+    }
+
+    /// Rows of different lengths padded together, and a row alone (review L1).
+    #[cfg(feature = "local-embed")]
+    #[tokio::test]
+    #[ignore = "needs the BGE model (133 MB)"]
+    async fn rten_matches_goldens_in_mixed_padding_passes() {
+        assert_goldens_in_passes(model::MAX_TOKENS, &[0..2, 2..3, 3..6]).await;
+    }
+
+    /// No padding at all: every text in a forward pass of its own (review L1).
+    #[cfg(feature = "local-embed")]
+    #[tokio::test]
+    #[ignore = "needs the BGE model (133 MB)"]
+    async fn rten_matches_goldens_one_text_per_pass() {
+        assert_goldens_in_passes(1, &[0..1, 1..2, 2..3, 3..4, 4..5, 5..6]).await;
     }
 
     #[cfg(feature = "local-embed")]

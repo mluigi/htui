@@ -25,9 +25,11 @@ use qdrant_client::qdrant::{
     UpsertPointsBuilder, Value, VectorParamsBuilder, VectorsConfigBuilder,
     point_id::PointIdOptions, vectors_config,
 };
+use serde::Deserialize as _;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
 use uuid::Uuid;
 
 /// The collection name. Versioned: a change to the vector layout or the payload gets a new name
@@ -376,6 +378,10 @@ pub fn is_embedder_mismatch(err: &StoreError) -> bool {
         if message.strip_prefix(EMBEDDER_MISMATCH).is_some_and(|rest| rest.starts_with(": ")))
 }
 
+/// Set once the process has warned that its Qdrant keeps no collection metadata, so that warning
+/// is said once, not on every connect.
+static UNSTAMPED_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// What `ensure_collection` does with a collection that already exists.
 #[derive(Debug, PartialEq, Eq)]
 enum Existing {
@@ -415,7 +421,7 @@ fn check_existing(
     let Some(stored) = stored else {
         return Ok(Existing::Stamp);
     };
-    let theirs = match serde_json::from_value::<EmbedderIdentity>(stored.clone()) {
+    let theirs = match EmbedderIdentity::deserialize(&stored) {
         Ok(id) if id == *mine => return Ok(Existing::Matches),
         Ok(id) => id.to_string(),
         Err(_) => stored.to_string(),
@@ -740,21 +746,44 @@ impl<E: DenseEmbedder> QdrantStore<E> {
         )? {
             Existing::Matches => {}
             Existing::Stamp => {
-                // Two processes stamping at once write the same value; the update merges keys.
+                // Qdrant merges an update's metadata into the collection's: the stamp adds its key
+                // and leaves any other (observed on 1.19.1 over gRPC and REST; `qdrant_live`'s
+                // `stamping_keeps_the_collections_other_metadata`). Two processes stamping at once
+                // write the same value.
                 self.client
                     .update_collection(
                         UpdateCollectionBuilder::new(&self.collection).metadata(self.metadata()?),
                     )
                     .await
                     .map_err(|e| backend("stamp embedder", e))?;
-                tracing::info!(
-                    collection = %self.collection,
-                    identity = %mine,
-                    "stamped the collection's embedder"
-                );
+                if self.stamp_reads_back().await {
+                    tracing::info!(
+                        collection = %self.collection,
+                        identity = %mine,
+                        "stamped the collection's embedder"
+                    );
+                } else if !UNSTAMPED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        collection = %self.collection,
+                        "this Qdrant does not keep collection metadata: the embedder check is off \
+                         for it, and a collection of another model's vectors would be searched \
+                         as this one's"
+                    );
+                }
             }
         }
         Ok(())
+    }
+
+    /// Whether the collection now records an embedder. A Qdrant that predates collection
+    /// metadata accepts the update and drops it, and a failed read is counted the same way.
+    async fn stamp_reads_back(&self) -> bool {
+        self.client
+            .collection_info(&self.collection)
+            .await
+            .ok()
+            .and_then(|info| info.result?.config)
+            .is_some_and(|config| config.metadata.contains_key(EMBEDDER_KEY))
     }
 
     /// `{EMBEDDER_KEY: identity}`, the collection metadata this embedder writes.
