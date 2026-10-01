@@ -3689,8 +3689,8 @@ pub(crate) mod tests {
     }
 
     /// OQ-5 pin: shutdown stays a hard drop. A parked walk ends within `2 × grace` with no
-    /// graceful cancel; its relay row is left `pending`, and `relay_view` hides it once the lease
-    /// is given back.
+    /// graceful cancel; `Engine::abandoned` marks its relay row `stale` before the lease goes back
+    /// (review L-1, blueprint A-11), so `relay_view` never lists it again.
     #[tokio::test]
     async fn shutdown_still_drops_a_parked_walk() {
         let fixture = Fixture::new().await;
@@ -3725,7 +3725,8 @@ pub(crate) mod tests {
         assert_eq!(park.grace(), None, "no graceful cancel on shutdown (OQ-5)");
         assert_eq!(
             relay_row(&fixture, parked.id).status,
-            PermissionStatus::Pending
+            PermissionStatus::Stale,
+            "a hard-dropped walk's request is staled, never answered `cancelled` (OQ-5, A-11)"
         );
         let view = fixture
             .store

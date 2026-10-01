@@ -2266,3 +2266,28 @@ binding where they differ from §2-§9 above.
   both pick up a row (the poll's read can predate the other's claim); the loser finding the run
   already `cancelled` resolves the row `applied`, not `refused`. (T4 `f17aece`, `58d372a`,
   `7d377d6`.)
+
+### Review gate (rust-reviewer, APPROVE WITH CHANGES; each finding adversarially verified)
+
+Confirmed and fixed: M-1, M-2, M-3, L-1, L-4. Refuted by their verifiers: L-2 (no production
+transport keeps the drain running past the preempt window) and L-3 (a 10 ms poll on a rare path,
+no wrong behaviour).
+
+- **A-11 · I-7 covers drained requests; cancel writes are best-effort (M-1, M-3).** The cancel's
+  drain answers every `PermissionRequest` it pulls with I-7's row (ACP answers all responders it
+  holds, queued ones included). Every store write in `cancel()` is best-effort (`warn`) except a
+  fence, so a graceful cancel always ends `Cancelled` (I-6). The parked poll rides out up to 29
+  consecutive `Unreachable`/`Backend` reads (`TRANSIENT_READS = 30`, about 30 s), then fails as
+  before. (`cc502f0`.)
+- **A-12 · A cancel or lost fence wins over a failed `recorder.finish()` (M-2).** `session` and
+  `candidate_live` close the recorder best-effort on `Cancelled`/fenced and return the original
+  error, as `judge_sessions` already did; a scrub residue no longer turns a cancel into a failure
+  write. (`fa1235d`.)
+- **A-13 · A dropped walk's requests are staled (L-1, extends D5 and OQ-5).** `Engine::abandoned`
+  and a same-owner lease re-take mark the run's `pending|answered` rows of this owner `stale`, so a
+  hard drop (shutdown, panic, preempt timeout) leaves no answerable ghost. Shutdown is still a hard
+  drop (no graceful cancel, no `cancelled` answer row) — OQ-5 stands; only the row's status moves
+  from `pending` to `stale`. (`2e5e790`; `shutdown_still_drops_a_parked_walk` updated.)
+- **A-14 · A queued cancel that loses to a claim goes durable (L-4).** When `cancel_run`'s queued
+  fallback meets `LeaseHeld` or a non-terminal `RunStatus`, it writes the `run_command` row and
+  answers "cancel requested". (`04f6431`.)
