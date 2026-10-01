@@ -98,8 +98,10 @@ const MODEL_DIR: &str = "bge-small-en-v1.5-ea104dac";
 /// fastembed's snapshots of [`REPO`], under the cache root; each may hold the pinned files.
 const FASTEMBED_SNAPSHOTS: &str = "fastembed/models--Xenova--bge-small-en-v1.5/snapshots";
 
-/// A `.part` older than this belongs to a killed run and is removed (A-3). A live download writes
-/// at least once per [`READ_TIMEOUT`], so a younger one may be another process's and is left.
+/// A `.part` older than this, and not locked, belongs to a killed run and is removed (A-3, review
+/// M1). The lock is the proof of a live writer; the age is kept as a second condition because a
+/// `.part` is unlocked between its handle's drop and its rename, and on a file system without
+/// locks. A live download writes at least once per [`READ_TIMEOUT`], so it never looks this old.
 const STALE_PART: Duration = Duration::from_secs(10 * 60);
 
 /// Bound on opening the connection.
@@ -259,13 +261,16 @@ impl ModelSource {
             )));
         }
         let part = part_path(dest, pin);
-        let mut file = tokio::fs::File::create(&part)
-            .await
-            .map_err(|e| cannot_write(&part, &e))?;
+        let locked = {
+            let part = part.clone();
+            blocking(move || create_locked(&part)).await?
+        };
+        let mut file = tokio::fs::File::from_std(locked.map_err(|e| cannot_write(&part, &e))?);
         let mut hasher = Sha256::new();
         let mut done = 0_u64;
-        // Every way out is a value, so the handle is dropped before the `.part` is removed or
-        // renamed: Windows refuses both on an open file (H-9).
+        // The handle holds the `.part`'s lock until it drops (M1). Every way out is a value, so
+        // the handle is dropped before the `.part` is removed or renamed: Windows refuses both on
+        // an open file (H-9).
         let failure = loop {
             match response.chunk().await {
                 Ok(Some(chunk)) => {
@@ -303,19 +308,12 @@ impl ModelSource {
                 pin.sha256
             )));
         }
-        match tokio::fs::rename(&part, dest).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&part).await;
-                // Another process may have won the race and holds `dest` open (Windows).
-                let (dest_owned, pin_owned) = (dest.to_path_buf(), pin.clone());
-                if blocking(move || verify(&dest_owned, &pin_owned)).await? {
-                    Ok(())
-                } else {
-                    Err(cannot_write(dest, &e))
-                }
-            }
-        }
+        // Unlocked from here to the rename; the sweep's age threshold covers the gap, as the
+        // `.part` was written a moment ago.
+        let (dest_owned, pin_owned) = (dest.to_path_buf(), pin.clone());
+        blocking(move || place(&part, &dest_owned, &pin_owned))
+            .await?
+            .map_err(|e| cannot_write(dest, &e))
     }
 }
 
@@ -389,8 +387,10 @@ fn hash_file(path: &Path) -> std::io::Result<String> {
 }
 
 /// Copies `pin` from the first fastembed snapshot whose copy hashes to the pin, through a fresh
-/// `.part`, then renames it onto `dest`. The snapshot is only read: its files may be symlinks
-/// into fastembed's `blobs/`, and `File::open` follows them.
+/// `.part`, then renames it onto `dest`. The snapshot is hashed where it is first, so one that
+/// does not match is never copied, and hashed again as it is copied, in case it changed in
+/// between. It is only read: its files may be symlinks into fastembed's `blobs/`, and
+/// `File::open` follows them.
 fn adopt(snapshots: &Path, dest: &Path, pin: &Pin) -> bool {
     for snap in snapshot_dirs(snapshots) {
         let src = snap.join(pin.remote);
@@ -398,24 +398,31 @@ fn adopt(snapshots: &Path, dest: &Path, pin: &Pin) -> bool {
             Ok(meta) if meta.is_file() && meta.len() == pin.bytes => {}
             _ => continue,
         }
+        match hash_file(&src) {
+            Ok(computed) if computed == pin.sha256 => {}
+            Ok(computed) => {
+                tracing::warn!(path = %src.display(), %computed, expected = %pin.sha256, "fastembed's copy has the wrong sha256; not adopting it");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(path = %src.display(), error = %e, "cannot read fastembed's model file");
+                continue;
+            }
+        }
         let part = part_path(dest, pin);
         match copy_hashed(&src, &part) {
-            Ok(computed) if computed == pin.sha256 => match std::fs::rename(&part, dest) {
+            Ok(computed) if computed == pin.sha256 => match place(&part, dest, pin) {
                 Ok(()) => {
                     tracing::info!(from = %src.display(), to = %dest.display(), "adopted the embedding model file from fastembed's cache");
                     return true;
                 }
                 Err(e) => {
-                    let _ = std::fs::remove_file(&part);
-                    if verify(dest, pin) {
-                        return true;
-                    }
                     tracing::warn!(path = %dest.display(), error = %e, "cannot place the adopted embedding model file");
                 }
             },
             Ok(computed) => {
                 let _ = std::fs::remove_file(&part);
-                tracing::warn!(path = %src.display(), %computed, expected = %pin.sha256, "fastembed's copy has the wrong sha256; not adopting it");
+                tracing::warn!(path = %src.display(), %computed, expected = %pin.sha256, "fastembed's copy changed while it was copied; not adopting it");
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&part);
@@ -440,11 +447,11 @@ fn snapshot_dirs(snapshots: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Copies `src` into a new `part`, hashing the bytes as they pass; the handle is synced and
-/// dropped before this returns.
+/// Copies `src` into a new, locked `part`, hashing the bytes as they pass; the handle is synced
+/// and dropped, so unlocked, before this returns.
 fn copy_hashed(src: &Path, part: &Path) -> std::io::Result<String> {
     let mut from = std::fs::File::open(src)?;
-    let mut to = std::fs::File::create(part)?;
+    let mut to = create_locked(part)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0_u8; CHUNK];
     loop {
@@ -459,8 +466,14 @@ fn copy_hashed(src: &Path, part: &Path) -> std::io::Result<String> {
     Ok(hex(&hasher.finalize()))
 }
 
-/// Removes every `*.part` in `dir` last modified more than [`STALE_PART`] before `now`. Errors are
-/// ignored: a sweep that cannot run leaves debris, not a failure.
+/// Removes every `*.part` in `dir` last modified more than [`STALE_PART`] before `now` and not
+/// locked by a live writer (review M1). Errors are ignored: a sweep that cannot run leaves debris,
+/// not a failure.
+///
+/// The age is read through a handle, not the directory entry: on NTFS an entry's times lag while
+/// another handle writes the file. The lock is what tells a live download apart, though: an
+/// orphan's lock died with its process. A `.part` is removed while this sweep holds its lock, so
+/// no writer can take it in between; on Windows the removal completes when the handle drops.
 fn sweep_stale_parts(dir: &Path, now: SystemTime) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -470,14 +483,59 @@ fn sweep_stale_parts(dir: &Path, now: SystemTime) {
         if path.extension().is_none_or(|ext| ext != "part") {
             continue;
         }
-        let stale = entry
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let stale = file
             .metadata()
             .and_then(|meta| meta.modified())
             .ok()
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age > STALE_PART);
-        if stale {
-            let _ = std::fs::remove_file(&path);
+        if !stale {
+            continue;
+        }
+        match file.try_lock() {
+            // A file system with no locks: the age alone decides, as before M1.
+            Ok(()) | Err(std::fs::TryLockError::Error(_)) => {
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {}
+        }
+    }
+}
+
+/// Creates `part` and locks it exclusively until the handle drops, so another process's
+/// [`sweep_stale_parts`] leaves it alone however old it looks (review M1). A file system with no
+/// locks leaves the age threshold the only guard, as before; a lock another process holds on this
+/// very name is an error.
+fn create_locked(part: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::File::create(part)?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "another process holds this file",
+            ));
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            tracing::debug!(path = %part.display(), error = %e, "cannot lock the embedding model's .part; the age threshold alone guards it");
+        }
+    }
+    Ok(file)
+}
+
+/// Renames a verified `part` onto `dest`. A rename that fails is still success when `dest` already
+/// holds the pinned bytes: another process placed it first, and Windows refuses to replace a file
+/// it holds open, or a sweep removed this `.part` once its handle was dropped (H-9). Every failure
+/// removes the `.part`.
+fn place(part: &Path, dest: &Path, pin: &Pin) -> std::io::Result<()> {
+    match std::fs::rename(part, dest) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(part);
+            if verify(dest, pin) { Ok(()) } else { Err(e) }
         }
     }
 }
@@ -548,6 +606,8 @@ mod tests {
     enum Answer {
         Body(u16, Vec<u8>),
         Redirect(u16, &'static str),
+        /// `200` with the whole body's `Content-Length`, then only its first half and a close.
+        Truncated(Vec<u8>),
     }
 
     /// A loopback HTTP/1.1 responder on a std thread: scripted routes, every request path
@@ -606,10 +666,11 @@ mod tests {
         }
         let Some(path) = path else { return };
         seen.lock().expect("the stub's log").push(path.clone());
-        let (code, location, body) = match routes.get(&path) {
-            Some(Answer::Body(code, body)) => (*code, None, body.clone()),
-            Some(Answer::Redirect(code, to)) => (*code, Some(*to), Vec::new()),
-            None => (404, None, Vec::new()),
+        let (code, location, body, sent) = match routes.get(&path) {
+            Some(Answer::Body(code, body)) => (*code, None, body.clone(), body.len()),
+            Some(Answer::Redirect(code, to)) => (*code, Some(*to), Vec::new(), 0),
+            Some(Answer::Truncated(body)) => (200, None, body.clone(), body.len() / 2),
+            None => (404, None, Vec::new(), 0),
         };
         let mut head = format!(
             "HTTP/1.1 {code} X\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -621,7 +682,7 @@ mod tests {
         head.push_str("\r\n");
         let mut out = stream;
         let _ = out.write_all(head.as_bytes());
-        let _ = out.write_all(&body);
+        let _ = out.write_all(&body[..sent]);
         let _ = out.flush();
     }
 
@@ -761,6 +822,23 @@ mod tests {
                 .await,
         );
         assert!(text.contains("larger than the expected"), "{text}");
+        assert!(!model_dir(root.path()).join("model.onnx").exists());
+        assert!(parts_in(&model_dir(root.path())).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_body_cut_off_mid_way_is_an_error_and_leaves_no_part() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let long = vec![b'o'; 64 * 1024];
+        let stub = Stub::start(vec![(
+            path_of("onnx/model.onnx"),
+            Answer::Truncated(long.clone()),
+        )]);
+        let src = source(&stub, root.path(), fake_pins(&long, TOK));
+        let url = src.url(&src.pins[0]);
+        let text = err_text(src.ensure().await);
+        assert!(text.contains("cannot download model.onnx"), "{text}");
+        assert!(text.contains(&url), "{text}");
         assert!(!model_dir(root.path()).join("model.onnx").exists());
         assert!(parts_in(&model_dir(root.path())).is_empty());
     }
@@ -918,6 +996,80 @@ mod tests {
             .expect("ensured");
         assert!(!stale.exists());
         assert!(fresh.exists());
+    }
+
+    /// M1: on NTFS a directory entry's mtime lags while a writer holds the file, so age alone
+    /// cannot tell a live download from an orphan; the writer's lock can.
+    #[test]
+    fn a_part_a_live_handle_locks_is_not_swept_however_old() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path();
+        let live = dir.join("model.onnx.7.0.part");
+        let orphan = dir.join("model.onnx.8.0.part");
+        write(&live, b"half");
+        write(&orphan, b"half");
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        let held = std::fs::File::options()
+            .write(true)
+            .open(&live)
+            .expect("open the live part");
+        held.try_lock().expect("lock the live part");
+        held.set_modified(old).expect("age the live part");
+        std::fs::File::options()
+            .write(true)
+            .open(&orphan)
+            .expect("open the orphan")
+            .set_modified(old)
+            .expect("age the orphan");
+        sweep_stale_parts(dir, SystemTime::now());
+        assert!(live.exists(), "a part a live writer locks is left");
+        assert!(!orphan.exists(), "an old unlocked part is removed");
+        drop(held);
+        sweep_stale_parts(dir, SystemTime::now());
+        assert!(!live.exists(), "released, it is an orphan like any other");
+    }
+
+    #[test]
+    fn a_new_part_is_locked_until_its_handle_drops() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let part = root.path().join("model.onnx.9.0.part");
+        let file = create_locked(&part).expect("create and lock");
+        let other = std::fs::File::open(&part).expect("open again");
+        assert!(matches!(
+            other.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(file);
+        other.try_lock().expect("released with its handle");
+    }
+
+    /// L5 (a), H-9: the `.part` is gone (swept, or another process won) but `dest` holds the
+    /// pinned bytes, so the file is in place.
+    #[test]
+    fn a_failed_rename_onto_a_verified_dest_is_success() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let pin = fake_pins(ONNX, TOK)[0].clone();
+        let dest = root.path().join("model.onnx");
+        write(&dest, ONNX);
+        let gone = root.path().join("model.onnx.9.0.part");
+        place(&gone, &dest, &pin).expect("dest already verifies");
+        assert_eq!(std::fs::read(&dest).expect("dest"), ONNX);
+    }
+
+    #[test]
+    fn a_failed_rename_onto_an_unverified_dest_is_an_error_and_drops_the_part() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let pin = fake_pins(ONNX, TOK)[0].clone();
+        let dest = root.path().join("model.onnx");
+        write(&dest.join("in-the-way"), b"a directory where the file goes");
+        let part = root.path().join("model.onnx.9.0.part");
+        write(&part, ONNX);
+        place(&part, &dest, &pin).expect_err("a directory is not the file");
+        assert!(!part.exists());
+        let gone = root.path().join("model.onnx.9.1.part");
+        std::fs::remove_dir_all(&dest).expect("clear");
+        write(&dest, b"corrupt");
+        place(&gone, &dest, &pin).expect_err("a corrupt dest is not the file");
     }
 
     #[tokio::test]
