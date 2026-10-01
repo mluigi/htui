@@ -641,8 +641,8 @@ fn read_box(checked: &RemoteOutput) -> Result<identity::Identity, String> {
     identity::parse_box_toml(&text).map_err(|err| err.to_string())
 }
 
-/// D313 through the verifier: `Some(wrote)` on success, after the progress line; `None` after the
-/// warning.
+/// D313 through the verifier: `Some(wrote)` on success, after a progress line that says whether it
+/// wrote or found `worker`; `None` after the warning.
 async fn set_executor(
     verifier: &dyn Verifier,
     id: BoxId,
@@ -651,7 +651,12 @@ async fn set_executor(
 ) -> Option<bool> {
     match verifier.set_executor(id).await {
         Ok(wrote) => {
-            note(err, dest, "executor set to worker");
+            let what = if wrote {
+                "executor set to worker"
+            } else {
+                "executor already worker"
+            };
+            note(err, dest, what);
             Some(wrote)
         }
         Err(reason) => {
@@ -1051,11 +1056,24 @@ mod tests {
             err: &mut err,
         })
         .await;
-        Ran {
+        let ran = Ran {
             result,
             out: String::from_utf8(out).expect("utf-8"),
             err: String::from_utf8(err).expect("utf-8"),
+        };
+        // House rule: no sentinel reaches an output, a command line or an exit sentence.
+        assert!(!ran.out.contains("SENTINEL"), "stdout holds a sentinel");
+        assert!(!ran.err.contains("SENTINEL"), "stderr holds a sentinel");
+        for (command, _) in remote.calls() {
+            assert!(!command.contains("SENTINEL"), "a command holds a sentinel");
         }
+        if let Err(exit) = &ran.result {
+            assert!(
+                !exit.to_string().contains("SENTINEL"),
+                "the exit sentence holds a sentinel"
+            );
+        }
+        ran
     }
 
     /// The fresh password host every failure case starts from, with nopasswd unless asked.
@@ -1282,6 +1300,16 @@ mod tests {
         assert_eq!(
             ran.out,
             format!("{DEST} is already provisioned with this build; box {BOX} (box1)\n")
+        );
+        assert!(
+            ran.err
+                .contains("provisioning alice@box1: executor already worker\n"),
+            "{}",
+            ran.err
+        );
+        assert!(
+            !ran.err.contains("executor set to worker"),
+            "stderr agrees with stdout that nothing changed"
         );
     }
 
