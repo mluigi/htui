@@ -6,8 +6,9 @@
 //! model nor a network. The sparse half of hybrid search is not a model at all: see
 //! [`crate::bm25`].
 use htui_core::store::StoreError;
+use std::fmt;
 #[cfg(feature = "local-embed")]
-use std::{fmt, sync::Arc};
+use std::sync::Arc;
 
 #[cfg(feature = "local-embed")]
 use crate::model::{self, ModelFiles};
@@ -15,11 +16,67 @@ use crate::model::{self, ModelFiles};
 /// Width of BGE-small-en-v1.5's vectors, and so of the index's `dense` vector.
 pub const DENSE_DIM: usize = 384;
 
+/// Which model made a collection's dense vectors (MOD-68 D8), as stored under the `embedder` key
+/// of the Qdrant collection's metadata. Two embedders with equal identities make the same vectors
+/// for the same text, so one may search what the other indexed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EmbedderIdentity {
+    /// The model's name: a Hugging Face repository, or `hash` for [`HashEmbedder`].
+    pub model: String,
+    /// The repository's commit the files come from; empty when there is none.
+    pub revision: String,
+    /// sha256 of the `model.onnx` that ran; empty when there is none.
+    pub onnx_sha256: String,
+    /// Width of the vectors.
+    pub dim: usize,
+    /// How a text's vector is taken from the model's output (`cls`, or `none`).
+    pub pooling: String,
+    /// How that vector is normalised (`l2`).
+    pub normalisation: String,
+}
+
+impl EmbedderIdentity {
+    /// [`HashEmbedder`]'s identity at width `dim`, which reads `hash/<dim>`.
+    #[must_use]
+    pub fn hash(dim: usize) -> Self {
+        Self {
+            model: "hash".to_owned(),
+            revision: String::new(),
+            onnx_sha256: String::new(),
+            dim,
+            pooling: "none".to_owned(),
+            normalisation: "l2".to_owned(),
+        }
+    }
+}
+
+impl fmt::Display for EmbedderIdentity {
+    /// `hash/384`, or `Xenova/bge-small-en-v1.5@ea104dac (model.onnx 828e1496d7fa, 384-d, cls
+    /// pooling, l2)`. A stored identity is untrusted: a short or odd field is shown whole, never
+    /// sliced past its end.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.onnx_sha256.is_empty() {
+            return write!(f, "{}/{}", self.model, self.dim);
+        }
+        let rev = self.revision.get(..8).unwrap_or(&self.revision);
+        let sha = self.onnx_sha256.get(..12).unwrap_or(&self.onnx_sha256);
+        write!(
+            f,
+            "{}@{rev} (model.onnx {sha}, {}-d, {} pooling, {})",
+            self.model, self.dim, self.pooling, self.normalisation
+        )
+    }
+}
+
 /// Turns texts into dense vectors of a fixed width.
 #[allow(async_fn_in_trait)]
 pub trait DenseEmbedder {
     /// Width of every vector [`embed`](DenseEmbedder::embed) returns.
     fn dim(&self) -> usize;
+
+    /// The model these vectors come from, recorded in and checked against the collection
+    /// (MOD-68 D8).
+    fn identity(&self) -> EmbedderIdentity;
 
     /// One vector per text, in input order.
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, StoreError>;
@@ -223,6 +280,10 @@ impl DenseEmbedder for RtenEmbedder {
         DENSE_DIM
     }
 
+    fn identity(&self) -> EmbedderIdentity {
+        model::identity()
+    }
+
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, StoreError> {
         let this = self.clone();
         tokio::task::spawn_blocking(move || this.embed_blocking(&texts, MAX_BATCH_TOKENS))
@@ -273,6 +334,11 @@ impl FastEmbedder {
 impl DenseEmbedder for FastEmbedder {
     fn dim(&self) -> usize {
         DENSE_DIM
+    }
+
+    /// The same files as [`RtenEmbedder`]'s, so the same identity (`docs/ANA-23.md` §5.6).
+    fn identity(&self) -> EmbedderIdentity {
+        model::identity()
     }
 
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, StoreError> {
@@ -329,6 +395,10 @@ impl HashEmbedder {
 impl DenseEmbedder for HashEmbedder {
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn identity(&self) -> EmbedderIdentity {
+        EmbedderIdentity::hash(self.dim)
     }
 
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, StoreError> {
@@ -429,6 +499,45 @@ mod tests {
             .await
             .unwrap();
         assert!(cosine(&v[0], &v[1]) > cosine(&v[0], &v[2]));
+    }
+
+    #[test]
+    fn the_hash_identity_reads_hash_slash_dim() {
+        assert_eq!(EmbedderIdentity::hash(384).to_string(), "hash/384");
+        assert_eq!(HashEmbedder::new(8).identity(), EmbedderIdentity::hash(8));
+        assert_eq!(HashEmbedder::new(8).identity().dim, 8);
+    }
+
+    #[test]
+    fn a_short_stored_identity_displays_without_slicing_past_its_end() {
+        let odd = EmbedderIdentity {
+            model: "m".into(),
+            revision: "abc".into(),
+            onnx_sha256: "é".into(),
+            dim: 2,
+            pooling: "cls".into(),
+            normalisation: "l2".into(),
+        };
+        assert_eq!(
+            odd.to_string(),
+            "m@abc (model.onnx é, 2-d, cls pooling, l2)"
+        );
+    }
+
+    #[cfg(feature = "local-embed")]
+    #[test]
+    fn the_model_identity_is_the_pinned_bge() {
+        let id = model::identity();
+        assert_eq!(id.model, model::REPO);
+        assert_eq!(id.revision, model::REVISION);
+        assert_eq!(id.onnx_sha256, model::ONNX_SHA256);
+        assert_eq!(id.dim, DENSE_DIM);
+        assert_eq!(id.pooling, model::POOLING);
+        assert_eq!(id.normalisation, model::NORMALISATION);
+        assert_eq!(
+            id.to_string(),
+            "Xenova/bge-small-en-v1.5@ea104dac (model.onnx 828e1496d7fa, 384-d, cls pooling, l2)"
+        );
     }
 
     #[tokio::test]

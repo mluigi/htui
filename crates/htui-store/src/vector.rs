@@ -8,7 +8,7 @@
 //! step. Qdrant errors are [`StoreError::Backend`], never [`StoreError::Unreachable`], so
 //! nothing that reads the latter as "Postgres went away" can mistake a down vector store for it.
 use crate::bm25::{self, SparseVector};
-use crate::embed::DenseEmbedder;
+use crate::embed::{DenseEmbedder, EmbedderIdentity};
 use crate::qdrant_settings::QdrantSettings;
 use chrono::{DateTime, Utc};
 use htui_core::model::{
@@ -18,11 +18,12 @@ use htui_core::model::{
 use htui_core::store::StoreError;
 use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
-    Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, DeletePointsBuilder,
-    Distance, FieldType, Filter, Fusion, Modifier, NamedVectors, PointId, PointStruct,
-    PrefetchQueryBuilder, Query, QueryPointsBuilder, ScrollPointsBuilder,
-    SparseVectorParamsBuilder, SparseVectorsConfigBuilder, UpsertPointsBuilder, Value,
-    VectorParamsBuilder, VectorsConfigBuilder, point_id::PointIdOptions,
+    CollectionInfo, Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
+    DeletePointsBuilder, Distance, FieldType, Filter, Fusion, Modifier, NamedVectors, PointId,
+    PointStruct, PrefetchQueryBuilder, Query, QueryPointsBuilder, ScrollPointsBuilder,
+    SparseVectorParamsBuilder, SparseVectorsConfigBuilder, UpdateCollectionBuilder,
+    UpsertPointsBuilder, Value, VectorParamsBuilder, VectorsConfigBuilder,
+    point_id::PointIdOptions, vectors_config,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -38,6 +39,8 @@ pub const COLLECTION: &str = "htui_concepts_v2";
 pub const DENSE: &str = "dense";
 /// Name of the sparse (BM25) vector.
 pub const SPARSE: &str = "sparse";
+/// The collection metadata key the embedder's identity is stored under (MOD-68 D8).
+pub const EMBEDDER_KEY: &str = "embedder";
 /// Longest snippet a point carries in its payload, in characters.
 pub const SNIPPET_CHARS: usize = 280;
 
@@ -356,6 +359,67 @@ fn backend(context: &str, e: impl std::fmt::Display) -> StoreError {
     StoreError::Backend(format!("qdrant: {context}: {e}"))
 }
 
+/// What `ensure_collection` does with a collection that already exists.
+#[derive(Debug, PartialEq, Eq)]
+enum Existing {
+    /// Its `dense` width and its recorded embedder are this one's.
+    Matches,
+    /// Its `dense` width is right and it records no embedder (every pre-MOD-68 index): record
+    /// this one. Safe because fastembed's vectors are the rten embedder's (`docs/ANA-23.md` §5.6).
+    Stamp,
+}
+
+/// Whether a collection holding `dense_size`-wide `dense` vectors and `stored` as its `embedder`
+/// metadata can be used by an embedder `mine` of width `dim` (MOD-68 D8). The width is checked
+/// first (A-10): a collection of the wrong width is refused even when it records nothing, so it
+/// is never stamped and then failed on every upsert.
+fn check_existing(
+    collection: &str,
+    dense_size: Option<u64>,
+    stored: Option<serde_json::Value>,
+    mine: &EmbedderIdentity,
+    dim: usize,
+) -> Result<Existing, StoreError> {
+    let refuse = |what: String| {
+        backend(
+            "embedder mismatch",
+            format_args!(
+                "collection `{collection}` {what}; delete collection `{collection}` and run \
+                 `htui --index-items` to rebuild it"
+            ),
+        )
+    };
+    match dense_size {
+        None => return Err(refuse("has no `dense` vector".to_owned())),
+        Some(found) if found != dim as u64 => {
+            return Err(refuse(format!(
+                "holds {found}-wide `dense` vectors, but this htui embeds {dim}-wide ones"
+            )));
+        }
+        Some(_) => {}
+    }
+    let Some(stored) = stored else {
+        return Ok(Existing::Stamp);
+    };
+    let theirs = match serde_json::from_value::<EmbedderIdentity>(stored.clone()) {
+        Ok(id) if id == *mine => return Ok(Existing::Matches),
+        Ok(id) => id.to_string(),
+        Err(_) => stored.to_string(),
+    };
+    Err(refuse(format!(
+        "holds vectors from {theirs}, but this htui embeds with {mine}"
+    )))
+}
+
+/// The width of the collection's `dense` vector; `None` when it has no such named vector.
+fn dense_size(info: &CollectionInfo) -> Option<u64> {
+    let params = info.config.as_ref()?.params.as_ref()?;
+    match params.vectors_config.as_ref()?.config.as_ref()? {
+        vectors_config::Config::ParamsMap(named) => named.map.get(DENSE).map(|p| p.size),
+        vectors_config::Config::Params(_) => None,
+    }
+}
+
 /// The start of `text`, whitespace folded and control characters dropped: item and document
 /// bodies are often agent-written, and a snippet ends up printed to a terminal.
 fn snippet(text: &str) -> String {
@@ -567,6 +631,11 @@ impl<E> std::fmt::Debug for QdrantStore<E> {
 
 impl<E: DenseEmbedder> QdrantStore<E> {
     /// Connects to [`COLLECTION`], creating it and its payload indexes on first use.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`] when Qdrant cannot be reached, and `embedder mismatch` when the
+    /// collection holds another width or another embedder's vectors (MOD-68 D8); one that records
+    /// no embedder is stamped with this one's [`identity`](DenseEmbedder::identity).
     pub async fn connect(settings: &QdrantSettings, embedder: E) -> Result<Self, StoreError> {
         Self::connect_to(settings, embedder, COLLECTION).await
     }
@@ -608,7 +677,9 @@ impl<E: DenseEmbedder> QdrantStore<E> {
             .collection_exists(&self.collection)
             .await
             .map_err(|e| backend("collection exists", e))?;
-        if !exists {
+        if exists {
+            self.check_collection().await?;
+        } else {
             self.create_collection().await?;
         }
         // Every time, not only on creation: re-creating an existing index is a no-op in Qdrant, and
@@ -629,6 +700,56 @@ impl<E: DenseEmbedder> QdrantStore<E> {
         Ok(())
     }
 
+    /// Refuses an existing collection of another width or another embedder, and records this
+    /// embedder in one that records none (MOD-68 D8).
+    async fn check_collection(&self) -> Result<(), StoreError> {
+        let info = self
+            .client
+            .collection_info(&self.collection)
+            .await
+            .map_err(|e| backend("collection info", e))?
+            .result
+            .ok_or_else(|| backend("collection info", "no result"))?;
+        let stored = info
+            .config
+            .as_ref()
+            .and_then(|c| c.metadata.get(EMBEDDER_KEY))
+            .cloned()
+            .map(serde_json::Value::from);
+        let mine = self.embedder.identity();
+        match check_existing(
+            &self.collection,
+            dense_size(&info),
+            stored,
+            &mine,
+            self.embedder.dim(),
+        )? {
+            Existing::Matches => {}
+            Existing::Stamp => {
+                // Two processes stamping at once write the same value; the update merges keys.
+                self.client
+                    .update_collection(
+                        UpdateCollectionBuilder::new(&self.collection).metadata(self.metadata()?),
+                    )
+                    .await
+                    .map_err(|e| backend("stamp embedder", e))?;
+                tracing::info!(
+                    collection = %self.collection,
+                    identity = %mine,
+                    "stamped the collection's embedder"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// `{EMBEDDER_KEY: identity}`, the collection metadata this embedder writes.
+    fn metadata(&self) -> Result<HashMap<String, serde_json::Value>, StoreError> {
+        let identity = serde_json::to_value(self.embedder.identity())
+            .map_err(|e| backend("embedder identity", e))?;
+        Ok(HashMap::from([(EMBEDDER_KEY.to_owned(), identity)]))
+    }
+
     async fn create_collection(&self) -> Result<(), StoreError> {
         let mut dense = VectorsConfigBuilder::default();
         dense.add_named_vector_params(
@@ -644,7 +765,8 @@ impl<E: DenseEmbedder> QdrantStore<E> {
             .create_collection(
                 CreateCollectionBuilder::new(&self.collection)
                     .vectors_config(dense)
-                    .sparse_vectors_config(sparse),
+                    .sparse_vectors_config(sparse)
+                    .metadata(self.metadata()?),
             )
             .await
             .map_err(|e| backend("create collection", e))?;
@@ -1164,5 +1286,116 @@ mod tests {
         };
         let hits = store.search(&closed).await.unwrap();
         assert!(hits.iter().all(|h| h.point_type != PointType::Requirement));
+    }
+
+    const C: &str = "htui_concepts_v2";
+
+    fn bge() -> EmbedderIdentity {
+        EmbedderIdentity {
+            model: "Xenova/bge-small-en-v1.5".into(),
+            revision: "ea104dacec62c0de699686887e3f920caeb4f3e3".into(),
+            onnx_sha256: "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35".into(),
+            dim: 384,
+            pooling: "cls".into(),
+            normalisation: "l2".into(),
+        }
+    }
+
+    fn stored(id: &EmbedderIdentity) -> Option<serde_json::Value> {
+        Some(serde_json::to_value(id).unwrap())
+    }
+
+    fn assert_names_the_remedy(err: &str) {
+        assert!(
+            err.contains("qdrant: embedder mismatch: collection `"),
+            "{err}"
+        );
+        assert!(err.contains(&format!("collection `{C}`")), "{err}");
+        assert!(
+            err.contains(&format!(
+                "delete collection `{C}` and run `htui --index-items` to rebuild it"
+            )),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_equal_identity_matches() {
+        assert_eq!(
+            check_existing(C, Some(384), stored(&bge()), &bge(), 384).unwrap(),
+            Existing::Matches
+        );
+    }
+
+    #[test]
+    fn a_collection_without_an_identity_is_stamped() {
+        assert_eq!(
+            check_existing(C, Some(384), None, &bge(), 384).unwrap(),
+            Existing::Stamp
+        );
+    }
+
+    #[test]
+    fn another_identity_is_refused_naming_both_and_the_remedy() {
+        let hash = EmbedderIdentity::hash(384);
+        let err = check_existing(C, Some(384), stored(&hash), &bge(), 384)
+            .unwrap_err()
+            .to_string();
+        assert_names_the_remedy(&err);
+        assert!(err.contains("holds vectors from hash/384"), "{err}");
+        assert!(
+            err.contains(&format!("but this htui embeds with {}", bge())),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn another_width_is_refused_before_any_stamp() {
+        for stored_id in [None, stored(&bge())] {
+            let err = check_existing(C, Some(8), stored_id, &bge(), 384)
+                .unwrap_err()
+                .to_string();
+            assert_names_the_remedy(&err);
+            assert!(
+                err.contains("holds 8-wide `dense` vectors, but this htui embeds 384-wide ones"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_collection_without_a_dense_vector_is_refused() {
+        let err = check_existing(C, None, None, &bge(), 384)
+            .unwrap_err()
+            .to_string();
+        assert_names_the_remedy(&err);
+        assert!(err.contains("has no `dense` vector"), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_identity_is_refused() {
+        let err = check_existing(
+            C,
+            Some(384),
+            Some(serde_json::json!("garbage")),
+            &bge(),
+            384,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_names_the_remedy(&err);
+        assert!(err.contains("holds vectors from \"garbage\""), "{err}");
+    }
+
+    #[test]
+    fn the_identity_round_trips_through_qdrant_metadata() {
+        let id = bge();
+        let json = serde_json::to_value(&id).unwrap();
+        assert_eq!(json["dim"], serde_json::json!(384));
+        let back = serde_json::Value::from(Value::from(json));
+        assert_eq!(
+            serde_json::from_value::<EmbedderIdentity>(back).unwrap(),
+            id
+        );
     }
 }

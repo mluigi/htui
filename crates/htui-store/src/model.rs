@@ -55,6 +55,20 @@ pub const POOLING: &str = "cls";
 /// How that vector is normalised: to unit L2 length.
 pub const NORMALISATION: &str = "l2";
 
+/// The identity of the pinned model (MOD-68 D8): what `RtenEmbedder` records in, and checks
+/// against, the collection.
+#[must_use]
+pub fn identity() -> crate::embed::EmbedderIdentity {
+    crate::embed::EmbedderIdentity {
+        model: REPO.to_owned(),
+        revision: REVISION.to_owned(),
+        onnx_sha256: ONNX_SHA256.to_owned(),
+        dim: crate::embed::DENSE_DIM,
+        pooling: POOLING.to_owned(),
+        normalisation: NORMALISATION.to_owned(),
+    }
+}
+
 /// The two files the embedder loads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelFiles {
