@@ -17,7 +17,7 @@ use htui_agent::record::{Control, Signal};
 use htui_agent::registry::DriverFactory;
 use htui_core::model::{
     AgentId, AgentSummary, BoxId, BoxProfile, CancelRequest, Executor, ItemId, RepoId, Run,
-    RunCommandId, RunCommandStatus, RunId, RunStatus, SnapshotCandidate, UserId,
+    RunCommandId, RunCommandStatus, RunId, RunKind, RunStatus, SnapshotCandidate, UserId,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{Result as StoreResult, StoreError};
@@ -1184,6 +1184,12 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
     /// already being applied (B-5), runs as an internal cancel (D12 steps 3-5, no second row).
     /// `live` is the loop's [`LiveChats`]: a cancel a live chat refuses stays pending, silently.
     pub fn poll_commands_with(&mut self, host: &H, sink: &P, live: LiveChats) {
+        // H-17: the worker runs no chats, so its loop hands an empty set (`worker.rs`), and the
+        // sweep's cancels it stores below refuse nothing there.
+        debug_assert!(
+            self.shared.role != Role::Worker || live.is_empty(),
+            "a worker runtime is polled with live chats"
+        );
         // MOD-24 D3 (B5): every tick, even one the in-flight check skips, so the sweep's cancels
         // refuse what this poll would.
         *self
@@ -1861,10 +1867,15 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
 
 /// D158, D189: the sweep's adoption: first the pending cancels of free runs (MOD-24 D3), then
 /// every lapsed lease on the box adopted, and each run that owes a walk resumed on its own task.
+/// A tick whose pending cancels could not be read adopts nothing.
 async fn adopt<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P>) {
     // Before `Kit::read`: `cancel_run` builds its own kit, and a failed read here must not skip
-    // the cancels.
-    cancels_first(ctx).await;
+    // the cancels. Their own read failing skips this tick's recovery instead: a cancel it could
+    // not see may be pending, and the next tick tries again.
+    if !cancels_first(ctx).await {
+        tracing::debug!("the sweep skips its recovery this tick: the pending cancels went unread");
+        return;
+    }
     let host = &ctx.host;
     let kit = match Kit::read(&ctx.shared, host, false).await {
         Ok(kit) => kit,
@@ -1918,20 +1929,27 @@ async fn adopt<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P
 /// (`cancel_leased` takes the lapsed lease) instead of being walked on, or finished by the
 /// recovery itself, which used to lose the user's cancel to the crash.
 ///
-/// Left to the poll: a run this process walks (a graceful preempt), and parked or terminal runs
-/// (the sweep never adopts them, so nothing races them). A run whose lease is live elsewhere is
-/// not in `pending_commands` at all. Failures are logged as the poll's are: a read at `warn`, a
-/// refused cancel at `debug` (its row stays pending, and recovery proceeds as before). The live
-/// chats are the last poll's (B5, D212), so a cancel the poll would refuse is refused here too.
-async fn cancels_first<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P>) {
+/// Only a graph run (`kind == RunKind::Graph`) that reads `running` is applied: a chat run is
+/// never adopted by the sweep (D3b), so its cancel has no recovery to beat and stays the poll's.
+/// Left to the poll too: a run this process walks (a graceful preempt), and parked or terminal
+/// runs (the sweep never adopts them, so nothing races them). A run whose lease is live elsewhere
+/// is not in `pending_commands` at all. Failures are logged as the poll's are: the pending rows'
+/// read at `warn`, a run's read and a refused cancel at `debug` (the row stays pending for the
+/// poll, and recovery proceeds as before). The live chats are the last poll's (B5, D212), so a
+/// cancel the poll would refuse is refused here too.
+///
+/// Answers whether the pending rows were read: when they were not (no writer, this box's row or
+/// the rows themselves unreadable), a pending cancel may be waiting unseen, and the caller skips
+/// this tick's recovery rather than recover a run whose cancel it could not see.
+async fn cancels_first<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P>) -> bool {
     let Some(writer) = ctx.host.writer() else {
-        return;
+        return false;
     };
     let box_id = match registered_box(&ctx.host).await {
         Ok(box_id) => box_id,
         Err(err) => {
             tracing::debug!(%err, "the sweep could not read this box for its cancels");
-            return;
+            return false;
         }
     };
     let rows =
@@ -1941,7 +1959,7 @@ async fn cancels_first<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &Task
             Ok(rows) => rows,
             Err(err) => {
                 tracing::warn!(%err, "the sweep could not read the pending run commands");
-                return;
+                return false;
             }
         };
     let live = ctx
@@ -1961,11 +1979,19 @@ async fn cancels_first<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &Task
         if ctx.shared.walks.is_live(row.run_id) {
             continue;
         }
-        let running = matches!(
-            htui_core::store::WorkerStore::run(&writer, row.run_id).await,
-            Ok(Some(run)) if run.status == RunStatus::Running
-        );
-        if !running {
+        let run = match htui_core::store::WorkerStore::run(&writer, row.run_id).await {
+            Ok(Some(run)) => run,
+            Ok(None) => continue,
+            Err(err) => {
+                tracing::debug!(
+                    run = %row.run_id,
+                    %err,
+                    "the sweep could not read a pending cancel's run; the poll retries it"
+                );
+                continue;
+            }
+        };
+        if run.kind != RunKind::Graph || run.status != RunStatus::Running {
             continue;
         }
         Box::pin(cancel_run(
@@ -1979,6 +2005,7 @@ async fn cancels_first<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &Task
         // ends here.
         ctx.shared.until_applied(row.id).await;
     }
+    true
 }
 
 /// Plan D14, OQ-5: this box's queued rows join the claim queue in `(queued_at, id)` order and are

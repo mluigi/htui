@@ -180,7 +180,8 @@ pub(crate) mod tests {
     use htui_agent::registry::{DriverFactory, TransportBuilder};
     use htui_core::fixtures::{demo_at, edit_agent, ids};
     use htui_core::model::{
-        Agent, AgentBox, AgentId, Billing, BoxEdit, BoxId, CancelRequest, DocumentId, EventKind,
+        Agent, AgentBox, AgentId, Billing, BoxEdit, BoxId, CancelRequest, ChatRunSpec, DocumentId,
+        EventKind,
         Executor, Gate, Item, ItemId, NewDocument, NewRepo, NewRun, NewRunStep, PermissionId,
         PermissionStatus, RepoId, Resolution, Run, RunCommand, RunCommandId, RunCommandKind,
         RunCommandStatus, RunId, RunMode, RunStatus, RunStep, RunStepCommit, SnapshotPhase, Status,
@@ -3716,6 +3717,38 @@ pub(crate) mod tests {
         );
         assert!(fixture.steps(run).await.is_empty(), "nothing recovered");
         assert!(!probe.is_applying(id));
+    }
+
+    /// MOD-24 D3 (review L4): the sweep's cancels apply to graph runs only. A chat run on this box
+    /// reads `running` with no lease, so its pending cancel is in `pending_commands`, but the
+    /// sweep never adopts a chat (D3b): there is no recovery to beat, and the row stays the poll's.
+    #[tokio::test]
+    async fn a_sweep_leaves_a_chat_runs_cancel_to_the_poll() {
+        let fixture = Fixture::new().await;
+        let project = fixture.item(ids::HTUI_ANA_2).await.project_id;
+        let chat = ChatRunSpec::mint(project, ids::BOX, ids::USER, None, None);
+        fixture
+            .store
+            .start_chat_run(&chat)
+            .await
+            .expect("the chat run lands");
+        let id = requested(&fixture, chat.run_id).await;
+        let mut runtime = fixture.runtime();
+        let probe = testing::probe(&runtime);
+
+        swept(&mut runtime, &fixture).await;
+        assert_eq!(
+            command_states(&fixture, chat.run_id),
+            [(id, RunCommandStatus::Pending)],
+            "the sweep left the chat's cancel to the poll"
+        );
+        assert_eq!(fixture.run(chat.run_id).await.status, RunStatus::Running);
+        // The engine refuses a chat's cancel anyway; what the kind check spares is the attempt,
+        // whose `cancel_run` would have minted the run's lock (pruned only at the next tick).
+        assert!(
+            !probe.has_lock_entry(chat.run_id),
+            "the sweep never tried the chat's cancel"
+        );
     }
 
     /// MOD-24 D3, regression guard: a run whose lease is live elsewhere is its holder's. Its
