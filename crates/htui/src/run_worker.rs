@@ -2271,6 +2271,40 @@ pub(crate) mod tests {
         );
     }
 
+    /// R-40: a step that goes live publishes a `Changed` frame at once, while its session is still
+    /// running, and not only when the walk rests. The pane re-reads on `Changed`, so no new kind.
+    #[tokio::test]
+    async fn a_step_that_goes_live_publishes_a_frame_before_its_session_ends() {
+        let fixture = Fixture::new().await;
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+        worker.send_at(
+            Origin::Tab(TabId("backlog")),
+            1,
+            StoreRequest::RunStream {
+                item: ids::HTUI_ANA_2,
+            },
+        );
+        let (run, research) = parked(&fixture, &mut worker).await;
+        frames(&mut worker);
+        let stall = Stall::default();
+        fixture.sessions.push(Play::Stall(stall.clone()));
+        worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::RetryStep {
+                run,
+                step: research.id,
+            })),
+        );
+        within("attempt 2's session starting", stall.reached.notified()).await;
+        let live = frames(&mut worker);
+        assert!(
+            live.iter()
+                .any(|(_, _, frame)| frame.run == Some(run)
+                    && matches!(frame.kind, FrameKind::Changed)),
+            "the step went live and said so: {live:?}"
+        );
+    }
+
     /// D174, PRD `:197`: off the server every command is refused with MOD-25's one sentence and
     /// nothing is spawned, while the stream and the verdicts still answer from the mirror.
     #[tokio::test]
