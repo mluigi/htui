@@ -3,7 +3,9 @@
 //!
 //! One read per event, one reply out; the section renders only the last snapshot and never
 //! patches a row into it (the rule [`crate::prompt_settings`] states in its module doc). Writes
-//! are `WriteStore::edit_box`, a compare-and-set on `box.edit_version` (D39, D41).
+//! are `WriteStore::edit_box`, a compare-and-set on `box.edit_version` (D39, D41), and
+//! `WriteStore::set_box_probe_spec`, a compare-and-set on the overlay row's `updated_at` (MOD-51
+//! D2), refused first by `spec::check` when the probe would ignore the overlay (MOD-51 D3).
 //!
 //! Known residue, the one [`crate::prompt_settings`] records: a re-read that fails after an
 //! applied write answers `Failed`, though the row has changed.
@@ -12,9 +14,8 @@
 
 use htui_agent::box_probe::spec;
 use htui_core::model::{BoxId, BoxRecord};
-use htui_core::store::{CasOutcome, Result, StoreError, WriteStore};
+use htui_core::store::{CasOutcome, Result, StoreError, StoredSetting, WriteStore};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
-use serde_json::Value;
 
 use crate::store_worker::{StoreReply, StoreRequest};
 
@@ -42,44 +43,53 @@ pub struct SpecView {
     /// `EffectiveSpec.error`: why a stored overlay was ignored (it starts with
     /// `spec::SPEC_IGNORED`).
     pub error: Option<String>,
+    /// The stored `box_probe_spec` row and its token (MOD-51 D5), `None` when there is no row;
+    /// the spec editor opens on it. Kept even when the probe ignores the value (R-6): the editor
+    /// shows what is stored, and clearing it is always accepted.
+    pub stored: Option<StoredSetting>,
 }
 
-/// The view of `spec::effective(spec::seed(), stored)`. Pure.
+/// The view of `spec::effective(spec::seed(), stored value)`, carrying the row. Pure.
 #[must_use]
-pub fn spec_view(stored: Option<&Value>) -> SpecView {
-    let effective = spec::effective(spec::seed(), stored);
+pub fn spec_view(stored: Option<StoredSetting>) -> SpecView {
+    let value = stored.as_ref().and_then(|row| row.value.as_ref());
+    let effective = spec::effective(spec::seed(), value);
     SpecView {
-        overlay: stored.is_some() && effective.error.is_none(),
+        overlay: value.is_some() && effective.error.is_none(),
         digest: effective.digest,
         error: effective.error,
+        stored,
     }
 }
 
 /// One read (D45): `backend.box_info()` for this box, `writer.boxes()`, and
-/// `backend.app_settings()` for `spec::SETTING_KEY`.
+/// `writer.box_probe_spec()`: the view and its token from one read (MOD-51 D5).
 ///
 /// # Errors
 /// Whatever the store reports.
 pub async fn snapshot(backend: &Backend, writer: &Writer) -> Result<BoxesSnapshot> {
     let this_box = backend.box_info().await?.map(|info| info.box_id);
     let boxes = writer.boxes().await?;
-    let settings = backend.app_settings().await?;
+    let stored = writer.box_probe_spec().await?;
     Ok(BoxesSnapshot {
         this_box,
         boxes,
-        spec: spec_view(settings.get(spec::SETTING_KEY)),
+        spec: spec_view(stored),
     })
 }
 
-/// Serves `Boxes` and `EditBox` (D45, D46). `Err(Unreachable(DATABASE_UNREACHABLE))` offline
-/// (the writer is `None`), for the read too. `EditBox` answers `Boxes` on `Applied`,
-/// `BoxesStale` on `Stale`, and `BoxesStale` on `NotFound { entity: "box" }` too, so a box that
-/// vanished under an open editor reaches the section as a snapshot without it.
+/// Serves `Boxes`, `EditBox` and `SetProbeSpec` (D45, D46; MOD-51 D4).
+/// `Err(Unreachable(DATABASE_UNREACHABLE))` offline (the writer is `None`), for the read too.
+/// `EditBox` answers `Boxes` on `Applied`, `BoxesStale` on `Stale`, and `BoxesStale` on
+/// `NotFound { entity: "box" }` too, so a box that vanished under an open editor reaches the
+/// section as a snapshot without it. `SetProbeSpec` answers `Boxes` on `Applied` and
+/// `BoxesStale` on `Stale` (the row gone included); an overlay `spec::check` refuses is
+/// `Err(Constraint("{SPEC_REFUSED}: {fault}"))` before the store is reached (MOD-51 D3).
 ///
 /// # Errors
-/// Whatever the seam reports (a `Constraint` becomes `Failed` with the store's tag or executor
-/// sentence), plus
-/// `Unreachable` offline and `Backend` for a request that is not one of the two.
+/// Whatever the seam reports (a `Constraint` becomes `Failed` with the store's tag, executor or
+/// overlay sentence), the checker's refusal above, plus
+/// `Unreachable` offline and `Backend` for a request that is not one of the three.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
     let writer = backend
         .writer()
@@ -111,7 +121,28 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 StoreReply::BoxesStale(fresh)
             })
         }
-        // `try_serve` routes exactly this module's two variants here, so the last arm is
+        StoreRequest::SetProbeSpec { overlay, expected } => {
+            // MOD-51 D3: the probe's own merge, without its warning; nothing is written on a
+            // refusal. A clear has nothing to check, and the store refuses one with no token.
+            if let Some(overlay) = overlay {
+                spec::check(overlay).map_err(|fault| {
+                    StoreError::Constraint(format!("{}: {fault}", spec::SPEC_REFUSED))
+                })?;
+            }
+            // A row gone under the editor is `Stale(None)`, a miss like a spent token (MOD-51
+            // D2), so it answers `BoxesStale` like one.
+            let outcome = writer
+                .set_box_probe_spec(overlay.clone(), *expected)
+                .await?;
+            let applied = matches!(outcome, CasOutcome::Applied(_));
+            let fresh = Box::new(snapshot(backend, &writer).await?);
+            Ok(if applied {
+                StoreReply::Boxes(fresh)
+            } else {
+                StoreReply::BoxesStale(fresh)
+            })
+        }
+        // `try_serve` routes exactly this module's three variants here, so the last arm is
         // unreachable from the shell; a caller that reached it anyway is better told which request
         // it sent than killed.
         other => Err(StoreError::Backend(format!(
@@ -121,11 +152,11 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
     }
 }
 
-/// The two request names, in [`StoreRequest`] order.
+/// The three request names, in [`StoreRequest`] order.
 ///
-/// [`StoreRequest::name`]'s arms and the section's `Failed` match both read from here, so a third
+/// [`StoreRequest::name`]'s arms and the section's `Failed` match both read from here, so a fourth
 /// request cannot be named in one place and matched in the other.
-pub const REQUEST_NAMES: [&str; 2] = ["boxes", "edit_box"];
+pub const REQUEST_NAMES: [&str; 3] = ["boxes", "edit_box", "set_probe_spec"];
 
 /// The **read**'s name: a refused read leaves the section with no list; a refused write leaves the
 /// editor over its text.

@@ -148,6 +148,12 @@ impl BoxRecord {
 /// The longest declared tag, in chars (MOD-7 D42).
 pub const DECLARED_TAG_MAX: usize = 64;
 
+/// The `app_setting` key of the box probe spec overlay (MOD-7 D52, MOD-51 D1): the one spelling
+/// the store's typed writer (`WriteStore::set_box_probe_spec`) and the probe
+/// (`htui_agent::box_probe::spec::SETTING_KEY`, an alias of this) share, so the two cannot
+/// disagree on the key while `htui-core` stays free of `htui-agent`.
+pub const BOX_PROBE_SPEC_KEY: &str = "box_probe_spec";
+
 /// One human edit of a box row (MOD-7 milestone 2, D41): `Some` writes that column, `None` leaves
 /// it alone. An edit with both `None` is legal and still bumps `edit_version`.
 ///

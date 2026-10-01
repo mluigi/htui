@@ -14,25 +14,26 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-01):** **MOD-41 is done** (`docs/decisions/mod/mod-41.md`): `htui worker`
+**Current status (2026-10-01):** **MOD-51 is done** (`docs/decisions/mod/mod-51.md`): Settings >
+Boxes edits the `box_probe_spec` overlay. `s` opens a JSON editor and `ctrl-s` saves it as a
+compare-and-set on `app_setting.updated_at` through `WriteStore::set_box_probe_spec`. The worker
+refuses any overlay the probe would ignore (`spec::check`, the probe's own merge) before it writes,
+a blank save clears the row, and the next `p` or connect re-probes under the new digest. No
+migration, no `.sqlx` change.
+Before it, **MOD-41 is done** (`docs/decisions/mod/mod-41.md`): `htui worker`
 runs a box's runs with no terminal (guide `docs/htui-worker.md`). Run supervision lives in the
 UI-free crate `crates/htui-worker` behind `RecorderStore`/`WorkerStore`/`WorkerHost`;
 `box.settings.executor` (Settings > Boxes, `w`) decides whether the TUI or the worker claims, adopts
 and sweeps on a box, and on a worker box the TUI hands answered runs back. The remaining step writes
 are lease-fenced, the heartbeat fences on a monotonic clock, and the worker re-syncs the concepts
 index. `R-ORCH-12` is now must; `R-ID-2` and `R-STO-1` were amended. No migration.
-Before it, **CLEAN-4 was done** (`docs/decisions/clean/clean-4.md`): the
+Before that, **CLEAN-4 was done** (`docs/decisions/clean/clean-4.md`): the
 review loop's `no_progress_review` stop is reachable. The predicate's review half compares the
 reviews of the loop's last two turns (review rows answered `Rejected`, each read through its newest
 `output_kind` document from `documents()` heads) instead of reading the latest-per-kind
 `documents_of_kinds`, which never held two. A loop whose two rejected reviews repeat each other now
 escalates at that attempt; the hash half is still asked first. `runs_pg`'s escalation case now stops
 on `no_progress_review`, and the stop is pinned in that test (MOD-4 R-9 closed).
-Before that, **MOD-59 done** (`docs/decisions/mod/mod-59.md`): an applied Skills,
-Templates or Requirements write answers its own reply (`SkillWritten`, `TemplateSaved`,
-`RequirementWritten`, as MOD-23's `AgentWritten`), so a form lands on its write and never stays "in
-flight" when another session changed the row or a read arrived first; a write whose re-read failed
-still lands, and a failed mint is hedged and re-reads the tree.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -272,16 +273,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   off the UI task (`R-NF-3`). **Unblocked:** MOD-7 is done (`docs/decisions/mod/mod-7.md`).
   Raised by the maintainer at MOD-7's PRD
   gate, 2026-09-25.
-- [ ] **MOD-51 - `box_probe_spec` editor in the Settings box section** (from MOD-7 milestone 2,
-  OQ-18). `R-BOX-2`, `R-TUI-8`. MOD-7 milestone 1's plan (OQ-9, D15, as amended at maintainer
-  review) promised milestone 2 a validated writer of the `app_setting.box_probe_spec` overlay; the
-  PRD's milestone 2 row does not carry it, and the maintainer deferred it here at milestone 2's
-  CONFIRM gate (2026-09-26). Milestone 2 ships only the read-only view of the effective spec. The
-  writer validates through `htui_agent::box_probe` spec parsing before it stores, is a
-  compare-and-set, and runs off the UI task (`R-NF-3`); the planned shape is task T6 of
-  `.claude/plans/mod-7-box-settings-section.plan.md`. Unblocked: MOD-7 is done
-  (`docs/decisions/mod/mod-7.md`); its milestone 2 landed
-  (the Boxes section, `crates/htui/src/ui/tabs/settings/boxes.rs`, and `crate::box_settings`).
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
   pattern masks, fail-closed persistence gate, Settings tab secret provider section. **No longer
@@ -604,6 +595,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 28 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 27 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

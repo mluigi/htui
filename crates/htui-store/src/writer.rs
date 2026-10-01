@@ -434,6 +434,24 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn box_probe_spec(&self) -> Result<Option<StoredSetting>> {
+        match self {
+            Self::Memory(store) => store.box_probe_spec().await,
+            Self::Online(pg) => pg.box_probe_spec().await,
+        }
+    }
+
+    async fn set_box_probe_spec(
+        &self,
+        overlay: Option<Value>,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Option<StoredSetting>>> {
+        match self {
+            Self::Memory(store) => store.set_box_probe_spec(overlay, expected).await,
+            Self::Online(pg) => pg.set_box_probe_spec(overlay, expected).await,
+        }
+    }
+
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> Result<()> {
         match self {
             Self::Memory(store) => store.start_chat_run(chat).await,

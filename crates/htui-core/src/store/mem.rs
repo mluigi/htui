@@ -22,21 +22,21 @@ use crate::clock::Clock;
 #[cfg(feature = "test-support")]
 use crate::clock::TestClock;
 use crate::model::{
-    Agent, AgentBox, AgentId, AgentSummary, AppUser, BindingChange, BoundSkill, BoxEdit, BoxId,
-    BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec,
-    CitationKind, Claim, CommandRun, CommandRunId, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS,
-    Document, DocumentHead, DocumentId, Executor, GateOutcome, Item, ItemCitation, ItemFilter,
-    ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement,
-    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument,
-    NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
-    PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
-    Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
-    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
-    SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch,
+    Agent, AgentBox, AgentId, AgentSummary, AppUser, BOX_PROBE_SPEC_KEY, BindingChange, BoundSkill,
+    BoxEdit, BoxId, BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool,
+    ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId, CoverageRow,
+    DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, Executor, GateOutcome, Item,
+    ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch,
+    ItemRequirement, ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode,
+    NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate,
+    NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath,
+    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementState,
+    RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId,
+    RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary,
+    Scope, SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch,
     SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
     StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
     WorkspacePatch, WorkspaceProject, WorkspaceSummary, canonical_declared_tags,
@@ -48,18 +48,18 @@ use crate::prompt::template::TemplateRole;
 use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
-    BOX_SETTINGS_NOT_AN_OBJECT, BindingFacts, CasOutcome, DeleteReach, DeleteTarget,
-    EXECUTOR_MUST_BE_KNOWN, ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome,
-    WriteStore, already_exists, chat_step_status, check_attachment, citation_key,
-    close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
-    finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project,
-    invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
-    lease_ttl_micros, legal_move, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
-    prompt_template_key, prompt_template_refusal, references_no_row, requirement_withdrawn,
-    reserved_phase_name, resolution_not_closable, row_names_another_step, run_is_terminal,
-    skill_body_refusal, skill_patch_refusal, skill_version_key, step_is_not_promotable,
-    step_slot_is_taken, summary_names_another_item, winner_is_not_settled,
-    withdrawn_requirement_cited,
+    BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
+    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, ReadStore,
+    SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore, already_exists,
+    chat_step_status, check_attachment, citation_key, close_out_needs_a_summary, expected_on_row,
+    failure_disagrees_with_status, finish_run_item_mirror, finish_run_needs_a_terminal_status,
+    graph_not_in_project, invalid_area_code, invalid_prefix, item_has_a_live_run,
+    item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move, new_skill_refusal,
+    not_a_fanout_candidate, not_a_terminal_status, prompt_template_key, prompt_template_refusal,
+    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
+    row_names_another_step, run_is_terminal, skill_body_refusal, skill_patch_refusal,
+    skill_version_key, step_is_not_promotable, step_slot_is_taken, summary_names_another_item,
+    winner_is_not_settled, withdrawn_requirement_cited,
 };
 use uuid::Uuid;
 
@@ -3510,6 +3510,63 @@ impl State {
         }
     }
 
+    /// The `box_probe_spec` row with its token (MOD-51 D2): `app_settings` holds it beside the
+    /// ten `SettingKey` rows, under a key no `SettingKey` spells.
+    fn box_probe_spec(&self) -> Option<StoredSetting> {
+        self.app_settings
+            .get(BOX_PROBE_SPEC_KEY)
+            .map(|(value, updated_at)| StoredSetting {
+                value: Some(value.clone()),
+                updated_at: *updated_at,
+            })
+    }
+
+    /// The overlay's compare-and-set (MOD-51 D2): both refusals first, then the `App` rung's
+    /// `(stored, expected)` rule of [`set_setting`](State::set_setting), except that a miss over
+    /// no row is `Stale(None)` rather than `NotFound`. `now` stands in for Postgres's
+    /// `DEFAULT now()` / `set_updated_at`.
+    fn set_box_probe_spec(
+        &mut self,
+        overlay: Option<Value>,
+        expected: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Option<StoredSetting>>> {
+        if overlay.as_ref().is_some_and(|value| !value.is_object()) {
+            return Err(StoreError::Constraint(
+                BOX_PROBE_SPEC_NOT_AN_OBJECT.to_owned(),
+            ));
+        }
+        if overlay.is_none() && expected.is_none() {
+            return Err(StoreError::Constraint(
+                BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN.to_owned(),
+            ));
+        }
+        let stored = self.box_probe_spec();
+        // `expected: None` is "I expect no row", as on the `App` rung.
+        let current = match (&stored, expected) {
+            (None, None) => true,
+            (Some(row), Some(want)) => row.updated_at == want,
+            (None, Some(_)) | (Some(_), None) => false,
+        };
+        if !current {
+            return Ok(CasOutcome::Stale(stored));
+        }
+        Ok(CasOutcome::Applied(match overlay {
+            Some(value) => {
+                self.app_settings
+                    .insert(BOX_PROBE_SPEC_KEY.to_owned(), (value.clone(), now));
+                Some(StoredSetting {
+                    value: Some(value),
+                    updated_at: now,
+                })
+            }
+            None => {
+                self.app_settings.remove(BOX_PROBE_SPEC_KEY);
+                None
+            }
+        }))
+    }
+
     /// What a workspace delete reaches: its links and its box paths, and no project (D4).
     fn workspace_reach(&self, id: WorkspaceId) -> Option<DeleteReach> {
         if !self.workspaces.contains_key(&id) {
@@ -5891,6 +5948,19 @@ impl WriteStore for MemStore {
         let user = self.this_user();
         let now = self.now();
         self.write(|state| state.edit_box(user, id, expected, edit, now))
+    }
+
+    async fn box_probe_spec(&self) -> Result<Option<StoredSetting>> {
+        Ok(self.read(State::box_probe_spec))
+    }
+
+    async fn set_box_probe_spec(
+        &self,
+        overlay: Option<Value>,
+        expected: Option<DateTime<Utc>>,
+    ) -> Result<CasOutcome<Option<StoredSetting>>> {
+        let now = self.now();
+        self.write(|state| state.set_box_probe_spec(overlay, expected, now))
     }
 
     async fn start_chat_run(&self, chat: &ChatRunSpec) -> Result<()> {

@@ -1,7 +1,8 @@
 //! `Settings > Boxes` (MOD-7 milestone 2, PRD D4, `R-TUI-8`): every box of this user with its
 //! profile, tools, probed and declared tags, quirks, executor and last probe; declared tags,
 //! quirks and the executor (MOD-41 plan D10) edited as a compare-and-set a reconnect cannot
-//! stale; the probe on this box only.
+//! stale; the probe on this box only. `s` edits the app-wide probe spec overlay (MOD-51 D6) in
+//! the body, box or no box.
 //!
 //! Holds no store handle and mints no id (`R-NF-3`): every `BoxId` it sends came out of a
 //! [`BoxesSnapshot`].
@@ -14,7 +15,12 @@
 //! which request it answers, so `busy` is the whole of the attribution. A read that lands between
 //! a save and its reply (a scope change or a tab re-activation) is taken for that reply and closes
 //! the editor early; if the save then comes back `BoxesStale`, `CHANGED_ELSEWHERE_CLOSED` says
-//! nothing was written and how to retry.
+//! nothing was written and how to retry. For a probe spec save the early close also shows
+//! `SPEC_SAVED` and loses the typed text, as for `edit_box`; the real reply's notice then
+//! replaces it (`CHANGED_ELSEWHERE_CLOSED`, or the refusal's sentence), and nothing is written
+//! wrongly (MOD-51 F-11, blueprint R-1). The same race can also land a tags or quirks save's
+//! `BoxesStale` in the probe spec editor's branch (opened after the early close), refreshing the
+//! spec token; nothing is written wrongly either (MOD-51 LOW-5).
 
 use htui_core::model::{
     BoxId, BoxRecord, Executor, Scope, canonical_declared_tags, declared_tags_from_text,
@@ -30,6 +36,7 @@ use crate::ui::tabs::settings::{
     is_error, message, wrapped,
 };
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
+use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use htui_core::model::BoxEdit;
 use ratatui::Frame;
@@ -37,6 +44,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+use serde_json::Value;
 
 /// What the body says before any boxes have arrived.
 const NOT_READ: &str = "boxes not read yet";
@@ -47,11 +55,19 @@ const UNAVAILABLE: &str = "boxes unavailable";
 /// What the body says over a list with no box in it.
 const NO_BOXES: &str = "no box is registered for this user yet";
 
-/// The Browse keys.
-const HINT_BROWSE: &str = "j/k move \u{b7} t tags \u{b7} e quirks \u{b7} w executor \u{b7} p probe this box \u{b7} r reload";
+/// The Browse keys (MOD-51 D6: `s` opens the probe spec editor; `p probe this box` became
+/// `p probe` so the line fits an 80-column terminal, blueprint F-10, and [`THIS_BOX_ONLY`] still
+/// explains `p` on another box).
+const HINT_BROWSE: &str = "j/k move \u{b7} t tags \u{b7} e quirks \u{b7} w executor \u{b7} p probe \
+                           \u{b7} s spec \u{b7} r reload";
 
-/// The Browse keys with no list to act on.
-const HINT_NO_LIST: &str = "r reload";
+/// The Browse keys over a read list with no box in it: the spec is app-wide, so `s` still works
+/// (MOD-51 D6).
+const HINT_NO_LIST: &str = "s spec \u{b7} r reload";
+
+/// The Browse keys before the first read and over a refused one, where `s` does nothing
+/// (MOD-51 F-3).
+const HINT_RELOAD: &str = "r reload";
 
 /// The tag editor's keys.
 const HINT_TAGS: &str = "Enter saves \u{b7} Esc cancels \u{b7} comma-separated";
@@ -61,6 +77,26 @@ const HINT_QUIRKS: &str = "ctrl-s saves \u{b7} Esc cancels \u{b7} Enter breaks t
 
 /// The executor confirmation's keys (MOD-41 plan D10).
 const HINT_EXECUTOR: &str = "y write \u{b7} n/esc cancel";
+
+/// The probe spec editor's keys (MOD-51 D6; OQ-16: `Enter` is a line break, so `ctrl-s` saves).
+const HINT_SPEC: &str =
+    "ctrl-s saves \u{b7} Esc cancels \u{b7} Enter breaks the line \u{b7} blank clears";
+
+/// The dim line above the probe spec editor: what the text is, and what blank does (MOD-51 D6).
+/// It fits a 78-column body unclipped.
+const SPEC_TITLE: &str =
+    "stored overlay box_probe_spec, merged into the seed by name; blank clears it";
+
+/// A probe spec save applied (MOD-51 D6, D8): nothing re-probes now; the next `p` or connect does.
+const SPEC_SAVED: &str =
+    "probe spec saved \u{2014} the next p (or the next connect) re-probes under it";
+
+/// The opening of a probe spec that does not parse; `serde_json`'s own sentence follows.
+const SPEC_NOT_JSON: &str = "the overlay is not JSON";
+
+/// How many lines `PageUp`/`PageDown` move in the probe spec editor: its drawn height follows
+/// the frame, which `on_key` cannot see.
+const SPEC_PAGE: u16 = 10;
 
 /// The list pane's width, the one-column gutter to the detail pane included.
 const LIST_WIDTH: u16 = 28;
@@ -77,12 +113,13 @@ const DIGEST_SHOWN: usize = 12;
 /// How many hex digits of a box id tell two same-named boxes apart (PRD `:262`).
 const ID_SUFFIX: usize = 8;
 
-/// A second save while the first is in flight (D56).
-const IN_FLIGHT: &str = "edit_box in flight";
+/// What a second write says while one is in flight, after the request's name (D56, MOD-51
+/// F-5): `edit_box in flight` is byte-identical to the sentence before MOD-51.
+const IN_FLIGHT: &str = "in flight";
 
-/// [`CHANGED_ELSEWHERE`] for the quirks editor, where `Enter` breaks the line (OQ-16) and
-/// `ctrl-s` is the save that retries. Starts `changed elsewhere`, so `is_error` draws it in
-/// `theme.error`.
+/// [`CHANGED_ELSEWHERE`] for the two `ctrl-s` editors, quirks and the probe spec (MOD-51 D6),
+/// where `Enter` breaks the line (OQ-16) and `ctrl-s` is the save that retries. Starts
+/// `changed elsewhere`, so `is_error` draws it in `theme.error`.
 const CHANGED_ELSEWHERE_QUIRKS: &str = "changed elsewhere since you opened it \u{2014} reloaded; ctrl-s retries against the current row";
 
 /// [`CHANGED_ELSEWHERE`] for the executor confirmation, where `y` is the write that retries
@@ -96,6 +133,9 @@ const THIS_BOX_ONLY: &str = "the probe runs on this box only";
 /// The name `busy` carries while an `EditBox` is in flight: the request's own name.
 const EDIT_NAME: &str = REQUEST_NAMES[1];
 
+/// The name `busy` carries while a `SetProbeSpec` is in flight (MOD-51 D6).
+const SPEC_NAME: &str = REQUEST_NAMES[2];
+
 /// The section.
 #[derive(Debug, Default)]
 pub struct BoxesSection {
@@ -107,7 +147,8 @@ pub struct BoxesSection {
     selected: Option<BoxId>,
     /// Browse, or one editor.
     mode: Mode,
-    /// The write in flight (D56): `Some("edit_box")` between an `EditBox` and its reply.
+    /// The write in flight (D56): `Some("edit_box")` between an `EditBox` and its reply,
+    /// `Some("set_probe_spec")` between a `SetProbeSpec` and its reply (MOD-51 D6).
     busy: Option<&'static str>,
     /// A `ProbeBox` is in flight: the hint says so. Cleared by `BoxProbed` or its `Failed`.
     probing: bool,
@@ -115,7 +156,7 @@ pub struct BoxesSection {
     notice: Option<String>,
 }
 
-/// Browse, or one editor open over one box.
+/// Browse, or one editor open: over one box, or over the app-wide probe spec (MOD-51 D6).
 #[derive(Debug, Default)]
 enum Mode {
     /// No editor open.
@@ -127,6 +168,22 @@ enum Mode {
     Quirks(Editor<TextArea, String>),
     /// The executor flip, awaiting y/n (MOD-41 plan D10).
     Executor(ExecutorFlip),
+    /// The probe spec editor (MOD-51 D6): app-wide, over no box.
+    Spec(SpecEditor),
+}
+
+/// An open probe spec editor: the token it holds, and the widget.
+///
+/// `TextArea` redacts its `Debug`, so the derived one prints no typed text.
+#[derive(Debug)]
+struct SpecEditor {
+    /// `SpecView.stored`'s `updated_at` at open, `None` for no row; replaced only by a
+    /// `BoxesStale` (D48), never by a plain `Boxes`. The blank rule reads it (D6, F-4; amended
+    /// at review (MOD-51 LOW-1): the live token decides).
+    expected: Option<DateTime<Utc>>,
+    /// The overlay pretty-printed (`serde_json::to_string_pretty`), or empty; the cursor at the
+    /// end, as the quirks editor's.
+    input: TextArea,
 }
 
 /// An open executor confirmation: the box, the token it opened on, and the flip it proposes.
@@ -218,10 +275,10 @@ impl BoxesSection {
         self.boxes().iter().find(|record| record.row.id == id)
     }
 
-    /// The box an open editor is over.
+    /// The box an open editor is over; the probe spec editor is over none.
     fn editor_box(&self) -> Option<BoxId> {
         match &self.mode {
-            Mode::Browse => None,
+            Mode::Browse | Mode::Spec(_) => None,
             Mode::Tags(editor) => Some(editor.box_id),
             Mode::Quirks(editor) => Some(editor.box_id),
             Mode::Executor(flip) => Some(flip.box_id),
@@ -265,12 +322,13 @@ impl BoxesSection {
 
     /// `Boxes` (D48, D56): only the reply to this section's own save closes an editor; a plain
     /// read (`r`, activation, the re-read after a probe or a reconnect) leaves the editor, its
-    /// text and its token alone.
+    /// text and its token alone. A probe spec save that applied says the next `p` re-probes
+    /// (MOD-51 D6, D8).
     fn on_boxes(&mut self, snapshot: &BoxesSnapshot) {
         self.replace(snapshot);
-        if self.busy.take().is_some() {
+        if let Some(name) = self.busy.take() {
             self.mode = Mode::Browse;
-            self.notice = None;
+            self.notice = (name == SPEC_NAME).then(|| SPEC_SAVED.to_owned());
         }
     }
 
@@ -279,6 +337,14 @@ impl BoxesSection {
     fn on_stale(&mut self, snapshot: &BoxesSnapshot) {
         self.busy = None;
         self.replace(snapshot);
+        // MOD-51 F-6(a): the probe spec editor is over no box, so it is settled before
+        // `editor_box` would take it for no editor at all. Its token is the overlay row's, `None`
+        // when the row is gone (the retry is then an insert).
+        if let Mode::Spec(editor) = &mut self.mode {
+            editor.expected = snapshot.spec.stored.as_ref().map(|row| row.updated_at);
+            self.notice = Some(CHANGED_ELSEWHERE_QUIRKS.to_owned());
+            return;
+        }
         let Some(box_id) = self.editor_box() else {
             // Nothing is open to retry from, so the sentence has to say the write did not apply.
             self.notice = Some(CHANGED_ELSEWHERE_CLOSED.to_owned());
@@ -302,7 +368,7 @@ impl BoxesSection {
                 flip.expected = token;
                 CHANGED_ELSEWHERE_EXECUTOR
             }
-            (Some(_), Mode::Browse) => CHANGED_ELSEWHERE,
+            (Some(_), Mode::Browse | Mode::Spec(_)) => CHANGED_ELSEWHERE,
             (None, _) => {
                 self.mode = Mode::Browse;
                 DELETED_ELSEWHERE
@@ -311,16 +377,16 @@ impl BoxesSection {
         self.notice = Some(notice.to_owned());
     }
 
-    /// Whether `t`/`e`/`w`/`p` must do nothing: a list the read could not confirm (the body shows
+    /// Whether `t`/`e`/`w`/`s` must do nothing: a list the read could not confirm (the body shows
     /// the refusal, not the rows), or a save in flight (D56, the kinds section's `blocked`): its
     /// reply closes whatever editor is open, so a second one would lose its text to the first's
-    /// reply.
+    /// reply. The notice names the write in flight (MOD-51 F-5).
     fn blocked(&mut self) -> bool {
         if self.unavailable.is_some() {
             return true;
         }
-        if self.busy.is_some() {
-            self.notice = Some(IN_FLIGHT.to_owned());
+        if let Some(name) = self.busy {
+            self.notice = Some(format!("{name} {IN_FLIGHT}"));
             return true;
         }
         false
@@ -383,6 +449,30 @@ impl BoxesSection {
         self.notice = None;
     }
 
+    /// `s` (MOD-51 D6): the probe spec editor over the stored overlay, with or without a listed
+    /// box, whenever a snapshot is present and the read was not refused. An overlay the probe
+    /// ignores opens as stored (plan R-6): saving it unchanged is refused, clearing it is not.
+    fn open_spec(&mut self) {
+        if self.blocked() {
+            return;
+        }
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let stored = snapshot.spec.stored.as_ref();
+        let text = stored
+            .and_then(|row| row.value.as_ref())
+            .map(|value| serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()))
+            .unwrap_or_default();
+        let mut input = TextArea::with_text(&text);
+        input.set_cursor(usize::MAX);
+        self.mode = Mode::Spec(SpecEditor {
+            expected: stored.map(|row| row.updated_at),
+            input,
+        });
+        self.notice = None;
+    }
+
     /// `p` (D49, PRD D4): milestone 1's probe, on this box only.
     ///
     /// One `ProbeBox` in flight per section, a deviation from D63: a second one would supersede
@@ -424,6 +514,7 @@ impl BoxesSection {
             Mode::Tags(editor) => editor.input.on_key(key),
             // `PageUp`/`PageDown` move by the editor's drawn height.
             Mode::Quirks(editor) => editor.input.on_key(key, QUIRKS_HEIGHT),
+            Mode::Spec(editor) => editor.input.on_key(key, SPEC_PAGE),
         };
         match outcome {
             FieldOutcome::Consumed => Handled::Consumed,
@@ -463,10 +554,11 @@ impl BoxesSection {
 
     /// `Enter` (tags), `ctrl-s` (quirks) or `y` (executor): one `EditBox` with only the edited
     /// field, when the value differs from what the editor opened on (D48, D59); a flip always
-    /// differs. The editor stays open until the reply.
+    /// differs. `ctrl-s` (probe spec, MOD-51 D6): one `SetProbeSpec` with the parsed overlay,
+    /// or a clear when the text is blank. The editor stays open until the reply.
     fn submit(&mut self, ctx: &Ctx<'_>) {
-        if self.busy.is_some() {
-            self.notice = Some(IN_FLIGHT.to_owned());
+        if let Some(name) = self.busy {
+            self.notice = Some(format!("{name} {IN_FLIGHT}"));
             return;
         }
         let request = match &self.mode {
@@ -510,15 +602,44 @@ impl BoxesSection {
                     ..BoxEdit::default()
                 },
             }),
+            Mode::Spec(editor) => {
+                let text = editor.input.text();
+                if text.trim().is_empty() {
+                    // D6, F-4, amended at review (MOD-51 LOW-1): the live token decides. With
+                    // no token (no row at open, or the row vanished under the editor) there is
+                    // nothing to clear and the editor just closes; under a token, the row it
+                    // names is cleared, including one a `BoxesStale` brought in after an open
+                    // over no row.
+                    editor.expected.map(|token| StoreRequest::SetProbeSpec {
+                        overlay: None,
+                        expected: Some(token),
+                    })
+                } else {
+                    match serde_json::from_str::<Value>(text) {
+                        // Parsed on the render side; nothing is sent until it parses.
+                        Err(error) => {
+                            self.notice = Some(format!("{SPEC_NOT_JSON}: {error}"));
+                            return;
+                        }
+                        // No unchanged short-circuit (F-15): R-6 needs an unchanged save sent.
+                        Ok(overlay) => Some(StoreRequest::SetProbeSpec {
+                            overlay: Some(overlay),
+                            expected: editor.expected,
+                        }),
+                    }
+                }
+            }
         };
         match request {
-            // Only a user who typed writes it: unchanged text closes the editor.
+            // Only a user who typed writes it: unchanged text (or, for the probe spec, blank
+            // text with nothing to clear) closes the editor.
             None => {
                 self.mode = Mode::Browse;
                 self.notice = None;
             }
             Some(request) => {
-                self.busy = Some(EDIT_NAME);
+                // `edit_box` or `set_probe_spec`: the name its `Failed` comes back under.
+                self.busy = Some(request.name());
                 ctx.request(request);
             }
         }
@@ -547,7 +668,8 @@ impl SettingsSection for BoxesSection {
         !matches!(self.mode, Mode::Browse)
     }
 
-    /// MOD-22 review M-1: a bracketed paste into the open tags field or quirks editor.
+    /// MOD-22 review M-1: a bracketed paste into the open tags field, quirks editor or probe
+    /// spec editor (MOD-51 D6).
     fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
         match &mut self.mode {
             Mode::Browse | Mode::Executor(_) => return Handled::Pass,
@@ -555,6 +677,7 @@ impl SettingsSection for BoxesSection {
                 editor.input.on_paste(text);
             }
             Mode::Quirks(editor) => editor.input.on_paste(text),
+            Mode::Spec(editor) => editor.input.on_paste(text),
         }
         Handled::Consumed
     }
@@ -563,7 +686,7 @@ impl SettingsSection for BoxesSection {
         if !matches!(self.mode, Mode::Browse) {
             return self.on_editor_key(key, ctx);
         }
-        // Browse. `j`, `k`, `t`, `e`, `p`, `r` are free: the global table binds `q`, `?`, the
+        // Browse. `j`, `k`, `t`, `e`, `p`, `r`, `s` are free: the global table binds `q`, `?`, the
         // digits and `w`, and the tab consumes `h`/`l`/`[`/`]`/arrows before a section sees them.
         // `w` (MOD-41 plan D10) shadows the global workspace switcher only while a box is listed
         // to act on; over no list it passes, so the switcher is still one key away.
@@ -588,6 +711,11 @@ impl SettingsSection for BoxesSection {
                 if self.unavailable.is_none() && self.selected_record().is_some() =>
             {
                 self.open_executor();
+                Handled::Consumed
+            }
+            // MOD-51 D6: the probe spec is app-wide, so `s` needs no listed box.
+            KeyCode::Char('s') => {
+                self.open_spec();
                 Handled::Consumed
             }
             KeyCode::Char('p') => {
@@ -624,7 +752,11 @@ impl SettingsSection for BoxesSection {
                 self.unavailable = Some(message.clone());
             }
             // A refused write: the editor stays open over its text, and a second save retries.
-            StoreReply::Failed { request, message } if *request == EDIT_NAME => {
+            // For a probe spec save (MOD-51 D6) the sentence is the probe's own when the overlay
+            // was refused (D3), the store's when the write was.
+            StoreReply::Failed { request, message }
+                if *request == EDIT_NAME || *request == SPEC_NAME =>
+            {
                 self.busy = None;
                 self.notice = Some(message.clone());
             }
@@ -652,33 +784,62 @@ impl SettingsSection for BoxesSection {
         ])
         .areas(area);
 
-        match (&self.unavailable, &self.snapshot) {
-            // An open editor survives a refused read (the re-read after a probe, a reconnect):
-            // the refusal takes the body's first line and the editor stays on screen under it,
-            // because an editor that still takes keys has to be one the user can see.
-            (Some(why), Some(snapshot))
-                if !matches!(self.mode, Mode::Browse) && !snapshot.boxes.is_empty() =>
-            {
-                let [refusal, rest] =
-                    Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
-                frame.render_widget(
-                    Paragraph::new(Line::styled(format!("{UNAVAILABLE}: {why}"), theme.error)),
-                    refusal,
-                );
-                self.render_body(frame, rest, snapshot, theme);
+        if let (Mode::Spec(editor), Some(snapshot)) = (&self.mode, &self.snapshot) {
+            // MOD-51 F-6(b): an editor that takes keys stays on screen (the rule below), box or
+            // no box: a refused read takes the body's first line and the editor keeps the rest.
+            let area = match &self.unavailable {
+                Some(why) => {
+                    let [refusal, rest] =
+                        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+                    frame.render_widget(
+                        Paragraph::new(Line::styled(format!("{UNAVAILABLE}: {why}"), theme.error)),
+                        refusal,
+                    );
+                    rest
+                }
+                None => body,
+            };
+            render_spec(frame, area, snapshot, editor, theme);
+        } else {
+            match (&self.unavailable, &self.snapshot) {
+                // An open editor survives a refused read (the re-read after a probe, a reconnect):
+                // the refusal takes the body's first line and the editor stays on screen under it,
+                // because an editor that still takes keys has to be one the user can see.
+                (Some(why), Some(snapshot))
+                    if !matches!(self.mode, Mode::Browse) && !snapshot.boxes.is_empty() =>
+                {
+                    let [refusal, rest] =
+                        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+                    frame.render_widget(
+                        Paragraph::new(Line::styled(format!("{UNAVAILABLE}: {why}"), theme.error)),
+                        refusal,
+                    );
+                    self.render_body(frame, rest, snapshot, theme);
+                }
+                // The refusal wins the body even with a list behind it: what is on screen
+                // would otherwise be boxes nothing has confirmed since the outage started (the
+                // kinds rule).
+                (Some(why), _) => frame.render_widget(
+                    Paragraph::new(Line::styled(format!("{UNAVAILABLE}: {why}"), theme.error))
+                        .wrap(Wrap { trim: true }),
+                    body,
+                ),
+                (None, None) => message(frame, body, NOT_READ, theme),
+                // MOD-51 LOW-6: the spec is app-wide, so it is drawn with no box listed too: a
+                // save over an empty list shows the new source and digest, and an ignored
+                // overlay says why.
+                (None, Some(snapshot)) if snapshot.boxes.is_empty() => {
+                    let width = usize::from(body.width).max(1);
+                    let mut lines: Vec<Line<'static>> = wrapped(NO_BOXES, width)
+                        .into_iter()
+                        .map(|line| Line::styled(line, theme.dim))
+                        .collect();
+                    lines.push(Line::default());
+                    lines.extend(spec_lines(&snapshot.spec, width, theme));
+                    frame.render_widget(Paragraph::new(lines), body);
+                }
+                (None, Some(snapshot)) => self.render_body(frame, body, snapshot, theme),
             }
-            // The refusal wins the body even with a list behind it: what is on screen would
-            // otherwise be boxes nothing has confirmed since the outage started (the kinds rule).
-            (Some(why), _) => frame.render_widget(
-                Paragraph::new(Line::styled(format!("{UNAVAILABLE}: {why}"), theme.error))
-                    .wrap(Wrap { trim: true }),
-                body,
-            ),
-            (None, None) => message(frame, body, NOT_READ, theme),
-            (None, Some(snapshot)) if snapshot.boxes.is_empty() => {
-                message(frame, body, NO_BOXES, theme);
-            }
-            (None, Some(snapshot)) => self.render_body(frame, body, snapshot, theme),
         }
 
         frame.render_widget(
@@ -899,13 +1060,17 @@ impl BoxesSection {
 
     /// The keys this mode binds, plus what is in flight.
     fn hint_text(&self) -> String {
-        let listed = self.unavailable.is_none() && !self.boxes().is_empty();
+        // MOD-51 F-3: `s` is offered exactly where it works, a read that was not refused.
+        let readable = self.unavailable.is_none() && self.snapshot.is_some();
+        let listed = readable && !self.boxes().is_empty();
         let mut hint = match self.mode {
             Mode::Browse if listed => HINT_BROWSE.to_owned(),
-            Mode::Browse => HINT_NO_LIST.to_owned(),
+            Mode::Browse if readable => HINT_NO_LIST.to_owned(),
+            Mode::Browse => HINT_RELOAD.to_owned(),
             Mode::Tags(_) => HINT_TAGS.to_owned(),
             Mode::Quirks(_) => HINT_QUIRKS.to_owned(),
             Mode::Executor(_) => HINT_EXECUTOR.to_owned(),
+            Mode::Spec(_) => HINT_SPEC.to_owned(),
         };
         if self.probing {
             hint.push_str(" \u{b7} probing\u{2026}");
@@ -1021,6 +1186,28 @@ fn seen(snapshot: &BoxesSnapshot) -> String {
         .map(String::as_str)
         .collect();
     tags.into_iter().collect::<Vec<_>>().join(", ")
+}
+
+/// The probe spec editor in the body (MOD-51 D6, F-6(c)): the spec in force as it stands (D51's
+/// lines, the ignored-overlay sentence included), the dim title, then the editor over every line
+/// left. The spec line does not follow the typing: it says what the next probe runs under, and the
+/// `Boxes` that answers a save carries the new digest.
+fn render_spec(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &BoxesSnapshot,
+    editor: &SpecEditor,
+    theme: &Theme,
+) {
+    let mut lines = spec_lines(&snapshot.spec, usize::from(area.width).max(1), theme);
+    lines.push(Line::styled(SPEC_TITLE, theme.dim));
+    let used = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    lines.extend(
+        editor
+            .input
+            .lines(area.width, area.height.saturating_sub(used), true, theme),
+    );
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// D51: the spec the next probe runs under, and why a stored overlay was ignored when it was.

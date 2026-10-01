@@ -503,6 +503,16 @@ impl WriteStore for SpyStore {
     ) -> StoreResult<CasOutcome<BoxRow>> {
         self.inner.edit_box(id, expected, edit).await
     }
+    async fn box_probe_spec(&self) -> StoreResult<Option<StoredSetting>> {
+        self.inner.box_probe_spec().await
+    }
+    async fn set_box_probe_spec(
+        &self,
+        overlay: Option<Value>,
+        expected: Option<DateTime<Utc>>,
+    ) -> StoreResult<CasOutcome<Option<StoredSetting>>> {
+        self.inner.set_box_probe_spec(overlay, expected).await
+    }
     async fn set_agent_box_quota(
         &self,
         agent_id: AgentId,
