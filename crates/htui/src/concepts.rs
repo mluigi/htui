@@ -19,10 +19,13 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use htui_core::model::{ProjectId, RequirementState, Resolution, Scope};
 use htui_core::store::{MemStore, ReadStore, StoreError};
-use htui_store::embed::FastEmbedder;
+use htui_store::embed::RtenEmbedder;
+use htui_store::model;
 use htui_store::pg::{CONNECT_TIMEOUT, PoolSize};
 use htui_store::qdrant_settings::QdrantSettings;
-use htui_store::vector::{Hit, PointType, QdrantStore, SearchQuery, VectorStore};
+use htui_store::vector::{
+    Hit, PointType, QdrantStore, SearchQuery, VectorStore, is_embedder_mismatch,
+};
 use htui_store::vector_sync::{Indexer, SyncReport};
 use htui_store::{HeadlessError, PgStore, identity, secret};
 use serde_json::Value;
@@ -87,7 +90,7 @@ pub fn settings_from(
     Ok(QdrantSettings::new(url, api_key)?)
 }
 
-async fn open() -> anyhow::Result<(PgStore, QdrantStore<FastEmbedder>)> {
+async fn open() -> anyhow::Result<(PgStore, QdrantStore<RtenEmbedder>)> {
     let settings = settings_from(secret::get_qdrant_url()?, secret::get_qdrant_api_key()?)?;
     let Some(dsn) = secret::get_dsn()? else {
         bail!("no Postgres DSN is stored; run `htui --set-dsn` first");
@@ -96,11 +99,30 @@ async fn open() -> anyhow::Result<(PgStore, QdrantStore<FastEmbedder>)> {
     let pg = PgStore::connect_headless(&dsn, &identity, CONNECT_TIMEOUT, PoolSize::TUI)
         .await
         .map_err(headless_refusal)?;
-    let embedder = FastEmbedder::new()?;
+    // Said on stderr only when a download happens: this command's log goes nowhere without
+    // `--log`, and 133 MB is otherwise a silent pause (review L4).
+    let files = model::ensure_model_noting(|line| eprintln!("{line}"))
+        .await
+        .context("cannot load the embedding model")?;
+    let embedder = tokio::task::spawn_blocking(move || RtenEmbedder::load(&files))
+        .await
+        .context("the embedding model's loader stopped")?
+        .context("cannot load the embedding model")?;
     let store = QdrantStore::connect(&settings, embedder)
         .await
-        .context("cannot reach Qdrant")?;
+        .map_err(qdrant_refusal)?;
     Ok((pg, store))
+}
+
+/// A failed `QdrantStore::connect` as the error a user reads, at all three sites that connect
+/// (review L3): "cannot reach Qdrant" above everything but an embedder mismatch, which Qdrant
+/// answered and which names its own remedy.
+pub(crate) fn qdrant_refusal(err: StoreError) -> anyhow::Error {
+    if is_embedder_mismatch(&err) {
+        anyhow::Error::new(err)
+    } else {
+        anyhow::Error::new(err).context("cannot reach Qdrant")
+    }
 }
 
 /// A headless connect's refusal as the line a user reads (MOD-40 plan D8's sentences, byte for
@@ -308,29 +330,75 @@ fn keyring_settings() -> Result<QdrantSettings, String> {
         .map_err(|err| format!("the stored Qdrant URL is not usable: {err}"))
 }
 
-/// The model on a thread of its own, then the collection; a failure is a `warn` and another
-/// attempt after the interval, forever (plan D19). Rebuilds the model each attempt:
-/// `QdrantStore::connect` takes it by value and `FastEmbedder` is not `Clone`.
-async fn open_index(pg: &PgStore, settings: &QdrantSettings) -> QdrantStore<FastEmbedder> {
+/// The model, then the collection; a failure is logged and another attempt follows after the
+/// interval, forever (plan D19). The model is fetched on this task and loaded on a thread of its
+/// own (`apart`), once: `RtenEmbedder` is `Clone`, so a retry after an unreachable Qdrant reuses
+/// it (MOD-68 A-4).
+///
+/// An embedder mismatch is an `error` once, then `debug` (review L3), and is still re-checked
+/// every interval rather than ending the job: its remedy (delete the collection, run `htui
+/// --index-items`) happens outside this process, and a job that had ended would leave the worker
+/// never syncing again until restarted. A check is two Qdrant round trips per interval, not a
+/// hot loop.
+async fn open_index(pg: &PgStore, settings: &QdrantSettings) -> QdrantStore<RtenEmbedder> {
+    let mut loaded: Option<RtenEmbedder> = None;
+    let mut reported = false;
     loop {
-        let opened = match apart("htui-index-model", FastEmbedder::new).await {
-            Some(Ok(embedder)) => QdrantStore::connect(settings, embedder)
-                .await
-                .map_err(|err| format!("cannot reach Qdrant: {err}")),
-            Some(Err(err)) => Err(err.to_string()),
-            None => Err("the model loader stopped".to_owned()),
+        let (err, mismatch) = match index_model(&mut loaded).await {
+            Ok(embedder) => match QdrantStore::connect(settings, embedder).await {
+                Ok(store) => return store,
+                Err(err) => {
+                    let mismatch = is_embedder_mismatch(&err);
+                    (format!("{:#}", qdrant_refusal(err)), mismatch)
+                }
+            },
+            Err(err) => (err, false),
         };
-        match opened {
-            Ok(store) => return store,
-            Err(err) => tracing::warn!(%err, "concepts index not opened; next cycle"),
+        match open_failure_level(mismatch, &mut reported) {
+            tracing::Level::ERROR => tracing::error!(
+                %err,
+                "concepts index refused by Qdrant; no sync until the collection is rebuilt (checked \
+                 again every interval, logged once)"
+            ),
+            tracing::Level::DEBUG => tracing::debug!(%err, "concepts index still refused"),
+            _ => tracing::warn!(%err, "concepts index not opened; next cycle"),
         }
         let app = pg.index_settings().await.unwrap_or_default();
         tokio::time::sleep(sync_interval(&app)).await;
     }
 }
 
+/// The level `open_index` logs one failed open at: an embedder mismatch is `ERROR` the first time
+/// and `DEBUG` after, since it says the same until someone rebuilds the collection; anything else
+/// is `WARN` every time (review L3).
+fn open_failure_level(mismatch: bool, reported: &mut bool) -> tracing::Level {
+    if !mismatch {
+        tracing::Level::WARN
+    } else if std::mem::replace(reported, true) {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::ERROR
+    }
+}
+
+/// The loaded model, or a fetch (on this task: `apart` threads have no runtime) and a load (on a
+/// thread of its own), kept in `loaded` for the next attempt.
+async fn index_model(loaded: &mut Option<RtenEmbedder>) -> Result<RtenEmbedder, String> {
+    if let Some(embedder) = loaded {
+        return Ok(embedder.clone());
+    }
+    let files = model::ensure_model().await.map_err(|err| err.to_string())?;
+    let embedder = match apart("htui-index-model", move || RtenEmbedder::load(&files)).await {
+        Some(Ok(embedder)) => embedder,
+        Some(Err(err)) => return Err(err.to_string()),
+        None => return Err("the model loader stopped".to_owned()),
+    };
+    *loaded = Some(embedder.clone());
+    Ok(embedder)
+}
+
 /// `work` on a named thread of its own, awaited. Not `spawn_blocking`: the runtime waits for its
-/// blocking tasks when it is dropped, and a keyring prompt nobody answers or a model download
+/// blocking tasks when it is dropped, and a keyring prompt nobody answers or a model load
 /// must not hold `htui worker`'s exit (`worker_cmd::read_dsn_apart`'s reason). The thread is
 /// left behind on an abort and dies with the process. `None` when the thread cannot be spawned
 /// or ends without answering.
@@ -459,6 +527,39 @@ mod tests {
         );
     }
 
+    /// Review L3: Qdrant answered and refused, so the line says that, not "cannot reach".
+    #[test]
+    fn an_embedder_mismatch_is_not_cannot_reach_qdrant() {
+        use htui_store::vector::EMBEDDER_MISMATCH;
+        let mismatch = StoreError::Backend(format!(
+            "{EMBEDDER_MISMATCH}: collection `c` holds vectors from hash/384; delete collection \
+             `c` and run `htui --index-items` to rebuild it"
+        ));
+        let text = format!("{:#}", qdrant_refusal(mismatch));
+        assert!(text.contains(EMBEDDER_MISMATCH), "{text}");
+        assert!(!text.contains("cannot reach"), "{text}");
+        let down = StoreError::Backend("qdrant: collection exists: transport error".into());
+        let text = format!("{:#}", qdrant_refusal(down));
+        assert!(text.starts_with("cannot reach Qdrant: "), "{text}");
+        assert!(
+            text.ends_with("qdrant: collection exists: transport error"),
+            "{text}"
+        );
+    }
+
+    /// Review L3: the index job says a mismatch once, at `error`, and a Qdrant that does not
+    /// answer every cycle, at `warn`.
+    #[test]
+    fn a_mismatch_is_an_error_once_then_debug_and_anything_else_a_warning() {
+        use tracing::Level;
+        let mut reported = false;
+        assert_eq!(open_failure_level(false, &mut reported), Level::WARN);
+        assert_eq!(open_failure_level(true, &mut reported), Level::ERROR);
+        assert_eq!(open_failure_level(true, &mut reported), Level::DEBUG);
+        assert_eq!(open_failure_level(false, &mut reported), Level::WARN);
+        assert_eq!(open_failure_level(true, &mut reported), Level::DEBUG);
+    }
+
     #[test]
     fn hits_print_key_place_score_and_snippet() {
         let line = format_hit(&hit(PointType::Document, Some("summary")));
@@ -555,12 +656,13 @@ mod tests {
         );
     }
 
-    /// The search runtime shares one loaded model between its tasks (MOD-64 D238); `htui-store`'s
-    /// own tests build without `local-embed`, so the check lives here (D258).
+    /// The search runtime shares one loaded model between its tasks (MOD-64 D238), the index job
+    /// keeps one across retries, and both move it across tasks; `htui-store`'s own tests build
+    /// without `local-embed`, so the check lives here (D258).
     #[test]
-    fn fast_embedder_is_clone() {
-        fn clone_of<T: Clone>() {}
-        clone_of::<FastEmbedder>();
+    fn rten_embedder_is_clone_send_and_sync() {
+        fn shared<T: Clone + Send + Sync + 'static>() {}
+        shared::<RtenEmbedder>();
     }
 
     /// The worker's index job (MOD-41 plan D19, blueprint §16) over `MemStore` and

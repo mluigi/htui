@@ -12,23 +12,49 @@ use htui_core::fixtures::ids;
 use htui_core::model::{
     ItemFilter, RequirementFilter, RequirementState, Resolution, Scope, Status,
 };
+use htui_core::store::StoreError;
 use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
-use htui_store::embed::{DENSE_DIM, HashEmbedder};
+use htui_store::embed::{DENSE_DIM, DenseEmbedder, EmbedderIdentity, HashEmbedder};
 use htui_store::qdrant_settings::QdrantSettings;
-use htui_store::vector::{Owner, PointType, QdrantStore, SearchQuery, VectorStore as _};
+use htui_store::vector::{
+    DENSE, EMBEDDER_KEY, Owner, PointType, QdrantStore, SPARSE, SearchQuery, VectorStore as _,
+    is_embedder_mismatch,
+};
 use htui_store::vector_sync::Indexer;
+use qdrant_client::Qdrant;
+use qdrant_client::qdrant::{
+    CreateCollectionBuilder, Distance, Modifier, SparseVectorParamsBuilder,
+    SparseVectorsConfigBuilder, VectorParamsBuilder, VectorsConfigBuilder,
+};
 
 const ENV_URL: &str = "HTUI_TEST_QDRANT_URL";
 
-async fn throwaway() -> Option<QdrantStore<HashEmbedder>> {
-    let Ok(url) = std::env::var(ENV_URL) else {
+/// The test Qdrant's URL, or the skip line.
+fn qdrant_url() -> Option<String> {
+    let url = std::env::var(ENV_URL).ok();
+    if url.is_none() {
         eprintln!("skipped: {ENV_URL} not set");
-        return None;
-    };
-    let settings = QdrantSettings::new(url, None).expect("valid URL");
-    let name = format!("htui_test_{}", uuid::Uuid::now_v7().simple());
+    }
+    url
+}
+
+fn fresh_name() -> String {
+    format!("htui_test_{}", uuid::Uuid::now_v7().simple())
+}
+
+async fn connect<E: DenseEmbedder>(
+    url: &str,
+    embedder: E,
+    name: &str,
+) -> Result<QdrantStore<E>, StoreError> {
+    let settings = QdrantSettings::new(url.to_owned(), None).expect("valid URL");
+    QdrantStore::connect_to(&settings, embedder, name).await
+}
+
+async fn throwaway() -> Option<QdrantStore<HashEmbedder>> {
+    let url = qdrant_url()?;
     Some(
-        QdrantStore::connect_to(&settings, HashEmbedder::new(DENSE_DIM), &name)
+        connect(&url, HashEmbedder::new(DENSE_DIM), &fresh_name())
             .await
             .expect("Qdrant answers"),
     )
@@ -291,4 +317,205 @@ async fn a_resolution_filter_keeps_decisions_and_leaves_requirements_out() {
     };
     assert!(store.search(&rejected).await.expect("search").is_empty());
     store.drop_collection().await.expect("drop");
+}
+
+// MOD-68 D8: the embedder's identity in the collection's metadata.
+
+/// A client of its own, to look at and set up collections behind `QdrantStore`'s back.
+fn raw(url: &str) -> Qdrant {
+    Qdrant::from_url(url)
+        .skip_compatibility_check()
+        .build()
+        .expect("client")
+}
+
+/// What the collection's `embedder` metadata says, if anything.
+async fn stored_identity(client: &Qdrant, name: &str) -> Option<EmbedderIdentity> {
+    let info = client
+        .collection_info(name)
+        .await
+        .expect("collection info")
+        .result
+        .expect("a result");
+    let value = info
+        .config
+        .expect("a config")
+        .metadata
+        .remove(EMBEDDER_KEY)?;
+    Some(serde_json::from_value(serde_json::Value::from(value)).expect("an identity"))
+}
+
+/// A collection laid out as `create_collection` makes one, `dense` `dense_size` wide, with no
+/// metadata: what every pre-MOD-68 collection looks like.
+async fn create_bare(client: &Qdrant, name: &str, dense_size: u64) {
+    create_unstamped(client, name, dense_size, None).await;
+}
+
+/// As [`create_bare`], holding `metadata` but no embedder.
+async fn create_unstamped(
+    client: &Qdrant,
+    name: &str,
+    dense_size: u64,
+    metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
+) {
+    let mut dense = VectorsConfigBuilder::default();
+    dense.add_named_vector_params(
+        DENSE,
+        VectorParamsBuilder::new(dense_size, Distance::Cosine),
+    );
+    let mut sparse = SparseVectorsConfigBuilder::default();
+    sparse.add_named_vector_params(
+        SPARSE,
+        SparseVectorParamsBuilder::default().modifier(Modifier::Idf),
+    );
+    let mut create = CreateCollectionBuilder::new(name)
+        .vectors_config(dense)
+        .sparse_vectors_config(sparse);
+    if let Some(metadata) = metadata {
+        create = create.metadata(metadata);
+    }
+    client
+        .create_collection(create)
+        .await
+        .expect("create a bare collection");
+}
+
+/// `HashEmbedder`'s vectors under another model's name.
+#[derive(Debug, Clone)]
+struct Renamed {
+    inner: HashEmbedder,
+    identity: EmbedderIdentity,
+}
+
+impl DenseEmbedder for Renamed {
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+
+    fn identity(&self) -> EmbedderIdentity {
+        self.identity.clone()
+    }
+
+    async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, StoreError> {
+        self.inner.embed(texts).await
+    }
+}
+
+#[tokio::test]
+async fn a_new_collection_records_the_embedder() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let store = connect(&url, HashEmbedder::new(DENSE_DIM), &name)
+        .await
+        .expect("Qdrant answers");
+    let client = raw(&url);
+    let stored = stored_identity(&client, &name).await;
+    store.drop_collection().await.expect("drop");
+    assert_eq!(stored, Some(EmbedderIdentity::hash(DENSE_DIM)));
+}
+
+#[tokio::test]
+async fn an_unrecorded_collection_is_stamped_once() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let client = raw(&url);
+    create_bare(&client, &name, DENSE_DIM as u64).await;
+    let first = connect(&url, HashEmbedder::new(DENSE_DIM), &name).await;
+    let stamped = stored_identity(&client, &name).await;
+    let second = connect(&url, HashEmbedder::new(DENSE_DIM), &name).await;
+    let after = stored_identity(&client, &name).await;
+    client.delete_collection(&name).await.expect("drop");
+    first.expect("an unrecorded collection is accepted");
+    assert_eq!(stamped, Some(EmbedderIdentity::hash(DENSE_DIM)));
+    second.expect("a stamped collection is accepted");
+    assert_eq!(after, stamped);
+}
+
+/// Qdrant merges an update's metadata into the collection's (observed on 1.19.1, over gRPC here
+/// and over REST): the stamp adds its key and leaves the others.
+#[tokio::test]
+async fn stamping_keeps_the_collections_other_metadata() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let client = raw(&url);
+    let other = std::collections::HashMap::from([("other".to_owned(), serde_json::json!("kept"))]);
+    create_unstamped(&client, &name, DENSE_DIM as u64, Some(other)).await;
+    let stamped = connect(&url, HashEmbedder::new(DENSE_DIM), &name).await;
+    let identity = stored_identity(&client, &name).await;
+    let info = client
+        .collection_info(&name)
+        .await
+        .expect("collection info")
+        .result
+        .expect("a result");
+    client.delete_collection(&name).await.expect("drop");
+    stamped.expect("an unrecorded collection is accepted");
+    assert_eq!(identity, Some(EmbedderIdentity::hash(DENSE_DIM)));
+    let kept = info
+        .config
+        .expect("a config")
+        .metadata
+        .remove("other")
+        .map(serde_json::Value::from);
+    assert_eq!(kept, Some(serde_json::json!("kept")));
+}
+
+#[tokio::test]
+async fn another_identity_is_refused_naming_both() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    connect(&url, HashEmbedder::new(DENSE_DIM), &name)
+        .await
+        .expect("Qdrant answers");
+    let other = Renamed {
+        inner: HashEmbedder::new(DENSE_DIM),
+        identity: EmbedderIdentity {
+            model: "test/other".into(),
+            ..EmbedderIdentity::hash(DENSE_DIM)
+        },
+    };
+    let refused = connect(&url, other, &name).await;
+    let client = raw(&url);
+    let stored = stored_identity(&client, &name).await;
+    client.delete_collection(&name).await.expect("drop");
+    let err = refused.expect_err("another embedder is refused");
+    assert!(is_embedder_mismatch(&err), "{err}");
+    let err = err.to_string();
+    assert!(err.contains("embedder mismatch"), "{err}");
+    assert!(err.contains("hash/384"), "{err}");
+    assert!(err.contains("test/other/384"), "{err}");
+    assert!(err.contains(&format!("collection `{name}`")), "{err}");
+    assert!(err.contains("htui --index-items"), "{err}");
+    assert_eq!(
+        stored,
+        Some(EmbedderIdentity::hash(DENSE_DIM)),
+        "left as it was"
+    );
+}
+
+#[tokio::test]
+async fn another_dense_width_is_refused_and_not_stamped() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let name = fresh_name();
+    let client = raw(&url);
+    create_bare(&client, &name, 8).await;
+    let refused = connect(&url, HashEmbedder::new(DENSE_DIM), &name).await;
+    let stored = stored_identity(&client, &name).await;
+    client.delete_collection(&name).await.expect("drop");
+    let err = refused.expect_err("another width is refused");
+    assert!(is_embedder_mismatch(&err), "{err}");
+    let err = err.to_string();
+    assert!(err.contains("8-wide"), "{err}");
+    assert!(err.contains("384-wide"), "{err}");
+    assert_eq!(stored, None, "a wrong-width collection is never stamped");
 }

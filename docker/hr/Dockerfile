@@ -12,7 +12,7 @@ ARG HR_UID=1000
 ARG HR_GID=1000
 ARG HR_HOME=/home/mluigi
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
-# libdbus-1-dev: keyring -> dbus-secret-service; libssl-dev: native-tls (hf-hub/fastembed, reqwest).
+# libdbus-1-dev: keyring -> dbus-secret-service; libssl-dev: native-tls (sentry -> reqwest).
 # postgresql-client-16 is in noble/main; no PGDG repo needed. PGDG alternative, only if a newer
 # 16.x minor is ever wanted:
 #   install -d /usr/share/postgresql-common/pgdg && curl -fsSLo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc

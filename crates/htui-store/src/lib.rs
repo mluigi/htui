@@ -18,6 +18,9 @@ pub mod dsn;
 pub mod embed;
 pub mod error;
 pub mod identity;
+/// The pinned BGE-small model files: where they are cached and how they are fetched (MOD-68).
+#[cfg(feature = "local-embed")]
+pub mod model;
 pub mod pg;
 /// Module defining the QdrantDsn type and logic.
 pub mod qdrant_settings;
