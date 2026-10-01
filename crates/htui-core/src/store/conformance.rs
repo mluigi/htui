@@ -13418,7 +13418,8 @@ async fn an_option_the_request_did_not_offer_is_refused<S: WriteStore>(store: &S
 
 /// MOD-42 plan D4, blueprint B-9: applying an answer is a compare-and-set `answered -> applied`
 /// fenced on the lease owner alone. Another owner's apply, an apply after the lease moved, and a
-/// second apply each answer `None` and write nothing.
+/// second apply each answer `None` and write nothing; an apply under the owner's lapsed but
+/// un-adopted lease succeeds (no expiry check).
 async fn apply_is_fenced_on_the_lease_owner<S: WriteStore>(store: &S) {
     const CASE: &str = "apply_is_fenced_on_the_lease_owner";
     let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
@@ -13426,7 +13427,12 @@ async fn apply_is_fenced_on_the_lease_owner<S: WriteStore>(store: &S) {
     let session = RelaySessionId::new();
     let first = parked(CASE, store, open_request(run, step, session, "req-1", a)).await;
     let second = parked(CASE, store, open_request(run, step, session, "req-2", a)).await;
-    for (id, option) in [(first, "allow-once"), (second, "reject-once")] {
+    let third = parked(CASE, store, open_request(run, step, session, "req-3", a)).await;
+    for (id, option) in [
+        (first, "allow-once"),
+        (second, "reject-once"),
+        (third, "allow-once"),
+    ] {
         assert_eq!(
             answer(CASE, store, id, option).await,
             AnswerOutcome::Answered,
@@ -13465,7 +13471,27 @@ async fn apply_is_fenced_on_the_lease_owner<S: WriteStore>(store: &S) {
         "{CASE}: the second apply wrote nothing"
     );
 
-    taken_by(CASE, store, run, a, b).await;
+    assert!(
+        store
+            .refresh_lease(run, a, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: A's lease lapses, as a suspended holder's does"
+    );
+    assert_eq!(
+        store.apply_permission(third, a).await.expect(CASE),
+        Some(PermissionChoice {
+            option_id: "allow-once".to_owned()
+        }),
+        "{CASE}: the apply fence is the owner alone (B-9): A still owns its lapsed, un-adopted lease"
+    );
+    assert!(
+        store
+            .take_lease(run, ids::BOX, b, TimeDelta::minutes(14))
+            .await
+            .expect(CASE),
+        "{CASE}: B takes A's lapsed lease"
+    );
     assert_eq!(
         store.apply_permission(first, a).await.expect(CASE),
         None,
@@ -13583,7 +13609,8 @@ async fn opening_a_permission_stales_older_sessions_of_the_step<S: WriteStore>(s
 
 /// MOD-42 blueprint B-9: `open_permission` is fenced like a step write. An unknown step is
 /// `NotFound`, a step of another run a `Constraint`, an owner that does not hold the run's lease
-/// `Fenced`; none of them writes a row.
+/// `Fenced`; none of them writes a row. The fence is the owner alone: an open under the owner's
+/// lapsed but un-adopted lease succeeds.
 async fn opening_a_permission_is_fenced_on_the_lease<S: WriteStore>(store: &S) {
     const CASE: &str = "opening_a_permission_is_fenced_on_the_lease";
     let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
@@ -13636,6 +13663,21 @@ async fn opening_a_permission_is_fenced_on_the_lease<S: WriteStore>(store: &S) {
     assert!(
         parked_before.status == PermissionStatus::Pending && parked_before.resolved_at.is_none(),
         "{CASE}: precondition: the parked row is pending, got {parked_before:?}"
+    );
+
+    assert!(
+        store
+            .refresh_lease(run, a, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: A's lease lapses, as a suspended holder's does"
+    );
+    let lapsed = open_request(run, step, RelaySessionId::new(), "req-4", a);
+    let lapsed_id = lapsed.id;
+    assert_eq!(
+        store.open_permission(lapsed).await.expect(CASE),
+        lapsed_id,
+        "{CASE}: the open fence is the owner alone (B-9): A still owns its lapsed, un-adopted lease"
     );
 }
 
@@ -13922,7 +13964,8 @@ async fn pending_commands_are_the_owners_and_the_boxs_free_runs<S: WriteStore>(s
 
 /// MOD-42 plan D14, blueprint B-4: an item's relay view lists its pending requests whose owner
 /// holds the run's lease live, and its non-terminal runs with a pending cancel. A stale row, a
-/// row whose lease lapsed and a terminal run's cancel are absent.
+/// row whose lease lapsed, a row of an owner whose lapsed lease another owner adopted and a
+/// terminal run's cancel are absent.
 async fn relay_view_lists_live_pending_requests_and_pending_cancels<S: WriteStore>(store: &S) {
     const CASE: &str = "relay_view_lists_live_pending_requests_and_pending_cancels";
     let a = Uuid::now_v7();
@@ -13982,6 +14025,40 @@ async fn relay_view_lists_live_pending_requests_and_pending_cancels<S: WriteStor
         lapsed.cancels,
         vec![run],
         "{CASE}: the cancel is still pending"
+    );
+
+    let b = Uuid::now_v7();
+    assert!(
+        store
+            .take_lease(run, ids::BOX, b, TimeDelta::minutes(14))
+            .await
+            .expect(CASE),
+        "{CASE}: B adopts A's lapsed lease"
+    );
+    assert_eq!(
+        permission_row(CASE, store, live).await.status,
+        PermissionStatus::Pending,
+        "{CASE}: precondition: A's row stays pending until B opens a row on the step (D5)"
+    );
+    let adopted = store.relay_view(ids::HTUI_ANA_2).await.expect(CASE);
+    assert!(
+        adopted.permissions.is_empty(),
+        "{CASE}: A's orphaned request is not listed under B's live lease (owner match), got {adopted:?}"
+    );
+    let adopters = parked(
+        CASE,
+        store,
+        open_request(run, step, RelaySessionId::new(), "req-1", b),
+    )
+    .await;
+    assert_eq!(
+        store
+            .relay_view(ids::HTUI_ANA_2)
+            .await
+            .expect(CASE)
+            .permissions,
+        vec![permission_row(CASE, store, adopters).await],
+        "{CASE}: the live lease owner's own request is listed"
     );
 
     store
