@@ -15,7 +15,7 @@
 //! harness awaits it inline, which is what keeps chat-tab snapshots byte-stable with no sleeps —
 //! the same trade `Harness::settle` makes for store requests.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -44,9 +44,10 @@ use htui_agent::install::{
     InstallConfig, InstallError, InstallJob, InstallOutcome, InstallPlan, InstallProgress,
     Installer, PlanError, install, plan as plan_install,
 };
-use htui_agent::launch::AgentSettings;
+use htui_agent::launch::{AgentLaunch, AgentSettings};
 use htui_agent::probe::{
-    ProbeContext, ProbeEnv, ProbeOutcome, ProbeSnapshot, ProbeStatus, SpawnTier2, probe_agent,
+    ProbeContext, ProbeEnv, ProbeOutcome, ProbeSnapshot, ProbeStatus, SpawnTier2, agent_box_row,
+    probe_agent, probe_snapshot,
 };
 use htui_agent::record::{
     AnsweredBy, CapBreach, QuotaLatch, Recorder, RunCap, enforce_breach as enforce_cap_breach,
@@ -65,6 +66,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent_settings::{AgentWrite, SET_TOOL_PATHS, parse_tool_path};
 use crate::store_worker::{
     AuthFrame, ChatFrame, InstallFrame, Origin, ReplyEnvelope, RequestEnvelope, Seq, StoreReply,
     StoreRequest, UNSOLICITED,
@@ -379,7 +381,8 @@ pub enum Served {
     /// Answer with this reply, now.
     Reply(StoreReply),
     /// A task the runtime owns answers this request itself, exactly once — the session task for a
-    /// chat command, the probe task for [`StoreRequest::ProbeAgents`].
+    /// chat command, the probe task for [`StoreRequest::ProbeAgents`], the tool-paths task for
+    /// [`StoreRequest::SetToolPaths`] (MOD-66 D7).
     Deferred,
     /// A chat is starting; the caller spawns (or polls) the future and attaches the handle.
     Start {
@@ -409,7 +412,8 @@ pub struct AgentRuntime {
     started: Vec<StepId>,
     grace: Duration,
     /// Tasks this runtime spawned that answer a request of their own: today the probe's (MOD-2
-    /// D53), a chat's staleness re-probe's (plan D55) and the prompt preview's (plan D102). Swept
+    /// D53), a chat's staleness re-probe's (plan D55), the prompt preview's (plan D102) and a
+    /// `SetToolPaths` write's (MOD-66 D8, tagged [`Writes::ToolPaths`]). Swept
     /// when finished, awaited by [`finish_background`](Self::finish_background), aborted by
     /// [`shutdown`](Self::shutdown).
     ///
@@ -1014,7 +1018,7 @@ impl AgentRuntime {
             step_id,
             cwd: opening.cwd,
             extra_dirs: opening.extra_dirs,
-            env: std::collections::BTreeMap::new(),
+            env: BTreeMap::new(),
             model: opening
                 .model
                 .or_else(|| summary.agent.default_model.clone()),
@@ -1143,6 +1147,15 @@ impl AgentRuntime {
                 Ok(served) => served,
                 Err(err) => Served::Reply(failed("probe_box", &err)),
             },
+            StoreRequest::SetToolPaths { agent_id, paths } => {
+                match self
+                    .set_tool_paths(backend, replies, addr, *agent_id, paths)
+                    .await
+                {
+                    Ok(served) => served,
+                    Err(err) => Served::Reply(failed(SET_TOOL_PATHS, &err)),
+                }
+            }
             StoreRequest::PromptPreview {
                 item,
                 template_name,
@@ -1336,6 +1349,12 @@ impl AgentRuntime {
                 live.agent_id
             )));
         }
+        // MOD-66 D8: a tool-paths write is probing and writing one row, and this probe writes
+        // every row. It is the one background writer consulted here: `r` beside a chat's
+        // staleness re-probe stays allowed, as before.
+        if let Some(agent_id) = self.background.iter().find_map(Background::tool_paths) {
+            return Err(StoreError::Backend(tool_paths_running(agent_id)));
+        }
         // MOD-7 D27: a box probe is already probing every row on this box.
         if self.box_probe_running() {
             return Err(StoreError::Backend(BOX_PROBE_RUNNING.to_owned()));
@@ -1372,6 +1391,99 @@ impl AgentRuntime {
                 }),
                 Some(answer),
             ))));
+        Ok(Served::Deferred)
+    }
+
+    /// The [`StoreRequest::SetToolPaths`] path (MOD-66 D7–D9). Every refusal comes **before
+    /// anything is spawned**, in `auth_start`'s order (B6): writer (offline:
+    /// `REGISTRY_ON_SERVER_ONLY`), registered box, the box claim, this row's re-probe claim, the
+    /// row exists, it is `enabled`, its `launch` parses, every key is a tool its
+    /// `discovery.tools` declares, and every value passes [`parse_tool_path`] and `is_file`. A
+    /// store refusal is an `Err`. A refused field is `Ok(Served::Reply(Failed))` carrying its own
+    /// sentence, never behind a `StoreError` prefix (MOD-23 D250's precedent).
+    ///
+    /// Awaited on the loop's arm: `box_info()`, `agents()` and one `metadata` per path, which is
+    /// the same class of cost the probe's and the login's arms already pay (`R-NF-3`). The probe
+    /// runs in the task, which holds the row's re-probe claim to its end (D8, H-10).
+    async fn set_tool_paths(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        addr: ReplyAddr,
+        agent_id: AgentId,
+        paths: &BTreeMap<String, String>,
+    ) -> Result<Served, StoreError> {
+        let writer = recording_writer(backend)?;
+        let box_id = registered_box(backend).await?;
+        self.claim_is_free()?;
+        // D8: `claim_is_free` cannot see a chat's D60 re-probe, which runs inside the chat task.
+        // The row's claim can, and it is moved into the task so it is held until the write lands.
+        let claim = self
+            .reprobe_claims
+            .claim((agent_id, box_id))
+            .ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "a re-probe is running for agent {agent_id}; try again in a moment"
+                ))
+            })?;
+        let agent = row_for(backend, agent_id).await?.agent;
+        if !agent.enabled {
+            return refuse_tool_paths(format!(
+                "`{}` is disabled in the registry; nothing to set a path for",
+                agent.name
+            ));
+        }
+        // No serde text: it can quote an `env` value (`R-SEC-2`, the `checked_launch` rule).
+        let Ok(launch) = serde_json::from_value::<AgentLaunch>(agent.launch.clone()) else {
+            return refuse_tool_paths(format!(
+                "`{}`'s launch does not parse; nothing declares a tool",
+                agent.name
+            ));
+        };
+        let declared = launch
+            .discovery
+            .map(|discovery| discovery.tools)
+            .unwrap_or_default();
+        // `BTreeMap` order, so the first refusal is the same one every time.
+        let mut checked = BTreeMap::new();
+        for (tool, text) in paths {
+            if !declared.contains_key(tool) {
+                return refuse_tool_paths(format!(
+                    "`{tool}` is not a tool `{}` declares",
+                    agent.name
+                ));
+            }
+            let path = match parse_tool_path(tool, text) {
+                Ok(path) => path,
+                Err(sentence) => return refuse_tool_paths(sentence),
+            };
+            if !htui_agent::probe::is_file(std::path::Path::new(&path)).await {
+                return refuse_tool_paths(format!("`{tool}`: `{path}` is not a file on this box"));
+            }
+            checked.insert(tool.clone(), path);
+        }
+        // Blueprint D35: the injected env when a test gave one, else this process's own.
+        let (env, _) = self.probe_env()?;
+
+        let frames = Frames::new(replies.clone(), addr);
+        let answer = frames.answer(tool_paths_failed);
+        self.background.push(Background::writing_tool_paths(
+            tokio::spawn(answering(
+                "tool paths",
+                run_tool_paths(ToolPathsArgs {
+                    backend: backend.clone(),
+                    writer,
+                    box_id,
+                    agent,
+                    paths: checked,
+                    env,
+                    frames,
+                    claim,
+                }),
+                Some(answer),
+            )),
+            agent_id,
+        ));
         Ok(Served::Deferred)
     }
 
@@ -1747,8 +1859,8 @@ impl AgentRuntime {
             .ok_or_else(|| StoreError::Backend("this runtime has no installer".to_owned()))
     }
 
-    /// `Ok` when no box probe, install, probe or login holds the claim (hazard H-10, MOD-21 D19,
-    /// MOD-7 D27).
+    /// `Ok` when no box probe, install, probe, login or tool-paths write holds the claim (hazard
+    /// H-10, MOD-21 D19, MOD-7 D27, MOD-66 D8).
     fn claim_is_free(&self) -> Result<(), StoreError> {
         // MOD-7 D27, the fourth holder: a box probe ends by probing every agent row on this box,
         // so it writes `agent_box` for every row, exactly as `ProbeAgents` does.
@@ -1785,6 +1897,13 @@ impl AgentRuntime {
         // `StoreReply::Agents` clears it (`ui/tabs/settings/agents.rs`, module doc), and
         // `wants_requests` re-issues `Agents` on every activation, so `r` → switch tab → back → `i`
         // reaches here with `run_probe` still running.
+        //
+        // MOD-66 D8, the fifth holder: a `SetToolPaths` task writes its row and is a writing
+        // background entry, so the check below would refuse beside it too, but with a sentence
+        // about a probe and an install. It names itself first (B5).
+        if let Some(agent_id) = self.background.iter().find_map(Background::tool_paths) {
+            return Err(StoreError::Backend(tool_paths_running(agent_id)));
+        }
         if self.background.iter().any(Background::writes_agent_box) {
             return Err(StoreError::Backend(
                 "a probe or a re-probe is already writing this box; install once it has finished"
@@ -1936,7 +2055,7 @@ impl AgentRuntime {
             extra_dirs: Vec::new(),
             // MOD-10 fills this from the secret provider; until then a session carries none, and
             // the scrubber below therefore masks the credential prefixes only.
-            env: std::collections::BTreeMap::new(),
+            env: BTreeMap::new(),
             model: model.clone(),
             tools: htui_agent::driver::ToolExposure::default(),
             mcp: Vec::new(),
@@ -2623,6 +2742,90 @@ async fn run_reprobe(args: ReprobeArgs) {
             tracing::debug!(agent = %agent.name, reason, "the re-probe left a row alone");
         }
     }
+}
+
+/// A `SetToolPaths` field refusal (MOD-66 D9): `Failed` with its own sentence, answered on the
+/// arm.
+fn refuse_tool_paths(message: String) -> Result<Served, StoreError> {
+    Ok(Served::Reply(StoreReply::Failed {
+        request: SET_TOOL_PATHS,
+        message,
+    }))
+}
+
+/// Everything a `SetToolPaths` task owns (MOD-66 D7). Reads go through a [`Backend`] clone
+/// (`BoxProbeArgs`'s precedent: the reply carries the registry re-read), and the write through
+/// the [`Writer`] taken at spawn. `claim` is the row's re-probe claim, **held to the end** and
+/// released by its `Drop`, aborted or not (D8, H-10).
+struct ToolPathsArgs {
+    backend: Backend,
+    writer: Writer,
+    box_id: BoxId,
+    agent: Agent,
+    paths: BTreeMap<String, String>,
+    env: ProbeEnv,
+    frames: Frames,
+    claim: ReprobeClaim,
+}
+
+impl core::fmt::Debug for ToolPathsArgs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ToolPathsArgs")
+            .field("writer", &self.writer.label())
+            .field("agent", &self.agent.name)
+            .field("paths", &self.paths.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One probe of one row over the requested map, written whatever it found (MOD-66 D9):
+/// [`probe_snapshot`], never `probe_agent`, so D51's `Kept` cannot swallow the edit (B1). Exactly
+/// one reply at the request's address: `AgentWritten { agents, ToolPaths { id, name, status } }`,
+/// or `Failed { "set_tool_paths" }` when the write fails. A re-read that fails after an applied
+/// write also answers `Failed` (`agent_settings::serve`'s known residue, B15).
+///
+/// `upsert_agent_box` applies `enabled AND NOT user_off`, so a row switched off on this box stays
+/// off with no code here (MOD-23 D243).
+async fn run_tool_paths(args: ToolPathsArgs) {
+    let ToolPathsArgs {
+        backend,
+        writer,
+        box_id,
+        agent,
+        paths,
+        env,
+        frames,
+        claim,
+    } = args;
+    let ctx = ProbeContext {
+        env,
+        now: Utc::now(),
+    };
+    let snapshot = probe_snapshot(&agent, &paths, &ctx, &SpawnTier2::default()).await;
+    let row = agent_box_row(&agent, box_id, &snapshot, ctx.now);
+    let reply = match writer.upsert_agent_box(&row).await {
+        Err(err) => failed(SET_TOOL_PATHS, &err),
+        Ok(_) => match backend.agents().await {
+            Ok(agents) => {
+                let name = agents
+                    .iter()
+                    .find(|summary| summary.agent.id == agent.id)
+                    .map_or_else(|| agent.name.clone(), |summary| summary.agent.name.clone());
+                StoreReply::AgentWritten {
+                    agents,
+                    outcome: AgentWrite::ToolPaths {
+                        id: agent.id,
+                        name,
+                        status: snapshot.status,
+                    },
+                }
+            }
+            Err(err) => failed(SET_TOOL_PATHS, &err),
+        },
+    };
+    // Before the answer: a request the reply prompts finds the row's claim free.
+    drop(claim);
+    frames.reply(&frames.addr(), reply);
 }
 
 /// The writer of a backend that can hold an `agent_box` row, or the refusal that names why not.
@@ -3470,6 +3673,15 @@ impl Frames {
 fn probe_agents_failed(message: String) -> Vec<StoreReply> {
     vec![StoreReply::Failed {
         request: "probe_agents",
+        message,
+    }]
+}
+
+/// A panicked `SetToolPaths`'s last word: the failure that clears the Agents section's `busy`
+/// (MOD-53's shape, MOD-66 D10).
+fn tool_paths_failed(message: String) -> Vec<StoreReply> {
+    vec![StoreReply::Failed {
+        request: SET_TOOL_PATHS,
         message,
     }]
 }
@@ -4349,7 +4561,7 @@ pub(crate) mod tests {
             sha256: None,
             cmd: format!("./{INSTALL_TOOL}"),
             args: Vec::new(),
-            env: std::collections::BTreeMap::new(),
+            env: BTreeMap::new(),
             license: None,
             license_url: None,
             install_dir: root.join(INSTALL_ID).join(INSTALL_VERSION),
@@ -7269,7 +7481,7 @@ done
             let snapshot = ProbeSnapshot {
                 transport: Transport::Acp,
                 resolved: None,
-                tools: std::collections::BTreeMap::new(),
+                tools: BTreeMap::new(),
                 handshake: Some(Handshake {
                     at: now,
                     protocol_version: 1,
@@ -7282,7 +7494,7 @@ done
                 status: ProbeStatus::Unauthenticated,
                 stderr_tail: None,
                 source: ProbeSource::Probe,
-                manual: std::collections::BTreeMap::new(),
+                manual: BTreeMap::new(),
             };
             AgentBox {
                 agent_id,
@@ -9331,7 +9543,7 @@ done
     /// `home` is `None`, so no `~` pattern reaches the maintainer's home (blueprint F-T).
     pub(crate) fn fake_env(tmp: &std::path::Path) -> ProbeEnv {
         std::fs::create_dir_all(tmp.join("bin")).expect("the fixture bin");
-        let mut vars = std::collections::BTreeMap::new();
+        let mut vars = BTreeMap::new();
         vars.insert(
             "PATH".to_owned(),
             tmp.join("bin").to_string_lossy().into_owned(),
@@ -10514,7 +10726,7 @@ done
     }
 
     /// `pairs` as the request's map.
-    fn tool_map(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    fn tool_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
             .iter()
             .map(|(tool, path)| ((*tool).to_owned(), (*path).to_owned()))
@@ -10549,7 +10761,7 @@ done
     fn refused(served: Served) -> String {
         match served {
             Served::Reply(StoreReply::Failed { request, message }) => {
-                assert_eq!(request, crate::agent_settings::SET_TOOL_PATHS);
+                assert_eq!(request, SET_TOOL_PATHS);
                 message
             }
             other => panic!("a refused SetToolPaths answers Failed on the arm: {other:?}"),
@@ -10571,7 +10783,7 @@ done
     }
 
     /// The `ToolPaths` outcome of `reply`.
-    fn tool_paths_outcome(reply: ReplyEnvelope) -> crate::agent_settings::AgentWrite {
+    fn tool_paths_outcome(reply: ReplyEnvelope) -> AgentWrite {
         match reply.reply {
             StoreReply::AgentWritten { outcome, .. } => outcome,
             other => panic!("a SetToolPaths that ran answers AgentWritten: {other:?}"),
@@ -10603,12 +10815,12 @@ done
     async fn stage_manual_row(
         store: &MemStore,
         agent_id: AgentId,
-        manual: std::collections::BTreeMap<String, String>,
+        manual: BTreeMap<String, String>,
     ) {
         let snapshot = ProbeSnapshot {
             transport: Transport::Acp,
             resolved: None,
-            tools: std::collections::BTreeMap::new(),
+            tools: BTreeMap::new(),
             handshake: None,
             credential: None,
             status: ProbeStatus::Ready,
@@ -10616,7 +10828,7 @@ done
             source: htui_agent::probe::ProbeSource::Manual,
             manual,
         };
-        let row = htui_agent::probe::agent_box_row(
+        let row = agent_box_row(
             &paths_row(agent_id),
             ids::BOX,
             &snapshot,
@@ -10684,12 +10896,17 @@ done
         assert!(message.contains("not found"), "{message}");
         assert_eq!(runtime.background_len(), 0);
 
-        let mut disabled = paths_row(agent_id);
+        // An update carries the stored `updated_at` as its token (MOD-23's CAS).
+        let mut disabled = summary_of(&store, agent_id).await.agent;
+        let token = disabled.updated_at;
         disabled.enabled = false;
-        store
-            .upsert_agent(&disabled, None)
-            .await
-            .expect("the row updates");
+        assert!(
+            matches!(
+                store.upsert_agent(&disabled, Some(token)).await,
+                Ok(htui_core::store::CasOutcome::Applied(_))
+            ),
+            "the row is switched off in the registry"
+        );
         let message = refused(set_paths(&mut runtime, &backend, &tx, 2, agent_id, &[]).await);
         assert_eq!(
             message,
@@ -10922,7 +11139,7 @@ done
             StoreReply::AgentWritten { agents, outcome } => {
                 assert_eq!(
                     outcome,
-                    crate::agent_settings::AgentWrite::ToolPaths {
+                    AgentWrite::ToolPaths {
                         id: agent_id,
                         name: PATHS_ROW.to_owned(),
                         status: ProbeStatus::Ready,
@@ -10980,7 +11197,7 @@ done
         assert!(matches!(served, Served::Deferred), "{served:?}");
         assert_eq!(
             tool_paths_outcome(one_reply(&mut runtime, &mut rx).await),
-            crate::agent_settings::AgentWrite::ToolPaths {
+            AgentWrite::ToolPaths {
                 id: agent_id,
                 name: PATHS_ROW.to_owned(),
                 status: ProbeStatus::Missing,
@@ -11029,7 +11246,7 @@ done
         assert!(matches!(served, Served::Deferred), "{served:?}");
         assert_eq!(
             tool_paths_outcome(one_reply(&mut runtime, &mut rx).await),
-            crate::agent_settings::AgentWrite::ToolPaths {
+            AgentWrite::ToolPaths {
                 id: agent_id,
                 name: PATHS_ROW.to_owned(),
                 status: ProbeStatus::Ready,
@@ -11052,7 +11269,7 @@ done
         assert!(matches!(served, Served::Deferred), "{served:?}");
         assert_eq!(
             tool_paths_outcome(one_reply(&mut runtime, &mut rx).await),
-            crate::agent_settings::AgentWrite::ToolPaths {
+            AgentWrite::ToolPaths {
                 id: agent_id,
                 name: PATHS_ROW.to_owned(),
                 status: ProbeStatus::Missing,
@@ -11103,7 +11320,7 @@ done
         assert!(matches!(served, Served::Deferred), "{served:?}");
         assert_eq!(
             tool_paths_outcome(one_reply(&mut runtime, &mut rx).await),
-            crate::agent_settings::AgentWrite::ToolPaths {
+            AgentWrite::ToolPaths {
                 id: agent_id,
                 name: PATHS_ROW.to_owned(),
                 status: ProbeStatus::Ready,
