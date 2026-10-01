@@ -29,12 +29,13 @@ use htui_core::model::{
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::item_writes::ItemFormContext;
 use crate::store_worker::StoreRequest;
 use crate::ui::tabs::backlog::filter;
 use crate::ui::tabs::backlog::list::clip;
+use crate::ui::tabs::settings::wrapped;
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 
 /// Lines `PageUp`/`PageDown` move in the paths and body areas.
@@ -55,8 +56,12 @@ const LABEL: usize = 9;
 /// Rows the paths area takes.
 const PATHS_HEIGHT: u16 = 3;
 
-/// Rows the notice takes: the D6 sentence wraps to two at the detail pane's width.
+/// Rows the notice takes at least: the D6 sentence wraps to two at the detail pane's width. A
+/// longer notice (a D11 hedge after a long store message) grows into the body's rows.
 const NOTICE_HEIGHT: u16 = 2;
+
+/// Rows the body keeps when a long notice grows.
+const BODY_MIN: u16 = 3;
 
 /// One focusable part of the form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -756,13 +761,28 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme)
         .copied()
         .filter(|field| !matches!(field, Field::Paths | Field::Body))
         .collect();
+    let notice_lines = form
+        .notice
+        .as_deref()
+        .map(|sentence| notice_lines(sentence, usize::from(inner.width)))
+        .unwrap_or_default();
+    // Every row but the body and the notice: the one-line rows, the paths and their label, the
+    // body label and the hint.
+    let fixed = u16::try_from(rows.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(PATHS_HEIGHT + 3);
+    let room = inner.height.saturating_sub(fixed).saturating_sub(BODY_MIN);
+    let notice_height = u16::try_from(notice_lines.len())
+        .unwrap_or(u16::MAX)
+        .min(room)
+        .max(NOTICE_HEIGHT);
     let mut constraints: Vec<Constraint> = rows.iter().map(|_| Constraint::Length(1)).collect();
     constraints.extend([
         Constraint::Length(1),
         Constraint::Length(PATHS_HEIGHT),
         Constraint::Length(1),
-        Constraint::Min(3),
-        Constraint::Length(NOTICE_HEIGHT),
+        Constraint::Min(BODY_MIN),
+        Constraint::Length(notice_height),
         Constraint::Length(1),
     ]);
     let areas = Layout::vertical(constraints).split(inner);
@@ -802,12 +822,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme)
         ),
         body,
     );
-    if let Some(sentence) = &form.notice {
-        frame.render_widget(
-            Paragraph::new(Line::styled(sentence.clone(), theme.error)).wrap(Wrap { trim: true }),
-            notice,
-        );
-    }
+    frame.render_widget(
+        Paragraph::new(
+            notice_lines
+                .into_iter()
+                .map(|line| Line::styled(line, theme.error))
+                .collect::<Vec<_>>(),
+        ),
+        notice,
+    );
     let text = match form.focus {
         Field::Project | Field::Kind | Field::Graph => HINT_PICK,
         Field::Title | Field::Priority | Field::Tags | Field::Paths | Field::Body => HINT_TEXT,
@@ -816,6 +839,24 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme)
         Paragraph::new(Line::styled(clip(text, usize::from(width)), theme.dim)),
         hint,
     );
+}
+
+/// The notice in rows of at most `width` characters: broken at spaces, and inside a word only
+/// when the word alone is wider (a long path in a refusal). Wrapped here rather than by
+/// `Paragraph`'s `Wrap`, because the layout sizes the notice from this count before drawing it
+/// (the `settings::wrapped` precedent), and a count that disagreed would cut off the D11 hedge.
+fn notice_lines(sentence: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for line in wrapped(sentence, width) {
+        let chars: Vec<char> = line.chars().collect();
+        lines.extend(
+            chars
+                .chunks(width)
+                .map(|chunk| chunk.iter().collect::<String>()),
+        );
+    }
+    lines
 }
 
 /// D6: a stale edit's notice. The text and the token are kept, so a second save diverges again.
@@ -1290,11 +1331,8 @@ mod tests {
         assert!(printed.contains("notice_len"), "{printed}");
     }
 
-    /// Every state shows as characters, because the snapshots are text (blueprint §4 render).
-    #[tokio::test]
-    async fn the_new_form_draws_its_rows_and_the_hint() {
-        let mut form = new_form().await;
-        type_text(&mut form, "Fresh item");
+    /// The form drawn into the detail pane at the default size, one string per row.
+    fn drawn(form: &ItemForm) -> Vec<String> {
         let [_, right] = panes(chrome(Rect::new(0, 0, DEFAULT_SIZE.0, DEFAULT_SIZE.1)).body);
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
             right.width,
@@ -1302,17 +1340,24 @@ mod tests {
         ))
         .expect("a test terminal");
         terminal
-            .draw(|frame| render(frame, frame.area(), &form, &Theme::default()))
+            .draw(|frame| render(frame, frame.area(), form, &Theme::default()))
             .expect("the frame draws");
         let buffer = terminal.backend().buffer();
-        let text: String = (0..buffer.area.height)
+        (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
                     .map(|x| buffer[(x, y)].symbol())
                     .collect::<String>()
             })
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect()
+    }
+
+    /// Every state shows as characters, because the snapshots are text (blueprint §4 render).
+    #[tokio::test]
+    async fn the_new_form_draws_its_rows_and_the_hint() {
+        let mut form = new_form().await;
+        type_text(&mut form, "Fresh item");
+        let text = drawn(&form).join("\n");
         for wanted in [
             " New item \u{b7} htui ",
             "> title    Fresh item",
@@ -1324,5 +1369,39 @@ mod tests {
         ] {
             assert!(text.contains(wanted), "{wanted:?} in\n{text}");
         }
+    }
+
+    /// D11: a Postgres `Unreachable` message runs past two rows, and the hedge after it still
+    /// shows whole, because the warning is what stops a second Ctrl+S from minting a duplicate.
+    #[tokio::test]
+    async fn the_hedge_after_a_long_failure_shows_whole() {
+        let mut form = new_form().await;
+        type_text(&mut form, "Fresh item");
+        let why = "store unreachable: error communicating with database: Connection reset by \
+                   peer (os error 104)";
+        let hedge = mint_may_have_landed(why);
+        form.settle(Some(hedge.clone()));
+        let rows = drawn(&form);
+        let flowed = rows
+            .iter()
+            .map(|row| row.trim_matches(|c| c == ' ' || c == '\u{2502}'))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(flowed.contains(&hedge), "{hedge:?} in\n{}", rows.join("\n"));
+        assert!(flowed.contains(HINT_TEXT), "{}", rows.join("\n"));
+    }
+
+    /// A word wider than the pane (a long path in a refusal) breaks inside, never off the edge.
+    #[tokio::test]
+    async fn a_notice_word_wider_than_the_pane_breaks_inside() {
+        let mut form = new_form().await;
+        let long = format!("touched path `{}` is bad", "a/".repeat(40));
+        form.settle(Some(long.clone()));
+        let rows = drawn(&form);
+        let flowed = rows
+            .iter()
+            .map(|row| row.trim_matches(|c| c == ' ' || c == '\u{2502}'))
+            .collect::<String>();
+        assert!(flowed.contains(&"a/".repeat(40)), "{}", rows.join("\n"));
     }
 }
