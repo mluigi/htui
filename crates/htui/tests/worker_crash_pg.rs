@@ -1154,3 +1154,152 @@ async fn a_worker_killed_after_capture_settles_the_step_done() {
     second.stopped().await;
     case.finish().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// K1 to K3: interrupted, then retried
+// ---------------------------------------------------------------------------------------------
+
+/// The step tree of `step`: its one repo's worktree.
+async fn tree_of(case: &Case, step: StepId) -> PathBuf {
+    let trees = case
+        .stack
+        .db
+        .store
+        .step_trees(step)
+        .await
+        .expect("the trees read");
+    assert_eq!(trees.len(), 1, "one repo, one tree: {trees:?}");
+    PathBuf::from(&trees[0].path)
+}
+
+/// Plan T4 K1: a worker killed once its session started and before any driver event, after the
+/// session wrote a file it never committed. The next worker's sweep resets the tree, fails attempt
+/// 1 `interrupted`, notes the retry, and walks attempt 2 to `done`; the stray file is in no tree
+/// the run lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_killed_before_any_event_retries_the_step() {
+    let Some(mut case) = Case::new().await else {
+        return;
+    };
+    let mut first = case.spawn(Act::Stall, None);
+    case.marked(&mut first).await;
+    first.killed();
+
+    let steps = case.steps().await;
+    let killed = prd(&steps, 1).expect("prd attempt 1").clone();
+    assert_eq!(killed.status, StepStatus::Running, "killed mid-step");
+    assert!(
+        tree_of(&case, killed.id).await.join(STRAY).exists(),
+        "the killed session left its stray file in its tree"
+    );
+    let prompt_only = vec![EventKind::Prompt];
+    let kinds = |events: Vec<(i32, EventKind)>| -> Vec<EventKind> {
+        events.into_iter().map(|(_, kind)| kind).collect()
+    };
+    assert_eq!(
+        kinds(case.events(killed.id).await),
+        prompt_only,
+        "no driver event was flushed before the kill"
+    );
+
+    let mut second = case.spawn(Act::Walks, None);
+    let row = case.rested(&mut second).await;
+    let retried = case.interrupted_then_retried(&row).await;
+    let landed = case.landed();
+    assert!(
+        !landed.iter().any(|path| path == STRAY),
+        "the stray file did not land: {landed:?}"
+    );
+    assert!(
+        !case.checkout().join(STRAY).exists(),
+        "nor is it in the checkout's working tree"
+    );
+    assert!(
+        !tree_of(&case, retried.id).await.join(STRAY).exists(),
+        "attempt 2's tree never held it"
+    );
+    assert_eq!(
+        kinds(case.events(killed.id).await),
+        prompt_only,
+        "recovery wrote nothing into attempt 1's log"
+    );
+    second.stopped().await;
+    case.finish().await;
+}
+
+/// Plan T4 K2: a worker killed after its session's `ToolCall` was flushed, while it parks on a
+/// permission request. As K1, and attempt 1 keeps its flushed rows (`R-HIS-1`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_killed_after_a_flush_keeps_its_rows_and_retries() {
+    let Some(mut case) = Case::new().await else {
+        return;
+    };
+    let mut first = case.spawn(Act::Park, None);
+    let deadline = Instant::now() + PATIENCE;
+    let killed = loop {
+        let steps = case.steps().await;
+        if let Some(step) = prd(&steps, 1) {
+            let events = case.events(step.id).await;
+            if events.iter().any(|(_, kind)| *kind != EventKind::Prompt) {
+                break step.clone();
+            }
+        }
+        first.alive("a flushed event");
+        assert!(
+            Instant::now() < deadline,
+            "no event beyond the prompt within {PATIENCE:?}; the child's log:\n{}",
+            first.log()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    first.killed();
+
+    let at_kill = case.events(killed.id).await;
+    assert!(
+        at_kill.iter().any(|(_, kind)| *kind == EventKind::ToolCall),
+        "the tool call was flushed: {at_kill:?}"
+    );
+    let mut second = case.spawn(Act::Walks, None);
+    let row = case.rested(&mut second).await;
+    case.interrupted_then_retried(&row).await;
+    assert_eq!(
+        case.events(killed.id).await,
+        at_kill,
+        "R-HIS-1: attempt 1 keeps exactly the rows it flushed"
+    );
+    second.stopped().await;
+    case.finish().await;
+}
+
+/// Plan T4 K3: a worker killed after `prd`'s output document was written, before its trees were
+/// captured. The document notwithstanding, the step is not finished: the sweep resets and retries
+/// it as K1, and attempt 2 writes its own document.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_killed_after_the_document_retries_the_step() {
+    let Some(mut case) = Case::new().await else {
+        return;
+    };
+    let mut first = case.spawn(Act::Walks, Some("documented@prd#1"));
+    case.marked(&mut first).await;
+    first.killed();
+
+    let steps = case.steps().await;
+    let killed = prd(&steps, 1).expect("prd attempt 1").clone();
+    assert_eq!(killed.status, StepStatus::Running, "killed mid-step");
+    assert_eq!(
+        case.produced_by("prd").await,
+        BTreeSet::from([killed.id]),
+        "attempt 1's document was written before the kill"
+    );
+
+    let mut second = case.spawn(Act::Walks, None);
+    let row = case.rested(&mut second).await;
+    let retried = case.interrupted_then_retried(&row).await;
+    assert_eq!(
+        case.produced_by("prd").await,
+        BTreeSet::from([killed.id, retried.id]),
+        "attempt 2 wrote its own document beside attempt 1's"
+    );
+    second.stopped().await;
+    case.finish().await;
+}
