@@ -39,9 +39,9 @@
 use core::cell::Cell;
 use htui_agent::event::{PermissionOption, PermissionOptionKind};
 use htui_core::model::{
-    Document, DocumentId, ItemId, RelayOption, RelayOptionKind, RelayView, Resolution, RunId,
-    RunMode, RunStatus, RunStepSummary, RunSummary, Status, StepId, StepPermission, StepStatus,
-    UsageTotals,
+    Document, DocumentId, ItemId, PermissionId, RelayOption, RelayOptionKind, RelayView,
+    Resolution, RunId, RunMode, RunStatus, RunStepSummary, RunSummary, Status, StepId,
+    StepPermission, StepStatus, UsageTotals,
 };
 use htui_orch::closeout::Preview;
 use htui_orch::{Command, CommandOutcome, GateAnswer};
@@ -176,6 +176,13 @@ pub struct RunsTab {
     mode: Mode,
     /// MOD-42 plan D14: the last `RelayView` for [`RunsTab::item`]; `None` until the first one.
     relay: Option<RelayView>,
+    /// The request this pane last sent an `AnswerPermission` for, until a refusal frees it.
+    ///
+    /// A second answer to it would supersede the first in the app's staleness gate
+    /// (`App::dispatch`), dropping the first's `PermissionAnswered` and leaving only the second's
+    /// `already answered` refusal on the status line; and a relay view read before the answer
+    /// landed may still list it as pending. Ids are never reused, so a stale entry matches nothing.
+    answering: Option<PermissionId>,
 }
 
 /// One place the cursor can be (blueprint D198): a step, or the header of a run with no step.
@@ -1255,6 +1262,7 @@ impl DetailTab for RunsTab {
         self.selected = None;
         self.actions = None;
         self.relay = None;
+        self.answering = None;
         self.mode = Mode::Browse;
     }
 
@@ -1281,13 +1289,17 @@ impl DetailTab for RunsTab {
         if let KeyCode::Char(digit @ '1'..='9') = key.code
             && let Some(pending) = self.pending_under_cursor()
         {
-            if let Some(option) =
-                PermissionStrip::pick_from(&strip_options(&pending.options), digit)
+            // One answer per request: a digit while it is in flight is swallowed.
+            if self.answering != Some(pending.id)
+                && let Some(option) =
+                    PermissionStrip::pick_from(&strip_options(&pending.options), digit)
             {
+                let permission = pending.id;
                 ctx.request(StoreRequest::AnswerPermission {
-                    permission: pending.id,
+                    permission,
                     option_id: option.id,
                 });
+                self.answering = Some(permission);
             }
             return Handled::Consumed;
         }
@@ -1377,6 +1389,8 @@ impl DetailTab for RunsTab {
             }
             StoreReply::PermissionAnswered { .. } => self.re_read(ctx),
             StoreReply::Failed { request, .. } if *request == ANSWER_PERMISSION => {
+                // Refused, so the request may be answered again.
+                self.answering = None;
                 self.re_read(ctx);
             }
             _ => {}
@@ -1518,7 +1532,7 @@ mod tests {
     use crossterm::event::KeyModifiers;
     use htui_core::fixtures::{demo_at, ids};
     use htui_core::model::{
-        GateOutcome, PermissionId, PermissionStatus, ProjectRef, RelaySessionId, Scope, WorkspaceId,
+        GateOutcome, PermissionStatus, ProjectRef, RelaySessionId, Scope, WorkspaceId,
     };
     use htui_core::store::{MemStore, ReadStore};
     use htui_orch::Rest;
@@ -3629,6 +3643,99 @@ mod tests {
             matches!(sent.as_slice(), [StoreRequest::AnswerPermission { permission, option_id }]
                 if *permission == pending.id && option_id == "reject"),
             "one answer, the second option's id: {sent:?}"
+        );
+    }
+
+    /// D14: a second digit while the first answer is in flight sends nothing. Its
+    /// `AnswerPermission` would supersede the first in the app's staleness gate
+    /// (`App::dispatch`), so the first answer's `PermissionAnswered` would be dropped and the
+    /// second's `already answered` refusal would be all the status line showed. The request stays
+    /// taken while a relay view drawn before the answer still lists it; a refusal frees it.
+    #[tokio::test]
+    async fn a_second_digit_while_the_answer_is_in_flight_sends_nothing() {
+        let shell = Shell::new();
+        let (mut pane, pending) = asking(&shell).await;
+
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('1')), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('2')), &mut shell.ctx()),
+            Handled::Consumed,
+            "the step still shows its request, so the digit is still the pane's"
+        );
+        let sent = requests(shell.emit.take());
+        assert!(
+            matches!(sent.as_slice(), [StoreRequest::AnswerPermission { permission, option_id }]
+                if *permission == pending.id && option_id == "allow"),
+            "exactly one answer, the first digit's: {sent:?}"
+        );
+
+        // A view read before the answer landed still lists the request as pending.
+        pane.on_reply(
+            &relay(ids::HTUI_FEAT_1, vec![pending.clone()], Vec::new()),
+            &mut shell.ctx(),
+        );
+        pane.on_reply(
+            &StoreReply::PermissionAnswered {
+                permission: pending.id,
+            },
+            &mut shell.ctx(),
+        );
+        let _ = shell.emit.take();
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('2')), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        assert!(
+            shell.emit.is_empty(),
+            "an answered request is never answered again: {:?}",
+            shell.emit.take()
+        );
+
+        // A refused answer leaves the request open to another try.
+        let (mut pane, pending) = asking(&shell).await;
+        pane.on_key(key(KeyCode::Char('1')), &mut shell.ctx());
+        let _ = shell.emit.take();
+        pane.on_reply(
+            &StoreReply::Failed {
+                request: "answer_permission",
+                message: htui_core::model::EXECUTOR_GONE.to_owned(),
+            },
+            &mut shell.ctx(),
+        );
+        let _ = shell.emit.take();
+        pane.on_key(key(KeyCode::Char('2')), &mut shell.ctx());
+        let sent = requests(shell.emit.take());
+        assert!(
+            matches!(sent.as_slice(), [StoreRequest::AnswerPermission { permission, option_id }]
+                if *permission == pending.id && option_id == "reject"),
+            "after a refusal the next digit answers again: {sent:?}"
+        );
+    }
+
+    /// D14, OQ-4: offline the relay read is an empty view (`try_serve`); the pane takes it
+    /// quietly - no request, no strip, no `cancel requested`, and the digits stay tab select.
+    #[tokio::test]
+    async fn an_empty_relay_view_draws_nothing_and_digits_pass() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        let before = lines(&pane, &shell);
+        pane.on_reply(
+            &relay(ids::HTUI_FEAT_1, Vec::new(), Vec::new()),
+            &mut shell.ctx(),
+        );
+        assert!(shell.emit.is_empty(), "{:?}", shell.emit.take());
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('1')), &mut shell.ctx()),
+            Handled::Pass
+        );
+        assert!(shell.emit.is_empty(), "{:?}", shell.emit.take());
+        assert_eq!(
+            lines(&pane, &shell),
+            before,
+            "the drawing is the one with no view"
         );
     }
 
