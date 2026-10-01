@@ -848,6 +848,10 @@ mod tests {
             .expect("the runtime refuses an unknown agent");
         assert!(status.starts_with("set_tool_paths: "), "{status}");
         assert!(!status.contains("no agent runtime in this"), "{status}");
+        assert!(
+            status.contains("not found"),
+            "the handler's own refusal of an unknown agent (review N2): {status}"
+        );
     }
 
     /// Blueprint D181, through a harness with a run runtime and no chat runtime: the promotion's

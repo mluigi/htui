@@ -4052,6 +4052,10 @@ mod tests {
                     message, "no agent runtime in this build",
                     "the loop routed the request to try_serve, not to the agent runtime"
                 );
+                assert!(
+                    message.contains("not found"),
+                    "the handler's own refusal of an unknown agent (review N2): {message}"
+                );
             }
             other => panic!("an unknown agent is refused: {other:?}"),
         }
