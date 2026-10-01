@@ -293,6 +293,11 @@ enum Mode {
     FailAnswers,
     /// No fake: `next_event` pends until `cancel`, then a `done { cancelled }` and the end.
     Stall,
+    /// No fake: `next_event` pends for ever, `cancel` or not (a turn that never ends).
+    Hang,
+    /// No fake: `next_event` pends until `cancel`, then a `done { cancelled }`, then pends for
+    /// ever: ACP's stream outlives the turn.
+    Linger,
 }
 
 #[derive(Debug)]
@@ -327,7 +332,11 @@ impl AgentSession for Watched {
                 return inner.next_event().await;
             }
             if self.cancelled {
-                return Ok(self.closing.take());
+                match (self.mode, self.closing.take()) {
+                    (Mode::Stall, closing) => return Ok(closing),
+                    (Mode::Linger, Some(closing)) => return Ok(Some(closing)),
+                    _ => {}
+                }
             }
             std::future::pending::<Result<Option<DriverEnvelope>, DriverError>>().await
         })
@@ -566,8 +575,19 @@ async fn a_stage_three_request_is_relayed_scrubbed_and_resumes_on_an_answer() {
         )),
         async {
             let row = parked_row(&fx.store).await?;
+            // §5.2: the request row is durable before a relay row names it; the recorder's
+            // buffer is not what a parked row may point at.
+            let stored = log(&fx.store, fx.step).await;
+            let durable = (
+                stored
+                    .iter()
+                    .any(|e| e.kind == EventKind::ToolCall && e.payload["tool_call_id"] == CALL),
+                stored.iter().any(|e| {
+                    e.kind == EventKind::PermissionRequest && e.payload["request_id"] == REQUEST
+                }),
+            );
             answer(&fx.store, &row, &row.options[0].id).await;
-            Some(row)
+            Some((row, durable))
         }
     );
     recorder.finish().await.expect("the recorder closes");
@@ -579,7 +599,12 @@ async fn a_stage_three_request_is_relayed_scrubbed_and_resumes_on_an_answer() {
         }),
         "the answered turn finishes"
     );
-    let parked = parked.expect("the client saw the parked request");
+    let (parked, durable) = parked.expect("the client saw the parked request");
+    assert_eq!(
+        durable,
+        (true, true),
+        "the call and its request are stored before the relay row is visible"
+    );
     let summary = parked
         .summary
         .clone()
@@ -821,6 +846,76 @@ async fn a_cancel_mid_turn_cancels_the_session_gracefully() {
         vec![grace],
         "session.cancel once, with the grace"
     );
+    let log = log(&fx.store, fx.step).await;
+    assert_eq!(
+        log.last().map(|row| row.payload["stop_reason"].clone()),
+        Some(json!("cancelled")),
+        "the drain recorded the cancel's `done`"
+    );
+}
+
+/// Drives `session` with a relay and sends `Signal::Cancel { grace }` 50 ms in; answers `drive`'s
+/// result and how long the paused clock ran from the cancel to `drive`'s return.
+async fn cancel_mid_turn(
+    fx: &Leased,
+    session: &mut Watched,
+    grace: Duration,
+) -> (Result<DoneEvent, DriverError>, Duration) {
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(fx, &scrubber);
+    let policy = PermissionPolicy::default();
+    let relay = relay(fx, &policy);
+    let (signal, mut control) = control_channel();
+
+    let (out, sent) = tokio::join!(
+        within(drive(session, &mut recorder, Some(&relay), &mut control)),
+        async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            signal.send_replace(Signal::Cancel { grace });
+            tokio::time::Instant::now()
+        }
+    );
+    let took = sent.elapsed();
+    recorder.finish().await.expect("the recorder closes");
+    (out, took)
+}
+
+/// B-11: a cancelled session that never ends its turn holds `drive` for `grace` plus one second,
+/// no longer, and the answer is still `Cancelled`.
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_session_that_never_ends_its_turn_is_bounded() {
+    let fx = leased().await;
+    let (mut session, seen) = watched(None, Mode::Hang);
+    let grace = Duration::from_secs(3);
+
+    let (out, took) = cancel_mid_turn(&fx, &mut session, grace).await;
+
+    assert_eq!(out, Err(DriverError::Cancelled), "still a graceful cancel");
+    assert_eq!(
+        seen.cancels(),
+        vec![grace],
+        "session.cancel once, with the grace"
+    );
+    assert_eq!(
+        took,
+        grace + Duration::from_secs(1),
+        "the drain waits grace + 1 s for a turn that never ends (B-11)"
+    );
+}
+
+/// B-11, D6: the drain stops at the cancel's `done`. A stream that outlives the turn (ACP) does
+/// not hold `drive` for the whole bound.
+#[tokio::test(start_paused = true)]
+async fn the_post_cancel_drain_stops_at_the_turns_done() {
+    let fx = leased().await;
+    let (mut session, seen) = watched(None, Mode::Linger);
+    let grace = Duration::from_secs(3);
+
+    let (out, took) = cancel_mid_turn(&fx, &mut session, grace).await;
+
+    assert_eq!(out, Err(DriverError::Cancelled));
+    assert_eq!(seen.cancels(), vec![grace]);
+    assert_eq!(took, Duration::ZERO, "no wait past the turn's `done`");
     let log = log(&fx.store, fx.step).await;
     assert_eq!(
         log.last().map(|row| row.payload["stop_reason"].clone()),
