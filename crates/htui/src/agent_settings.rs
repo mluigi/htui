@@ -495,8 +495,14 @@ pub const SET_TOOL_PATHS: &str = "set_tool_paths";
 /// # Errors
 /// `` `<tool>`: the path is empty `` or `` `<tool>`: the path must be absolute ``.
 pub fn parse_tool_path(tool: &str, text: &str) -> Result<String, String> {
-    let _ = (tool, text);
-    todo!("MOD-66 T2: parse_tool_path")
+    let path = text.trim();
+    if path.is_empty() {
+        return Err(format!("`{tool}`: the path is empty"));
+    }
+    if !std::path::Path::new(path).is_absolute() {
+        return Err(format!("`{tool}`: the path must be absolute"));
+    }
+    Ok(path.to_owned())
 }
 
 /// What one registry write did (plan D240), carried by `StoreReply::AgentWritten` beside the
