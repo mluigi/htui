@@ -5,8 +5,9 @@
 //! directory under test, D309). The DSN and the sudo password are never arguments.
 //!
 //! Exit codes a script chooses: 3, the uploaded binary does not run (PREPARE); 4, sudo refused
-//! the password (INSTALL); 5, the service did not come up (VERIFY). Anything else is the failing
-//! command's own status.
+//! the password (INSTALL); 5, the service did not come up (VERIFY); 6, the upload's sha256 is not
+//! the payload's (PREPARE). A script with a temporary file removes it on exit and on HUP, INT and
+//! TERM (which exit 1). Anything else is the failing command's own status.
 
 /// `$0` of every script but [`INSTALL_ROOT`], so a remote error line reads `htui-provision: …`.
 pub const ARG0: &str = "htui-provision";
@@ -19,6 +20,8 @@ pub const BOX_END: &str = "htui.box.end";
 
 /// Read-only facts about the host (D299): `htui.<key>=<value>` lines, nothing else written.
 /// `$1` root. Never fails on a missing tool: a missing tool is a value (`none`, `no`, `unknown`).
+/// `printf` is `builtin` when this `sh` has it built in, `external` otherwise (review finding 5:
+/// INSTALL hands the sudo password to `printf`, which must not be a process of its own).
 pub const PREFLIGHT: &str = r#"set -eu
 root=$1
 say() {
@@ -66,23 +69,36 @@ elif sudo -k -n true >/dev/null 2>&1; then
 else
   say sudo password
 fi
+p=$(command -v printf || true)
+case $p in
+  printf) say printf builtin ;;
+  *) say printf external ;;
+esac
 "#;
 
-/// Unprivileged (D304): the log directory, then, with `send=1`, the binary on stdin, which must
-/// run `--version` before it replaces anything. `$1` root (unused), `$2` home, `$3` send (`0`|`1`).
-/// Exit 3: the uploaded binary does not run here; the temporary file is removed.
+/// Unprivileged (D304): the log directory, then, with `send=1`, the binary on stdin, whose sha256
+/// must be `$4` and which must run `--version` before it replaces anything. `$1` root (unused),
+/// `$2` home, `$3` send (`0`|`1`), `$4` the payload's lowercase hex sha256. Exit 6: the upload is
+/// not the payload (review finding 11); exit 3: it does not run here. Either way, and on a
+/// signal, the temporary file is removed.
 pub const PREPARE: &str = r#"set -eu
 home=$2
 send=$3
+sha=$4
 bin="$home/.local/bin"
 tmp="$bin/.htui.provision.$$"
 cleanup() {
   rm -f -- "$tmp"
 }
 trap cleanup EXIT
+trap "exit 1" HUP INT TERM
 mkdir -p "$home/.local/state/htui" "$bin"
 if [ "$send" = 1 ]; then
   cat > "$tmp"
+  got=$(sha256sum < "$tmp")
+  if [ "${got%% *}" != "$sha" ]; then
+    exit 6
+  fi
   chmod 0755 "$tmp"
   if ! "$tmp" --version; then
     exit 3
@@ -134,6 +150,7 @@ cleanup() {
   rm -f -- "$tmp" "$cred.new"
 }
 trap cleanup EXIT
+trap "exit 1" HUP INT TERM
 install -d -m 0700 "$creds"
 if [ ! -e "$cred" ] || [ "$replace" = 1 ]; then
   rm -f -- "$cred.new"
@@ -473,6 +490,156 @@ WantedBy=multi-user.target
                 !line.contains("$home"),
                 "INSTALL_ROOT line {i} touches home: {line:?}"
             );
+        }
+    }
+
+    /// A fresh `<home>` for PREPARE, under the system temp directory (nothing is executed there).
+    fn prepare_home() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("htui-prepare-")
+            .tempdir()
+            .expect("a temporary home")
+    }
+
+    /// The names left in `<home>/.local/bin`.
+    fn bin_entries(home: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(home.join(".local/bin"))
+            .map(|entries| {
+                entries
+                    .map(|e| {
+                        e.expect("an entry")
+                            .file_name()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Review finding 11: an upload whose sha256 is not the expected one exits 6, removes the
+    /// temporary file and installs nothing.
+    #[test]
+    fn prepare_refuses_a_corrupted_upload() {
+        use std::io::Write as _;
+        let home = prepare_home();
+        let home_text = home.path().to_str().expect("a UTF-8 home");
+        let wrong = "0".repeat(64);
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", PREPARE, ARG0, "", home_text, "1", wrong.as_str()])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("sh runs");
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin
+            .write_all(b"#!/bin/sh\necho htui 0.0.0\n")
+            .expect("write the upload");
+        drop(stdin);
+        let status = child.wait().expect("PREPARE ends");
+        assert_eq!(status.code(), Some(6), "a corrupted upload exits 6");
+        assert!(
+            bin_entries(home.path()).is_empty(),
+            "left behind: {:?}",
+            bin_entries(home.path())
+        );
+    }
+
+    /// Review finding 12: a signal while the upload is being read still removes the temporary
+    /// file, under every shell at hand.
+    #[test]
+    fn prepare_removes_its_temporary_file_on_a_signal() {
+        for shell in ["sh", "dash", "bash"] {
+            if !on_path(shell) {
+                println!("{shell} is not on PATH; skipping");
+                continue;
+            }
+            let home = prepare_home();
+            let home_text = home.path().to_str().expect("a UTF-8 home");
+            let sha = "0".repeat(64);
+            let mut child = std::process::Command::new(shell)
+                .args(["-c", PREPARE, ARG0, "", home_text, "1", sha.as_str()])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("the shell runs");
+            let stdin = child.stdin.take().expect("stdin");
+            let started = std::time::Instant::now();
+            while !bin_entries(home.path())
+                .iter()
+                .any(|name| name.starts_with(".htui.provision."))
+            {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(10),
+                    "{shell}: PREPARE never created its temporary file"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let killed = std::process::Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status()
+                .expect("kill runs");
+            assert!(killed.success());
+            // `cat` still holds the pipe; closing it lets the shell run its trap.
+            drop(stdin);
+            let status = child.wait().expect("the shell ends");
+            assert!(!status.success(), "{shell}: {status:?}");
+            assert!(
+                bin_entries(home.path()).is_empty(),
+                "{shell} left {:?}",
+                bin_entries(home.path())
+            );
+        }
+    }
+
+    /// Review finding 12: every script with a cleanup trap also exits on HUP, INT and TERM, so
+    /// the EXIT trap runs on a signal too.
+    #[test]
+    fn every_cleanup_trap_covers_the_signals() {
+        let mut seen = 0;
+        for (name, script) in ALL {
+            let lines: Vec<&str> = script.lines().collect();
+            if let Some(at) = lines.iter().position(|line| *line == "trap cleanup EXIT") {
+                seen += 1;
+                assert_eq!(
+                    lines.get(at + 1).copied(),
+                    Some(r#"trap "exit 1" HUP INT TERM"#),
+                    "{name}"
+                );
+            }
+        }
+        assert_eq!(seen, 2, "PREPARE and INSTALL_ROOT clean up");
+    }
+
+    /// Review finding 11: PREPARE compares the upload's sha256 before it runs it.
+    #[test]
+    fn prepare_checks_the_sha_before_it_runs_the_upload() {
+        let read = line_of(PREPARE, r#"cat > "$tmp""#);
+        let hash = line_of(PREPARE, r#"sha256sum < "$tmp""#);
+        let refuse = line_of(PREPARE, "exit 6");
+        let run = line_of(PREPARE, r#""$tmp" --version"#);
+        assert!(read < hash && hash < refuse && refuse < run);
+    }
+
+    /// Review finding 5: PREFLIGHT says whether `printf` is a builtin of the remote `sh`.
+    #[test]
+    fn preflight_reports_whether_printf_is_a_builtin() {
+        assert!(PREFLIGHT.contains("command -v printf"));
+        assert!(PREFLIGHT.contains("say printf builtin"));
+        assert!(PREFLIGHT.contains("say printf external"));
+        let probe = "p=$(command -v printf || true)\ncase $p in\n  printf) echo builtin ;;\n  *) echo external ;;\nesac\n";
+        assert!(PREFLIGHT.contains(&probe.replace("echo ", "say printf ")));
+        for shell in ["sh", "dash", "bash"] {
+            if !on_path(shell) {
+                continue;
+            }
+            let out = std::process::Command::new(shell)
+                .args(["-c", probe])
+                .output()
+                .expect("the shell runs");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "builtin\n", "{shell}");
         }
     }
 

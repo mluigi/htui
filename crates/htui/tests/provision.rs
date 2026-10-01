@@ -314,6 +314,9 @@ struct LocalShell {
     home: PathBuf,
     stub: PathBuf,
     noise: bool,
+    /// Flips the last byte of every non-empty stdin, as a corrupting link would (review finding
+    /// 11).
+    corrupt: bool,
     /// Every command as `run_with` built it (never the noisy one), with its stdin's length.
     commands: Mutex<Vec<(String, usize)>>,
 }
@@ -324,6 +327,7 @@ impl LocalShell {
             home: world.home.clone(),
             stub: world.stub.clone(),
             noise: false,
+            corrupt: false,
             commands: Mutex::new(Vec::new()),
         }
     }
@@ -353,7 +357,13 @@ impl Remote for LocalShell {
             .env("PATH", format!("{}:/usr/bin:/bin", self.stub.display()))
             .env("STUB_DIR", &self.stub)
             .env("LC_ALL", "C");
-        run_piped(sh, stdin).await
+        let mut input = stdin.to_vec();
+        if self.corrupt
+            && let Some(last) = input.last_mut()
+        {
+            *last ^= 1;
+        }
+        run_piped(sh, &input).await
     }
 }
 
@@ -713,10 +723,10 @@ async fn a_fresh_password_host_is_provisioned() {
     // VERIFY.
     let commands = shell.commands();
     assert_eq!(commands.len(), 4);
-    assert_eq!(
-        script_args(&commands[1].0).last().map(String::as_str),
-        Some("1")
-    );
+    // PREPARE's `$3` is send, `$4` the payload's sha256 (review finding 11).
+    let prepare_args = script_args(&commands[1].0);
+    assert_eq!(prepare_args[2], "1");
+    assert_eq!(prepare_args[3], hex_sha256(GOOD_HTUI.as_bytes()));
     assert_eq!(commands[1].1, GOOD_HTUI.len());
     assert_eq!(commands[2].1, PASSWORD.len() + 1 + DSN.len() + 1);
     assert_eq!(commands[3].1, 0);
@@ -866,7 +876,7 @@ async fn replace_credential_re_encrypts_and_restarts() {
     let commands = shell.commands();
     let (prepare, prepare_stdin) = &commands[calls + 1];
     assert_eq!(*prepare_stdin, 0, "the same build is not uploaded again");
-    assert_eq!(script_args(prepare).last().map(String::as_str), Some("0"));
+    assert_eq!(script_args(prepare)[2], "0");
     let credential = std::fs::read(world.credential()).expect("the credential");
     assert!(
         holds(&credential, "db2.example"),
@@ -969,6 +979,32 @@ async fn a_binary_that_does_not_run_is_removed() {
     assert!(left.is_empty(), "{} holds {left:?}", bin.display());
     assert!(!world.root.join("etc").exists());
     assert_eq!(world.systemctl_writes(), Vec::<String>::new());
+    sweep_run(&world, &shell, &run);
+}
+
+/// Review finding 11: an upload that arrives altered is refused by its sha256 before it runs, and
+/// nothing is installed.
+#[tokio::test]
+async fn a_corrupted_upload_is_refused_and_removed() {
+    let world = World::new("nopasswd");
+    let shell = LocalShell {
+        corrupt: true,
+        ..LocalShell::new(&world)
+    };
+    let run = provision(&world, &shell, Setup::default()).await;
+    let (code, sentence) = run.exit();
+    assert_eq!(code, 1);
+    assert_eq!(
+        sentence,
+        "provisioning stub-dest failed: the upload to stub-dest was corrupted (its sha256 is \
+         not this build's); nothing was replaced"
+    );
+    assert!(
+        files_under(&world.home.join(".local/bin")).is_empty(),
+        "nothing is left in the bin directory"
+    );
+    assert!(!world.root.join("etc").exists());
+    assert_eq!(shell.commands().len(), 2, "PREFLIGHT and PREPARE only");
     sweep_run(&world, &shell, &run);
 }
 

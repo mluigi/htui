@@ -371,7 +371,7 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
     let send = if upload { "1" } else { "0" };
     let prepared = remote
         .run(
-            &script::remote_command(script::PREPARE, &[root, &facts.home, send]),
+            &script::remote_command(script::PREPARE, &[root, &facts.home, send, payload.sha()]),
             if upload { payload.bytes() } else { b"" },
         )
         .await
@@ -384,6 +384,15 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
                 &format!(
                     "the htui binary does not run on {dest}: {}",
                     prepared.last_stderr_line()
+                ),
+            ));
+        }
+        Some(6) => {
+            return Err(failed(
+                dest,
+                &format!(
+                    "the upload to {dest} was corrupted (its sha256 is not this build's); \
+                     nothing was replaced"
                 ),
             ));
         }
@@ -1197,7 +1206,11 @@ mod tests {
                 Vec::new(),
             ]
         );
-        assert!(remote.command_of("PREPARE").ends_with(" /home/alice 1"));
+        assert!(
+            remote
+                .command_of("PREPARE")
+                .ends_with(&format!(" /home/alice 1 {}", payload().sha()))
+        );
         let install = remote.command_of("INSTALL");
         assert!(install.contains(" password '"), "{install}");
         assert!(install.contains(script::INSTALL_ROOT));
@@ -1253,7 +1266,11 @@ mod tests {
         let ran = drive(DEST, DSN, false, &remote, &prompt, &verifier).await;
         assert!(ran.result.is_ok());
         assert!(remote.stdin_of("PREPARE").is_empty());
-        assert!(remote.command_of("PREPARE").ends_with(" /home/alice 0"));
+        assert!(
+            remote
+                .command_of("PREPARE")
+                .ends_with(&format!(" /home/alice 0 {sha}"))
+        );
         assert!(!ran.err.contains("uploading"));
     }
 
@@ -1523,6 +1540,12 @@ mod tests {
                 )],
                 "provisioning alice@box1 failed: the htui binary does not run on alice@box1: \
                  ./htui: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found"
+                    .to_owned(),
+            ),
+            (
+                vec![exit(6, "", "")],
+                "provisioning alice@box1 failed: the upload to alice@box1 was corrupted (its \
+                 sha256 is not this build's); nothing was replaced"
                     .to_owned(),
             ),
             (
