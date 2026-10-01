@@ -14,7 +14,15 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-01):** **MOD-41 is done** (`docs/decisions/mod/mod-41.md`): `htui worker`
+**Current status (2026-10-01):** **MOD-42 is done** (`docs/decisions/mod/mod-42.md`): engine-driven
+ACP steps no longer fail at their first permission request. The engine applies the agent's own
+permission policy; a request that still needs a human is a pending `step_permission` row (migration
+`0011`) that any TUI answers from the Runs pane (digits `1`-`9`), on any box, by a compare-and-set
+that never takes the lease; the executing process applies it and records the answer. Every cancel of
+a leased run is a durable `run_command` row applied gracefully by whoever walks the run (parked
+requests answered `cancelled`, then `session.cancel(grace)`), which replaces MOD-41's worker-walk
+refusal and closes MOD-37's R-38. Follow-up on engine steps is MOD-70.
+Before it, **MOD-41 was done** (`docs/decisions/mod/mod-41.md`): `htui worker`
 runs a box's runs with no terminal (guide `docs/htui-worker.md`). Run supervision lives in the
 UI-free crate `crates/htui-worker` behind `RecorderStore`/`WorkerStore`/`WorkerHost`;
 `box.settings.executor` (Settings > Boxes, `w`) decides whether the TUI or the worker claims, adopts
@@ -28,16 +36,6 @@ reviews of the loop's last two turns (review rows answered `Rejected`, each read
 `documents_of_kinds`, which never held two. A loop whose two rejected reviews repeat each other now
 escalates at that attempt; the hash half is still asked first. `runs_pg`'s escalation case now stops
 on `no_progress_review`, and the stop is pinned in that test (MOD-4 R-9 closed).
-Before that, **MOD-59 done** (`docs/decisions/mod/mod-59.md`): an applied Skills,
-Templates or Requirements write answers its own reply (`SkillWritten`, `TemplateSaved`,
-`RequirementWritten`, as MOD-23's `AgentWritten`), so a form lands on its write and never stays "in
-flight" when another session changed the row or a read arrived first; a write whose re-read failed
-still lands, and a failed mint is hedged and re-reads the tree.
-Before it, **MOD-14 done** (`docs/decisions/mod/mod-14.md`): the Backlog's
-Graph sub-tab draws the selected item's link neighbourhood as a tree, 1-3 hops (`+`/`-`, default 2,
-fetched at 3), across projects, with link kind and status per row; `J`/`K` move, `Enter` re-roots the
-Backlog selection through MOD-64's reveal, a node outside the workspace refuses on the status line,
-and `m` opens the sub-tab (`R-TUI-2` `open graph`).
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -186,9 +184,9 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
     walks the primary's first-parent history back to the step's base. This costs speed only. The
     fix is to open the repository once and pass `&gix::Repository` to private `*_in` variants (lease
     blueprint §23.4).
-  - **R-38**: preempting a running step (`cancel`, `promote`) kills the agent without ANA-4 §4.3's
-    grace window and without answering parked permission requests. A graceful path needs a cancel
-    seam inside `pump` (drive plan, Risks).
+  - ~~**R-38**~~: closed by MOD-42 (`docs/decisions/mod/mod-42.md`): a `cancel` or `promote`
+    preempt signals the walk, which answers parked requests `cancelled` and cancels the session
+    with grace before the walk is dropped.
   - **R-40**: `RunStream` frames are sent at session end and at rest only, so a step's
     `pending → running` is not signalled to the Runs pane. The next frame, or re-selecting the item,
     shows it. The fix is a step-start hook (drive plan, Risks).
@@ -464,23 +462,19 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   Not blocked (MOD-41 is done). Relates to ANA-16 (`docs/ANA-16.md` §8), which flagged the
   conflict this decision settles.
 
-- [ ] **MOD-42 - Permission and control relay through Postgres** (from ANA-16, §8 item 3).
-  `R-AGT-1`, `R-HIS-1`, `R-TUI-6`. The engine's `pump` (`record.rs:1684-1703`) cannot answer a
-  parked ACP request, so engine-driven ACP steps fail on their first permission request today. The
-  worker records `permission_request`, waits on a `permission_answer` row, then answers the session;
-  cancel and follow-up become command rows. Answers from another box go through the relay, never
-  `take_lease`. `htui worker` (MOD-41, done: `docs/decisions/mod/mod-41.md`) consumes it; MOD-41's
-  hand-back is the in-box half of its command rows, and cancelling a live worker walk is refused
-  until this item (`docs/htui-worker.md`).
-  **MOD-4 M6 landed without closing this gap** (MOD-4 done, `docs/decisions/mod/mod-4.md`): the
-  engine still drives a graph step through `pump` (`crates/htui-orch/src/engine.rs:5146`, `pump` now
-  at `crates/htui-agent/src/record.rs:1725-1743`) with the default `PermissionPolicy`, so engine-driven
-  ACP steps still fail on their first permission request. The MOD-4 (M6) dependency is met.
+- [ ] **MOD-70 - Follow-up command rows for engine steps** (from MOD-42, PRD Q9;
+  `docs/decisions/mod/mod-42.md`). `R-AGT-1`, `R-HIS-1`. MOD-42's `run_command` table carries only
+  `kind = 'cancel'`; a follow-up typed in any TUI for a step an engine walks (in process or on a
+  worker, on any box) would be a second kind, applied by the lease holder like a cancel. Open first:
+  the engine has no follow-up verb and ANA-2 no state that accepts one (a walk's session ends at
+  `done` before the step parks, `docs/ANA-2.md:1235-1238`), and the text is typed on one box but must
+  be scrubbed on the executing box (`R-SEC-3`, `R-ID-7`). Not blocked.
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
   until its worker claims it; the Runs view follows `session_event` by `seq` with `LISTEN`/`NOTIFY`
-  hints and a poll backstop, and shows worker liveness. Blocked on MOD-42, and MOD-12 for
-  auto mode.
+  hints and a poll backstop, and shows worker liveness. Blocked on MOD-12 for auto mode only
+  (MOD-42 is done: `docs/decisions/mod/mod-42.md`; its relay answers within a 1 s poll, which a
+  `NOTIFY` hint would shorten).
 - [ ] **MOD-44 - Container execution environment** (from ANA-16, §8 item 5). `R-BOX-1..3`,
   `R-AGT-5`, `R-AGT-6`, `R-AGT-9`, `R-SEC-2`, `R-MCP-1`, `R-NF-1`, `R-NF-2`. A child `box` of kind
   `container` with its own id and hostname; probe, install and auth inside the image; one container
@@ -515,9 +509,10 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
   (optional self-hosted server), `R-ID-2` (self-hosted control plane is not a cloud service),
   `R-ORCH-12` ("polling Postgres or the control plane"), `R-STO-1` (worker holds a box-scoped
   revocable key), `R-STO-5` (server owns migrations for workers), `R-USR-3` (roles enforced in the
-  server). Blocked on MOD-42 (MOD-40 and MOD-41 are done: `docs/decisions/mod/mod-40.md`,
-  `docs/decisions/mod/mod-41.md`; the worker reaches the store only through `WorkerStore`/`WorkerHost`,
-  which a control-plane client would implement).
+  server). Not blocked: MOD-40, MOD-41 and MOD-42 are done (`docs/decisions/mod/mod-40.md`,
+  `docs/decisions/mod/mod-41.md`, `docs/decisions/mod/mod-42.md`); the worker reaches the store only
+  through `WorkerStore`/`WorkerHost`/`RelayStore`, which a control-plane client would implement, and
+  MOD-42's `step_permission`/`run_command` rows are the payload the server relays.
 - [ ] **MOD-48 - Config manager and secret distribution (phase 2)** (from ANA-16, §6.2, §8 item 9).
   `R-ID-3`, `R-AGT-9`, `R-AGT-10`, `R-SEC-1`, `R-SEC-2`. `GetManifest`/`WatchManifest` over agent
   registry, box profiles, settings, images, target build and digest; full resync on a stale cursor;
@@ -586,6 +581,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`) (MOD-15 is done, 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-23 pure-Rust embedder, ANA-24 licensed coding benchmark source, ANA-25 learned weights) |
-| MOD-N   | 28 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-42 permission relay, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 28 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-43 remote dispatch, MOD-44 container env, MOD-45 SSH provisioning, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-51 probe spec editor, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys, MOD-70 engine follow-up; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

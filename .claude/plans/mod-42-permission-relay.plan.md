@@ -1,6 +1,6 @@
 # Plan: MOD-42 — Permission and control relay through Postgres
 
-**Status: CONFIRMED by the maintainer 2026-10-01, OQ-1 to OQ-5 as recommended. Fact-checked
+**Status: IMPLEMENTED 2026-10-01 (all three milestones, T0-T6 and the review round; write-up `docs/decisions/mod/mod-42.md`; implementation amendments in the blueprint's §13). CONFIRMED by the maintainer 2026-10-01, OQ-1 to OQ-5 as recommended. Fact-checked
 2026-10-01 (handoff-run step 3.5: five independent verification passes, workflow
 `wf_362e6c61-139`; falsified and partly-true claims amended in place, see "Verified claims").**
 
