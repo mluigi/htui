@@ -99,6 +99,12 @@ pub const KEEP_RAW_ENV: &str = "HTUI_KEEP_RAW_EVENTS";
 pub const BOX_PROBE_RUNNING: &str =
     "a box probe is running on this box; try again once it has finished";
 
+/// What `claim_is_free` refuses with while a probe or a chat's staleness re-probe writes this
+/// box. Verb-neutral, because every claim-taking request reads it: an install, a login, a
+/// `ProbeBox` and a `SetToolPaths` (MOD-66 review L4).
+const BOX_WRITE_RUNNING: &str =
+    "a probe or a re-probe is already writing this box; try again once it has finished";
+
 /// What one box probe did (MOD-7 D13, blueprint D25): the only thing the box probe task ever
 /// sends.
 ///
@@ -604,7 +610,8 @@ impl Background {
 }
 
 /// What `claim_is_free` and `ProbeAgents` refuse with while a `SetToolPaths` write runs (MOD-66
-/// B5): its own sentence, because the generic one says "install once it has finished" (F-7).
+/// B5): its own sentence, naming the write and the row, where the generic
+/// [`BOX_WRITE_RUNNING`] names a probe (F-7).
 fn tool_paths_running(agent_id: AgentId) -> String {
     format!("a tool-paths write is running for agent {agent_id}; try again once it has finished")
 }
@@ -1904,10 +1911,7 @@ impl AgentRuntime {
             return Err(StoreError::Backend(tool_paths_running(agent_id)));
         }
         if self.background.iter().any(Background::writes_agent_box) {
-            return Err(StoreError::Backend(
-                "a probe or a re-probe is already writing this box; install once it has finished"
-                    .to_owned(),
-            ));
+            return Err(StoreError::Backend(BOX_WRITE_RUNNING.to_owned()));
         }
         Ok(())
     }
@@ -6681,7 +6685,7 @@ pub(crate) mod tests {
             Served::Reply(StoreReply::Failed { request, message }) => {
                 assert_eq!(request, "install_plan");
                 assert!(
-                    message.contains("is already writing this box"),
+                    message.ends_with(BOX_WRITE_RUNNING),
                     "the refusal names what holds the box: {message}"
                 );
             }
@@ -6880,7 +6884,7 @@ pub(crate) mod tests {
             Served::Reply(StoreReply::Failed { request, message }) => {
                 assert_eq!(request, "install_plan");
                 assert!(
-                    message.contains("is already writing this box"),
+                    message.ends_with(BOX_WRITE_RUNNING),
                     "the refusal names the re-probe as well as the probe (MOD-31 D6): {message}"
                 );
             }
@@ -11079,7 +11083,10 @@ done
             .background
             .push(Background::writing(tokio::spawn(std::future::pending())));
         let message = refused(set_paths(&mut runtime, &backend, &tx, 1, agent_id, &[]).await);
-        assert!(message.contains("is already writing this box"), "{message}");
+        assert!(
+            message.ends_with(BOX_WRITE_RUNNING),
+            "verb-neutral, not \"install\" (review L4): {message}"
+        );
         assert_eq!(runtime.background_len(), 1, "the refusal spawned nothing");
         abort_background(&mut runtime);
 
