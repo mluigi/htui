@@ -53,6 +53,14 @@
 //! [`StoreRequest::AuthDeliver`]. The login's own task relays it to the listener on this box and
 //! answers with what the listener said. The pasted address is a credential for the length of that
 //! request; the rule it is held to is `htui_agent::auth::loopback`'s (MOD-22 D273).
+//!
+//! Since MOD-66 it is also where this box is given a **manual path** for a tool (D10, D11): `m`
+//! on the highlighted row opens a form with one field per `${tool}` its `discovery.tools`
+//! declares, prefilled from `agent_box.probe.manual`. `Enter` sends one
+//! [`StoreRequest::SetToolPaths`], which the agent runtime serves (it probes the row over the
+//! paths), not `crate::agent_settings`'s loop; its [`StoreReply::AgentWritten`] closes the form.
+//! A row whose `probe.source` is `manual` ends its `on this box` cell in `*`, and the idle note
+//! says what the star means while such a row is listed.
 
 use chrono::{DateTime, Utc};
 use htui_agent::auth::loopback::{
@@ -60,16 +68,17 @@ use htui_agent::auth::loopback::{
 };
 use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::install::PlanError;
+use htui_agent::launch::AgentLaunch;
 use htui_agent::probe::{ProbeSnapshot, ProbeStatus};
 use htui_agent::registry::caps_for;
 use htui_agent::{InstallOutcome, InstallPhase, InstallPlan, ManualSteps};
-use htui_core::model::{Agent, AgentId, AgentSummary, Scope, Transport};
+use htui_core::model::{Agent, AgentBox, AgentId, AgentSummary, Scope, Transport};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 
 use crate::agent_settings::{
@@ -106,10 +115,11 @@ const FULL: f64 = 1.0;
 /// allowance is exhausted while the predicate would still select it (review L-3).
 const NEARLY_FULL: f64 = 99.0;
 
-/// The keys line with nothing in flight (79 of the 98 columns, MOD-23 D245). It stands in for a
-/// help entry: a Settings section has no [`KeyScope`](crate::keymap::KeyScope) of its own (MOD-20
-/// D19), so the keys are written where they are pressed.
-const HINT_IDLE: &str = "j/k select \u{b7} n new \u{b7} e edit \u{b7} t this box \u{b7} r probe \u{b7} i install \u{b7} a authenticate";
+/// The keys line with nothing in flight (89 of the 98 columns, MOD-23 D245, MOD-66 D10). It stands
+/// in for a help entry: a Settings section has no [`KeyScope`](crate::keymap::KeyScope) of its own
+/// (MOD-20 D19), so the keys are written where they are pressed. `m` sits with the other write
+/// keys (MOD-66 B9).
+const HINT_IDLE: &str = "j/k select \u{b7} n new \u{b7} e edit \u{b7} m paths \u{b7} t this box \u{b7} r probe \u{b7} i install \u{b7} a authenticate";
 
 /// What the note line says when there is no notice and the section is idle: the one limit of this
 /// section that is not a key (MOD-2 D73).
@@ -132,6 +142,22 @@ const SWITCHED_OFF: &str = "switched off";
 
 /// What an edit that changed nothing says as it closes (plan D239's "unchanged closes").
 const UNCHANGED: &str = "nothing changed; nothing was written";
+
+/// What the `on this box` cell appends when `probe.source` is `manual` (MOD-66 D10, the
+/// maintainer's answer to blueprint F-3). One character, so the 13-wide column keeps it on every
+/// verdict but `unauthenticated`, which that column already clips.
+const MANUAL_SUFFIX: &str = "*";
+
+/// What the idle note adds while any row's `probe.source` is `manual`: the key to
+/// [`MANUAL_SUFFIX`] (MOD-66, the amendment to blueprint §5). 60 of the 98 columns with
+/// [`QUOTA_NOTE`].
+const MANUAL_NOTE: &str = " \u{b7} * manual path";
+
+/// `m` on a row whose launch declares no tool (MOD-66 D10): there is no `${tool}` to give a path.
+const LITERAL_LAUNCH: &str = "this row's launch is literal; e edits its command";
+
+/// `m` on a row whose launch does not parse (MOD-66 B14): "literal" would misdescribe it.
+const LAUNCH_UNREADABLE: &str = "this row's launch does not parse; nothing declares a tool";
 
 /// What a missing row says when no form is open to close: the write was `t`'s, or the form went
 /// before its answer came back. Opens like [`DELETED_ELSEWHERE`], so [`is_error`] draws it the same.
@@ -320,7 +346,7 @@ enum AuthState {
 }
 
 /// What the section is doing besides an install and a login (MOD-23 D230): browsing the table, or
-/// one registry form open under it. `Browse` captures nothing.
+/// one form open under it. `Browse` captures nothing.
 #[derive(Debug, Default)]
 enum Mode {
     /// The rows, the cursor and the tab's own `h`/`l`.
@@ -328,6 +354,35 @@ enum Mode {
     Browse,
     /// A create or an edit form, taking every printable key.
     Editing(Editor),
+    /// `m`'s form (MOD-66 D10): one path per tool the row declares, taking every printable key.
+    /// Its own type, so the create and edit forms keep their `&'static str` labels (D11, B7).
+    Paths(PathsForm),
+}
+
+/// The tool-paths form (MOD-66 D10, B7). It holds its own row identity (MOD-23 F-14), never an
+/// index into the table.
+#[derive(Debug)]
+struct PathsForm {
+    /// The row.
+    agent_id: AgentId,
+    /// Its name, for the header.
+    name: String,
+    /// The stored `probe.manual`, restricted to the declared tools: the prefill, and what `Enter`
+    /// compares against ("unchanged closes").
+    opened: BTreeMap<String, String>,
+    /// One per declared tool, in `discovery.tools` (name) order.
+    fields: Vec<PathField>,
+    /// Index into `fields`.
+    focus: usize,
+}
+
+/// One input of the tool-paths form, labelled with a tool name: a runtime string (MOD-66 D11).
+#[derive(Debug)]
+struct PathField {
+    /// The `${tool}` name this path is for.
+    tool: String,
+    /// The buffer; its `Debug` never prints the text.
+    input: TextField,
 }
 
 /// The open form (plan D231): which write it makes, its fields in tab order, and which one has
@@ -1175,6 +1230,10 @@ impl AgentsSection {
     /// `unauthenticated` and `failed` are the three facts a version string cannot express (plan
     /// D50). Everything left is a row that works, or one written before the `probe` column
     /// existed, and both are answered by the version.
+    ///
+    /// A `manual` row's verdict ends in `*`, whatever it is (MOD-66 D10, B17): the status word or
+    /// the version, never the install, login, probing, switched-off or not-probed cells, which are
+    /// not the snapshot's verdict.
     fn on_box_cell(&self, summary: &AgentSummary) -> String {
         if let Some(cell) = self.install_cell(summary.agent.id) {
             return cell;
@@ -1201,15 +1260,29 @@ impl AgentsSection {
             .as_ref()
             .and_then(|probe| probe.get("status"))
             .and_then(Value::as_str);
-        if let Some(status @ ("missing" | "unauthenticated" | "failed")) = status {
-            return status.to_owned();
-        }
-        let version = row.version.as_deref().unwrap_or(NONE);
-        if row.enabled {
-            version.to_owned()
+        let cell = if let Some(status @ ("missing" | "unauthenticated" | "failed")) = status {
+            status.to_owned()
         } else {
-            format!("{version} (off)")
+            let version = row.version.as_deref().unwrap_or(NONE);
+            if row.enabled {
+                version.to_owned()
+            } else {
+                format!("{version} (off)")
+            }
+        };
+        if is_manual(row) {
+            format!("{cell}{MANUAL_SUFFIX}")
+        } else {
+            cell
         }
+    }
+
+    /// Whether any listed row's `probe.source` is `manual`: the idle note then says what the
+    /// cell's `*` means (MOD-66, the amendment to blueprint §5).
+    fn lists_a_manual_row(&self) -> bool {
+        self.agents
+            .iter()
+            .any(|summary| summary.on_box.as_ref().is_some_and(is_manual))
     }
 
     /// The progress cell of the row an install is running on, or `None` for every other row.
@@ -1246,11 +1319,20 @@ impl AgentsSection {
     /// An open registry form wins over both (MOD-23 D230): it can only be opened while no install
     /// and no login is in flight, so the one it can cover is a `Manual` pane, which is back the
     /// moment the form closes. It takes the width because its fields draw a window of their text.
+    /// The tool-paths form (MOD-66 D10) is drawn the same way and wins for the same reason.
     fn pane(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-        if let Mode::Editing(editor) = &self.mode {
-            return core::iter::once(Line::styled(editor.header(), theme.base))
-                .chain(editor.lines(width, theme))
-                .collect();
+        match &self.mode {
+            Mode::Editing(editor) => {
+                return core::iter::once(Line::styled(editor.header(), theme.base))
+                    .chain(editor.lines(width, theme))
+                    .collect();
+            }
+            Mode::Paths(form) => {
+                return core::iter::once(Line::styled(form.header(), theme.base))
+                    .chain(form.lines(width, theme))
+                    .collect();
+            }
+            Mode::Browse => {}
         }
         match &self.install {
             InstallState::Pending { plan } => core::iter::once(Line::default())
@@ -1279,10 +1361,11 @@ impl AgentsSection {
     ///
     /// Two lines rather than one since MOD-23 added three keys: the idle keys and the note were
     /// already 95 of the 98 columns together. A `None` note still takes its line, so the layout
-    /// never changes height with it.
+    /// never changes height with it. While a `manual` row is listed, the idle note ends in
+    /// [`MANUAL_NOTE`], the key to the cell's `*` (MOD-66).
     fn hint(&self) -> (&'static str, Option<String>) {
         let keys = match (&self.mode, &self.install) {
-            (Mode::Editing(_), _) => HINT_EDITING,
+            (Mode::Editing(_) | Mode::Paths(_), _) => HINT_EDITING,
             // With no install in flight the login owns the line, because it is the only other
             // thing here that binds keys of its own.
             (Mode::Browse, InstallState::Idle) => match &self.auth {
@@ -1303,15 +1386,20 @@ impl AgentsSection {
         let idle = matches!(self.mode, Mode::Browse)
             && matches!(self.install, InstallState::Idle)
             && matches!(self.auth, AuthState::Idle);
-        let note = self
-            .notice
-            .clone()
-            .or_else(|| idle.then(|| QUOTA_NOTE.to_owned()));
+        let note = self.notice.clone().or_else(|| {
+            idle.then(|| {
+                if self.lists_a_manual_row() {
+                    format!("{QUOTA_NOTE}{MANUAL_NOTE}")
+                } else {
+                    QUOTA_NOTE.to_owned()
+                }
+            })
+        });
         (keys, note)
     }
 
-    /// Whether `n`, `e` or `t` is refused right now, with the status-line sentence that says why
-    /// (MOD-23 D232, blueprint F-20).
+    /// Whether `n`, `e`, `m` or `t` is refused right now, with the status-line sentence that says
+    /// why (MOD-23 D232, blueprint F-20; MOD-66 D10).
     ///
     /// A write in flight first: one registry write at a time. Then an install, a login and a probe,
     /// in [`begin_install`](Self::begin_install)'s order and for its reason: each ends by writing
@@ -1372,6 +1460,22 @@ impl AgentsSection {
         self.send(request, ctx);
     }
 
+    /// `m`: the tool-paths form over the highlighted row, or the sentence that says why not
+    /// (MOD-66 D10, B14).
+    fn open_paths(&mut self, ctx: &mut Ctx<'_>) {
+        let Some(summary) = self.selected() else {
+            ctx.emit(Action::Error("no agent row is selected".to_owned()));
+            return;
+        };
+        match PathsForm::open(summary) {
+            Ok(form) => {
+                self.mode = Mode::Paths(form);
+                self.notice = None;
+            }
+            Err(refusal) => ctx.emit(Action::Error(refusal.to_owned())),
+        }
+    }
+
     /// Sends one registry write and holds the guard until its answer (blueprint F-20).
     fn send(&mut self, request: StoreRequest, ctx: &mut Ctx<'_>) {
         self.busy = Some(request.name());
@@ -1402,20 +1506,61 @@ impl AgentsSection {
                 self.notice = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass => {
-                let len = editor.fields.len().max(1);
-                match key.code {
-                    KeyCode::Tab | KeyCode::Down => {
-                        editor.focus = (editor.focus + 1) % len;
-                        Handled::Consumed
-                    }
-                    KeyCode::BackTab | KeyCode::Up => {
-                        editor.focus = (editor.focus + len - 1) % len;
-                        Handled::Consumed
-                    }
-                    _ if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
-                    _ => Handled::Consumed,
-                }
+            FieldOutcome::Pass => form_navigation(key, &mut editor.focus, editor.fields.len()),
+        }
+    }
+
+    /// One key while the tool-paths form is open (MOD-66 D10): [`on_editor_key`]'s rule over
+    /// the form's own fields, so a path's `h`, `l` and `q` are letters of it (H-12).
+    ///
+    /// [`on_editor_key`]: Self::on_editor_key
+    fn on_paths_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let Mode::Paths(form) = &mut self.mode else {
+            return Handled::Pass;
+        };
+        let outcome = match form.fields.get_mut(form.focus) {
+            Some(field) => field.input.on_key(key),
+            None => FieldOutcome::Pass,
+        };
+        match outcome {
+            FieldOutcome::Consumed => Handled::Consumed,
+            FieldOutcome::Submit => {
+                self.submit_paths(ctx);
+                Handled::Consumed
+            }
+            FieldOutcome::Cancel => {
+                self.mode = Mode::Browse;
+                self.notice = None;
+                Handled::Consumed
+            }
+            FieldOutcome::Pass => form_navigation(key, &mut form.focus, form.fields.len()),
+        }
+    }
+
+    /// `Enter` in the tool-paths form: [`submit`](Self::submit)'s shape (MOD-66 D10). The guard
+    /// first; then one `SetToolPaths`, or `UNCHANGED` and the form closed, or a local refusal
+    /// naming the tool, with the focus moved to its field. The form **stays open** until the
+    /// reply, so a refusal from the worker leaves the text where it was.
+    fn submit_paths(&mut self, ctx: &mut Ctx<'_>) {
+        if let Some(busy) = self.busy {
+            ctx.emit(Action::Error(in_flight(busy)));
+            return;
+        }
+        let Mode::Paths(form) = &mut self.mode else {
+            return;
+        };
+        match form.request() {
+            Ok(Some(request)) => {
+                self.notice = None;
+                self.send(request, ctx);
+            }
+            Ok(None) => {
+                self.mode = Mode::Browse;
+                self.notice = Some(UNCHANGED.to_owned());
+            }
+            Err((index, sentence)) => {
+                form.focus = index;
+                self.notice = Some(sentence);
             }
         }
     }
@@ -1527,7 +1672,8 @@ impl AgentsSection {
                     Some((updated_at, draft)) => {
                         let clashes = match &mut self.mode {
                             Mode::Editing(editor) => editor.rebase(updated_at, draft),
-                            Mode::Browse => Vec::new(),
+                            // `editing(id)` held above, so only the edit form reaches here.
+                            Mode::Browse | Mode::Paths(_) => Vec::new(),
                         };
                         self.notice = Some(if clashes.is_empty() {
                             CHANGED_ELSEWHERE.to_owned()
@@ -1566,7 +1712,11 @@ impl AgentsSection {
                     format!("`{name}` switched off on this box")
                 });
             }
-            AgentWrite::ToolPaths { name, status, .. } => {
+            // MOD-66 D10, B18: the form closes only on its own row's answer (MOD-23 F-14).
+            AgentWrite::ToolPaths { id, name, status } => {
+                if matches!(&self.mode, Mode::Paths(form) if form.agent_id == *id) {
+                    self.mode = Mode::Browse;
+                }
                 self.notice = Some(tool_paths_saved(name, *status));
             }
         }
@@ -1890,6 +2040,150 @@ impl Editor {
     }
 }
 
+impl PathsForm {
+    /// The form over `summary`, or the refusal sentence: [`LAUNCH_UNREADABLE`] for a `launch`
+    /// that does not parse, [`LITERAL_LAUNCH`] for no `discovery` or no `tools` (MOD-66 D10,
+    /// B14). Fields in `discovery.tools` order, prefilled from the stored `probe.manual`. An
+    /// unreadable snapshot prefills nothing (blueprint H-21).
+    fn open(summary: &AgentSummary) -> Result<Self, &'static str> {
+        let launch = serde_json::from_value::<AgentLaunch>(summary.agent.launch.clone())
+            .map_err(|_| LAUNCH_UNREADABLE)?;
+        let tools: Vec<String> = launch
+            .discovery
+            .map(|discovery| discovery.tools.into_keys().collect())
+            .unwrap_or_default();
+        if tools.is_empty() {
+            return Err(LITERAL_LAUNCH);
+        }
+        let opened: BTreeMap<String, String> = summary
+            .on_box
+            .as_ref()
+            .and_then(ProbeSnapshot::from_row)
+            .map(|snapshot| snapshot.manual)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(tool, _)| tools.contains(tool))
+            .collect();
+        let fields = tools
+            .into_iter()
+            .map(|tool| PathField {
+                input: TextField::with_text(opened.get(&tool).map_or("", String::as_str)),
+                tool,
+            })
+            .collect();
+        Ok(Self {
+            agent_id: summary.agent.id,
+            name: summary.agent.name.clone(),
+            opened,
+            fields,
+            focus: 0,
+        })
+    }
+
+    /// The form's request (MOD-66 D9, D10): `Ok(None)` for an unchanged map, else one
+    /// `SetToolPaths` with every non-blank field trimmed (an empty map clears). A field
+    /// `parse_tool_path` refuses is `Err((its index, the sentence))`, the first in tab order.
+    fn request(&self) -> Result<Option<StoreRequest>, (usize, String)> {
+        let mut paths = BTreeMap::new();
+        for (index, field) in self.fields.iter().enumerate() {
+            let text = field.input.text().unwrap_or_default();
+            if text.trim().is_empty() {
+                continue;
+            }
+            let path = agent_settings::parse_tool_path(&field.tool, text)
+                .map_err(|sentence| (index, sentence))?;
+            paths.insert(field.tool.clone(), path);
+        }
+        if paths == self.opened {
+            return Ok(None);
+        }
+        Ok(Some(StoreRequest::SetToolPaths {
+            agent_id: self.agent_id,
+            paths,
+        }))
+    }
+
+    /// The pane's first line: whose paths `Enter` writes, and what an empty field means.
+    fn header(&self) -> String {
+        format!("tool paths for {} \u{b7} empty = no manual path", self.name)
+    }
+
+    /// One line per tool, [`Editor::lines`]' shape (MOD-66 D11, B8). The label column is the
+    /// longest tool name, capped at a third of `width`; a longer name is cut to one less than the
+    /// column and ends in `…`.
+    fn lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+        let longest = self
+            .fields
+            .iter()
+            .map(|field| field.tool.chars().count())
+            .max()
+            .unwrap_or(0);
+        let column = longest.min(usize::from(width) / 3);
+        self.fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let focused = index == self.focus;
+                let style = if focused { theme.accent } else { theme.dim };
+                let label = fit_label(&field.tool, column);
+                let mut spans = vec![Span::styled(format!("{label}: "), style)];
+                let room = usize::from(width).saturating_sub(column + 2);
+                spans.extend(
+                    field
+                        .input
+                        .line(u16::try_from(room).unwrap_or(u16::MAX), focused, theme)
+                        .spans,
+                );
+                Line::from(spans)
+            })
+            .collect()
+    }
+}
+
+/// `tool` in a label column `column` wide (MOD-66 B8): padded when it fits, else cut to
+/// `column - 1` characters and `…`.
+fn fit_label(tool: &str, column: usize) -> String {
+    if tool.chars().count() <= column {
+        format!("{tool:<column$}")
+    } else {
+        let mut cut: String = tool.chars().take(column.saturating_sub(1)).collect();
+        if column > 0 {
+            cut.push('\u{2026}');
+        }
+        cut
+    }
+}
+
+/// What a form does with a key its focused field passed on (plan D231): `Tab`/`Down` and
+/// `BackTab`/`Up` move the focus with a wrap, a `CONTROL` chord passes so `ctrl-c` still quits,
+/// and everything else is swallowed rather than offered to the shell.
+fn form_navigation(key: KeyEvent, focus: &mut usize, fields: usize) -> Handled {
+    let len = fields.max(1);
+    match key.code {
+        KeyCode::Tab | KeyCode::Down => {
+            *focus = (*focus + 1) % len;
+            Handled::Consumed
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            *focus = (*focus + len - 1) % len;
+            Handled::Consumed
+        }
+        _ if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
+        _ => Handled::Consumed,
+    }
+}
+
+/// Whether an `agent_box` row's `probe.source` is `manual` (MOD-66 D10). Read by key, as
+/// [`AgentsSection::on_box_cell`] reads `status`, so a snapshot this build cannot parse whole is
+/// still marked.
+fn is_manual(row: &AgentBox) -> bool {
+    row.probe
+        .as_ref()
+        .and_then(|probe| probe.get("source"))
+        .and_then(Value::as_str)
+        == Some("manual")
+}
+
 impl Field {
     /// A field labelled `label` holding `text`, cursor at the end.
     fn new(label: &'static str, text: &str) -> Self {
@@ -1971,11 +2265,11 @@ impl SettingsSection for AgentsSection {
         "Agents"
     }
 
-    /// While a registry form is open (blueprint F-11), and while the login's paste field is
-    /// (MOD-22 D270): `l` and `h` are letters there, not section cycling. Derived from the state,
-    /// never a flag.
+    /// While a registry or tool-paths form is open (blueprint F-11, MOD-66 H-12), and while the
+    /// login's paste field is (MOD-22 D270): `l` and `h` are letters there, not section cycling.
+    /// Derived from the state, never a flag.
     fn captures_input(&self) -> bool {
-        matches!(self.mode, Mode::Editing(_))
+        matches!(self.mode, Mode::Editing(_) | Mode::Paths(_))
             || matches!(self.auth, AuthState::Running { paste: Some(_), .. })
     }
 
@@ -2038,6 +2332,13 @@ impl SettingsSection for AgentsSection {
             }
             return Handled::Consumed;
         }
+        // MOD-66 H-12: a path is the kind of text that is pasted.
+        if let Mode::Paths(form) = &mut self.mode {
+            if let Some(field) = form.fields.get_mut(form.focus) {
+                field.input.on_paste(text);
+            }
+            return Handled::Consumed;
+        }
         Handled::Pass
     }
 
@@ -2055,6 +2356,10 @@ impl SettingsSection for AgentsSection {
         if matches!(self.mode, Mode::Editing(_)) {
             return self.on_editor_key(key, ctx);
         }
+        // The tool-paths form, for the same reason and under the same rule (MOD-66 D10, H-12).
+        if matches!(self.mode, Mode::Paths(_)) {
+            return self.on_paths_key(key, ctx);
+        }
         // A plan on screen answers first, and answers everything: MOD-20 D19's modality.
         if matches!(self.install, InstallState::Pending { .. }) {
             return self.answer_consent(key, ctx);
@@ -2070,10 +2375,11 @@ impl SettingsSection for AgentsSection {
         if matches!(self.auth, AuthState::Running { paste: Some(_), .. }) {
             return self.on_paste_key(key, ctx);
         }
-        // `a`, `e`, `i`, `j`, `k`, `n`, `o`, `p`, `r`, `t` and `x` are free: the global keymap binds `q`,
-        // `Tab`/`BackTab`, the digits, `?`, `ctrl-c` and `w`, and the tab itself consumes
-        // `h`/`l`/`[`/`]`/arrows before a section is offered the key. `n` is also the consent and
-        // chooser modals' "no", and they answer above, before this match.
+        // `a`, `e`, `i`, `j`, `k`, `m`, `n`, `o`, `p`, `r`, `t` and `x` are free: the global keymap
+        // binds `q`, `Tab`/`BackTab`, the digits, `?`, `ctrl-c` and `w`, and the tab itself
+        // consumes `h`/`l`/`[`/`]`/arrows before a section is offered the key (only the Backlog tab
+        // binds `m`, MOD-66 D10). `n` is also the consent and chooser modals' "no", and they
+        // answer above, before this match.
         match key.code {
             // MOD-23 D232 and blueprint F-20: one registry write at a time, and none of the three
             // flows that write this box's `agent_box` row beside it.
@@ -2098,6 +2404,13 @@ impl SettingsSection for AgentsSection {
             KeyCode::Char('t') => {
                 if !self.refuse_write(ctx) {
                     self.switch_this_box(ctx);
+                }
+                Handled::Consumed
+            }
+            // MOD-66 D10: refused as `n`, `e` and `t` are, because it writes this box's row too.
+            KeyCode::Char('m') => {
+                if !self.refuse_write(ctx) {
+                    self.open_paths(ctx);
                 }
                 Handled::Consumed
             }
@@ -2207,7 +2520,13 @@ impl SettingsSection for AgentsSection {
             // A registry write was refused — a taken name, a field the worker refused, this box not
             // registered, or offline. The shell has put `{request}: {message}` on the status line;
             // the note line says it under the form, which stays open over its text.
-            StoreReply::Failed { request, message } if REQUEST_NAMES.contains(request) => {
+            //
+            // `SET_TOOL_PATHS` beside them (MOD-66 H-6): the agent runtime serves it, so it is not
+            // in `REQUEST_NAMES`, but `send` holds the guard on its name all the same.
+            StoreReply::Failed { request, message }
+                if REQUEST_NAMES.contains(request)
+                    || *request == agent_settings::SET_TOOL_PATHS =>
+            {
                 self.busy = None;
                 self.notice = Some(message.clone());
             }

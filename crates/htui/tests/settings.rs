@@ -22,7 +22,7 @@ use htui_agent::auth::loopback::{
 };
 use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::install::InstallRecord;
-use htui_agent::probe::{CredentialTier, ProbeSnapshot, ProbeSource, ProbeStatus};
+use htui_agent::probe::{CredentialTier, ProbeSnapshot, ProbeSource, ProbeStatus, agent_box_row};
 use htui_agent::{ArchiveFormat, InstallOutcome, InstallPhase, InstallPlan, ManualSteps};
 use htui_core::model::{Agent, AgentBox, AgentId, AgentSummary, Billing, BoxId, Scope, Transport};
 use htui_core::store::{MemStore, WriteStore};
@@ -3598,7 +3598,7 @@ async fn the_paste_field_renders_under_the_link() {
 const LABEL_WIDTH: usize = 13;
 
 /// The idle keys line (D245), written out rather than read from the section: this is the pin.
-const IDLE_KEYS: &str = "j/k select \u{b7} n new \u{b7} e edit \u{b7} t this box \u{b7} r probe \u{b7} i install \u{b7} a authenticate";
+const IDLE_KEYS: &str = "j/k select \u{b7} n new \u{b7} e edit \u{b7} m paths \u{b7} t this box \u{b7} r probe \u{b7} i install \u{b7} a authenticate";
 
 /// The idle note line, the one limit of this section that is not a key (MOD-2 D73).
 const IDLE_NOTE: &str = "quota latches per chat, r cannot refresh it";
@@ -4853,6 +4853,646 @@ async fn a_switched_off_row_renders_in_the_table() {
     let section = section_over(&bench, vec![on, off]);
     let rendered = render_section(&section, &bench.ctx());
     insta::assert_snapshot!("agents_switched_off", rendered);
+}
+
+// -------------------------------------------------------------------------------------------
+// MOD-66 T4: m and the tool-paths form (plan D10, D11; blueprint §5)
+// -------------------------------------------------------------------------------------------
+
+/// `m` on a row whose launch declares no tool (D10).
+const LITERAL_LAUNCH: &str = "this row's launch is literal; e edits its command";
+
+/// `m` on a row whose launch does not parse (B14).
+const LAUNCH_UNREADABLE: &str = "this row's launch does not parse; nothing declares a tool";
+
+/// The idle note with a manual row in the table (blueprint §5, the maintainer's amendment).
+const IDLE_NOTE_MANUAL: &str = "quota latches per chat, r cannot refresh it \u{b7} * manual path";
+
+/// The tool-paths form's header for a row named `paths`.
+const PATHS_HEADER: &str = "tool paths for paths \u{b7} empty = no manual path";
+
+/// An absolute path under the temp directory. Built rather than written out, because `/opt/x` is
+/// not absolute on Windows (blueprint H-17). Never created: the form checks the shape, and whether
+/// it is a file is the worker's check.
+fn tool_path(leaf: &str) -> String {
+    std::env::temp_dir().join(leaf).display().to_string()
+}
+
+/// The snapshot a probe wrote over `stored`, with `0.48.0` as the handshake's version.
+fn paths_snapshot(
+    stored: &[(&str, &str)],
+    source: ProbeSource,
+    status: ProbeStatus,
+) -> ProbeSnapshot {
+    ProbeSnapshot {
+        transport: Transport::Acp,
+        resolved: None,
+        tools: BTreeMap::new(),
+        handshake: Some(Handshake {
+            at: htui_core::fixtures::demo_at(0, 0),
+            protocol_version: 1,
+            agent_name: None,
+            agent_version: Some("0.48.0".to_owned()),
+            capabilities: json!({}),
+            auth_methods: Vec::new(),
+        }),
+        credential: None,
+        status,
+        stderr_tail: None,
+        source,
+        manual: stored
+            .iter()
+            .map(|(tool, path)| ((*tool).to_owned(), (*path).to_owned()))
+            .collect(),
+    }
+}
+
+/// [`paths_row`] with the probe's verdict chosen.
+fn paths_row_with(
+    name: &str,
+    tools: &[&str],
+    stored: &[(&str, &str)],
+    source: ProbeSource,
+    status: ProbeStatus,
+) -> AgentSummary {
+    let mut summary = registry_row(name, false);
+    let declared: serde_json::Map<String, Value> = tools
+        .iter()
+        .map(|tool| {
+            (
+                (*tool).to_owned(),
+                json!({ "kind": "path", "names": [tool] }),
+            )
+        })
+        .collect();
+    summary.agent.launch = json!({
+        "command": format!("${{{}}}", tools.first().copied().unwrap_or("none")),
+        "args": [],
+        "env": {},
+        "discovery": { "tools": declared, "handshake": true },
+    });
+    // Through `agent_box_row`, as `login_row` goes through `ProbeSnapshot`: the section reads the
+    // map back with `ProbeSnapshot::from_row`, and a hand-written document might not parse.
+    let snapshot = paths_snapshot(stored, source, status);
+    summary.on_box = Some(agent_box_row(
+        &summary.agent,
+        BoxId::new(),
+        &snapshot,
+        htui_core::fixtures::demo_at(0, 0),
+    ));
+    summary
+}
+
+/// A registry row declaring one `path` tool per name in `tools`, whose `agent_box` row a probe
+/// wrote `ready` over the manual map `stored`.
+fn paths_row(
+    name: &str,
+    tools: &[&str],
+    stored: &[(&str, &str)],
+    source: ProbeSource,
+) -> AgentSummary {
+    paths_row_with(name, tools, stored, source, ProbeStatus::Ready)
+}
+
+/// The text of one tool-paths field as drawn, its label padded to `width` (blueprint H-9: the
+/// form sizes its label column to its own tools, so [`field_of`]'s 13 does not apply). An empty
+/// field draws its label and nothing after the colon, and the line is trimmed.
+fn paths_field_of(rendered: &str, label: &str, width: usize) -> Option<String> {
+    let prefix = format!("{label:<width$}:");
+    rendered
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .map(|rest| rest.trim().to_owned())
+}
+
+/// Whether the tool-paths field labelled `label` holds the focus: its label is the accented one.
+fn paths_focused_on(section: &AgentsSection, bench: &SectionBench, label: &str) -> bool {
+    accented_lines(section, &bench.ctx())
+        .iter()
+        .any(|line| line.starts_with(label))
+}
+
+/// The one `SetToolPaths` a drain asked for, or a panic naming what was asked instead.
+fn tool_paths_request(bench: &SectionBench) -> (AgentId, BTreeMap<String, String>) {
+    match requests_of(bench).as_slice() {
+        [StoreRequest::SetToolPaths { agent_id, paths }] => (*agent_id, paths.clone()),
+        other => panic!("expected exactly one set_tool_paths: {other:?}"),
+    }
+}
+
+/// `m` opens the form under the table: one field per tool the row declares, in name order, each
+/// prefilled from the stored map (an empty field is "no manual path"). From then on the section
+/// takes every printable key, so `l` and `h` are letters of a path, not section cycling (H-12).
+#[tokio::test]
+async fn m_opens_the_tool_paths_form_with_one_field_per_declared_tool() {
+    let bench = SectionBench::new().await;
+    let alpha = tool_path("htui-mod66-alpha");
+    let row = paths_row(
+        "paths",
+        &["beta_tool", "alpha_tool"],
+        &[("alpha_tool", alpha.as_str())],
+        ProbeSource::Manual,
+    );
+    let mut section = section_over(&bench, vec![row]);
+    let _ = bench.drained();
+    assert!(!section.captures_input(), "browsing captures nothing");
+
+    assert_eq!(bench.key(&mut section, "m"), Handled::Consumed);
+    assert!(
+        section.captures_input(),
+        "an open tool-paths form takes every printable key"
+    );
+    assert!(
+        requests_of(&bench).is_empty(),
+        "opening a form asks for nothing"
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(rendered.contains(PATHS_HEADER), "{rendered}");
+    assert_eq!(
+        paths_field_of(&rendered, "alpha_tool", 10),
+        Some(alpha.clone()),
+        "prefilled from the stored map: {rendered}"
+    );
+    assert_eq!(
+        paths_field_of(&rendered, "beta_tool", 10),
+        Some(String::new()),
+        "a tool with no manual path is an empty field: {rendered}"
+    );
+    let alpha_at = rendered.find("alpha_tool").expect("alpha_tool is drawn");
+    let beta_at = rendered.find("beta_tool ").expect("beta_tool is drawn");
+    assert!(alpha_at < beta_at, "fields in name order: {rendered}");
+    assert!(
+        paths_focused_on(&section, &bench, "alpha_tool"),
+        "the first field holds the focus"
+    );
+    // The last drawn line: the note line under it is empty while a form is open, and `lines`
+    // does not yield a trailing empty line.
+    assert_eq!(
+        rendered.lines().last(),
+        Some("Tab next field \u{b7} Enter saves \u{b7} Esc cancels"),
+        "the form's keys line: {rendered}"
+    );
+
+    for chord in ["l", "h"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Consumed, "{chord}");
+    }
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        paths_field_of(&rendered, "alpha_tool", 10),
+        Some(format!("{alpha}lh")),
+        "`l` and `h` landed in the focused field: {rendered}"
+    );
+
+    assert_eq!(bench.key(&mut section, "esc"), Handled::Consumed);
+    assert!(!section.captures_input(), "`Esc` closes the form");
+    assert!(requests_of(&bench).is_empty(), "and writes nothing");
+}
+
+/// D10, B14: `m` on a row whose launch declares no tool says how that row is edited instead, and
+/// one whose launch does not parse says so; an empty table has no row. Nothing opens, nothing is
+/// asked.
+#[tokio::test]
+async fn m_on_a_literal_row_is_refused() {
+    let bench = SectionBench::new().await;
+    let mut literal = paths_row("literal", &["alpha_tool"], &[], ProbeSource::Probe);
+    literal.agent.launch = json!({ "command": "/bin/x", "args": [], "env": {} });
+    let mut no_tools = paths_row("no-tools", &["alpha_tool"], &[], ProbeSource::Probe);
+    no_tools.agent.launch["discovery"]["tools"] = json!({});
+    let mut broken = paths_row("broken", &["alpha_tool"], &[], ProbeSource::Probe);
+    broken.agent.launch = json!("nonsense");
+
+    for (rows, expected) in [
+        (vec![literal], LITERAL_LAUNCH),
+        (vec![no_tools], LITERAL_LAUNCH),
+        (vec![broken], LAUNCH_UNREADABLE),
+        (Vec::new(), "no agent row is selected"),
+    ] {
+        let mut section = section_over(&bench, rows);
+        let _ = bench.drained();
+        assert_eq!(
+            bench.key(&mut section, "m"),
+            Handled::Consumed,
+            "{expected}"
+        );
+        let emitted = bench.drained();
+        assert_eq!(errors_of(&emitted), vec![expected.to_owned()]);
+        assert!(!asked_anything(&emitted), "{expected}: {emitted:?}");
+        assert!(!section.captures_input(), "{expected}: nothing opened");
+    }
+}
+
+/// D10: `m` is refused as `n`, `e` and `t` are, while a registry write, a probe, an install or a
+/// login is in flight, and a probe's own `Failed` frees it again.
+#[tokio::test]
+async fn m_is_refused_while_a_write_or_a_probe_is_in_flight() {
+    let bench = SectionBench::new().await;
+    let row = || paths_row("paths", &["alpha_tool"], &[], ProbeSource::Probe);
+
+    let mut writing = section_over(&bench, vec![row()]);
+    bench.key(&mut writing, "t");
+    let mut probing = section_over(&bench, vec![row()]);
+    bench.key(&mut probing, "r");
+    let mut installing = section_over(&bench, vec![registry_row("declared", true)]);
+    bench.key(&mut installing, "i");
+    let mut logging_in = section_over(
+        &bench,
+        vec![login_row(
+            "loginable",
+            ProbeStatus::Unauthenticated,
+            &[METHOD],
+        )],
+    );
+    bench.key(&mut logging_in, "a");
+    let _ = bench.drained();
+
+    for (section, expected) in [
+        (&mut writing, "`set_agent_on_box` is still in flight"),
+        (&mut probing, "a probe is running; edit afterwards"),
+        (&mut installing, "an install is running; edit afterwards"),
+        (&mut logging_in, "a login is running; edit afterwards"),
+    ] {
+        assert_eq!(bench.key(section, "m"), Handled::Consumed, "{expected}");
+        let emitted = bench.drained();
+        assert_eq!(errors_of(&emitted), vec![expected.to_owned()]);
+        assert!(!asked_anything(&emitted), "{expected}: {emitted:?}");
+        assert!(!section.captures_input(), "{expected}: nothing opened");
+    }
+
+    bench.reply(
+        &mut probing,
+        &StoreReply::Failed {
+            request: "probe_agents",
+            message: "refused".to_owned(),
+        },
+    );
+    bench.key(&mut probing, "m");
+    assert!(bench.errors().is_empty(), "the probe is over");
+    assert!(probing.captures_input(), "and `m` opens the form");
+}
+
+/// D10: `Enter` sends one `SetToolPaths` carrying every non-empty field, trimmed. The form stays
+/// open until the reply, and a second `Enter` meanwhile is refused by the guard (F-20).
+#[tokio::test]
+async fn enter_sends_set_tool_paths_with_trimmed_non_empty_entries() {
+    let bench = SectionBench::new().await;
+    let (alpha, beta) = (tool_path("htui-mod66-alpha"), tool_path("htui-mod66-beta"));
+    let row = paths_row(
+        "paths",
+        &["alpha_tool", "beta_tool", "gamma_tool"],
+        &[("alpha_tool", alpha.as_str())],
+        ProbeSource::Manual,
+    );
+    let agent = row.agent.id;
+    let mut section = section_over(&bench, vec![row]);
+    bench.key(&mut section, "m");
+    bench.key(&mut section, "tab");
+    typed(&bench, &mut section, &format!("  {beta}  "));
+    bench.key(&mut section, "tab");
+    typed(&bench, &mut section, "   ");
+    let _ = bench.drained();
+
+    bench.key(&mut section, "enter");
+    let (agent_id, paths) = tool_paths_request(&bench);
+    assert_eq!(agent_id, agent);
+    assert_eq!(
+        paths,
+        BTreeMap::from([
+            ("alpha_tool".to_owned(), alpha),
+            ("beta_tool".to_owned(), beta),
+        ]),
+        "trimmed, and a blank field is no manual path"
+    );
+    assert!(
+        section.captures_input(),
+        "the form stays open until the reply"
+    );
+
+    bench.key(&mut section, "enter");
+    let emitted = bench.drained();
+    assert_eq!(
+        errors_of(&emitted),
+        vec!["`set_tool_paths` is still in flight".to_owned()]
+    );
+    assert!(!asked_anything(&emitted), "{emitted:?}");
+}
+
+/// D9: an empty map is "clear every manual path", and the form sends it.
+#[tokio::test]
+async fn clearing_every_field_sends_an_empty_map() {
+    let bench = SectionBench::new().await;
+    let alpha = tool_path("htui-mod66-alpha");
+    let row = paths_row(
+        "paths",
+        &["alpha_tool"],
+        &[("alpha_tool", alpha.as_str())],
+        ProbeSource::Manual,
+    );
+    let mut section = section_over(&bench, vec![row]);
+    bench.key(&mut section, "m");
+    pressed(&bench, &mut section, "backspace", 64);
+    let _ = bench.drained();
+
+    bench.key(&mut section, "enter");
+    let (_, paths) = tool_paths_request(&bench);
+    assert!(paths.is_empty(), "{paths:?}");
+}
+
+/// D10: an unchanged map closes the form with `UNCHANGED` and writes nothing. A field holding
+/// only spaces is still "no manual path".
+#[tokio::test]
+async fn an_unchanged_map_closes_with_unchanged() {
+    let bench = SectionBench::new().await;
+    let alpha = tool_path("htui-mod66-alpha");
+    let row = paths_row(
+        "paths",
+        &["alpha_tool", "beta_tool"],
+        &[("alpha_tool", alpha.as_str())],
+        ProbeSource::Manual,
+    );
+    for blank in ["", "   "] {
+        let mut section = section_over(&bench, vec![row.clone()]);
+        bench.key(&mut section, "m");
+        bench.key(&mut section, "tab");
+        typed(&bench, &mut section, blank);
+        let _ = bench.drained();
+
+        bench.key(&mut section, "enter");
+        assert!(!section.captures_input(), "{blank:?}: the form closed");
+        assert_eq!(
+            note_line(&render_section(&section, &bench.ctx())),
+            UNCHANGED,
+            "{blank:?}"
+        );
+        assert!(requests_of(&bench).is_empty(), "{blank:?}: nothing written");
+    }
+}
+
+/// D10, B10: a relative path is refused here by `parse_tool_path`'s own sentence, naming the
+/// tool; the focus moves to that field and nothing is sent.
+#[tokio::test]
+async fn a_relative_path_is_refused_locally_naming_the_tool() {
+    let bench = SectionBench::new().await;
+    let row = paths_row(
+        "paths",
+        &["alpha_tool", "beta_tool"],
+        &[],
+        ProbeSource::Probe,
+    );
+    let mut section = section_over(&bench, vec![row]);
+    bench.key(&mut section, "m");
+    bench.key(&mut section, "tab");
+    typed(&bench, &mut section, "bin/x");
+    bench.key(&mut section, "tab");
+    assert!(paths_focused_on(&section, &bench, "alpha_tool"));
+    let _ = bench.drained();
+
+    bench.key(&mut section, "enter");
+    assert!(requests_of(&bench).is_empty(), "nothing is sent");
+    assert!(section.captures_input(), "the form stays open");
+    assert_eq!(
+        note_line(&render_section(&section, &bench.ctx())),
+        "`beta_tool`: the path must be absolute"
+    );
+    assert!(
+        paths_focused_on(&section, &bench, "beta_tool"),
+        "the focus moved to the refused field"
+    );
+}
+
+/// D10, B16, B18: `AgentWritten::ToolPaths` for the form's own row closes it and notes the probe's
+/// word; one for another row leaves it open.
+#[tokio::test]
+async fn agent_written_tool_paths_closes_the_form_and_notes_the_status() {
+    let bench = SectionBench::new().await;
+    let row = paths_row("paths", &["alpha_tool"], &[], ProbeSource::Probe);
+    let other = paths_row("other", &["alpha_tool"], &[], ProbeSource::Probe);
+    let (id, other_id) = (row.agent.id, other.agent.id);
+    let rows = vec![other, row];
+    let mut section = section_over(&bench, rows.clone());
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "m");
+    let _ = bench.drained();
+
+    bench.reply(
+        &mut section,
+        &written(
+            rows.clone(),
+            AgentWrite::ToolPaths {
+                id: other_id,
+                name: "other".to_owned(),
+                status: ProbeStatus::Missing,
+            },
+        ),
+    );
+    assert!(
+        section.captures_input(),
+        "another row's answer leaves this form open (B18)"
+    );
+
+    bench.reply(
+        &mut section,
+        &written(
+            rows,
+            AgentWrite::ToolPaths {
+                id,
+                name: "paths".to_owned(),
+                status: ProbeStatus::Ready,
+            },
+        ),
+    );
+    assert!(!section.captures_input(), "its own answer closes it");
+    assert_eq!(
+        note_line(&render_section(&section, &bench.ctx())),
+        "tool paths saved for `paths` \u{b7} this box: ready"
+    );
+}
+
+/// H-6: a refused `set_tool_paths` clears the guard though it is not in `REQUEST_NAMES`; the form
+/// stays open over its text with the worker's sentence, and the next `Enter` sends again.
+#[tokio::test]
+async fn a_failed_set_tool_paths_clears_busy_and_keeps_the_form() {
+    let bench = SectionBench::new().await;
+    let beta = tool_path("htui-mod66-beta");
+    let row = paths_row(
+        "paths",
+        &["alpha_tool", "beta_tool"],
+        &[],
+        ProbeSource::Probe,
+    );
+    let mut section = section_over(&bench, vec![row]);
+    bench.key(&mut section, "m");
+    bench.key(&mut section, "tab");
+    typed(&bench, &mut section, &beta);
+    bench.key(&mut section, "enter");
+    let _ = tool_paths_request(&bench);
+
+    let message = format!("`beta_tool`: `{beta}` is not a file on this box");
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "set_tool_paths",
+            message: message.clone(),
+        },
+    );
+    assert!(section.captures_input(), "the form stays open");
+    assert_eq!(note_line(&render_section(&section, &bench.ctx())), message);
+
+    bench.key(&mut section, "enter");
+    let (_, paths) = tool_paths_request(&bench);
+    assert_eq!(
+        paths,
+        BTreeMap::from([("beta_tool".to_owned(), beta)]),
+        "the guard is cleared and `Enter` retries"
+    );
+}
+
+/// H-12: a bracketed paste lands in the focused field of an open tool-paths form.
+#[tokio::test]
+async fn a_paste_lands_in_the_focused_tool_path() {
+    let bench = SectionBench::new().await;
+    let beta = tool_path("htui-mod66-beta");
+    let row = paths_row(
+        "paths",
+        &["alpha_tool", "beta_tool"],
+        &[],
+        ProbeSource::Probe,
+    );
+    let mut section = section_over(&bench, vec![row]);
+    bench.key(&mut section, "m");
+    bench.key(&mut section, "tab");
+    assert_eq!(bench.paste(&mut section, &beta), Handled::Consumed);
+    let _ = bench.drained();
+
+    bench.key(&mut section, "enter");
+    let (_, paths) = tool_paths_request(&bench);
+    assert_eq!(paths, BTreeMap::from([("beta_tool".to_owned(), beta)]));
+}
+
+/// D10, B17, and the maintainer's amendment to blueprint §5: a row whose `probe.source` is
+/// `manual` ends its verdict in `*`, whatever the verdict is, and the idle note says what the
+/// star means only while such a row is listed. A switched-off row reads `switched off`, unmarked.
+#[tokio::test]
+async fn a_manual_row_reads_manual_in_the_on_this_box_cell() {
+    let bench = SectionBench::new().await;
+    let alpha = tool_path("htui-mod66-alpha");
+    let stored = [("alpha_tool", alpha.as_str())];
+    let tools = ["alpha_tool"];
+    let manual_ready = paths_row("m-ready", &tools, &stored, ProbeSource::Manual);
+    let manual_missing = paths_row_with(
+        "m-missing",
+        &tools,
+        &stored,
+        ProbeSource::Manual,
+        ProbeStatus::Missing,
+    );
+    let probe_ready = paths_row("p-ready", &tools, &[], ProbeSource::Probe);
+    let mut manual_off = paths_row("m-off", &tools, &stored, ProbeSource::Manual);
+    manual_off.user_off = true;
+
+    let section = section_over(
+        &bench,
+        vec![
+            manual_ready,
+            manual_missing,
+            probe_ready.clone(),
+            manual_off,
+        ],
+    );
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(on_box_cell(&rendered, "m-ready"), "0.48.0*", "{rendered}");
+    assert_eq!(
+        on_box_cell(&rendered, "m-missing"),
+        "missing*",
+        "{rendered}"
+    );
+    assert_eq!(on_box_cell(&rendered, "p-ready"), "0.48.0", "{rendered}");
+    assert_eq!(
+        on_box_cell(&rendered, "m-off"),
+        "switched off",
+        "{rendered}"
+    );
+    assert_eq!(note_line(&rendered), IDLE_NOTE_MANUAL, "{rendered}");
+    assert!(IDLE_NOTE_MANUAL.chars().count() <= SECTION_BORDERED as usize);
+
+    let section = section_over(&bench, vec![probe_ready]);
+    assert_eq!(
+        note_line(&render_section(&section, &bench.ctx())),
+        IDLE_NOTE,
+        "no manual row, no star to explain"
+    );
+}
+
+/// B8: the label column is the longest tool's name, capped at a third of the width; a longer name
+/// is cut to one less than the column and ends in `…`.
+#[tokio::test]
+async fn the_tool_paths_form_sizes_its_labels_to_the_longest_tool() {
+    let bench = SectionBench::new().await;
+    let row = paths_row(
+        "paths",
+        &["demo_agent_server", "x"],
+        &[],
+        ProbeSource::Probe,
+    );
+    let mut section = section_over(&bench, vec![row]);
+    bench.key(&mut section, "m");
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        paths_field_of(&rendered, "demo_agent_server", 17),
+        Some(String::new()),
+        "{rendered}"
+    );
+    assert_eq!(
+        paths_field_of(&rendered, "x", 17),
+        Some(String::new()),
+        "`x` is padded to the longest tool: {rendered}"
+    );
+
+    let long = format!("tool_{}", "n".repeat(35));
+    assert_eq!(long.chars().count(), 40);
+    let row = paths_row("paths", &[long.as_str(), "x"], &[], ProbeSource::Probe);
+    let mut section = section_over(&bench, vec![row]);
+    bench.key(&mut section, "m");
+    let rendered = render_section(&section, &bench.ctx());
+    let cut = format!("{}\u{2026}", &long[..32]);
+    assert_eq!(cut.chars().count(), usize::from(SECTION_WIDE) / 3);
+    assert_eq!(
+        paths_field_of(&rendered, &cut, 33),
+        Some(String::new()),
+        "{rendered}"
+    );
+    assert_eq!(
+        paths_field_of(&rendered, "x", 33),
+        Some(String::new()),
+        "{rendered}"
+    );
+}
+
+/// The tool-paths form under the table (D10), on the second of two rows.
+#[tokio::test]
+async fn the_tool_paths_form_renders_under_the_table() {
+    let bench = SectionBench::new().await;
+    let alpha = tool_path("htui-mod66-alpha");
+    let mut section = section_over(
+        &bench,
+        vec![
+            paths_row(
+                "manual",
+                &["alpha_tool"],
+                &[("alpha_tool", alpha.as_str())],
+                ProbeSource::Manual,
+            ),
+            paths_row(
+                "paths",
+                &["alpha_tool", "demo_agent_server"],
+                &[],
+                ProbeSource::Probe,
+            ),
+        ],
+    );
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "m");
+    let rendered = render_section(&section, &bench.ctx());
+    insta::assert_snapshot!("agents_tool_paths_form", rendered);
 }
 
 /// A Qdrant snapshot with the URL stored and no key.
