@@ -23,10 +23,10 @@ use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
     AgentId, AgentSummary, AnswerOutcome, BindingChange, BoxEdit, BoxId, BoxInfo, CitationKind,
     Document, DocumentHead, DocumentId, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch,
-    ItemSummary, LinkGraph, Note, PermissionId, PhaseId, PhasePatch, Priority, ProjectId,
+    ItemSpec, ItemSummary, LinkGraph, Note, PermissionId, PhaseId, PhasePatch, Priority, ProjectId,
     ProjectPatch, RelayView, RepoId, RepoPatch, RequirementAreaId, RequirementId, RunSummary,
-    Scope, SessionEvent, SkillBindingKey, SkillId, SkillPatch, StepGraphId, StepGraphPatch, StepId,
-    WorkspaceId, WorkspacePatch, WorkspaceSummary,
+    Scope, SessionEvent, SkillBindingKey, SkillId, SkillPatch, SpecChanges, StepGraphId,
+    StepGraphPatch, StepId, WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::store::{
@@ -47,6 +47,7 @@ use crate::catalogue::{self, CatalogueSnapshot};
 use crate::concepts_worker::{self, ConceptsReply, ConceptsRuntime, ConceptsServed};
 use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, InferReport, MirrorAfterDelete};
+use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
 use crate::prompt_settings::{self, SettingsSnapshot};
 use crate::requirements::{
     self, ItemCitations, RequirementDetail, RequirementText, RequirementWrite, RequirementsSnapshot,
@@ -852,6 +853,32 @@ pub enum StoreRequest {
         /// The citation kind.
         kind: CitationKind,
     },
+    /// MOD-13 milestone 2 D3: the read that opens the Backlog's item form; answered with
+    /// [`StoreReply::ItemForm`]. Refused offline (D2). For an edit, `project` must be the item's.
+    ItemForm {
+        /// The project the form writes in: its kinds, graphs and repos are read.
+        project: ProjectId,
+        /// The item an edit form opens on; `None` for a new item.
+        item: Option<ItemId>,
+    },
+    /// §7.1 through the shared validator (D4); the worker mints the id and fills `created_by` and
+    /// `box_id`. Answered with [`StoreReply::ItemWritten`].
+    MintItem {
+        /// The project the item is minted in.
+        project: ProjectId,
+        /// The spec columns; `body` and `touched_paths` print as lengths (E6).
+        spec: ItemSpec,
+    },
+    /// §7.2 at `expected_version`, only the changed columns (D5). Answered with
+    /// [`StoreReply::ItemWritten`] or [`StoreReply::ItemDiverged`].
+    EditItem {
+        /// The item edited.
+        id: ItemId,
+        /// The compare-and-set token: the `version` the form's text came from (D6).
+        expected_version: i32,
+        /// The changed columns; `body` and `touched_paths` print as lengths (E6).
+        changes: SpecChanges,
+    },
 }
 
 impl StoreRequest {
@@ -967,6 +994,10 @@ impl StoreRequest {
             Self::CiteRequirement { .. } => "cite_requirement",
             Self::UnciteRequirement { .. } => "uncite_requirement",
             Self::ReconfirmCitation { .. } => "reconfirm_citation",
+            // The three of `item_writes::REQUEST_NAMES`, in that order (MOD-13 milestone 2).
+            Self::ItemForm { .. } => "item_form",
+            Self::MintItem { .. } => "mint_item",
+            Self::EditItem { .. } => "edit_item",
         }
     }
 }
@@ -1239,6 +1270,17 @@ pub enum StoreReply {
     RequirementDetail(Box<RequirementDetail>),
     /// Answer to [`StoreRequest::ItemRequirements`] and to every citation write that applied.
     ItemCitations(Box<ItemCitations>),
+    /// Answer to [`StoreRequest::ItemForm`]; boxed, it carries a whole `Item`.
+    ItemForm(Box<ItemFormContext>),
+    /// An item write that applied (self-naming, MOD-59): the tab lands a write on this alone.
+    ItemWritten {
+        /// The item written.
+        item: ItemId,
+        /// What the write did.
+        outcome: ItemWrite,
+    },
+    /// An edit that missed its version (D6): nothing was written.
+    ItemDiverged(Box<ItemDivergence>),
     /// The store failed. `request` is [`StoreRequest::name`].
     Failed {
         /// Which request failed.
@@ -1607,6 +1649,12 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::CiteRequirement { .. }
         | StoreRequest::UnciteRequirement { .. }
         | StoreRequest::ReconfirmCitation { .. } => requirements::serve(backend, request).await?,
+        // The three item requests, or-ed for the reason the arms above are: a guard does not
+        // count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-13
+        // milestone 2 D1).
+        StoreRequest::ItemForm { .. }
+        | StoreRequest::MintItem { .. }
+        | StoreRequest::EditItem { .. } => item_writes::serve(backend, request).await?,
         StoreRequest::StoreState => StoreReply::StoreState {
             label: backend.label(),
             migrations_pending: None,
