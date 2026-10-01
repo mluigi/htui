@@ -14608,6 +14608,15 @@ mod tests {
         /// The grace a case's cancel carries.
         const GRACE: Duration = Duration::from_secs(2);
 
+        /// `walk` bounded in paused time: a relay row nobody lists or a policy nobody reads
+        /// leaves the walk polling forever, so the case fails here instead of hanging. The
+        /// bound outlasts [`CLIENT_LIMIT`], so a client that gave up has spoken first.
+        async fn walked<T>(walk: impl Future<Output = T>) -> T {
+            tokio::time::timeout(CLIENT_LIMIT * 2, walk)
+                .await
+                .expect("the walk ends within its bound")
+        }
+
         /// The request every parked script asks: one allow and one reject option over `call-1`.
         fn request() -> PermissionRequestEvent {
             PermissionRequestEvent {
@@ -14859,7 +14868,7 @@ mod tests {
             harness.orch.script("prd", 1, parks("the prd"));
             let client = answering_client(harness.orch.store.clone(), ids::HTUI_FEAT_3);
 
-            let walked = harness.dispatch(start_feat_3()).await;
+            let walked = walked(harness.dispatch(start_feat_3())).await;
             let parked = client.await.expect("the client task ends");
 
             let Ok(CommandOutcome::Started { run, rest }) = walked else {
@@ -14914,7 +14923,7 @@ mod tests {
                 },
             );
 
-            let walked = harness.dispatch(start_feat_3()).await;
+            let walked = walked(harness.dispatch(start_feat_3())).await;
 
             let Ok(CommandOutcome::Started { run, .. }) = walked else {
                 panic!("the walk started: {walked:?}");
@@ -14951,7 +14960,7 @@ mod tests {
             let notes = note_count(&harness.orch, ids::HTUI_FEAT_3).await;
 
             let (walked, parked) = tokio::join!(
-                harness.dispatch(start_feat_3()),
+                walked(harness.dispatch(start_feat_3())),
                 cancelling_client(&harness.orch)
             );
 
@@ -15031,7 +15040,7 @@ mod tests {
             let notes = note_count(&harness.orch, ids::HTUI_FEAT_3).await;
 
             let (walked, parked) = tokio::join!(
-                harness.dispatch(start_feat_3()),
+                walked(harness.dispatch(start_feat_3())),
                 cancelling_client(&harness.orch)
             );
 
@@ -15097,7 +15106,7 @@ mod tests {
             let notes = note_count(&harness.orch, ids::HTUI_ANA_2).await;
 
             let (walked, parked) = tokio::join!(
-                harness.dispatch(start_ana_2()),
+                walked(harness.dispatch(start_ana_2())),
                 cancelling_client(&harness.orch)
             );
 
@@ -15138,7 +15147,7 @@ mod tests {
             harness.orch.script("prd", 1, parks("the prd"));
             let client = stealing_client(&harness.orch, ids::HTUI_FEAT_3);
 
-            let walked = harness.dispatch(start_feat_3()).await;
+            let walked = walked(harness.dispatch(start_feat_3())).await;
             let parked = client
                 .await
                 .expect("the client task ends")
@@ -15205,7 +15214,7 @@ mod tests {
             let notes = note_count(&harness.orch, ids::HTUI_FEAT_3).await;
             let client = stealing_client(&harness.orch, ids::HTUI_FEAT_3);
 
-            let walked = harness.dispatch(start_feat_3()).await;
+            let walked = walked(harness.dispatch(start_feat_3())).await;
             let parked = client
                 .await
                 .expect("the client task ends")
@@ -15246,7 +15255,7 @@ mod tests {
             let notes = note_count(&harness.orch, ids::HTUI_ANA_2).await;
             let client = stealing_client(&harness.orch, ids::HTUI_ANA_2);
 
-            let walked = harness.dispatch(start_ana_2()).await;
+            let walked = walked(harness.dispatch(start_ana_2())).await;
             let parked = client
                 .await
                 .expect("the client task ends")
@@ -15336,7 +15345,7 @@ mod tests {
                 .expect("the graph resolves");
 
             orch.cancel_walks(GRACE);
-            let claimed = engine.claim(run).await;
+            let claimed = walked(engine.claim(run)).await;
 
             assert!(
                 matches!(claimed, Err(EngineError::Cancelled { run: stopped }) if stopped == run),
