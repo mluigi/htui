@@ -488,6 +488,30 @@ pub async fn probe_tools(discovery: Option<&Discovery>, env: &ProbeEnv) -> Resul
     Ok(report)
 }
 
+/// [`probe_tools`] with this box's manual paths (MOD-66 D2, D3). Per tool, in this order:
+///
+/// 1. `HTUI_TOOL_<NAME>`, unchanged: checked with `exists`, recorded with no version, no args.
+/// 2. `manual[name]`, when present: it must be an **absolute** path (B3) to a **file**
+///    ([`is_file`]). Then it is found with `version: None`, `below_min: false`, and, for a
+///    [`ToolProbe::Glob`] tool, the matching platform's `args` (D3). Otherwise it is
+///    **missing**, with a `warn!` naming the tool. It never falls through to step 3, because
+///    that would silently replace the human's choice.
+/// 3. The tool's own `discovery` probe ([`resolve_tool`]), unchanged.
+///
+/// A key of `manual` that `discovery.tools` does not declare is ignored here, and carried by the
+/// snapshot as-is (D4).
+///
+/// # Errors
+/// As [`resolve_tool`].
+pub async fn probe_tools_with(
+    discovery: Option<&Discovery>,
+    manual: &BTreeMap<String, String>,
+    env: &ProbeEnv,
+) -> Result<ToolReport> {
+    let _ = (discovery, manual, env);
+    todo!("MOD-66 T1: the manual tier")
+}
+
 /// The first of `names` that `which` finds on the injected `PATH`, or `None`.
 ///
 /// `which` rather than a bare `Command::new`: `std::process::Command` does not read `PATHEXT`, so
@@ -1368,6 +1392,21 @@ pub async fn probe_agent(
         };
     }
     ProbeOutcome::Row(agent_box_row(agent, box_id, &snapshot, ctx.now))
+}
+
+/// Steps 1–7 of [`probe_agent`] over `manual`, with no stored row: the whole answer, and never
+/// [`ProbeOutcome::Kept`]. A caller that was **asked** to write gets a row
+/// ([`agent_box_row`]): `htui`'s `SetToolPaths` (MOD-66 D9). Every snapshot carries `manual`
+/// verbatim. `source` is [`ProbeSource::Manual`] exactly when the tool walk used a manual path
+/// (D4), and [`ProbeSource::Probe`] for the three failures that end before the walk.
+pub async fn probe_snapshot(
+    agent: &Agent,
+    manual: &BTreeMap<String, String>,
+    ctx: &ProbeContext,
+    tier2: &dyn Tier2,
+) -> ProbeSnapshot {
+    let _ = (agent, manual, ctx, tier2);
+    todo!("MOD-66 T1: snapshot_for over a manual map")
 }
 
 /// Steps 1–7 of [`probe_agent`]: everything that decides the snapshot, with no knowledge of what
