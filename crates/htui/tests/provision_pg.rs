@@ -131,6 +131,34 @@ async fn a_touch_after_the_baseline_is_seen() {
     db.drop_db().await;
 }
 
+/// Review finding 3: the baseline is taken after INSTALL, so a fast new worker may already be in
+/// it. Its next connect (a restart, as `Restart=on-failure` does) refreshes its row, which counts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_in_the_baseline_is_seen_when_it_connects_again() {
+    let Some(db) = testkit::demo_db().await else {
+        return;
+    };
+    let local = temp_root("provision-local-");
+    let remote_root = temp_root("provision-remote-");
+    let first = register_remote(&db.url, &remote_root).await;
+    let id = first.this_box();
+    drop(first);
+
+    let verifier = PgVerifier::new(local.path().to_path_buf());
+    let baseline = verifier.baseline(&db.url).await.expect("a baseline");
+    assert!(baseline.contains_key(&id), "the new box is already listed");
+    let unchanged = verifier.box_seen(id, &baseline, NOT_SEEN).await;
+    assert!(unchanged.is_err(), "no check-in yet: {unchanged:?}");
+
+    let again = register_remote(&db.url, &remote_root).await;
+    assert_eq!(again.this_box(), id, "the same box.toml, the same box");
+    assert_eq!(verifier.box_seen(id, &baseline, SEEN).await, Ok(()));
+
+    drop(again);
+    drop(verifier);
+    db.drop_db().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn set_executor_writes_worker_and_keeps_every_other_key() {
     let Some(db) = testkit::demo_db().await else {
