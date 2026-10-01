@@ -1502,6 +1502,12 @@ async fn s_with_no_box_listed_still_opens_the_spec_editor() {
         frame.contains("probe spec: seed \u{b7} "),
         "the spec in force is on screen with no box listed (F-6(c)): {frame}"
     );
+    // The spec line is drawn over an empty list in Browse too (review LOW-6), so the editor's own
+    // title is what proves the editor is the thing drawn.
+    assert!(
+        frame.contains("stored overlay box_probe_spec, merged into the seed by name"),
+        "the spec editor is drawn over no box: {frame}"
+    );
 
     bench.paste(&mut section, r#"{"tools": {}}"#);
     bench.key(&mut section, "ctrl-s");
