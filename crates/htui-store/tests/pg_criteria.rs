@@ -18,11 +18,13 @@ use chrono::{DateTime, SubsecRound as _, TimeDelta, Utc};
 use futures::future::join_all;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BoxId, Claim, CommandRunId, CommandRunStatus, EventKind,
-    EventRole, GraphSnapshot, Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch,
-    NewCommandRun, NewItem, NewProject, NewRepo, NewRequirement, NewRun, NewWorkspace, Priority,
-    ProjectId, RepoId, RequirementId, RunId, RunMode, RunStatus, RunStepTree, SessionEvent,
-    SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome, TIMESTAMPTZ_DIGITS, Transport,
+    Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Billing, BoxId, CancelRequest, Claim,
+    CommandRunId, CommandRunStatus, EventKind, EventRole, GraphSnapshot, Isolation, ItemFilter,
+    ItemId, ItemKindId, ItemKindPatch, ItemPatch, NewCommandRun, NewItem, NewProject, NewRepo,
+    NewRequirement, NewRun, NewWorkspace, OpenPermission, PermissionId, PermissionStatus, Priority,
+    ProjectId, RelayOption, RelayOptionKind, RelaySessionId, RepoId, RequirementId,
+    RunCommandStatus, RunId, RunMode, RunStatus, RunStepTree, SessionEvent, SnapshotGraph,
+    SnapshotSettings, Status, StepId, StepOutcome, TIMESTAMPTZ_DIGITS, Transport, UserId,
     WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
@@ -5221,6 +5223,660 @@ async fn queued_runs_on_box_lists_this_boxs_queued_runs_in_queue_order() {
             .expect("the read is answered"),
         expected,
         "this box's queued runs, the fixture's then this case's three, by `(queued_at, id)`"
+    );
+
+    db.drop_db().await;
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-42 (plan D1-D5, D12-D14, I-1, I-3, I-4; blueprint §4.3): the permission and control relay
+// across two boxes of one database.
+// ------------------------------------------------------------------------------------------------
+
+/// The two options every relay row here offers.
+fn relay_options() -> Vec<RelayOption> {
+    vec![
+        RelayOption {
+            id: "allow".to_owned(),
+            label: "Allow once".to_owned(),
+            kind: RelayOptionKind::AllowOnce,
+        },
+        RelayOption {
+            id: "reject".to_owned(),
+            label: "Reject once".to_owned(),
+            kind: RelayOptionKind::RejectOnce,
+        },
+    ]
+}
+
+/// A row of the fixture's `RUN_2` / `STEP_R2_PRD`, parked by `owner` in `session`.
+fn relay_open(session: RelaySessionId, request_id: &str, owner: uuid::Uuid) -> OpenPermission {
+    OpenPermission {
+        id: PermissionId::new(),
+        run_id: ids::RUN_2,
+        run_step_id: ids::STEP_R2_PRD,
+        session,
+        request_id: request_id.to_owned(),
+        tool_call_id: Some(format!("call-{request_id}")),
+        summary: Some(format!("edit: {request_id}")),
+        options: relay_options(),
+        owner,
+    }
+}
+
+/// A claims the fixture's queued `RUN_2` on `ids::BOX` for five minutes.
+async fn relay_claim(db: &common::TestDb, a: uuid::Uuid) {
+    assert_eq!(
+        db.store
+            .claim_run(ids::RUN_2, ids::BOX, a, Utc::now(), TimeDelta::minutes(5))
+            .await
+            .expect("the claim must not fail"),
+        Claim::Admitted,
+        "A claims the queued fixture run"
+    );
+}
+
+/// A second client of the same database: its own pool and its own `box.toml` under a temporary
+/// root (never the real config root), so it registers a second box under the fixture user.
+async fn second_box(db: &common::TestDb) -> (PgStore, tempfile::TempDir) {
+    let root = tempfile::tempdir().expect("a temporary config root");
+    let identity =
+        htui_store::identity::load_or_mint(root.path()).expect("mint the second box.toml");
+    let store = PgStore::connect(&db.url, &identity)
+        .await
+        .expect("the second box connects")
+        .store;
+    assert_ne!(
+        store.this_box(),
+        db.store.this_box(),
+        "the second client is another box"
+    );
+    (store, root)
+}
+
+/// MOD-42 D3, D4, I-1: B answers a row A parked; only A applies it. B's answer writes nothing but
+/// the row: no `session_event`, no lease move.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_box_answers_and_the_executor_applies() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (b, _root) = second_box(&db).await;
+    let a = uuid::Uuid::now_v7();
+    relay_claim(&db, a).await;
+    let open = relay_open(RelaySessionId::new(), "r1", a);
+    let id = db
+        .store
+        .open_permission(open)
+        .await
+        .expect("A parks the request");
+
+    let view = b
+        .relay_view(ids::HTUI_FEAT_3)
+        .await
+        .expect("B reads the item");
+    assert_eq!(
+        view.permissions.iter().map(|p| p.id).collect::<Vec<_>>(),
+        vec![id],
+        "B sees A's pending request"
+    );
+
+    let events_before = common::count(&db.pool, "session_event").await;
+    let lease_before: (Option<uuid::Uuid>, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT lease_owner, lease_expires_at FROM run WHERE id = $1")
+            .bind(ids::RUN_2.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the lease");
+    assert_eq!(
+        b.answer_permission(id, "reject", b.this_user(), b.this_box())
+            .await
+            .expect("B's answer is answered"),
+        AnswerOutcome::Answered,
+        "B wins the compare-and-set"
+    );
+    assert_eq!(
+        common::count(&db.pool, "session_event").await,
+        events_before,
+        "I-1: the answering box wrote no session_event"
+    );
+    let lease_after: (Option<uuid::Uuid>, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT lease_owner, lease_expires_at FROM run WHERE id = $1")
+            .bind(ids::RUN_2.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the lease");
+    assert_eq!(
+        lease_after, lease_before,
+        "I-1: the answer never touches the lease"
+    );
+
+    assert_eq!(
+        b.apply_permission(id, uuid::Uuid::now_v7())
+            .await
+            .expect("an apply by a stranger is answered"),
+        None,
+        "only the row's owner applies it"
+    );
+    let choice = db
+        .store
+        .apply_permission(id, a)
+        .await
+        .expect("A's apply is answered")
+        .expect("A applies B's answer");
+    assert_eq!(
+        choice.option_id, "reject",
+        "the applied choice is B's option"
+    );
+
+    let row = db
+        .store
+        .permission(id)
+        .await
+        .expect("the read is answered")
+        .expect("the row exists");
+    assert_eq!(row.status, PermissionStatus::Applied);
+    assert_eq!(row.option_id.as_deref(), Some("reject"));
+    assert_eq!(
+        row.answered_box,
+        Some(b.this_box()),
+        "the answering box is B"
+    );
+    assert_eq!(row.answered_by, Some(b.this_user()));
+    assert!(row.answered_at.is_some() && row.resolved_at.is_some());
+    assert_eq!(
+        common::count(&db.pool, "session_event").await,
+        events_before,
+        "the relay itself wrote no session_event"
+    );
+
+    b.pool().close().await;
+    db.drop_db().await;
+}
+
+/// MOD-42 D3: once the parking process's lease lapses, or another owner took the run, an answer
+/// from another box is refused `ExecutorGone` and the row stays `pending`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_box_cannot_answer_after_adoption_or_expiry() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (b, _root) = second_box(&db).await;
+    let a = uuid::Uuid::now_v7();
+    relay_claim(&db, a).await;
+    let session = RelaySessionId::new();
+    let lapsed = db
+        .store
+        .open_permission(relay_open(session, "r1", a))
+        .await
+        .expect("A parks the first request");
+    assert!(
+        db.store
+            .refresh_lease(ids::RUN_2, a, TimeDelta::zero())
+            .await
+            .expect("the refresh is answered"),
+        "A's lease lapses, as a suspended holder's does"
+    );
+    assert_eq!(
+        b.answer_permission(lapsed, "allow", b.this_user(), b.this_box())
+            .await
+            .expect("the answer is answered"),
+        AnswerOutcome::Refused(AnswerRefusal::ExecutorGone),
+        "a lapsed lease cannot be answered"
+    );
+
+    // The fence of `open_permission` is the owner only (B-9): A still names the run's owner.
+    let adopted = db
+        .store
+        .open_permission(relay_open(session, "r2", a))
+        .await
+        .expect("A parks the second request under its lapsed lease");
+    let x = uuid::Uuid::now_v7();
+    assert!(
+        db.store
+            .take_lease(ids::RUN_2, ids::BOX, x, TimeDelta::minutes(5))
+            .await
+            .expect("the take is answered"),
+        "X adopts the lapsed run"
+    );
+    assert_eq!(
+        b.answer_permission(adopted, "allow", b.this_user(), b.this_box())
+            .await
+            .expect("the answer is answered"),
+        AnswerOutcome::Refused(AnswerRefusal::ExecutorGone),
+        "a row of an adopted run cannot be answered"
+    );
+
+    for id in [lapsed, adopted] {
+        let row = db
+            .store
+            .permission(id)
+            .await
+            .expect("the read is answered")
+            .expect("the row exists");
+        assert_eq!(
+            row.status,
+            PermissionStatus::Pending,
+            "a refusal writes nothing"
+        );
+        assert!(row.option_id.is_none() && row.answered_box.is_none());
+    }
+    assert!(
+        b.relay_view(ids::HTUI_FEAT_3)
+            .await
+            .expect("the view is answered")
+            .permissions
+            .is_empty(),
+        "neither row is live"
+    );
+
+    b.pool().close().await;
+    db.drop_db().await;
+}
+
+/// MOD-42 I-3: two boxes answering one row at once, twenty times: exactly one `Answered` per
+/// round, the other `Refused(Answered)`, and the row names the winner's option.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_concurrent_answers_admit_one() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (b, _root) = second_box(&db).await;
+    let a = uuid::Uuid::now_v7();
+    relay_claim(&db, a).await;
+    let session = RelaySessionId::new();
+    for round in 0..20 {
+        let id = db
+            .store
+            .open_permission(relay_open(session, &format!("r{round}"), a))
+            .await
+            .expect("A parks the request");
+        let (left, right) = tokio::join!(
+            db.store.answer_permission(id, "allow", ids::USER, ids::BOX),
+            b.answer_permission(id, "reject", b.this_user(), b.this_box()),
+        );
+        let (left, right) = (left.expect("A's answer"), right.expect("B's answer"));
+        let winner = match (left, right) {
+            (AnswerOutcome::Answered, AnswerOutcome::Refused(AnswerRefusal::Answered)) => "allow",
+            (AnswerOutcome::Refused(AnswerRefusal::Answered), AnswerOutcome::Answered) => "reject",
+            other => panic!("round {round}: exactly one answer wins, got {other:?}"),
+        };
+        let row = db
+            .store
+            .permission(id)
+            .await
+            .expect("the read is answered")
+            .expect("the row exists");
+        assert_eq!(row.status, PermissionStatus::Answered, "round {round}");
+        assert_eq!(
+            row.option_id.as_deref(),
+            Some(winner),
+            "round {round}: the row keeps the winner's option"
+        );
+    }
+
+    b.pool().close().await;
+    db.drop_db().await;
+}
+
+/// MOD-42 D1, D12: two boxes requesting a cancel of one run at once insert one row; the other is
+/// told which row is pending. Ten rounds, each resolved before the next.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_concurrent_cancel_requests_insert_one() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (b, _root) = second_box(&db).await;
+    relay_claim(&db, uuid::Uuid::now_v7()).await;
+    for round in 0..10 {
+        let (left, right) = tokio::join!(
+            db.store.request_cancel(ids::RUN_2, ids::USER, ids::BOX),
+            b.request_cancel(ids::RUN_2, b.this_user(), b.this_box()),
+        );
+        let (left, right) = (left.expect("A's request"), right.expect("B's request"));
+        let id = match (left, right) {
+            (CancelRequest::Inserted(x), CancelRequest::AlreadyPending(y))
+            | (CancelRequest::AlreadyPending(y), CancelRequest::Inserted(x))
+                if x == y =>
+            {
+                x
+            }
+            other => panic!("round {round}: one insert, one already pending, got {other:?}"),
+        };
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM run_command WHERE run_id = $1 AND status = 'pending'",
+        )
+        .bind(ids::RUN_2.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count the pending rows");
+        assert_eq!(pending, 1, "round {round}: one pending row");
+        assert!(
+            db.store
+                .resolve_command(id, RunCommandStatus::Applied, None)
+                .await
+                .expect("the resolve is answered"),
+            "round {round}: the pending row resolves"
+        );
+    }
+    assert_eq!(
+        common::count(&db.pool, "run_command").await,
+        10,
+        "one row per round"
+    );
+
+    b.pool().close().await;
+    db.drop_db().await;
+}
+
+/// MOD-42 I-4: every relay instant is the database's clock, between two `clock_timestamp()`
+/// readings taken around the writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_times_are_the_databases() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let a = uuid::Uuid::now_v7();
+    relay_claim(&db, a).await;
+    let clock = || async {
+        sqlx::query_scalar::<_, DateTime<Utc>>("SELECT clock_timestamp()")
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the database clock")
+    };
+    let before = clock().await;
+    let id = db
+        .store
+        .open_permission(relay_open(RelaySessionId::new(), "r1", a))
+        .await
+        .expect("open");
+    assert_eq!(
+        db.store
+            .answer_permission(id, "allow", ids::USER, ids::BOX)
+            .await
+            .expect("answer"),
+        AnswerOutcome::Answered
+    );
+    db.store
+        .apply_permission(id, a)
+        .await
+        .expect("apply")
+        .expect("applied");
+    let CancelRequest::Inserted(command) = db
+        .store
+        .request_cancel(ids::RUN_2, ids::USER, ids::BOX)
+        .await
+        .expect("request")
+    else {
+        panic!("a first cancel request inserts");
+    };
+    assert!(
+        db.store
+            .resolve_command(command, RunCommandStatus::Refused, Some("no".to_owned()))
+            .await
+            .expect("resolve")
+    );
+    let after = clock().await;
+
+    let row = db
+        .store
+        .permission(id)
+        .await
+        .expect("read")
+        .expect("the row exists");
+    let (issued_at, resolved_at): (DateTime<Utc>, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT issued_at, resolved_at FROM run_command WHERE id = $1")
+            .bind(command.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the command");
+    let stamps = [
+        ("created_at", Some(row.created_at)),
+        ("answered_at", row.answered_at),
+        ("resolved_at", row.resolved_at),
+        ("issued_at", Some(issued_at)),
+        ("run_command.resolved_at", resolved_at),
+    ];
+    for (name, stamp) in stamps {
+        let stamp = stamp.unwrap_or_else(|| panic!("{name} is set"));
+        assert!(
+            before <= stamp && stamp <= after,
+            "{name} {stamp} lies between the database's {before} and {after}"
+        );
+    }
+    assert!(
+        row.created_at <= row.answered_at.expect("set")
+            && row.answered_at <= row.resolved_at
+            && issued_at <= resolved_at.expect("set"),
+        "the database clock runs forward through the writes"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-42 D1: both tables go with their run (`ON DELETE CASCADE`), which `delete_project` relies
+/// on.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_project_holding_relay_rows_succeeds() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let a = uuid::Uuid::now_v7();
+    relay_claim(&db, a).await;
+    let session = RelaySessionId::new();
+    let answered = db
+        .store
+        .open_permission(relay_open(session, "r1", a))
+        .await
+        .expect("open");
+    db.store
+        .answer_permission(answered, "allow", ids::USER, ids::BOX)
+        .await
+        .expect("answer");
+    db.store
+        .open_permission(relay_open(session, "r2", a))
+        .await
+        .expect("open a pending one");
+    db.store
+        .request_cancel(ids::RUN_2, ids::USER, ids::BOX)
+        .await
+        .expect("request");
+    assert_eq!(common::count(&db.pool, "step_permission").await, 2);
+    assert_eq!(common::count(&db.pool, "run_command").await, 1);
+
+    db.store
+        .delete_project(ids::PROJECT_HTUI)
+        .await
+        .expect("the delete takes the relay rows with its runs");
+    assert_eq!(common::count(&db.pool, "step_permission").await, 0);
+    assert_eq!(common::count(&db.pool, "run_command").await, 0);
+
+    db.drop_db().await;
+}
+
+/// MOD-42 B-4 on Postgres: a pending cancel of a run that finished before its executor saw it is
+/// still handed to its box (which refuses it with the status), and the Runs pane no longer lists
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_runs_pending_cancel_is_listed_for_its_box() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let a = uuid::Uuid::now_v7();
+    relay_claim(&db, a).await;
+    let CancelRequest::Inserted(command) = db
+        .store
+        .request_cancel(ids::RUN_2, ids::USER, ids::BOX)
+        .await
+        .expect("request")
+    else {
+        panic!("a first cancel request inserts");
+    };
+    assert_eq!(
+        db.store
+            .relay_view(ids::HTUI_FEAT_3)
+            .await
+            .expect("view")
+            .cancels,
+        vec![ids::RUN_2],
+        "a running run's pending cancel is shown"
+    );
+    let stranger = uuid::Uuid::now_v7();
+    assert!(
+        db.store
+            .pending_commands(stranger, ids::BOX)
+            .await
+            .expect("poll")
+            .is_empty(),
+        "a live lease of another owner hides the command"
+    );
+
+    db.store
+        .finish_run(ids::RUN_2, RunStatus::Done, None, Utc::now())
+        .await
+        .expect("the run finishes");
+    let listed = db
+        .store
+        .pending_commands(stranger, ids::BOX)
+        .await
+        .expect("poll");
+    assert_eq!(
+        listed.iter().map(|c| c.id).collect::<Vec<_>>(),
+        vec![command],
+        "a terminal run's pending cancel is listed for its executing box"
+    );
+    assert!(
+        db.store
+            .pending_commands(stranger, BoxId::new())
+            .await
+            .expect("poll")
+            .is_empty(),
+        "and for no other box"
+    );
+    assert!(
+        db.store
+            .relay_view(ids::HTUI_FEAT_3)
+            .await
+            .expect("view")
+            .cancels
+            .is_empty(),
+        "relay_view hides a terminal run's cancel"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-42 B-7, the main thread's order: the actor is checked before the status, so an unknown
+/// user or box is a `Constraint` on a row already answered and on a run already holding a pending
+/// cancel, as in `MemStore` — never `Refused(Answered)` or `AlreadyPending`. An unknown row or run
+/// is `NotFound` first. Nothing is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_actor_is_refused_before_the_status() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let a = uuid::Uuid::now_v7();
+    relay_claim(&db, a).await;
+    let id = db
+        .store
+        .open_permission(relay_open(RelaySessionId::new(), "r1", a))
+        .await
+        .expect("open");
+    assert_eq!(
+        db.store
+            .answer_permission(id, "allow", ids::USER, ids::BOX)
+            .await
+            .expect("answer"),
+        AnswerOutcome::Answered
+    );
+    let constraint = |what: &str, got: Result<_, htui_core::store::StoreError>| {
+        assert!(
+            matches!(got, Err(htui_core::store::StoreError::Constraint(_))),
+            "{what}: an unknown actor is a Constraint, got {got:?}"
+        );
+    };
+    constraint(
+        "answer by an unknown user",
+        db.store
+            .answer_permission(id, "reject", UserId::new(), ids::BOX)
+            .await
+            .map(|o| format!("{o:?}")),
+    );
+    constraint(
+        "answer from an unknown box",
+        db.store
+            .answer_permission(id, "reject", ids::USER, BoxId::new())
+            .await
+            .map(|o| format!("{o:?}")),
+    );
+    let row = db
+        .store
+        .permission(id)
+        .await
+        .expect("read")
+        .expect("the row exists");
+    assert_eq!(
+        row.option_id.as_deref(),
+        Some("allow"),
+        "the refusals wrote nothing"
+    );
+    assert_eq!(row.answered_box, Some(ids::BOX));
+    assert!(
+        matches!(
+            db.store
+                .answer_permission(PermissionId::new(), "allow", UserId::new(), BoxId::new())
+                .await,
+            Err(htui_core::store::StoreError::NotFound {
+                entity: "step_permission",
+                ..
+            })
+        ),
+        "an unknown row is NotFound before the actor"
+    );
+
+    let CancelRequest::Inserted(command) = db
+        .store
+        .request_cancel(ids::RUN_2, ids::USER, ids::BOX)
+        .await
+        .expect("request")
+    else {
+        panic!("a first cancel request inserts");
+    };
+    constraint(
+        "cancel by an unknown user",
+        db.store
+            .request_cancel(ids::RUN_2, UserId::new(), ids::BOX)
+            .await
+            .map(|o| format!("{o:?}")),
+    );
+    constraint(
+        "cancel from an unknown box",
+        db.store
+            .request_cancel(ids::RUN_2, ids::USER, BoxId::new())
+            .await
+            .map(|o| format!("{o:?}")),
+    );
+    assert!(
+        matches!(
+            db.store
+                .request_cancel(RunId::new(), UserId::new(), BoxId::new())
+                .await,
+            Err(htui_core::store::StoreError::NotFound { entity: "run", .. })
+        ),
+        "an unknown run is NotFound before the actor"
+    );
+    assert_eq!(
+        common::count(&db.pool, "run_command").await,
+        1,
+        "only the first request wrote a row"
+    );
+    assert_eq!(
+        db.store
+            .request_cancel(ids::RUN_2, ids::USER, ids::BOX)
+            .await
+            .expect("request"),
+        CancelRequest::AlreadyPending(command),
+        "a known actor is told the pending row"
     );
 
     db.drop_db().await;
