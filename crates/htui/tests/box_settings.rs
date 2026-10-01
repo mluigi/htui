@@ -9,7 +9,7 @@
 //! end-to-end path by `tests/box_probe_pg.rs`.
 #![cfg(feature = "testkit")]
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use htui::agent_worker::BoxProbeReport;
 use htui::app::{Action, Handled};
 use htui::box_settings::{self, BoxesSnapshot, REQUEST_NAMES, spec_view};
@@ -19,6 +19,7 @@ use htui::ui::tabs::settings::{BoxesSection, SettingsSection, SettingsTab};
 use htui_agent::box_probe::spec;
 use htui_core::fixtures::{demo_data, ids};
 use htui_core::model::{BoxEdit, BoxId, BoxRecord, Executor, Scope, canonical_declared_tags};
+use htui_core::store::traits::BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN;
 use htui_core::store::{MemStore, StoreError};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use serde_json::{Value, json};
@@ -100,6 +101,22 @@ fn edit(box_id: BoxId, expected: i32, tags: Option<&[&str]>, quirks: Option<&str
             executor: None,
         },
     }
+}
+
+/// A `SetProbeSpec` request (MOD-51 D4): `overlay: None` clears, `expected: None` expects no row.
+fn set_spec(overlay: Option<Value>, expected: Option<DateTime<Utc>>) -> StoreRequest {
+    StoreRequest::SetProbeSpec { overlay, expected }
+}
+
+/// The token of the stored overlay row a snapshot carries, or a panic when there is no row.
+#[track_caller]
+fn spec_token(snapshot: &BoxesSnapshot) -> DateTime<Utc> {
+    snapshot
+        .spec
+        .stored
+        .as_ref()
+        .map(|row| row.updated_at)
+        .unwrap_or_else(|| panic!("a stored overlay row: {:?}", snapshot.spec))
 }
 
 /// The record of `id` in a snapshot, or a panic listing what the snapshot holds.
@@ -243,6 +260,11 @@ async fn the_spec_view_names_a_stored_overlay_and_an_ignored_one() {
         spec::effective(spec::seed(), Some(&terraform)).digest
     );
     assert_ne!(accepted.digest, spec::digest(spec::seed()));
+    assert_eq!(
+        accepted.stored.map(|row| row.value),
+        Some(Some(terraform)),
+        "MOD-51 D5: the view carries the row it was computed from"
+    );
 
     let store = MemStore::demo();
     store.set_app_setting(spec::SETTING_KEY, json!(42));
@@ -255,12 +277,171 @@ async fn the_spec_view_names_a_stored_overlay_and_an_ignored_one() {
         "the probe's own prefix: {error}"
     );
     assert_eq!(ignored.digest, spec::digest(spec::seed()));
+    assert_eq!(
+        ignored.stored.map(|row| row.value),
+        Some(Some(json!(42))),
+        "MOD-51 D5, R-6: an ignored overlay still carries its row"
+    );
 }
 
-/// Offline, both are refused by their own names with MOD-25's sentence: `Backend::writer()` is
-/// `None`, so `serve` never reaches the seam, the read included.
+/// MOD-51 D4, D5: an applied save answers `Boxes` with the overlay in force, its digest the
+/// checker's, and the row with its token; a plain read afterwards carries the same row.
 #[tokio::test]
-async fn offline_both_are_refused_with_the_database_sentence() {
+async fn set_probe_spec_applied_answers_boxes_with_the_overlay_in_force() {
+    let backend = demo();
+    let snapshot = boxes(serve(&backend, &set_spec(Some(terraform_spec()), None)).await);
+
+    assert!(snapshot.spec.overlay, "the overlay is in force");
+    assert_eq!(snapshot.spec.error, None);
+    assert_eq!(
+        snapshot.spec.digest,
+        spec::check(&terraform_spec()).expect("the terraform overlay is accepted")
+    );
+    assert_ne!(snapshot.spec.digest, spec::digest(spec::seed()));
+    assert_eq!(
+        snapshot.spec.stored.as_ref().map(|row| &row.value),
+        Some(&Some(terraform_spec()))
+    );
+
+    let read = boxes(serve(&backend, &StoreRequest::Boxes).await);
+    assert_eq!(
+        read.spec.stored, snapshot.spec.stored,
+        "the same row, the same token"
+    );
+}
+
+/// MOD-51 D2, D4: a spent token answers `BoxesStale` with the row as the first save left it, and
+/// so does an insert (`expected: None`) over a row that exists.
+#[tokio::test]
+async fn set_probe_spec_with_a_spent_token_answers_boxes_stale_and_writes_nothing() {
+    let backend = demo();
+    let cmake = json!({ "tools": { "cmake": { "disabled": true } } });
+    let inserted = boxes(serve(&backend, &set_spec(Some(terraform_spec()), None)).await);
+    let t1 = spec_token(&inserted);
+    let updated = boxes(serve(&backend, &set_spec(Some(cmake.clone()), Some(t1))).await);
+    let t2 = spec_token(&updated);
+
+    let again = stale(serve(&backend, &set_spec(Some(json!({})), Some(t1))).await);
+    assert_eq!(
+        again.spec.stored.as_ref().map(|row| &row.value),
+        Some(&Some(cmake.clone())),
+        "the spent token wrote nothing"
+    );
+    assert_eq!(spec_token(&again), t2, "the token the first update left");
+
+    let insert = stale(serve(&backend, &set_spec(Some(json!({})), None)).await);
+    assert_eq!(
+        insert.spec.stored.as_ref().map(|row| &row.value),
+        Some(&Some(cmake)),
+        "an insert over a row never overwrites it"
+    );
+}
+
+/// MOD-51 D3, F-8: an overlay the probe would ignore is refused before the store, under the
+/// request's own name, with the probe's own fault sentence after `SPEC_REFUSED`; nothing is
+/// written. Through `store_worker::serve` the sentence follows the `Constraint` prefix; one layer
+/// down, `box_settings::serve` answers the `Constraint` itself.
+#[tokio::test]
+async fn a_refused_overlay_is_failed_with_the_probe_s_sentence_and_nothing_is_written() {
+    let backend = demo();
+    let bad = json!({ "tools": { "x": { "kind": "path", "names": ["bin/x"] } } });
+    let fault = spec::check(&bad).expect_err("a non-bare tool name is refused");
+
+    let (request, message) = refusal(serve(&backend, &set_spec(Some(bad.clone()), None)).await);
+    assert_eq!(request, "set_probe_spec");
+    assert!(
+        message.contains(&format!("{}: {fault}", spec::SPEC_REFUSED)),
+        "the probe's own sentence after the refusal prefix: {message}"
+    );
+
+    let (request, message) = refusal(serve(&backend, &set_spec(Some(json!(42)), None)).await);
+    assert_eq!(request, "set_probe_spec");
+    assert!(
+        message.contains("box_probe_spec refused: the value is not a JSON object"),
+        "a non-object is the probe's refusal too: {message}"
+    );
+
+    let read = boxes(serve(&backend, &StoreRequest::Boxes).await);
+    assert_eq!(read.spec.stored, None, "nothing was written");
+
+    match box_settings::serve(&backend, &set_spec(Some(bad), None)).await {
+        Err(StoreError::Constraint(sentence)) => assert!(
+            sentence.starts_with("box_probe_spec refused: "),
+            "the refusal starts with SPEC_REFUSED: {sentence}"
+        ),
+        other => panic!("expected a constraint: {other:?}"),
+    }
+}
+
+/// MOD-51 D2, D4: a clear under the token answers `Boxes` with no stored row and the seed's spec.
+#[tokio::test]
+async fn clearing_under_the_token_answers_boxes_with_no_stored_overlay() {
+    let backend = demo();
+    let inserted = boxes(serve(&backend, &set_spec(Some(terraform_spec()), None)).await);
+
+    let cleared = boxes(serve(&backend, &set_spec(None, Some(spec_token(&inserted)))).await);
+    assert_eq!(cleared.spec.stored, None);
+    assert!(!cleared.spec.overlay);
+    assert_eq!(cleared.spec.error, None);
+    assert_eq!(cleared.spec.digest, spec::digest(spec::seed()));
+}
+
+/// MOD-51 D2: a clear with no token is the store's `Constraint`, bubbled to `Failed` under the
+/// request's name (the checker has nothing to check in a clear).
+#[tokio::test]
+async fn a_clear_without_a_token_is_failed_by_the_store() {
+    let (request, message) = refusal(serve(&demo(), &set_spec(None, None)).await);
+
+    assert_eq!(request, "set_probe_spec");
+    assert!(
+        message.contains(BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN),
+        "the store's own sentence: {message}"
+    );
+}
+
+/// MOD-51 R-6: a stored overlay the probe ignores still carries its row and token, so the editor
+/// can clear it; storing it again is refused.
+#[tokio::test]
+async fn a_stored_overlay_the_probe_ignores_carries_its_token_and_clears() {
+    let store = MemStore::demo();
+    store.set_app_setting(spec::SETTING_KEY, json!(42));
+    let backend = Backend::memory(store);
+
+    let snapshot = boxes(serve(&backend, &StoreRequest::Boxes).await);
+    assert_eq!(
+        snapshot.spec.stored.as_ref().map(|row| &row.value),
+        Some(&Some(json!(42)))
+    );
+    assert!(!snapshot.spec.overlay);
+    let error = snapshot
+        .spec
+        .error
+        .clone()
+        .expect("an ignored overlay says why");
+    assert!(
+        error.starts_with(spec::SPEC_IGNORED),
+        "the probe's own prefix: {error}"
+    );
+
+    let cleared = boxes(serve(&backend, &set_spec(None, Some(spec_token(&snapshot)))).await);
+    assert_eq!(
+        cleared.spec.stored, None,
+        "clearing an ignored overlay is accepted"
+    );
+
+    let (request, message) = refusal(serve(&backend, &set_spec(Some(json!(42)), None)).await);
+    assert_eq!(request, "set_probe_spec");
+    assert!(
+        message.contains(spec::SPEC_REFUSED),
+        "storing it back is refused: {message}"
+    );
+}
+
+/// Offline, all three are refused by their own names with MOD-25's sentence: `Backend::writer()`
+/// is `None`, so `serve` never reaches the seam (nor, for `SetProbeSpec`, the checker), the read
+/// included. The length assertion keeps the `zip` from dropping a request (MOD-51 F-7).
+#[tokio::test]
+async fn offline_every_box_request_is_refused_with_the_database_sentence() {
     let root = tempfile::tempdir().expect("a throwaway config root");
     let cache = CacheStore::open(
         root.path(),
@@ -274,7 +455,12 @@ async fn offline_both_are_refused_with_the_database_sentence() {
         since: Some(Utc::now()),
     };
 
-    let requests = [StoreRequest::Boxes, edit(ids::BOX, 0, Some(&["gpu"]), None)];
+    let requests = [
+        StoreRequest::Boxes,
+        edit(ids::BOX, 0, Some(&["gpu"]), None),
+        set_spec(Some(terraform_spec()), None),
+    ];
+    assert_eq!(requests.len(), REQUEST_NAMES.len(), "one request per name");
     for (request, name) in requests.into_iter().zip(REQUEST_NAMES) {
         let (refused, message) = refusal(serve(&backend, &request).await);
         assert_eq!(refused, name);

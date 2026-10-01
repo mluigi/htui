@@ -234,6 +234,20 @@ pub enum StoreRequest {
         /// Only the edited field is `Some`.
         edit: BoxEdit,
     },
+    /// Set, replace or clear the `app_setting.box_probe_spec` overlay (MOD-51 D2–D4), a
+    /// compare-and-set on the row's `updated_at`. `overlay: Some` is checked by
+    /// `htui_agent::box_probe::spec::check` before anything is written, and a refusal is
+    /// [`StoreReply::Failed`] carrying the probe's own fault sentence; `overlay: None` clears the
+    /// row and needs `expected`. Answered with [`StoreReply::Boxes`] when it applied and
+    /// [`StoreReply::BoxesStale`] when the token was spent or the row is gone. The overlay is a
+    /// tool list, not a secret, so `Debug` may print it (the rule above).
+    SetProbeSpec {
+        /// The overlay to store, or `None` to clear the row.
+        overlay: Option<Value>,
+        /// The `updated_at` of the row the editor opened on (`SpecView.stored`); `None` expects
+        /// no row.
+        expected: Option<DateTime<Utc>>,
+    },
     /// Create one `agent` row from the Settings form (MOD-23 D239). The worker mints the id and
     /// the clock, builds `launch` as `{command, args, env: {}}`, and copies `settings` from
     /// `settings_from` (OQ-5) or starts from `{}`. Served in the loop by
@@ -844,9 +858,11 @@ impl StoreRequest {
             Self::ChatFollow { .. } => "chat_follow",
             Self::ProbeAgents => "probe_agents",
             Self::ProbeBox => "probe_box",
-            // The two of `box_settings::REQUEST_NAMES`, in that order (MOD-7 milestone 2, D46).
+            // The three of `box_settings::REQUEST_NAMES`, in that order (MOD-7 milestone 2, D46;
+            // MOD-51 D4).
             Self::Boxes => "boxes",
             Self::EditBox { .. } => "edit_box",
+            Self::SetProbeSpec { .. } => "set_probe_spec",
             // The three of `agent_settings::REQUEST_NAMES`, in that order (MOD-23 D241).
             Self::CreateAgent { .. } => "create_agent",
             Self::EditAgent { .. } => "edit_agent",
@@ -1150,10 +1166,10 @@ pub enum StoreReply {
     /// [`UNSOLICITED`].
     BoxProbed(crate::agent_worker::BoxProbeReport),
     /// This user's boxes, freshly read: the answer to [`StoreRequest::Boxes`] and to every box
-    /// edit that applied (MOD-7 milestone 2, D46).
+    /// or probe spec write that applied (MOD-7 milestone 2, D46; MOD-51 D4).
     Boxes(Box<BoxesSnapshot>),
-    /// A box edit missed its token, or its box is gone (D46, D48): the boxes as they are now, for
-    /// the editor to reload against. The editor keeps its typed text and retries only on save.
+    /// A box edit or a probe spec write missed its token, or its row is gone (D46, D48; MOD-51
+    /// D4): the boxes as they are now, for the editor to reload against. The editor keeps its typed text and retries only on save.
     BoxesStale(Box<BoxesSnapshot>),
     /// The answer to every agent registry write (MOD-23 D240): the registry re-read after the
     /// write, and what the write did. Self-naming (MOD-59): the Settings section lands a write on
@@ -1527,10 +1543,10 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::SetDsn(_)
         | StoreRequest::ClearDsn
         | StoreRequest::RebuildCache => connection::serve(backend, request).await?,
-        // The two box requests, or-ed for the same reason the twenty-nine above are: a guard
+        // The three box requests, or-ed for the same reason the twenty-nine above are: a guard
         // does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would be an
-        // E0004 here (MOD-15 M3 plan F-12, MOD-7 milestone 2 D46).
-        StoreRequest::Boxes | StoreRequest::EditBox { .. } => {
+        // E0004 here (MOD-15 M3 plan F-12, MOD-7 milestone 2 D46, MOD-51 D4).
+        StoreRequest::Boxes | StoreRequest::EditBox { .. } | StoreRequest::SetProbeSpec { .. } => {
             box_settings::serve(backend, request).await?
         }
         // The three agent registry writes, or-ed for the reason the arms above are: a guard does
@@ -3601,8 +3617,9 @@ mod tests {
         );
     }
 
-    /// The two box requests are named exactly as `box_settings::REQUEST_NAMES` lists them, so the
-    /// section's `Failed` match and the worker cannot drift apart (MOD-7 milestone 2, D46).
+    /// The three box requests are named exactly as `box_settings::REQUEST_NAMES` lists them, so
+    /// the section's `Failed` match and the worker cannot drift apart (MOD-7 milestone 2, D46;
+    /// MOD-51 D4).
     #[test]
     fn box_requests_are_named_as_box_settings_lists_them() {
         assert_eq!(
@@ -3612,6 +3629,11 @@ mod tests {
                     box_id: BoxId::new(),
                     expected: 0,
                     edit: BoxEdit::default(),
+                }
+                .name(),
+                StoreRequest::SetProbeSpec {
+                    overlay: None,
+                    expected: None,
                 }
                 .name(),
             ],
