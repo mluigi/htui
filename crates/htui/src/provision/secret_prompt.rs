@@ -1,7 +1,8 @@
 //! The sudo password, read with no echo (MOD-45 D302): crossterm raw mode, key events up to
 //! `Enter`, into a pre-sized `Zeroizing<String>`. crossterm falls back to `/dev/tty` when stdin is
 //! not a terminal, so `--dsn-stdin` and a password prompt work together. A guard's `Drop` restores
-//! the terminal.
+//! the terminal. The prompt line itself is written to `/dev/tty` too when it opens, else to stderr
+//! ([`PasswordPrompt::prompt_writer`]).
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::future::BoxFuture;
@@ -23,6 +24,13 @@ pub enum PromptError {
 pub trait PasswordPrompt: core::fmt::Debug + Send + Sync {
     /// The caller has already printed the prompt.
     fn ask(&self) -> BoxFuture<'_, Result<Zeroizing<String>, PromptError>>;
+
+    /// Where the caller prints the prompt and the newline after it: the terminal [`Self::ask`]
+    /// reads from, so the prompt is seen even when stderr is redirected (review finding 10).
+    /// `None`, the default, means the caller's stderr.
+    fn prompt_writer(&self) -> Option<Box<dyn std::io::Write + Send>> {
+        None
+    }
 }
 
 /// The terminal one. Runs `crossterm::event::read` on a thread of its own and answers through a
@@ -40,6 +48,15 @@ impl PasswordPrompt for TtyPrompt {
                 .map_err(|_| PromptError::NoTerminal)?;
             answered.await.unwrap_or(Err(PromptError::Aborted))
         })
+    }
+
+    /// `/dev/tty` when it opens for writing; `None` (stderr) otherwise.
+    fn prompt_writer(&self) -> Option<Box<dyn std::io::Write + Send>> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/tty")
+            .ok()
+            .map(|tty| Box::new(tty) as Box<dyn std::io::Write + Send>)
     }
 }
 

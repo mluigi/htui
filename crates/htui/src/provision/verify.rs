@@ -1,6 +1,8 @@
-//! Did the new box reach Postgres, judged against a baseline taken before INSTALL (MOD-45 D305),
-//! and its executor (D313). Both timestamps are the database's `clock_timestamp()`; no local clock
-//! is used.
+//! Did the new box reach Postgres, judged against a baseline taken once INSTALL has returned, so
+//! the service is already started or restarted (MOD-45 D305; review finding 3), and its executor
+//! (D313). Both timestamps are the database's `clock_timestamp()`; no local clock is used. A box
+//! already in the baseline is only "seen" by a later `last_seen_at`, which any htui with the same
+//! `box.toml` also moves, so that case is best-effort and `run_with` says so.
 //!
 //! The production verifier connects through [`worker_cmd::connect`] with this machine's own config
 //! root, which registers or refreshes **this** box's row, as `htui --index-items` does (R-6). It

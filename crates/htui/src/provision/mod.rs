@@ -5,7 +5,8 @@
 //! Four short sessions: the preflight (read-only), prepare (unprivileged: the log directory and the
 //! binary), install (privileged: the credential, the unit, the start) and verify (wait for the
 //! service and its `box.toml`). Then, from this machine, the box is checked in Postgres against a
-//! baseline taken before the install, and its executor is set to `worker` (D313).
+//! baseline taken once the install has returned, and its executor is set to `worker` (D313). Each
+//! session is bounded ([`Timings`]), and remote text is sanitised before it is printed.
 //!
 //! Every remote script is a constant in [`script`]. Values reach a script only as quoted
 //! positional arguments. The DSN and the sudo password travel only on the ssh child's stdin:
@@ -22,6 +23,7 @@ pub mod secret_prompt;
 pub mod verify;
 
 use std::io::Write;
+use std::time::Duration;
 
 use htui_core::model::BoxId;
 use htui_store::dsn::DsnHost;
@@ -91,13 +93,7 @@ impl Payload {
     #[must_use]
     pub fn new(bytes: Vec<u8>, arch: &str) -> Self {
         let digest = sha2::Sha256::digest(&bytes);
-        let sha = digest
-            .iter()
-            .fold(String::with_capacity(64), |mut hex, byte| {
-                use core::fmt::Write as _;
-                let _ = write!(hex, "{byte:02x}");
-                hex
-            });
+        let sha = format!("{digest:x}");
         Self {
             bytes,
             arch: arch.to_owned(),
@@ -134,7 +130,7 @@ impl Payload {
     }
 }
 
-/// The waits (D305; E-10).
+/// The waits (D305; E-10) and the bound on each ssh session (review finding 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timings {
     /// VERIFY's checks inside its one session.
@@ -143,18 +139,50 @@ pub struct Timings {
     pub verify_pause_secs: u32,
     /// The local `box_seen` poll.
     pub poll: verify::Poll,
+    /// The preflight session's bound; past it the run is refused (nothing was written).
+    pub preflight_limit: Duration,
+    /// PREPARE's bound without an upload.
+    pub prepare_limit: Duration,
+    /// Added to [`Timings::prepare_limit`] for each MiB uploaded.
+    pub upload_per_mib: Duration,
+    /// INSTALL's bound.
+    pub install_limit: Duration,
+    /// VERIFY's bound beyond its own `verify_tries` × `verify_pause_secs`.
+    pub verify_slack: Duration,
 }
 
 impl Timings {
-    /// 30 checks 2 s apart; poll every 2 s for up to 60 s.
+    /// 30 checks 2 s apart (58 s of waiting); a poll every 2 s for one box heartbeat plus 30 s
+    /// (90 s), because the baseline is taken after INSTALL and a fast new worker may already be in
+    /// it (review finding 3). Sessions: 120 s for the preflight, 120 s plus 2 s per uploaded MiB
+    /// for PREPARE, 300 s for INSTALL, VERIFY's own wait plus 120 s.
     pub const PRODUCTION: Self = Self {
         verify_tries: 30,
         verify_pause_secs: 2,
         poll: verify::Poll {
-            interval: std::time::Duration::from_secs(2),
-            deadline: std::time::Duration::from_secs(60),
+            interval: Duration::from_secs(2),
+            deadline: htui_store::connect::BOX_HEARTBEAT.saturating_add(Duration::from_secs(30)),
         },
+        preflight_limit: Duration::from_secs(120),
+        prepare_limit: Duration::from_secs(120),
+        upload_per_mib: Duration::from_secs(2),
+        install_limit: Duration::from_secs(300),
+        verify_slack: Duration::from_secs(120),
     };
+
+    /// How long VERIFY waits at most, in seconds: the pauses between its checks (review finding
+    /// 13), `(tries - 1) × pause`.
+    #[must_use]
+    pub fn verify_wait_secs(&self) -> u64 {
+        u64::from(self.verify_tries.saturating_sub(1)) * u64::from(self.verify_pause_secs)
+    }
+
+    /// VERIFY's session bound: its own wait plus [`Timings::verify_slack`].
+    #[must_use]
+    pub fn verify_limit(&self) -> Duration {
+        let wait = u64::from(self.verify_tries) * u64::from(self.verify_pause_secs);
+        Duration::from_secs(wait).saturating_add(self.verify_slack)
+    }
 }
 
 /// Everything `run_with` needs (D309). `Debug` redacts the DSN and summarises the payload.
@@ -284,10 +312,15 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
 
     // 3–4: the preflight.
     note(err, dest, "preflight");
-    let answer = remote
-        .run(&script::remote_command(script::PREFLIGHT, &[root]), b"")
-        .await
-        .map_err(|e| refused(dest, &format!("cannot run ssh: {e}")))?;
+    let answer = bounded(
+        remote,
+        &format!("the preflight on {dest}"),
+        timings.preflight_limit,
+        &script::remote_command(script::PREFLIGHT, &[root]),
+        b"",
+    )
+    .await
+    .map_err(|reason| refused(dest, &reason))?;
     let facts = match Facts::parse(&answer.stdout_text()) {
         Ok(facts) => facts,
         Err(FactsError::NoPreflight) if answer.code != Some(0) => {
@@ -333,14 +366,22 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
         Decision::Steps { upload, sudo } => (upload, sudo),
     };
 
-    // 7: the sudo password, before anything is written.
+    // 7: the sudo password, before anything is written. The prompt goes where the answer is read
+    // from, the terminal, when the prompter has one (review finding 10).
     let password = match sudo {
         SudoMode::NoPassword => None,
         SudoMode::Password => {
-            let _ = write!(err, "[sudo] password for {} on {dest}: ", facts.user);
-            let _ = err.flush();
+            let mut terminal = prompter.prompt_writer();
+            let shown: &mut dyn Write = match terminal.as_mut() {
+                Some(terminal) => terminal,
+                None => &mut *err,
+            };
+            let _ = write!(shown, "[sudo] password for {} on {dest}: ", facts.user);
+            let _ = shown.flush();
             let answer = prompter.ask().await;
-            let _ = writeln!(err);
+            let _ = writeln!(shown);
+            let _ = shown.flush();
+            drop(terminal);
             match answer {
                 Ok(password) => Some(password),
                 Err(PromptError::Aborted) => {
@@ -360,22 +401,29 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
         }
     };
 
-    // 8: the baseline never fails the run; its reason is kept for step 12.
-    let baseline = verifier.baseline(&dsn).await;
-
-    // 9: PREPARE, the first remote write. From here every exit is a failure.
+    // 8: PREPARE, the first remote write. From here every exit is a failure.
+    let mib = payload.bytes().len().div_ceil(1024 * 1024);
     if upload {
-        let mib = payload.bytes().len().div_ceil(1024 * 1024);
         note(err, dest, &format!("uploading htui ({mib} MiB)"));
     }
     let send = if upload { "1" } else { "0" };
-    let prepared = remote
-        .run(
-            &script::remote_command(script::PREPARE, &[root, &facts.home, send, payload.sha()]),
-            if upload { payload.bytes() } else { b"" },
-        )
-        .await
-        .map_err(|e| failed(dest, &format!("cannot run ssh: {e}")))?;
+    let prepare_limit = if upload {
+        let per = timings
+            .upload_per_mib
+            .saturating_mul(u32::try_from(mib).unwrap_or(u32::MAX));
+        timings.prepare_limit.saturating_add(per)
+    } else {
+        timings.prepare_limit
+    };
+    let prepared = bounded(
+        remote,
+        &format!("preparing {dest}"),
+        prepare_limit,
+        &script::remote_command(script::PREPARE, &[root, &facts.home, send, payload.sha()]),
+        if upload { payload.bytes() } else { b"" },
+    )
+    .await
+    .map_err(|reason| failed(dest, &reason))?;
     match prepared.code {
         Some(0) => {}
         Some(3) => {
@@ -407,7 +455,7 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
         }
     }
 
-    // 10: INSTALL, under sudo.
+    // 9: INSTALL, under sudo.
     note(err, dest, "installing the service");
     let mode = match sudo {
         SudoMode::Password => "password",
@@ -416,36 +464,62 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
     let replace = if replace_credential { "1" } else { "0" };
     let stdin = install_stdin(password.as_ref().map(|p| p.as_str()), &dsn);
     drop(password);
-    let installed = remote
-        .run(
-            &script::remote_command(
-                script::INSTALL,
-                &[
-                    root,
-                    &facts.user,
-                    &facts.home,
-                    replace,
-                    mode,
-                    script::INSTALL_ROOT,
-                ],
-            ),
-            &stdin,
-        )
-        .await;
+    let installed = bounded(
+        remote,
+        &format!("installing the service on {dest}"),
+        timings.install_limit,
+        &script::remote_command(
+            script::INSTALL,
+            &[
+                root,
+                &facts.user,
+                &facts.home,
+                replace,
+                mode,
+                script::INSTALL_ROOT,
+            ],
+        ),
+        &stdin,
+    )
+    .await;
     drop(stdin);
-    let installed = installed.map_err(|e| failed(dest, &format!("cannot run ssh: {e}")))?;
+    let installed = installed.map_err(|reason| failed(dest, &reason))?;
     if installed.code != Some(0) {
         let root_started = installed
             .stdout_text()
             .lines()
             .any(|line| line.trim_end() == script::ROOT_MARKER);
-        if installed.code == Some(4) || !root_started {
+        if !root_started && matches!(installed.code, Some(255) | None) {
             return Err(failed(
                 dest,
-                &format!(
-                    "sudo refused the password (or needs a tty or a second factor) on {dest}; \
-                     nothing privileged was written"
+                &with_detail(
+                    &format!(
+                        "the ssh session to {dest} dropped before the privileged part (exit {}); \
+                         nothing privileged was written",
+                        exit_text(installed.code)
+                    ),
+                    &installed.last_stderr_line(),
                 ),
+            ));
+        }
+        if installed.code == Some(4) || !root_started {
+            let refusal = match sudo {
+                SudoMode::Password => {
+                    "sudo refused the password (or needs a tty or a second factor)"
+                }
+                SudoMode::NoPassword => {
+                    "sudo refused to run the installer as root (or needs a tty)"
+                }
+            };
+            let said = installed.last_stderr_line();
+            let said = if said.is_empty() {
+                String::new()
+            } else {
+                format!(" ({said})")
+            };
+            return Err(failed(
+                dest,
+                &format!("{refusal} on {dest}{said}; nothing privileged was written"),
             ));
         }
         return Err(failed(
@@ -460,11 +534,15 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
         ));
     }
 
+    // 10: the baseline, once INSTALL has started or restarted the service, so no heartbeat of an
+    // old worker counts (review finding 3). It never fails the run; its reason is kept for 12.
+    let baseline = verifier.baseline(&dsn).await;
+
     // 11: VERIFY, inside one session.
     note(err, dest, "waiting for the worker");
-    let checked = verify_session(remote, root, &facts.home, timings)
+    let checked = verify_session(remote, dest, root, &facts.home, timings)
         .await
-        .map_err(|e| failed(dest, &format!("cannot run ssh: {e}")))?;
+        .map_err(|reason| failed(dest, &reason))?;
     match checked.code {
         Some(0) => {}
         Some(5) => {
@@ -478,8 +556,9 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
                 dest,
                 &format!(
                     "the htui-worker service on {dest} did not start with a box.toml within {} s \
-                     (systemctl says {state}); its last journal and log lines follow:\n{}",
-                    u64::from(timings.verify_tries) * u64::from(timings.verify_pause_secs),
+                     (systemctl says {state}); if the worker cannot use its DSN, fix it and \
+                     re-run with --replace-credential; its last journal and log lines follow:\n{}",
+                    timings.verify_wait_secs(),
                     stderr.trim_end()
                 ),
             ));
@@ -508,7 +587,19 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
     // 12: Postgres, from here; a warning at worst.
     let (verified, executor_set) = match baseline {
         Ok(baseline) => match verifier.box_seen(id, &baseline, timings.poll).await {
-            Ok(()) => (true, set_executor(verifier, id, dest, err).await.is_some()),
+            Ok(()) => {
+                if baseline.contains_key(&id) {
+                    // Review finding 3: no new row, only a later last_seen_at, which any htui on
+                    // the host with the same box.toml (a TUI over ssh) also moves.
+                    let _ = writeln!(
+                        err,
+                        "note: box {id} was registered before this install, so the check-in is \
+                         best-effort: an htui TUI on {dest} with the same box.toml would also \
+                         count"
+                    );
+                }
+                (true, set_executor(verifier, id, dest, err).await.is_some())
+            }
             Err(reason) => {
                 not_verified(
                     err,
@@ -531,7 +622,7 @@ pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionEx
     let _ = writeln!(
         out,
         "box {id} ({}) provisioned on {dest}",
-        identity.hostname
+        remote::sanitise(&identity.hostname)
     );
     let _ = writeln!(
         err,
@@ -572,17 +663,17 @@ impl<R: Remote> Finish<'_, '_, R> {
             out,
             err,
         } = self;
-        let _ = writeln!(
-            err,
-            "(--replace-credential re-encrypts the DSN and restarts the service)"
-        );
         note(
             err,
             dest,
             "already provisioned with this build; reading its box",
         );
-        let identity = match verify_session(remote, root, &facts.home, timings).await {
-            Err(e) => Err(format!("cannot run ssh: {e}")),
+        let _ = writeln!(
+            err,
+            "(--replace-credential re-encrypts the DSN and restarts the service)"
+        );
+        let identity = match verify_session(remote, dest, root, &facts.home, timings).await {
+            Err(reason) => Err(reason),
             Ok(checked) if checked.code == Some(0) => read_box(&checked),
             Ok(checked) => Err(with_detail(
                 &format!("the check exited {}", exit_text(checked.code)),
@@ -594,8 +685,9 @@ impl<R: Remote> Finish<'_, '_, R> {
             Err(reason) => {
                 let _ = writeln!(
                     err,
-                    "warning: the box on {dest} could not be read: {reason}; if its executor is \
-                     not worker yet, set it in Settings › Boxes"
+                    "warning: the box on {dest} could not be read: {}; if its executor is not \
+                     worker yet, set it in Settings › Boxes",
+                    remote::sanitise(&reason)
                 );
                 let _ = writeln!(
                     out,
@@ -620,27 +712,59 @@ impl<R: Remote> Finish<'_, '_, R> {
         let _ = writeln!(
             out,
             "{dest} is already provisioned with this build; box {id} ({}){suffix}",
-            identity.hostname
+            remote::sanitise(&identity.hostname)
         );
         Outcome::AlreadyProvisioned
     }
 }
 
-/// VERIFY with `Ctx.timings` (E-10).
+/// VERIFY with `Ctx.timings` (E-10), bounded by [`Timings::verify_limit`].
 async fn verify_session<R: Remote>(
     remote: &R,
+    dest: &str,
     root: &str,
     home: &str,
     timings: Timings,
-) -> std::io::Result<RemoteOutput> {
+) -> Result<RemoteOutput, String> {
     let tries = timings.verify_tries.to_string();
     let pause = timings.verify_pause_secs.to_string();
-    remote
-        .run(
-            &script::remote_command(script::VERIFY, &[root, home, &tries, &pause]),
-            b"",
-        )
-        .await
+    bounded(
+        remote,
+        &format!("waiting for the worker on {dest}"),
+        timings.verify_limit(),
+        &script::remote_command(script::VERIFY, &[root, home, &tries, &pause]),
+        b"",
+    )
+    .await
+}
+
+/// One session, given at most `limit` (review finding 2). On the timeout the session's future is
+/// dropped, and with it the local `ssh`, which `run_piped`'s `kill_on_drop` kills. `Err` is the
+/// sentence: `cannot run ssh: …`, or `<what> did not finish within …`.
+async fn bounded<R: Remote>(
+    remote: &R,
+    what: &str,
+    limit: Duration,
+    command: &str,
+    stdin: &[u8],
+) -> Result<RemoteOutput, String> {
+    match tokio::time::timeout(limit, remote.run(command, stdin)).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(format!("cannot run ssh: {e}")),
+        Err(_) => Err(format!(
+            "{what} did not finish within {}; its ssh session was closed",
+            duration_text(limit)
+        )),
+    }
+}
+
+/// `120 s`, or `50 ms` under a second.
+fn duration_text(limit: Duration) -> String {
+    if limit.as_secs() > 0 {
+        format!("{} s", limit.as_secs())
+    } else {
+        format!("{} ms", limit.as_millis())
+    }
 }
 
 /// The `box.toml` VERIFY printed between its markers.
@@ -774,14 +898,19 @@ fn read_dsn(dsn_stdin: bool, dest: &str) -> Result<Zeroizing<String>, ProvisionE
     }
 }
 
-/// `not provisioning {dest}: {sentence}`.
+/// `not provisioning {dest}: {sentence}`, sanitised: it may quote the remote host (review finding
+/// 9).
 fn refused(dest: &str, sentence: &str) -> ProvisionExit {
-    ProvisionExit::Refused(format!("not provisioning {dest}: {sentence}"))
+    ProvisionExit::Refused(remote::sanitise(&format!(
+        "not provisioning {dest}: {sentence}"
+    )))
 }
 
-/// `provisioning {dest} failed: {sentence}`.
+/// `provisioning {dest} failed: {sentence}`, sanitised like [`refused`].
 fn failed(dest: &str, sentence: &str) -> ProvisionExit {
-    ProvisionExit::Failed(format!("provisioning {dest} failed: {sentence}"))
+    ProvisionExit::Failed(remote::sanitise(&format!(
+        "provisioning {dest} failed: {sentence}"
+    )))
 }
 
 /// A progress line (D307); a write error is ignored.
@@ -789,12 +918,13 @@ fn note(err: &mut dyn Write, dest: &str, what: &str) {
     let _ = writeln!(err, "provisioning {dest}: {what}");
 }
 
-/// `sentence: detail`, or the sentence alone when there is no detail.
+/// `sentence: detail`, or the sentence alone when there is no detail; the detail, remote text, is
+/// sanitised (review finding 9).
 fn with_detail(sentence: &str, detail: &str) -> String {
     if detail.is_empty() {
         sentence.to_owned()
     } else {
-        format!("{sentence}: {detail}")
+        format!("{sentence}: {}", remote::sanitise(detail))
     }
 }
 
@@ -807,9 +937,8 @@ fn exit_text(code: Option<i32>) -> String {
 mod tests {
     use std::collections::VecDeque;
     use std::io;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex};
 
     use futures::future::BoxFuture;
 
@@ -829,6 +958,21 @@ mod tests {
             interval: Duration::from_millis(10),
             deadline: Duration::from_millis(50),
         },
+        preflight_limit: Duration::from_secs(10),
+        prepare_limit: Duration::from_secs(10),
+        upload_per_mib: Duration::from_secs(1),
+        install_limit: Duration::from_secs(10),
+        verify_slack: Duration::from_secs(10),
+    };
+
+    /// Every bound 50 ms, for the sessions that never end.
+    const SHORT: Timings = Timings {
+        preflight_limit: Duration::from_millis(50),
+        prepare_limit: Duration::from_millis(50),
+        upload_per_mib: Duration::ZERO,
+        install_limit: Duration::from_millis(50),
+        verify_slack: Duration::from_millis(50),
+        ..TIMINGS
     };
 
     /// Answers each session from a script and records what it was asked.
@@ -836,13 +980,17 @@ mod tests {
     struct ScriptedRemote {
         answers: Mutex<VecDeque<io::Result<RemoteOutput>>>,
         calls: Mutex<Vec<(String, Vec<u8>)>>,
+        /// The session (by index) that never ends.
+        hang_at: Option<usize>,
+        /// Shared with a [`FakeVerifier`] to see the two in one order.
+        timeline: Arc<Mutex<Vec<String>>>,
     }
 
     impl ScriptedRemote {
         fn new(answers: Vec<io::Result<RemoteOutput>>) -> Self {
             Self {
                 answers: Mutex::new(answers.into()),
-                calls: Mutex::default(),
+                ..Self::default()
             }
         }
 
@@ -877,10 +1025,18 @@ mod tests {
 
     impl Remote for ScriptedRemote {
         async fn run(&self, command: &str, stdin: &[u8]) -> io::Result<RemoteOutput> {
-            self.calls
+            let index = {
+                let mut calls = self.calls.lock().expect("calls");
+                calls.push((command.to_owned(), stdin.to_vec()));
+                calls.len() - 1
+            };
+            self.timeline
                 .lock()
-                .expect("calls")
-                .push((command.to_owned(), stdin.to_vec()));
+                .expect("timeline")
+                .push(session(command).to_owned());
+            if self.hang_at == Some(index) {
+                std::future::pending::<()>().await;
+            }
             self.answers
                 .lock()
                 .expect("answers")
@@ -908,6 +1064,8 @@ mod tests {
         seen: Result<(), String>,
         executor: Result<bool, String>,
         log: Mutex<Vec<String>>,
+        /// See [`ScriptedRemote::timeline`].
+        timeline: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeVerifier {
@@ -917,18 +1075,24 @@ mod tests {
                 seen: Ok(()),
                 executor: Ok(true),
                 log: Mutex::default(),
+                timeline: Arc::default(),
             }
         }
 
         fn log(&self) -> Vec<String> {
             self.log.lock().expect("log").clone()
         }
+
+        fn note(&self, call: String) {
+            self.timeline.lock().expect("timeline").push(call.clone());
+            self.log.lock().expect("log").push(call);
+        }
     }
 
     impl Verifier for FakeVerifier {
         fn baseline<'a>(&'a self, dsn: &'a str) -> BoxFuture<'a, Result<Baseline, String>> {
             assert_eq!(dsn, DSN, "the baseline connects with the DSN being shipped");
-            self.log.lock().expect("log").push("baseline".to_owned());
+            self.note("baseline".to_owned());
             Box::pin(futures::future::ready(self.baseline.clone()))
         }
 
@@ -938,19 +1102,34 @@ mod tests {
             _baseline: &'a Baseline,
             _poll: Poll,
         ) -> BoxFuture<'a, Result<(), String>> {
-            self.log
-                .lock()
-                .expect("log")
-                .push(format!("box_seen({id})"));
+            self.note(format!("box_seen({id})"));
             Box::pin(futures::future::ready(self.seen.clone()))
         }
 
         fn set_executor(&self, id: BoxId) -> BoxFuture<'_, Result<bool, String>> {
-            self.log
-                .lock()
-                .expect("log")
-                .push(format!("set_executor({id})"));
+            self.note(format!("set_executor({id})"));
             Box::pin(futures::future::ready(self.executor.clone()))
+        }
+    }
+
+    /// A `Write` into a shared buffer: the fake terminal of [`FakePrompt::terminal`].
+    #[derive(Debug, Clone, Default)]
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Shared {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("buffer").clone()).expect("utf-8")
         }
     }
 
@@ -958,6 +1137,8 @@ mod tests {
     struct FakePrompt {
         answer: Result<&'static str, PromptError>,
         count: AtomicUsize,
+        /// `Some`: the prompt's own terminal (review finding 10).
+        terminal: Option<Shared>,
     }
 
     impl FakePrompt {
@@ -965,6 +1146,7 @@ mod tests {
             Self {
                 answer,
                 count: AtomicUsize::new(0),
+                terminal: None,
             }
         }
 
@@ -978,6 +1160,12 @@ mod tests {
             self.count.fetch_add(1, Ordering::SeqCst);
             let answer = self.answer.map(|p| Zeroizing::new(p.to_owned()));
             Box::pin(futures::future::ready(answer))
+        }
+
+        fn prompt_writer(&self) -> Option<Box<dyn Write + Send>> {
+            self.terminal
+                .clone()
+                .map(|t| Box::new(t) as Box<dyn Write + Send>)
         }
     }
 
@@ -1050,6 +1238,27 @@ mod tests {
         prompter: &FakePrompt,
         verifier: &FakeVerifier,
     ) -> Ran {
+        drive_with(
+            TIMINGS,
+            dest,
+            dsn,
+            replace_credential,
+            remote,
+            prompter,
+            verifier,
+        )
+        .await
+    }
+
+    async fn drive_with(
+        timings: Timings,
+        dest: &str,
+        dsn: &str,
+        replace_credential: bool,
+        remote: &ScriptedRemote,
+        prompter: &FakePrompt,
+        verifier: &FakeVerifier,
+    ) -> Ran {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let result = run_with(Ctx {
@@ -1061,7 +1270,7 @@ mod tests {
             dsn: Zeroizing::new(dsn.to_owned()),
             prompter,
             verifier,
-            timings: TIMINGS,
+            timings,
             out: &mut out,
             err: &mut err,
         })
@@ -1306,6 +1515,16 @@ mod tests {
                  to worker\n"
             )
         );
+        // Review finding 14: the progress line, then the hint.
+        let progress = ran
+            .err
+            .find("provisioning alice@box1: already provisioned with this build; reading its box")
+            .expect("the progress line");
+        let hint = ran
+            .err
+            .find("(--replace-credential re-encrypts the DSN and restarts the service)")
+            .expect("the hint");
+        assert!(progress < hint, "{}", ran.err);
 
         // Already `worker`: the same, without the suffix.
         let remote = ScriptedRemote::new(vec![provisioned(), verified()]);
@@ -1528,8 +1747,8 @@ mod tests {
 
     #[tokio::test]
     async fn exit_codes_map_to_their_sentences() {
-        let sudo_refused = "provisioning alice@box1 failed: sudo refused the password (or needs a \
-                            tty or a second factor) on alice@box1; nothing privileged was written";
+        let sudo_refused = "provisioning alice@box1 failed: sudo refused to run the installer as \
+                            root (or needs a tty) on alice@box1; nothing privileged was written";
         let cases: Vec<(Vec<io::Result<RemoteOutput>>, String)> =
             vec![
             (
@@ -1558,7 +1777,39 @@ mod tests {
             (vec![ok(""), exit(4, "", "")], sudo_refused.to_owned()),
             (
                 vec![ok(""), exit(1, "", "sudo: a password is required\n")],
-                sudo_refused.to_owned(),
+                "provisioning alice@box1 failed: sudo refused to run the installer as root (or \
+                 needs a tty) on alice@box1 (sudo: a password is required); nothing privileged \
+                 was written"
+                    .to_owned(),
+            ),
+            (
+                vec![ok(""), exit(255, "", "Connection reset by peer\n")],
+                "provisioning alice@box1 failed: the ssh session to alice@box1 dropped before the \
+                 privileged part (exit 255); nothing privileged was written: Connection reset \
+                 by peer"
+                    .to_owned(),
+            ),
+            (
+                vec![
+                    ok(""),
+                    Ok(RemoteOutput {
+                        code: None,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    }),
+                ],
+                "provisioning alice@box1 failed: the ssh session to alice@box1 dropped before the \
+                 privileged part (exit by a signal); nothing privileged was written"
+                    .to_owned(),
+            ),
+            (
+                vec![
+                    ok(""),
+                    exit(255, "htui.root=start\n", "Connection reset by peer\n"),
+                ],
+                "provisioning alice@box1 failed: installing the service on alice@box1 failed \
+                 (exit 255): Connection reset by peer"
+                    .to_owned(),
             ),
             (
                 vec![
@@ -1576,8 +1827,9 @@ mod tests {
                     exit(5, "htui.active=activating\n", "a journal line\na log line\n"),
                 ],
                 "provisioning alice@box1 failed: the htui-worker service on alice@box1 did not \
-                 start with a box.toml within 0 s (systemctl says activating); its last journal \
-                 and log lines follow:\na journal line\na log line"
+                 start with a box.toml within 0 s (systemctl says activating); if the worker \
+                 cannot use its DSN, fix it and re-run with --replace-credential; its last \
+                 journal and log lines follow:\na journal line\na log line"
                     .to_owned(),
             ),
             (
@@ -1704,5 +1956,275 @@ mod tests {
         let install = String::from_utf8(remote.stdin_of("INSTALL")).expect("utf-8");
         assert!(install.contains("SENTINEL-SUDO-PW") && install.contains("SENTINEL-DSN-PW"));
         assert!(remote.command_of("INSTALL").contains(" 1 password '"));
+    }
+
+    /// Review finding 8: every session's whole `ssh` argv, as `SshRemote` would spawn it, is free
+    /// of both sentinels.
+    #[tokio::test]
+    async fn ssh_argv_of_every_session_carries_no_sentinel() {
+        let remote = ScriptedRemote::new(vec![
+            preflight(&[]),
+            ok(""),
+            ok("htui.root=start\n"),
+            verified(),
+        ]);
+        let prompt = FakePrompt::new(Ok(PASSWORD));
+        let verifier = FakeVerifier::new();
+        let ran = drive(DEST, DSN, true, &remote, &prompt, &verifier).await;
+        assert!(ran.result.is_ok());
+        assert_eq!(
+            remote.sessions(),
+            ["PREFLIGHT", "PREPARE", "INSTALL", "VERIFY"]
+        );
+        for (command, _) in remote.calls() {
+            let argv = remote::ssh_argv(DEST, &command);
+            assert_eq!(
+                argv.last().map(|a| a.to_string_lossy().into_owned()),
+                Some(command)
+            );
+            for arg in argv {
+                let arg = arg.to_string_lossy();
+                assert!(
+                    !arg.contains("SENTINEL"),
+                    "an ssh argument holds a sentinel"
+                );
+                assert!(!arg.contains(DSN) && !arg.contains(PASSWORD));
+            }
+        }
+    }
+
+    /// Review finding 3: the baseline comes after INSTALL, before VERIFY.
+    #[tokio::test]
+    async fn the_baseline_is_taken_after_install() {
+        let timeline: Arc<Mutex<Vec<String>>> = Arc::default();
+        let remote = ScriptedRemote {
+            timeline: Arc::clone(&timeline),
+            ..fresh(true, vec![ok(""), ok("htui.root=start\n"), verified()])
+        };
+        let prompt = FakePrompt::new(Ok(PASSWORD));
+        let verifier = FakeVerifier {
+            timeline: Arc::clone(&timeline),
+            ..FakeVerifier::new()
+        };
+        let ran = drive(DEST, DSN, false, &remote, &prompt, &verifier).await;
+        assert!(ran.result.is_ok());
+        assert_eq!(
+            *timeline.lock().expect("timeline"),
+            [
+                "PREFLIGHT".to_owned(),
+                "PREPARE".to_owned(),
+                "INSTALL".to_owned(),
+                "baseline".to_owned(),
+                "VERIFY".to_owned(),
+                format!("box_seen({BOX})"),
+                format!("set_executor({BOX})"),
+            ]
+        );
+        assert!(!ran.err.contains("best-effort"), "a new box needs no note");
+
+        // INSTALL that fails takes no baseline.
+        let remote = fresh(true, vec![ok(""), exit(4, "", "")]);
+        let verifier = FakeVerifier::new();
+        let ran = drive(DEST, DSN, false, &remote, &prompt, &verifier).await;
+        expect_exit(&ran, 1);
+        assert!(verifier.log().is_empty());
+    }
+
+    /// Review finding 3: a box already in the baseline (a re-provision) is verified only by a
+    /// later last_seen_at, and the run says that is best-effort.
+    #[tokio::test]
+    async fn a_box_already_in_the_baseline_is_verified_best_effort() {
+        let remote = fresh(true, vec![ok(""), ok("htui.root=start\n"), verified()]);
+        let prompt = FakePrompt::new(Ok(PASSWORD));
+        let before = chrono::Utc::now();
+        let verifier = FakeVerifier {
+            baseline: Ok([(box_id(), before)].into_iter().collect()),
+            ..FakeVerifier::new()
+        };
+        let ran = drive(DEST, DSN, true, &remote, &prompt, &verifier).await;
+        assert!(matches!(
+            ran.result,
+            Ok(Outcome::Provisioned {
+                verified: true,
+                executor_set: true,
+                ..
+            })
+        ));
+        assert!(
+            ran.err.contains(&format!(
+                "note: box {BOX} was registered before this install, so the check-in is \
+                 best-effort: an htui TUI on alice@box1 with the same box.toml would also count\n"
+            )),
+            "{}",
+            ran.err
+        );
+    }
+
+    /// Review finding 2: a session that never ends is closed at its bound: a refusal for the
+    /// preflight, a failure after it.
+    #[tokio::test]
+    async fn a_session_that_never_ends_is_bounded() {
+        let cases = [
+            (
+                0,
+                2,
+                "not provisioning alice@box1: the preflight on alice@box1 did not finish within \
+                 50 ms; its ssh session was closed",
+            ),
+            (
+                1,
+                1,
+                "provisioning alice@box1 failed: preparing alice@box1 did not finish within 50 \
+                 ms; its ssh session was closed",
+            ),
+            (
+                2,
+                1,
+                "provisioning alice@box1 failed: installing the service on alice@box1 did not \
+                 finish within 50 ms; its ssh session was closed",
+            ),
+            (
+                3,
+                1,
+                "provisioning alice@box1 failed: waiting for the worker on alice@box1 did not \
+                 finish within 50 ms; its ssh session was closed",
+            ),
+        ];
+        for (hang_at, code, expected) in cases {
+            let remote = ScriptedRemote {
+                hang_at: Some(hang_at),
+                ..fresh(true, vec![ok(""), ok("htui.root=start\n"), verified()])
+            };
+            let prompt = FakePrompt::new(Ok(PASSWORD));
+            let verifier = FakeVerifier::new();
+            let ran = tokio::time::timeout(
+                Duration::from_secs(10),
+                drive_with(SHORT, DEST, DSN, false, &remote, &prompt, &verifier),
+            )
+            .await
+            .expect("the run ends at the bound");
+            assert_eq!(expect_exit(&ran, code), expected);
+            assert_eq!(remote.calls().len(), hang_at + 1);
+        }
+    }
+
+    #[test]
+    fn the_production_bounds() {
+        let t = Timings::PRODUCTION;
+        assert_eq!(t.verify_wait_secs(), 58, "29 pauses of 2 s");
+        assert_eq!(t.verify_limit(), Duration::from_secs(180));
+        assert_eq!(t.poll.deadline, Duration::from_secs(90));
+        assert_eq!(t.preflight_limit, Duration::from_secs(120));
+        assert_eq!(t.install_limit, Duration::from_secs(300));
+        assert_eq!(duration_text(Duration::from_millis(50)), "50 ms");
+        assert_eq!(duration_text(Duration::from_secs(120)), "120 s");
+    }
+
+    /// Review finding 4: in password mode the sentence names the password and quotes sudo.
+    #[tokio::test]
+    async fn a_refused_password_quotes_sudo() {
+        let remote = fresh(
+            false,
+            vec![
+                ok(""),
+                exit(
+                    1,
+                    "",
+                    "Sorry, try again.\nsudo: 3 incorrect password attempts\n",
+                ),
+            ],
+        );
+        let prompt = FakePrompt::new(Ok(PASSWORD));
+        let verifier = FakeVerifier::new();
+        let ran = drive(DEST, DSN, false, &remote, &prompt, &verifier).await;
+        assert_eq!(
+            expect_exit(&ran, 1),
+            "provisioning alice@box1 failed: sudo refused the password (or needs a tty or a \
+             second factor) on alice@box1 (sudo: 3 incorrect password attempts); nothing \
+             privileged was written"
+        );
+    }
+
+    /// Review finding 9: remote text reaches neither stream nor the exit sentence with a control
+    /// character other than a newline or a tab.
+    #[tokio::test]
+    async fn remote_text_is_sanitised_before_it_reaches_the_terminal() {
+        let raw = |text: &str| {
+            text.chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+        };
+
+        let remote = fresh(
+            true,
+            vec![
+                ok(""),
+                ok("htui.root=start\n"),
+                exit(
+                    5,
+                    "htui.active=\u{1b}[2Jfailed\n",
+                    "\u{1b}]0;owned\u{7}a journal line\n",
+                ),
+            ],
+        );
+        let prompt = FakePrompt::new(Ok(PASSWORD));
+        let verifier = FakeVerifier::new();
+        let ran = drive(DEST, DSN, false, &remote, &prompt, &verifier).await;
+        let sentence = expect_exit(&ran, 1);
+        assert!(!raw(&sentence), "{sentence:?}");
+        assert!(
+            sentence.contains("\\u{1b}]0;owned\\u{7}a journal line"),
+            "{sentence}"
+        );
+        assert!(
+            sentence.contains("systemctl says \\u{1b}[2Jfailed"),
+            "{sentence}"
+        );
+
+        let remote = ScriptedRemote::new(vec![preflight(&[("os", "Plan9\u{1b}[2J")])]);
+        let ran = drive(DEST, DSN, false, &remote, &prompt, &verifier).await;
+        let sentence = expect_exit(&ran, 2);
+        assert!(!raw(&sentence), "{sentence:?}");
+
+        let remote = fresh(
+            true,
+            vec![
+                ok(""),
+                ok("htui.root=start\n"),
+                ok(&format!(
+                    "{}\nbox_id = \"{BOX}\"\nhostname = \"box1\\u001b]0;owned\\u0007\"\n{}\n",
+                    script::BOX_BEGIN,
+                    script::BOX_END
+                )),
+            ],
+        );
+        let verifier = FakeVerifier::new();
+        let ran = drive(DEST, DSN, false, &remote, &prompt, &verifier).await;
+        assert!(ran.result.is_ok(), "{:?}", ran.result);
+        assert!(!raw(&ran.out), "{:?}", ran.out);
+        assert!(!raw(&ran.err), "{:?}", ran.err);
+        assert_eq!(
+            ran.out,
+            format!("box {BOX} (box1\\u{{1b}}]0;owned\\u{{7}}) provisioned on {DEST}\n")
+        );
+    }
+
+    /// Review finding 10: with a terminal of its own, the prompt and its newline go there, not to
+    /// stderr.
+    #[tokio::test]
+    async fn the_prompt_goes_to_the_prompters_terminal() {
+        let remote = fresh(false, vec![ok(""), ok("htui.root=start\n"), verified()]);
+        let terminal = Shared::default();
+        let prompt = FakePrompt {
+            terminal: Some(terminal.clone()),
+            ..FakePrompt::new(Ok(PASSWORD))
+        };
+        let verifier = FakeVerifier::new();
+        let ran = drive(DEST, DSN, false, &remote, &prompt, &verifier).await;
+        assert!(ran.result.is_ok());
+        assert_eq!(
+            terminal.text(),
+            "[sudo] password for alice on alice@box1: \n"
+        );
+        assert!(!ran.err.contains("[sudo]"), "{}", ran.err);
     }
 }

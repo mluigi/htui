@@ -29,18 +29,19 @@ impl RemoteOutput {
         String::from_utf8_lossy(&self.stdout)
     }
 
-    /// The last non-empty stderr line, trimmed; `""` when there is none.
+    /// The last non-empty stderr line, trimmed and [`sanitise`]d; `""` when there is none.
     #[must_use]
     pub fn last_stderr_line(&self) -> String {
-        String::from_utf8_lossy(&self.stderr)
-            .lines()
-            .map(str::trim)
-            .rfind(|line| !line.is_empty())
-            .unwrap_or_default()
-            .to_owned()
+        sanitise(
+            String::from_utf8_lossy(&self.stderr)
+                .lines()
+                .map(str::trim)
+                .rfind(|line| !line.is_empty())
+                .unwrap_or_default(),
+        )
     }
 
-    /// The last `n` non-empty stderr lines, joined by `\n`.
+    /// The last `n` non-empty stderr lines, joined by `\n` and [`sanitise`]d.
     #[must_use]
     pub fn stderr_tail(&self, n: usize) -> String {
         let text = String::from_utf8_lossy(&self.stderr);
@@ -49,8 +50,24 @@ impl RemoteOutput {
             .map(str::trim_end)
             .filter(|line| !line.trim().is_empty())
             .collect();
-        lines[lines.len().saturating_sub(n)..].join("\n")
+        sanitise(&lines[lines.len().saturating_sub(n)..].join("\n"))
     }
+}
+
+/// Remote text made safe to print (review finding 9): every control character but `\n` and `\t`
+/// becomes its [`char::escape_default`] form, so an ESC or OSC sequence from the remote host is
+/// shown as text instead of driving this terminal. Idempotent.
+#[must_use]
+pub fn sanitise(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() && c != '\n' && c != '\t' {
+            shown.extend(c.escape_default());
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
 }
 
 /// One remote session: run `command` under the remote login shell, feed it `stdin`, then close it.
@@ -92,14 +109,26 @@ impl Remote for SshRemote {
     }
 }
 
-/// `-T -o ConnectTimeout=15 -- <destination> <command>` (V-7: `--` stops ssh from reading options
-/// after the destination). Pure.
+/// `-T -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -- <destination>
+/// <command>` (V-7: `--` stops ssh from reading options after the destination). The keepalives end
+/// a session whose peer went silent after about a minute (review finding 2). Pure.
 #[must_use]
 pub fn ssh_argv(destination: &str, command: &str) -> Vec<OsString> {
-    ["-T", "-o", "ConnectTimeout=15", "--", destination, command]
-        .into_iter()
-        .map(OsString::from)
-        .collect()
+    [
+        "-T",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=4",
+        "--",
+        destination,
+        command,
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect()
 }
 
 /// Spawns `command` with all three streams piped and `kill_on_drop(true)`, then joins
@@ -168,12 +197,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::provision::script::{
-        INSTALL, INSTALL_ROOT, PREFLIGHT, PREPARE, VERIFY, remote_command,
-    };
-
-    const DSN: &str = "postgres://u:SENTINEL-DSN-PW@db.example:5432/htui";
-    const PASSWORD: &str = "SENTINEL-SUDO-PW";
 
     #[test]
     fn ssh_argv_puts_the_separator_before_the_destination() {
@@ -184,6 +207,10 @@ mod tests {
                 "-T",
                 "-o",
                 "ConnectTimeout=15",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=4",
                 "--",
                 "u@box1",
                 "sh -c true"
@@ -193,27 +220,28 @@ mod tests {
         );
     }
 
+    // Review finding 8: the sentinel check over `ssh_argv` runs a whole `run_with` now, in
+    // `provision::tests::ssh_argv_of_every_session_carries_no_sentinel`.
+
+    /// Review finding 9.
     #[test]
-    fn ssh_argv_carries_no_sentinel() {
-        let commands = [
-            remote_command(PREFLIGHT, &[""]),
-            remote_command(PREPARE, &["", "/home/alice", "1"]),
-            remote_command(
-                INSTALL,
-                &["", "alice", "/home/alice", "0", "password", INSTALL_ROOT],
-            ),
-            remote_command(VERIFY, &["", "/home/alice", "30", "2"]),
-        ];
-        for command in &commands {
-            for arg in ssh_argv("box1", command) {
-                let arg = arg.to_string_lossy();
-                assert!(
-                    !arg.contains("SENTINEL"),
-                    "an ssh argument holds a sentinel"
-                );
-                assert!(!arg.contains(DSN) && !arg.contains(PASSWORD));
-            }
-        }
+    fn sanitise_escapes_every_control_character_but_newline_and_tab() {
+        let remote = "ok\u{1b}]0;owned\u{7} \u{1b}[31mred\u{1b}[0m\r\n\tdone\u{7f}\u{9b}";
+        let shown = sanitise(remote);
+        assert_eq!(
+            shown,
+            "ok\\u{1b}]0;owned\\u{7} \\u{1b}[31mred\\u{1b}[0m\\r\n\tdone\\u{7f}\\u{9b}"
+        );
+        assert_eq!(sanitise(&shown), shown, "idempotent");
+        assert_eq!(sanitise("pläin › text"), "pläin › text");
+
+        let output = RemoteOutput {
+            code: Some(1),
+            stdout: Vec::new(),
+            stderr: b"one\n\x1b[2Jtwo\x1b]8;;x\x07\n".to_vec(),
+        };
+        assert_eq!(output.last_stderr_line(), "\\u{1b}[2Jtwo\\u{1b}]8;;x\\u{7}");
+        assert!(!output.stderr_tail(2).contains('\u{1b}'));
     }
 
     #[test]

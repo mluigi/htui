@@ -317,6 +317,9 @@ struct LocalShell {
     /// Flips the last byte of every non-empty stdin, as a corrupting link would (review finding
     /// 11).
     corrupt: bool,
+    /// The session (by index) that never ends: its `sh` writes its pid to `<stub>/hang.pid`, then
+    /// execs a long `sleep` (review finding 2).
+    hang_at: Option<usize>,
     /// Every command as `run_with` built it (never the noisy one), with its stdin's length.
     commands: Mutex<Vec<(String, usize)>>,
 }
@@ -328,6 +331,7 @@ impl LocalShell {
             stub: world.stub.clone(),
             noise: false,
             corrupt: false,
+            hang_at: None,
             commands: Mutex::new(Vec::new()),
         }
     }
@@ -340,11 +344,14 @@ impl LocalShell {
 
 impl Remote for LocalShell {
     async fn run(&self, command: &str, stdin: &[u8]) -> std::io::Result<RemoteOutput> {
-        self.commands
-            .lock()
-            .expect("the command log")
-            .push((command.to_owned(), stdin.len()));
-        let line = if self.noise {
+        let index = {
+            let mut commands = self.commands.lock().expect("the command log");
+            commands.push((command.to_owned(), stdin.len()));
+            commands.len() - 1
+        };
+        let line = if self.hang_at == Some(index) {
+            "echo $$ > \"$STUB_DIR/hang.pid\"; exec sleep 30".to_owned()
+        } else if self.noise {
             format!("echo \"Welcome to stub-host\"; echo \"htui-motd: hi\"; {command}")
         } else {
             command.to_owned()
@@ -388,10 +395,12 @@ impl PasswordPrompt for FakePrompt {
 }
 
 /// Answers every check with success and logs each call by name, in order. The DSN `baseline`
-/// receives is never stored.
-#[derive(Debug, Default)]
+/// receives is never stored. `baseline` logs whether the unit was already installed then (review
+/// finding 3: it must be).
+#[derive(Debug)]
 struct FakeVerifier {
     log: Mutex<Vec<String>>,
+    unit: PathBuf,
 }
 
 impl FakeVerifier {
@@ -406,7 +415,12 @@ impl FakeVerifier {
 
 impl Verifier for FakeVerifier {
     fn baseline<'a>(&'a self, _dsn: &'a str) -> BoxFuture<'a, Result<Baseline, String>> {
-        self.note("baseline".to_owned());
+        let unit = if self.unit.exists() {
+            "present"
+        } else {
+            "absent"
+        };
+        self.note(format!("baseline (unit {unit})"));
         Box::pin(async { Ok(Baseline::new()) })
     }
 
@@ -434,6 +448,12 @@ const TIMINGS: Timings = Timings {
         interval: Duration::from_millis(10),
         deadline: Duration::from_millis(100),
     },
+    // Generous: only `a_session_that_never_ends_is_closed_and_its_ssh_killed` waits on one.
+    preflight_limit: Duration::from_secs(60),
+    prepare_limit: Duration::from_secs(60),
+    upload_per_mib: Duration::from_secs(1),
+    install_limit: Duration::from_secs(60),
+    verify_slack: Duration::from_secs(60),
 };
 
 /// One `run_with` and everything it left behind.
@@ -508,11 +528,24 @@ impl Default for Setup<'_> {
 
 /// `run_with` over `shell` in `world`, with fresh fakes.
 async fn provision(world: &World, shell: &LocalShell, setup: Setup<'_>) -> Run {
+    provision_with(TIMINGS, world, shell, setup).await
+}
+
+/// [`provision`] with other [`Timings`].
+async fn provision_with(
+    timings: Timings,
+    world: &World,
+    shell: &LocalShell,
+    setup: Setup<'_>,
+) -> Run {
     let prompter = FakePrompt {
         answer: setup.password.map(str::to_owned),
         calls: AtomicUsize::new(0),
     };
-    let verifier = FakeVerifier::default();
+    let verifier = FakeVerifier {
+        log: Mutex::new(Vec::new()),
+        unit: world.unit(),
+    };
     let mut out = Vec::new();
     let mut err = Vec::new();
     let result = run_with(Ctx {
@@ -524,7 +557,7 @@ async fn provision(world: &World, shell: &LocalShell, setup: Setup<'_>) -> Run {
         dsn: Zeroizing::new(setup.dsn.to_owned()),
         prompter: &prompter,
         verifier: &verifier,
-        timings: TIMINGS,
+        timings,
         out: &mut out,
         err: &mut err,
     })
@@ -708,11 +741,11 @@ async fn a_fresh_password_host_is_provisioned() {
     assert_eq!(run.prompt_calls, 1);
     // (g): sudo read the password line and never the DSN line.
     assert_eq!(world.sudo_reads(), Some(1));
-    // (h)
+    // (h): the baseline is taken once INSTALL has written the unit (review finding 3).
     assert_eq!(
         run.verifier,
         [
-            "baseline".to_owned(),
+            "baseline (unit present)".to_owned(),
             format!("box_seen {BOX_ID}"),
             format!("set_executor {BOX_ID}")
         ]
@@ -912,7 +945,10 @@ async fn a_re_run_changes_nothing() {
     );
     assert_eq!(
         second.verifier,
-        ["baseline".to_owned(), format!("set_executor {BOX_ID}")]
+        [
+            "baseline (unit present)".to_owned(),
+            format!("set_executor {BOX_ID}")
+        ]
     );
     let after: Vec<Vec<u8>> = files
         .iter()
@@ -1138,8 +1174,66 @@ async fn a_service_that_never_starts_times_out_with_its_journal() {
     }
     assert_eq!(
         run.verifier,
-        ["baseline".to_owned()],
+        ["baseline (unit present)".to_owned()],
         "box_seen was never called"
     );
+    assert!(
+        sentence.contains("re-run with --replace-credential"),
+        "{sentence}"
+    );
+    sweep_run(&world, &shell, &run);
+}
+
+/// Whether `pid` has ended: gone, or a zombie its parent has not reaped yet.
+fn has_ended(pid: &str) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+    }
+}
+
+/// Review finding 2: a session that never ends is closed at its bound, and its process (the
+/// local `ssh`, here the `sh` that stands in for it) is killed.
+#[tokio::test]
+async fn a_session_that_never_ends_is_closed_and_its_ssh_killed() {
+    let world = World::new("nopasswd");
+    let shell = LocalShell {
+        hang_at: Some(2),
+        ..LocalShell::new(&world)
+    };
+    let timings = Timings {
+        install_limit: Duration::from_millis(500),
+        ..TIMINGS
+    };
+    let run = tokio::time::timeout(
+        Duration::from_secs(20),
+        provision_with(timings, &world, &shell, Setup::default()),
+    )
+    .await
+    .expect("the run ends at the bound, not when sleep does");
+    let (code, sentence) = run.exit();
+    assert_eq!(code, 1);
+    assert_eq!(
+        sentence,
+        "provisioning stub-dest failed: installing the service on stub-dest did not finish \
+         within 500 ms; its ssh session was closed"
+    );
+    assert_eq!(
+        run.verifier,
+        Vec::<String>::new(),
+        "no baseline after a hung INSTALL"
+    );
+    let pid = std::fs::read_to_string(world.stub.join("hang.pid")).expect("the hung sh ran");
+    let pid = pid.trim();
+    let started = std::time::Instant::now();
+    while !has_ended(pid) {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the hung session's process {pid} is still running"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     sweep_run(&world, &shell, &run);
 }
