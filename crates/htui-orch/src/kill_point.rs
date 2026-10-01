@@ -8,7 +8,10 @@
 //! cancel is spawned. Fan-out candidates and judges have none (plan D1).
 //!
 //! Without this crate's `test-support` feature, [`reached`] is an empty `#[inline]` function and
-//! nothing reads the environment. The production `htui` binary never enables the feature.
+//! nothing reads the environment. The feature is never enabled outside test builds: a plain or
+//! release `cargo build` of `htui` leaves it off. A `cargo test` or `--all-targets` build of the
+//! `htui` binary does compile it in (the crate's dev-dependencies unify it on), and that binary is
+//! armed but inert: nothing stops unless [`POINT_VAR`] is set in its environment.
 //!
 //! With the feature, the first call reads [`POINT_VAR`] once. Its grammar is
 //! `<point>[@<phase>][#<attempt>]`, where `<point>` is a [`KillPoint::name`], and the optional
@@ -17,7 +20,7 @@
 //! into place, so a reader never sees half of it. It then parks the calling thread until the
 //! test's `SIGKILL`. A park still waiting after five minutes exits with [`PARK_EXPIRED_EXIT`]. A
 //! malformed spec, or a spec with no marker path, exits with [`MISCONFIGURED_EXIT`] at the first
-//! call. That half is a private module, `armed`, named in plain text: a link to it would be a
+//! call, and so does a matching call whose marker cannot be written. That half is a private module, `armed`, named in plain text: a link to it would be a
 //! `broken_intra_doc_links` error in any build without the feature.
 
 use htui_core::model::RunStep;
@@ -28,7 +31,8 @@ pub const POINT_VAR: &str = "HTUI_TEST_KILL_POINT";
 pub const MARK_VAR: &str = "HTUI_TEST_KILL_MARK";
 /// The exit code of a process whose parked kill point was never killed.
 pub const PARK_EXPIRED_EXIT: i32 = 86;
-/// The exit code of a process whose kill-point spec does not parse, or names no marker.
+/// The exit code of a process whose kill-point spec does not parse or names no marker, or whose
+/// marker could not be written.
 pub const MISCONFIGURED_EXIT: i32 = 87;
 
 /// A place a crash test may stop the process at.

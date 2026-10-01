@@ -13,7 +13,7 @@
 //! case names: the marker file `htui_orch::kill_point` writes (`documented`, `captured`,
 //! `command_picked`), the marker a stalled session writes, or a `session_event` row in Postgres.
 //! No destructor runs, no lease is given back, nothing shuts down. A second child (a new process,
-//! so a new lease owner) then waits out the dead lease (`lease_ttl_seconds` is 2 for the case) and
+//! so a new lease owner) then waits out the dead lease (`lease_ttl_seconds` is 5 for the case) and
 //! recovers. Killing in process would not be a crash: an aborted loop task leaves its walks
 //! heartbeating (plan fact 7).
 //!
@@ -78,9 +78,10 @@ const CONFIG: WorkerConfig = WorkerConfig {
     grace: Duration::ZERO,
 };
 
-/// `app_setting.lease_ttl_seconds` for the case, so a dead child's lease lapses in two seconds
-/// (blueprint H-9: a live walk renews every TTL/3 and fences itself after two missed beats).
-const TTL_SECONDS: i32 = 2;
+/// `app_setting.lease_ttl_seconds` for the case, so a dead child's lease lapses in five seconds
+/// (blueprint H-9: a live walk renews every TTL/3 and fences itself after two missed beats). Five,
+/// not two: a beat stalled for a second on a loaded box must not fence a live walk.
+const TTL_SECONDS: i32 = 5;
 
 /// The child entry's name; `--exact` matches a top-level fn's bare name only (blueprint H-14).
 const CHILD: &str = "crash_child";
@@ -98,6 +99,12 @@ const SCRIPT_VAR: &str = "HTUI_TEST_CRASH_SCRIPT";
 const TREE: &str = "htui";
 /// The file a stalled session leaves uncommitted in its tree (K1).
 const STRAY: &str = "stray.txt";
+/// Set on every child and every git command of this file: a developer's global or system git
+/// config (a signing key, a hook path, `init.defaultBranch`) never reaches a case.
+const NO_GIT_CONFIG: [(&str, &str); 2] = [
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+];
 
 // ---------------------------------------------------------------------------------------------
 // The child's parts
@@ -294,7 +301,16 @@ impl AgentSession for Session {
     fn next_event<'a>(&'a mut self) -> DriverFuture<'a, Option<DriverEnvelope>> {
         Box::pin(async move {
             match self.play.take() {
-                Some(Play::Commit) => commit_step(&self.tree, self.step),
+                // Off the runtime's threads: the git subprocesses must never hold up the walk's
+                // lease heartbeat on a one-worker runtime.
+                Some(Play::Commit) => {
+                    let (tree, step) = (self.tree.clone(), self.step);
+                    if let Err(err) =
+                        tokio::task::spawn_blocking(move || commit_step(&tree, step)).await
+                    {
+                        std::panic::resume_unwind(err.into_panic());
+                    }
+                }
                 Some(Play::Stray(mark)) => {
                     assert_tree(&self.tree);
                     std::fs::write(self.tree.join(STRAY), "never committed\n")
@@ -347,6 +363,8 @@ fn commit_step(tree: &Path, step: StepId) {
             "user.name=htui-test",
             "-c",
             "user.email=test@localhost",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "-q",
             "-m",
@@ -360,12 +378,14 @@ fn step_file(step: StepId) -> String {
     format!("step-{step}.txt")
 }
 
-/// `git -C <dir> <args>`, which must succeed; its stdout.
+/// `git -C <dir> <args>`, which must succeed; its stdout. Blind to the developer's global and
+/// system config ([`NO_GIT_CONFIG`]), as every child is.
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Process::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
+        .envs(NO_GIT_CONFIG)
         .output()
         .expect("git runs");
     assert!(
@@ -720,7 +740,7 @@ impl Reaped {
     fn alive(&mut self, waiting_for: &str) {
         if let Some(status) = self.child.try_wait().expect("poll the child") {
             let why = match status.code() {
-                Some(MISCONFIGURED_EXIT) => "the kill-point spec is malformed",
+                Some(MISCONFIGURED_EXIT) => "kill-point spec malformed or marker write failed",
                 Some(PARK_EXPIRED_EXIT) => "a parked kill point was never killed",
                 Some(0) => "the child returned: did `--exact crash_child` match a test? (H-14)",
                 _ => "the child failed",
@@ -792,6 +812,12 @@ struct Case {
 impl Case {
     /// The case, or `None` (after the skip sentence) without `git` or without a server.
     async fn new() -> Option<Self> {
+        // H-3: a developer shell's kill point must not reach the parent, whose own runtime is
+        // built armed (the feature is on in this test binary) and would stop at the same sites.
+        assert!(
+            std::env::var_os(POINT_VAR).is_none(),
+            "{POINT_VAR} is set in the test's own environment; unset it"
+        );
         htui_orch::skip_without_git!()?;
         let mut stack = Stack::new().await?;
         stack.ungate_feat().await;
@@ -849,6 +875,7 @@ impl Case {
             .env("GIT_AUTHOR_EMAIL", "test@localhost")
             .env("GIT_COMMITTER_NAME", "htui-test")
             .env("GIT_COMMITTER_EMAIL", "test@localhost")
+            .envs(NO_GIT_CONFIG)
             .stdin(Stdio::piped())
             .stdout(out)
             .stderr(err);
@@ -1173,9 +1200,11 @@ async fn tree_of(case: &Case, step: StepId) -> PathBuf {
 }
 
 /// Plan T4 K1: a worker killed once its session started and before any driver event, after the
-/// session wrote a file it never committed. The next worker's sweep resets the tree, fails attempt
-/// 1 `interrupted`, notes the retry, and walks attempt 2 to `done`; the stray file is in no tree
-/// the run lands.
+/// session wrote a file it never committed. The next worker's sweep fails attempt 1
+/// `interrupted`, notes the retry, and walks attempt 2 to `done`. The stray file stays out of what
+/// the run lands: not in the checkout's `HEAD`, not in its working tree, and not in attempt 2's
+/// tree (which is its own, so this shows no carry-over, not that attempt 1's tree was reset).
+/// Recovery writes nothing into attempt 1's event log.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_worker_killed_before_any_event_retries_the_step() {
     let Some(mut case) = Case::new().await else {
@@ -1348,9 +1377,11 @@ async fn pending_request(client: &PgStore, child: &mut Reaped) -> StepPermission
 
 /// Plan T4 K5: a client on another box requests a cancel while the worker's session is parked
 /// (the lease is live, so the row waits for the executor); the worker's command poll picks the row
-/// up and dies before applying it. The next worker applies it before it recovers anything (D3):
-/// the run ends `cancelled` with its command `applied`, no step was retried, and it never reached
-/// `done`.
+/// up and dies before applying it. An outcome test: the next worker applies the cancel, whichever
+/// of its sweep (D3's `cancels_first`) or its command poll gets there first, and the run ends
+/// `cancelled` with its command `applied`, no step retried, nothing `done`. That the sweep itself
+/// applies it before any recovery is T2's to prove, deterministically, in `run_worker.rs`'s MOD-24
+/// D3 cases.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancel_picked_but_not_applied_survives_the_kill() {
     let Some(mut case) = Case::new().await else {
