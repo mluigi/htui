@@ -28,6 +28,10 @@ pub const RELAY_POLL: Duration = Duration::from_secs(1);
 pub const RELAY_GRACE: Duration = Duration::from_secs(2);
 /// B-11: how long past the grace the post-cancel drain may run.
 const DRAIN_SLACK: Duration = Duration::from_secs(1);
+/// D8: the consecutive transient failures (`Unreachable`, `Backend`) of a parked row's read that
+/// end the park; every one before it is a `warn` and the poll goes on, as the lease heartbeat
+/// rides out a store blip (D123). Half a minute at [`RELAY_POLL`].
+const TRANSIENT_READS: u32 = 30;
 
 /// What a walk is asked to do (D10, D11). `Copy`, read with [`Control::signal`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -180,11 +184,19 @@ impl htui_core::store::RelayStore for NoRelay {
 /// `cancelled` itself, the fake drops it — then the parked request's `permission_answer {option_id:
 /// null, by: "policy", cancelled: true}`, which no transport writes, then the rows, then a drain of
 /// what the cancel produced up to the turn's `done`, bounded by `grace` plus one second (B-11).
+/// A request the drain pulls was emitted before the cancel (ACP parks a request when it emits it,
+/// so its cancel answered that one too): it is recorded with the same `cancelled` answer after
+/// it. Every store write of the sequence is best-effort (I-6): a failure is a `warn` and the
+/// answer stays `Cancelled`, unless it is a fence.
+///
+/// **A parked poll** rides out up to [`TRANSIENT_READS`] consecutive `Unreachable`/`Backend`
+/// failures of its row's read, each a `warn`; the next one is the answer.
 ///
 /// # Errors
 /// [`DriverError::Cancelled`] after a graceful cancel (I-7); [`DriverError::Store`]
-/// `(Fenced { step })` when an answer can no longer be applied under the lease (D4);
-/// [`DriverError::Closed`] for a stream that ended without `done`; the recorder's failures.
+/// `(Fenced { step })` when an answer can no longer be applied under the lease (D4), or a write
+/// of the cancel sequence is fenced; [`DriverError::Closed`] for a stream that ended without
+/// `done`; the recorder's failures.
 pub async fn drive<S: htui_core::store::RecorderStore, R: htui_core::store::RelayStore>(
     session: &mut dyn AgentSession,
     recorder: &mut Recorder<'_, S>,
@@ -352,19 +364,33 @@ async fn park<S: htui_core::store::RecorderStore, R: htui_core::store::RelayStor
     .await?;
     *opened = true;
 
+    // The consecutive transient read failures so far ([`TRANSIENT_READS`]).
+    let mut failures = 0_u32;
     loop {
         if let Signal::Cancel { grace } = control.signal() {
             return Ok(Parked::Cancel { grace });
         }
-        let row = htui_core::store::RelayStore::permission(relay.store, id)
-            .await?
-            .ok_or_else(|| StoreError::NotFound {
-                entity: "step_permission",
-                id: id.to_string(),
-            })?;
-        match row.status {
-            PermissionStatus::Pending => {}
-            PermissionStatus::Answered => {
+        let status = match htui_core::store::RelayStore::permission(relay.store, id).await {
+            Ok(row) => {
+                failures = 0;
+                let row = row.ok_or_else(|| StoreError::NotFound {
+                    entity: "step_permission",
+                    id: id.to_string(),
+                })?;
+                Some(row.status)
+            }
+            Err(err @ (StoreError::Unreachable(_) | StoreError::Backend(_)))
+                if failures + 1 < TRANSIENT_READS =>
+            {
+                failures += 1;
+                tracing::warn!(%err, failures, "a parked request's row was not read; polling on");
+                None
+            }
+            Err(err) => return Err(err.into()),
+        };
+        match status {
+            None | Some(PermissionStatus::Pending) => {}
+            Some(PermissionStatus::Answered) => {
                 // D4: apply under the lease, answer the live session, echo through the recorder.
                 // `None` right after the row read `answered` is the lease gone (B-16).
                 let Some(choice) =
@@ -391,11 +417,11 @@ async fn park<S: htui_core::store::RecorderStore, R: htui_core::store::RelayStor
                 return Ok(Parked::Resumed);
             }
             // B-16: superseded by a newer session of the step, or cancelled by someone else.
-            PermissionStatus::Stale | PermissionStatus::Cancelled => {
+            Some(PermissionStatus::Stale | PermissionStatus::Cancelled) => {
                 return Ok(Parked::Cancel { grace: relay.grace });
             }
             // Applied, and not by this call: the row is no longer this session's to apply.
-            PermissionStatus::Applied => {
+            Some(PermissionStatus::Applied) => {
                 return Err(StoreError::Fenced { step: relay.step }.into());
             }
         }
@@ -421,17 +447,19 @@ async fn cancel<S: htui_core::store::RecorderStore, R: htui_core::store::RelaySt
     }
     if let Some(relay) = relay {
         if let Some(request_id) = parked {
-            recorder
-                .record_permission_answer(request_id, None, AnsweredBy::Policy, true, (relay.now)())
-                .await?;
+            answer_cancelled(recorder, relay, request_id).await?;
         }
         if opened {
-            htui_core::store::RelayStore::settle_permissions(
+            let settled = htui_core::store::RelayStore::settle_permissions(
                 relay.store,
                 relay.session,
                 PermissionStatus::Cancelled,
             )
-            .await?;
+            .await;
+            best_effort(
+                settled.map(drop).map_err(DriverError::from),
+                "the session's permission rows were not settled cancelled",
+            )?;
         }
     }
     // B-11 bounds the pulls, never a recording: `Recorder::flush` is not cancel-safe (it numbers
@@ -451,8 +479,24 @@ async fn cancel<S: htui_core::store::RecorderStore, R: htui_core::store::RelaySt
         match pulled {
             Some(Ok(Some(envelope))) => {
                 let done = matches!(envelope.event, DriverEvent::Done(_));
+                // I-7: a request the session emitted before the cancel and `drive` had not pulled
+                // yet. ACP parked it at the emit, so its cancel answered it `cancelled` with the
+                // rest; no transport writes that answer.
+                let drained = match (&envelope.event, relay) {
+                    (DriverEvent::PermissionRequest(request), Some(relay)) => {
+                        Some((request.request_id.clone(), relay))
+                    }
+                    _ => None,
+                };
                 // A breach verdict here is spent: the session is already closing.
-                recorder.record(envelope).await?;
+                let recorded = recorder.record(envelope).await;
+                best_effort(
+                    recorded.map(drop).map_err(DriverError::from),
+                    "an event drained after the cancel was not recorded",
+                )?;
+                if let Some((request_id, relay)) = drained {
+                    answer_cancelled(recorder, relay, &request_id).await?;
+                }
                 if done {
                     break;
                 }
@@ -465,6 +509,39 @@ async fn cancel<S: htui_core::store::RecorderStore, R: htui_core::store::RelaySt
         }
     }
     Err(DriverError::Cancelled)
+}
+
+/// I-7's row for `request_id`: `permission_answer {option_id: null, by: "policy", cancelled:
+/// true}`, best-effort ([`best_effort`]).
+async fn answer_cancelled<S: htui_core::store::RecorderStore, R: htui_core::store::RelayStore>(
+    recorder: &mut Recorder<'_, S>,
+    relay: &Relay<'_, R>,
+    request_id: &PermissionRequestId,
+) -> Result<(), DriverError> {
+    let recorded = recorder
+        .record_permission_answer(request_id, None, AnsweredBy::Policy, true, (relay.now)())
+        .await;
+    best_effort(
+        recorded.map_err(DriverError::from),
+        "a cancelled request's answer was not recorded",
+    )
+}
+
+/// I-6 inside the cancel sequence: a store failure there is a `warn`, so a graceful cancel still
+/// ends `Cancelled` rather than as a failed session the walk would settle. A refused flush keeps
+/// the rows it numbered owed, landed by the recorder's next flush (MOD-40 D3); an event refused
+/// before it was buffered is lost with the `warn`, as it was with the error. A row left `pending`
+/// is unanswerable once the lease is gone (D3, D5). A fence is the exception: the lease is another
+/// process's, and a fenced writer writes nothing more (MOD-40 D1).
+fn best_effort(result: Result<(), DriverError>, what: &str) -> Result<(), DriverError> {
+    match result {
+        Err(err @ DriverError::Store(StoreError::Fenced { .. })) => Err(err),
+        Err(err) => {
+            tracing::warn!(%err, "{what}");
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+    }
 }
 
 /// B-14: `"<tool_kind>: <title>"` and the labels, scrubbed together as one document by the

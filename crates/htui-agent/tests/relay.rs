@@ -10,9 +10,10 @@
 
 #![cfg(feature = "test-support")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -160,8 +161,17 @@ async fn leased() -> Leased {
 
 /// The relay every case drives with: the fixture's run and step, a fresh session, `policy`.
 fn relay<'a>(fx: &'a Leased, policy: &'a PermissionPolicy) -> Relay<'a, MemStore> {
+    relay_over(&fx.store, fx, policy)
+}
+
+/// [`relay`] over another relay store.
+fn relay_over<'a, R: htui_core::store::RelayStore>(
+    store: &'a R,
+    fx: &Leased,
+    policy: &'a PermissionPolicy,
+) -> Relay<'a, R> {
     Relay {
-        store: &fx.store,
+        store,
         owner: fx.owner,
         run: fx.run,
         step: fx.step,
@@ -197,19 +207,29 @@ fn spec(step: StepId) -> SessionSpec {
 
 /// The gated call: an `execute` whose title carries `secret`.
 fn call(title: &str) -> ScriptEvent {
-    ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
+    ScriptEvent::Emit(call_event(title))
+}
+
+/// [`call`]'s event.
+fn call_event(title: &str) -> DriverEvent {
+    DriverEvent::ToolCall(ToolCallEvent {
         tool_call_id: CALL.to_owned(),
         title: title.to_owned(),
         tool_kind: ToolKind::Execute,
         input: json!({ "command": "cargo test" }),
         locations: Vec::new(),
-    }))
+    })
 }
 
 /// The request for [`CALL`], with an allow and a reject option labelled `allow_label`/"Reject".
 fn park(allow_label: &str) -> ScriptEvent {
-    ScriptEvent::ParkPermission(PermissionRequestEvent {
-        request_id: PermissionRequestId::new(REQUEST),
+    ScriptEvent::ParkPermission(permission_request(REQUEST, allow_label))
+}
+
+/// [`park`]'s request under `request_id`.
+fn permission_request(request_id: &str, allow_label: &str) -> PermissionRequestEvent {
+    PermissionRequestEvent {
+        request_id: PermissionRequestId::new(request_id),
         tool_call_id: Some(CALL.to_owned()),
         options: vec![
             PermissionOption {
@@ -223,7 +243,7 @@ fn park(allow_label: &str) -> ScriptEvent {
                 kind: PermissionOptionKind::RejectOnce,
             },
         ],
-    })
+    }
 }
 
 fn finished() -> Vec<ScriptEvent> {
@@ -394,19 +414,82 @@ impl AgentSession for Watched {
 // A relay store whose reads fail
 // ---------------------------------------------------------------------------------------------
 
-/// `MemStore`'s relay surface, except that `permission` answers `Unreachable`.
+/// `MemStore`'s relay surface, except that `permission` fails: for ever ([`FailingReads::always`],
+/// `Unreachable`), or its first `n` reads ([`FailingReads::times`], `Backend` and `Unreachable`
+/// alternating), the transient errors a lease heartbeat also survives (D123).
 #[derive(Debug)]
-struct FailingReads(MemStore);
+struct FailingReads {
+    store: MemStore,
+    /// Failures left; `usize::MAX` is "for ever".
+    left: AtomicUsize,
+}
+
+impl FailingReads {
+    fn always(store: MemStore) -> Self {
+        Self {
+            store,
+            left: AtomicUsize::new(usize::MAX),
+        }
+    }
+
+    fn times(store: MemStore, n: usize) -> Self {
+        Self {
+            store,
+            left: AtomicUsize::new(n),
+        }
+    }
+}
 
 impl htui_core::store::RelayStore for FailingReads {
+    async fn open_permission(&self, open: OpenPermission) -> StoreResult<PermissionId> {
+        WriteStore::open_permission(&self.store, open).await
+    }
+
+    async fn permission(&self, id: PermissionId) -> StoreResult<Option<StepPermission>> {
+        let left = self.left.load(Ordering::SeqCst);
+        if left == 0 {
+            return htui_core::store::RelayStore::permission(&self.store, id).await;
+        }
+        if left != usize::MAX {
+            self.left.store(left - 1, Ordering::SeqCst);
+        }
+        if left.is_multiple_of(2) {
+            Err(StoreError::Backend("deadlock detected".to_owned()))
+        } else {
+            Err(StoreError::Unreachable(
+                "the relay read is switched off".to_owned(),
+            ))
+        }
+    }
+
+    async fn apply_permission(
+        &self,
+        id: PermissionId,
+        owner: Uuid,
+    ) -> StoreResult<Option<PermissionChoice>> {
+        WriteStore::apply_permission(&self.store, id, owner).await
+    }
+
+    async fn settle_permissions(
+        &self,
+        session: RelaySessionId,
+        to: PermissionStatus,
+    ) -> StoreResult<u64> {
+        WriteStore::settle_permissions(&self.store, session, to).await
+    }
+}
+
+/// `MemStore`'s relay surface, except that `settle_permissions` answers `Unreachable`.
+#[derive(Debug)]
+struct FailingSettles(MemStore);
+
+impl htui_core::store::RelayStore for FailingSettles {
     async fn open_permission(&self, open: OpenPermission) -> StoreResult<PermissionId> {
         WriteStore::open_permission(&self.0, open).await
     }
 
-    async fn permission(&self, _id: PermissionId) -> StoreResult<Option<StepPermission>> {
-        Err(StoreError::Unreachable(
-            "the relay read is switched off".to_owned(),
-        ))
+    async fn permission(&self, id: PermissionId) -> StoreResult<Option<StepPermission>> {
+        htui_core::store::RelayStore::permission(&self.0, id).await
     }
 
     async fn apply_permission(
@@ -419,10 +502,62 @@ impl htui_core::store::RelayStore for FailingReads {
 
     async fn settle_permissions(
         &self,
-        session: RelaySessionId,
-        to: PermissionStatus,
+        _session: RelaySessionId,
+        _to: PermissionStatus,
     ) -> StoreResult<u64> {
-        WriteStore::settle_permissions(&self.0, session, to).await
+        Err(StoreError::Unreachable(
+            "the settle is switched off".to_owned(),
+        ))
+    }
+}
+
+/// `MemStore`'s recorder surface, except that every `append_events` answers `Unreachable` while
+/// `down` is set. The recorder keeps the refused rows owed (MOD-40 D3), so a later flush lands
+/// them.
+#[derive(Debug)]
+struct FlakyAppends<'a> {
+    store: &'a MemStore,
+    down: AtomicBool,
+}
+
+impl htui_core::store::RecorderStore for FlakyAppends<'_> {
+    async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> StoreResult<usize> {
+        if self.down.load(Ordering::SeqCst) {
+            return Err(StoreError::Unreachable(
+                "the log is switched off".to_owned(),
+            ));
+        }
+        htui_core::store::RecorderStore::append_events(self.store, fence, events).await
+    }
+
+    async fn set_step_usage(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        usage: Value,
+        prompt_digest: Option<String>,
+    ) -> StoreResult<()> {
+        htui_core::store::RecorderStore::set_step_usage(
+            self.store,
+            fence,
+            step,
+            usage,
+            prompt_digest,
+        )
+        .await
+    }
+
+    async fn set_agent_box_quota(
+        &self,
+        agent_id: htui_core::model::AgentId,
+        box_id: htui_core::model::BoxId,
+        quota: Value,
+        quota_at: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        htui_core::store::RecorderStore::set_agent_box_quota(
+            self.store, agent_id, box_id, quota, quota_at,
+        )
+        .await
     }
 }
 
@@ -1222,7 +1357,7 @@ async fn a_session_that_fails_while_parked_leaves_no_pending_row() {
     let fx = leased().await;
     let mut recorder = fenced_recorder(&fx, &scrubber);
     let (mut session, _seen) = watched(Some(fake(answered_script(), fx.step).await), Mode::Forward);
-    let failing = FailingReads(fx.store.clone());
+    let failing = FailingReads::always(fx.store.clone());
     let relay = Relay {
         store: &failing,
         owner: fx.owner,
@@ -1294,4 +1429,410 @@ async fn drive_without_a_relay_is_pump() {
         "the same rows"
     );
     assert!(driven.store.relay_rows().is_empty(), "and no relay row");
+}
+
+// ---------------------------------------------------------------------------------------------
+// ACP's shape: requests queued behind the parked one
+// ---------------------------------------------------------------------------------------------
+
+/// The request queued behind [`REQUEST`].
+const QUEUED: &str = "perm-2";
+
+/// ACP's shape (`acp/mod.rs`): the transport parks every request it emits, before `drive` pulls
+/// it, so its cancel answers a request still queued in the channel `cancelled` on the wire with
+/// the rest; the handle's `cancel` keeps the queued events and the turn then ends with `done
+/// { cancelled }`. `next_event` hands `queue` out in order and pends once it is empty.
+#[derive(Debug)]
+struct Queued {
+    queue: VecDeque<DriverEvent>,
+    cancelled: bool,
+}
+
+impl Queued {
+    fn new(events: impl IntoIterator<Item = DriverEvent>) -> Self {
+        Self {
+            queue: events.into_iter().collect(),
+            cancelled: false,
+        }
+    }
+}
+
+impl AgentSession for Queued {
+    fn session_ref(&self) -> Option<&AgentSessionRef> {
+        None
+    }
+
+    fn next_event<'a>(&'a mut self) -> DriverFuture<'a, Option<DriverEnvelope>> {
+        Box::pin(async move {
+            match self.queue.pop_front() {
+                Some(event) => Ok(Some(DriverEnvelope {
+                    event,
+                    raw: None,
+                    at: at(),
+                })),
+                None => std::future::pending().await,
+            }
+        })
+    }
+
+    fn send_follow_up<'a>(&'a mut self, _text: String) -> DriverFuture<'a, ()> {
+        Box::pin(async { Err(DriverError::Closed) })
+    }
+
+    fn answer_permission<'a>(
+        &'a mut self,
+        _request_id: PermissionRequestId,
+        _answer: PermissionAnswer,
+    ) -> DriverFuture<'a, ()> {
+        Box::pin(async { Err(DriverError::Closed) })
+    }
+
+    fn cancel<'a>(&'a mut self, _grace: Duration) -> DriverFuture<'a, ()> {
+        Box::pin(async move {
+            if !self.cancelled {
+                self.cancelled = true;
+                self.queue.push_back(DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::Cancelled,
+                }));
+            }
+            Ok(())
+        })
+    }
+}
+
+/// I-7 over a whole log: the requests and answers are exactly `requests`, each answered once,
+/// right after itself, `{option_id: null, by: "policy", cancelled: true}`; the log ends at the
+/// cancel's `done`.
+fn assert_each_answered_cancelled(log: &[SessionEvent], requests: &[&str]) {
+    let rows: Vec<(EventKind, String)> = log
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.kind,
+                EventKind::PermissionRequest | EventKind::PermissionAnswer
+            )
+        })
+        .map(|row| {
+            let id = row.payload["request_id"].as_str().unwrap_or_default();
+            (row.kind, id.to_owned())
+        })
+        .collect();
+    let expected: Vec<(EventKind, String)> = requests
+        .iter()
+        .flat_map(|id| {
+            [
+                (EventKind::PermissionRequest, (*id).to_owned()),
+                (EventKind::PermissionAnswer, (*id).to_owned()),
+            ]
+        })
+        .collect();
+    assert_eq!(rows, expected, "each request answered once, after itself");
+    for answer in answers_in(log) {
+        assert_eq!(answer["option_id"], Value::Null, "{answer}");
+        assert_eq!(answer["by"], "policy", "{answer}");
+        assert_eq!(answer["cancelled"], true, "{answer}");
+    }
+    assert_eq!(
+        log.last().map(|row| row.payload["stop_reason"].clone()),
+        Some(json!("cancelled")),
+        "the log ends at the cancel's `done`"
+    );
+}
+
+/// I-7: a request queued behind the parked one when the cancel lands was answered `cancelled` by
+/// the transport with the parked one, so the drain records its answer too.
+#[tokio::test(start_paused = true)]
+async fn a_request_queued_behind_the_parked_one_is_answered_cancelled_too() {
+    let fx = leased().await;
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut session = Queued::new([
+        call_event("run the suite"),
+        DriverEvent::PermissionRequest(permission_request(REQUEST, "Allow")),
+        DriverEvent::PermissionRequest(permission_request(QUEUED, "Allow")),
+    ]);
+    let policy = PermissionPolicy::default();
+    let relay = relay(&fx, &policy);
+    let (signal, mut control) = control_channel();
+
+    let (out, parked) = tokio::join!(
+        within(drive(
+            &mut session,
+            &mut recorder,
+            Some(&relay),
+            &mut control
+        )),
+        async {
+            let row = parked_row(&fx.store).await?;
+            signal.send_replace(Signal::Cancel {
+                grace: Duration::from_secs(3),
+            });
+            Some(row)
+        }
+    );
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(out, Err(DriverError::Cancelled), "a graceful cancel");
+    assert_eq!(
+        parked.expect("a request was parked").request_id,
+        REQUEST,
+        "the first request is the parked one"
+    );
+    assert_each_answered_cancelled(&log(&fx.store, fx.step).await, &[REQUEST, QUEUED]);
+}
+
+/// I-7: a cancel that lands while a request is queued but not yet pulled parks nothing, and the
+/// drain still records the request's `cancelled` answer. Without a relay (I-8) it records none.
+#[tokio::test(start_paused = true)]
+async fn a_request_queued_when_the_cancel_lands_is_answered_cancelled() {
+    let script = || {
+        Queued::new([
+            call_event("run the suite"),
+            DriverEvent::PermissionRequest(permission_request(REQUEST, "Allow")),
+        ])
+    };
+    let cancel = Signal::Cancel {
+        grace: Duration::from_secs(3),
+    };
+    let scrubber = scrubber();
+    let policy = PermissionPolicy::default();
+
+    let fx = leased().await;
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let relay = relay(&fx, &policy);
+    let (signal, mut control) = control_channel();
+    signal.send_replace(cancel);
+    let out = within(drive(
+        &mut script(),
+        &mut recorder,
+        Some(&relay),
+        &mut control,
+    ))
+    .await;
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(out, Err(DriverError::Cancelled), "a graceful cancel");
+    assert!(fx.store.relay_rows().is_empty(), "nothing was parked");
+    assert_each_answered_cancelled(&log(&fx.store, fx.step).await, &[REQUEST]);
+
+    let fx = leased().await;
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let (signal, mut control) = control_channel();
+    signal.send_replace(cancel);
+    let out = within(drive(
+        &mut script(),
+        &mut recorder,
+        None::<&Relay<'_, NoRelay>>,
+        &mut control,
+    ))
+    .await;
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(out, Err(DriverError::Cancelled), "a graceful cancel");
+    let log = log(&fx.store, fx.step).await;
+    assert!(
+        position(&log, EventKind::PermissionRequest).is_some(),
+        "the request is recorded: {log:?}"
+    );
+    assert!(answers_in(&log).is_empty(), "and no answer without a relay");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Store blips
+// ---------------------------------------------------------------------------------------------
+
+/// I-6: a store blip inside the cancel sequence does not turn the graceful cancel into a failure.
+/// The settle and the recordings are best-effort there: the rows a refused flush numbered stay
+/// owed and land at the recorder's next flush (MOD-40 D3), and a `pending` row left behind is
+/// unanswerable once the lease is gone (D3, D5). Before the fix both ended `Err(Store(..))`.
+#[tokio::test(start_paused = true)]
+async fn a_store_blip_during_a_cancel_still_ends_it_as_a_cancel() {
+    let scrubber = scrubber();
+    let policy = PermissionPolicy::default();
+    let grace = Duration::from_secs(3);
+
+    // The settle fails.
+    let fx = leased().await;
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let (mut session, _seen) =
+        watched(Some(fake(cancelled_script(), fx.step).await), Mode::Forward);
+    let failing = FailingSettles(fx.store.clone());
+    let relay = relay_over(&failing, &fx, &policy);
+    let (signal, mut control) = control_channel();
+
+    let (out, parked) = tokio::join!(
+        within(drive(
+            &mut session,
+            &mut recorder,
+            Some(&relay),
+            &mut control
+        )),
+        async {
+            let row = parked_row(&fx.store).await?;
+            signal.send_replace(Signal::Cancel { grace });
+            Some(row)
+        }
+    );
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(
+        out,
+        Err(DriverError::Cancelled),
+        "the failed settle is a warn"
+    );
+    assert!(parked.is_some(), "the request was relayed");
+    assert_eq!(
+        the_one_row(&fx.store).status,
+        PermissionStatus::Pending,
+        "the settle did not land"
+    );
+    assert_each_answered_cancelled(&log(&fx.store, fx.step).await, &[REQUEST]);
+
+    // The log's appends fail from the cancel on.
+    let fx = leased().await;
+    let flaky = FlakyAppends {
+        store: &fx.store,
+        down: AtomicBool::new(false),
+    };
+    let mut recorder = Recorder::new(&flaky, &scrubber, fx.step, false, None)
+        .with_fence(StepFence::Lease(fx.owner));
+    let (mut session, _seen) =
+        watched(Some(fake(cancelled_script(), fx.step).await), Mode::Forward);
+    let relay = relay_over(&fx.store, &fx, &policy);
+    let (signal, mut control) = control_channel();
+
+    let (out, parked) = tokio::join!(
+        within(drive(
+            &mut session,
+            &mut recorder,
+            Some(&relay),
+            &mut control
+        )),
+        async {
+            let row = parked_row(&fx.store).await?;
+            flaky.down.store(true, Ordering::SeqCst);
+            signal.send_replace(Signal::Cancel { grace });
+            Some(row)
+        }
+    );
+    flaky.down.store(false, Ordering::SeqCst);
+    recorder
+        .finish()
+        .await
+        .expect("the owed rows land at the close");
+
+    assert_eq!(
+        out,
+        Err(DriverError::Cancelled),
+        "the failed appends are a warn"
+    );
+    assert!(parked.is_some(), "the request was relayed");
+    assert_eq!(
+        the_one_row(&fx.store).status,
+        PermissionStatus::Cancelled,
+        "the settle landed"
+    );
+    // The answer was numbered before its flush was refused, so it was owed and landed at the
+    // close; an event the drain pulled while the log was down was refused before it was
+    // numbered, and is lost with its `warn`, as it was with the error.
+    let answers = answers_in(&log(&fx.store, fx.step).await);
+    assert_eq!(answers.len(), 1, "I-7's row once: {answers:?}");
+    assert_eq!(answers[0]["request_id"], REQUEST);
+    assert_eq!(answers[0]["cancelled"], true);
+}
+
+/// A fenced write inside the cancel sequence is still the answer: the lease is another
+/// process's, and a fenced writer writes nothing more (MOD-40 D1, A-2).
+#[tokio::test(start_paused = true)]
+async fn a_cancel_whose_lease_is_gone_is_fenced() {
+    let fx = leased().await;
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let (mut session, _seen) =
+        watched(Some(fake(cancelled_script(), fx.step).await), Mode::Forward);
+    let policy = PermissionPolicy::default();
+    let relay = relay(&fx, &policy);
+    let (signal, mut control) = control_channel();
+
+    let (out, parked) = tokio::join!(
+        within(drive(
+            &mut session,
+            &mut recorder,
+            Some(&relay),
+            &mut control
+        )),
+        async {
+            let row = parked_row(&fx.store).await?;
+            assert!(
+                fx.store
+                    .release_lease(fx.run, fx.owner)
+                    .await
+                    .expect("the release is answered"),
+                "the executor's lease is released before the cancel"
+            );
+            signal.send_replace(Signal::Cancel {
+                grace: Duration::from_secs(3),
+            });
+            Some(row)
+        }
+    );
+
+    assert_eq!(
+        out,
+        Err(DriverError::Store(StoreError::Fenced { step: fx.step })),
+        "the fence is the answer, not the cancel"
+    );
+    assert!(parked.is_some(), "the request was relayed");
+}
+
+/// D8: a parked request's poll survives a few transient read failures (`Unreachable`, `Backend`),
+/// as the lease heartbeat does (D123), and resumes on the client's answer.
+#[tokio::test(start_paused = true)]
+async fn a_parked_poll_survives_a_few_failed_reads() {
+    let fx = leased().await;
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let (mut session, seen) = watched(Some(fake(answered_script(), fx.step).await), Mode::Forward);
+    let policy = PermissionPolicy::default();
+    let failing = FailingReads::times(fx.store.clone(), 4);
+    let relay = relay_over(&failing, &fx, &policy);
+    let mut control = Control::never();
+
+    let (out, parked) = tokio::join!(
+        within(drive(
+            &mut session,
+            &mut recorder,
+            Some(&relay),
+            &mut control
+        )),
+        async {
+            let row = parked_row(&fx.store).await?;
+            answer(&fx.store, &row, ALLOW).await;
+            Some(row)
+        }
+    );
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(
+        out,
+        Ok(DoneEvent {
+            stop_reason: StopReason::EndTurn
+        }),
+        "the blips cost nothing"
+    );
+    assert!(parked.is_some(), "the request was relayed");
+    assert_eq!(
+        failing.left.load(Ordering::SeqCst),
+        0,
+        "every blip was read"
+    );
+    assert_eq!(the_one_row(&fx.store).status, PermissionStatus::Applied);
+    assert_eq!(
+        seen.answers(),
+        vec![(
+            PermissionRequestId::new(REQUEST),
+            PermissionAnswer::Selected(ALLOW.to_owned())
+        )],
+        "the live session got the client's option"
+    );
 }
