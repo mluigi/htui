@@ -1,7 +1,7 @@
 //! The run runtime (MOD-4 milestone 6, plan D153; MOD-41 plan D6, D7): every command on a task of
 //! its own, serialised per run, supervised, swept.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::path::PathBuf;
@@ -16,8 +16,8 @@ use htui_agent::error::DriverError;
 use htui_agent::record::Control;
 use htui_agent::registry::DriverFactory;
 use htui_core::model::{
-    AgentId, AgentSummary, BoxId, BoxProfile, Executor, ItemId, RepoId, Run, RunId, RunStatus,
-    SnapshotCandidate, UserId,
+    AgentId, AgentSummary, BoxId, BoxProfile, Executor, ItemId, RepoId, Run, RunCommandId, RunId,
+    RunStatus, SnapshotCandidate, UserId,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{Result as StoreResult, StoreError};
@@ -101,6 +101,24 @@ pub fn worker_walks(run: RunId) -> String {
         "the worker on this box is walking run {run}; cancelling a live run needs MOD-42's cancel command"
     )
 }
+
+/// MOD-42 plan D12 step 6: a cancel this process cannot apply now; the run's executor does.
+pub const CANCEL_REQUESTED: &str = "cancel requested: the run's executor applies it";
+/// The same, when a cancel of the run was already pending.
+pub const CANCEL_ALREADY_REQUESTED: &str =
+    "a cancel is already requested: the run's executor applies it";
+
+/// MOD-42 OQ-3: `p` on a step the box's worker walks. Promotion hands a live session to this
+/// TUI's chat, which cannot cross processes.
+#[must_use]
+pub fn promote_needs_the_walker(run: RunId) -> String {
+    format!(
+        "the worker on this box is walking run {run}; a live step is promoted only by the process that walks it"
+    )
+}
+
+/// MOD-42 plan D11, B-19: the window a graceful preempt gives a session's cancel.
+pub const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 /// OQ-6: the first delay before a run whose resume failed is resumed again.
 const BACKOFF_FIRST: Duration = Duration::from_secs(5);
@@ -199,6 +217,13 @@ struct Shared<P: ReplySink> {
     last_executor: StdMutex<Option<Executor>>,
     /// OQ-6, blueprint B-10: the runs whose resume keeps failing (role [`Role::Worker`] only).
     backoff: StdMutex<HashMap<RunId, Backoff>>,
+    /// MOD-42 plan D13: one command poll at a time.
+    polling: AtomicBool,
+    /// MOD-42 B-5: the run commands a task of this process is applying now, so the poll never
+    /// applies a row the inline path (or an earlier tick) is still applying.
+    applying: StdMutex<HashSet<RunCommandId>>,
+    /// MOD-42 plan D11, B-19: the grace a graceful preempt gives a session's cancel.
+    cancel_grace: Duration,
 }
 
 /// One task of the runtime, with the run it works on once it knows it.
@@ -969,6 +994,9 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 sweeping: AtomicBool::new(false),
                 last_executor: StdMutex::default(),
                 backoff: StdMutex::default(),
+                polling: AtomicBool::new(false),
+                applying: StdMutex::default(),
+                cancel_grace: CANCEL_GRACE,
             }),
             events: Some(receiver),
             host: PhantomData,
@@ -1036,6 +1064,26 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
             sweep_once(ctx).await;
         });
         shared.track(tag, handle);
+    }
+
+    /// MOD-42 plan D13 (B-1, B-10): one command poll, the `sweep_with` shape: sync, one tracked
+    /// task under an in-flight flag so ticks never overlap; nothing without a writer or after
+    /// close. Each pending row this process may apply (`pending_commands(owner, box)`), not
+    /// already being applied (B-5), runs as an internal cancel (D12 steps 3-5, no second row).
+    /// `live` is the loop's [`LiveChats`]: a cancel a live chat refuses stays pending, silently.
+    pub fn poll_commands_with(&mut self, host: &H, sink: &P, live: LiveChats) {
+        // MOD-42 T4: red — the poll does nothing yet.
+        let _ = (host, sink, live);
+    }
+
+    /// B-19: the grace [`CANCEL_GRACE`] stands for, fixed by a test.
+    ///
+    /// # Panics
+    /// When called after the runtime has served.
+    #[must_use]
+    pub fn with_cancel_grace(mut self, grace: Duration) -> Self {
+        self.configure().cancel_grace = grace;
+        self
     }
 
     /// The shared state, while nothing else holds it: configuration happens before the first
@@ -2161,6 +2209,22 @@ pub mod testing {
     }
 
     impl<P: ReplySink> Probe<P> {
+        /// This process's lease owner (MOD-42: a case hands it a run's lease).
+        #[must_use]
+        pub fn owner(&self) -> uuid::Uuid {
+            self.0.owner
+        }
+
+        /// Whether a task of this process is applying the run command `id` (MOD-42 B-5).
+        #[must_use]
+        pub fn is_applying(&self, id: htui_core::model::RunCommandId) -> bool {
+            self.0
+                .applying
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&id)
+        }
+
         /// `run`'s lock when nobody holds it.
         #[must_use]
         pub fn try_lock(&self, run: RunId) -> Option<OwnedMutexGuard<()>> {
@@ -2222,6 +2286,18 @@ pub mod testing {
                 .unwrap_or_else(PoisonError::into_inner)
                 .iter()
                 .all(|task| task.handle.is_finished())
+        }
+
+        /// How many tracked tasks have not finished yet.
+        #[must_use]
+        pub fn unfinished_tasks(&self) -> usize {
+            self.0
+                .tasks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .filter(|task| !task.handle.is_finished())
+                .count()
         }
 
         /// The sink frames go out on.
