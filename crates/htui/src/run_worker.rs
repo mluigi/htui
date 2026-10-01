@@ -3478,6 +3478,84 @@ pub(crate) mod tests {
         assert!(fixture.steps(run).await.is_empty(), "nothing walked");
     }
 
+    /// D12 steps 1 and 2 (review L-4): `c` read the run `queued`, but another process on this box
+    /// claimed it before the queued CAS. The run is no longer queued, so the cancel is durable: one
+    /// pending row and the `requested` answer, not the engine's raw `LeaseHeld` sentence.
+    #[tokio::test]
+    async fn a_cancel_whose_queued_run_is_claimed_meanwhile_is_requested() {
+        let fixture = Fixture::new().await;
+        let run = queued_by_another(&fixture, ids::HTUI_ANA_2).await;
+        let mut runtime = fixture.runtime();
+        let probe = testing::probe(&runtime);
+        // Hold the run's lock so the cancel parks after its snapshot read, before the CAS.
+        let held = probe.try_lock(run).expect("nobody holds it");
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, mut answers) = mpsc::unbounded_channel();
+
+        let served = runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq: 1,
+                    origin: Origin::App,
+                    request: cancel(run),
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(matches!(served, RunServed::Deferred), "{served:?}");
+        within("the cancel waiting for the run's lock", async {
+            while probe.live_walks(run) < 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        // The box's worker claims the run, for a day.
+        let claim = fixture
+            .store
+            .claim_run(
+                run,
+                ids::BOX,
+                Uuid::now_v7(),
+                Utc::now(),
+                TimeDelta::days(1),
+            )
+            .await
+            .expect("the claim answers");
+        assert!(claim.is_admitted(), "{claim}");
+        let before = fixture.run(run).await;
+        drop(held);
+
+        assert!(runtime.settle(PATIENCE).await.is_empty(), "no task stuck");
+        drop(replies);
+        let mut reply = None;
+        while let Ok(envelope) = answers.try_recv() {
+            if envelope.seq == 1 && !matches!(envelope.reply, StoreReply::RunStream(_)) {
+                reply = Some(envelope.reply);
+            }
+        }
+        let reply = reply.expect("the cancel was answered");
+        assert!(
+            matches!(&reply, StoreReply::Failed { request: "cancel_run", message } if message == CANCEL_REQUESTED),
+            "{reply:?}"
+        );
+        assert_eq!(
+            commands_of(&fixture, run)
+                .iter()
+                .map(|row| (row.kind, row.status))
+                .collect::<Vec<_>>(),
+            [(RunCommandKind::Cancel, RunCommandStatus::Pending)],
+            "one durable cancel row, left for the claimant"
+        );
+        let row = fixture.run(run).await;
+        assert_eq!(
+            (row.status, row.lease_expires_at),
+            (RunStatus::Running, before.lease_expires_at),
+            "the claimant's run is untouched"
+        );
+    }
+
     /// D11: a command queued for the lock of a run being cancelled gracefully is refused at the
     /// cancel's signal, not at the token's drop, so the cancel ends as soon as the walk rests —
     /// well inside its grace — and the queued command is answered `PREEMPTED`.

@@ -2134,6 +2134,33 @@ async fn on_run<H: htui_core::store::WorkerHost, P: ReplySink>(
     preempt: Preempt,
     live: &LiveChats,
 ) {
+    let _answered = on_run_unless_claimed(&ctx, run, command, preempt, live, false).await;
+}
+
+/// MOD-42 review L-4: whether `err` says the run is no longer queued because a claim won the race
+/// with a cancel that read it `queued` — a live lease elsewhere on this box, or a run executing
+/// (or parked) rather than queued or terminal.
+fn lost_to_a_claim(err: &EngineError) -> bool {
+    match err {
+        EngineError::LeaseHeld { .. } => true,
+        EngineError::RunStatus { status, .. } => {
+            *status != RunStatus::Queued && !status.is_terminal()
+        }
+        _ => false,
+    }
+}
+
+/// [`on_run`]'s body. With `claimed_back`, an error that says a claim won the race with the
+/// command ([`lost_to_a_claim`]) is not answered but handed back, the run's lock released, so a
+/// cancel can take D12 step 2's durable path; every other ending is answered here.
+async fn on_run_unless_claimed<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: &TaskCtx<H, P>,
+    run: RunId,
+    command: Command,
+    preempt: Preempt,
+    live: &LiveChats,
+    claimed_back: bool,
+) -> Option<EngineError> {
     let early = ctx.tag(run).await;
     if moves_the_run(&command) && !live.is_empty() {
         let refusal = match ctx.host.run_steps(run).await {
@@ -2141,7 +2168,8 @@ async fn on_run<H: htui_core::store::WorkerHost, P: ReplySink>(
             Err(err) => Some(err.to_string()),
         };
         if let Some(refusal) = refusal {
-            return ctx.refuse(refusal);
+            ctx.refuse(refusal);
+            return None;
         }
     }
     if preempt == Preempt::IfLive && ctx.shared.walks.is_live(run) {
@@ -2152,14 +2180,19 @@ async fn on_run<H: htui_core::store::WorkerHost, P: ReplySink>(
     }
     let walk = ctx.shared.walks.child(run);
     let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
-        return ctx.refuse(PREEMPTED.to_owned());
+        ctx.refuse(PREEMPTED.to_owned());
+        return None;
     };
     let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {
         Ok(kit) => kit,
-        Err(message) => return ctx.refuse(message),
+        Err(message) => {
+            ctx.refuse(message);
+            return None;
+        }
     };
     if let Some(refusal) = kit.refusal(&command) {
-        return ctx.refuse(refusal);
+        ctx.refuse(refusal);
+        return None;
     }
     // `project_id` never changes, so the row read before the lock stands in for a failed one.
     let row = ctx.tag_run(&kit.writer, run).await.or(early);
@@ -2239,9 +2272,14 @@ async fn on_run<H: htui_core::store::WorkerHost, P: ReplySink>(
         {
             ctx.refuse(promote_needs_the_walker(held));
         }
+        Some(Err(err)) if claimed_back && lost_to_a_claim(&err) => {
+            drop(guard);
+            return Some(err);
+        }
         Some(Err(err)) => ctx.refuse(err.to_string()),
     }
     drop(guard);
+    None
 }
 
 /// MOD-42 plan D12: every cancel of a live run is a durable command its executor applies.
@@ -2297,9 +2335,31 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
     // 1 (not B-20's `Preempt::Never`): a queued run's own start or claim task in this process is
     // still stopped first, as MOD-41's `Preempt::Always` did, now gracefully; with `Never` the
     // cancel would wait behind that task's whole walk.
-    if existing.is_none() && (row.status == RunStatus::Queued || row.status.is_terminal()) {
-        return on_run(ctx, run, command, Preempt::IfLive, live).await;
-    }
+    //
+    // Review L-4: a claim by another process that lands between this snapshot and the queued CAS
+    // leaves a run that is no longer queued, so D12 step 2's "otherwise" holds: the run is read
+    // again (its `executing_box_id` decides step 4) and the cancel goes durable. A run that reads
+    // queued or terminal again keeps today's rowless refusal.
+    let row = if existing.is_none() && (row.status == RunStatus::Queued || row.status.is_terminal())
+    {
+        let queued = Box::pin(on_run_unless_claimed(
+            &ctx,
+            run,
+            Command::CancelRun { run },
+            Preempt::IfLive,
+            live,
+            true,
+        ));
+        let Some(lost) = queued.await else {
+            return;
+        };
+        match ctx.tag(run).await {
+            Some(row) if row.status != RunStatus::Queued && !row.status.is_terminal() => row,
+            _ => return refuse(&ctx, lost.to_string()),
+        }
+    } else {
+        row
+    };
     let Some(writer) = ctx.host.writer() else {
         return refuse(&ctx, DATABASE_UNREACHABLE.to_owned());
     };
