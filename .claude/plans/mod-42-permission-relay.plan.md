@@ -1,8 +1,8 @@
 # Plan: MOD-42 — Permission and control relay through Postgres
 
-**Status: DRAFT — fact-checked 2026-10-01 (handoff-run step 3.5: five independent verification
-passes, workflow `wf_362e6c61-139`; falsified and partly-true claims amended in place, see
-"Verified claims"). Awaiting maintainer CONFIRM.**
+**Status: CONFIRMED by the maintainer 2026-10-01, OQ-1 to OQ-5 as recommended. Fact-checked
+2026-10-01 (handoff-run step 3.5: five independent verification passes, workflow
+`wf_362e6c61-139`; falsified and partly-true claims amended in place, see "Verified claims").**
 
 **Source PRD**: `.claude/prds/mod-42-permission-relay.prd.md`, all three milestones, with its gate
 decisions (maintainer, 2026-10-01, "proceed" = every recommended default; cited as **PRD Q1-Q10**).

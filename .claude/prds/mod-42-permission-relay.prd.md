@@ -100,8 +100,9 @@ worker walk reaches a terminal state within the grace window plus one poll inter
    event (answerers never write `session_event` — single-writer `seq` and the lease fence stand).
 3. **Stale-answer safety.** An answer applies only while the executor holds the lease and only to
    the live session attempt (request ids are scoped per attempt; JSON-RPC ids repeat across
-   respawns). Pending requests of a dead attempt become stale; a late answer is persisted as
-   refused, never silently dropped (ANA-2 inv. 7). First answer wins.
+   respawns). Pending requests of a dead attempt become stale; a late answer is refused to its
+   sender with the actual state, never applied (ANA-2 inv. 1; amended at the plan's CONFIRM,
+   OQ-1, 2026-10-01 — it is not persisted). First answer wins.
 4. **Runs-pane answering.** Any TUI holding the DSN shows a step's pending request in the Runs pane
    and answers it with the same option keys as chat (`R-TUI-6`). "Awaiting permission" is derived
    from the pending request, not a new step status.
