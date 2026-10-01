@@ -286,9 +286,13 @@ fn classify_host(host: &str) -> DsnHost {
     if lower == "localhost" || lower.ends_with(".localhost") {
         return DsnHost::Loopback;
     }
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(v4)) if v4.is_loopback() || v4.is_unspecified() => DsnHost::Loopback,
-        Ok(IpAddr::V6(v6))
+    match host
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| parse_inet_aton(host).map(IpAddr::V4))
+    {
+        Some(IpAddr::V4(v4)) if v4.is_loopback() || v4.is_unspecified() => DsnHost::Loopback,
+        Some(IpAddr::V6(v6))
             if v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()) =>
@@ -297,6 +301,46 @@ fn classify_host(host: &str) -> DsnHost {
         }
         _ => DsnHost::Remote,
     }
+}
+
+/// An IPv4 address in one of the shorthand spellings `inet_aton` accepts: one to four
+/// `.`-separated parts, each decimal, octal (leading `0`) or hex (`0x`), the last filling the
+/// remaining bytes (`127.1`, `2130706433`, `0x7f.1`, `0`).
+///
+/// sqlx passes the host to the resolver verbatim and glibc's `getaddrinfo` reads these as
+/// addresses, so `classify_host` must too. `None` for anything else.
+fn parse_inet_aton(host: &str) -> Option<core::net::Ipv4Addr> {
+    let parts = host
+        .split('.')
+        .map(|part| {
+            let (digits, radix) =
+                if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+                    (hex, 16)
+                } else if part.len() > 1 && part.starts_with('0') {
+                    (&part[1..], 8)
+                } else {
+                    (part, 10)
+                };
+            if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+                return None;
+            }
+            u32::from_str_radix(digits, radix).ok()
+        })
+        .collect::<Option<Vec<u32>>>()?;
+    let (last, leading) = parts.split_last()?;
+    if leading.len() > 3 || leading.iter().any(|&part| part > 0xff) {
+        return None;
+    }
+    let tail_bits = 32 - 8 * u32::try_from(leading.len()).ok()?;
+    if tail_bits < 32 && *last >> tail_bits != 0 {
+        return None;
+    }
+    let head = leading
+        .iter()
+        .fold(0_u32, |acc, &part| (acc << 8) | part)
+        .checked_shl(tail_bits)
+        .unwrap_or(0);
+    Some(core::net::Ipv4Addr::from(head | last))
 }
 
 /// Whether sqlx's `match` has an arm for `key`, including the `options[<name>]` family.
