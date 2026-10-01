@@ -1097,6 +1097,19 @@ fn step_lines(
     [first, second]
 }
 
+/// A parked step's reason on a third line (R-3): `Some` only for an awaiting step with a
+/// non-empty `gate_note`, indented to the status column and fitted to the pane.
+fn note_line(step: &RunStepSummary, theme: &Theme) -> Option<Line<'static>> {
+    if step.status != StepStatus::AwaitingApproval {
+        return None;
+    }
+    let note = step.gate_note.as_deref().filter(|note| !note.is_empty())?;
+    Some(Line::from(vec![
+        Span::raw(blank(INDENT)),
+        Span::styled(fit(note, PANE - INDENT), theme.accent),
+    ]))
+}
+
 /// A relayed request's options as the strip takes them (MOD-42 blueprint F-19: the orphan rule
 /// forbids a `From` between core's and the agent crate's types).
 fn strip_options(options: &[RelayOption]) -> Vec<PermissionOption> {
@@ -1465,6 +1478,7 @@ impl RunsTab {
             for step in &run.steps {
                 let on_cursor = step_cursor == Some(step.id);
                 lines.extend(step_lines(step, &run.steps, on_cursor, theme));
+                lines.extend(note_line(step, theme));
                 // MOD-42 D14: the request's two lines belong to the step, so the cursor's end
                 // counts them and the scroll keeps them in view.
                 if let Some(pending) = self.pending_on(step.id) {
@@ -1808,6 +1822,59 @@ mod tests {
             2 + 2 + 4 * 2,
             "the header, the run and four two-line steps"
         );
+    }
+
+    /// R-3: a parked step's reason takes a third line under its two, indented to the status
+    /// column; a step without a note keeps two.
+    #[tokio::test]
+    async fn a_parked_step_shows_its_reason_on_a_third_line() {
+        const NOTE: &str = "judge failed: orderings disagree";
+        let shell = Shell::new();
+        let mut runs = feat_1_runs().await;
+        runs[0].steps[2].status = StepStatus::AwaitingApproval;
+        runs[0].steps[2].gate_note = Some(NOTE.to_owned());
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+        let _ = shell.emit.take();
+        let lines = lines(&pane, &shell);
+        let at = lines
+            .iter()
+            .position(|line| line.contains("implement"))
+            .expect("the `implement` step is listed");
+        let third = lines.get(at + 2).expect("the parked step has a third line");
+        assert!(
+            third.starts_with(&" ".repeat(INDENT)) && third.contains(NOTE),
+            "the reason sits on the third line, indented: {third:?}"
+        );
+        assert!(
+            !lines.get(at + 3).is_some_and(|line| line.contains(NOTE)),
+            "once"
+        );
+        assert_eq!(
+            lines.iter().filter(|line| !line.is_empty()).count(),
+            2 + 2 + 4 * 2 + 1,
+            "only the parked step with a note grew"
+        );
+    }
+
+    /// R-3: the reason line is the pane's 43 columns whatever the note holds, cut with `CUT`.
+    #[tokio::test]
+    async fn a_reason_line_is_forty_three_columns_whatever_the_note() {
+        let theme = Theme::default();
+        let mut step = feat_1_runs().await[0].steps[0].clone();
+        step.status = StepStatus::AwaitingApproval;
+        let note = format!("first\nsecond\tthird {}", "x".repeat(300));
+        step.gate_note = Some(note);
+        let line = note_line(&step, &theme).expect("a parked step with a note has a line");
+        assert_eq!(line.width(), PANE);
+        assert!(text(&line).ends_with(CUT), "{:?}", text(&line));
+        assert!(text(&line).chars().all(|c| !c.is_control()));
+        step.gate_note = Some(String::new());
+        assert!(note_line(&step, &theme).is_none(), "an empty note is none");
+        step.gate_note = Some("a note".to_owned());
+        step.status = StepStatus::Running;
+        assert!(note_line(&step, &theme).is_none(), "only a parked step");
     }
 
     /// The text of a line, spans joined.
