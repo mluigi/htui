@@ -2271,6 +2271,56 @@ pub(crate) mod tests {
         );
     }
 
+    /// R-51: a command queued behind a live walk announces the wait with one `Waiting` frame, and
+    /// the walk has not rested.
+    #[tokio::test]
+    async fn a_command_queued_behind_a_live_walk_publishes_a_waiting_frame() {
+        let fixture = Fixture::new().await;
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime());
+        worker.send_at(
+            Origin::Tab(TabId("backlog")),
+            1,
+            StoreRequest::RunStream {
+                item: ids::HTUI_ANA_2,
+            },
+        );
+        let (run, research) = parked(&fixture, &mut worker).await;
+        frames(&mut worker);
+        let stall = Stall::default();
+        fixture.sessions.push(Play::Stall(stall.clone()));
+        worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::RetryStep {
+                run,
+                step: research.id,
+            })),
+        );
+        within("attempt 2's session starting", stall.reached.notified()).await;
+        worker.send(
+            Origin::App,
+            StoreRequest::Orch(OrchRequest::Command(Command::AnswerGate {
+                run,
+                step: research.id,
+                answer: GateAnswer::Approved,
+            })),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let seen = frames(&mut worker);
+        let waiting = seen
+            .iter()
+            .filter(|(_, _, frame)| {
+                frame.run == Some(run) && matches!(frame.kind, FrameKind::Waiting)
+            })
+            .count();
+        assert_eq!(waiting, 1, "one Waiting frame for the queued command");
+        assert!(
+            !seen
+                .iter()
+                .any(|(_, _, frame)| matches!(frame.kind, FrameKind::Rested(_))),
+            "the walk has not rested"
+        );
+    }
+
     /// R-40: a step that goes live publishes a `Changed` frame at once, while its session is still
     /// running, and not only when the walk rests. The pane re-reads on `Changed`, so no new kind.
     #[tokio::test]
