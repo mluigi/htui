@@ -19,6 +19,7 @@ Where this file and the plan disagree on a detail, this file wins (errata §0).
 | E9 | T3: "`MintItem` lands `KEY-n+1` with revision 1"; "`EditItem` … lands `version + 1` with reason `edited`" | No public read returns `item_revision` rows (`ReadStore` has none; `MemStore` has no accessor). A revision appears only as `UpdateOutcome::Diverged.ancestor` | Assert `version == 1` on the mint (the revision itself is pinned by conformance `mint_writes_revision_v1`). Pin `reason = "edited"` through the `ancestor` of a later, deliberately stale edit (§3 test 7) |
 | E10 | (silent) | `BacklogTab` derives `Debug` (`backlog/mod.rs:53`) and the form holds an `Item` whose `Debug` prints `body` | `ItemForm` hand-writes `Debug` (lengths only), the `RequirementForm` precedent (`requirements/forms.rs:122-125`) |
 | E11 | (silent) | Offline harness: once item rows are seeded, the first `Items` reply selects `htui ANA-1` and sends the seven detail reads, so the status line is **not** clean before `N`. The milestone-1 offline test's `status == None` precheck (`tests/backlog.rs:1555`) cannot be copied | The offline test sets the scope to Platform explicitly, then asserts the **exact** status after `N` and after `e` (§5 test 5) |
+| E12 | §1c: the body is returned "as given"; the check order is title, kind, tags, graph, paths; D4 refuses a NUL in `touched_paths` only | Postgres `text` cannot hold U+0000 (`22021`). A NUL in the title or body mints on `MemStore` but fails on `PgStore` as a `Backend` error, which §10.1 would hedge as "may have been written". Both stores already refuse such text by rule elsewhere (`has_nul`, `store/traits.rs:1897`) | The validator refuses it by rule (implemented in `6caae9d`): `SpecError::Nul(&'static str)`, `"{0} must not contain a NUL character"` (`has_nul`'s sentence), with the column named `item.title` or `item.body`. `parse_title` refuses it after `BlankTitle`; a private `check_body` refuses it in the body. The order is **title, body, kind, tags, graph, paths**. T3's `refused` maps it to `Constraint` like every other `SpecError`, so `mint_refused` (§10.1) treats it as a refusal, not a hedge. Nothing matches `SpecError` exhaustively in T3/T4 (both use `Display`). Test `a_nul_in_the_title_or_body_is_refused` |
 
 ## 1. Shared validator (Task 1, `htui-core`)
 
@@ -110,6 +111,9 @@ pub enum SpecError {
     Kind(ItemKindId),
     #[error("that step graph is not one of this project's graphs")]
     Graph(StepGraphId),
+    /// E12: a NUL in the title or body; the column is `item.title` or `item.body`.
+    #[error("{0} must not contain a NUL character")]
+    Nul(&'static str),
     #[error("touched path `{entry}` {why}")]
     Path { entry: String, why: String },
 }
@@ -117,7 +121,7 @@ pub enum SpecError {
 
 **Text front (form only):**
 ```rust
-pub fn parse_title(text: &str) -> Result<String, SpecError>;   // trim; empty -> BlankTitle
+pub fn parse_title(text: &str) -> Result<String, SpecError>;   // trim; empty -> BlankTitle; NUL -> Nul("item.title") (E12)
 pub fn parse_priority(text: &str) -> Result<i16, SpecError>;   // text.trim().parse::<i16>(); Err -> Priority(trimmed)
 pub fn parse_tags(text: &str) -> Result<Vec<String>, SpecError>; // declared_tags_from_text, Err -> Tags
 #[must_use] pub fn parse_paths(text: &str) -> Vec<String>;     // lines, trim each, drop blanks, dedup keeping order
@@ -131,7 +135,7 @@ pub fn check_paths(paths: &[String], repos: &[Repo]) -> Result<Vec<String>, Spec
 pub fn check_spec(spec: &ItemSpec, ctx: &SpecContext<'_>) -> Result<ItemSpec, SpecError>;
 pub fn check_changes(changes: &SpecChanges, ctx: &SpecContext<'_>) -> Result<SpecChanges, SpecError>;
 ```
-Both checks return the **canonical** value: the title trimmed, the tags through `canonical_declared_tags`, the paths through `check_paths`, everything else as given. `check_changes` checks only the `Some` fields (A4). The order is title, kind, tags, graph, paths, and the first refusal wins. `check_spec` uses the same private per-field functions, so no `expect` is needed.
+Both checks return the **canonical** value: the title trimmed, the tags through `canonical_declared_tags`, the paths through `check_paths`, everything else as given, except that a body holding a NUL is refused (E12). `check_changes` checks only the `Some` fields (A4). The order is title, body, kind, tags, graph, paths (E12), and the first refusal wins. `check_spec` uses the same private per-field functions, so no `expect` is needed.
 - kind: `ctx.kinds.iter().any(|k| k.id == id)`, else `Kind(id)`.
 - graph: `None` passes; `Some(id)` passes when `ctx.graphs.iter().any(|g| g.id == id && !g.is_override)`, else `Graph(id)`. An unchanged override graph is never in `SpecChanges`, so it is never checked (A4 covers D4's "only as the unchanged value").
 - `check_paths`: first canonicalise (trim, drop blanks, dedup keeping order, so the function is idempotent). Then, per entry, the first rule that fires gives the `why`:
