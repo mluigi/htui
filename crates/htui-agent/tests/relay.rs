@@ -903,8 +903,9 @@ async fn a_cancelled_session_that_never_ends_its_turn_is_bounded() {
     );
 }
 
-/// B-11, D6: the drain stops at the cancel's `done`. A stream that outlives the turn (ACP) does
-/// not hold `drive` for the whole bound.
+/// The post-cancel drain stops at the cancel's `done` (`drive`'s doc; a refinement of D6's "drain
+/// to the stream's end" that awaits its own §0a entry). A stream that outlives the turn (ACP) does
+/// not hold `drive` for B-11's whole bound.
 #[tokio::test(start_paused = true)]
 async fn the_post_cancel_drain_stops_at_the_turns_done() {
     let fx = leased().await;
@@ -922,6 +923,146 @@ async fn the_post_cancel_drain_stops_at_the_turns_done() {
         Some(json!("cancelled")),
         "the drain recorded the cancel's `done`"
     );
+}
+
+/// A session that, once cancelled, emits `tool_call`/`tool_result` pairs at once and for ever:
+/// every `record` of the drain flushes the row before it.
+#[derive(Debug, Default)]
+struct Chatter {
+    cancelled: bool,
+    emitted: usize,
+}
+
+impl AgentSession for Chatter {
+    fn session_ref(&self) -> Option<&AgentSessionRef> {
+        None
+    }
+
+    fn next_event<'a>(&'a mut self) -> DriverFuture<'a, Option<DriverEnvelope>> {
+        Box::pin(async move {
+            if !self.cancelled {
+                std::future::pending::<()>().await;
+            }
+            let id = format!("late-{}", self.emitted / 2);
+            let event = if self.emitted.is_multiple_of(2) {
+                DriverEvent::ToolCall(ToolCallEvent {
+                    tool_call_id: id,
+                    title: "late".to_owned(),
+                    tool_kind: ToolKind::Execute,
+                    input: json!({}),
+                    locations: Vec::new(),
+                })
+            } else {
+                DriverEvent::ToolResult(ToolResultEvent {
+                    tool_call_id: id,
+                    status: ToolResultStatus::Failed,
+                    output: None,
+                    locations: Vec::new(),
+                    terminal_reason: None,
+                })
+            };
+            self.emitted += 1;
+            Ok(Some(DriverEnvelope {
+                event,
+                raw: None,
+                at: at(),
+            }))
+        })
+    }
+
+    fn send_follow_up<'a>(&'a mut self, _text: String) -> DriverFuture<'a, ()> {
+        Box::pin(async { Err(DriverError::Closed) })
+    }
+
+    fn answer_permission<'a>(
+        &'a mut self,
+        _request_id: PermissionRequestId,
+        _answer: PermissionAnswer,
+    ) -> DriverFuture<'a, ()> {
+        Box::pin(async { Err(DriverError::Closed) })
+    }
+
+    fn cancel<'a>(&'a mut self, _grace: Duration) -> DriverFuture<'a, ()> {
+        Box::pin(async move {
+            self.cancelled = true;
+            Ok(())
+        })
+    }
+}
+
+/// `MemStore`'s recorder surface, except that every `append_events` takes [`SLOW_APPEND`] first.
+#[derive(Debug)]
+struct SlowAppends<'a>(&'a MemStore);
+
+/// Longer than B-11's slack is short: a drain that times out mid-flush lands inside one.
+const SLOW_APPEND: Duration = Duration::from_millis(700);
+
+impl htui_core::store::RecorderStore for SlowAppends<'_> {
+    async fn append_events(&self, fence: StepFence, events: &[SessionEvent]) -> StoreResult<usize> {
+        tokio::time::sleep(SLOW_APPEND).await;
+        htui_core::store::RecorderStore::append_events(self.0, fence, events).await
+    }
+
+    async fn set_step_usage(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        usage: Value,
+        prompt_digest: Option<String>,
+    ) -> StoreResult<()> {
+        htui_core::store::RecorderStore::set_step_usage(self.0, fence, step, usage, prompt_digest)
+            .await
+    }
+
+    async fn set_agent_box_quota(
+        &self,
+        agent_id: htui_core::model::AgentId,
+        box_id: htui_core::model::BoxId,
+        quota: Value,
+        quota_at: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        htui_core::store::RecorderStore::set_agent_box_quota(
+            self.0, agent_id, box_id, quota, quota_at,
+        )
+        .await
+    }
+}
+
+/// B-11 bounds the drain's pulls, never a recording: a slow store whose flush is still running
+/// when the bound passes loses no row the recorder numbered, so the log holds every `seq`.
+#[tokio::test(start_paused = true)]
+async fn the_drain_bound_never_drops_a_row_mid_flush() {
+    let fx = leased().await;
+    let scrubber = scrubber();
+    let slow = SlowAppends(&fx.store);
+    let mut recorder = Recorder::new(&slow, &scrubber, fx.step, false, None)
+        .with_fence(StepFence::Lease(fx.owner));
+    let mut session = Chatter::default();
+    let (signal, mut control) = control_channel();
+
+    let (out, ()) = tokio::join!(
+        within(drive(
+            &mut session,
+            &mut recorder,
+            None::<&Relay<'_, NoRelay>>,
+            &mut control
+        )),
+        async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            signal.send_replace(Signal::Cancel {
+                grace: Duration::ZERO,
+            });
+        }
+    );
+    let summary = recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(out, Err(DriverError::Cancelled), "still a graceful cancel");
+    let log = log(&fx.store, fx.step).await;
+    assert!(log.len() >= 2, "the drain recorded the late rows: {log:?}");
+    let seqs: Vec<i32> = log.iter().map(|row| row.seq).collect();
+    let numbered: Vec<i32> = (0..summary.seq).collect();
+    assert_eq!(seqs, numbered, "every seq the recorder numbered is stored");
+    assert_eq!(summary.rows, log.len(), "and the recorder counted each one");
 }
 
 /// B-16, D5: a newer session of the step supersedes the parked row (`stale`), and `drive` reads

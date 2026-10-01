@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use super::{AnsweredBy, RecordError, Recorder, enforce_breach};
+use super::{AnsweredBy, Recorder, enforce_breach};
 use crate::driver::{AgentSession, PermissionAnswer, PermissionPolicy, PermissionRequestId};
 use crate::error::DriverError;
 use crate::event::{
@@ -434,21 +434,34 @@ async fn cancel<S: htui_core::store::RecorderStore, R: htui_core::store::RelaySt
             .await?;
         }
     }
-    let drained = async {
-        while let Ok(Some(envelope)) = session.next_event().await {
-            let done = matches!(envelope.event, DriverEvent::Done(_));
-            // A breach verdict here is spent: the session is already closing.
-            recorder.record(envelope).await?;
-            if done {
+    // B-11 bounds the pulls, never a recording: `Recorder::flush` is not cancel-safe (it numbers
+    // its rows before it appends them), so a `record` the bound interrupted would lose a row whose
+    // `seq` is already spent. A recording in flight completes; the next pull sees the bound.
+    let deadline = tokio::time::Instant::now() + grace.saturating_add(DRAIN_SLACK);
+    loop {
+        // `None` is the bound. Checked before the pull too: `timeout_at` polls its future first,
+        // so a session that is always ready would never time out.
+        let pulled = if tokio::time::Instant::now() < deadline {
+            tokio::time::timeout_at(deadline, session.next_event())
+                .await
+                .ok()
+        } else {
+            None
+        };
+        match pulled {
+            Some(Ok(Some(envelope))) => {
+                let done = matches!(envelope.event, DriverEvent::Done(_));
+                // A breach verdict here is spent: the session is already closing.
+                recorder.record(envelope).await?;
+                if done {
+                    break;
+                }
+            }
+            Some(Ok(None) | Err(_)) => break,
+            None => {
+                tracing::warn!("the cancelled session did not end its turn within the grace");
                 break;
             }
-        }
-        Ok::<(), RecordError>(())
-    };
-    match tokio::time::timeout(grace + DRAIN_SLACK, drained).await {
-        Ok(recorded) => recorded?,
-        Err(_) => {
-            tracing::warn!("the cancelled session did not end its turn within the grace");
         }
     }
     Err(DriverError::Cancelled)
