@@ -5,7 +5,7 @@
 **Selected Milestone**: the only one (ANA-23 §8)
 **Requirements**: `R-STO-8`, `R-NF-1`, `R-NF-2`, `R-NF-3`
 **Complexity**: Medium
-**Status**: CONFIRMED by the maintainer 2026-10-01 (OQ-1 and OQ-2 defaults accepted)
+**Status**: DONE 2026-10-01 (write-up `docs/decisions/mod/mod-68.md`); CONFIRMED by the maintainer 2026-10-01 (OQ-1 and OQ-2 defaults accepted)
 
 ## Summary
 

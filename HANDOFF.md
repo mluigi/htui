@@ -14,7 +14,14 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-01):** **MOD-42 is done** (`docs/decisions/mod/mod-42.md`): engine-driven
+**Current status (2026-10-01):** **MOD-68 is done** (`docs/decisions/mod/mod-68.md`): the
+concepts index embeds with `rten`, a pure-Rust ONNX runtime, instead of `fastembed`/`ort`. Nothing is
+downloaded at build time, and the embedder needs no C compiler. The BGE-small weights are fetched on
+first use from the pinned `Xenova/bge-small-en-v1.5` commit `ea104dac`, sha256-checked per file
+(`model.onnx` `828e1496…cf35`), and an existing fastembed cache is adopted. The vectors match
+fastembed's goldens to 3e-7, so stored vectors stay valid. The Qdrant collection now records which
+embedder made it, and a mismatch is refused. Its Windows/macOS run is MOD-16's.
+Before it, **MOD-42 was done** (`docs/decisions/mod/mod-42.md`): engine-driven
 ACP steps no longer fail at their first permission request. The engine applies the agent's own
 permission policy; a request that still needs a human is a pending `step_permission` row (migration
 `0011`) that any TUI answers from the Runs pane (digits `1`-`9`), on any box, by a compare-and-set
@@ -22,31 +29,12 @@ that never takes the lease; the executing process applies it and records the ans
 a leased run is a durable `run_command` row applied gracefully by whoever walks the run (parked
 requests answered `cancelled`, then `session.cancel(grace)`), which replaces MOD-41's worker-walk
 refusal and closes MOD-37's R-38. Follow-up on engine steps is MOD-70.
-Before it, **Current status (2026-10-01):** **ANA-27 was concluded** (`docs/ANA-27.md`,
+Before it, **ANA-27 was concluded** (`docs/ANA-27.md`,
 `docs/decisions/ana/ana-27.md`): OpenRig's LLM lead, durable specialist sessions and tmux
 transport are rejected on recorded decisions (`R-ID-6`, `R-PRM-1`, `R-ID-2`); the discipline around
 its durable rows is taken as ANA-27 notes on MOD-42, MOD-43, MOD-37, MOD-27, MOD-26, MOD-16 and
 MOD-24. Spawned MOD-69 (waiting-on-you list across items; proposed `R-TUI-11` awaits the
 maintainer).
-Before them, **ANA-24 is concluded** (`docs/decisions/ana/ana-24.md`): the
-weight map's implement axis gains two sources that may be both fetched and shipped, Epoch's own
-MirrorCode run (primary) and Arena's CC BY 4.0 Hugging Face leaderboard dataset, which also
-separates effort levels. tbench.ai stays blocked on its results licence, and no permissible
-Terminal-Bench 4.0 mirror exists. The registry entries and parsers land in MOD-36.
-Before it, **ANA-23 was concluded** (`docs/ANA-23.md`,
-`docs/decisions/ana/ana-23.md`): `fastembed`/`ort` gives way to `rten`, a pure-Rust ONNX runtime
-that runs the same BGE-small ONNX file with no native runtime fetched at build time and no C
-compiler for the embedder, at 1.29x fastembed's time on htui's per-item calls. The stored Qdrant
-vectors stay valid (identical top 10), so nothing is re-embedded. It also found that a fresh install
-cannot load the model today (`hf-hub` 0.3.2 and HuggingFace's relative redirects). Spawned MOD-68.
-Before it, **MOD-45 was done** (`docs/decisions/mod/mod-45.md`):
-`htui provision <destination> [--dsn-stdin] [--replace-credential]` turns an ssh-reachable Linux
-host into a worker box in one command (guide `docs/htui-worker.md` § Provisioning a remote box).
-Four ssh sessions (preflight, prepare, install, verify) ship the local build, encrypt the DSN with
-`systemd-creds` from stdin (never argv or a file), install the `htui-worker` system unit, then
-wait for the box to check in and set its executor to `worker`. The TUI gained `--dsn-stdin` for
-agent login over `ssh -t`; `R-STO-1` was amended. No migration. **The live check on a real host is
-the maintainer's** (write-up § Not done here).
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -466,6 +454,11 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   death-signal alternative avoids the reused-pid hazard entirely. OpenRig treats pid plus start time
   as a process's identity in the same way (an argv token match, then a lineage fingerprint including
   `lstart` compared across two `ps` observations).
+  **MOD-68 added one more** (`docs/decisions/mod/mod-68.md`, OQ-1): the `rten` embedder was checked
+  only by a cross `cargo check` for Windows and macOS. Run `htui --index-items` (or a Ctrl+F search)
+  there once with an empty `<cache>/htui/model`, so that the pinned fetch, the locked `.part`, the
+  rename onto a file another process may hold open, and the golden tests
+  (`cargo test -p htui-store --features local-embed --lib embed -- --ignored`) run on that platform.
 
 - [ ] **MOD-66 - Per-box manual tool path editor in Settings > Agents** (from MOD-23, plan OQ-3).
   `R-AGT-6`. ANA-4 §4.6 (`docs/ANA-4.md:796-798`) describes a per-box manual entry: write
@@ -606,19 +599,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   passes `Tab` to the tab bar. Six milestones (ANA-26 §8): M1 catalogue and resolver, M2 the file,
   M3 Settings and overlays, M4 Skills and Requirements, M5 Backlog and Chat, M6 close-out; M3-M5
   are independent but share snapshots. Not blocked.
-- [ ] **MOD-68 - Replace `fastembed`/`ort` with an `rten` embedder and a pinned weight fetch** (from
-  ANA-23, `docs/ANA-23.md`, `docs/decisions/ana/ana-23.md`). `R-STO-8`, `R-NF-1`, `R-NF-2`, `R-NF-3`.
-  `rten` 0.26 runs the same `Xenova/bge-small-en-v1.5` `onnx/model.onnx` behind `DenseEmbedder`,
-  with `tokenizers` 0.23 on `fancy-regex`: no native runtime fetched at build time, no C compiler
-  for the embedder. The stored vectors stay valid (1 - 4e-13 cosine, identical top 10), so nothing
-  is re-embedded. Weights come over the existing `reqwest`, pinned to commit `ea104dac`, sha256 per
-  file, written by temp-and-rename, and an existing `~/.cache/htui/fastembed` snapshot is reused.
-  Every failure is a `StoreError`, never a panic. This also fixes a live defect: `hf-hub` 0.3.2
-  cannot follow HuggingFace's relative redirects, so a fresh install cannot load the model today
-  (ANA-23 §2.4). One milestone (ANA-23 §8): record fastembed goldens first, then the embedder (an
-  explicit thread pool, `i32` inputs, padded tokens capped per call), the fetch, the model identity
-  recorded and checked on connect, and the removal of `fastembed`. Build the embedder on Windows and
-  macOS before removing fastembed; tract-onnx is the fallback. Not blocked.
 - [ ] **MOD-69 - Waiting-on-you list across items** (from ANA-27, `docs/ANA-27.md` §5.1 T8,
   `docs/decisions/ana/ana-27.md`). `R-TUI-1`, `R-TUI-4`, `R-ORCH-2`, `R-ORCH-4`, `R-NF-3`. The Runs
   pane shows what waits on a person only for the selected item, and the top bar counts active runs,
@@ -652,6 +632,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 28 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys, MOD-68 rten embedder, MOD-69 waiting-on-you list; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 27 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-66 per-box tool path editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |
