@@ -1303,3 +1303,117 @@ async fn a_worker_killed_after_the_document_retries_the_step() {
     second.stopped().await;
     case.finish().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// K5: a cancel picked, not applied
+// ---------------------------------------------------------------------------------------------
+
+/// A second store client registered as **another box** (`worker_pg.rs`), as a TUI elsewhere
+/// holding the DSN; its `box.toml` lives in the returned directory, never the real home.
+async fn another_box(db: &testkit::TestDb) -> (PgStore, tempfile::TempDir) {
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let identity = htui_store::identity::load_or_mint(root.path()).expect("mint box.toml");
+    let client = PgStore::connect(&db.url, &identity)
+        .await
+        .expect("the second client connects")
+        .store;
+    assert_ne!(
+        client.this_box(),
+        ids::BOX,
+        "the second client is another box"
+    );
+    (client, root)
+}
+
+/// The first pending request the other box's Runs pane shows for `FEAT-3`, while `child` lives.
+async fn pending_request(client: &PgStore, child: &mut Reaped) -> StepPermission {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let view = client
+            .relay_view(ids::HTUI_FEAT_3)
+            .await
+            .expect("the relay view reads");
+        if let Some(row) = view.permissions.into_iter().next() {
+            return row;
+        }
+        child.alive("the parked request");
+        assert!(
+            Instant::now() < deadline,
+            "no request parked within {PATIENCE:?}; the child's log:\n{}",
+            child.log()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Plan T4 K5: a client on another box requests a cancel while the worker's session is parked
+/// (the lease is live, so the row waits for the executor); the worker's command poll picks the row
+/// up and dies before applying it. The next worker applies it before it recovers anything (D3):
+/// the run ends `cancelled` with its command `applied`, no step was retried, and it never reached
+/// `done`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_picked_but_not_applied_survives_the_kill() {
+    let Some(mut case) = Case::new().await else {
+        return;
+    };
+    let mut first = case.spawn(Act::Park, Some("command_picked"));
+    let (client, _client_root) = another_box(&case.stack.db).await;
+    let parked = pending_request(&client, &mut first).await;
+    assert_eq!(parked.run_id, case.run);
+    let requested = client
+        .request_cancel(case.run, client.this_user(), client.this_box())
+        .await
+        .expect("the cancel is written");
+    assert!(
+        matches!(requested, CancelRequest::Inserted(_)),
+        "queued for the executor, whose lease is live: {requested:?}"
+    );
+    case.marked(&mut first).await;
+    first.killed();
+
+    assert_eq!(
+        case.command_statuses().await,
+        [RunCommandStatus::Pending],
+        "picked, not applied"
+    );
+    assert_eq!(
+        case.stack.run_row(case.run).await.status,
+        RunStatus::Running,
+        "the kill left the run running"
+    );
+
+    let mut second = case.spawn(Act::Walks, None);
+    let row = case.rested(&mut second).await;
+    let steps = case.steps().await;
+    assert_eq!(
+        row.status,
+        RunStatus::Cancelled,
+        "the cancel survived the kill: {:?}",
+        shape(&steps)
+    );
+    let deadline = Instant::now() + PATIENCE;
+    while case.command_statuses().await != [RunCommandStatus::Applied] {
+        second.alive("the command to be applied");
+        assert!(
+            Instant::now() < deadline,
+            "the command was not applied: {:?}",
+            case.command_statuses().await
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        steps.iter().all(|step| step.attempt == 1)
+            && !steps.iter().any(|step| step.status == StepStatus::Done),
+        "no recovery ran, so nothing was retried or finished: {:?}",
+        shape(&steps)
+    );
+    assert_eq!(
+        prd(&steps, 1).map(|step| step.status),
+        Some(StepStatus::Cancelled),
+        "the parked step was cancelled: {:?}",
+        shape(&steps)
+    );
+    drop(client);
+    second.stopped().await;
+    case.finish().await;
+}
