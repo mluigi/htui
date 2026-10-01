@@ -3285,6 +3285,43 @@ pub(crate) mod tests {
         );
     }
 
+    /// D12 steps 3 and 5: a pending cancel whose run is already `cancelled` — another process on
+    /// this box applied it and is still in `cancel_leased`'s cleanup, its row not yet resolved —
+    /// is `applied` at the next poll, never `refused`, whichever process resolves the row first.
+    #[tokio::test]
+    async fn a_pending_cancel_of_a_cancelled_run_is_applied() {
+        let fixture = Fixture::new().await;
+        let run = stranded(&fixture, ids::HTUI_ANA_2).await;
+        let id = requested(&fixture, run).await;
+        fixture
+            .store
+            .finish_run(run, RunStatus::Cancelled, None, Utc::now())
+            .await
+            .expect("another process cancels the run");
+        let mut runtime = fixture.runtime();
+
+        let frames = polled_watching(
+            &mut runtime,
+            &fixture,
+            ids::HTUI_ANA_2,
+            &LiveChats::default(),
+        )
+        .await;
+        let commands = commands_of(&fixture, run);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            (commands[0].id, commands[0].status),
+            (id, RunCommandStatus::Applied)
+        );
+        assert_eq!(fixture.run(run).await.status, RunStatus::Cancelled);
+        assert!(
+            !frames
+                .iter()
+                .any(|kind| matches!(kind, FrameKind::Error(_))),
+            "a polled cancel publishes nothing: {frames:?}"
+        );
+    }
+
     /// One command poll of `runtime` under `live`, settled, while a pane watches `item`: the kinds
     /// of the frames published for it meanwhile.
     async fn polled_watching(

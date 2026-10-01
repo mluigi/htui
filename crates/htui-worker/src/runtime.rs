@@ -2360,7 +2360,17 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
         }
         // D12 step 5: a live lease elsewhere on this box (the worker): its poll applies it.
         Some(Err(EngineError::LeaseHeld { .. })) => ctx.requested(already),
-        // D13, B-4: already terminal → refused with the actual status.
+        // D12 steps 3 and 5: already `cancelled` means the cancel's goal holds — most often
+        // another process on this box applied this very row and is still in `cancel_leased`'s
+        // cleanup, where B-4's terminal clause hands the pending row to this poll too. The row is
+        // `applied` whichever process resolves it first; a TUI's own `c` still hears the status.
+        Some(Err(err @ EngineError::RunStatus { status, .. }))
+            if status == RunStatus::Cancelled =>
+        {
+            resolve(RunCommandStatus::Applied, None).await;
+            refuse(&ctx, err.to_string());
+        }
+        // D13, B-4: otherwise already terminal → refused with the actual status.
         Some(Err(err @ EngineError::RunStatus { status, .. })) if status.is_terminal() => {
             let sentence = err.to_string();
             resolve(RunCommandStatus::Refused, Some(sentence.clone())).await;
