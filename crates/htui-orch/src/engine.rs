@@ -4002,8 +4002,8 @@ where
         {
             Ok(result) => result,
             Err(refused) => {
-                recorder.finish().await?;
-                return Err(refused);
+                let finished = recorder.finish().await;
+                return Err(refused_over_finish(refused, finished, run.id, step.id));
             }
         };
         let cap_breach = recorder.finish().await?.cap_breach;
@@ -5603,8 +5603,8 @@ where
         {
             Ok(result) => result,
             Err(refused) => {
-                recorder.finish().await?;
-                return Err(refused);
+                let finished = recorder.finish().await;
+                return Err(refused_over_finish(refused, finished, run.id, step.id));
             }
         };
         let summary = recorder.finish().await?;
@@ -6105,6 +6105,33 @@ const fn is_fenced(err: &EngineError) -> bool {
             | EngineError::Record(htui_agent::RecordError::Store(StoreError::Fenced { .. }))
             | EngineError::Driver(DriverError::Store(StoreError::Fenced { .. }))
     )
+}
+
+/// MOD-42 M-2: the error a session raises when its `drive_once` refused with `refused` and its
+/// recorder's `finish` then answered `finished`. A cancel or a lost fence wins over a failed
+/// `finish` (logged at `warn`): an `Unmasked` residue or a store blip from the close-out would
+/// otherwise reach the walk's catch-all `fail_hard` / `fail_candidate`, failing a cancelled run
+/// (I-6) or writing unfenced on a run another process holds (A-7). Any other refusal keeps the
+/// close-out's own error first, as before. `judge_sessions` orders its calls the same way.
+fn refused_over_finish<T>(
+    refused: EngineError,
+    finished: Result<T, htui_agent::RecordError>,
+    run: RunId,
+    step: StepId,
+) -> EngineError {
+    match finished {
+        Ok(_) => refused,
+        Err(err) if matches!(refused, EngineError::Cancelled { .. }) || is_fenced(&refused) => {
+            tracing::warn!(
+                run = %run,
+                step = %step,
+                error = %err,
+                "recorder finish failed on a cancelled or fenced session; raising the cancel or fence"
+            );
+            refused
+        }
+        Err(err) => err.into(),
+    }
 }
 
 /// The error a group's `join_all` raises, if any of its candidates answered one.
@@ -15094,6 +15121,150 @@ mod tests {
                     .iter()
                     .all(|step| !matches!(step.status, StepStatus::Running | StepStatus::Pending)),
                 "no member is left live"
+            );
+        }
+
+        /// A request whose option label the scrubber refuses (R-SEC-3): its `permission_request`
+        /// row is replaced by a `scrub_residue` row, so the recorder holds a residue while the
+        /// request is parked.
+        fn parks_with_residue(body: &str) -> ScriptedStep {
+            let mut request = request();
+            request.options[0].label = "Allow sk-ant-api03-abcdefghijklmnopqrstuvwx".to_owned();
+            ScriptedStep::parks(request, body)
+        }
+
+        /// The step's log carries the recorder's `scrub_residue` verdict: the precondition of the
+        /// residue cases below.
+        async fn assert_residue_recorded(store: &MemStore, step: StepId) {
+            assert!(
+                log(store, step).await.iter().any(|row| {
+                    row.kind == EventKind::Error && row.payload["code"] == "scrub_residue"
+                }),
+                "the refused request left a scrub_residue row"
+            );
+        }
+
+        /// M-2, I-6: a cancel reaching a parked single step whose recorder holds a scrub residue
+        /// is still `Cancelled` — `finish`'s `Unmasked` does not mask it into a `fail_hard`.
+        #[tokio::test(start_paused = true)]
+        async fn a_cancel_over_a_scrub_residue_still_settles_nothing() {
+            let harness = Harness::new().await;
+            feat_3_with_prd_ungated(&harness).await;
+            harness.orch.script("prd", 1, parks_with_residue("the prd"));
+            let notes = note_count(&harness.orch, ids::HTUI_FEAT_3).await;
+
+            let (walked, parked) = tokio::join!(
+                walked(harness.dispatch(start_feat_3())),
+                cancelling_client(&harness.orch)
+            );
+
+            let parked = parked.expect("the request was relayed before the cancel");
+            let run = parked.run_id;
+            assert_residue_recorded(&harness.orch.store, parked.run_step_id).await;
+            assert!(
+                matches!(walked, Err(EngineError::Cancelled { run: stopped }) if stopped == run),
+                "the walk answers `Cancelled`, not the residue: {walked:?}"
+            );
+            let row = harness.orch.run(run).await;
+            assert_eq!((row.status, row.failure), (RunStatus::Running, None));
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(
+                (prd.status, prd.finished_at),
+                (StepStatus::Running, None),
+                "no `fail_hard` for a cancel"
+            );
+            assert_eq!(
+                note_count(&harness.orch, ids::HTUI_FEAT_3).await,
+                notes,
+                "no failure note"
+            );
+        }
+
+        /// M-2 across a group: a parked candidate holding a scrub residue is not failed by a
+        /// cancel either.
+        #[tokio::test(start_paused = true)]
+        async fn a_cancel_over_a_candidate_scrub_residue_still_settles_nothing() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.fan_out = 2;
+                        phase.gate = Gate::Never;
+                    }
+                })
+                .await;
+            harness
+                .orch
+                .script_candidate("prd", 1, 0, 0, parks_with_residue("candidate 0"));
+            harness.orch.script_candidate(
+                "prd",
+                1,
+                1,
+                0,
+                ScriptedStep::done_with_output("candidate 1"),
+            );
+            let notes = note_count(&harness.orch, ids::HTUI_FEAT_3).await;
+
+            let (walked, parked) = tokio::join!(
+                walked(harness.dispatch(start_feat_3())),
+                cancelling_client(&harness.orch)
+            );
+
+            let parked = parked.expect("candidate 0's request was relayed");
+            let run = parked.run_id;
+            assert_residue_recorded(&harness.orch.store, parked.run_step_id).await;
+            assert!(
+                matches!(walked, Err(EngineError::Cancelled { run: stopped }) if stopped == run),
+                "the walk answers `Cancelled`, not the residue: {walked:?}"
+            );
+            let first = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(
+                (first.status, first.finished_at),
+                (StepStatus::Running, None),
+                "no `fail_candidate` for a cancel"
+            );
+            let row = harness.orch.run(run).await;
+            assert_eq!((row.status, row.failure), (RunStatus::Running, None));
+            assert_eq!(
+                note_count(&harness.orch, ids::HTUI_FEAT_3).await,
+                notes,
+                "no failure note"
+            );
+        }
+
+        /// M-2, A-7: a fenced apply on a session holding a scrub residue is still a lost lease;
+        /// `finish`'s `Unmasked` does not turn it into an unfenced `fail_hard` on the stranger's
+        /// run.
+        #[tokio::test(start_paused = true)]
+        async fn a_fenced_apply_over_a_scrub_residue_writes_nothing() {
+            let harness = Harness::new().await;
+            feat_3_with_prd_ungated(&harness).await;
+            harness.orch.script("prd", 1, parks_with_residue("the prd"));
+            let client = stealing_client(&harness.orch, ids::HTUI_FEAT_3);
+
+            let walked = walked(harness.dispatch(start_feat_3())).await;
+            let parked = client
+                .await
+                .expect("the client task ends")
+                .expect("the client saw the parked request");
+
+            assert_residue_recorded(&harness.orch.store, parked.run_step_id).await;
+            assert!(
+                matches!(walked, Err(EngineError::LeaseLost { run }) if run == parked.run_id),
+                "the fenced apply is a lost lease, not the residue: {walked:?}"
+            );
+            let step = step_at(&harness.orch, parked.run_id, 0, 0).await;
+            assert_eq!(
+                (step.status, step.finished_at),
+                (StepStatus::Running, None),
+                "no `fail_hard` for a lost fence"
+            );
+            let row = harness.orch.run(parked.run_id).await;
+            assert_eq!(
+                (row.status, row.failure),
+                (RunStatus::Running, None),
+                "the stranger's run is not failed"
             );
         }
 
