@@ -1,6 +1,6 @@
 //! `htui_core::store`'s MOD-41 worker traits for the server-side stores (plan D4, D5).
 //!
-//! `RecorderStore` and `WorkerStore` for [`PgStore`] and [`Writer`], `WorkerHost` for [`PgStore`]
+//! `RecorderStore`, `RelayStore` (MOD-42) and `WorkerStore` for [`PgStore`] and [`Writer`], `WorkerHost` for [`PgStore`]
 //! (the headless worker's host) and [`Backend`] (the TUI's). Every body forwards by path (UFCS) to
 //! the [`ReadStore`]/[`WriteStore`] method or the inherent read of the same name, and the traits
 //! are named by path, never imported (plan D5: a receiver that sees both families is E0034).
@@ -10,13 +10,15 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::{
-    AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow, Claim,
-    CommandRun, Document, DocumentHead, DocumentId, GateOutcome, Item, ItemId, ItemKind,
-    NewCommandRun, NewDocument, NewNote, NewRun, NewRunStep, Note, PhaseAgent, PhaseId, Project,
-    ProjectId, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, Resolution, ResolvedGraph,
-    ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary,
-    SessionEvent, Status, StepGraphId, StepGraphPhase, StepId, StepOutcome, StepStatus,
-    UpstreamEntry, UserId, WorkspaceSummary,
+    AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow, CancelRequest,
+    Claim, CommandRun, Document, DocumentHead, DocumentId, GateOutcome, Item, ItemId, ItemKind,
+    NewCommandRun, NewDocument, NewNote, NewRun, NewRunStep, Note, OpenPermission,
+    PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId,
+    PromptScope, PromptTemplate, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution,
+    ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, Status, StepGraphId,
+    StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId,
+    WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StepFence, WriteStore};
 use serde_json::Value;
@@ -47,6 +49,29 @@ impl htui_core::store::RecorderStore for PgStore {
         quota_at: DateTime<Utc>,
     ) -> Result<bool> {
         WriteStore::set_agent_box_quota(self, agent_id, box_id, quota, quota_at).await
+    }
+}
+
+impl htui_core::store::RelayStore for PgStore {
+    async fn open_permission(&self, open: OpenPermission) -> Result<PermissionId> {
+        WriteStore::open_permission(self, open).await
+    }
+    async fn permission(&self, id: PermissionId) -> Result<Option<StepPermission>> {
+        WriteStore::permission(self, id).await
+    }
+    async fn apply_permission(
+        &self,
+        id: PermissionId,
+        owner: Uuid,
+    ) -> Result<Option<PermissionChoice>> {
+        WriteStore::apply_permission(self, id, owner).await
+    }
+    async fn settle_permissions(
+        &self,
+        session: RelaySessionId,
+        to: PermissionStatus,
+    ) -> Result<u64> {
+        WriteStore::settle_permissions(self, session, to).await
     }
 }
 
@@ -258,6 +283,25 @@ impl htui_core::store::WorkerStore for PgStore {
     async fn write_document(&self, new: NewDocument) -> Result<Document> {
         WriteStore::write_document(self, new).await
     }
+    async fn request_cancel(
+        &self,
+        run: RunId,
+        user: UserId,
+        box_id: BoxId,
+    ) -> Result<CancelRequest> {
+        WriteStore::request_cancel(self, run, user, box_id).await
+    }
+    async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> Result<Vec<RunCommand>> {
+        WriteStore::pending_commands(self, owner, box_id).await
+    }
+    async fn resolve_command(
+        &self,
+        id: RunCommandId,
+        to: RunCommandStatus,
+        resolution: Option<String>,
+    ) -> Result<bool> {
+        WriteStore::resolve_command(self, id, to, resolution).await
+    }
 }
 
 impl htui_core::store::RecorderStore for Writer {
@@ -281,6 +325,29 @@ impl htui_core::store::RecorderStore for Writer {
         quota_at: DateTime<Utc>,
     ) -> Result<bool> {
         WriteStore::set_agent_box_quota(self, agent_id, box_id, quota, quota_at).await
+    }
+}
+
+impl htui_core::store::RelayStore for Writer {
+    async fn open_permission(&self, open: OpenPermission) -> Result<PermissionId> {
+        WriteStore::open_permission(self, open).await
+    }
+    async fn permission(&self, id: PermissionId) -> Result<Option<StepPermission>> {
+        WriteStore::permission(self, id).await
+    }
+    async fn apply_permission(
+        &self,
+        id: PermissionId,
+        owner: Uuid,
+    ) -> Result<Option<PermissionChoice>> {
+        WriteStore::apply_permission(self, id, owner).await
+    }
+    async fn settle_permissions(
+        &self,
+        session: RelaySessionId,
+        to: PermissionStatus,
+    ) -> Result<u64> {
+        WriteStore::settle_permissions(self, session, to).await
     }
 }
 
@@ -491,6 +558,25 @@ impl htui_core::store::WorkerStore for Writer {
     }
     async fn write_document(&self, new: NewDocument) -> Result<Document> {
         WriteStore::write_document(self, new).await
+    }
+    async fn request_cancel(
+        &self,
+        run: RunId,
+        user: UserId,
+        box_id: BoxId,
+    ) -> Result<CancelRequest> {
+        WriteStore::request_cancel(self, run, user, box_id).await
+    }
+    async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> Result<Vec<RunCommand>> {
+        WriteStore::pending_commands(self, owner, box_id).await
+    }
+    async fn resolve_command(
+        &self,
+        id: RunCommandId,
+        to: RunCommandStatus,
+        resolution: Option<String>,
+    ) -> Result<bool> {
+        WriteStore::resolve_command(self, id, to, resolution).await
     }
 }
 

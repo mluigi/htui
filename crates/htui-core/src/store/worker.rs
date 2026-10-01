@@ -12,9 +12,10 @@
 //! [`WriteStore`] method of the same name by path (UFCS): this module defines the new traits, so
 //! both families are in scope here and a method-call body would be ambiguous.
 //!
-//! `WorkerStore` is 42 methods: 13 [`ReadStore`] reads, 5 [`WriteStore`] reads, 23 writes and
-//! `write_document`. `WorkerHost` is `writer` plus 20 reads (blueprint F-5); MOD-41 T7 adds the
-//! 22nd, `queued_runs_on_box`.
+//! `WorkerStore` is 45 methods: 13 [`ReadStore`] reads, 5 [`WriteStore`] reads, 23 writes,
+//! `write_document` and MOD-42's three command methods; [`RelayStore`] is four (MOD-42 plan D2).
+//! `WorkerHost` is `writer` plus 20 reads (blueprint F-5); MOD-41 T7 adds the 22nd,
+//! `queued_runs_on_box`.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -24,13 +25,15 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::{
-    AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow, Claim,
-    CommandRun, Document, DocumentHead, DocumentId, GateOutcome, Item, ItemId, ItemKind,
-    NewCommandRun, NewDocument, NewNote, NewRun, NewRunStep, Note, PhaseAgent, PhaseId, Project,
-    ProjectId, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, Resolution, ResolvedGraph,
-    ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary,
-    SessionEvent, Status, StepGraphId, StepGraphPhase, StepId, StepOutcome, StepStatus,
-    UpstreamEntry, UserId, WorkspaceSummary,
+    AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow, CancelRequest,
+    Claim, CommandRun, Document, DocumentHead, DocumentId, GateOutcome, Item, ItemId, ItemKind,
+    NewCommandRun, NewDocument, NewNote, NewRun, NewRunStep, Note, OpenPermission,
+    PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId,
+    PromptScope, PromptTemplate, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution,
+    ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, Status, StepGraphId,
+    StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId,
+    WorkspaceSummary,
 };
 use crate::store::error::Result;
 use crate::store::mem::MemStore;
@@ -62,11 +65,39 @@ pub trait RecorderStore: Send + Sync {
     ) -> impl Future<Output = Result<bool>> + Send;
 }
 
+/// What `htui_agent::record::drive` writes and reads while a request is parked (MOD-42 plan D2,
+/// D6). Separate from [`RecorderStore`] so `drive` can take a recorder store and a relay store as
+/// two type parameters: the spies implement only the first (plan probe A1b).
+pub trait RelayStore: Send + Sync {
+    /// [`WriteStore::open_permission`].
+    fn open_permission(
+        &self,
+        open: OpenPermission,
+    ) -> impl Future<Output = Result<PermissionId>> + Send;
+    /// [`WriteStore::permission`].
+    fn permission(
+        &self,
+        id: PermissionId,
+    ) -> impl Future<Output = Result<Option<StepPermission>>> + Send;
+    /// [`WriteStore::apply_permission`].
+    fn apply_permission(
+        &self,
+        id: PermissionId,
+        owner: Uuid,
+    ) -> impl Future<Output = Result<Option<PermissionChoice>>> + Send;
+    /// [`WriteStore::settle_permissions`].
+    fn settle_permissions(
+        &self,
+        session: RelaySessionId,
+        to: PermissionStatus,
+    ) -> impl Future<Output = Result<u64>> + Send;
+}
+
 /// Every store call of the engine, `gate`, `graph::resolve` and the progress sink (plan D4).
 ///
 /// `graph::override_graph`'s seven extra methods are deliberately absent: it has no production
 /// caller and keeps its [`WriteStore`] bound.
-pub trait WorkerStore: RecorderStore {
+pub trait WorkerStore: RecorderStore + RelayStore {
     // -- 13 ReadStore reads
     /// [`ReadStore::item`].
     fn item(&self, id: ItemId) -> impl Future<Output = Result<Option<Item>>> + Send;
@@ -278,6 +309,28 @@ pub trait WorkerStore: RecorderStore {
     // -- the progress sink's document write (plan D4, PRD D5: no production caller until MOD-11)
     /// [`WriteStore::write_document`].
     fn write_document(&self, new: NewDocument) -> impl Future<Output = Result<Document>> + Send;
+
+    // -- MOD-42 (plan D2, D12, D13): the command side
+    /// [`WriteStore::request_cancel`].
+    fn request_cancel(
+        &self,
+        run: RunId,
+        user: UserId,
+        box_id: BoxId,
+    ) -> impl Future<Output = Result<CancelRequest>> + Send;
+    /// [`WriteStore::pending_commands`].
+    fn pending_commands(
+        &self,
+        owner: Uuid,
+        box_id: BoxId,
+    ) -> impl Future<Output = Result<Vec<RunCommand>>> + Send;
+    /// [`WriteStore::resolve_command`].
+    fn resolve_command(
+        &self,
+        id: RunCommandId,
+        to: RunCommandStatus,
+        resolution: Option<String>,
+    ) -> impl Future<Output = Result<bool>> + Send;
 }
 
 /// The supervisor's source (plan D4): the process's store and every read the runtime makes.
@@ -383,6 +436,29 @@ impl RecorderStore for MemStore {
         quota_at: DateTime<Utc>,
     ) -> Result<bool> {
         WriteStore::set_agent_box_quota(self, agent_id, box_id, quota, quota_at).await
+    }
+}
+
+impl RelayStore for MemStore {
+    async fn open_permission(&self, open: OpenPermission) -> Result<PermissionId> {
+        WriteStore::open_permission(self, open).await
+    }
+    async fn permission(&self, id: PermissionId) -> Result<Option<StepPermission>> {
+        WriteStore::permission(self, id).await
+    }
+    async fn apply_permission(
+        &self,
+        id: PermissionId,
+        owner: Uuid,
+    ) -> Result<Option<PermissionChoice>> {
+        WriteStore::apply_permission(self, id, owner).await
+    }
+    async fn settle_permissions(
+        &self,
+        session: RelaySessionId,
+        to: PermissionStatus,
+    ) -> Result<u64> {
+        WriteStore::settle_permissions(self, session, to).await
     }
 }
 
@@ -594,6 +670,25 @@ impl WorkerStore for MemStore {
     async fn write_document(&self, new: NewDocument) -> Result<Document> {
         WriteStore::write_document(self, new).await
     }
+    async fn request_cancel(
+        &self,
+        run: RunId,
+        user: UserId,
+        box_id: BoxId,
+    ) -> Result<CancelRequest> {
+        WriteStore::request_cancel(self, run, user, box_id).await
+    }
+    async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> Result<Vec<RunCommand>> {
+        WriteStore::pending_commands(self, owner, box_id).await
+    }
+    async fn resolve_command(
+        &self,
+        id: RunCommandId,
+        to: RunCommandStatus,
+        resolution: Option<String>,
+    ) -> Result<bool> {
+        WriteStore::resolve_command(self, id, to, resolution).await
+    }
 }
 
 #[cfg(all(test, feature = "test-support"))]
@@ -609,9 +704,13 @@ mod tests {
     /// Compiles only when `S` is a [`WorkerStore`].
     fn is_worker<S: WorkerStore>() {}
 
+    /// Compiles only when `S` is a [`RelayStore`] (MOD-42 plan D2).
+    fn is_relay<S: RelayStore>() {}
+
     #[test]
     fn worker_store_is_object_of_the_engines_calls() {
         is_recorder::<MemStore>();
+        is_relay::<MemStore>();
         is_worker::<MemStore>();
     }
 

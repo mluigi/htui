@@ -115,4 +115,12 @@ id_newtype!(
     RequirementAreaId,
     /// `requirement.id` (ANA-11 §5).
     RequirementId,
+    /// `step_permission.id` (MOD-42 plan D1): one parked stage-3 permission request.
+    PermissionId,
+    /// `run_command.id` (MOD-42 plan D1): one requested command on a run (today: cancel).
+    RunCommandId,
+    /// `step_permission.session` (MOD-42 plan D1): one driven agent session, minted per
+    /// `drive_once` (a candidate's session, each judge call), so request ids that repeat across
+    /// sessions never collide (PRD MVP item 3).
+    RelaySessionId,
 );

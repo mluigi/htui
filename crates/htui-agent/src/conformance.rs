@@ -30,19 +30,21 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow,
-    ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId,
-    EventKind, EventRole, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
-    ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemSummary, LinkGraph, NewCommandRun,
-    NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, PER_TOKEN_CAP_RUN, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, PromptScope, PromptTemplate, Quota, QuotaSource, Repo, RepoBoxPath, RepoId,
-    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
-    ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
+    Agent, AgentBox, AgentId, AnswerOutcome, Billing, BindingChange, BoxEdit, BoxId, BoxProbe,
+    BoxRecord, BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow,
+    Document, DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Item, ItemCitation,
+    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement,
+    ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject,
+    NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill,
+    NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PER_TOKEN_CAP_RUN,
+    PermissionChoice, PermissionId, PermissionStatus, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, PromptScope, PromptTemplate, Quota, QuotaSource, RelaySessionId, RelayView, Repo,
+    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
+    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
+    RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus,
+    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
+    SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
     UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
     WorkspaceProject, normalize,
 };
@@ -1281,6 +1283,70 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
         kind: CitationKind,
     ) -> StoreResult<ItemRequirement> {
         self.inner.reconfirm(item, requirement, kind).await
+    }
+
+    // -- MOD-42 (plan D2): forwarded, never logged; the spy implements no `RelayStore`.
+
+    async fn open_permission(&self, open: OpenPermission) -> StoreResult<PermissionId> {
+        self.inner.open_permission(open).await
+    }
+
+    async fn permission(&self, id: PermissionId) -> StoreResult<Option<StepPermission>> {
+        self.inner.permission(id).await
+    }
+
+    async fn apply_permission(
+        &self,
+        id: PermissionId,
+        owner: Uuid,
+    ) -> StoreResult<Option<PermissionChoice>> {
+        self.inner.apply_permission(id, owner).await
+    }
+
+    async fn settle_permissions(
+        &self,
+        session: RelaySessionId,
+        to: PermissionStatus,
+    ) -> StoreResult<u64> {
+        self.inner.settle_permissions(session, to).await
+    }
+
+    async fn request_cancel(
+        &self,
+        run: RunId,
+        user: UserId,
+        box_id: BoxId,
+    ) -> StoreResult<CancelRequest> {
+        self.inner.request_cancel(run, user, box_id).await
+    }
+
+    async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> StoreResult<Vec<RunCommand>> {
+        self.inner.pending_commands(owner, box_id).await
+    }
+
+    async fn resolve_command(
+        &self,
+        id: RunCommandId,
+        to: RunCommandStatus,
+        resolution: Option<String>,
+    ) -> StoreResult<bool> {
+        self.inner.resolve_command(id, to, resolution).await
+    }
+
+    async fn relay_view(&self, item: ItemId) -> StoreResult<RelayView> {
+        self.inner.relay_view(item).await
+    }
+
+    async fn answer_permission(
+        &self,
+        id: PermissionId,
+        option_id: &str,
+        user: UserId,
+        box_id: BoxId,
+    ) -> StoreResult<AnswerOutcome> {
+        self.inner
+            .answer_permission(id, option_id, user, box_id)
+            .await
     }
 }
 

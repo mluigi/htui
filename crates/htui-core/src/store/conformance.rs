@@ -14,22 +14,25 @@ use uuid::Uuid;
 
 use crate::fixtures::ids;
 use crate::model::{
-    Activation, Agent, AgentBox, AgentId, Attachment, Billing, BindingChange, BoxEdit, BoxId,
-    BoxProbe, BoxRow, ChatRunSpec, CitationKind, Claim, CommandQueue, CommandRun, CommandRunId,
-    CommandRunStatus, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EventKind, EventRole,
-    Executor, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId,
-    ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument,
-    NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    NoteId, OverlapRule, PhaseId, PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch,
-    PromptScope, PromptTemplate, PromptTemplateId, RepoBoxPath, RepoId, RepoPatch, RepoScope,
+    Activation, Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Attachment, Billing,
+    BindingChange, BoxEdit, BoxId, BoxProbe, BoxRow, CancelRequest, ChatRunSpec, CitationKind,
+    Claim, CommandQueue, CommandRun, CommandRunId, CommandRunStatus, CoverageRow,
+    DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EventKind, EventRole, Executor, Gate, GateOutcome,
+    GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKindId, ItemKindPatch,
+    ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
+    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
+    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, NoteId, OpenPermission, OverlapRule,
+    PermissionChoice, PermissionId, PermissionStatus, PhaseId, PhasePatch, Priority, ProbedTool,
+    ProjectId, ProjectPatch, PromptScope, PromptTemplate, PromptTemplateId, RelayOption,
+    RelayOptionKind, RelaySessionId, RelayView, RepoBoxPath, RepoId, RepoPatch, RepoScope,
     Requirement, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementState, RequirementUpdate, Resolution, Run, RunId, RunKind,
-    RunMode, RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, Skill,
-    SkillBindingKey, SkillId, SkillPatch, SkillVersion, SnapshotGraph, SnapshotSettings, Status,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
-    TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure,
+    RequirementRevision, RequirementState, RequirementUpdate, Resolution, Run, RunCommandId,
+    RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunScope, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, Scope, SessionEvent, Skill, SkillBindingKey, SkillId, SkillPatch,
+    SkillVersion, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
+    UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject, canonical_declared_tags, missing_tags_failure,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -146,6 +149,18 @@ pub const CASES: &[&str] = &[
     "edit_box_writes_the_executor_and_keeps_every_other_setting",
     "an_unknown_executor_is_refused_and_writes_nothing",
     "an_executor_edit_is_a_compare_and_set",
+    "a_pending_permission_is_answered_once",
+    "an_answer_after_the_owner_changed_is_refused_executor_gone",
+    "an_option_the_request_did_not_offer_is_refused",
+    "apply_is_fenced_on_the_lease_owner",
+    "opening_a_permission_stales_older_sessions_of_the_step",
+    "opening_a_permission_is_fenced_on_the_lease",
+    "settle_moves_only_pending_and_answered_rows",
+    "a_run_has_at_most_one_pending_cancel",
+    "resolve_command_is_a_compare_and_set",
+    "pending_commands_are_the_owners_and_the_boxs_free_runs",
+    "relay_view_lists_live_pending_requests_and_pending_cancels",
+    "deleting_a_project_takes_its_relay_rows",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -360,6 +375,36 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "an_executor_edit_is_a_compare_and_set" => {
             an_executor_edit_is_a_compare_and_set(store).await;
+        }
+        "a_pending_permission_is_answered_once" => {
+            a_pending_permission_is_answered_once(store).await
+        }
+        "an_answer_after_the_owner_changed_is_refused_executor_gone" => {
+            an_answer_after_the_owner_changed_is_refused_executor_gone(store).await
+        }
+        "an_option_the_request_did_not_offer_is_refused" => {
+            an_option_the_request_did_not_offer_is_refused(store).await
+        }
+        "apply_is_fenced_on_the_lease_owner" => apply_is_fenced_on_the_lease_owner(store).await,
+        "opening_a_permission_stales_older_sessions_of_the_step" => {
+            opening_a_permission_stales_older_sessions_of_the_step(store).await
+        }
+        "opening_a_permission_is_fenced_on_the_lease" => {
+            opening_a_permission_is_fenced_on_the_lease(store).await
+        }
+        "settle_moves_only_pending_and_answered_rows" => {
+            settle_moves_only_pending_and_answered_rows(store).await
+        }
+        "a_run_has_at_most_one_pending_cancel" => a_run_has_at_most_one_pending_cancel(store).await,
+        "resolve_command_is_a_compare_and_set" => resolve_command_is_a_compare_and_set(store).await,
+        "pending_commands_are_the_owners_and_the_boxs_free_runs" => {
+            pending_commands_are_the_owners_and_the_boxs_free_runs(store).await
+        }
+        "relay_view_lists_live_pending_requests_and_pending_cancels" => {
+            relay_view_lists_live_pending_requests_and_pending_cancels(store).await
+        }
+        "deleting_a_project_takes_its_relay_rows" => {
+            deleting_a_project_takes_its_relay_rows(store).await
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -13058,6 +13103,826 @@ async fn requirement_revisions_or_not_cached<S: ReadStore>(store: &S) {
     assert!(
         unknown.is_none_or(|rows| rows.is_empty()),
         "{CASE}: an unknown id has no history"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// MOD-42 T0 (plan D1-D5, D12, D13; blueprint B-4, B-7, B-9): the permission and control relay.
+// Each case starts from `leased_step` (owner A, the fixture box, item `HTUI_ANA_2`); the demo
+// user and the fixture box are the answering actor.
+// ------------------------------------------------------------------------------------------
+
+/// The two options every relayed request in these cases offers, in the agent's order.
+fn relay_options() -> Vec<RelayOption> {
+    vec![
+        RelayOption {
+            id: "allow-once".to_owned(),
+            label: "Allow once".to_owned(),
+            kind: RelayOptionKind::AllowOnce,
+        },
+        RelayOption {
+            id: "reject-once".to_owned(),
+            label: "Reject".to_owned(),
+            kind: RelayOptionKind::RejectOnce,
+        },
+    ]
+}
+
+/// A request of `session` on `step` of `run`, parked by `owner`, with a fresh id.
+fn open_request(
+    run: RunId,
+    step: StepId,
+    session: RelaySessionId,
+    request_id: &str,
+    owner: Uuid,
+) -> OpenPermission {
+    OpenPermission {
+        id: PermissionId::new(),
+        run_id: run,
+        run_step_id: step,
+        session,
+        request_id: request_id.to_owned(),
+        tool_call_id: Some(format!("call-{request_id}")),
+        summary: Some(format!("edit: {request_id}")),
+        options: relay_options(),
+        owner,
+    }
+}
+
+/// Parks `open` and answers its id, or a panic naming the case.
+async fn parked<S: WriteStore>(case: &str, store: &S, open: OpenPermission) -> PermissionId {
+    let id = open.id;
+    assert_eq!(
+        store.open_permission(open).await.expect(case),
+        id,
+        "{case}: open_permission answers the row's own id"
+    );
+    id
+}
+
+/// The relay row, or a panic naming the case.
+async fn permission_row<S: WriteStore>(case: &str, store: &S, id: PermissionId) -> StepPermission {
+    store
+        .permission(id)
+        .await
+        .expect(case)
+        .unwrap_or_else(|| panic!("{case}: permission {id} exists"))
+}
+
+/// The demo user answers `id` with `option` from the fixture box.
+async fn answer<S: WriteStore>(
+    case: &str,
+    store: &S,
+    id: PermissionId,
+    option: &str,
+) -> AnswerOutcome {
+    store
+        .answer_permission(id, option, ids::USER, ids::BOX)
+        .await
+        .expect(case)
+}
+
+/// The demo user asks the fixture box to cancel `run`.
+async fn cancel_of<S: WriteStore>(case: &str, store: &S, run: RunId) -> CancelRequest {
+    store
+        .request_cancel(run, ids::USER, ids::BOX)
+        .await
+        .expect(case)
+}
+
+/// The ids `pending_commands(owner, box_id)` lists, in its order.
+async fn pending_ids<S: WriteStore>(
+    case: &str,
+    store: &S,
+    owner: Uuid,
+    box_id: BoxId,
+) -> Vec<RunCommandId> {
+    store
+        .pending_commands(owner, box_id)
+        .await
+        .expect(case)
+        .into_iter()
+        .map(|row| row.id)
+        .collect()
+}
+
+/// MOD-42 plan D3, I-3: a pending request is answered once. The first answer wins the
+/// compare-and-set and records who, from where and when; a second answer is told the actual
+/// state and writes nothing; the answered row leaves the item's relay view.
+async fn a_pending_permission_is_answered_once<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_pending_permission_is_answered_once";
+    let a = Uuid::now_v7();
+    let (run, step) = leased_step(CASE, store, a, seam_clock()).await;
+    let open = open_request(run, step, RelaySessionId::new(), "req-1", a);
+    let id = parked(CASE, store, open.clone()).await;
+
+    let parked_row = permission_row(CASE, store, id).await;
+    assert_eq!(
+        (
+            parked_row.run_id,
+            parked_row.run_step_id,
+            parked_row.session,
+            parked_row.request_id.as_str(),
+            parked_row.tool_call_id.as_deref(),
+            parked_row.summary.as_deref(),
+            &parked_row.options,
+            parked_row.status,
+        ),
+        (
+            run,
+            step,
+            open.session,
+            "req-1",
+            Some("call-req-1"),
+            Some("edit: req-1"),
+            &relay_options(),
+            PermissionStatus::Pending,
+        ),
+        "{CASE}: the parked row reads back as written, pending"
+    );
+    assert!(
+        parked_row.option_id.is_none()
+            && parked_row.answered_by.is_none()
+            && parked_row.answered_box.is_none()
+            && parked_row.answered_at.is_none()
+            && parked_row.resolved_at.is_none(),
+        "{CASE}: a parked row carries no answer, got {parked_row:?}"
+    );
+    let view = store.relay_view(ids::HTUI_ANA_2).await.expect(CASE);
+    assert_eq!(
+        view.permissions,
+        vec![parked_row],
+        "{CASE}: the item's relay view lists the live pending request"
+    );
+
+    assert_eq!(
+        answer(CASE, store, id, "reject-once").await,
+        AnswerOutcome::Answered,
+        "{CASE}: the first answer wins"
+    );
+    let answered = permission_row(CASE, store, id).await;
+    assert_eq!(
+        answered.status,
+        PermissionStatus::Answered,
+        "{CASE}: status"
+    );
+    assert_eq!(
+        answered.option_id.as_deref(),
+        Some("reject-once"),
+        "{CASE}: the chosen option"
+    );
+    assert_eq!(answered.answered_by, Some(ids::USER), "{CASE}: who");
+    assert_eq!(answered.answered_box, Some(ids::BOX), "{CASE}: from where");
+    assert!(answered.answered_at.is_some(), "{CASE}: when");
+    assert!(
+        answered.resolved_at.is_none(),
+        "{CASE}: an answer is not a resolution; the executor applies it (D4)"
+    );
+
+    assert_eq!(
+        answer(CASE, store, id, "allow-once").await,
+        AnswerOutcome::Refused(AnswerRefusal::Answered),
+        "{CASE}: a second answer is told the request was already answered"
+    );
+    assert_eq!(
+        permission_row(CASE, store, id).await,
+        answered,
+        "{CASE}: the losing answer wrote nothing"
+    );
+    assert!(
+        store
+            .relay_view(ids::HTUI_ANA_2)
+            .await
+            .expect(CASE)
+            .permissions
+            .is_empty(),
+        "{CASE}: an answered request leaves the relay view"
+    );
+}
+
+/// MOD-42 plan D3, I-2: an answer needs the row's owner to hold the run's lease, live. Once B has
+/// taken A's lapsed lease, A's request is refused `ExecutorGone`; so is B's own request once B's
+/// lease lapses in turn. Neither refusal writes anything.
+async fn an_answer_after_the_owner_changed_is_refused_executor_gone<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_answer_after_the_owner_changed_is_refused_executor_gone";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let (run, step) = leased_step(CASE, store, a, seam_clock()).await;
+    let first = parked(
+        CASE,
+        store,
+        open_request(run, step, RelaySessionId::new(), "req-1", a),
+    )
+    .await;
+    taken_by(CASE, store, run, a, b).await;
+    assert_eq!(
+        answer(CASE, store, first, "allow-once").await,
+        AnswerOutcome::Refused(AnswerRefusal::ExecutorGone),
+        "{CASE}: A no longer holds the run"
+    );
+    assert_eq!(
+        permission_row(CASE, store, first).await.status,
+        PermissionStatus::Pending,
+        "{CASE}: the refusal wrote nothing"
+    );
+
+    let fresh = store
+        .create_step(new_run_step(run, 1, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let second = parked(
+        CASE,
+        store,
+        open_request(run, fresh, RelaySessionId::new(), "req-1", b),
+    )
+    .await;
+    assert!(
+        store
+            .refresh_lease(run, b, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: B's lease lapses, as a suspended holder's does"
+    );
+    assert_eq!(
+        answer(CASE, store, second, "allow-once").await,
+        AnswerOutcome::Refused(AnswerRefusal::ExecutorGone),
+        "{CASE}: a lapsed lease is no live executor, even with the owner unchanged"
+    );
+    assert_eq!(
+        permission_row(CASE, store, second).await.status,
+        PermissionStatus::Pending,
+        "{CASE}: the second refusal wrote nothing either"
+    );
+}
+
+/// MOD-42 plan D3: an option the request did not offer is refused and writes nothing; an unknown
+/// request is `NotFound`.
+async fn an_option_the_request_did_not_offer_is_refused<S: WriteStore>(store: &S) {
+    const CASE: &str = "an_option_the_request_did_not_offer_is_refused";
+    let a = Uuid::now_v7();
+    let (run, step) = leased_step(CASE, store, a, seam_clock()).await;
+    let id = parked(
+        CASE,
+        store,
+        open_request(run, step, RelaySessionId::new(), "req-1", a),
+    )
+    .await;
+    let before = permission_row(CASE, store, id).await;
+    assert_eq!(
+        answer(CASE, store, id, "nope").await,
+        AnswerOutcome::Refused(AnswerRefusal::NotOffered),
+        "{CASE}: `nope` is not one of the request's options"
+    );
+    assert_eq!(
+        permission_row(CASE, store, id).await,
+        before,
+        "{CASE}: the refusal wrote nothing; the row is still pending"
+    );
+    not_found_on(
+        CASE,
+        store
+            .answer_permission(PermissionId::new(), "allow-once", ids::USER, ids::BOX)
+            .await,
+        "step_permission",
+        "an answer to an unknown request",
+    );
+}
+
+/// MOD-42 plan D4, blueprint B-9: applying an answer is a compare-and-set `answered -> applied`
+/// fenced on the lease owner alone. Another owner's apply, an apply after the lease moved, and a
+/// second apply each answer `None` and write nothing.
+async fn apply_is_fenced_on_the_lease_owner<S: WriteStore>(store: &S) {
+    const CASE: &str = "apply_is_fenced_on_the_lease_owner";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let (run, step) = leased_step(CASE, store, a, seam_clock()).await;
+    let session = RelaySessionId::new();
+    let first = parked(CASE, store, open_request(run, step, session, "req-1", a)).await;
+    let second = parked(CASE, store, open_request(run, step, session, "req-2", a)).await;
+    for (id, option) in [(first, "allow-once"), (second, "reject-once")] {
+        assert_eq!(
+            answer(CASE, store, id, option).await,
+            AnswerOutcome::Answered,
+            "{CASE}: {id} is answered"
+        );
+    }
+
+    assert_eq!(
+        store.apply_permission(first, b).await.expect(CASE),
+        None,
+        "{CASE}: B neither parked the row nor holds the lease"
+    );
+    assert_eq!(
+        store.apply_permission(second, a).await.expect(CASE),
+        Some(PermissionChoice {
+            option_id: "reject-once".to_owned()
+        }),
+        "{CASE}: A, holding the run, applies the answer it parked"
+    );
+    let applied = permission_row(CASE, store, second).await;
+    assert_eq!(applied.status, PermissionStatus::Applied, "{CASE}: status");
+    assert!(applied.resolved_at.is_some(), "{CASE}: resolved_at is set");
+    assert_eq!(
+        store.apply_permission(second, a).await.expect(CASE),
+        None,
+        "{CASE}: a second apply finds no answered row"
+    );
+    assert_eq!(
+        permission_row(CASE, store, second).await,
+        applied,
+        "{CASE}: the second apply wrote nothing"
+    );
+
+    taken_by(CASE, store, run, a, b).await;
+    assert_eq!(
+        store.apply_permission(first, a).await.expect(CASE),
+        None,
+        "{CASE}: A's lease is gone, so A cannot apply"
+    );
+    assert_eq!(
+        store.apply_permission(first, b).await.expect(CASE),
+        None,
+        "{CASE}: B holds the run but did not park the row"
+    );
+    assert_eq!(
+        permission_row(CASE, store, first).await.status,
+        PermissionStatus::Answered,
+        "{CASE}: the fenced row stays answered"
+    );
+    not_found_on(
+        CASE,
+        store.apply_permission(PermissionId::new(), a).await,
+        "step_permission",
+        "an apply of an unknown request",
+    );
+}
+
+/// MOD-42 plan D5: a new session's first request on a step makes every pending or answered row
+/// of the step's older sessions stale. A row of the old session on another step is untouched; a
+/// repeated `(session, request_id)` or a repeated id is a `Constraint`.
+async fn opening_a_permission_stales_older_sessions_of_the_step<S: WriteStore>(store: &S) {
+    const CASE: &str = "opening_a_permission_stales_older_sessions_of_the_step";
+    let a = Uuid::now_v7();
+    let (run, step) = leased_step(CASE, store, a, seam_clock()).await;
+    let other_step = store
+        .create_step(new_run_step(run, 1, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let (s1, s2) = (RelaySessionId::new(), RelaySessionId::new());
+    let r1 = parked(CASE, store, open_request(run, step, s1, "req-1", a)).await;
+    let r2 = parked(CASE, store, open_request(run, step, s1, "req-2", a)).await;
+    assert_eq!(
+        answer(CASE, store, r2, "allow-once").await,
+        AnswerOutcome::Answered,
+        "{CASE}: r2 is answered"
+    );
+    let elsewhere = parked(CASE, store, open_request(run, other_step, s1, "req-3", a)).await;
+
+    let r3 = parked(CASE, store, open_request(run, step, s2, "req-1", a)).await;
+    for (id, what) in [(r1, "pending r1"), (r2, "answered r2")] {
+        let row = permission_row(CASE, store, id).await;
+        assert_eq!(
+            row.status,
+            PermissionStatus::Stale,
+            "{CASE}: {what} goes stale"
+        );
+        assert!(row.resolved_at.is_some(), "{CASE}: {what} is resolved");
+    }
+    assert_eq!(
+        permission_row(CASE, store, r3).await.status,
+        PermissionStatus::Pending,
+        "{CASE}: the new session's row is pending"
+    );
+    assert_eq!(
+        permission_row(CASE, store, elsewhere).await.status,
+        PermissionStatus::Pending,
+        "{CASE}: the old session's row on another step is untouched"
+    );
+
+    let again = open_request(run, step, s2, "req-1", a);
+    let again_id = again.id;
+    constraint_with(
+        CASE,
+        store.open_permission(again).await,
+        "",
+        "a repeated (session, request_id)",
+    );
+    assert_eq!(
+        store.permission(again_id).await.expect(CASE),
+        None,
+        "{CASE}: the refused row was not written"
+    );
+    let mut repeated = open_request(run, step, s2, "req-9", a);
+    repeated.id = r3;
+    constraint_with(
+        CASE,
+        store.open_permission(repeated).await,
+        "",
+        "a repeated id",
+    );
+}
+
+/// MOD-42 blueprint B-9: `open_permission` is fenced like a step write. An unknown step is
+/// `NotFound`, a step of another run a `Constraint`, an owner that does not hold the run's lease
+/// `Fenced`; none of them writes a row.
+async fn opening_a_permission_is_fenced_on_the_lease<S: WriteStore>(store: &S) {
+    const CASE: &str = "opening_a_permission_is_fenced_on_the_lease";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let (run, step) = leased_step(CASE, store, a, seam_clock()).await;
+    let session = RelaySessionId::new();
+
+    let unknown = open_request(run, StepId::new(), session, "req-1", a);
+    let unknown_id = unknown.id;
+    not_found_on(
+        CASE,
+        store.open_permission(unknown).await,
+        "run_step",
+        "a request on an unknown step",
+    );
+    let foreign = open_request(run, ids::STEP_IMPL, session, "req-2", a);
+    let foreign_id = foreign.id;
+    constraint_with(
+        CASE,
+        store.open_permission(foreign).await,
+        "",
+        "a request on another run's step",
+    );
+    let stranger = open_request(run, step, session, "req-3", b);
+    let stranger_id = stranger.id;
+    let fenced = store.open_permission(stranger).await;
+    assert!(
+        matches!(fenced, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: B does not hold the run's lease, got {fenced:?}"
+    );
+    for id in [unknown_id, foreign_id, stranger_id] {
+        assert_eq!(
+            store.permission(id).await.expect(CASE),
+            None,
+            "{CASE}: a refused open wrote no row"
+        );
+    }
+}
+
+/// MOD-42 plan D5, I-7: settling a session moves its pending and answered rows, and only those,
+/// to `cancelled` or `stale`; any other target is a `Constraint`.
+async fn settle_moves_only_pending_and_answered_rows<S: WriteStore>(store: &S) {
+    const CASE: &str = "settle_moves_only_pending_and_answered_rows";
+    let a = Uuid::now_v7();
+    let (run, step) = leased_step(CASE, store, a, seam_clock()).await;
+    let other_step = store
+        .create_step(new_run_step(run, 1, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let (session, other) = (RelaySessionId::new(), RelaySessionId::new());
+    let pending = parked(CASE, store, open_request(run, step, session, "req-1", a)).await;
+    let answered = parked(CASE, store, open_request(run, step, session, "req-2", a)).await;
+    let applied = parked(CASE, store, open_request(run, step, session, "req-3", a)).await;
+    for id in [answered, applied] {
+        assert_eq!(
+            answer(CASE, store, id, "allow-once").await,
+            AnswerOutcome::Answered,
+            "{CASE}: {id} is answered"
+        );
+    }
+    assert!(
+        store
+            .apply_permission(applied, a)
+            .await
+            .expect(CASE)
+            .is_some(),
+        "{CASE}: the third row is applied"
+    );
+    let untouched = parked(
+        CASE,
+        store,
+        open_request(run, other_step, other, "req-1", a),
+    )
+    .await;
+    let applied_before = permission_row(CASE, store, applied).await;
+    let untouched_before = permission_row(CASE, store, untouched).await;
+
+    assert_eq!(
+        store
+            .settle_permissions(session, PermissionStatus::Cancelled)
+            .await
+            .expect(CASE),
+        2,
+        "{CASE}: the pending and the answered row move"
+    );
+    for id in [pending, answered] {
+        let row = permission_row(CASE, store, id).await;
+        assert_eq!(row.status, PermissionStatus::Cancelled, "{CASE}: {id}");
+        assert!(row.resolved_at.is_some(), "{CASE}: {id} is resolved");
+    }
+    assert_eq!(
+        permission_row(CASE, store, applied).await,
+        applied_before,
+        "{CASE}: an applied row is left alone"
+    );
+    assert_eq!(
+        permission_row(CASE, store, untouched).await,
+        untouched_before,
+        "{CASE}: another session's row is left alone"
+    );
+    constraint_with(
+        CASE,
+        store
+            .settle_permissions(session, PermissionStatus::Applied)
+            .await,
+        "",
+        "settling to `applied`",
+    );
+    assert_eq!(
+        store
+            .settle_permissions(session, PermissionStatus::Stale)
+            .await
+            .expect(CASE),
+        0,
+        "{CASE}: nothing of the session is left to settle"
+    );
+}
+
+/// MOD-42 plan D1, D12: one pending cancel per run. A second request names the pending one and
+/// writes nothing; once it is resolved, a new request writes a new row. An unknown run is
+/// `NotFound`.
+async fn a_run_has_at_most_one_pending_cancel<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_run_has_at_most_one_pending_cancel";
+    let a = Uuid::now_v7();
+    let (run, _) = leased_step(CASE, store, a, seam_clock()).await;
+    let CancelRequest::Inserted(x) = cancel_of(CASE, store, run).await else {
+        panic!("{CASE}: the first request writes a row");
+    };
+    let rows = store.pending_commands(a, ids::BOX).await.expect(CASE);
+    assert_eq!(rows.len(), 1, "{CASE}: one pending row, got {rows:?}");
+    let row = &rows[0];
+    assert_eq!(
+        (
+            row.id,
+            row.run_id,
+            row.kind,
+            row.issued_by,
+            row.issued_box,
+            row.status,
+            row.resolution.as_deref(),
+            row.resolved_at,
+        ),
+        (
+            x,
+            run,
+            RunCommandKind::Cancel,
+            ids::USER,
+            ids::BOX,
+            RunCommandStatus::Pending,
+            None,
+            None,
+        ),
+        "{CASE}: the row reads back as written, pending"
+    );
+    assert_eq!(
+        cancel_of(CASE, store, run).await,
+        CancelRequest::AlreadyPending(x),
+        "{CASE}: a second request names the pending one"
+    );
+    assert_eq!(
+        pending_ids(CASE, store, a, ids::BOX).await,
+        vec![x],
+        "{CASE}: and wrote nothing"
+    );
+    assert!(
+        store
+            .resolve_command(x, RunCommandStatus::Applied, None)
+            .await
+            .expect(CASE),
+        "{CASE}: the pending cancel is applied"
+    );
+    let CancelRequest::Inserted(y) = cancel_of(CASE, store, run).await else {
+        panic!("{CASE}: with nothing pending, a request writes a row again");
+    };
+    assert_ne!(y, x, "{CASE}: a new row, not the resolved one");
+    not_found_on(
+        CASE,
+        store
+            .request_cancel(RunId::new(), ids::USER, ids::BOX)
+            .await,
+        "run",
+        "a cancel of an unknown run",
+    );
+}
+
+/// MOD-42 plan D12, D13, I-3: resolving a command is a compare-and-set on `pending`. A second
+/// resolve answers `false`; resolving to `pending` is a `Constraint`; an unknown id `NotFound`.
+async fn resolve_command_is_a_compare_and_set<S: WriteStore>(store: &S) {
+    const CASE: &str = "resolve_command_is_a_compare_and_set";
+    let a = Uuid::now_v7();
+    let (run, _) = leased_step(CASE, store, a, seam_clock()).await;
+    let CancelRequest::Inserted(x) = cancel_of(CASE, store, run).await else {
+        panic!("{CASE}: the first request writes a row");
+    };
+    constraint_with(
+        CASE,
+        store
+            .resolve_command(x, RunCommandStatus::Pending, None)
+            .await,
+        "",
+        "resolving to `pending`",
+    );
+    assert!(
+        store
+            .resolve_command(
+                x,
+                RunCommandStatus::Refused,
+                Some("the run is already done".to_owned())
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the pending row is refused"
+    );
+    for to in [RunCommandStatus::Refused, RunCommandStatus::Applied] {
+        assert!(
+            !store.resolve_command(x, to, None).await.expect(CASE),
+            "{CASE}: a resolved row is not pending, so resolving it to {to} is zero rows"
+        );
+    }
+    assert!(
+        pending_ids(CASE, store, a, ids::BOX).await.is_empty(),
+        "{CASE}: the refused row is no longer pending"
+    );
+    not_found_on(
+        CASE,
+        store
+            .resolve_command(RunCommandId::new(), RunCommandStatus::Applied, None)
+            .await,
+        "run_command",
+        "resolving an unknown command",
+    );
+}
+
+/// MOD-42 plan D13, blueprint B-4: the commands a process applies are those of the runs it
+/// leases, of the runs on its box whose lease is free or expired, and of the runs on its box that
+/// are already terminal (so it can refuse them). A live lease of another owner, or another box,
+/// lists nothing.
+async fn pending_commands_are_the_owners_and_the_boxs_free_runs<S: WriteStore>(store: &S) {
+    const CASE: &str = "pending_commands_are_the_owners_and_the_boxs_free_runs";
+    let (a, c) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let (run, _) = leased_step(CASE, store, a, at).await;
+    let CancelRequest::Inserted(x) = cancel_of(CASE, store, run).await else {
+        panic!("{CASE}: the first request writes a row");
+    };
+    assert_eq!(
+        pending_ids(CASE, store, a, ids::BOX).await,
+        vec![x],
+        "{CASE}: A leases the run"
+    );
+    assert!(
+        pending_ids(CASE, store, c, ids::BOX).await.is_empty(),
+        "{CASE}: A's live lease keeps the row from C"
+    );
+    assert!(
+        store
+            .refresh_lease(run, a, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: A's lease lapses"
+    );
+    assert_eq!(
+        pending_ids(CASE, store, c, ids::BOX).await,
+        vec![x],
+        "{CASE}: a lapsed lease on C's box frees the row for C"
+    );
+    assert!(
+        pending_ids(CASE, store, c, BoxId::new()).await.is_empty(),
+        "{CASE}: another box sees nothing"
+    );
+
+    assert!(
+        store.refresh_lease(run, a, LEASE).await.expect(CASE),
+        "{CASE}: A's heartbeat makes the lease live again"
+    );
+    assert!(
+        pending_ids(CASE, store, c, ids::BOX).await.is_empty(),
+        "{CASE}: a live lease of A keeps the row from C again"
+    );
+    store
+        .finish_run(run, RunStatus::Cancelled, None, at)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        pending_ids(CASE, store, c, ids::BOX).await,
+        vec![x],
+        "{CASE}: a terminal run on the box is listed, so its pending row can be refused (B-4)"
+    );
+}
+
+/// MOD-42 plan D14, blueprint B-4: an item's relay view lists its pending requests whose owner
+/// holds the run's lease live, and its non-terminal runs with a pending cancel. A stale row, a
+/// row whose lease lapsed and a terminal run's cancel are absent.
+async fn relay_view_lists_live_pending_requests_and_pending_cancels<S: WriteStore>(store: &S) {
+    const CASE: &str = "relay_view_lists_live_pending_requests_and_pending_cancels";
+    let a = Uuid::now_v7();
+    let at = seam_clock();
+    let (run, step) = leased_step(CASE, store, a, at).await;
+    let stale = parked(
+        CASE,
+        store,
+        open_request(run, step, RelaySessionId::new(), "req-1", a),
+    )
+    .await;
+    let live = parked(
+        CASE,
+        store,
+        open_request(run, step, RelaySessionId::new(), "req-1", a),
+    )
+    .await;
+    assert_eq!(
+        permission_row(CASE, store, stale).await.status,
+        PermissionStatus::Stale,
+        "{CASE}: precondition: the newer session staled the older row"
+    );
+    assert!(
+        matches!(
+            cancel_of(CASE, store, run).await,
+            CancelRequest::Inserted(_)
+        ),
+        "{CASE}: a pending cancel"
+    );
+
+    let view = store.relay_view(ids::HTUI_ANA_2).await.expect(CASE);
+    assert_eq!(
+        view.permissions,
+        vec![permission_row(CASE, store, live).await],
+        "{CASE}: only the live pending request is listed"
+    );
+    assert_eq!(view.cancels, vec![run], "{CASE}: the run's pending cancel");
+    assert_eq!(
+        store.relay_view(ids::HTUI_FEAT_1).await.expect(CASE),
+        RelayView::default(),
+        "{CASE}: another item's view is empty"
+    );
+
+    assert!(
+        store
+            .refresh_lease(run, a, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: A's lease lapses"
+    );
+    let lapsed = store.relay_view(ids::HTUI_ANA_2).await.expect(CASE);
+    assert!(
+        lapsed.permissions.is_empty(),
+        "{CASE}: a request whose executor's lease lapsed is not listed, got {lapsed:?}"
+    );
+    assert_eq!(
+        lapsed.cancels,
+        vec![run],
+        "{CASE}: the cancel is still pending"
+    );
+
+    store
+        .finish_run(run, RunStatus::Cancelled, None, at)
+        .await
+        .expect(CASE);
+    assert!(
+        store
+            .relay_view(ids::HTUI_ANA_2)
+            .await
+            .expect(CASE)
+            .cancels
+            .is_empty(),
+        "{CASE}: a terminal run's pending cancel is not listed (B-4)"
+    );
+}
+
+/// MOD-42 plan D1: both relay tables go with their run, so deleting the project takes its rows.
+async fn deleting_a_project_takes_its_relay_rows<S: WriteStore>(store: &S) {
+    const CASE: &str = "deleting_a_project_takes_its_relay_rows";
+    let a = Uuid::now_v7();
+    let (run, step) = leased_step(CASE, store, a, seam_clock()).await;
+    let id = parked(
+        CASE,
+        store,
+        open_request(run, step, RelaySessionId::new(), "req-1", a),
+    )
+    .await;
+    let CancelRequest::Inserted(x) = cancel_of(CASE, store, run).await else {
+        panic!("{CASE}: the first request writes a row");
+    };
+    assert_eq!(
+        pending_ids(CASE, store, a, ids::BOX).await,
+        vec![x],
+        "{CASE}: precondition: the cancel is pending"
+    );
+
+    store.delete_project(ids::PROJECT_HTUI).await.expect(CASE);
+    assert_eq!(
+        store.permission(id).await.expect(CASE),
+        None,
+        "{CASE}: the request went with its run"
+    );
+    assert!(
+        pending_ids(CASE, store, a, ids::BOX).await.is_empty(),
+        "{CASE}: the cancel went with its run"
     );
 }
 

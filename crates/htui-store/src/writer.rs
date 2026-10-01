@@ -22,20 +22,22 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow,
-    ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow, Document, DocumentHead, DocumentId,
-    GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch,
-    ItemPatch, ItemRequirement, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
-    NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
-    RequirementUpdate, Resolution, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit,
+    Agent, AgentBox, AgentId, AnswerOutcome, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord,
+    BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow, Document,
+    DocumentHead, DocumentId, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
+    ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemSummary, LinkGraph, NewCommandRun,
+    NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo,
+    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
+    PermissionStatus, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope,
+    PromptTemplate, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run,
+    RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit,
     RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId,
     SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
-    StepId, StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject,
+    StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
@@ -1176,6 +1178,95 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.reconfirm(item, requirement, kind).await,
             Self::Online(pg) => pg.reconfirm(item, requirement, kind).await,
+        }
+    }
+
+    // -- MOD-42: the permission and control relay (plan D1-D5, D12-D14)
+
+    async fn open_permission(&self, open: OpenPermission) -> Result<PermissionId> {
+        match self {
+            Self::Memory(store) => store.open_permission(open).await,
+            Self::Online(pg) => pg.open_permission(open).await,
+        }
+    }
+
+    async fn permission(&self, id: PermissionId) -> Result<Option<StepPermission>> {
+        match self {
+            Self::Memory(store) => store.permission(id).await,
+            Self::Online(pg) => pg.permission(id).await,
+        }
+    }
+
+    async fn apply_permission(
+        &self,
+        id: PermissionId,
+        owner: Uuid,
+    ) -> Result<Option<PermissionChoice>> {
+        match self {
+            Self::Memory(store) => store.apply_permission(id, owner).await,
+            Self::Online(pg) => pg.apply_permission(id, owner).await,
+        }
+    }
+
+    async fn settle_permissions(
+        &self,
+        session: RelaySessionId,
+        to: PermissionStatus,
+    ) -> Result<u64> {
+        match self {
+            Self::Memory(store) => store.settle_permissions(session, to).await,
+            Self::Online(pg) => pg.settle_permissions(session, to).await,
+        }
+    }
+
+    async fn request_cancel(
+        &self,
+        run: RunId,
+        user: UserId,
+        box_id: BoxId,
+    ) -> Result<CancelRequest> {
+        match self {
+            Self::Memory(store) => store.request_cancel(run, user, box_id).await,
+            Self::Online(pg) => pg.request_cancel(run, user, box_id).await,
+        }
+    }
+
+    async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> Result<Vec<RunCommand>> {
+        match self {
+            Self::Memory(store) => store.pending_commands(owner, box_id).await,
+            Self::Online(pg) => pg.pending_commands(owner, box_id).await,
+        }
+    }
+
+    async fn resolve_command(
+        &self,
+        id: RunCommandId,
+        to: RunCommandStatus,
+        resolution: Option<String>,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.resolve_command(id, to, resolution).await,
+            Self::Online(pg) => pg.resolve_command(id, to, resolution).await,
+        }
+    }
+
+    async fn relay_view(&self, item: ItemId) -> Result<RelayView> {
+        match self {
+            Self::Memory(store) => store.relay_view(item).await,
+            Self::Online(pg) => pg.relay_view(item).await,
+        }
+    }
+
+    async fn answer_permission(
+        &self,
+        id: PermissionId,
+        option_id: &str,
+        user: UserId,
+        box_id: BoxId,
+    ) -> Result<AnswerOutcome> {
+        match self {
+            Self::Memory(store) => store.answer_permission(id, option_id, user, box_id).await,
+            Self::Online(pg) => pg.answer_permission(id, option_id, user, box_id).await,
         }
     }
 }

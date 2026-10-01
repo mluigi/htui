@@ -31,6 +31,11 @@
 //!
 //! **MOD-23** adds one narrow writer, [`WriteStore::set_agent_box_enabled`], the per-box switch
 //! (plan D242).
+//!
+//! **MOD-42** (plan D1-D5, D12-D14) adds nine writer methods over two tables, `step_permission`
+//! and `run_command`: the permission and control relay. Neither table is mirrored (plan OQ-4), so
+//! all nine are online and writer-only, by the `command_runs` precedent; `RelayStore` and
+//! `WorkerStore` forward seven of them, and `relay_view` / `answer_permission` stay here alone.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
@@ -40,19 +45,21 @@ use crate::model::skill::validate_name;
 use crate::model::skill_glob::{SkillGlob, canonical_globs};
 use crate::model::skill_language;
 use crate::model::{
-    Activation, Agent, AgentBox, AgentId, Attachment, BindingChange, BoxEdit, BoxId, BoxProbe,
-    BoxRecord, BoxRow, ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow, Document,
-    DocumentHead, DocumentId, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
-    ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkGraph,
-    NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate,
-    NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
-    PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
-    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunId,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
-    SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus, UpstreamEntry,
+    Activation, Agent, AgentBox, AgentId, AnswerOutcome, Attachment, BindingChange, BoxEdit, BoxId,
+    BoxProbe, BoxRecord, BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun,
+    CoverageRow, Document, DocumentHead, DocumentId, GateOutcome, Item, ItemCitation, ItemFilter,
+    ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision,
+    ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject,
+    NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill,
+    NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
+    PermissionId, PermissionStatus, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    PromptScope, PromptTemplate, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
+    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding,
+    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
     UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
@@ -1546,6 +1553,105 @@ pub trait WriteStore: ReadStore {
         requirement: RequirementId,
         kind: CitationKind,
     ) -> Result<ItemRequirement>;
+
+    // -- MOD-42: the permission and control relay (plan D1-D5, D12-D14)
+
+    /// D1, D5, B-9: parks one stage-3 request. In one transaction: the step and its run's lease
+    /// (`NotFound { entity: "run_step" }`; `Constraint` when the step is not `open.run_id`'s;
+    /// `Fenced { step }` when `run.lease_owner` is not `open.owner`), then every `pending` or
+    /// `answered` row of the same step from **another session** moves to `stale` (D5), then the
+    /// insert. Answers `open.id`. `created_at` is the store's clock (I-4).
+    ///
+    /// # Errors
+    /// The three above; `Constraint` for a repeated id or a repeated `(session, request_id)`.
+    async fn open_permission(&self, open: OpenPermission) -> Result<PermissionId>;
+
+    /// One row by id; `None` for an id no row has.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn permission(&self, id: PermissionId) -> Result<Option<StepPermission>>;
+
+    /// D4: compare-and-set `answered → applied`, only while `run.lease_owner = owner` (B-9: owner
+    /// only, as a step fence). `Some(choice)` = applied now; `None` = not `answered`, not
+    /// `owner`'s row, or the run's lease is not `owner`'s. `resolved_at` is the store's clock.
+    ///
+    /// # Errors
+    /// `NotFound { entity: "step_permission" }` for an unknown id, told apart by one re-read.
+    async fn apply_permission(
+        &self,
+        id: PermissionId,
+        owner: Uuid,
+    ) -> Result<Option<PermissionChoice>>;
+
+    /// D5, I-7: every `pending` or `answered` row of `session` moves to `to` (`Cancelled` or
+    /// `Stale`), `resolved_at` the store's clock. Answers how many moved.
+    ///
+    /// # Errors
+    /// `Constraint` for any other `to`, before anything is written.
+    async fn settle_permissions(
+        &self,
+        session: RelaySessionId,
+        to: PermissionStatus,
+    ) -> Result<u64>;
+
+    /// D12: one `pending` cancel per run. Writes `(id, run, 'cancel', user, box_id)` unless a
+    /// pending cancel exists. Never reads the run's status: the caller decides (B-20).
+    ///
+    /// # Errors
+    /// `NotFound { entity: "run" }`; `Constraint` for an unknown user or box (B-7).
+    async fn request_cancel(
+        &self,
+        run: RunId,
+        user: UserId,
+        box_id: BoxId,
+    ) -> Result<CancelRequest>;
+
+    /// D13, B-4: the `pending` commands this process applies, `(issued_at, id)` order: runs whose
+    /// `lease_owner = owner`; runs executing on `box_id` whose lease is free or expired by the
+    /// store's clock and whose status is `running` or `awaiting_approval`; and runs executing on
+    /// `box_id` that are already terminal (the caller refuses those with their status).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> Result<Vec<RunCommand>>;
+
+    /// D12, D13: compare-and-set `pending → to` (`Applied` or `Refused`), with `resolution`,
+    /// `resolved_at` the store's clock. `Ok(false)` = not pending any more (I-3).
+    ///
+    /// # Errors
+    /// `Constraint` for `to = Pending`, before anything is read; `NotFound { entity:
+    /// "run_command" }` for an unknown id.
+    async fn resolve_command(
+        &self,
+        id: RunCommandId,
+        to: RunCommandStatus,
+        resolution: Option<String>,
+    ) -> Result<bool>;
+
+    /// D14: the item's `pending` requests whose owner holds the run's lease live by the store's
+    /// clock, and its non-terminal runs with a `pending` cancel. A read on `WriteStore` by the
+    /// `command_runs` precedent: neither table is mirrored (OQ-4).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn relay_view(&self, item: ItemId) -> Result<RelayView>;
+
+    /// D3: compare-and-set `pending → answered`, only while `option_id` is one of the row's
+    /// options and the row's `owner` holds the run's lease live by the store's clock. Never
+    /// touches `run`, the lease or `session_event` (I-1). A loser is `Refused` with the actual
+    /// state, decided by one re-read in this order: status (not `pending`), then `NotOffered`,
+    /// then `ExecutorGone`.
+    ///
+    /// # Errors
+    /// `NotFound { entity: "step_permission" }`; `Constraint` for an unknown user or box.
+    async fn answer_permission(
+        &self,
+        id: PermissionId,
+        option_id: &str,
+        user: UserId,
+        box_id: BoxId,
+    ) -> Result<AnswerOutcome>;
 }
 
 /// The `run_step.status` a terminal [`RunStatus`] closes a chat step with, or `None` when the

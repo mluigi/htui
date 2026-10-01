@@ -22,25 +22,27 @@ use crate::clock::Clock;
 #[cfg(feature = "test-support")]
 use crate::clock::TestClock;
 use crate::model::{
-    Agent, AgentBox, AgentId, AgentSummary, AppUser, BindingChange, BoundSkill, BoxEdit, BoxId,
-    BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec,
-    CitationKind, Claim, CommandRun, CommandRunId, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS,
-    Document, DocumentHead, DocumentId, Executor, GateOutcome, Item, ItemCitation, ItemFilter,
-    ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement,
-    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument,
-    NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
-    PromptScope, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
-    Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
-    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
-    SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch,
-    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOutcome, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, WorkspaceSummary, canonical_declared_tags,
-    missing_tags_failure, overlaps, prompt_summary, scope_of,
+    Agent, AgentBox, AgentId, AgentSummary, AnswerOutcome, AppUser, BindingChange, BoundSkill,
+    BoxEdit, BoxId, BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool,
+    CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId, CoverageRow,
+    DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, Executor, GateOutcome, Item,
+    ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch,
+    ItemRequirement, ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode,
+    NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate,
+    NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
+    PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, RelaySessionId, RelayView, Repo,
+    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
+    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
+    RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase,
+    Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
+    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission,
+    StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject, WorkspaceSummary, canonical_declared_tags, missing_tags_failure, overlaps,
+    prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -6473,6 +6475,68 @@ impl WriteStore for MemStore {
         let now = self.now();
         self.write(|state| state.reconfirm(item, requirement, kind, now))
     }
+
+    // -- MOD-42: the permission and control relay (plan D1-D5, D12-D14)
+
+    async fn open_permission(&self, _open: OpenPermission) -> Result<PermissionId> {
+        Err(StoreError::Backend("MOD-42 T0: red".into()))
+    }
+
+    async fn permission(&self, _id: PermissionId) -> Result<Option<StepPermission>> {
+        Err(StoreError::Backend("MOD-42 T0: red".into()))
+    }
+
+    async fn apply_permission(
+        &self,
+        _id: PermissionId,
+        _owner: Uuid,
+    ) -> Result<Option<PermissionChoice>> {
+        Err(StoreError::Backend("MOD-42 T0: red".into()))
+    }
+
+    async fn settle_permissions(
+        &self,
+        _session: RelaySessionId,
+        _to: PermissionStatus,
+    ) -> Result<u64> {
+        Err(StoreError::Backend("MOD-42 T0: red".into()))
+    }
+
+    async fn request_cancel(
+        &self,
+        _run: RunId,
+        _user: UserId,
+        _box_id: BoxId,
+    ) -> Result<CancelRequest> {
+        Err(StoreError::Backend("MOD-42 T0: red".into()))
+    }
+
+    async fn pending_commands(&self, _owner: Uuid, _box_id: BoxId) -> Result<Vec<RunCommand>> {
+        Err(StoreError::Backend("MOD-42 T0: red".into()))
+    }
+
+    async fn resolve_command(
+        &self,
+        _id: RunCommandId,
+        _to: RunCommandStatus,
+        _resolution: Option<String>,
+    ) -> Result<bool> {
+        Err(StoreError::Backend("MOD-42 T0: red".into()))
+    }
+
+    async fn relay_view(&self, _item: ItemId) -> Result<RelayView> {
+        Err(StoreError::Backend("MOD-42 T0: red".into()))
+    }
+
+    async fn answer_permission(
+        &self,
+        _id: PermissionId,
+        _option_id: &str,
+        _user: UserId,
+        _box_id: BoxId,
+    ) -> Result<AnswerOutcome> {
+        Err(StoreError::Backend("MOD-42 T0: red".into()))
+    }
 }
 
 #[cfg(all(test, feature = "test-support"))]
@@ -6483,13 +6547,15 @@ mod tests {
     use crate::clock::{Clock as _, TestClock};
     use crate::fixtures::ids;
     use crate::model::{
-        AgentBox, AgentId, BoxId, BoxProbe, ChatRunSpec, CitationKind, Claim, DocumentId,
-        GateOutcome, GraphSnapshot, Isolation, ItemId, ItemKindPatch, NewDocument, NewItem,
-        NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-        NoteId, OverlapRule, Priority, ProbedTool, ProjectId, ProjectPatch, RepoId,
-        RequirementAreaId, RequirementId, RequirementPatch, RequirementUpdate, Resolution, RunId,
-        RunKind, RunMode, RunStatus, RunStepCommit, RunStepTree, Scope, SnapshotGraph,
-        SnapshotSettings, Status, StepId, StepOutcome, StepStatus, UserId, VerifyOutcome,
+        AgentBox, AgentId, AnswerOutcome, BoxId, BoxProbe, CancelRequest, ChatRunSpec,
+        CitationKind, Claim, DocumentId, GateOutcome, GraphSnapshot, Isolation, ItemId,
+        ItemKindPatch, NewDocument, NewItem, NewNote, NewProject, NewRepo, NewRequirement,
+        NewRequirementArea, NewRun, NewRunStep, NoteId, OpenPermission, OverlapRule, PermissionId,
+        Priority, ProbedTool, ProjectId, ProjectPatch, RelayOption, RelayOptionKind,
+        RelaySessionId, RepoId, RequirementAreaId, RequirementId, RequirementPatch,
+        RequirementUpdate, Resolution, RunId, RunKind, RunMode, RunStatus, RunStepCommit,
+        RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome,
+        StepStatus, UserId, VerifyOutcome,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -8101,6 +8167,97 @@ mod tests {
             "a refused clear removed nothing"
         );
         assert_eq!(after, token, "and did not advance the token either");
+    }
+
+    /// MOD-42 I-4: every time the relay writes is the handle's clock (`clock_timestamp()` on
+    /// Postgres), never a box's wall clock: opening, answering, applying and requesting a cancel
+    /// on a handle frozen at `t` stamp exactly `t`.
+    #[tokio::test]
+    async fn relay_times_are_the_handles_clock() {
+        let t = Utc::now() - TimeDelta::days(2);
+        let store = MemStore::demo().handle_at(t);
+        let owner = Uuid::now_v7();
+        let run = store
+            .create_run(graph_run(ids::HTUI_ANA_2, ids::PROJECT_HTUI, Vec::new()))
+            .await
+            .expect("the run is created")
+            .id;
+        assert_eq!(
+            store
+                .claim_run(run, ids::BOX, owner, t, TimeDelta::minutes(5))
+                .await
+                .expect("the claim lands"),
+            Claim::Admitted
+        );
+        let step = store
+            .create_step(new_step(run, 0, 1, 0))
+            .await
+            .expect("the step is created")
+            .id;
+        let open = |request: &str| OpenPermission {
+            id: PermissionId::new(),
+            run_id: run,
+            run_step_id: step,
+            session: RelaySessionId::new(),
+            request_id: request.to_owned(),
+            tool_call_id: None,
+            summary: None,
+            options: vec![RelayOption {
+                id: "allow-once".to_owned(),
+                label: "Allow once".to_owned(),
+                kind: RelayOptionKind::AllowOnce,
+            }],
+            owner,
+        };
+        let id = store
+            .open_permission(open("req-1"))
+            .await
+            .expect("the request parks");
+        assert_eq!(
+            store
+                .answer_permission(id, "allow-once", ids::USER, ids::BOX)
+                .await
+                .expect("the answer lands"),
+            AnswerOutcome::Answered
+        );
+        assert!(
+            store
+                .apply_permission(id, owner)
+                .await
+                .expect("the apply lands")
+                .is_some(),
+            "the owner applies the answer"
+        );
+        let row = store
+            .permission(id)
+            .await
+            .expect("read")
+            .expect("the row exists");
+        assert_eq!(row.created_at, t, "created_at is the handle's clock");
+        assert_eq!(
+            row.answered_at,
+            Some(t),
+            "answered_at is the handle's clock"
+        );
+        assert_eq!(
+            row.resolved_at,
+            Some(t),
+            "resolved_at is the handle's clock"
+        );
+
+        assert!(matches!(
+            store
+                .request_cancel(run, ids::USER, ids::BOX)
+                .await
+                .expect("the cancel is written"),
+            CancelRequest::Inserted(_)
+        ));
+        let commands = store.pending_commands(owner, ids::BOX).await.expect("read");
+        assert_eq!(
+            commands.iter().map(|row| row.issued_at).collect::<Vec<_>>(),
+            vec![t],
+            "issued_at is the handle's clock"
+        );
     }
 
     /// PRD D13's cascade with no ghost left behind, read straight out of `State`.

@@ -20,19 +20,21 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::{
-    Activation, Agent, AgentBox, AgentId, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord,
-    BoxRow, BoxSettings, BoxTool, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId,
-    CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor, GateOutcome, Isolation,
-    Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision,
-    NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate,
-    NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Priority, Project, ProjectId,
-    ProjectPatch, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
-    RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Skill,
-    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepStatus,
+    Activation, Agent, AgentBox, AgentId, AnswerOutcome, BindingChange, BoxEdit, BoxId, BoxProbe,
+    BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec, CitationKind, Claim,
+    CommandRun, CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor,
+    GateOutcome, Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
+    ItemRequirement, ItemRevision, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
+    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
+    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
+    PermissionId, PermissionStatus, PhaseId, PhasePatch, Priority, Project, ProjectId,
+    ProjectPatch, PromptTemplate, PromptTemplateId, RelaySessionId, RelayView, Repo, RepoBoxPath,
+    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
+    Resolution, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Skill, SkillBinding,
+    SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
     UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
     WorkspaceProject, canonical_declared_tags, missing_tags_failure, overlaps, scope_of,
 };
@@ -5835,6 +5837,69 @@ impl WriteStore for PgStore {
 
         tx.commit().await.map_err(map_sqlx)?;
         Ok(row)
+    }
+
+    // -- MOD-42: the permission and control relay (plan D1-D5, D12-D14). T1 replaces each body
+    // with a delegation to `pg/relay.rs`.
+
+    async fn open_permission(&self, _open: OpenPermission) -> Result<PermissionId> {
+        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+    }
+
+    async fn permission(&self, _id: PermissionId) -> Result<Option<StepPermission>> {
+        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+    }
+
+    async fn apply_permission(
+        &self,
+        _id: PermissionId,
+        _owner: Uuid,
+    ) -> Result<Option<PermissionChoice>> {
+        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+    }
+
+    async fn settle_permissions(
+        &self,
+        _session: RelaySessionId,
+        _to: PermissionStatus,
+    ) -> Result<u64> {
+        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+    }
+
+    async fn request_cancel(
+        &self,
+        _run: RunId,
+        _user: UserId,
+        _box_id: BoxId,
+    ) -> Result<CancelRequest> {
+        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+    }
+
+    async fn pending_commands(&self, _owner: Uuid, _box_id: BoxId) -> Result<Vec<RunCommand>> {
+        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+    }
+
+    async fn resolve_command(
+        &self,
+        _id: RunCommandId,
+        _to: RunCommandStatus,
+        _resolution: Option<String>,
+    ) -> Result<bool> {
+        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+    }
+
+    async fn relay_view(&self, _item: ItemId) -> Result<RelayView> {
+        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
+    }
+
+    async fn answer_permission(
+        &self,
+        _id: PermissionId,
+        _option_id: &str,
+        _user: UserId,
+        _box_id: BoxId,
+    ) -> Result<AnswerOutcome> {
+        Err(StoreError::Backend("MOD-42 T1: not yet implemented".into()))
     }
 }
 
