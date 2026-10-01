@@ -616,10 +616,11 @@ impl RunsTab {
 }
 
 /// Whether a frame of the pane's item means its rows changed: every kind but the subscription's
-/// acknowledgement (D172). Written out, so a new kind has to be placed deliberately.
+/// acknowledgement (D172) and a command's wait (R-51). Written out, so a new kind has to be placed
+/// deliberately.
 const fn invalidates(kind: &FrameKind) -> bool {
     match kind {
-        FrameKind::Subscribed => false,
+        FrameKind::Subscribed | FrameKind::Waiting => false,
         FrameKind::Started
         | FrameKind::SessionDone { .. }
         | FrameKind::Rested(_)

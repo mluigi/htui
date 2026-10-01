@@ -159,6 +159,8 @@ pub enum FrameKind {
     /// A command changed the item's rows with no walk to rest: a reopen, a close-out, a cleanup
     /// (D200), or a step went live (R-40).
     Changed,
+    /// A command is queued behind a live walk of the run (R-51). Nothing changed in the rows.
+    Waiting,
     /// A sweep adopted the run; its walk resumes on a task of its own.
     Adopted,
     /// A command or walk failed, with the sentence.
