@@ -277,11 +277,14 @@ short sessions; with password logins you are asked once per session, so use a ke
 - systemd 250 or later, with `systemd-creds` on the `PATH`.
 - sudo (a password prompt is fine). When sudo wants a password, `htui` asks for it here, with no
   echo: `[sudo] password for <user> on <destination>:`. `Esc` or `Ctrl-C` cancels before anything
-  is written. A sudo that asks a second question (a one-time code) or insists on a tty refuses
-  safely; give such a host NOPASSWD instead.
+  is written. A sudo that asks a second question (a one-time code) or insists on a tty
+  (`requiretty`) fails safely: exit 1, and nothing privileged is written. Give a host that asks
+  for a one-time code NOPASSWD. NOPASSWD does not get around `requiretty`; turn it off for that
+  user instead (`Defaults:<user> !requiretty`).
 - A POSIX login shell on the remote user (sh, bash, zsh, ksh); fish and csh are refused.
 - A user and group name matching `[a-z_][a-z0-9_-]{0,31}`, and a home directory whose path uses
-  only `A-Z a-z 0-9 _ . / -` with no `..`, because all three are written into the unit file.
+  only `A-Z a-z 0-9 _ . / -` with no `..`. The user and the home are written into the unit file;
+  the group is checked the same way.
 
 **What is written where.** On the remote host, for the user you log in as:
 
@@ -297,8 +300,11 @@ filled in and the binary in `~/.local/bin`. The worker mints its `box.toml` in `
 its first start, so the new box belongs to that user. The DSN is encrypted by `systemd-creds` on
 that host and is never in a command line, the environment, a log or a plain file on either
 machine. The sudo password, likewise, travels only on `ssh`'s standard input. The notes under the
-sample apply to this unit too; to add an `Environment=` line (`PATH`, `XDG_CONFIG_HOME`), use a
-drop-in (`sudo systemctl edit htui-worker.service`), which a re-run leaves alone.
+sample apply to this unit too; to add an `Environment=` line (`PATH`, say), use a drop-in
+(`sudo systemctl edit htui-worker.service`), which a re-run leaves alone. Do not set
+`XDG_CONFIG_HOME` there: provisioning assumes `~/.config`, and a worker that reads another
+`box.toml` is another box, with its executor still `tui`, and a later re-run would wait on the
+wrong file.
 
 **The DSN.** From your OS keyring, or one line of stdin with `--dsn-stdin` when the remote host
 reaches Postgres at another address. A DSN whose host is `localhost`, a loopback address or a Unix
@@ -343,15 +349,17 @@ different build, or one set up by hand, is refused: upgrading is not supported y
 `<destination> is already provisioned with this build; nothing was changed`. A run that failed
 partway is completed by running it again: the binary is not sent twice, an existing credential is
 kept unless you pass `--replace-credential`, and a unit that is installed but not running is
-written again and started.
+written again and started. A run that failed while waiting for the worker may leave the service
+running; the re-run then says it is already provisioned and does not set the executor. Set it in
+**Settings › Boxes**, or re-run with `--replace-credential`, which goes through the check again.
 
 **Exit codes.**
 
 | Code | Meaning |
 |---|---|
 | `0` | Provisioned, or already provisioned. A warning on standard error may still ask you to set the executor by hand. |
-| `2` | Refused; nothing was written on the remote host. The sentence starts `not provisioning <destination>:` and names the reason: no DSN, a DSN the remote host cannot use, `ssh` that could not connect (`ssh to <destination> failed (exit 255): …`), a login shell that did not run the preflight, the host's OS, architecture, systemd, `systemd-creds` or sudo, a different build already installed, a user, group or home that cannot go into a unit file, or a cancelled password prompt. |
-| `1` | Failed after a remote write; re-running completes it. The sentence starts `provisioning <destination> failed:`. |
+| `2` | Refused; nothing was written on the remote host. The sentence starts `not provisioning <destination>:` and names the reason, among them: a destination that is empty, starts with `-` or contains whitespace, no DSN, a keyring that could not be read, a DSN the remote host cannot use, a local `htui` binary that cannot be read or is not a Linux build, `ssh` that could not be run (`cannot run ssh: …`) or could not connect (`ssh to <destination> failed (exit 255): …`), a login shell that did not run the preflight, the host's OS, architecture, systemd, `systemd-creds` or sudo, a different build already installed, a user, group or home that cannot go into a unit file, or a cancelled password prompt. |
+| `1` | Failed after a remote write; re-running completes it (see **Re-running** for the executor). The sentence starts `provisioning <destination> failed:`. |
 
 The failures:
 
@@ -376,7 +384,7 @@ When sudo wants a password and no terminal can be opened, the run is refused (ex
 `ssh -t <host> ~/.local/bin/htui --dsn-stdin`, paste the DSN, then **Settings › Agents**. The DSN is
 held in memory for that session only; it is neither read from nor written to a keyring, and
 systemd decrypts the service's credential only for the unit. The TUI runs as the same user with
-the same `box.toml`, so it is the same box (see
+the same `box.toml` (unless that login sets `XDG_CONFIG_HOME`), so it is the same box (see
 [The TUI on a worker box](#the-tui-on-a-worker-box)). **Settings › Connection** there shows the
 keyring's state, not this session's DSN, and saving a DSN from it tries a keyring the box does not
 have. `--dsn-stdin` cannot be combined with `--set-dsn`, `--clear-dsn`, `--demo`, `--offline`,
