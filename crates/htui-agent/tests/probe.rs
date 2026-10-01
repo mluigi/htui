@@ -2432,6 +2432,7 @@ fn snapshot(
         status,
         stderr_tail: None,
         source,
+        manual: BTreeMap::new(),
     }
 }
 

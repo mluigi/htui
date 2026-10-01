@@ -535,6 +535,7 @@ fn snapshot(source: ProbeSource, status: ProbeStatus, resolved: ResolvedLaunch) 
         status,
         stderr_tail: None,
         source,
+        manual: BTreeMap::new(),
     }
 }
 

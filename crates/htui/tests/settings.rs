@@ -1922,6 +1922,7 @@ fn login_row(name: &str, status: ProbeStatus, auth_methods: &[&str]) -> AgentSum
         status,
         stderr_tail: None,
         source: ProbeSource::Probe,
+        manual: BTreeMap::new(),
     };
     probed_row(name, true, Some("1.1.1"), Some(snapshot.to_value()))
 }

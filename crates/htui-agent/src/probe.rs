@@ -245,6 +245,10 @@ pub struct ToolReport {
     /// Names that resolved nowhere or below their floor, in `BTreeMap` order. A name below its
     /// floor is in **both** maps: it was found, and it does not count.
     pub missing: Vec<String>,
+    /// Names that resolved through this box's **manual path** (MOD-66 D2), in `BTreeMap` order:
+    /// a subset of `found`'s keys. Non-empty makes the snapshot's `source`
+    /// [`ProbeSource::Manual`] (D4): a human decided at least part of this launch.
+    pub manual: Vec<String>,
 }
 
 impl ToolReport {
@@ -575,18 +579,22 @@ async fn exists(path: &Path) -> bool {
 
 /// Whether `path` is a **file**, off the runtime's worker.
 ///
-/// [`exists`]'s stricter sibling, `pub(crate)` for [`crate::acp::AcpDriver::launch_for`], which
-/// applies D58's fourth rule — the recorded command is still on disk — and is asking a narrower
-/// question than the tiers above. It is about to hand the path to `execve`, and the self-update
-/// ANA-4 §4.6 describes rearranges version-numbered *directories*: a recorded path that has become
-/// one exists, is not a launch, and would fail the chat with a `Spawn` error and earn the row a
-/// D60 re-probe it does not need. One `is_file` on the same `metadata` call turns that into the
-/// fallback the rule already has.
+/// `exists`'s stricter sibling. `pub` for its three callers: D58's disk check in `launch_from`,
+/// the manual tier of `probe_tools_with` (MOD-66 D2), and the `SetToolPaths` worker check in
+/// `htui` (MOD-66 D9).
+///
+/// D58's check applies its fourth rule — the recorded command is still on disk — and is asking a
+/// narrower question than the tiers above. It is about to hand the path to `execve`, and the
+/// self-update ANA-4 §4.6 describes rearranges version-numbered *directories*: a recorded path
+/// that has become one exists, is not a launch, and would fail the chat with a `Spawn` error and
+/// earn the row a D60 re-probe it does not need. One `is_file` on the same `metadata` call turns
+/// that into the fallback the rule already has. A manual path is held to the same standard, for
+/// the same reason: a directory is not spawnable.
 ///
 /// A path that cannot be `stat`ed at all — gone, or a directory this process may not traverse — is
 /// `false` for the same reason: the answer to "can this be spawned" is no either way, and
 /// resolution is the honest second attempt.
-pub(crate) async fn is_file(path: &Path) -> bool {
+pub async fn is_file(path: &Path) -> bool {
     tokio::fs::metadata(path)
         .await
         .is_ok_and(|meta| meta.is_file())
@@ -1115,6 +1123,12 @@ pub struct ProbeSnapshot {
     /// nobody marked `manual` may be refreshed.
     #[serde(default)]
     pub source: ProbeSource,
+    /// MOD-66 D1: `${tool}` name → the absolute path a human gave this box for it. Written by
+    /// `SetToolPaths`, read by every probe as a resolution tier, and carried forward by every
+    /// snapshot the probe writes. Absent in older documents, and absent when empty, so a row with
+    /// no manual path keeps its exact bytes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub manual: BTreeMap<String, String>,
 }
 
 impl ProbeSnapshot {
@@ -1371,6 +1385,7 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
             status,
             stderr_tail: tail,
             source: ProbeSource::Probe,
+            manual: BTreeMap::new(),
         }
     };
 
@@ -1460,6 +1475,7 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
             status: ProbeStatus::Ready,
             stderr_tail: None,
             source: ProbeSource::Probe,
+            manual: BTreeMap::new(),
         };
     }
 
@@ -1473,6 +1489,7 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
             credential,
             stderr_tail: None,
             source: ProbeSource::Probe,
+            manual: BTreeMap::new(),
         },
         Err(error) => ProbeSnapshot {
             transport: agent.transport,
@@ -1490,6 +1507,7 @@ async fn snapshot_for(agent: &Agent, ctx: &ProbeContext, tier2: &dyn Tier2) -> P
                 other => other.to_string(),
             })),
             source: ProbeSource::Probe,
+            manual: BTreeMap::new(),
         },
     }
 }

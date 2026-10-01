@@ -218,6 +218,7 @@ fn probed_login_box(agent_id: AgentId) -> AgentBox {
         status: ProbeStatus::Unauthenticated,
         stderr_tail: None,
         source: ProbeSource::Probe,
+        manual: std::collections::BTreeMap::new(),
     };
     AgentBox {
         agent_id,
