@@ -1980,7 +1980,11 @@ impl AgentRuntime {
         };
 
         let step_id = chat.step_id;
-        let answer = frames.answer(chat_failed);
+        // MOD-24 D4: copies of the pair and the writer, because the panicked task is dropped with
+        // the originals before its answer is sent.
+        let answer = frames
+            .answer(chat_failed)
+            .closing(writer.clone(), chat.clone());
         let args = ChatArgs {
             driver,
             writer,
@@ -3392,8 +3396,9 @@ impl Frames {
 /// The replies a task owes its request if it panics: the ones that end the request (MOD-53).
 ///
 /// A plain `fn` so every spawn site names its own, and so the answer carries no state of the task
-/// it outlives. More than one because a chat's stream ends the way its own failures end it:
-/// `Failed`, then `Ended`.
+/// it outlives; a fresh chat's answer carries copies of the run's ids and a writer (MOD-24 D4).
+/// More than one because a chat's stream ends the way its own failures end it: `Failed`, then
+/// `Ended`.
 type LastWord = fn(String) -> Vec<StoreReply>;
 
 /// Where a panicked task's [`LastWord`] goes: the task's reply channel and its stream (MOD-53).
@@ -3404,6 +3409,10 @@ struct Answer {
     tx: mpsc::UnboundedSender<ReplyEnvelope>,
     stream: Stream,
     last_word: LastWord,
+    /// MOD-24 D4: a fresh chat's `run(kind='chat')` pair, closed `failed` before the last word is
+    /// sent, so a tab that re-reads runs on `Ended` finds it closed. `None` for every other task,
+    /// and for a promoted step's chat, which opened no run (MOD-4 D165).
+    closes: Option<(Writer, ChatRunSpec)>,
 }
 
 impl Answer {
@@ -3412,8 +3421,21 @@ impl Answer {
         Frames::new(tx, addr).answer(last_word)
     }
 
-    /// Sends the last word for `message` at the stream's address as it is now.
-    fn send(self, message: String) {
+    /// MOD-24 D4: this answer closes `chat`'s run first. Copies, not the task's state: the task
+    /// is dropped before the answer is sent.
+    fn closing(mut self, writer: Writer, chat: ChatRunSpec) -> Self {
+        self.closes = Some((writer, chat));
+        self
+    }
+
+    /// Closes the run this answer owns, if any, then sends the last word for `message` at the
+    /// stream's address as it is now.
+    async fn send(self, message: String) {
+        // Awaited before the frames go out: a tab that re-reads runs on `Ended` must find the run
+        // closed. `close_run` logs its own failure.
+        if let Some((writer, chat)) = &self.closes {
+            close_run(writer, chat, RunStatus::Failed).await;
+        }
         let addr = self.stream.lock().addr.clone();
         for reply in (self.last_word)(message) {
             // A UI that has gone away is not an error, as in `Frames::send`.
@@ -3433,6 +3455,7 @@ impl Frames {
             tx: self.tx.clone(),
             stream: self.stream.clone(),
             last_word,
+            closes: None,
         }
     }
 }
@@ -3492,6 +3515,7 @@ fn auth_failed(message: String) -> Vec<StoreReply> {
 /// A panicked chat's last words, as its transport failures end it: `Failed`, which clears a
 /// pending start, then `Ended`, which tells an accepted session it is over so the tab stops
 /// sending to a chat the runtime has already swept. `Cancelled`, because the last turn was cut.
+/// Sent after the chat's run is closed `failed` (MOD-24 D4).
 fn chat_failed(message: String) -> Vec<StoreReply> {
     vec![
         StoreReply::Chat(ChatFrame::Failed { message }),
@@ -3512,8 +3536,8 @@ fn chat_failed(message: String) -> Vec<StoreReply> {
 ///
 /// So each poll runs inside [`contain`](htui_agent::excerpt::contain) and `catch_unwind`. On an
 /// unwind the task is dropped, which runs whatever guards it still held (a `ChildGuard` kills its
-/// child, a `ReprobeClaim` releases its row), the panic is logged, and `answer`, when the task owes
-/// one, is sent. The reply goes out at once, not at the next sweep, because the sweep only runs
+/// child, a `ReprobeClaim` releases its row), the panic is logged, a fresh chat's run is closed
+/// (MOD-24 D4), and `answer`, when the task owes one, is sent. The reply goes out at once, not at the next sweep, because the sweep only runs
 /// when another request arrives. Cancelling is untouched: an aborted task is dropped at an await
 /// and never reaches the catch, so a superseded preview or a shutdown still answers nothing.
 ///
@@ -3545,7 +3569,7 @@ where
     let message = format!("the {name} task panicked: {}", panic_text(payload.as_ref()));
     tracing::error!(task = name, %message, "a runtime task panicked; its request is answered as failed");
     if let Some(answer) = answer {
-        answer.send(message);
+        answer.send(message).await;
     }
 }
 
