@@ -1136,11 +1136,12 @@ pub trait WriteStore: ReadStore {
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }`.
     async fn refresh_lease(&self, run: RunId, owner: Uuid, ttl: TimeDelta) -> Result<bool>;
 
-    /// ANA-2 §4.9's sweep: every `running` run whose `executing_box_id` is `box_id` and whose
-    /// lease is `NULL` or expired **by the store's clock** becomes ours (`lease_owner = owner`,
-    /// `lease_expires_at` = the store's clock plus `ttl`). Returns the adopted rows in `queued_at`
-    /// order, ties broken by `id` so the order is total and the same on every backend; empty when
-    /// nothing was abandoned. A box that does not exist adopts nothing (`Ok(vec![])`).
+    /// ANA-2 §4.9's sweep: every `running` run of `kind = 'graph'` whose `executing_box_id` is
+    /// `box_id` and whose lease is `NULL` or expired **by the store's clock** becomes ours
+    /// (`lease_owner = owner`, `lease_expires_at` = the store's clock plus `ttl`); never a chat
+    /// run (MOD-24 D3b). Returns the adopted rows in `queued_at` order, ties broken by `id` so the
+    /// order is total and the same on every backend; empty when nothing was abandoned. A box that
+    /// does not exist adopts nothing (`Ok(vec![])`).
     ///
     /// **Never** a run whose `lease_owner` is `owner` (plan D88): a process whose heartbeat
     /// stalled past its TTL must not adopt its own live walk and run it twice under one owner.

@@ -4046,9 +4046,13 @@ impl WriteStore for PgStore {
         }
     }
 
-    /// ANA-2 §4.9's sweep: every `running` run on the box whose lease is `NULL` or expired by
-    /// `clock_timestamp()`, and is not already `owner`'s (plan D88), becomes `owner`'s, in one
-    /// statement, its lease `clock_timestamp()` plus the TTL (MOD-40 plan D10).
+    /// ANA-2 §4.9's sweep: every `running` **graph** run on the box whose lease is `NULL` or
+    /// expired by `clock_timestamp()`, and is not already `owner`'s (plan D88), becomes `owner`'s,
+    /// in one statement, its lease `clock_timestamp()` plus the TTL (MOD-40 plan D10).
+    ///
+    /// A chat run (`kind = 'chat'`, `running` with no lease, `start_chat_run`) is never the
+    /// sweep's: the engine cannot recover it, and leasing it fenced the chat's own unleased writes
+    /// until `unrecovered` gave it back (MOD-24 D3b).
     ///
     /// The candidates are locked in `(queued_at, id)` order with `FOR UPDATE SKIP LOCKED`
     /// (blueprint A-5): two concurrent sweeps never wait on each other's row locks and cannot
@@ -4072,6 +4076,7 @@ impl WriteStore for PgStore {
                   FROM run
                  WHERE executing_box_id = $1
                    AND status = 'running'
+                   AND kind = 'graph'
                    AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())
                    AND lease_owner IS DISTINCT FROM $2
                  ORDER BY queued_at, id
