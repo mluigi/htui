@@ -757,14 +757,7 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             .into_iter()
             .map(|summary| (summary.agent.id, summary))
             .collect();
-        let policies: HashMap<AgentId, PermissionPolicy> = agents
-            .values()
-            .map(|summary| {
-                let settings: AgentSettings =
-                    serde_json::from_value(summary.agent.settings.clone()).unwrap_or_default();
-                (summary.agent.id, settings.permission)
-            })
-            .collect();
+        let policy = policy_lookup(&agents);
         Ok(Self {
             sink: ProgressSink {
                 publisher: Arc::new(shared.publisher.clone()),
@@ -788,7 +781,7 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             role: shared.role,
             executor,
             tails,
-            policy: Box::new(move |agent| policies.get(&agent).cloned().unwrap_or_default()),
+            policy,
             control: Box::new(htui_orch::never_cancelled),
         })
     }
@@ -2319,6 +2312,24 @@ pub mod testing {
 /// MOD-41 plan D8: the parts only the library owns, over `Backend::memory(MemStore::demo())`. The
 /// runtime is reached through its generic API alone, so no case imports `WorkerHost` beside the
 /// `ReadStore` that `Backend` also implements (blueprint F-33).
+/// MOD-42 plan D9: [`Kit`]'s policy lookup over `agents`, each agent's
+/// `agent.settings.permission` parsed once per task as chat parses it
+/// (`agent_worker.rs:968-969`): a row that does not parse, and an agent the task did not read,
+/// ask.
+fn policy_lookup(
+    agents: &HashMap<AgentId, AgentSummary>,
+) -> Box<dyn Fn(AgentId) -> PermissionPolicy + Send + Sync> {
+    let policies: HashMap<AgentId, PermissionPolicy> = agents
+        .values()
+        .map(|summary| {
+            let settings: AgentSettings =
+                serde_json::from_value(summary.agent.settings.clone()).unwrap_or_default();
+            (summary.agent.id, settings.permission)
+        })
+        .collect();
+    Box::new(move |agent| policies.get(&agent).cloned().unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex as StdMutex, PoisonError};
@@ -3249,6 +3260,60 @@ mod role_gate {
             backed_off(shared),
             [within].into_iter().collect(),
             "the grace is twice the sweep period, not {BACKOFF_MAX:?}"
+        );
+    }
+}
+
+/// MOD-42 plan D9: the production policy lookup `Kit::read` builds.
+#[cfg(test)]
+mod kit_policy {
+    use std::collections::HashMap;
+
+    use chrono::DateTime;
+    use htui_agent::driver::{PermissionDefault, PermissionPolicy};
+    use htui_core::model::agent::seed_rows;
+    use htui_core::model::{AgentId, AgentSummary};
+    use serde_json::{Value, json};
+
+    /// One seeded agent per `settings` document, keyed by its id, in the given order.
+    fn agents(settings: [Value; 2]) -> (Vec<AgentId>, HashMap<AgentId, AgentSummary>) {
+        let now = DateTime::from_timestamp(1_788_393_600, 0).expect("a valid timestamp");
+        let summaries: Vec<AgentSummary> = seed_rows(now)
+            .into_iter()
+            .zip(settings)
+            .map(|(mut agent, settings)| {
+                agent.settings = settings;
+                AgentSummary {
+                    agent,
+                    on_box: None,
+                    user_off: false,
+                }
+            })
+            .collect();
+        let ids = summaries.iter().map(|summary| summary.agent.id).collect();
+        let map = summaries
+            .into_iter()
+            .map(|summary| (summary.agent.id, summary))
+            .collect();
+        (ids, map)
+    }
+
+    #[test]
+    fn each_agent_gets_its_own_parsed_policy_and_anything_else_asks() {
+        let (ids, agents) = agents([
+            json!({ "permission": { "default": "allow" } }),
+            // Not a policy: the whole row does not parse, and it asks (fail closed).
+            json!({ "permission": 42 }),
+        ]);
+        let policy = super::policy_lookup(&agents);
+
+        assert_eq!(policy(ids[0]).default, PermissionDefault::Allow);
+        assert_eq!(policy(ids[1]), PermissionPolicy::default());
+        assert_eq!(policy(ids[1]).default, PermissionDefault::Ask);
+        assert_eq!(
+            policy(AgentId::new()),
+            PermissionPolicy::default(),
+            "an agent the task did not read asks"
         );
     }
 }
