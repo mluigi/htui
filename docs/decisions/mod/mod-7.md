@@ -208,7 +208,7 @@ D126-D144). Five tasks in two waves of worktrees, merged in order: T0 `7810c4c`,
 |---|---|---|
 | R-18, macOS `xcode-select` stubs | none (deferred) | A probe on a Mac without the Command Line Tools opens an install dialog; guard sketched in the milestone 1 blueprint §11. Revisit when someone verifies macOS. |
 | Windows runtime facts of the probe | **MOD-16** | `MachineGuid` fingerprint, `sysinfo`, the `powershell.exe` CIM GPU query, the WSL `bash.exe` launcher and the Store `python3` stub. |
-| Probe spec editor | **MOD-51** | Milestone 2 ships only the read-only view. |
+| Probe spec editor | **MOD-51** (done, `docs/decisions/mod/mod-51.md`) | Milestone 2 ships only the read-only view. |
 | Terminal replies of panicked runtime tasks; wide characters in the text widgets | **MOD-53**, **MOD-54** | Milestone 2 review deferrals. |
 | Two claim-time test gaps | **MOD-58** | Milestone 3 review. |
 | Interactive path picker | **MOD-49** | Unblocked by milestone 4; the typed fallback is Hierarchy's `b`. |
