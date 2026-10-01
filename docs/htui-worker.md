@@ -57,8 +57,8 @@ What it does:
 - Applies a cancel requested from any TUI: it reads requests every second and stops the walk
   gracefully (see [Cancelling](#cancelling-a-run-the-worker-walks)).
 - Stops on SIGINT or SIGTERM (Ctrl-C, Ctrl-Break, closing the console or a system shutdown on
-  Windows): it cancels its walks with a short grace period and gives their leases back, then exits
-  0. A step it interrupted is reset and retried by the next sweep on the box. This stop is a hard
+  Windows): it drops its walks at once, waits a short grace period for their tasks to end and
+  gives their leases back, then exits 0. A step it interrupted is reset and retried by the next sweep on the box. This stop is a hard
   drop, not a graceful cancel: a step parked on a permission request is not answered first (see
   [below](#permission-requests-on-worker-steps)).
 
@@ -188,7 +188,8 @@ applies it:
   permission request the step is parked on is answered `cancelled` (and recorded in the step's
   log), the agent is asked to cancel its turn and given 2 seconds to wind down, and the walk is
   then dropped. The run and its live steps become `cancelled`, as an in-process cancel would make
-  them, so a cancel takes effect within about 3 seconds.
+  them, so a cancel usually takes effect within about 3 seconds (the 2-second grace plus one
+  poll), and at most a second later if the agent does not wind down.
 - **A request whose executor is not running waits.** It stays pending, with no timeout, and the
   Runs pane keeps showing `cancel requested`. If the worker died holding the run, the request waits
   until the run's lease lapses; from then on the next process on the run's box that reads cancel
