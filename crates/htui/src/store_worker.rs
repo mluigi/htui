@@ -204,7 +204,7 @@ pub enum StoreRequest {
     /// Stream a live chat's frames to this request's address from now on (MOD-4 plan D165,
     /// blueprint D185).
     ///
-    /// The Chat tab sends it when a promoted chat is accepted. A promotion's address is an `Orch`
+    /// The Chat tab sends it when a promotion answers (T7). A promotion's address is an `Orch`
     /// request's, and any later `Orch` request from the tab — a second promotion the run runtime
     /// refuses included — supersedes it in the shell's staleness index (`App::is_fresh`), which
     /// would drop every frame after it. Nothing else from the tab supersedes this one while the
