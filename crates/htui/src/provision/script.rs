@@ -22,6 +22,7 @@ pub const BOX_END: &str = "htui.box.end";
 /// `$1` root. Never fails on a missing tool: a missing tool is a value (`none`, `no`, `unknown`).
 /// `printf` is `builtin` when this `sh` has it built in, `external` otherwise (review finding 5:
 /// INSTALL hands the sudo password to `printf`, which must not be a process of its own).
+/// `sha256sum` is `yes` when it is on the `PATH`: PREPARE checks the upload with it.
 pub const PREFLIGHT: &str = r#"set -eu
 root=$1
 say() {
@@ -74,6 +75,11 @@ case $p in
   printf) say printf builtin ;;
   *) say printf external ;;
 esac
+if command -v sha256sum >/dev/null 2>&1; then
+  say sha256sum yes
+else
+  say sha256sum no
+fi
 "#;
 
 /// Unprivileged (D304): the log directory, then, with `send=1`, the binary on stdin, whose sha256
@@ -621,6 +627,18 @@ WantedBy=multi-user.target
         let refuse = line_of(PREPARE, "exit 6");
         let run = line_of(PREPARE, r#""$tmp" --version"#);
         assert!(read < hash && hash < refuse && refuse < run);
+    }
+
+    /// Verify round 1 (review finding 11): PREFLIGHT says whether PREPARE's `sha256sum` is there,
+    /// so a host without it is refused before any write instead of failing PREPARE with 127.
+    #[test]
+    fn preflight_reports_whether_sha256sum_is_on_the_path() {
+        let probe = "if command -v sha256sum >/dev/null 2>&1; then\n  say sha256sum yes\nelse\n  say sha256sum no\nfi\n";
+        assert!(PREFLIGHT.contains(probe));
+        let printf = line_of(PREFLIGHT, "say printf builtin");
+        let sha = line_of(PREFLIGHT, "say sha256sum yes");
+        assert!(printf < sha, "the keys come in KEYS order");
+        assert!(PREPARE.contains("sha256sum"));
     }
 
     /// Review finding 5: PREFLIGHT says whether `printf` is a builtin of the remote `sh`.

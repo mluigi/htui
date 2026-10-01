@@ -42,8 +42,8 @@ pub const MIN_SYSTEMD: u32 = 250;
 
 /// D300, in order: refusals (OS, architecture, systemd, `systemd-creds`, sudo), a running
 /// `htui-worker` from a unit htui did not write (review finding 6), the different-build refusal,
-/// already provisioned, a password sudo whose `sh` has no `printf` builtin (review finding 5),
-/// else the steps.
+/// already provisioned, no `sha256sum` to check the upload with (review finding 11), a password
+/// sudo whose `sh` has no `printf` builtin (review finding 5), else the steps.
 #[must_use]
 pub fn decide(facts: &Facts, local: &LocalFacts, replace_credential: bool) -> Decision {
     let refuse = Decision::Refuse;
@@ -107,6 +107,13 @@ pub fn decide(facts: &Facts, local: &LocalFacts, replace_credential: bool) -> De
         if facts.active == "active" && !replace_credential {
             return Decision::AlreadyProvisioned;
         }
+    }
+    if !same_build && !facts.sha256sum {
+        return refuse(
+            "the remote host has no sha256sum on its PATH (coreutils); provisioning checks the \
+             upload with it"
+                .to_owned(),
+        );
     }
     if sudo == SudoMode::Password && !facts.printf_builtin {
         return refuse(
@@ -208,6 +215,10 @@ mod tests {
                                    sending the sudo password would put it in a process's \
                                    arguments; configure NOPASSWD for this user instead";
 
+    /// Review finding 11, verify round 1.
+    const NO_SHA256SUM: &str = "the remote host has no sha256sum on its PATH (coreutils); \
+                                provisioning checks the upload with it";
+
     /// A fresh host: nothing installed, a password sudo.
     fn fresh() -> Facts {
         Facts {
@@ -223,6 +234,7 @@ mod tests {
             active: "inactive".into(),
             sudo: Some(SudoMode::Password),
             printf_builtin: true,
+            sha256sum: true,
         }
     }
 
@@ -521,6 +533,48 @@ mod tests {
                 x86.clone(),
                 true,
                 refuse(PRINTF_EXTERNAL),
+            ),
+            (
+                "no sha256sum, upload",
+                Facts {
+                    sha256sum: false,
+                    ..fresh()
+                },
+                x86.clone(),
+                false,
+                refuse(NO_SHA256SUM),
+            ),
+            (
+                "no sha256sum, nopasswd",
+                Facts {
+                    sha256sum: false,
+                    sudo: Some(SudoMode::NoPassword),
+                    ..fresh()
+                },
+                x86.clone(),
+                false,
+                refuse(NO_SHA256SUM),
+            ),
+            (
+                "no sha256sum and external printf: sha256sum first",
+                Facts {
+                    sha256sum: false,
+                    printf_builtin: false,
+                    ..fresh()
+                },
+                x86.clone(),
+                false,
+                refuse(NO_SHA256SUM),
+            ),
+            (
+                "no sha256sum, already provisioned",
+                Facts {
+                    sha256sum: false,
+                    ..provisioned()
+                },
+                x86.clone(),
+                false,
+                Decision::AlreadyProvisioned,
             ),
             (
                 "no unit, this build",

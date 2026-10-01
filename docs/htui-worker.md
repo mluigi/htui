@@ -279,6 +279,8 @@ with its control characters escaped.
   binary is uploaded unless the host already has the same build, and its size is printed; a
   release build is much smaller than a debug one.
 - systemd 250 or later, with `systemd-creds` on the `PATH`.
+- `sha256sum` (coreutils) on the `PATH`: the upload is checked with it, and a host without it is
+  refused before anything is written.
 - sudo (a password prompt is fine). When sudo wants a password, `htui` asks for it here, on your
   terminal, with no echo: `[sudo] password for <user> on <destination>:`. `Esc` or `Ctrl-C`
   cancels before anything is written. A sudo that asks a second question (a one-time code) or

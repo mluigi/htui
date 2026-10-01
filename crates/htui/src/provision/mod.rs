@@ -1190,6 +1190,7 @@ mod tests {
             ("active", "inactive"),
             ("sudo", "password"),
             ("printf", "builtin"),
+            ("sha256sum", "yes"),
         ];
         let mut text = "Welcome to box1\n".to_owned();
         for (key, value) in defaults {
@@ -1702,6 +1703,10 @@ mod tests {
             (
                 preflight(&[("group", "Staff")]),
                 "the remote group \"Staff\" is not a name",
+            ),
+            (
+                preflight(&[("sha256sum", "no")]),
+                "the remote host has no sha256sum on its PATH",
             ),
         ];
         for (answer, expected) in cases {

@@ -6,10 +6,21 @@ use std::fmt;
 
 use crate::provision::plan::SudoMode;
 
-/// The twelve keys, in the order [`crate::provision::script::PREFLIGHT`] prints them.
-pub const KEYS: [&str; 12] = [
-    "os", "arch", "systemd", "creds", "user", "group", "home", "bin_sha", "unit", "active", "sudo",
+/// The thirteen keys, in the order [`crate::provision::script::PREFLIGHT`] prints them.
+pub const KEYS: [&str; 13] = [
+    "os",
+    "arch",
+    "systemd",
+    "creds",
+    "user",
+    "group",
+    "home",
+    "bin_sha",
+    "unit",
+    "active",
+    "sudo",
     "printf",
+    "sha256sum",
 ];
 
 /// What the remote host said about itself. Holds no secret.
@@ -41,6 +52,8 @@ pub struct Facts {
     /// `printf=builtin`: the remote `sh` has `printf` built in, so INSTALL's `printf` of the sudo
     /// password is no process of its own (review finding 5). `external` is `false`.
     pub printf_builtin: bool,
+    /// `sha256sum` is on `PATH`; PREPARE checks the upload with it (review finding 11).
+    pub sha256sum: bool,
 }
 
 /// Why the answer is not a preflight. Each variant names its key; none carries a value.
@@ -149,6 +162,7 @@ impl Facts {
             active: get("active").to_owned(),
             sudo,
             printf_builtin,
+            sha256sum: yes_no("sha256sum")?,
         })
     }
 }
@@ -172,6 +186,7 @@ mod tests {
             ("active", "inactive"),
             ("sudo", "password"),
             ("printf", "builtin"),
+            ("sha256sum", "yes"),
         ]
     }
 
@@ -206,6 +221,7 @@ mod tests {
             active: "inactive".into(),
             sudo: Some(SudoMode::Password),
             printf_builtin: true,
+            sha256sum: true,
         }
     }
 
@@ -232,9 +248,11 @@ mod tests {
             ("active", "active"),
             ("sudo", "nopasswd"),
             ("printf", "external"),
+            ("sha256sum", "no"),
         ]))
         .expect("parses");
         assert!(!facts.printf_builtin);
+        assert!(!facts.sha256sum);
         assert_eq!(facts.systemd, None);
         assert!(!facts.creds);
         assert_eq!(facts.home, "");
@@ -307,6 +325,7 @@ mod tests {
             ("sudo", "sometimes"),
             ("printf", "maybe"),
             ("printf", ""),
+            ("sha256sum", "maybe"),
         ] {
             let key: &'static str = KEYS.iter().find(|k| **k == key).expect("a key");
             assert_eq!(
