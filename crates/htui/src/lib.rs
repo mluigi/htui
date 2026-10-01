@@ -204,7 +204,12 @@ fn set_dsn_from_stdin() -> anyhow::Result<()> {
 ///
 /// A blank line or end of input, a read error, or a DSN `Dsn::parse` refuses; never the DSN's text.
 fn session_dsn(reader: &mut dyn std::io::BufRead) -> anyhow::Result<String> {
-    todo!("MOD-45 T3 red")
+    let Some(mut line) = secret::read_dsn_line(reader)? else {
+        anyhow::bail!("no DSN on stdin; nothing was read");
+    };
+    htui_store::Dsn::parse(&line)
+        .map_err(|err| anyhow::anyhow!("the DSN on stdin cannot be used: {err}"))?;
+    Ok(std::mem::take(&mut *line))
 }
 
 /// Sends `tracing` to a file, or nowhere at all.
