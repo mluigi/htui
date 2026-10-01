@@ -266,7 +266,11 @@ machine, with the [unit below](#running-it-as-a-systemd-service), and sets the n
 alias. It runs your own `ssh`, so `~/.ssh/config`, `ProxyJump` and your agent apply. It opens four
 short sessions; with password logins you are asked once per session, so use a key or
 `ControlMaster`. Progress goes to standard error and the result to standard output. As for
-`worker`, `--log` goes after `provision`.
+`worker`, `--log` goes after `provision`. Each session is bounded: `ssh` keepalives end one whose
+host has gone silent for about a minute, and `htui` closes the preflight after 120 s, the upload
+after 120 s plus 2 s per MiB, the install after 300 s, and the wait for the worker after its own
+minute plus 120 s. Text from the remote host (error lines, journal lines, the hostname) is printed
+with its control characters escaped.
 
 **What the remote host needs.**
 
@@ -275,16 +279,23 @@ short sessions; with password logins you are asked once per session, so use a ke
   binary is uploaded unless the host already has the same build, and its size is printed; a
   release build is much smaller than a debug one.
 - systemd 250 or later, with `systemd-creds` on the `PATH`.
-- sudo (a password prompt is fine). When sudo wants a password, `htui` asks for it here, with no
-  echo: `[sudo] password for <user> on <destination>:`. `Esc` or `Ctrl-C` cancels before anything
-  is written. A sudo that asks a second question (a one-time code) or insists on a tty
-  (`requiretty`) fails safely: exit 1, and nothing privileged is written. Give a host that asks
-  for a one-time code NOPASSWD. NOPASSWD does not get around `requiretty`; turn it off for that
-  user instead (`Defaults:<user> !requiretty`).
-- A POSIX login shell on the remote user (sh, bash, zsh, ksh); fish and csh are refused.
+- sudo (a password prompt is fine). When sudo wants a password, `htui` asks for it here, on your
+  terminal, with no echo: `[sudo] password for <user> on <destination>:`. `Esc` or `Ctrl-C`
+  cancels before anything is written. A sudo that asks a second question (a one-time code) or
+  insists on a tty (`requiretty`) fails safely: exit 1, and nothing privileged is written. Give a
+  host that asks for a one-time code NOPASSWD. NOPASSWD does not get around `requiretty`; turn it
+  off for that user instead (`Defaults:<user> !requiretty`).
+- With a password sudo, a remote `sh` with `printf` built in (dash, bash, busybox and ksh93 have
+  it; posh and mksh do not). The password is handed to sudo through `printf`, and an external one
+  would show it in the process list, so such a host is refused: give that user NOPASSWD.
+- A POSIX login shell on the remote user (sh, bash, zsh, ksh); csh and tcsh are refused. fish is
+  untested and likely works, since every command is a plain `sh -c '…'`.
+- No `htui-worker` service already running from a unit `htui` did not write (one that is not
+  `/etc/systemd/system/htui-worker.service`): such a host is refused; stop and remove that unit
+  first.
 - A user and group name matching `[a-z_][a-z0-9_-]{0,31}`, and a home directory whose path uses
   only `A-Z a-z 0-9 _ . / -` with no `..`. The user and the home are written into the unit file;
-  the group is checked the same way.
+  the group is only checked, and written nowhere.
 
 **What is written where.** On the remote host, for the user you log in as:
 
@@ -317,10 +328,10 @@ sudo's standard input, so such a sudo would record it in its I/O log (`/var/log/
 off by default; `sudo -l` and `/etc/sudoers` show it when it is set.
 
 **Verification and the executor.** After the install, the service must be active with a
-`box.toml` within 60 s. The box is then checked in Postgres from this machine, which registers or
-refreshes this machine's own box, as `htui --index-items` does. When the new box shows up, or its
-`last_seen_at` moves past what it was before the install, its executor is set to `worker` and
-`htui` prints, on standard output:
+`box.toml` within about a minute. The box is then checked in Postgres from this machine, which
+registers or refreshes this machine's own box, as `htui --index-items` does. When the new box shows
+up, or its `last_seen_at` moves past what it was once the install had returned, its executor is set
+to `worker` and `htui` prints, on standard output:
 
 ```
 box <id> (<hostname>) provisioned on <destination>
@@ -331,10 +342,16 @@ Otherwise the same line is printed, the exit is still 0, and a warning says what
 - `warning: service active, box <id>; not verified in Postgres from here: <reason>`, followed by
   `set box <id>'s executor to worker in Settings › Boxes`. The reason is either why this machine
   could not use the DSN (it reaches Postgres only from the remote network, say), or
-  `box <id> did not check in within 60 s; see journalctl -u htui-worker and
+  `box <id> did not check in within 90 s; see journalctl -u htui-worker and
   ~/.local/state/htui/worker.log on <destination>`.
 - `warning: box <id>'s executor is not set to worker: <reason>; set it in Settings › Boxes`, when
   the box checked in but the write did not apply.
+
+When the box was already in Postgres before the install (a re-run with `--replace-credential`,
+say), only a later `last_seen_at` counts, and an `htui` TUI on that host with the same `box.toml`
+moves it too. The check is then best-effort, and a line on standard error says so:
+`note: box <id> was registered before this install, so the check-in is best-effort: an htui TUI on
+<destination> with the same box.toml would also count`.
 
 An active service with a `box.toml` does not prove the worker connected: it writes `box.toml`
 before it connects, and a worker refused at start (exit 2) is restarted every 10 seconds and looks
@@ -362,7 +379,7 @@ finds it already provisioned and sets the executor.
 | Code | Meaning |
 |---|---|
 | `0` | Provisioned, or already provisioned. A warning on standard error may still ask you to set the executor by hand. |
-| `2` | Refused; nothing was written on the remote host. The sentence starts `not provisioning <destination>:` and names the reason, among them: a destination that is empty, starts with `-` or contains whitespace, no DSN, a keyring that could not be read, a DSN the remote host cannot use, a local `htui` binary that cannot be read or is not a Linux build, `ssh` that could not be run (`cannot run ssh: …`) or could not connect (`ssh to <destination> failed (exit 255): …`), a login shell that did not run the preflight, the host's OS, architecture, systemd, `systemd-creds` or sudo, a different build already installed, a user, group or home that cannot go into a unit file, or a cancelled password prompt. |
+| `2` | Refused; nothing was written on the remote host. The sentence starts `not provisioning <destination>:` and names the reason, among them: a destination that is empty, starts with `-` or contains whitespace, no DSN, a keyring that could not be read, a DSN the remote host cannot use, a local `htui` binary that cannot be read or is not a Linux build, `ssh` that could not be run (`cannot run ssh: …`) or could not connect (`ssh to <destination> failed (exit 255): …`), a preflight that did not finish (`the preflight on <destination> did not finish within 120 s; its ssh session was closed`), a login shell that did not run the preflight, the host's OS, architecture, systemd, `systemd-creds` or sudo, a password sudo whose `sh` has no `printf` builtin, an `htui-worker` already running from a unit `htui` did not write, a different build already installed, a user, group or home that cannot go into a unit file, or a cancelled password prompt. |
 | `1` | Failed after a remote write; re-running completes it, the executor included (see **Re-running**). The sentence starts `provisioning <destination> failed:`. |
 
 The failures:
@@ -370,13 +387,23 @@ The failures:
 - **The binary does not run there** (often an older glibc):
   `the htui binary does not run on <destination>: <its last error line>`. The uploaded copy is
   removed; a binary already installed stays.
-- **sudo refused the password:** `sudo refused the password (or needs a tty or a second factor) on
-  <destination>; nothing privileged was written`. The DSN was not read. A session that drops
-  before the privileged part starts reports the same sentence.
+- **The upload arrived altered:** `the upload to <destination> was corrupted (its sha256 is not
+  this build's); nothing was replaced`. The uploaded copy is checked before it runs, and removed.
+- **sudo refused:** with a password, `sudo refused the password (or needs a tty or a second
+  factor) on <destination> (<sudo's last line>); nothing privileged was written`; with NOPASSWD,
+  `sudo refused to run the installer as root (or needs a tty) on <destination> (<sudo's last
+  line>); nothing privileged was written`. The DSN was not read.
+- **ssh dropped before the privileged part:** `the ssh session to <destination> dropped before the
+  privileged part (exit <code>); nothing privileged was written: <its last line>`.
 - **The service did not start:** `the htui-worker service on <destination> did not start with a
-  box.toml within 60 s (systemctl says <state>); its last journal and log lines follow:`, then the
-  last lines of `journalctl -u htui-worker` and of `~/.local/state/htui/worker.log`.
-- **ssh dropped**, or a step failed for another reason: `preparing <destination> failed (exit
+  box.toml within 58 s (systemctl says <state>); if the worker cannot use its DSN, fix it and re-run
+  with --replace-credential; its last journal and log lines follow:`, then the last lines of
+  `journalctl -u htui-worker` and of `~/.local/state/htui/worker.log`. A plain re-run keeps the
+  credential already there.
+- **A session did not finish in time:** `preparing <destination> did not finish within <bound>;
+  its ssh session was closed`, and likewise `installing the service on <destination>` and
+  `waiting for the worker on <destination>`.
+- **ssh dropped later**, or a step failed for another reason: `preparing <destination> failed (exit
   <code>): …`, `installing the service on <destination> failed (exit <code>): …` or
   `waiting for the worker on <destination> failed (exit <code>): …`, with the last lines the
   session printed. `ssh`'s own failures are exit 255.
