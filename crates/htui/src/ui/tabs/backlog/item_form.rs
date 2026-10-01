@@ -190,7 +190,7 @@ impl core::fmt::Debug for ItemForm {
             .field("graph", &self.graph)
             .field("focus", &self.focus)
             .field("busy", &self.busy)
-            .field("notice", &self.notice)
+            .field("notice_len", &self.notice.as_ref().map(String::len))
             .field("body_len", &self.body.len())
             .field("paths_len", &self.paths.len())
             .finish_non_exhaustive()
@@ -1271,6 +1271,23 @@ mod tests {
         assert!(!printed.contains("SECRET-BODY"), "{printed}");
         assert!(!printed.contains("secret/dir"), "{printed}");
         assert!(printed.contains("body_len"), "{printed}");
+    }
+
+    /// A path refusal's notice names the entry, so `Debug` prints the notice's length only (E10).
+    #[tokio::test]
+    async fn debug_prints_no_path_from_a_refusal_notice() {
+        let mut form = new_form().await;
+        type_text(&mut form, "Fresh item");
+        focus_on(&mut form, Field::Paths);
+        type_text(&mut form, "nope:secret/dir");
+        assert!(matches!(form.on_key(ctrl('s')), ItemFormOutcome::Stay));
+        assert!(
+            form.notice()
+                .is_some_and(|notice| notice.contains("secret/dir"))
+        );
+        let printed = format!("{form:?}");
+        assert!(!printed.contains("secret/dir"), "{printed}");
+        assert!(printed.contains("notice_len"), "{printed}");
     }
 
     /// Every state shows as characters, because the snapshots are text (blueprint §4 render).
