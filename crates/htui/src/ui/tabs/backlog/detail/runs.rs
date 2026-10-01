@@ -33,7 +33,7 @@
 use core::cell::Cell;
 use htui_core::model::{
     Document, DocumentId, ItemId, Resolution, RunId, RunMode, RunStatus, RunStepSummary,
-    RunSummary, Status, StepId, StepStatus, UsageTotals,
+    RunSummary, Status, StepId, StepPermission, StepStatus, UsageTotals,
 };
 use htui_orch::closeout::Preview;
 use htui_orch::{Command, CommandOutcome, GateAnswer};
@@ -1038,6 +1038,12 @@ fn step_lines(
     [first, second]
 }
 
+/// MOD-42 T5 red: the two lines a step with a pending request takes; drawn by nothing yet.
+#[allow(dead_code)]
+fn permission_lines(_pending: &StepPermission, _theme: &Theme) -> [Line<'static>; 2] {
+    [Line::default(), Line::default()]
+}
+
 /// D170's usage cell: dollars when the usage document carries a cost, else tokens, else `—`. At
 /// most [`USAGE_WIDTH`] characters over the whole of `i64`.
 ///
@@ -1356,7 +1362,10 @@ mod tests {
     use chrono::TimeDelta;
     use crossterm::event::KeyModifiers;
     use htui_core::fixtures::{demo_at, ids};
-    use htui_core::model::{GateOutcome, ProjectRef, Scope, WorkspaceId};
+    use htui_core::model::{
+        GateOutcome, PermissionId, PermissionStatus, ProjectRef, RelayOption, RelayOptionKind,
+        RelaySessionId, RelayView, Scope, WorkspaceId,
+    };
     use htui_core::store::{MemStore, ReadStore};
     use htui_orch::Rest;
     use serde_json::json;
@@ -2991,14 +3000,20 @@ mod tests {
             matches!(sent.as_slice(), [
                 StoreRequest::RunStream { item: streamed },
                 StoreRequest::RunActions(asked),
-            ] if *streamed == ids::HTUI_FEAT_1 && *asked == ids::HTUI_FEAT_1),
-            "{sent:?}"
+                StoreRequest::RelayView { item: relayed },
+            ] if *streamed == ids::HTUI_FEAT_1
+                && *asked == ids::HTUI_FEAT_1
+                && *relayed == ids::HTUI_FEAT_1),
+            "MOD-42 D14: the relay view rides along with the verdicts: {sent:?}"
         );
 
         pane.on_reply(&StoreReply::Runs(runs.clone()), &mut shell.ctx());
         let sent = requests(shell.emit.take());
         assert!(
-            matches!(sent.as_slice(), [StoreRequest::RunActions(asked)] if *asked == ids::HTUI_FEAT_1),
+            matches!(sent.as_slice(), [
+                StoreRequest::RunActions(asked),
+                StoreRequest::RelayView { item: relayed },
+            ] if *asked == ids::HTUI_FEAT_1 && *relayed == ids::HTUI_FEAT_1),
             "one subscription per item: {sent:?}"
         );
 
@@ -3010,7 +3025,10 @@ mod tests {
             matches!(sent.as_slice(), [
                 StoreRequest::RunStream { item: streamed },
                 StoreRequest::RunActions(asked),
-            ] if *streamed == ids::HTUI_ANA_2 && *asked == ids::HTUI_ANA_2),
+                StoreRequest::RelayView { item: relayed },
+            ] if *streamed == ids::HTUI_ANA_2
+                && *asked == ids::HTUI_ANA_2
+                && *relayed == ids::HTUI_ANA_2),
             "{sent:?}"
         );
 
@@ -3360,5 +3378,306 @@ mod tests {
             drawn[1].contains("w9x39"),
             "and `k` walks back one row: {drawn:#?}"
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-42 plan D14: the relayed permission requests and the pending cancels.
+    // -----------------------------------------------------------------------------------------
+
+    /// An option of a relayed request.
+    fn option(id: &str, label: &str, kind: RelayOptionKind) -> RelayOption {
+        RelayOption {
+            id: id.to_owned(),
+            label: label.to_owned(),
+            kind,
+        }
+    }
+
+    /// `[1] Allow once  [2] Reject once`.
+    fn two_options() -> Vec<RelayOption> {
+        vec![
+            option("allow", "Allow once", RelayOptionKind::AllowOnce),
+            option("reject", "Reject once", RelayOptionKind::RejectOnce),
+        ]
+    }
+
+    /// A pending request on `step` of `run`.
+    fn pending_on(
+        run: RunId,
+        step: StepId,
+        summary: Option<&str>,
+        options: Vec<RelayOption>,
+    ) -> StepPermission {
+        StepPermission {
+            id: PermissionId::new(),
+            run_id: run,
+            run_step_id: step,
+            session: RelaySessionId::new(),
+            request_id: "req-1".to_owned(),
+            tool_call_id: Some("call-1".to_owned()),
+            summary: summary.map(str::to_owned),
+            options,
+            status: PermissionStatus::Pending,
+            option_id: None,
+            answered_by: None,
+            answered_box: None,
+            created_at: demo_at(1, 9),
+            answered_at: None,
+            resolved_at: None,
+        }
+    }
+
+    /// A `RelayView` reply for `item`.
+    fn relay(item: ItemId, permissions: Vec<StepPermission>, cancels: Vec<RunId>) -> StoreReply {
+        StoreReply::RelayView {
+            item,
+            view: Box::new(RelayView {
+                permissions,
+                cancels,
+            }),
+        }
+    }
+
+    /// The `FEAT-1` pane with a two-option request pending on `prd`, the step under the cursor.
+    async fn asking(shell: &Shell) -> (RunsTab, StepPermission) {
+        let mut pane = pane(shell).await;
+        let pending = pending_on(
+            ids::RUN_1,
+            ids::STEP_PRD,
+            Some("execute: cargo test"),
+            two_options(),
+        );
+        pane.on_reply(
+            &relay(ids::HTUI_FEAT_1, vec![pending.clone()], Vec::new()),
+            &mut shell.ctx(),
+        );
+        assert!(shell.emit.is_empty(), "a relay view asks for nothing");
+        (pane, pending)
+    }
+
+    /// D14: a digit on a step with a pending request answers it with that option's id.
+    #[tokio::test]
+    async fn a_digit_answers_the_pending_request_under_the_cursor() {
+        let shell = Shell::new();
+        let (mut pane, pending) = asking(&shell).await;
+        assert_eq!(pane.selected_step(), Some(ids::STEP_PRD));
+
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('2')), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        let sent = requests(shell.emit.take());
+        assert!(
+            matches!(sent.as_slice(), [StoreRequest::AnswerPermission { permission, option_id }]
+                if *permission == pending.id && option_id == "reject"),
+            "one answer, the second option's id: {sent:?}"
+        );
+    }
+
+    /// D14, `chat/mod.rs`: while a request is pending every digit is the pane's, so one past the
+    /// offered options neither answers nor switches the tab.
+    #[tokio::test]
+    async fn a_digit_past_the_offered_options_is_consumed_and_sends_nothing() {
+        let shell = Shell::new();
+        let (mut pane, _) = asking(&shell).await;
+        for digit in ['3', '5', '9'] {
+            assert_eq!(
+                pane.on_key(key(KeyCode::Char(digit)), &mut shell.ctx()),
+                Handled::Consumed,
+                "`{digit}`"
+            );
+        }
+        assert!(shell.emit.is_empty(), "{:?}", shell.emit.take());
+    }
+
+    /// D14: with nothing pending under the cursor a digit passes on to the global tab select.
+    #[tokio::test]
+    async fn a_digit_with_no_pending_request_passes_to_tab_select() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('1')), &mut shell.ctx()),
+            Handled::Pass,
+            "no relay view at all"
+        );
+
+        let elsewhere = pending_on(ids::RUN_1, ids::STEP_PLAN, None, two_options());
+        pane.on_reply(
+            &relay(ids::HTUI_FEAT_1, vec![elsewhere], Vec::new()),
+            &mut shell.ctx(),
+        );
+        assert_eq!(pane.selected_step(), Some(ids::STEP_PRD));
+        for digit in ['1', '2', '9'] {
+            assert_eq!(
+                pane.on_key(key(KeyCode::Char(digit)), &mut shell.ctx()),
+                Handled::Pass,
+                "a request on another step does not take `{digit}`"
+            );
+        }
+        assert!(shell.emit.is_empty());
+    }
+
+    /// D14: a relay view answered for another item is not this pane's, and an item change drops
+    /// the one it kept.
+    #[tokio::test]
+    async fn a_relay_view_for_another_item_is_dropped() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        let pending = pending_on(ids::RUN_1, ids::STEP_PRD, None, two_options());
+        pane.on_reply(
+            &relay(ids::HTUI_ANA_2, vec![pending], Vec::new()),
+            &mut shell.ctx(),
+        );
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('1')), &mut shell.ctx()),
+            Handled::Pass
+        );
+        assert!(shell.emit.is_empty());
+
+        let (mut pane, _) = asking(&shell).await;
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Runs(feat_1_runs().await), &mut shell.ctx());
+        let _ = shell.emit.take();
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('1')), &mut shell.ctx()),
+            Handled::Pass,
+            "an item change forgets the relay view until the next one arrives"
+        );
+    }
+
+    /// D14: the summary and the strip are two more lines, each exactly the pane's 43 columns
+    /// whatever they hold, drawn right under the step's own two.
+    #[tokio::test]
+    async fn a_step_with_a_pending_request_takes_two_more_lines_each_forty_three_wide() {
+        let theme = Theme::default();
+        let long = "a summary far too long for any pane ".repeat(6);
+        let four = vec![
+            option(
+                "allow-once",
+                "Allow this one call of a very long tool",
+                RelayOptionKind::AllowOnce,
+            ),
+            option(
+                "allow-always",
+                "Allow every call like it from now on",
+                RelayOptionKind::AllowAlways,
+            ),
+            option(
+                "reject-once",
+                "Reject this one call",
+                RelayOptionKind::RejectOnce,
+            ),
+            option(
+                "reject-always",
+                "Reject every call like it",
+                RelayOptionKind::RejectAlways,
+            ),
+        ];
+        assert!(long.chars().count() >= 200);
+        for (summary, options) in [
+            (Some("execute: cargo test"), two_options()),
+            (Some(long.as_str()), two_options()),
+            (None, two_options()),
+            (Some("edit: src/lib.rs"), four),
+        ] {
+            let pending = pending_on(ids::RUN_1, ids::STEP_PRD, summary, options);
+            let [asks, strip] = permission_lines(&pending, &theme);
+            for line in [&asks, &strip] {
+                assert_eq!(
+                    line.width(),
+                    PANE,
+                    "{:?} is not {PANE} columns wide",
+                    text(line)
+                );
+            }
+            let asks = text(&asks);
+            assert!(asks.starts_with(&blank(INDENT)), "{asks:?}");
+            let shown = summary.unwrap_or("a permission");
+            assert!(
+                asks.trim_start()
+                    .starts_with(&format!("asks: {}", &shown[..shown.len().min(10)])),
+                "{asks:?}"
+            );
+            assert!(text(&strip).contains("[1] "), "{:?}", text(&strip));
+        }
+
+        let shell = Shell::new();
+        let (pane, _) = asking(&shell).await;
+        let drawn = lines(&pane, &shell);
+        let at = drawn
+            .iter()
+            .position(|line| line.contains("prd"))
+            .expect("the `prd` step is listed");
+        assert!(
+            drawn[at + 2].contains("asks: execute: cargo test"),
+            "the summary is right under the step's second line: {drawn:#?}"
+        );
+        assert!(
+            drawn[at + 3].contains("[1] Allow once  [2] Reject once"),
+            "and the strip under it: {drawn:#?}"
+        );
+        assert!(
+            drawn[at + 4].contains("plan"),
+            "the next step follows: {drawn:#?}"
+        );
+        assert_eq!(
+            drawn.iter().filter(|line| !line.is_empty()).count(),
+            2 + 2 + 4 * 2 + 2,
+            "the header, the run, four two-line steps and the request's two"
+        );
+    }
+
+    /// D14: a run with a pending cancel says so under its grid, which does not move.
+    #[tokio::test]
+    async fn a_run_with_a_pending_cancel_says_cancel_requested() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        let before = lines(&pane, &shell);
+        pane.on_reply(
+            &relay(ids::HTUI_FEAT_1, Vec::new(), vec![ids::RUN_1]),
+            &mut shell.ctx(),
+        );
+        let after = lines(&pane, &shell);
+        assert_eq!(
+            after[..4],
+            before[..4],
+            "the header and the run grid are unchanged"
+        );
+        assert_eq!(
+            after[4].trim(),
+            "cancel requested",
+            "one more line, under the grid: {after:#?}"
+        );
+        assert_eq!(after[5..], before[4..before.len() - 1], "{after:#?}");
+    }
+
+    /// D14, B-13: an answer, applied or refused, re-reads the runs; the refusal's sentence is on
+    /// the status line already.
+    #[tokio::test]
+    async fn an_answer_reply_re_reads_the_runs() {
+        let shell = Shell::new();
+        let (mut pane, pending) = asking(&shell).await;
+        pane.on_reply(
+            &StoreReply::PermissionAnswered {
+                permission: pending.id,
+            },
+            &mut shell.ctx(),
+        );
+        assert!(is_one_re_read(
+            &requests(shell.emit.take()),
+            ids::HTUI_FEAT_1
+        ));
+
+        pane.on_reply(
+            &StoreReply::Failed {
+                request: "answer_permission",
+                message: htui_core::model::EXECUTOR_GONE.to_owned(),
+            },
+            &mut shell.ctx(),
+        );
+        assert!(is_one_re_read(
+            &requests(shell.emit.take()),
+            ids::HTUI_FEAT_1
+        ));
     }
 }

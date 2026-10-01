@@ -24,6 +24,14 @@ impl PermissionStrip {
         let TranscriptRow::Permission { options, .. } = row else {
             return;
         };
+        frame.render_widget(Paragraph::new(Self::line(options, theme)), area);
+    }
+
+    /// The strip itself, `answer  [1] Allow once  [2] Reject once`, over any list of offered
+    /// options: the chat's parked row draws it, and so does the Runs pane's relayed request
+    /// (MOD-42 plan D14).
+    #[must_use]
+    pub fn line(options: &[PermissionOption], theme: &Theme) -> Line<'static> {
         let mut spans = vec![Span::styled("answer  ", theme.title)];
         for (index, option) in options.iter().enumerate() {
             spans.push(Span::styled(format!("[{}] ", index + 1), theme.accent));
@@ -39,7 +47,7 @@ impl PermissionStrip {
             }
             spans.push(Span::raw("  "));
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        Line::from(spans)
     }
 
     /// The option a digit picks, 1-based, or `None` when the row does not offer one.
@@ -48,6 +56,13 @@ impl PermissionStrip {
         let TranscriptRow::Permission { options, .. } = row else {
             return None;
         };
+        Self::pick_from(options, digit)
+    }
+
+    /// The option a digit picks among `options`, 1-based, or `None` past the last one and for `0`
+    /// (MOD-42 plan D14: the Runs pane picks from a relayed request's options).
+    #[must_use]
+    pub fn pick_from(options: &[PermissionOption], digit: char) -> Option<PermissionOption> {
         let index = digit.to_digit(10)?;
         if index == 0 {
             return None;
