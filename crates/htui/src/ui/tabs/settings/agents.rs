@@ -1566,6 +1566,9 @@ impl AgentsSection {
                     format!("`{name}` switched off on this box")
                 });
             }
+            AgentWrite::ToolPaths { name, status, .. } => {
+                self.notice = Some(tool_paths_saved(name, *status));
+            }
         }
     }
 
@@ -2506,6 +2509,11 @@ fn entry_id(dir: &Path) -> String {
     dir.parent()
         .and_then(Path::file_name)
         .map_or_else(String::new, |id| id.to_string_lossy().into_owned())
+}
+
+/// What `AgentWritten::ToolPaths` says (MOD-66 D10): the row and the probe's word, never a path.
+fn tool_paths_saved(name: &str, status: ProbeStatus) -> String {
+    format!("tool paths saved for `{name}` \u{b7} this box: {status}")
 }
 
 /// The first line of a probe's failure text, or the status when it produced none.
