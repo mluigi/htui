@@ -761,7 +761,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme)
         .copied()
         .filter(|field| !matches!(field, Field::Paths | Field::Body))
         .collect();
-    let notice_lines = form
+    let mut notice_lines = form
         .notice
         .as_deref()
         .map(|sentence| notice_lines(sentence, usize::from(inner.width)))
@@ -771,17 +771,22 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme)
     let fixed = u16::try_from(rows.len())
         .unwrap_or(u16::MAX)
         .saturating_add(PATHS_HEIGHT + 3);
-    let room = inner.height.saturating_sub(fixed).saturating_sub(BODY_MIN);
-    let notice_height = u16::try_from(notice_lines.len())
-        .unwrap_or(u16::MAX)
-        .min(room)
-        .max(NOTICE_HEIGHT);
+    // The notice grows into the body's rows when it has to (a small terminal), and a notice
+    // longer than all of them loses its first rows: the D11 hedge ends the sentence, and it is
+    // what stops a second Ctrl+S from minting a duplicate.
+    let room = inner.height.saturating_sub(fixed);
+    let wanted = u16::try_from(notice_lines.len()).unwrap_or(u16::MAX);
+    let notice_height = wanted.min(room).max(NOTICE_HEIGHT);
+    let body_min = BODY_MIN.min(room.saturating_sub(notice_height));
+    if wanted > notice_height {
+        notice_lines.drain(..usize::from(wanted - notice_height));
+    }
     let mut constraints: Vec<Constraint> = rows.iter().map(|_| Constraint::Length(1)).collect();
     constraints.extend([
         Constraint::Length(1),
         Constraint::Length(PATHS_HEIGHT),
         Constraint::Length(1),
-        Constraint::Min(BODY_MIN),
+        Constraint::Min(body_min),
         Constraint::Length(notice_height),
         Constraint::Length(1),
     ]);
@@ -1333,7 +1338,12 @@ mod tests {
 
     /// The form drawn into the detail pane at the default size, one string per row.
     fn drawn(form: &ItemForm) -> Vec<String> {
-        let [_, right] = panes(chrome(Rect::new(0, 0, DEFAULT_SIZE.0, DEFAULT_SIZE.1)).body);
+        drawn_at(form, DEFAULT_SIZE)
+    }
+
+    /// The form drawn into the detail pane of a `(width, height)` terminal, one string per row.
+    fn drawn_at(form: &ItemForm, (width, height): (u16, u16)) -> Vec<String> {
+        let [_, right] = panes(chrome(Rect::new(0, 0, width, height)).body);
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
             right.width,
             right.height,
@@ -1389,6 +1399,46 @@ mod tests {
             .join(" ");
         assert!(flowed.contains(&hedge), "{hedge:?} in\n{}", rows.join("\n"));
         assert!(flowed.contains(HINT_TEXT), "{}", rows.join("\n"));
+    }
+
+    /// The notice's rows drawn at `size`, joined back into one sentence.
+    fn flowed_at(form: &ItemForm, size: (u16, u16)) -> (String, String) {
+        let rows = drawn_at(form, size);
+        let flowed = rows
+            .iter()
+            .map(|row| row.trim_matches(|c| c == ' ' || c == '\u{2502}'))
+            .collect::<Vec<_>>()
+            .join(" ");
+        (flowed, rows.join("\n"))
+    }
+
+    /// D11 on a standard 80x24 terminal: the notice takes the body's rows rather than lose the
+    /// hedge, because the hedge is the end of the sentence and the rows past the room are cut.
+    #[tokio::test]
+    async fn the_hedge_shows_whole_on_an_80_by_24_terminal() {
+        let mut form = new_form().await;
+        type_text(&mut form, "Fresh item");
+        let why = "store unreachable: error communicating with database: Connection reset by \
+                   peer (os error 104)";
+        let hedge = mint_may_have_landed(why);
+        form.settle(Some(hedge.clone()));
+        let (flowed, rows) = flowed_at(&form, (80, 24));
+        assert!(flowed.contains(&hedge), "{hedge:?} in\n{rows}");
+    }
+
+    /// A failure too long for the pane loses its start, never the hedge at its end (D11).
+    #[tokio::test]
+    async fn a_failure_too_long_for_the_pane_keeps_the_hedge() {
+        let mut form = new_form().await;
+        type_text(&mut form, "Fresh item");
+        let why = format!(
+            "store unreachable: {}",
+            "connection reset by peer ".repeat(12)
+        );
+        form.settle(Some(mint_may_have_landed(why.trim_end())));
+        let tail = mint_may_have_landed("");
+        let (flowed, rows) = flowed_at(&form, (80, 24));
+        assert!(flowed.contains(tail.trim_start()), "{tail:?} in\n{rows}");
     }
 
     /// A word wider than the pane (a long path in a refusal) breaks inside, never off the edge.
