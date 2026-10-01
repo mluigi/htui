@@ -30,7 +30,7 @@ use htui_orch::{
 };
 use htui_store::{DATABASE_UNREACHABLE, identity};
 use serde_json::Value;
-use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
+use tokio::sync::{Notify, OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -215,6 +215,12 @@ struct Shared<P: ReplySink> {
     /// MOD-42 B-5: the run commands a task of this process is applying now, so the poll never
     /// applies a row the inline path (or an earlier tick) is still applying.
     applying: StdMutex<HashSet<RunCommandId>>,
+    /// MOD-24 D3 (B5): the live chats the last command poll was handed; the sweep's own cancels
+    /// honour them as the poll does (D212). Always empty for the worker.
+    last_live: StdMutex<LiveChats>,
+    /// MOD-24 D3: notified whenever an `Applying` guard drops, so the sweep can await a row the
+    /// poll is applying.
+    applied: Notify,
     /// MOD-42 plan D11, B-19: the grace a graceful preempt gives a session's cancel.
     cancel_grace: Duration,
 }
@@ -473,6 +479,7 @@ impl<P: ReplySink> Shared<P> {
             .insert(id)
             .then_some(Applying {
                 set: &self.applying,
+                done: &self.applied,
                 id,
             })
     }
@@ -484,11 +491,26 @@ impl<P: ReplySink> Shared<P> {
             .unwrap_or_else(PoisonError::into_inner)
             .contains(&id)
     }
+
+    /// MOD-24 D3: until no task of this process applies `id` (B-5's guard is free).
+    async fn until_applied(&self, id: RunCommandId) {
+        loop {
+            let mut notified = std::pin::pin!(self.applied.notified());
+            // Registered before the check, so a guard dropped in between is never missed.
+            notified.as_mut().enable();
+            if !self.is_applying(id) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
-/// MOD-42 B-5: one run command a task is applying; dropping it frees the id for the next poll.
+/// MOD-42 B-5: one run command a task is applying; dropping it frees the id for the next poll
+/// and wakes whoever awaits it (MOD-24 D3).
 struct Applying<'a> {
     set: &'a StdMutex<HashSet<RunCommandId>>,
+    done: &'a Notify,
     id: RunCommandId,
 }
 
@@ -498,6 +520,7 @@ impl Drop for Applying<'_> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&self.id);
+        self.done.notify_waiters();
     }
 }
 
@@ -1083,6 +1106,8 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 backoff: StdMutex::default(),
                 polling: AtomicBool::new(false),
                 applying: StdMutex::default(),
+                last_live: StdMutex::default(),
+                applied: Notify::new(),
                 cancel_grace: CANCEL_GRACE,
             }),
             events: Some(receiver),
@@ -1159,6 +1184,13 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
     /// already being applied (B-5), runs as an internal cancel (D12 steps 3-5, no second row).
     /// `live` is the loop's [`LiveChats`]: a cancel a live chat refuses stays pending, silently.
     pub fn poll_commands_with(&mut self, host: &H, sink: &P, live: LiveChats) {
+        // MOD-24 D3 (B5): every tick, even one the in-flight check skips, so the sweep's cancels
+        // refuse what this poll would.
+        *self
+            .shared
+            .last_live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = live.clone();
         // Every tick, like a sweep's: the poll's own finished handles never pile up between the
         // sweeps (the TUI's sweep period is the lease TTL).
         self.shared.prune_tasks();
@@ -1827,9 +1859,12 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
     }
 }
 
-/// D158, D189: the sweep's adoption: every lapsed lease on the box adopted, and each run that
-/// owes a walk resumed on its own task.
+/// D158, D189: the sweep's adoption: first the pending cancels of free runs (MOD-24 D3), then
+/// every lapsed lease on the box adopted, and each run that owes a walk resumed on its own task.
 async fn adopt<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P>) {
+    // Before `Kit::read`: `cancel_run` builds its own kit, and a failed read here must not skip
+    // the cancels.
+    cancels_first(ctx).await;
     let host = &ctx.host;
     let kit = match Kit::read(&ctx.shared, host, false).await {
         Ok(kit) => kit,
@@ -1871,6 +1906,69 @@ async fn adopt<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P
             Next::Parked(rest) | Next::Finished(rest) => frame(FrameKind::Rested(rest)),
             Next::Error(sentence) => frame(FrameKind::Error(sentence)),
         }
+    }
+}
+
+/// MOD-24 D3 (OQ-2): before the sweep recovers anything, every pending cancel this process may
+/// apply (`pending_commands(owner, box)`, B-4) whose run is `running` and not walked here is
+/// applied, through the poll's own `cancel_run`, and then awaited under B-5's guard: a row the
+/// poll took first is waited for, never applied twice. Such a run is cancelled without recovery
+/// (`cancel_leased` takes the lapsed lease) instead of being walked on, or finished by the
+/// recovery itself, which used to lose the user's cancel to the crash.
+///
+/// Left to the poll: a run this process walks (a graceful preempt), and parked or terminal runs
+/// (the sweep never adopts them, so nothing races them). A run whose lease is live elsewhere is
+/// not in `pending_commands` at all. Failures are logged as the poll's are: a read at `warn`, a
+/// refused cancel at `debug` (its row stays pending, and recovery proceeds as before). The live
+/// chats are the last poll's (B5, D212), so a cancel the poll would refuse is refused here too.
+async fn cancels_first<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P>) {
+    let Some(writer) = ctx.host.writer() else {
+        return;
+    };
+    let box_id = match registered_box(&ctx.host).await {
+        Ok(box_id) => box_id,
+        Err(err) => {
+            tracing::debug!(%err, "the sweep could not read this box for its cancels");
+            return;
+        }
+    };
+    let rows =
+        match htui_core::store::WorkerStore::pending_commands(&writer, ctx.shared.owner, box_id)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(%err, "the sweep could not read the pending run commands");
+                return;
+            }
+        };
+    let live = ctx
+        .shared
+        .last_live
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    for row in rows {
+        if ctx.shared.walks.is_live(row.run_id) {
+            continue;
+        }
+        let running = matches!(
+            htui_core::store::WorkerStore::run(&writer, row.run_id).await,
+            Ok(Some(run)) if run.status == RunStatus::Running
+        );
+        if !running {
+            continue;
+        }
+        Box::pin(cancel_run(
+            ctx.unaddressed("cancel_run"),
+            row.run_id,
+            &live,
+            Some(row.id),
+        ))
+        .await;
+        // B-5: if the poll took the row first, `cancel_run` returned at once; its application
+        // ends here.
+        ctx.shared.until_applied(row.id).await;
     }
 }
 
