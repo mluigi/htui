@@ -76,9 +76,7 @@ async fn body() -> ExitCode {
                         .map(htui::provision::ProvisionExit::code)
                 })
                 .unwrap_or(1);
-            // MOD-41 E-1: a startup refusal is a configuration state the user reads on stderr
-            // and in the log, not a crash report.
-            if code != 2 {
+            if reports_to_sentry(&error, code) {
                 sentry_anyhow::capture_anyhow(&error);
             }
             eprintln!("htui: {error:#}");
@@ -87,13 +85,52 @@ async fn body() -> ExitCode {
     }
 }
 
+/// Whether `body` sends `error`, ending in exit `code`, to Sentry.
+///
+/// MOD-41 E-1: a startup refusal (2) is a configuration state the user reads on stderr and in the
+/// log, not a crash report. MOD-45 review finding 1: no `htui provision` end is either, whatever
+/// its code: its sentences carry `user@host`, remote paths and the host's journal and log lines,
+/// and each describes that host's state.
+fn reports_to_sentry(error: &anyhow::Error, code: u8) -> bool {
+    code != 2
+        && error
+            .downcast_ref::<htui::provision::ProvisionExit>()
+            .is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use super::run_bounded;
+    use super::{reports_to_sentry, run_bounded};
+    use htui::provision::ProvisionExit;
+    use htui::worker_cmd::WorkerExit;
+
+    /// MOD-45 review finding 1: no `htui provision` end reaches Sentry, whatever its code; a
+    /// worker refusal does not either, and every other failure still does.
+    #[test]
+    fn only_crashes_are_reported_to_sentry() {
+        let failed = anyhow::Error::from(ProvisionExit::Failed("provisioning h failed".into()));
+        assert!(!reports_to_sentry(&failed, 1), "a provision failure");
+        let refused = anyhow::Error::from(ProvisionExit::Refused("not provisioning h".into()));
+        assert!(!reports_to_sentry(&refused, 2), "a provision refusal");
+        let wrapped = failed.context("while provisioning");
+        assert!(
+            !reports_to_sentry(&wrapped, 1),
+            "a wrapped provision failure"
+        );
+
+        let refused = anyhow::Error::from(WorkerExit::Refused("no DSN".into()));
+        assert!(!reports_to_sentry(&refused, 2), "a worker refusal");
+        let failed = anyhow::Error::from(WorkerExit::Failed("lost".into()));
+        assert!(reports_to_sentry(&failed, 1), "a worker failure");
+        assert!(
+            reports_to_sentry(&anyhow::anyhow!("boom"), 1),
+            "any other error"
+        );
+    }
 
     /// MOD-41 review RF-4: a body that panics while a blocking task never ends still leaves
     /// within the grace, so the panic reaches its exit (101) and a unit's `Restart=on-failure`.
