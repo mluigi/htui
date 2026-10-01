@@ -1384,11 +1384,18 @@ impl DetailTab for RunsTab {
             StoreReply::RunStream(frame)
                 if Some(frame.item) == self.item && invalidates(&frame.kind) =>
             {
-                match frame.run {
-                    Some(run) => {
-                        self.waiting.remove(&run);
+                // Only a frame that ends the wait clears it: the walk's own `Changed` and
+                // `SessionDone` land while the command is still queued behind it (R-51).
+                if matches!(
+                    frame.kind,
+                    FrameKind::Rested(_) | FrameKind::Error(_) | FrameKind::Adopted
+                ) {
+                    match frame.run {
+                        Some(run) => {
+                            self.waiting.remove(&run);
+                        }
+                        None => self.waiting.clear(),
                     }
-                    None => self.waiting.clear(),
                 }
                 if let FrameKind::Error(sentence) = &frame.kind {
                     ctx.emit(Action::Error(sentence.clone()));
@@ -4092,6 +4099,46 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("waiting for the walk"))
         );
+    }
+
+    /// R-51 (review F1): the walk's own frames (`Changed` at a step start, `SessionDone` after
+    /// one) land while the command is still queued, so they keep the line; the rest ends it.
+    #[tokio::test]
+    async fn a_walks_own_frames_keep_the_waiting_line() {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        let frame = |kind| {
+            StoreReply::RunStream(RunFrame {
+                item: ids::HTUI_FEAT_1,
+                run: Some(ids::RUN_1),
+                kind,
+            })
+        };
+        let shown = |pane: &_| {
+            lines(pane, &shell)
+                .iter()
+                .any(|line| line.trim() == "waiting for the walk")
+        };
+        pane.on_reply(&frame(FrameKind::Waiting), &mut shell.ctx());
+        assert!(shown(&pane));
+        for kind in [
+            FrameKind::Changed,
+            FrameKind::SessionDone {
+                step: ids::STEP_PRD,
+            },
+            FrameKind::Started,
+        ] {
+            pane.on_reply(&frame(kind.clone()), &mut shell.ctx());
+            shell.emit.take();
+            assert!(shown(&pane), "{kind:?} keeps the line");
+        }
+        pane.on_reply(&frame(FrameKind::Adopted), &mut shell.ctx());
+        shell.emit.take();
+        assert!(!shown(&pane), "Adopted ends the wait");
+        pane.on_reply(&frame(FrameKind::Waiting), &mut shell.ctx());
+        pane.on_reply(&frame(FrameKind::Error("x".into())), &mut shell.ctx());
+        shell.emit.take();
+        assert!(!shown(&pane), "Error ends the wait");
     }
 
     /// D14, B-13: an answer, applied or refused, re-reads the runs; the refusal's sentence is on
