@@ -266,7 +266,277 @@ pub async fn run(args: ProvisionArgs) -> Result<(), ProvisionExit> {
 ///
 /// [`ProvisionExit`]: `Refused` before the first remote write, `Failed` after it.
 pub async fn run_with<R: Remote>(ctx: Ctx<'_, R>) -> Result<Outcome, ProvisionExit> {
-    todo!("MOD-45 T3 red")
+    let Ctx {
+        destination: dest,
+        root,
+        replace_credential,
+        remote,
+        payload,
+        dsn,
+        prompter,
+        verifier,
+        timings,
+        out,
+        err,
+    } = ctx;
+
+    // 1–2: local checks, no remote call.
+    plan::validate_destination(dest).map_err(|sentence| refused(dest, &sentence))?;
+    check_dsn(dest, &dsn)?;
+
+    // 3–4: the preflight.
+    note(err, dest, "preflight");
+    let answer = remote
+        .run(&script::remote_command(script::PREFLIGHT, &[root]), b"")
+        .await
+        .map_err(|e| refused(dest, &format!("cannot run ssh: {e}")))?;
+    let facts = match Facts::parse(&answer.stdout_text()) {
+        Ok(facts) => facts,
+        Err(FactsError::NoPreflight) if answer.code != Some(0) => {
+            return Err(refused(
+                dest,
+                &with_detail(
+                    &format!("ssh to {dest} failed (exit {})", exit_text(answer.code)),
+                    &answer.last_stderr_line(),
+                ),
+            ));
+        }
+        Err(error) => {
+            return Err(refused(
+                dest,
+                &with_detail(&error.to_string(), &answer.last_stderr_line()),
+            ));
+        }
+    };
+
+    // 5–6: the values that go into the unit, then D300.
+    plan::validate_account("user", &facts.user)
+        .and_then(|()| plan::validate_account("group", &facts.group))
+        .and_then(|()| plan::validate_home(&facts.home))
+        .map_err(|sentence| refused(dest, &sentence))?;
+    let local = LocalFacts {
+        arch: payload.arch().to_owned(),
+        sha: payload.sha().to_owned(),
+    };
+    let (upload, sudo) = match plan::decide(&facts, &local, replace_credential) {
+        Decision::Refuse(sentence) => return Err(refused(dest, &sentence)),
+        Decision::AlreadyProvisioned => {
+            let finish = Finish {
+                dest,
+                root,
+                remote,
+                verifier,
+                timings,
+                out,
+                err,
+            };
+            return Ok(finish.already_provisioned(&facts, &dsn).await);
+        }
+        Decision::Steps { upload, sudo } => (upload, sudo),
+    };
+
+    // 7: the sudo password, before anything is written.
+    let password = match sudo {
+        SudoMode::NoPassword => None,
+        SudoMode::Password => {
+            let _ = write!(err, "[sudo] password for {} on {dest}: ", facts.user);
+            let _ = err.flush();
+            let answer = prompter.ask().await;
+            let _ = writeln!(err);
+            match answer {
+                Ok(password) => Some(password),
+                Err(PromptError::Aborted) => {
+                    return Err(refused(
+                        dest,
+                        "the sudo password prompt was cancelled; nothing was written",
+                    ));
+                }
+                Err(PromptError::NoTerminal) => {
+                    return Err(refused(
+                        dest,
+                        "sudo needs a password and there is no terminal; configure NOPASSWD or \
+                         run interactively",
+                    ));
+                }
+            }
+        }
+    };
+
+    // 8: the baseline never fails the run; its reason is kept for step 12.
+    let baseline = verifier.baseline(&dsn).await;
+
+    // 9: PREPARE, the first remote write. From here every exit is a failure.
+    if upload {
+        let mib = payload.bytes().len().div_ceil(1024 * 1024);
+        note(err, dest, &format!("uploading htui ({mib} MiB)"));
+    }
+    let send = if upload { "1" } else { "0" };
+    let prepared = remote
+        .run(
+            &script::remote_command(script::PREPARE, &[root, &facts.home, send]),
+            if upload { payload.bytes() } else { b"" },
+        )
+        .await
+        .map_err(|e| failed(dest, &format!("cannot run ssh: {e}")))?;
+    match prepared.code {
+        Some(0) => {}
+        Some(3) => {
+            return Err(failed(
+                dest,
+                &format!(
+                    "the htui binary does not run on {dest}: {}",
+                    prepared.last_stderr_line()
+                ),
+            ));
+        }
+        code => {
+            return Err(failed(
+                dest,
+                &with_detail(
+                    &format!("preparing {dest} failed (exit {})", exit_text(code)),
+                    &prepared.stderr_tail(5),
+                ),
+            ));
+        }
+    }
+
+    // 10: INSTALL, under sudo.
+    note(err, dest, "installing the service");
+    let mode = match sudo {
+        SudoMode::Password => "password",
+        SudoMode::NoPassword => "nopasswd",
+    };
+    let replace = if replace_credential { "1" } else { "0" };
+    let stdin = install_stdin(password.as_ref().map(|p| p.as_str()), &dsn);
+    drop(password);
+    let installed = remote
+        .run(
+            &script::remote_command(
+                script::INSTALL,
+                &[
+                    root,
+                    &facts.user,
+                    &facts.home,
+                    replace,
+                    mode,
+                    script::INSTALL_ROOT,
+                ],
+            ),
+            &stdin,
+        )
+        .await;
+    drop(stdin);
+    let installed = installed.map_err(|e| failed(dest, &format!("cannot run ssh: {e}")))?;
+    if installed.code != Some(0) {
+        let root_started = installed
+            .stdout_text()
+            .lines()
+            .any(|line| line.trim_end() == script::ROOT_MARKER);
+        if installed.code == Some(4) || !root_started {
+            return Err(failed(
+                dest,
+                &format!(
+                    "sudo refused the password (or needs a tty or a second factor) on {dest}; \
+                     nothing privileged was written"
+                ),
+            ));
+        }
+        return Err(failed(
+            dest,
+            &with_detail(
+                &format!(
+                    "installing the service on {dest} failed (exit {})",
+                    exit_text(installed.code)
+                ),
+                &installed.stderr_tail(5),
+            ),
+        ));
+    }
+
+    // 11: VERIFY, inside one session.
+    note(err, dest, "waiting for the worker");
+    let checked = verify_session(remote, root, &facts.home, timings)
+        .await
+        .map_err(|e| failed(dest, &format!("cannot run ssh: {e}")))?;
+    match checked.code {
+        Some(0) => {}
+        Some(5) => {
+            let stdout = checked.stdout_text();
+            let state = stdout
+                .lines()
+                .find_map(|line| line.trim_end().strip_prefix("htui.active="))
+                .unwrap_or("unknown");
+            let stderr = String::from_utf8_lossy(&checked.stderr);
+            return Err(failed(
+                dest,
+                &format!(
+                    "the htui-worker service on {dest} did not start with a box.toml within {} s \
+                     (systemctl says {state}); its last journal and log lines follow:\n{}",
+                    u64::from(timings.verify_tries) * u64::from(timings.verify_pause_secs),
+                    stderr.trim_end()
+                ),
+            ));
+        }
+        code => {
+            return Err(failed(
+                dest,
+                &with_detail(
+                    &format!(
+                        "waiting for the worker on {dest} failed (exit {})",
+                        exit_text(code)
+                    ),
+                    &checked.stderr_tail(5),
+                ),
+            ));
+        }
+    }
+    let identity = read_box(&checked).map_err(|reason| {
+        failed(
+            dest,
+            &format!("the worker on {dest} wrote a box.toml htui cannot read: {reason}"),
+        )
+    })?;
+    let id = identity.box_id;
+
+    // 12: Postgres, from here; a warning at worst.
+    let (verified, executor_set) = match baseline {
+        Ok(baseline) => match verifier.box_seen(id, &baseline, timings.poll).await {
+            Ok(()) => (true, set_executor(verifier, id, dest, err).await.is_some()),
+            Err(reason) => {
+                not_verified(
+                    err,
+                    id,
+                    &format!(
+                        "{reason}; see journalctl -u htui-worker and \
+                         ~/.local/state/htui/worker.log on {dest}"
+                    ),
+                );
+                (false, false)
+            }
+        },
+        Err(reason) => {
+            not_verified(err, id, &reason);
+            (false, false)
+        }
+    };
+
+    // 13: the result, then the way in for an agent login (OQ-1 (a); E-26).
+    let _ = writeln!(
+        out,
+        "box {id} ({}) provisioned on {dest}",
+        identity.hostname
+    );
+    let _ = writeln!(
+        err,
+        "to log an agent in on {dest}: ssh -t {dest} '~/.local/bin/htui' --dsn-stdin, paste the \
+         DSN, then Settings › Agents"
+    );
+    Ok(Outcome::Provisioned {
+        box_id: id,
+        hostname: identity.hostname,
+        verified,
+        executor_set,
+    })
 }
 
 /// The parts the already-provisioned path still needs (E-25).
