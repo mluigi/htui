@@ -10331,7 +10331,7 @@ done
     }
 
     /// A chat whose session panics ends its stream with a `Failed` frame, which is what clears the
-    /// chat tab's pending start.
+    /// chat tab's pending start, and closes the run it opened first (MOD-24 D4).
     #[tokio::test]
     async fn a_chat_that_panics_ends_its_stream_with_failed_then_ended() {
         let store = MemStore::demo();
@@ -10342,9 +10342,10 @@ done
             .expect("the fake row lands");
         let mut factory = DriverFactory::new();
         factory.register("cli/fake", Box::new(PanickingBuilder));
-        let backend = Backend::memory(store);
+        let backend = Backend::memory(store.clone());
         let mut runtime = AgentRuntime::new(factory).with_grace(Duration::from_millis(0));
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let before = store.active_runs(&scope()).await.expect("count");
 
         let Served::Start { task, .. } = runtime
             .serve(&backend, &tx, &envelope(7, start(agent_id, "hi")))
@@ -10378,6 +10379,214 @@ done
             ),
             "{replies:?}"
         );
+        assert_eq!(
+            store.active_runs(&scope()).await.expect("count"),
+            before,
+            "the panicked chat's run is closed"
+        );
+    }
+
+    /// A transport whose sessions start cleanly and panic on their first pull: a panic **mid-turn**,
+    /// past `run_chat`'s own close of a failed start, so only the wrapper is left to close the run
+    /// (MOD-24 D4).
+    #[derive(Debug)]
+    struct PanicsMidTurn;
+
+    impl AgentDriver for PanicsMidTurn {
+        fn name(&self) -> &str {
+            "panics-mid-turn-fixture"
+        }
+
+        fn caps(&self) -> DriverCaps {
+            DriverCaps::default()
+        }
+
+        fn start<'a>(
+            &'a self,
+            _spec: SessionSpec,
+            _prompt: String,
+        ) -> htui_agent::driver::DriverFuture<'a, Box<dyn AgentSession>> {
+            Box::pin(async { Ok(Box::new(PanicsOnPull) as Box<dyn AgentSession>) })
+        }
+    }
+
+    /// [`PanicsMidTurn`]'s session: accepted, then a panic on the turn's first `next_event`.
+    #[derive(Debug)]
+    struct PanicsOnPull;
+
+    impl AgentSession for PanicsOnPull {
+        fn session_ref(&self) -> Option<&htui_agent::driver::AgentSessionRef> {
+            None
+        }
+
+        fn next_event<'a>(
+            &'a mut self,
+        ) -> htui_agent::driver::DriverFuture<'a, Option<DriverEnvelope>> {
+            Box::pin(async { panic!("the adapter blew up mid-turn") })
+        }
+
+        fn send_follow_up<'a>(
+            &'a mut self,
+            _text: String,
+        ) -> htui_agent::driver::DriverFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn answer_permission<'a>(
+            &'a mut self,
+            _request_id: PermissionRequestId,
+            _answer: PermissionAnswer,
+        ) -> htui_agent::driver::DriverFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn cancel<'a>(&'a mut self, _grace: Duration) -> htui_agent::driver::DriverFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanicsMidTurnBuilder;
+
+    impl htui_agent::registry::TransportBuilder for PanicsMidTurnBuilder {
+        fn build(
+            &self,
+            _agent: &Agent,
+            _on_box: Option<&AgentBox>,
+            _caps: DriverCaps,
+        ) -> Result<Box<dyn AgentDriver>, DriverError> {
+            Ok(Box::new(PanicsMidTurn))
+        }
+    }
+
+    /// The demo store plus the fake row, and a runtime whose `cli/fake` sessions panic mid-turn.
+    async fn panics_mid_turn() -> (MemStore, Backend, AgentRuntime, AgentId) {
+        let store = MemStore::demo();
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&fake_row(agent_id), None)
+            .await
+            .expect("the fake row lands");
+        let mut factory = DriverFactory::new();
+        factory.register("cli/fake", Box::new(PanicsMidTurnBuilder));
+        let backend = Backend::memory(store.clone());
+        let runtime = AgentRuntime::new(factory).with_grace(Duration::from_millis(0));
+        (store, backend, runtime, agent_id)
+    }
+
+    /// The stream's last two frames: a `Failed` naming `panic`, then `Ended { Cancelled }`, both
+    /// at seq 7.
+    fn ends_failed_then_ended(replies: &[ReplyEnvelope], panic: &str) {
+        let [.., failed, ended] = replies else {
+            panic!("the stream ends with two frames: {replies:?}")
+        };
+        assert_eq!((failed.seq, ended.seq), (7, 7), "{replies:?}");
+        assert!(
+            matches!(
+                &failed.reply,
+                StoreReply::Chat(ChatFrame::Failed { message }) if message.contains(panic)
+            ),
+            "{replies:?}"
+        );
+        assert!(
+            matches!(
+                &ended.reply,
+                StoreReply::Chat(ChatFrame::Ended {
+                    stop_reason: StopReason::Cancelled
+                })
+            ),
+            "{replies:?}"
+        );
+    }
+
+    /// MOD-24 D4: a fresh chat whose session panics mid-turn closes its `run(kind='chat')` pair
+    /// before its stream ends, so a tab that re-reads runs on `Ended` finds no chat still running.
+    #[tokio::test]
+    async fn a_chat_that_panics_mid_turn_closes_its_run_then_ends_its_stream() {
+        let (store, backend, mut runtime, agent_id) = panics_mid_turn().await;
+        let before = store.active_runs(&scope()).await.expect("count");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let Served::Start { task, .. } = runtime
+            .serve(&backend, &tx, &envelope(7, start(agent_id, "hi")))
+            .await
+        else {
+            panic!("a chat start opens a session")
+        };
+        assert_eq!(
+            store.active_runs(&scope()).await.expect("count"),
+            before + 1,
+            "the start opened the chat's run"
+        );
+        task.await;
+
+        let replies = sent(&mut rx);
+        assert!(
+            replies
+                .iter()
+                .any(|reply| matches!(reply.reply, StoreReply::ChatAccepted { .. })),
+            "the session was accepted before it panicked: {replies:?}"
+        );
+        ends_failed_then_ended(&replies, "the adapter blew up mid-turn");
+        assert_eq!(
+            store.active_runs(&scope()).await.expect("count"),
+            before,
+            "the panicked chat's run is closed"
+        );
+    }
+
+    /// MOD-24 D4 leaves MOD-4 D165 alone: a promoted step's chat opened no run, so its panic closes
+    /// nothing; the step and its run stay as the promotion left them.
+    #[tokio::test]
+    async fn a_promoted_chat_that_panics_closes_nothing() {
+        let (store, backend, mut runtime, agent_id) = panics_mid_turn().await;
+        let run_before = store
+            .run(ids::RUN_1)
+            .await
+            .expect("the read answers")
+            .expect("the fixture's run");
+        let step_of = async |store: &MemStore| {
+            store
+                .run_steps(ids::RUN_1)
+                .await
+                .expect("the read answers")
+                .into_iter()
+                .find(|step| step.id == ids::STEP_PLAN)
+                .expect("the fixture's step")
+        };
+        let step_before = step_of(&store).await;
+        let active = store.active_runs(&scope()).await.expect("count");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let promotion = promoted(
+            agent_id,
+            OpeningPath::Handoff {
+                text: "pick up where the step stopped".to_owned(),
+                digest: "d-handoff".to_owned(),
+            },
+        );
+        let Served::Start { task, .. } = runtime
+            .attach_promoted(&backend, &tx, promote_addr(), promotion)
+            .await
+        else {
+            panic!("a promotion over a registered row opens a session")
+        };
+        task.await;
+
+        ends_failed_then_ended(&sent(&mut rx), "the adapter blew up mid-turn");
+        let run_after = store
+            .run(ids::RUN_1)
+            .await
+            .expect("the read answers")
+            .expect("the fixture's run");
+        assert_eq!(run_after.status, run_before.status, "the run is untouched");
+        assert_eq!(run_after.finished_at, run_before.finished_at);
+        assert_eq!(
+            step_of(&store).await.status,
+            step_before.status,
+            "so is the step"
+        );
+        assert_eq!(store.active_runs(&scope()).await.expect("count"), active);
     }
 
     /// The registration probe answers at `UNSOLICITED`, where only a `BoxProbed` is rendered, so a
