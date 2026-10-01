@@ -203,9 +203,9 @@ impl Drop for Terminating {
                 "htui-provision",
                 &pid.to_string(),
             ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success());
         if !asked {
