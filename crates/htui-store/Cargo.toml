@@ -19,7 +19,9 @@ test-support = ["demo"]
 # MOD-34 D2: the production embedder (`embed::FastEmbedder`). Off by default because `ort`
 # downloads onnxruntime at build time; the `htui` binary turns it on. Offline builds can point
 # `ORT_LIB_LOCATION` at a local onnxruntime 1.18 instead.
-local-embed = ["dep:fastembed", "dep:rten", "dep:rten-tensor", "dep:tokenizers"]
+local-embed = [
+    "dep:fastembed", "dep:rten", "dep:rten-tensor", "dep:tokenizers", "dep:reqwest", "dep:rustls",
+]
 
 [dependencies]
 htui-core   = { workspace = true, features = ["sqlx"] }
@@ -47,6 +49,10 @@ fastembed          = { workspace = true, optional = true }
 rten               = { workspace = true, optional = true }
 rten-tensor        = { workspace = true, optional = true }
 tokenizers         = { workspace = true, optional = true }
+# MOD-68 D6: the pinned model fetch (`model::ensure_model`). Both are already in the graph through
+# `qdrant-client`; `rustls` is named to install `ring` as the provider, as `htui-agent` does.
+reqwest            = { workspace = true, optional = true }
+rustls             = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # MOD-7 D1: the fingerprint's Windows machine identity, `HKLM\SOFTWARE\Microsoft\Cryptography`

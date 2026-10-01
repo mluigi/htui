@@ -577,17 +577,13 @@ mod tests {
         assert!(holding.len() <= 16, "{holding:?} of {ranges:?}");
     }
 
-    /// The seeded fastembed snapshot (T2); T3 swaps this for `model::ensure_model()`.
+    /// The pinned files through the production path (B3): on a box with fastembed's old cache
+    /// this proves adoption end to end, with no download.
     #[cfg(feature = "local-embed")]
     async fn golden_model() -> ModelFiles {
-        let snap = dirs::cache_dir()
-            .expect("a cache dir")
-            .join("htui/fastembed/models--Xenova--bge-small-en-v1.5/snapshots")
-            .join(model::REVISION);
-        ModelFiles {
-            onnx: snap.join("onnx/model.onnx"),
-            tokenizer: snap.join("tokenizer.json"),
-        }
+        model::ensure_model()
+            .await
+            .expect("the model is fetched or adopted")
     }
 
     /// Each vector within 1e-5 per element and cosine ≥ 1 - 1e-9 of its golden (D2).
