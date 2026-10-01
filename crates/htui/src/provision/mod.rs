@@ -91,11 +91,13 @@ impl Payload {
     #[must_use]
     pub fn new(bytes: Vec<u8>, arch: &str) -> Self {
         let digest = sha2::Sha256::digest(&bytes);
-        let sha = digest.iter().fold(String::with_capacity(64), |mut hex, byte| {
-            use core::fmt::Write as _;
-            let _ = write!(hex, "{byte:02x}");
-            hex
-        });
+        let sha = digest
+            .iter()
+            .fold(String::with_capacity(64), |mut hex, byte| {
+                use core::fmt::Write as _;
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            });
         Self {
             bytes,
             arch: arch.to_owned(),
@@ -230,12 +232,8 @@ pub async fn run(args: ProvisionArgs) -> Result<(), ProvisionExit> {
     }
     plan::validate_destination(dest).map_err(|sentence| refused(dest, &sentence))?;
     let dsn = read_dsn(args.dsn_stdin, dest)?;
-    let payload = Payload::this_binary().map_err(|err| {
-        refused(
-            dest,
-            &format!("this htui binary could not be read: {err}"),
-        )
-    })?;
+    let payload = Payload::this_binary()
+        .map_err(|err| refused(dest, &format!("this htui binary could not be read: {err}")))?;
     let root = identity::config_root().map_err(|err| refused(dest, &err.to_string()))?;
     let remote = remote::SshRemote::new(dest);
     let verifier = verify::PgVerifier::new(root);
@@ -569,7 +567,11 @@ impl<R: Remote> Finish<'_, '_, R> {
             err,
             "(--replace-credential re-encrypts the DSN and restarts the service)"
         );
-        note(err, dest, "already provisioned with this build; reading its box");
+        note(
+            err,
+            dest,
+            "already provisioned with this build; reading its box",
+        );
         let identity = match verify_session(remote, root, &facts.home, timings).await {
             Err(e) => Err(format!("cannot run ssh: {e}")),
             Ok(checked) if checked.code == Some(0) => read_box(&checked),
@@ -922,7 +924,10 @@ mod tests {
             _baseline: &'a Baseline,
             _poll: Poll,
         ) -> BoxFuture<'a, Result<(), String>> {
-            self.log.lock().expect("log").push(format!("box_seen({id})"));
+            self.log
+                .lock()
+                .expect("log")
+                .push(format!("box_seen({id})"));
             Box::pin(futures::future::ready(self.seen.clone()))
         }
 
@@ -1091,7 +1096,10 @@ mod tests {
         assert_eq!(payload.arch(), "x86_64");
         assert_eq!(payload.bytes(), b"abc");
         let shown = format!("{payload:?}");
-        assert!(shown.contains("len: 3") && !shown.contains("97, 98"), "{shown}");
+        assert!(
+            shown.contains("len: 3") && !shown.contains("97, 98"),
+            "{shown}"
+        );
     }
 
     #[test]
@@ -1114,7 +1122,10 @@ mod tests {
             err: &mut err,
         };
         let shown = format!("{ctx:?}");
-        assert!(!shown.contains("SENTINEL-DSN-PW"), "Ctx's Debug shows the DSN");
+        assert!(
+            !shown.contains("SENTINEL-DSN-PW"),
+            "Ctx's Debug shows the DSN"
+        );
         assert!(shown.contains("<redacted>"));
     }
 
@@ -1182,9 +1193,18 @@ mod tests {
             ]
         );
         assert_eq!(prompt.count(), 1);
-        assert!(ran.err.contains("[sudo] password for alice on alice@box1: \n"));
-        assert!(ran.err.contains("provisioning alice@box1: uploading htui (1 MiB)\n"));
-        assert!(ran.err.contains("provisioning alice@box1: executor set to worker\n"));
+        assert!(
+            ran.err
+                .contains("[sudo] password for alice on alice@box1: \n")
+        );
+        assert!(
+            ran.err
+                .contains("provisioning alice@box1: uploading htui (1 MiB)\n")
+        );
+        assert!(
+            ran.err
+                .contains("provisioning alice@box1: executor set to worker\n")
+        );
         assert!(ran.err.ends_with(HINT), "{}", ran.err);
     }
 
@@ -1289,7 +1309,10 @@ mod tests {
             ran.out,
             format!("{DEST} is already provisioned with this build; nothing was changed\n")
         );
-        assert!(ran.err.contains("warning: the box on alice@box1 could not be read"));
+        assert!(
+            ran.err
+                .contains("warning: the box on alice@box1 could not be read")
+        );
         assert!(ran.err.contains("Settings › Boxes"));
         assert!(verifier.log().is_empty());
 
@@ -1329,7 +1352,11 @@ mod tests {
     #[tokio::test]
     async fn local_refusals_make_no_remote_call() {
         let cases = [
-            ("-oProxyCommand=x", DSN, "the ssh destination must not be empty"),
+            (
+                "-oProxyCommand=x",
+                DSN,
+                "the ssh destination must not be empty",
+            ),
             (
                 DEST,
                 "postgres://u:p@localhost/htui",
@@ -1341,7 +1368,11 @@ mod tests {
                 "the DSN names a Unix socket",
             ),
             (DEST, "postgres://u:p@/htui", "the DSN names no host"),
-            (DEST, "mysql://u:p@db.example/htui", "the DSN cannot be used: "),
+            (
+                DEST,
+                "mysql://u:p@db.example/htui",
+                "the DSN cannot be used: ",
+            ),
         ];
         for (dest, dsn, expected) in cases {
             let remote = ScriptedRemote::default();
@@ -1366,7 +1397,8 @@ mod tests {
             let exit = result.expect_err(expected);
             assert_eq!(exit.code(), 2, "{exit}");
             assert!(
-                exit.to_string().starts_with(&format!("not provisioning {dest}: ")),
+                exit.to_string()
+                    .starts_with(&format!("not provisioning {dest}: ")),
                 "{exit}"
             );
             assert!(exit.to_string().contains(expected), "{exit}");
@@ -1384,7 +1416,11 @@ mod tests {
                  login shell (sh, bash, zsh, ksh)",
             ),
             (
-                exit(255, "", "ssh: connect to host box1 port 22: Connection refused\n"),
+                exit(
+                    255,
+                    "",
+                    "ssh: connect to host box1 port 22: Connection refused\n",
+                ),
                 "ssh to alice@box1 failed (exit 255): ssh: connect to host box1 port 22: \
                  Connection refused",
             ),
@@ -1448,7 +1484,8 @@ mod tests {
     async fn exit_codes_map_to_their_sentences() {
         let sudo_refused = "provisioning alice@box1 failed: sudo refused the password (or needs a \
                             tty or a second factor) on alice@box1; nothing privileged was written";
-        let cases: Vec<(Vec<io::Result<RemoteOutput>>, String)> = vec![
+        let cases: Vec<(Vec<io::Result<RemoteOutput>>, String)> =
+            vec![
             (
                 vec![exit(
                     3,
@@ -1532,7 +1569,10 @@ mod tests {
                 executor_set: false,
             }
         );
-        assert!(ran.err.contains("not verified in Postgres from here: unreachable\n"));
+        assert!(
+            ran.err
+                .contains("not verified in Postgres from here: unreachable\n")
+        );
         assert!(ran.err.contains("Settings › Boxes"));
         assert_eq!(verifier.log(), ["baseline"]);
         assert_eq!(ran.out, format!("box {BOX} (box1) provisioned on {DEST}\n"));

@@ -168,7 +168,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::provision::script::{INSTALL, INSTALL_ROOT, PREFLIGHT, PREPARE, VERIFY, remote_command};
+    use crate::provision::script::{
+        INSTALL, INSTALL_ROOT, PREFLIGHT, PREPARE, VERIFY, remote_command,
+    };
 
     const DSN: &str = "postgres://u:SENTINEL-DSN-PW@db.example:5432/htui";
     const PASSWORD: &str = "SENTINEL-SUDO-PW";
@@ -178,9 +180,16 @@ mod tests {
         let argv = ssh_argv("u@box1", "sh -c true");
         assert_eq!(
             argv,
-            ["-T", "-o", "ConnectTimeout=15", "--", "u@box1", "sh -c true"]
-                .map(OsString::from)
-                .to_vec()
+            [
+                "-T",
+                "-o",
+                "ConnectTimeout=15",
+                "--",
+                "u@box1",
+                "sh -c true"
+            ]
+            .map(OsString::from)
+            .to_vec()
         );
     }
 
@@ -198,7 +207,10 @@ mod tests {
         for command in &commands {
             for arg in ssh_argv("box1", command) {
                 let arg = arg.to_string_lossy();
-                assert!(!arg.contains("SENTINEL"), "an ssh argument holds a sentinel");
+                assert!(
+                    !arg.contains("SENTINEL"),
+                    "an ssh argument holds a sentinel"
+                );
                 assert!(!arg.contains(DSN) && !arg.contains(PASSWORD));
             }
         }

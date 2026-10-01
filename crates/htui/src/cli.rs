@@ -282,7 +282,10 @@ mod tests {
                 replace_credential: true,
             }))
         );
-        assert!(!args.dsn_stdin, "the flag is the subcommand's, not the TUI's");
+        assert!(
+            !args.dsn_stdin,
+            "the flag is the subcommand's, not the TUI's"
+        );
         let args = Args::try_parse_from(["htui", "provision", "box1"]).expect("parse");
         assert_eq!(
             args.command,
@@ -352,7 +355,10 @@ mod tests {
         ] {
             let mut argv = vec!["htui", "--dsn-stdin"];
             argv.extend_from_slice(other);
-            assert!(Args::try_parse_from(&argv).is_err(), "{argv:?} must not parse");
+            assert!(
+                Args::try_parse_from(&argv).is_err(),
+                "{argv:?} must not parse"
+            );
         }
         assert!(Args::try_parse_from(["htui", "--dsn-stdin", "worker"]).is_err());
         let args = Args::try_parse_from(["htui", "worker", "--dsn-stdin"]).expect("parse");

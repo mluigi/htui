@@ -123,9 +123,15 @@ mod tests {
         let mut typed = buffer();
         let capacity = typed.capacity();
         for c in ['p', 'w', 'x'] {
-            assert_eq!(apply_key(&mut typed, &press(KeyCode::Char(c))), KeyStep::More);
+            assert_eq!(
+                apply_key(&mut typed, &press(KeyCode::Char(c))),
+                KeyStep::More
+            );
         }
-        assert_eq!(apply_key(&mut typed, &press(KeyCode::Backspace)), KeyStep::More);
+        assert_eq!(
+            apply_key(&mut typed, &press(KeyCode::Backspace)),
+            KeyStep::More
+        );
         assert_eq!(
             apply_key(
                 &mut typed,
@@ -149,11 +155,21 @@ mod tests {
         let mut full = buffer();
         let capacity = full.capacity();
         for _ in 0..PASSWORD_MAX {
-            assert_eq!(apply_key(&mut full, &press(KeyCode::Char('a'))), KeyStep::More);
+            assert_eq!(
+                apply_key(&mut full, &press(KeyCode::Char('a'))),
+                KeyStep::More
+            );
         }
-        assert_eq!(apply_key(&mut full, &press(KeyCode::Char('a'))), KeyStep::Abort);
+        assert_eq!(
+            apply_key(&mut full, &press(KeyCode::Char('a'))),
+            KeyStep::Abort
+        );
         assert_eq!(full.len(), PASSWORD_MAX);
-        assert_eq!(full.capacity(), capacity, "the cap keeps the buffer in place");
+        assert_eq!(
+            full.capacity(),
+            capacity,
+            "the cap keeps the buffer in place"
+        );
     }
 
     #[test]

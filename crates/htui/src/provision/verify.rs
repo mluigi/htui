@@ -176,7 +176,9 @@ mod tests {
     use super::*;
 
     fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_800_000_000 + secs, 0).single().expect("a time")
+        Utc.timestamp_opt(1_800_000_000 + secs, 0)
+            .single()
+            .expect("a time")
     }
 
     fn record(id: BoxId, last_seen_at: DateTime<Utc>) -> BoxRecord {
@@ -216,7 +218,10 @@ mod tests {
         assert!(seen_against(&[record(id, at(5))], id, &empty), "new");
 
         let before: Baseline = [(id, at(5))].into_iter().collect();
-        assert!(!seen_against(&[record(id, at(5))], id, &before), "unchanged");
+        assert!(
+            !seen_against(&[record(id, at(5))], id, &before),
+            "unchanged"
+        );
         assert!(seen_against(&[record(id, at(6))], id, &before), "later");
         assert!(!seen_against(&[record(other, at(9))], id, &empty), "absent");
     }
