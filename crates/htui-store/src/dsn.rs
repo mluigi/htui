@@ -295,7 +295,9 @@ fn classify_host(host: &str) -> DsnHost {
         Some(IpAddr::V6(v6))
             if v6.is_loopback()
                 || v6.is_unspecified()
-                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()) =>
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified()) =>
         {
             DsnHost::Loopback
         }
@@ -441,6 +443,7 @@ mod tests {
             ("::1", DsnHost::Loopback),
             ("[::]", DsnHost::Loopback),
             ("[::ffff:127.0.0.1]", DsnHost::Loopback),
+            ("[::ffff:0.0.0.0]", DsnHost::Loopback),
             ("[::ffff:10.0.0.3]", DsnHost::Remote),
             ("[fd00::3]", DsnHost::Remote),
             ("10.0.0.3", DsnHost::Remote),
