@@ -342,16 +342,20 @@ active in between. When the box did not check in, read the worker's log on the h
 (`journalctl -u htui-worker` may need sudo; `~/.local/state/htui/worker.log` does not), fix the
 cause, and flip the executor in **Settings › Boxes** once the box shows up there.
 
-**Re-running.** On a host already provisioned with this build and running, it says so and changes
-nothing. `--replace-credential` re-encrypts the DSN and restarts the service. A host with a
+**Re-running.** On a host already provisioned with this build and running, nothing is installed
+or restarted, and no sudo password is asked: `htui` reads the box's `box.toml` there (one more
+unprivileged session), sets that box's executor to `worker` when it is not already, and prints
+`<destination> is already provisioned with this build; box <id> (<hostname>)`, ending in
+`; executor set to worker` when it changed it. When the box cannot be read there, the line is
+`<destination> is already provisioned with this build; nothing was changed`; when this machine
+cannot use the DSN, or the write does not apply, the same warnings as above say so. The exit is 0
+either way. `--replace-credential` re-encrypts the DSN and restarts the service. A host with a
 different build, or one set up by hand, is refused: upgrading is not supported yet. The binary in
-`~/.local/bin/htui` is replaced on a host without the unit. The first case prints
-`<destination> is already provisioned with this build; nothing was changed`. A run that failed
-partway is completed by running it again: the binary is not sent twice, an existing credential is
-kept unless you pass `--replace-credential`, and a unit that is installed but not running is
-written again and started. A run that failed while waiting for the worker may leave the service
-running; the re-run then says it is already provisioned and does not set the executor. Set it in
-**Settings › Boxes**, or re-run with `--replace-credential`, which goes through the check again.
+`~/.local/bin/htui` is replaced on a host without the unit. A run that failed partway is completed
+by running it again: the binary is not sent twice, an existing credential is kept unless you pass
+`--replace-credential`, and a unit that is installed but not running is written again and started.
+A run that failed while waiting for the worker may leave the service running; the re-run then
+finds it already provisioned and sets the executor.
 
 **Exit codes.**
 
@@ -359,7 +363,7 @@ running; the re-run then says it is already provisioned and does not set the exe
 |---|---|
 | `0` | Provisioned, or already provisioned. A warning on standard error may still ask you to set the executor by hand. |
 | `2` | Refused; nothing was written on the remote host. The sentence starts `not provisioning <destination>:` and names the reason, among them: a destination that is empty, starts with `-` or contains whitespace, no DSN, a keyring that could not be read, a DSN the remote host cannot use, a local `htui` binary that cannot be read or is not a Linux build, `ssh` that could not be run (`cannot run ssh: …`) or could not connect (`ssh to <destination> failed (exit 255): …`), a login shell that did not run the preflight, the host's OS, architecture, systemd, `systemd-creds` or sudo, a different build already installed, a user, group or home that cannot go into a unit file, or a cancelled password prompt. |
-| `1` | Failed after a remote write; re-running completes it (see **Re-running** for the executor). The sentence starts `provisioning <destination> failed:`. |
+| `1` | Failed after a remote write; re-running completes it, the executor included (see **Re-running**). The sentence starts `provisioning <destination> failed:`. |
 
 The failures:
 
