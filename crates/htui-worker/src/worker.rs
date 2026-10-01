@@ -44,8 +44,9 @@ impl WorkerConfig {
 /// given back). A store outage is logged by each arm and the loop carries on (plan D14).
 ///
 /// Every ticker fires at once (blueprint B-11): the first sweep, the first command poll (MOD-42
-/// plan D13, every [`COMMAND_POLL`]) and the first box beat are at start, not one period out. One beat is in flight at a time, on its own task, so a slow server
-/// never delays a sweep; a beat still in flight at shutdown is aborted.
+/// plan D13, every [`COMMAND_POLL`]) and the first box beat are at start, not one period out.
+/// One beat is in flight at a time, on its own task, so a slow server never delays a sweep; a
+/// beat still in flight at shutdown is aborted.
 pub async fn run(
     host: PgStore,
     mut runtime: RunRuntime<PgStore, Unaddressed>,
