@@ -22,27 +22,27 @@ use crate::clock::Clock;
 #[cfg(feature = "test-support")]
 use crate::clock::TestClock;
 use crate::model::{
-    Agent, AgentBox, AgentId, AgentSummary, AnswerOutcome, AppUser, BindingChange, BoundSkill,
-    BoxEdit, BoxId, BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool,
-    CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId, CoverageRow,
-    DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, Executor, GateOutcome, Item,
-    ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch,
-    ItemRequirement, ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode,
-    NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate,
-    NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
-    PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
-    ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, RelaySessionId, RelayView, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
-    RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase,
-    Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
-    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission,
-    StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject, WorkspaceSummary, canonical_declared_tags, missing_tags_failure, overlaps,
-    prompt_summary, scope_of,
+    Agent, AgentBox, AgentId, AgentSummary, AnswerOutcome, AnswerRefusal, AppUser, BindingChange,
+    BoundSkill, BoxEdit, BoxId, BoxInfo, BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings,
+    BoxTool, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId,
+    CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, Executor,
+    GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch,
+    ItemLink, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind,
+    LinkNode, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject,
+    NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill,
+    NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
+    PermissionId, PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, RelaySessionId,
+    RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput,
+    ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind,
+    RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
+    SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch,
+    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary, canonical_declared_tags,
+    missing_tags_failure, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -119,6 +119,16 @@ pub enum MemFault {
     ReleaseLease,
     /// [`WriteStore::transition`], the item compare-and-set.
     ItemTransition,
+}
+
+/// A `step_permission` row with its `owner`, which [`StepPermission`] deliberately omits
+/// (MOD-42 blueprint B-8).
+#[derive(Debug, Clone)]
+struct PermissionRow {
+    /// The row as readers see it.
+    row: StepPermission,
+    /// `step_permission.owner`: the executor's lease owner at park time (I-2).
+    owner: Uuid,
 }
 
 /// Every §5 table the TUI reads, keyed the way the queries of §7 look rows up.
@@ -219,6 +229,11 @@ struct State {
     /// and a reader has no use for another process's liveness token (blueprint F-S). Kept beside
     /// the run so [`WriteStore::refresh_lease`] can compare against it.
     lease_owners: HashMap<RunId, Uuid>,
+    /// `step_permission` (MOD-42 plan D1), by id; `owner` beside the row (B-8), as
+    /// [`State::lease_owners`] sits beside `runs`.
+    permissions: BTreeMap<PermissionId, PermissionRow>,
+    /// `run_command` (MOD-42 plan D1), by id.
+    run_commands: BTreeMap<RunCommandId, RunCommand>,
     /// `session_event`.
     events: Vec<SessionEvent>,
     /// `requirement_spec` (ANA-11 §4.4), keyed by its primary key, the project (MOD-38).
@@ -318,6 +333,8 @@ impl MemStore {
             step_commits: BTreeMap::new(),
             command_runs: BTreeMap::new(),
             lease_owners: HashMap::new(),
+            permissions: BTreeMap::new(),
+            run_commands: BTreeMap::new(),
             events: data.events,
             requirement_specs: data
                 .requirement_specs
@@ -846,6 +863,21 @@ impl MemStore {
     #[must_use]
     pub fn handle_at(&self, now: DateTime<Utc>) -> Self {
         self.clone().with_clock(Arc::new(TestClock::at(now)))
+    }
+
+    /// Every `step_permission` row, in id order (MOD-42 blueprint B-21): for tests that must see
+    /// rows no trait method lists (stale, cancelled, another item's).
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn relay_rows(&self) -> Vec<StepPermission> {
+        self.read(|state| state.permissions.values().map(|p| p.row.clone()).collect())
+    }
+
+    /// Every `run_command` row, in id order (MOD-42 blueprint B-21).
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn command_rows(&self) -> Vec<RunCommand> {
+        self.read(|state| state.run_commands.values().cloned().collect())
     }
 
     /// This handle's "now": its injected clock, else `Utc::now()` untruncated (blueprint B21).
@@ -3771,6 +3803,11 @@ impl State {
         self.steps.retain(|id, _| !gone.steps.contains(id));
         self.runs.retain(|id, _| !gone.runs.contains(id));
         self.lease_owners.retain(|id, _| !gone.runs.contains(id));
+        // MOD-42 plan D1: both relay tables go with their run (`ON DELETE CASCADE`, F-18).
+        self.permissions
+            .retain(|_, p| !gone.runs.contains(&p.row.run_id));
+        self.run_commands
+            .retain(|_, c| !gone.runs.contains(&c.run_id));
         self.documents
             .retain(|row| !gone.items.contains(&row.item_id));
         self.notes.retain(|row| !gone.items.contains(&row.item_id));
@@ -5678,6 +5715,322 @@ fn require_author(id: UserId, column: &str) -> Result<()> {
     Ok(())
 }
 
+/// MOD-42 (plan D1-D5, D12-D14; blueprint §2.11): the relay's reference semantics. Every time is
+/// the handle's clock, passed in as `now` (I-4); every status move is a compare-and-set (I-3).
+impl State {
+    /// The run's lease owner while its lease is live by `now`: Postgres's
+    /// `r.lease_owner = p.owner AND r.lease_expires_at > clock_timestamp()`.
+    fn live_owner(&self, run: RunId, now: DateTime<Utc>) -> Option<Uuid> {
+        let expiry = self.runs.get(&run)?.lease_expires_at?;
+        if expiry > now {
+            self.lease_owners.get(&run).copied()
+        } else {
+            None
+        }
+    }
+
+    /// `answered_by`/`issued_by` and `answered_box`/`issued_box` must name rows (blueprint B-7).
+    fn require_actor(&self, user: UserId, box_id: BoxId, table: &str, by: &str) -> Result<()> {
+        self.require_user(user, &format!("{table}.{by}_by"))?;
+        if !self.boxes.contains_key(&box_id) {
+            return Err(StoreError::Constraint(references_no_row(
+                &format!("{table}.{by}_box"),
+                box_id,
+                "box",
+            )));
+        }
+        Ok(())
+    }
+
+    fn open_permission(
+        &mut self,
+        open: OpenPermission,
+        now: DateTime<Utc>,
+    ) -> Result<PermissionId> {
+        let step = self
+            .steps
+            .get(&open.run_step_id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "run_step",
+                id: open.run_step_id.to_string(),
+            })?;
+        if step.run_id != open.run_id {
+            return Err(StoreError::Constraint(format!(
+                "step_permission.run_step_id `{}` is not a step of run `{}`",
+                open.run_step_id, open.run_id
+            )));
+        }
+        if self.lease_owners.get(&open.run_id) != Some(&open.owner) {
+            return Err(StoreError::Fenced {
+                step: open.run_step_id,
+            });
+        }
+        if self.permissions.contains_key(&open.id) {
+            return Err(StoreError::Constraint(already_exists(
+                "step_permission",
+                open.id,
+            )));
+        }
+        if self
+            .permissions
+            .values()
+            .any(|p| p.row.session == open.session && p.row.request_id == open.request_id)
+        {
+            return Err(StoreError::Constraint(format!(
+                "step_permission (session, request_id) `({}, {})` already exists",
+                open.session, open.request_id
+            )));
+        }
+        // D5: an older session's open rows on the same step go stale.
+        for p in self.permissions.values_mut() {
+            if p.row.run_step_id == open.run_step_id
+                && p.row.session != open.session
+                && matches!(
+                    p.row.status,
+                    PermissionStatus::Pending | PermissionStatus::Answered
+                )
+            {
+                p.row.status = PermissionStatus::Stale;
+                p.row.resolved_at = Some(now);
+            }
+        }
+        let id = open.id;
+        self.permissions.insert(
+            id,
+            PermissionRow {
+                row: StepPermission {
+                    id,
+                    run_id: open.run_id,
+                    run_step_id: open.run_step_id,
+                    session: open.session,
+                    request_id: open.request_id,
+                    tool_call_id: open.tool_call_id,
+                    summary: open.summary,
+                    options: open.options,
+                    status: PermissionStatus::Pending,
+                    option_id: None,
+                    answered_by: None,
+                    answered_box: None,
+                    created_at: now,
+                    answered_at: None,
+                    resolved_at: None,
+                },
+                owner: open.owner,
+            },
+        );
+        Ok(id)
+    }
+
+    fn apply_permission(
+        &mut self,
+        id: PermissionId,
+        owner: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<Option<PermissionChoice>> {
+        let leased = |run: RunId| self.lease_owners.get(&run) == Some(&owner);
+        let Some(p) = self.permissions.get(&id) else {
+            return Err(StoreError::NotFound {
+                entity: "step_permission",
+                id: id.to_string(),
+            });
+        };
+        if p.row.status != PermissionStatus::Answered || p.owner != owner || !leased(p.row.run_id) {
+            return Ok(None);
+        }
+        let Some(p) = self.permissions.get_mut(&id) else {
+            return Ok(None);
+        };
+        p.row.status = PermissionStatus::Applied;
+        p.row.resolved_at = Some(now);
+        Ok(p.row
+            .option_id
+            .clone()
+            .map(|option_id| PermissionChoice { option_id }))
+    }
+
+    fn settle_permissions(
+        &mut self,
+        session: RelaySessionId,
+        to: PermissionStatus,
+        now: DateTime<Utc>,
+    ) -> Result<u64> {
+        if !matches!(to, PermissionStatus::Cancelled | PermissionStatus::Stale) {
+            return Err(StoreError::Constraint(format!(
+                "step_permission rows settle to `cancelled` or `stale`, not `{to}`"
+            )));
+        }
+        let mut moved = 0;
+        for p in self.permissions.values_mut() {
+            if p.row.session == session
+                && matches!(
+                    p.row.status,
+                    PermissionStatus::Pending | PermissionStatus::Answered
+                )
+            {
+                p.row.status = to;
+                p.row.resolved_at = Some(now);
+                moved += 1;
+            }
+        }
+        Ok(moved)
+    }
+
+    fn answer_permission(
+        &mut self,
+        id: PermissionId,
+        option_id: &str,
+        user: UserId,
+        box_id: BoxId,
+        now: DateTime<Utc>,
+    ) -> Result<AnswerOutcome> {
+        let Some(p) = self.permissions.get(&id) else {
+            return Err(StoreError::NotFound {
+                entity: "step_permission",
+                id: id.to_string(),
+            });
+        };
+        let (run, owner, status) = (p.row.run_id, p.owner, p.row.status);
+        let offered = p.row.options.iter().any(|option| option.id == option_id);
+        self.require_actor(user, box_id, "step_permission", "answered")?;
+        let refusal = match status {
+            PermissionStatus::Pending => None,
+            PermissionStatus::Answered => Some(AnswerRefusal::Answered),
+            PermissionStatus::Applied => Some(AnswerRefusal::Applied),
+            PermissionStatus::Cancelled => Some(AnswerRefusal::Cancelled),
+            PermissionStatus::Stale => Some(AnswerRefusal::Stale),
+        }
+        .or_else(|| (!offered).then_some(AnswerRefusal::NotOffered))
+        .or_else(|| {
+            (self.live_owner(run, now) != Some(owner)).then_some(AnswerRefusal::ExecutorGone)
+        });
+        if let Some(refusal) = refusal {
+            return Ok(AnswerOutcome::Refused(refusal));
+        }
+        if let Some(p) = self.permissions.get_mut(&id) {
+            p.row.status = PermissionStatus::Answered;
+            p.row.option_id = Some(option_id.to_owned());
+            p.row.answered_by = Some(user);
+            p.row.answered_box = Some(box_id);
+            p.row.answered_at = Some(now);
+        }
+        Ok(AnswerOutcome::Answered)
+    }
+
+    fn relay_view(&self, item: ItemId, now: DateTime<Utc>) -> RelayView {
+        let of_item = |run: RunId| self.runs.get(&run).filter(|row| row.item_id == Some(item));
+        let mut permissions: Vec<StepPermission> = self
+            .permissions
+            .values()
+            .filter(|p| {
+                p.row.status == PermissionStatus::Pending
+                    && of_item(p.row.run_id).is_some()
+                    && self.live_owner(p.row.run_id, now) == Some(p.owner)
+            })
+            .map(|p| p.row.clone())
+            .collect();
+        permissions.sort_unstable_by_key(|row| (row.created_at, row.id));
+        let cancels: BTreeSet<RunId> = self
+            .run_commands
+            .values()
+            .filter(|c| {
+                c.kind == RunCommandKind::Cancel
+                    && c.status == RunCommandStatus::Pending
+                    && of_item(c.run_id).is_some_and(|run| !run.status.is_terminal())
+            })
+            .map(|c| c.run_id)
+            .collect();
+        RelayView {
+            permissions,
+            cancels: cancels.into_iter().collect(),
+        }
+    }
+
+    fn request_cancel(
+        &mut self,
+        run: RunId,
+        user: UserId,
+        box_id: BoxId,
+        now: DateTime<Utc>,
+    ) -> Result<CancelRequest> {
+        self.require_run(run)?;
+        self.require_actor(user, box_id, "run_command", "issued")?;
+        if let Some(pending) = self.run_commands.values().find(|c| {
+            c.run_id == run
+                && c.kind == RunCommandKind::Cancel
+                && c.status == RunCommandStatus::Pending
+        }) {
+            return Ok(CancelRequest::AlreadyPending(pending.id));
+        }
+        let id = RunCommandId::new();
+        self.run_commands.insert(
+            id,
+            RunCommand {
+                id,
+                run_id: run,
+                kind: RunCommandKind::Cancel,
+                issued_by: user,
+                issued_box: box_id,
+                status: RunCommandStatus::Pending,
+                resolution: None,
+                issued_at: now,
+                resolved_at: None,
+            },
+        );
+        Ok(CancelRequest::Inserted(id))
+    }
+
+    fn pending_commands(&self, owner: Uuid, box_id: BoxId, now: DateTime<Utc>) -> Vec<RunCommand> {
+        let applies = |run: RunId| {
+            if self.lease_owners.get(&run) == Some(&owner) {
+                return true;
+            }
+            let Some(row) = self.runs.get(&run) else {
+                return false;
+            };
+            row.executing_box_id == Some(box_id)
+                && (row.status.is_terminal()
+                    || (matches!(row.status, RunStatus::Running | RunStatus::AwaitingApproval)
+                        && (!self.lease_owners.contains_key(&run)
+                            || row.lease_expires_at.is_none_or(|expiry| expiry <= now))))
+        };
+        let mut rows: Vec<RunCommand> = self
+            .run_commands
+            .values()
+            .filter(|c| c.status == RunCommandStatus::Pending && applies(c.run_id))
+            .cloned()
+            .collect();
+        rows.sort_unstable_by_key(|row| (row.issued_at, row.id));
+        rows
+    }
+
+    fn resolve_command(
+        &mut self,
+        id: RunCommandId,
+        to: RunCommandStatus,
+        resolution: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        if to == RunCommandStatus::Pending {
+            return Err(StoreError::Constraint(format!(
+                "run_command `{id}` resolves to `applied` or `refused`, not `pending`"
+            )));
+        }
+        let Some(row) = self.run_commands.get_mut(&id) else {
+            return Err(StoreError::NotFound {
+                entity: "run_command",
+                id: id.to_string(),
+            });
+        };
+        if row.status != RunCommandStatus::Pending {
+            return Ok(false);
+        }
+        row.status = to;
+        row.resolution = resolution;
+        row.resolved_at = Some(now);
+        Ok(true)
+    }
+}
+
 impl ReadStore for MemStore {
     async fn items(&self, scope: &Scope, filter: &ItemFilter) -> Result<Vec<ItemSummary>> {
         Ok(self.read(|state| state.item_summaries(scope, filter)))
@@ -6478,64 +6831,72 @@ impl WriteStore for MemStore {
 
     // -- MOD-42: the permission and control relay (plan D1-D5, D12-D14)
 
-    async fn open_permission(&self, _open: OpenPermission) -> Result<PermissionId> {
-        Err(StoreError::Backend("MOD-42 T0: red".into()))
+    async fn open_permission(&self, open: OpenPermission) -> Result<PermissionId> {
+        let now = self.now();
+        self.write(|state| state.open_permission(open, now))
     }
 
-    async fn permission(&self, _id: PermissionId) -> Result<Option<StepPermission>> {
-        Err(StoreError::Backend("MOD-42 T0: red".into()))
+    async fn permission(&self, id: PermissionId) -> Result<Option<StepPermission>> {
+        Ok(self.read(|state| state.permissions.get(&id).map(|p| p.row.clone())))
     }
 
     async fn apply_permission(
         &self,
-        _id: PermissionId,
-        _owner: Uuid,
+        id: PermissionId,
+        owner: Uuid,
     ) -> Result<Option<PermissionChoice>> {
-        Err(StoreError::Backend("MOD-42 T0: red".into()))
+        let now = self.now();
+        self.write(|state| state.apply_permission(id, owner, now))
     }
 
     async fn settle_permissions(
         &self,
-        _session: RelaySessionId,
-        _to: PermissionStatus,
+        session: RelaySessionId,
+        to: PermissionStatus,
     ) -> Result<u64> {
-        Err(StoreError::Backend("MOD-42 T0: red".into()))
+        let now = self.now();
+        self.write(|state| state.settle_permissions(session, to, now))
     }
 
     async fn request_cancel(
         &self,
-        _run: RunId,
-        _user: UserId,
-        _box_id: BoxId,
+        run: RunId,
+        user: UserId,
+        box_id: BoxId,
     ) -> Result<CancelRequest> {
-        Err(StoreError::Backend("MOD-42 T0: red".into()))
+        let now = self.now();
+        self.write(|state| state.request_cancel(run, user, box_id, now))
     }
 
-    async fn pending_commands(&self, _owner: Uuid, _box_id: BoxId) -> Result<Vec<RunCommand>> {
-        Err(StoreError::Backend("MOD-42 T0: red".into()))
+    async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> Result<Vec<RunCommand>> {
+        let now = self.now();
+        Ok(self.read(|state| state.pending_commands(owner, box_id, now)))
     }
 
     async fn resolve_command(
         &self,
-        _id: RunCommandId,
-        _to: RunCommandStatus,
-        _resolution: Option<String>,
+        id: RunCommandId,
+        to: RunCommandStatus,
+        resolution: Option<String>,
     ) -> Result<bool> {
-        Err(StoreError::Backend("MOD-42 T0: red".into()))
+        let now = self.now();
+        self.write(|state| state.resolve_command(id, to, resolution, now))
     }
 
-    async fn relay_view(&self, _item: ItemId) -> Result<RelayView> {
-        Err(StoreError::Backend("MOD-42 T0: red".into()))
+    async fn relay_view(&self, item: ItemId) -> Result<RelayView> {
+        let now = self.now();
+        Ok(self.read(|state| state.relay_view(item, now)))
     }
 
     async fn answer_permission(
         &self,
-        _id: PermissionId,
-        _option_id: &str,
-        _user: UserId,
-        _box_id: BoxId,
+        id: PermissionId,
+        option_id: &str,
+        user: UserId,
+        box_id: BoxId,
     ) -> Result<AnswerOutcome> {
-        Err(StoreError::Backend("MOD-42 T0: red".into()))
+        let now = self.now();
+        self.write(|state| state.answer_permission(id, option_id, user, box_id, now))
     }
 }
 
@@ -8174,7 +8535,8 @@ mod tests {
     /// on a handle frozen at `t` stamp exactly `t`.
     #[tokio::test]
     async fn relay_times_are_the_handles_clock() {
-        let t = Utc::now() - TimeDelta::days(2);
+        // A `TestClock` truncates to Postgres's digits, so `t` is read back through one.
+        let t = TestClock::at(Utc::now() - TimeDelta::days(2)).now();
         let store = MemStore::demo().handle_at(t);
         let owner = Uuid::now_v7();
         let run = store
@@ -8271,10 +8633,60 @@ mod tests {
     async fn delete_project_leaves_no_row_in_any_map() {
         let store = MemStore::demo();
         let gone = ids::PROJECT_HTUI;
+        // MOD-42 (F-18): the fixture seeds no relay row, so one of each is staged on `htui` runs.
+        assert!(matches!(
+            store
+                .request_cancel(ids::RUN_2, ids::USER, ids::BOX)
+                .await
+                .expect("the cancel is written"),
+            CancelRequest::Inserted(_)
+        ));
+        let owner = Uuid::now_v7();
+        let staged = PermissionId::new();
+        store
+            .write(|state| {
+                state.lease_owners.insert(ids::RUN_1, owner);
+                state.open_permission(
+                    OpenPermission {
+                        id: staged,
+                        run_id: ids::RUN_1,
+                        run_step_id: ids::STEP_IMPL,
+                        session: RelaySessionId::new(),
+                        request_id: "req-1".to_owned(),
+                        tool_call_id: None,
+                        summary: None,
+                        options: Vec::new(),
+                        owner,
+                    },
+                    Utc::now(),
+                )
+            })
+            .expect("the request parks");
+        assert_eq!(
+            (store.relay_rows().len(), store.command_rows().len()),
+            (1, 1),
+            "precondition: one relay row of each table"
+        );
         store.delete_project(gone).await.expect("the delete lands");
 
         store.read(|state| {
             assert!(!state.projects.contains_key(&gone), "the project itself");
+            assert!(
+                state
+                    .permissions
+                    .values()
+                    .all(|p| state.runs.contains_key(&p.row.run_id))
+                    && !state.permissions.contains_key(&staged),
+                "step_permission goes with its run (MOD-42 plan D1)"
+            );
+            assert!(
+                state
+                    .run_commands
+                    .values()
+                    .all(|c| state.runs.contains_key(&c.run_id))
+                    && state.run_commands.is_empty(),
+                "run_command goes with its run (MOD-42 plan D1)"
+            );
             assert!(
                 state.kinds.values().all(|row| row.project_id != gone),
                 "item_kind"
