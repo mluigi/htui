@@ -5373,6 +5373,8 @@ async fn a_paste_lands_in_the_focused_tool_path() {
 /// D10, B17, and the maintainer's amendment to blueprint §5: a row whose `probe.source` is
 /// `manual` ends its verdict in `*`, whatever the verdict is, and the idle note says what the
 /// star means only while such a row is listed. A switched-off row reads `switched off`, unmarked.
+/// The note counts only a star a cell can show (review N1): not a switched-off row's, and none
+/// while every cell reads `probing…`.
 #[tokio::test]
 async fn a_manual_row_reads_manual_in_the_on_this_box_cell() {
     let bench = SectionBench::new().await;
@@ -5394,10 +5396,10 @@ async fn a_manual_row_reads_manual_in_the_on_this_box_cell() {
     let section = section_over(
         &bench,
         vec![
-            manual_ready,
+            manual_ready.clone(),
             manual_missing,
             probe_ready.clone(),
-            manual_off,
+            manual_off.clone(),
         ],
     );
     let rendered = render_section(&section, &bench.ctx());
@@ -5416,11 +5418,33 @@ async fn a_manual_row_reads_manual_in_the_on_this_box_cell() {
     assert_eq!(note_line(&rendered), IDLE_NOTE_MANUAL, "{rendered}");
     assert!(IDLE_NOTE_MANUAL.chars().count() <= SECTION_BORDERED as usize);
 
-    let section = section_over(&bench, vec![probe_ready]);
+    let section = section_over(&bench, vec![probe_ready.clone()]);
     assert_eq!(
         note_line(&render_section(&section, &bench.ctx())),
         IDLE_NOTE,
         "no manual row, no star to explain"
+    );
+
+    let section = section_over(&bench, vec![manual_off, probe_ready]);
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        note_line(&rendered),
+        IDLE_NOTE,
+        "a switched-off manual row shows no star: {rendered}"
+    );
+
+    let mut section = section_over(&bench, vec![manual_ready]);
+    bench.key(&mut section, "r");
+    let rendered = render_section(&section, &bench.ctx());
+    assert_eq!(
+        on_box_cell(&rendered, "m-ready"),
+        "probing\u{2026}",
+        "{rendered}"
+    );
+    assert_eq!(
+        note_line(&rendered),
+        IDLE_NOTE,
+        "no star while probing: {rendered}"
     );
 }
 

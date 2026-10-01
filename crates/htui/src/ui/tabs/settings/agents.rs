@@ -1277,12 +1277,17 @@ impl AgentsSection {
         }
     }
 
-    /// Whether any listed row's `probe.source` is `manual`: the idle note then says what the
-    /// cell's `*` means (MOD-66, the amendment to blueprint §5).
+    /// Whether any listed row's cell shows `*`: the idle note then says what it means (MOD-66,
+    /// the amendment to blueprint §5). Only a star [`on_box_cell`](Self::on_box_cell) can draw
+    /// counts (review N1): none while `probing` covers every cell, and none on a row switched off
+    /// here, whose cell reads `switched off`. The install and login cells need no test: the note
+    /// is the idle one, so neither is running.
     fn lists_a_manual_row(&self) -> bool {
-        self.agents
-            .iter()
-            .any(|summary| summary.on_box.as_ref().is_some_and(is_manual))
+        !self.probing
+            && self
+                .agents
+                .iter()
+                .any(|summary| !summary.user_off && summary.on_box.as_ref().is_some_and(is_manual))
     }
 
     /// The progress cell of the row an install is running on, or `None` for every other row.
