@@ -1862,12 +1862,18 @@ pub async fn pump<S: htui_core::store::RecorderStore>(
     // MOD-42 plan D6: `drive` with no relay and a control nothing signals is today's loop: no
     // policy evaluation, no row, and a parked request is pulled past exactly as before, so the
     // transport still answers "is parked" (I-8).
-    drive(
+    //
+    // Boxed: `drive`'s state machine (the relay wait, the cancel sequence, its `select!`s) is
+    // large, and awaiting it inline embeds it in every caller's future. The engine nests this
+    // future several levels deep, and the debug build's 2 MiB test and worker stacks overflowed
+    // on it (`htui-orch` `every_case_name_dispatches`, MOD-42 wave gate). One allocation per
+    // session.
+    Box::pin(drive(
         session,
         recorder,
         None::<&Relay<'_, NoRelay>>,
         &mut Control::never(),
-    )
+    ))
     .await
 }
 

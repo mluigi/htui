@@ -2207,3 +2207,37 @@ check() { (cd crates/htui-store && $LOCK env DATABASE_URL=$SQLX_DB \
 | G-T3 | `nopg htui-orch`; `nopg htui-worker`; `$NOPG cargo test -p htui --all-features run_worker -- --test-threads=1`; `lint htui-orch`; `lint htui-worker`; `cargo fmt --all -- --check` |
 | G-T4 | `nopg htui-worker`; `pg htui` (includes `runs_pg`, `worker_pg`); `lint htui-worker`; `lint htui`; `cargo fmt --all -- --check` |
 | G-Final | The plan's Validation list: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `SQLX_OFFLINE=true cargo check --workspace --all-targets --all-features`; `$LOCK cargo test --workspace --all-features -- --test-threads=1`; `check`; `cargo insta test --workspace --all-features` with nothing pending (DSN unset); `bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh`; the §10 rule 10 checks |
+
+---
+
+## 13. Implementation amendments (recorded by the main thread)
+
+Deviations the lanes made on evidence, accepted by the main thread; the code and its tests are
+binding where they differ from §2-§9 above.
+
+- **A-1 · Actor before status, both stores (T0 deferred → T1).** `answer_permission` and
+  `request_cancel` check, on a miss: `NotFound` (row / run), then the actor (`Constraint`,
+  B-7), then status / `NotOffered` / `ExecutorGone` (resp. `AlreadyPending`). MemStore's order
+  (§2.11) is the spec; PgStore's re-reads follow it (`pg/relay.rs`), and §2.10's `live!` column is
+  dropped (with the row pending and the option offered the answer is `ExecutorGone` either way).
+  Pinned by `pg_criteria.rs::an_unknown_actor_is_refused_before_the_status`. (T1 `f066694`.)
+- **A-2 · A fenced exit settles nothing (T2, amends B-15).** `drive` marks leftover rows `stale` on
+  every exit except `Cancelled` **and `Store(Fenced)`**: a writer that lost its lease writes nothing
+  more (MOD-40 D1). The row stays `answered`, is unanswerable (`ExecutorGone`), is hidden by
+  `relay_view`, and is staled by the adopter's next `open_permission` on the step (D5). Pinned by
+  `an_answer_whose_lease_is_gone_is_fenced`. (T2 `9e93de2`.)
+- **A-3 · The post-cancel drain stops at the turn's `done` (T2, amends plan D6 "to the stream's
+  end").** ACP's stream outlives a cancelled turn, so draining to `None` would make every cancel
+  wait the full `grace + DRAIN_SLACK`. The cancel's synthesized `tool_result`s arrive before the
+  `done`; the log still ends `done {stop_reason: cancelled}` (I-7). B-11's bound covers only the
+  pulls, never a recording in flight (`the_drain_bound_never_drops_a_row_mid_flush`). (T2
+  `9e93de2`, `13123e0`.)
+- **A-4 · `Control::changed` as an if-let chain (T2).** §2.5's match-guard body does not compile
+  (E0596); same meaning.
+- **A-5 · One answer in flight per relayed request (T5).** A second digit before the first
+  `AnswerPermission` reply is consumed and sends nothing: the app's staleness gate keys on
+  `(origin, discriminant)` and would otherwise drop the winning reply and show the loser's
+  `ALREADY_ANSWERED`. (T5 `cbbc061`.)
+- **A-6 · Offline harness test dispatches `RelayView` directly (T5).** `seed_mirror` seeds no
+  items, so the offline Runs pane is unreachable in the harness; the pane's empty-view path is
+  pinned by a `runs.rs` unit case instead. (T5 `a339e4d`, `cbbc061`.)
