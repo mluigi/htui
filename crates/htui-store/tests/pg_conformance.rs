@@ -17,16 +17,17 @@ use htui_store::testkit as common;
 /// The number of cases `crates/htui-core/tests/mem_store.rs` carries, asserted here too so a case
 /// added to `CASES` without a Postgres run fails loudly.
 /// 96 before MOD-41 and MOD-23's switch case; MOD-41 T1's four fence cases (plan D1) and T7's three
-/// executor edit cases (plan D10) make it 104.
-const EXPECTED_CASES: usize = 104;
+/// executor edit cases (plan D10) make it 104, and MOD-51's two `box_probe_spec` cases (plan D7)
+/// 106.
+const EXPECTED_CASES: usize = 106;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (103 since MOD-41 T7's three \
-         executor edit cases)"
+        "every conformance case must run against PgStore too (106 since MOD-51's two \
+         box_probe_spec cases)"
     );
 }
 

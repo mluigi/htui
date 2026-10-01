@@ -20,15 +20,15 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::{
-    Activation, Agent, AgentBox, AgentId, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord,
-    BoxRow, BoxSettings, BoxTool, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId,
-    CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor, GateOutcome, Isolation,
-    Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision,
-    NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate,
-    NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Priority, Project, ProjectId,
-    ProjectPatch, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
+    Activation, Agent, AgentBox, AgentId, BOX_PROBE_SPEC_KEY, BindingChange, BoxEdit, BoxId,
+    BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool, ChatRunSpec, CitationKind, Claim,
+    CommandRun, CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor,
+    GateOutcome, Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
+    ItemRequirement, ItemRevision, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
+    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
+    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, PhaseId, PhasePatch, Priority,
+    Project, ProjectId, ProjectPatch, PromptTemplate, PromptTemplateId, Repo, RepoBoxPath, RepoId,
+    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
     RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
     RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Skill,
     SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
@@ -39,7 +39,10 @@ use htui_core::model::{
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::seed;
-use htui_core::store::traits::{BOX_SETTINGS_NOT_AN_OBJECT, EXECUTOR_MUST_BE_KNOWN};
+use htui_core::store::traits::{
+    BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
+    EXECUTOR_MUST_BE_KNOWN,
+};
 use htui_core::store::{
     BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung,
     StepFence, StoreError, StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, already_exists,
@@ -1612,17 +1615,95 @@ impl WriteStore for PgStore {
         }
     }
 
+    /// The overlay row (MOD-51 D2): `PgStore::stored_setting`'s `App` statement, byte for byte,
+    /// bound to [`BOX_PROBE_SPEC_KEY`], so it reuses that statement's offline entry.
     async fn box_probe_spec(&self) -> Result<Option<StoredSetting>> {
-        todo!("MOD-51 T2: the App-rung SELECT, next commit")
+        let row = sqlx::query!(
+            "SELECT value, updated_at FROM app_setting WHERE key = $1",
+            BOX_PROBE_SPEC_KEY,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(row.map(|row| StoredSetting {
+            value: Some(row.value),
+            updated_at: row.updated_at,
+        }))
     }
 
+    /// The overlay's compare-and-set (MOD-51 D2): the `App` rung's three statements of
+    /// `set_setting` and `clear_setting`, byte for byte, so no offline entry is added. A miss
+    /// re-reads through [`box_probe_spec`](WriteStore::box_probe_spec) and answers `Stale` with
+    /// whatever is there now, `None` included; unlike `cas_miss`, never `NotFound`.
+    ///
+    /// The re-read is a second statement outside the write, the window every `cas_miss` caller
+    /// has: a row inserted or deleted between the two is reported as it is at the re-read.
     async fn set_box_probe_spec(
         &self,
         overlay: Option<Value>,
         expected: Option<DateTime<Utc>>,
     ) -> Result<CasOutcome<Option<StoredSetting>>> {
-        let _ = (overlay, expected);
-        todo!("MOD-51 T2: the App-rung INSERT / UPDATE / DELETE, next commit")
+        if overlay.as_ref().is_some_and(|value| !value.is_object()) {
+            return Err(StoreError::Constraint(
+                BOX_PROBE_SPEC_NOT_AN_OBJECT.to_owned(),
+            ));
+        }
+        let name = BOX_PROBE_SPEC_KEY;
+        // The three literals are `set_setting`'s and `clear_setting`'s `App` statements byte for
+        // byte, indentation included: the offline cache keys a statement by the SHA-256 of its
+        // text (MOD-51 F-9), so they look mis-indented here on purpose.
+        let landed: Option<DateTime<Utc>> = match (&overlay, expected) {
+            // Before any SQL, so both refusals win over `Stale` (D2's precedence).
+            (None, None) => {
+                return Err(StoreError::Constraint(
+                    BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN.to_owned(),
+                ));
+            }
+            // "I expect no row": a conflict means somebody is there, and that is `Stale`.
+            (Some(value), None) => sqlx::query_scalar!(
+                r#"
+                        INSERT INTO app_setting (key, value) VALUES ($1, $2)
+                        ON CONFLICT (key) DO NOTHING
+                        RETURNING updated_at AS "updated_at!"
+                        "#,
+                name,
+                value,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?,
+            (Some(value), Some(token)) => sqlx::query_scalar!(
+                r#"
+                        UPDATE app_setting SET value = $2
+                         WHERE key = $1 AND updated_at = $3
+                        RETURNING updated_at AS "updated_at!"
+                        "#,
+                name,
+                value,
+                token,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?,
+            (None, Some(token)) => sqlx::query_scalar!(
+                r#"
+                    DELETE FROM app_setting WHERE key = $1 AND updated_at = $2
+                    RETURNING updated_at AS "updated_at!"
+                    "#,
+                name,
+                token,
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?,
+        };
+        match landed {
+            Some(updated_at) => Ok(CasOutcome::Applied(overlay.map(|value| StoredSetting {
+                value: Some(value),
+                updated_at,
+            }))),
+            None => Ok(CasOutcome::Stale(self.box_probe_spec().await?)),
+        }
     }
 
     /// The `run` / `run_step` pair of a free-standing chat, in one transaction, both
