@@ -75,8 +75,71 @@ impl Facts {
     ///
     /// [`FactsError`], first by line order for duplicates, then by [`KEYS`] order for absences.
     pub fn parse(stdout: &str) -> Result<Self, FactsError> {
-        let _ = stdout;
-        todo!()
+        let mut values: [Option<&str>; KEYS.len()] = [None; KEYS.len()];
+        for line in stdout.lines() {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let Some((key, value)) = line
+                .strip_prefix("htui.")
+                .and_then(|rest| rest.split_once('='))
+            else {
+                continue;
+            };
+            let Some(at) = KEYS.iter().position(|k| *k == key) else {
+                continue;
+            };
+            if values[at].is_some() {
+                return Err(FactsError::Duplicate(KEYS[at]));
+            }
+            values[at] = Some(value);
+        }
+        if values.iter().all(Option::is_none) {
+            return Err(FactsError::NoPreflight);
+        }
+        if let Some(at) = values.iter().position(Option::is_none) {
+            return Err(FactsError::Missing(KEYS[at]));
+        }
+        let get = |key: &'static str| -> &str {
+            KEYS.iter()
+                .position(|k| *k == key)
+                .and_then(|at| values[at])
+                .unwrap_or_default()
+        };
+        let yes_no = |key: &'static str| match get(key) {
+            "yes" => Ok(true),
+            "no" => Ok(false),
+            _ => Err(FactsError::Unreadable(key)),
+        };
+        let systemd = match get("systemd") {
+            "none" => None,
+            v if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => Some(
+                v.parse::<u32>()
+                    .map_err(|_| FactsError::Unreadable("systemd"))?,
+            ),
+            _ => return Err(FactsError::Unreadable("systemd")),
+        };
+        let sudo = match get("sudo") {
+            "nopasswd" => Some(SudoMode::NoPassword),
+            "password" => Some(SudoMode::Password),
+            "none" => None,
+            _ => return Err(FactsError::Unreadable("sudo")),
+        };
+        let bin_sha = match get("bin_sha") {
+            "none" => None,
+            v => Some(v.to_owned()),
+        };
+        Ok(Self {
+            os: get("os").to_owned(),
+            arch: get("arch").to_owned(),
+            systemd,
+            creds: yes_no("creds")?,
+            user: get("user").to_owned(),
+            group: get("group").to_owned(),
+            home: get("home").to_owned(),
+            bin_sha,
+            unit: yes_no("unit")?,
+            active: get("active").to_owned(),
+            sudo,
+        })
     }
 }
 

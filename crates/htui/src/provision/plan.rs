@@ -44,15 +44,71 @@ pub const MIN_SYSTEMD: u32 = 250;
 /// different-build refusal, already provisioned, else the steps.
 #[must_use]
 pub fn decide(facts: &Facts, local: &LocalFacts, replace_credential: bool) -> Decision {
-    let _ = (facts, local, replace_credential);
-    todo!()
+    let refuse = Decision::Refuse;
+    if facts.os != "Linux" {
+        return refuse(format!("the remote host runs {}, not Linux", facts.os));
+    }
+    if !matches!(local.arch.as_str(), "x86_64" | "aarch64") {
+        return refuse(format!(
+            "this htui build is {}; provisioning supports x86_64 and aarch64",
+            local.arch
+        ));
+    }
+    let remote = normalise_arch(&facts.arch);
+    if remote != local.arch {
+        return refuse(format!(
+            "the remote host is {remote} and this htui build is {}; provisioning ships this \
+             binary, so the two must match",
+            local.arch
+        ));
+    }
+    let Some(systemd) = facts.systemd else {
+        return refuse("the remote host has no systemd".to_owned());
+    };
+    if systemd < MIN_SYSTEMD {
+        return refuse(format!(
+            "the remote host has systemd {systemd}; provisioning needs {MIN_SYSTEMD} or later for \
+             LoadCredentialEncrypted="
+        ));
+    }
+    if !facts.creds {
+        return refuse("the remote host has no systemd-creds on its PATH".to_owned());
+    }
+    let Some(sudo) = facts.sudo else {
+        return refuse(
+            "the remote host has no sudo; provisioning installs a system service and needs it"
+                .to_owned(),
+        );
+    };
+    let same_build = facts.bin_sha.as_deref() == Some(local.sha.as_str());
+    if facts.unit {
+        if facts.bin_sha.is_none() {
+            return refuse(
+                "already provisioned with a different build, or set up by hand; upgrading is not \
+                 supported yet"
+                    .to_owned(),
+            );
+        }
+        if !same_build {
+            return refuse(
+                "already provisioned with a different build; upgrading is not supported yet"
+                    .to_owned(),
+            );
+        }
+        if facts.active == "active" && !replace_credential {
+            return Decision::AlreadyProvisioned;
+        }
+    }
+    Decision::Steps {
+        upload: !same_build,
+        sudo,
+    }
 }
 
 /// `arm64` → `aarch64`; anything else unchanged (D293).
 #[must_use]
 pub fn normalise_arch(arch: &str) -> &str {
-    let _ = arch;
-    todo!()
+    if arch == "arm64" { "aarch64" } else { arch }
 }
 
 /// D296: non-empty, no leading `-`, no whitespace or control character.
@@ -61,8 +117,19 @@ pub fn normalise_arch(arch: &str) -> &str {
 ///
 /// The refusal sentence (it never repeats the destination).
 pub fn validate_destination(destination: &str) -> Result<(), String> {
-    let _ = destination;
-    todo!()
+    let bad = destination.is_empty()
+        || destination.starts_with('-')
+        || destination
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control());
+    if bad {
+        return Err(
+            "the ssh destination must not be empty, start with \"-\", or contain \
+                    whitespace or control characters"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 /// D296: `^[a-z_][a-z0-9_-]{0,31}$`; `field` is `user` or `group`.
@@ -71,8 +138,20 @@ pub fn validate_destination(destination: &str) -> Result<(), String> {
 ///
 /// The refusal sentence, naming `field`.
 pub fn validate_account(field: &'static str, name: &str) -> Result<(), String> {
-    let _ = (field, name);
-    todo!()
+    let bytes = name.as_bytes();
+    let ok = matches!(bytes.first(), Some(b'a'..=b'z' | b'_'))
+        && bytes.len() <= 32
+        && bytes[1..]
+            .iter()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "the remote {field} {name:?} is not a name htui provision writes into a unit file \
+             (it must match [a-z_][a-z0-9_-]{{0,31}})"
+        ))
+    }
 }
 
 /// D296: absolute, bytes in `[A-Za-z0-9_./-]`, no `..`.
@@ -81,8 +160,19 @@ pub fn validate_account(field: &'static str, name: &str) -> Result<(), String> {
 ///
 /// The refusal sentence.
 pub fn validate_home(home: &str) -> Result<(), String> {
-    let _ = home;
-    todo!()
+    let ok = home.starts_with('/')
+        && !home.contains("..")
+        && home
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'/' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "the remote home {home:?} is not a path htui provision writes into a unit file \
+             (absolute, only A-Z a-z 0-9 _ . / -, no \"..\")"
+        ))
+    }
 }
 
 #[cfg(test)]
