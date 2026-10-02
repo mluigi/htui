@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM persona WHERE name = ANY($1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8b888a75c3d2797cd1a05e706abcb8f75dbb77cfb5a06eb2fc27aee570e98073"
+}

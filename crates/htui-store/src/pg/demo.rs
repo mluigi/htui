@@ -5,18 +5,18 @@
 //! the `BEFORE UPDATE` trigger of the migration does not touch an `INSERT`.
 //!
 //! No `ON CONFLICT DO NOTHING` anywhere: `load_demo` runs against a database created seconds
-//! earlier, so a conflict is a bug that must surface. The single exception is `agent`, which
-//! `seed_if_empty_as` has filled since MOD-2: the fixture deletes those two rows by name before
-//! inserting its own, because it brings a whole world rather than rows to merge (see the comment
-//! at the `agent` loop).
+//! earlier, so a conflict is a bug that must surface. The exceptions are `agent`, which
+//! `seed_if_empty_as` has filled since MOD-2, and `persona`, which it has filled since MOD-26
+//! (plan D7): the fixture deletes those rows by name before inserting its own, because it brings
+//! a whole world rather than rows to merge (see the comment at the `agent` loop).
 
 use htui_core::fixtures::DemoData;
 use htui_core::model::{
     AgentId, BoxId, CommandQueue, DocumentId, Gate, GateOutcome, Isolation, ItemId, ItemKindId,
-    NoteId, PhaseId, ProjectId, RequirementAreaId, RequirementId, Resolution, RunId,
+    NoteId, PersonaId, PhaseId, ProjectId, RequirementAreaId, RequirementId, Resolution, RunId,
     SkillBindingId, SkillId, StepGraphId, StepId, UserId, WorkspaceId,
 };
-use htui_core::store::Result;
+use htui_core::store::{Result, StoreError};
 
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
@@ -184,6 +184,43 @@ impl PgStore {
             .map_err(map_sqlx)?;
         }
 
+        // MOD-26 D7: `persona` is the agent registry's case again. `seed_if_empty_as` put the two
+        // seed personas in; the fixture carries the same names under its own ids, so the seeded
+        // rows go first. No phase is bound yet (the phases are inserted below).
+        let fixture_personas: Vec<String> =
+            data.personas.iter().map(|row| row.name.clone()).collect();
+        sqlx::query!(
+            "DELETE FROM persona WHERE name = ANY($1)",
+            &fixture_personas[..]
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        for row in &data.personas {
+            let tools = serde_json::to_value(&row.tools).map_err(|error| {
+                StoreError::Constraint(format!("persona.tools does not serialise: {error}"))
+            })?;
+            let permission = serde_json::to_value(&row.permission).map_err(|error| {
+                StoreError::Constraint(format!("persona.permission does not serialise: {error}"))
+            })?;
+            sqlx::query!(
+                "INSERT INTO persona (id, name, description, body, tools, permission, created_at, \
+                 updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                PersonaId::as_uuid(row.id),
+                row.name,
+                row.description,
+                row.body,
+                tools,
+                permission,
+                row.created_at,
+                row.updated_at,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
         for row in &data.graphs {
             sqlx::query!(
                 "INSERT INTO step_graph (id, project_id, name, description, created_at, \
@@ -204,9 +241,10 @@ impl PgStore {
             sqlx::query!(
                 "INSERT INTO step_graph_phase (id, graph_id, position, name, fan_out, gate, \
                  gate_hard, retry_limit, input_kinds, output_kind, isolation, command_queue, \
-                 verify_command, template_name, template_version, token_budget, updated_at) \
+                 verify_command, template_name, template_version, token_budget, updated_at, \
+                 persona_id) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-                 $17)",
+                 $17, $18)",
                 row.id.as_uuid(),
                 StepGraphId::as_uuid(row.graph_id),
                 row.position,
@@ -224,6 +262,7 @@ impl PgStore {
                 row.template_version,
                 row.token_budget,
                 row.updated_at,
+                row.persona_id.map(PersonaId::as_uuid),
             )
             .execute(&mut *tx)
             .await

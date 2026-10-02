@@ -56,6 +56,7 @@ use serde_json::Value;
 
 use crate::model::box_::BoxProfile;
 use crate::model::link::UpstreamEntry;
+use crate::model::persona::SnapshotPersona;
 use crate::model::skill::{BoundSkill, SkillChoice, StepFiles, select};
 use crate::prompt::render::{HostnameLine, Rendered};
 use crate::prompt::trim::{Inputs, Trimmer};
@@ -106,6 +107,10 @@ pub struct PromptSpec {
     /// attachments, most specific winning, inactive ones included. The assembler collapses and
     /// selects (MOD-9 D43).
     pub skills: Vec<BoundSkill>,
+    /// MOD-26 D13: the phase's persona, rendered as the protected `persona` section ahead of
+    /// the template body. `None` — every judge, handoff and preview spec and every persona-less
+    /// phase — renders exactly as before (I-7).
+    pub persona: Option<PersonaBlock>,
     /// §4.5's read and windowed excerpts, with the audit half the ranker filled.
     pub excerpts: ExcerptSet,
     /// MOD-9 D110/D117: the F2 file set a `glob` attachment matches against — the excerpt walk's
@@ -142,6 +147,28 @@ pub struct TemplateRef {
     /// `prompt_template.version`. Never `latest`: invariant 10 pins it into the snapshot.
     pub version: i32,
 }
+
+/// MOD-26 D13: what the persona frame renders — a frozen persona's name and body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonaBlock {
+    /// `SnapshotPersona.name`, the section's `persona` attribute.
+    pub name: String,
+    /// `SnapshotPersona.body`, the section's content.
+    pub body: String,
+}
+
+impl From<&SnapshotPersona> for PersonaBlock {
+    fn from(persona: &SnapshotPersona) -> Self {
+        Self {
+            name: persona.name.clone(),
+            body: persona.body.clone(),
+        }
+    }
+}
+
+/// MOD-26 D13, B-17: the bytes between the persona frame and the template body, counted in the
+/// frame's estimate.
+pub const PERSONA_SEPARATOR: &str = "\n\n";
 
 /// One resolved input document: the winner of its kind (§4.7 rule 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +272,9 @@ pub struct StepSummary {
 pub enum SectionName {
     /// The frame's literal spans. Always the first `sections[]` entry (P-9).
     Template,
+    /// The persona frame (MOD-26 D13). Always `sections[1]` when present: `template` keeps
+    /// `sections[0]`, P-9.
+    Persona,
     /// `item.body`.
     Item,
     /// One per resolved input kind; the payload is `document.kind`.
@@ -281,6 +311,7 @@ impl SectionName {
     pub fn render(&self) -> String {
         match self {
             Self::Template => "template".to_owned(),
+            Self::Persona => "persona".to_owned(),
             Self::Item => "item".to_owned(),
             Self::Documents(kind) => format!("documents:{kind}"),
             Self::Upstream => "upstream".to_owned(),
@@ -305,7 +336,7 @@ impl SectionName {
     #[must_use]
     pub const fn is_protected(&self, role: TemplateRole) -> bool {
         match self {
-            Self::Template | Self::Box | Self::Skills | Self::CommandQueue => true,
+            Self::Template | Self::Persona | Self::Box | Self::Skills | Self::CommandQueue => true,
             Self::FailureReason => matches!(role, TemplateRole::Handoff),
             _ => false,
         }
@@ -483,6 +514,11 @@ pub fn assemble(
 
     // 3. Render every section at full size, from inputs in canonical order (§4.7 rules 2, 4, 6).
     let mut rendered: Vec<(Placeholder, Rendered, i64)> = Vec::new();
+    // MOD-26 D13: the persona frame renders first and outside the body's spans, so it is scanned
+    // with every section below, protected in the trimmer, and recorded as `sections[1]`.
+    for section in render_sections(Placeholder::Persona, spec, upstream, skills, candidates) {
+        rendered.push((Placeholder::Persona, section, 1));
+    }
     for placeholder in &parsed.used {
         if !placeholder.is_section() {
             continue;
@@ -522,7 +558,12 @@ pub fn assemble(
 
     // 4. Estimate, 5. refuse, 6. trim — all three inside the trimmer, which owns the arithmetic.
     let est = spec.estimator;
-    let template_tokens = est.estimate(&masked.literals.concat());
+    // MOD-26 B-17: with a persona, the separator between its frame and the body is the frame's.
+    let mut frame = masked.literals.concat();
+    if spec.persona.is_some() {
+        frame.push_str(PERSONA_SEPARATOR);
+    }
+    let template_tokens = est.estimate(&frame);
     let inputs = Inputs {
         spec,
         upstream,
@@ -632,6 +673,12 @@ fn substitute(
             .push(render::wrap(section));
     }
     let mut text = String::new();
+    // MOD-26 D13: the persona frame, then one blank line, ahead of every span. `live` carries it
+    // only when the spec does, so a persona-less prompt is byte-identical (I-7).
+    if let Some(frame) = blocks.get(&Placeholder::Persona) {
+        text.push_str(&frame.join("\n\n"));
+        text.push_str(PERSONA_SEPARATOR);
+    }
     let mut literal = literals.iter();
     for span in &parsed.spans {
         match span {
@@ -749,6 +796,7 @@ fn render_sections(
             .iter()
             .map(|handoff| render::failure_reason(&handoff.failure_reason))
             .collect(),
+        Placeholder::Persona => spec.persona.iter().map(render::persona).collect(),
         Placeholder::ItemKey
         | Placeholder::ItemTitle
         | Placeholder::ItemKind
@@ -869,6 +917,12 @@ fn scrubbed_inputs(
     for skill in &mut spec.skills {
         mask(scrubber, &mut skill.name, &skills_name)?;
         mask(scrubber, &mut skill.body, &skills_name)?;
+    }
+
+    if let Some(persona) = &mut spec.persona {
+        let persona_name = SectionName::Persona.render();
+        mask(scrubber, &mut persona.name, &persona_name)?;
+        mask(scrubber, &mut persona.body, &persona_name)?;
     }
 
     let excerpts_name = SectionName::Excerpts.render();
@@ -1263,6 +1317,7 @@ mod tests {
         );
         assert_eq!(SectionName::JudgeCandidate(2).render(), "judge_candidate:2");
         assert_eq!(SectionName::Box.to_string(), "box");
+        assert_eq!(SectionName::Persona.render(), "persona");
         assert_eq!(
             serde_json::to_value(SectionName::VerifyFailure).expect("a string"),
             Value::String("verify_failure".to_owned()),
@@ -1279,6 +1334,7 @@ mod tests {
         ] {
             for name in [
                 SectionName::Template,
+                SectionName::Persona,
                 SectionName::Box,
                 SectionName::Skills,
                 SectionName::CommandQueue,

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id               AS \"id: PhaseId\",\n                   graph_id         AS \"graph_id: StepGraphId\",\n                   position,\n                   name,\n                   fan_out,\n                   gate             AS \"gate: Gate\",\n                   gate_hard,\n                   retry_limit,\n                   input_kinds,\n                   output_kind,\n                   isolation        AS \"isolation: Isolation\",\n                   command_queue    AS \"command_queue: CommandQueue\",\n                   verify_command,\n                   template_name,\n                   template_version,\n                   token_budget,\n                   updated_at\n              FROM step_graph_phase\n             WHERE graph_id = $1\n             ORDER BY position\n            ",
+  "query": "\n            INSERT INTO step_graph_phase (id, graph_id, position, name, fan_out, gate, gate_hard,\n                                          retry_limit, input_kinds, output_kind, isolation,\n                                          command_queue, verify_command, template_name,\n                                          template_version, token_budget, persona_id)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)\n            RETURNING id               AS \"id: PhaseId\",\n                      graph_id         AS \"graph_id: StepGraphId\",\n                      position,\n                      name,\n                      fan_out,\n                      gate             AS \"gate: htui_core::model::Gate\",\n                      gate_hard,\n                      retry_limit,\n                      input_kinds,\n                      output_kind,\n                      isolation        AS \"isolation: Isolation\",\n                      command_queue    AS \"command_queue: htui_core::model::CommandQueue\",\n                      verify_command,\n                      template_name,\n                      template_version,\n                      token_budget,\n                      persona_id       AS \"persona_id: PersonaId\",\n                      updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -60,7 +60,7 @@
       },
       {
         "ordinal": 5,
-        "name": "gate: Gate",
+        "name": "gate: htui_core::model::Gate",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -126,7 +126,7 @@
       },
       {
         "ordinal": 11,
-        "name": "command_queue: CommandQueue",
+        "name": "command_queue: htui_core::model::CommandQueue",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -181,6 +181,17 @@
       },
       {
         "ordinal": 16,
+        "name": "persona_id: PersonaId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "persona_id"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -193,6 +204,22 @@
     ],
     "parameters": {
       "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4",
+        "Text",
+        "Int4",
+        "Text",
+        "Bool",
+        "Int4",
+        "TextArray",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int4",
+        "Int4",
         "Uuid"
       ]
     },
@@ -213,8 +240,9 @@
       false,
       true,
       true,
+      true,
       false
     ]
   },
-  "hash": "53f57a029c09b07bcc37a6bb7ac10b05b9efa4542380b4a371966d7eb1fe3024"
+  "hash": "64322867aa0870fb1cd10499f2631aa81f1e8cd95732d7f0a9bafe222c071b43"
 }

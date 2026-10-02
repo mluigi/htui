@@ -300,6 +300,8 @@ pub fn judge_phase(
         template,
         candidates: vec![judge.clone()],
         judge: None,
+        // MOD-26 OQ-2: a judge runs under no persona, whatever the judged phase names.
+        persona: None,
         ..phase.clone()
     }
 }
@@ -725,6 +727,25 @@ mod tests {
         assert_eq!(forward.task, reversed.task);
         assert!(!forward.reverse);
         assert!(reversed.reverse);
+    }
+
+    /// MOD-26 OQ-2: the judge never inherits the judged phase's persona.
+    #[test]
+    fn the_judge_phase_drops_the_persona() {
+        let judged = SnapshotPhase {
+            persona: Some("reviewer".into()),
+            ..phase()
+        };
+        let template = SnapshotTemplate {
+            name: "judge".to_owned(),
+            version: 3,
+        };
+        let judge = SnapshotCandidate {
+            agent_id: ids::AGENT_AGY,
+            agent_name: "agy".to_owned(),
+            model: "gemini".to_owned(),
+        };
+        assert_eq!(judge_phase(&judged, template, &judge).persona, None);
     }
 
     /// D51, D53, F-G: the judge's phase is the judged one with the judge's own shape.

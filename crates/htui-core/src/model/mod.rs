@@ -91,6 +91,7 @@ pub mod kind;
 pub mod link;
 pub mod note;
 pub mod overlap;
+pub mod persona;
 pub mod quota;
 pub mod relay;
 pub mod requirement;
@@ -116,8 +117,8 @@ pub use hierarchy::{
     RepoPatch, Workspace, WorkspaceBoxPath, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
 };
 pub use ids::{
-    AgentId, BoxId, CommandRunId, DocumentId, ItemId, ItemKindId, NoteId, PermissionId, PhaseId,
-    ProjectId, PromptTemplateId, RelaySessionId, RepoId, RequirementAreaId, RequirementId,
+    AgentId, BoxId, CommandRunId, DocumentId, ItemId, ItemKindId, NoteId, PermissionId, PersonaId,
+    PhaseId, ProjectId, PromptTemplateId, RelaySessionId, RepoId, RequirementAreaId, RequirementId,
     RunCommandId, RunId, SkillBindingId, SkillId, StepGraphId, StepId, UserId, WorkspaceId,
 };
 pub use item::{
@@ -134,6 +135,10 @@ pub use link::{ItemLink, LinkEdge, LinkGraph, LinkKind, LinkNode, UpstreamEntry}
 pub use note::{NewNote, Note};
 pub use overlap::{
     Claim, OverlapRule, RepoScope, RunScope, missing_tags_failure, overlaps, scope_of,
+};
+pub use persona::{
+    NewPersona, Persona, PersonaAnswer, PersonaDefault, PersonaFile, PersonaFileError,
+    PersonaMatch, PersonaPatch, PersonaPermission, PersonaRule, PersonaTools, SnapshotPersona,
 };
 pub use quota::{
     Availability, CapError, PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN, ProjectCaps, Quota,
@@ -454,6 +459,7 @@ mod tests {
         check_id(PermissionId::from_uuid(u), u);
         check_id(RunCommandId::from_uuid(u), u);
         check_id(RelaySessionId::from_uuid(u), u);
+        check_id(PersonaId::from_uuid(u), u);
     }
 
     #[test]

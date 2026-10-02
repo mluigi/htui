@@ -97,6 +97,8 @@ pub fn handoff_spec(
         previous_diff: None,
         judge: None,
         skills: Vec::new(),
+        // MOD-26 OQ-5: a handoff runs under no persona, whatever the abandoned phase named.
+        persona: None,
         handoff: Some(HandoffInputs {
             step_summary: StepSummary::from_events(events, roots),
             diff_so_far,
@@ -113,7 +115,7 @@ mod tests {
     use htui_core::model::{EventRole, ProjectId, PromptTemplateId, StepId, UserId};
     use htui_core::prompt::excerpt::RootSource;
     use htui_core::prompt::fixtures::{handoff_basic, phase_implement_attempt2};
-    use htui_core::prompt::{assemble, body_of, parse};
+    use htui_core::prompt::{PersonaBlock, assemble, body_of, parse};
     use htui_core::scrub::MinimalScrubber;
     use serde_json::{Value, json};
     use uuid::Uuid;
@@ -426,6 +428,7 @@ mod tests {
             handoff: spec.handoff.clone(),
             // Blueprint F-C, D63: the fixture phase carries one skill, and a handoff carries none.
             skills: Vec::new(),
+            persona: None,
             ..phase.clone()
         };
         assert_eq!(
@@ -435,6 +438,27 @@ mod tests {
         assert_eq!(spec.item_key, phase.item_key);
         assert_eq!(spec.budget, phase.budget);
         assert_eq!(spec.attempt, phase.attempt);
+    }
+
+    /// MOD-26 OQ-5: the handoff spec never carries the abandoned phase's persona frame.
+    #[test]
+    fn the_handoff_spec_drops_the_persona() {
+        let phase = PromptSpec {
+            persona: Some(PersonaBlock {
+                name: "reviewer".to_owned(),
+                body: "You are the reviewer for this step.\n".to_owned(),
+            }),
+            ..phase_implement_attempt2()
+        };
+        let spec = handoff_spec(
+            phase,
+            &handoff_template(),
+            &handoff_events(),
+            &[root()],
+            Some(diff()),
+            "gave up".to_owned(),
+        );
+        assert_eq!(spec.persona, None);
     }
 
     /// MOD-9 D44 (blueprint F-D, D63): the handoff body cannot place `{{skills}}`, so a phase's

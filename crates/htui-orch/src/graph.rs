@@ -16,12 +16,13 @@ use std::collections::BTreeMap;
 use htui_core::model::{
     Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, GraphSnapshot,
     Isolation, Item, ItemId, ItemPatch, NewStepGraph, PhaseAgent, PhaseId, Project, ProjectId,
-    ProjectSettings, PromptTemplate, RepoId, ResolvedGraph, RunMode, SkillBinding, SkillBindingKey,
-    SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPhase, SnapshotSettings,
-    SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
+    ProjectSettings, PromptTemplate, RepoId, ResolvedGraph, ResolvedPhase, RunMode, SkillBinding,
+    SkillBindingKey, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPersona,
+    SnapshotPhase, SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WriteStore, check_attachment,
+    references_no_row,
 };
 use serde_json::Value;
 
@@ -252,9 +253,11 @@ pub enum ResolveError {
 ///
 /// ANA-2 defines the hash as "over the canonical serialisation of `phases[]`" (`:1479`) and never
 /// defines "canonical", so this is where it is defined: the envelope (`v`, `graph`, `mode`,
-/// `settings`) is excluded, field order is [`SnapshotPhase`]'s declaration order, and nulls are
-/// emitted because no field carries `skip_serializing_if`. Adding a `SnapshotPhase` field changes
-/// every digest and is therefore a `GraphSnapshot::V` question.
+/// `settings`, `scope`, `personas`) is excluded, field order is [`SnapshotPhase`]'s declaration
+/// order and nulls are emitted, **except `persona`** (MOD-26 D9), which is skipped when `None`, so
+/// a persona-less phase serialises exactly as before and only a bound phase's digest names its
+/// persona. Any other field added to `SnapshotPhase` changes every digest and is a
+/// `GraphSnapshot::V` question.
 ///
 /// **Never route this through `serde_json::Value`.** `serde_json`'s `preserve_order` feature is
 /// enabled in a whole-workspace build — `schemars` ← `agent-client-protocol-schema` ←
@@ -324,6 +327,8 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
     rows.sort_by_key(|row| row.phase.position);
 
     let mut phases = Vec::with_capacity(rows.len());
+    // MOD-26 D9 (B-18): each bound persona frozen once, by name and content.
+    let mut personas: Vec<SnapshotPersona> = Vec::new();
     for (dense, row) in rows.iter().enumerate() {
         let position = i32::try_from(dense).map_err(|_| {
             StoreError::Constraint(format!(
@@ -331,20 +336,21 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
                 resolved.graph.id
             ))
         })?;
-        phases.push(
-            snapshot_phase(
-                source,
-                &row.phase,
-                &row.agents,
-                position,
-                project.id,
-                &settings,
-                app,
-                box_id,
-            )
-            .await?,
-        );
+        let mut phase = snapshot_phase(
+            source,
+            &row.phase,
+            &row.agents,
+            position,
+            project.id,
+            &settings,
+            app,
+            box_id,
+        )
+        .await?;
+        phase.persona = frozen_persona(row, &mut personas)?;
+        phases.push(phase);
     }
+    personas.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
 
     let settings = SnapshotSettings {
         default_isolation: settings.default_isolation,
@@ -373,12 +379,39 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
         phases,
         settings,
         scope: Some(scope),
+        personas,
     };
 
     Ok(Resolved {
         snapshot,
         repo_scope,
     })
+}
+
+/// MOD-26 D9: the name of the persona `row` binds, frozen once into `personas`. A `persona_id`
+/// with no row is refused (unreachable under the FK and MemStore's write check) rather than
+/// frozen un-narrowed.
+fn frozen_persona(
+    row: &ResolvedPhase,
+    personas: &mut Vec<SnapshotPersona>,
+) -> std::result::Result<Option<String>, ResolveError> {
+    let Some(id) = row.phase.persona_id else {
+        return Ok(None);
+    };
+    let Some(persona) = &row.persona else {
+        return Err(ResolveError::Store(StoreError::Constraint(
+            references_no_row("step_graph_phase.persona_id", id, "persona"),
+        )));
+    };
+    if !personas.iter().any(|frozen| frozen.name == persona.name) {
+        personas.push(SnapshotPersona::freeze(persona).map_err(|err| {
+            ResolveError::Store(StoreError::Constraint(format!(
+                "persona `{}` does not serialise: {err}",
+                persona.name
+            )))
+        })?);
+    }
+    Ok(Some(persona.name.clone()))
 }
 
 /// `<item.key>-override`: a clone deep over `step_graph_phase` **and** over the source phases'
@@ -731,6 +764,9 @@ async fn snapshot_phase<G: GraphSource>(
                 template: judge_template(source, project).await?,
             }),
         },
+        // MOD-26 D9 (B-18): `resolve` binds the persona after this call, where the snapshot's
+        // persona list is built.
+        persona: None,
     })
 }
 
@@ -872,11 +908,12 @@ async fn agent_name<G: GraphSource>(
 mod tests {
     use htui_core::fixtures::{DemoData, demo_data, ids};
     use htui_core::model::{
-        Activation, Gate, NewRepo, PromptTemplateId, RepoId, RepoScope, RunScope, SkillBinding,
-        SkillBindingId,
+        Activation, Gate, NewRepo, PersonaId, PromptTemplateId, RepoId, RepoScope, RunScope,
+        SkillBinding, SkillBindingId, SnapshotPersona,
     };
     use htui_core::store::{
         MemStore, ReadStore, StoreError, glob_names_unknown_repo, negative_position,
+        references_no_row,
     };
     use serde_json::json;
 
@@ -915,6 +952,9 @@ question and not a test fix. Decide the version bump first, then paste the new d
     struct TestSource<'a> {
         store: &'a MemStore,
         candidates: Vec<(AgentId, &'static str)>,
+        /// MOD-26 B-18: a `persona_id` the first phase names with no `persona` row behind it, a
+        /// shape neither store can write.
+        unbacked: Option<PersonaId>,
     }
 
     impl<'a> TestSource<'a> {
@@ -923,6 +963,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             Self {
                 store,
                 candidates: vec![(ids::AGENT_CLAUDE, "sonnet")],
+                unbacked: None,
             }
         }
 
@@ -931,13 +972,24 @@ question and not a test fix. Decide the version bump first, then paste the new d
             Self {
                 store,
                 candidates: Vec::new(),
+                unbacked: None,
             }
         }
     }
 
     impl GraphSource for TestSource<'_> {
         async fn resolve_graph(&self, item: ItemId) -> Result<Option<ResolvedGraph>> {
-            self.store.resolve_graph(item).await
+            let mut graph = self.store.resolve_graph(item).await?;
+            if let (Some(id), Some(graph)) = (self.unbacked, graph.as_mut()) {
+                let first = graph
+                    .phases
+                    .iter_mut()
+                    .min_by_key(|row| row.phase.position)
+                    .expect("the graph has a phase");
+                first.phase.persona_id = Some(id);
+                first.persona = None;
+            }
+            Ok(graph)
         }
 
         async fn phase_agents(&self, phase: PhaseId) -> Result<Vec<PhaseAgent>> {
@@ -2242,5 +2294,112 @@ question and not a test fix. Decide the version bump first, then paste the new d
         resolve_item(&store, ids::HTUI_FEAT_1, &BTreeMap::new())
             .await
             .expect("`review` at fan_out 1 is the ordinary case");
+    }
+
+    /// The demo fixture with `FEAT`'s phases bound as `bind` names them: `(phase, persona id)`.
+    fn store_bound(bind: &[(&str, PersonaId)]) -> MemStore {
+        store_with(|data| {
+            for phase in &mut data.phases {
+                if phase.graph_id != ids::GRAPH_HTUI_FEAT {
+                    continue;
+                }
+                if let Some((_, persona)) = bind.iter().find(|(name, _)| *name == phase.name) {
+                    phase.persona_id = Some(*persona);
+                }
+            }
+        })
+    }
+
+    /// The fixture's persona row `id`.
+    fn persona_row(id: PersonaId) -> htui_core::model::Persona {
+        demo_data()
+            .personas
+            .into_iter()
+            .find(|row| row.id == id)
+            .expect("the fixture seeds both personas")
+    }
+
+    /// MOD-26 D9 (B-18): `StartRun` freezes each bound persona once, sorted by name bytes, with
+    /// `SnapshotPersona::freeze`'s digest, and each bound phase names its persona.
+    #[tokio::test]
+    async fn start_run_freezes_each_bound_persona_once() {
+        let store = store_bound(&[
+            ("prd", ids::PERSONA_REVIEWER),
+            ("plan", ids::PERSONA_ARCHITECT),
+            ("review", ids::PERSONA_REVIEWER),
+        ]);
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the bound feature graph resolves")
+            .snapshot;
+
+        let expected: Vec<SnapshotPersona> = [ids::PERSONA_ARCHITECT, ids::PERSONA_REVIEWER]
+            .into_iter()
+            .map(|id| SnapshotPersona::freeze(&persona_row(id)).expect("a fixture persona freezes"))
+            .collect();
+        assert_eq!(
+            snapshot.personas, expected,
+            "one frozen persona per name, sorted by name bytes"
+        );
+        assert_eq!(
+            snapshot
+                .phases
+                .iter()
+                .map(|phase| (phase.name.as_str(), phase.persona.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("prd", Some("reviewer")),
+                ("plan", Some("architect")),
+                ("implement", None),
+                ("review", Some("reviewer")),
+            ],
+            "each bound phase names its persona; the unbound one names none"
+        );
+    }
+
+    /// MOD-26 D9, I-7: a persona-less graph keeps [`FEATURE_TOPOLOGY`]; binding one phase moves it.
+    #[tokio::test]
+    async fn only_a_bound_phase_moves_the_topology() {
+        let store = MemStore::demo();
+        let bare = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the seeded feature graph resolves");
+        assert_eq!(bare.snapshot.topology, FEATURE_TOPOLOGY, "{TOPOLOGY_MOVED}");
+        assert!(
+            bare.snapshot.personas.is_empty(),
+            "no bound phase, no frozen persona"
+        );
+
+        let store = store_bound(&[("implement", ids::PERSONA_REVIEWER)]);
+        let bound = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the bound feature graph resolves");
+        assert_ne!(
+            bound.snapshot.topology, FEATURE_TOPOLOGY,
+            "a bound phase's digest names its persona (MOD-26 D9)"
+        );
+    }
+
+    /// MOD-26 B-18: a `persona_id` with no row behind it is refused at resolution rather than
+    /// frozen un-narrowed.
+    #[tokio::test]
+    async fn an_unbacked_persona_id_is_refused_at_resolution() {
+        let store = MemStore::demo();
+        let id = PersonaId::new();
+        let source = TestSource {
+            unbacked: Some(id),
+            ..TestSource::claude(&store)
+        };
+        let error = resolve_feat(&store, &source)
+            .await
+            .expect_err("an unbacked persona is refused");
+        assert_eq!(
+            error,
+            ResolveError::Store(StoreError::Constraint(references_no_row(
+                "step_graph_phase.persona_id",
+                id,
+                "persona",
+            )))
+        );
     }
 }

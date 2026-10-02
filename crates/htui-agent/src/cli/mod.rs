@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use crate::driver::{
     AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, PermissionAnswer,
-    PermissionRequestId, SessionSpec,
+    PermissionRequestId, SessionSpec, ToolExposure,
 };
 use crate::error::{DriverError, Result};
 use crate::event::{
@@ -103,6 +103,10 @@ pub const UNPARSED: &str = "<unparsed>";
 ///    continues, and the CLI refuses the pair (blueprint H-18);
 /// 5. the spec's model and extra directories;
 /// 6. the budget, **only above zero** — see below;
+///
+///    6½. the step's narrowing (MOD-26 D11): `--tools=<allow>` when the allow-list is not empty,
+///    then `--disallowedTools=<deny and the names deny_kinds inverts to>` when that is not empty,
+///    each one `=`-joined argument; `--allowedTools` is never emitted (I-1);
 /// 7. `settings.cli.extra_args` **last**, so an operator's repeated flag is the one the CLI keeps.
 ///
 /// **The budget flag is omitted at zero, and that is a measurement, not a nicety** (plan F-10):
@@ -157,8 +161,36 @@ pub fn argv(
         }
     }
 
+    // MOD-26 D11: the step's narrowing, each as one `=`-joined argument (the closure above pushes
+    // pairs). `--tools` restricts the built-in set and is omitted when `allow` is empty —
+    // `--tools=""` would disable every tool. `--allowedTools` is never emitted: it auto-approves
+    // (I-1, probed).
+    if !spec.tools.allow.is_empty() {
+        args.push(format!("--tools={}", spec.tools.allow.join(",")));
+    }
+    let denied = disallowed(&spec.tools);
+    if !denied.is_empty() {
+        args.push(format!("--disallowedTools={}", denied.join(",")));
+    }
+
     args.extend(cli.extra_args.iter().cloned());
     args
+}
+
+/// `deny`, then every name `deny_kinds` inverts to ([`claude::tool_names`]), first occurrence
+/// kept.
+fn disallowed(tools: &ToolExposure) -> Vec<String> {
+    let inverted = tools
+        .deny_kinds
+        .iter()
+        .flat_map(|kind| claude::tool_names(*kind).iter().copied());
+    let mut names: Vec<String> = Vec::new();
+    for name in tools.deny.iter().map(String::as_str).chain(inverted) {
+        if !names.iter().any(|kept| kept == name) {
+            names.push(name.to_owned());
+        }
+    }
+    names
 }
 
 /// USD micros as the decimal `--max-budget-usd` takes: integer arithmetic, six places, no float.

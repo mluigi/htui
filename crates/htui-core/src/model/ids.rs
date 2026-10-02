@@ -123,4 +123,6 @@ id_newtype!(
     /// `drive_once` (a candidate's session, each judge call), so request ids that repeat across
     /// sessions never collide (PRD MVP item 3).
     RelaySessionId,
+    /// `persona.id` (MOD-26 plan D1): one agent persona of the global registry.
+    PersonaId,
 );

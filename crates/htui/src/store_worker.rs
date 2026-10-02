@@ -603,7 +603,7 @@ pub enum StoreRequest {
         /// `step_graph_phase.input_kinds`, replaced whole.
         input_kinds: Vec<String>,
     },
-    /// CAS on `step_graph_phase.updated_at` (M1 D3) over [`PhasePatch`]'s five columns.
+    /// CAS on `step_graph_phase.updated_at` (M1 D3) over [`PhasePatch`]'s six columns.
     UpdatePhase {
         /// The scope the reply re-reads.
         scope: Scope,

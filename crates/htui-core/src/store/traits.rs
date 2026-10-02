@@ -49,18 +49,19 @@ use crate::model::{
     BoxProbe, BoxRecord, BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun,
     CoverageRow, Document, DocumentHead, DocumentId, GateOutcome, Item, ItemCitation, ItemFilter,
     ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision,
-    ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject,
-    NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill,
-    NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
-    PermissionId, PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, PromptScope, PromptTemplate, RelaySessionId, RelayView, Repo, RepoBoxPath,
-    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
-    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate,
-    Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus,
-    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding,
-    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
-    UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewPersona,
+    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
+    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
+    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId,
+    PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, RelaySessionId,
+    RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId,
+    RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission,
+    StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::prompt::template::{TemplateRole, parse};
@@ -859,7 +860,9 @@ pub trait WriteStore: ReadStore {
     ///
     /// # Errors
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a reserved name, a
-    /// taken `(graph_id, position)` or `(graph_id, name)`, or a `graph_id` that names no row.
+    /// taken `(graph_id, position)` or `(graph_id, name)`, a `graph_id` that names no row, or a
+    /// `persona_id` that names no row (`references_no_row("step_graph_phase.persona_id", id,
+    /// "persona")`), checked after the position and name clashes (MOD-26 D5).
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase>;
 
     /// Inserts `agents` as `phase`'s candidate rows, all or nothing; an empty slice writes nothing
@@ -873,13 +876,15 @@ pub trait WriteStore: ReadStore {
     /// batch.
     async fn create_phase_agents(&self, phase: PhaseId, agents: &[PhaseAgent]) -> Result<()>;
 
-    /// Edits the five columns of [`PhasePatch`] under CAS; `token_budget` is
+    /// Edits the six columns of [`PhasePatch`] under CAS; `token_budget` is
     /// [`set_setting`](Self::set_setting)'s on the `Phase` rung and is not here (D8).
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an unknown id;
-    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a reserved name or a
-    /// `(graph_id, position)` / `(graph_id, name)` collision.
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a reserved name, a
+    /// `(graph_id, position)` / `(graph_id, name)` collision, or a `persona_id` that names no row
+    /// (`references_no_row("step_graph_phase.persona_id", id, "persona")`), checked after the
+    /// position and name clashes (MOD-26 D5).
     async fn update_phase(
         &self,
         id: PhaseId,
@@ -994,6 +999,43 @@ pub trait WriteStore: ReadStore {
         expected: Option<DateTime<Utc>>,
         change: BindingChange,
     ) -> Result<CasOutcome<Option<SkillBinding>>>;
+
+    // persona (MOD-26 milestone 1, plan D4)
+    //
+    // A global registry like `skill`, read and written here for the skill block's reason
+    // (above). No delete in milestone 1: `step_graph_phase.persona_id` is `ON DELETE RESTRICT`,
+    // and M2 adds the delete with its "bound to phases" refusal. The refusal sentences are
+    // `model::persona`'s pure helpers, re-exported below (plan D3), so both stores word them once.
+
+    /// Every persona, ordered by `name` bytes (`COLLATE "C"`).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn personas(&self) -> Result<Vec<Persona>>;
+
+    /// Inserts one persona; both stamps are the store's clock (plan D4). Order:
+    /// [`new_persona_refusal`]'s sentences, then a taken id (`already_exists("persona", id)`),
+    /// then a taken name (`already_exists("persona", name)`).
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) as above. Nothing is
+    /// written.
+    async fn create_persona(&self, new: NewPersona) -> Result<Persona>;
+
+    /// Edits a persona under CAS on `persona.updated_at` (plan D4), `update_skill`'s order:
+    /// `NotFound { entity: "persona" }` for an unknown id, then `Stale(current)` for a spent token
+    /// (even with bad input), then `Constraint` for [`persona_patch_refusal`]'s sentences or a
+    /// taken name (`already_exists("persona", name)`). An all-`None` patch still stamps
+    /// `updated_at`. A started run never sees the edit: it reads its snapshot (I-3).
+    ///
+    /// # Errors
+    /// As above.
+    async fn update_persona(
+        &self,
+        id: PersonaId,
+        expected: DateTime<Utc>,
+        patch: PersonaPatch,
+    ) -> Result<CasOutcome<Persona>>;
 
     // settings (D7, D8)
 
@@ -1899,6 +1941,14 @@ pub fn prompt_template_refusal(name: &str, body: &str) -> Option<String> {
         .err()
         .map(|err| err.to_string())
 }
+
+// ---- MOD-26: the persona writers' refusals (plan D3) live in `model::persona`, where the
+// persona-file reader needs them too; re-exported so the store's refusal vocabulary is one list.
+pub use crate::model::persona::{
+    BLANK_PERSONA_BODY, MODEL_REFUSED, RULE_MATCHES_EVERYTHING, allow_names_an_mcp_tool,
+    invalid_persona_name, kind_not_narrowable, new_persona_refusal, not_a_tool_name,
+    persona_not_in_snapshot, persona_patch_refusal, persona_refusal,
+};
 
 // ---- MOD-9 milestone 3: the skill writers' refusals (plan D71-D79, blueprint D88) -------------
 //

@@ -759,6 +759,23 @@ impl WriteStore for SpyStore {
     ) -> StoreResult<CasOutcome<Option<SkillBinding>>> {
         self.inner.set_skill_binding(key, expected, change).await
     }
+    async fn personas(&self) -> StoreResult<Vec<htui_core::model::Persona>> {
+        self.inner.personas().await
+    }
+    async fn create_persona(
+        &self,
+        new: htui_core::model::NewPersona,
+    ) -> StoreResult<htui_core::model::Persona> {
+        self.inner.create_persona(new).await
+    }
+    async fn update_persona(
+        &self,
+        id: htui_core::model::PersonaId,
+        expected: DateTime<Utc>,
+        patch: htui_core::model::PersonaPatch,
+    ) -> StoreResult<CasOutcome<htui_core::model::Persona>> {
+        self.inner.update_persona(id, expected, patch).await
+    }
     async fn set_setting(
         &self,
         rung: SettingRung,

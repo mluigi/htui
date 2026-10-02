@@ -27,6 +27,10 @@ use htui_core::model::{
 use htui_core::model::{
     BoxEdit, Claim, NewItem, OverlapRule, Quota, QuotaSource, RunKind, Scope, Spend, WorkspaceId,
 };
+use htui_core::model::{
+    CommandQueue, GraphSnapshot, NewPersona, Persona, PersonaId, PersonaPatch, PersonaPermission,
+    PersonaTools, SnapshotPersona,
+};
 use htui_core::prompt::DiffBlock;
 use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
 use tokio::sync::Notify;
@@ -315,11 +319,11 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Eighty-six, and the count is pinned in two places on purpose — here by
+/// Ninety-one, and the count is pinned in two places on purpose — here by
 /// `cases_are_unique_and_counted` and out of crate by `tests/fake_conformance.rs` —
 /// because a binding that silently ran one fewer of them would still be green.
 ///
-/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11.
+/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 5.
 ///
 /// **Eighteen before milestone 4.** Six are `docs/ANA-2.md` §12's validation criteria (1, 2, 3,
 /// 5, 6 and 7); four are contract lines §12 does not number but §4.2 states outright; one is the
@@ -382,6 +386,11 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// accept, retry of an awaiting step, group retry, retry past the budget — adopted and walked by
 /// the box's worker to the in-process rest; the changed-graph park the crash path's topology gate
 /// makes; and the hand-back's window, which writes no step past itself.
+///
+/// **Five for MOD-26 milestone 1** (plan D9, D12, D13, OQ-2): the persona frame of a bound
+/// phase, a persona edit that does not reach a started run, the judge without a persona, a
+/// persona without `command_run` dropping the `command_queue` section, and the agent row a
+/// persona-bound run leaves untouched.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -575,6 +584,16 @@ pub const CASES: &[&str] = &[
     "a_handed_back_run_on_a_changed_graph_parks_with_the_topology_note",
     // MOD-41 plan D12: a hand-back writes its window and nothing past it.
     "a_hand_back_writes_no_step_past_the_window",
+    // MOD-26 D13: a persona-bound phase's prompt opens with the persona frame, `sections[1]`.
+    "a_persona_bound_phase_prompt_carries_the_persona_section",
+    // MOD-26 I-3 (D9): a persona edited after `StartRun` does not reach the run.
+    "a_persona_edit_after_start_run_does_not_reach_the_run",
+    // MOD-26 OQ-2: the judge runs without a persona; its task replays the candidates' frame.
+    "the_judge_step_runs_without_a_persona",
+    // MOD-26 D13: a persona without `command_run` drops the `command_queue` section.
+    "a_persona_without_command_run_drops_the_command_queue_section",
+    // MOD-26 PRD metric: a persona-bound run leaves the agent row untouched.
+    "a_persona_run_leaves_the_agent_row_untouched",
 ];
 
 /// Run one case by name.
@@ -597,13 +616,16 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
 /// # Panics
 /// On a name [`CASES`] holds and this `match` does not.
 fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
-    hand_back_case(name, harness).unwrap_or_else(|| earlier_case(name, harness))
+    hand_back_case(name, harness)
+        .or_else(|| persona_case(name, harness))
+        .unwrap_or_else(|| earlier_case(name, harness))
 }
 
 /// [`case`] for every name before MOD-41 T9's.
 ///
 /// # Panics
-/// On a name [`CASES`] holds and neither this `match` nor [`hand_back_case`] does.
+/// On a name [`CASES`] holds and neither this `match` nor [`hand_back_case`] nor
+/// [`persona_case`] does.
 fn earlier_case<'a, H: CaseHarness>(
     name: &str,
     harness: &'a H,
@@ -864,6 +886,33 @@ fn hand_back_case<'a, H: CaseHarness>(
     })
 }
 
+/// MOD-26 milestone 1's cases, in a frame of their own for [`hand_back_case`]'s reason (blueprint
+/// F-23): each arm's future is boxed before it is polled, so none of them adds a slot to the
+/// frames the other cases run beneath.
+fn persona_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "a_persona_bound_phase_prompt_carries_the_persona_section" => Box::pin(
+            a_persona_bound_phase_prompt_carries_the_persona_section(harness),
+        ),
+        "a_persona_edit_after_start_run_does_not_reach_the_run" => Box::pin(
+            a_persona_edit_after_start_run_does_not_reach_the_run(harness),
+        ),
+        "the_judge_step_runs_without_a_persona" => {
+            Box::pin(the_judge_step_runs_without_a_persona(harness))
+        }
+        "a_persona_without_command_run_drops_the_command_queue_section" => {
+            Box::pin(a_persona_without_command_run_drops_the_command_queue_section(harness))
+        }
+        "a_persona_run_leaves_the_agent_row_untouched" => {
+            Box::pin(a_persona_run_leaves_the_agent_row_untouched(harness))
+        }
+        _ => return None,
+    })
+}
+
 // -- what every case needs, written once ---------------------------------------------------------
 
 /// The run's steps in `(position, attempt, fanout_index)` order.
@@ -942,12 +991,13 @@ async fn free_feat_3<O: Orchestrate>(orch: &O) {
 
 /// Repoints `item` at a clone of its graph whose phases `mutate` has edited.
 ///
-/// **`PhasePatch` carries five fields — `name`, `position`, `template_name`, `gate_hard` and
-/// `input_kinds` — and `gate`, `retry_limit`, `isolation`, `fan_out` and `token_budget` are none of
-/// them** (`crates/htui-core/src/model/kind.rs:221-232`), so the blueprint's
-/// `update_phase(review, expected, PhasePatch { gate: Some(Gate::Never), .. })` recipe does not
-/// compile. `create_phase` takes a whole `StepGraphPhase`, so a clone carrying the row a case wants
-/// is the reachable edit — and it is the same pair of writers `graph::override_graph` uses.
+/// **`PhasePatch` carries six fields — `name`, `position`, `template_name`, `gate_hard`,
+/// `input_kinds` and `persona` (MOD-26 D5) — and `gate`, `retry_limit`, `isolation`, `fan_out`
+/// and `token_budget` are none of them** (`crates/htui-core/src/model/kind.rs:230-251`), so the
+/// blueprint's `update_phase(review, expected, PhasePatch { gate: Some(Gate::Never), .. })`
+/// recipe does not compile. `create_phase` takes a whole `StepGraphPhase`, so a clone carrying the
+/// row a case wants is the reachable edit — and it is the same pair of writers
+/// `graph::override_graph` uses.
 ///
 /// # Panics
 /// When any of the three writes is refused, which means the fixture moved under the case.
@@ -1454,7 +1504,7 @@ async fn live_run_ignores_a_gate_edit<H: CaseHarness>(harness: &H) {
 
 /// ANA-2 §12 criterion 3 (`docs/ANA-2.md:2090`): the graph moved under a parked run.
 ///
-/// `input_kinds` is the edit because it is both one of `PhasePatch`'s five fields and a
+/// `input_kinds` is the edit because it is both one of `PhasePatch`'s six fields and a
 /// `SnapshotPhase` field, so patching it moves the `topology` digest — which is the whole content of
 /// the criterion. The assertion is that **nothing advanced**: the same step rows, plus a note an
 /// operator can read. The second half proves the comparison is a comparison and not a constant: an
@@ -6845,6 +6895,292 @@ async fn a_hand_back_writes_no_step_past_the_window<H: CaseHarness>(harness: &H)
     );
 }
 
+// -- MOD-26 milestone 1: personas reach the walk (plan D9, D12, D13, OQ-2) -----------------------
+
+/// MOD-26: binds `persona` (by name, read through `personas()`) to `item`'s phase `phase` with
+/// `update_phase`, [`repoint`]'s shape; answers the persona row.
+///
+/// # Panics
+/// When the persona or the phase is not there, or the write is refused.
+async fn bind_persona<O: Orchestrate>(
+    orch: &O,
+    item: ItemId,
+    phase: &str,
+    persona: &str,
+) -> Persona {
+    let row = orch
+        .store()
+        .personas()
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .find(|row| row.name == persona)
+        .unwrap_or_else(|| panic!("the store holds the `{persona}` persona"));
+    let graph = orch
+        .store()
+        .resolve_graph(item)
+        .await
+        .expect("MemStore never fails a read")
+        .expect("the item resolves to a graph");
+    let target = &graph
+        .phases
+        .iter()
+        .find(|candidate| candidate.phase.name == phase)
+        .unwrap_or_else(|| panic!("the graph names a `{phase}` phase"))
+        .phase;
+    let outcome = orch
+        .store()
+        .update_phase(
+            target.id,
+            target.updated_at,
+            PhasePatch {
+                persona: Some(Some(row.id)),
+                ..PhasePatch::default()
+            },
+        )
+        .await
+        .expect("the persona names a row");
+    assert!(
+        matches!(outcome, CasOutcome::Applied(_)),
+        "the phase's version is current: {outcome:?}"
+    );
+    row
+}
+
+/// The frame a persona section opens with (MOD-26 B-20).
+fn frame_of(persona: &str) -> String {
+    format!("<section name=\"persona\" persona=\"{persona}\">\n")
+}
+
+/// The run's stored snapshot, decoded.
+///
+/// # Panics
+/// When the run carries no snapshot, which the walk always writes.
+async fn snapshot_of<O: Orchestrate>(orch: &O, run: RunId) -> GraphSnapshot {
+    serde_json::from_value(
+        run_of(orch, run)
+            .await
+            .graph_snapshot
+            .expect("the walk created the run with a snapshot"),
+    )
+    .expect("the engine wrote a `GraphSnapshot`")
+}
+
+/// MOD-26 D13: `reviewer` bound to `FEAT-3`'s first phase. The step's prompt sections are
+/// `template`, then `persona` (`template` keeps `sections[0]`), and its recorded text opens with
+/// the persona's frame.
+async fn a_persona_bound_phase_prompt_carries_the_persona_section<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    let reviewer = bind_persona(&orch, ids::HTUI_FEAT_3, "prd", "reviewer").await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(0))
+    );
+    let prd = at(&steps_of(&orch, run).await, 0, 1).clone();
+    let sections = prompt_sections(&orch, prd.id).await;
+    assert_eq!(
+        sections.get(..2),
+        Some(["template".to_owned(), "persona".to_owned()].as_slice()),
+        "{sections:?}"
+    );
+    let text = prompt_text(&orch, prd.id).await;
+    assert!(
+        text.starts_with(&format!("{}{}", frame_of("reviewer"), reviewer.body)),
+        "the prompt opens with the persona frame and its body:\n{text}"
+    );
+}
+
+/// MOD-26 I-3 (D9): `reviewer` bound to `FEAT-3`'s second phase, edited after `StartRun`. The
+/// second step's prompt carries the body frozen at `StartRun` and the snapshot keeps the
+/// pre-edit digest.
+async fn a_persona_edit_after_start_run_does_not_reach_the_run<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    let reviewer = bind_persona(&orch, ids::HTUI_FEAT_3, "plan", "reviewer").await;
+    let frozen = SnapshotPersona::freeze(&reviewer).expect("a seed persona freezes");
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.position, Some(0), "the run parks at `prd`");
+    let edited = orch
+        .store()
+        .update_persona(
+            reviewer.id,
+            reviewer.updated_at,
+            PersonaPatch {
+                body: Some("changed\n".to_owned()),
+                ..PersonaPatch::default()
+            },
+        )
+        .await
+        .expect("the edit is valid");
+    assert!(matches!(edited, CasOutcome::Applied(_)), "{edited:?}");
+
+    let (parked, _) = answer(&orch, run, GateAnswer::Approved).await;
+    assert_eq!(parked.position, 0);
+    let plan = at(&steps_of(&orch, run).await, 1, 1).clone();
+    let text = prompt_text(&orch, plan.id).await;
+    assert!(
+        text.starts_with(&format!("{}{}", frame_of("reviewer"), reviewer.body)),
+        "the second step reads the body frozen at `StartRun`:\n{text}"
+    );
+    assert!(!text.contains("changed\n</section>"), "{text}");
+    let snapshot = snapshot_of(&orch, run).await;
+    assert_eq!(
+        snapshot
+            .personas
+            .iter()
+            .map(|persona| (persona.name.as_str(), persona.digest.as_str()))
+            .collect::<Vec<_>>(),
+        [("reviewer", frozen.digest.as_str())],
+        "the snapshot keeps the pre-edit digest"
+    );
+}
+
+/// MOD-26 OQ-2: a judged fan-out phase with `reviewer` bound. Every candidate's prompt carries the
+/// frame at `sections[1]`; the judge's prompt has no `persona` section, while its task replays a
+/// candidate's prompt, frame included.
+async fn the_judge_step_runs_without_a_persona<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    fan_research(&orch, Gate::Never, false).await;
+    set_judge(&orch, ids::HTUI_ANA_2).await;
+    research_candidates(&orch, 1);
+    judge_both(&orch, "research", 1, 1, "the most thorough");
+    let reviewer = bind_persona(&orch, ids::HTUI_ANA_2, "research", "reviewer").await;
+
+    let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::Done, None, None)
+    );
+    let steps = steps_of(&orch, run).await;
+    for index in 0..3 {
+        let sections = prompt_sections(&orch, candidate(&steps, 0, 1, index).id).await;
+        assert_eq!(
+            sections.get(1).map(String::as_str),
+            Some("persona"),
+            "candidate {index}: {sections:?}"
+        );
+    }
+    let judge = judge_of(&steps, 0, 1).expect("the judge is a step");
+    let sections = prompt_sections(&orch, judge.id).await;
+    assert!(
+        !sections.iter().any(|section| section == "persona"),
+        "the judge runs without a persona: {sections:?}"
+    );
+    assert!(
+        sections.iter().any(|section| section == "judge_task"),
+        "{sections:?}"
+    );
+    let first_line = reviewer
+        .body
+        .lines()
+        .next()
+        .expect("the seed body has a line");
+    let text = prompt_text(&orch, judge.id).await;
+    assert!(
+        text.contains(first_line),
+        "the judge's task replays the candidates' frame:\n{text}"
+    );
+}
+
+/// MOD-26 D13: a persona with `command_run: false` bound to a phase whose `command_queue` is on
+/// drops the `command_queue` section; the same phase unbound keeps it.
+async fn a_persona_without_command_run_drops_the_command_queue_section<H: CaseHarness>(
+    harness: &H,
+) {
+    let queued = |phase: &mut StepGraphPhase| {
+        if phase.name == "prd" {
+            phase.command_queue = CommandQueue::Always;
+        }
+    };
+
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, queued).await;
+    orch.store()
+        .create_persona(NewPersona {
+            id: PersonaId::new(),
+            name: "no-commands".to_owned(),
+            description: "queues no command".to_owned(),
+            body: "You queue no command.\n".to_owned(),
+            tools: PersonaTools {
+                command_run: false,
+                ..PersonaTools::default()
+            },
+            permission: PersonaPermission::default(),
+        })
+        .await
+        .expect("a valid persona");
+    bind_persona(&orch, ids::HTUI_FEAT_3, "prd", "no-commands").await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let sections = prompt_sections(&orch, at(&steps_of(&orch, run).await, 0, 1).id).await;
+    assert!(
+        sections.iter().any(|section| section == "persona"),
+        "the persona ran: {sections:?}"
+    );
+    assert!(
+        !sections.iter().any(|section| section == "command_queue"),
+        "a persona without `command_run` drops the section: {sections:?}"
+    );
+
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, queued).await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let sections = prompt_sections(&orch, at(&steps_of(&orch, run).await, 0, 1).id).await;
+    assert!(
+        sections.iter().any(|section| section == "command_queue"),
+        "the unbound phase keeps its section: {sections:?}"
+    );
+}
+
+/// MOD-26 PRD metric "agent row untouched": a persona narrows the step, never the row. The
+/// candidate agent's `updated_at` and `settings` are the same before and after a persona-bound
+/// run walked to `done`.
+async fn a_persona_run_leaves_the_agent_row_untouched<H: CaseHarness>(harness: &H) {
+    async fn claude<O: Orchestrate>(
+        orch: &O,
+    ) -> (chrono::DateTime<chrono::Utc>, serde_json::Value) {
+        let agent = orch
+            .store()
+            .agents()
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .map(|row| row.agent)
+            .find(|agent| agent.id == ids::AGENT_CLAUDE)
+            .expect("the fixture seeds `claude`");
+        (agent.updated_at, agent.settings)
+    }
+
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    bind_persona(&orch, ids::HTUI_FEAT_3, "prd", "reviewer").await;
+    let before = claude(&orch).await;
+
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let rest = approve(&orch, run, 4).await;
+    assert_eq!(rest.run, RunStatus::Done);
+    let steps = steps_of(&orch, run).await;
+    let prd = at(&steps, 0, 1);
+    assert_eq!(
+        prd.agent_id,
+        Some(ids::AGENT_CLAUDE),
+        "the candidate agent drove"
+    );
+    assert!(
+        prompt_sections(&orch, prd.id)
+            .await
+            .iter()
+            .any(|section| section == "persona"),
+        "the persona ran"
+    );
+    assert_eq!(claude(&orch).await, before, "the agent row is untouched");
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -6869,8 +7205,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            87,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            92,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -6896,7 +7232,10 @@ mod tests {
              woken after `Done` records no commits, plan D1), and MOD-41 T9's eleven hand-back cases (plan D12: \
              one per walking command and retry route walked by the adopter, the changed-graph \
              park of OQ-6, and the window that writes nothing past itself), and MOD-37 review L1's \
-             one (a crashed rejection's `u` handed back and failed by the adopter)"
+             one (a crashed rejection's `u` handed back and failed by the adopter), and MOD-26's five \
+             persona cases (plan D9, D12, D13, OQ-2: the persona frame, an edit that does not \
+             reach a started run, the judge without a persona, `command_run` dropping the \
+             `command_queue` section, and the agent row left untouched)"
         );
     }
 

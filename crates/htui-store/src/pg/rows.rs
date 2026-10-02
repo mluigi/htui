@@ -20,17 +20,21 @@
 //!   [`LinkNode`](htui_core::model::LinkNode) declares it as a `u8`.
 //! - [`UpstreamRow`] does the same for the amended §7.3 walk of `docs/ANA-5.md` §4.3, and joins
 //!   `project.slug` into the `qualified_key` the render and the sort both key on.
+//! - [`PersonaRow`] keeps `persona`'s two `JSONB` columns wrapped in [`Json`], which `query_as!`
+//!   can decode where the model's blob types have no `sqlx::Type` (MOD-26 B-15).
 //!
 //! Field order is load-bearing: `query_as!` binds result columns to fields positionally, so the
 //! `SELECT` list in `read.rs` is written in the order declared here.
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Activation, AgentId, BoxId, GateOutcome, ItemId, LinkNode, PhaseId, ProjectId, RunId, RunKind,
-    RunMode, RunStatus, RunStepSummary, RunSummary, SkillBinding, SkillBindingId, SkillId, Status,
-    StepId, StepStatus, UpstreamEntry, VerifyOutcome,
+    Activation, AgentId, BoxId, GateOutcome, ItemId, LinkNode, Persona, PersonaId,
+    PersonaPermission, PersonaTools, PhaseId, ProjectId, RunId, RunKind, RunMode, RunStatus,
+    RunStepSummary, RunSummary, SkillBinding, SkillBindingId, SkillId, Status, StepId, StepStatus,
+    UpstreamEntry, VerifyOutcome,
 };
 use serde_json::Value;
+use sqlx::types::Json;
 
 /// One `run` row with the joined `box.hostname`: every [`RunSummary`] field except `steps`.
 #[derive(Debug, Clone)]
@@ -301,5 +305,45 @@ impl SkillBindingRow {
             },
             self.name,
         )
+    }
+}
+
+/// One `persona` row with its two `JSONB` columns still wrapped (MOD-26 B-15).
+///
+/// A hand-written blob that does not decode (an unknown key, I-2) is the driver's decode error,
+/// which [`map_sqlx`](crate::error::map_sqlx) answers as a backend failure: a read refuses rather
+/// than hand out half a persona.
+#[derive(Debug)]
+pub(crate) struct PersonaRow {
+    /// `persona.id`.
+    pub(crate) id: PersonaId,
+    /// `persona.name`.
+    pub(crate) name: String,
+    /// `persona.description`.
+    pub(crate) description: String,
+    /// `persona.body`.
+    pub(crate) body: String,
+    /// `persona.tools`.
+    pub(crate) tools: Json<PersonaTools>,
+    /// `persona.permission`.
+    pub(crate) permission: Json<PersonaPermission>,
+    /// `persona.created_at`.
+    pub(crate) created_at: DateTime<Utc>,
+    /// `persona.updated_at`.
+    pub(crate) updated_at: DateTime<Utc>,
+}
+
+impl From<PersonaRow> for Persona {
+    fn from(row: PersonaRow) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            description: row.description,
+            body: row.body,
+            tools: row.tools.0,
+            permission: row.permission.0,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
     }
 }

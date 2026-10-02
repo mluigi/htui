@@ -25,9 +25,10 @@ use htui_core::model::{
     CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS,
     Document, Executor, GateOutcome, Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch,
     ItemPatch, ItemRequirement, ItemRevision, NewCommandRun, NewDocument, NewItem, NewItemKind,
-    NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
-    NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission,
-    PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Priority,
+    NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
+    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
+    PersonaPatch, PersonaPermission, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority,
     Project, ProjectId, ProjectPatch, PromptTemplate, PromptTemplateId, RelaySessionId, RelayView,
     Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
     RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementState,
@@ -52,19 +53,21 @@ use htui_core::store::{
     expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
     finish_run_needs_a_terminal_status, graph_not_in_project, illegal_move, invalid_area_code,
     invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros,
-    legal_move, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
-    prompt_template_key, prompt_template_refusal, references_no_row, requirement_withdrawn,
-    reserved_phase_name, resolution_not_closable, row_names_another_phase, row_names_another_step,
-    run_is_terminal, skill_body_refusal, skill_patch_refusal, skill_version_key,
-    step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
-    withdrawn_requirement_cited,
+    legal_move, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
+    not_a_terminal_status, persona_patch_refusal, prompt_template_key, prompt_template_refusal,
+    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
+    row_names_another_phase, row_names_another_step, run_is_terminal, skill_body_refusal,
+    skill_patch_refusal, skill_version_key, step_is_not_promotable, summary_names_another_item,
+    winner_is_not_settled, withdrawn_requirement_cited,
 };
 use serde_json::Value;
 use sqlx::PgConnection;
+use sqlx::types::Json;
 use uuid::Uuid;
 
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
+use crate::pg::rows::PersonaRow;
 
 /// The refusal text for a kind that is unknown or belongs to another project.
 ///
@@ -654,6 +657,50 @@ async fn revise_requirement(
 // ------------------------------------------------------------------------------------------------
 // MOD-9 milestone 3 helpers (plan D75-D79, blueprint D89, D92).
 // ------------------------------------------------------------------------------------------------
+
+/// MOD-26 D4: `uq_persona_name`'s `23505` in `MemStore`'s sentence; anything else through
+/// [`map_sqlx`].
+fn persona_name_taken(err: sqlx::Error, name: &str) -> StoreError {
+    match &err {
+        sqlx::Error::Database(db) if db.constraint() == Some("uq_persona_name") => {
+            StoreError::Constraint(already_exists("persona", name))
+        }
+        _ => map_sqlx(err),
+    }
+}
+
+/// `create_persona`'s refusals in `MemStore`'s order: `persona_pkey` is the id, then the name.
+fn persona_insert_refused(err: sqlx::Error, new: &NewPersona) -> StoreError {
+    match &err {
+        sqlx::Error::Database(db) if db.constraint() == Some("persona_pkey") => {
+            StoreError::Constraint(already_exists("persona", new.id))
+        }
+        _ => persona_name_taken(err, &new.name),
+    }
+}
+
+/// MOD-26 D5: `fk_step_graph_phase_persona`'s `23503` in `MemStore`'s sentence (every other
+/// `23xxx` stays raw, `error.rs`); anything else through [`map_sqlx`].
+fn phase_persona_refused(err: sqlx::Error, persona: Option<PersonaId>) -> StoreError {
+    match (&err, persona) {
+        (sqlx::Error::Database(db), Some(persona))
+            if db.constraint() == Some("fk_step_graph_phase_persona") =>
+        {
+            StoreError::Constraint(references_no_row(
+                "step_graph_phase.persona_id",
+                persona,
+                "persona",
+            ))
+        }
+        _ => map_sqlx(err),
+    }
+}
+
+/// A persona blob as `JSONB`, `create_run`'s shape.
+fn persona_json<T: serde::Serialize>(column: &str, value: &T) -> Result<Value> {
+    serde_json::to_value(value)
+        .map_err(|error| StoreError::Constraint(format!("{column} does not serialise: {error}")))
+}
 
 /// D92 (F-P): `skill_name_key`'s `23505` in the sentence `MemStore` gives a taken name; anything
 /// else through [`map_sqlx`].
@@ -2711,7 +2758,10 @@ impl WriteStore for PgStore {
     /// # Errors
     ///
     /// [`StoreError::Constraint`] for a reserved name, a taken `(graph_id, position)` or
-    /// `(graph_id, name)` (`23505`), or a `graph_id` that names no row (`23503`).
+    /// `(graph_id, name)` (`23505`), a `graph_id` that names no row (`23503`), or a `persona_id`
+    /// that names no row (`fk_step_graph_phase_persona`'s `23503`, worded
+    /// `references_no_row("step_graph_phase.persona_id", id, "persona")`), checked after the
+    /// clashes (MOD-26 D5).
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase> {
         if TemplateRole::of_name(&phase.name) != TemplateRole::Phase {
             return Err(StoreError::Constraint(reserved_phase_name(&phase.name)));
@@ -2723,8 +2773,8 @@ impl WriteStore for PgStore {
             INSERT INTO step_graph_phase (id, graph_id, position, name, fan_out, gate, gate_hard,
                                           retry_limit, input_kinds, output_kind, isolation,
                                           command_queue, verify_command, template_name,
-                                          template_version, token_budget)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                                          template_version, token_budget, persona_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             RETURNING id               AS "id: PhaseId",
                       graph_id         AS "graph_id: StepGraphId",
                       position,
@@ -2741,6 +2791,7 @@ impl WriteStore for PgStore {
                       template_name,
                       template_version,
                       token_budget,
+                      persona_id       AS "persona_id: PersonaId",
                       updated_at
             "#,
             phase.id.as_uuid(),
@@ -2759,10 +2810,11 @@ impl WriteStore for PgStore {
             phase.template_name,
             phase.template_version,
             phase.token_budget,
+            phase.persona_id.map(PersonaId::as_uuid),
         )
         .fetch_one(&self.pool)
         .await
-        .map_err(map_sqlx)
+        .map_err(|err| phase_persona_refused(err, phase.persona_id))
     }
 
     /// One `UNNEST` insert (MOD-37 R-6), so the batch lands whole or not at all. A row naming
@@ -2804,7 +2856,7 @@ impl WriteStore for PgStore {
         Ok(())
     }
 
-    /// The compare-and-set of D3 over [`PhasePatch`]'s five columns.
+    /// The compare-and-set of D3 over [`PhasePatch`]'s six columns.
     ///
     /// `token_budget` is not among them and cannot be: the `Phase` rung of
     /// [`set_setting`](WriteStore::set_setting) is that column's one writer, so the value the
@@ -2815,8 +2867,11 @@ impl WriteStore for PgStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] for a reserved name
-    /// or a `(graph_id, position)` / `(graph_id, name)` collision (`23505`).
+    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] for a reserved name,
+    /// a `(graph_id, position)` / `(graph_id, name)` collision (`23505`), or a `persona_id` that
+    /// names no row (`fk_step_graph_phase_persona`'s `23503`, worded
+    /// `references_no_row("step_graph_phase.persona_id", id, "persona")`), checked after the
+    /// clashes (MOD-26 D5).
     async fn update_phase(
         &self,
         id: PhaseId,
@@ -2838,6 +2893,9 @@ impl WriteStore for PgStore {
             return Err(StoreError::Constraint(reserved_phase_name(name)));
         }
 
+        // MOD-26 D5: `COALESCE` cannot clear, so the binding is a flag and a value; read before
+        // the macro, which moves the patch's other fields.
+        let persona = patch.persona;
         let updated = sqlx::query_as!(
             StepGraphPhase,
             r#"
@@ -2846,7 +2904,8 @@ impl WriteStore for PgStore {
                 position      = COALESCE($4, position),
                 template_name = COALESCE($5, template_name),
                 gate_hard     = COALESCE($6, gate_hard),
-                input_kinds   = COALESCE($7, input_kinds)
+                input_kinds   = COALESCE($7, input_kinds),
+                persona_id    = CASE WHEN $8::bool THEN $9::uuid ELSE persona_id END
              WHERE id = $1 AND updated_at = $2
             RETURNING id               AS "id: PhaseId",
                       graph_id         AS "graph_id: StepGraphId",
@@ -2864,6 +2923,7 @@ impl WriteStore for PgStore {
                       template_name,
                       template_version,
                       token_budget,
+                      persona_id       AS "persona_id: PersonaId",
                       updated_at
             "#,
             id.as_uuid(),
@@ -2873,10 +2933,12 @@ impl WriteStore for PgStore {
             patch.template_name,
             patch.gate_hard,
             patch.input_kinds.as_deref(),
+            persona.is_some(),
+            persona.flatten().map(PersonaId::as_uuid),
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(map_sqlx)?;
+        .map_err(|err| phase_persona_refused(err, persona.flatten()))?;
 
         match updated {
             Some(row) => Ok(CasOutcome::Applied(row)),
@@ -3327,6 +3389,117 @@ impl WriteStore for PgStore {
         match written {
             Some(row) => Ok(CasOutcome::Applied(Some(row))),
             None => Ok(CasOutcome::Stale(self.skill_binding_row(key).await?)),
+        }
+    }
+
+    // persona (MOD-26 milestone 1, plan D4)
+
+    /// Every persona in `name` byte order (`COLLATE "C"`).
+    async fn personas(&self) -> Result<Vec<Persona>> {
+        self.persona_rows().await
+    }
+
+    /// D3 before the statement, then one `INSERT … RETURNING`: `persona_pkey` is the id,
+    /// `uq_persona_name` the name ([`persona_insert_refused`], `MemStore`'s order). Both stamps
+    /// are the columns' `now()` defaults.
+    async fn create_persona(&self, new: NewPersona) -> Result<Persona> {
+        if let Some(refusal) = new_persona_refusal(&new) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        let tools = persona_json("persona.tools", &new.tools)?;
+        let permission = persona_json("persona.permission", &new.permission)?;
+        sqlx::query_as!(
+            PersonaRow,
+            r#"
+            INSERT INTO persona (id, name, description, body, tools, permission)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id          AS "id: PersonaId",
+                      name,
+                      description,
+                      body,
+                      tools       AS "tools: Json<PersonaTools>",
+                      permission  AS "permission: Json<PersonaPermission>",
+                      created_at,
+                      updated_at
+            "#,
+            new.id.as_uuid(),
+            new.name,
+            new.description,
+            new.body,
+            tools,
+            permission,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map(Persona::from)
+        .map_err(|err| persona_insert_refused(err, &new))
+    }
+
+    /// `update_skill`'s shape: bad input pays one read for `NotFound` → `Stale` → `Constraint`;
+    /// a spent token matches no row and never reaches the unique index. `trg_persona_updated_at`
+    /// stamps `updated_at`, an all-`None` patch included.
+    async fn update_persona(
+        &self,
+        id: PersonaId,
+        expected: DateTime<Utc>,
+        patch: PersonaPatch,
+    ) -> Result<CasOutcome<Persona>> {
+        if let Some(refusal) = persona_patch_refusal(&patch) {
+            return match self.persona_row(id).await? {
+                None => Err(StoreError::NotFound {
+                    entity: "persona",
+                    id: id.to_string(),
+                }),
+                Some(row) if row.updated_at != expected => Ok(CasOutcome::Stale(row)),
+                Some(_) => Err(StoreError::Constraint(refusal)),
+            };
+        }
+        let tools = patch
+            .tools
+            .as_ref()
+            .map(|tools| persona_json("persona.tools", tools))
+            .transpose()?;
+        let permission = patch
+            .permission
+            .as_ref()
+            .map(|permission| persona_json("persona.permission", permission))
+            .transpose()?;
+        let updated = sqlx::query_as!(
+            PersonaRow,
+            r#"
+            UPDATE persona SET
+                name        = COALESCE($3, name),
+                description = COALESCE($4, description),
+                body        = COALESCE($5, body),
+                tools       = COALESCE($6, tools),
+                permission  = COALESCE($7, permission)
+             WHERE id = $1 AND updated_at = $2
+            RETURNING id          AS "id: PersonaId",
+                      name,
+                      description,
+                      body,
+                      tools       AS "tools: Json<PersonaTools>",
+                      permission  AS "permission: Json<PersonaPermission>",
+                      created_at,
+                      updated_at
+            "#,
+            id.as_uuid(),
+            expected,
+            patch.name.as_deref(),
+            patch.description.as_deref(),
+            patch.body.as_deref(),
+            tools,
+            permission,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| match &patch.name {
+            Some(name) => persona_name_taken(err, name),
+            None => map_sqlx(err),
+        })?;
+        match updated {
+            Some(row) => Ok(CasOutcome::Applied(row.into())),
+            None => cas_miss(self.persona_row(id).await?, "persona", id),
         }
     }
 

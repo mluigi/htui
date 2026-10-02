@@ -114,6 +114,11 @@ pub enum Placeholder {
     DiffSoFar,
     /// `{{failure_reason}}` — handoff only. Required in a handoff body.
     FailureReason,
+    /// MOD-26 D13: the persona frame. **Internal**: not in [`Placeholder::ALL`], so
+    /// [`Placeholder::from_token`] never yields it and no template can place it — a body that
+    /// writes `{{persona}}` is refused as an unknown placeholder. `assemble` renders it ahead of
+    /// the body whenever the spec carries a persona.
+    Persona,
 }
 
 /// A judge body must place `{{candidates}}`.
@@ -124,7 +129,8 @@ const HANDOFF_REQUIRED: &[Placeholder] = &[Placeholder::StepSummary, Placeholder
 const NONE_REQUIRED: &[Placeholder] = &[];
 
 impl Placeholder {
-    /// Every variant, in declaration order.
+    /// Every placeholder a template may place, in declaration order: every variant but the
+    /// internal [`Placeholder::Persona`] (MOD-26 D13), which no body can name.
     pub const ALL: &'static [Self] = &[
         Self::ItemKey,
         Self::ItemTitle,
@@ -172,6 +178,7 @@ impl Placeholder {
             Self::StepSummary => "step_summary",
             Self::DiffSoFar => "diff_so_far",
             Self::FailureReason => "failure_reason",
+            Self::Persona => "persona",
         }
     }
 
@@ -194,6 +201,7 @@ impl Placeholder {
                     | Self::StepSummary
                     | Self::DiffSoFar
                     | Self::FailureReason
+                    | Self::Persona
             ),
             TemplateRole::Judge => {
                 matches!(
@@ -215,7 +223,8 @@ impl Placeholder {
     }
 
     /// Whether this placeholder stands for a wrapped section rather than a scalar substitution.
-    /// False for the six scalars of ANA-5 `:362`, true for the other fourteen.
+    /// False for the six scalars of ANA-5 `:362`, true for the other fourteen and for the
+    /// internal [`Placeholder::Persona`] (MOD-26 D13).
     #[must_use]
     pub const fn is_section(self) -> bool {
         !matches!(

@@ -54,7 +54,7 @@ use crate::driver::{
 use crate::error::{DriverError, Result};
 use crate::event::{
     DoneEvent, DriverEnvelope, DriverEvent, EditProposalEvent, ErrorEvent, OtherEvent,
-    PermissionOptionKind, StopReason, TerminalReason, ToolResultEvent, ToolResultStatus,
+    PermissionOptionKind, StopReason, TerminalReason, ToolKind, ToolResultEvent, ToolResultStatus,
 };
 // The three pieces this transport shares with every other one, published under the paths its own
 // callers have always used: the capture clock and the two wire strings live in `crate::event`, the
@@ -74,6 +74,10 @@ pub const MODEL_UNAVAILABLE: &str = "model_unavailable";
 
 /// `error.code` of a refused `fs/*` path (plan D22, [`fs::PathOutside`]).
 pub const PATH_OUTSIDE_SESSION: &str = "path_outside_session";
+
+/// `error.code` of an `fs/*` request the step's persona denies (MOD-26 D11):
+/// `fs/read_text_file` under a denied `read`, `fs/write_text_file` under a denied `edit`.
+pub const TOOL_KIND_DENIED: &str = "tool_kind_denied";
 
 /// Depth of the session task's event channel (plan D18).
 ///
@@ -1069,6 +1073,7 @@ async fn session_main(
     child: &Mutex<ChildGuard>,
 ) {
     let mut state = TaskState::new(options.stamp, spec.retain_raw);
+    let deny_kinds = spec.tools.deny_kinds.clone();
     let filesystem = match fs::SessionFs::new(&spec.cwd, &spec.extra_dirs).await {
         Ok(filesystem) => filesystem,
         Err(err) => {
@@ -1262,7 +1267,7 @@ async fn session_main(
                 break;
             }
             Step::Inbound(Some(request)) => {
-                if !on_inbound(&mut state, &events, &filesystem, request).await {
+                if !on_inbound(&mut state, &events, &filesystem, &deny_kinds, request).await {
                     break;
                 }
             }
@@ -1454,6 +1459,7 @@ async fn on_inbound(
     state: &mut TaskState,
     events: &mpsc::Sender<DriverEnvelope>,
     filesystem: &fs::SessionFs,
+    deny_kinds: &[ToolKind],
     request: Inbound,
 ) -> bool {
     match request {
@@ -1477,6 +1483,31 @@ async fn on_inbound(
                 events,
                 DriverEvent::PermissionRequest(event),
                 Some(raw),
+            )
+            .await
+        }
+        // MOD-26 D11 (B-12): a denied kind is refused first, whatever the path.
+        Inbound::ReadFile(request, responder) if deny_kinds.contains(&ToolKind::Read) => {
+            let _ = responder.respond_with_error(agent_client_protocol::Error::invalid_params());
+            denied(
+                state,
+                events,
+                ToolKind::Read,
+                "fs/read_text_file",
+                &request.path,
+            )
+            .await
+        }
+        Inbound::WriteFile(request, responder) if deny_kinds.contains(&ToolKind::Edit) => {
+            // Before `guard`, the read of the old text and the `EditProposal`: nothing touches the
+            // file and no proposal is recorded for an edit that never happens.
+            let _ = responder.respond_with_error(agent_client_protocol::Error::invalid_params());
+            denied(
+                state,
+                events,
+                ToolKind::Edit,
+                "fs/write_text_file",
+                &request.path,
             )
             .await
         }
@@ -1547,6 +1578,25 @@ async fn on_inbound(
             }
         }
     }
+}
+
+/// Records a request the step's persona denies (MOD-26 D11), `refused`'s shape.
+async fn denied(
+    state: &mut TaskState,
+    events: &mpsc::Sender<DriverEnvelope>,
+    kind: ToolKind,
+    method: &str,
+    path: &Path,
+) -> bool {
+    tracing::warn!(%kind, method, "an fs request the step's persona denies");
+    let event = DriverEvent::Error(ErrorEvent {
+        code: TOOL_KIND_DENIED.to_owned(),
+        message: format!(
+            "the step's persona denies `{kind}`: {method} of `{}` refused",
+            path.display()
+        ),
+    });
+    emit(state, events, event, None).await
 }
 
 /// Records a refused path.

@@ -40,14 +40,14 @@ Earlier completions are in `DECISIONS.md`.
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
 (MOD-38), `0007_skill_attachments` (MOD-9 milestone 2), `0008_trim_record_v3` (MOD-9 milestone 5,
 comment only) `0009_agent_box_user_off` (MOD-23), `0010_prompt_digest_undigested` (MOD-33, comment only)
-and `0011_permission_relay` (MOD-42; cache: `0001`..`0004`), so **the next migration is `0012`** (cache: `0005`).
+`0011_permission_relay` (MOD-42) and `0012_persona` (MOD-26 milestone 1; cache: `0001`..`0004`), so **the next migration is `0013`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
 (done, all four milestones), MOD-38, MOD-9 (done, all five milestones), MOD-40, MOD-39, MOD-64,
-MOD-23, MOD-22, MOD-41, MOD-59, MOD-24 and MOD-49 (re-counted 2026-10-01; `StoreReply` 2026-09-30; `CASES`, `.sqlx` and snapshots 2026-10-02): store conformance `CASES` 119, `READ_CASES` 14, `htui-orch` `CASES` 86,
+MOD-23, MOD-22, MOD-41, MOD-59, MOD-24, MOD-49 and MOD-26 milestone 1 (re-counted 2026-10-01; `StoreReply` 2026-09-30; `CASES`, `.sqlx`, `TABLES`, snapshots and commented columns 2026-10-02): store conformance `CASES` 130, `READ_CASES` 14, `htui-orch` `CASES` 92,
 `GraphSource` 7 methods, `StoreRequest` 96, `StoreReply` 55 (both re-counted 2026-10-02), `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
-`skills::REQUEST_NAMES` 6, `TABLES` 39, 307 `.sqlx` files, 129
+`skills::REQUEST_NAMES` 6, `TABLES` 42, 318 `.sqlx` files, 132
 `crates/htui/tests/snapshots`, six workspace members (`htui-worker` since MOD-41),
-`MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 35 pinned commented
+`MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 44 pinned commented
 columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 4` (MOD-33 `undigested`) with `skill_choices` (a
 `matched` choice carries `path`, `<repo>:<path>`); `Isolator` gained `changed_paths` (MOD-9 D119).
 Excerpts reach phase prompts since MOD-7 milestone 4, so a phase-prompt digest recorded before
@@ -260,6 +260,16 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   htui inlines into the step prompt (`R-ID-5`, `R-PRM-1`), not a file handed to the agent. ANA-13
   §3.1's "`DriverCaps` overrides" reads as `SessionSpec` overrides, since `DriverCaps` are transport
   facts. Cites `R-AGT-4`, `R-ID-3`, `R-ID-5`, `R-PRM-1`.
+  **Phase 1 landed (`dc5ba263`..`d1871f5e`, 2026-10-02):** personas as Postgres registry rows
+  (`0012_persona`, global like skills; seeds `reviewer`, `architect`), bound by a nullable
+  `step_graph_phase.persona_id`, frozen into the run snapshot at `StartRun`, inlined as a protected
+  frame before the template, and narrowing the step through `htui_agent::persona::narrow`
+  (`claude-cli`: `--tools=`/`--disallowedTools=`, never `--allowedTools`; ACP: relay kind rules and
+  htui's fs handlers). A persona carries **no model**, so ANA-27's precedence reads "agent row, then
+  the persona narrows; the model is the phase candidate's" (PRD Q-model). Binding moved from the
+  phase candidate to the phase (`phase_agent` has no writer, R-6). Docs `docs/personas.md`; PRD
+  `.claude/prds/mod-26-agent-personas.prd.md`; plan and blueprint under `.claude/plans/`. Milestone 2
+  (Settings > Personas, `.md` import, delete, review N4/N5) remains.
 - [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`); the MCP half needs MOD-11.
   **ANA-27 note (2026-10-01, `docs/ANA-27.md` §5.1 T6-T7):** settle in the PRD, from OpenRig's queue
   and workflow runtime: (1) **The swarm baton is a typed exit.** An agent yields with one exit from
