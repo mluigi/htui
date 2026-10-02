@@ -24,6 +24,7 @@ pub mod hierarchy;
 pub mod item_writes;
 pub mod keymap;
 pub mod persona_import;
+pub mod persona_settings;
 pub mod preview;
 pub mod prompt_settings;
 pub mod provision;
