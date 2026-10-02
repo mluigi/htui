@@ -549,7 +549,7 @@ pub fn parse_file(text: &str) -> Result<PersonaFile, PersonaFileError> {
         let Value::Scalar(value) = &entry.value else {
             return Err(not_one_line());
         };
-        if value.contains('\n') {
+        if value.contains('\n') || is_block_scalar(text, entry.line) {
             return Err(not_one_line());
         }
         match key {
@@ -612,6 +612,17 @@ pub fn parse_file(text: &str) -> Result<PersonaFile, PersonaFileError> {
         &file.permission,
     )
     .map_or(Ok(file), |refusal| Err(PersonaFileError::Refused(refusal)))
+}
+
+/// Whether the key on 1-based `line` of `text` opens a `|` or `>` block scalar (B-1). The reader
+/// resolves a chomped one (`|-`, `>-`) to a newline-free scalar, so the newline check alone does
+/// not see it; the source line does. A plain scalar cannot begin with either indicator, so a
+/// value written that way is refused rather than read as text.
+fn is_block_scalar(text: &str, line: usize) -> bool {
+    text.split('\n')
+        .nth(line.saturating_sub(1))
+        .and_then(|source| source.split_once(':'))
+        .is_some_and(|(_, rest)| rest.trim_start_matches([' ', '\t']).starts_with(['|', '>']))
 }
 
 /// A one-line list value (plan D8): comma-separated, each item trimmed, empty items dropped, so
