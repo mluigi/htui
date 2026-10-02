@@ -374,12 +374,18 @@ impl RunsTab {
 
     /// MOD-28 D7, D12: rebuilds the flow from the cursor's run, the cursor's step selected. Only
     /// while the flow is shown: the list never pays for it, and `v` syncs on the way in.
-    fn sync_graph(&self, theme: &Theme) {
-        if self.view == View::Flow {
-            self.graph
-                .borrow_mut()
-                .sync(self.entry_run(), self.selected_step(), theme);
+    ///
+    /// `get_mut`, not `borrow_mut`: `render_flow` holds the only runtime borrow (review N1).
+    fn sync_graph(&mut self, theme: &Theme) {
+        if self.view != View::Flow {
+            return;
         }
+        let step = self.selected_step();
+        let run = match self.entry() {
+            Some(Entry::Step { run, .. } | Entry::Run { run }) => self.runs.get(run),
+            None => None,
+        };
+        self.graph.get_mut().sync(run, step, theme);
     }
 
     /// First run to draw: the scrolled-to one, except that the cursor is never scrolled off the
@@ -1547,24 +1553,42 @@ impl DetailTab for RunsTab {
 }
 
 impl RunsTab {
-    /// MOD-28 D11: the flow branch of `render`. Row 1 is the run's first `run_lines` line, and the
-    /// rest is the canvas, or "No steps yet." under a run with none.
+    /// MOD-28 D11: the flow branch of `render`. The head is what the list says about the cursor's
+    /// run and step, and the rest is the canvas, or "No steps yet." under a run with none.
     fn render_flow(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         let Some(run) = self.entry_run() else {
             return;
         };
-        let [head, canvas] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
-        let line = run_lines(run, self.cancel_requested(run.id), theme)
-            .into_iter()
-            .next()
-            .unwrap_or_default();
-        frame.render_widget(Paragraph::new(line), head);
+        let lines = self.flow_head(run, theme);
+        let [head, canvas] = Layout::vertical([
+            Constraint::Length(u16::try_from(lines.len()).unwrap_or(u16::MAX)),
+            Constraint::Min(0),
+        ])
+        .areas(area);
+        frame.render_widget(Paragraph::new(lines), head);
         if run.steps.is_empty() {
             message(frame, canvas, NO_STEPS_YET, theme);
             return;
         }
         self.graph.borrow_mut().render(frame, canvas);
+    }
+
+    /// MOD-28 review L3, H1: the flow's head, the lines the list draws for `run` and the cursor's
+    /// step that a node has no room for: the run header (failure, pending cancel, a queued
+    /// command), the step's parked reason, and the pending request the digits answer, so a digit
+    /// in the flow never answers a request the pane does not show.
+    fn flow_head(&self, run: &RunSummary, theme: &Theme) -> Vec<Line<'static>> {
+        let mut lines = run_lines(run, self.cancel_requested(run.id), theme);
+        if self.waiting.contains(&run.id) {
+            lines.push(Line::styled(fit(WAITING_LINE, PANE), theme.accent));
+        }
+        if let Some((_, step)) = self.entry_step() {
+            lines.extend(note_line(step, theme));
+            if let Some(pending) = self.pending_on(step.id) {
+                lines.extend(permission_lines(pending, theme));
+            }
+        }
+        lines
     }
 
     /// The runs from the first visible one, each with its steps, and the line index just past the
@@ -3802,7 +3826,8 @@ mod tests {
         pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
         pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
         let lines = lines(&pane, &shell);
-        assert_eq!(lines[1], NO_STEPS_YET, "{lines:#?}");
+        // Rows 0 and 1 are the run header (review L3).
+        assert_eq!(lines[2], NO_STEPS_YET, "{lines:#?}");
     }
 
     /// MOD-28 review L3: the flow's head is the list's whole run header (the failure, a pending
