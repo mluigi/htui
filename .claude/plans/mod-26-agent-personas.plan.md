@@ -407,8 +407,11 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
       review R1 named the last two: I-5 on `the_model_key_is_refused_with_its_sentence` (and
       `the_model_key_is_refused_in_any_case`), I-6 on `seed_rows_are_the_two_seed_files`
 - [x] PRD metrics pinned per the test plan
-- [ ] Validation passes; reviewer gate (`rust-reviewer`) findings applied or deferred with the
-      maintainer
+- [x] Validation passes; reviewer gate (`rust-reviewer`) findings applied or deferred with the
+      maintainer — approve-with-fixes (0 critical/high/medium); R1 fixed L1, L3, N1-N3, N6-N8,
+      documented L2, L4; N4, N5 deferred to milestone 2 (maintainer, 2026-10-02). Final gate on
+      `a948c4dd`: fmt, clippy, offline check, `sqlx prepare --check`, workspace tests with Postgres
+      (`--test-threads=1`) and insta all green
 - [x] Close-out restates moved counts from a fresh count: store `CASES` (119 → N), `READ_CASES`
       (14), htui-orch `CASES` (86 → N), `.sqlx`, snapshots, migrations (11 → 12, next `0013`),
       `TABLES` (41 → 42)
