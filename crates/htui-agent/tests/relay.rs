@@ -29,10 +29,13 @@ use htui_agent::event::{
     PermissionRequestEvent, StopReason, ToolCallEvent, ToolKind, ToolResultEvent, ToolResultStatus,
 };
 use htui_agent::fake::FakeDriver;
+use htui_agent::permission::{PolicyStage, evaluate};
+use htui_agent::persona::narrow;
 use htui_agent::record::{
     Control, NoRelay, RELAY_GRACE, Recorder, Relay, Signal, control_channel, drive, pump,
 };
 use htui_core::fixtures::ids;
+use htui_core::model::persona::SnapshotPersona;
 use htui_core::model::{
     AnswerOutcome, Claim, EventKind, GraphSnapshot, Isolation, NewRun, NewRunStep, OpenPermission,
     PermissionChoice, PermissionId, PermissionStatus, RelayOptionKind, RelaySessionId, RunId,
@@ -208,18 +211,37 @@ fn spec(step: StepId) -> SessionSpec {
 
 /// The gated call: an `execute` whose title carries `secret`.
 fn call(title: &str) -> ScriptEvent {
-    ScriptEvent::Emit(call_event(title))
+    call_of(title, ToolKind::Execute)
+}
+
+/// [`call`] of another kind (MOD-26: a persona denies by kind).
+fn call_of(title: &str, kind: ToolKind) -> ScriptEvent {
+    ScriptEvent::Emit(call_event_of(title, kind))
 }
 
 /// [`call`]'s event.
 fn call_event(title: &str) -> DriverEvent {
+    call_event_of(title, ToolKind::Execute)
+}
+
+/// [`call_of`]'s event.
+fn call_event_of(title: &str, kind: ToolKind) -> DriverEvent {
     DriverEvent::ToolCall(ToolCallEvent {
         tool_call_id: CALL.to_owned(),
         title: title.to_owned(),
-        tool_kind: ToolKind::Execute,
+        tool_kind: kind,
         input: json!({ "command": "cargo test" }),
         locations: Vec::new(),
     })
+}
+
+/// The `reviewer` seed persona as a run freezes it (MOD-26 D7, D9): it denies `edit`.
+fn reviewer() -> SnapshotPersona {
+    let row = htui_core::model::persona::seed_rows(at())
+        .into_iter()
+        .find(|row| row.name == "reviewer")
+        .expect("the reviewer seed");
+    SnapshotPersona::freeze(&row).expect("a seed freezes")
 }
 
 /// The request for [`CALL`], with an allow and a reject option labelled `allow_label`/"Reject".
@@ -680,6 +702,73 @@ async fn a_policy_answer_writes_no_relay_row_and_records_by_policy() {
     assert_eq!(answers[0]["by"], "policy");
     assert_eq!(answers[0]["option_id"], ALLOW);
     assert_eq!(answers[0]["cancelled"], false);
+}
+
+/// MOD-26 D10, D11 (I-1): under the `reviewer` persona a parked `edit` request is answered
+/// `reject_once` by policy stage 1 — over a base that would have asked — so nothing is relayed and
+/// the answer is recorded `by: policy`, the `a_policy_answer_writes_no_relay_row_and_records_by_policy`
+/// shape. The recorded row carries no reason; the reason is the policy's, read back from it.
+#[tokio::test(start_paused = true)]
+async fn a_persona_denied_kind_is_rejected_by_policy() {
+    let fx = leased().await;
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut events = vec![call_of("edit the README", ToolKind::Edit), park("Allow")];
+    events.extend(finished());
+    let (mut session, seen) = watched(
+        Some(fake(Script::one_turn(events), fx.step).await),
+        Mode::Forward,
+    );
+    let base = PermissionPolicy::default();
+    assert_eq!(base.default, PermissionDefault::Ask, "the base would ask");
+    let policy = narrow(&ToolExposure::default(), &base, &reviewer()).1;
+    let relay = relay(&fx, &policy);
+
+    let out = within(drive(
+        &mut session,
+        &mut recorder,
+        Some(&relay),
+        &mut Control::never(),
+    ))
+    .await;
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(
+        out,
+        Ok(DoneEvent {
+            stop_reason: StopReason::EndTurn
+        }),
+        "the persona's answer lets the turn finish"
+    );
+    assert!(
+        fx.store.relay_rows().is_empty(),
+        "a persona's reject parks nothing"
+    );
+    assert_eq!(
+        seen.answers(),
+        vec![(
+            PermissionRequestId::new(REQUEST),
+            PermissionAnswer::Selected(REJECT.to_owned())
+        )],
+        "the session got the reject option"
+    );
+    let answers = answers_in(&log(&fx.store, fx.step).await);
+    assert_eq!(answers.len(), 1, "one recorded answer: {answers:?}");
+    assert_eq!(answers[0]["by"], "policy");
+    assert_eq!(answers[0]["option_id"], REJECT);
+    assert_eq!(answers[0]["cancelled"], false);
+
+    let DriverEvent::ToolCall(edit) = call_event_of("edit the README", ToolKind::Edit) else {
+        unreachable!("call_event_of builds a tool call")
+    };
+    let answer = evaluate(
+        &policy,
+        Some(&edit),
+        &permission_request(REQUEST, "Allow").options,
+    )
+    .expect("the persona answers");
+    assert_eq!(answer.stage, PolicyStage::Rule);
+    assert_eq!(answer.reason, "persona reviewer denies edit");
 }
 
 /// D3, D4, I-5: a stage-3 request is relayed scrubbed, answered by a client, applied under the
