@@ -585,7 +585,6 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             .chain(MOD23_COLUMN_COMMENTS)
             .chain(MOD33_COLUMN_COMMENTS)
             .chain(MOD26_COLUMN_COMMENTS)
-            .chain(MOD26_COLUMN_COMMENTS)
             .map(|(table, _, _)| (*table).to_owned())
             .collect::<BTreeSet<String>>()
             .into_iter()
