@@ -24,7 +24,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use htui_core::model::item_spec::{self, NOTHING_TO_SAVE};
 use htui_core::model::{
-    ItemId, ItemKindId, ItemSpec, ProjectId, ProjectRef, SpecChanges, SpecError, StepGraphId,
+    EditReason, ItemId, ItemKindId, ItemSpec, ProjectId, ProjectRef, SpecChanges, SpecError,
+    StepGraphId,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -571,6 +572,7 @@ impl ItemForm {
                         id: item.id,
                         expected_version: item.version,
                         changes,
+                        reason: EditReason::Edited,
                     },
                     Busy::Editing,
                 ))
@@ -1092,6 +1094,7 @@ mod tests {
                     id,
                     expected_version: 1,
                     changes,
+                    reason: EditReason::Edited,
                 }) if *id == ids::HTUI_ANA_1
                     && *changes == SpecChanges { title: Some(title.clone()), ..SpecChanges::default() }
             ),

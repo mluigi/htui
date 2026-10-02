@@ -14,7 +14,7 @@
 use htui::item_writes::{ItemFormContext, ItemWrite};
 use htui::store_worker::{self, StoreReply, StoreRequest};
 use htui_core::fixtures::ids;
-use htui_core::model::{Item, ItemFilter, ItemId, ItemSpec, Scope, SpecChanges};
+use htui_core::model::{EditReason, Item, ItemFilter, ItemId, ItemSpec, Scope, SpecChanges};
 use htui_core::store::{MemStore, ReadStore as _};
 use htui_store::{Backend, CacheStore, PgStore, testkit};
 
@@ -110,6 +110,7 @@ fn retitle(title: &str, expected: i32) -> StoreRequest {
             title: Some(title.to_owned()),
             ..SpecChanges::default()
         },
+        reason: EditReason::Edited,
     }
 }
 

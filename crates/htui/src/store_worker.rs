@@ -23,11 +23,12 @@ use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
     AgentId, AgentSummary, AnswerOutcome, BindingChange, BoxEdit, BoxId, BoxInfo, CitationKind,
-    Document, DocumentHead, DocumentId, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch,
-    ItemSpec, ItemSummary, LinkGraph, Note, PermissionId, PhaseId, PhasePatch, Priority, ProjectId,
-    ProjectPatch, RelayView, RepoId, RepoPatch, RequirementAreaId, RequirementId, RunSummary,
-    Scope, SessionEvent, SkillBindingKey, SkillId, SkillPatch, SpecChanges, StepGraphId,
-    StepGraphPatch, StepId, WorkspaceId, WorkspacePatch, WorkspaceSummary,
+    Document, DocumentHead, DocumentId, EditReason, Item, ItemFilter, ItemId, ItemKindId,
+    ItemKindPatch, ItemSpec, ItemSummary, LinkGraph, Note, PermissionId, PhaseId, PhasePatch,
+    Priority, ProjectId, ProjectPatch, RelayView, RepoId, RepoPatch, RequirementAreaId,
+    RequirementId, RunSummary, Scope, SessionEvent, SkillBindingKey, SkillId, SkillPatch,
+    SpecChanges, StepGraphId, StepGraphPatch, StepId, WorkspaceId, WorkspacePatch,
+    WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::store::{
@@ -884,8 +885,8 @@ pub enum StoreRequest {
         /// The spec columns; `body` and `touched_paths` print as lengths (E6).
         spec: ItemSpec,
     },
-    /// §7.2 at `expected_version`, only the changed columns (D5). Answered with
-    /// [`StoreReply::ItemWritten`] or [`StoreReply::ItemDiverged`].
+    /// §7.2 at `expected_version`, only the changed columns (D5), with its reason (milestone 3
+    /// D6). Answered with [`StoreReply::ItemWritten`] or [`StoreReply::ItemDiverged`].
     EditItem {
         /// The item edited.
         id: ItemId,
@@ -893,6 +894,9 @@ pub enum StoreRequest {
         expected_version: i32,
         /// The changed columns; `body` and `touched_paths` print as lengths (E6).
         changes: SpecChanges,
+        /// The revision's reason: `Edited` until the form is rebased on a divergence's head, then
+        /// `DivergenceResolution` (milestone 3 D6).
+        reason: EditReason,
     },
 }
 
@@ -1296,7 +1300,8 @@ pub enum StoreReply {
         /// What the write did.
         outcome: ItemWrite,
     },
-    /// An edit that missed its version (D6): nothing was written.
+    /// An edit that missed its version: nothing was written; both sides and the fresh catalogue
+    /// (milestone 3 D7).
     ItemDiverged(Box<ItemDivergence>),
     /// The store failed. `request` is [`StoreRequest::name`].
     Failed {

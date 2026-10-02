@@ -2017,8 +2017,12 @@ mod tests {
         assert!(
             matches!(
                 &request,
-                StoreRequest::EditItem { id, expected_version: 1, changes }
-                    if *id == first && *changes == htui_core::model::SpecChanges {
+                StoreRequest::EditItem {
+                    id,
+                    expected_version: 1,
+                    changes,
+                    reason: htui_core::model::EditReason::Edited,
+                } if *id == first && *changes == htui_core::model::SpecChanges {
                         title: Some(title.clone()),
                         ..htui_core::model::SpecChanges::default()
                     }

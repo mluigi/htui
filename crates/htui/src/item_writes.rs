@@ -18,9 +18,10 @@
 //! through [`SpecError`]'s `Display`. An edit with no change is refused before anything is written
 //! (D5), because both stores bump `version` on an all-`None` patch.
 //!
-//! **A stale edit is never written over the head** (D6). [`UpdateOutcome::Diverged`] answers
-//! [`StoreReply::ItemDiverged`] with both sides, for milestone 3's view; the token is the
-//! request's own and nothing here moves it, so a second save at the same token diverges again.
+//! **A stale edit is never written over the head** (milestone 2 D6). [`UpdateOutcome::Diverged`]
+//! answers [`StoreReply::ItemDiverged`] with both sides and the catalogue just read (milestone 3
+//! D7). The token is the request's own and nothing here moves it. The request carries its revision
+//! reason (milestone 3 D6): `divergence_resolution` once the form is rebased on a head.
 //!
 //! **A mint's `Failed` is hedged unless it is a refusal** (D11, as amended by the maintainer's
 //! §10.1): a COMMIT whose answer was lost comes back as `Failed`, and a retry would mint a second
@@ -37,7 +38,7 @@
 
 use htui_core::model::item_spec::{self, NOTHING_TO_SAVE, SpecContext};
 use htui_core::model::{
-    EditReason, Item, ItemId, ItemKind, ItemRevision, ProjectId, Repo, SpecError, StepGraph,
+    Item, ItemId, ItemKind, ItemRevision, ProjectId, Repo, SpecError, StepGraph,
 };
 use htui_core::store::{ReadStore as _, Result, StoreError, UpdateOutcome, WriteStore as _};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
@@ -107,15 +108,19 @@ impl core::fmt::Debug for ItemFormContext {
     }
 }
 
-/// D6: both sides of a stale edit, carried for milestone 3's view.
+/// A stale edit (milestone 2 D6): both sides and the project's catalogue, for milestone 3's view.
 ///
 /// `Debug` is hand-written (review L2): see the impl.
 #[derive(Clone, PartialEq)]
 pub struct ItemDivergence {
     /// The row as it is now.
     pub head: Item,
-    /// The revision at the version the edit was made from.
+    /// The revision at the version the edit was made from: the spec's cross-check (ANA-9 §4.2
+    /// step 3). The view renders the form's own opened item instead (milestone 3 D1).
     pub ancestor: ItemRevision,
+    /// The catalogue the worker read to check the edit, with `item = Some(head)` (milestone 3
+    /// D7): the rebased form opens on it, so a re-kinded or re-graphed head still has labels.
+    pub context: ItemFormContext,
 }
 
 /// As [`ItemFormContext`]'s: ids, the key, the versions and lengths only (review L2).
@@ -124,6 +129,7 @@ impl core::fmt::Debug for ItemDivergence {
         f.debug_struct("ItemDivergence")
             .field("head", &ItemDigest(&self.head))
             .field("ancestor", &RevisionDigest(&self.ancestor))
+            .field("context", &self.context)
             .finish()
     }
 }
@@ -239,13 +245,14 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             id,
             expected_version,
             changes,
+            reason,
         } => {
             let writer = write_access(backend)?;
             if changes.is_empty() {
                 return Err(StoreError::Constraint(NOTHING_TO_SAVE.to_owned()));
             }
             let project = existing(&writer, *id).await?.project_id;
-            let context = catalogue(&writer, project).await?;
+            let mut context = catalogue(&writer, project).await?;
             let changes =
                 item_spec::check_changes(changes, &context.spec_context()).map_err(refused)?;
             let me = backend.this_user().await?;
@@ -255,7 +262,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 .update_item(
                     *id,
                     *expected_version,
-                    changes.into_patch(me, box_id, EditReason::Edited),
+                    changes.into_patch(me, box_id, *reason),
                 )
                 .await?
             {
@@ -267,9 +274,12 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                     },
                 }),
                 UpdateOutcome::Diverged { head, ancestor } => {
+                    // Milestone 3 D7: the catalogue just read, with the head as its item.
+                    context.item = Some(head.clone());
                     Ok(StoreReply::ItemDiverged(Box::new(ItemDivergence {
                         head,
                         ancestor,
+                        context,
                     })))
                 }
             }
@@ -333,8 +343,8 @@ mod tests {
     use htui_core::fixtures::ids;
     use htui_core::model::item_spec::NOTHING_TO_SAVE;
     use htui_core::model::{
-        Item, ItemId, ItemPatch, ItemRevision, ItemSpec, NewRepo, NewStepGraph, ProjectId, RepoId,
-        SpecChanges, StepGraphId,
+        EditReason, Item, ItemId, ItemPatch, ItemRevision, ItemSpec, NewRepo, NewStepGraph,
+        ProjectId, RepoId, SpecChanges, StepGraphId,
     };
     use htui_core::store::{MemStore, ReadStore as _, StoreError, UpdateOutcome, WriteStore as _};
     use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE};
@@ -406,6 +416,33 @@ mod tests {
             id: ids::HTUI_ANA_2,
             expected_version,
             changes,
+            reason: EditReason::Edited,
+        }
+    }
+
+    /// [`edit`] once the form is rebased on a divergence's head (milestone 3 D6).
+    fn resolve(expected_version: i32, changes: SpecChanges) -> StoreRequest {
+        StoreRequest::EditItem {
+            id: ids::HTUI_ANA_2,
+            expected_version,
+            changes,
+            reason: EditReason::DivergenceResolution,
+        }
+    }
+
+    /// Someone else's title change, written straight to the store at `version`.
+    fn theirs(title: &str) -> ItemPatch {
+        ItemPatch {
+            title: Some(title.to_owned()),
+            body: None,
+            kind_id: None,
+            required_tags: None,
+            priority: None,
+            touched_paths: None,
+            step_graph_id: None,
+            author_id: ids::USER,
+            box_id: None,
+            reason: "elsewhere".to_owned(),
         }
     }
 
@@ -638,6 +675,7 @@ mod tests {
         let ItemDivergence {
             head: answered,
             ancestor,
+            ..
         } = *divergence;
         assert_eq!(answered, head);
         assert_eq!(ancestor.version, 1);
@@ -645,6 +683,89 @@ mod tests {
         assert_eq!(after.title, "First");
         assert_eq!(after.version, 2);
         assert_eq!(after, head);
+    }
+
+    /// Milestone 3 D6: a resolution lands with its own reason, pinned through the ancestor of a
+    /// later, deliberately stale edit.
+    #[tokio::test]
+    async fn a_resolution_lands_with_reason_divergence_resolution() {
+        let (store, backend) = demo();
+        let moved = store
+            .update_item(ids::HTUI_ANA_2, 1, theirs("Theirs"))
+            .await
+            .expect("their edit");
+        assert!(matches!(moved, UpdateOutcome::Updated(ref head) if head.version == 2));
+        let stale = serve(&backend, &edit(1, retitle("Mine")))
+            .await
+            .expect("a stale edit is an answer");
+        assert!(matches!(stale, StoreReply::ItemDiverged(_)), "{stale:?}");
+
+        let answer = serve(&backend, &resolve(2, retitle("Resolved")))
+            .await
+            .expect("the resolution applies");
+        assert!(
+            matches!(
+                &answer,
+                StoreReply::ItemWritten {
+                    outcome: ItemWrite::Edited { version: 3, .. },
+                    ..
+                }
+            ),
+            "{answer:?}"
+        );
+
+        let moved = store
+            .update_item(ids::HTUI_ANA_2, 3, theirs("Theirs again"))
+            .await
+            .expect("their second edit");
+        assert!(matches!(moved, UpdateOutcome::Updated(ref head) if head.version == 4));
+        let stale = serve(&backend, &edit(3, retitle("Stale")))
+            .await
+            .expect("a stale edit is an answer");
+        let StoreReply::ItemDiverged(divergence) = stale else {
+            panic!("a stale edit diverges, not {stale:?}")
+        };
+        assert_eq!(divergence.ancestor.version, 3);
+        assert_eq!(divergence.ancestor.reason, "divergence_resolution");
+        assert_eq!(divergence.ancestor.title, "Resolved");
+        assert_eq!(divergence.ancestor.author_id, ids::USER);
+    }
+
+    /// Milestone 3 D7: the divergence carries the catalogue the worker read for this edit, fresh,
+    /// with the head as its item.
+    #[tokio::test]
+    async fn a_stale_edit_carries_the_fresh_catalogue_and_the_head() {
+        let (store, backend) = demo();
+        serve(&backend, &edit(1, retitle("First")))
+            .await
+            .expect("the first edit applies");
+        let graph = store
+            .create_step_graph(NewStepGraph {
+                id: StepGraphId::new(),
+                project_id: ids::PROJECT_HTUI,
+                name: "after the form".to_owned(),
+                description: String::new(),
+                is_override: false,
+            })
+            .await
+            .expect("create a graph");
+
+        let answer = serve(&backend, &edit(1, retitle("Second")))
+            .await
+            .expect("a stale edit is an answer");
+
+        let StoreReply::ItemDiverged(d) = answer else {
+            panic!("a stale edit diverges, not {answer:?}")
+        };
+        assert_eq!(d.context.project, ids::PROJECT_HTUI);
+        assert_eq!(d.context.item.as_ref(), Some(&d.head));
+        assert!(d.context.graphs.iter().any(|g| g.id == graph.id));
+        assert!(d.context.graphs.iter().all(|g| !g.is_override));
+        let kinds = store.item_kinds(ids::PROJECT_HTUI).await.expect("kinds");
+        assert_eq!(
+            d.context.kinds.iter().map(|k| k.id).collect::<Vec<_>>(),
+            kinds.iter().map(|k| k.id).collect::<Vec<_>>()
+        );
     }
 
     /// D5: both stores would bump `version` on an all-`None` patch.
@@ -846,16 +967,22 @@ mod tests {
         let divergence = ItemDivergence {
             head: item.clone(),
             ancestor,
+            context: context.clone(),
         };
         for reply in [
             StoreReply::ItemForm(Box::new(context)),
             StoreReply::ItemDiverged(Box::new(divergence)),
         ] {
+            let diverged = matches!(reply, StoreReply::ItemDiverged(_));
             for printed in [format!("{reply:?}"), format!("{reply:#?}")] {
                 for secret in ["SECRET-BODY", "SECRET-ANCESTOR", "secret/dir"] {
                     assert!(!printed.contains(secret), "{secret}: {printed}");
                 }
                 assert!(printed.contains(&item.key), "{printed}");
+                if diverged {
+                    // Milestone 3 D7: the catalogue prints, as counts.
+                    assert!(printed.contains("kinds"), "{printed}");
+                }
             }
         }
     }
