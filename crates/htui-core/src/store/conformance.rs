@@ -22,10 +22,10 @@ use crate::model::{
     ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
     NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
     NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, NoteId, OpenPermission, OverlapRule,
-    PermissionChoice, PermissionId, PermissionStatus, PhaseId, PhasePatch, Priority, ProbedTool,
-    ProjectId, ProjectPatch, PromptScope, PromptTemplate, PromptTemplateId, RelayOption,
-    RelayOptionKind, RelaySessionId, RelayView, RepoBoxPath, RepoId, RepoPatch, RepoScope,
-    Requirement, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
+    PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Priority,
+    ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate, PromptTemplateId,
+    RelayOption, RelayOptionKind, RelaySessionId, RelayView, RepoBoxPath, RepoId, RepoPatch,
+    RepoScope, Requirement, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
     RequirementRevision, RequirementState, RequirementUpdate, Resolution, Run, RunCommandId,
     RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunScope, RunStatus, RunStep,
     RunStepCommit, RunStepTree, Scope, SessionEvent, Skill, SkillBindingKey, SkillId, SkillPatch,
@@ -166,6 +166,7 @@ pub const CASES: &[&str] = &[
     "deleting_a_project_takes_its_relay_rows",
     "adopt_runs_never_leases_a_chat_run",
     "queued_at_ties_inside_a_microsecond_break_on_id",
+    "phase_agents_are_written_whole_and_counted",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -420,6 +421,9 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "adopt_runs_never_leases_a_chat_run" => adopt_runs_never_leases_a_chat_run(store).await,
         "queued_at_ties_inside_a_microsecond_break_on_id" => {
             queued_at_ties_inside_a_microsecond_break_on_id(store).await;
+        }
+        "phase_agents_are_written_whole_and_counted" => {
+            phase_agents_are_written_whole_and_counted(store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -5111,6 +5115,125 @@ async fn queued_at_ties_inside_a_microsecond_break_on_id<S: WriteStore>(store: &
         },
         "{CASE}: the two runs tie on queued_at, so the lower id is the first overlap"
     );
+}
+
+/// MOD-37 R-6: [`WriteStore::create_phase_agents`] writes a phase's candidates all or nothing,
+/// and a project's delete reach counts what it wrote.
+///
+/// The rows are read back through `delete_reach` because `phase_agents` and `resolve_graph` are
+/// inherent reads, on neither trait. `written_phase_agents_answer_every_reader` reads them back
+/// on `MemStore`, and `pg_criteria.rs::inherent_orchestration_reads_answer_the_fixture` compares
+/// Postgres with it.
+async fn phase_agents_are_written_whole_and_counted<S: WriteStore>(store: &S) {
+    const CASE: &str = "phase_agents_are_written_whole_and_counted";
+    let implement = ids::PHASE_HTUI_IMPLEMENT;
+    let row = |phase: PhaseId, position: i32, agent_id: AgentId, model: &str| PhaseAgent {
+        phase_id: phase,
+        position,
+        agent_id,
+        model: model.to_owned(),
+    };
+    assert_eq!(
+        phase_agent_count(CASE, store).await,
+        0,
+        "{CASE}: the fixture seeds no phase_agent row"
+    );
+
+    store
+        .create_phase_agents(
+            implement,
+            &[
+                row(implement, 1, ids::AGENT_AGY, "opus"),
+                row(implement, 0, ids::AGENT_CLAUDE, "sonnet"),
+            ],
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        phase_agent_count(CASE, store).await,
+        2,
+        "{CASE}: two rows written out of position order are both stored"
+    );
+
+    let other = store
+        .phases(ids::GRAPH_HTUI_FEAT)
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|phase| phase.id != implement)
+        .unwrap_or_else(|| panic!("{CASE}: the FEAT graph has another phase"))
+        .id;
+    let unknown = PhaseId::new();
+    let refusals = [
+        (
+            "a row that names another phase",
+            implement,
+            vec![row(other, 5, ids::AGENT_CLAUDE, "sonnet")],
+        ),
+        (
+            "a phase that names no row",
+            unknown,
+            vec![row(unknown, 0, ids::AGENT_CLAUDE, "sonnet")],
+        ),
+        (
+            "an agent that names no row",
+            implement,
+            vec![row(implement, 5, AgentId::new(), "sonnet")],
+        ),
+        (
+            "a taken position",
+            implement,
+            vec![row(implement, 0, ids::AGENT_AGY, "opus")],
+        ),
+        (
+            "a good row beside a taken one",
+            implement,
+            vec![
+                row(implement, 5, ids::AGENT_CLAUDE, "sonnet"),
+                row(implement, 1, ids::AGENT_CLAUDE, "sonnet"),
+            ],
+        ),
+        (
+            "one position twice in the batch",
+            implement,
+            vec![
+                row(implement, 6, ids::AGENT_CLAUDE, "sonnet"),
+                row(implement, 6, ids::AGENT_AGY, "opus"),
+            ],
+        ),
+    ];
+    for (what, phase, rows) in refusals {
+        let answer = store.create_phase_agents(phase, &rows).await;
+        assert!(
+            matches!(answer, Err(StoreError::Constraint(_))),
+            "{CASE}: {what} is a constraint refusal, not {answer:?}"
+        );
+        assert_eq!(
+            phase_agent_count(CASE, store).await,
+            2,
+            "{CASE}: {what} writes nothing"
+        );
+    }
+
+    store
+        .create_phase_agents(unknown, &[])
+        .await
+        .unwrap_or_else(|err| panic!("{CASE}: an empty slice checks nothing, not {err:?}"));
+    assert_eq!(
+        phase_agent_count(CASE, store).await,
+        2,
+        "{CASE}: and writes nothing"
+    );
+}
+
+/// `phase_agent` rows the `htui` project's delete would take.
+async fn phase_agent_count<S: WriteStore>(case: &str, store: &S) -> u64 {
+    store
+        .delete_reach(DeleteTarget::Project(ids::PROJECT_HTUI))
+        .await
+        .expect(case)
+        .unwrap_or_else(|| panic!("{case}: the fixture project has a reach"))
+        .phase_agents
 }
 
 /// A tag list from string literals, in the order given (the store cases pass tags out of byte

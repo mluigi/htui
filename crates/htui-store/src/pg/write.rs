@@ -27,12 +27,12 @@ use htui_core::model::{
     ItemPatch, ItemRequirement, ItemRevision, NewCommandRun, NewDocument, NewItem, NewItemKind,
     NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
     NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission,
-    PermissionChoice, PermissionId, PermissionStatus, PhaseId, PhasePatch, Priority, Project,
-    ProjectId, ProjectPatch, PromptTemplate, PromptTemplateId, RelaySessionId, RelayView, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
-    Resolution, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Skill, SkillBinding,
+    PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Priority,
+    Project, ProjectId, ProjectPatch, PromptTemplate, PromptTemplateId, RelaySessionId, RelayView,
+    Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementState,
+    RequirementUpdate, Resolution, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind,
+    RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Skill, SkillBinding,
     SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
     StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
     UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
@@ -54,9 +54,9 @@ use htui_core::store::{
     item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move, new_skill_refusal,
     not_a_fanout_candidate, not_a_terminal_status, prompt_template_key, prompt_template_refusal,
     references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
-    row_names_another_step, run_is_terminal, skill_body_refusal, skill_patch_refusal,
-    skill_version_key, step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
-    withdrawn_requirement_cited,
+    row_names_another_phase, row_names_another_step, run_is_terminal, skill_body_refusal,
+    skill_patch_refusal, skill_version_key, step_is_not_promotable, summary_names_another_item,
+    winner_is_not_settled, withdrawn_requirement_cited,
 };
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -2752,6 +2752,45 @@ impl WriteStore for PgStore {
         .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx)
+    }
+
+    /// One `UNNEST` insert (MOD-37 R-6), so the batch lands whole or not at all. A row naming
+    /// another phase is refused before the statement; everything else is the schema's.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] for a row whose `phase_id` is not `phase`, a `phase` or an
+    /// `agent_id` that names no row (`23503`), or a taken `(phase_id, position)`, stored or
+    /// within the batch (`23505`).
+    async fn create_phase_agents(&self, phase: PhaseId, agents: &[PhaseAgent]) -> Result<()> {
+        if agents.is_empty() {
+            return Ok(());
+        }
+        if let Some(row) = agents.iter().find(|row| row.phase_id != phase) {
+            return Err(StoreError::Constraint(row_names_another_phase(
+                "phase_agent",
+                row.phase_id,
+                phase,
+            )));
+        }
+        let positions: Vec<i32> = agents.iter().map(|row| row.position).collect();
+        let agent_ids: Vec<Uuid> = agents.iter().map(|row| row.agent_id.as_uuid()).collect();
+        let models: Vec<String> = agents.iter().map(|row| row.model.clone()).collect();
+        sqlx::query!(
+            r#"
+            INSERT INTO phase_agent (phase_id, position, agent_id, model)
+            SELECT $1, t.position, t.agent_id, t.model
+              FROM UNNEST($2::int4[], $3::uuid[], $4::text[]) AS t(position, agent_id, model)
+            "#,
+            phase.as_uuid(),
+            &positions,
+            &agent_ids,
+            &models,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
     }
 
     /// The compare-and-set of D3 over [`PhasePatch`]'s five columns.

@@ -312,7 +312,8 @@ pub struct ResolvedGraph {
 pub struct ResolvedPhase {
     /// The `step_graph_phase` row.
     pub phase: StepGraphPhase,
-    /// `phase_agent` rows in `position` order; empty on `MemStore`, which holds no such table.
+    /// `phase_agent` rows in `position` order; empty for a phase that has none, as every phase of
+    /// the demo fixture is.
     pub agents: Vec<PhaseAgent>,
 }
 

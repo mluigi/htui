@@ -52,12 +52,12 @@ use crate::model::{
     ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject,
     NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill,
     NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
-    PermissionId, PermissionStatus, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
-    PromptScope, PromptTemplate, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
-    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding,
+    PermissionId, PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, PromptScope, PromptTemplate, RelaySessionId, RelayView, Repo, RepoBoxPath,
+    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate,
+    Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding,
     SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
     StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
     UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
@@ -861,6 +861,17 @@ pub trait WriteStore: ReadStore {
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a reserved name, a
     /// taken `(graph_id, position)` or `(graph_id, name)`, or a `graph_id` that names no row.
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase>;
+
+    /// Inserts `agents` as `phase`'s candidate rows, all or nothing; an empty slice writes nothing
+    /// and checks nothing (MOD-37 R-6). Insert-only: `override_graph` writes to fresh phases. The
+    /// rows may come in any order; the readers sort by `position`.
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for a row whose `phase_id`
+    /// is not `phase` ([`row_names_another_phase`]), a `phase` or an `agent_id` that names no
+    /// row, or a `(phase_id, position)` already taken, by a stored row or by another row of the
+    /// batch.
+    async fn create_phase_agents(&self, phase: PhaseId, agents: &[PhaseAgent]) -> Result<()>;
 
     /// Edits the five columns of [`PhasePatch`] under CAS; `token_budget` is
     /// [`set_setting`](Self::set_setting)'s on the `Phase` rung and is not here (D8).
@@ -2194,6 +2205,12 @@ pub fn row_names_another_step(table: &str, row: StepId, step: StepId) -> String 
     format!("{table}.run_step_id `{row}` is not the step being written (`{step}`)")
 }
 
+/// MOD-37 R-6: a batch of `phase_agent` rows belongs to the phase it is written for.
+#[must_use]
+pub fn row_names_another_phase(table: &str, row: PhaseId, phase: PhaseId) -> String {
+    format!("{table}.phase_id `{row}` is not the phase being written (`{phase}`)")
+}
+
 /// §4.8: promotion takes a step the run stopped on, not one that is still moving or already done.
 #[must_use]
 pub fn step_is_not_promotable(step: StepId, status: StepStatus) -> String {
@@ -2358,10 +2375,10 @@ pub enum DeleteTarget {
 ///
 /// One struct rather than a method per table, so a table `0003` adds is a field here and the two
 /// callers of the counting code cannot disagree about it. A workspace delete fills
-/// `workspace_links` and `workspace_box_paths` only. `phase_agents` is `0` on `MemStore`, which
-/// holds no such table, and `0` on the demo database, which seeds none; `run_step_commits`,
-/// `run_step_trees` and `command_runs` are counted on both since MOD-4. MOD-38's six
-/// requirement fields are counted on both stores.
+/// `workspace_links` and `workspace_box_paths` only. `phase_agents` is counted on both stores
+/// since MOD-37 R-6 gave `MemStore` the table, and is `0` on the demo fixture, which seeds none;
+/// `run_step_commits`, `run_step_trees` and `command_runs` are counted on both since MOD-4.
+/// MOD-38's six requirement fields are counted on both stores.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeleteReach {
     /// `workspace_project` rows.

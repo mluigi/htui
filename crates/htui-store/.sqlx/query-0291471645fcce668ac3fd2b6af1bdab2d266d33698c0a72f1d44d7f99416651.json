@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO phase_agent (phase_id, position, agent_id, model)\n            SELECT $1, t.position, t.agent_id, t.model\n              FROM UNNEST($2::int4[], $3::uuid[], $4::text[]) AS t(position, agent_id, model)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4Array",
+        "UuidArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0291471645fcce668ac3fd2b6af1bdab2d266d33698c0a72f1d44d7f99416651"
+}

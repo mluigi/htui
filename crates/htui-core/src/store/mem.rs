@@ -59,9 +59,9 @@ use crate::store::traits::{
     item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move, new_skill_refusal,
     not_a_fanout_candidate, not_a_terminal_status, prompt_template_key, prompt_template_refusal,
     references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
-    row_names_another_step, run_is_terminal, skill_body_refusal, skill_patch_refusal,
-    skill_version_key, step_is_not_promotable, step_slot_is_taken, summary_names_another_item,
-    winner_is_not_settled, withdrawn_requirement_cited,
+    row_names_another_phase, row_names_another_step, run_is_terminal, skill_body_refusal,
+    skill_patch_refusal, skill_version_key, step_is_not_promotable, step_slot_is_taken,
+    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
 use uuid::Uuid;
 
@@ -158,6 +158,10 @@ struct State {
     graphs: HashMap<StepGraphId, StepGraph>,
     /// `step_graph_phase`, read by [`WriteStore::phases`] since MOD-15 (plan D1).
     phases: Vec<StepGraphPhase>,
+    /// `phase_agent`, keyed as its primary key is, so the map's order is `position` order within
+    /// each phase. Written by [`WriteStore::create_phase_agents`] only (MOD-37 R-6); no fixture
+    /// loads it.
+    phase_agents: BTreeMap<(PhaseId, i32), PhaseAgent>,
     /// `prompt_template`, read by the inherent [`MemStore::prompt_templates`] (MOD-2 plan D102) and
     /// appended to only by [`WriteStore::append_prompt_template`] and the project seed (MOD-9 D1).
     templates: Vec<PromptTemplate>,
@@ -307,6 +311,7 @@ impl MemStore {
             kinds: data.kinds.into_iter().map(|row| (row.id, row)).collect(),
             graphs: data.graphs.into_iter().map(|row| (row.id, row)).collect(),
             phases: data.phases,
+            phase_agents: BTreeMap::new(),
             templates: data.templates,
             skills: data.skills.into_iter().map(|row| (row.id, row)).collect(),
             skill_versions: data.skill_versions,
@@ -620,15 +625,15 @@ impl MemStore {
         Ok(self.read(|state| state.graphs.get(&id).cloned()))
     }
 
-    /// A phase's candidate agents in `position` order. Always empty here: `phase_agent` is a table
-    /// this store does not hold, and the snapshot builder falls back to
-    /// `project.settings.default_agent_id` when a phase has no candidate.
+    /// A phase's candidate agents in `position` order: the rows
+    /// [`WriteStore::create_phase_agents`] wrote (MOD-37 R-6). The fixture seeds none, and the
+    /// snapshot builder falls back to `project.settings.default_agent_id` when a phase has no
+    /// candidate.
     ///
     /// # Errors
     /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
     pub async fn phase_agents(&self, phase: PhaseId) -> Result<Vec<PhaseAgent>> {
-        let _ = phase;
-        Ok(Vec::new())
+        Ok(self.read(|state| state.phase_agents_of(phase)))
     }
 
     /// One `prompt_template` by `(project, name)`: the pinned `version` when there is one, else
@@ -2916,6 +2921,59 @@ impl State {
         Ok(row)
     }
 
+    /// Inserts a phase's candidate rows, all or nothing (MOD-37 R-6): every refusal is decided
+    /// before the first insert, in the order `PgStore` meets them. An empty slice checks nothing.
+    fn create_phase_agents(&mut self, phase: PhaseId, agents: &[PhaseAgent]) -> Result<()> {
+        if agents.is_empty() {
+            return Ok(());
+        }
+        if let Some(row) = agents.iter().find(|row| row.phase_id != phase) {
+            return Err(StoreError::Constraint(row_names_another_phase(
+                "phase_agent",
+                row.phase_id,
+                phase,
+            )));
+        }
+        if self.phase(phase).is_none() {
+            return Err(StoreError::Constraint(references_no_row(
+                "phase_agent.phase_id",
+                phase,
+                "step_graph_phase",
+            )));
+        }
+        let mut batch = HashSet::new();
+        for row in agents {
+            if !self.agents.contains_key(&row.agent_id) {
+                return Err(StoreError::Constraint(references_no_row(
+                    "phase_agent.agent_id",
+                    row.agent_id,
+                    "agent",
+                )));
+            }
+            if self.phase_agents.contains_key(&(phase, row.position)) || !batch.insert(row.position)
+            {
+                return Err(StoreError::Constraint(already_exists(
+                    "phase_agent",
+                    format!("({phase}, {})", row.position),
+                )));
+            }
+        }
+        self.phase_agents.extend(
+            agents
+                .iter()
+                .map(|row| ((row.phase_id, row.position), row.clone())),
+        );
+        Ok(())
+    }
+
+    /// A phase's `phase_agent` rows in `position` order, the map's own order.
+    fn phase_agents_of(&self, phase: PhaseId) -> Vec<PhaseAgent> {
+        self.phase_agents
+            .range((phase, i32::MIN)..=(phase, i32::MAX))
+            .map(|(_, row)| row.clone())
+            .collect()
+    }
+
     /// Compare-and-set on the phase's `updated_at` over [`PhasePatch`]'s five columns;
     /// `token_budget` is the `Phase` rung's and is not here (D8).
     fn update_phase(
@@ -3628,11 +3686,10 @@ impl State {
     ///
     /// The counts and the id sets come out of the same predicates, which is what makes
     /// `delete_reach`'s report and `delete_project`'s act equal by construction rather than by two
-    /// lists kept in step by hand. `phase_agents` is `0` because this store holds no such table,
-    /// and `workspace_box_paths` because a project is not a workspace; `run_step_commits` and
-    /// `run_step_trees` were `0` for the same reason until MOD-4 milestone 1 gave this store the
-    /// two maps (plan D12), and `command_runs` until milestone 3 gave it the third (plan D31).
-    /// MOD-38's six requirement counts come from the same pass (blueprint F1, §4.4).
+    /// lists kept in step by hand. `workspace_box_paths` is `0` because a project is not a
+    /// workspace. `run_step_commits` and `run_step_trees` were `0` until MOD-4 milestone 1 gave
+    /// this store the two maps (plan D12), `command_runs` until milestone 3 gave it the third
+    /// (plan D31), and `phase_agents` until MOD-37 R-6 gave it the fourth. MOD-38's six requirement counts come from the same pass (blueprint F1, §4.4).
     fn project_reach(&self, id: ProjectId) -> Option<(DeleteReach, ProjectReach)> {
         if !self.projects.contains_key(&id) {
             return None;
@@ -3711,7 +3768,12 @@ impl State {
             ),
             step_graphs: rows(graphs.len()),
             phases: rows(phases.len()),
-            phase_agents: 0,
+            phase_agents: rows(
+                self.phase_agents
+                    .keys()
+                    .filter(|(phase, _)| phases.contains(phase))
+                    .count(),
+            ),
             prompt_templates: rows(
                 self.templates
                     .iter()
@@ -3913,6 +3975,8 @@ impl State {
             .retain(|(project, _), _| *project != id);
         self.skill_bindings.retain(|row| row.project_id != Some(id));
         self.kinds.retain(|_, row| row.project_id != id);
+        self.phase_agents
+            .retain(|(phase, _), _| !gone.phases.contains(phase));
         self.phases.retain(|row| !gone.phases.contains(&row.id));
         self.graphs.retain(|id, _| !gone.graphs.contains(id));
         self.templates.retain(|row| row.project_id != id);
@@ -5165,8 +5229,7 @@ impl State {
                 .into_iter()
                 .map(|phase| ResolvedPhase {
                     phase: phase.clone(),
-                    // `phase_agent` is not a table this store holds (blueprint F-N).
-                    agents: Vec::new(),
+                    agents: self.phase_agents_of(phase.id),
                 })
                 .collect(),
         })
@@ -6493,6 +6556,10 @@ impl WriteStore for MemStore {
         self.write(|state| state.create_phase(phase, now))
     }
 
+    async fn create_phase_agents(&self, phase: PhaseId, agents: &[PhaseAgent]) -> Result<()> {
+        self.write(|state| state.create_phase_agents(phase, agents))
+    }
+
     async fn update_phase(
         &self,
         id: PhaseId,
@@ -6988,7 +7055,7 @@ mod tests {
         CitationKind, Claim, DocumentId, GateOutcome, GraphSnapshot, Isolation, ItemId,
         ItemKindPatch, NewDocument, NewItem, NewNote, NewProject, NewRepo, NewRequirement,
         NewRequirementArea, NewRun, NewRunStep, NoteId, OpenPermission, OverlapRule, PermissionId,
-        Priority, ProbedTool, ProjectId, ProjectPatch, RelayOption, RelayOptionKind,
+        PhaseAgent, Priority, ProbedTool, ProjectId, ProjectPatch, RelayOption, RelayOptionKind,
         RelaySessionId, RepoId, RequirementAreaId, RequirementId, RequirementPatch,
         RequirementUpdate, Resolution, RunCommandStatus, RunId, RunKind, RunMode, RunStatus,
         RunStepCommit, RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status, StepId,
@@ -11134,6 +11201,73 @@ mod tests {
         ));
     }
 
+    /// MOD-37 R-6: what `create_phase_agents` writes is what every inherent reader answers, and a
+    /// project delete takes it. The store-side half is the conformance case
+    /// `phase_agents_are_written_whole_and_counted`.
+    #[tokio::test]
+    async fn written_phase_agents_answer_every_reader() {
+        let store = MemStore::demo();
+        let implement = ids::PHASE_HTUI_IMPLEMENT;
+        let row = |position: i32, agent_id: AgentId, model: &str| PhaseAgent {
+            phase_id: implement,
+            position,
+            agent_id,
+            model: model.to_owned(),
+        };
+        let first = row(0, ids::AGENT_CLAUDE, "sonnet");
+        let second = row(1, ids::AGENT_AGY, "opus");
+        store
+            .create_phase_agents(implement, &[second.clone(), first.clone()])
+            .await
+            .expect("the rows are written");
+
+        assert_eq!(
+            store
+                .phase_agents(implement)
+                .await
+                .expect("the read is total"),
+            vec![first.clone(), second.clone()],
+            "candidates come back in position order, not insertion order"
+        );
+        let resolved = store
+            .resolve_graph(ids::HTUI_FEAT_1)
+            .await
+            .expect("the graph resolves")
+            .expect("FEAT items have a default graph");
+        assert!(
+            resolved
+                .phases
+                .iter()
+                .any(|phase| phase.phase.id == implement),
+            "the implement phase is in the FEAT graph"
+        );
+        for phase in &resolved.phases {
+            let expected = if phase.phase.id == implement {
+                vec![first.clone(), second.clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                phase.agents, expected,
+                "resolve_graph carries each phase's own candidates"
+            );
+        }
+
+        let report = store
+            .delete_project(ids::PROJECT_HTUI)
+            .await
+            .expect("the project is deleted");
+        assert_eq!(report.phase_agents, 2, "the delete counts the two rows");
+        assert!(
+            store
+                .phase_agents(implement)
+                .await
+                .expect("the read is total")
+                .is_empty(),
+            "and takes them with their phase"
+        );
+    }
+
     /// The eleven inherent reads of ANA-2 §8 that `Backend`'s `match self` will dispatch (plan
     /// D1, blueprint F-N): each answers from the fixture, and the two that take an id refuse an
     /// unknown one.
@@ -11154,7 +11288,7 @@ mod tests {
                 .await
                 .expect("the read is total")
                 .is_empty(),
-            "MemStore holds no phase_agent table"
+            "the fixture seeds no phase_agent row"
         );
         assert!(
             store
@@ -11189,7 +11323,7 @@ mod tests {
         );
         assert!(
             resolved.phases.iter().all(|row| row.agents.is_empty()),
-            "no phase_agent table here either"
+            "the fixture seeds no phase_agent row"
         );
         assert!(
             store
