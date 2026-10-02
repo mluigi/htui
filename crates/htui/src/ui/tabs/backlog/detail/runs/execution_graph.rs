@@ -5,11 +5,6 @@
 //! selection of its own: the cursor step is rebuilt selected on every sync (plan D7), and no key
 //! ever reaches rataflow's own bindings (blueprint H-1).
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "MOD-28 T3 wires the flow view into RunsTab")
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use htui_core::model::{RunId, RunStepSummary, RunSummary, StepId, StepStatus};

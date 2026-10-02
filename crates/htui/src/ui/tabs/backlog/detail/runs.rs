@@ -26,11 +26,17 @@
 //! | `u` / `R` | item | `Unblock` / `StartRun` |
 //! | `C` | item | close-out: the counts, a picked resolution, a `y`, the key typed back (D167) |
 //! | `1`-`9` | step with a pending request | `AnswerPermission` with that option (MOD-42 D14) |
+//! | `v` | pane | the list or the flow view of the cursor's run (MOD-28 D1, D8) |
+//! | `+` / `-` / `=` | flow | zoom in, zoom out, fit the run (MOD-28 D8) |
 //!
 //! MOD-42 plan D14: every `Runs` reply also asks for the item's `RelayView`. A step whose session
 //! parked a stage-3 permission request takes two more lines, the scrubbed summary and the strip,
 //! and while the cursor is on it every digit is the pane's; anywhere else a digit passes on to the
 //! global tab select. A run with a pending cancel says `cancel requested` under its grid.
+//!
+//! MOD-28: `v` draws the run under the cursor as a flow (`execution_graph.rs`). The flow's selected
+//! node *is* the cursor, so every key above acts the same in both views (ANA-12 invariant 2).
+//! `PageUp`/`PageDown` do nothing there.
 //!
 //! At the close-out's counts `←`/`→` (and `h`/`l`) pick the resolution among the legal ones for
 //! the item's status (`Resolution::closes_from`), starting on `Resolution::default_for` (MOD-39
@@ -366,6 +372,16 @@ impl RunsTab {
         self.selected = Some(current.saturating_add_signed(delta).min(last));
     }
 
+    /// MOD-28 D7, D12: rebuilds the flow from the cursor's run, the cursor's step selected. Only
+    /// while the flow is shown: the list never pays for it, and `v` syncs on the way in.
+    fn sync_graph(&self, theme: &Theme) {
+        if self.view == View::Flow {
+            self.graph
+                .borrow_mut()
+                .sync(self.entry_run(), self.selected_step(), theme);
+        }
+    }
+
     /// First run to draw: the scrolled-to one, except that the cursor is never scrolled off the
     /// top - the offset is derived here rather than being a second thing `J` has to keep right.
     fn first_visible(&self) -> usize {
@@ -397,6 +413,7 @@ impl RunsTab {
                     .position(|entry| self.entry_key(*entry) == Some(kept))
             })
             .or_else(|| (!entries.is_empty()).then_some(0));
+        self.sync_graph(ctx.theme);
         let Some(item) = self.item else {
             return;
         };
@@ -1347,14 +1364,32 @@ impl DetailTab for RunsTab {
             return Handled::Consumed;
         }
         match key.code {
-            KeyCode::Char('J') => self.move_cursor(1),
-            KeyCode::Char('K') => self.move_cursor(-1),
+            KeyCode::Char('J') => {
+                self.move_cursor(1);
+                self.sync_graph(ctx.theme);
+            }
+            KeyCode::Char('K') => {
+                self.move_cursor(-1);
+                self.sync_graph(ctx.theme);
+            }
             KeyCode::Enter => {
                 let Some(step_id) = self.selected_step() else {
                     return Handled::Pass;
                 };
                 ctx.emit(Action::Replay { step_id });
             }
+            KeyCode::Char('v') => {
+                self.view = match self.view {
+                    View::List => View::Flow,
+                    View::Flow => View::List,
+                };
+                self.sync_graph(ctx.theme);
+            }
+            KeyCode::Char('+') if self.view == View::Flow => self.graph.get_mut().zoom_in(),
+            KeyCode::Char('-') if self.view == View::Flow => self.graph.get_mut().zoom_out(),
+            KeyCode::Char('=') if self.view == View::Flow => self.graph.get_mut().fit(),
+            // MOD-28 D8: the list's page keys do nothing in the flow, and leave its scroll alone.
+            KeyCode::PageUp | KeyCode::PageDown if self.view == View::Flow => {}
             KeyCode::Char(
                 key @ ('a' | 'x' | 'r' | 'p' | 'c' | 'o' | 's' | 'u' | 'A' | 'R' | 'C' | 'T'),
             ) => return self.action(key, ctx),
@@ -1491,6 +1526,10 @@ impl DetailTab for RunsTab {
             message(frame, list, "No runs for this item.", ctx.theme);
             return;
         }
+        if self.view == View::Flow {
+            self.render_flow(frame, list, ctx.theme);
+            return;
+        }
 
         // The header stays on top, and the runs under it scroll so the cursor's lines are always
         // in the rows the footer leaves: D197 made every step two lines, and one long run can be
@@ -1508,6 +1547,26 @@ impl DetailTab for RunsTab {
 }
 
 impl RunsTab {
+    /// MOD-28 D11: the flow branch of `render`. Row 1 is the run's first `run_lines` line, and the
+    /// rest is the canvas, or "No steps yet." under a run with none.
+    fn render_flow(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+        let Some(run) = self.entry_run() else {
+            return;
+        };
+        let [head, canvas] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        let line = run_lines(run, self.cancel_requested(run.id), theme)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        frame.render_widget(Paragraph::new(line), head);
+        if run.steps.is_empty() {
+            message(frame, canvas, NO_STEPS_YET, theme);
+            return;
+        }
+        self.graph.borrow_mut().render(frame, canvas);
+    }
+
     /// The runs from the first visible one, each with its steps, and the line index just past the
     /// cursor's entry (0 with no cursor): what the list has to show to keep the cursor in view.
     fn list_lines(&self, theme: &Theme) -> (Vec<Line<'static>>, usize) {
