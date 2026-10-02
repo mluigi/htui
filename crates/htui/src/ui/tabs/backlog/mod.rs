@@ -34,6 +34,7 @@ use crate::ui::tabs::backlog::detail::{
 use crate::ui::tabs::backlog::filter::{BacklogFilter, FilterForm, FormOutcome};
 use crate::ui::tabs::backlog::item_form::{
     Busy, ItemForm, ItemFormOutcome, item_changed_elsewhere, mint_may_have_landed,
+    mint_may_have_landed_in_the_old_scope,
 };
 use crate::ui::tabs::backlog::list::{ListView, Selection};
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
@@ -466,9 +467,10 @@ impl BacklogTab {
     ///
     /// Review L4, the one case: such a mint `Failed` that finds no minting form (a scope change
     /// dropped it, and a form opened since is not the mint's) has nowhere to show its hedge, so
-    /// the tab emits the hedge as an `Action::Error`. It is drained after `App`'s plain report,
-    /// so the hedge is what the status line keeps. Nothing is re-read: the item would be the old
-    /// scope's. A refused mint stays silent there, `App`'s report says it all.
+    /// the tab emits a status-line hedge as an `Action::Error`. It is drained after `App`'s plain
+    /// report, so the hedge is what the status line keeps. Nothing is re-read: the item would be
+    /// the old scope's, so the hedge promises no re-read and no Ctrl+S, and names that scope. A
+    /// refused mint stays silent there, `App`'s report says it all.
     fn on_item_failed(&mut self, request: &str, message: &str, ctx: &Ctx<'_>) {
         let busy = self.item_form.as_ref().and_then(ItemForm::busy);
         match (request, busy) {
@@ -492,7 +494,9 @@ impl BacklogTab {
                 }
             }
             (item_writes::MINT_NAME, _) if !item_writes::mint_refused(message) => {
-                ctx.emit(Action::Error(mint_may_have_landed(message)));
+                ctx.emit(Action::Error(mint_may_have_landed_in_the_old_scope(
+                    message,
+                )));
             }
             (item_writes::EDIT_NAME, Some(Busy::Editing)) => {
                 if let Some(form) = self.item_form.as_mut() {
@@ -2306,11 +2310,15 @@ mod tests {
             &mut bench.ctx(),
         );
         let actions = bench.actions();
-        let hedge = mint_may_have_landed(&why);
-        assert!(
-            matches!(actions.as_slice(), [Action::Error(sentence)] if *sentence == hedge),
-            "{actions:?}"
-        );
+        let [Action::Error(sentence)] = actions.as_slice() else {
+            panic!("one status-line hedge, nothing re-read: {actions:?}");
+        };
+        assert!(sentence.starts_with(&why), "{sentence:?}");
+        assert!(sentence.contains("may have been written"), "{sentence:?}");
+        // Round 2: nothing is re-read and no form is open, so neither is promised.
+        assert!(!sentence.contains("re-read"), "{sentence:?}");
+        assert!(!sentence.contains("Ctrl+S"), "{sentence:?}");
+        assert_eq!(*sentence, mint_may_have_landed_in_the_old_scope(&why));
         assert!(tab.item_form.is_none());
     }
 

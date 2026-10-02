@@ -881,6 +881,16 @@ pub fn mint_may_have_landed(why: &str) -> String {
     )
 }
 
+/// Review L4: the same hedge for a mint whose form a scope change closed. Nothing is re-read and
+/// no form is open, so it promises neither; it points at the scope the mint was sent to.
+#[must_use]
+pub fn mint_may_have_landed_in_the_old_scope(why: &str) -> String {
+    format!(
+        "{why} \u{2014} the new item may have been written in the scope you left; look for it \
+         there before creating it again"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
