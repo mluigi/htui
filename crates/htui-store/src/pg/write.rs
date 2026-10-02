@@ -2747,7 +2747,10 @@ impl WriteStore for PgStore {
     /// # Errors
     ///
     /// [`StoreError::Constraint`] for a reserved name, a taken `(graph_id, position)` or
-    /// `(graph_id, name)` (`23505`), or a `graph_id` that names no row (`23503`).
+    /// `(graph_id, name)` (`23505`), a `graph_id` that names no row (`23503`), or a `persona_id`
+    /// that names no row (`fk_step_graph_phase_persona`'s `23503`, worded
+    /// `references_no_row("step_graph_phase.persona_id", id, "persona")`), checked after the
+    /// clashes (MOD-26 D5).
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase> {
         if TemplateRole::of_name(&phase.name) != TemplateRole::Phase {
             return Err(StoreError::Constraint(reserved_phase_name(&phase.name)));
@@ -2803,7 +2806,7 @@ impl WriteStore for PgStore {
         .map_err(|err| phase_persona_refused(err, phase.persona_id))
     }
 
-    /// The compare-and-set of D3 over [`PhasePatch`]'s five columns.
+    /// The compare-and-set of D3 over [`PhasePatch`]'s six columns.
     ///
     /// `token_budget` is not among them and cannot be: the `Phase` rung of
     /// [`set_setting`](WriteStore::set_setting) is that column's one writer, so the value the
@@ -2814,8 +2817,11 @@ impl WriteStore for PgStore {
     ///
     /// # Errors
     ///
-    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] for a reserved name
-    /// or a `(graph_id, position)` / `(graph_id, name)` collision (`23505`).
+    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] for a reserved name,
+    /// a `(graph_id, position)` / `(graph_id, name)` collision (`23505`), or a `persona_id` that
+    /// names no row (`fk_step_graph_phase_persona`'s `23503`, worded
+    /// `references_no_row("step_graph_phase.persona_id", id, "persona")`), checked after the
+    /// clashes (MOD-26 D5).
     async fn update_phase(
         &self,
         id: PhaseId,

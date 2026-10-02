@@ -2927,7 +2927,7 @@ impl State {
         Ok(row)
     }
 
-    /// Compare-and-set on the phase's `updated_at` over [`PhasePatch`]'s five columns;
+    /// Compare-and-set on the phase's `updated_at` over [`PhasePatch`]'s six columns;
     /// `token_budget` is the `Phase` rung's and is not here (D8).
     fn update_phase(
         &mut self,

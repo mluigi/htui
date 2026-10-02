@@ -865,7 +865,7 @@ pub trait WriteStore: ReadStore {
     /// "persona")`), checked after the position and name clashes (MOD-26 D5).
     async fn create_phase(&self, phase: &StepGraphPhase) -> Result<StepGraphPhase>;
 
-    /// Edits the five columns of [`PhasePatch`] under CAS; `token_budget` is
+    /// Edits the six columns of [`PhasePatch`] under CAS; `token_budget` is
     /// [`set_setting`](Self::set_setting)'s on the `Phase` rung and is not here (D8).
     ///
     /// # Errors
