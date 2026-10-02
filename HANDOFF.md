@@ -138,6 +138,12 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   changed, escalates again (it used to be refused); a test pins it. rust-reviewer approved; its
   three LOWs and one NIT were applied. Two NITs were left: `unblock_enabled`'s bare `bool` and a
   `Vec<String>` copy in the `phase_agent` insert.
+  **Phase 3 landed (`7cf455a8`..`a387249c`, 2026-10-02):** git cost. R-37 is closed. Plan and
+  blueprint are `.claude/plans/mod-37-git-cost.plan.md` and
+  `.claude/plans/mod-37-git-cost.blueprint.md`. rust-reviewer approved; its two LOWs and three NITs
+  were applied, and one NIT (a hash parsed twice, which is negligible) was left. Not in R-37 and not
+  changed: `RealIsolator`'s reconcile still opens the checkout once per `blocking` hop
+  (`isolate/real.rs`, `head`, `merge_of`, `is_ancestor` twice) under the admin lock.
   - ~~**R-3**~~: closed by MOD-37 phase 1. `RunStepSummary` carries `gate_note` from all three
     builders (Mem, Pg, cache mirror), and the Runs pane shows a parked step's reason on a third
     line. `run.failure` stays NULL on a park, as before.
@@ -165,10 +171,11 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
     refusal, and the lost part is the reason text, which only `never_reset` holds in memory;
     keeping it needs a new column or a change to `gate_note`, which the engine and four tests match
     exactly. Diagnostics only (lease blueprint §22.3).
-  - **R-37**: `git::reconcile_parent` opens the checkout up to six times per diff row, and `merge_of`
-    walks the primary's first-parent history back to the step's base. This costs speed only. The
-    fix is to open the repository once and pass `&gix::Repository` to private `*_in` variants (lease
-    blueprint §23.4).
+  - ~~**R-37**~~: closed by MOD-37 phase 3. `reconcile_parent` opens the checkout once and hands
+    the `gix::Repository` to private workers; the public path-taking functions keep their
+    signatures, their error order and their text. A test-only open counter pins it (6 opens before,
+    1 after). `merge_of`'s first-parent walk down to the base stays: it is D136's semantics, and
+    D142 already bounds it.
   - ~~**R-38**~~: closed by MOD-42 (`docs/decisions/mod/mod-42.md`): a `cancel` or `promote`
     preempt signals the walk, which answers parked requests `cancelled` and cancels the session
     with grace before the walk is dropped.

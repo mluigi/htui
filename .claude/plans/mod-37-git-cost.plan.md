@@ -88,10 +88,26 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 | `htui-orch` stack headroom | L | no new futures; still gate with `--no-fail-fast` and grep SIGABRT |
 
 ## Acceptance
-- [ ] Task 1's test was red (6 opens) before Task 2
-- [ ] Validation passes on the real tree, `--test-threads=1`
-- [ ] Reviewer gate run over the full change set
-- [ ] HANDOFF R-37 closed; PRD M3 complete
+- [x] Task 1's test was red (6 opens) before Task 2
+- [x] Validation passes on the real tree, `--test-threads=1`
+- [x] Reviewer gate run over the full change set
+- [x] HANDOFF R-37 closed; PRD M3 complete
 
 ---
-*Status: CONFIRMED (2026-10-02) - implementation in progress.*
+*Status: DONE (2026-10-02), commits `7cf455a8`..`a387249c`.*
+
+## As built
+- **Red** (`7cf455a8`): `reconcile_parent_opens_the_checkout_once` failed on the count alone,
+  `left: 6, right: 1`. It uses D136's moved-primary shape (merge `[moved, tip]`), because the plan's
+  `[base, tip]` shape opened only 4 times on the old code (blueprint deviation 1). The not-held
+  case passed on the old code too (1 open) and pins the early `None`.
+- **Green** (`b79ed641`): `has_commit_in`, `head_in`, `ancestor_walk` and `merge_walk` take
+  `&gix::Repository`. `is_ancestor` and `merge_of` parse their hashes before they open (blueprint
+  deviation 3). The counter's doc comment sits on `static OPENS` inside the macro: on the macro
+  call it raised `unused_doc_comments`.
+- **Review** (`a387249c`): rust-reviewer approved. L1, L2, NIT-3, NIT-4 and NIT-5 were applied.
+  L2's `hashes_are_read_before_the_repository_opens` fails when `is_ancestor` is mutated to open
+  first. NIT-6 (each hash parsed twice) was left as negligible.
+- **Gate**: fmt; clippy `-D warnings` on the workspace (`--all-targets --all-features`) and on the
+  `htui-orch` non-test lib; `htui-orch` `--all-features --test-threads=1`, 571 passed, 0 failed,
+  no SIGABRT.
