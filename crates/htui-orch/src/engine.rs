@@ -1377,10 +1377,17 @@ where
                     }
                     // Not reachable with `strict = false` either: a handoff opens without a
                     // persona it cannot find (MOD-26 OQ-5), and `phase_spec` never assembles.
-                    Err(other) => {
+                    // Each carries its own sentence, never a `Debug` rendering (review N2).
+                    Err(StageThree::Refused(err)) => {
                         return Err(EngineError::Snapshot {
                             run: run.id,
-                            reason: format!("the handoff prompt was refused: {other:?}"),
+                            reason: format!("the handoff prompt was refused: {err}"),
+                        });
+                    }
+                    Err(StageThree::NoPersona(reason)) => {
+                        return Err(EngineError::Snapshot {
+                            run: run.id,
+                            reason: format!("the handoff prompt was refused: {reason}"),
                         });
                     }
                 };
