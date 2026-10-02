@@ -30,6 +30,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::item_form::{ctrl_s, notice_lines};
 use crate::item_writes::{ItemDivergence, ItemFormContext};
+use crate::ui::cells::{cell_width, graphemes};
 use crate::ui::tabs::backlog::{filter, list::clip};
 use crate::ui::{Theme, diff};
 
@@ -558,17 +559,20 @@ fn diff_rows(unified: &str, width: u16) -> Vec<(&str, String)> {
         .collect()
 }
 
-/// `line` in rows of at most `width` characters: broken at a space where one fits, inside a word
-/// only when the word alone is wider. An empty line is one empty row, and the spaces a line
-/// starts with are kept (a context line's gutter). `detail::runs`' `wrap_line`, which is private
-/// to the detail pane; the same rule `Paragraph`'s `Wrap { trim: false }` drew the diffs with.
+/// `line` in rows of at most `width` terminal cells, measured with [`cell_width`] over grapheme
+/// clusters, so a row of wide characters (CJK, emoji) is never wider than the column the view
+/// draws it in unwrapped (MOD-13 M3 review verify round 1). A row breaks at a space where one
+/// fits, and inside a word only when the word alone is wider. Only a cluster wider than the whole
+/// column overflows it, alone on its row. An empty line is one empty row, and the spaces a line
+/// starts with are kept (a context line's gutter). `detail::runs`' `wrap_line` rule, which is
+/// private to the detail pane, measured in cells rather than chars.
 fn wrap_row(line: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows = vec![String::new()];
     for (at, word) in line.split(' ').enumerate() {
-        let used = rows.last().map_or(0, |row| row.chars().count());
+        let used = rows.last().map_or(0, |row| cell_width(row));
         if at > 0 {
-            if used + 1 + word.chars().count() <= width {
+            if used + 1 + cell_width(word) <= width {
                 if let Some(row) = rows.last_mut() {
                     row.push(' ');
                     row.push_str(word);
@@ -583,12 +587,22 @@ fn wrap_row(line: &str, width: usize) -> Vec<String> {
                 rows.push(String::new());
             }
         }
-        for c in word.chars() {
-            if rows.last().is_some_and(|row| row.chars().count() >= width) {
+        for cluster in graphemes(word) {
+            // A control character draws as one blank cell.
+            let cluster = if cluster.chars().any(char::is_control) {
+                " "
+            } else {
+                cluster
+            };
+            let cells = cell_width(cluster);
+            if rows
+                .last()
+                .is_some_and(|row| !row.is_empty() && cell_width(row) + cells > width)
+            {
                 rows.push(String::new());
             }
             if let Some(row) = rows.last_mut() {
-                row.push(if c.is_control() { ' ' } else { c });
+                row.push_str(cluster);
             }
         }
     }
@@ -977,6 +991,57 @@ mod tests {
         assert!(bottom.contains("end-of-39"), "{bottom}");
         view.on_key(key(KeyCode::Char('j')));
         assert_eq!(view.scroll(), end, "clamped at the last wrapped row");
+    }
+
+    /// MOD-13 M3 review verify round 1: the diff rows wrap by terminal cells, not by chars, so a
+    /// line of wide characters (CJK, emoji) wraps instead of being cut at the column's edge.
+    #[tokio::test]
+    async fn a_wide_character_body_wraps_and_shows_its_last_character() {
+        let cjk = format!("{}\u{7d42}", "\u{6f22}".repeat(45));
+        let emoji = format!("{}\u{1f3c1}", "\u{1f642}".repeat(45));
+        let body = format!("{cjk}\n{emoji}\n");
+        let mut view = view(
+            move |_| ItemPatch {
+                body: Some(body),
+                ..patch()
+            },
+            |_| {},
+        )
+        .await;
+        let top = drawn(&view).join("\n");
+        assert!(top.contains('\u{7d42}'), "the CJK line's last in\n{top}");
+        for _ in 0..100 {
+            view.on_key(key(KeyCode::PageDown));
+        }
+        let end = drawn(&view).join("\n");
+        assert!(end.contains('\u{1f3c1}'), "the emoji line's last in\n{end}");
+    }
+
+    #[test]
+    fn no_wrapped_row_is_wider_than_its_column() {
+        for line in [
+            format!("+{}\u{7d42}", "\u{6f22}".repeat(45)),
+            format!("+{} end", "\u{1f642}".repeat(30)),
+            " ascii then \u{6f22}\u{5b57} and a\u{301} \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"
+                .to_owned(),
+            "\u{1}\u{7f}x".to_owned(),
+        ] {
+            for width in [1, 2, 3, 7, 20, 48] {
+                let rows = wrap_row(&line, width);
+                // A wide cluster alone on a row is the one overflow a 1-cell column allows.
+                let room = width.max(2);
+                for row in &rows {
+                    let cells = cell_width(row);
+                    assert!(cells <= room, "{row:?} is {cells} cells at {width}");
+                }
+                let kept: String = rows.concat().chars().filter(|c| *c != ' ').collect();
+                let wanted: String = line
+                    .chars()
+                    .filter(|c| *c != ' ' && !c.is_control())
+                    .collect();
+                assert_eq!(kept, wanted, "nothing dropped from {line:?} at {width}");
+            }
+        }
     }
 
     #[tokio::test]
