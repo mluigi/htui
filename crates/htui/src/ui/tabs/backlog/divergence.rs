@@ -215,8 +215,8 @@ impl Divergence {
     }
 
     /// One key (D5), in order: Ctrl+S is swallowed, another chord passes, `Esc` goes back, `t`/`m`
-    /// resolve, `Tab`/`BackTab` switch the diffs, `j`/`k`/`PageDown`/`PageUp` scroll them, and
-    /// anything else is swallowed.
+    /// (or `T`/`M`) resolve, `Tab`/`BackTab` switch the diffs, `j`/`k`/`PageDown`/`PageUp` scroll
+    /// them, and anything else is swallowed.
     pub fn on_key(&mut self, key: KeyEvent) -> ViewOutcome {
         // Caught before the chord pass (D5): a passed Ctrl+S would reach the app.
         if ctrl_s(&key) {
@@ -227,8 +227,9 @@ impl Divergence {
         }
         match key.code {
             KeyCode::Esc => return ViewOutcome::Back,
-            KeyCode::Char('t') => return ViewOutcome::Resolve(Side::Theirs),
-            KeyCode::Char('m') => return ViewOutcome::Resolve(Side::Mine),
+            // A capital too (MOD-13 review NIT-3): Shift or Caps Lock is not a different pick.
+            KeyCode::Char('t' | 'T') => return ViewOutcome::Resolve(Side::Theirs),
+            KeyCode::Char('m' | 'M') => return ViewOutcome::Resolve(Side::Mine),
             KeyCode::Tab | KeyCode::BackTab if self.both_texts() => {
                 self.pane = match self.pane {
                     Some(DiffPane::Body) => Some(DiffPane::Paths),
@@ -927,6 +928,30 @@ mod tests {
         assert_eq!(view.on_key(ctrl('c')), ViewOutcome::Pass);
         assert_eq!(view.on_key(key(KeyCode::Char('x'))), ViewOutcome::Stay);
         assert_eq!(view.on_key(key(KeyCode::Enter)), ViewOutcome::Stay);
+    }
+
+    #[tokio::test]
+    async fn capital_t_and_m_resolve_like_the_lowercase_keys() {
+        let mut view = view(
+            |_| ItemPatch {
+                title: Some("Theirs".to_owned()),
+                ..patch()
+            },
+            |spec| spec.title = "Mine".to_owned(),
+        )
+        .await;
+        for modifiers in [KeyModifiers::SHIFT, KeyModifiers::NONE] {
+            assert_eq!(
+                view.on_key(KeyEvent::new(KeyCode::Char('T'), modifiers)),
+                ViewOutcome::Resolve(Side::Theirs),
+                "T with {modifiers:?}"
+            );
+            assert_eq!(
+                view.on_key(KeyEvent::new(KeyCode::Char('M'), modifiers)),
+                ViewOutcome::Resolve(Side::Mine),
+                "M with {modifiers:?}"
+            );
+        }
     }
 
     #[tokio::test]
