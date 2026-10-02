@@ -529,3 +529,4 @@ arguments. See [`docs/hr-sandbox.md`](docs/hr-sandbox.md).
 
 - [`CONCEPTS.md`](CONCEPTS.md): what `htui` is, and the design decisions behind it.
 - [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md): the full requirements.
+- [`docs/personas.md`](docs/personas.md): agent personas and how they narrow a step.

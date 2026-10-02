@@ -1,8 +1,9 @@
 # Plan: MOD-26 — Declarative agent personas, milestone 1 (registry rows applied by the engine)
 
-**Status: CONFIRMED by the maintainer 2026-10-02, OQ-1 to OQ-6 as recommended. Fact-checked 2026-10-02 (handoff-run step 3.5: three independent verifiers —
-store, orchestrator/prompt, agent/transports with an offline `claude` 2.1.286 probe; falsified and
-partly-true claims amended in place, see "Verified claims").**
+**Status: IMPLEMENTED 2026-10-02 (milestone 1, T0-T5). CONFIRMED by the maintainer 2026-10-02,
+OQ-1 to OQ-6 as recommended. Fact-checked 2026-10-02 (handoff-run step 3.5: three independent
+verifiers — store, orchestrator/prompt, agent/transports with an offline `claude` 2.1.286 probe;
+falsified and partly-true claims amended in place, see "Verified claims").**
 
 **Source PRD**: `.claude/prds/mod-26-agent-personas.prd.md`, milestone 1, with its gate decisions
 (maintainer, 2026-10-02; cited as **PRD Q-storage**, **Q-model**, **Q-binding** (revised to the
@@ -402,14 +403,38 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 
 ## Acceptance
 
-- [ ] I-1…I-7 hold, each with a test naming it
-- [ ] PRD metrics pinned per the test plan
+- [ ] I-1…I-7 hold, each with a test naming it — I-1, I-2, I-3, I-4 and I-7 are named by tests;
+      I-5 is pinned by `the_model_key_is_refused_with_its_sentence` (`MODEL_REFUSED`, documented
+      I-5) and I-6 is structural (`include_str!` seeds, `seed_rows_are_the_two_seed_files`), but no
+      test names either invariant
+- [x] PRD metrics pinned per the test plan
 - [ ] Validation passes; reviewer gate (`rust-reviewer`) findings applied or deferred with the
       maintainer
-- [ ] Close-out restates moved counts from a fresh count: store `CASES` (119 → N), `READ_CASES`
+- [x] Close-out restates moved counts from a fresh count: store `CASES` (119 → N), `READ_CASES`
       (14), htui-orch `CASES` (86 → N), `.sqlx`, snapshots, migrations (11 → 12, next `0013`),
       `TABLES` (41 → 42)
 - [ ] ANA-27's precedence sentence corrected where it is quoted (HANDOFF MOD-26 entry, DECISIONS)
+
+### Close-out counts
+
+Fresh count at T5 (2026-10-02, after T4's `eaa68b9d`), each read at its pin site:
+
+- Store conformance `CASES`: 119 → **124** (`htui-core/src/store/conformance.rs`; pinned at
+  `htui-core/tests/mem_store.rs:36-37` and `htui-store/tests/pg_conformance.rs` `EXPECTED_CASES`).
+- `READ_CASES`: **14**, unchanged (`htui-core/tests/mem_store.rs:60-61`).
+- `htui-orch` `CASES`: 86 → **91** (`htui-orch/src/conformance.rs` `cases_are_unique_and_counted`;
+  `htui-orch/tests/fake_conformance.rs` `cases_len_is_pinned`).
+- `.sqlx` files: 307 → **315** (`ls crates/htui-store/.sqlx | wc -l`).
+- Migrations: 11 → **12** (`0012_persona.sql`; next `0013`); version vector, `Pending(12)` and
+  `MigrationsPending(12)` in `htui-store/tests/migrations.rs` and `tests/connect.rs`.
+- Postgres `TABLES`: 41 → **42** (`htui-store/tests/migrations.rs`, `persona` added).
+- Column comments: 35 → **44** (nine in `MOD26_COLUMN_COMMENTS`, chained into all three chains;
+  "forty-four" in `the_ana_column_comments_are_present_and_verbatim`).
+- `load_demo` tables: 25 → **26** (`persona`).
+- Snapshots: unchanged — no file under `crates/htui/tests/snapshots` (128),
+  `crates/htui/src/snapshots`, `crates/htui-core/tests/snapshots` or
+  `crates/htui-agent/tests/snapshots` differs from `main`.
+- Unchanged pins: `Placeholder::ALL` 20, `GraphSnapshot::V` 1, `RECORD_VERSION` 4.
 
 ## Verified claims
 

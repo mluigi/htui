@@ -124,8 +124,13 @@ the recorded step shows the persona's block in its prompt and its narrowed expos
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Personas in the registry, applied by the engine | A persona row (seeded `reviewer`/`architect`) bound to a phase candidate changes that step's prompt block, exposure and policy; narrow-only refused at save; snapshot-stable; out-of-list calls refused by the relay and by `claude` CLI flags | in-progress | `.claude/plans/mod-26-agent-personas.plan.md` |
+| 1 | Personas in the registry, applied by the engine | A persona row (seeded `reviewer`/`architect`) bound to a phase candidate changes that step's prompt block, exposure and policy; narrow-only refused at save; snapshot-stable; out-of-list calls refused by the relay and by `claude` CLI flags | complete | `.claude/plans/mod-26-agent-personas.plan.md` (T0-T5) |
 | 2 | Authoring in the TUI | Settings > Personas lists, edits, validates and saves personas; frontmatter `.md` import; a phase's persona is picked in the step-graph editor | pending | — |
+
+Milestone 1 shipped 2026-10-02 (T0-T5; the binding landed on the step-graph phase, per Q-binding's
+revision). Moved counts: store conformance `CASES` 119 → 124 (`READ_CASES` 14), `htui-orch`
+`CASES` 86 → 91, migrations 11 → 12 (`0012_persona.sql`; next `0013`), Postgres tables 41 → 42,
+column comments 35 → 44, `.sqlx` files 307 → 315. Operator guide: `docs/personas.md`.
 
 ## Open Questions
 
@@ -170,4 +175,4 @@ the recorded step shows the persona's block in its prompt and its narrowed expos
 | Migration, `.sqlx`, seeds and snapshots couple "independent" implementer tasks | High | Medium | File-set intersection at plan fact-check decides parallelism (auto-memory `parallel-fanout-hidden-file-coupling`) |
 
 ---
-*Status: DRAFT — requirements only. Implementation planning pending via /plan (milestone 1 next).*
+*Status: IN PROGRESS — milestone 1 complete (2026-10-02); milestone 2 (authoring in the TUI) pending.*
