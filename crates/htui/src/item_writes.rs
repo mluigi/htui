@@ -29,7 +29,8 @@
 //! Redaction (A9, blueprint E6): `body` and `touched_paths` travel in
 //! [`ItemSpec`](htui_core::model::ItemSpec) and [`SpecChanges`](htui_core::model::SpecChanges),
 //! whose hand-written `Debug` prints their lengths only. No request carries a `NewItem` or an
-//! `ItemPatch`, both of which derive `Debug` over the body.
+//! `ItemPatch`, both of which derive `Debug` over the body. The replies' [`ItemFormContext`] and
+//! [`ItemDivergence`] carry whole items, so their `Debug` is hand-written too (review L2).
 //!
 //! The worker fills the id ([`ItemId::new`]), the author and the box from [`Backend::this_user`]
 //! and [`Backend::box_info`]; the render side never holds a `UserId` (`R-NF-3`).
@@ -63,7 +64,9 @@ pub fn is_item_request(name: &str) -> bool {
 }
 
 /// The answer to `StoreRequest::ItemForm` (D3): one project's catalogue, read through the writer.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` is hand-written (review L2): see the impl.
+#[derive(Clone, PartialEq)]
 pub struct ItemFormContext {
     /// The project the form writes in.
     pub project: ProjectId,
@@ -89,13 +92,72 @@ impl ItemFormContext {
     }
 }
 
+/// Ids, the key, the version and lengths, never the body or the paths (review L2): the rule of
+/// `StoreRequest`'s doc (E6), since this struct rides in a [`StoreReply`]. The catalogue prints
+/// as counts.
+impl core::fmt::Debug for ItemFormContext {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ItemFormContext")
+            .field("project", &self.project)
+            .field("kinds", &self.kinds.len())
+            .field("graphs", &self.graphs.len())
+            .field("repos", &self.repos.len())
+            .field("item", &self.item.as_ref().map(ItemDigest))
+            .finish()
+    }
+}
+
 /// D6: both sides of a stale edit, carried for milestone 3's view.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` is hand-written (review L2): see the impl.
+#[derive(Clone, PartialEq)]
 pub struct ItemDivergence {
     /// The row as it is now.
     pub head: Item,
     /// The revision at the version the edit was made from.
     pub ancestor: ItemRevision,
+}
+
+/// As [`ItemFormContext`]'s: ids, the key, the versions and lengths only (review L2).
+impl core::fmt::Debug for ItemDivergence {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ItemDivergence")
+            .field("head", &ItemDigest(&self.head))
+            .field("ancestor", &RevisionDigest(&self.ancestor))
+            .finish()
+    }
+}
+
+/// An [`Item`] as the reply payloads print it: ids, key, version and lengths (review L2).
+struct ItemDigest<'a>(&'a Item);
+
+impl core::fmt::Debug for ItemDigest<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let item = self.0;
+        f.debug_struct("Item")
+            .field("id", &item.id)
+            .field("project_id", &item.project_id)
+            .field("kind_id", &item.kind_id)
+            .field("key", &item.key)
+            .field("version", &item.version)
+            .field("body_len", &item.body.len())
+            .field("touched_paths", &item.touched_paths.len())
+            .finish()
+    }
+}
+
+/// An [`ItemRevision`] as [`ItemDivergence`] prints it: ids, version and the body's length.
+struct RevisionDigest<'a>(&'a ItemRevision);
+
+impl core::fmt::Debug for RevisionDigest<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let revision = self.0;
+        f.debug_struct("ItemRevision")
+            .field("item_id", &revision.item_id)
+            .field("version", &revision.version)
+            .field("body_len", &revision.body.len())
+            .finish()
+    }
 }
 
 /// What an applied item write did (self-naming, MOD-59).
@@ -267,8 +329,8 @@ mod tests {
     use htui_core::fixtures::ids;
     use htui_core::model::item_spec::NOTHING_TO_SAVE;
     use htui_core::model::{
-        Item, ItemId, ItemPatch, ItemSpec, NewRepo, NewStepGraph, ProjectId, RepoId, SpecChanges,
-        StepGraphId,
+        Item, ItemId, ItemPatch, ItemRevision, ItemSpec, NewRepo, NewStepGraph, ProjectId, RepoId,
+        SpecChanges, StepGraphId,
     };
     use htui_core::store::{MemStore, ReadStore as _, StoreError, UpdateOutcome, WriteStore as _};
     use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE};
@@ -743,6 +805,53 @@ mod tests {
                 assert!(!printed.contains("SECRET-BODY"), "{printed}");
                 assert!(!printed.contains("secret/dir"), "{printed}");
                 assert!(printed.contains("Visible title"), "{printed}");
+            }
+        }
+    }
+
+    /// Review L2: the form's read and a divergence carry whole items; their replies print ids,
+    /// keys, versions and lengths, never a body or a path.
+    #[tokio::test]
+    async fn form_and_divergence_debug_print_no_body_and_no_paths() {
+        let (store, _) = demo();
+        let mut item = store
+            .item(ids::HTUI_ANA_2)
+            .await
+            .expect("read")
+            .expect("the item");
+        item.body = "SECRET-BODY".to_owned();
+        item.touched_paths = strings(&["secret/dir/**"]);
+        let ancestor = ItemRevision {
+            item_id: item.id,
+            version: 1,
+            title: item.title.clone(),
+            body: "SECRET-ANCESTOR".to_owned(),
+            required_tags: Vec::new(),
+            author_id: ids::USER,
+            box_id: None,
+            reason: "created".to_owned(),
+            created_at: item.created_at,
+        };
+        let context = ItemFormContext {
+            project: item.project_id,
+            kinds: Vec::new(),
+            graphs: Vec::new(),
+            repos: Vec::new(),
+            item: Some(item.clone()),
+        };
+        let divergence = ItemDivergence {
+            head: item.clone(),
+            ancestor,
+        };
+        for reply in [
+            StoreReply::ItemForm(Box::new(context)),
+            StoreReply::ItemDiverged(Box::new(divergence)),
+        ] {
+            for printed in [format!("{reply:?}"), format!("{reply:#?}")] {
+                for secret in ["SECRET-BODY", "SECRET-ANCESTOR", "secret/dir"] {
+                    assert!(!printed.contains(secret), "{secret}: {printed}");
+                }
+                assert!(printed.contains(&item.key), "{printed}");
             }
         }
     }
