@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-28](docs/decisions/mod/mod-28.md)** - rataflow execution view (done, 2026-10-02)
 - **[MOD-49](docs/decisions/mod/mod-49.md)** - Interactive path picker for repo and workspace roots (done, 2026-10-02)
 - **[MOD-24](docs/decisions/mod/mod-24.md)** - Crash recovery of runs under the headless worker (done, 2026-10-02)
 - **[MOD-68](docs/decisions/mod/mod-68.md)** - Replace `fastembed`/`ort` with an `rten` embedder and a pinned weight fetch (done, 2026-10-01)

@@ -218,6 +218,12 @@ If an action isn't allowed right now, the status line says why and nothing happe
 | `T` | Retry the run's cleanup |
 | `u` | Unblock the item |
 | `C` | Close out the item: pick how it ends with `←` / `→`, press `y`, then type the item's key to confirm |
+| `v` | Switch between the list and the flow view |
+| `+` / `-`, `=` | In the flow view: zoom in / out, fit the whole run |
+
+The flow view draws the run under the cursor as a graph. Fan-out candidates sit side by side, the
+judge goes below them, and a retry follows the attempt it replaces. It uses the same cursor as the
+list, so `J` / `K` and every key above work in both views.
 
 When you close out an item, the picker offers only the endings that fit its status. A `done` item
 starts on `done` and can end as done, concluded, rejected, withdrawn, superseded or duplicate. An

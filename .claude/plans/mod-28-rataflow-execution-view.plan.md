@@ -6,7 +6,7 @@
 (mouse support is still wanted, just not in this item). **Tool-call chips deferred** to a follow-up MOD. Both are
 minted at close-out (T4).
 **Complexity**: Medium
-**Status**: confirmed by the maintainer 2026-10-02 (implementation in progress)
+**Status**: done 2026-10-02 (`docs/decisions/mod/mod-28.md`)
 
 ## Summary
 
