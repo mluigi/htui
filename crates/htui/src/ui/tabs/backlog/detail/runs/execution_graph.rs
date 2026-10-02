@@ -251,7 +251,7 @@ impl NodeContent for StepNode {
 
 /// `text` in at most `width` terminal cells, by grapheme, cut with `…` (blueprint E11).
 ///
-/// A control character reads as a space, so one line stays one line (the list's `fit` rule). A
+/// A control character reads as a space, so one line stays one line (`cells::fit`'s rule). A
 /// wide glyph that would straddle the last cell is dropped, so the result may be a cell short; it
 /// is never a cell long.
 fn clip(text: &str, width: usize) -> String {

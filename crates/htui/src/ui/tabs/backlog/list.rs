@@ -238,16 +238,6 @@ fn row(
     }
 }
 
-/// `text` cut to `width` characters, the last one replaced by an ellipsis when it did not fit.
-pub fn clip(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.to_owned();
-    }
-    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
-    out.push('\u{2026}');
-    out
-}
-
 /// First visible row: enough to keep `cursor` inside a `height`-tall viewport.
 ///
 /// Stateless on purpose — it is a function of the cursor, so no scroll offset can survive a fold

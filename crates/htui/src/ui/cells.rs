@@ -114,10 +114,6 @@ fn flatten(text: &str) -> Cow<'_, str> {
 /// also when nothing is cut. Width 0 is `""`: a lone `…` would be a cell over. A cluster that
 /// would straddle the cut is dropped, so a cut result may fall short of `width` by up to that
 /// cluster's cells less one (a stacked `ｶﾞﾞﾞ` is 4, so up to 3); never long. [`fit`] pads it back.
-#[allow(
-    dead_code,
-    reason = "MOD-60 T0 lands before its callers (T1-T4); T5 deletes this attribute"
-)]
 #[must_use]
 pub(crate) fn clip(text: &str, width: usize) -> String {
     let flat = flatten(text);
@@ -150,10 +146,6 @@ fn head(text: &str, room: usize) -> String {
 
 /// `text` followed by spaces up to `width` cells (MOD-60 D1). Never clips, never rewrites:
 /// a `text` already `width` or wider comes back unchanged.
-#[allow(
-    dead_code,
-    reason = "MOD-60 T0 lands before its callers (T1-T4); T5 deletes this attribute"
-)]
 #[must_use]
 pub(crate) fn pad(text: &str, width: usize) -> String {
     let mut out = text.to_owned();
@@ -163,10 +155,6 @@ pub(crate) fn pad(text: &str, width: usize) -> String {
 
 /// Spaces then `text`, right-aligned in `width` cells — `{:>N}` measured in cells (MOD-60 D1).
 /// Never clips.
-#[allow(
-    dead_code,
-    reason = "MOD-60 T0 lands before its callers (T1-T4); T5 deletes this attribute"
-)]
 #[must_use]
 pub(crate) fn pad_left(text: &str, width: usize) -> String {
     let mut out = " ".repeat(width.saturating_sub(cell_width(text)));
@@ -176,10 +164,6 @@ pub(crate) fn pad_left(text: &str, width: usize) -> String {
 
 /// Exactly `width` cells: [`clip`] then [`pad`], so a straddling wide cluster's lost cell is
 /// padded back and the next column stays put (MOD-60 D1, R-3).
-#[allow(
-    dead_code,
-    reason = "MOD-60 T0 lands before its callers (T1-T4); T5 deletes this attribute"
-)]
 #[must_use]
 pub(crate) fn fit(text: &str, width: usize) -> String {
     pad(&clip(text, width), width)
@@ -236,10 +220,6 @@ pub(crate) fn wrap(line: &str, width: usize) -> Vec<String> {
 /// `spans` cut from the end to at most `width` cells, every kept span keeping its style; when
 /// anything was cut, [`ELLIPSIS`] ends the line in the style of the span the cut fell in (B1).
 /// Controls flattened per span (D3). No padding. Width 0 is no spans.
-#[allow(
-    dead_code,
-    reason = "MOD-60 T0 lands before its callers (T1-T4); T5 deletes this attribute"
-)]
 #[must_use]
 pub(crate) fn clip_spans(spans: &[Span<'_>], width: usize) -> Vec<Span<'static>> {
     let flat: Vec<(Cow<'_, str>, Style)> = spans
