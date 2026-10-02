@@ -58,12 +58,12 @@ use crate::store::traits::{
     failure_disagrees_with_status, finish_run_item_mirror, finish_run_needs_a_terminal_status,
     graph_not_in_project, invalid_area_code, invalid_prefix, item_has_a_live_run,
     item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move, new_persona_refusal,
-    new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status, persona_patch_refusal,
-    prompt_template_key, prompt_template_refusal, references_no_row, requirement_withdrawn,
-    reserved_phase_name, resolution_not_closable, row_names_another_phase, row_names_another_step,
-    run_is_terminal, skill_body_refusal, skill_patch_refusal, skill_version_key,
-    step_is_not_promotable, step_slot_is_taken, summary_names_another_item, winner_is_not_settled,
-    withdrawn_requirement_cited,
+    new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status, persona_is_bound,
+    persona_patch_refusal, prompt_template_key, prompt_template_refusal, references_no_row,
+    requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_phase,
+    row_names_another_step, run_is_terminal, skill_body_refusal, skill_patch_refusal,
+    skill_version_key, step_is_not_promotable, step_slot_is_taken, summary_names_another_item,
+    winner_is_not_settled, withdrawn_requirement_cited,
 };
 use uuid::Uuid;
 
@@ -3317,6 +3317,37 @@ impl State {
         }
         row.updated_at = now;
         Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// MOD-26 M2 D14: `NotFound("persona")` → [`persona_is_bound`] naming every phase that binds
+    /// it (graph → project; a missing parent is named `?`, unreachable, B-5) → remove.
+    fn delete_persona(&mut self, id: PersonaId) -> Result<()> {
+        let persona = self.personas.get(&id).ok_or_else(|| StoreError::NotFound {
+            entity: "persona",
+            id: id.to_string(),
+        })?;
+        if self.phases.iter().any(|phase| phase.persona_id == Some(id)) {
+            let holders: Vec<(String, String, String)> = self
+                .phases
+                .iter()
+                .filter(|phase| phase.persona_id == Some(id))
+                .map(|phase| {
+                    let graph = self.graphs.get(&phase.graph_id);
+                    let project = graph.and_then(|graph| self.projects.get(&graph.project_id));
+                    (
+                        project.map_or_else(|| "?".to_owned(), |row| row.slug.clone()),
+                        graph.map_or_else(|| "?".to_owned(), |row| row.name.clone()),
+                        phase.name.clone(),
+                    )
+                })
+                .collect();
+            return Err(StoreError::Constraint(persona_is_bound(
+                &persona.name,
+                &holders,
+            )));
+        }
+        self.personas.remove(&id);
+        Ok(())
     }
 
     /// MOD-26 D5: `fk_step_graph_phase_persona` in `references_no_row`'s words.
@@ -6859,6 +6890,10 @@ impl WriteStore for MemStore {
     ) -> Result<CasOutcome<Persona>> {
         let now = self.now();
         self.write(|state| state.update_persona(id, expected, patch, now))
+    }
+
+    async fn delete_persona(&self, id: PersonaId) -> Result<()> {
+        self.write(|state| state.delete_persona(id))
     }
 
     async fn set_setting(
@@ -11851,6 +11886,45 @@ mod tests {
             (edited.created_at, edited.updated_at),
             (t, clock.now()),
             "an edit stamps updated_at only, with the handle's clock"
+        );
+    }
+
+    /// MOD-26 M2 D14 (blueprint F-6, B-4): `persona_is_bound` sorts the `(slug, graph, phase)`
+    /// triples, not the joined strings (`"web-app/x" < "web/x"` as strings, but `"web" <
+    /// "web-app"` as the first component), counts a duplicate once, names at most five and counts
+    /// the rest.
+    #[test]
+    fn persona_is_bound_sorts_by_the_triple_and_counts_the_rest() {
+        let triple = |project: &str, graph: &str, phase: &str| {
+            (project.to_owned(), graph.to_owned(), phase.to_owned())
+        };
+        assert_eq!(
+            crate::store::persona_is_bound("reviewer", &[triple("htui", "feature", "review")]),
+            "persona `reviewer` is bound to 1 phase (`htui/feature/review`); clear it in \
+             Settings \u{203a} Kinds first"
+        );
+        assert_eq!(
+            crate::store::persona_is_bound(
+                "reviewer",
+                &[
+                    triple("web-app", "x", "p"),
+                    triple("web", "x", "p"),
+                    triple("web", "x", "p")
+                ],
+            ),
+            "persona `reviewer` is bound to 2 phases (`web/x/p`, `web-app/x/p`); clear them in \
+             Settings \u{203a} Kinds first",
+            "triple order puts `web` before `web-app`, and the duplicate counts once"
+        );
+        let seven: Vec<(String, String, String)> = ["a", "b", "c", "d", "e", "f", "g"]
+            .iter()
+            .map(|phase| triple("htui", "feature", phase))
+            .collect();
+        assert_eq!(
+            crate::store::persona_is_bound("architect", &seven),
+            "persona `architect` is bound to 7 phases (`htui/feature/a`, `htui/feature/b`, \
+             `htui/feature/c`, `htui/feature/d`, `htui/feature/e` and 2 more); clear them in \
+             Settings \u{203a} Kinds first"
         );
     }
 }

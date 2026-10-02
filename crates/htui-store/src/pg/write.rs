@@ -54,11 +54,11 @@ use htui_core::store::{
     finish_run_needs_a_terminal_status, graph_not_in_project, illegal_move, invalid_area_code,
     invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros,
     legal_move, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
-    not_a_terminal_status, persona_patch_refusal, prompt_template_key, prompt_template_refusal,
-    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
-    row_names_another_phase, row_names_another_step, run_is_terminal, skill_body_refusal,
-    skill_patch_refusal, skill_version_key, step_is_not_promotable, summary_names_another_item,
-    winner_is_not_settled, withdrawn_requirement_cited,
+    not_a_terminal_status, persona_is_bound, persona_patch_refusal, prompt_template_key,
+    prompt_template_refusal, references_no_row, requirement_withdrawn, reserved_phase_name,
+    resolution_not_closable, row_names_another_phase, row_names_another_step, run_is_terminal,
+    skill_body_refusal, skill_patch_refusal, skill_version_key, step_is_not_promotable,
+    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -3501,6 +3501,76 @@ impl WriteStore for PgStore {
             Some(row) => Ok(CasOutcome::Applied(row.into())),
             None => cas_miss(self.persona_row(id).await?, "persona", id),
         }
+    }
+
+    /// Locks the persona, then deletes it under a guard the lock makes authoritative (MOD-26 M2
+    /// D14), `delete_item_kind`'s shape (review L2's reasoning, above).
+    ///
+    /// A bind (`create_phase`/`update_phase` naming the persona) takes `FOR KEY SHARE` on the
+    /// persona row through `fk_step_graph_phase_persona`, which `FOR UPDATE` conflicts with: a bind
+    /// in flight is waited for and then **seen** by the guarded `DELETE`'s snapshot (zero rows, the
+    /// sentence); a bind that arrives after the lock waits behind it and gets `23503`, which
+    /// [`phase_persona_refused`] words as `references_no_row`. Without the lock the deleter itself
+    /// would see a raw `23503` (probed, plan "Verified claims").
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] with
+    /// [`persona_is_bound`]'s sentence while a phase binds it.
+    async fn delete_persona(&self, id: PersonaId) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let Some(name) = sqlx::query_scalar!(
+            "SELECT name FROM persona WHERE id = $1 FOR UPDATE",
+            id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        else {
+            return Err(StoreError::NotFound {
+                entity: "persona",
+                id: id.to_string(),
+            });
+        };
+
+        let removed = sqlx::query_scalar!(
+            r#"
+            DELETE FROM persona
+             WHERE id = $1
+               AND NOT EXISTS (SELECT 1 FROM step_graph_phase WHERE persona_id = $1)
+            RETURNING id
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        if removed.is_none() {
+            // The row is there - it was just locked - so zero rows means the guard fired; the
+            // holders are read only to name them in the sentence.
+            let holders = sqlx::query!(
+                r#"
+                SELECT pr.slug AS "project!", g.name AS "graph!", p.name AS "phase!"
+                  FROM step_graph_phase p
+                  JOIN step_graph g ON g.id = p.graph_id
+                  JOIN project pr ON pr.id = g.project_id
+                 WHERE p.persona_id = $1
+                "#,
+                id.as_uuid(),
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .into_iter()
+            .map(|row| (row.project, row.graph, row.phase))
+            .collect::<Vec<_>>();
+            return Err(StoreError::Constraint(persona_is_bound(&name, &holders)));
+        }
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(())
     }
 
     // settings (D7, D8)

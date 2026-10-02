@@ -818,6 +818,13 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn delete_persona(&self, id: PersonaId) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.delete_persona(id).await,
+            Self::Online(pg) => pg.delete_persona(id).await,
+        }
+    }
+
     async fn set_setting(
         &self,
         rung: SettingRung,
