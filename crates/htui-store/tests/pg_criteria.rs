@@ -3506,6 +3506,83 @@ async fn a_bind_behind_a_persona_delete_gets_references_no_row() {
     db.drop_db().await;
 }
 
+/// MOD-26 milestone 2 D14 (I-9): an unbind that commits after the guarded `DELETE` fired but
+/// before the holders are read leaves nothing to name, so `delete_persona` deletes rather than
+/// refusing with "bound to 0 phases ()".
+///
+/// The racer holds `ACCESS EXCLUSIVE` on `project` with its unbind uncommitted: the guard still
+/// sees the bind, and the holders query (which joins `project`) parks on the lock until the unbind
+/// commits, so its fresh `READ COMMITTED` snapshot sees no holder.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unbind_racing_a_persona_delete_lets_it_delete() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let reviewer = ids::PERSONA_REVIEWER;
+    let review = htui_feature_phase(&db.store, "review").await;
+    sqlx::query("UPDATE step_graph_phase SET persona_id = $1 WHERE id = $2")
+        .bind(reviewer.as_uuid())
+        .bind(review.id.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("bind reviewer to the review phase");
+
+    let mut racer = PgConnection::connect(&db.url)
+        .await
+        .expect("a second connection");
+    sqlx::raw_sql("BEGIN; LOCK TABLE project IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut racer)
+        .await
+        .expect("BEGIN and lock project on the racing connection");
+    sqlx::query("UPDATE step_graph_phase SET persona_id = NULL WHERE id = $1")
+        .bind(review.id.as_uuid())
+        .execute(&mut racer)
+        .await
+        .expect("the racing unbind");
+
+    let store = db.store.clone();
+    let deleting = tokio::spawn(async move { store.delete_persona(reviewer).await });
+
+    // Commit only once the delete is parked on the `project` lock, i.e. past its guard.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let parked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                AND query LIKE '%JOIN project pr%'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("read pg_stat_activity");
+        if parked == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the delete never reached the holders query"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    sqlx::raw_sql("COMMIT")
+        .execute(&mut racer)
+        .await
+        .expect("COMMIT on the racing connection");
+    racer.close().await.expect("close the racing connection");
+
+    match deleting.await.expect("the delete task") {
+        Ok(()) => {}
+        other => panic!("a persona no phase binds any more is deleted, got {other:?}"),
+    }
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM persona WHERE id = $1")
+        .bind(reviewer.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count the persona");
+    assert_eq!(left, 0, "the delete removed the persona");
+
+    db.drop_db().await;
+}
+
 /// MOD-15 D4's template rows, which no `WriteStore` reader returns: ten per project, named by
 /// `DEFAULT_TEMPLATES`, body `body_of(name)`, version 1, `created_by` the creator's.
 ///

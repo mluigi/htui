@@ -3511,7 +3511,8 @@ impl WriteStore for PgStore {
     /// in flight is waited for and then **seen** by the guarded `DELETE`'s snapshot (zero rows, the
     /// sentence); a bind that arrives after the lock waits behind it and gets `23503`, which
     /// [`phase_persona_refused`] words as `references_no_row`. Without the lock the deleter itself
-    /// would see a raw `23503` (probed, plan "Verified claims").
+    /// would see a raw `23503` (probed, plan "Verified claims"). A guard that fired over holders an
+    /// unbind removed before they were read runs again, so the sentence never names zero phases.
     ///
     /// # Errors
     ///
@@ -3534,20 +3535,28 @@ impl WriteStore for PgStore {
             });
         };
 
-        let removed = sqlx::query_scalar!(
-            r#"
+        // Each pass is two READ COMMITTED statements, two snapshots: an unbind, phase delete or
+        // graph delete that commits between the guard and the holders read leaves the guard
+        // fired over holders that are gone. Nothing can become a holder while the row is locked
+        // (a bind's `FOR KEY SHARE` waits on it), so the holders only shrink and an empty read
+        // means the guarded `DELETE` is simply run again.
+        loop {
+            let removed = sqlx::query_scalar!(
+                r#"
             DELETE FROM persona
              WHERE id = $1
                AND NOT EXISTS (SELECT 1 FROM step_graph_phase WHERE persona_id = $1)
             RETURNING id
             "#,
-            id.as_uuid(),
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(map_sqlx)?;
+                id.as_uuid(),
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            if removed.is_some() {
+                break;
+            }
 
-        if removed.is_none() {
             // The row is there - it was just locked - so zero rows means the guard fired; the
             // holders are read only to name them in the sentence.
             let holders = sqlx::query!(
@@ -3566,7 +3575,9 @@ impl WriteStore for PgStore {
             .into_iter()
             .map(|row| (row.project, row.graph, row.phase))
             .collect::<Vec<_>>();
-            return Err(StoreError::Constraint(persona_is_bound(&name, &holders)));
+            if !holders.is_empty() {
+                return Err(StoreError::Constraint(persona_is_bound(&name, &holders)));
+            }
         }
 
         tx.commit().await.map_err(map_sqlx)?;
