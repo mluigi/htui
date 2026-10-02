@@ -985,12 +985,13 @@ async fn free_feat_3<O: Orchestrate>(orch: &O) {
 
 /// Repoints `item` at a clone of its graph whose phases `mutate` has edited.
 ///
-/// **`PhasePatch` carries five fields — `name`, `position`, `template_name`, `gate_hard` and
-/// `input_kinds` — and `gate`, `retry_limit`, `isolation`, `fan_out` and `token_budget` are none of
-/// them** (`crates/htui-core/src/model/kind.rs:221-232`), so the blueprint's
-/// `update_phase(review, expected, PhasePatch { gate: Some(Gate::Never), .. })` recipe does not
-/// compile. `create_phase` takes a whole `StepGraphPhase`, so a clone carrying the row a case wants
-/// is the reachable edit — and it is the same pair of writers `graph::override_graph` uses.
+/// **`PhasePatch` carries six fields — `name`, `position`, `template_name`, `gate_hard`,
+/// `input_kinds` and `persona` (MOD-26 D5) — and `gate`, `retry_limit`, `isolation`, `fan_out`
+/// and `token_budget` are none of them** (`crates/htui-core/src/model/kind.rs:230-251`), so the
+/// blueprint's `update_phase(review, expected, PhasePatch { gate: Some(Gate::Never), .. })`
+/// recipe does not compile. `create_phase` takes a whole `StepGraphPhase`, so a clone carrying the
+/// row a case wants is the reachable edit — and it is the same pair of writers
+/// `graph::override_graph` uses.
 ///
 /// # Panics
 /// When any of the three writes is refused, which means the fixture moved under the case.
@@ -1497,7 +1498,7 @@ async fn live_run_ignores_a_gate_edit<H: CaseHarness>(harness: &H) {
 
 /// ANA-2 §12 criterion 3 (`docs/ANA-2.md:2090`): the graph moved under a parked run.
 ///
-/// `input_kinds` is the edit because it is both one of `PhasePatch`'s five fields and a
+/// `input_kinds` is the edit because it is both one of `PhasePatch`'s six fields and a
 /// `SnapshotPhase` field, so patching it moves the `topology` digest — which is the whole content of
 /// the criterion. The assertion is that **nothing advanced**: the same step rows, plus a note an
 /// operator can read. The second half proves the comparison is a comparison and not a constant: an

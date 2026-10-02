@@ -3529,7 +3529,7 @@ async fn item_kind_delete_refused_while_referenced<S: WriteStore>(store: &S) {
 }
 
 /// The graph and its phases: uniqueness the database owns, the reserved names D11 owns, and
-/// [`PhasePatch`]'s five columns — `token_budget` is not among them, because the `Phase` rung of
+/// [`PhasePatch`]'s six columns — `token_budget` is not among them, because the `Phase` rung of
 /// [`WriteStore::set_setting`] is that column's one writer (D8).
 async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
     const CASE: &str = "step_graph_and_phase_round_trip";
@@ -3718,7 +3718,7 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
             edited.input_kinds.as_slice()
         ),
         ("tag", 3, "plan", true, ["plan".to_owned()].as_slice()),
-        "{CASE}: all five columns of the patch"
+        "{CASE}: the five columns the patch sets (it leaves `persona` untouched)"
     );
     assert_eq!(
         edited.token_budget, None,

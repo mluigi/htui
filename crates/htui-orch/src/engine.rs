@@ -6801,8 +6801,8 @@ mod tests {
 
         /// Repoints the item at a clone of its graph whose phases `mutate` has edited.
         ///
-        /// **`PhasePatch` carries five fields and `gate`, `retry_limit`, `isolation` and
-        /// `fan_out` are none of them** (`model/kind.rs:221-232`), so the blueprint's
+        /// **`PhasePatch` carries six fields and `gate`, `retry_limit`, `isolation` and
+        /// `fan_out` are none of them** (`model/kind.rs:230-251`), so the blueprint's
         /// `update_phase(review, expected, PhasePatch { gate: Some(Gate::Never), .. })` does not
         /// exist. `create_phase` takes a whole `StepGraphPhase`, so a clone with the row a test
         /// wants is the reachable edit — the same two writers `graph::override_graph` uses.
@@ -11626,7 +11626,7 @@ mod tests {
     async fn parked_run_with_a_moved_graph() -> (Harness, htui_core::model::RunId) {
         let harness = Harness::new().await;
         let (run, _) = started(&harness).await;
-        // `input_kinds` is one of `PhasePatch`'s five, and it is a `SnapshotPhase` field, so
+        // `input_kinds` is one of `PhasePatch`'s six, and it is a `SnapshotPhase` field, so
         // editing it moves the topology digest — which is the whole content of criterion 3.
         let graph = harness
             .orch
