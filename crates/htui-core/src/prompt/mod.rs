@@ -56,6 +56,7 @@ use serde_json::Value;
 
 use crate::model::box_::BoxProfile;
 use crate::model::link::UpstreamEntry;
+use crate::model::persona::SnapshotPersona;
 use crate::model::skill::{BoundSkill, SkillChoice, StepFiles, select};
 use crate::prompt::render::{HostnameLine, Rendered};
 use crate::prompt::trim::{Inputs, Trimmer};
@@ -106,6 +107,10 @@ pub struct PromptSpec {
     /// attachments, most specific winning, inactive ones included. The assembler collapses and
     /// selects (MOD-9 D43).
     pub skills: Vec<BoundSkill>,
+    /// MOD-26 D13: the phase's persona, rendered as the protected `persona` section ahead of
+    /// the template body. `None` — every judge, handoff and preview spec and every persona-less
+    /// phase — renders exactly as before (I-7).
+    pub persona: Option<PersonaBlock>,
     /// §4.5's read and windowed excerpts, with the audit half the ranker filled.
     pub excerpts: ExcerptSet,
     /// MOD-9 D110/D117: the F2 file set a `glob` attachment matches against — the excerpt walk's
@@ -141,6 +146,24 @@ pub struct TemplateRef {
     pub name: String,
     /// `prompt_template.version`. Never `latest`: invariant 10 pins it into the snapshot.
     pub version: i32,
+}
+
+/// MOD-26 D13: what the persona frame renders — a frozen persona's name and body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonaBlock {
+    /// `SnapshotPersona.name`, the section's `persona` attribute.
+    pub name: String,
+    /// `SnapshotPersona.body`, the section's content.
+    pub body: String,
+}
+
+impl From<&SnapshotPersona> for PersonaBlock {
+    fn from(persona: &SnapshotPersona) -> Self {
+        Self {
+            name: persona.name.clone(),
+            body: persona.body.clone(),
+        }
+    }
 }
 
 /// One resolved input document: the winner of its kind (§4.7 rule 3).

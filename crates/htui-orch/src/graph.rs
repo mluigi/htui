@@ -373,6 +373,7 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
         phases,
         settings,
         scope: Some(scope),
+        personas: Vec::new(),
     };
 
     Ok(Resolved {
@@ -717,6 +718,9 @@ async fn snapshot_phase<G: GraphSource>(
                 template: judge_template(source, project).await?,
             }),
         },
+        // MOD-26 D9 (B-18): `resolve` binds the persona after this call, where the snapshot's
+        // persona list is built.
+        persona: None,
     })
 }
 

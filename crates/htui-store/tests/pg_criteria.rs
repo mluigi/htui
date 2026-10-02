@@ -1103,6 +1103,7 @@ fn race_run(item: ItemId) -> NewRun {
                 max_agents_per_run: 6,
             },
             scope: None,
+            personas: Vec::new(),
         },
         repo_scope: Vec::new(),
         queued_at: Utc::now(),

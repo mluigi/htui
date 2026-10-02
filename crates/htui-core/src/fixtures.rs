@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::model::{
     Activation, Agent, AppUser, BoxRow, BoxTool, CitationKind, Document, EventKind, EventRole,
     GateOutcome, GraphSnapshot, Isolation, Item, ItemKind, ItemKindId, ItemLink, ItemRequirement,
-    ItemRevision, LinkKind, Note, NoteId, OsFamily, PhaseId, Priority, Project, ProjectId,
+    ItemRevision, LinkKind, Note, NoteId, OsFamily, Persona, PhaseId, Priority, Project, ProjectId,
     PromptTemplate, PromptTemplateId, Requirement, RequirementArea, RequirementAreaId,
     RequirementId, RequirementRevision, RequirementSpec, RequirementState, Resolution, Run,
     RunKind, RunMode, RunStatus, RunStep, SessionEvent, Skill, SkillBinding, SkillVersion,
@@ -80,6 +80,8 @@ mod class {
     pub const REQUIREMENT_AREA: u8 = 18;
     /// `requirement` (MOD-38).
     pub const REQUIREMENT: u8 = 19;
+    /// `persona` (MOD-26).
+    pub const PERSONA: u8 = 20;
 }
 
 /// A v7-shaped, fully deterministic UUID: 48-bit timestamp = [`DEMO_EPOCH_MS`] + `class` * 1000 +
@@ -118,7 +120,7 @@ pub fn demo_at(day: i64, hour: i64) -> DateTime<Utc> {
 pub mod ids {
     use super::{class, demo_uuid};
     use crate::model::{
-        AgentId, BoxId, DocumentId, ItemId, ItemKindId, NoteId, PhaseId, ProjectId,
+        AgentId, BoxId, DocumentId, ItemId, ItemKindId, NoteId, PersonaId, PhaseId, ProjectId,
         RequirementAreaId, RequirementId, RunId, SkillBindingId, SkillId, StepGraphId, StepId,
         UserId, WorkspaceId,
     };
@@ -145,6 +147,10 @@ pub mod ids {
         AGENT_AGY: AgentId = (class::AGENT, 1),
         /// `agent` `claude-cli` (`cli`, `subscription`), MOD-2 D79's third seed row.
         AGENT_CLAUDE_CLI: AgentId = (class::AGENT, 2),
+        /// `persona` `reviewer`, the first seed persona (MOD-26 D7).
+        PERSONA_REVIEWER: PersonaId = (class::PERSONA, 0),
+        /// `persona` `architect`, the second seed persona (MOD-26 D7).
+        PERSONA_ARCHITECT: PersonaId = (class::PERSONA, 1),
         /// `workspace` `Platform`.
         WORKSPACE_PLATFORM: WorkspaceId = (class::WORKSPACE, 0),
         /// `workspace` `Graphics`.
@@ -364,6 +370,8 @@ pub struct DemoData {
     pub templates: Vec<PromptTemplate>,
     /// `agent` rows.
     pub agents: Vec<Agent>,
+    /// `persona` rows (MOD-26 D7): the two seeds, re-stamped.
+    pub personas: Vec<Persona>,
     /// `skill` rows (§5.6); read-only in MOD-2 (plan D105).
     pub skills: Vec<Skill>,
     /// `skill_version` rows (§5.6).
@@ -420,6 +428,7 @@ pub fn demo_data() -> DemoData {
         phases,
         templates,
         agents: agents(),
+        personas: Vec::new(),
         skills: skills(),
         skill_versions: skill_versions(),
         skill_bindings: skill_bindings(),
@@ -1372,6 +1381,7 @@ fn demo_graph_snapshot() -> Value {
                         .expect("every `RUN_1` step names a model"),
                 }],
                 judge: None,
+                persona: None,
             }
         })
         .collect();
@@ -1394,6 +1404,7 @@ fn demo_graph_snapshot() -> Value {
             max_agents_per_run: 8,
         },
         scope: None,
+        personas: Vec::new(),
     })
     .expect("a literal this module owns serialises")
 }
@@ -2033,6 +2044,36 @@ mod tests {
     use super::{DemoData, demo_at, demo_data, demo_uuid, ids};
     use crate::model::{Resolution, Status, StepGraphId};
     use std::collections::HashSet;
+
+    /// MOD-26 D7 (B-3): the demo registry's personas are the two seed files, re-stamped with the
+    /// fixture's ids and epoch, the way `agents()` re-stamps the agent seeds.
+    #[test]
+    fn the_fixture_personas_are_the_seeds_re_stamped() {
+        let personas = demo_data().personas;
+        let names: Vec<&str> = personas.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["reviewer", "architect"]);
+        let fixture_ids: Vec<_> = personas.iter().map(|row| row.id).collect();
+        assert_eq!(fixture_ids, [ids::PERSONA_REVIEWER, ids::PERSONA_ARCHITECT]);
+        for (row, seed) in personas
+            .iter()
+            .zip(crate::model::persona::seed_rows(super::epoch()))
+        {
+            assert_eq!(
+                (row.created_at, row.updated_at),
+                (super::epoch(), super::epoch()),
+                "{}",
+                row.name
+            );
+            assert_eq!(
+                (&row.name, &row.description, &row.body),
+                (&seed.name, &seed.description, &seed.body)
+            );
+            assert_eq!(
+                (&row.tools, &row.permission),
+                (&seed.tools, &seed.permission)
+            );
+        }
+    }
 
     #[test]
     fn demo_uuid_matches_the_blueprint() {

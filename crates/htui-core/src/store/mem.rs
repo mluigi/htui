@@ -9323,6 +9323,7 @@ mod tests {
                 max_agents_per_run: 6,
             },
             scope: None,
+            personas: Vec::new(),
         }
     }
 

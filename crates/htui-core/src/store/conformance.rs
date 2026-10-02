@@ -4296,6 +4296,7 @@ fn run_snapshot() -> GraphSnapshot {
             max_agents_per_run: 8,
         },
         scope: None,
+        personas: Vec::new(),
     }
 }
 

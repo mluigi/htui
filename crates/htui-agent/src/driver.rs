@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{AuthFlow, AuthOutcome};
 use crate::error::DriverError;
-use crate::event::{DriverEnvelope, PermissionOptionKind};
+use crate::event::{DriverEnvelope, PermissionOptionKind, ToolKind};
 
 /// What a hand-written `Debug` prints in place of an environment value (ANA-4 §4.1, invariant 4).
 const REDACTED: &str = "[REDACTED]";
@@ -199,8 +199,8 @@ pub struct PermissionPolicy {
 
 /// Which tools a session may use (`R-MCP-3`).
 ///
-/// A plain record with no reader in milestones 1–2: MOD-11 fills it and the transports read it
-/// (plan D16).
+/// Filled by the engine from a persona (MOD-26 D10); read by `claude-cli`'s argv (D11), the
+/// relay's policy and the ACP `fs/*` handlers (`deny_kinds`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolExposure {
@@ -210,6 +210,10 @@ pub struct ToolExposure {
     pub deny: Vec<String>,
     /// Whether `htui`'s own `command_run` MCP tool is exposed for this step (`R-MCP-4`).
     pub command_run: bool,
+    /// ACP tool kinds the step may never use (MOD-26 D10): refused by the permission relay on
+    /// every transport that asks and by `htui`'s own ACP `fs/*` handlers, and inverted to tool
+    /// names on `claude-cli`'s argv (D11). Empty denies no kind.
+    pub deny_kinds: Vec<ToolKind>,
 }
 
 /// One MCP server handed to the agent at `session/new` (`R-MCP-1`).

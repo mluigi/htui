@@ -294,6 +294,8 @@ pub async fn build(
         box_profile,
         box_hostname,
         skills,
+        // MOD-26 D13: the preview renders no persona frame.
+        persona: None,
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,

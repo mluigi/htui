@@ -4758,6 +4758,8 @@ where
             skills: skills.clone(),
             // No pass for a judge (plan D109): its placeholder set cannot place `{{excerpts}}`
             // (`template.rs:188-215`), so a file read here could only reach the audit.
+            // MOD-26 OQ-2: a judge runs under no persona, whatever the judged phase names.
+            persona: None,
             excerpts: no_excerpts(caps),
             // MOD-9 D123: a judge runs in no tree (`prepare(…, &[], Isolation::Local, None)`) and
             // gets no pass, so a placed `glob` winner records `no_path` truthfully; the default
@@ -5481,6 +5483,8 @@ where
             // not here: this builder is also the promote/handoff path's, and a handoff never reads
             // a file. So the caps are recorded and nothing else, and `with_excerpts` replaces this
             // for a phase prompt.
+            // MOD-26 D13: the phase's persona frame; T4 looks it up in the run's snapshot.
+            persona: None,
             excerpts: no_excerpts(caps),
             // MOD-9 D117: reaches no repo here, for the same reason as `excerpts`: the handoff
             // matches nothing, and `with_excerpts` replaces it for a phase prompt.
@@ -6862,6 +6866,7 @@ mod tests {
             token_budget: None,
             candidates: Vec::new(),
             judge: None,
+            persona: None,
         };
         let candidates = vec![
             SnapshotCandidate {
@@ -7661,6 +7666,7 @@ mod tests {
             token_budget: None,
             candidates: Vec::new(),
             judge: None,
+            persona: None,
         }
     }
 

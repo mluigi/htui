@@ -449,11 +449,30 @@ pub struct GraphSnapshot {
     /// [`scope_of`](crate::model::overlap::scope_of).
     #[serde(default)]
     pub scope: Option<crate::model::overlap::RunScope>,
+    /// MOD-26 D9: every persona a phase names, frozen at `StartRun`, one per name, ordered by
+    /// name bytes. **Not** hashed by `topology` (editing a persona's body never parks a run,
+    /// I-3) and [`GraphSnapshot::V`] is not bumped; absent from the JSON when empty (B-10).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub personas: Vec<crate::model::persona::SnapshotPersona>,
 }
 
 impl GraphSnapshot {
     /// The `v` this crate writes and the only one it reads.
     pub const V: u32 = 1;
+
+    /// MOD-26 D12, I-4: the frozen persona `phase` names. `Ok(None)` for a persona-less phase;
+    /// `Err` is [`persona_not_in_snapshot`](crate::model::persona::persona_not_in_snapshot)'s
+    /// sentence when the snapshot does not carry the name.
+    ///
+    /// # Errors
+    /// As above.
+    pub fn persona_for(
+        &self,
+        phase: &SnapshotPhase,
+    ) -> Result<Option<&crate::model::persona::SnapshotPersona>, String> {
+        let _ = phase;
+        Ok(None)
+    }
 }
 
 /// The `step_graph` half of a [`GraphSnapshot`].
@@ -509,6 +528,11 @@ pub struct SnapshotPhase {
     /// The fan-out judge, when the phase has one.
     #[serde(default)]
     pub judge: Option<SnapshotJudge>,
+    /// MOD-26 D9: the name of the persona this phase runs under, frozen with its content in
+    /// [`GraphSnapshot::personas`]. Hashed by `topology` when bound; absent from the JSON, and
+    /// so from the digest, when `None` (I-7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
 }
 
 /// The prompt template of a [`SnapshotPhase`].
@@ -1011,5 +1035,138 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&pinned).expect("encodes"))
                 .expect("decodes");
         assert_eq!(again, pinned, "encode then decode is the identity");
+    }
+
+    fn snapshot_phase(persona: Option<&str>) -> super::SnapshotPhase {
+        use crate::model::kind::{CommandQueue, Gate, Isolation};
+        super::SnapshotPhase {
+            position: 0,
+            name: "review".to_owned(),
+            fan_out: 1,
+            gate: Gate::Never,
+            gate_effective: Gate::Never,
+            gate_hard: false,
+            retry_limit: 0,
+            input_kinds: Vec::new(),
+            output_kind: "review".to_owned(),
+            isolation: Isolation::Local,
+            command_queue: CommandQueue::Off,
+            verify_command: None,
+            deadline_seconds: None,
+            template: SnapshotTemplate {
+                name: "review".to_owned(),
+                version: 1,
+            },
+            token_budget: None,
+            candidates: Vec::new(),
+            judge: None,
+            persona: persona.map(str::to_owned),
+        }
+    }
+
+    fn graph_snapshot(
+        phases: Vec<super::SnapshotPhase>,
+        personas: Vec<crate::model::persona::SnapshotPersona>,
+    ) -> super::GraphSnapshot {
+        use crate::model::ids::StepGraphId;
+        use crate::model::kind::Isolation;
+        super::GraphSnapshot {
+            v: super::GraphSnapshot::V,
+            graph: super::SnapshotGraph {
+                id: StepGraphId::new(),
+                name: "feature".to_owned(),
+                is_override: false,
+            },
+            topology: "sha256:00".to_owned(),
+            mode: super::RunMode::Auto,
+            phases,
+            settings: super::SnapshotSettings {
+                default_isolation: Isolation::Local,
+                per_token_cap_run: None,
+                per_token_cap_batch: None,
+                max_fan_out: 1,
+                max_agents_per_run: 1,
+            },
+            scope: None,
+            personas,
+        }
+    }
+
+    fn frozen(name: &str) -> crate::model::persona::SnapshotPersona {
+        use crate::model::persona::{PersonaPermission, PersonaTools, SnapshotPersona};
+        SnapshotPersona {
+            name: name.to_owned(),
+            digest: "sha256:00".to_owned(),
+            body: format!("You are the {name}.\n"),
+            tools: PersonaTools::default(),
+            permission: PersonaPermission::default(),
+        }
+    }
+
+    #[test]
+    fn a_persona_less_phase_serialises_without_a_persona_key() {
+        let phase = snapshot_phase(None);
+        let text = serde_json::to_string(&phase).expect("encodes");
+        assert!(!text.contains("\"persona\""), "{text}");
+
+        let back: super::SnapshotPhase = serde_json::from_str(&text).expect("decodes");
+        assert_eq!(back.persona, None);
+        assert_eq!(back, phase);
+    }
+
+    #[test]
+    fn a_bound_phase_carries_its_persona_name() {
+        let phase = snapshot_phase(Some("reviewer"));
+        let text = serde_json::to_string(&phase).expect("encodes");
+        assert!(text.ends_with(",\"persona\":\"reviewer\"}"), "{text}");
+
+        let back: super::SnapshotPhase = serde_json::from_str(&text).expect("decodes");
+        assert_eq!(back, phase);
+    }
+
+    #[test]
+    fn a_snapshot_without_personas_omits_the_key() {
+        let snapshot = graph_snapshot(vec![snapshot_phase(None)], Vec::new());
+        let text = serde_json::to_string(&snapshot).expect("encodes");
+        assert!(!text.contains("\"personas\""), "{text}");
+        let back: super::GraphSnapshot = serde_json::from_str(&text).expect("old JSON decodes");
+        assert!(back.personas.is_empty());
+        assert_eq!(back, snapshot);
+
+        let bound = graph_snapshot(
+            vec![snapshot_phase(Some("reviewer"))],
+            vec![frozen("reviewer")],
+        );
+        let text = serde_json::to_string(&bound).expect("encodes");
+        assert!(
+            text.contains("\"personas\":[{\"name\":\"reviewer\""),
+            "{text}"
+        );
+        let back: super::GraphSnapshot = serde_json::from_str(&text).expect("decodes");
+        assert_eq!(back, bound);
+    }
+
+    #[test]
+    fn persona_for_finds_refuses_and_skips() {
+        use crate::model::persona::persona_not_in_snapshot;
+
+        let carried = graph_snapshot(
+            vec![snapshot_phase(None), snapshot_phase(Some("reviewer"))],
+            vec![frozen("architect"), frozen("reviewer")],
+        );
+        assert_eq!(carried.persona_for(&carried.phases[0]), Ok(None));
+        assert_eq!(
+            carried.persona_for(&carried.phases[1]),
+            Ok(Some(&carried.personas[1]))
+        );
+
+        let missing = graph_snapshot(
+            vec![snapshot_phase(Some("reviewer"))],
+            vec![frozen("architect")],
+        );
+        assert_eq!(
+            missing.persona_for(&missing.phases[0]),
+            Err(persona_not_in_snapshot("reviewer"))
+        );
     }
 }
