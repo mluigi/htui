@@ -474,6 +474,308 @@ fn is_tool_name(name: &str) -> bool {
             .any(|c| c.is_whitespace() || c == ',' || c == '\0')
 }
 
+// ---- MOD-26 milestone 2 D17: the rule lines of the Settings › Personas rules editor ----------
+
+/// The four matcher keys of a rule line (MOD-26 M2 D17), in the order [`format_rules`] writes
+/// them: `kind` → `tool_kind`, `name` → `tool_name`, `path` → `path_prefix`, `command` →
+/// `command_prefix`.
+pub const RULE_KEYS: [&str; 4] = ["kind", "name", "path", "command"];
+
+/// Why [`parse_rules`] refused a rules text (MOD-26 M2 D17): the 1-based line and one sentence.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("rules line {line}: {message}")]
+pub struct RuleLineError {
+    /// The 1-based line of the text.
+    pub line: usize,
+    /// One sentence; for a kind outside [`TOOL_KINDS`], [`rule_kind_unknown`]'s — the store's.
+    pub message: String,
+}
+
+/// Reads the Settings › Personas rules editor (MOD-26 M2 D17, OQ-10): one rule per line, blank
+/// lines and `#` lines ignored. Pure. The result still goes through the store's rules (I-8):
+/// an empty match or a NUL is refused there, not here.
+///
+/// # Errors
+/// The first [`RuleLineError`], in line order.
+pub fn parse_rules(text: &str) -> Result<Vec<PersonaRule>, RuleLineError> {
+    let mut rules = Vec::new();
+    for (index, raw) in text.split('\n').enumerate() {
+        // One trailing `\r`: a pasted CRLF.
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let chars: Vec<char> = line.chars().collect();
+        match rule_line(&chars) {
+            Ok(Some(rule)) => rules.push(rule),
+            Ok(None) => {}
+            Err(message) => {
+                return Err(RuleLineError {
+                    line: index + 1,
+                    message,
+                });
+            }
+        }
+    }
+    Ok(rules)
+}
+
+/// Writes `rules` one per line, `\n`-separated, no trailing newline, each in the shortest form
+/// [`parse_rules`] reads back to the same rule. Pure.
+#[must_use]
+pub fn format_rules(rules: &[PersonaRule]) -> String {
+    rules.iter().map(rule_text).collect::<Vec<_>>().join("\n")
+}
+
+/// D17 E-7.
+const UNCLOSED_QUOTE: &str = "a quoted string is not closed";
+
+/// One rule line's cursor, over its chars.
+struct LineCursor<'a> {
+    chars: &'a [char],
+    at: usize,
+}
+
+impl LineCursor<'_> {
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.at).copied()
+    }
+
+    /// Skips `char::is_whitespace`; whether anything was skipped.
+    fn skip_ws(&mut self) -> bool {
+        let start = self.at;
+        while self.peek().is_some_and(char::is_whitespace) {
+            self.at += 1;
+        }
+        self.at > start
+    }
+
+    /// The maximal run of chars `stop` does not end.
+    fn run(&mut self, stop: impl Fn(char) -> bool) -> String {
+        let start = self.at;
+        while self.peek().is_some_and(|c| !stop(c)) {
+            self.at += 1;
+        }
+        self.chars[start..self.at].iter().collect()
+    }
+
+    /// A quoted string, the cursor on its opening `"`: every char literal but `"` and `\`, and
+    /// the five escapes (D17, B-2).
+    fn quoted(&mut self) -> Result<String, String> {
+        self.at += 1;
+        let mut out = String::new();
+        loop {
+            match self.peek() {
+                None => return Err(UNCLOSED_QUOTE.to_owned()),
+                Some('"') => {
+                    self.at += 1;
+                    return Ok(out);
+                }
+                Some('\\') => {
+                    self.at += 1;
+                    out.push(match self.peek() {
+                        None => return Err(UNCLOSED_QUOTE.to_owned()),
+                        Some('"') => '"',
+                        Some('\\') => '\\',
+                        Some('n') => '\n',
+                        Some('t') => '\t',
+                        Some('r') => '\r',
+                        Some(other) => {
+                            return Err(format!(
+                                "`\\{}` is not an escape; use \\\", \\\\, \\n, \\t or \\r",
+                                other.escape_debug()
+                            ));
+                        }
+                    });
+                    self.at += 1;
+                }
+                Some(c) => {
+                    out.push(c);
+                    self.at += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Ends the answer word and a bare value (D17 rules 2 and 5).
+fn ends_word(c: char) -> bool {
+    c.is_whitespace() || c == '#'
+}
+
+/// Ends a key (D17 rule 4).
+fn ends_key(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '#' | '=' | '"')
+}
+
+/// One line of [`parse_rules`]: `Ok(None)` for a blank or comment line, `Err` the E-n sentence.
+fn rule_line(chars: &[char]) -> Result<Option<PersonaRule>, String> {
+    let mut cursor = LineCursor { chars, at: 0 };
+    cursor.skip_ws();
+    if matches!(cursor.peek(), None | Some('#')) {
+        return Ok(None);
+    }
+    let word = cursor.run(ends_word);
+    let answer = match word.as_str() {
+        "reject_once" => PersonaAnswer::RejectOnce,
+        "reject_always" => PersonaAnswer::RejectAlways,
+        _ => {
+            return Err(format!(
+                "a rule starts with reject_once or reject_always, not `{}`",
+                word.escape_debug()
+            ));
+        }
+    };
+    let mut matcher = PersonaMatch::default();
+    let mut reason = String::new();
+    let mut after = format!("`{}`", word.escape_debug());
+    loop {
+        let spaced = cursor.skip_ws();
+        match cursor.peek() {
+            None => break,
+            Some('#') => {
+                reason = rule_reason(&mut cursor)?;
+                break;
+            }
+            Some(_) if !spaced => {
+                return Err(format!(
+                    "expected a space, `#` or the end of the line after {after}"
+                ));
+            }
+            Some(_) => {}
+        }
+        let start = cursor.at;
+        let key = cursor.run(ends_key);
+        if key.is_empty() || cursor.peek() != Some('=') {
+            cursor.at = start;
+            let token = cursor.run(char::is_whitespace);
+            return Err(format!("`{}` is not `key=value`", token.escape_debug()));
+        }
+        cursor.at += 1;
+        let slot = match key.as_str() {
+            "kind" => &mut matcher.tool_kind,
+            "name" => &mut matcher.tool_name,
+            "path" => &mut matcher.path_prefix,
+            "command" => &mut matcher.command_prefix,
+            _ => {
+                return Err(format!(
+                    "`{}` is not a rule key; a rule takes kind, name, path and command",
+                    key.escape_debug()
+                ));
+            }
+        };
+        if slot.is_some() {
+            return Err(format!("rule key `{key}` appears more than once"));
+        }
+        let value = if cursor.peek() == Some('"') {
+            cursor.quoted()?
+        } else {
+            let bare = cursor.run(ends_word);
+            if bare.is_empty() {
+                return Err(format!(
+                    "`{key}=` needs a value; write `{key}=\"\"` for an empty one"
+                ));
+            }
+            if bare
+                .chars()
+                .any(|c| matches!(c, '"' | '=' | '\\') || c.is_control())
+            {
+                return Err(format!(
+                    "the value of `{key}` must be quoted: it holds `\"`, `=`, `\\` or a control \
+                     character"
+                ));
+            }
+            bare
+        };
+        *slot = Some(value);
+        after = format!("`{key}`'s value");
+    }
+    if let Some(kind) = matcher.tool_kind.as_deref()
+        && !TOOL_KINDS.contains(&kind)
+    {
+        return Err(rule_kind_unknown(kind));
+    }
+    Ok(Some(PersonaRule {
+        matcher,
+        answer,
+        reason,
+    }))
+}
+
+/// The reason, the cursor on its `#`: quoted iff its first non-`ws` char is `"` (then nothing but
+/// `ws` may follow, E-10), otherwise the rest of the line, trimmed.
+fn rule_reason(cursor: &mut LineCursor<'_>) -> Result<String, String> {
+    cursor.at += 1;
+    cursor.skip_ws();
+    if cursor.peek() == Some('"') {
+        let reason = cursor.quoted()?;
+        cursor.skip_ws();
+        if cursor.peek().is_some() {
+            return Err("nothing may follow a quoted reason".to_owned());
+        }
+        return Ok(reason);
+    }
+    Ok(cursor.run(|_| false).trim().to_owned())
+}
+
+/// One rule in [`format_rules`]' shortest form.
+fn rule_text(rule: &PersonaRule) -> String {
+    let mut line = match rule.answer {
+        PersonaAnswer::RejectOnce => "reject_once",
+        PersonaAnswer::RejectAlways => "reject_always",
+    }
+    .to_owned();
+    let matcher = &rule.matcher;
+    let values = [
+        &matcher.tool_kind,
+        &matcher.tool_name,
+        &matcher.path_prefix,
+        &matcher.command_prefix,
+    ];
+    for (key, value) in RULE_KEYS.into_iter().zip(values) {
+        if let Some(value) = value {
+            line.push(' ');
+            line.push_str(key);
+            line.push('=');
+            let bare = !value.is_empty()
+                && !value.chars().any(|c| {
+                    c.is_whitespace() || c.is_control() || matches!(c, '"' | '#' | '=' | '\\')
+                });
+            if bare {
+                line.push_str(value);
+            } else {
+                push_quoted(&mut line, value);
+            }
+        }
+    }
+    let reason = rule.reason.as_str();
+    if !reason.is_empty() {
+        line.push_str(" # ");
+        let plain = reason == reason.trim()
+            && !reason.starts_with('"')
+            && !reason.chars().any(char::is_control);
+        if plain {
+            line.push_str(reason);
+        } else {
+            push_quoted(&mut line, reason);
+        }
+    }
+    line
+}
+
+/// `value` in quotes, with D17's five escapes; every other char raw (B-2).
+fn push_quoted(line: &mut String, value: &str) {
+    line.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => line.push_str("\\\""),
+            '\\' => line.push_str("\\\\"),
+            '\n' => line.push_str("\\n"),
+            '\t' => line.push_str("\\t"),
+            '\r' => line.push_str("\\r"),
+            other => line.push(other),
+        }
+    }
+    line.push('"');
+}
+
 /// Why a persona file was refused (B-24). `Display` is the sentence.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PersonaFileError {
@@ -1373,5 +1675,363 @@ mod tests {
                 assert!(!list[index + 1..].contains(entry), "{entry} twice");
             }
         }
+    }
+
+    fn rule_with(answer: PersonaAnswer, matcher: [Option<&str>; 4], reason: &str) -> PersonaRule {
+        let [tool_kind, tool_name, path_prefix, command_prefix] =
+            matcher.map(|value| value.map(str::to_owned));
+        PersonaRule {
+            matcher: PersonaMatch {
+                tool_kind,
+                tool_name,
+                path_prefix,
+                command_prefix,
+            },
+            answer,
+            reason: reason.to_owned(),
+        }
+    }
+
+    /// MOD-26 M2 D17: §2.3's fixed table, each row both ways.
+    fn fixed_rule_lines() -> Vec<(PersonaRule, &'static str)> {
+        use PersonaAnswer::{RejectAlways as Always, RejectOnce as Once};
+        vec![
+            (
+                rule_with(
+                    Once,
+                    [Some("execute"), None, None, Some("rm -rf")],
+                    "never wipe",
+                ),
+                r#"reject_once kind=execute command="rm -rf" # never wipe"#,
+            ),
+            (
+                rule_with(Always, [None, None, Some("/etc"), None], ""),
+                "reject_always path=/etc",
+            ),
+            (
+                rule_with(Once, [None, Some(""), None, None], ""),
+                r#"reject_once name="""#,
+            ),
+            (
+                rule_with(Once, [None, None, None, Some("say \"hi\"")], ""),
+                r#"reject_once command="say \"hi\"""#,
+            ),
+            (
+                rule_with(Once, [None, None, Some("C:\\tmp"), None], ""),
+                r#"reject_once path="C:\\tmp""#,
+            ),
+            (
+                rule_with(Once, [None, None, None, Some("a#b")], ""),
+                r#"reject_once command="a#b""#,
+            ),
+            (
+                rule_with(Once, [None, None, None, Some("x=1")], ""),
+                r#"reject_once command="x=1""#,
+            ),
+            (
+                rule_with(Once, [None, None, None, Some("l1\nl2\tx\r")], ""),
+                r#"reject_once command="l1\nl2\tx\r""#,
+            ),
+            (
+                rule_with(Once, [None, Some("café→"), None, None], ""),
+                "reject_once name=café→",
+            ),
+            (
+                rule_with(Once, [Some("read"), None, None, None], "  padded  "),
+                r#"reject_once kind=read # "  padded  ""#,
+            ),
+            (
+                rule_with(Once, [Some("read"), None, None, None], "\"quoted\" first"),
+                r#"reject_once kind=read # "\"quoted\" first""#,
+            ),
+            (
+                rule_with(Once, [Some("read"), None, None, None], "two\nlines"),
+                r#"reject_once kind=read # "two\nlines""#,
+            ),
+            (
+                rule_with(Once, [Some("read"), None, None, None], "has # inside"),
+                "reject_once kind=read # has # inside",
+            ),
+            (
+                rule_with(
+                    Always,
+                    [Some("fetch"), Some("WebFetch"), Some("/"), Some("curl")],
+                    "no network",
+                ),
+                "reject_always kind=fetch name=WebFetch path=/ command=curl # no network",
+            ),
+            (
+                rule_with(Once, [None, None, None, Some("\u{1b}[0m")], ""),
+                "reject_once command=\"\u{1b}[0m\"",
+            ),
+            (
+                rule_with(Once, [None, Some("a\u{a0}b"), None, None], ""),
+                "reject_once name=\"a\u{a0}b\"",
+            ),
+            (
+                rule_with(Once, [Some("switch_mode"), None, None, None], "#tag"),
+                "reject_once kind=switch_mode # #tag",
+            ),
+        ]
+    }
+
+    #[test]
+    fn rule_lines_round_trip_the_fixed_table() {
+        let table = fixed_rule_lines();
+        assert_eq!(table.len(), 17);
+        for (rule, line) in &table {
+            assert_eq!(format_rules(std::slice::from_ref(rule)), *line, "{rule:?}");
+            assert_eq!(parse_rules(line), Ok(vec![rule.clone()]), "{line:?}");
+        }
+
+        let two = [table[0].0.clone(), table[1].0.clone()];
+        let text = format!("{}\n{}", table[0].1, table[1].1);
+        assert_eq!(format_rules(&two), text);
+        assert_eq!(parse_rules(&text), Ok(two.to_vec()));
+    }
+
+    #[test]
+    fn rule_lines_round_trip_generated_values() {
+        const FRAGMENTS: [&str; 15] = [
+            "a", "Z9", " ", "\"", "\\", "#", "=", "\n", "\t", "\r", "é", "→", "\u{1b}", "\u{a0}",
+            "/",
+        ];
+        let mut values = vec![String::new()];
+        for one in FRAGMENTS {
+            values.push(one.to_owned());
+        }
+        for one in FRAGMENTS {
+            for two in FRAGMENTS {
+                values.push(format!("{one}{two}"));
+            }
+        }
+        for one in FRAGMENTS {
+            for two in FRAGMENTS {
+                for three in FRAGMENTS {
+                    values.push(format!("{one}{two}{three}"));
+                }
+            }
+        }
+        assert_eq!(values.len(), 3_616);
+
+        let mut all = Vec::new();
+        for (index, value) in values.iter().enumerate() {
+            let v = Some(value.as_str());
+            let rules = [
+                rule_with(PersonaAnswer::RejectOnce, [None, v, None, None], ""),
+                rule_with(
+                    PersonaAnswer::RejectAlways,
+                    [Some(TOOL_KINDS[index % 10]), None, v, None],
+                    value,
+                ),
+                rule_with(PersonaAnswer::RejectOnce, [None, None, None, v], "x"),
+            ];
+            for rule in rules {
+                let line = format_rules(std::slice::from_ref(&rule));
+                assert_eq!(line.lines().count(), 1, "{line:?}");
+                assert_eq!(parse_rules(&line), Ok(vec![rule.clone()]), "{line:?}");
+                all.push(rule);
+            }
+        }
+        let text = format_rules(&all);
+        assert_eq!(text.lines().count(), all.len());
+        assert_eq!(parse_rules(&text), Ok(all));
+    }
+
+    #[test]
+    fn rule_lines_parse_spacing_comments_and_blank_lines() {
+        let read = |reason: &str| {
+            rule_with(
+                PersonaAnswer::RejectOnce,
+                [Some("read"), None, None, None],
+                reason,
+            )
+        };
+
+        assert_eq!(parse_rules("\n  # header\n\n"), Ok(Vec::new()));
+        assert_eq!(parse_rules(""), Ok(Vec::new()));
+        assert_eq!(
+            parse_rules("  reject_once   kind=read   "),
+            Ok(vec![read("")])
+        );
+        assert_eq!(
+            parse_rules("reject_once command=\"rm\"#why"),
+            Ok(vec![rule_with(
+                PersonaAnswer::RejectOnce,
+                [None, None, None, Some("rm")],
+                "why"
+            )])
+        );
+        assert_eq!(
+            parse_rules("reject_once kind=read #   "),
+            Ok(vec![read("")])
+        );
+        assert_eq!(
+            parse_rules("reject_once kind=read\r\nreject_always path=/x\r"),
+            Ok(vec![
+                read(""),
+                rule_with(
+                    PersonaAnswer::RejectAlways,
+                    [None, None, Some("/x"), None],
+                    ""
+                ),
+            ])
+        );
+        assert_eq!(
+            parse_rules("reject_once path=/a#b"),
+            Ok(vec![rule_with(
+                PersonaAnswer::RejectOnce,
+                [None, None, Some("/a"), None],
+                "b"
+            )])
+        );
+        assert_eq!(
+            parse_rules("reject_once"),
+            Ok(vec![rule(PersonaMatch::default())]),
+            "an empty match is the store's refusal, not the parser's"
+        );
+        assert_eq!(
+            parse_rules("reject_once command=x kind=read"),
+            Ok(vec![rule_with(
+                PersonaAnswer::RejectOnce,
+                [Some("read"), None, None, Some("x")],
+                ""
+            )])
+        );
+    }
+
+    #[test]
+    fn rule_line_errors_name_their_line() {
+        let cases: [(&str, String); 11] = [
+            (
+                "reject kind=read",
+                "a rule starts with reject_once or reject_always, not `reject`".to_owned(),
+            ),
+            (
+                "reject_once colour=red",
+                "`colour` is not a rule key; a rule takes kind, name, path and command".to_owned(),
+            ),
+            (
+                "reject_once kind=read kind=edit",
+                "rule key `kind` appears more than once".to_owned(),
+            ),
+            ("reject_once kind", "`kind` is not `key=value`".to_owned()),
+            (
+                "reject_once kind= name=x",
+                r#"`kind=` needs a value; write `kind=""` for an empty one"#.to_owned(),
+            ),
+            (
+                "reject_once path=a=b",
+                r#"the value of `path` must be quoted: it holds `"`, `=`, `\` or a control character"#
+                    .to_owned(),
+            ),
+            (
+                r#"reject_once path="open"#,
+                "a quoted string is not closed".to_owned(),
+            ),
+            (
+                r#"reject_once path="a\qb""#,
+                r#"`\q` is not an escape; use \", \\, \n, \t or \r"#.to_owned(),
+            ),
+            (
+                r#"reject_once path="a"b"#,
+                "expected a space, `#` or the end of the line after `path`'s value".to_owned(),
+            ),
+            (
+                r#"reject_once kind=read # "r" x"#,
+                "nothing may follow a quoted reason".to_owned(),
+            ),
+            (
+                "reject_oncekind=read",
+                "a rule starts with reject_once or reject_always, not `reject_oncekind=read`"
+                    .to_owned(),
+            ),
+        ];
+        for (input, message) in cases {
+            let refused = parse_rules(&format!("reject_once kind=read\n{input}"));
+            let expected = RuleLineError {
+                line: 2,
+                message: message.clone(),
+            };
+            assert_eq!(refused, Err(expected.clone()), "{input:?}");
+            assert_eq!(expected.to_string(), format!("rules line 2: {message}"));
+        }
+    }
+
+    #[test]
+    fn a_rule_line_kind_outside_the_list_is_the_store_sentence() {
+        assert_eq!(
+            parse_rules("reject_once kind=exec"),
+            Err(RuleLineError {
+                line: 1,
+                message: rule_kind_unknown("exec"),
+            })
+        );
+        assert_eq!(
+            parse_rules(r#"reject_once kind="""#),
+            Err(RuleLineError {
+                line: 1,
+                message: rule_kind_unknown(""),
+            })
+        );
+        assert_eq!(
+            parse_rules(r#"reject_once kind="read""#),
+            Ok(vec![rule_with(
+                PersonaAnswer::RejectOnce,
+                [Some("read"), None, None, None],
+                ""
+            )])
+        );
+    }
+
+    #[test]
+    fn an_empty_value_is_quoted_and_an_absent_key_is_none() {
+        let empty = rule_with(PersonaAnswer::RejectOnce, [None, Some(""), None, None], "");
+        assert_eq!(
+            parse_rules(r#"reject_once name="""#),
+            Ok(vec![empty.clone()])
+        );
+        assert_eq!(
+            format_rules(std::slice::from_ref(&empty)),
+            r#"reject_once name="""#
+        );
+
+        let parsed = parse_rules("reject_once path=/x").expect("parses");
+        assert_eq!(parsed[0].matcher.tool_kind, None);
+        assert_eq!(parsed[0].matcher.tool_name, None);
+        assert_eq!(parsed[0].matcher.command_prefix, None);
+        let line = format_rules(&parsed);
+        for key in ["kind", "name", "command"] {
+            assert!(!line.contains(&format!("{key}=")), "{line}");
+        }
+    }
+
+    #[test]
+    fn format_rules_writes_one_line_per_rule() {
+        assert_eq!(format_rules(&[]), "");
+        let rules = [
+            rule_with(
+                PersonaAnswer::RejectOnce,
+                [Some("read"), None, None, None],
+                "",
+            ),
+            rule_with(
+                PersonaAnswer::RejectAlways,
+                [None, None, Some("/etc"), None],
+                "why",
+            ),
+            rule_with(
+                PersonaAnswer::RejectOnce,
+                [None, None, None, Some("rm")],
+                "",
+            ),
+        ];
+        let text = format_rules(&rules);
+        assert_eq!(
+            text,
+            "reject_once kind=read\nreject_always path=/etc # why\nreject_once command=rm"
+        );
+        assert!(!text.ends_with('\n'));
+        assert_eq!(text.split('\n').count(), 3);
     }
 }

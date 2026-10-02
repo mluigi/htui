@@ -139,7 +139,7 @@ pub use overlap::{
 pub use persona::{
     NewPersona, Persona, PersonaAnswer, PersonaDefault, PersonaFile, PersonaFileError,
     PersonaMatch, PersonaNotInSnapshot, PersonaPatch, PersonaPermission, PersonaRule, PersonaTools,
-    SnapshotPersona,
+    RuleLineError, SnapshotPersona,
 };
 pub use quota::{
     Availability, CapError, PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN, ProjectCaps, Quota,
