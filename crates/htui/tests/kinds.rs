@@ -7,7 +7,7 @@
 
 use chrono::{Duration, Utc};
 use htui::app::{Action, Handled};
-use htui::catalogue::{self, CatalogueSnapshot, GraphEntry, REQUEST_NAMES};
+use htui::catalogue::{self, CatalogueSnapshot, GraphEntry, PersonaSummary, REQUEST_NAMES};
 use htui::hierarchy::MirrorAfterDelete;
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
@@ -17,8 +17,8 @@ use htui::ui::tabs::settings::{
 };
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    ItemKind, ItemKindId, ItemKindPatch, NewProject, PhaseId, PhasePatch, ProjectId, Scope,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, WorkspaceId,
+    ItemKind, ItemKindId, ItemKindPatch, NewProject, PersonaId, PhaseId, PhasePatch, ProjectId,
+    Scope, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, WorkspaceId,
 };
 use htui_core::seed::{PHASES_PER_PROJECT, PhaseSeed, phase_row};
 use htui_core::store::{
@@ -181,6 +181,28 @@ async fn the_demo_catalogue_reads_back_the_seed() {
         .expect("the analysis graph");
     let names: Vec<&str> = analysis.phases.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["research", "verdict"], "phases in position order");
+}
+
+/// The same read carries the global persona registry by name, id and name only: the phase editor's
+/// `persona` field resolves against it and a bound phase's line names its persona from it (MOD-26
+/// M2 D23). By name bytes, as `personas()` answers.
+#[tokio::test]
+async fn the_catalogue_carries_the_personas_by_name() {
+    let snapshot = demo_catalogue(&demo()).await;
+
+    assert_eq!(
+        snapshot.personas,
+        [
+            PersonaSummary {
+                id: ids::PERSONA_ARCHITECT,
+                name: "architect".to_owned(),
+            },
+            PersonaSummary {
+                id: ids::PERSONA_REVIEWER,
+                name: "reviewer".to_owned(),
+            },
+        ]
+    );
 }
 
 /// Two projects in the scope answer two catalogues in **scope order**, which is the whole reason
@@ -1548,10 +1570,11 @@ fn research(snapshot: &CatalogueSnapshot) -> StepGraphPhase {
         .clone()
 }
 
-/// `e` on a phase opens exactly PRD D2's six columns — MOD-4's are on the read-only line, not in
-/// the editor — and `Enter` sends one `update_phase` with `input_kinds` replaced whole (D13).
+/// `e` on a phase opens exactly PRD D2's six columns plus MOD-26 M2's `persona`, last — MOD-4's
+/// are on the read-only line, not in the editor — and `Enter` sends one `update_phase` with
+/// `input_kinds` replaced whole (D13) and the untouched `persona` left alone (D23, B-8).
 #[tokio::test]
-async fn e_on_a_phase_opens_six_fields_and_enter_sends_update_phase() {
+async fn e_on_a_phase_opens_seven_fields_and_enter_sends_update_phase() {
     let (bench, mut section, snapshot) = bench_with_demo().await;
     let stored = research(&snapshot);
     bench.key(&mut section, "j");
@@ -1566,12 +1589,24 @@ async fn e_on_a_phase_opens_six_fields_and_enter_sends_update_phase() {
         "gate_hard (y/n)",
         "input_kinds",
         "token_budget",
+        "persona",
     ] {
         assert!(
             frame.contains(label),
             "`{label}` is an editable column: {frame}"
         );
     }
+    let fields: Vec<&str> = frame
+        .lines()
+        .filter(|line| line.contains(": ") || line.trim_end().ends_with(':'))
+        .filter(|line| !line.starts_with(' '))
+        .collect();
+    assert!(
+        fields
+            .last()
+            .is_some_and(|line| line.starts_with("persona ") && line.trim_end().ends_with(':')),
+        "`persona` is the last field, blank for an unbound phase: {fields:?}"
+    );
     assert!(
         !frame.contains("fan_out  "),
         "MOD-4's columns are not editable here: {frame}"
@@ -1612,6 +1647,10 @@ async fn e_on_a_phase_opens_six_fields_and_enter_sends_update_phase() {
         Some(stored.template_name.as_str())
     );
     assert_eq!(patch.gate_hard, Some(stored.gate_hard));
+    assert_eq!(
+        patch.persona, None,
+        "an untouched `persona` field writes nothing to the binding (B-8)"
+    );
 }
 
 /// `token_budget` is not in `PhasePatch` at all: it rides the `Phase` rung, so a budget-only change
@@ -1956,6 +1995,290 @@ async fn a_gate_hard_that_is_not_y_or_n_is_refused() {
 
     assert!(bench.drained().is_empty());
     assert!(error_text(&bench, &section, 100).contains(&"`gate_hard (y/n)` is y or n".to_owned()));
+}
+
+// -------------------------------------------------------------------------------------------
+// The phase editor's `persona` field (MOD-26 M2 D23, OQ-11): typed like every other field, blank
+// for none, resolved against the catalogue's persona list before anything is sent.
+// -------------------------------------------------------------------------------------------
+
+/// A bench over the demo world with vulkan `analysis/research` bound to `persona` (or left unbound
+/// for `None`), the catalogue read back through the worker and delivered to a fresh section.
+async fn bench_with_bound(
+    persona: Option<PersonaId>,
+) -> (SectionBench, KindsSection, CatalogueSnapshot) {
+    let store = MemStore::demo();
+    let research = store
+        .phases(ids::GRAPH_VULKAN_ANA)
+        .await
+        .expect("the memory store never fails")
+        .into_iter()
+        .find(|phase| phase.name == "research")
+        .expect("the analysis graph's `research`");
+    let outcome = store
+        .update_phase(
+            research.id,
+            research.updated_at,
+            PhasePatch {
+                persona: Some(persona),
+                ..PhasePatch::default()
+            },
+        )
+        .await
+        .expect("the binding is written");
+    assert!(
+        matches!(outcome, htui_core::store::CasOutcome::Applied(_)),
+        "against the row's own token: {outcome:?}"
+    );
+    let snapshot = catalogue(
+        serve(
+            &Backend::memory(store),
+            &StoreRequest::Catalogue(vulkan_scope()),
+        )
+        .await,
+    );
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Catalogue(Box::new(snapshot.clone())),
+    );
+    let _ = bench.drained();
+    (bench, section, snapshot)
+}
+
+/// The editor's `persona` line, as drawn: the last field of a phase edit.
+#[track_caller]
+fn persona_field(bench: &SectionBench, section: &KindsSection) -> String {
+    let frame = bench.render_section(section, 100);
+    frame
+        .lines()
+        .find(|line| line.starts_with("persona "))
+        .unwrap_or_else(|| panic!("the editor draws a `persona` field: {frame}"))
+        .trim_end()
+        .to_owned()
+}
+
+/// Opens the phase editor on `research` (project → ANA → `research`).
+fn edit_research(bench: &SectionBench, section: &mut KindsSection) {
+    bench.key(section, "j");
+    bench.key(section, "j");
+    bench.key(section, "e");
+}
+
+/// Moves the focus from `name` to `persona`, the seventh field.
+fn focus_persona(bench: &SectionBench, section: &mut KindsSection) {
+    for _ in 0..6 {
+        bench.key(section, "tab");
+    }
+}
+
+/// The one `update_phase` an `Enter` sent, or a panic naming what was sent instead.
+#[track_caller]
+fn the_update_phase(asked: &[Action]) -> PhasePatch {
+    let [Action::Store(StoreRequest::UpdatePhase { patch, .. })] = asked else {
+        panic!("exactly one `update_phase`: {asked:?}");
+    };
+    patch.clone()
+}
+
+/// A name the loaded list holds binds the phase: the patch carries that persona's id (D23).
+#[tokio::test]
+async fn a_typed_persona_name_binds_the_phase() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    edit_research(&bench, &mut section);
+    focus_persona(&bench, &mut section);
+    type_at(&bench, &mut section, "reviewer");
+
+    bench.key(&mut section, "enter");
+
+    let patch = the_update_phase(&bench.drained());
+    assert_eq!(patch.persona, Some(Some(ids::PERSONA_REVIEWER)));
+}
+
+/// A persona and a budget changed by one `Enter` are D-4's shape: the patch goes first and carries
+/// the persona, and the budget follows on the patch's reply (B-4). Without the persona in
+/// `patch_changed` this was one `set_phase_budget`, with the persona dropped.
+#[tokio::test]
+async fn a_persona_and_budget_change_sends_the_patch_then_the_budget() {
+    let (bench, mut section, snapshot) = bench_with_demo().await;
+    edit_research(&bench, &mut section);
+    for _ in 0..5 {
+        bench.key(&mut section, "tab");
+    }
+    type_at(&bench, &mut section, "9000");
+    bench.key(&mut section, "tab");
+    type_at(&bench, &mut section, "reviewer");
+
+    bench.key(&mut section, "enter");
+
+    let patch = the_update_phase(&bench.drained());
+    assert_eq!(
+        patch.persona,
+        Some(Some(ids::PERSONA_REVIEWER)),
+        "the persona rides the patch, which goes first"
+    );
+
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
+    let asked = bench.drained();
+    let [Action::Store(StoreRequest::SetPhaseBudget { budget, .. })] = asked.as_slice() else {
+        panic!("the budget is still owed, once: {asked:?}");
+    };
+    assert_eq!(*budget, Some(9_000));
+}
+
+/// A bound phase opens with its persona's name in the field, and blanking it unbinds: `Some(None)`
+/// (D23).
+#[tokio::test]
+async fn blanking_a_bound_persona_sends_some_none() {
+    let (bench, mut section, _) = bench_with_bound(Some(ids::PERSONA_REVIEWER)).await;
+    edit_research(&bench, &mut section);
+    assert!(
+        persona_field(&bench, &section).ends_with(": reviewer"),
+        "prefilled with the bound name: {}",
+        persona_field(&bench, &section)
+    );
+    focus_persona(&bench, &mut section);
+    for _ in 0.."reviewer".len() {
+        bench.key(&mut section, "backspace");
+    }
+
+    bench.key(&mut section, "enter");
+
+    let patch = the_update_phase(&bench.drained());
+    assert_eq!(patch.persona, Some(None), "a blank field is no persona");
+}
+
+/// An edit that never touched the `persona` field leaves the binding alone: `None`, so another
+/// writer's binding is not rewritten from this editor's copy (B-8).
+#[tokio::test]
+async fn an_untouched_bound_persona_sends_none() {
+    let (bench, mut section, _) = bench_with_bound(Some(ids::PERSONA_REVIEWER)).await;
+    edit_research(&bench, &mut section);
+    type_at(&bench, &mut section, "2");
+
+    bench.key(&mut section, "enter");
+
+    let patch = the_update_phase(&bench.drained());
+    assert_eq!(patch.name.as_deref(), Some("research2"));
+    assert_eq!(patch.persona, None, "the untouched field writes nothing");
+}
+
+/// A name the loaded list does not hold is refused before anything is sent, with the names it
+/// does hold, in `theme.error` (D23).
+#[tokio::test]
+async fn an_unknown_persona_name_is_refused_before_sending() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    edit_research(&bench, &mut section);
+    focus_persona(&bench, &mut section);
+    type_at(&bench, &mut section, "ghost");
+
+    bench.key(&mut section, "enter");
+
+    assert!(bench.drained().is_empty(), "nothing is sent");
+    let flagged = error_text(&bench, &section, 100);
+    assert!(
+        flagged.contains(&"no persona named `ghost`; known: architect, reviewer".to_owned()),
+        "the refusal lists the known names: {flagged:?}"
+    );
+}
+
+/// With an empty registry the refusal says where personas are made rather than listing nothing
+/// (D23).
+#[tokio::test]
+async fn with_no_personas_the_refusal_says_add_one() {
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    let mut snapshot = demo_catalogue(&demo()).await;
+    snapshot.personas.clear();
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
+    let _ = bench.drained();
+    edit_research(&bench, &mut section);
+    focus_persona(&bench, &mut section);
+    type_at(&bench, &mut section, "ghost");
+
+    bench.key(&mut section, "enter");
+
+    assert!(bench.drained().is_empty(), "nothing is sent");
+    let flagged = error_text(&bench, &section, 100);
+    assert!(
+        flagged.contains(&"no personas exist; add one in Settings \u{203a} Personas".to_owned()),
+        "the refusal says where personas come from: {flagged:?}"
+    );
+}
+
+/// A binding to an id the loaded list does not know — a persona created after the catalogue was
+/// read — prints as the id, prefills the field with it, and is left alone by an edit that does not
+/// touch the field (D23, B-8).
+#[tokio::test]
+async fn an_id_the_list_does_not_know_prints_as_the_id_and_is_left_alone() {
+    let unknown = PersonaId::new();
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    let mut snapshot = demo_catalogue(&demo()).await;
+    snapshot.projects[0]
+        .graphs
+        .iter_mut()
+        .find(|entry| entry.graph.id == ids::GRAPH_VULKAN_ANA)
+        .expect("the analysis graph")
+        .phases[0]
+        .persona_id = Some(unknown);
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
+    let _ = bench.drained();
+
+    let frame = bench.render_section(&section, 160);
+    let line = frame
+        .lines()
+        .find(|line| line.contains(". research "))
+        .unwrap_or_else(|| panic!("the research row: {frame}"));
+    assert!(
+        line.trim_end()
+            .ends_with(&format!(" \u{b7} persona {unknown}")),
+        "an id the list does not know prints as the id: {line}"
+    );
+
+    edit_research(&bench, &mut section);
+    assert!(
+        persona_field(&bench, &section).ends_with(&format!(": {unknown}")),
+        "and prefills the field: {}",
+        persona_field(&bench, &section)
+    );
+    type_at(&bench, &mut section, "2");
+    bench.key(&mut section, "enter");
+
+    let patch = the_update_phase(&bench.drained());
+    assert_eq!(
+        patch.persona, None,
+        "an id nobody typed is not refused and not rewritten"
+    );
+}
+
+/// A bound phase's row ends with its persona's name; an unbound one's is exactly what it was
+/// (D23, I-12).
+#[tokio::test]
+async fn a_bound_phase_line_names_its_persona() {
+    let (bench, section, _) = bench_with_bound(Some(ids::PERSONA_REVIEWER)).await;
+
+    let frame = bench.render_section(&section, 100);
+    let research = frame
+        .lines()
+        .find(|line| line.contains(". research "))
+        .unwrap_or_else(|| panic!("the research row: {frame}"));
+    assert!(
+        research
+            .trim_end()
+            .ends_with(" \u{b7} budget inherit \u{b7} persona reviewer"),
+        "the bound row names its persona last: {research}"
+    );
+    let verdict = frame
+        .lines()
+        .find(|line| line.contains(". verdict "))
+        .unwrap_or_else(|| panic!("the verdict row: {frame}"));
+    assert!(
+        !verdict.contains("persona"),
+        "an unbound row says nothing of personas: {verdict}"
+    );
+    insta::assert_snapshot!("phase_persona", frame);
 }
 
 /// `d` on a kind asks once and writes nothing until `y` (D11).
