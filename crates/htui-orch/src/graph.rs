@@ -864,11 +864,12 @@ async fn agent_name<G: GraphSource>(
 mod tests {
     use htui_core::fixtures::{DemoData, demo_data, ids};
     use htui_core::model::{
-        Activation, Gate, NewRepo, PromptTemplateId, RepoId, RepoScope, RunScope, SkillBinding,
-        SkillBindingId,
+        Activation, Gate, NewRepo, PersonaId, PromptTemplateId, RepoId, RepoScope, RunScope,
+        SkillBinding, SkillBindingId, SnapshotPersona,
     };
     use htui_core::store::{
         MemStore, ReadStore, StoreError, glob_names_unknown_repo, negative_position,
+        references_no_row,
     };
     use serde_json::json;
 
@@ -906,6 +907,9 @@ question and not a test fix. Decide the version bump first, then paste the new d
     struct TestSource<'a> {
         store: &'a MemStore,
         candidates: Vec<(AgentId, &'static str)>,
+        /// MOD-26 B-18: a `persona_id` the first phase names with no `persona` row behind it, a
+        /// shape neither store can write.
+        unbacked: Option<PersonaId>,
     }
 
     impl<'a> TestSource<'a> {
@@ -914,6 +918,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
             Self {
                 store,
                 candidates: vec![(ids::AGENT_CLAUDE, "sonnet")],
+                unbacked: None,
             }
         }
 
@@ -922,13 +927,24 @@ question and not a test fix. Decide the version bump first, then paste the new d
             Self {
                 store,
                 candidates: Vec::new(),
+                unbacked: None,
             }
         }
     }
 
     impl GraphSource for TestSource<'_> {
         async fn resolve_graph(&self, item: ItemId) -> Result<Option<ResolvedGraph>> {
-            self.store.resolve_graph(item).await
+            let mut graph = self.store.resolve_graph(item).await?;
+            if let (Some(id), Some(graph)) = (self.unbacked, graph.as_mut()) {
+                let first = graph
+                    .phases
+                    .iter_mut()
+                    .min_by_key(|row| row.phase.position)
+                    .expect("the graph has a phase");
+                first.phase.persona_id = Some(id);
+                first.persona = None;
+            }
+            Ok(graph)
         }
 
         async fn phase_agents(&self, phase: PhaseId) -> Result<Vec<PhaseAgent>> {
@@ -2159,5 +2175,112 @@ question and not a test fix. Decide the version bump first, then paste the new d
         resolve_item(&store, ids::HTUI_FEAT_1, &BTreeMap::new())
             .await
             .expect("`review` at fan_out 1 is the ordinary case");
+    }
+
+    /// The demo fixture with `FEAT`'s phases bound as `bind` names them: `(phase, persona id)`.
+    fn store_bound(bind: &[(&str, PersonaId)]) -> MemStore {
+        store_with(|data| {
+            for phase in &mut data.phases {
+                if phase.graph_id != ids::GRAPH_HTUI_FEAT {
+                    continue;
+                }
+                if let Some((_, persona)) = bind.iter().find(|(name, _)| *name == phase.name) {
+                    phase.persona_id = Some(*persona);
+                }
+            }
+        })
+    }
+
+    /// The fixture's persona row `id`.
+    fn persona_row(id: PersonaId) -> htui_core::model::Persona {
+        demo_data()
+            .personas
+            .into_iter()
+            .find(|row| row.id == id)
+            .expect("the fixture seeds both personas")
+    }
+
+    /// MOD-26 D9 (B-18): `StartRun` freezes each bound persona once, sorted by name bytes, with
+    /// `SnapshotPersona::freeze`'s digest, and each bound phase names its persona.
+    #[tokio::test]
+    async fn start_run_freezes_each_bound_persona_once() {
+        let store = store_bound(&[
+            ("prd", ids::PERSONA_REVIEWER),
+            ("plan", ids::PERSONA_ARCHITECT),
+            ("review", ids::PERSONA_REVIEWER),
+        ]);
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the bound feature graph resolves")
+            .snapshot;
+
+        let expected: Vec<SnapshotPersona> = [ids::PERSONA_ARCHITECT, ids::PERSONA_REVIEWER]
+            .into_iter()
+            .map(|id| SnapshotPersona::freeze(&persona_row(id)).expect("a fixture persona freezes"))
+            .collect();
+        assert_eq!(
+            snapshot.personas, expected,
+            "one frozen persona per name, sorted by name bytes"
+        );
+        assert_eq!(
+            snapshot
+                .phases
+                .iter()
+                .map(|phase| (phase.name.as_str(), phase.persona.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("prd", Some("reviewer")),
+                ("plan", Some("architect")),
+                ("implement", None),
+                ("review", Some("reviewer")),
+            ],
+            "each bound phase names its persona; the unbound one names none"
+        );
+    }
+
+    /// MOD-26 D9, I-7: a persona-less graph keeps [`FEATURE_TOPOLOGY`]; binding one phase moves it.
+    #[tokio::test]
+    async fn only_a_bound_phase_moves_the_topology() {
+        let store = MemStore::demo();
+        let bare = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the seeded feature graph resolves");
+        assert_eq!(bare.snapshot.topology, FEATURE_TOPOLOGY, "{TOPOLOGY_MOVED}");
+        assert!(
+            bare.snapshot.personas.is_empty(),
+            "no bound phase, no frozen persona"
+        );
+
+        let store = store_bound(&[("implement", ids::PERSONA_REVIEWER)]);
+        let bound = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("the bound feature graph resolves");
+        assert_ne!(
+            bound.snapshot.topology, FEATURE_TOPOLOGY,
+            "a bound phase's digest names its persona (MOD-26 D9)"
+        );
+    }
+
+    /// MOD-26 B-18: a `persona_id` with no row behind it is refused at resolution rather than
+    /// frozen un-narrowed.
+    #[tokio::test]
+    async fn an_unbacked_persona_id_is_refused_at_resolution() {
+        let store = MemStore::demo();
+        let id = PersonaId::new();
+        let source = TestSource {
+            unbacked: Some(id),
+            ..TestSource::claude(&store)
+        };
+        let error = resolve_feat(&store, &source)
+            .await
+            .expect_err("an unbacked persona is refused");
+        assert_eq!(
+            error,
+            ResolveError::Store(StoreError::Constraint(references_no_row(
+                "step_graph_phase.persona_id",
+                id,
+                "persona",
+            )))
+        );
     }
 }

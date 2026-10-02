@@ -33,9 +33,9 @@ use htui_core::model::{
     DocumentId, EventKind, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId,
     NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectId, ProjectSettings,
     PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, RunSummary, SnapshotCandidate, SnapshotPhase, SnapshotTemplate,
-    Status, StepFiles, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
-    missing_tags_failure,
+    RunStepCommit, RunStepTree, RunSummary, SnapshotCandidate, SnapshotPersona, SnapshotPhase,
+    SnapshotTemplate, Status, StepFiles, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS,
+    UserId, VerifyOutcome, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
@@ -1369,10 +1369,18 @@ where
                 {
                     Ok(spec) => spec,
                     // Not reachable with `strict = false`: a missing input is a note there.
-                    Err(kind) => {
+                    Err(StageThree::MissingInput(kind)) => {
                         return Err(EngineError::Snapshot {
                             run: run.id,
                             reason: format!("the handoff prompt found no `{kind}` document"),
+                        });
+                    }
+                    // Not reachable with `strict = false` either: a handoff opens without a
+                    // persona it cannot find (MOD-26 OQ-5), and `phase_spec` never assembles.
+                    Err(other) => {
+                        return Err(EngineError::Snapshot {
+                            run: run.id,
+                            reason: format!("the handoff prompt was refused: {other:?}"),
                         });
                     }
                 };
@@ -3433,9 +3441,18 @@ where
             }
             // MOD-4 plan D162: the step fails before a token and the item is blocked.
             Err(StageThree::Refused(err)) => {
-                return self.refuse_prompt(run, step, phase, &err).await.map(Some);
+                return self
+                    .refuse_prompt(run, step, phase, err.to_string())
+                    .await
+                    .map(Some);
+            }
+            // MOD-26 I-4: the step fails before a token, the item is blocked, the run settles.
+            Err(StageThree::NoPersona(reason)) => {
+                return self.refuse_prompt(run, step, phase, reason).await.map(Some);
             }
         };
+        // MOD-26 T4: red — stage 3 does not look the persona up yet.
+        let persona: Option<&SnapshotPersona> = None;
         // `unwrap_or(Value::Null)` here once wrote a **null** `trim_record` and said nothing: the
         // row that records which sections were dropped and why would silently become "there was
         // no record", which is the one thing `run_step.trim_record` exists to rule out. That is
@@ -3469,7 +3486,15 @@ where
         // -- stage 4: session -----------------------------------------------------------------
         let session_cwd = prepared.cwd.clone();
         let (result, cap_breach) = self
-            .session(run, step, phase, &prompt, prepared.cwd, prepared.extra_dirs)
+            .session(
+                run,
+                step,
+                phase,
+                persona,
+                &prompt,
+                prepared.cwd,
+                prepared.extra_dirs,
+            )
             .await?;
         if let Ok(done) = &result {
             self.parts
@@ -3797,7 +3822,20 @@ where
                     .await
                     .map(Some);
             }
+            // MOD-26 I-4 at `drive_group`: the whole group fails before a token, the item blocked.
+            Err(StageThree::NoPersona(reason)) => {
+                let failure = RunFailure::PromptRefused {
+                    phase: phase.name.clone(),
+                    reason,
+                };
+                return self
+                    .fail_group_before_a_token(run, phase, &pending, failure, true)
+                    .await
+                    .map(Some);
+            }
         };
+        // MOD-26 T4: red — stage 3 does not look the persona up yet.
+        let persona: Option<&SnapshotPersona> = None;
 
         let settled = futures::future::join_all(pending.iter().map(|step| {
             self.run_candidate(CandidateStage {
@@ -3806,6 +3844,7 @@ where
                 step,
                 prompt: &prompt,
                 base: &base,
+                persona,
             })
         }))
         .await;
@@ -4007,6 +4046,7 @@ where
             step,
             prompt,
             base,
+            persona,
         } = *stage;
         let item = Self::item_of(run)?;
 
@@ -4079,6 +4119,7 @@ where
                 run,
                 step,
                 phase,
+                persona,
                 &key,
                 &prompt.text,
                 prepared.cwd.clone(),
@@ -4977,6 +5018,9 @@ where
                     run,
                     judge,
                     jp,
+                    // MOD-26 OQ-2: the judge runs without a persona; its `{{task}}` replays the
+                    // candidate's prompt, frame included.
+                    None,
                     &key,
                     text,
                     prepared.cwd.clone(),
@@ -5218,11 +5262,11 @@ where
         run: &Run,
         step: &RunStep,
         phase: &SnapshotPhase,
-        err: &htui_core::prompt::AssembleError,
+        reason: String,
     ) -> Result<Rest, EngineError> {
         let failure = RunFailure::PromptRefused {
             phase: phase.name.clone(),
-            reason: err.to_string(),
+            reason,
         };
         let now = self.now();
         self.move_step(
@@ -5271,8 +5315,10 @@ where
     ///
     /// The inner `Err` is the run's own outcome rather than an engine fault (blueprint D195):
     /// [`StageThree::MissingInput`] is a required input that resolved to no document, which the
-    /// caller turns into the hard failure, and [`StageThree::Refused`] is `assemble`'s own refusal
-    /// of the phase's prompt, which blocks the item (MOD-4 plan D162). A store error and a phase
+    /// caller turns into the hard failure, [`StageThree::Refused`] is `assemble`'s own refusal
+    /// of the phase's prompt, which blocks the item (MOD-4 plan D162), and
+    /// [`StageThree::NoPersona`] is a phase whose persona the snapshot does not carry, refused the
+    /// same way (MOD-26 I-4). A store error and a phase
     /// whose pinned template is gone (`ResolveError::NoTemplate`) stay outer: they are not about
     /// this prompt.
     async fn assemble_prompt(
@@ -5288,7 +5334,7 @@ where
             .await?
         {
             Ok(spec) => spec,
-            Err(missing) => return Ok(Err(StageThree::MissingInput(missing))),
+            Err(stage) => return Ok(Err(stage)),
         };
         // MOD-7 milestone 4 (D125): here and not in `phase_spec`, which is also the handoff's
         // builder; a handoff reads no file.
@@ -5368,8 +5414,10 @@ where
     /// The phase's [`PromptSpec`] for `step`: its resolved inputs, its pinned template, its
     /// upstream summaries and, from attempt 2, the loop's forwarded sections (plan D67).
     ///
-    /// `Err(kind)` is a required input that resolved to no document, when `strict`. A promoted
-    /// step's handoff (plan D163) is not strict: its chat opens with the gap noted instead.
+    /// `Err(MissingInput(kind))` is a required input that resolved to no document, when `strict`.
+    /// `Err(NoPersona(reason))` is a phase naming a persona its snapshot does not carry, when
+    /// `strict` (MOD-26 I-4). A promoted step's handoff (plan D163) is not strict: its chat opens
+    /// with the gap noted instead, and without the persona (MOD-26 OQ-5).
     ///
     /// The skill candidates are resolved here for every caller, the handoff included, although
     /// `promote::handoff_spec` then empties them (MOD-9 D44): a handoff is rare, the two reads go
@@ -5383,7 +5431,7 @@ where
         phase: &SnapshotPhase,
         item: ItemId,
         strict: bool,
-    ) -> Result<Result<PromptSpec, String>, EngineError> {
+    ) -> Result<Result<PromptSpec, StageThree>, EngineError> {
         let row = self.item(item).await?;
         let project = self.project(row.project_id).await?;
         let resolved = self
@@ -5402,7 +5450,7 @@ where
                     body: document.body,
                 }),
                 None if strict && required.contains(&input.kind) => {
-                    return Ok(Err(input.kind));
+                    return Ok(Err(StageThree::MissingInput(input.kind)));
                 }
                 None if required.contains(&input.kind) => notes.push(format!(
                     "input `{}` resolves to no document; the handoff opens without it",
@@ -5668,6 +5716,7 @@ where
         run: &Run,
         step: &RunStep,
         phase: &SnapshotPhase,
+        persona: Option<&SnapshotPersona>,
         prompt: &AssembledPrompt,
         cwd: PathBuf,
         extra_dirs: Vec<PathBuf>,
@@ -5685,6 +5734,7 @@ where
                 run,
                 step,
                 phase,
+                persona,
                 &SessionKey::of(step),
                 &prompt.text,
                 cwd,
@@ -5759,14 +5809,15 @@ where
     /// `is_fenced` makes [`EngineError::LeaseLost`]); both leave before settle can read them.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the session's four coordinates and its three per-call inputs; a struct would be \
-                  built at exactly two call sites and read here only"
+        reason = "the session's four coordinates, the persona stage 3 froze and its three per-call \
+                  inputs; a struct would be built at exactly three call sites and read here only"
     )]
     async fn drive_once(
         &self,
         run: &Run,
         step: &RunStep,
         phase: &SnapshotPhase,
+        persona: Option<&SnapshotPersona>,
         key: &SessionKey<'_>,
         text: &str,
         cwd: PathBuf,
@@ -5784,6 +5835,9 @@ where
         // MOD-42 D9: the agent's own policy (a judge call's is the judge agent's: `candidate_of`
         // over the judge phase).
         let policy = (self.parts.policy)(candidate.agent_id);
+        // MOD-26 T4: red — the persona does not narrow the session yet.
+        let tools = ToolExposure::default();
+        let _ = persona;
         let driver = (self.parts.driver)(&candidate, key);
 
         let spec = SessionSpec {
@@ -5798,7 +5852,7 @@ where
             // wiring one. The walk invents none.
             env: BTreeMap::new(),
             model: Some(candidate.model.clone()),
-            tools: ToolExposure::default(),
+            tools,
             mcp: Vec::new(),
             permission: policy.clone(),
             retain_raw: settings.keep_raw_events,
@@ -6165,6 +6219,9 @@ enum StageThree {
     MissingInput(String),
     /// `assemble` refused the phase's own prompt (MOD-4 plan D162, ANA-5 criterion 3).
     Refused(htui_core::prompt::AssembleError),
+    /// MOD-26 I-4: the phase names a persona the run's snapshot does not carry; carries
+    /// `persona_not_in_snapshot`'s sentence.
+    NoPersona(String),
 }
 
 /// One fan-out candidate's inputs to [`Engine::run_candidate`]: everything its stages 2 to 5 read
@@ -6181,6 +6238,8 @@ struct CandidateStage<'s> {
     prompt: &'s AssembledPrompt,
     /// The group's base per repo (plan D54(a)).
     base: &'s BTreeMap<RepoId, String>,
+    /// MOD-26 D12: the phase's frozen persona.
+    persona: Option<&'s SnapshotPersona>,
 }
 
 /// The judge's two orderings and the template they were assembled from (plan D52, D53).
@@ -9609,6 +9668,7 @@ mod tests {
                 step: &stale,
                 prompt: &prompt,
                 base: &BTreeMap::new(),
+                persona: None,
             })
             .await
             .expect_err("the candidate's compare-and-set found the row moved");
@@ -11604,6 +11664,186 @@ mod tests {
         ));
     }
 
+    /// MOD-26 I-4 at stage 3 (B-4): a snapshot whose phase names a persona it does not carry is
+    /// `StageThree::NoPersona` with `persona_not_in_snapshot`'s sentence, never a prompt.
+    #[tokio::test]
+    async fn a_snapshot_without_its_persona_refuses_at_stage_three() {
+        let harness = Harness::new().await;
+        let (row, mut snapshot, prd) = skills_prologue(&harness).await;
+        snapshot.phases[0].persona = Some("reviewer".to_owned());
+        snapshot.personas.clear();
+        harness_engine!(harness.orch, engine);
+
+        let refused = engine
+            .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
+            .await
+            .expect("no store fault");
+        let expected = htui_core::model::persona::persona_not_in_snapshot("reviewer");
+        assert!(
+            matches!(&refused, Err(super::StageThree::NoPersona(reason)) if *reason == expected),
+            "{refused:?}"
+        );
+    }
+
+    /// MOD-26 I-4 end to end (B-5): a claimed run whose snapshot names a persona it lost fails
+    /// that step before a token, blocks the item and settles — `claim` answers `Ok`, the walk is
+    /// not aborted, and no driver is ever built.
+    #[tokio::test]
+    async fn a_claimed_run_whose_snapshot_lost_its_persona_fails_the_step_and_settles() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        bind_persona(
+            &harness.orch,
+            ids::HTUI_FEAT_3,
+            "prd",
+            ids::PERSONA_REVIEWER,
+        )
+        .await;
+        let item = harness.orch.item(ids::HTUI_FEAT_3).await;
+        let mut resolved = crate::graph::resolve(
+            &harness.orch.store,
+            &harness.orch.graphs(),
+            &item,
+            RunMode::Manual,
+            &BTreeMap::new(),
+            None,
+            harness.orch.box_id(),
+        )
+        .await
+        .expect("the bound graph resolves");
+        assert_eq!(
+            resolved.snapshot.phases[0].persona.as_deref(),
+            Some("reviewer"),
+            "the freeze named the persona"
+        );
+        resolved.snapshot.personas.clear();
+        let run = htui_core::model::RunId::new();
+        harness
+            .orch
+            .store
+            .create_run(htui_core::model::NewRun {
+                id: run,
+                project_id: item.project_id,
+                item_id: item.id,
+                mode: RunMode::Manual,
+                target_box_id: harness.orch.box_id(),
+                started_by: harness.orch.user(),
+                graph_snapshot: resolved.snapshot,
+                repo_scope: resolved.repo_scope,
+                queued_at: harness.orch.clock.now(),
+            })
+            .await
+            .expect("MemStore creates the run");
+
+        let calls = AtomicUsize::new(0);
+        let graphs = harness.orch.graphs();
+        let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            harness.orch.driver_for_key(key)
+        };
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let engine = crate::engine::Engine::new(
+            crate::engine::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
+                .await
+                .expect("the harness has a box"),
+        );
+        let outcome = engine
+            .claim(run)
+            .await
+            .expect("an I-4 refusal settles the run; it is not an engine error");
+
+        let CommandOutcome::Started { rest, .. } = outcome else {
+            panic!("`claim` answers `Started`, not {outcome:?}");
+        };
+        assert_eq!(rest.run, RunStatus::Failed);
+        assert_eq!(
+            rest.failure,
+            Some(RunFailure::PromptRefused {
+                phase: "prd".to_owned(),
+                reason: htui_core::model::persona::persona_not_in_snapshot("reviewer"),
+            })
+        );
+        let steps = harness.orch.steps(run).await;
+        assert_eq!(steps.len(), 1, "the walk stopped at the refused step");
+        assert_eq!(
+            (steps[0].status, steps[0].prompt_digest.as_deref()),
+            (StepStatus::Failed, None),
+            "the step failed before a prompt was written"
+        );
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Blocked
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no driver was built");
+    }
+
+    /// MOD-26 D9, I-3: rebinding a phase's persona under a parked run moves the topology, so a
+    /// resume parks on it; editing the bound persona's body does not.
+    #[tokio::test]
+    async fn rebinding_a_phase_persona_parks_a_resumed_run() {
+        let harness = Harness::new().await;
+        bind_persona(
+            &harness.orch,
+            ids::HTUI_FEAT_3,
+            "plan",
+            ids::PERSONA_REVIEWER,
+        )
+        .await;
+        let (run, _) = started(&harness).await;
+        bind_persona(
+            &harness.orch,
+            ids::HTUI_FEAT_3,
+            "plan",
+            ids::PERSONA_ARCHITECT,
+        )
+        .await;
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        assert!(
+            matches!(resumed, Resume::TopologyChanged { .. }),
+            "a rebound phase is a topology mismatch: {resumed:?}"
+        );
+
+        let harness = Harness::new().await;
+        bind_persona(
+            &harness.orch,
+            ids::HTUI_FEAT_3,
+            "plan",
+            ids::PERSONA_REVIEWER,
+        )
+        .await;
+        let (run, _) = started(&harness).await;
+        let reviewer = harness
+            .orch
+            .store
+            .personas()
+            .await
+            .expect("MemStore never fails a read")
+            .into_iter()
+            .find(|row| row.id == ids::PERSONA_REVIEWER)
+            .expect("the fixture seeds `reviewer`");
+        let edited = harness
+            .orch
+            .store
+            .update_persona(
+                reviewer.id,
+                reviewer.updated_at,
+                htui_core::model::PersonaPatch {
+                    body: Some("A changed body.\n".to_owned()),
+                    ..htui_core::model::PersonaPatch::default()
+                },
+            )
+            .await
+            .expect("the edit is valid");
+        assert!(matches!(edited, CasOutcome::Applied(_)), "{edited:?}");
+        let resumed = harness.resume(run).await.expect("the run is readable");
+        assert!(
+            matches!(resumed, Resume::Walked(_)),
+            "a body edit is not a topology change (I-3): {resumed:?}"
+        );
+    }
+
     /// The driver factory's contract: one driver per `(phase, attempt)`, because `FakeDriver`
     /// plays its script once (blueprint H-12).
     #[tokio::test]
@@ -11898,8 +12138,14 @@ mod tests {
         let elsewhere = std::path::PathBuf::from("/elsewhere/docs");
         orch.isolator.script_extra_dirs(vec![elsewhere.clone()]);
 
-        let seen: std::sync::Arc<std::sync::Mutex<Option<htui_agent::driver::SessionSpec>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen = spied_start(&orch).await;
+        assert_eq!(seen.0.extra_dirs, vec![elsewhere]);
+    }
+
+    /// `StartRun` on `FEAT-3` under a [`SpecSpy`]: what stage 4 handed the driver, spec and
+    /// prompt. The spy refuses to start, so the walk ends there.
+    async fn spied_start(orch: &FakeOrchestrator) -> (htui_agent::driver::SessionSpec, String) {
+        let seen: SpySlot = std::sync::Arc::new(std::sync::Mutex::new(None));
         let graphs = orch.graphs();
         let spy = seen.clone();
         let driver = move |_candidate: &SnapshotCandidate,
@@ -11909,7 +12155,7 @@ mod tests {
         };
         let scrubber = htui_core::scrub::MinimalScrubber::new([]);
         let engine = super::Engine::new(
-            super::fake_parts(&orch, &graphs, &driver, &scrubber)
+            super::fake_parts(orch, &graphs, &driver, &scrubber)
                 .await
                 .expect("the fixture holds a box"),
         );
@@ -11923,19 +12169,158 @@ mod tests {
             .expect_err("the spy refuses to start");
         assert!(matches!(refused, EngineError::Driver(_)), "{refused}");
 
-        let spec = seen
-            .lock()
+        seen.lock()
             .expect("no panic holds the spy's lock")
             .clone()
-            .expect("stage 4 built a spec");
-        assert_eq!(spec.extra_dirs, vec![elsewhere]);
+            .expect("stage 4 built a spec")
     }
 
-    /// An [`AgentDriver`](htui_agent::driver::AgentDriver) that records its `SessionSpec` and then
-    /// refuses, so a test can read stage 4's argument without opening a session.
+    /// MOD-26: binds `persona` to `item`'s phase `phase` through `update_phase` (plan D5).
+    async fn bind_persona(
+        orch: &FakeOrchestrator,
+        item: htui_core::model::ItemId,
+        phase: &str,
+        persona: htui_core::model::PersonaId,
+    ) {
+        let graph = orch
+            .store
+            .resolve_graph(item)
+            .await
+            .expect("MemStore never fails a read")
+            .expect("the item resolves to a graph");
+        let row = &graph
+            .phases
+            .iter()
+            .find(|row| row.phase.name == phase)
+            .expect("the graph names the phase")
+            .phase;
+        let outcome = orch
+            .store
+            .update_phase(
+                row.id,
+                row.updated_at,
+                PhasePatch {
+                    persona: Some(Some(persona)),
+                    ..PhasePatch::default()
+                },
+            )
+            .await
+            .expect("the persona names a row");
+        assert!(
+            matches!(outcome, CasOutcome::Applied(_)),
+            "the phase's version is current: {outcome:?}"
+        );
+    }
+
+    /// The agent row's own policy in the spec tests: one rule of its own, so "the agent's rules
+    /// follow" has something to follow.
+    fn agent_policy() -> htui_agent::driver::PermissionPolicy {
+        htui_agent::driver::PermissionPolicy {
+            default: htui_agent::driver::PermissionDefault::Ask,
+            rules: vec![htui_agent::driver::PermissionRule {
+                matcher: htui_agent::driver::PermissionMatch {
+                    tool_name: Some("Bash".to_owned()),
+                    ..htui_agent::driver::PermissionMatch::default()
+                },
+                answer: htui_agent::event::PermissionOptionKind::RejectOnce,
+                reason: "the agent's own rule".to_owned(),
+            }],
+            remembered: Vec::new(),
+        }
+    }
+
+    /// MOD-26 D10, D12, I-1: a `reviewer`-bound step's session is narrowed — its three denied
+    /// kinds on the exposure, their reject rules ahead of the agent's own — and its prompt opens
+    /// with the persona frame (D13).
+    #[tokio::test]
+    async fn a_persona_narrows_the_session_spec() {
+        use htui_agent::event::{PermissionOptionKind, ToolKind};
+
+        let orch = FakeOrchestrator::demo();
+        orch.store
+            .finish_run(ids::RUN_2, RunStatus::Cancelled, None, orch.clock.now())
+            .await
+            .expect("the seeded run is queued and cancellable");
+        let policy = agent_policy();
+        orch.set_policy(ids::AGENT_CLAUDE, policy.clone());
+        bind_persona(&orch, ids::HTUI_FEAT_3, "prd", ids::PERSONA_REVIEWER).await;
+
+        let (spec, prompt) = spied_start(&orch).await;
+
+        assert_eq!(
+            spec.tools.deny_kinds,
+            [ToolKind::Edit, ToolKind::Delete, ToolKind::Move]
+        );
+        assert!(spec.tools.allow.is_empty(), "{:?}", spec.tools.allow);
+        assert_eq!(
+            spec.permission
+                .rules
+                .iter()
+                .take(3)
+                .map(|rule| (
+                    rule.matcher.tool_kind.as_deref(),
+                    rule.answer,
+                    rule.reason.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    Some("edit"),
+                    PermissionOptionKind::RejectOnce,
+                    "persona reviewer denies edit"
+                ),
+                (
+                    Some("delete"),
+                    PermissionOptionKind::RejectOnce,
+                    "persona reviewer denies delete"
+                ),
+                (
+                    Some("move"),
+                    PermissionOptionKind::RejectOnce,
+                    "persona reviewer denies move"
+                ),
+            ],
+            "the persona's kind rejects come first"
+        );
+        assert_eq!(
+            spec.permission.rules.get(3..),
+            Some(policy.rules.as_slice()),
+            "the agent's own rules follow"
+        );
+        assert!(
+            prompt.starts_with("<section name=\"persona\" persona=\"reviewer\">\n"),
+            "the prompt opens with the persona frame:\n{prompt}"
+        );
+    }
+
+    /// MOD-26 I-7: a persona-less step's session is exactly today's — the default exposure and
+    /// the agent's own policy, untouched — and its prompt carries no frame.
+    #[tokio::test]
+    async fn a_persona_less_step_spec_is_unchanged() {
+        let orch = FakeOrchestrator::demo();
+        orch.store
+            .finish_run(ids::RUN_2, RunStatus::Cancelled, None, orch.clock.now())
+            .await
+            .expect("the seeded run is queued and cancellable");
+        let policy = agent_policy();
+        orch.set_policy(ids::AGENT_CLAUDE, policy.clone());
+
+        let (spec, prompt) = spied_start(&orch).await;
+
+        assert_eq!(spec.tools, htui_agent::driver::ToolExposure::default());
+        assert_eq!(spec.permission, policy);
+        assert!(!prompt.contains("name=\"persona\""), "{prompt}");
+    }
+
+    /// What a [`SpecSpy`] saw: stage 4's spec and the prompt it was started with.
+    type SpySlot =
+        std::sync::Arc<std::sync::Mutex<Option<(htui_agent::driver::SessionSpec, String)>>>;
+
+    /// An [`AgentDriver`](htui_agent::driver::AgentDriver) that records its `SessionSpec` and its
+    /// prompt and then refuses, so a test can read stage 4's arguments without opening a session.
     #[derive(Debug)]
     struct SpecSpy {
-        seen: std::sync::Arc<std::sync::Mutex<Option<htui_agent::driver::SessionSpec>>>,
+        seen: SpySlot,
     }
 
     impl htui_agent::driver::AgentDriver for SpecSpy {
@@ -11954,8 +12339,7 @@ mod tests {
         ) -> htui_agent::driver::DriverFuture<'a, Box<dyn htui_agent::driver::AgentSession>>
         {
             Box::pin(async move {
-                drop(prompt);
-                *self.seen.lock().expect("no panic holds the spy's lock") = Some(spec);
+                *self.seen.lock().expect("no panic holds the spy's lock") = Some((spec, prompt));
                 Err(DriverError::Spawn("the spy never starts".to_owned()))
             })
         }
@@ -15156,6 +15540,57 @@ mod tests {
             assert_eq!(answers.len(), 1, "one recorded answer: {answers:?}");
             assert_eq!(answers[0]["by"], "policy");
             assert_eq!(answers[0]["option_id"], "allow-once");
+        }
+
+        /// MOD-26 B-13, D10: a persona denying `execute` answers the parked `execute` request
+        /// reject **by policy**, under an agent policy that would have relayed it: no relay row,
+        /// one recorded answer `by: policy`.
+        #[tokio::test(start_paused = true)]
+        async fn the_relay_rejects_a_kind_the_persona_denies() {
+            use htui_core::model::{NewPersona, PersonaId, PersonaPermission, PersonaTools};
+
+            let harness = Harness::new().await;
+            feat_3_with_prd_ungated(&harness).await;
+            let persona = harness
+                .orch
+                .store
+                .create_persona(NewPersona {
+                    id: PersonaId::new(),
+                    name: "no-shell".to_owned(),
+                    description: "never runs a command".to_owned(),
+                    body: "You never run shell commands.\n".to_owned(),
+                    tools: PersonaTools {
+                        deny_kinds: vec!["execute".to_owned()],
+                        ..PersonaTools::default()
+                    },
+                    permission: PersonaPermission::default(),
+                })
+                .await
+                .expect("a valid persona");
+            super::bind_persona(&harness.orch, ids::HTUI_FEAT_3, "prd", persona.id).await;
+            harness.orch.set_policy(
+                ids::AGENT_CLAUDE,
+                PermissionPolicy {
+                    default: PermissionDefault::Ask,
+                    ..PermissionPolicy::default()
+                },
+            );
+            harness.orch.script("prd", 1, parks("the prd"));
+
+            let walked = walked(harness.dispatch(start_feat_3())).await;
+
+            let Ok(CommandOutcome::Started { run, .. }) = walked else {
+                panic!("the walk started: {walked:?}");
+            };
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert!(
+                harness.orch.store.relay_rows().is_empty(),
+                "a persona's reject is never relayed"
+            );
+            let answers = answers_in(&log(&harness.orch.store, prd.id).await);
+            assert_eq!(answers.len(), 1, "one recorded answer: {answers:?}");
+            assert_eq!(answers[0]["by"], "policy");
+            assert_eq!(answers[0]["option_id"], "reject-once");
         }
 
         /// D10, I-6, I-7: a cancel reaching a parked single step ends the walk with
