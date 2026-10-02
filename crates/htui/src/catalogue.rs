@@ -10,7 +10,7 @@
 
 use chrono::Utc;
 use htui_core::model::{
-    ItemKind, ItemKindId, NewItemKind, NewStepGraph, PhaseId, Project, Scope, StepGraph,
+    ItemKind, ItemKindId, NewItemKind, NewStepGraph, PersonaId, PhaseId, Project, Scope, StepGraph,
     StepGraphId, StepGraphPhase,
 };
 use htui_core::prompt::SettingKey;
@@ -36,6 +36,19 @@ use crate::store_worker::{StoreReply, StoreRequest};
 pub struct CatalogueSnapshot {
     /// The scope's projects, in scope order.
     pub projects: Vec<ProjectCatalogue>,
+    /// The global persona registry by name (MOD-26 M2 D23): the phase editor's `persona` field
+    /// resolves against it and a bound phase's line names its persona from it.
+    pub personas: Vec<PersonaSummary>,
+}
+
+/// One persona as `Settings > Kinds` names it (MOD-26 M2 D23): id and name, nothing the phase
+/// editor does not print.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonaSummary {
+    /// `persona.id`.
+    pub id: PersonaId,
+    /// `persona.name`.
+    pub name: String,
 }
 
 /// One project with everything the Kinds section shows of it.
@@ -71,7 +84,8 @@ impl ProjectCatalogue {
 }
 
 /// One read of the whole scope: every project of `scope.project_ids` that still names a row, with
-/// its kinds, its graphs and each graph's phases.
+/// its kinds, its graphs and each graph's phases, then the persona registry by name (MOD-26 M2
+/// D23) — global rather than per project, so one `personas()` read whatever the scope holds.
 ///
 /// N+1 reads on purpose (D3, M3 D5's trade, same words): they happen per event — activation, a
 /// scope change, after a write — never per keystroke, and a joined reader would be a seam method
@@ -104,7 +118,16 @@ pub async fn snapshot<S: ReadStore + WriteStore + ?Sized>(
             graphs,
         });
     }
-    Ok(CatalogueSnapshot { projects })
+    let personas = store
+        .personas()
+        .await?
+        .into_iter()
+        .map(|row| PersonaSummary {
+            id: row.id,
+            name: row.name,
+        })
+        .collect();
+    Ok(CatalogueSnapshot { projects, personas })
 }
 
 /// Serves one catalogue request, off the UI task.

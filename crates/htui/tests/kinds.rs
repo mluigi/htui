@@ -7,7 +7,7 @@
 
 use chrono::{Duration, Utc};
 use htui::app::{Action, Handled};
-use htui::catalogue::{self, CatalogueSnapshot, GraphEntry, REQUEST_NAMES};
+use htui::catalogue::{self, CatalogueSnapshot, GraphEntry, PersonaSummary, REQUEST_NAMES};
 use htui::hierarchy::MirrorAfterDelete;
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
@@ -181,6 +181,28 @@ async fn the_demo_catalogue_reads_back_the_seed() {
         .expect("the analysis graph");
     let names: Vec<&str> = analysis.phases.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["research", "verdict"], "phases in position order");
+}
+
+/// The same read carries the global persona registry by name, id and name only: the phase editor's
+/// `persona` field resolves against it and a bound phase's line names its persona from it (MOD-26
+/// M2 D23). By name bytes, as `personas()` answers.
+#[tokio::test]
+async fn the_catalogue_carries_the_personas_by_name() {
+    let snapshot = demo_catalogue(&demo()).await;
+
+    assert_eq!(
+        snapshot.personas,
+        [
+            PersonaSummary {
+                id: ids::PERSONA_ARCHITECT,
+                name: "architect".to_owned(),
+            },
+            PersonaSummary {
+                id: ids::PERSONA_REVIEWER,
+                name: "reviewer".to_owned(),
+            },
+        ]
+    );
 }
 
 /// Two projects in the scope answer two catalogues in **scope order**, which is the whole reason
