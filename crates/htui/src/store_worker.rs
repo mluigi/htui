@@ -30,6 +30,7 @@ use htui_core::model::{
     WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
+use htui_core::root_path::{DirListing, list_dirs};
 use htui_core::store::{
     DeleteReach, DeleteTarget, ReadStore, Result as StoreResult, SettingRung, StoreError,
     WriteStore,
@@ -70,6 +71,14 @@ pub const UNSOLICITED: Seq = Seq::MAX;
 /// the same string the request does (`preview::run_preview` cannot call `name()` — it no longer has
 /// the request).
 pub const PROMPT_PREVIEW: &str = "prompt_preview";
+
+/// [`StoreRequest::name`] of [`StoreRequest::ListDir`] (MOD-49 plan P3, blueprint D2). Not in
+/// `hierarchy::REQUEST_NAMES`: a listing reads this box's filesystem and no store, so it is not one
+/// of the thirteen offline refusals, and the Hierarchy section matches its `Failed` by this name.
+pub const LIST_DIR: &str = "list_dir";
+
+/// The most entries one [`StoreReply::DirListing`] carries; the rest is its `more` (MOD-49 P4).
+pub const LIST_CAP: usize = 1000;
 
 /// What [`serve`] answers an orchestrator command with when no `RunRuntime` serves it (blueprint
 /// D183): the test harness without one.
@@ -489,6 +498,17 @@ pub enum StoreRequest {
     /// with exactly one matching checkout gets a canonical row, inserted only where none exists,
     /// so a manual path is never replaced. Answers [`StoreReply::RepoPathsInferred`].
     InferRepoPaths(WorkspaceId),
+
+    // MOD-49 (plan P3): not one of the thirteen above — no store, no box row, no writer.
+    /// The directories in `path` on **this** box, for the path picker (MOD-49 P1, P3, P4). A read:
+    /// the section that sends it marks nothing busy (P11). Answers [`StoreReply::DirListing`], or
+    /// `Failed { request: "list_dir" }` carrying the guard's sentence about the path as typed.
+    ListDir {
+        /// The directory to list, as the picker navigated to it (never canonicalised, P5).
+        path: String,
+        /// Whether `.`-prefixed entries are listed (blueprint D1).
+        show_hidden: bool,
+    },
 
     // MOD-15 milestone 4 (D5): the nine catalogue requests, served by [`crate::catalogue`]. Every
     // write carries the `Scope` because the tree the reply re-reads *is* the scope (M4 D7), and all
@@ -929,6 +949,8 @@ impl StoreRequest {
             Self::DeleteWorkspace(..) => "delete_workspace",
             Self::DeleteProject(..) => "delete_project",
             Self::InferRepoPaths(..) => "infer_repo_paths",
+            // MOD-49: outside `hierarchy::REQUEST_NAMES` on purpose (blueprint D2).
+            Self::ListDir { .. } => LIST_DIR,
             // The nine of `catalogue::REQUEST_NAMES`, in that order (MOD-15 M4 D5).
             Self::Catalogue(..) => "catalogue",
             Self::CreateKind { .. } => "create_kind",
@@ -1113,6 +1135,9 @@ pub enum StoreReply {
         /// Per repo, what happened and why.
         report: InferReport,
     },
+    /// Answer to [`StoreRequest::ListDir`] (MOD-49 P3): directories and links to directories,
+    /// names only, never a link's target (`R-BOX-4`).
+    DirListing(DirListing),
     /// The scope's catalogue, freshly read: the answer to [`StoreRequest::Catalogue`] and to every
     /// catalogue write that applied (M4 D2/D7).
     Catalogue(Box<CatalogueSnapshot>),
@@ -1635,6 +1660,9 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
                 .map(str::to_owned),
         },
         StoreRequest::ApplyMigrations => StoreReply::MigrationsApplied { applied: 0 },
+        // MOD-49 (plan P3): this box's filesystem under `spawn_blocking`; no store is read, so it
+        // answers offline too, and a refusal is a `Constraint` that never drops the backend.
+        StoreRequest::ListDir { path, show_hidden } => list_dir(path, *show_hidden).await?,
         StoreRequest::QdrantInfo
         | StoreRequest::SetQdrantUrl(_)
         | StoreRequest::SetQdrantApiKey(_)
@@ -1748,6 +1776,14 @@ fn runnable_here(rows: Vec<ItemSummary>, info: Option<&BoxInfo>) -> Vec<ItemSumm
             })
         })
         .collect()
+}
+
+/// `ListDir` (MOD-49 P3): [`list_dirs`] off the async task, as `hierarchy::canonical` wraps
+/// `canonical_root`. A refusal becomes [`StoreError::Constraint`], so it reads
+/// ``list_dir: constraint violated: `/x` does not exist on this box``.
+async fn list_dir(path: &str, show_hidden: bool) -> StoreResult<StoreReply> {
+    let _ = (path, show_hidden);
+    todo!("MOD-49 T2")
 }
 
 /// Renders a store error into the reply the asking view receives.

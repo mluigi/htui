@@ -14,7 +14,7 @@ use htui::app::Action;
 use htui::hierarchy::{
     HierarchySnapshot, InferOutcome, InferReport, MirrorAfterDelete, REQUEST_NAMES, RepoInference,
 };
-use htui::store_worker::{StoreReply, StoreRequest, serve};
+use htui::store_worker::{LIST_CAP, LIST_DIR, StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{AgentsSection, HierarchySection, SettingsSection, SettingsTab};
@@ -23,6 +23,7 @@ use htui_core::model::{
     NewProject, ProjectId, ProjectPatch, RepoBoxPath, RepoId, RepoPatch, WorkspaceBoxPath,
     WorkspaceId, WorkspacePatch,
 };
+use htui_core::root_path::DirListing;
 use htui_core::store::{DeleteReach, DeleteTarget, MemStore, ReadStore, WriteStore};
 use htui_orch::infer::{MAX_DIRS, MatchedBy};
 use htui_orch::isolate::git::testkit::repo_with_one_commit;
@@ -470,6 +471,148 @@ async fn a_box_with_no_row_is_refused_before_the_path_is_read() {
         message.contains("box `(this box)` not found"),
         "the box is refused, not the path: {message}"
     );
+}
+
+// ---- worker: ListDir (MOD-49 T2) ----
+
+/// The listing a reply carries, or a panic naming what came back instead.
+#[track_caller]
+fn listing(reply: StoreReply) -> DirListing {
+    match reply {
+        StoreReply::DirListing(listing) => listing,
+        other => panic!("expected a listing: {other:?}"),
+    }
+}
+
+/// `ListDir` for `path`, hidden entries as asked.
+fn list(path: &Path, show_hidden: bool) -> StoreRequest {
+    StoreRequest::ListDir {
+        path: path.display().to_string(),
+        show_hidden,
+    }
+}
+
+/// The names of a listing, in order.
+fn listed(listing: &DirListing) -> Vec<&str> {
+    listing
+        .entries
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect()
+}
+
+/// MOD-49 P3/P4: the worker lists a directory's subdirectories, in byte order, echoing the path as
+/// typed; `.`-entries only when asked (blueprint D1).
+#[tokio::test]
+async fn list_dir_lists_the_subdirectories_of_a_tempdir() {
+    let dir = tempfile::tempdir().expect("a throwaway directory");
+    for name in ["beta", "alpha", ".hidden"] {
+        fs::create_dir(dir.path().join(name)).expect("the directory is created");
+    }
+    fs::write(dir.path().join("notes.txt"), b"a file").expect("the file is written");
+
+    let shown = listing(serve(&demo(), &list(dir.path(), false)).await);
+    assert_eq!(shown.path, dir.path().display().to_string());
+    assert_eq!(listed(&shown), ["alpha", "beta"]);
+    assert_eq!(shown.more, 0);
+
+    let hidden = listing(serve(&demo(), &list(dir.path(), true)).await);
+    assert_eq!(listed(&hidden), [".hidden", "alpha", "beta"]);
+}
+
+/// MOD-49 P3: a refused listing is `Failed { request: "list_dir" }` carrying the guard's sentence
+/// about the path as typed.
+#[tokio::test]
+async fn a_missing_listing_is_refused_by_name() {
+    let dir = tempfile::tempdir().expect("a throwaway directory");
+    let gone = dir.path().join("gone");
+
+    let (request, message) = refusal(serve(&demo(), &list(&gone, false)).await);
+    assert_eq!(request, LIST_DIR);
+    assert!(
+        message.contains(&gone.display().to_string()),
+        "the refusal names the path as typed: {message}"
+    );
+    assert!(
+        message.contains("does not exist on this box"),
+        "with the guard's sentence: {message}"
+    );
+    assert!(
+        message.contains("constraint violated"),
+        "as a constraint, not a backend failure: {message}"
+    );
+}
+
+/// `R-BOX-4`: a link is listed under its own name and marked, and nothing in the reply names what
+/// it points at.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_link_is_listed_without_its_target() {
+    let outer = tempfile::tempdir().expect("a throwaway directory");
+    let target = outer.path().join("secret-target-name");
+    fs::create_dir(&target).expect("the target directory is created");
+    let dir = outer.path().join("listed");
+    fs::create_dir(&dir).expect("the listed directory is created");
+    std::os::unix::fs::symlink(&target, dir.join("shared")).expect("the link is created");
+
+    let reply = serve(&demo(), &list(&dir, false)).await;
+    let debug = format!("{reply:?}");
+    assert!(
+        !debug.contains("secret-target-name"),
+        "a reply never names a link's target: {debug}"
+    );
+    let shown = listing(reply);
+    assert_eq!(listed(&shown), ["shared"]);
+    assert!(shown.entries[0].is_link, "a link is marked as one");
+}
+
+/// MOD-49 P4: past `LIST_CAP` the reply carries the first `LIST_CAP` names and counts the rest.
+#[tokio::test]
+async fn a_listing_past_the_cap_reports_the_rest() {
+    let dir = tempfile::tempdir().expect("a throwaway directory");
+    for n in 0..LIST_CAP + 2 {
+        fs::create_dir(dir.path().join(format!("d{n:04}"))).expect("the directory is created");
+    }
+
+    let shown = listing(serve(&demo(), &list(dir.path(), false)).await);
+    assert_eq!(shown.entries.len(), LIST_CAP);
+    assert_eq!(shown.more, 2);
+    assert_eq!(shown.entries[0].name, "d0000");
+}
+
+/// Blueprint D2: a listing reads this box's filesystem and no store, so it answers offline too.
+#[tokio::test]
+async fn a_listing_needs_no_store() {
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let cache = CacheStore::open(root.path(), "hierarchy-list-dir", PgStore::schema_version())
+        .await
+        .expect("a fresh mirror");
+    let backend = Backend::Offline {
+        cache,
+        since: Some(Utc::now()),
+    };
+    let dir = tempfile::tempdir().expect("a throwaway directory");
+    fs::create_dir(dir.path().join("alpha")).expect("the directory is created");
+
+    let reply = serve(&backend, &list(dir.path(), false)).await;
+    assert!(
+        !format!("{reply:?}").contains(DATABASE_UNREACHABLE),
+        "a listing is not an offline refusal: {reply:?}"
+    );
+    assert_eq!(listed(&listing(reply)), ["alpha"]);
+}
+
+/// Blueprint D2: `ListDir` is named `list_dir`, outside the Hierarchy thirteen, so the offline
+/// refusal and name-stability pins stay true and the section matches its `Failed` by this name.
+#[test]
+fn list_dir_is_named_outside_the_hierarchy_thirteen() {
+    let request = StoreRequest::ListDir {
+        path: "/".to_owned(),
+        show_hidden: false,
+    };
+    assert_eq!(request.name(), LIST_DIR);
+    assert_eq!(LIST_DIR, "list_dir");
+    assert!(!REQUEST_NAMES.contains(&LIST_DIR));
 }
 
 /// The workspace a write's reply re-reads is resolved **before** the write: a project that is
