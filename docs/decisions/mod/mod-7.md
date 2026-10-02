@@ -211,7 +211,7 @@ D126-D144). Five tasks in two waves of worktrees, merged in order: T0 `7810c4c`,
 | Probe spec editor | **MOD-51** (done, `docs/decisions/mod/mod-51.md`) | Milestone 2 ships only the read-only view. |
 | Terminal replies of panicked runtime tasks; wide characters in the text widgets | **MOD-53**, **MOD-54** | Milestone 2 review deferrals. |
 | Two claim-time test gaps | **MOD-58** | Milestone 3 review. |
-| Interactive path picker | **MOD-49** | Unblocked by milestone 4; the typed fallback is Hierarchy's `b`. |
+| Interactive path picker | **MOD-49** (done, `docs/decisions/mod/mod-49.md`) | `b` in Hierarchy now opens a directory picker in place of the typed path. |
 | A manual row landing mid-pass is not added to `held` | accepted | Best effort: the manual row itself is never overwritten (the conflict clause answers `AlreadySet`), but its path is not held, so another repo's match in the same pass could still take it. `b` corrects it. |
 | A caller's own notes in `excerpts_for` skip `withhold_unmaskable_notes` | accepted | They are engine-authored and carry no filesystem text. |
 | The judge prompt carries no excerpts | accepted | D109, above. |

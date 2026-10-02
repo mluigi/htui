@@ -3,7 +3,7 @@
 **Source**: HANDOFF `MOD-49` (from MOD-7; `R-BOX-4`, `R-TUI-8`, `R-NF-3`, F-102)
 **Routed**: plan path via `/handoff-run` (C2 fired; C3/C4 borderline, low confidence), accepted by the maintainer 2026-10-02.
 **Complexity**: Medium
-**Status**: CONFIRMED 2026-10-02 (maintainer: "proceed"), implementation in progress
+**Status**: done 2026-10-02 (`docs/decisions/mod/mod-49.md`)
 
 ## Summary
 

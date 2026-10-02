@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-02):** **MOD-24 is done** (`docs/decisions/mod/mod-24.md`): a worker killed
+**Current status (2026-10-02):** **MOD-49 is done** (`docs/decisions/mod/mod-49.md`): `b` in
+Settings > Hierarchy opens a popup that lists directories on this box (links to a directory marked
+`@`, their targets never shown) and chooses one for the workspace root or a repo checkout; the
+choice goes through the unchanged `SetWorkspaceRoot`/`SetRepoPath` and `canonical_root` (F-102).
+Listing is `StoreRequest::ListDir`, served off the store-worker loop under `spawn_blocking` with a
+10 s bound, so neither the UI nor the worker waits on a hung mount. No migration.
+Before it, **MOD-24 is done** (`docs/decisions/mod/mod-24.md`): a worker killed
 mid-run loses at most the step it was walking, now pinned by `crates/htui/tests/worker_crash_pg.rs`,
 which `SIGKILL`s a real worker process at five seeded kill points (`htui_orch::kill_point`, armed only
 under `test-support`) and restarts it: a step killed before its work is captured is retried, one
@@ -29,26 +35,6 @@ first use from the pinned `Xenova/bge-small-en-v1.5` commit `ea104dac`, sha256-c
 (`model.onnx` `828e1496…cf35`), and an existing fastembed cache is adopted. The vectors match
 fastembed's goldens to 3e-7, so stored vectors stay valid. The Qdrant collection now records which
 embedder made it, and a mismatch is refused. Its Windows/macOS run is MOD-16's.
-Before it, **MOD-66 is done** (`docs/decisions/mod/mod-66.md`): a box can
-be given an explicit path for any `${tool}` an agent row declares. `m` in Settings > Agents opens a
-tool-paths form; the paths live in `agent_box.probe.manual` and are a probe tier between the
-`HTUI_TOOL_<NAME>` override and discovery, so the same handshake and status mapping vet them, and
-`recorded_launch` now honours `source: manual` so they reach every spawn. A manual row reads `*`.
-No migration, no `.sqlx` change.
-Before it, **MOD-42 is done** (`docs/decisions/mod/mod-42.md`): engine-driven
-ACP steps no longer fail at their first permission request. The engine applies the agent's own
-permission policy; a request that still needs a human is a pending `step_permission` row (migration
-`0011`) that any TUI answers from the Runs pane (digits `1`-`9`), on any box, by a compare-and-set
-that never takes the lease; the executing process applies it and records the answer. Every cancel of
-a leased run is a durable `run_command` row applied gracefully by whoever walks the run (parked
-requests answered `cancelled`, then `session.cancel(grace)`), which replaces MOD-41's worker-walk
-refusal and closes MOD-37's R-38. Follow-up on engine steps is MOD-70.
-Before it, **ANA-27 was concluded** (`docs/ANA-27.md`,
-`docs/decisions/ana/ana-27.md`): OpenRig's LLM lead, durable specialist sessions and tmux
-transport are rejected on recorded decisions (`R-ID-6`, `R-PRM-1`, `R-ID-2`); the discipline around
-its durable rows is taken as ANA-27 notes on MOD-42, MOD-43, MOD-37, MOD-27, MOD-26, MOD-16 and
-MOD-24. Spawned MOD-69 (waiting-on-you list across items; proposed `R-TUI-11` awaits the
-maintainer).
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -57,9 +43,9 @@ comment only) `0009_agent_box_user_off` (MOD-23), `0010_prompt_digest_undigested
 and `0011_permission_relay` (MOD-42; cache: `0001`..`0004`), so **the next migration is `0012`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
 (done, all four milestones), MOD-38, MOD-9 (done, all five milestones), MOD-40, MOD-39, MOD-64,
-MOD-23, MOD-22, MOD-41, MOD-59 and MOD-24 (re-counted 2026-10-01; `StoreReply` 2026-09-30; `CASES`, `.sqlx` and snapshots 2026-10-02): store conformance `CASES` 119, `READ_CASES` 14, `htui-orch` `CASES` 86,
-`GraphSource` 7 methods, `StoreRequest` 91, `StoreReply` 52, `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
-`skills::REQUEST_NAMES` 6, `TABLES` 39, 307 `.sqlx` files, 127
+MOD-23, MOD-22, MOD-41, MOD-59, MOD-24 and MOD-49 (re-counted 2026-10-01; `StoreReply` 2026-09-30; `CASES`, `.sqlx` and snapshots 2026-10-02): store conformance `CASES` 119, `READ_CASES` 14, `htui-orch` `CASES` 86,
+`GraphSource` 7 methods, `StoreRequest` 96, `StoreReply` 55 (both re-counted 2026-10-02), `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
+`skills::REQUEST_NAMES` 6, `TABLES` 39, 307 `.sqlx` files, 129
 `crates/htui/tests/snapshots`, six workspace members (`htui-worker` since MOD-41),
 `MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 35 pinned commented
 columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 4` (MOD-33 `undigested`) with `skill_choices` (a
@@ -293,17 +279,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   ` · read-only` marker before the project name) and the Reqs sub-tab's `cut`
   (`docs/decisions/mod/mod-39.md`, "Carried"), and `chars().count()` counters in
   `crates/htui/src/ui/tabs/requirements/detail.rs` and `forms.rs`.
-- [ ] **MOD-49 - Interactive path picker for repo and workspace roots** (from MOD-7). `R-BOX-4`,
-  `R-TUI-8`. MOD-7 D5 infers each repo's path on a box and falls back to a typed path in a text box
-  when inference fails; as built, the typed fallback is Settings > Hierarchy's `b` (MOD-7 milestone
-  4 plan D115), not a box in the Boxes section. Replace the typed fallback with a popup window that
-  browses the box's
-  filesystem and selects a directory, reusable wherever the Settings tab asks for a path (repo paths
-  in the box section, workspace roots in the hierarchy section). The chosen path goes through the
-  same canonicalisation as the text box (`htui_core::root_path::canonical_root`, F-102). Listing runs
-  off the UI task (`R-NF-3`). **Unblocked:** MOD-7 is done (`docs/decisions/mod/mod-7.md`).
-  Raised by the maintainer at MOD-7's PRD
-  gate, 2026-09-25.
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
   pattern masks, fail-closed persistence gate, Settings tab secret provider section. **No longer
@@ -613,6 +588,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 25 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 24 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |
