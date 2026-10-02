@@ -213,7 +213,7 @@ struct Texts<'a> {
 }
 
 /// Ctrl+S, with or without `SHIFT` (the Requirements tab's rule).
-fn ctrl_s(key: &KeyEvent) -> bool {
+pub(super) fn ctrl_s(key: &KeyEvent) -> bool {
     key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL
         && matches!(key.code, KeyCode::Char('s' | 'S'))
 }
@@ -852,7 +852,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme)
 /// when the word alone is wider (a long path in a refusal). Wrapped here rather than by
 /// `Paragraph`'s `Wrap`, because the layout sizes the notice from this count before drawing it
 /// (the `settings::wrapped` precedent), and a count that disagreed would cut off the D11 hedge.
-fn notice_lines(sentence: &str, width: usize) -> Vec<String> {
+pub(super) fn notice_lines(sentence: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
     for line in wrapped(sentence, width) {

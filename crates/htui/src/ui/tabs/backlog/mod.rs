@@ -17,6 +17,7 @@
 //! re-read (D11, §10).
 
 pub mod detail;
+pub mod divergence;
 pub mod filter;
 pub mod item_form;
 pub mod list;
