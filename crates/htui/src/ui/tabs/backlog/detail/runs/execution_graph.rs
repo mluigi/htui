@@ -836,11 +836,43 @@ mod tests {
 
     /// One frame of `graph` at 43x23 (the 100x30 frame's Runs canvas: 24 rows less the header).
     fn draw(graph: &mut ExecutionGraph) -> Buffer {
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(43, 23))
+        draw_at(graph, 43, 23)
+    }
+
+    /// One frame of `graph` at `width` x `height`.
+    fn draw_at(graph: &mut ExecutionGraph, width: u16, height: u16) -> Buffer {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
             .expect("the test backend is constructible");
         term.draw(|frame| graph.render(frame, frame.area()))
             .expect("the graph draws");
         term.backend().buffer().clone()
+    }
+
+    /// A linear run of `n` steps, one per position.
+    fn linear(n: u128) -> RunSummary {
+        let steps = (0..n)
+            .map(|k| step(k, i32::try_from(k).expect("small"), 1, 0))
+            .collect();
+        run(1, steps)
+    }
+
+    /// Every `┌` in `buf` heads a node: the cell under it is `│` and the next one holds the
+    /// slot's first digit. A corner left by an earlier pass heads nothing (blueprint B-2).
+    fn assert_no_ghost_corner(buf: &Buffer) {
+        for y in buf.area.top()..buf.area.bottom().saturating_sub(1) {
+            for x in buf.area.left()..buf.area.right().saturating_sub(1) {
+                if buf[(x, y)].symbol() == "\u{250c}" {
+                    assert_eq!(buf[(x, y + 1)].symbol(), "\u{2502}", "({x}, {y})");
+                    assert!(
+                        buf[(x + 1, y + 1)]
+                            .symbol()
+                            .starts_with(|c: char| c.is_ascii_digit()),
+                        "a ghost corner at ({x}, {y}): {:#?}",
+                        rows(buf)
+                    );
+                }
+            }
+        }
     }
 
     /// Each row as a `String`, trailing blanks trimmed (as `runs.rs`'s `lines`).
@@ -1083,6 +1115,7 @@ mod tests {
         );
         assert!(!graph.flow.edges().is_empty());
         assert!(graph.flow.edges().iter().all(|edge| !edge.deletable));
+        assert!(graph.flow.edges().iter().all(|edge| !edge.selectable));
         assert!(!graph.flow.edges_reconnectable);
     }
 
@@ -1106,6 +1139,108 @@ mod tests {
         graph.fit();
         draw(&mut graph);
         assert!(graph.zoom() < 1.0, "{}", graph.zoom());
+    }
+
+    /// Review M1: `=` at the 0.5 floor cannot show a tall run whole, so it keeps the cursor on
+    /// screen too.
+    #[test]
+    fn fit_keeps_the_cursor_node_on_screen() {
+        let mut graph = synced(&linear(10), Some(id(9)));
+        draw(&mut graph);
+        graph.fit();
+        let buf = draw(&mut graph);
+        assert!((graph.zoom() - 0.5).abs() < 1e-9, "{}", graph.zoom());
+        let selected = (buf.area.top()..buf.area.bottom())
+            .flat_map(|y| (buf.area.left()..buf.area.right()).map(move |x| (x, y)))
+            .any(|at| buf[at].modifier.contains(Modifier::REVERSED));
+        assert!(selected, "the cursor's border is drawn: {:#?}", rows(&buf));
+    }
+
+    /// Review L1: a canvas too small to draw in keeps the reveal for the next frame.
+    #[test]
+    fn a_reveal_waits_for_a_canvas_big_enough_to_hold_it() {
+        let mut graph = synced(&linear(8), Some(id(7)));
+        draw_at(&mut graph, 1, 1);
+        let rows = rows(&draw(&mut graph));
+        assert!(rows.iter().any(|row| row.contains("7.1 done")), "{rows:#?}");
+    }
+
+    /// Review L2: a re-read whose new layer is wider than the run was moves the centring, and the
+    /// viewport moves with it, so the nodes already on screen stay where they were.
+    #[test]
+    fn a_wider_re_read_of_the_same_run_keeps_the_nodes_still() {
+        let before = run(1, vec![step(1, 0, 1, 0)]);
+        let mut graph = synced(&before, Some(id(1)));
+        let buf = draw(&mut graph);
+        let column = corner_of(&buf, "0.1 done");
+
+        let mut after = before.clone();
+        after.steps.extend([
+            candidate(2, 1, 1, 0, None),
+            candidate(3, 1, 1, 1, None),
+            candidate(4, 1, 1, 2, None),
+        ]);
+        graph.sync(Some(&after), Some(id(1)), &Theme::default());
+        let buf = draw(&mut graph);
+        assert_eq!(corner_of(&buf, "0.1 done"), column, "{:#?}", rows(&buf));
+    }
+
+    /// Review L5: a retry into a fan-out fed by every candidate labels one edge per target.
+    #[test]
+    fn retry_is_labelled_once_per_target() {
+        let projection = project(&run(
+            1,
+            vec![
+                candidate(1, 0, 1, 0, None),
+                candidate(2, 0, 1, 1, None),
+                candidate(3, 0, 2, 0, None),
+                candidate(4, 0, 2, 1, None),
+            ],
+        ));
+        assert_eq!(projection.edges.len(), 4);
+        for target in [id(3), id(4)] {
+            let labelled = projection
+                .edges
+                .iter()
+                .filter(|(_, to, label)| *to == target && label.is_some())
+                .count();
+            assert_eq!(labelled, 1, "{target}: {:?}", projection.edges);
+        }
+    }
+
+    /// Review N3: the reveal's scratch pass leaves nothing in the frame, on the first draw or the
+    /// next one into the same terminal.
+    #[test]
+    fn the_reveal_leaves_no_ghost_corner() {
+        let mut graph = synced(&linear(8), Some(id(7)));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(43, 23))
+            .expect("the test backend is constructible");
+        for _ in 0..2 {
+            term.draw(|frame| graph.render(frame, frame.area()))
+                .expect("the graph draws");
+            assert_no_ghost_corner(term.backend().buffer());
+        }
+        graph.sync(Some(&linear(8)), Some(id(0)), &Theme::default());
+        term.draw(|frame| graph.render(frame, frame.area()))
+            .expect("the graph draws");
+        assert_no_ghost_corner(term.backend().buffer());
+    }
+
+    /// Review N4: a running and a parked step take the accent border.
+    #[test]
+    fn running_and_awaiting_steps_have_the_accent_border() {
+        let run = run(
+            1,
+            vec![
+                step(1, 0, 1, 0),
+                with_status(step(2, 1, 1, 0), StepStatus::Running),
+                with_status(step(3, 2, 1, 0), StepStatus::AwaitingApproval),
+            ],
+        );
+        let mut graph = synced(&run, Some(id(1)));
+        let buf = draw(&mut graph);
+        assert_eq!(buf[corner_of(&buf, "1.1 running")].fg, Color::Cyan);
+        assert_eq!(buf[corner_of(&buf, "2.1 awaiting")].fg, Color::Cyan);
     }
 
     #[test]
