@@ -30,6 +30,7 @@ use htui_core::model::{
     StepGraphPatch, StepId, WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
+use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
 use htui_core::store::{
     DeleteReach, DeleteTarget, ReadStore, Result as StoreResult, SettingRung, StoreError,
     WriteStore,
@@ -71,6 +72,19 @@ pub const UNSOLICITED: Seq = Seq::MAX;
 /// the same string the request does (`preview::run_preview` cannot call `name()` — it no longer has
 /// the request).
 pub const PROMPT_PREVIEW: &str = "prompt_preview";
+
+/// [`StoreRequest::name`] of [`StoreRequest::ListDir`] (MOD-49 plan P3, blueprint D2). Not in
+/// `hierarchy::REQUEST_NAMES`: a listing reads this box's filesystem and no store, so it is not one
+/// of the thirteen offline refusals, and the Hierarchy section matches its `Failed` by this name.
+pub const LIST_DIR: &str = "list_dir";
+
+/// The most entries one [`StoreReply::DirListing`] carries; the rest is its `more` (MOD-49 P4).
+pub const LIST_CAP: usize = 1000;
+
+/// How long one listing may take before it is answered as refused (MOD-49 review M-1): a hung
+/// NFS, sshfs or autofs mount never returns from `stat` or `read_dir`, and the picker must hear
+/// back rather than read `reading…` forever.
+pub const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What [`serve`] answers an orchestrator command with when no `RunRuntime` serves it (blueprint
 /// D183): the test harness without one.
@@ -490,6 +504,17 @@ pub enum StoreRequest {
     /// with exactly one matching checkout gets a canonical row, inserted only where none exists,
     /// so a manual path is never replaced. Answers [`StoreReply::RepoPathsInferred`].
     InferRepoPaths(WorkspaceId),
+
+    // MOD-49 (plan P3): not one of the thirteen above — no store, no box row, no writer.
+    /// The directories in `path` on **this** box, for the path picker (MOD-49 P1, P3, P4). A read:
+    /// the section that sends it marks nothing busy (P11). Answers [`StoreReply::DirListing`], or
+    /// `Failed { request: "list_dir" }` carrying the guard's sentence about the path as typed.
+    ListDir {
+        /// The directory to list, as the picker navigated to it (never canonicalised, P5).
+        path: String,
+        /// Whether `.`-prefixed entries are listed (blueprint D1).
+        show_hidden: bool,
+    },
 
     // MOD-15 milestone 4 (D5): the nine catalogue requests, served by [`crate::catalogue`]. Every
     // write carries the `Scope` because the tree the reply re-reads *is* the scope (M4 D7), and all
@@ -956,6 +981,8 @@ impl StoreRequest {
             Self::DeleteWorkspace(..) => "delete_workspace",
             Self::DeleteProject(..) => "delete_project",
             Self::InferRepoPaths(..) => "infer_repo_paths",
+            // MOD-49: outside `hierarchy::REQUEST_NAMES` on purpose (blueprint D2).
+            Self::ListDir { .. } => LIST_DIR,
             // The nine of `catalogue::REQUEST_NAMES`, in that order (MOD-15 M4 D5).
             Self::Catalogue(..) => "catalogue",
             Self::CreateKind { .. } => "create_kind",
@@ -1144,6 +1171,9 @@ pub enum StoreReply {
         /// Per repo, what happened and why.
         report: InferReport,
     },
+    /// Answer to [`StoreRequest::ListDir`] (MOD-49 P3): directories and links to directories,
+    /// names only, never a link's target (`R-BOX-4`).
+    DirListing(DirListing),
     /// The scope's catalogue, freshly read: the answer to [`StoreRequest::Catalogue`] and to every
     /// catalogue write that applied (M4 D2/D7).
     Catalogue(Box<CatalogueSnapshot>),
@@ -1683,6 +1713,11 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
                 .map(str::to_owned),
         },
         StoreRequest::ApplyMigrations => StoreReply::MigrationsApplied { applied: 0 },
+        // MOD-49 (plan P3): this box's filesystem under `spawn_blocking`; no store is read, so it
+        // answers offline too, and a refusal is a `Constraint` that never drops the backend. The
+        // spawned loop answers it from its own task before reaching here (review M-1); this arm
+        // is `serve`'s, for the harness and `--demo`.
+        StoreRequest::ListDir { path, show_hidden } => list_dir(path, *show_hidden).await?,
         StoreRequest::QdrantInfo
         | StoreRequest::SetQdrantUrl(_)
         | StoreRequest::SetQdrantApiKey(_)
@@ -1796,6 +1831,45 @@ fn runnable_here(rows: Vec<ItemSummary>, info: Option<&BoxInfo>) -> Vec<ItemSumm
             })
         })
         .collect()
+}
+
+/// `ListDir` (MOD-49 P3): [`list_dirs`] off the async task, as `hierarchy::canonical` wraps
+/// `canonical_root`, bounded by [`LIST_TIMEOUT`] (review M-1). A refusal becomes
+/// [`StoreError::Constraint`], so it reads
+/// ``list_dir: constraint violated: `/x` does not exist on this box``.
+async fn list_dir(path: &str, show_hidden: bool) -> StoreResult<StoreReply> {
+    list_dir_within(path, show_hidden, LIST_TIMEOUT, list_dirs).await
+}
+
+/// [`list_dir`] over a chosen lister and bound, so a test can hang one (MOD-49 review M-1).
+///
+/// A listing that hasn't answered within `within` becomes [`StoreError::Constraint`] naming the
+/// path as typed. Its blocking thread is left to finish on its own: a thread stuck in the kernel
+/// can't be cancelled, only stopped being waited for.
+async fn list_dir_within<F>(
+    path: &str,
+    show_hidden: bool,
+    within: std::time::Duration,
+    lister: F,
+) -> StoreResult<StoreReply>
+where
+    F: FnOnce(&std::path::Path, bool, usize) -> Result<DirListing, RootRefusal> + Send + 'static,
+{
+    let typed = path.to_owned();
+    let walk = tokio::task::spawn_blocking(move || {
+        lister(std::path::Path::new(&typed), show_hidden, LIST_CAP)
+    });
+    let listing = tokio::time::timeout(within, walk)
+        .await
+        .map_err(|_| {
+            StoreError::Constraint(format!(
+                "`{path}` did not answer within {} s on this box",
+                within.as_secs_f32()
+            ))
+        })?
+        .map_err(|err| StoreError::Backend(err.to_string()))?
+        .map_err(|refusal| StoreError::Constraint(refusal.to_string()))?;
+    Ok(StoreReply::DirListing(listing))
 }
 
 /// Renders a store error into the reply the asking view receives.
@@ -2323,6 +2397,23 @@ pub(crate) fn spawn_with_concepts(
                                 ConceptsServed::Deferred => continue,
                             }
                         }
+                        // MOD-49 review M-1: a listing reads this box's filesystem, and a hung mount
+                        // never returns, so it is answered from its own task, like the concepts
+                        // arm: `continue` is the whole of `R-NF-3` for it, and `LIST_TIMEOUT`
+                        // bounds what the picker waits for. `try_serve` keeps an inline arm for
+                        // `serve`'s callers (the harness, `--demo`), which have no loop to stall.
+                        StoreRequest::ListDir { path, show_hidden } => {
+                            let (path, show_hidden) = (path.clone(), *show_hidden);
+                            let (seq, origin, tx) = (envelope.seq, envelope.origin.clone(), tx.clone());
+                            tokio::spawn(async move {
+                                let reply = match list_dir(&path, show_hidden).await {
+                                    Ok(reply) => reply,
+                                    Err(err) => failed(LIST_DIR, &err),
+                                };
+                                let _ = tx.send(ReplyEnvelope { seq, origin, reply });
+                            });
+                            continue;
+                        }
                         other => match try_serve(&backend, other).await {
                             Ok(reply) => reply,
                             Err(err) => {
@@ -2755,6 +2846,100 @@ mod tests {
         };
         assert_eq!(echoed, &query);
         assert_eq!(error, message);
+    }
+
+    /// MOD-49 review M-1: a listing that hangs (a dead mount) is answered as refused once its
+    /// bound passes, naming the path as typed. The fake lister blocks until the test releases it,
+    /// so the runtime's shutdown doesn't wait on it.
+    #[tokio::test]
+    async fn a_listing_that_does_not_answer_in_time_is_refused_by_its_path() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let err = list_dir_within(
+            "/mnt/hung",
+            false,
+            std::time::Duration::from_millis(20),
+            move |path, _, _| {
+                let _ = held.recv();
+                Err(RootRefusal::Missing(path.to_path_buf()))
+            },
+        )
+        .await
+        .expect_err("a hung listing is refused");
+        let _ = release.send(());
+
+        let StoreReply::Failed { request, message } = failed(LIST_DIR, &err) else {
+            panic!("a refusal renders as `Failed`")
+        };
+        assert_eq!(request, LIST_DIR);
+        assert!(
+            message.contains("`/mnt/hung`") && message.contains("did not answer"),
+            "the refusal names the path as typed and says why: {message}"
+        );
+    }
+
+    /// The bounded helper answers a listing that is in time exactly as before.
+    #[tokio::test]
+    async fn a_listing_within_its_bound_is_answered() {
+        let dir = tempfile::tempdir().expect("a throwaway directory");
+        std::fs::create_dir(dir.path().join("alpha")).expect("the directory is created");
+        let typed = dir.path().display().to_string();
+
+        let reply = list_dir_within(&typed, false, LIST_TIMEOUT, list_dirs)
+            .await
+            .expect("a real directory is listed");
+        let StoreReply::DirListing(listing) = reply else {
+            panic!("a listing answers `DirListing`: {reply:?}")
+        };
+        assert_eq!(listing.path, typed);
+        assert_eq!(listing.entries.len(), 1);
+    }
+
+    /// MOD-49 review M-1: the loop answers a listing from its own task, addressed to the request
+    /// that asked (its `seq` and `origin`), beside the requests that follow it.
+    #[tokio::test]
+    async fn the_loop_answers_a_listing_at_its_own_address() {
+        let dir = tempfile::tempdir().expect("a throwaway directory");
+        let (tx, mut rx, _worker) = detached(demo());
+        for (seq, request) in [
+            (
+                7,
+                StoreRequest::ListDir {
+                    path: dir.path().display().to_string(),
+                    show_hidden: false,
+                },
+            ),
+            (8, StoreRequest::BoxInfo),
+        ] {
+            tx.send(RequestEnvelope {
+                seq,
+                origin: Origin::App,
+                request,
+            })
+            .expect("the worker is alive");
+        }
+
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            replies.push(rx.recv().await.expect("the worker answers"));
+        }
+        replies.sort_by_key(|reply| reply.seq);
+        assert!(
+            matches!(
+                &replies[0],
+                ReplyEnvelope {
+                    seq: 7,
+                    origin: Origin::App,
+                    reply: StoreReply::DirListing(_)
+                }
+            ),
+            "{:?}",
+            replies[0]
+        );
+        assert!(
+            matches!(&replies[1].reply, StoreReply::BoxInfo(_)),
+            "{:?}",
+            replies[1]
+        );
     }
 
     #[tokio::test]

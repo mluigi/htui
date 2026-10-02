@@ -297,7 +297,7 @@ conversation exactly as it was.
 | Section | What you do there |
 |---|---|
 | **Agents** | See which agents work on this machine (`r` checks again), install an agent's adapter (`i`), and log in (`a`). |
-| **Hierarchy** | Create and edit workspaces (`N`), projects and repositories (`n`), and tell `htui` where each repository lives on this machine (`b`, or `i` to detect them). |
+| **Hierarchy** | Create and edit workspaces (`N`), projects and repositories (`n`), and tell `htui` where each repository lives on this machine (`b` picks a directory, or `i` detects them). |
 | **Kinds** | Item kinds, their phases and step graphs. |
 | **Prompt** | Prompt settings such as the token budget. |
 | **Connection** | The database connection string (`e` edit, `c` clear) and rebuilding the local copy (`R`). |

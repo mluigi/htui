@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/hierarchy.rs
+expression: "bench.render_section(&section, 100)"
+---
+Graphics (graphics) — root on this box: /srv
+  ┌ Root of `graphics` on this box ──────────────────────────────────────────────────────────────┐
+  │/srv                                                                                          │
+  │  htui/                                                                                       │
+  │> notes/                                                                                      │
+  │  shared@                                                                                     │
+  │  +3 more                                                                                     │
+  │                                                                                              │
+  │  j/k move · Enter open · h up · s choose · S this dir · / go to · . hidden · Esc cancel      │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  │                                                                                              │
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘
+choosing a directory · Esc cancel
