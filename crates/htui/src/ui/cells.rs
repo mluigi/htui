@@ -27,8 +27,8 @@
 //! [`pad_left`], [`fit`], [`wrap`] and [`clip_spans`], all cutting at [`ELLIPSIS`] and all drawing
 //! a control character as one blank cell (D3). A few walks are other operations and keep their
 //! own loop over the two measures above: the text widgets' cursor windows, `path_picker`'s cut
-//! from the left, the graph pane's edge cut (no mark), and `concepts_search`'s unmarked clip and
-//! grapheme-only wrap.
+//! from the left and its word wrap (which keeps controls raw; out of MOD-60's scope, D10), the
+//! graph pane's edge cut (no mark), and `concepts_search`'s unmarked clip and grapheme-only wrap.
 
 use std::borrow::Cow;
 
