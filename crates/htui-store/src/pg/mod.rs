@@ -501,6 +501,34 @@ impl PgStore {
             .map_err(map_sqlx)?;
         }
 
+        // MOD-26 D7: the persona seeds, the agent loop's name-keyed top-up: an operator's edit
+        // survives, a seed the table lacks is added.
+        for persona in htui_core::model::persona::seed_rows(Utc::now()) {
+            let tools = serde_json::to_value(&persona.tools).map_err(|error| {
+                StoreError::Constraint(format!("persona.tools does not serialise: {error}"))
+            })?;
+            let permission = serde_json::to_value(&persona.permission).map_err(|error| {
+                StoreError::Constraint(format!("persona.permission does not serialise: {error}"))
+            })?;
+            sqlx::query!(
+                "INSERT INTO persona (id, name, description, body, tools, permission, \
+                                      created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 ON CONFLICT (name) DO NOTHING",
+                persona.id.as_uuid(),
+                persona.name,
+                persona.description,
+                persona.body,
+                tools,
+                permission,
+                persona.created_at,
+                persona.updated_at,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
         // The oldest row, not `WHERE name = $1`: this box's OS user name is how an empty database
         // is stamped, not how the single `app_user` of `R-USR-2` is found again.
         let row = sqlx::query!(

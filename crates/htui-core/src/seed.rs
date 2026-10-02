@@ -234,6 +234,7 @@ pub fn phase_row(
         template_name: phase.name.to_owned(),
         template_version: None,
         token_budget: None,
+        persona_id: None,
         updated_at: now,
     }
 }

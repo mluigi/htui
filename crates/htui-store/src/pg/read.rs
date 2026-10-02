@@ -18,24 +18,25 @@ use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile,
     BoxRow, BoxTool, CitationKind, CommandQueue, CoverageRow, Document, DocumentHead, DocumentId,
     Gate, GateOutcome, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
-    ItemSummary, LinkEdge, LinkGraph, LinkKind, Note, PhaseAgent, PhaseId, Priority, Project,
-    ProjectId, ProjectRef, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, Requirement,
-    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementRevision,
-    RequirementSpec, RequirementState, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase,
-    Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree,
-    RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
-    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus,
-    UpstreamEntry, UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspaceProject, WorkspaceSummary,
+    ItemSummary, LinkEdge, LinkGraph, LinkKind, Note, Persona, PersonaId, PersonaPermission,
+    PersonaTools, PhaseAgent, PhaseId, Priority, Project, ProjectId, ProjectRef, PromptScope,
+    PromptTemplate, Repo, RepoBoxPath, RepoId, Requirement, RequirementArea, RequirementAreaId,
+    RequirementFilter, RequirementId, RequirementRevision, RequirementSpec, RequirementState,
+    Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
+    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
+    SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillVersion,
+    Status, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus, UpstreamEntry, UserId,
+    VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
 use serde_json::Value;
+use sqlx::types::Json;
 use uuid::Uuid;
 
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
-use crate::pg::rows::{LinkNodeRow, RunRow, SkillBindingRow, StepRow, UpstreamRow};
+use crate::pg::rows::{LinkNodeRow, PersonaRow, RunRow, SkillBindingRow, StepRow, UpstreamRow};
 use crate::{MAX_UPSTREAM_HOPS, order_documents};
 
 /// The `status IN (...)` list `active_runs` spells out, because `query!` needs a literal and
@@ -1747,7 +1748,28 @@ impl PgStore {
         let mut phases = Vec::new();
         for phase in self.phase_rows(graph_id).await? {
             let agents = self.phase_agents(phase.id).await?;
-            phases.push(ResolvedPhase { phase, agents });
+            phases.push(ResolvedPhase {
+                phase,
+                agents,
+                persona: None,
+            });
+        }
+        // MOD-26 D6: one read over the distinct bound personas.
+        let mut ids: Vec<Uuid> = phases
+            .iter()
+            .filter_map(|row| row.phase.persona_id)
+            .map(PersonaId::as_uuid)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if !ids.is_empty() {
+            let personas = self.persona_rows_by_id(&ids).await?;
+            for row in &mut phases {
+                row.persona = row
+                    .phase
+                    .persona_id
+                    .and_then(|id| personas.iter().find(|persona| persona.id == id).cloned());
+            }
         }
         Ok(Some(ResolvedGraph { graph, phases }))
     }
@@ -2243,6 +2265,7 @@ impl PgStore {
                    template_name,
                    template_version,
                    token_budget,
+                   persona_id       AS "persona_id: PersonaId",
                    updated_at
               FROM step_graph_phase WHERE id = $1
             "#,
@@ -2388,6 +2411,7 @@ impl PgStore {
                    template_name,
                    template_version,
                    token_budget,
+                   persona_id       AS "persona_id: PersonaId",
                    updated_at
               FROM step_graph_phase
              WHERE graph_id = $1
@@ -2398,6 +2422,95 @@ impl PgStore {
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)
+    }
+
+    // ---- MOD-26 milestone 1: the persona readers (plan D4, D6; blueprint B-15) --------------
+    //
+    // One select list, three predicates. The two `JSONB` columns decode through [`PersonaRow`],
+    // because the model's blob types have no `sqlx::Type`.
+
+    /// Every persona, ordered by `name` bytes (plan D4).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`]; a blob that does not decode included.
+    pub(crate) async fn persona_rows(&self) -> Result<Vec<Persona>> {
+        let rows = sqlx::query_as!(
+            PersonaRow,
+            r#"
+            SELECT id          AS "id: PersonaId",
+                   name,
+                   description,
+                   body,
+                   tools       AS "tools: Json<PersonaTools>",
+                   permission  AS "permission: Json<PersonaPermission>",
+                   created_at,
+                   updated_at
+              FROM persona
+             ORDER BY name COLLATE "C"
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows.into_iter().map(Persona::from).collect())
+    }
+
+    /// One persona by id, `None` when there is no such row.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn persona_row(&self, id: PersonaId) -> Result<Option<Persona>> {
+        let row = sqlx::query_as!(
+            PersonaRow,
+            r#"
+            SELECT id          AS "id: PersonaId",
+                   name,
+                   description,
+                   body,
+                   tools       AS "tools: Json<PersonaTools>",
+                   permission  AS "permission: Json<PersonaPermission>",
+                   created_at,
+                   updated_at
+              FROM persona
+             WHERE id = $1
+            "#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(row.map(Persona::from))
+    }
+
+    /// The personas `ids` name, in `name` byte order; an id that names no row is absent.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub(crate) async fn persona_rows_by_id(&self, ids: &[Uuid]) -> Result<Vec<Persona>> {
+        let rows = sqlx::query_as!(
+            PersonaRow,
+            r#"
+            SELECT id          AS "id: PersonaId",
+                   name,
+                   description,
+                   body,
+                   tools       AS "tools: Json<PersonaTools>",
+                   permission  AS "permission: Json<PersonaPermission>",
+                   created_at,
+                   updated_at
+              FROM persona
+             WHERE id = ANY($1)
+             ORDER BY name COLLATE "C"
+            "#,
+            ids,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows.into_iter().map(Persona::from).collect())
     }
 
     // ---- MOD-9 milestone 3: the skill readers (plan D75, blueprint D91, D92) -----------------

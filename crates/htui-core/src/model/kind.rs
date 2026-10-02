@@ -4,8 +4,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::model::ids::{
-    AgentId, ItemKindId, PhaseId, ProjectId, PromptTemplateId, StepGraphId, UserId,
+    AgentId, ItemKindId, PersonaId, PhaseId, ProjectId, PromptTemplateId, StepGraphId, UserId,
 };
+use crate::model::persona::Persona;
 
 str_enum!(
     /// `step_graph_phase.gate` (§5.4): when the phase stops for a human.
@@ -210,6 +211,10 @@ pub struct StepGraphPhase {
     pub template_version: Option<i32>,
     /// `step_graph_phase.token_budget`; `None` falls back to `project.settings.token_budget`.
     pub token_budget: Option<i32>,
+    /// `step_graph_phase.persona_id` (MOD-26 D5): the persona this phase runs under; `None` for
+    /// none. Frozen by name and content into a run's snapshot at `StartRun` (D9).
+    #[serde(default)]
+    pub persona_id: Option<PersonaId>,
     /// `step_graph_phase.updated_at`.
     pub updated_at: DateTime<Utc>,
 }
@@ -220,6 +225,7 @@ pub struct StepGraphPhase {
 /// [`crate::store::WriteStore::set_setting`] owns alone (plan D8): a column two writers could set
 /// is the hole the rung design closes. `fan_out`, `isolation`, `command_queue`, `verify_command`
 /// and `retry_limit` are MOD-4's and are rendered rather than edited, so they are not here either.
+/// MOD-26 D5 adds the persona binding.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PhasePatch {
     /// `step_graph_phase.name`; `judge` and `handoff` are refused (ANA-5 §4.6).
@@ -232,6 +238,10 @@ pub struct PhasePatch {
     pub gate_hard: Option<bool>,
     /// `step_graph_phase.input_kinds`, replaced whole.
     pub input_kinds: Option<Vec<String>>,
+    /// `step_graph_phase.persona_id` (MOD-26 D5): `None` leaves the binding, `Some(None)` clears
+    /// it, `Some(Some(id))` binds `id`, which must name a `persona` row (`references_no_row`).
+    #[serde(default)]
+    pub persona: Option<Option<PersonaId>>,
 }
 
 /// A row of `phase_agent` (§5.4): a candidate agent for a phase, in priority order.
@@ -314,6 +324,9 @@ pub struct ResolvedPhase {
     pub phase: StepGraphPhase,
     /// `phase_agent` rows in `position` order; empty on `MemStore`, which holds no such table.
     pub agents: Vec<PhaseAgent>,
+    /// The `persona` row `phase.persona_id` names (MOD-26 D6); `None` when it names none.
+    #[serde(default)]
+    pub persona: Option<Persona>,
 }
 
 /// A row of `prompt_template` (§5.4).

@@ -22,9 +22,10 @@ use sqlx::Row as _;
 /// The `connect_timeout` every headless connect here passes.
 const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The 41 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
+/// The 42 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
 /// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5), then
-/// the two of `0011_permission_relay.sql` (MOD-42 plan D1).
+/// the two of `0011_permission_relay.sql` (MOD-42 plan D1), then the one of `0012_persona.sql`
+/// (MOD-26 plan D1).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -70,6 +71,8 @@ const TABLES: &[&str] = &[
     // 0011_permission_relay.sql (MOD-42)
     "step_permission",
     "run_command",
+    // 0012_persona.sql (MOD-26)
+    "persona",
 ];
 
 #[tokio::test]
@@ -90,13 +93,13 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
          MOD-7 milestone 1's 0005_box_identity.sql, MOD-38's 0006_requirements.sql, MOD-9 \
          milestone 2's 0007_skill_attachments.sql, MOD-9 milestone 5's 0008_trim_record_v3.sql, \
-         MOD-23's 0009_agent_box_user_off.sql, MOD-33's 0010_prompt_digest_undigested.sql \
-         and MOD-42's 0011_permission_relay.sql, in ordinal order"
+         MOD-23's 0009_agent_box_user_off.sql, MOD-33's 0010_prompt_digest_undigested.sql, \
+         MOD-42's 0011_permission_relay.sql and MOD-26's 0012_persona.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -114,17 +117,19 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        41,
+        42,
         "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
-         0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six \
-         and MOD-42's 0011_permission_relay.sql adds step_permission and run_command"
+         0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six, \
+         MOD-42's 0011_permission_relay.sql adds step_permission and run_command and MOD-26's \
+         0012_persona.sql adds persona"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migrations create the 41 tables of B.1 as amended by ANA-2 §9, ANA-11 §5 and \
-         MOD-42's 0011_permission_relay.sql and nothing else, got {present:?}"
+        "the migrations create the 42 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
+         MOD-42's 0011_permission_relay.sql and MOD-26's 0012_persona.sql and nothing else, \
+         got {present:?}"
     );
 
     db.drop_db().await;
@@ -442,6 +447,65 @@ const MOD33_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The nine `COMMENT ON COLUMN` texts of `0012_persona.sql` (MOD-26 plan D1, D5), verbatim and in
+/// the migration's order, for [`ANA_COLUMN_COMMENTS`]'s reason. `step_graph_phase` is already a
+/// checked table, so its new `persona_id` is listed with the eight `persona` columns.
+const MOD26_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "persona",
+        "id",
+        "MOD-26 D1: client-minted UUIDv7; what step_graph_phase.persona_id references.",
+    ),
+    (
+        "persona",
+        "name",
+        "MOD-26 D1, D3: the registry name, unique; 1-64 of a-z, 0-9 and single inner hyphens, \
+         checked by the writers. A run snapshot freezes a persona under this name.",
+    ),
+    (
+        "persona",
+        "description",
+        "MOD-26 D1: the one-line summary a picker shows; never rendered into a prompt.",
+    ),
+    (
+        "persona",
+        "body",
+        "MOD-26 D1, D13: the role text stage 3 renders as the protected persona section ahead of \
+         the phase template. Never blank.",
+    ),
+    (
+        "persona",
+        "tools",
+        "MOD-26 D2, D10: {allow, deny, deny_kinds, command_run}, narrow-only against the agent \
+         row. allow keeps built-in tool names (empty keeps all), deny removes tool names, \
+         deny_kinds denies ACP tool kinds (read, edit, delete, move, search, execute, fetch), \
+         command_run false withdraws the command queue. Unknown keys are refused.",
+    ),
+    (
+        "persona",
+        "permission",
+        "MOD-26 D2, D10: {default, rules[]}, deny-only. default is null, ask or deny; every rule \
+         answers reject_once or reject_always and is evaluated before the agent row rules and \
+         remembered choices. Unknown keys are refused.",
+    ),
+    (
+        "persona",
+        "created_at",
+        "MOD-26 D1: when the row was inserted.",
+    ),
+    (
+        "persona",
+        "updated_at",
+        "MOD-26 D1: the update_persona compare-and-set token, stamped by trg_persona_updated_at.",
+    ),
+    (
+        "step_graph_phase",
+        "persona_id",
+        "MOD-26 D5: the persona this phase runs under; NULL for none. StartRun freezes it by name \
+         and content into run.graph_snapshot (phases[].persona, personas[]); ON DELETE RESTRICT.",
+    ),
+];
+
 /// The one `COMMENT ON TABLE` of `0003_orchestration.sql` (ANA-2 §9), verbatim. Kept beside
 /// [`ANA_COLUMN_COMMENTS`] rather than in it: `col_description` cannot read it, because a table
 /// comment is `objsubid = 0`.
@@ -463,6 +527,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD9_COLUMN_COMMENTS)
         .chain(MOD23_COLUMN_COMMENTS)
         .chain(MOD33_COLUMN_COMMENTS)
+        .chain(MOD26_COLUMN_COMMENTS)
     {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.col_description(c.oid, a.attnum) \
@@ -479,8 +544,8 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         assert_eq!(
             actual.as_deref(),
             Some(*expected),
-            "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9, MOD-23 or MOD-33) text byte \
-             for byte"
+            "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9, MOD-23, MOD-33 or MOD-26) text \
+             byte for byte"
         );
     }
 
@@ -502,8 +567,8 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
     );
 
     // And nothing else in those tables carries one, so a reader of `\d+` sees exactly the
-    // thirty-five contracts the three ANAs, MOD-7, ANA-22, MOD-23 and MOD-33 wrote and no
-    // half-finished thirty-sixth.
+    // forty-four contracts the three ANAs, MOD-7, ANA-22, MOD-23, MOD-33 and MOD-26 wrote and no
+    // half-finished forty-fifth.
     let commented: Vec<(String, String)> = sqlx::query_as(
         "SELECT c.relname::text, a.attname::text FROM pg_class c \
          JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -519,6 +584,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             .chain(MOD9_COLUMN_COMMENTS)
             .chain(MOD23_COLUMN_COMMENTS)
             .chain(MOD33_COLUMN_COMMENTS)
+            .chain(MOD26_COLUMN_COMMENTS)
             .map(|(table, _, _)| (*table).to_owned())
             .collect::<BTreeSet<String>>()
             .into_iter()
@@ -534,12 +600,13 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD9_COLUMN_COMMENTS)
         .chain(MOD23_COLUMN_COMMENTS)
         .chain(MOD33_COLUMN_COMMENTS)
+        .chain(MOD26_COLUMN_COMMENTS)
         .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
         .collect();
     expected.sort();
     assert_eq!(
         commented, expected,
-        "exactly the thirty-five commented columns, and no others"
+        "exactly the forty-four commented columns, and no others"
     );
 
     db.drop_db().await;
@@ -919,8 +986,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(11),
-        "eleven embedded migrations, none applied (through MOD-42's 0011_permission_relay.sql)"
+        MigrationState::Pending(12),
+        "twelve embedded migrations, none applied (through MOD-26's 0012_persona.sql)"
     );
 
     db.drop_db().await;
@@ -1018,12 +1085,12 @@ async fn a_headless_connect_never_migrates() {
     let Some(db) = common::bare_db().await else {
         return;
     };
-    assert_eq!(db.migrations_at_connect, MigrationState::Pending(11));
+    assert_eq!(db.migrations_at_connect, MigrationState::Pending(12));
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
         .await
         .expect_err("a pending schema is refused");
-    assert_eq!(refused, HeadlessError::MigrationsPending(11));
+    assert_eq!(refused, HeadlessError::MigrationsPending(12));
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
         0,
@@ -1042,7 +1109,7 @@ async fn a_headless_connect_never_migrates() {
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
         .await
         .expect_err("no migrations table is every migration pending");
-    assert_eq!(refused, HeadlessError::MigrationsPending(11));
+    assert_eq!(refused, HeadlessError::MigrationsPending(12));
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
         .await
@@ -1192,9 +1259,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        11,
-        "the later applies migrate nothing: the eleven embedded migrations (through MOD-42's \
-         0011_permission_relay.sql) are applied once"
+        12,
+        "the later applies migrate nothing: the twelve embedded migrations (through MOD-26's \
+         0012_persona.sql) are applied once"
     );
 
     db.drop_db().await;
@@ -1570,6 +1637,64 @@ async fn a_seeded_database_gains_a_later_row_and_keeps_an_operator_edit() {
     db.drop_db().await;
 }
 
+/// MOD-26 plan D7: the persona seeds are the agent loop's name-keyed top-up. A fresh database
+/// holds `architect` and `reviewer`; a later pass brings back a deleted seed and leaves an
+/// operator's edit to the other alone (`ON CONFLICT (name) DO NOTHING`).
+#[tokio::test]
+async fn seeding_adds_both_personas_once_and_keeps_an_operator_edit() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let rows = |pool: sqlx::PgPool| async move {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT name, body FROM persona ORDER BY name COLLATE \"C\"",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read the persona registry")
+    };
+
+    let seeded = rows(db.pool.clone()).await;
+    assert_eq!(
+        seeded
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["architect", "reviewer"],
+        "a fresh database holds both seed personas"
+    );
+
+    sqlx::query("UPDATE persona SET body = 'You review, briefly.' WHERE name = 'reviewer'")
+        .execute(&db.pool)
+        .await
+        .expect("an operator edits a seed");
+    sqlx::query("DELETE FROM persona WHERE name = 'architect'")
+        .execute(&db.pool)
+        .await
+        .expect("an operator deletes the other");
+
+    db.store.seed_if_empty().await.expect("the next seed pass");
+    let again = rows(db.pool.clone()).await;
+    assert_eq!(
+        again
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["architect", "reviewer"],
+        "the deleted seed is back, and nothing is doubled"
+    );
+    assert_eq!(
+        again[0].1, seeded[0].1,
+        "the returning seed carries its file's body"
+    );
+    assert_eq!(
+        again[1].1, "You review, briefly.",
+        "`ON CONFLICT (name) DO NOTHING`: the operator's edit survives"
+    );
+
+    db.drop_db().await;
+}
+
 /// `R-USR-2`: one `app_user`, however many boxes and whatever their OS user is called.
 ///
 /// The seed name is injected rather than pushed through `USERNAME` / `USER` so the case does not
@@ -1852,6 +1977,7 @@ async fn load_demo_round_trips_a_count_per_table() {
         "project",
         "workspace_project",
         "agent",
+        "persona",
         "step_graph",
         "step_graph_phase",
         "prompt_template",
@@ -1880,13 +2006,14 @@ async fn load_demo_round_trips_a_count_per_table() {
     let data = htui_core::fixtures::demo_data();
     db.store.load_demo(&data).await.expect("load the fixture");
 
-    let expected: [(&str, usize); 25] = [
+    let expected: [(&str, usize); 26] = [
         ("app_user", data.users.len()),
         ("box", data.boxes.len()),
         ("workspace", data.workspaces.len()),
         ("project", data.projects.len()),
         ("workspace_project", data.workspace_projects.len()),
         ("agent", data.agents.len()),
+        ("persona", data.personas.len()),
         ("step_graph", data.graphs.len()),
         ("step_graph_phase", data.phases.len()),
         ("prompt_template", data.templates.len()),
@@ -1929,18 +2056,16 @@ async fn load_demo_round_trips_a_count_per_table() {
         let after = common::count(&db.pool, table).await;
         let expected_rows = i64::try_from(*len).expect("a fixture vector fits in i64");
 
-        if *table == "agent" {
-            // `agent` is the one table the fixture *replaces* rather than adds to: since MOD-2,
-            // `seed_if_empty_as` has already put `claude` and `agy` there, and the fixture carries
-            // the same two names under its own ids, so `load_demo` deletes them by name first. The
-            // delta is therefore zero and the absolute count is what carries meaning.
-            assert_eq!(
-                before[i], expected_rows,
-                "the seed put the two §5.3 rows in"
-            );
+        if *table == "agent" || *table == "persona" {
+            // `agent` and `persona` are the two tables the fixture *replaces* rather than adds
+            // to: `seed_if_empty_as` has already put the seed rows there (MOD-2's agents, MOD-26
+            // D7's `reviewer` and `architect`), and the fixture carries the same names under its
+            // own ids, so `load_demo` deletes them by name first. The delta is therefore zero and
+            // the absolute count is what carries meaning.
+            assert_eq!(before[i], expected_rows, "the seed put `{table}`'s rows in");
             assert_eq!(
                 after, expected_rows,
-                "`agent` holds the fixture's rows, not the seed's plus the fixture's"
+                "`{table}` holds the fixture's rows, not the seed's plus the fixture's"
             );
             continue;
         }

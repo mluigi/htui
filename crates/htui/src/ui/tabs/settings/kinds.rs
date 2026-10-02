@@ -979,6 +979,7 @@ impl KindsSection {
             template_name: Some(template_name),
             gate_hard: Some(gate_hard),
             input_kinds: Some(input_kinds),
+            persona: None,
         };
         // A budget-only change is one write on the rung; anything else starts with the patch.
         if budget_changed && !patch_changed {

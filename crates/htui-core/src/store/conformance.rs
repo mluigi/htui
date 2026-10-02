@@ -20,16 +20,17 @@ use crate::model::{
     DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EventKind, EventRole, Executor, Gate, GateOutcome,
     GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKindId, ItemKindPatch,
     ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
-    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, NoteId, OpenPermission, OverlapRule,
-    PermissionChoice, PermissionId, PermissionStatus, PhaseId, PhasePatch, Priority, ProbedTool,
-    ProjectId, ProjectPatch, PromptScope, PromptTemplate, PromptTemplateId, RelayOption,
-    RelayOptionKind, RelaySessionId, RelayView, RepoBoxPath, RepoId, RepoPatch, RepoScope,
-    Requirement, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementState, RequirementUpdate, Resolution, Run, RunCommandId,
-    RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunScope, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, Scope, SessionEvent, Skill, SkillBindingKey, SkillId, SkillPatch,
-    SkillVersion, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch,
+    NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
+    NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, NoteId, OpenPermission,
+    OverlapRule, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaAnswer,
+    PersonaId, PersonaMatch, PersonaPatch, PersonaPermission, PersonaRule, PersonaTools, PhaseId,
+    PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate,
+    PromptTemplateId, RelayOption, RelayOptionKind, RelaySessionId, RelayView, RepoBoxPath, RepoId,
+    RepoPatch, RepoScope, Requirement, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementState, RequirementUpdate, Resolution, Run,
+    RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunScope, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, Skill, SkillBindingKey, SkillId,
+    SkillPatch, SkillVersion, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch,
     StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
     UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
     WorkspaceProject, canonical_declared_tags, missing_tags_failure,
@@ -38,10 +39,12 @@ use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::store::error::StoreError;
 use crate::store::traits::{
-    BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, CasOutcome, DeleteReach,
-    DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL, ReadStore, SettingRung, StepFence,
-    StoredSetting, UpdateOutcome, WriteStore, already_exists, citation_key, illegal_move,
-    invalid_area_code, requirement_withdrawn, resolution_not_closable, withdrawn_requirement_cited,
+    BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
+    CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL,
+    RULE_MATCHES_EVERYTHING, ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome,
+    WriteStore, allow_names_an_mcp_tool, already_exists, citation_key, has_nul, illegal_move,
+    invalid_area_code, invalid_persona_name, kind_not_narrowable, not_a_tool_name,
+    references_no_row, requirement_withdrawn, resolution_not_closable, withdrawn_requirement_cited,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -165,6 +168,11 @@ pub const CASES: &[&str] = &[
     "relay_view_lists_live_pending_requests_and_pending_cancels",
     "deleting_a_project_takes_its_relay_rows",
     "adopt_runs_never_leases_a_chat_run",
+    "personas_are_listed_by_name_and_created_once",
+    "update_persona_is_a_compare_and_set",
+    "persona_writers_refuse_every_widening_shape",
+    "a_phase_naming_no_persona_is_refused",
+    "a_phase_persona_binding_sets_keeps_and_clears",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -417,6 +425,17 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
             deleting_a_project_takes_its_relay_rows(store).await
         }
         "adopt_runs_never_leases_a_chat_run" => adopt_runs_never_leases_a_chat_run(store).await,
+        "personas_are_listed_by_name_and_created_once" => {
+            personas_are_listed_by_name_and_created_once(store).await;
+        }
+        "update_persona_is_a_compare_and_set" => update_persona_is_a_compare_and_set(store).await,
+        "persona_writers_refuse_every_widening_shape" => {
+            persona_writers_refuse_every_widening_shape(store).await;
+        }
+        "a_phase_naming_no_persona_is_refused" => a_phase_naming_no_persona_is_refused(store).await,
+        "a_phase_persona_binding_sets_keeps_and_clears" => {
+            a_phase_persona_binding_sets_keeps_and_clears(store).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -2291,6 +2310,7 @@ fn new_phase(graph: StepGraphId, position: i32, name: &str) -> StepGraphPhase {
         template_name: name.to_owned(),
         template_version: None,
         token_budget: None,
+        persona_id: None,
         updated_at: Utc::now(),
     }
 }
@@ -3683,6 +3703,7 @@ async fn step_graph_and_phase_round_trip<S: WriteStore>(store: &S) {
                     template_name: Some("plan".to_owned()),
                     gate_hard: Some(true),
                     input_kinds: Some(vec!["plan".to_owned()]),
+                    persona: None,
                 },
             )
             .await
@@ -14462,6 +14483,532 @@ async fn deleting_a_project_takes_its_relay_rows<S: WriteStore>(store: &S) {
             .await,
         "run_command",
         "resolving the cancel of a deleted run",
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-26 milestone 1: the persona registry and the phase binding (plan D3-D5)
+// ------------------------------------------------------------------------------------------------
+
+/// A persona request with a fresh id, an empty description and the narrowing-free blobs.
+fn new_persona(name: &str, body: &str) -> NewPersona {
+    NewPersona {
+        id: PersonaId::new(),
+        name: name.to_owned(),
+        description: String::new(),
+        body: body.to_owned(),
+        tools: PersonaTools::default(),
+        permission: PersonaPermission::default(),
+    }
+}
+
+/// The registry's names, in the order the store answers them.
+async fn persona_names<S: WriteStore>(case: &str, store: &S) -> Vec<String> {
+    store
+        .personas()
+        .await
+        .expect(case)
+        .into_iter()
+        .map(|row| row.name)
+        .collect()
+}
+
+/// The registry row named `name`, or a panic naming the case.
+async fn persona_named<S: WriteStore>(case: &str, store: &S, name: &str) -> Persona {
+    store
+        .personas()
+        .await
+        .expect(case)
+        .into_iter()
+        .find(|row| row.name == name)
+        .unwrap_or_else(|| panic!("{case}: the registry holds `{name}`"))
+}
+
+/// A `Constraint` carrying exactly `sentence`, or a panic naming the case and what was tried.
+fn constraint_exactly<T: core::fmt::Debug>(
+    case: &str,
+    outcome: Result<T, StoreError>,
+    sentence: &str,
+    what: &str,
+) {
+    match outcome {
+        Err(StoreError::Constraint(message)) => assert_eq!(
+            message, sentence,
+            "{case}: {what}: the refusal is worded once for both stores"
+        ),
+        other => panic!("{case}: {what} is Constraint({sentence:?}), got {other:?}"),
+    }
+}
+
+/// MOD-26 plan D4: the registry is listed in name byte order; a create returns its input with
+/// both stamps equal; a taken id, then a taken name, is refused and writes nothing.
+async fn personas_are_listed_by_name_and_created_once<S: WriteStore>(store: &S) {
+    const CASE: &str = "personas_are_listed_by_name_and_created_once";
+    assert_eq!(
+        persona_names(CASE, store).await,
+        ["architect", "reviewer"],
+        "{CASE}: the demo registry is the two seeds, in name byte order"
+    );
+
+    let mut scout = new_persona("scout", "You scout.");
+    scout.tools.deny_kinds = vec!["execute".to_owned()];
+    let created = store.create_persona(scout.clone()).await.expect(CASE);
+    assert_eq!(
+        (
+            created.id,
+            created.name.as_str(),
+            created.description.as_str(),
+            created.body.as_str(),
+            &created.tools,
+            &created.permission,
+        ),
+        (
+            scout.id,
+            scout.name.as_str(),
+            scout.description.as_str(),
+            scout.body.as_str(),
+            &scout.tools,
+            &scout.permission,
+        ),
+        "{CASE}: the row is the request"
+    );
+    assert_eq!(
+        created.created_at, created.updated_at,
+        "{CASE}: a new row has not been edited"
+    );
+    assert_eq!(
+        persona_names(CASE, store).await,
+        ["architect", "reviewer", "scout"],
+        "{CASE}: the new row is listed in name order"
+    );
+    assert_eq!(
+        persona_named(CASE, store, "scout").await,
+        created,
+        "{CASE}: the row reads back as the create answered it"
+    );
+
+    let mut twin = new_persona("scout-twin", "You scout twice.");
+    twin.id = scout.id;
+    constraint_exactly(
+        CASE,
+        store.create_persona(twin).await,
+        &already_exists("persona", scout.id),
+        "a taken id",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .create_persona(new_persona("scout", "You scout again."))
+            .await,
+        &already_exists("persona", "scout"),
+        "a taken name",
+    );
+    assert_eq!(
+        persona_names(CASE, store).await,
+        ["architect", "reviewer", "scout"],
+        "{CASE}: the refusals wrote nothing"
+    );
+}
+
+/// MOD-26 plan D4: an edit is a compare-and-set on `persona.updated_at`, in `update_skill`'s
+/// order: `NotFound`, then `Stale` (even for a patch that would be refused), then `Constraint`.
+/// An all-`None` patch still moves the token.
+async fn update_persona_is_a_compare_and_set<S: WriteStore>(store: &S) {
+    const CASE: &str = "update_persona_is_a_compare_and_set";
+    let row = persona_named(CASE, store, "architect").await;
+    let body = |text: &str| PersonaPatch {
+        body: Some(text.to_owned()),
+        ..PersonaPatch::default()
+    };
+
+    not_found_on(
+        CASE,
+        store
+            .update_persona(PersonaId::new(), row.updated_at, body("x"))
+            .await,
+        "persona",
+        "an unknown id",
+    );
+    let current = stale(
+        CASE,
+        store
+            .update_persona(
+                row.id,
+                row.updated_at - TimeDelta::seconds(1),
+                PersonaPatch {
+                    name: Some("Bad".to_owned()),
+                    ..PersonaPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        current, row,
+        "{CASE}: a spent token is Stale before the patch is judged, carrying the row"
+    );
+
+    let edited = applied(
+        CASE,
+        store
+            .update_persona(row.id, row.updated_at, body("Design it first.\n"))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        edited.body, "Design it first.\n",
+        "{CASE}: the body changed"
+    );
+    assert!(
+        edited.updated_at > row.updated_at,
+        "{CASE}: the edit moved the token"
+    );
+    assert_eq!(
+        Persona {
+            body: row.body.clone(),
+            updated_at: row.updated_at,
+            ..edited.clone()
+        },
+        row,
+        "{CASE}: every `None` field is kept"
+    );
+
+    let now = stale(
+        CASE,
+        store
+            .update_persona(row.id, row.updated_at, body("Again.\n"))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(now, edited, "{CASE}: the old token finds the edited row");
+
+    constraint_exactly(
+        CASE,
+        store
+            .update_persona(
+                row.id,
+                edited.updated_at,
+                PersonaPatch {
+                    name: Some("reviewer".to_owned()),
+                    ..PersonaPatch::default()
+                },
+            )
+            .await,
+        &already_exists("persona", "reviewer"),
+        "a rename into a taken name",
+    );
+
+    let touched = applied(
+        CASE,
+        store
+            .update_persona(row.id, edited.updated_at, PersonaPatch::default())
+            .await
+            .expect(CASE),
+    );
+    assert!(
+        touched.updated_at > edited.updated_at,
+        "{CASE}: an all-`None` patch still stamps updated_at"
+    );
+    assert_eq!(
+        Persona {
+            updated_at: edited.updated_at,
+            ..touched
+        },
+        edited,
+        "{CASE}: an all-`None` patch changes nothing else"
+    );
+}
+
+/// MOD-26 plan D3 (I-1, I-2): every widening shape the persona rules know, the list the
+/// `model::persona` unit test walks, is refused with its exact sentence by `create_persona` and,
+/// as a patch, by `update_persona`. Nothing is written.
+async fn persona_writers_refuse_every_widening_shape<S: WriteStore>(store: &S) {
+    const CASE: &str = "persona_writers_refuse_every_widening_shape";
+    let before = store.personas().await.expect(CASE);
+    let reviewer = persona_named(CASE, store, "reviewer").await;
+
+    let rule = |matcher: PersonaMatch| PersonaRule {
+        matcher,
+        answer: PersonaAnswer::RejectOnce,
+        reason: String::new(),
+    };
+    let tools = |edit: &dyn Fn(&mut PersonaTools)| {
+        let mut tools = PersonaTools::default();
+        edit(&mut tools);
+        tools
+    };
+    let rules = |rules: Vec<PersonaRule>| PersonaPermission {
+        default: None,
+        rules,
+    };
+
+    let mut shapes: Vec<(NewPersona, PersonaPatch, String)> = Vec::new();
+    let mut push = |edit: &dyn Fn(&mut NewPersona), patch: PersonaPatch, sentence: String| {
+        let mut new = new_persona("scout", "You scout.");
+        edit(&mut new);
+        shapes.push((new, patch, sentence));
+    };
+    push(
+        &|new| new.name = "Bad Name".to_owned(),
+        PersonaPatch {
+            name: Some("Bad Name".to_owned()),
+            ..PersonaPatch::default()
+        },
+        invalid_persona_name("Bad Name"),
+    );
+    push(
+        &|new| new.description = "a\0b".to_owned(),
+        PersonaPatch {
+            description: Some("a\0b".to_owned()),
+            ..PersonaPatch::default()
+        },
+        has_nul("persona.description"),
+    );
+    for (body, sentence) in [
+        (" \n\t\n", BLANK_PERSONA_BODY.to_owned()),
+        ("You\0 review", has_nul("persona.body")),
+    ] {
+        push(
+            &|new| new.body = body.to_owned(),
+            PersonaPatch {
+                body: Some(body.to_owned()),
+                ..PersonaPatch::default()
+            },
+            sentence,
+        );
+    }
+    let mut narrowings: Vec<(PersonaTools, String)> = ["", "Read Grep", "Read,Grep", "Re\0ad"]
+        .into_iter()
+        .map(|bad| {
+            (
+                tools(&|tools| tools.allow.push(bad.to_owned())),
+                not_a_tool_name("allow", bad),
+            )
+        })
+        .collect();
+    narrowings.push((
+        tools(&|tools| tools.allow.push("mcp__x__y".to_owned())),
+        allow_names_an_mcp_tool("mcp__x__y"),
+    ));
+    narrowings.push((
+        tools(&|tools| tools.deny.push("Bash Output".to_owned())),
+        not_a_tool_name("deny", "Bash Output"),
+    ));
+    for kind in ["think", "switch_mode", "other", "Edit"] {
+        narrowings.push((
+            tools(&|tools| tools.deny_kinds.push(kind.to_owned())),
+            kind_not_narrowable(kind),
+        ));
+    }
+    for (narrowing, sentence) in narrowings {
+        push(
+            &|new| new.tools = narrowing.clone(),
+            PersonaPatch {
+                tools: Some(narrowing.clone()),
+                ..PersonaPatch::default()
+            },
+            sentence,
+        );
+    }
+    let permissions = [
+        (
+            rules(vec![rule(PersonaMatch::default())]),
+            RULE_MATCHES_EVERYTHING.to_owned(),
+        ),
+        (
+            rules(vec![rule(PersonaMatch {
+                path_prefix: Some("/e\0tc".to_owned()),
+                ..PersonaMatch::default()
+            })]),
+            has_nul("persona.permission.rules"),
+        ),
+        (
+            rules(vec![PersonaRule {
+                reason: "no\0".to_owned(),
+                ..rule(PersonaMatch {
+                    tool_kind: Some("execute".to_owned()),
+                    ..PersonaMatch::default()
+                })
+            }]),
+            has_nul("persona.permission.rules"),
+        ),
+    ];
+    for (permission, sentence) in permissions {
+        push(
+            &|new| new.permission = permission.clone(),
+            PersonaPatch {
+                permission: Some(permission.clone()),
+                ..PersonaPatch::default()
+            },
+            sentence,
+        );
+    }
+    assert_eq!(shapes.len(), 17, "{CASE}: every shape of the D3 list");
+
+    for (new, patch, sentence) in shapes {
+        let what = format!("{new:?}");
+        constraint_exactly(
+            CASE,
+            store.create_persona(new).await,
+            &sentence,
+            &format!("create {what}"),
+        );
+        constraint_exactly(
+            CASE,
+            store
+                .update_persona(reviewer.id, reviewer.updated_at, patch.clone())
+                .await,
+            &sentence,
+            &format!("patch {patch:?}"),
+        );
+    }
+    assert_eq!(
+        store.personas().await.expect(CASE),
+        before,
+        "{CASE}: no refusal wrote anything"
+    );
+}
+
+/// MOD-26 plan D5: a phase that names no persona row is refused with `references_no_row`'s
+/// sentence by both phase writers, after the position and name clashes; nothing is written.
+async fn a_phase_naming_no_persona_is_refused<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_phase_naming_no_persona_is_refused";
+    let unknown = PersonaId::new();
+    let sentence = references_no_row("step_graph_phase.persona_id", unknown, "persona");
+    let before = store.phases(ids::GRAPH_HTUI_FEAT).await.expect(CASE);
+
+    constraint_exactly(
+        CASE,
+        store
+            .create_phase(&StepGraphPhase {
+                persona_id: Some(unknown),
+                ..new_phase(ids::GRAPH_HTUI_FEAT, 9, "cut")
+            })
+            .await,
+        &sentence,
+        "a create naming no persona",
+    );
+    match store
+        .create_phase(&StepGraphPhase {
+            persona_id: Some(unknown),
+            ..new_phase(ids::GRAPH_HTUI_FEAT, 0, "cut")
+        })
+        .await
+    {
+        Err(StoreError::Constraint(message)) => assert_ne!(
+            message, sentence,
+            "{CASE}: a taken position is refused before the persona is looked up (D5)"
+        ),
+        other => panic!("{CASE}: a taken position is Constraint, got {other:?}"),
+    }
+
+    let phase = before
+        .iter()
+        .find(|row| row.name == "plan")
+        .expect("the FEAT graph has a plan phase");
+    constraint_exactly(
+        CASE,
+        store
+            .update_phase(
+                phase.id,
+                phase.updated_at,
+                PhasePatch {
+                    persona: Some(Some(unknown)),
+                    ..PhasePatch::default()
+                },
+            )
+            .await,
+        &sentence,
+        "an update naming no persona",
+    );
+    assert_eq!(
+        store.phases(ids::GRAPH_HTUI_FEAT).await.expect(CASE),
+        before,
+        "{CASE}: the refusals wrote nothing"
+    );
+}
+
+/// MOD-26 plan D5: `PhasePatch.persona` is a three-way edit: `Some(Some(id))` binds, `None`
+/// leaves the binding alone, `Some(None)` clears it. `phases()` reads each state back.
+async fn a_phase_persona_binding_sets_keeps_and_clears<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_phase_persona_binding_sets_keeps_and_clears";
+    let reviewer = persona_named(CASE, store, "reviewer").await.id;
+    let phase = store
+        .phases(ids::GRAPH_HTUI_FEAT)
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|row| row.name == "plan")
+        .expect("the FEAT graph has a plan phase");
+    assert_eq!(phase.persona_id, None, "{CASE}: no fixture phase is bound");
+    let read_back = |id: PhaseId| async move {
+        store
+            .phases(ids::GRAPH_HTUI_FEAT)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .find(|row| row.id == id)
+            .expect("the phase is still there")
+    };
+
+    let bound = applied(
+        CASE,
+        store
+            .update_phase(
+                phase.id,
+                phase.updated_at,
+                PhasePatch {
+                    persona: Some(Some(reviewer)),
+                    ..PhasePatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(bound.persona_id, Some(reviewer), "{CASE}: the binding set");
+    assert_eq!(read_back(phase.id).await, bound, "{CASE}: read back bound");
+
+    let renamed = applied(
+        CASE,
+        store
+            .update_phase(
+                phase.id,
+                bound.updated_at,
+                PhasePatch {
+                    name: Some("design".to_owned()),
+                    ..PhasePatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        (renamed.name.as_str(), renamed.persona_id),
+        ("design", Some(reviewer)),
+        "{CASE}: a patch without `persona` keeps the binding"
+    );
+    assert_eq!(read_back(phase.id).await, renamed, "{CASE}: read back kept");
+
+    let cleared = applied(
+        CASE,
+        store
+            .update_phase(
+                phase.id,
+                renamed.updated_at,
+                PhasePatch {
+                    persona: Some(None),
+                    ..PhasePatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(cleared.persona_id, None, "{CASE}: `Some(None)` clears it");
+    assert_eq!(cleared.name, "design", "{CASE}: and keeps the rest");
+    assert_eq!(
+        read_back(phase.id).await,
+        cleared,
+        "{CASE}: read back cleared"
     );
 }
 

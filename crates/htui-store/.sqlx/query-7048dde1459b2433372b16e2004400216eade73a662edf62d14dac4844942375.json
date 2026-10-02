@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO step_graph_phase (id, graph_id, position, name, fan_out, gate, gate_hard, retry_limit, input_kinds, output_kind, isolation, command_queue, verify_command, template_name, template_version, token_budget, updated_at, persona_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4",
+        "Text",
+        "Int4",
+        "Text",
+        "Bool",
+        "Int4",
+        "TextArray",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int4",
+        "Int4",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7048dde1459b2433372b16e2004400216eade73a662edf62d14dac4844942375"
+}
