@@ -5042,10 +5042,13 @@ impl State {
     }
 
     /// MOD-37 R-5: the gate's park, `promote_step`'s shape. Every check runs before the first
-    /// write, in Postgres's order: the step, the fence, the step's status, the run's status, and
-    /// then the item (review N1), so the park is all-or-nothing by construction, as Postgres's
-    /// rollback makes it. The item must exist and its `in_progress -> awaiting_approval` be
-    /// legal; an item another writer moved is left where it is (plan D17's "already moved").
+    /// write, so the park is all-or-nothing by construction, as Postgres's rollback makes it
+    /// (review N1). The step, the fence, the step's status and the run's status run in
+    /// Postgres's order. The item check after them is Mem-only: Postgres's item `UPDATE` is
+    /// guarded by `status = 'in_progress'` and checks nothing, and `run.item_id`'s FK cascade
+    /// guarantees the row Mem checks for. The item must exist and its
+    /// `in_progress -> awaiting_approval` be legal; an item another writer moved is left where it
+    /// is (plan D17's "already moved").
     fn park_step(
         &mut self,
         fence: StepFence,
