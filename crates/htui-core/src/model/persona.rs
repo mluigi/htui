@@ -329,8 +329,9 @@ pub fn kind_not_narrowable(kind: &str) -> String {
 #[must_use]
 pub fn persona_not_in_snapshot(persona: &str) -> String {
     format!(
-        "persona `{persona}` is not in the run's snapshot, so the step does not run un-narrowed \
-         (MOD-26 I-4)"
+        "persona `{}` is not in the run's snapshot, so the step does not run un-narrowed \
+         (MOD-26 I-4)",
+        persona.escape_debug()
     )
 }
 
@@ -787,6 +788,24 @@ mod tests {
             parse("name: reviewer\nmodel: opus\ncolor: blue\n", "body\n"),
             Err(PersonaFileError::Model),
             "`model` is refused with its own sentence before a later unknown key"
+        );
+    }
+
+    /// MOD-26 review N3: the persona name is escaped like every sibling sentence's interpolation,
+    /// so a stored refusal is one line whatever the snapshot's name holds.
+    #[test]
+    fn the_snapshot_refusal_escapes_the_persona_name() {
+        let sentence = persona_not_in_snapshot("rev\niewer");
+        assert!(
+            sentence.starts_with("persona `rev\\niewer` is not in the run's snapshot"),
+            "the name is escape_debug'd: {sentence}"
+        );
+        assert!(!sentence.contains('\n'), "one line: {sentence:?}");
+        assert_eq!(
+            persona_not_in_snapshot("reviewer"),
+            "persona `reviewer` is not in the run's snapshot, so the step does not run \
+             un-narrowed (MOD-26 I-4)",
+            "a plain name reads as before"
         );
     }
 
