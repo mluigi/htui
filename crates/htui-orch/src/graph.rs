@@ -401,8 +401,8 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
 ///
 /// **Re-override is still owed** (ANA-2 `:297-300`: delete the existing override's phases and
 /// re-clone, leaving `item.step_graph_id` alone). It needs a phase deleter `WriteStore` does not
-/// carry; until it does, a second call earns `create_step_graph`'s own `(project_id, name)` `Constraint`, which is
-/// a refusal rather than a wrong answer.
+/// carry; until it does, a second call earns `create_step_graph`'s own `(project_id, name)`
+/// `Constraint`, which is a refusal rather than a wrong answer.
 ///
 /// # Errors
 /// [`ResolveError::NoGraph`] when the item resolves to no graph; [`ResolveError::Store`] for the

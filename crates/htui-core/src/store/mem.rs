@@ -2922,7 +2922,8 @@ impl State {
     }
 
     /// Inserts a phase's candidate rows, all or nothing (MOD-37 R-6): every refusal is decided
-    /// before the first insert, in the order `PgStore` meets them. An empty slice checks nothing.
+    /// before the first insert, and is a `Constraint` as `PgStore`'s is. An empty slice checks
+    /// nothing.
     fn create_phase_agents(&mut self, phase: PhaseId, agents: &[PhaseAgent]) -> Result<()> {
         if agents.is_empty() {
             return Ok(());
@@ -3689,7 +3690,8 @@ impl State {
     /// lists kept in step by hand. `workspace_box_paths` is `0` because a project is not a
     /// workspace. `run_step_commits` and `run_step_trees` were `0` until MOD-4 milestone 1 gave
     /// this store the two maps (plan D12), `command_runs` until milestone 3 gave it the third
-    /// (plan D31), and `phase_agents` until MOD-37 R-6 gave it the fourth. MOD-38's six requirement counts come from the same pass (blueprint F1, §4.4).
+    /// (plan D31), and `phase_agents` until MOD-37 R-6 gave it the fourth. MOD-38's six
+    /// requirement counts come from the same pass (blueprint F1, §4.4).
     fn project_reach(&self, id: ProjectId) -> Option<(DeleteReach, ProjectReach)> {
         if !self.projects.contains_key(&id) {
             return None;
