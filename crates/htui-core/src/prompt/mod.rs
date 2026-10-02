@@ -166,6 +166,10 @@ impl From<&SnapshotPersona> for PersonaBlock {
     }
 }
 
+/// MOD-26 D13, B-17: the bytes between the persona frame and the template body, counted in the
+/// frame's estimate.
+pub const PERSONA_SEPARATOR: &str = "\n\n";
+
 /// One resolved input document: the winner of its kind (§4.7 rule 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputDocument {
@@ -268,6 +272,9 @@ pub struct StepSummary {
 pub enum SectionName {
     /// The frame's literal spans. Always the first `sections[]` entry (P-9).
     Template,
+    /// The persona frame (MOD-26 D13). Always `sections[1]` when present: `template` keeps
+    /// `sections[0]`, P-9.
+    Persona,
     /// `item.body`.
     Item,
     /// One per resolved input kind; the payload is `document.kind`.
@@ -304,6 +311,7 @@ impl SectionName {
     pub fn render(&self) -> String {
         match self {
             Self::Template => "template".to_owned(),
+            Self::Persona => "persona".to_owned(),
             Self::Item => "item".to_owned(),
             Self::Documents(kind) => format!("documents:{kind}"),
             Self::Upstream => "upstream".to_owned(),
@@ -328,7 +336,7 @@ impl SectionName {
     #[must_use]
     pub const fn is_protected(&self, role: TemplateRole) -> bool {
         match self {
-            Self::Template | Self::Box | Self::Skills | Self::CommandQueue => true,
+            Self::Template | Self::Persona | Self::Box | Self::Skills | Self::CommandQueue => true,
             Self::FailureReason => matches!(role, TemplateRole::Handoff),
             _ => false,
         }
@@ -772,6 +780,7 @@ fn render_sections(
             .iter()
             .map(|handoff| render::failure_reason(&handoff.failure_reason))
             .collect(),
+        Placeholder::Persona => spec.persona.iter().map(render::persona).collect(),
         Placeholder::ItemKey
         | Placeholder::ItemTitle
         | Placeholder::ItemKind
@@ -892,6 +901,12 @@ fn scrubbed_inputs(
     for skill in &mut spec.skills {
         mask(scrubber, &mut skill.name, &skills_name)?;
         mask(scrubber, &mut skill.body, &skills_name)?;
+    }
+
+    if let Some(persona) = &mut spec.persona {
+        let persona_name = SectionName::Persona.render();
+        mask(scrubber, &mut persona.name, &persona_name)?;
+        mask(scrubber, &mut persona.body, &persona_name)?;
     }
 
     let excerpts_name = SectionName::Excerpts.render();
@@ -1286,6 +1301,7 @@ mod tests {
         );
         assert_eq!(SectionName::JudgeCandidate(2).render(), "judge_candidate:2");
         assert_eq!(SectionName::Box.to_string(), "box");
+        assert_eq!(SectionName::Persona.render(), "persona");
         assert_eq!(
             serde_json::to_value(SectionName::VerifyFailure).expect("a string"),
             Value::String("verify_failure".to_owned()),
@@ -1302,6 +1318,7 @@ mod tests {
         ] {
             for name in [
                 SectionName::Template,
+                SectionName::Persona,
                 SectionName::Box,
                 SectionName::Skills,
                 SectionName::CommandQueue,

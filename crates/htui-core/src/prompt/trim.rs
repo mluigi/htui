@@ -501,6 +501,7 @@ impl<'a> Trimmer<'a> {
                 .position(|c| c.fanout_index == *index)
                 .map_or(Source::Fixed, |i| Source::Candidate(i, false)),
             SectionName::Template
+            | SectionName::Persona
             | SectionName::Box
             | SectionName::Skills
             | SectionName::CommandQueue
@@ -807,6 +808,7 @@ impl<'a> Trimmer<'a> {
                 .as_ref()
                 .and_then(|handoff| handoff.diff_so_far.as_ref()),
             SectionName::Template
+            | SectionName::Persona
             | SectionName::Item
             | SectionName::Documents(_)
             | SectionName::Upstream
