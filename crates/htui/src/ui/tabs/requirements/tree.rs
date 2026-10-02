@@ -15,7 +15,7 @@ use ratatui::text::{Line, Span};
 
 use crate::requirements::{ProjectRequirements, RequirementsSnapshot, matches_filter};
 use crate::ui::Theme;
-use crate::ui::tabs::backlog::list::clip;
+use crate::ui::cells::{self, cell_width};
 
 /// Two spaces between the columns of a requirement row.
 const GAP: usize = 2;
@@ -33,6 +33,13 @@ const WITHDRAWN_MARK: char = '\u{2715}';
 
 /// The priority column: `later` is the longer of the two.
 const PRIORITY_WIDTH: usize = 5;
+
+/// A project header's tail when another user owns the spec.
+const READ_ONLY_TAIL: &str = " \u{b7} read-only";
+
+/// The fewest cells of a project name worth drawing before the header gives up its tail
+/// (MOD-60 D7; `graph.rs::fit_label`'s `slug_room >= 2`).
+const NAME_MIN: usize = 2;
 
 /// Which row of the tree the cursor is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,7 +190,7 @@ pub(super) fn lines(
     let key_width = groups
         .iter()
         .flat_map(|group| group.areas.iter().flat_map(|(_, rows)| rows.iter()))
-        .map(|row| row.key.chars().count())
+        .map(|row| cell_width(&row.key))
         .max()
         .unwrap_or(0);
     let body_width = width
@@ -202,25 +209,18 @@ pub(super) fn lines(
     for group in &groups {
         let id = group.project.project_id;
         let folded = view.folded.contains(&Fold::Project(id));
-        let mut spans = vec![Span::styled(
-            format!(
-                "{} {} ({})",
-                marker(folded),
-                group.project.name,
-                group.count()
-            ),
-            theme.title,
-        )];
-        if !group.entry.maintainer {
-            spans.push(Span::styled(" \u{b7} read-only", theme.dim));
-        }
-        push(Line::from(spans), Row::Project(id), &mut out);
+        push(
+            project_header(group, folded, width, theme),
+            Row::Project(id),
+            &mut out,
+        );
         if folded {
             continue;
         }
         if group.areas.is_empty() {
+            // Not a row, so `pad` never sees it: cut here (MOD-60 B4).
             out.push(Line::styled(
-                format!("{}no areas", " ".repeat(AREA_INDENT)),
+                cells::clip(&format!("{}no areas", " ".repeat(AREA_INDENT)), width),
                 theme.dim,
             ));
             continue;
@@ -252,6 +252,46 @@ pub(super) fn lines(
     (out, cursor)
 }
 
+/// `▾ htui (3) · read-only`, the name cut so the rest fits `width` cells (MOD-60 D7): the marker,
+/// the count and the tail are the information, the name is what gives way. When fewer than
+/// [`NAME_MIN`] cells of name would be left, the tail goes first; narrower still, the whole header
+/// is handed to [`pad`], which cuts it from the end.
+fn project_header(group: &Group<'_>, folded: bool, width: usize, theme: &Theme) -> Line<'static> {
+    let head = format!("{} ", marker(folded));
+    let count = format!(" ({})", group.count());
+    let name = &group.project.name;
+    let read_only = !group.entry.maintainer;
+    let fixed = cell_width(&head) + cell_width(&count);
+    let tail_width = if read_only {
+        cell_width(READ_ONLY_TAIL)
+    } else {
+        0
+    };
+    let fits = |room: usize| cell_width(name) <= room || room >= NAME_MIN;
+    let title = |name: &str| Span::styled(format!("{head}{name}{count}"), theme.title);
+    let tail = || Span::styled(READ_ONLY_TAIL, theme.dim);
+    if let Some(room) = width.checked_sub(fixed + tail_width)
+        && fits(room)
+    {
+        let mut spans = vec![title(&cells::clip(name, room))];
+        if read_only {
+            spans.push(tail());
+        }
+        Line::from(spans)
+    } else if read_only
+        && let Some(room) = width.checked_sub(fixed)
+        && fits(room)
+    {
+        Line::from(title(&cells::clip(name, room)))
+    } else {
+        let mut spans = vec![title(name)];
+        if read_only {
+            spans.push(tail());
+        }
+        Line::from(spans)
+    }
+}
+
 /// `    R-ENT-1  must   <first line of body>`: the key accented, the rest in
 /// [`requirement_style`]; a withdrawn requirement is `  ✕ R-ENT-2  …`, every span dim.
 fn requirement_line(
@@ -270,11 +310,17 @@ fn requirement_line(
     };
     Line::from(vec![
         Span::styled(indent, style),
-        Span::styled(padded(&requirement.key, key_width), key_style),
+        Span::styled(cells::pad(&requirement.key, key_width), key_style),
         Span::styled(" ".repeat(GAP), style),
-        Span::styled(padded(requirement.priority.as_str(), PRIORITY_WIDTH), style),
+        Span::styled(
+            cells::pad(requirement.priority.as_str(), PRIORITY_WIDTH),
+            style,
+        ),
         Span::styled(" ".repeat(GAP), style),
-        Span::styled(clip(first_line(&requirement.body), body_width), style),
+        Span::styled(
+            cells::clip(first_line(&requirement.body), body_width),
+            style,
+        ),
     ])
 }
 
@@ -283,30 +329,12 @@ const fn marker(folded: bool) -> char {
     if folded { '\u{25b8}' } else { '\u{25be}' }
 }
 
-/// `text` padded with spaces to `width` chars.
-fn padded(text: &str, width: usize) -> String {
-    let mut out = text.to_owned();
-    out.extend(std::iter::repeat_n(
-        ' ',
-        width.saturating_sub(text.chars().count()),
-    ));
-    out
-}
-
-/// The line cut to `width`, padded out to it so the selected style covers the whole row.
+/// The line cut to `width` cells (MOD-60 D7: `cells::clip_spans`, so a body row cuts its body),
+/// padded out to it so the selected style covers the whole row.
 fn pad(line: Line<'static>, width: usize, selected: bool, theme: &Theme) -> Line<'static> {
-    let mut spans = line.spans;
-    let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
-    if used > width {
-        // A header too long for the pane: cut its last span, as a requirement's body is cut.
-        let over = used - width;
-        if let Some(last) = spans.last_mut() {
-            let keep = last.content.chars().count().saturating_sub(over);
-            last.content = clip(&last.content, keep).into();
-        }
-    } else {
-        spans.push(Span::raw(" ".repeat(width - used)));
-    }
+    let mut spans = cells::clip_spans(&line.spans, width);
+    let used: usize = spans.iter().map(|span| cell_width(&span.content)).sum();
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
     let line = Line::from(spans);
     if selected {
         line.style(theme.selected)
@@ -318,10 +346,153 @@ fn pad(line: Line<'static>, width: usize, selected: bool, theme: &Theme) -> Line
 #[cfg(test)]
 mod tests {
     use super::{Fold, Row, TreeView, lines, rows};
+    use crate::requirements::RequirementsSnapshot;
     use crate::ui::Theme;
+    use crate::ui::cells::cell_width;
     use crate::ui::tabs::requirements::tests::platform;
     use htui_core::fixtures::ids;
-    use htui_core::model::RequirementState;
+    use htui_core::model::{ProjectRef, RequirementAreaId, RequirementState};
+    use ratatui::text::Line;
+    use uuid::Uuid;
+
+    /// A line's text, span after span.
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// A line's width in cells, as the terminal draws it.
+    fn line_width(line: &Line<'_>) -> usize {
+        line.spans
+            .iter()
+            .map(|span| cell_width(&span.content))
+            .sum()
+    }
+
+    /// Project htui renamed to `name`.
+    fn rename(projects: &mut [ProjectRef], name: &str) {
+        for project in projects
+            .iter_mut()
+            .filter(|project| project.project_id == ids::PROJECT_HTUI)
+        {
+            project.name = name.to_owned();
+        }
+    }
+
+    /// Project htui's spec owned by this user (`true`) or another (`false`).
+    fn set_maintainer(snapshot: &mut RequirementsSnapshot, maintainer: bool) {
+        for entry in snapshot
+            .projects
+            .iter_mut()
+            .filter(|entry| entry.project_id == ids::PROJECT_HTUI)
+        {
+            entry.maintainer = maintainer;
+        }
+    }
+
+    /// The tree's lines at `width`, nothing folded, nothing selected.
+    fn tree_lines(
+        snapshot: &RequirementsSnapshot,
+        projects: &[ProjectRef],
+        width: usize,
+    ) -> Vec<Line<'static>> {
+        let view = TreeView {
+            snapshot,
+            projects,
+            folded: &[],
+            filter: "",
+            selected: None,
+        };
+        lines(&view, width, &Theme::default()).0
+    }
+
+    /// MOD-60 D7: the marker, the count and ` · read-only` are the information; the name is what
+    /// gives way.
+    #[tokio::test]
+    async fn a_narrow_pane_keeps_read_only_and_elides_the_project_name() {
+        let (mut snapshot, mut projects, _) = platform().await;
+        rename(&mut projects, "a very long project name");
+        set_maintainer(&mut snapshot, false);
+        let lines = tree_lines(&snapshot, &projects, 24);
+        assert_eq!(
+            line_text(&lines[0]),
+            "\u{25be} a ver\u{2026} (3) \u{b7} read-only"
+        );
+    }
+
+    /// MOD-60 D7's second step: with fewer than two cells of name left beside the tail, the tail
+    /// goes and the name takes its room; narrower still, the header is cut from the end and the
+    /// marker is what stays.
+    #[tokio::test]
+    async fn a_pane_too_narrow_for_the_tail_drops_it_before_the_name() {
+        let (mut snapshot, mut projects, _) = platform().await;
+        rename(&mut projects, "a very long project name");
+        set_maintainer(&mut snapshot, false);
+        assert_eq!(
+            line_text(&tree_lines(&snapshot, &projects, 18)[0]),
+            "\u{25be} a very long\u{2026} (3)"
+        );
+        assert_eq!(
+            line_text(&tree_lines(&snapshot, &projects, 7)[0]),
+            "\u{25be} a ve\u{2026}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wide_project_name_is_clipped_by_cells() {
+        let (mut snapshot, mut projects, _) = platform().await;
+        rename(&mut projects, &"\u{6f22}\u{5b57}".repeat(6));
+        set_maintainer(&mut snapshot, true);
+        let lines = tree_lines(&snapshot, &projects, 20);
+        let header = line_text(&lines[0]);
+        assert_eq!(cell_width(&header), 20, "{header:?}");
+        assert!(header.contains(" (3)"), "{header:?}");
+        assert!(header.contains('\u{2026}'), "{header:?}");
+        assert!(header.starts_with("\u{25be} "), "{header:?}");
+    }
+
+    /// Every row kind (project header with its tail, area header, an area with no requirement,
+    /// a requirement with a wide body, `no areas`) at every width a pane can be.
+    #[tokio::test]
+    async fn no_tree_line_is_wider_than_the_pane_at_any_width() {
+        let (mut snapshot, mut projects, _) = platform().await;
+        rename(&mut projects, &"\u{6f22}\u{5b57}".repeat(6));
+        set_maintainer(&mut snapshot, false);
+        for entry in snapshot
+            .projects
+            .iter_mut()
+            .filter(|entry| entry.project_id == ids::PROJECT_HTUI)
+        {
+            let mut empty = entry.areas[0].clone();
+            empty.id = RequirementAreaId::from_uuid(Uuid::from_u128(0x60));
+            empty.code = "EMPTY".to_owned();
+            empty.title = "\u{7a7a}".repeat(10);
+            entry.areas.push(empty);
+            for row in &mut entry.requirements {
+                if row.id == ids::REQ_ENT_1 {
+                    row.body = "\u{6587}".repeat(30);
+                }
+            }
+        }
+        let wide: Vec<String> = tree_lines(&snapshot, &projects, 45)
+            .iter()
+            .map(line_text)
+            .collect();
+        for needle in ["read-only", "EMPTY", "\u{6587}", "no areas"] {
+            assert!(
+                wide.iter().any(|text| text.contains(needle)),
+                "the fixture draws {needle:?}: {wide:#?}"
+            );
+        }
+        for width in 1..=45 {
+            for line in &tree_lines(&snapshot, &projects, width) {
+                let text = line_text(line);
+                assert!(line_width(line) <= width, "{text:?} at {width}");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn the_filter_keeps_matching_rows_and_their_headers() {
