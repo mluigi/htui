@@ -523,7 +523,7 @@ impl ItemForm {
 
     /// D4: the `$EDITOR` handoff came back. No field out (`external` is `None`): ignored.
     /// `Edited` replaces only the handed-out field's text (control characters dropped, then D5),
-    /// focuses it and says `EDITED`;
+    /// puts the cursor at its end, focuses it and says `EDITED`;
     /// the token, reason, `opened` and every other field are untouched, so A4's "unchanged" still
     /// compares against what the form opened with. `Unchanged` says `NO_CHANGES` (+ `WAIT_FLAG`
     /// when quick); `Failed` says its sentence; neither touches the text.
@@ -546,6 +546,8 @@ impl ItemForm {
                     self.notice = Some(NO_CHANGES.to_owned());
                 } else {
                     *area = TextArea::with_text(text);
+                    // Review L4: at the end, so a long body's edited tail is what the area shows.
+                    area.set_cursor(usize::MAX);
                     self.focus = field;
                     self.notice = Some(EDITED.to_owned());
                 }
@@ -604,11 +606,11 @@ impl ItemForm {
 
     /// Feeds one key.
     ///
-    /// In order: an open divergence view takes every key, Ctrl+S included (milestone 3 D5);
-    /// Ctrl+S saves (A6; swallowed while busy); Ctrl+E hands Body or Paths to `$EDITOR`
-    /// (milestone 4 D1, D2; swallowed on any other field and while busy); any other chord passes;
-    /// while busy everything else is swallowed, `Esc` included (D8); `Tab`/`BackTab` cycle the
-    /// focus; then the focused field takes the key.
+    /// In order: an open divergence view takes every key, Ctrl+S and Ctrl+E included (milestone 3
+    /// D5, review L3); Ctrl+S saves (A6; swallowed while busy); Ctrl+E hands Body or Paths to
+    /// `$EDITOR` (milestone 4 D1, D2; swallowed on any other field and while busy); any other chord
+    /// passes; while busy everything else is swallowed, `Esc` included (D8); `Tab`/`BackTab` cycle
+    /// the focus; then the focused field takes the key.
     pub fn on_key(&mut self, key: KeyEvent) -> ItemFormOutcome {
         if self.resolving.is_some() {
             return self.on_view_key(key);
@@ -697,11 +699,16 @@ impl ItemForm {
     }
 
     /// A key while the view is open (D5). `Esc` closes it and keeps the text, focus, token and
-    /// reason; `m`/`t` rebase the form on the head with the resolved spec.
+    /// reason; `m`/`t` rebase the form on the head with the resolved spec. Ctrl+E is swallowed
+    /// here, not passed as a chord (review L3): no editor opens over the view, and the key never
+    /// reaches a global binding from inside the form (milestone 4 D1).
     fn on_view_key(&mut self, key: KeyEvent) -> ItemFormOutcome {
         let Some(view) = self.resolving.as_mut() else {
             return ItemFormOutcome::Stay;
         };
+        if ctrl_e(&key) {
+            return ItemFormOutcome::Stay;
+        }
         match view.on_key(key) {
             ViewOutcome::Stay => ItemFormOutcome::Stay,
             ViewOutcome::Pass => ItemFormOutcome::Pass,
@@ -2163,12 +2170,23 @@ mod tests {
         assert_eq!(form.external, None);
     }
 
-    /// D2: the open three-way view passes Ctrl+E as a chord, as any other.
+    /// Review L3: the open three-way view swallows Ctrl+E, so it never reaches a global binding
+    /// (D1's rule) and no editor opens over the view.
     #[tokio::test]
-    async fn ctrl_e_in_the_divergence_view_passes() {
+    async fn ctrl_e_in_the_divergence_view_is_swallowed() {
         let store = MemStore::demo();
         let mut form = resolving(&store, retitled("Theirs")).await;
-        assert!(matches!(form.on_key(ctrl('e')), ItemFormOutcome::Pass));
+        for event in [
+            ctrl('e'),
+            KeyEvent::new(
+                KeyCode::Char('E'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            let outcome = form.on_key(event);
+            assert!(matches!(outcome, ItemFormOutcome::Stay), "{outcome:?}");
+        }
+        assert!(form.resolving().is_some(), "still open");
         assert_eq!(form.external, None);
     }
 
@@ -2191,6 +2209,11 @@ mod tests {
             form.body.text(),
             "New body.",
             "D5 dropped the editor's newline"
+        );
+        assert_eq!(
+            form.body.cursor_line_col(),
+            (0, 9),
+            "review L4: the cursor ends the text"
         );
         assert_eq!(form.focus(), Field::Body);
         assert_eq!(form.notice(), Some(EDITED));
@@ -2221,6 +2244,11 @@ mod tests {
         handed(&mut form);
         form.on_external_edit(ExternalEditOutcome::Edited("src/**\nlib/**\n".to_owned()));
         assert_eq!(form.paths.text(), "src/**\nlib/**");
+        assert_eq!(
+            form.paths.cursor_line_col(),
+            (1, 6),
+            "review L4: at the end"
+        );
         assert_eq!(form.body.text(), body);
         assert_eq!(form.focus(), Field::Paths);
         assert_eq!(form.notice(), Some(EDITED));
