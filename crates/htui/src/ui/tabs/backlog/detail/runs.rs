@@ -3805,6 +3805,84 @@ mod tests {
         assert_eq!(lines[1], NO_STEPS_YET, "{lines:#?}");
     }
 
+    /// MOD-28 review L3: the flow's head is the list's whole run header (the failure, a pending
+    /// cancel, a queued command), and the cursor step's parked reason under it.
+    #[tokio::test]
+    async fn the_flow_view_shows_the_run_s_failure_and_the_cursor_step_s_note() {
+        let shell = Shell::new();
+        let mut run = feat_1_runs().await.remove(0);
+        run.status = RunStatus::Failed;
+        run.failure = Some("the box went away".to_owned());
+        run.steps[1].status = StepStatus::AwaitingApproval;
+        run.steps[1].gate_note = Some("needs a second look".to_owned());
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Runs(vec![run]), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        let lines = lines(&pane, &shell);
+        assert!(lines[0].starts_with("graph"), "{lines:#?}");
+        assert!(
+            lines[1].starts_with("manual"),
+            "the run's mode line: {lines:#?}"
+        );
+        assert!(
+            lines[2].contains("the box went away"),
+            "the failure: {lines:#?}"
+        );
+        assert!(
+            lines[3].contains("needs a second look"),
+            "the cursor step's note: {lines:#?}"
+        );
+    }
+
+    /// MOD-28 review H1: a digit in the flow answers the request the flow draws, as in the list.
+    #[tokio::test]
+    async fn the_flow_view_draws_the_pending_request_a_digit_answers() {
+        let shell = Shell::new();
+        let (mut pane, pending) = asking(&shell).await;
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        let lines = lines(&pane, &shell);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("asks: execute: cargo test")),
+            "the request's summary: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("Allow once")),
+            "its strip: {lines:#?}"
+        );
+
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('2')), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        let sent = requests(shell.emit.take());
+        assert!(
+            matches!(sent.as_slice(), [StoreRequest::AnswerPermission { permission, option_id }]
+                if *permission == pending.id && option_id == "reject"),
+            "{sent:?}"
+        );
+    }
+
+    /// MOD-28 review L4: with no request pending, the flow keeps neither `Tab` nor a digit, so
+    /// both reach the global keymap.
+    #[tokio::test]
+    async fn tab_and_a_digit_pass_in_flow_with_no_pending_request() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        for code in [KeyCode::Tab, KeyCode::BackTab, KeyCode::Char('3')] {
+            assert_eq!(
+                pane.on_key(key(code), &mut shell.ctx()),
+                Handled::Pass,
+                "{code:?}"
+            );
+        }
+        assert!(shell.emit.is_empty());
+    }
+
     #[tokio::test]
     async fn the_flow_view_survives_an_item_change() {
         let shell = Shell::new();
