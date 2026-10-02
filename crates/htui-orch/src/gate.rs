@@ -16,7 +16,7 @@ use htui_core::model::{
     RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus, UserId, VerifyOutcome,
 };
 use htui_core::prompt::digest::{canonical, sha256_hex};
-use htui_core::store::{StepFence, StoreError};
+use htui_core::store::{ParkOutcome, StepFence, StoreError};
 
 use crate::command::{EngineError, Rest, stale_run, stale_step};
 use crate::isolate::Clock;
@@ -364,14 +364,13 @@ pub enum Landing {
 ///
 /// Three rows of the table and their writes:
 ///
-/// - **park** — `transition_step(Running -> AwaitingApproval)`, `transition_run(Running ->
-///   AwaitingApproval)`, `transition(item, InProgress -> AwaitingApproval)`, in that order. Not one
-///   transaction (blueprint F-K, H-10): the order is chosen so the forbidden interleaving — a run
-///   waiting with no waiting step — cannot occur, and the composite writer is carried as R-5.
-/// - **done + skipped** — `transition_step(Running -> Done)`. `gate_outcome = 'skipped'` is *not*
-///   written: `answer_gate` is `awaiting_approval`-only
-///   (`crates/htui-core/src/store/traits.rs:794-799`) and no writer sets the column on a `running`
-///   step. That is blueprint **H-9**, carried with R-5; no milestone-2 criterion asserts `skipped`.
+/// - **park** — `park_step`, under the walk's fence: the step and the run `running ->
+///   awaiting_approval` and the item `in_progress -> awaiting_approval`, one transaction (MOD-37
+///   R-5, which closes blueprint F-K and H-10). A refused park writes nothing. A park written
+///   before R-5 could stop between its three moves, which is what recovery's D96 branch repairs.
+/// - **done + skipped** — `pass_step`, under the walk's fence: `running -> done` with
+///   `gate_outcome = 'skipped'` and the settle's note as `gate_note` (MOD-37 R-5, which closes
+///   blueprint H-9).
 /// - **fail run** — `transition_step(Running -> Failed)` then `finish_run(run, Failed, …)`, which
 ///   mirrors the item in the same transaction (plan D7).
 ///
@@ -393,16 +392,27 @@ pub async fn apply<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
         // without first being told which one it is, so the two arms below split on the outcome.
         (Gate::Always, outcome) => {
             note_step(ctx, step, gate_note(&outcome).as_deref(), now).await?;
-            park(ctx, step, phase, now).await
+            park(ctx, step, phase).await
         }
         (Gate::OnFailure | Gate::Never, Settle::Ok { note }) => {
             note_step(ctx, step, note.as_deref(), now).await?;
-            move_step(ctx, step.id, StepStatus::Running, StepStatus::Done, now).await?;
+            if !ctx
+                .store
+                .pass_step(ctx.fence, step.id, note.as_deref(), now)
+                .await?
+            {
+                return Err(stale_step(
+                    ctx.run.id,
+                    step.id,
+                    StepStatus::Running,
+                    StepStatus::Done,
+                ));
+            }
             Ok(Landing::Advance)
         }
         (Gate::OnFailure, outcome @ (Settle::Failed(_) | Settle::Rejected { .. })) => {
             note_step(ctx, step, gate_note(&outcome).as_deref(), now).await?;
-            park(ctx, step, phase, now).await
+            park(ctx, step, phase).await
         }
         (Gate::Never, Settle::Failed(failure)) => {
             note_step(ctx, step, Some(&failure.to_string()), now).await?;
@@ -449,16 +459,13 @@ fn gate_note(settle: &Settle) -> Option<String> {
     }
 }
 
-/// Records why a step settled the way it did, on the **item** rather than on the step.
+/// Records why a step settled the way it did, on the **item**: the row a human is already
+/// reading, so a parked step never lacks a readable reason (ANA-2 invariant 7,
+/// `docs/ANA-2.md:132-135`).
 ///
-/// **Blueprint H-9, widened.** The blueprint puts these sentences on `run_step.gate_note`, and
-/// there is no writer that can: `answer_gate` is a compare-and-set on `awaiting_approval`
-/// (`crates/htui-core/src/store/traits.rs:794-799`) and `select_fanout` is fan-out's, so nothing
-/// writes `gate_note` on a `running` step and nothing writes it at all without also *answering*
-/// the gate the walk is about to park at. Dropping the sentence would leave a parked step with no
-/// readable reason, which ANA-2 invariant 7 forbids (`docs/ANA-2.md:132-135`), so it goes to
-/// `add_note` — a shipped writer, on the row a human is already reading. The `gate_note` column
-/// stays NULL until a human answers, and the composite park writer is carried with **R-5**.
+/// **Blueprint H-9.** A pass also writes the note to `run_step.gate_note` through `pass_step`
+/// (MOD-37 R-5); the item note stays. A park leaves `gate_note` NULL until a human answers:
+/// `park_step` writes no note, and `answer_gate` is the gate's answer, not its question.
 ///
 /// A settle with nothing to say writes nothing: the happy path adds no rows.
 async fn note_step<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
@@ -487,24 +494,33 @@ async fn note_step<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     Ok(())
 }
 
-/// The three compare-and-sets of a gate park, in step → run → item order (blueprint H-10).
+/// A gate park: the step, the run and the item in one transaction under the walk's fence (MOD-37
+/// R-5, closing blueprint H-10). A step or run another writer moved first is
+/// [`EngineError::StaleWrite`], and nothing is written. The store's future is boxed so the
+/// Postgres transaction stays out of [`apply`]'s frame.
 async fn park<S: htui_core::store::WorkerStore, C: Clock + ?Sized>(
     ctx: &GateContext<'_, S, C>,
     step: &RunStep,
     phase: &SnapshotPhase,
-    now: DateTime<Utc>,
 ) -> Result<Landing, EngineError> {
-    move_step(
-        ctx,
-        step.id,
-        StepStatus::Running,
-        StepStatus::AwaitingApproval,
-        now,
-    )
-    .await?;
-    move_run(ctx, RunStatus::Running, RunStatus::AwaitingApproval, now).await?;
-    ctx.move_item(Status::InProgress, Status::AwaitingApproval)
-        .await?;
+    match Box::pin(ctx.store.park_step(ctx.fence, step.id)).await? {
+        ParkOutcome::Parked => {}
+        ParkOutcome::StepMoved => {
+            return Err(stale_step(
+                ctx.run.id,
+                step.id,
+                StepStatus::Running,
+                StepStatus::AwaitingApproval,
+            ));
+        }
+        ParkOutcome::RunMoved => {
+            return Err(stale_run(
+                ctx.run.id,
+                RunStatus::Running,
+                RunStatus::AwaitingApproval,
+            ));
+        }
+    }
     Ok(Landing::Rest(Rest {
         run: RunStatus::AwaitingApproval,
         position: Some(phase.position),
@@ -1944,8 +1960,9 @@ mod tests {
         assert_eq!(row.status, RunStatus::Done, "no `finish_run` was written");
         assert_eq!(row.failure, None);
 
-        // A park whose step move lands but whose run move does not: `RUN_3` is `done`, not
-        // `running`, so the run's compare-and-set is the one refused.
+        // A park of a running step whose run another writer moved: `RUN_3` is `done`, not
+        // `running`, so the park is refused on the run, and being one transaction (R-5) it
+        // writes nothing, the step included.
         let live = step(&store, 4, 0, &[StepStatus::Running]).await;
         let refused = super::apply(
             &ctx,
@@ -1956,6 +1973,11 @@ mod tests {
         .await
         .expect_err("the run is not `running`");
         stale(&refused, "the run", "running", "awaiting_approval");
+        assert_eq!(
+            status_of(&store, live.id).await,
+            StepStatus::Running,
+            "a refused park writes nothing"
+        );
     }
 
     /// Plan D144 (review L-c): the automatic rejection's `answer_gate` is a compare-and-set on

@@ -1437,11 +1437,11 @@ async fn live_run_ignores_a_gate_edit<H: CaseHarness>(harness: &H) {
             .map(|step| (step.phase_name.as_str(), step.status, step.gate_outcome))
             .collect::<Vec<_>>(),
         [
-            ("research", StepStatus::Done, None),
-            ("verdict", StepStatus::Done, None),
+            ("research", StepStatus::Done, Some(GateOutcome::Skipped)),
+            ("verdict", StepStatus::Done, Some(GateOutcome::Skipped)),
         ],
-        "`never` passes a step `running -> done` and leaves `gate_outcome` NULL: `answer_gate` is \
-         the only writer of it and it is `awaiting_approval`-only (blueprint H-9)"
+        "`never` passes a step `running -> done` with `gate_outcome = 'skipped'` (MOD-37 R-5, \
+         ANA-2 §4.2)"
     );
     assert_eq!(item_of(&orch, ids::HTUI_ANA_2).await.status, Status::Done);
 }
@@ -2190,8 +2190,8 @@ async fn a_never_gate_rejection_loops_the_review<H: CaseHarness>(harness: &H) {
     );
     assert_eq!(
         at(&steps, 3, 2).gate_outcome,
-        None,
-        "`never` passes a step `running -> done` and leaves `gate_outcome` NULL (blueprint H-9)"
+        Some(GateOutcome::Skipped),
+        "`never` passes a step `running -> done` with `gate_outcome = 'skipped'` (MOD-37 R-5)"
     );
     assert_eq!(item_of(&orch, ids::HTUI_FEAT_3).await.status, Status::Done);
 }
@@ -2316,9 +2316,8 @@ async fn on_failure_passes_ok_and_parks_failed<H: CaseHarness>(harness: &H) {
     );
     assert_eq!(
         at(&steps, 0, 1).gate_outcome,
-        None,
-        "`gate_outcome = 'skipped'` is not written: `answer_gate` is the only writer of the column \
-         and it is `awaiting_approval`-only (blueprint H-9)"
+        Some(GateOutcome::Skipped),
+        "`on_failure` passes an ok settle with `gate_outcome = 'skipped'` (MOD-37 R-5)"
     );
 
     // Half 2: the same gate, the same phase, a settle that failed — and now it stops.
@@ -4979,8 +4978,8 @@ async fn an_interrupted_judge_parks_for_selection<H: CaseHarness>(harness: &H) {
     );
 }
 
-/// Plan D96: a crash inside `gate::park`'s three writes leaves a waiting step under a `running`
-/// run. The sweep completes the park — run, then item — and moves no step.
+/// Plan D96: a park written before R-5's one-transaction writer could leave a waiting step under
+/// a `running` run. The sweep completes the park — run, then item — and moves no step.
 async fn a_half_written_park_is_completed<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     primary_repo(&orch).await;
