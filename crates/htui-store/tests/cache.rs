@@ -573,7 +573,8 @@ async fn the_0003_columns_reach_the_mirror() {
         .expect("declare an overlap set");
     sqlx::query(
         "UPDATE run_step SET verify_outcome = 'fail', verify_exit_code = 7, promoted_at = $2, \
-                             exit_code = 3, selected = true, usage = '{\"in\":1}'::jsonb \
+                             exit_code = 3, selected = true, usage = '{\"in\":1}'::jsonb, \
+                             gate_note = 'parked: no tests' \
           WHERE id = $1",
     )
     .bind(ids::STEP_IMPL.as_uuid())
@@ -628,6 +629,7 @@ async fn the_0003_columns_reach_the_mirror() {
             step.selected,
             step.usage.clone(),
             step.agent_name.as_deref(),
+            step.gate_note.as_deref(),
         ),
         (
             Some(htui_core::model::VerifyOutcome::Fail),
@@ -636,6 +638,7 @@ async fn the_0003_columns_reach_the_mirror() {
             Some(true),
             Some(serde_json::json!({ "in": 1 })),
             Some("claude"),
+            Some("parked: no tests"),
         ),
         "the six RunStepSummary fields ANA-2 added come off the mirror, `agent_name` through the \
          `LEFT JOIN agent` that stands in for `MemStore`'s agent map"

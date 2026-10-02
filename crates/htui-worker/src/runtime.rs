@@ -461,7 +461,26 @@ impl<P: ReplySink> Shared<P> {
         run: RunId,
         walk: &WalkToken,
     ) -> Option<OwnedMutexGuard<()>> {
+        self.lock_announcing(run, walk, || {}).await
+    }
+
+    /// [`Self::lock_unless_cancelled`], calling `waiting` once when the lock is held and the task
+    /// has to queue (R-51). A cancelled task is refused first, as ever; a free lock is taken
+    /// without announcing anything.
+    async fn lock_announcing(
+        &self,
+        run: RunId,
+        walk: &WalkToken,
+        waiting: impl FnOnce(),
+    ) -> Option<OwnedMutexGuard<()>> {
         let mut signal = walk.signal.clone();
+        if walk.token.is_cancelled() || signal.borrow().is_cancel() {
+            return None;
+        }
+        if let Some(guard) = self.locks.try_lock(run) {
+            return Some(guard);
+        }
+        waiting();
         tokio::select! {
             biased;
             () = walk.token.cancelled() => None,
@@ -2319,7 +2338,11 @@ async fn on_run_unless_claimed<H: htui_core::store::WorkerHost, P: ReplySink>(
             .await;
     }
     let walk = ctx.shared.walks.child(run);
-    let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
+    let Some(guard) = ctx
+        .shared
+        .lock_announcing(run, &walk, || ctx.publish(Some(run), FrameKind::Waiting))
+        .await
+    else {
         ctx.refuse(PREEMPTED.to_owned());
         return None;
     };
@@ -2533,7 +2556,11 @@ async fn cancel_run<H: htui_core::store::WorkerHost, P: ReplySink>(
         return ctx.requested(already);
     }
     let walk = ctx.shared.walks.child(run);
-    let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
+    let Some(guard) = ctx
+        .shared
+        .lock_announcing(run, &walk, || ctx.publish(Some(run), FrameKind::Waiting))
+        .await
+    else {
         return refuse(&ctx, PREEMPTED.to_owned());
     };
     let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {
@@ -2657,7 +2684,11 @@ async fn unblock<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, 
     };
     let _ = ctx.tag.run.set(run);
     let walk = ctx.shared.walks.child(run);
-    let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
+    let Some(guard) = ctx
+        .shared
+        .lock_announcing(run, &walk, || ctx.publish(Some(run), FrameKind::Waiting))
+        .await
+    else {
         return ctx.refuse(PREEMPTED.to_owned());
     };
     if engine.unblock_case(item).await.ok() != Some(case) {
@@ -2679,7 +2710,11 @@ async fn unblock<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, 
 async fn cleanup<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, P>, run: RunId) {
     ctx.tag(run).await;
     let walk = ctx.shared.walks.child(run);
-    let Some(guard) = ctx.shared.lock_unless_cancelled(run, &walk).await else {
+    let Some(guard) = ctx
+        .shared
+        .lock_announcing(run, &walk, || ctx.publish(Some(run), FrameKind::Waiting))
+        .await
+    else {
         return ctx.refuse(PREEMPTED.to_owned());
     };
     let kit = match Kit::read(&ctx.shared, &ctx.host, false).await {

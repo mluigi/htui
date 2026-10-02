@@ -138,10 +138,15 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   no other item owns them. Each is small, known and recorded; none blocks a manual run today. Pick
   them off singly or in batches. Sources are under `.claude/plans/mod-4-orch-*`, and the context is
   in the MOD-4 write-up's "Carried" section (`docs/decisions/mod/mod-4.md`).
-  - **R-3**: a parked run's `run.failure` stays NULL. The reason lives only in the step's
-    `gate_note` and the `item_note`, and the Runs pane shows `awaiting_approval` without it, because
-    adding `gate_note` to `RunStepSummary` touches three builders and the mirror (engine blueprint
-    F-I; drive plan, "What this milestone touches").
+  PRD `.claude/prds/mod-37-orchestrator-hardening.prd.md`, five milestones.
+  **Phase 1 landed (`19ca229`..`151c87e`, 2026-10-02):** run state and visibility. R-3, R-40,
+  R-41, R-51 and T7 are closed. R-44 and R-53 are re-deferred with reasons. Plan and blueprint are
+  `.claude/plans/mod-37-run-state.plan.md` and `.claude/plans/mod-37-run-state.blueprint.md`. The review left one LOW unfixed: the Chat
+  tab's `followed` stays set after a failed bind until the next `Promoted` overwrites it, which is
+  harmless.
+  - ~~**R-3**~~: closed by MOD-37 phase 1. `RunStepSummary` carries `gate_note` from all three
+    builders (Mem, Pg, cache mirror), and the Runs pane shows a parked step's reason on a third
+    line. `run.failure` stays NULL on a park, as before.
   - **R-5**: the gate park is three compare-and-sets (step, run, item), not one transaction on
     Postgres; milestone 5's D96 closed its crash half. Nothing writes `gate_outcome = skipped`, so a
     `never`/`on_failure` pass leaves the gate NULL and the step list renders `—` (engine blueprint
@@ -168,14 +173,14 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   - ~~**R-38**~~: closed by MOD-42 (`docs/decisions/mod/mod-42.md`): a `cancel` or `promote`
     preempt signals the walk, which answers parked requests `cancelled` and cancels the session
     with grace before the walk is dropped.
-  - **R-40**: `RunStream` frames are sent at session end and at rest only, so a step's
-    `pending → running` is not signalled to the Runs pane. The next frame, or re-selecting the item,
-    shows it. The fix is a step-start hook (drive plan, Risks).
-  - **R-41**: an `Orch` reply can arrive hours after its request, and a newer `Orch` request from
-    the same origin makes it stale, so it is dropped (`App::is_fresh`). The walk's result still
-    reaches the pane as a `RunStream` frame and through the rows (drive plan, Risks).
-  - **R-44**: step rows at 43 columns truncate `agent/model` for long model ids. `…` marks the cut
-    and the width test keeps it from clipping silently (drive plan, Risks).
+  - ~~**R-40**~~: closed by MOD-37 phase 1. `SessionSink::started` runs after each
+    `pending → running` move, and `ProgressSink` publishes `FrameKind::Changed` for it.
+  - ~~**R-41**~~: closed by MOD-37 phase 1. A `RunStream` `Error` frame puts its sentence on the
+    status line even when the `Orch` reply that carried the failure was dropped as stale.
+  - **R-44** (re-deferred by MOD-37 phase 1): step rows at 43 columns truncate `agent/model` for
+    long model ids. `…` marks the cut and the width test keeps it from clipping silently (drive
+    plan, Risks). Any real fix is a layout decision (drop the indent, abbreviate the model, or add
+    a line), so it waits for the Runs pane's next layout change.
   - **R-46**: a walk task keeps the `Backend` clone it started with. After an `Online → Offline`
     swap its `PgStore` handle keeps failing until the heartbeat fences, and the sweep after reconnect
     adopts the run (drive plan, Risks).
@@ -194,23 +199,24 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
     guard. The guard was released at `capture` or by `abandoned`, so another run may `prepare` the
     same checkout meanwhile. The fix is to take the guard again in `attach_promoted` (drive
     blueprint §18).
-  - **R-51**: a command on a run with a live walk waits for the whole walk (D157), and the pane shows
-    nothing while it waits. The fix is a "waiting" frame (drive blueprint §18).
-  - **R-53**: `ItemActions` is as of the last `Runs` reply, so a verdict can flip before the key is
-    pressed. The engine re-checks with the same admission function (D184) and the pane re-reads
-    (D171) (drive blueprint §18).
+  - ~~**R-51**~~: closed by MOD-37 phase 1. A command that queues behind a live walk publishes
+    `FrameKind::Waiting`, and the pane shows "waiting for the walk" until the walk rests, fails or is
+    adopted. The walk keeps its D157 lock.
+  - **R-53** (re-deferred by MOD-37 phase 1; mitigated, no code change): `ItemActions` is as of the
+    last `Runs` reply, so a verdict can flip before the key is pressed. The engine re-checks with
+    the same admission function (D184) and the pane re-reads (D171) (drive blueprint §18). The
+    pane re-requests the actions with every `Runs` read, so what is left is the interval between
+    that reply and the key press, which D184 already guards.
   - **R-55**: the TUI reads `box.settings.command_limits` once per process, per server, so an edit
     does not reach its verifier until a restart or a server switch. `htui worker` re-reads them at a
     sweep with no live walk after a repo or checkout change, and a change to the limits alone at
     restart (`docs/htui-worker.md`). Nothing edits it today;
     whoever adds an editor re-reads the limits or rebuilds the verifier when no walk is live (drive
     blueprint §21.3).
-  - **T7's residual window**: a promoted chat first streams at the promotion's `Orch` address and
-    moves to its own once the Chat tab's `ChatFollow` is served. Between the chat's `ChatAccepted`
-    and that `ChatFollow`, a second `Orch` request from the Chat tab supersedes the address, so the
-    frames sent in between are dropped from the view as stale while the store keeps recording them.
-    A promotion refused at the bind is already handed the stream (blueprint D185); the interval
-    before the follow is served is not covered (T7 repair `9f7cc5c`, `agent_worker.rs` `Stream`).
+  - ~~**T7's residual window**~~: closed by MOD-37 phase 1. The Chat tab sends `ChatFollow` as soon
+    as the `Promoted` reply arrives, and the worker keeps a follow served before the bind for that
+    bind, so the chat's frames carry the follow's address from the first one. Moving the stream
+    inside the worker was ruled out: only `App::dispatch` mints a fresh seq.
   - **Deadline (from ANA-27, `docs/ANA-27.md` §5.1 T4)**: `deadline_seconds` limits the verify
     command (which gets what is left of the step deadline) and is checked when a step settles
     (`crates/htui-orch/src/gate.rs` `deadline_elapsed`), but nothing times the agent session:

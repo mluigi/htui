@@ -157,8 +157,10 @@ pub enum FrameKind {
     /// A walk rested.
     Rested(Rest),
     /// A command changed the item's rows with no walk to rest: a reopen, a close-out, a cleanup
-    /// (D200).
+    /// (D200), or a step went live (R-40).
     Changed,
+    /// A command is queued behind a live walk of the run (R-51). Nothing changed in the rows.
+    Waiting,
     /// A sweep adopted the run; its walk resumes on a task of its own.
     Adopted,
     /// A command or walk failed, with the sentence.
@@ -522,6 +524,14 @@ pub struct ProgressSink<S> {
 }
 
 impl<S: htui_core::store::WorkerStore> SessionSink for ProgressSink<S> {
+    fn started(&self, item: ItemId, run: RunId, _step: StepId) {
+        self.publisher.publish(&RunFrame {
+            item,
+            run: Some(run),
+            kind: FrameKind::Changed,
+        });
+    }
+
     async fn after_done(
         &self,
         item: ItemId,

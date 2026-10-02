@@ -164,6 +164,10 @@ pub struct ChatTab {
     session: Option<ChatSessionState>,
     /// A start that has been asked for and not yet answered.
     pending_start: bool,
+    /// The promoted step whose `ChatFollow` this tab has already sent, when its `Promoted` reply
+    /// asked for it (T7). The first acceptance of that step then sends none: a second follow
+    /// would supersede the first in the shell's staleness index and reopen the window.
+    followed: Option<StepId>,
     transcript: Transcript,
     composer: Composer,
     /// `Esc` once arms the cancel; `Esc` again ends the session. Any other key disarms it, so an
@@ -200,6 +204,7 @@ impl ChatTab {
             agent_index: 0,
             session: None,
             pending_start: false,
+            followed: None,
             transcript: Transcript::new(),
             composer: Composer::default(),
             cancel_armed: false,
@@ -563,9 +568,14 @@ impl Tab for ChatTab {
                 // one, and the next `Orch` request from this tab (a refused second promotion)
                 // would make every frame after it stale. Its frames follow this tab to a chat
                 // request's address instead, which nothing else it sends supersedes.
-                if self.promoted.is_some() {
+                //
+                // The follow went out when the promotion answered (T7), so that no frame can
+                // arrive between the two; only an acceptance sent again by a refused promotion
+                // (D185) follows here.
+                if self.promoted.is_some() && self.followed != Some(*step_id) {
                     ctx.request(StoreRequest::ChatFollow { step_id: *step_id });
                 }
+                self.followed = None;
                 // A chat the tab started itself, after a promoted one has ended, is not the
                 // promoted step's: its header goes back to naming the agent picker.
                 if self
@@ -643,6 +653,11 @@ impl Tab for ChatTab {
                 self.refusal = None;
                 self.cancel_armed = false;
                 self.replay = None;
+                // The chat's frames are addressed at this reply's request, an `Orch` one that any
+                // later `Orch` request supersedes, and they can start before the acceptance is
+                // read: follow now, not then (T7).
+                ctx.request(StoreRequest::ChatFollow { step_id: *step });
+                self.followed = Some(*step);
             }
             StoreReply::Failed { request, message }
                 if request.starts_with("chat_") || *request == PROMOTE_STEP =>
@@ -1110,6 +1125,53 @@ mod tests {
         assert!(
             tab.promoted().is_none(),
             "a chat on another step is the tab's own, and its header names the agent again"
+        );
+    }
+
+    /// T7: the follow is asked for when the promotion answers, so no chat frame can arrive between
+    /// the acceptance and the follow; the first acceptance of that step adds none, and one sent
+    /// again by a refused promotion (D185) follows as before.
+    #[test]
+    fn a_promoted_reply_asks_for_the_follow_at_once() {
+        let shell = Shell::new();
+        let mut tab = ChatTab::new();
+        let step = StepId::new();
+        tab.on_reply(
+            &StoreReply::Orch(OrchReply::Promoted {
+                step,
+                run: htui_core::model::RunId::new(),
+                phase: "research".to_owned(),
+                agent: "scripted".to_owned(),
+                model: None,
+                via: Via::Resumed,
+            }),
+            &mut shell.ctx(),
+        );
+        assert!(
+            matches!(
+                shell.emit.take().as_slice(),
+                [Action::Store(StoreRequest::ChatFollow { step_id })] if *step_id == step
+            ),
+            "the promotion's answer asks for the follow",
+        );
+        let accepted = StoreReply::ChatAccepted {
+            step_id: step,
+            session_ref: None,
+            caps: live(&shell).session().expect("a session").caps,
+        };
+        drop(shell.emit.take());
+        tab.on_reply(&accepted, &mut shell.ctx());
+        assert!(
+            shell.emit.is_empty(),
+            "the first acceptance adds no second follow"
+        );
+        tab.on_reply(&accepted, &mut shell.ctx());
+        assert!(
+            matches!(
+                shell.emit.take().as_slice(),
+                [Action::Store(StoreRequest::ChatFollow { step_id })] if *step_id == step
+            ),
+            "an acceptance sent again follows",
         );
     }
 

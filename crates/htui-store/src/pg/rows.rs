@@ -137,6 +137,8 @@ pub(crate) struct StepRow {
     /// `agent.name` of `agent_id`, joined: `MemStore` denormalises it out of its agent map, so the
     /// statement `LEFT JOIN`s `agent` to answer the same thing (MOD-4 milestone 1).
     pub(crate) agent_name: Option<String>,
+    /// `run_step.gate_note`, appended last (positional).
+    pub(crate) gate_note: Option<String>,
 }
 
 impl StepRow {
@@ -162,6 +164,7 @@ impl StepRow {
             verify_outcome: self.verify_outcome,
             promoted_at: self.promoted_at,
             agent_name: self.agent_name,
+            gate_note: self.gate_note,
         }
     }
 }

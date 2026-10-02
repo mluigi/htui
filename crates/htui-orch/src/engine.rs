@@ -191,6 +191,12 @@ impl AgentSelector for FirstCandidate {
     reason = "no `dyn SessionSink` is formed: the engine is generic over `K` (`store/traits.rs:62`)"
 )]
 pub trait SessionSink: Sync {
+    /// A step went live: its `pending -> running` move just succeeded (R-40).
+    ///
+    /// Sync, defaulted and infallible: a sink that only wants `after_done` needs no edit, and a
+    /// signal cannot refuse a walk. It is called before the step's session starts.
+    fn started(&self, _item: ItemId, _run: RunId, _step: StepId) {}
+
     /// Whatever has to happen between the session ending and the settle reading its artefact.
     ///
     /// `key` is the session's [`SessionKey`] (plan D68): three candidates share `(phase, attempt)`
@@ -3347,6 +3353,7 @@ where
             now,
         )
         .await?;
+        self.step_started(run, step.id);
 
         // `transition_step` stamps `started_at = COALESCE(started_at, at)`, so this instant *is*
         // the step's start. Read from the row the walk holds, it would still be `NULL` — the row
@@ -3944,6 +3951,7 @@ where
             started_at,
         )
         .await?;
+        self.step_started(stage.run, stage.step.id);
         let mut trees = None;
         let mut captured = false;
         match self.candidate_live(&stage, &mut trees, &mut captured).await {
@@ -4483,6 +4491,7 @@ where
             now,
         )
         .await?;
+        self.step_started(run, judge.id);
         let prompts = match prompts {
             Ok(prompts) => prompts,
             Err(failure) => {
@@ -5972,6 +5981,13 @@ where
     /// walk's many call sites.
     fn snapshot_of(run: &Run) -> Result<GraphSnapshot, EngineError> {
         crate::command::snapshot_of(run)
+    }
+
+    /// Tell the sink a step just went live (R-40). A chat run has no item and is never walked.
+    fn step_started(&self, run: &Run, step: StepId) {
+        if let Ok(item) = Self::item_of(run) {
+            self.parts.sink.started(item, run.id, step);
+        }
     }
 
     /// A graph run always has an item; a chat run (`item_id IS NULL`) is MOD-2's and never reaches
@@ -9762,6 +9778,87 @@ mod tests {
         let row = harness.orch.run(*run).await;
         assert_eq!(row.status, RunStatus::Running, "not this walk's run to end");
         assert_eq!(row.failure, None);
+    }
+
+    /// R-40: the sink hears `started` after the `pending -> running` move and before the session's
+    /// `after_done`, once per step that goes live.
+    #[tokio::test]
+    async fn a_sink_hears_started_before_after_done_for_each_step_that_goes_live() {
+        /// The harness's own sink, with a log of what it was told and in which order.
+        struct Recording<'o>(&'o FakeOrchestrator, std::sync::Mutex<Vec<&'static str>>);
+        impl super::SessionSink for Recording<'_> {
+            fn started(
+                &self,
+                _item: htui_core::model::ItemId,
+                _run: htui_core::model::RunId,
+                _step: StepId,
+            ) {
+                self.1.lock().expect("the log").push("started");
+            }
+
+            async fn after_done(
+                &self,
+                item: htui_core::model::ItemId,
+                step: &htui_core::model::RunStep,
+                phase: &SnapshotPhase,
+                key: &SessionKey<'_>,
+                done: &htui_agent::event::DoneEvent,
+            ) -> Result<(), htui_core::store::StoreError> {
+                self.1.lock().expect("the log").push("after_done");
+                super::SessionSink::after_done(self.0, item, step, phase, key, done).await
+            }
+        }
+
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                phase.gate = Gate::Never;
+            })
+            .await;
+        let graphs = harness.orch.graphs();
+        let driver =
+            |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| harness.orch.driver_for_key(key);
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let parts = super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
+            .await
+            .expect("the harness has a box");
+        let recording = Recording(&harness.orch, std::sync::Mutex::new(Vec::new()));
+        let engine = super::Engine::new(super::EngineParts {
+            store: parts.store,
+            graphs: parts.graphs,
+            isolator: parts.isolator,
+            verifier: parts.verifier,
+            clock: parts.clock,
+            selector: parts.selector,
+            sink: &recording,
+            driver: parts.driver,
+            policy: &super::ask_policy,
+            control: &super::never_cancelled,
+            scrubber: parts.scrubber,
+            app: parts.app,
+            box_profile: parts.box_profile,
+            box_id: parts.box_id,
+            owner: parts.owner,
+            dead_walks: parts.dead_walks,
+            user: parts.user,
+            tails: super::Tails::Walk,
+        });
+
+        engine
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk rests");
+        // The walk runs every step of the graph; each one is a `started` then its `after_done`.
+        let log = recording.1.lock().expect("the log").clone();
+        assert!(!log.is_empty(), "the walk ran a step");
+        for pair in log.chunks(2) {
+            assert_eq!(pair, ["started", "after_done"], "in {log:?}");
+        }
     }
 
     /// Blueprint A-4: one adopted run whose recovery fails is [`super::Next::Error`] with the
