@@ -1,10 +1,13 @@
-//! MOD-13 milestone 2 T5: the Backlog's item writes land on **Postgres**.
+//! MOD-13 milestones 2 and 3: the Backlog's item writes land on **Postgres**.
 //!
 //! `item_writes`' own tests prove the worker over a `MemStore`, and `tests/backlog.rs` proves the
 //! tab. What only this file can prove is that `PgStore` answers the same requests the same way: a
 //! mint continues the kind's counter as this user, an edit at the head writes the next version,
 //! an edit at an older one answers `ItemDiverged` and writes nothing, a spec refusal writes
-//! nothing, and the form's catalogue read matches the memory store's (plan D3-D6, D10).
+//! nothing, and the form's catalogue read matches the memory store's (milestone 2 plan D3-D6,
+//! D10). Milestone 3 adds the divergence's catalogue (D7, `context` with `item = Some(head)`)
+//! and the edit's reason: a resolution saved at the head writes its revision with
+//! `divergence_resolution` (D6), read back as the ancestor of a later stale edit.
 //!
 //! No harness: `store_worker::serve` over `Backend::Online { pg, cache }` is what the worker task
 //! runs. The case prints `testkit::SKIP` and returns with `HTUI_TEST_DATABASE_URL` unset, and
@@ -114,6 +117,19 @@ fn retitle(title: &str, expected: i32) -> StoreRequest {
     }
 }
 
+/// [`retitle`] as the rebased form saves it: a divergence resolution (milestone 3 D6).
+fn resolution(title: &str, expected: i32) -> StoreRequest {
+    StoreRequest::EditItem {
+        id: ids::HTUI_ANA_2,
+        expected_version: expected,
+        changes: SpecChanges {
+            title: Some(title.to_owned()),
+            ..SpecChanges::default()
+        },
+        reason: EditReason::DivergenceResolution,
+    }
+}
+
 /// The write an item request answered with; panics on anything else.
 fn written(reply: StoreReply) -> (ItemId, ItemWrite) {
     match reply {
@@ -178,6 +194,47 @@ async fn mint_edit_and_a_stale_edit_on_postgres() {
         ("Mine", 2),
         "the stale edit wrote nothing"
     );
+    // Milestone 3 D7: the divergence carries the catalogue the rebased form opens on.
+    assert_eq!(divergence.context.project, ids::PROJECT_HTUI);
+    assert_eq!(
+        divergence.context.item.as_ref(),
+        Some(&divergence.head),
+        "the catalogue's item is the head"
+    );
+    assert!(
+        !divergence.context.kinds.is_empty() && !divergence.context.graphs.is_empty(),
+        "the catalogue is read: {:?}",
+        divergence.context
+    );
+
+    // Milestone 3 D6: the resolution, saved at the head, writes the next version ...
+    let (_, outcome) = written(store_worker::serve(backend, &resolution("Resolved", 2)).await);
+    assert_eq!(
+        outcome,
+        ItemWrite::Edited {
+            key: "ANA-2".to_owned(),
+            version: 3
+        }
+    );
+    let (_, outcome) = written(store_worker::serve(backend, &retitle("After", 3)).await);
+    assert_eq!(
+        outcome,
+        ItemWrite::Edited {
+            key: "ANA-2".to_owned(),
+            version: 4
+        }
+    );
+    // ... and its revision carries the reason. No request reads a revision, so a stale edit at
+    // version 3 diverges and brings that revision back as its ancestor.
+    let reply = store_worker::serve(backend, &retitle("Stale", 3)).await;
+    let StoreReply::ItemDiverged(divergence) = reply else {
+        panic!("an edit at version 3 diverges: {reply:?}");
+    };
+    assert_eq!(divergence.ancestor.version, 3);
+    assert_eq!(divergence.ancestor.reason, "divergence_resolution");
+    assert_eq!(divergence.ancestor.title, "Resolved");
+    let head = stack.head(ids::HTUI_ANA_2).await;
+    assert_eq!((head.title.as_str(), head.version), ("After", 4));
 
     stack.finish().await;
 }
