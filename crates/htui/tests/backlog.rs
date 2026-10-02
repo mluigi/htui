@@ -1850,6 +1850,22 @@ async fn their_write(store: &MemStore, patch: ItemPatch) {
     );
 }
 
+/// The state the divergence view gives `field`, read off that field's own row: the block title,
+/// the column headers and the hint line name `theirs` and `mine` whatever the rows say.
+fn divergence_state<'a>(frame: &'a str, field: &str) -> &'a str {
+    frame
+        .lines()
+        .find_map(|line| {
+            let mut words = line.trim_start_matches('\u{2502}').split_whitespace();
+            if words.next() == Some(field) {
+                words.next()
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| panic!("a {field:?} row in the view:\n{frame}"))
+}
+
 /// `e`, their write, ` mine` typed after the title and `Ctrl+S`: the stale save opens the view.
 async fn diverged_on(store: &MemStore, theirs: ItemPatch) -> Harness {
     let mut harness = backlog_over(store.clone()).await;
@@ -1868,9 +1884,18 @@ async fn a_stale_edit_opens_the_view_and_m_lands_mine_at_version_3() {
     let store = MemStore::demo();
     let mut harness = diverged_on(&store, retitled("Theirs")).await;
     let frame = harness.render();
-    for wanted in ["ANA-1  v1 \u{2192} theirs v2", "Theirs", "conflict", "mine"] {
+    for wanted in [
+        "ANA-1  v1 \u{2192} theirs v2",
+        "Theirs",
+        "sync topology mine",
+    ] {
         assert!(frame.contains(wanted), "{wanted:?} in the view:\n{frame}");
     }
+    assert_eq!(
+        divergence_state(&frame, "title"),
+        "conflict",
+        "both sides retitled:\n{frame}"
+    );
     assert_eq!(
         ana_1_head(&store).await,
         ("Theirs".to_owned(), 2),
@@ -1913,8 +1938,16 @@ async fn a_resolution_keeps_their_priority_and_my_title() {
     };
     let mut harness = diverged_on(&store, theirs).await;
     let frame = harness.render();
-    assert!(frame.contains("priority"), "a priority row:\n{frame}");
-    assert!(frame.contains("theirs"), "its state:\n{frame}");
+    assert_eq!(
+        divergence_state(&frame, "priority"),
+        "theirs",
+        "only they moved the priority:\n{frame}"
+    );
+    assert_eq!(
+        divergence_state(&frame, "title"),
+        "mine",
+        "only I moved the title:\n{frame}"
+    );
 
     keys(&mut harness, &["m", "ctrl-s"]).await;
     let head = store
