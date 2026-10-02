@@ -41,6 +41,7 @@ use crate::skill_import::ImportOutcome;
 use crate::skills::{READ_NAME, REQUEST_NAMES, SkillWrite, SkillsSnapshot, StaleWhat};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::TemplateBody;
+use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::detail::Scroll;
 use crate::ui::tabs::settings::wrapped;
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
@@ -53,11 +54,11 @@ const NOTICE_LINES: usize = 2;
 /// index rather than a literal, so the two cannot drift (`request_names_match_the_name_arms`).
 const IMPORT_NAME: &str = REQUEST_NAMES[5];
 
-/// The list's width, borders included: `  {name:<22} v{head:<3}` is 29 chars, a longer name cut
-/// to [`NAME_WIDTH`].
+/// The list's width, borders included: two spaces, the name fitted to [`NAME_WIDTH`] cells, ` v`
+/// and a head of up to three digits make 29 cells.
 const LIST_WIDTH: u16 = 32;
 
-/// A library row's name field, in chars: a longer name is cut to `NAME_WIDTH - 1` and `…`.
+/// A library row's name field, in cells: a name is fitted to it with `cells::fit`.
 const NAME_WIDTH: usize = 22;
 
 /// The rename form's label column: `description` and two spaces.
@@ -1446,18 +1447,12 @@ impl LibraryView {
                     .map(|row| row.version)
                     .max()
                     .unwrap_or(0);
-                let name = if entry.skill.name.chars().count() > NAME_WIDTH {
-                    let cut: String = entry.skill.name.chars().take(NAME_WIDTH - 1).collect();
-                    format!("{cut}\u{2026}")
-                } else {
-                    entry.skill.name.clone()
-                };
                 let style = if index == self.cursor {
                     theme.selected
                 } else {
                     theme.base
                 };
-                Line::styled(format!("  {name:<NAME_WIDTH$} v{head:<3}"), style)
+                Line::styled(browse_row(&entry.skill.name, head), style)
             })
             .collect();
         let offset = self
@@ -1497,7 +1492,8 @@ impl LibraryView {
     fn pane(&self, width: u16, ctx: &Ctx<'_>) -> (String, Vec<Line<'static>>) {
         let theme = ctx.theme;
         let prompt = |prompt: String, field: &TextField| {
-            let budget = width.saturating_sub(u16::try_from(prompt.chars().count()).unwrap_or(0));
+            let budget =
+                width.saturating_sub(u16::try_from(cell_width(&prompt)).unwrap_or(u16::MAX));
             let mut spans = vec![Span::styled(prompt, theme.base)];
             spans.extend(field.line(budget, true, theme).spans);
             (" new skill ".to_owned(), vec![Line::from(spans)])
@@ -1511,7 +1507,7 @@ impl LibraryView {
             Mode::ImportPath { field } => {
                 let label = "path: ";
                 let budget =
-                    width.saturating_sub(u16::try_from(label.chars().count()).unwrap_or(0));
+                    width.saturating_sub(u16::try_from(cell_width(label)).unwrap_or(u16::MAX));
                 let mut spans = vec![Span::styled(label, theme.base)];
                 spans.extend(field.line(budget, true, theme).spans);
                 return (
@@ -1710,6 +1706,11 @@ fn in_scope(snapshot: &SkillsSnapshot, ctx: &Ctx<'_>) -> bool {
         .eq(ctx.scope.project_ids.iter().copied())
 }
 
+/// One browse row: two spaces, the name fitted to [`NAME_WIDTH`] cells, then ` v` and the head.
+fn browse_row(name: &str, head: i32) -> String {
+    format!("  {} v{head:<3}", cells::fit(name, NAME_WIDTH))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1727,7 +1728,65 @@ mod tests {
     use crate::skills;
     use crate::store_worker::Origin;
     use crate::ui::Theme;
+    use crate::ui::cells::cell_width;
     use crate::ui::tabs::SkillsTab;
+
+    /// MOD-60 D1: the name is fitted in cells, so a wide name never pushes the version right.
+    #[test]
+    fn a_wide_skill_name_keeps_the_version_column() {
+        for name in [
+            "release-notes".to_owned(),
+            "a".repeat(40),
+            "\u{6f22}".repeat(3),
+            "\u{6f22}".repeat(20),
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}".repeat(12),
+        ] {
+            let row = browse_row(&name, 7);
+            let at = row.find(" v7").expect("the version is on the row");
+            assert_eq!(
+                cell_width(&row[..at]),
+                2 + NAME_WIDTH,
+                "{row:?} for {name:?}"
+            );
+        }
+    }
+
+    /// MOD-60: the description prompt carries the runtime skill name, so the field's budget is
+    /// the pane less the prompt in cells. A CJK name measured in chars leaves the field 5 cells
+    /// too many and the prompt line runs past the pane.
+    #[test]
+    fn a_wide_skill_name_keeps_the_description_prompt_within_the_pane() {
+        let (top_bar, keymap, theme, emit) = (
+            TopBarState::default(),
+            Keymap::default_global(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let scope = vulkan();
+        let ctx = Ctx::new(
+            &scope,
+            &[],
+            &top_bar,
+            &keymap,
+            &theme,
+            Origin::Tab(SkillsTab::ID),
+            &emit,
+        );
+        let view = LibraryView {
+            mode: Mode::Describing {
+                name: "\u{6f22}".repeat(5),
+                field: TextField::with_text(&"x".repeat(80)),
+            },
+            ..LibraryView::default()
+        };
+        let (_, lines) = view.pane(40, &ctx);
+        let drawn: usize = lines[0]
+            .spans
+            .iter()
+            .map(|span| cell_width(&span.content))
+            .sum();
+        assert_eq!(drawn, 40, "{lines:?}");
+    }
 
     /// The Harness's startup scope: the Graphics workspace and its one project.
     fn vulkan() -> Scope {

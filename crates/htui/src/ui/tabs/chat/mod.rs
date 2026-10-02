@@ -38,6 +38,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use crate::app::{Ctx, Handled};
 use crate::run_worker::{OrchReply, Via};
 use crate::store_worker::{ChatFrame, StoreReply, StoreRequest};
+use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::registry::{Tab, TabId};
 use composer::{Composer, ComposerOutcome};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -109,33 +110,6 @@ pub struct ReplayState {
     /// The reply carried `None`: this box has no rows for the step (D38). Distinct from a step
     /// that recorded nothing, which is a conversation that happened and said nothing.
     pub missing: bool,
-}
-
-/// How many columns `text` takes.
-fn columns(text: &str) -> usize {
-    Span::raw(text).width()
-}
-
-/// `text` cut to `room` columns, its last one an ellipsis when anything was cut.
-fn clip(text: &str, room: usize) -> String {
-    if columns(text) <= room {
-        return text.to_owned();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let width = columns(ch.encode_utf8(&mut [0; 4]));
-        // One column stays free for the ellipsis.
-        if used + width + 1 > room {
-            break;
-        }
-        out.push(ch);
-        used += width;
-    }
-    if room > 0 {
-        out.push('\u{2026}');
-    }
-    out
 }
 
 /// The one line a replay shows instead of a transcript, or `None` when it has rows to show.
@@ -360,12 +334,18 @@ impl ChatTab {
             let lead = format!("promoted · {}", promoted.phase);
             let middle = format!(" · {via} · {} · {model}", promoted.agent);
             let mut tail = format!(" · session {session}");
-            if columns(&lead) + columns(&middle) + columns(&tail) > width {
+            if cell_width(&lead) + cell_width(&middle) + cell_width(&tail) > width {
                 tail = format!(" · {session}");
             }
-            let room = width.saturating_sub(columns(&tail));
-            let lead = clip(&lead, room);
-            let middle = clip(&middle, room.saturating_sub(columns(&lead)));
+            let room = width.saturating_sub(cell_width(&tail));
+            // A lead cut through a wide cluster comes back a cell short; that leftover cell would
+            // only hold a second ellipsis, so a cut lead takes the middle's room with it.
+            let middle = if cell_width(&lead) > room {
+                String::new()
+            } else {
+                cells::clip(&middle, room - cell_width(&lead))
+            };
+            let lead = cells::clip(&lead, room);
             return Line::from(vec![
                 Span::styled(lead, ctx.theme.accent),
                 Span::styled(format!("{middle}{tail}"), ctx.theme.dim),
@@ -1207,7 +1187,81 @@ mod tests {
             "the label goes first"
         );
         assert_eq!(text(40), "promoted · implementation · ha\u{2026} · live-1");
-        assert_eq!(columns(&text(40)), 40, "and the line fits");
+        assert_eq!(cell_width(&text(40)), 40, "and the line fits");
+    }
+
+    /// The promoted header's text at `width`, for a step with these fields.
+    fn promoted_text(phase: &str, agent: &str, width: u16) -> String {
+        let shell = Shell::new();
+        let mut tab = live(&shell);
+        tab.promoted = Some(PromotedHeader {
+            step: StepId::new(),
+            phase: phase.to_owned(),
+            agent: agent.to_owned(),
+            model: Some("sonnet".to_owned()),
+            via: Via::Handoff,
+        });
+        tab.header(&shell.ctx(), width)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// MOD-60 D9: a halfwidth sound mark is a cell of its own, as `ratatui` draws it. `Span::width`
+    /// calls `ｶﾞ` one cell, so the header measured that way ran ten cells past its width.
+    #[test]
+    fn a_halfwidth_phase_keeps_the_promoted_header_within_its_width() {
+        let phase = "\u{ff76}\u{ff9e}".repeat(10);
+        assert_eq!(cell_width(&phase), 20);
+        let text = promoted_text(&phase, "scripted", 40);
+        assert!(cell_width(&text) <= 40, "{text:?} against 40");
+        assert!(
+            text.ends_with(" · live-1"),
+            "{text:?} keeps the session ref"
+        );
+    }
+
+    /// MOD-60 D9: a phase cut through a wide cluster comes back a cell short of its room, and that
+    /// lone leftover cell is not handed to the fields after it — one ellipsis marks the cut, not
+    /// two in a row.
+    #[test]
+    fn a_wide_phase_cut_short_marks_the_cut_once() {
+        let phase = "\u{6f22}".repeat(8);
+        for width in 20..=40 {
+            let text = promoted_text(&phase, "scripted", width);
+            assert!(
+                !text.contains("\u{2026}\u{2026}"),
+                "{text:?} at {width} doubles the ellipsis"
+            );
+            assert!(
+                cell_width(&text) <= usize::from(width),
+                "{text:?} against {width}"
+            );
+            assert!(
+                text.ends_with(" · live-1"),
+                "{text:?} keeps the session ref"
+            );
+        }
+    }
+
+    /// MOD-60 D9: the header is cut at a grapheme boundary, so a ZWJ family is drawn whole or not
+    /// at all — never a lone joiner left dangling at the cut.
+    #[test]
+    fn a_family_emoji_is_never_split_in_the_header() {
+        const FAMILY: &str = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        let agent = FAMILY.repeat(10);
+        for width in 20..=80 {
+            let text = promoted_text("p", &agent, width);
+            assert!(
+                !text.replace(FAMILY, "").contains('\u{200d}'),
+                "{text:?} splits a family at {width}"
+            );
+            assert!(
+                cell_width(&text) <= usize::from(width),
+                "{text:?} against {width}"
+            );
+        }
     }
 
     /// D38's two answers are two different facts and must not read as one.
