@@ -33,7 +33,7 @@ use htui_core::store::StoreError;
 
 use crate::graph::ResolveError;
 use crate::isolate::IsolateError;
-use crate::status::{Cursor, RunFailure, group_at, latest_at, may_attempt, resumable_park};
+use crate::status::{RunFailure, group_at, latest_at, may_attempt};
 
 /// What a human asks the orchestrator to do, in manual mode (ANA-2 §6.2, `docs/ANA-2.md:1557`).
 ///
@@ -1157,17 +1157,21 @@ pub fn accept_enabled(
 }
 
 /// §4.3 verdict 1's `unblock` (MOD-4 plan D161): which of [`UnblockCase`]'s three cases the item
-/// is in, over the item's active runs and each one's cursor.
+/// is in, over the item's active runs, each paired with whether it is resumable.
 ///
 /// 1. `blocked` and no run is active: [`UnblockCase::Reopen`].
 /// 2. `blocked` and an active run is parked: [`UnblockCase::FollowRun`].
-/// 3. `awaiting_approval` over a parked run whose cursor is [`resumable_park`]:
-///    [`UnblockCase::Resume`].
+/// 3. `awaiting_approval` over a parked run that is resumable: [`UnblockCase::Resume`].
+///
+/// The bool is [`crate::status::resumable`] over the run's cursor and its steps (blueprint D196,
+/// widened by MOD-37 R-31), and no other predicate computes it: a crashed rejection is told by the
+/// step's `gate_outcome`, which the cursor alone cannot see, so the callers, who already hold the
+/// steps, compute it.
 ///
 /// # Errors
 /// [`EngineError::NotBlocked`] for anything else, naming what holds the item.
-pub fn unblock_enabled(item: &Item, runs: &[(Run, Cursor)]) -> Result<UnblockCase, EngineError> {
-    let active: Vec<&(Run, Cursor)> = runs
+pub fn unblock_enabled(item: &Item, runs: &[(Run, bool)]) -> Result<UnblockCase, EngineError> {
+    let active: Vec<&(Run, bool)> = runs
         .iter()
         .filter(|(run, _)| run.status.is_active())
         .collect();
@@ -1177,7 +1181,7 @@ pub fn unblock_enabled(item: &Item, runs: &[(Run, Cursor)]) -> Result<UnblockCas
     let why = match (item.status, parked, active.first()) {
         (Status::Blocked, _, None) => return Ok(UnblockCase::Reopen),
         (Status::Blocked, Some((run, _)), _) => return Ok(UnblockCase::FollowRun(run.id)),
-        (Status::AwaitingApproval, Some((run, cursor)), _) if resumable_park(cursor) => {
+        (Status::AwaitingApproval, Some((run, true)), _) => {
             return Ok(UnblockCase::Resume(run.id));
         }
         (Status::AwaitingApproval, Some((run, _)), _) => run_waits_at_a_gate(run.id),
@@ -1249,7 +1253,7 @@ pub fn start_enabled(item: &Item) -> Result<(), EngineError> {
 mod tests {
     use htui_core::fixtures::{demo_data, ids};
     use htui_core::model::{
-        Claim, GraphSnapshot, Item, OverlapRule, Resolution, Run, RunStatus, RunStep,
+        Claim, GateOutcome, GraphSnapshot, Item, OverlapRule, Resolution, Run, RunStatus, RunStep,
         SnapshotPhase, Status, StepStatus,
     };
     use htui_core::store::StoreError;
@@ -1262,7 +1266,7 @@ mod tests {
         retry_group_enabled, run_is_walking, run_waits_at_a_gate, select_enabled, start_enabled,
         unblock_enabled,
     };
-    use crate::status::Cursor;
+    use crate::status::{Cursor, resumable};
 
     /// `RUN_1`'s `review` step, at position 3, and the snapshot phase it walked.
     fn review() -> (RunStep, SnapshotPhase) {
@@ -2121,14 +2125,9 @@ mod tests {
         finished.status = RunStatus::Failed;
         let mut running = parked.clone();
         running.status = RunStatus::Running;
-        let gate = Cursor::Rest {
-            step: ids::STEP_R2_PRD,
-            status: StepStatus::AwaitingApproval,
-        };
-        let crashed = Cursor::Create {
-            position: 1,
-            attempt: 1,
-        };
+        // `status::resumable` over a real gate, and over a crashed command's cursor.
+        let gate = false;
+        let crashed = true;
 
         let blocked = item_at(Status::Blocked);
         assert!(matches!(
@@ -2137,16 +2136,16 @@ mod tests {
         ));
         assert!(
             matches!(
-                unblock_enabled(&blocked, &[(finished.clone(), gate.clone())]),
+                unblock_enabled(&blocked, &[(finished.clone(), gate)]),
                 Ok(UnblockCase::Reopen)
             ),
             "a finished run is not active"
         );
         assert!(matches!(
-            unblock_enabled(&blocked, &[(finished, gate.clone()), (parked.clone(), gate.clone())]),
+            unblock_enabled(&blocked, &[(finished, gate), (parked.clone(), gate)]),
             Ok(UnblockCase::FollowRun(run)) if run == parked.id
         ));
-        let refused = unblock_enabled(&blocked, &[(running.clone(), crashed.clone())])
+        let refused = unblock_enabled(&blocked, &[(running.clone(), crashed)])
             .expect_err("a walking run holds the item");
         assert_eq!(
             refused.to_string(),
@@ -2179,6 +2178,38 @@ mod tests {
                 "{refused}"
             );
         }
+    }
+
+    /// MOD-37 R-31: a run parked over the `failed` + `rejected` step a crash left between the
+    /// rejection and its unpark is resumed by `Unblock`; the same `failed` step with no
+    /// `gate_outcome` (a spent budget, an interrupt) is a gate's, and named so.
+    #[test]
+    fn unblock_resumes_a_run_parked_over_a_crashed_rejection() {
+        let parked = parked_run();
+        let (mut step, _) = review();
+        step.status = StepStatus::Failed;
+        step.gate_outcome = Some(GateOutcome::Rejected);
+        step.gate_note = Some("not like this".to_owned());
+        let at = Cursor::Rest {
+            step: step.id,
+            status: StepStatus::Failed,
+        };
+        let waiting = item_at(Status::AwaitingApproval);
+
+        let rejected = [step.clone()];
+        assert!(matches!(
+            unblock_enabled(&waiting, &[(parked.clone(), resumable(&at, &rejected))]),
+            Ok(UnblockCase::Resume(run)) if run == parked.id
+        ));
+
+        step.gate_outcome = None;
+        let spent = [step];
+        let refused = unblock_enabled(&waiting, &[(parked.clone(), resumable(&at, &spent))])
+            .expect_err("a step no rejection failed is not a crashed rejection");
+        assert!(
+            matches!(&refused, EngineError::NotBlocked { why, .. } if *why == run_waits_at_a_gate(parked.id)),
+            "{refused}"
+        );
     }
 
     /// MOD-4 plan D167: close-out is refused while a run of the item is active, then for an item
