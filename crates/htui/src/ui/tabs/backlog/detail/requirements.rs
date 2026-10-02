@@ -56,6 +56,7 @@ use crate::requirements::{
 };
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
+use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -70,9 +71,6 @@ pub const NO_CANDIDATES: &str = "the project has no active requirement left to c
 
 /// Marks the row the cursor is on; the other rows carry a space of the same width.
 const CURSOR: &str = "\u{25b8}";
-
-/// Marks a cut in [`cut`].
-const CUT: char = '\u{2026}';
 
 /// The browsing footer's words before the write keys; with [`HINT_WRITES`], 42 columns, inside
 /// the 43 a detail pane has at 100x30.
@@ -372,7 +370,7 @@ impl ReqsTab {
             lines.push(Line::styled(
                 format!(
                     "  {}",
-                    cut(first_line(&requirement.body), width.saturating_sub(2))
+                    cells::clip(first_line(&requirement.body), width.saturating_sub(2))
                 ),
                 theme.dim,
             ));
@@ -383,12 +381,12 @@ impl ReqsTab {
     /// The footer of the current mode, every line cut to `width`; the picker shows at most
     /// `room` candidates, a window that keeps its cursor in view.
     fn footer(&self, width: usize, room: usize, theme: &Theme) -> Vec<Line<'static>> {
-        let hint = |text: &str| Line::styled(cut(text, width), theme.dim);
-        let title = |text: String| Line::styled(cut(&text, width), theme.title);
+        let hint = |text: &str| Line::styled(cells::clip(text, width), theme.dim);
+        let title = |text: String| Line::styled(cells::clip(&text, width), theme.title);
         match self.mode {
             Mode::Browse => {
-                let moves = cut(HINT_MOVE, width);
-                let rest = width.saturating_sub(moves.chars().count());
+                let moves = cells::clip(HINT_MOVE, width);
+                let rest = width.saturating_sub(cell_width(&moves));
                 let writes = if self.writable() {
                     theme.base
                 } else {
@@ -396,7 +394,7 @@ impl ReqsTab {
                 };
                 vec![Line::from(vec![
                     Span::styled(moves, theme.base),
-                    Span::styled(cut(HINT_WRITES, rest), writes),
+                    Span::styled(cells::clip(HINT_WRITES, rest), writes),
                 ])]
             }
             Mode::Pick { cursor } => {
@@ -416,7 +414,7 @@ impl ReqsTab {
                             candidate.priority,
                             first_line(&candidate.body)
                         );
-                        Line::styled(cut(&text, width), theme.base)
+                        Line::styled(cells::clip(&text, width), theme.base)
                     })
                     .collect();
                 lines.push(hint(PICK_HINT));
@@ -576,26 +574,6 @@ fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("")
 }
 
-/// `text` in at most `width` characters, cut with `…` as its last one.
-///
-/// Counted in `char`s, like the Runs pane's `fit`; a control character becomes a space, so one
-/// line stays one line.
-fn cut(text: &str, width: usize) -> String {
-    let flat: Vec<char> = text
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    if flat.len() <= width {
-        flat.into_iter().collect()
-    } else if width == 0 {
-        String::new()
-    } else {
-        let mut out: String = flat[..width - 1].iter().collect();
-        out.push(CUT);
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use htui_core::fixtures::ids;
@@ -688,6 +666,29 @@ mod tests {
             &mut shell.ctx(),
         );
         pane
+    }
+
+    /// MOD-60 D1: a requirement's first line is cut in cells, so a CJK body ends on the
+    /// pane's edge with the cut mark rather than running past it.
+    #[tokio::test]
+    async fn a_wide_requirement_body_is_cut_by_cells() {
+        let shell = Shell::new();
+        let mut reply = citations(ids::HTUI_ANA_1).await;
+        assert!(!reply.citations.is_empty(), "a cited requirement");
+        for citation in &mut reply.citations {
+            citation.requirement.body = "\u{6f22}".repeat(40);
+        }
+        let pane = pane(&shell, ids::HTUI_ANA_1, reply);
+        let (lines, _) = pane.list_lines(30, &Theme::default());
+        for line in lines.iter().skip(1).step_by(2) {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert!(cell_width(&text) <= 30, "{text:?} against 30");
+            assert!(text.ends_with('\u{2026}'), "{text:?}");
+        }
     }
 
     /// Plan P9: `ANA-2`'s `amends` citation records a decision; `u` says so and asks nothing.
