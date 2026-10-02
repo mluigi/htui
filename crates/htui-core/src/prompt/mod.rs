@@ -514,6 +514,11 @@ pub fn assemble(
 
     // 3. Render every section at full size, from inputs in canonical order (§4.7 rules 2, 4, 6).
     let mut rendered: Vec<(Placeholder, Rendered, i64)> = Vec::new();
+    // MOD-26 D13: the persona frame renders first and outside the body's spans, so it is scanned
+    // with every section below, protected in the trimmer, and recorded as `sections[1]`.
+    for section in render_sections(Placeholder::Persona, spec, upstream, skills, candidates) {
+        rendered.push((Placeholder::Persona, section, 1));
+    }
     for placeholder in &parsed.used {
         if !placeholder.is_section() {
             continue;
@@ -553,7 +558,13 @@ pub fn assemble(
 
     // 4. Estimate, 5. refuse, 6. trim — all three inside the trimmer, which owns the arithmetic.
     let est = spec.estimator;
-    let template_tokens = est.estimate(&masked.literals.concat());
+    // MOD-26 B-17: with a persona, the separator between its frame and the body is the frame's.
+    let frame = masked.literals.concat();
+    let template_tokens = if spec.persona.is_some() {
+        est.estimate(&format!("{frame}{PERSONA_SEPARATOR}"))
+    } else {
+        est.estimate(&frame)
+    };
     let inputs = Inputs {
         spec,
         upstream,
@@ -663,6 +674,12 @@ fn substitute(
             .push(render::wrap(section));
     }
     let mut text = String::new();
+    // MOD-26 D13: the persona frame, then one blank line, ahead of every span. `live` carries it
+    // only when the spec does, so a persona-less prompt is byte-identical (I-7).
+    if let Some(frame) = blocks.get(&Placeholder::Persona) {
+        text.push_str(&frame.join("\n\n"));
+        text.push_str(PERSONA_SEPARATOR);
+    }
     let mut literal = literals.iter();
     for span in &parsed.spans {
         match span {

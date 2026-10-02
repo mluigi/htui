@@ -117,9 +117,14 @@ fn the_persona_section_survives_any_trim() {
     assert!(persona.tokens_before > 0);
     let floor = protected_floor(&full);
 
-    // At the protected floor every trimmable section is driven to the end of its ladder — the
-    // item to its 80-line floor, which this three-line body already is under, and every other one
-    // dropped — and the persona loses nothing.
+    // At the protected floor every trimmable section is driven to the end of its ladder and the
+    // persona loses nothing. §4.4 drops everything but the two sections a phase works from: the
+    // item stays at its 80-line floor and the first resolved document at its 40-line floor, both
+    // of which this fixture's short bodies are already under.
+    let kept_at_floor = [
+        SectionName::Item,
+        SectionName::Documents(spec.documents[0].kind.clone()),
+    ];
     let prompt = ok(&at_target(&spec, floor));
     for row in &prompt.trim.sections {
         if row.name.is_protected(TemplateRole::Phase) {
@@ -131,7 +136,14 @@ fn the_persona_section_survives_any_trim() {
             );
             assert!(!row.trimmed, "`{}` is protected", row.name);
             assert_eq!(row.tokens_before, row.tokens_after, "`{}`", row.name);
-        } else if row.name != SectionName::Item {
+        } else if kept_at_floor.contains(&row.name) {
+            assert_ne!(
+                row.strategy,
+                TrimStrategy::Dropped,
+                "`{}` is kept",
+                row.name
+            );
+        } else {
             assert_eq!(
                 row.strategy,
                 TrimStrategy::Dropped,
