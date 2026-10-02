@@ -348,6 +348,11 @@ fn path_refusal(entry: &str, repos: &[Repo]) -> Option<String> {
     if glob.starts_with('/') {
         return Some("is absolute; touched paths are repo-relative".to_owned());
     }
+    // Review L1: a touched path is a glob from the repo root, and `./src` or `src/../x` is
+    // written from somewhere else.
+    if glob.starts_with("./") || glob.split('/').any(|segment| segment == "..") {
+        return Some("is not repo-relative".to_owned());
+    }
     skill_glob::matcher(glob).err().map(|err| {
         let message = match err {
             GlobError::Invalid { message, .. } => message,
@@ -651,6 +656,20 @@ mod tests {
             why("web:/abs", &[repo("web", false)]),
             "is absolute; touched paths are repo-relative",
             "the glob after the qualifier is checked too"
+        );
+    }
+
+    /// Review L1: a glob that starts with `./` or climbs with a `..` segment is not
+    /// repo-relative, bare or qualified; `..` inside a segment's name is.
+    #[test]
+    fn a_dot_or_dot_dot_segment_is_refused() {
+        let repos = [repo("htui", true), repo("web", false)];
+        for entry in ["./src/**", "web:../x", "src/../x", "..", "web:./x"] {
+            assert_eq!(why(entry, &repos), "is not repo-relative", "{entry:?}");
+        }
+        assert_eq!(
+            check_paths(&strings(&["src/..foo", "a..b/**"]), &repos),
+            Ok(strings(&["src/..foo", "a..b/**"]))
         );
     }
 
