@@ -5042,7 +5042,10 @@ impl State {
     }
 
     /// MOD-37 R-5: the gate's park, `promote_step`'s shape. Every check runs before the first
-    /// write, in Postgres's order: the step, the fence, the step's status, the run's status.
+    /// write, in Postgres's order: the step, the fence, the step's status, the run's status, and
+    /// then the item (review N1), so the park is all-or-nothing by construction, as Postgres's
+    /// rollback makes it. The item must exist and its `in_progress -> awaiting_approval` be
+    /// legal; an item another writer moved is left where it is (plan D17's "already moved").
     fn park_step(
         &mut self,
         fence: StepFence,
@@ -5059,8 +5062,20 @@ impl State {
         if run.status != RunStatus::Running {
             return Ok(ParkOutcome::RunMoved);
         }
-        let item_id = run.item_id;
+        let move_item = match run.item_id {
+            // A chat run has no item to move.
+            None => None,
+            Some(item) => {
+                let row = self.items.get(&item).ok_or_else(|| StoreError::NotFound {
+                    entity: "item",
+                    id: item.to_string(),
+                })?;
+                legal_move(Status::InProgress, Status::AwaitingApproval)?;
+                (row.status == Status::InProgress).then_some(item)
+            }
+        };
 
+        // Every check passed: the three moves below cannot fail.
         if let Some(row) = self.steps.get_mut(&step) {
             row.status = StepStatus::AwaitingApproval;
             row.updated_at = now;
@@ -5069,13 +5084,11 @@ impl State {
             row.status = RunStatus::AwaitingApproval;
             row.updated_at = now;
         }
-        if let Some(item) = item_id
-            && self
-                .items
-                .get(&item)
-                .is_some_and(|row| row.status == Status::InProgress)
-        {
-            self.transition(item, Status::InProgress, Status::AwaitingApproval, now)?;
+        if let Some(row) = move_item.and_then(|item| self.items.get_mut(&item)) {
+            // `transition`'s write: `awaiting_approval` is live, so `closed_at` clears.
+            row.status = Status::AwaitingApproval;
+            row.updated_at = now;
+            row.closed_at = None;
         }
         Ok(ParkOutcome::Parked)
     }
