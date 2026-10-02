@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-13-backlog-editing.prd.md`
 **Selected Milestone**: 2 — New and edit
 **Complexity**: Large
-**Status**: fact-checked (step 3.5, 25 claims, amendments A1–A16 applied), awaiting CONFIRM
+**Status**: complete (2026-10-02) — CONFIRMed, implemented `7b32f86`..`ac7c989`, rust-reviewer approve-with-fixes, fixes applied
 
 ## Summary
 This milestone adds two Backlog actions over the seven `version`-covered spec columns (ANA-9 §4.2):
@@ -353,9 +353,9 @@ cargo test --workspace --all-features --no-fail-fast -- --test-threads=1   # ful
 | D11' | A mint's lost answer is covered | ✗ (A12) | MOD-59 M1 hazard; `mint_failed` at `requirements/mod.rs:126-136` |
 
 ## Acceptance
-- [ ] All tasks complete
-- [ ] Validation passes
-- [ ] Patterns mirrored, not reinvented
-- [ ] No existing snapshot changed
-- [ ] Offline: `N`/`e` refused with the read-only notice and no write
-- [ ] A stale edit never overwrites the head
+- [x] All tasks complete
+- [x] Validation passes
+- [x] Patterns mirrored, not reinvented
+- [x] No existing snapshot changed
+- [x] Offline: `N`/`e` refused with the read-only notice and no write
+- [x] A stale edit never overwrites the head
