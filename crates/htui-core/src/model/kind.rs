@@ -240,8 +240,25 @@ pub struct PhasePatch {
     pub input_kinds: Option<Vec<String>>,
     /// `step_graph_phase.persona_id` (MOD-26 D5): `None` leaves the binding, `Some(None)` clears
     /// it, `Some(Some(id))` binds `id`, which must name a `persona` row (`references_no_row`).
-    #[serde(default)]
+    ///
+    /// On the wire an absent key is `None` and `null` is `Some(None)`, so a clear survives a
+    /// serde round trip (MOD-26 review L1).
+    #[serde(
+        default,
+        deserialize_with = "present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub persona: Option<Option<PersonaId>>,
+}
+
+/// Reads a present field as `Some(value)`, `null` included, for a double-option patch field whose
+/// absent key falls to `#[serde(default)]`'s `None` (MOD-26 review L1).
+fn present_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// A row of `phase_agent` (§5.4): a candidate agent for a phase, in priority order.
@@ -379,7 +396,8 @@ impl PromptTemplate {
 
 #[cfg(test)]
 mod tests {
-    use super::{ItemKind, PromptTemplate};
+    use super::{ItemKind, PhasePatch, PromptTemplate};
+    use crate::model::ids::PersonaId;
 
     /// The CHECK, byte for byte: `^[A-Z][A-Z0-9]{1,15}$` (`0001_init.sql:282-290`).
     ///
@@ -423,6 +441,30 @@ mod tests {
                 "`{}` does not name a template",
                 bad.escape_debug()
             );
+        }
+    }
+
+    /// MOD-26 review L1: `PhasePatch.persona`'s three states survive a JSON round trip. An
+    /// absent key leaves the binding (`None`), `null` clears it (`Some(None)`) and an id binds it
+    /// (`Some(Some(id))`); a plain `Option<Option<_>>` reads `null` back as `None` and loses the
+    /// clear.
+    #[test]
+    fn phase_patch_persona_round_trips_all_three_states() {
+        let id = PersonaId::new();
+        for (persona, json) in [
+            (None, "{}".to_owned()),
+            (Some(None), r#"{"persona":null}"#.to_owned()),
+            (Some(Some(id)), format!(r#"{{"persona":"{id}"}}"#)),
+        ] {
+            let patch = PhasePatch {
+                persona,
+                ..PhasePatch::default()
+            };
+            let text = serde_json::to_string(&patch).expect("a patch serialises");
+            let back: PhasePatch = serde_json::from_str(&text).expect("a patch deserialises");
+            assert_eq!(back, patch, "`{text}` round-trips");
+            let read: PhasePatch = serde_json::from_str(&json).expect("the literal deserialises");
+            assert_eq!(read.persona, persona, "`{json}` reads as {persona:?}");
         }
     }
 }
