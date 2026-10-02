@@ -419,8 +419,28 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
     wording after a lost edit answer.
 
   Plan `.claude/plans/mod-13-new-edit.plan.md`, blueprint
-  `.claude/plans/mod-13-new-edit.blueprint.md`. Next: milestone 3, the three-way divergence
-  view.
+  `.claude/plans/mod-13-new-edit.blueprint.md`.
+  **Phase 3 landed (`54667c9`..`ec0f00c`, 2026-10-02):** Divergence. A stale edit opens a
+  three-way view over the whole Backlog area in place of milestone 2's D6 notice. The view shows
+  ancestor, theirs and mine for each field that differs, plus side-by-side body/paths diffs. `m`
+  or `t` rebases the form on the head, and Ctrl+S saves one §7.2 compare-and-set at
+  `head.version` with `reason = 'divergence_resolution'`.
+  - **Ancestor.** The ancestor is the item the form opened on, which covers all seven
+    `version`-covered columns. `item_revision` snapshots only title, body and tags, and no
+    migration was added.
+  - **Field-level merge.** `htui_core::model::item_merge` keeps both sides' changes that do not
+    conflict. `m`/`t` only pick the winner where both sides changed a field, so no path reverts a
+    column only the head changed.
+  - **Esc.** Esc in the view returns to the unchanged form, keeping its text and its old token.
+  - **Reply.** `ItemDiverged` carries the fresh catalogue.
+  - **Counts.** No new `StoreRequest`/`StoreReply` variant; `EditItem` gains `reason`.
+    Conformance case 121 (`item_edit_reason_lands_in_revision`) and 1 snapshot.
+  - **Deferred** (maintainer, review): display-width measurement in the view's notice, clip and
+    column padding (review L3; the diff rows already measure cells), which belongs to MOD-60;
+    and the by-value `merge` that would avoid three spec clones (NIT-2).
+
+  Plan `.claude/plans/mod-13-divergence.plan.md`, blueprint
+  `.claude/plans/mod-13-divergence.blueprint.md`. Next: milestone 4, the `$EDITOR` round-trip.
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
   `R-NF-3`, `R-HIS-1`. **This is now the only Windows check** (TOOL-3 decided 2026-09-28,
   `docs/decisions/tool/tool-3.md`): the maintainer accepted that

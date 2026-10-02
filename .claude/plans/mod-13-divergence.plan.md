@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-13-backlog-editing.prd.md`
 **Selected Milestone**: 3 — Divergence
 **Complexity**: Medium
-**Status**: CONFIRMed 2026-10-02 — implementation pending
+**Status**: complete (2026-10-02) — CONFIRMed, implemented `54667c9`..`ec0f00c`, rust-reviewer approve-with-fixes, fixes applied (L3, NIT-2 deferred)
 
 ## Summary
 A stale edit opens a three-way view in place of milestone 2's D6 notice. The three columns are
@@ -286,10 +286,10 @@ cargo test --workspace --all-features --no-fail-fast -- --test-threads=1   # ful
 | C15 | T1–T4 are serial (no independence claimed) | ✓ | T2 needs `EditReason` (T1), T3 the request/reply shape (T2), T4 all three; T1 ∩ T3 file sets are disjoint, but T3 cannot compile before T2 |
 
 ## Acceptance
-- [ ] All tasks complete
-- [ ] Validation passes
-- [ ] Patterns mirrored, not reinvented
-- [ ] No existing snapshot changed
-- [ ] A stale edit opens the three-way view; resolution lands as one revision with
+- [x] All tasks complete
+- [x] Validation passes
+- [x] Patterns mirrored, not reinvented
+- [x] No existing snapshot changed
+- [x] A stale edit opens the three-way view; resolution lands as one revision with
       `reason = 'divergence_resolution'` on both stores
-- [ ] No resolution path reverts a column only the head changed, and Esc never discards text
+- [x] No resolution path reverts a column only the head changed, and Esc never discards text
