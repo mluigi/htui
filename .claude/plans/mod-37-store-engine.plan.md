@@ -153,4 +153,27 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 - [ ] HANDOFF R-lines updated: closed, or re-deferred with a reason
 
 ---
-*Status: CONFIRMED (2026-10-02); blueprint next.*
+*Status: DONE (2026-10-02), commits `1d1118f3`..`7df69d33`.*
+
+## As built
+- **C0** (`1d1118f3`): `GateContext` carries the walk's `StepFence`. It also touched
+  `crates/htui-orch/tests/review_loop.rs`, which the blueprint missed.
+- **Lane B** ran in a worktree and was merged as `1e50fa91`:
+  - T5 / R-30 (`d4be38ec`);
+  - T6 / R-32b (`29bcc594`);
+  - T4 / R-31 (`8640d4d4`).
+- **Lane A** ran on the primary tree:
+  - T1 / R-29 (`19dc3af9`);
+  - T2 / R-6 (`52f3e509`, `5bc4372f`, `de918596`);
+  - T3 / R-5 (`2ece53cc`, `a2cf16f4`, `033625f6`).
+- **R-31 side effect (blueprint claim 2), accepted by the maintainer:** `Unblock` on a followed
+  review-loop escalation now resumes it and re-runs the loop. It is pinned by
+  `unblock_on_a_followed_escalation_reruns_the_loop_and_escalates_again`.
+- **R-32a** is re-deferred, with its reason on the HANDOFF line.
+- **Review** (rust-reviewer): approve. There was no BLOCKER, HIGH or MEDIUM finding.
+  - Applied: L1 (`e4f49308`, the hand-back of a crashed rejection), L2 (`020dfc85`, the worker
+    `Unblock` verdict), L3 (`c02e7508`, the fence answered before the status on both stores) and
+    N1 (`7df69d33`, MemStore's park is all-or-nothing).
+  - Left: NIT 3 (`unblock_enabled`'s bare `bool`) and NIT 4 (the `Vec<String>` copy in the
+    `phase_agent` insert).
+  - Noted on HANDOFF: NIT 2 (chat runs keep their timestamps untruncated).
