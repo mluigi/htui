@@ -63,6 +63,11 @@ Postgres gets the seeds each time htui (the TUI or `htui worker`) connects to a 
 keyed by name with `ON CONFLICT (name) DO NOTHING`: a seed the table lacks is added, and an
 operator's edit to a seeded row survives every later connect.
 
+Because the top-up is keyed by name, **renaming a seed brings it back**: rename `reviewer` (or
+`architect`) and the next connect finds no row called `reviewer`, so it creates a fresh one, with
+a new id, beside your renamed row. To retire a seed's behaviour, edit the `reviewer` row rather
+than renaming it.
+
 ## Binding a persona to a phase in milestone 1
 
 A `step_graph_phase` names at most one persona through its nullable `persona_id` column. The
@@ -260,6 +265,11 @@ permission}`). From then on the run reads personas only from its snapshot.
 - **Rebinding a phase does change the graph.** The phase's persona name is part of the graph's
   topology digest, so a run resumed after its phase was bound, unbound or rebound sees a topology
   mismatch and is parked, like any other graph change made under a run.
+- **Renaming a persona changes the graph too.** The topology digest hashes the persona's name, not
+  its id, so renaming a persona that is bound to a phase moves the topology of every graph bound
+  to it: a run on such a graph that is resumed afterwards sees a topology mismatch and is parked.
+  Rename only when no run on those graphs is waiting to resume. (Renaming a seed also brings the
+  seed back on the next connect; see [The two seeds](#the-two-seeds).)
 
 A snapshot without a persona key and a phase without a persona serialise exactly as before, so
 persona-less runs keep their topology digests.
@@ -315,7 +325,11 @@ These gaps are real; a persona narrows what htui can see, not everything an agen
   built-in names only. An MCP tool is removed only by naming it in `disallowed-tools`.
 - **Tool names on ACP.** `allow` and `deny` are stored but no ACP transport enforces them.
 - **An operator's `extra_args`.** The agent's own `extra_args` come last on the CLI argv, so a flag
-  an operator put there is read after the persona's.
+  an operator put there is read after the persona's. In particular, a `--disallowedTools=` in the
+  agent row's `extra_args` replaces the persona's whole deny list, the inverted `deny_kinds`
+  included, so it can loosen the persona (an `extra_args` list that omits `Edit` lets a
+  `reviewer`-bound step edit). **Do not set `--disallowedTools` in the `extra_args` of an agent
+  that runs a persona-bound phase**; put the names in the persona's `disallowed-tools` instead.
 
 ## What a step records
 
