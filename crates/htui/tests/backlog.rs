@@ -10,6 +10,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use htui::agent_worker::AgentRuntime;
 use htui::app::{Action, RevealKind};
+use htui::editor::{ExternalEdit, ExternalEditOutcome};
 use htui::keymap::KeyScope;
 use htui::requirements::decision_citation_stays;
 use htui::run_worker::{self, LiveChats, RunRuntime, StepAuthor};
@@ -1840,23 +1841,12 @@ async fn seed_mirror_items(cache: &CacheStore, items: &[Item]) {
     }
 }
 
-/// D2, A11 (blueprint E11): offline, `N` and `e` are refused by the worker before anything is
-/// read. The status line carries the read-only sentence under `item_form`, no form opens, and
-/// the mirror is untouched.
-///
-/// With item rows in the mirror the first `Items` reply selects `ANA-1` and sends its detail
-/// reads, so the status line is not clean on arrival; it is cleared before each key instead.
-#[tokio::test]
-async fn offline_n_and_e_are_refused_with_the_read_only_notice() {
-    let _keyring = htui_store::testkit::mock_keyring().await;
-    let root = tempfile::tempdir().expect("a throwaway config root");
-    let cache = CacheStore::open(
-        root.path(),
-        "backlog-items-offline",
-        PgStore::schema_version(),
-    )
-    .await
-    .expect("a fresh mirror");
+/// A Backlog scoped to `Platform` over an offline mirror under `root`, seeded with the demo and
+/// its items. The caller holds the keyring guard and the temp dir.
+async fn offline_backlog(root: &std::path::Path) -> (Harness, CacheStore) {
+    let cache = CacheStore::open(root, "backlog-items-offline", PgStore::schema_version())
+        .await
+        .expect("a fresh mirror");
     let demo = htui_core::fixtures::demo_data();
     htui_store::testkit::seed_mirror(&cache, &demo)
         .await
@@ -1873,6 +1863,20 @@ async fn offline_n_and_e_are_refused_with_the_read_only_notice() {
         workspace: workspace("platform").await,
     });
     harness.drive_to_end().await;
+    (harness, cache)
+}
+
+/// D2, A11 (blueprint E11): offline, `N` and `e` are refused by the worker before anything is
+/// read. The status line carries the read-only sentence under `item_form`, no form opens, and
+/// the mirror is untouched.
+///
+/// With item rows in the mirror the first `Items` reply selects `ANA-1` and sends its detail
+/// reads, so the status line is not clean on arrival; it is cleared before each key instead.
+#[tokio::test]
+async fn offline_n_and_e_are_refused_with_the_read_only_notice() {
+    let _keyring = htui_store::testkit::mock_keyring().await;
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let (mut harness, cache) = offline_backlog(root.path()).await;
     assert!(
         harness.render().contains("┌ ANA-1"),
         "the mirror's items are listed and the first is selected"
@@ -2166,4 +2170,202 @@ async fn the_divergence_view_renders_over_the_whole_tab() {
         "paths are the same:\n{frame}"
     );
     insta::assert_snapshot!("item_divergence", frame);
+}
+
+// ---------------------------------------------------------------------------------------------
+// $EDITOR round-trip (MOD-13 milestone 4, plan D1-D8).
+// ---------------------------------------------------------------------------------------------
+
+/// `ANA-1`'s head row.
+async fn ana_1(store: &MemStore) -> Item {
+    store
+        .item(ids::HTUI_ANA_1)
+        .await
+        .expect("the memory store never fails")
+        .expect("the demo item exists")
+}
+
+/// D3, D4: `e`, Body, `Ctrl+E` asks the loop for the editor with ANA-1's body; the text that
+/// comes back lands in the form (minus the editor's final newline, D5) and `Ctrl+S` saves it as
+/// version 2.
+#[tokio::test]
+async fn ctrl_e_hands_the_body_out_and_ctrl_s_saves_what_came_back() {
+    let store = MemStore::demo();
+    let mut harness = backlog_over(store.clone()).await;
+    keys(&mut harness, &["e"]).await;
+    keys(&mut harness, &TITLE_TO_BODY).await;
+    keys(&mut harness, &["ctrl-e"]).await;
+    assert_eq!(
+        harness.app().take_external_edit(),
+        Some((
+            BacklogTab::ID,
+            ExternalEdit {
+                text: ana_1(&store).await.body,
+                stem: "ANA-1-body".to_owned(),
+            }
+        ))
+    );
+    assert!(harness.app().take_external_edit().is_none(), "asked once");
+
+    harness.app().finish_external_edit(
+        BacklogTab::ID,
+        ExternalEditOutcome::Edited("New body.\n".to_owned()),
+    );
+    let frame = harness.render();
+    assert!(frame.contains("edited in $EDITOR"), "the notice:\n{frame}");
+    assert!(
+        frame.contains(" Edit ANA-1 (v1) "),
+        "the form, unsaved:\n{frame}"
+    );
+
+    keys(&mut harness, &["ctrl-s"]).await;
+    let head = ana_1(&store).await;
+    assert_eq!(head.body, "New body.", "D5 dropped the editor's newline");
+    assert_eq!(head.version, 2);
+    let detail = detail_pane(&harness.render());
+    assert!(detail.contains("version 2"), "the new version:\n{detail}");
+    assert!(
+        !detail.contains(" Edit "),
+        "the form closed on the write:\n{detail}"
+    );
+    assert_eq!(
+        harness.app().status,
+        None,
+        "an external edit raises nothing"
+    );
+}
+
+/// The PRD risk (blueprint E2): replies land on both sides of the editor's outcome and another
+/// writer moves the head while the editor is open. The editor's text and the form's token
+/// survive, so `Ctrl+S` is stale and opens the three-way view with the editor's body as mine.
+#[tokio::test]
+async fn a_reply_and_a_concurrent_write_around_the_editor_end_in_the_divergence_view() {
+    let store = MemStore::demo();
+    let mut harness = backlog_over(store.clone()).await;
+    keys(&mut harness, &["e"]).await;
+    keys(&mut harness, &TITLE_TO_BODY).await;
+    // One shell refresh (`update.rs`'s private `TICKS_PER_REFRESH` is 4): `StoreState` and
+    // `ActiveRuns` are queued, not served.
+    for _ in 0..4 {
+        harness.app().update(Action::Tick);
+    }
+    // `key`, not `keys`: nothing is served yet.
+    harness.key("ctrl-e");
+    let (tab, edit) = harness
+        .app()
+        .take_external_edit()
+        .expect("`Ctrl+E` asked for the editor");
+    their_write(&store, retitled("Theirs")).await;
+    // The queued replies land before the outcome (the plan's order)...
+    harness.settle().await;
+    for _ in 0..4 {
+        harness.app().update(Action::Tick);
+    }
+    harness.app().finish_external_edit(
+        tab,
+        ExternalEditOutcome::Edited(format!("{}\nWritten in the editor.\n", edit.text)),
+    );
+    // ...and these after it (the loop's: `finish_external_edit`, then the next `select!`).
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains("edited in $EDITOR"), "the notice:\n{frame}");
+    assert!(
+        frame.contains(" Edit ANA-1 (v1) "),
+        "the token did not move:\n{frame}"
+    );
+
+    keys(&mut harness, &["ctrl-s"]).await;
+    let frame = harness.render();
+    for wanted in ["ANA-1  v1 \u{2192} theirs v2", "Written in the editor."] {
+        assert!(frame.contains(wanted), "{wanted:?} in the view:\n{frame}");
+    }
+    assert_eq!(divergence_state(&frame, "title"), "theirs", "{frame}");
+    assert_eq!(divergence_state(&frame, "body"), "mine", "{frame}");
+    assert_eq!(
+        ana_1_head(&store).await,
+        ("Theirs".to_owned(), 2),
+        "the stale save wrote nothing"
+    );
+
+    keys(&mut harness, &["m"]).await;
+    keys(&mut harness, &["ctrl-s"]).await;
+    let head = ana_1(&store).await;
+    assert_eq!(head.title, "Theirs");
+    assert_eq!(head.body, format!("{}\nWritten in the editor.", edit.text));
+    assert_eq!(head.version, 3);
+    assert_eq!(harness.app().status, None, "a resolution raises nothing");
+}
+
+/// E3: a real (fake) editor through the public `editor::run`, with the `ExternalEdit` the app
+/// asked for. It appends a line and saves with a final newline, as an editor does; D5 drops that
+/// newline, so the stored body ends on the appended line. No terminal is driven:
+/// `run_suspended`'s leave/enter is pinned by `editor.rs`'s `suspension` tests.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fake_editor_appends_a_line_and_ctrl_s_saves_it() {
+    use htui::editor::EditorCommand;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let store = MemStore::demo();
+    let mut harness = backlog_over(store.clone()).await;
+    keys(&mut harness, &["e"]).await;
+    keys(&mut harness, &TITLE_TO_BODY).await;
+    keys(&mut harness, &["ctrl-e"]).await;
+    let (tab, edit) = harness
+        .app()
+        .take_external_edit()
+        .expect("`Ctrl+E` asked for the editor");
+
+    let dir = tempfile::TempDir::new().expect("a temp dir");
+    let path = dir.path().join("append");
+    // R-13: `fs::write` closes the handle at once, so the exec never meets `ETXTBSY`.
+    std::fs::write(
+        &path,
+        "#!/bin/sh\nprintf '\\nAppended by the editor.\\n' >> \"$1\"\n",
+    )
+    .expect("the script is written");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("the script is executable");
+    let cmd = EditorCommand::resolve(move |key: &str| {
+        (key == "VISUAL").then(|| format!("'{}'", path.display()))
+    });
+    let outcome = htui::editor::run(&cmd, &edit.text, &edit.stem).await;
+    assert_eq!(
+        outcome,
+        ExternalEditOutcome::Edited(format!("{}\nAppended by the editor.\n", edit.text))
+    );
+
+    harness.app().finish_external_edit(tab, outcome);
+    keys(&mut harness, &["ctrl-s"]).await;
+    let head = ana_1(&store).await;
+    assert_eq!(
+        head.body,
+        format!("{}\nAppended by the editor.", edit.text),
+        "D5 dropped the editor's final newline"
+    );
+    assert_eq!(head.version, 2);
+    assert_eq!(
+        harness.app().status,
+        None,
+        "an external edit raises nothing"
+    );
+}
+
+/// D6: offline no form opens, so `Ctrl+E` asks for no editor; with no form the chord reaches the
+/// detail pane, and nothing there or globally claims it.
+#[tokio::test]
+async fn offline_ctrl_e_asks_for_no_editor() {
+    let _keyring = htui_store::testkit::mock_keyring().await;
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let (mut harness, _cache) = offline_backlog(root.path()).await;
+    let refused = format!("item_form: store unreachable: {DATABASE_UNREACHABLE}");
+
+    harness.app().status = None;
+    keys(&mut harness, &["e"]).await;
+    assert_eq!(harness.app().status, Some(refused), "`e` offline");
+    let frame = harness.render();
+    assert!(!frame.contains(" Edit "), "no form opened:\n{frame}");
+
+    keys(&mut harness, &["ctrl-e"]).await;
+    assert!(harness.app().take_external_edit().is_none());
 }

@@ -17,6 +17,10 @@
 //!
 //! A stale edit opens the three-way view in the whole tab area (milestone 3). `m`/`t` rebase the
 //! form on the head, and Ctrl+S then lands a `divergence_resolution` revision.
+//!
+//! Milestone 4: Ctrl+E in the item form's body or paths hands that text to `$EDITOR` (MOD-9's
+//! handoff). The outcome comes back through `Tab::on_external_edit` to the form, and Ctrl+S saves
+//! it as before.
 
 pub mod detail;
 pub mod divergence;
@@ -29,6 +33,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 
 use crate::app::{Action, Ctx, Handled, RevealTarget};
+use crate::editor::ExternalEditOutcome;
 use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::backlog::detail::{
@@ -675,6 +680,16 @@ impl Tab for BacklogTab {
             self.filter.clone_from(&self.shown);
         }
         self.detail.on_reply(reply, ctx);
+    }
+
+    /// MOD-13 milestone 4 D4: the `$EDITOR` outcome goes to the open item form, which ignores one
+    /// it did not ask for. With no form (a scope change landed first) it is dropped, as
+    /// `App::finish_external_edit` drops one for a gone tab.
+    fn on_external_edit(&mut self, outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {
+        match self.item_form.as_mut() {
+            Some(form) => form.on_external_edit(outcome),
+            None => tracing::debug!("the item form that asked for the editor is gone"),
+        }
     }
 
     /// MOD-41 plan D16: every fifth refresh (5 s), the selected item's runs are read again while
@@ -2766,5 +2781,95 @@ mod tests {
         open_with(&mut tab, &bench, &store, KeyCode::Char('N')).await;
         assert_eq!(tab.on_key(ctrl('c'), &mut bench.ctx()), Handled::Pass);
         assert!(tab.item_form.is_some());
+    }
+
+    // ---- MOD-13 milestone 4: the $EDITOR round-trip ------------------------------------------
+
+    /// From the open form's Title, `Tab` five times to Body: Priority, Tags, Graph, Paths, Body.
+    fn to_body(tab: &mut BacklogTab, bench: &Bench) {
+        for _ in 0..5 {
+            press(tab, bench, KeyCode::Tab);
+        }
+    }
+
+    /// D3: Ctrl+E on the body reaches the loop as an `EditExternally`, and nothing is read.
+    #[tokio::test]
+    async fn ctrl_e_on_the_body_emits_an_external_edit_for_the_loop() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let Selection::Item(first) = bench.first else {
+            panic!("the first row is an item")
+        };
+        let item = store.item(first).await.expect("read").expect("the item");
+        let mut tab = bench.tab();
+        open_with(&mut tab, &bench, &store, KeyCode::Char('e')).await;
+        to_body(&mut tab, &bench);
+        assert_eq!(tab.on_key(ctrl('e'), &mut bench.ctx()), Handled::Consumed);
+        let actions = bench.actions();
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::EditExternally(edit)]
+                    if edit.stem == format!("{}-body", item.key) && edit.text == item.body
+            ),
+            "{actions:?}"
+        );
+    }
+
+    /// D1: on a one-line field Ctrl+E is consumed, so it never reaches a global binding.
+    #[tokio::test]
+    async fn ctrl_e_on_the_title_is_consumed_and_emits_nothing() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        open_with(&mut tab, &bench, &store, KeyCode::Char('e')).await;
+        assert_eq!(tab.on_key(ctrl('e'), &mut bench.ctx()), Handled::Consumed);
+        assert!(bench.actions().is_empty());
+    }
+
+    /// D4: the outcome reaches the open form, and Ctrl+S sends the body alone at the read version.
+    #[tokio::test]
+    async fn the_outcome_reaches_the_open_form_and_ctrl_s_saves_the_body() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        open_with(&mut tab, &bench, &store, KeyCode::Char('e')).await;
+        to_body(&mut tab, &bench);
+        assert_eq!(tab.on_key(ctrl('e'), &mut bench.ctx()), Handled::Consumed);
+        assert_eq!(bench.actions().len(), 1, "the handoff");
+        tab.on_external_edit(
+            ExternalEditOutcome::Edited("New body.".to_owned()),
+            &mut bench.ctx(),
+        );
+        assert_eq!(notice(&tab).as_deref(), Some(crate::editor::EDITED));
+        let request = saved(&mut tab, &bench);
+        assert!(
+            matches!(
+                &request,
+                StoreRequest::EditItem {
+                    expected_version: 1,
+                    changes,
+                    reason: htui_core::model::EditReason::Edited,
+                    ..
+                } if *changes == htui_core::model::SpecChanges {
+                        body: Some("New body.".to_owned()),
+                        ..htui_core::model::SpecChanges::default()
+                    }
+            ),
+            "{request:?}"
+        );
+    }
+
+    /// D4: with no form open the outcome is dropped; nothing opens and nothing is emitted.
+    #[tokio::test]
+    async fn an_outcome_with_no_form_open_is_dropped() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        tab.on_external_edit(
+            ExternalEditOutcome::Edited("x".to_owned()),
+            &mut bench.ctx(),
+        );
+        assert!(tab.item_form.is_none());
+        assert!(bench.actions().is_empty());
     }
 }
