@@ -2235,9 +2235,12 @@ async fn ctrl_e_hands_the_body_out_and_ctrl_s_saves_what_came_back() {
     );
 }
 
-/// The PRD risk (blueprint E2): replies land on both sides of the editor's outcome and another
-/// writer moves the head while the editor is open. The editor's text and the form's token
-/// survive, so `Ctrl+S` is stale and opens the three-way view with the editor's body as mine.
+/// The PRD risk (blueprint E2). Two batches of app-origin polls (`StoreState`, `ActiveRuns`) are
+/// served, one on each side of the editor's outcome: they are addressed to the shell, not the
+/// tab, so this pins only that they cannot reach or disturb the open form (nothing Backlog-bound
+/// can be in flight while an idle form is open). The real asserts are the rest: another writer
+/// moves the head while the editor is open, the editor's text and the form's token survive, and
+/// `Ctrl+S` is stale and opens the three-way view with the editor's body as mine.
 #[tokio::test]
 async fn a_reply_and_a_concurrent_write_around_the_editor_end_in_the_divergence_view() {
     let store = MemStore::demo();
@@ -2257,7 +2260,9 @@ async fn a_reply_and_a_concurrent_write_around_the_editor_end_in_the_divergence_
         .expect("`Ctrl+E` asked for the editor");
     their_write(&store, retitled("Theirs")).await;
     // The queued replies land before the outcome (the plan's order)...
+    assert!(harness.queued() > 0, "the refresh's polls are in flight");
     harness.settle().await;
+    assert_eq!(harness.queued(), 0, "and served before the outcome");
     for _ in 0..4 {
         harness.app().update(Action::Tick);
     }
@@ -2266,7 +2271,12 @@ async fn a_reply_and_a_concurrent_write_around_the_editor_end_in_the_divergence_
         ExternalEditOutcome::Edited(format!("{}\nWritten in the editor.\n", edit.text)),
     );
     // ...and these after it (the loop's: `finish_external_edit`, then the next `select!`).
+    assert!(
+        harness.queued() > 0,
+        "the second refresh's polls are in flight"
+    );
     harness.settle().await;
+    assert_eq!(harness.queued(), 0, "and served after the outcome");
     let frame = harness.render();
     assert!(frame.contains("edited in $EDITOR"), "the notice:\n{frame}");
     assert!(
@@ -2318,7 +2328,8 @@ async fn a_fake_editor_appends_a_line_and_ctrl_s_saves_it() {
 
     let dir = tempfile::TempDir::new().expect("a temp dir");
     let path = dir.path().join("append");
-    // R-13: `fs::write` closes the handle at once, so the exec never meets `ETXTBSY`.
+    // R-13: `fs::write` closes the handle at once, so a fork elsewhere cannot hold it open for
+    // long.
     std::fs::write(
         &path,
         "#!/bin/sh\nprintf '\\nAppended by the editor.\\n' >> \"$1\"\n",

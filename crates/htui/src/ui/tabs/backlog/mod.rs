@@ -686,9 +686,10 @@ impl Tab for BacklogTab {
     /// it did not ask for. With no form (a scope change landed first) it is dropped, as
     /// `App::finish_external_edit` drops one for a gone tab.
     fn on_external_edit(&mut self, outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {
-        match self.item_form.as_mut() {
-            Some(form) => form.on_external_edit(outcome),
-            None => tracing::debug!("the item form that asked for the editor is gone"),
+        if let Some(form) = self.item_form.as_mut() {
+            form.on_external_edit(outcome);
+        } else {
+            tracing::debug!("the item form that asked for the editor is gone");
         }
     }
 

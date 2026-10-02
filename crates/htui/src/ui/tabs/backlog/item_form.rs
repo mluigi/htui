@@ -533,8 +533,10 @@ impl ItemForm {
         };
         match outcome {
             ExternalEditOutcome::Edited(returned) => {
-                // Unreachable `None`: only an area is handed out.
-                let Some(area) = self.area_mut(field) else {
+                // Unreachable `None`: only an area is handed out. Logged (the field, never text)
+                // so a future non-area handoff shows.
+                let Some((area, _)) = self.area_mut(field) else {
+                    tracing::debug!(?field, "an $EDITOR outcome for a field that is not an area");
                     return;
                 };
                 // Filtered first (review L2), so a return that differs only by control characters
@@ -560,11 +562,12 @@ impl ItemForm {
         }
     }
 
-    /// The text area behind `field`: Paths or Body; `None` for a one-line field or a picker.
-    fn area_mut(&mut self, field: Field) -> Option<&mut TextArea> {
+    /// The text area behind `field` and its part of the temp-file stem (D3): Paths or Body;
+    /// `None` for a one-line field or a picker.
+    fn area_mut(&mut self, field: Field) -> Option<(&mut TextArea, &'static str)> {
         match field {
-            Field::Paths => Some(&mut self.paths),
-            Field::Body => Some(&mut self.body),
+            Field::Paths => Some((&mut self.paths, "paths")),
+            Field::Body => Some((&mut self.body, "body")),
             Field::Project
             | Field::Kind
             | Field::Title
@@ -574,19 +577,14 @@ impl ItemForm {
         }
     }
 
-    /// The temp-file stem (D3): `<key>-body` / `<key>-paths`, `new-body` / `new-paths` on a new
-    /// form. `editor::run` sanitises it (D25).
-    fn stem(&self, field: Field) -> String {
+    /// The temp-file stem (D3) for an area's `part`: `<key>-body` / `<key>-paths`, `new-body` /
+    /// `new-paths` on a new form. `editor::run` sanitises it (D25).
+    fn stem(&self, part: &str) -> String {
         let owner = self
             .context
             .item
             .as_ref()
             .map_or("new", |item| item.key.as_str());
-        let part = if field == Field::Paths {
-            "paths"
-        } else {
-            "body"
-        };
         format!("{owner}-{part}")
     }
 
@@ -595,11 +593,11 @@ impl ItemForm {
     /// as the Templates handoff leaves it: the outcome always sets it.
     fn hand_off(&mut self) -> ItemFormOutcome {
         let field = self.focus;
-        let stem = self.stem(field);
-        let Some(area) = self.area_mut(field) else {
+        let Some((area, part)) = self.area_mut(field) else {
             return ItemFormOutcome::Stay;
         };
         let text = area.text().to_owned();
+        let stem = self.stem(part);
         self.external = Some(field);
         ItemFormOutcome::External(ExternalEdit { text, stem })
     }
