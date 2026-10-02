@@ -338,8 +338,14 @@ impl ChatTab {
                 tail = format!(" · {session}");
             }
             let room = width.saturating_sub(cell_width(&tail));
+            // A lead cut through a wide cluster comes back a cell short; that leftover cell would
+            // only hold a second ellipsis, so a cut lead takes the middle's room with it.
+            let middle = if cell_width(&lead) > room {
+                String::new()
+            } else {
+                cells::clip(&middle, room - cell_width(&lead))
+            };
             let lead = cells::clip(&lead, room);
-            let middle = cells::clip(&middle, room.saturating_sub(cell_width(&lead)));
             return Line::from(vec![
                 Span::styled(lead, ctx.theme.accent),
                 Span::styled(format!("{middle}{tail}"), ctx.theme.dim),
@@ -1214,6 +1220,29 @@ mod tests {
             text.ends_with(" · live-1"),
             "{text:?} keeps the session ref"
         );
+    }
+
+    /// MOD-60 D9: a phase cut through a wide cluster comes back a cell short of its room, and that
+    /// lone leftover cell is not handed to the fields after it — one ellipsis marks the cut, not
+    /// two in a row.
+    #[test]
+    fn a_wide_phase_cut_short_marks_the_cut_once() {
+        let phase = "\u{6f22}".repeat(8);
+        for width in 20..=40 {
+            let text = promoted_text(&phase, "scripted", width);
+            assert!(
+                !text.contains("\u{2026}\u{2026}"),
+                "{text:?} at {width} doubles the ellipsis"
+            );
+            assert!(
+                cell_width(&text) <= usize::from(width),
+                "{text:?} against {width}"
+            );
+            assert!(
+                text.ends_with(" · live-1"),
+                "{text:?} keeps the session ref"
+            );
+        }
     }
 
     /// MOD-60 D9: the header is cut at a grapheme boundary, so a ZWJ family is drawn whole or not
