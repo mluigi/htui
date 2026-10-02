@@ -46,6 +46,7 @@ impl EditReason {
         }
     }
 }
+
 /// D5: an edit whose every field equals the item's. Said by the form, refused by the worker.
 pub const NOTHING_TO_SAVE: &str = "nothing to save: no field differs from the item";
 
