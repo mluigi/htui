@@ -6,13 +6,34 @@
 //! Navigation is lexical and never canonicalises, so nothing on screen names a link's target (P5,
 //! `R-BOX-4`): the one canonicalisation is the write the section sends on [`PickerOutcome::Chosen`].
 
+use std::path::Path;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use htui_core::root_path::DirListing;
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use crate::store_worker::{StoreReply, StoreRequest};
-use crate::ui::{TextField, Theme};
+use crate::store_worker::{LIST_DIR, StoreReply, StoreRequest};
+use crate::ui::cells::{cell_width, graphemes};
+use crate::ui::layout::centered;
+use crate::ui::{FieldOutcome, TextField, Theme};
+
+/// Marker in front of the highlighted entry, visible in a snapshot (the workspace switcher's).
+const CURSOR: &str = "> ";
+
+/// The marker's width, in front of every other line, so names stay in one column.
+const NO_CURSOR: &str = "  ";
+
+/// The popup's last line: every key the picker binds (P8).
+const HINT: &str = "j/k move \u{b7} Enter open \u{b7} h up \u{b7} s choose \u{b7} S this dir \u{b7} / go to \u{b7} . hidden \u{b7} Esc cancel";
+
+/// The label in front of the go-to field (P6).
+const GOTO: &str = "go to: ";
+
+/// The widest the popup gets (blueprint D14): a listing can't be sized to its content.
+const MAX_WIDTH: u16 = 96;
 
 /// What one key did (MOD-49 P8).
 #[derive(Debug, Clone)]
@@ -54,8 +75,12 @@ pub struct PathPicker {
 /// (a repo's workspace root on this box), else `home`, else `/`. Empty strings count as unset.
 #[must_use]
 pub fn start_dir(stored: Option<&str>, fallback: Option<&str>, home: Option<&str>) -> String {
-    let _ = (stored, fallback, home);
-    todo!("MOD-49 T3")
+    [stored, fallback, home]
+        .into_iter()
+        .flatten()
+        .find(|path| !path.is_empty())
+        .unwrap_or("/")
+        .to_owned()
 }
 
 impl PathPicker {
@@ -64,40 +89,294 @@ impl PathPicker {
     /// `h` still goes up (P7).
     #[must_use]
     pub fn open(title: impl Into<String>, start: String) -> (Self, StoreRequest) {
-        let _ = (title.into(), start);
-        todo!("MOD-49 T3")
+        let mut picker = Self {
+            title: title.into(),
+            path: start.clone(),
+            asked: String::new(),
+            listing: None,
+            error: None,
+            cursor: 0,
+            show_hidden: false,
+            goto: None,
+            reselect: None,
+        };
+        let request = picker.ask(start);
+        (picker, request)
     }
 
     /// The directory on screen.
     #[must_use]
     pub fn path(&self) -> &str {
-        todo!("MOD-49 T3")
+        &self.path
     }
 
     /// One key (P8, blueprint D11, D12, D15). The caller passes `CONTROL` chords on before
     /// calling this; every key not bound here is swallowed (`PickerOutcome::None`).
     pub fn on_key(&mut self, key: KeyEvent) -> PickerOutcome {
-        let _ = key;
-        todo!("MOD-49 T3")
+        if let Some(field) = &mut self.goto {
+            return match field.on_key(key) {
+                FieldOutcome::Submit => {
+                    let typed = field.text().unwrap_or_default().trim().to_owned();
+                    self.goto = None;
+                    if typed.is_empty() {
+                        PickerOutcome::None
+                    } else {
+                        PickerOutcome::Request(self.ask(typed))
+                    }
+                }
+                FieldOutcome::Cancel => {
+                    self.goto = None;
+                    PickerOutcome::None
+                }
+                FieldOutcome::Consumed | FieldOutcome::Pass => PickerOutcome::None,
+            };
+        }
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                let last = self.entry_count().saturating_sub(1);
+                self.cursor = (self.cursor + 1).min(last);
+                PickerOutcome::None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.cursor = self.cursor.saturating_sub(1);
+                PickerOutcome::None
+            }
+            KeyCode::Enter | KeyCode::Char('l') => match self.highlighted() {
+                Some(next) => PickerOutcome::Request(self.ask(next)),
+                None => PickerOutcome::None,
+            },
+            KeyCode::Char('h') | KeyCode::Backspace => match parent(&self.path) {
+                Some(up) => {
+                    self.reselect = Path::new(&self.path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned);
+                    PickerOutcome::Request(self.ask(up))
+                }
+                None => PickerOutcome::None,
+            },
+            KeyCode::Char('s') => self
+                .highlighted()
+                .map_or(PickerOutcome::None, PickerOutcome::Chosen),
+            KeyCode::Char('S') if self.listing.is_some() => {
+                PickerOutcome::Chosen(self.path.clone())
+            }
+            KeyCode::Char('/') => {
+                self.goto = Some(TextField::with_text("/"));
+                PickerOutcome::None
+            }
+            KeyCode::Char('.') => {
+                self.show_hidden = !self.show_hidden;
+                PickerOutcome::Request(self.ask(self.path.clone()))
+            }
+            KeyCode::Esc => PickerOutcome::Cancelled,
+            // Swallowed (D15): `q` must not quit and `?` must not open help mid-pick.
+            _ => PickerOutcome::None,
+        }
     }
 
     /// A bracketed paste (P6, blueprint D12): into go-to when it is open, opening it otherwise.
     pub fn on_paste(&mut self, text: &str) {
-        let _ = text;
-        todo!("MOD-49 T3")
+        match &mut self.goto {
+            // Go-to opens holding `/`; an absolute paste over that lone slash replaces it, so a
+            // pasted path never reads `//srv`.
+            Some(field) if field.text() == Some("/") && text.trim_start().starts_with('/') => {
+                *field = TextField::new();
+                field.on_paste(text);
+            }
+            Some(field) => {
+                field.on_paste(text);
+            }
+            None => {
+                let mut field = TextField::new();
+                field.on_paste(text);
+                self.goto = Some(field);
+            }
+        }
     }
 
     /// A reply addressed to the section; `true` when it was this picker's (blueprint D10).
     pub fn on_reply(&mut self, reply: &StoreReply) -> bool {
-        let _ = reply;
-        todo!("MOD-49 T3")
+        match reply {
+            StoreReply::DirListing(listing) if listing.path == self.asked => {
+                let reselect = self.reselect.take();
+                self.cursor = reselect
+                    .and_then(|name| listing.entries.iter().position(|e| e.name == name))
+                    .unwrap_or(0);
+                self.path.clone_from(&self.asked);
+                self.listing = Some(listing.clone());
+                self.error = None;
+                true
+            }
+            StoreReply::Failed {
+                request: LIST_DIR,
+                message,
+            } => {
+                self.path.clone_from(&self.asked);
+                self.listing = None;
+                self.error = Some(message.clone());
+                self.cursor = 0;
+                self.reselect = None;
+                true
+            }
+            _ => false,
+        }
     }
 
-    /// The popup, centred over `area` (blueprint D14).
+    /// The popup, centred over `area` (blueprint D14): a fixed box, because a listing of up to
+    /// `LIST_CAP` entries can't be sized to its content.
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-        let _ = (frame, area, theme);
-        todo!("MOD-49 T3")
+        let box_area = centered(
+            area,
+            area.width.saturating_sub(4).min(MAX_WIDTH),
+            area.height.saturating_sub(2),
+        );
+        let lines = self.lines(
+            box_area.width.saturating_sub(2),
+            usize::from(box_area.height.saturating_sub(2)),
+            theme,
+        );
+        frame.render_widget(Clear, box_area);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(format!(" {} ", self.title), theme.title)),
+            ),
+            box_area,
+        );
     }
+
+    /// `ask(p)`: remember `p` as the newest path asked for (P9) and build its request.
+    fn ask(&mut self, path: String) -> StoreRequest {
+        self.asked.clone_from(&path);
+        StoreRequest::ListDir {
+            path,
+            show_hidden: self.show_hidden,
+        }
+    }
+
+    /// How many entries the landed listing holds.
+    fn entry_count(&self) -> usize {
+        self.listing.as_ref().map_or(0, |l| l.entries.len())
+    }
+
+    /// The highlighted entry as a path under `path` (lexical, D23), when a listing has one.
+    fn highlighted(&self) -> Option<String> {
+        let entry = self.listing.as_ref()?.entries.get(self.cursor)?;
+        Some(child(&self.path, &entry.name))
+    }
+
+    /// The box's contents for an inner area of `width` × `height`: the header, the entries
+    /// window (or one of the three empty texts), go-to while open, a blank line and the hint.
+    fn lines(&self, width: u16, height: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let mut footer = Vec::new();
+        if let Some(field) = &self.goto {
+            let room = width.saturating_sub(u16::try_from(GOTO.len()).unwrap_or(u16::MAX));
+            let mut spans = vec![Span::styled(GOTO, theme.base)];
+            spans.extend(field.line(room, true, theme).spans);
+            footer.push(Line::from(spans));
+        }
+        footer.push(Line::raw(""));
+        footer.push(Line::styled(format!("{NO_CURSOR}{HINT}"), theme.dim));
+
+        let rows = height.saturating_sub(1 + footer.len());
+        let mut lines = vec![Line::styled(
+            clip_left(&self.path, usize::from(width)),
+            theme.accent,
+        )];
+        lines.extend(self.body(rows, theme));
+        lines.extend(footer);
+        lines
+    }
+
+    /// The entries in a window of `rows` lines that always holds the cursor, then `+N more`; or
+    /// the error, "reading…", or the empty text — three different screens (the switcher's rule).
+    fn body(&self, rows: usize, theme: &Theme) -> Vec<Line<'static>> {
+        if let Some(error) = &self.error {
+            return vec![Line::styled(format!("{NO_CURSOR}{error}"), theme.error)];
+        }
+        let Some(listing) = &self.listing else {
+            return vec![Line::styled(
+                format!("{NO_CURSOR}reading\u{2026}"),
+                theme.dim,
+            )];
+        };
+        if listing.entries.is_empty() {
+            let hidden = if self.show_hidden {
+                ""
+            } else {
+                " \u{b7} . shows hidden"
+            };
+            return vec![Line::styled(
+                format!("{NO_CURSOR}no directories here{hidden}"),
+                theme.dim,
+            )];
+        }
+        let window = rows.saturating_sub(usize::from(listing.more > 0)).max(1);
+        // Stateless scroll: the window ends on the cursor once it passes the bottom, so `render`
+        // stays `&self` and the cursor is always on screen.
+        let offset = self.cursor.saturating_sub(window - 1);
+        let mut lines: Vec<Line<'static>> = listing
+            .entries
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(window)
+            .map(|(index, entry)| {
+                let selected = index == self.cursor;
+                let marker = if selected { CURSOR } else { NO_CURSOR };
+                // `ls -F` marks: a link is `@` and never shows where it points (`R-BOX-4`).
+                let kind = if entry.is_link { '@' } else { '/' };
+                let style = if selected { theme.accent } else { theme.base };
+                Line::styled(format!("{marker}{}{kind}", entry.name), style)
+            })
+            .collect();
+        if listing.more > 0 {
+            lines.push(Line::styled(
+                format!("{NO_CURSOR}+{} more", listing.more),
+                theme.dim,
+            ));
+        }
+        lines
+    }
+}
+
+/// `path/name`, lexically (blueprint D23): `Path::join`, never a `canonicalize`.
+fn child(path: &str, name: &str) -> String {
+    Path::new(path).join(name).to_string_lossy().into_owned()
+}
+
+/// The lexical parent (blueprint D23): `None` at `/`, and an empty parent (a relative path) is
+/// `/`. `.` and `..` aren't normalised.
+fn parent(path: &str) -> Option<String> {
+    let up = Path::new(path).parent()?;
+    if up.as_os_str().is_empty() {
+        Some("/".to_owned())
+    } else {
+        Some(up.to_string_lossy().into_owned())
+    }
+}
+
+/// `text` in at most `width` cells, cut from the **left** behind a `…`: the end of a path is the
+/// part that tells directories apart.
+fn clip_left(text: &str, width: usize) -> String {
+    if cell_width(text) <= width {
+        return text.to_owned();
+    }
+    let budget = width.saturating_sub(1);
+    let clusters: Vec<&str> = graphemes(text).collect();
+    let mut used = 0;
+    let mut start = clusters.len();
+    for (index, cluster) in clusters.iter().enumerate().rev() {
+        let w = cell_width(cluster);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        start = index;
+    }
+    format!("\u{2026}{}", clusters[start..].concat())
 }
 
 #[cfg(test)]
