@@ -1382,11 +1382,20 @@ pub fn unborn_head(name: &str) -> String {
     format!("unborn HEAD: {name} has no commit to record as before_hash")
 }
 
+#[cfg(test)]
+thread_local! {
+    /// R-37's pin: how many times this thread has called [`open`]. Test builds only; the type is
+    /// spelled in full because a top-level `use std::cell::Cell` is unused in the non-test build.
+    static OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// `gix::open` (`gix-0.87.1/src/lib.rs:418`).
 ///
 /// # Errors
 /// [`IsolateError::Git`] when there is no repository at `path` or it cannot be read.
 pub fn open(path: &Path) -> Result<gix::Repository, IsolateError> {
+    #[cfg(test)]
+    OPENS.set(OPENS.get() + 1);
     gix::open(path)
         .map_err(|err| IsolateError::Git(format!("cannot open {}: {err}", path.display())))
 }
@@ -2354,6 +2363,28 @@ mod tests {
             .to_string()
     }
 
+    /// An empty-tree commit on `parents` with `message`, written through `HEAD`: gix's
+    /// `commit_as` expects `HEAD`'s branch to sit on the first parent (`MustExistAndMatch`,
+    /// `gix-0.87.1/src/repository/object.rs:423-431`) and moves it to the new commit.
+    fn commit_on_head(dir: &std::path::Path, parents: &[&str], message: &str) -> String {
+        let repo = gix::open(dir).expect("the repository opens");
+        let who = gix::actor::SignatureRef {
+            name: gix::bstr::BStr::new(b"htui test"),
+            email: gix::bstr::BStr::new(b"test@localhost"),
+            time: "1600009000 +0000",
+        };
+        let parents: Vec<gix::ObjectId> = parents
+            .iter()
+            .map(|hex| gix::ObjectId::from_hex(hex.as_bytes()).expect("a hex object id"))
+            .collect();
+        let tree = gix::ObjectId::empty_tree(gix::hash::Kind::Sha1);
+        repo.commit_as(who, who, "HEAD", message, tree, parents)
+            .expect("the commit is written and HEAD moves")
+            .detach()
+            .to_hex()
+            .to_string()
+    }
+
     /// Forty commits in a line, each a minute after the last; the last one is returned.
     fn long_history(dir: &std::path::Path) -> String {
         empty_repo(dir);
@@ -2410,6 +2441,51 @@ mod tests {
         let (found, read) = merge_walk(dir.path(), &merge, &base, &tip).expect("the walk");
         assert_eq!(found.as_deref(), Some(merge.as_str()), "the merge is found");
         assert!(read <= 1, "and nothing under it is read: {read} commits");
+    }
+
+    /// R-37 (lease blueprint §23.4): `reconcile_parent` opens the primary once per diff row, not
+    /// six times. The primary moved under the step (another run's commit sits on `before`), so
+    /// every check runs: the lookup, the ancestor walk past `before`, `HEAD`, the merge walk.
+    #[test]
+    fn reconcile_parent_opens_the_checkout_once() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let before = repo_with_one_commit(dir.path());
+        let moved = commit_file(dir.path(), "g", "other run\n", "another run's work");
+        let tip = commit_at(dir.path(), &[&before], 1);
+        let step = htui_core::model::StepId::new();
+        let merge = commit_on_head(dir.path(), &[&moved, &tip], &super::reconcile_message(step));
+        assert_eq!(
+            super::head(dir.path()).expect("HEAD reads"),
+            merge,
+            "HEAD is on the merge"
+        );
+
+        super::OPENS.set(0);
+        let parent = super::reconcile_parent(dir.path(), &before, &merge, step).expect("it reads");
+        assert_eq!(
+            parent.as_deref(),
+            Some(moved.as_str()),
+            "the merge's first parent"
+        );
+        assert_eq!(super::OPENS.get(), 1, "one open of the checkout");
+    }
+
+    /// R-37: a commit the checkout does not hold answers `None` after that one open, before any
+    /// commit is read.
+    #[test]
+    fn reconcile_parent_opens_once_for_a_commit_it_does_not_hold() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let before = repo_with_one_commit(dir.path());
+        let other = tempfile::tempdir().expect("a temporary directory");
+        empty_repo(other.path());
+        let elsewhere = commit_file(other.path(), "x", "elsewhere\n", "a line of its own");
+        let step = htui_core::model::StepId::new();
+
+        super::OPENS.set(0);
+        let parent =
+            super::reconcile_parent(dir.path(), &before, &elsewhere, step).expect("it reads");
+        assert_eq!(parent, None, "the checkout does not hold it");
+        assert_eq!(super::OPENS.get(), 1, "one open, then the early None");
     }
 
     /// `gix::init` alone makes a repository with an unborn `HEAD`, and `before_hash` is `NOT NULL`
