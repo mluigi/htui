@@ -14,7 +14,14 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-02):** **MOD-28 is done** (`docs/decisions/mod/mod-28.md`): `v` in the
+**Current status (2026-10-03):** **MOD-60 is done** (`docs/decisions/mod/mod-60.md`): every
+hand-laid-out row in the TUI measures, pads, clips and wraps in terminal cells, the way ratatui draws
+them, so CJK, emoji, combining marks and halfwidth kana no longer overrun a pane or push a column out
+of line. `ui::cells` gained `clip`/`pad`/`pad_left`/`fit`/`wrap`/`clip_spans` and ~16 local copies
+went; `cell_width` is now a per-grapheme sum (B10); the requirements tree elides a narrow project
+name before its ` · read-only` marker; the MOD-13 divergence columns stay fixed-width. No migration,
+no new crate, no snapshot moved.
+Before it, **MOD-28 is done** (`docs/decisions/mod/mod-28.md`): `v` in the
 Backlog detail's Runs sub-tab switches to a **flow view**. It draws the run under the cursor as a
 `rataflow` node graph: fan-out candidates side by side, the judge below them, the winner feeding the
 next phase, and retries labelled. It shares the list's cursor, so every run action and permission
@@ -27,14 +34,6 @@ Settings > Hierarchy opens a popup that lists directories on this box (links to 
 choice goes through the unchanged `SetWorkspaceRoot`/`SetRepoPath` and `canonical_root` (F-102).
 Listing is `StoreRequest::ListDir`, served off the store-worker loop under `spawn_blocking` with a
 10 s bound, so neither the UI nor the worker waits on a hung mount. No migration.
-Before it, **MOD-24 is done** (`docs/decisions/mod/mod-24.md`): a worker killed
-mid-run loses at most the step it was walking, now pinned by `crates/htui/tests/worker_crash_pg.rs`,
-which `SIGKILL`s a real worker process at five seeded kill points (`htui_orch::kill_point`, armed only
-under `test-support`) and restarts it: a step killed before its work is captured is retried, one
-killed after capture settles `done`. A cancel requested before the crash is applied before recovery
-(it used to lose to it); the sweep adopts graph runs only (it leased live chats each sweep, fencing
-their writes); a chat that panics closes its run `failed`. The review round also fixed a MOD-42
-deadlock in the command guard. No migration.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -300,21 +299,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   attempt, fanout_index)`; crash recovery of a child under ANA-2 §4.9; and whether graph steps deny
   the harness's own subagent tool, whose sessions htui never sees. Cites `R-MCP-2`, which already
   lists the tool.
-- [ ] **MOD-60 - Display width in every hand-laid-out row** (from MOD-54, plan D18). `R-TUI-1`,
-  `R-NF-1`. MOD-54 made `TextField` and `TextArea` count cells instead of code points through
-  `crate::ui::cells`; every other place that lays text out in `char`s has the identical class of
-  bug and is untouched on purpose. In order of severity: `crates/htui/src/ui/diff.rs` (the
-  Templates line diff -- a CJK hunk overrunning its pane), `crates/htui/src/ui/top_bar.rs` (the
-  tab bar and the clock), `crates/htui/src/ui/tabs/chat/transcript.rs` (wrap and clip), and
-  `settings::wrapped` plus every row renderer under `crates/htui/src/ui/tabs/settings/` and
-  `crates/htui/src/ui/tabs/backlog/detail/`. `ui::cells::cell_width` is the shared measurement to
-  build on. Note the chat transcript is the one to be careful with, because a snapshot there would
-  move. Also out of scope there: soft wrap, bidi, and terminals that report a CJK char as one cell.
-  Not blocked; MOD-54 is done (`docs/decisions/mod/mod-54.md`). MOD-39 added two more `char`
-  counters: the Requirements tab's `tree::pad`/`clip` (on a narrow pane `pad` cuts the
-  ` · read-only` marker before the project name) and the Reqs sub-tab's `cut`
-  (`docs/decisions/mod/mod-39.md`, "Carried"), and `chars().count()` counters in
-  `crates/htui/src/ui/tabs/requirements/detail.rs` and `forms.rs`.
 - [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
   Infisical implementation, environment injection at run start, scrubber with exact-match and
   pattern masks, fail-closed persistence gate, Settings tab secret provider section. **No longer
@@ -447,7 +431,8 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   - **Counts.** No new `StoreRequest`/`StoreReply` variant; `EditItem` gains `reason`.
     Conformance case 121 (`item_edit_reason_lands_in_revision`) and 1 snapshot.
   - **Deferred** (maintainer, review): display-width measurement in the view's notice, clip and
-    column padding (review L3; the diff rows already measure cells), which belongs to MOD-60;
+    column padding (review L3; the diff rows already measure cells), done by MOD-60
+    (`docs/decisions/mod/mod-60.md`);
     and the by-value `merge` that would avoid three spec clones (NIT-2).
 
   Plan `.claude/plans/mod-13-divergence.plan.md`, blueprint
@@ -614,7 +599,8 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   included. The alternative, nvim's `--embed` RPC UI (`nvim-rs`), is nvim-only and was not
   preferred. The three crates are not in `Cargo.lock`, so the plan owns that dependency decision.
   Not blocked. Its in-app widget draws through `ui::cells` (MOD-54, done:
-  `docs/decisions/mod/mod-54.md`); the rest of the display-width work is MOD-60.
+  `docs/decisions/mod/mod-54.md`), and every other row fits through the same module (MOD-60,
+  done: `docs/decisions/mod/mod-60.md`).
   **Keys (ANA-26, `R-TUI-10`):** the reserved leave chord is an action in MOD-67's catalogue, never a
   hard-coded key, and this pane is the one place `ctrl-c` is forwarded instead of quitting; the
   leave action must stay bound (`docs/ANA-26.md` §6.4).
@@ -667,6 +653,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 25 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-26 personas, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-71 mouse support, MOD-72 tool-call chips; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 24 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-26 personas, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-71 mouse support, MOD-72 tool-call chips; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |
