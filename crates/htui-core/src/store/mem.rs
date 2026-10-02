@@ -11570,8 +11570,9 @@ mod tests {
     /// MOD-26 plan D4: a persona's two stamps are the handle's clock, on create and on update.
     #[tokio::test]
     async fn persona_times_are_the_handles_clock() {
-        let t = Utc::now() - TimeDelta::days(2);
-        let clock = TestClock::at(t);
+        let clock = TestClock::at(Utc::now() - TimeDelta::days(2));
+        // The clock's own reading, which is truncated to the column's microseconds.
+        let t = clock.now();
         let store = MemStore::demo().with_clock(Arc::new(clock.clone()));
         let created = store
             .create_persona(crate::model::NewPersona {
