@@ -564,6 +564,9 @@ pub const CASES: &[&str] = &[
     "a_selection_handed_back_is_walked_by_the_adopter",
     "a_retry_of_a_failed_step_handed_back_is_walked_by_the_adopter",
     "a_resume_handed_back_is_walked_by_the_adopter",
+    // MOD-37 R-31 (review L1): `u` handed back over a rejection a crash left parked unparks it,
+    // and the adopter owes the rejection (plan D131).
+    "a_crashed_rejection_handed_back_is_failed_by_the_adopter",
     "an_accept_handed_back_is_walked_by_the_adopter",
     "a_retry_of_an_awaiting_step_handed_back_is_walked_by_the_adopter",
     "a_group_retry_handed_back_is_walked_by_the_adopter",
@@ -836,6 +839,9 @@ fn hand_back_case<'a, H: CaseHarness>(
         "a_resume_handed_back_is_walked_by_the_adopter" => {
             Box::pin(a_resume_handed_back_is_walked_by_the_adopter(harness))
         }
+        "a_crashed_rejection_handed_back_is_failed_by_the_adopter" => Box::pin(
+            a_crashed_rejection_handed_back_is_failed_by_the_adopter(harness),
+        ),
         "an_accept_handed_back_is_walked_by_the_adopter" => {
             Box::pin(an_accept_handed_back_is_walked_by_the_adopter(harness))
         }
@@ -6540,6 +6546,78 @@ async fn a_resume_handed_back_is_walked_by_the_adopter<H: CaseHarness>(harness: 
     );
 }
 
+/// `FEAT-3` parked at `prd`'s gate and rejected by a process that crashed before its unpark
+/// (MOD-37 R-31): `prd` is `failed` + `rejected`, the run and the item still `awaiting_approval`.
+async fn parked_over_a_crashed_rejection<O: Orchestrate>(orch: &O) -> RunId {
+    let run = parked_at_prd(orch).await;
+    let prd = step_at(orch, run, 0, 1).await;
+    assert!(
+        orch.store()
+            .answer_gate(
+                prd.id,
+                GateOutcome::Rejected,
+                Some("not like this".to_owned()),
+                orch.clock().now()
+            )
+            .await
+            .expect("MemStore takes the answer"),
+        "the rejection's first write landed and its unpark did not"
+    );
+    assert_eq!(run_of(orch, run).await.status, RunStatus::AwaitingApproval);
+    assert_eq!(
+        item_of(orch, ids::HTUI_FEAT_3).await.status,
+        Status::AwaitingApproval
+    );
+    run
+}
+
+/// MOD-37 R-31 (review L1): `u` handed back over a rejection a crash left parked unparks it
+/// (`hand_back_resume` reads `resumable`, not only `resumable_park`), and the adopter's recovery
+/// owes the rejection through plan D131's `settle_failed`: `prd` cannot loop, so the run fails
+/// `Rejected`, as the in-process resume did.
+async fn a_crashed_rejection_handed_back_is_failed_by_the_adopter<H: CaseHarness>(harness: &H) {
+    let (control, a) = (harness.fresh(), harness.fresh());
+    let c_run = parked_over_a_crashed_rejection(&control).await;
+    let run = parked_over_a_crashed_rejection(&a).await;
+
+    let b = Box::pin(hand_back_matches(
+        (&control, c_run),
+        (&a, run),
+        Act::Unblock(ids::HTUI_FEAT_3),
+    ))
+    .await;
+    let row = run_of(&b, run).await;
+    assert_eq!(
+        row.status,
+        RunStatus::Failed,
+        "the adopter owed the rejection"
+    );
+    assert_eq!(
+        row.failure,
+        Some(
+            RunFailure::Rejected {
+                phase: "prd".to_owned()
+            }
+            .to_string()
+        )
+    );
+    let prd = step_at(&b, run, 0, 1).await;
+    assert_eq!(
+        (prd.status, prd.gate_outcome, prd.gate_note.as_deref()),
+        (
+            StepStatus::Failed,
+            Some(GateOutcome::Rejected),
+            Some("not like this")
+        ),
+        "the crashed rejection's row is kept"
+    );
+    assert_eq!(
+        item_of(&b, ids::HTUI_FEAT_3).await.status,
+        Status::Failed,
+        "plan D7: the item mirrors the run's `failed` after the unpark"
+    );
+}
+
 /// `FEAT-3`'s `prd` promoted at its gate, with a passing verify scripted for the accept.
 async fn promoted_prd<O: Orchestrate>(orch: &O) -> RunId {
     primary_repo(orch).await;
@@ -6791,8 +6869,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            86,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            87,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -6817,7 +6895,8 @@ mod tests {
              the loop on `no_progress_review`), and MOD-41 T1's fenced capture (a walk \
              woken after `Done` records no commits, plan D1), and MOD-41 T9's eleven hand-back cases (plan D12: \
              one per walking command and retry route walked by the adopter, the changed-graph \
-             park of OQ-6, and the window that writes nothing past itself)"
+             park of OQ-6, and the window that writes nothing past itself), and MOD-37 review L1's \
+             one (a crashed rejection's `u` handed back and failed by the adopter)"
         );
     }
 
