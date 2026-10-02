@@ -37,8 +37,9 @@ const PRIORITY_WIDTH: usize = 5;
 /// A project header's tail when another user owns the spec.
 const READ_ONLY_TAIL: &str = " \u{b7} read-only";
 
-/// The fewest cells of a project name worth drawing before the header gives up its tail
-/// (MOD-60 D7; `graph.rs::fit_label`'s `slug_room >= 2`).
+/// The fewest cells of a project name worth drawing, its `…` counted, before the header gives up
+/// its tail (MOD-60 D7; `graph.rs::fit_label`'s `slug_room >= 2`). Measured on the clipped name,
+/// not the room: two cells of room hold no 2-cell glyph, only a bare `…`.
 const NAME_MIN: usize = 2;
 
 /// Which row of the tree the cursor is on.
@@ -267,7 +268,8 @@ fn project_header(group: &Group<'_>, folded: bool, width: usize, theme: &Theme) 
     } else {
         0
     };
-    let fits = |room: usize| cell_width(name) <= room || room >= NAME_MIN;
+    let fits =
+        |room: usize| cell_width(name) <= room || cell_width(&cells::clip(name, room)) >= NAME_MIN;
     let title = |name: &str| Span::styled(format!("{head}{name}{count}"), theme.title);
     let tail = || Span::styled(READ_ONLY_TAIL, theme.dim);
     if let Some(room) = width.checked_sub(fixed + tail_width)
@@ -437,6 +439,24 @@ mod tests {
         assert_eq!(
             line_text(&tree_lines(&snapshot, &projects, 7)[0]),
             "\u{25be} a ve\u{2026}"
+        );
+    }
+
+    /// MOD-60 D7 counts the name that is drawn, not the room: two cells of room hold no 2-cell
+    /// glyph, only a bare `…`, so the tail gives way rather than the whole name.
+    #[tokio::test]
+    async fn a_wide_first_glyph_drops_the_tail_before_the_whole_name() {
+        let (mut snapshot, mut projects, _) = platform().await;
+        rename(&mut projects, &"\u{6f22}\u{5b57}".repeat(6));
+        set_maintainer(&mut snapshot, false);
+        assert_eq!(
+            line_text(&tree_lines(&snapshot, &projects, 21)[0]),
+            "\u{25be} \u{6f22}\u{2026} (3) \u{b7} read-only"
+        );
+        assert_eq!(
+            line_text(&tree_lines(&snapshot, &projects, 20)[0]),
+            format!("\u{25be} {}\u{2026} (3) ", "\u{6f22}\u{5b57}".repeat(3)),
+            "19 cells of header, padded to the pane"
         );
     }
 
