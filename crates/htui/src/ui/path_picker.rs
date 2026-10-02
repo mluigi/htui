@@ -481,7 +481,12 @@ mod tests {
 
     /// The popup over a blank 100×30 frame, one trimmed line per row.
     fn render(picker: &PathPicker) -> String {
-        let mut term = Terminal::new(TestBackend::new(100, 30)).expect("a test backend");
+        render_at(picker, 100, 30)
+    }
+
+    /// The popup over a blank `width`×`height` frame, one trimmed line per row.
+    fn render_at(picker: &PathPicker, width: u16, height: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(width, height)).expect("a test backend");
         term.draw(|frame| picker.render(frame, frame.area(), &Theme::default()))
             .expect("the picker draws");
         let buffer = term.backend().buffer();
@@ -775,6 +780,33 @@ mod tests {
         assert!(render(&picker).contains("`/srv/gone` does not exist on this box"));
         assert_eq!(picker.path(), "/srv/gone");
         assert_eq!(asked(picker.on_key(ch('h'))), ("/srv".to_owned(), false));
+    }
+
+    /// MOD-49 review L-2: on 80 columns (an inner width of 74) the hint splits onto two lines
+    /// instead of losing its tail, and a refusal naming a long path wraps instead of running off
+    /// the edge.
+    #[test]
+    fn a_narrow_popup_wraps_the_refusal_and_splits_the_hint() {
+        let path =
+            "/srv/a-rather-long-directory-name/with-another-long-component/and-one-more-level";
+        let message = format!("constraint violated: `{path}` does not exist on this box");
+        let (mut picker, _) = PathPicker::open("Root", path.to_owned());
+        assert!(picker.on_reply(&StoreReply::Failed {
+            request: LIST_DIR,
+            message: message.clone(),
+        }));
+
+        let frame = render_at(&picker, 80, 24);
+        assert!(frame.contains("S this dir"), "{frame}");
+        assert!(frame.contains(". hidden \u{b7} Esc cancel"), "{frame}");
+        let flat: String = frame
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '\u{2502}')
+            .collect();
+        assert!(
+            flat.contains(&message.replace(' ', "")),
+            "the whole refusal is on screen: {frame}"
+        );
     }
 
     /// A refusal of another request isn't the picker's.
