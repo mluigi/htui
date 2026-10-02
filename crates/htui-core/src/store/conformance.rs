@@ -165,6 +165,7 @@ pub const CASES: &[&str] = &[
     "relay_view_lists_live_pending_requests_and_pending_cancels",
     "deleting_a_project_takes_its_relay_rows",
     "adopt_runs_never_leases_a_chat_run",
+    "queued_at_ties_inside_a_microsecond_break_on_id",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -417,6 +418,9 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
             deleting_a_project_takes_its_relay_rows(store).await
         }
         "adopt_runs_never_leases_a_chat_run" => adopt_runs_never_leases_a_chat_run(store).await,
+        "queued_at_ties_inside_a_microsecond_break_on_id" => {
+            queued_at_ties_inside_a_microsecond_break_on_id(store).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -4991,6 +4995,121 @@ async fn claim_run_applies_the_isolation_and_path_rules<S: WriteStore>(store: &S
         run_row(CASE, store, j).await.status,
         RunStatus::Queued,
         "{CASE}: and J stays queued"
+    );
+}
+
+/// MOD-37 R-29: `queued_at` is kept to the microsecond, as `timestamptz` keeps it, so two runs
+/// queued inside one microsecond tie and the tie breaks on `id`.
+///
+/// Mirrors `claim_run_applies_the_isolation_and_path_rules`. The lower `RunId` is queued 500 ns
+/// after the higher one, inside the same microsecond: a store that kept the nanoseconds would put
+/// the higher id first in `(queued_at, id)` order, and C's overlap would name it.
+async fn queued_at_ties_inside_a_microsecond_break_on_id<S: WriteStore>(store: &S) {
+    const CASE: &str = "queued_at_ties_inside_a_microsecond_break_on_id";
+    let core = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE)
+        .id;
+    let isolated = |prefix: &str| RepoScope {
+        isolated: true,
+        local: false,
+        prefixes: vec![prefix.to_owned()],
+    };
+    // `seam_clock` is on a whole microsecond, so `base + 500ns` is inside the same one.
+    let base = seam_clock();
+    let (low, high) = {
+        let (one, two) = (RunId::new(), RunId::new());
+        (one.min(two), two.max(one))
+    };
+    let legs = [
+        (
+            'A',
+            low,
+            base + TimeDelta::nanoseconds(500),
+            isolated("src/"),
+        ),
+        ('B', high, base, isolated("docs/")),
+        (
+            'C',
+            RunId::new(),
+            base + TimeDelta::seconds(1),
+            RepoScope::default(),
+        ),
+    ];
+    let mut runs = Vec::new();
+    for (leg, id, queued_at, repo) in legs {
+        let item = store
+            .mint_item(new_item(
+                ids::PROJECT_HTUI,
+                ids::KIND_HTUI_FEAT,
+                &format!("Leg {leg}"),
+            ))
+            .await
+            .expect(CASE)
+            .id;
+        let run = store
+            .create_run(NewRun {
+                id,
+                graph_snapshot: GraphSnapshot {
+                    scope: Some(RunScope {
+                        repos: [(core, repo)].into_iter().collect(),
+                    }),
+                    ..run_snapshot()
+                },
+                queued_at,
+                ..new_run(ids::PROJECT_HTUI, item, vec![core])
+            })
+            .await
+            .expect(CASE)
+            .id;
+        runs.push(run);
+    }
+    let [_, _, c] = runs[..] else {
+        panic!("{CASE}: three runs were queued")
+    };
+
+    assert_eq!(
+        run_row(CASE, store, low).await.queued_at,
+        base,
+        "{CASE}: the 500 ns past the microsecond are not kept (R-29)"
+    );
+    assert_eq!(
+        run_row(CASE, store, high).await.queued_at,
+        base,
+        "{CASE}: the higher id's queued_at reads back as written"
+    );
+
+    let owner = Uuid::now_v7();
+    let claimed_at = base + TimeDelta::minutes(1);
+    let claim = |run: RunId| store.claim_run(run, ids::BOX, owner, claimed_at, LEASE);
+    for run in [low, high] {
+        assert_eq!(
+            claim(run).await.expect(CASE),
+            Claim::Admitted,
+            "{CASE}: the two isolated runs on disjoint paths both run"
+        );
+        assert!(
+            store
+                .transition_run(
+                    run,
+                    RunStatus::Running,
+                    RunStatus::AwaitingApproval,
+                    claimed_at
+                )
+                .await
+                .expect(CASE),
+            "{CASE}: the admitted run parks at a gate and frees its slot"
+        );
+    }
+
+    assert_eq!(
+        claim(c).await.expect(CASE),
+        Claim::Overlaps {
+            with: low,
+            rule: OverlapRule::NotIsolated
+        },
+        "{CASE}: the two runs tie on queued_at, so the lower id is the first overlap"
     );
 }
 

@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, SubsecRound as _, TimeDelta, Utc};
 
 use serde_json::Value;
 
@@ -40,9 +40,9 @@ use crate::model::{
     RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
     SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch,
     SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary, canonical_declared_tags,
-    missing_tags_failure, overlaps, prompt_summary, scope_of,
+    StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, UpstreamEntry, UserId, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
+    canonical_declared_tags, missing_tags_failure, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -4163,7 +4163,9 @@ impl State {
             executing_box_id: None,
             graph_snapshot: Some(snapshot),
             started_by: new.started_by,
-            queued_at: new.queued_at,
+            // Postgres keeps `timestamptz` to the microsecond (sqlx truncates toward zero), and
+            // `(queued_at, id)` order must tie where it ties there (MOD-37 R-29).
+            queued_at: new.queued_at.trunc_subsecs(TIMESTAMPTZ_DIGITS),
             started_at: None,
             finished_at: None,
             failure: None,
@@ -6990,7 +6992,7 @@ mod tests {
         RelaySessionId, RepoId, RequirementAreaId, RequirementId, RequirementPatch,
         RequirementUpdate, Resolution, RunCommandStatus, RunId, RunKind, RunMode, RunStatus,
         RunStepCommit, RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status, StepId,
-        StepOutcome, StepStatus, UserId, VerifyOutcome,
+        StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -6998,7 +7000,7 @@ mod tests {
     use crate::store::{
         CasOutcome, DeleteTarget, ReadStore as _, SettingRung, StepFence, WriteStore as _,
     };
-    use chrono::{TimeDelta, Utc};
+    use chrono::{SubsecRound as _, TimeDelta, Utc};
     use serde_json::{Value, json};
     use uuid::Uuid;
 
@@ -9616,7 +9618,8 @@ mod tests {
             .queued_runs_on_box(ids::BOX)
             .await
             .expect("the read is answered");
-        let early = Utc::now();
+        // Truncated as the store keeps it, since `expected` compares it with the read-back.
+        let early = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
         assert!(
             fixture.iter().all(|(_, at)| *at < early),
             "the fixture's queued runs predate this case's, got {fixture:?}"
