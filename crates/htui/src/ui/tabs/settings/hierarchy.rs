@@ -117,9 +117,9 @@ enum Row {
 
 /// Which row an open editor writes back to, and what it needs to address it.
 ///
-/// `UpdateRepo` (and `SetRepoPath`, now [`PathTarget::RepoPath`]'s, MOD-49) carry the repo's
-/// **project** because the seam has no `repo(id)` reader: the worker re-reads the tree the reply renders, and it needs the project to find the
-/// workspace (plan open item O-2).
+/// `EditRepo` carries the repo's **project** because the seam has no `repo(id)` reader: the worker
+/// re-reads the tree the reply renders, and it needs the project to find the workspace (plan open
+/// item O-2). [`PathTarget::RepoPath`] carries it for the same reason (MOD-49).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditorKind {
     /// `N`: a workspace the shell then enters (D11).
