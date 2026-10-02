@@ -457,12 +457,18 @@ impl BacklogTab {
         }
     }
 
-    /// An item request's `Failed`. No `Action::Error` here: `App::on_reply` already reports
-    /// every `Failed` on the status line (A8).
+    /// An item request's `Failed`. `App::on_reply` already reports every `Failed` on the status
+    /// line (A8), so the tab adds no `Action::Error` of its own but in one case below.
     ///
     /// A refused form read opens nothing (D2). A mint that may have followed a COMMIT is hedged
     /// and the whole list re-read, the filter cleared so it cannot hide the item (D11, §10.1,
     /// §10.2); a refusal given before the insert is said plainly with nothing re-read.
+    ///
+    /// Review L4, the one case: such a mint `Failed` that finds no minting form (a scope change
+    /// dropped it, and a form opened since is not the mint's) has nowhere to show its hedge, so
+    /// the tab emits the hedge as an `Action::Error`. It is drained after `App`'s plain report, so the hedge is what the status
+    /// line keeps. Nothing is re-read: the item would be the old scope's. A refused mint stays
+    /// silent there, `App`'s report says it all.
     fn on_item_failed(&mut self, request: &str, message: &str, ctx: &Ctx<'_>) {
         let busy = self.item_form.as_ref().and_then(ItemForm::busy);
         match (request, busy) {
@@ -484,6 +490,9 @@ impl BacklogTab {
                 if !refused {
                     self.apply(BacklogFilter::default(), ctx);
                 }
+            }
+            (item_writes::MINT_NAME, _) if !item_writes::mint_refused(message) => {
+                ctx.emit(Action::Error(mint_may_have_landed(message)));
             }
             (item_writes::EDIT_NAME, Some(Busy::Editing)) => {
                 if let Some(form) = self.item_form.as_mut() {
@@ -2276,6 +2285,53 @@ mod tests {
             bench.actions().is_empty(),
             "nothing re-read, nothing reported"
         );
+    }
+
+    /// Review L4: a store-failed mint that lands after a scope change closed its form keeps its
+    /// hedge, on the status line, as the one error the tab raises of its own; nothing is re-read.
+    #[tokio::test]
+    async fn a_store_failed_mint_with_its_form_gone_is_hedged_on_the_status_line() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        let _ = a_mint_saved(&mut tab, &bench, &store).await;
+        tab.on_scope_change(&bench.scope);
+        let why =
+            htui_core::store::StoreError::Backend("the server went away".to_owned()).to_string();
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: item_writes::MINT_NAME,
+                message: why.clone(),
+            },
+            &mut bench.ctx(),
+        );
+        let actions = bench.actions();
+        assert!(
+            matches!(actions.as_slice(), [Action::Error(sentence)] if *sentence == mint_may_have_landed(&why)),
+            "{actions:?}"
+        );
+        assert!(tab.item_form.is_none());
+    }
+
+    /// Review L4: a refused mint wrote nothing, and `App` already reports its `Failed`, so with
+    /// its form gone the tab adds nothing.
+    #[tokio::test]
+    async fn a_refused_mint_with_its_form_gone_adds_nothing() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        let _ = a_mint_saved(&mut tab, &bench, &store).await;
+        tab.on_scope_change(&bench.scope);
+        let why =
+            htui_core::store::StoreError::Constraint("that kind is gone".to_owned()).to_string();
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: item_writes::MINT_NAME,
+                message: why,
+            },
+            &mut bench.ctx(),
+        );
+        assert!(bench.actions().is_empty());
     }
 
     /// D2, A8: a refused form read opens nothing, and the tab adds no error to the one `App`
