@@ -7,7 +7,9 @@
 
 use core::fmt;
 
-use htui_core::model::{GraphSnapshot, RunStep, StepId, StepStatus, missing_tags_failure};
+use htui_core::model::{
+    GateOutcome, GraphSnapshot, RunStep, StepId, StepStatus, missing_tags_failure,
+};
 
 /// The `run_step.fanout_index` a `fan_out = 1` phase walks, and the one every fan-out slot has.
 ///
@@ -317,6 +319,44 @@ pub fn resumable_park(cursor: &Cursor) -> bool {
     )
 }
 
+/// MOD-37 R-31: the `failed` + `rejected` latest step of a parked run, which
+/// `answer_gate(Rejected)` wrote and whose unpark a crash cut off.
+///
+/// `answer_gate` moves the step `awaiting_approval -> failed` and the unpark is the command's
+/// second write, so a crash between them leaves the run (and the item) `awaiting_approval` over a
+/// [`Cursor::Rest`] at `failed` whose `gate_outcome` is `rejected`. No gate waits on a human there:
+/// the rejection was answered, and only its tail (the end of the run, or the review loop) is owed.
+/// A `failed` step with no `gate_outcome` (a spent budget, an interrupt) is not one of these.
+///
+/// A followed review-loop escalation looks exactly like this too (MOD-37 milestone 2 blueprint,
+/// claim 2): the run parked over its `failed` + `rejected` review, the item moved back to
+/// `awaiting_approval` by `Unblock`'s `FollowRun`. No row tells the two apart, so `Unblock` resumes
+/// that one as well and the loop, with nothing changed, escalates again.
+#[must_use]
+pub fn crashed_rejection<'s>(cursor: &Cursor, steps: &'s [RunStep]) -> Option<&'s RunStep> {
+    let Cursor::Rest {
+        step,
+        status: StepStatus::Failed,
+    } = cursor
+    else {
+        return None;
+    };
+    steps
+        .iter()
+        .find(|row| row.id == *step)
+        .filter(|row| row.gate_outcome == Some(GateOutcome::Rejected))
+}
+
+/// Blueprint D196, widened by MOD-37 R-31: the one predicate every resume reader reads.
+///
+/// [`resumable_park`]'s three cursors, or a [`crashed_rejection`]. `Unblock`'s third case
+/// (through [`crate::command::unblock_enabled`]'s callers), `Engine::resume`'s walk and the
+/// worker box's hand-back resume all read this, and none open-codes it.
+#[must_use]
+pub fn resumable(cursor: &Cursor, steps: &[RunStep]) -> bool {
+    resumable_park(cursor) || crashed_rejection(cursor, steps).is_some()
+}
+
 /// Plan D59 for one fanned-out position; `None` when the slot is complete and the walk goes on.
 ///
 /// The order is load-bearing (blueprint §9.3, H-14): a `selected` `done` candidate completes the
@@ -376,11 +416,11 @@ fn group_cursor(steps: &[RunStep], position: i32, fan_out: i32) -> Option<Cursor
 #[cfg(test)]
 mod tests {
     use htui_core::fixtures::{demo_data, ids};
-    use htui_core::model::{GraphSnapshot, RunStep, StepId, StepStatus};
+    use htui_core::model::{GateOutcome, GraphSnapshot, RunStep, StepId, StepStatus};
 
     use crate::status::{
-        Cursor, RunFailure, cursor, group_at, judge_at, latest_at, may_attempt, next_attempt,
-        resumable_park, winner_at,
+        Cursor, RunFailure, crashed_rejection, cursor, group_at, judge_at, latest_at, may_attempt,
+        next_attempt, resumable, resumable_park, winner_at,
     };
 
     /// The four `RUN_1` steps, the one `RUN_2` step, or whatever the fixture holds for a run.
@@ -547,6 +587,45 @@ mod tests {
         ] {
             assert!(!resumable_park(&cursor), "{cursor:?} waits on a human");
         }
+    }
+
+    /// MOD-37 R-31: a run parked over the `failed` + `rejected` step `answer_gate(Rejected)` wrote,
+    /// whose unpark a crash cut off, is resumable, and [`crashed_rejection`] names the step. A
+    /// `failed` step with no `gate_outcome` (a spent budget, an interrupt) is not, nor is a real
+    /// gate. The rows are also exactly a followed review-loop escalation's (the MOD-37 milestone 2
+    /// blueprint, claim 2), its twin: `Unblock` resumes that one too.
+    #[test]
+    fn a_rejection_a_crash_left_parked_is_resumable() {
+        let mut steps = steps_of(ids::RUN_2);
+        let step = steps[0].id;
+        steps[0].status = StepStatus::Failed;
+        steps[0].gate_outcome = Some(GateOutcome::Rejected);
+        steps[0].gate_note = Some("not like this".to_owned());
+        let failed = Cursor::Rest {
+            step,
+            status: StepStatus::Failed,
+        };
+        assert!(resumable(&failed, &steps), "the rejection's tail is owed");
+        assert_eq!(
+            crashed_rejection(&failed, &steps).map(|row| row.id),
+            Some(step),
+            "the predicate names the rejected step"
+        );
+
+        let mut spent = steps.clone();
+        spent[0].gate_outcome = None;
+        assert!(
+            !resumable(&failed, &spent),
+            "a budget's or an interrupt's `failed` step is no rejection"
+        );
+        assert!(crashed_rejection(&failed, &spent).is_none());
+
+        let gate = Cursor::Rest {
+            step,
+            status: StepStatus::AwaitingApproval,
+        };
+        assert!(!resumable(&gate, &steps), "a real gate waits on a human");
+        assert!(crashed_rejection(&gate, &steps).is_none());
     }
 
     /// `RUN_3`'s two `research` candidates with the selection moved to index 1: the winner is

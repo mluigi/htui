@@ -12,9 +12,9 @@ use htui_core::model::{
 };
 use htui_core::store::{Result as StoreResult, StoreError};
 use htui_orch::command::{answer_gate_enabled, cancel_enabled, select_enabled};
-use htui_orch::status::group_at;
+use htui_orch::status::{group_at, resumable};
 use htui_orch::{
-    Command, CommandOutcome, Cursor, EngineError, GateAnswer, Rest, SessionKey, SessionSink,
+    Command, CommandOutcome, EngineError, GateAnswer, Rest, SessionKey, SessionSink,
     accept_enabled, cleanup_enabled, close_out_enabled, cursor, phase_at, promote_enabled,
     retry_admitted, snapshot_of, start_enabled, unblock_enabled,
 };
@@ -341,7 +341,7 @@ fn verdicts(
         steps: BTreeMap::new(),
     };
 
-    let mut active: Vec<(Run, Cursor)> = Vec::new();
+    let mut active: Vec<(Run, bool)> = Vec::new();
     let mut unblock_refusal = None;
     for (run, steps) in runs {
         // D212: while a step of this run is chatted with, the verbs that would move the run grey
@@ -370,7 +370,7 @@ fn verdicts(
             }
         };
         if run.status.is_active() {
-            active.push((run.clone(), cursor(&snapshot, steps)));
+            active.push((run.clone(), resumable(&cursor(&snapshot, steps), steps)));
         }
         for step in steps {
             let phase = match phase_at(run.id, &snapshot, step.position) {
