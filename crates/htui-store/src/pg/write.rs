@@ -28,16 +28,16 @@ use htui_core::model::{
     NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
     NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
     Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
-    PersonaPatch, PhaseId, PhasePatch, Priority, Project, ProjectId, ProjectPatch, PromptTemplate,
-    PromptTemplateId, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
-    RequirementArea, RequirementAreaId, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run, RunCommand,
-    RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
-    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
-    StepId, StepOutcome, StepPermission, StepStatus, UserId, VerifyOutcome, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, canonical_declared_tags,
-    missing_tags_failure, overlaps, scope_of,
+    PersonaPatch, PersonaPermission, PersonaTools, PhaseId, PhasePatch, Priority, Project,
+    ProjectId, ProjectPatch, PromptTemplate, PromptTemplateId, RelaySessionId, RelayView, Repo,
+    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
+    Resolution, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Skill, SkillBinding,
+    SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
+    UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject, canonical_declared_tags, missing_tags_failure, overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -52,19 +52,21 @@ use htui_core::store::{
     chat_step_status, check_attachment, citation_key, close_out_needs_a_summary, expected_on_row,
     failure_disagrees_with_status, finish_run_item_mirror, finish_run_needs_a_terminal_status,
     graph_not_in_project, illegal_move, invalid_area_code, invalid_prefix, item_has_a_live_run,
-    item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move, new_skill_refusal,
-    not_a_fanout_candidate, not_a_terminal_status, prompt_template_key, prompt_template_refusal,
-    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
-    row_names_another_step, run_is_terminal, skill_body_refusal, skill_patch_refusal,
-    skill_version_key, step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
-    withdrawn_requirement_cited,
+    item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move, new_persona_refusal,
+    new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status, persona_patch_refusal,
+    prompt_template_key, prompt_template_refusal, references_no_row, requirement_withdrawn,
+    reserved_phase_name, resolution_not_closable, row_names_another_step, run_is_terminal,
+    skill_body_refusal, skill_patch_refusal, skill_version_key, step_is_not_promotable,
+    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
 use serde_json::Value;
 use sqlx::PgConnection;
+use sqlx::types::Json;
 use uuid::Uuid;
 
 use crate::error::map_sqlx;
 use crate::pg::PgStore;
+use crate::pg::rows::PersonaRow;
 
 /// The refusal text for a kind that is unknown or belongs to another project.
 ///
@@ -644,6 +646,50 @@ async fn revise_requirement(
 // ------------------------------------------------------------------------------------------------
 // MOD-9 milestone 3 helpers (plan D75-D79, blueprint D89, D92).
 // ------------------------------------------------------------------------------------------------
+
+/// MOD-26 D4: `uq_persona_name`'s `23505` in `MemStore`'s sentence; anything else through
+/// [`map_sqlx`].
+fn persona_name_taken(err: sqlx::Error, name: &str) -> StoreError {
+    match &err {
+        sqlx::Error::Database(db) if db.constraint() == Some("uq_persona_name") => {
+            StoreError::Constraint(already_exists("persona", name))
+        }
+        _ => map_sqlx(err),
+    }
+}
+
+/// `create_persona`'s refusals in `MemStore`'s order: `persona_pkey` is the id, then the name.
+fn persona_insert_refused(err: sqlx::Error, new: &NewPersona) -> StoreError {
+    match &err {
+        sqlx::Error::Database(db) if db.constraint() == Some("persona_pkey") => {
+            StoreError::Constraint(already_exists("persona", new.id))
+        }
+        _ => persona_name_taken(err, &new.name),
+    }
+}
+
+/// MOD-26 D5: `fk_step_graph_phase_persona`'s `23503` in `MemStore`'s sentence (every other
+/// `23xxx` stays raw, `error.rs`); anything else through [`map_sqlx`].
+fn phase_persona_refused(err: sqlx::Error, persona: Option<PersonaId>) -> StoreError {
+    match (&err, persona) {
+        (sqlx::Error::Database(db), Some(persona))
+            if db.constraint() == Some("fk_step_graph_phase_persona") =>
+        {
+            StoreError::Constraint(references_no_row(
+                "step_graph_phase.persona_id",
+                persona,
+                "persona",
+            ))
+        }
+        _ => map_sqlx(err),
+    }
+}
+
+/// A persona blob as `JSONB`, `create_run`'s shape.
+fn persona_json<T: serde::Serialize>(column: &str, value: &T) -> Result<Value> {
+    serde_json::to_value(value)
+        .map_err(|error| StoreError::Constraint(format!("{column} does not serialise: {error}")))
+}
 
 /// D92 (F-P): `skill_name_key`'s `23505` in the sentence `MemStore` gives a taken name; anything
 /// else through [`map_sqlx`].
@@ -2754,7 +2800,7 @@ impl WriteStore for PgStore {
         )
         .fetch_one(&self.pool)
         .await
-        .map_err(map_sqlx)
+        .map_err(|err| phase_persona_refused(err, phase.persona_id))
     }
 
     /// The compare-and-set of D3 over [`PhasePatch`]'s five columns.
@@ -2836,7 +2882,7 @@ impl WriteStore for PgStore {
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(map_sqlx)?;
+        .map_err(|err| phase_persona_refused(err, persona.flatten()))?;
 
         match updated {
             Some(row) => Ok(CasOutcome::Applied(row)),
@@ -3292,21 +3338,113 @@ impl WriteStore for PgStore {
 
     // persona (MOD-26 milestone 1, plan D4)
 
+    /// Every persona in `name` byte order (`COLLATE "C"`).
     async fn personas(&self) -> Result<Vec<Persona>> {
-        Err(StoreError::Backend("MOD-26 T1: red".into()))
+        self.persona_rows().await
     }
 
-    async fn create_persona(&self, _new: NewPersona) -> Result<Persona> {
-        Err(StoreError::Backend("MOD-26 T1: red".into()))
+    /// D3 before the statement, then one `INSERT … RETURNING`: `persona_pkey` is the id,
+    /// `uq_persona_name` the name ([`persona_insert_refused`], `MemStore`'s order). Both stamps
+    /// are the columns' `now()` defaults.
+    async fn create_persona(&self, new: NewPersona) -> Result<Persona> {
+        if let Some(refusal) = new_persona_refusal(&new) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        let tools = persona_json("persona.tools", &new.tools)?;
+        let permission = persona_json("persona.permission", &new.permission)?;
+        sqlx::query_as!(
+            PersonaRow,
+            r#"
+            INSERT INTO persona (id, name, description, body, tools, permission)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id          AS "id: PersonaId",
+                      name,
+                      description,
+                      body,
+                      tools       AS "tools: Json<PersonaTools>",
+                      permission  AS "permission: Json<PersonaPermission>",
+                      created_at,
+                      updated_at
+            "#,
+            new.id.as_uuid(),
+            new.name,
+            new.description,
+            new.body,
+            tools,
+            permission,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map(Persona::from)
+        .map_err(|err| persona_insert_refused(err, &new))
     }
 
+    /// `update_skill`'s shape: bad input pays one read for `NotFound` → `Stale` → `Constraint`;
+    /// a spent token matches no row and never reaches the unique index. `trg_persona_updated_at`
+    /// stamps `updated_at`, an all-`None` patch included.
     async fn update_persona(
         &self,
-        _id: PersonaId,
-        _expected: DateTime<Utc>,
-        _patch: PersonaPatch,
+        id: PersonaId,
+        expected: DateTime<Utc>,
+        patch: PersonaPatch,
     ) -> Result<CasOutcome<Persona>> {
-        Err(StoreError::Backend("MOD-26 T1: red".into()))
+        if let Some(refusal) = persona_patch_refusal(&patch) {
+            return match self.persona_row(id).await? {
+                None => Err(StoreError::NotFound {
+                    entity: "persona",
+                    id: id.to_string(),
+                }),
+                Some(row) if row.updated_at != expected => Ok(CasOutcome::Stale(row)),
+                Some(_) => Err(StoreError::Constraint(refusal)),
+            };
+        }
+        let tools = patch
+            .tools
+            .as_ref()
+            .map(|tools| persona_json("persona.tools", tools))
+            .transpose()?;
+        let permission = patch
+            .permission
+            .as_ref()
+            .map(|permission| persona_json("persona.permission", permission))
+            .transpose()?;
+        let updated = sqlx::query_as!(
+            PersonaRow,
+            r#"
+            UPDATE persona SET
+                name        = COALESCE($3, name),
+                description = COALESCE($4, description),
+                body        = COALESCE($5, body),
+                tools       = COALESCE($6, tools),
+                permission  = COALESCE($7, permission)
+             WHERE id = $1 AND updated_at = $2
+            RETURNING id          AS "id: PersonaId",
+                      name,
+                      description,
+                      body,
+                      tools       AS "tools: Json<PersonaTools>",
+                      permission  AS "permission: Json<PersonaPermission>",
+                      created_at,
+                      updated_at
+            "#,
+            id.as_uuid(),
+            expected,
+            patch.name.as_deref(),
+            patch.description.as_deref(),
+            patch.body.as_deref(),
+            tools,
+            permission,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| match &patch.name {
+            Some(name) => persona_name_taken(err, name),
+            None => map_sqlx(err),
+        })?;
+        match updated {
+            Some(row) => Ok(CasOutcome::Applied(row.into())),
+            None => cas_miss(self.persona_row(id).await?, "persona", id),
+        }
     }
 
     // settings (D7, D8)
