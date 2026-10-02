@@ -141,6 +141,10 @@ pub struct Divergence {
     rows: Vec<Row>,
     /// The text the diffs show; `None` when body and paths are both `Same`.
     pane: Option<DiffPane>,
+    /// The pane's two unified diffs, ancestor → theirs and ancestor → mine; `None` without a
+    /// pane. Computed when the view opens and when `Tab` switches the pane, never per frame or
+    /// key (MOD-13 review L1). Body or path text, so the hand-written `Debug` never prints it.
+    diffs: Option<(String, String)>,
     /// The diffs' first row.
     scroll: u16,
     /// The two diff columns' widths at the last draw, which the next scroll key wraps at (the
@@ -208,6 +212,8 @@ impl Divergence {
         } else {
             None
         };
+        let diffs =
+            pane.map(|pane| pane_diffs(&merge, pane, ancestor.version, divergence.head.version));
         Self {
             key: divergence.head.key.clone(),
             ancestor_version: ancestor.version,
@@ -216,6 +222,7 @@ impl Divergence {
             merge,
             rows,
             pane,
+            diffs,
             scroll: 0,
             widths: Cell::new((0, 0)),
         }
@@ -242,6 +249,9 @@ impl Divergence {
                     Some(DiffPane::Body) => Some(DiffPane::Paths),
                     Some(DiffPane::Paths) | None => Some(DiffPane::Body),
                 };
+                self.diffs = self.pane.map(|pane| {
+                    pane_diffs(&self.merge, pane, self.ancestor_version, self.head_version)
+                });
                 self.scroll = 0;
             }
             KeyCode::Char('j') | KeyCode::Down => self.scroll_by(1, true),
@@ -323,13 +333,13 @@ impl Divergence {
     /// widths of the last draw (MOD-13 review M1: a prose body wraps several rows a line, and a
     /// clamp on its lines left the tail unreachable). The view never scrolls blank.
     fn scroll_by(&mut self, by: usize, down: bool) {
-        let Some((theirs, mine)) = self.diffs() else {
+        let Some((theirs, mine)) = &self.diffs else {
             return;
         };
         let (left, right) = self.widths.get();
-        let last = diff_rows(&theirs, left)
+        let last = diff_rows(theirs, left)
             .len()
-            .max(diff_rows(&mine, right).len())
+            .max(diff_rows(mine, right).len())
             .saturating_sub(1);
         let at = usize::from(self.scroll);
         let next = if down {
@@ -339,31 +349,25 @@ impl Divergence {
         };
         self.scroll = u16::try_from(next.min(last)).unwrap_or(u16::MAX);
     }
+}
 
-    /// The two unified diffs, ancestor → theirs and ancestor → mine, of the pane's text; computed
-    /// on demand so no text is stored beside the merge. `None` without a pane.
-    fn diffs(&self) -> Option<(String, String)> {
-        let pane = self.pane?;
-        let text = |spec: &ItemSpec| match pane {
-            DiffPane::Body => spec.body.clone(),
-            DiffPane::Paths => item_spec::paths_text(&spec.touched_paths),
-        };
-        let (ancestor, theirs, mine) = (
-            text(self.merge.ancestor()),
-            text(self.merge.theirs()),
-            text(self.merge.mine()),
-        );
-        let from = format!("ancestor v{}", self.ancestor_version);
-        Some((
-            diff::unified(
-                &ancestor,
-                &theirs,
-                &from,
-                &format!("theirs v{}", self.head_version),
-            ),
-            diff::unified(&ancestor, &mine, &from, "mine"),
-        ))
-    }
+/// The two unified diffs of `pane`'s text, ancestor → theirs and ancestor → mine, labelled with
+/// the two versions.
+fn pane_diffs(merge: &SpecMerge, pane: DiffPane, ancestor: i32, head: i32) -> (String, String) {
+    let text = |spec: &ItemSpec| match pane {
+        DiffPane::Body => spec.body.clone(),
+        DiffPane::Paths => item_spec::paths_text(&spec.touched_paths),
+    };
+    let (old, theirs, mine) = (
+        text(merge.ancestor()),
+        text(merge.theirs()),
+        text(merge.mine()),
+    );
+    let from = format!("ancestor v{ancestor}");
+    (
+        diff::unified(&old, &theirs, &from, &format!("theirs v{head}")),
+        diff::unified(&old, &mine, &from, "mine"),
+    )
 }
 
 /// The two catalogues a kind or graph label is read through: the reply's fresh one first (D7),
@@ -476,7 +480,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, theme: &Them
     );
     frame.render_widget(Paragraph::new(table), table_at);
 
-    if let (Some(pane), Some((theirs, mine))) = (view.pane, view.diffs()) {
+    if let (Some(pane), Some((theirs, mine))) = (view.pane, &view.diffs) {
         let columns = Layout::horizontal([
             Constraint::Fill(1),
             Constraint::Length(1),
@@ -499,7 +503,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, theme: &Them
         let [left, gap, right] = columns.areas(diffs_at);
         view.widths.set((left.width, right.width));
         let sides = [(theirs, left), (mine, right)].map(|(unified, at)| {
-            let lines: Vec<Line<'static>> = diff_rows(&unified, at.width)
+            let lines: Vec<Line<'static>> = diff_rows(unified, at.width)
                 .into_iter()
                 .map(|(line, row)| Line::styled(row, diff::diff_style(line, theme)))
                 .collect();
@@ -860,6 +864,30 @@ mod tests {
         assert_eq!(both.scroll(), 0, "a switch starts at the top");
         both.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(both.pane(), Some(DiffPane::Body));
+    }
+
+    /// MOD-13 review L1: the diffs are computed when the view opens and when `Tab` switches the
+    /// pane, and a scroll key reuses them.
+    #[tokio::test]
+    async fn the_diffs_are_cached_per_pane() {
+        let mut view = view(
+            |_| ItemPatch {
+                body: Some("theirs\n".to_owned()),
+                ..patch()
+            },
+            |spec| spec.touched_paths = vec!["src/mine/**".to_owned()],
+        )
+        .await;
+        let body = view.diffs.clone().expect("the body's diffs");
+        assert!(body.0.contains("+theirs"), "{:?}", body.0);
+        assert_eq!(body.1, "", "my body did not move");
+        view.on_key(key(KeyCode::Char('j')));
+        assert_eq!(view.diffs.as_ref(), Some(&body), "a scroll reuses them");
+        view.on_key(key(KeyCode::Tab));
+        let paths = view.diffs.clone().expect("the paths' diffs");
+        assert!(paths.1.contains("+src/mine/**"), "{:?}", paths.1);
+        view.on_key(key(KeyCode::Tab));
+        assert_eq!(view.diffs, Some(body), "back on the body");
     }
 
     #[tokio::test]
