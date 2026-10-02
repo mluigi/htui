@@ -1666,7 +1666,9 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         },
         StoreRequest::ApplyMigrations => StoreReply::MigrationsApplied { applied: 0 },
         // MOD-49 (plan P3): this box's filesystem under `spawn_blocking`; no store is read, so it
-        // answers offline too, and a refusal is a `Constraint` that never drops the backend.
+        // answers offline too, and a refusal is a `Constraint` that never drops the backend. The
+        // spawned loop answers it from its own task before reaching here (review M-1); this arm
+        // is `serve`'s, for the harness and `--demo`.
         StoreRequest::ListDir { path, show_hidden } => list_dir(path, *show_hidden).await?,
         StoreRequest::QdrantInfo
         | StoreRequest::SetQdrantUrl(_)
@@ -1784,17 +1786,11 @@ fn runnable_here(rows: Vec<ItemSummary>, info: Option<&BoxInfo>) -> Vec<ItemSumm
 }
 
 /// `ListDir` (MOD-49 P3): [`list_dirs`] off the async task, as `hierarchy::canonical` wraps
-/// `canonical_root`. A refusal becomes [`StoreError::Constraint`], so it reads
+/// `canonical_root`, bounded by [`LIST_TIMEOUT`] (review M-1). A refusal becomes
+/// [`StoreError::Constraint`], so it reads
 /// ``list_dir: constraint violated: `/x` does not exist on this box``.
 async fn list_dir(path: &str, show_hidden: bool) -> StoreResult<StoreReply> {
-    let typed = path.to_owned();
-    let listing = tokio::task::spawn_blocking(move || {
-        list_dirs(std::path::Path::new(&typed), show_hidden, LIST_CAP)
-    })
-    .await
-    .map_err(|err| StoreError::Backend(err.to_string()))?
-    .map_err(|refusal| StoreError::Constraint(refusal.to_string()))?;
-    Ok(StoreReply::DirListing(listing))
+    list_dir_within(path, show_hidden, LIST_TIMEOUT, list_dirs).await
 }
 
 /// [`list_dir`] over a chosen lister and bound, so a test can hang one (MOD-49 review M-1).
@@ -1811,8 +1807,21 @@ async fn list_dir_within<F>(
 where
     F: FnOnce(&std::path::Path, bool, usize) -> Result<DirListing, RootRefusal> + Send + 'static,
 {
-    let _ = (path, show_hidden, within, lister);
-    todo!("MOD-49 review M-1")
+    let typed = path.to_owned();
+    let walk = tokio::task::spawn_blocking(move || {
+        lister(std::path::Path::new(&typed), show_hidden, LIST_CAP)
+    });
+    let listing = tokio::time::timeout(within, walk)
+        .await
+        .map_err(|_| {
+            StoreError::Constraint(format!(
+                "`{path}` did not answer within {} s on this box",
+                within.as_secs_f32()
+            ))
+        })?
+        .map_err(|err| StoreError::Backend(err.to_string()))?
+        .map_err(|refusal| StoreError::Constraint(refusal.to_string()))?;
+    Ok(StoreReply::DirListing(listing))
 }
 
 /// Renders a store error into the reply the asking view receives.
@@ -2339,6 +2348,23 @@ pub(crate) fn spawn_with_concepts(
                                 ConceptsServed::Reply(reply) => reply,
                                 ConceptsServed::Deferred => continue,
                             }
+                        }
+                        // MOD-49 review M-1: a listing reads this box's filesystem, and a hung mount
+                        // never returns, so it is answered from its own task, like the concepts
+                        // arm: `continue` is the whole of `R-NF-3` for it, and `LIST_TIMEOUT`
+                        // bounds what the picker waits for. `try_serve` keeps an inline arm for
+                        // `serve`'s callers (the harness, `--demo`), which have no loop to stall.
+                        StoreRequest::ListDir { path, show_hidden } => {
+                            let (path, show_hidden) = (path.clone(), *show_hidden);
+                            let (seq, origin, tx) = (envelope.seq, envelope.origin.clone(), tx.clone());
+                            tokio::spawn(async move {
+                                let reply = match list_dir(&path, show_hidden).await {
+                                    Ok(reply) => reply,
+                                    Err(err) => failed(LIST_DIR, &err),
+                                };
+                                let _ = tx.send(ReplyEnvelope { seq, origin, reply });
+                            });
+                            continue;
                         }
                         other => match try_serve(&backend, other).await {
                             Ok(reply) => reply,
