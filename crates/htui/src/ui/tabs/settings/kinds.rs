@@ -28,6 +28,7 @@ use crate::app::{Ctx, Handled};
 use crate::catalogue::{CatalogueSnapshot, GraphEntry, ProjectCatalogue, REQUEST_NAMES};
 use crate::hierarchy::MirrorAfterDelete;
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
     message, wrapped,
@@ -1228,7 +1229,7 @@ impl KindsSection {
         // The outcome wins the line when both do not fit: the keys are on screen every other
         // frame, and this is the only place the outcome appears.
         let room = usize::from(width);
-        if keys.chars().count() + text.chars().count() + 3 > room {
+        if cell_width(&keys) + cell_width(&text) + 3 > room {
             return Line::styled(text, style);
         }
         Line::from(vec![
@@ -1588,7 +1589,7 @@ impl Editor {
         let label_width = self
             .fields
             .iter()
-            .map(|field| field.label.chars().count())
+            .map(|field| cell_width(field.label))
             .max()
             .unwrap_or(0);
         self.fields
@@ -1596,9 +1597,9 @@ impl Editor {
             .enumerate()
             .map(|(index, field)| {
                 let focused = index == self.focus;
-                let padding = " ".repeat(label_width - field.label.chars().count());
                 let style = if focused { theme.accent } else { theme.dim };
-                let mut spans = vec![Span::styled(format!("{}{padding}: ", field.label), style)];
+                let label = cells::pad(field.label, label_width);
+                let mut spans = vec![Span::styled(format!("{label}: "), style)];
                 let room = usize::from(width).saturating_sub(label_width + 2);
                 spans.extend(
                     field
@@ -1927,5 +1928,27 @@ mod tests {
             printed.contains("ConfirmPrefix") && printed.contains("ANA"),
             "the variant and the stored prefix are still legible: {printed}"
         );
+    }
+
+    /// MOD-60: the hint line measures the notice in cells, so a CJK notice that fits by `char`
+    /// count but not on screen takes the line alone rather than overrunning it.
+    #[test]
+    fn a_wide_notice_takes_the_hint_line_alone() {
+        let k = 10;
+        let notice = "\u{6f22}".repeat(k);
+        let section = KindsSection {
+            notice: Some(Notice::Error(notice.clone())),
+            ..KindsSection::new()
+        };
+        let keys = section.hint_text();
+        let width = cell_width(&keys) + k + 3;
+
+        let line = section.hint(
+            u16::try_from(width).expect("a hint this narrow fits u16"),
+            &Theme::default(),
+        );
+
+        assert_eq!(line.spans.len(), 1, "{line:?} against {width}");
+        assert_eq!(line.spans[0].content, notice);
     }
 }

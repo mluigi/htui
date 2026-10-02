@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span};
 use crate::app::{Ctx, Handled};
 use crate::qdrant_settings_info::{QdrantSnapshot, QdrantState};
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::cells::cell_width;
 use crate::ui::tabs::settings::{SectionId, SettingsSection, wrapped};
 use crate::ui::{FieldOutcome, TextField};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -228,6 +229,31 @@ impl QdrantSection {
         self.busy = Some(request.name());
         self.notice = None;
         ctx.request(request);
+    }
+
+    /// The one line under the pane: the keys this mode binds, then the last outcome.
+    ///
+    /// The outcome only appears here in Browse. When both do not fit in `room` cells the outcome
+    /// wins the line: the keys are on screen every other frame, and this is the only place the
+    /// outcome appears.
+    fn hint(&self, room: usize, theme: &crate::ui::Theme) -> Line<'static> {
+        let keys = self.hint_text();
+        let (Some(notice), Mode::Browse) = (&self.notice, &self.mode) else {
+            return Line::styled(keys, theme.dim);
+        };
+        let text = notice.text().to_owned();
+        let sty = if notice.is_error() {
+            theme.error
+        } else {
+            theme.dim
+        };
+        if cell_width(&keys) + cell_width(&text) + 3 > room {
+            return Line::styled(text, sty);
+        }
+        Line::from(vec![
+            Span::styled(format!("{keys} \u{b7} "), theme.dim),
+            Span::styled(text, sty),
+        ])
     }
 
     fn hint_text(&self) -> String {
@@ -464,7 +490,9 @@ impl SettingsSection for QdrantSection {
             Mode::Browse => {}
             Mode::EditingUrl(editor) => {
                 let l = "URL: ";
-                let field_room = area.width.saturating_sub(l.chars().count() as u16);
+                let field_room = area
+                    .width
+                    .saturating_sub(u16::try_from(cell_width(l)).unwrap_or(u16::MAX));
                 let mut spans = vec![Span::styled(l, ctx.theme.accent)];
                 spans.extend(editor.input.line(field_room.max(1), true, ctx.theme).spans);
                 lines.push(Line::from(spans));
@@ -486,7 +514,9 @@ impl SettingsSection for QdrantSection {
             }
             Mode::EditingKey(editor) => {
                 let l = "Key: ";
-                let field_room = area.width.saturating_sub(l.chars().count() as u16);
+                let field_room = area
+                    .width
+                    .saturating_sub(u16::try_from(cell_width(l)).unwrap_or(u16::MAX));
                 let mut spans = vec![Span::styled(l, ctx.theme.accent)];
                 spans.extend(editor.input.line(field_room.max(1), true, ctx.theme).spans);
                 lines.push(Line::from(spans));
@@ -507,29 +537,34 @@ impl SettingsSection for QdrantSection {
             }
         }
 
-        let keys = self.hint_text();
-        let hint_line = match (&self.notice, &self.mode) {
-            (Some(notice), Mode::Browse) => {
-                let text = notice.text().to_owned();
-                let sty = if notice.is_error() {
-                    ctx.theme.error
-                } else {
-                    ctx.theme.dim
-                };
-                if keys.chars().count() + text.chars().count() + 3 > room {
-                    Line::styled(text, sty)
-                } else {
-                    Line::from(vec![
-                        Span::styled(format!("{keys} \u{b7} "), ctx.theme.dim),
-                        Span::styled(text, sty),
-                    ])
-                }
-            }
-            _ => Line::styled(keys, ctx.theme.dim),
-        };
-        lines.push(hint_line);
+        lines.push(self.hint(room, ctx.theme));
 
         let p = ratatui::widgets::Paragraph::new(lines);
         frame.render_widget(p, area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::Theme;
+
+    /// MOD-60: the hint line measures the notice in cells, so a CJK notice that fits by `char`
+    /// count but not on screen takes the line alone rather than overrunning it.
+    #[test]
+    fn a_wide_notice_takes_the_hint_line_alone() {
+        let k = 10;
+        let notice = "\u{6f22}".repeat(k);
+        let section = QdrantSection {
+            notice: Some(Notice::Error(notice.clone())),
+            ..QdrantSection::new()
+        };
+        let keys = section.hint_text();
+        let width = cell_width(&keys) + k + 3;
+
+        let line = section.hint(width, &Theme::default());
+
+        assert_eq!(line.spans.len(), 1, "{line:?} against {width}");
+        assert_eq!(line.spans[0].content, notice);
     }
 }
