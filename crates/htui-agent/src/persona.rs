@@ -23,11 +23,12 @@ pub fn tool_kind_of(text: &str) -> Option<ToolKind> {
 ///   in base order, every base name outside the persona's appended to `deny`, and the base list
 ///   kept when the intersection is empty (B-8);
 /// - `deny`: base, then persona's, then B-8's additions, first occurrence kept;
-/// - `deny_kinds`: base, then persona's (`tool_kind_of`, an unknown string → `Other`, B-19);
+/// - `deny_kinds`: base, then persona's (`tool_kind_of`, an unknown string → `Other`, B-19),
+///   first occurrence kept;
 /// - `command_run`: `base && persona`;
 /// - rules: persona rules (reject-only; empty reason → `persona <name>`, B-21), then one
 ///   `{match: {tool_kind}, answer: reject_once, reason: "persona <name> denies <kind>"}` per
-///   persona `deny_kinds` entry, then the base rules;
+///   distinct persona `deny_kinds` entry, then the base rules;
 /// - `remembered`: the base's, evaluated after every rule (`permission.rs:81-92`);
 /// - `default`: the stricter of the two, `Allow < Ask < Deny`.
 #[must_use]
@@ -62,11 +63,17 @@ pub fn narrow(
     };
 
     // B-19: a string this build cannot read is still a denial, of `other`, never dropped.
-    let own_kinds: Vec<ToolKind> = own
+    // Review N6: a repeated kind is one rule, first occurrence kept.
+    let mut own_kinds: Vec<ToolKind> = Vec::new();
+    for kind in own
         .deny_kinds
         .iter()
         .map(|text| tool_kind_of(text).unwrap_or(ToolKind::Other))
-        .collect();
+    {
+        if !own_kinds.contains(&kind) {
+            own_kinds.push(kind);
+        }
+    }
     let mut deny_kinds = base.deny_kinds.clone();
     for kind in &own_kinds {
         if !deny_kinds.contains(kind) {
@@ -534,6 +541,42 @@ mod tests {
                 answer: PermissionOptionKind::RejectOnce,
                 reason: "persona reviewer denies other".to_owned(),
             }]
+        );
+    }
+
+    /// MOD-26 review N6: a repeated `deny_kinds` entry is one kind rule, first occurrence kept.
+    #[test]
+    fn a_repeated_deny_kind_is_one_rule() {
+        let kind_rule = |kind: &str| PermissionRule {
+            matcher: PermissionMatch {
+                tool_kind: Some(kind.to_owned()),
+                ..PermissionMatch::default()
+            },
+            answer: PermissionOptionKind::RejectOnce,
+            reason: format!("persona reviewer denies {kind}"),
+        };
+        let (exposure, policy) = narrow(
+            &ToolExposure::default(),
+            &PermissionPolicy::default(),
+            &tooled(denying_kinds(&["edit", "edit"])),
+        );
+        assert_eq!(exposure.deny_kinds, vec![ToolKind::Edit]);
+        assert_eq!(
+            policy.rules,
+            vec![kind_rule("edit")],
+            "[edit, edit] is one rule"
+        );
+
+        let (exposure, policy) = narrow(
+            &ToolExposure::default(),
+            &PermissionPolicy::default(),
+            &tooled(denying_kinds(&["edit", "read", "edit"])),
+        );
+        assert_eq!(exposure.deny_kinds, vec![ToolKind::Edit, ToolKind::Read]);
+        assert_eq!(
+            policy.rules,
+            vec![kind_rule("edit"), kind_rule("read")],
+            "first occurrence kept, in order"
         );
     }
 
