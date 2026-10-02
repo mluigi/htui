@@ -2870,36 +2870,45 @@ mod tests {
 
     /// MOD-60: the tool-name column is measured and cut in cells. A CJK name that fits the
     /// column by `char` count is twice as wide on screen; it is cut with `…` so every label,
-    /// wide or not, ends at the same cell. The column is odd (63 / 3 = 21) so the cut lands on a
-    /// cluster boundary and `…` sits right against the `": "`.
+    /// wide or not, ends at the same cell. At an odd column (63 / 3 = 21) the cut lands on a
+    /// cluster boundary and `…` sits right against the `": "`; at an even one (60 / 3 = 20)
+    /// a wide glyph cannot fill the last cell before `…`, so `cells::fit` pads one space after
+    /// it. Both pin the exact label, so an over-clip padded back to the column cannot pass.
     #[test]
     fn a_wide_tool_name_is_fitted_to_the_label_column() {
-        let width = 63;
-        let column = usize::from(width) / 3;
-        let form = PathsForm {
-            agent_id: AgentId::new(),
-            name: "agent".to_owned(),
-            opened: BTreeMap::new(),
-            fields: ["\u{6f22}".repeat(20), "git".to_owned()]
-                .into_iter()
-                .map(|tool| PathField {
-                    tool,
-                    input: TextField::new(),
-                })
-                .collect(),
-            focus: 0,
-        };
+        let wide = "\u{6f22}";
+        let cases = [
+            (63, format!("{}\u{2026}: ", wide.repeat(10))),
+            (60, format!("{}\u{2026} : ", wide.repeat(9))),
+        ];
+        for (width, expected) in cases {
+            let column = usize::from(width) / 3;
+            let form = PathsForm {
+                agent_id: AgentId::new(),
+                name: "agent".to_owned(),
+                opened: BTreeMap::new(),
+                fields: [wide.repeat(20), "git".to_owned()]
+                    .into_iter()
+                    .map(|tool| PathField {
+                        tool,
+                        input: TextField::new(),
+                    })
+                    .collect(),
+                focus: 0,
+            };
 
-        let lines = form.lines(width, &Theme::default());
+            let lines = form.lines(width, &Theme::default());
 
-        for line in &lines {
-            let label = &line.spans[0].content;
-            assert_eq!(cell_width(label), column + 2, "{label:?} against {column}");
+            for line in &lines {
+                let label = &line.spans[0].content;
+                assert_eq!(cell_width(label), column + 2, "{label:?} against {column}");
+            }
+            assert_eq!(lines[0].spans[0].content, expected, "width {width}");
+            assert_eq!(
+                lines[1].spans[0].content,
+                format!("{:<column$}: ", "git"),
+                "width {width}"
+            );
         }
-        assert!(
-            lines[0].spans[0].content.ends_with("\u{2026}: "),
-            "{:?}",
-            lines[0].spans[0].content
-        );
     }
 }
