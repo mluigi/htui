@@ -111,8 +111,9 @@ fn flatten(text: &str) -> Cow<'_, str> {
 
 /// `text` in at most `width` cells, cut at a grapheme boundary with [`ELLIPSIS`] as its last cell
 /// when anything was cut (MOD-60 D1, D2). A control character draws as one blank cell (D3) —
-/// also when nothing is cut. Width 0 is `""`: a lone `…` would be a cell over. A wide cluster that
-/// would straddle the cut is dropped, so a cut result may be one cell short; never one long.
+/// also when nothing is cut. Width 0 is `""`: a lone `…` would be a cell over. A cluster that
+/// would straddle the cut is dropped, so a cut result may fall short of `width` by up to that
+/// cluster's cells less one (a stacked `ｶﾞﾞﾞ` is 4, so up to 3); never long. [`fit`] pads it back.
 #[allow(
     dead_code,
     reason = "MOD-60 T0 lands before its callers (T1-T4); T5 deletes this attribute"
@@ -447,6 +448,8 @@ mod tests {
             "\u{2014}".to_owned(),
             "abc".to_owned(),
             String::new(),
+            "\u{6f22}\u{5b57}a".to_owned(),
+            "a\u{ff76}\u{ff9e}\u{ff9e}\u{ff9e}".to_owned(),
         ]
     }
 
@@ -485,6 +488,16 @@ mod tests {
             ("a\r\nb", 3, "a b".to_owned(), 3),
             ("ab\ncd", 3, "ab\u{2026}".to_owned(), 3),
             ("\t", 1, " ".to_owned(), 1),
+            // The cut stops at the first cluster that does not fit: the narrower `a` behind it
+            // is not pulled forward, which would reorder the text (blueprint §1.3 step 4).
+            ("\u{6f22}\u{5b57}a", 4, "\u{6f22}\u{2026}".to_owned(), 3),
+            // A straddling cluster of 4 cells leaves the cut 2 short, not 1.
+            (
+                "a\u{ff76}\u{ff9e}\u{ff9e}\u{ff9e}",
+                4,
+                "a\u{2026}".to_owned(),
+                2,
+            ),
         ];
         for (text, width, want, cells) in cases {
             let out = clip(text, width);
@@ -543,6 +556,11 @@ mod tests {
         assert_eq!(fit(CJK, 5), "\u{6f22}\u{5b57}\u{2026}");
         assert_eq!(fit(&FAMILY.repeat(2), 2), "\u{2026} ");
         assert_eq!(fit(&SOUND.repeat(2), 2), "\u{2026} ");
+        assert_eq!(
+            fit("a\u{ff76}\u{ff9e}\u{ff9e}\u{ff9e}", 4),
+            "a\u{2026}  ",
+            "a cut two cells short is padded back by two"
+        );
         for input in table_inputs() {
             for w in 0..=8 {
                 let out = fit(&input, w);
