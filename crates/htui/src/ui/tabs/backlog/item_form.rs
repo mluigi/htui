@@ -315,6 +315,20 @@ fn strip_added_newline<'a>(handed: &str, returned: &'a str) -> &'a str {
     }
 }
 
+/// Review L2: `returned` without its control characters, as [`TextArea::on_paste`] drops them
+/// from a paste, so an escape sequence an editor or a script left in the file is not saved into
+/// the item, where typing and pasting cannot put one. `\n` is kept, and so is `\t`: unlike a
+/// paste, an editor's text is often indented code, and the area draws a `\t` as spaces to its
+/// next tab stop with the cursor counted the same way (`text_area.rs` `drawn`, pinned by
+/// `a_tab_draws_as_spaces_to_the_next_stop`). `returned` is already LF-only (`editor::run`
+/// normalises it), so no `\r` is lost.
+fn without_controls(returned: &str) -> String {
+    returned
+        .chars()
+        .filter(|c| matches!(c, '\n' | '\t') || !c.is_control())
+        .collect()
+}
+
 impl ItemForm {
     /// `N`: text blank, priority `0`, kind = `kind` when it is one of `context.kinds` else the
     /// first, graph the kind default, focus Title. `projects` is `ctx.projects` (scope order).
@@ -508,7 +522,8 @@ impl ItemForm {
     }
 
     /// D4: the `$EDITOR` handoff came back. No field out (`external` is `None`): ignored.
-    /// `Edited` replaces only the handed-out field's text (after D5), focuses it and says `EDITED`;
+    /// `Edited` replaces only the handed-out field's text (control characters dropped, then D5),
+    /// focuses it and says `EDITED`;
     /// the token, reason, `opened` and every other field are untouched, so A4's "unchanged" still
     /// compares against what the form opened with. `Unchanged` says `NO_CHANGES` (+ `WAIT_FLAG`
     /// when quick); `Failed` says its sentence; neither touches the text.
@@ -522,8 +537,10 @@ impl ItemForm {
                 let Some(area) = self.area_mut(field) else {
                     return;
                 };
-                // D5's baseline is the widget: nothing reaches the form between the handoff and
-                // its outcome (the event loop runs them back to back).
+                // Filtered first (review L2), so a return that differs only by control characters
+                // reads as unchanged. D5's baseline is the widget: nothing reaches the form between
+                // the handoff and its outcome (the event loop runs them back to back).
+                let returned = without_controls(&returned);
                 let text = strip_added_newline(area.text(), &returned);
                 if text == area.text() {
                     self.notice = Some(NO_CHANGES.to_owned());
@@ -2290,6 +2307,36 @@ mod tests {
         form.on_external_edit(ExternalEditOutcome::Edited("abc\n\n".to_owned()));
         assert_eq!(form.body.text(), "abc\n\n");
         assert_eq!(form.notice(), Some(EDITED));
+    }
+
+    /// Review L2: a control character from the editor is dropped, as a paste drops one; a `\t`
+    /// is kept, because the area draws it to the next tab stop.
+    #[tokio::test]
+    async fn an_editor_return_loses_its_control_characters_and_keeps_its_tabs() {
+        let store = MemStore::demo();
+        let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
+        form.body = TextArea::with_text("abc");
+        focus_on(&mut form, Field::Body);
+        handed(&mut form);
+        form.on_external_edit(ExternalEditOutcome::Edited(
+            "a\u{1b}[31mb\u{7}c\u{0}\n\tindented\u{7f}\n".to_owned(),
+        ));
+        assert_eq!(form.body.text(), "a[31mbc\n\tindented");
+        assert_eq!(form.notice(), Some(EDITED));
+    }
+
+    /// Review L2: the filter runs before D5's compare, so a return that differs only by control
+    /// characters (and the editor's final newline) is no change.
+    #[tokio::test]
+    async fn a_return_differing_only_by_control_characters_is_no_change() {
+        let store = MemStore::demo();
+        let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
+        form.body = TextArea::with_text("abc");
+        focus_on(&mut form, Field::Body);
+        handed(&mut form);
+        form.on_external_edit(ExternalEditOutcome::Edited("a\u{1b}bc\u{0}\n".to_owned()));
+        assert_eq!(form.notice(), Some(NO_CHANGES));
+        assert_eq!(form.body.text(), "abc");
     }
 
     #[tokio::test]
