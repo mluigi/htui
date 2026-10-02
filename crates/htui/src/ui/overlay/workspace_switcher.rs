@@ -189,18 +189,7 @@ impl Overlay for WorkspaceSwitcher {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let lines = self.lines(ctx.theme);
-        // Measured in cells as the rows were padded: `Line::width` skips the halfwidth sound mark
-        // rule, so a name the column pads by cells would come out a cell short (MOD-60 B3).
-        let widest = lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| cell_width(&span.content))
-                    .sum::<usize>()
-            })
-            .max()
-            .unwrap_or(0);
+        let widest = widest(&lines);
         let width = u16::try_from(widest)
             .unwrap_or(u16::MAX)
             .saturating_add(CHROME);
@@ -228,6 +217,22 @@ fn projects_label(count: usize) -> String {
         1 => "1 project".to_owned(),
         n => format!("{n} projects"),
     }
+}
+
+/// The widest of `lines`, in cells. Measured as the rows were padded: `Line::width` skips the
+/// halfwidth sound mark rule, so a name the column pads by cells would overrun a box sized by it
+/// (MOD-60 B3).
+fn widest(lines: &[Line<'_>]) -> usize {
+    lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| cell_width(&span.content))
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -260,5 +265,28 @@ mod tests {
             .map(|line| cell_width(&line.spans[0].content))
             .collect();
         assert_eq!(first[0], first[1], "{lines:?}");
+    }
+
+    /// MOD-60 B3: the box is as wide as the widest row in cells. `ｶﾞ` is two cells and one to
+    /// `Line::width`, so a box sized that way is narrower than the row padded in cells.
+    #[test]
+    fn a_halfwidth_workspace_name_fits_inside_the_box() {
+        let name = "\u{ff76}\u{ff9e}".repeat(20);
+        let switcher = WorkspaceSwitcher {
+            workspaces: vec![workspace(&name)],
+            selected: 0,
+            loaded: true,
+        };
+        let lines = switcher.lines(&Theme::default());
+        let row: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(
+            cell_width(&row),
+            2 + 40 + 2 + cell_width(&projects_label(0))
+        );
+        assert_eq!(widest(&lines), cell_width(&row), "{row:?}");
     }
 }
