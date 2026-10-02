@@ -85,6 +85,7 @@ pub mod frontmatter;
 pub mod hierarchy;
 pub mod ids;
 pub mod item;
+pub mod item_merge;
 pub mod item_spec;
 pub mod kind;
 pub mod link;
@@ -122,6 +123,7 @@ pub use ids::{
 pub use item::{
     Item, ItemFilter, ItemPatch, ItemRevision, ItemSummary, NewItem, Resolution, Status,
 };
+pub use item_merge::{FieldState, Side, SpecField, SpecMerge};
 pub use item_spec::{EditReason, ItemSpec, SpecChanges, SpecContext, SpecError};
 pub use kind::{
     CommandQueue, Gate, Isolation, ItemKind, ItemKindPatch, NewItemKind, NewPromptTemplate,
