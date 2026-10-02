@@ -3037,6 +3037,7 @@ dependencies = [
  "htui-store",
  "htui-worker",
  "insta",
+ "rataflow",
  "ratatui",
  "sentry",
  "sentry-anyhow",
@@ -4978,6 +4979,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
 dependencies = [
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "rataflow"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37bbb54f8b326976a8ebc3efb0f6937325fb68a267d121eb6ef6803429f2f113"
+dependencies = [
+ "ratatui",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

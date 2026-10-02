@@ -26,17 +26,25 @@
 //! | `u` / `R` | item | `Unblock` / `StartRun` |
 //! | `C` | item | close-out: the counts, a picked resolution, a `y`, the key typed back (D167) |
 //! | `1`-`9` | step with a pending request | `AnswerPermission` with that option (MOD-42 D14) |
+//! | `v` | pane | the list or the flow view of the cursor's run (MOD-28 D1, D8) |
+//! | `+` / `-` / `=` | flow | zoom in, zoom out, fit the run (MOD-28 D8) |
 //!
 //! MOD-42 plan D14: every `Runs` reply also asks for the item's `RelayView`. A step whose session
 //! parked a stage-3 permission request takes two more lines, the scrubbed summary and the strip,
 //! and while the cursor is on it every digit is the pane's; anywhere else a digit passes on to the
 //! global tab select. A run with a pending cancel says `cancel requested` under its grid.
 //!
+//! MOD-28: `v` draws the run under the cursor as a flow (`execution_graph.rs`). The flow's selected
+//! node *is* the cursor, so every key above acts the same in both views (ANA-12 invariant 2).
+//! `PageUp`/`PageDown` do nothing there.
+//!
 //! At the close-out's counts `←`/`→` (and `h`/`l`) pick the resolution among the legal ones for
 //! the item's status (`Resolution::closes_from`), starting on `Resolution::default_for` (MOD-39
 //! plan P13).
 
-use core::cell::Cell;
+mod execution_graph;
+
+use core::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 
 use htui_agent::event::{PermissionOption, PermissionOptionKind};
@@ -54,6 +62,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use serde_json::Value;
 
+use self::execution_graph::ExecutionGraph;
 use crate::app::{Action, Ctx, Handled};
 use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, OrchRequest};
 use crate::store_worker::{StoreReply, StoreRequest};
@@ -100,6 +109,9 @@ const CANCEL_REQUESTED_LINE: &str = "cancel requested";
 
 /// The line under a run a command is queued behind (R-51).
 const WAITING_LINE: &str = "waiting for the walk";
+
+/// MOD-28 D5: what the flow view says under a run with no step yet.
+const NO_STEPS_YET: &str = "No steps yet.";
 
 /// What a relayed request with no summary asks for (MOD-42 blueprint B-14: the transport named no
 /// call, or the scrubber refused it).
@@ -191,6 +203,11 @@ pub struct RunsTab {
     /// R-51: the runs a command is queued behind a live walk of, from a `Waiting` frame until the
     /// next frame that invalidates.
     waiting: BTreeSet<RunId>,
+    /// MOD-28 D14: list or flow. Starts as list, and an item change leaves it alone.
+    view: View,
+    /// MOD-28 D13: the flow, behind a `RefCell` because `DetailTab::render` takes `&self` and
+    /// rataflow draws through `impl Widget for &mut Flow` only.
+    graph: RefCell<ExecutionGraph>,
 }
 
 /// One place the cursor can be (blueprint D198): a step, or the header of a run with no step.
@@ -217,6 +234,16 @@ enum EntryKey {
     Step(StepId),
     /// A run with no step.
     Run(RunId),
+}
+
+/// MOD-28 D1, D14: which view of the runs the pane draws. Per pane, not per item, never persisted.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum View {
+    /// The run list (MOD-4 D197).
+    #[default]
+    List,
+    /// The cursor's run as a `rataflow` graph (MOD-28).
+    Flow,
 }
 
 /// The pane's modes. Anything but [`Mode::Browse`] captures the keyboard (blueprint D201).
@@ -345,6 +372,22 @@ impl RunsTab {
         self.selected = Some(current.saturating_add_signed(delta).min(last));
     }
 
+    /// MOD-28 D7, D12: rebuilds the flow from the cursor's run, the cursor's step selected. Only
+    /// while the flow is shown: the list never pays for it, and `v` syncs on the way in.
+    ///
+    /// `get_mut`, not `borrow_mut`: `render_flow` holds the only runtime borrow (review N1).
+    fn sync_graph(&mut self, theme: &Theme) {
+        if self.view != View::Flow {
+            return;
+        }
+        let step = self.selected_step();
+        let run = match self.entry() {
+            Some(Entry::Step { run, .. } | Entry::Run { run }) => self.runs.get(run),
+            None => None,
+        };
+        self.graph.get_mut().sync(run, step, theme);
+    }
+
     /// First run to draw: the scrolled-to one, except that the cursor is never scrolled off the
     /// top - the offset is derived here rather than being a second thing `J` has to keep right.
     fn first_visible(&self) -> usize {
@@ -376,6 +419,7 @@ impl RunsTab {
                     .position(|entry| self.entry_key(*entry) == Some(kept))
             })
             .or_else(|| (!entries.is_empty()).then_some(0));
+        self.sync_graph(ctx.theme);
         let Some(item) = self.item else {
             return;
         };
@@ -1326,14 +1370,32 @@ impl DetailTab for RunsTab {
             return Handled::Consumed;
         }
         match key.code {
-            KeyCode::Char('J') => self.move_cursor(1),
-            KeyCode::Char('K') => self.move_cursor(-1),
+            KeyCode::Char('J') => {
+                self.move_cursor(1);
+                self.sync_graph(ctx.theme);
+            }
+            KeyCode::Char('K') => {
+                self.move_cursor(-1);
+                self.sync_graph(ctx.theme);
+            }
             KeyCode::Enter => {
                 let Some(step_id) = self.selected_step() else {
                     return Handled::Pass;
                 };
                 ctx.emit(Action::Replay { step_id });
             }
+            KeyCode::Char('v') => {
+                self.view = match self.view {
+                    View::List => View::Flow,
+                    View::Flow => View::List,
+                };
+                self.sync_graph(ctx.theme);
+            }
+            KeyCode::Char('+') if self.view == View::Flow => self.graph.get_mut().zoom_in(),
+            KeyCode::Char('-') if self.view == View::Flow => self.graph.get_mut().zoom_out(),
+            KeyCode::Char('=') if self.view == View::Flow => self.graph.get_mut().fit(),
+            // MOD-28 D8: the list's page keys do nothing in the flow, and leave its scroll alone.
+            KeyCode::PageUp | KeyCode::PageDown if self.view == View::Flow => {}
             KeyCode::Char(
                 key @ ('a' | 'x' | 'r' | 'p' | 'c' | 'o' | 's' | 'u' | 'A' | 'R' | 'C' | 'T'),
             ) => return self.action(key, ctx),
@@ -1470,6 +1532,10 @@ impl DetailTab for RunsTab {
             message(frame, list, "No runs for this item.", ctx.theme);
             return;
         }
+        if self.view == View::Flow {
+            self.render_flow(frame, list, ctx.theme);
+            return;
+        }
 
         // The header stays on top, and the runs under it scroll so the cursor's lines are always
         // in the rows the footer leaves: D197 made every step two lines, and one long run can be
@@ -1487,6 +1553,44 @@ impl DetailTab for RunsTab {
 }
 
 impl RunsTab {
+    /// MOD-28 D11: the flow branch of `render`. The head is what the list says about the cursor's
+    /// run and step, and the rest is the canvas, or "No steps yet." under a run with none.
+    fn render_flow(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+        let Some(run) = self.entry_run() else {
+            return;
+        };
+        let lines = self.flow_head(run, theme);
+        let [head, canvas] = Layout::vertical([
+            Constraint::Length(u16::try_from(lines.len()).unwrap_or(u16::MAX)),
+            Constraint::Min(0),
+        ])
+        .areas(area);
+        frame.render_widget(Paragraph::new(lines), head);
+        if run.steps.is_empty() {
+            message(frame, canvas, NO_STEPS_YET, theme);
+            return;
+        }
+        self.graph.borrow_mut().render(frame, canvas);
+    }
+
+    /// MOD-28 review L3, H1: the flow's head, the lines the list draws for `run` and the cursor's
+    /// step that a node has no room for: the run header (failure, pending cancel, a queued
+    /// command), the step's parked reason, and the pending request the digits answer, so a digit
+    /// in the flow never answers a request the pane does not show.
+    fn flow_head(&self, run: &RunSummary, theme: &Theme) -> Vec<Line<'static>> {
+        let mut lines = run_lines(run, self.cancel_requested(run.id), theme);
+        if self.waiting.contains(&run.id) {
+            lines.push(Line::styled(fit(WAITING_LINE, PANE), theme.accent));
+        }
+        if let Some((_, step)) = self.entry_step() {
+            lines.extend(note_line(step, theme));
+            if let Some(pending) = self.pending_on(step.id) {
+                lines.extend(permission_lines(pending, theme));
+            }
+        }
+        lines
+    }
+
     /// The runs from the first visible one, each with its steps, and the line index just past the
     /// cursor's entry (0 with no cursor): what the list has to show to keep the cursor in view.
     fn list_lines(&self, theme: &Theme) -> (Vec<Line<'static>>, usize) {
@@ -3518,6 +3622,299 @@ mod tests {
             None,
             "an item with no run has no step"
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-28: the flow view (plan D5, D7, D8, D11, D14).
+    // -----------------------------------------------------------------------------------------
+
+    /// `FEAT-1`'s run with a fresh run id and fresh step ids, a second run to cross into.
+    async fn copied_run() -> RunSummary {
+        let mut run = feat_1_runs().await.remove(0);
+        run.id = RunId::new();
+        for step in &mut run.steps {
+            step.id = StepId::new();
+        }
+        run
+    }
+
+    /// `FEAT-1`'s run with a fresh id and no step, as a just-queued run reads.
+    async fn stepless_run() -> RunSummary {
+        let mut run = feat_1_runs().await.remove(0);
+        run.id = RunId::new();
+        run.steps.clear();
+        run
+    }
+
+    #[tokio::test]
+    async fn v_toggles_the_flow_view_and_is_typed_in_a_modal() {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        assert_eq!(pane.view, View::List, "the pane starts on the list");
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        assert_eq!(pane.view, View::Flow);
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        assert_eq!(pane.view, View::List);
+
+        pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('x')), &mut shell.ctx());
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        assert_eq!(pane.view, View::List, "`v` in the note is a letter");
+        assert_eq!(footer(&pane)[1], "v", "and it is typed");
+    }
+
+    #[tokio::test]
+    async fn j_and_k_in_flow_move_the_same_cursor_across_runs() {
+        let shell = Shell::new();
+        let first = feat_1_runs().await.remove(0);
+        let second = copied_run().await;
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(
+            &StoreReply::Runs(vec![first.clone(), second.clone()]),
+            &mut shell.ctx(),
+        );
+        let _ = shell.emit.take();
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        assert_eq!(pane.graph.borrow().shown_run(), Some(first.id));
+        assert_eq!(
+            pane.graph.borrow().selected(),
+            Some(first.steps[0].id.to_string())
+        );
+
+        for _ in 0..4 {
+            pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        }
+        assert_eq!(pane.selected_step(), Some(second.steps[0].id));
+        assert_eq!(pane.graph.borrow().shown_run(), Some(second.id));
+        assert_eq!(
+            pane.graph.borrow().selected(),
+            Some(second.steps[0].id.to_string())
+        );
+
+        pane.on_key(key(KeyCode::Char('K')), &mut shell.ctx());
+        assert_eq!(pane.selected_step(), Some(first.steps[3].id));
+        assert_eq!(pane.graph.borrow().shown_run(), Some(first.id));
+        assert_eq!(
+            pane.graph.borrow().selected(),
+            Some(first.steps[3].id.to_string())
+        );
+    }
+
+    /// ANA-12 invariant 2: the flow's selected node is the list's cursor, so an action key sends
+    /// exactly what it sends in the list.
+    #[tokio::test]
+    async fn action_keys_in_flow_send_what_the_list_sends() {
+        for (code, down) in [
+            (KeyCode::Char('a'), 1),
+            (KeyCode::Char('s'), 3),
+            (KeyCode::Enter, 1),
+            (KeyCode::Char('r'), 0),
+        ] {
+            let (_, listed, _) = allowed_emit(key(code), down).await;
+
+            let shell = Shell::new();
+            let (mut pane, _) = driven(&shell, true).await;
+            pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+            assert!(shell.emit.take().is_empty(), "`v` sends nothing");
+            for _ in 0..down {
+                pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+            }
+            assert_eq!(pane.on_key(key(code), &mut shell.ctx()), Handled::Consumed);
+            let flowed = shell.emit.take();
+            assert_eq!(flowed.len(), 1, "{code:?} sends one action: {flowed:?}");
+            assert_eq!(
+                format!("{:?}", flowed[0]),
+                format!("{listed:?}"),
+                "{code:?} {down} down"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plus_minus_and_equals_pass_in_the_list_view() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        for c in ['+', '-', '='] {
+            assert_eq!(
+                pane.on_key(key(KeyCode::Char(c)), &mut shell.ctx()),
+                Handled::Pass,
+                "`{c}` is not the list's"
+            );
+        }
+
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('+')), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        assert!(pane.graph.borrow().zoom() > 1.0);
+        for c in ['-', '='] {
+            assert_eq!(
+                pane.on_key(key(KeyCode::Char(c)), &mut shell.ctx()),
+                Handled::Consumed,
+                "`{c}` is the flow's"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn page_keys_are_a_no_op_in_flow() {
+        let shell = Shell::new();
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        let mut runs = vec![stepless_run().await];
+        runs.extend(feat_1_runs().await);
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        let scroll = pane.scroll;
+        for code in [KeyCode::PageDown, KeyCode::PageUp] {
+            assert_eq!(pane.on_key(key(code), &mut shell.ctx()), Handled::Consumed);
+            assert_eq!(
+                pane.scroll, scroll,
+                "{code:?} leaves the list's scroll alone"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_runs_re_read_keeps_the_cursor_node_selected() {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        let implement = pane.runs[0].steps[2].id;
+
+        let mut runs = vec![stepless_run().await];
+        runs.extend(feat_1_runs().await);
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+        assert_eq!(pane.selected_step(), Some(implement));
+        assert_eq!(pane.graph.borrow().selected(), Some(implement.to_string()));
+    }
+
+    #[tokio::test]
+    async fn the_flow_view_draws_the_run_line_then_the_canvas() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        let lines = lines(&pane, &shell);
+        assert!(lines[0].starts_with("graph"), "{lines:#?}");
+        assert!(
+            lines.iter().any(|line| line.contains("0.1 done")),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("kind")),
+            "no list header: {lines:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_steps_says_so_in_flow() {
+        let shell = Shell::new();
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        let mut runs = vec![stepless_run().await];
+        runs.extend(feat_1_runs().await);
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        let lines = lines(&pane, &shell);
+        // Rows 0 and 1 are the run header (review L3).
+        assert_eq!(lines[2], NO_STEPS_YET, "{lines:#?}");
+    }
+
+    /// MOD-28 review L3: the flow's head is the list's whole run header (the failure, a pending
+    /// cancel, a queued command), and the cursor step's parked reason under it.
+    #[tokio::test]
+    async fn the_flow_view_shows_the_run_s_failure_and_the_cursor_step_s_note() {
+        let shell = Shell::new();
+        let mut run = feat_1_runs().await.remove(0);
+        run.status = RunStatus::Failed;
+        run.failure = Some("the box went away".to_owned());
+        run.steps[1].status = StepStatus::AwaitingApproval;
+        run.steps[1].gate_note = Some("needs a second look".to_owned());
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Runs(vec![run]), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        let lines = lines(&pane, &shell);
+        assert!(lines[0].starts_with("graph"), "{lines:#?}");
+        assert!(
+            lines[1].starts_with("manual"),
+            "the run's mode line: {lines:#?}"
+        );
+        assert!(
+            lines[2].contains("the box went away"),
+            "the failure: {lines:#?}"
+        );
+        assert!(
+            lines[3].contains("needs a second look"),
+            "the cursor step's note: {lines:#?}"
+        );
+    }
+
+    /// MOD-28 review H1: a digit in the flow answers the request the flow draws, as in the list.
+    #[tokio::test]
+    async fn the_flow_view_draws_the_pending_request_a_digit_answers() {
+        let shell = Shell::new();
+        let (mut pane, pending) = asking(&shell).await;
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        let lines = lines(&pane, &shell);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("asks: execute: cargo test")),
+            "the request's summary: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("Allow once")),
+            "its strip: {lines:#?}"
+        );
+
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('2')), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        let sent = requests(shell.emit.take());
+        assert!(
+            matches!(sent.as_slice(), [StoreRequest::AnswerPermission { permission, option_id }]
+                if *permission == pending.id && option_id == "reject"),
+            "{sent:?}"
+        );
+    }
+
+    /// MOD-28 review L4: with no request pending, the flow keeps neither `Tab` nor a digit, so
+    /// both reach the global keymap.
+    #[tokio::test]
+    async fn tab_and_a_digit_pass_in_flow_with_no_pending_request() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        for code in [KeyCode::Tab, KeyCode::BackTab, KeyCode::Char('3')] {
+            assert_eq!(
+                pane.on_key(key(code), &mut shell.ctx()),
+                Handled::Pass,
+                "{code:?}"
+            );
+        }
+        assert!(shell.emit.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_flow_view_survives_an_item_change() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        pane.on_item_change(Some(ids::HTUI_ANA_2));
+        assert_eq!(pane.view, View::Flow);
     }
 
     // -----------------------------------------------------------------------------------------

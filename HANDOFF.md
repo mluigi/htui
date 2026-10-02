@@ -14,7 +14,14 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-02):** **MOD-49 is done** (`docs/decisions/mod/mod-49.md`): `b` in
+**Current status (2026-10-02):** **MOD-28 is done** (`docs/decisions/mod/mod-28.md`): `v` in the
+Backlog detail's Runs sub-tab switches to a **flow view**. It draws the run under the cursor as a
+`rataflow` node graph: fan-out candidates side by side, the judge below them, the winner feeding the
+next phase, and retries labelled. It shares the list's cursor, so every run action and permission
+digit works the same in both views. `+`/`-` zoom and `=` fits. The view is a pure projection,
+rebuilt from every `Runs` reply. It is keyboard only: mouse support is MOD-71 and tool-call chips
+are MOD-72. No migration. The only new crate is `rataflow` (`default-features = false`).
+Before it, **MOD-49 is done** (`docs/decisions/mod/mod-49.md`): `b` in
 Settings > Hierarchy opens a popup that lists directories on this box (links to a directory marked
 `@`, their targets never shown) and chooses one for the workspace root or a repo checkout; the
 choice goes through the unchanged `SetWorkspaceRoot`/`SetRepoPath` and `canonical_root` (F-102).
@@ -28,13 +35,6 @@ killed after capture settles `done`. A cancel requested before the crash is appl
 (it used to lose to it); the sweep adopts graph runs only (it leased live chats each sweep, fencing
 their writes); a chat that panics closes its run `failed`. The review round also fixed a MOD-42
 deadlock in the command guard. No migration.
-Before it, **MOD-68 is done** (`docs/decisions/mod/mod-68.md`): the
-concepts index embeds with `rten`, a pure-Rust ONNX runtime, instead of `fastembed`/`ort`. Nothing is
-downloaded at build time, and the embedder needs no C compiler. The BGE-small weights are fetched on
-first use from the pinned `Xenova/bge-small-en-v1.5` commit `ea104dac`, sha256-checked per file
-(`model.onnx` `828e1496…cf35`), and an existing fastembed cache is adopted. The vectors match
-fastembed's goldens to 3e-7, so stored vectors stay valid. The Qdrant collection now records which
-embedder made it, and a mismatch is refused. Its Windows/macOS run is MOD-16's.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -43,9 +43,9 @@ comment only) `0009_agent_box_user_off` (MOD-23), `0010_prompt_digest_undigested
 `0011_permission_relay` (MOD-42) and `0012_persona` (MOD-26 milestone 1; cache: `0001`..`0004`), so **the next migration is `0013`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
 (done, all four milestones), MOD-38, MOD-9 (done, all five milestones), MOD-40, MOD-39, MOD-64,
-MOD-23, MOD-22, MOD-41, MOD-59, MOD-24, MOD-49 and MOD-26 milestone 1 (re-counted 2026-10-01; `StoreReply` 2026-09-30; `CASES`, `.sqlx`, `TABLES`, snapshots and commented columns 2026-10-02): store conformance `CASES` 130, `READ_CASES` 14, `htui-orch` `CASES` 92,
+MOD-23, MOD-22, MOD-41, MOD-59, MOD-24, MOD-49, MOD-26 milestone 1 and MOD-28 (re-counted 2026-10-01; `StoreReply` 2026-09-30; `CASES`, `.sqlx`, `TABLES`, snapshots and commented columns 2026-10-02): store conformance `CASES` 130, `READ_CASES` 14, `htui-orch` `CASES` 92,
 `GraphSource` 7 methods, `StoreRequest` 96, `StoreReply` 55 (both re-counted 2026-10-02), `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
-`skills::REQUEST_NAMES` 6, `TABLES` 42, 318 `.sqlx` files, 132
+`skills::REQUEST_NAMES` 6, `TABLES` 42, 318 `.sqlx` files, 134
 `crates/htui/tests/snapshots`, six workspace members (`htui-worker` since MOD-41),
 `MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 44 pinned commented
 columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 4` (MOD-33 `undigested`) with `skill_choices` (a
@@ -248,7 +248,20 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   implement axis, `epoch-eci` is narrowed to `eci_scores.csv`, `tbench-4-0` stays blocked. Each
   dynamic source needs a parser under the fetch conditions of §6 (Arena from Hugging Face only, with
   a per-fetch licence check; Epoch keyed on `benchmark_metadata.csv`, never `*_external.csv`).
-- [ ] **MOD-28 - rataflow execution view (from ANA-12).** Add `rataflow` dependency, implement `ExecutionGraph` widget mapping `RunStep` and `SessionEvent` lists to a node graph, add view toggle to Runs tab (`R-TUI-4`), and wire mouse/keyboard events for standard run actions.
+- [ ] **MOD-71 - Mouse support: capture policy and the Runs flow view** (from MOD-28,
+  `docs/decisions/mod/mod-28.md` "Carried"). `R-TUI-4`, `R-TUI-1`. htui has never enabled mouse
+  capture, and enabling it disables the terminal's own text selection. Decide the policy: capture
+  only while a view wants it is the proposal (the active view answers `wants_mouse()` after each
+  event, and the event loop toggles `Enable`/`DisableMouseCapture`). Route `Event::Mouse` through
+  `Tab`/`DetailTab`. Make the restore, panic-hook and editor-suspend paths give the mouse back. Then
+  give the Runs flow view click to select (`FlowEvent::NodeClicked` moves the shared cursor),
+  drag to pan and scroll to zoom (`rataflow`'s `crossterm` feature, `handle_mouse_event`). Nodes stay
+  read-only (MOD-28 D9). Raised by the maintainer at MOD-28's plan gate, 2026-10-02.
+- [ ] **MOD-72 - Tool-call chips in the Runs flow view** (from MOD-28, ANA-12 §3.2). `R-TUI-4`.
+  Add a per-step tool-call count read for a run. That means Postgres plus `MemStore`, `.sqlx`, and a
+  `StoreRequest`/`StoreReply` pair asked alongside `Runs`. Draw the counts as chips in MOD-28's
+  `StepNode` (e.g. `⚒ bash ×3`). The Runs tab has no `SessionEvent` data today (`StepEvents` only
+  serves Replay). Deferred from MOD-28 by the maintainer, 2026-10-02.
 - [ ] **MOD-26 - Declarative Agent Personas (from ANA-13).** Build Markdown/Frontmatter parser in `htui-core`, discover from `~/.config/htui/agents.d/`, map to `SessionSpec` overrides (model, tools).
   **Relates to ANA-16** (`docs/ANA-16.md` §6.2, §8): personas should be registry rows rather than a
   per-box directory, so they are distributed like the rest of the config (MOD-48).
@@ -654,6 +667,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 24 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 25 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-26 personas, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-71 mouse support, MOD-72 tool-call chips; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

@@ -22,10 +22,11 @@ use htui_agent::fake::FakeAdapter;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::{demo_at, edit_agent, ids};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, CitationKind, Claim, DocumentId, EXECUTOR_GONE, Item,
-    ItemFilter, ItemId, ItemPatch, NewDocument, NewItem, NewRunStep, OpenPermission, PermissionId,
-    PermissionStatus, RelayOption, RelayOptionKind, RelaySessionId, Resolution, RunStatus, RunStep,
-    Scope, SnapshotPhase, Status, StepId, Transport, WorkspaceSummary,
+    Agent, AgentBox, AgentId, Billing, CitationKind, Claim, DocumentId, EXECUTOR_GONE,
+    GraphSnapshot, Isolation, Item, ItemFilter, ItemId, ItemPatch, NewDocument, NewItem, NewRun,
+    NewRunStep, OpenPermission, PermissionId, PermissionStatus, RelayOption, RelayOptionKind,
+    RelaySessionId, Resolution, RunId, RunMode, RunStatus, RunStep, Scope, SnapshotGraph,
+    SnapshotPhase, SnapshotSettings, Status, StepId, Transport, WorkspaceSummary,
 };
 use htui_core::store::{MAX_LEASE_TTL, MemStore, ReadStore as _, UpdateOutcome, WriteStore as _};
 use htui_orch::Clock;
@@ -755,6 +756,132 @@ async fn the_runs_pane_greys_a_key_with_the_guard_s_sentence() {
         .clone()
         .expect_err("a `done` step cannot be approved");
 
+    harness.key("a");
+    harness.drive().await;
+    assert_eq!(harness.app().status.as_deref(), Some(sentence.as_str()));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Runs pane's flow view (MOD-28 plan D1-D15).
+// ---------------------------------------------------------------------------------------------
+
+/// MOD-28 D1, D10: `v` on `ANA-1`'s fan-out run draws its two candidates side by side, the winner
+/// checked and the loser superseded; a second `v` is back on the list.
+#[tokio::test]
+async fn v_draws_the_fan_out_run_as_a_flow() {
+    let mut harness = backlog().await;
+    sub_tab(&mut harness, 1);
+    harness.key("v");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("0.1/0 done \u{2713}") && frame.contains("0.1/1 superseded"),
+        "both candidates are drawn:\n{frame}"
+    );
+    assert!(!frame.contains("kind   status"), "no list header:\n{frame}");
+    insta::assert_snapshot!("runs_flow_fanout", frame);
+
+    harness.key("v");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("kind   status"),
+        "the list is back:\n{frame}"
+    );
+}
+
+/// MOD-28 D11: a modal footer is drawn under the flow exactly as under the list.
+#[tokio::test]
+async fn the_reject_note_renders_under_the_flow() {
+    let mut harness = parked().await;
+    harness.key("v");
+    harness.key("x");
+    type_text(&mut harness, "needs work");
+    harness.drive().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("reject with a note:") && frame.contains("research"),
+        "the note is under the parked step's node:\n{frame}"
+    );
+    insta::assert_snapshot!("runs_flow_reject_note", frame);
+}
+
+/// The smallest snapshot `create_run` accepts (`htui-agent/tests/relay.rs`).
+fn bare_snapshot() -> GraphSnapshot {
+    GraphSnapshot {
+        v: GraphSnapshot::V,
+        graph: SnapshotGraph {
+            id: ids::GRAPH_HTUI_FEAT,
+            name: "feature".to_owned(),
+            is_override: false,
+        },
+        topology: "sha256:flow".to_owned(),
+        mode: RunMode::Manual,
+        phases: Vec::new(),
+        settings: SnapshotSettings {
+            default_isolation: Isolation::Worktree,
+            per_token_cap_run: None,
+            per_token_cap_batch: None,
+            max_fan_out: 4,
+            max_agents_per_run: 8,
+        },
+        scope: None,
+        personas: Vec::new(),
+    }
+}
+
+/// MOD-28 D5: a queued run with no step yet shows its run line and says so.
+#[tokio::test]
+async fn a_run_with_no_steps_says_so_in_the_flow() {
+    let store = MemStore::demo();
+    store
+        .create_run(NewRun {
+            id: RunId::new(),
+            project_id: ids::PROJECT_HTUI,
+            item_id: ids::HTUI_ANA_2,
+            mode: RunMode::Manual,
+            target_box_id: ids::BOX,
+            started_by: ids::USER,
+            graph_snapshot: bare_snapshot(),
+            repo_scope: Vec::new(),
+            queued_at: demo_at(2, 8),
+        })
+        .await
+        .expect("the run is queued");
+    // No run runtime: nothing claims the run, so it never gets a step.
+    let mut harness = polled(store).await;
+    down(&mut harness, TO_ANA_2).await;
+    sub_tab(&mut harness, 1);
+    harness.key("v");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("No steps yet.") && frame.contains("queued"),
+        "the run line, then the empty canvas:\n{frame}"
+    );
+}
+
+/// MOD-28 D7, ANA-12 invariant 2: an action key in the flow is answered as in the list, through
+/// the real worker (blueprint E14).
+#[tokio::test]
+async fn an_action_key_in_flow_answers_as_in_the_list() {
+    let mut harness = backlog().await;
+    down(&mut harness, TO_FEAT_1).await;
+    sub_tab(&mut harness, 1);
+
+    let verdicts = run_worker::actions(
+        &Backend::memory(MemStore::demo()),
+        ids::HTUI_FEAT_1,
+        &LiveChats::default(),
+    )
+    .await
+    .expect("the verdicts read");
+    let sentence = verdicts.steps[&ids::STEP_PRD]
+        .approve
+        .clone()
+        .expect_err("a `done` step cannot be approved");
+
+    harness.key("v");
     harness.key("a");
     harness.drive().await;
     assert_eq!(harness.app().status.as_deref(), Some(sentence.as_str()));
