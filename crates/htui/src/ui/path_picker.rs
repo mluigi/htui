@@ -675,6 +675,24 @@ mod tests {
         assert_eq!(chosen(picker.on_key(ch('s'))), "/srv/notes");
     }
 
+    /// MOD-49 review N-1: the place going up remembers is for the parent it asked for only. A
+    /// newer request elsewhere forgets it, so a listing of an unrelated directory that happens to
+    /// hold the same name doesn't open on it.
+    #[test]
+    fn a_newer_request_forgets_where_going_up_came_from() {
+        let (mut picker, _) = PathPicker::open("Root", "/srv/notes".to_owned());
+        assert!(picker.on_reply(&dirs("/srv/notes", &[], 0)));
+        assert_eq!(asked(picker.on_key(ch('h'))), ("/srv".to_owned(), false));
+        picker.on_paste("/opt");
+        assert_eq!(
+            asked(picker.on_key(key(KeyCode::Enter))),
+            ("/opt".to_owned(), false)
+        );
+        // `/srv`'s listing was superseded; `/opt` lands holding a `notes` of its own.
+        assert!(picker.on_reply(&dirs("/opt", &[("data", false), ("notes", false)], 0)));
+        assert_eq!(chosen(picker.on_key(ch('s'))), "/opt/data");
+    }
+
     #[test]
     fn s_chooses_the_highlighted_directory() {
         let mut picker = at_srv();
