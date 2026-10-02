@@ -325,14 +325,18 @@ pub fn kind_not_narrowable(kind: &str) -> String {
     )
 }
 
-/// I-4 (plan D12): a phase names a persona its run's snapshot does not carry.
-#[must_use]
-pub fn persona_not_in_snapshot(persona: &str) -> String {
-    format!(
-        "persona `{}` is not in the run's snapshot, so the step does not run un-narrowed \
-         (MOD-26 I-4)",
-        persona.escape_debug()
-    )
+/// I-4 (plan D12; MOD-26 milestone 2 D16, review N4): a phase names a persona its run's snapshot
+/// does not carry. `Display` is the sentence `RunFailure::PromptRefused.reason` stores, byte for
+/// byte as milestone 1 wrote it; the name is `escape_debug`'d so a stored reason is one line.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "persona `{}` is not in the run's snapshot, so the step does not run un-narrowed \
+     (MOD-26 I-4)",
+    .persona.escape_debug()
+)]
+pub struct PersonaNotInSnapshot {
+    /// The name `SnapshotPhase.persona` carries, unescaped.
+    pub persona: String,
 }
 
 /// Plan D3 over a whole row: name; description NUL; body blank, body NUL; tools; permission.
@@ -798,14 +802,20 @@ mod tests {
     /// so a stored refusal is one line whatever the snapshot's name holds.
     #[test]
     fn the_snapshot_refusal_escapes_the_persona_name() {
-        let sentence = persona_not_in_snapshot("rev\niewer");
+        let sentence = PersonaNotInSnapshot {
+            persona: "rev\niewer".into(),
+        }
+        .to_string();
         assert!(
             sentence.starts_with("persona `rev\\niewer` is not in the run's snapshot"),
             "the name is escape_debug'd: {sentence}"
         );
         assert!(!sentence.contains('\n'), "one line: {sentence:?}");
         assert_eq!(
-            persona_not_in_snapshot("reviewer"),
+            PersonaNotInSnapshot {
+                persona: "reviewer".into()
+            }
+            .to_string(),
             "persona `reviewer` is not in the run's snapshot, so the step does not run \
              un-narrowed (MOD-26 I-4)",
             "a plain name reads as before"

@@ -1945,9 +1945,9 @@ pub fn prompt_template_refusal(name: &str, body: &str) -> Option<String> {
 // ---- MOD-26: the persona writers' refusals (plan D3) live in `model::persona`, where the
 // persona-file reader needs them too; re-exported so the store's refusal vocabulary is one list.
 pub use crate::model::persona::{
-    BLANK_PERSONA_BODY, MODEL_REFUSED, RULE_MATCHES_EVERYTHING, allow_names_an_mcp_tool,
-    invalid_persona_name, kind_not_narrowable, new_persona_refusal, not_a_tool_name,
-    persona_not_in_snapshot, persona_patch_refusal, persona_refusal,
+    BLANK_PERSONA_BODY, MODEL_REFUSED, PersonaNotInSnapshot, RULE_MATCHES_EVERYTHING,
+    allow_names_an_mcp_tool, invalid_persona_name, kind_not_narrowable, new_persona_refusal,
+    not_a_tool_name, persona_patch_refusal, persona_refusal,
 };
 
 // ---- MOD-9 milestone 3: the skill writers' refusals (plan D71-D79, blueprint D88) -------------

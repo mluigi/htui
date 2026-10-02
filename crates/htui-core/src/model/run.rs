@@ -461,15 +461,18 @@ impl GraphSnapshot {
     pub const V: u32 = 1;
 
     /// MOD-26 D12, I-4: the frozen persona `phase` names. `Ok(None)` for a persona-less phase;
-    /// `Err` is [`persona_not_in_snapshot`](crate::model::persona::persona_not_in_snapshot)'s
-    /// sentence when the snapshot does not carry the name.
+    /// `Err` is [`PersonaNotInSnapshot`](crate::model::persona::PersonaNotInSnapshot) when the
+    /// snapshot does not carry the name.
     ///
     /// # Errors
     /// As above.
     pub fn persona_for(
         &self,
         phase: &SnapshotPhase,
-    ) -> Result<Option<&crate::model::persona::SnapshotPersona>, String> {
+    ) -> Result<
+        Option<&crate::model::persona::SnapshotPersona>,
+        crate::model::persona::PersonaNotInSnapshot,
+    > {
         let Some(name) = phase.persona.as_deref() else {
             return Ok(None);
         };
@@ -477,7 +480,9 @@ impl GraphSnapshot {
             .iter()
             .find(|persona| persona.name == name)
             .map(Some)
-            .ok_or_else(|| crate::model::persona::persona_not_in_snapshot(name))
+            .ok_or_else(|| crate::model::persona::PersonaNotInSnapshot {
+                persona: name.to_owned(),
+            })
     }
 }
 
@@ -1154,7 +1159,7 @@ mod tests {
 
     #[test]
     fn persona_for_finds_refuses_and_skips() {
-        use crate::model::persona::persona_not_in_snapshot;
+        use crate::model::persona::PersonaNotInSnapshot;
 
         let carried = graph_snapshot(
             vec![snapshot_phase(None), snapshot_phase(Some("reviewer"))],
@@ -1172,7 +1177,9 @@ mod tests {
         );
         assert_eq!(
             missing.persona_for(&missing.phases[0]),
-            Err(persona_not_in_snapshot("reviewer"))
+            Err(PersonaNotInSnapshot {
+                persona: "reviewer".into()
+            })
         );
     }
 }
