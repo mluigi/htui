@@ -1,6 +1,6 @@
 # Plan: MOD-26 — Declarative agent personas, milestone 2 (authoring in the TUI)
 
-**Status: DRAFTED and FACT-CHECKED 2026-10-02 — awaiting the maintainer's CONFIRM.** Three
+**Status: CONFIRMED by the maintainer 2026-10-02, OQ-7 to OQ-12 as recommended. DRAFTED and FACT-CHECKED 2026-10-02.** Three
 verifiers (core/engine with a scratch parser probe over the six real agent files; store/migrations
 with a migrated scratch database and two-session lock probes; TUI/worker) checked every claim;
 falsified and partly-true claims are amended in place — see "Verified claims".
