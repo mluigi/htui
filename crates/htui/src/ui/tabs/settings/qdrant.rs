@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span};
 use crate::app::{Ctx, Handled};
 use crate::qdrant_settings_info::{QdrantSnapshot, QdrantState};
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::cells::cell_width;
 use crate::ui::tabs::settings::{SectionId, SettingsSection, wrapped};
 use crate::ui::{FieldOutcome, TextField};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -464,7 +465,9 @@ impl SettingsSection for QdrantSection {
             Mode::Browse => {}
             Mode::EditingUrl(editor) => {
                 let l = "URL: ";
-                let field_room = area.width.saturating_sub(l.chars().count() as u16);
+                let field_room = area
+                    .width
+                    .saturating_sub(u16::try_from(cell_width(l)).unwrap_or(u16::MAX));
                 let mut spans = vec![Span::styled(l, ctx.theme.accent)];
                 spans.extend(editor.input.line(field_room.max(1), true, ctx.theme).spans);
                 lines.push(Line::from(spans));
@@ -486,7 +489,9 @@ impl SettingsSection for QdrantSection {
             }
             Mode::EditingKey(editor) => {
                 let l = "Key: ";
-                let field_room = area.width.saturating_sub(l.chars().count() as u16);
+                let field_room = area
+                    .width
+                    .saturating_sub(u16::try_from(cell_width(l)).unwrap_or(u16::MAX));
                 let mut spans = vec![Span::styled(l, ctx.theme.accent)];
                 spans.extend(editor.input.line(field_room.max(1), true, ctx.theme).spans);
                 lines.push(Line::from(spans));
@@ -516,7 +521,7 @@ impl SettingsSection for QdrantSection {
                 } else {
                     ctx.theme.dim
                 };
-                if keys.chars().count() + text.chars().count() + 3 > room {
+                if cell_width(&keys) + cell_width(&text) + 3 > room {
                     Line::styled(text, sty)
                 } else {
                     Line::from(vec![

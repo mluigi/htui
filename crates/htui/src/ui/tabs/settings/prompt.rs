@@ -43,6 +43,7 @@ use serde_json::Value;
 use crate::app::{Ctx, Handled};
 use crate::prompt_settings::{AppEntry, ProjectEntry, READ_NAME, REQUEST_NAMES, SettingsSnapshot};
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::cells::cell_width;
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
     message, wrapped,
@@ -698,7 +699,7 @@ impl PromptSection {
         // a reload that moved it can never leave someone typing into a field they cannot see.
         if let Mode::Editing(editor) = &self.mode {
             let label = format!("{}: ", editor.target.key);
-            let room = usize::from(width).saturating_sub(label.chars().count());
+            let room = usize::from(width).saturating_sub(cell_width(&label));
             let mut spans = vec![Span::styled(label, theme.accent)];
             spans.extend(
                 editor
@@ -730,7 +731,7 @@ impl PromptSection {
         // The outcome wins the line when both do not fit: the keys are on screen every other
         // frame, and this is the only place the outcome appears.
         let room = usize::from(width);
-        if keys.chars().count() + text.chars().count() + 3 > room {
+        if cell_width(&keys) + cell_width(&text) + 3 > room {
             return Line::styled(text, style);
         }
         Line::from(vec![
@@ -1055,7 +1056,7 @@ fn effective(
 static KEY_WIDTH: LazyLock<usize> = LazyLock::new(|| {
     SettingKey::ALL
         .iter()
-        .map(|key| key.key().chars().count())
+        .map(|key| cell_width(key.key()))
         .max()
         .unwrap_or(0)
 });

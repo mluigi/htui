@@ -31,6 +31,7 @@ use crate::hierarchy::{
     RepoEntry, reach_parts, reach_totals,
 };
 use crate::store_worker::{LIST_DIR, StoreReply, StoreRequest};
+use crate::ui::cells::{self, cell_width};
 use crate::ui::path_picker::{PathPicker, PickerOutcome, start_dir};
 use crate::ui::tabs::settings::{SectionId, SettingsSection, message, wrapped};
 use crate::ui::{FieldOutcome, TextField, Theme};
@@ -430,7 +431,7 @@ impl HierarchySection {
         // that is 98, and a notice clipped at `deleted \`` is a line that reports nothing. The
         // keys are on screen every other frame; this one is the only place the outcome appears.
         let room = usize::from(width);
-        if keys.chars().count() + notice.chars().count() + 3 > room {
+        if cell_width(&keys) + cell_width(notice) + 3 > room {
             return Line::styled(notice.clone(), style);
         }
         Line::from(vec![
@@ -1485,7 +1486,7 @@ impl Editor {
         let label_width = self
             .fields
             .iter()
-            .map(|field| field.label.chars().count())
+            .map(|field| cell_width(field.label))
             .max()
             .unwrap_or(0);
         self.fields
@@ -1493,9 +1494,9 @@ impl Editor {
             .enumerate()
             .map(|(index, field)| {
                 let focused = index == self.focus;
-                let padding = " ".repeat(label_width - field.label.chars().count());
                 let style = if focused { theme.accent } else { theme.dim };
-                let mut spans = vec![Span::styled(format!("{}{padding}: ", field.label), style)];
+                let label = cells::pad(field.label, label_width);
+                let mut spans = vec![Span::styled(format!("{label}: "), style)];
                 let room = usize::from(width).saturating_sub(label_width + 2);
                 spans.extend(
                     field
@@ -1680,7 +1681,7 @@ fn delete_pane(
         .collect();
     if let DeleteStage::Typed { field, .. } = stage {
         let prompt = format!("Type `{slug}` to confirm: ");
-        let used = prompt.chars().count();
+        let used = cell_width(&prompt);
         let mut spans = vec![Span::styled(prompt, theme.error)];
         spans.extend(
             field
@@ -1694,4 +1695,37 @@ fn delete_pane(
         lines.push(Line::from(spans));
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MOD-60: the confirm field's room is what the prompt leaves in **cells**. A CJK slug is
+    /// twice as wide as its `char` count, and measuring it by `char` handed the field 16 cells
+    /// the line does not have.
+    #[test]
+    fn a_wide_slug_leaves_the_confirm_field_its_room() {
+        let width = 40;
+        let stage = DeleteStage::Typed {
+            reach: Box::default(),
+            field: TextField::with_text(&"x".repeat(60)),
+        };
+
+        let lines = delete_pane(
+            DeleteTarget::Project(ProjectId::new()),
+            &"\u{6f22}".repeat(8),
+            &stage,
+            width,
+            &Theme::default(),
+        );
+
+        let last = lines.last().expect("the confirm line");
+        let drawn: usize = last
+            .spans
+            .iter()
+            .map(|span| cell_width(&span.content))
+            .sum();
+        assert!(drawn <= usize::from(width), "{last:?} against {width}");
+    }
 }
