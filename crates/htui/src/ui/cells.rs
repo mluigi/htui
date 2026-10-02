@@ -22,9 +22,13 @@
 //! `•`, `U+FFFD`, every box-drawing char — are 1 cell under `width()` and 2 under `width_cjk()`,
 //! and `…` and `•` are two of the glyphs `TextField` draws itself. `ratatui` uses `width()`.
 //!
-//! Every clip, pad, fit and wrap in `ui/` goes through the operations below (MOD-60 D1), so a row
-//! is never measured one way and drawn another: [`clip`], [`pad`], [`pad_left`], [`fit`],
-//! [`wrap`] and [`clip_spans`], all cutting at [`ELLIPSIS`].
+//! Every clip with a cut mark, pad, fit and word wrap in `ui/` goes through the operations below
+//! (MOD-60 D1), so a row is never measured one way and drawn another: [`clip`], [`pad`],
+//! [`pad_left`], [`fit`], [`wrap`] and [`clip_spans`], all cutting at [`ELLIPSIS`] and all drawing
+//! a control character as one blank cell (D3). A few walks are other operations and keep their
+//! own loop over the two measures above: the text widgets' cursor windows, `path_picker`'s cut
+//! from the left, the graph pane's edge cut (no mark), and `concepts_search`'s unmarked clip and
+//! grapheme-only wrap.
 
 use std::borrow::Cow;
 
@@ -86,7 +90,8 @@ pub(crate) fn graphemes(s: &str) -> impl Iterator<Item = &str> + '_ {
 /// doc).
 pub(crate) const ELLIPSIS: char = '\u{2026}';
 
-/// `text` with every control cluster drawn as one blank cell (MOD-60 D3).
+/// `text` with every control cluster drawn as one blank cell (MOD-60 D3). Every op below applies
+/// it to its output — [`pad`] and [`pad_left`] too, which otherwise never rewrite.
 ///
 /// `cell_width("\u{1}")` is 1, but `ratatui` skips a control grapheme when it draws, so an
 /// unflattened control is measured one way and drawn another. Per **cluster**, not per `char`:
@@ -144,21 +149,23 @@ fn head(text: &str, room: usize) -> String {
     out
 }
 
-/// `text` followed by spaces up to `width` cells (MOD-60 D1). Never clips, never rewrites:
-/// a `text` already `width` or wider comes back unchanged.
+/// `text` followed by spaces up to `width` cells (MOD-60 D1). Never clips: a `text` already
+/// `width` or wider comes back unpadded. A control character draws as one blank cell (D3), as in
+/// [`clip`]: `ratatui` draws nothing for it, so an unflattened one leaves the row a cell short.
 #[must_use]
 pub(crate) fn pad(text: &str, width: usize) -> String {
-    let mut out = text.to_owned();
-    out.push_str(&" ".repeat(width.saturating_sub(cell_width(text))));
+    let mut out = flatten(text).into_owned();
+    out.push_str(&" ".repeat(width.saturating_sub(cell_width(&out))));
     out
 }
 
 /// Spaces then `text`, right-aligned in `width` cells — `{:>N}` measured in cells (MOD-60 D1).
-/// Never clips.
+/// Never clips; a control character draws as one blank cell (D3), as in [`pad`].
 #[must_use]
 pub(crate) fn pad_left(text: &str, width: usize) -> String {
-    let mut out = " ".repeat(width.saturating_sub(cell_width(text)));
-    out.push_str(text);
+    let flat = flatten(text);
+    let mut out = " ".repeat(width.saturating_sub(cell_width(&flat)));
+    out.push_str(&flat);
     out
 }
 
@@ -178,19 +185,22 @@ pub(crate) fn fit(text: &str, width: usize) -> String {
 pub(crate) fn wrap(line: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows = vec![String::new()];
+    // The last row's cells, kept as a running sum: [`cell_width`] is the sum of the clusters'
+    // widths (B10), so adding each push's cells is exactly the re-measured row (review M1).
+    let mut used = 0;
     for (at, raw) in line.split(' ').enumerate() {
         // Flattened before either push path, so the fits-after-a-space one draws a control as
         // a blank cell too (MOD-60 B8). Widths do not move: a control cluster is 1 cell either
         // way.
         let word = flatten(raw);
-        // Re-measured rather than kept as a running sum: it measures what is drawn.
-        let used = rows.last().map_or(0, |row| cell_width(row));
         if at > 0 {
-            if used + 1 + cell_width(&word) <= width {
+            let word_cells = cell_width(&word);
+            if used + 1 + word_cells <= width {
                 if let Some(row) = rows.last_mut() {
                     row.push(' ');
                     row.push_str(&word);
                 }
+                used += 1 + word_cells;
                 continue;
             }
             if word.is_empty() {
@@ -199,19 +209,19 @@ pub(crate) fn wrap(line: &str, width: usize) -> Vec<String> {
             }
             if used > 0 {
                 rows.push(String::new());
+                used = 0;
             }
         }
         for cluster in graphemes(&word) {
             let cells = cell_width(cluster);
-            if rows
-                .last()
-                .is_some_and(|row| !row.is_empty() && cell_width(row) + cells > width)
-            {
+            if rows.last().is_some_and(|row| !row.is_empty()) && used + cells > width {
                 rows.push(String::new());
+                used = 0;
             }
             if let Some(row) = rows.last_mut() {
                 row.push_str(cluster);
             }
+            used += cells;
         }
     }
     rows
@@ -257,6 +267,7 @@ pub(crate) fn clip_spans(spans: &[Span<'_>], width: usize) -> Vec<Span<'static>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::{Color, Modifier};
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
     #[test]
@@ -398,8 +409,6 @@ mod tests {
     // The shared operations (MOD-60 D1-D4, D12): one table per op.
     // -----------------------------------------------------------------------------------------
 
-    use ratatui::style::{Color, Modifier};
-
     /// Three wide CJK characters: 6 cells.
     const CJK: &str = "\u{6f22}\u{5b57}\u{6587}";
     /// A ZWJ family: one cluster of five code points, 2 cells.
@@ -508,7 +517,23 @@ mod tests {
         assert_eq!(pad(COMBINING, 2), "e\u{301} ");
         assert_eq!(pad("abcdef", 4), "abcdef", "never clips");
         assert_eq!(pad("", 0), "");
-        assert_eq!(pad("a\u{1}", 3), "a\u{1} ", "no rewrite; measured 2");
+    }
+
+    /// D3 for the pads: `ratatui` draws nothing for a control, so an unflattened one would leave
+    /// the row a cell short of the width it was measured at and shift the next column left.
+    #[test]
+    fn pad_and_pad_left_draw_a_control_char_as_a_blank_cell() {
+        assert_eq!(pad("a\u{1}", 3), "a  ");
+        assert_eq!(pad("a\r\nb", 4), "a b ", "one cluster, one blank cell");
+        assert_eq!(pad("a\tbcd", 2), "a bcd", "flattened, and still never clipped");
+        assert_eq!(pad_left("a\u{1}", 3), " a ");
+        assert_eq!(pad_left("\u{7f}bc", 2), " bc", "never clips");
+        for (out, width) in [
+            (pad("a\u{1}", 3), 3),
+            (pad_left("\u{1}\u{7f}", 4), 4),
+        ] {
+            assert_eq!(drawn(&out), width, "{out:?} against {width}");
+        }
     }
 
     #[test]
@@ -622,6 +647,85 @@ mod tests {
             [SOUND.repeat(2), SOUND.to_owned()]
         );
         assert_eq!(wrap("ab", 0), ["a", "b"], "width 0 reads as 1");
+    }
+
+    /// `wrap` as it was before the running sum (MOD-60 review M1): every row re-measured whole
+    /// with [`cell_width`] for every cluster. Since B10 that is a per-cluster sum, so a running
+    /// count must give the same rows; this is the oracle that says so.
+    fn remeasuring_wrap(line: &str, width: usize) -> Vec<String> {
+        let width = width.max(1);
+        let mut rows = vec![String::new()];
+        for (at, raw) in line.split(' ').enumerate() {
+            let word = flatten(raw);
+            let used = rows.last().map_or(0, |row| cell_width(row));
+            if at > 0 {
+                if used + 1 + cell_width(&word) <= width {
+                    if let Some(row) = rows.last_mut() {
+                        row.push(' ');
+                        row.push_str(&word);
+                    }
+                    continue;
+                }
+                if word.is_empty() {
+                    continue;
+                }
+                if used > 0 {
+                    rows.push(String::new());
+                }
+            }
+            for cluster in graphemes(&word) {
+                let cells = cell_width(cluster);
+                if rows
+                    .last()
+                    .is_some_and(|row| !row.is_empty() && cell_width(row) + cells > width)
+                {
+                    rows.push(String::new());
+                }
+                if let Some(row) = rows.last_mut() {
+                    row.push_str(cluster);
+                }
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn wrap_with_a_running_sum_matches_the_remeasuring_wrap() {
+        let words = [
+            "ab".to_owned(),
+            "abcdefghij".to_owned(),
+            CJK.to_owned(),
+            FAMILY.repeat(3),
+            COMBINING.repeat(4),
+            SOUND.repeat(3),
+            "a\u{ff76}\u{ff9e}\u{ff9e}\u{ff9e}".to_owned(),
+            "a\u{1}b".to_owned(),
+            "\r\n".to_owned(),
+            "x\ty\u{7f}".to_owned(),
+            LAM_ALEF.repeat(3),
+            SALAM.to_owned(),
+            String::new(),
+        ];
+        let mut lines = vec![String::new(), " ".to_owned(), "   ".to_owned()];
+        for first in &words {
+            lines.push(first.clone());
+            lines.push(format!("  {first} "));
+            for second in &words {
+                lines.push(format!("{first} {second}"));
+                lines.push(format!("{first}  {second} {first}"));
+            }
+        }
+        lines.push(words.join(" "));
+        lines.push(words.join("  "));
+        for line in &lines {
+            for width in 0..=12 {
+                assert_eq!(
+                    wrap(line, width),
+                    remeasuring_wrap(line, width),
+                    "{line:?} at {width}"
+                );
+            }
+        }
     }
 
     #[test]
