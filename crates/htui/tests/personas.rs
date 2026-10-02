@@ -202,6 +202,38 @@ async fn the_registry_lists_one_line_per_persona() {
     insta::assert_snapshot!("browse", frame);
 }
 
+/// A description of wide glyphs is cut by display cells, not by chars: the tail still shows.
+#[tokio::test]
+async fn a_wide_description_is_cut_by_cells_and_keeps_the_tail() {
+    let mut rows = demo_rows().await;
+    for row in &mut rows {
+        row.description = if row.id == ids::PERSONA_ARCHITECT {
+            format!("{} searches", "\u{1f50d}".repeat(40))
+        } else {
+            "\u{691c}\u{7d22}\u{30a8}\u{30fc}\u{30b8}\u{30a7}\u{30f3}\u{30c8}".repeat(6)
+        };
+    }
+    let (bench, section) = bench_with(rows).await;
+    let frame = frame(&bench, &section);
+    let lines: Vec<&str> = frame.lines().collect();
+
+    assert!(
+        lines[0].starts_with("architect \u{b7} \u{1f50d}"),
+        "{frame}"
+    );
+    assert!(
+        lines[0].ends_with("\u{b7} deny edit,delete,move \u{b7} allow 0 \u{b7} rules 0"),
+        "the architect's tail is whole: {frame}"
+    );
+    assert!(lines[0].contains('\u{2026}'), "cut: {frame}");
+    assert!(lines[2].starts_with("reviewer \u{b7} \u{691c}"), "{frame}");
+    assert!(
+        lines[2].trim_end().ends_with(" \u{b7} rules 0"),
+        "the reviewer's tail is whole: {frame}"
+    );
+    assert!(lines[2].contains('\u{2026}'), "cut: {frame}");
+}
+
 #[tokio::test]
 async fn j_and_k_move_the_cursor_and_stop_at_the_ends() {
     let (bench, mut section) = bench_with_demo().await;

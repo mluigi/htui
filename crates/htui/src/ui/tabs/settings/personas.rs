@@ -36,6 +36,7 @@ use crate::app::{Ctx, Handled};
 use crate::persona_import::PersonaOutcome;
 use crate::persona_settings::{IMPORT_NAME, PersonaWrite, READ_NAME, REQUEST_NAMES};
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::cells::{cell_width, graphemes};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
     is_error, wrapped, yes_or_no,
@@ -1478,7 +1479,8 @@ fn at_end(text: &str) -> TextArea {
 
 /// One Browse line: `{name} · {description} · deny {kinds} · allow {n} · rules {n}`, the
 /// description cut with `…` to fit; the name and the tail are never cut, and an empty description
-/// drops its segment.
+/// drops its segment. Everything is measured in display cells (MOD-54's [`cell_width`]) and the
+/// description is cut at a grapheme boundary, so a wide glyph never pushes the tail off the line.
 fn row_line(row: &Persona, width: usize) -> String {
     let deny = if row.tools.deny_kinds.is_empty() {
         "none".to_owned()
@@ -1494,15 +1496,25 @@ fn row_line(row: &Persona, width: usize) -> String {
         return format!("{}{tail}", row.name);
     }
     let room = width
-        .saturating_sub(row.name.chars().count())
-        .saturating_sub(tail.chars().count())
-        .saturating_sub(DOT.chars().count());
-    let description = if row.description.chars().count() <= room {
+        .saturating_sub(cell_width(&row.name))
+        .saturating_sub(cell_width(&tail))
+        .saturating_sub(cell_width(DOT));
+    let description = if cell_width(&row.description) <= room {
         row.description.clone()
     } else if room == 0 {
         return format!("{}{tail}", row.name);
     } else {
-        let mut cut: String = row.description.chars().take(room - 1).collect();
+        // One cell is the `…`'s; a wide glyph that would pass the edge is left out whole.
+        let mut cut = String::new();
+        let mut used = 0;
+        for grapheme in graphemes(&row.description) {
+            let cells = cell_width(grapheme);
+            if used + cells > room - 1 {
+                break;
+            }
+            used += cells;
+            cut.push_str(grapheme);
+        }
         cut.push('\u{2026}');
         cut
     };
