@@ -137,7 +137,15 @@ impl<W: WriteStore> Batch<'_, W> {
             }];
         }
 
-        let mut candidates = markdown_files(&root);
+        let mut candidates = match markdown_files(&root) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                return vec![PersonaOutcome::Refused {
+                    path: path.to_owned(),
+                    message: format!("could not read `{path}` ({error})"),
+                }];
+            }
+        };
         let past = candidates.len().saturating_sub(MAX_FILES);
         candidates.truncate(MAX_FILES);
         let mut report = Vec::with_capacity(candidates.len() + 1);
@@ -216,10 +224,12 @@ impl<W: WriteStore> Batch<'_, W> {
 /// A directory's depth-0 regular `*.md` files (extension exactly `md`), links followed to files,
 /// sorted by file-name bytes (B-14). Subdirectories, other files and broken links are left alone
 /// and not reported: a sweep that reported them would open the report for every directory.
-fn markdown_files(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
+///
+/// # Errors
+/// The `read_dir` error of a directory that stats but cannot be listed, so the walk refuses it in
+/// one sentence rather than reporting an empty directory.
+fn markdown_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(dir)?;
     let mut files: Vec<PathBuf> = entries
         .filter_map(std::result::Result::ok)
         .map(|entry| entry.path())
@@ -232,7 +242,7 @@ fn markdown_files(dir: &Path) -> Vec<PathBuf> {
             .as_encoded_bytes()
             .cmp(right.file_name().unwrap_or_default().as_encoded_bytes())
     });
-    files
+    Ok(files)
 }
 
 /// Reads a file as text, refusing in one sentence each (copied from `skill_import.rs`, which
@@ -581,6 +591,46 @@ mod tests {
             message.starts_with(&format!("could not read `{path}` (")) && message.ends_with(')'),
             "{message}"
         );
+    }
+
+    /// A directory that stats but cannot be listed is refused with the OS error, never reported
+    /// as an empty directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unlistable_directory_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (store, backend) = demo();
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let agents = dir.path().join("agents");
+        write(&agents, "a.md", SCOUT);
+        fs::set_permissions(&agents, fs::Permissions::from_mode(0o311)).expect("chmod");
+        if fs::read_dir(&agents).is_ok() {
+            // Root lists any directory; there is nothing to probe.
+            fs::set_permissions(&agents, fs::Permissions::from_mode(0o755)).expect("chmod back");
+            return;
+        }
+        let path = label(&agents);
+        let before = names(&store).await;
+
+        let report = import(&backend, &path).await.expect("the import runs");
+
+        fs::set_permissions(&agents, fs::Permissions::from_mode(0o755)).expect("chmod back");
+        let [
+            PersonaOutcome::Refused {
+                path: named,
+                message,
+            },
+        ] = report.as_slice()
+        else {
+            panic!("an unlistable directory is one refusal: {report:?}")
+        };
+        assert_eq!(*named, path);
+        assert!(
+            message.starts_with(&format!("could not read `{path}` (")) && message.ends_with(')'),
+            "{message}"
+        );
+        assert_eq!(names(&store).await, before, "no row");
     }
 
     #[tokio::test]
