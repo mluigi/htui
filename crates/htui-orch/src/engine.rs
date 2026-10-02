@@ -5363,9 +5363,9 @@ where
     /// of the phase's prompt, which blocks the item (MOD-4 plan D162), and
     /// [`StageThree::NoPersona`] is a phase whose persona the snapshot does not carry, refused the
     /// same way (MOD-26 I-4) with the typed
-    /// [`PersonaNotInSnapshot`](htui_core::model::persona::PersonaNotInSnapshot). A store error and a phase
-    /// whose pinned template is gone (`ResolveError::NoTemplate`) stay outer: they are not about
-    /// this prompt.
+    /// [`PersonaNotInSnapshot`](htui_core::model::persona::PersonaNotInSnapshot). A store error
+    /// and a phase whose pinned template is gone (`ResolveError::NoTemplate`) stay outer: they are
+    /// not about this prompt.
     async fn assemble_prompt(
         &self,
         run: &Run,
