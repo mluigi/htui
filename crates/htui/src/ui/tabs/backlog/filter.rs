@@ -17,7 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::store_worker::StoreRequest;
-use crate::ui::tabs::backlog::list::clip;
+use crate::ui::cells::{self, cell_width};
 use crate::ui::{FieldOutcome, TextField, Theme};
 
 /// Rows the form takes at the bottom of the list pane: two borders, four rows and the hint.
@@ -340,13 +340,13 @@ impl FilterForm {
         };
         let head = format!("{} {label:<LABEL$}", if focused { '>' } else { ' ' });
         let head_style = if focused { theme.title } else { theme.dim };
-        let room = width.saturating_sub(head.chars().count());
+        let room = width.saturating_sub(cell_width(&head));
         let value = match row {
             FilterRow::Tags => {
                 let field = self
                     .tags
                     .line(u16::try_from(room).unwrap_or(u16::MAX), focused, theme);
-                let mut spans = vec![Span::styled(clip(&head, width), head_style)];
+                let mut spans = vec![Span::styled(cells::clip(&head, width), head_style)];
                 spans.extend(field.spans);
                 return Line::from(spans);
             }
@@ -383,8 +383,8 @@ impl FilterForm {
             ),
         };
         Line::from(vec![
-            Span::styled(clip(&head, width), head_style),
-            Span::styled(clip(&value, room), theme.base),
+            Span::styled(cells::clip(&head, width), head_style),
+            Span::styled(cells::clip(&value, room), theme.base),
         ])
     }
 }
@@ -427,7 +427,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &FilterForm, theme: &Them
     } else {
         HINT_CHOICES
     };
-    lines.push(Line::styled(clip(hint, width), theme.dim));
+    lines.push(Line::styled(cells::clip(hint, width), theme.dim));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -872,6 +872,25 @@ mod tests {
         assert_eq!(form.tags.text(), Some("rust,gpu"));
     }
 
+    /// MOD-60 D1: the value is clipped in cells, so a CJK project name stays inside the row.
+    #[test]
+    fn a_wide_project_name_is_clipped_to_the_row() {
+        let projects = vec![ProjectRef {
+            project_id: ids::PROJECT_HTUI,
+            slug: "wide".to_owned(),
+            name: "\u{6f22}".repeat(30),
+            position: 0,
+        }];
+        let form = FilterForm::open(&BacklogFilter::default(), &projects);
+        let line = form.line(FilterRow::Project, 30, &Theme::default());
+        let used: usize = line
+            .spans
+            .iter()
+            .map(|span| cell_width(&span.content))
+            .sum();
+        assert!(used <= 30, "{line:?} against 30");
+    }
+
     /// Both hints fit the form's inner width inside the list pane at the harness's pinned size, so
     /// a longer hint fails here rather than as a clipped snapshot (MOD-30).
     #[test]
@@ -883,9 +902,9 @@ mod tests {
         let room = usize::from(list.width) - 2;
         for hint in [HINT_CHOICES, HINT_TAGS] {
             assert!(
-                hint.chars().count() <= room,
+                cell_width(hint) <= room,
                 "{hint:?} is {} columns against {room}",
-                hint.chars().count()
+                cell_width(hint)
             );
         }
     }

@@ -28,10 +28,11 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use super::item_form::{ctrl_s, notice_lines};
+use super::item_form::ctrl_s;
 use crate::item_writes::{ItemDivergence, ItemFormContext};
-use crate::ui::cells::{cell_width, graphemes};
-use crate::ui::tabs::backlog::{filter, list::clip};
+use crate::ui::cells;
+use crate::ui::tabs::backlog::filter;
+use crate::ui::tabs::settings::wrapped;
 use crate::ui::{Theme, diff};
 
 /// The hint's pick part while a field conflicts (D4).
@@ -442,12 +443,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, theme: &Them
     let width = usize::from(inner.width);
     let vw = width.saturating_sub(LABEL_WIDTH + STATE_WIDTH + 2) / 3;
     let headings = format!(
-        "{:<LABEL_WIDTH$}{:<STATE_WIDTH$}{:<vw$} {:<vw$} {:<vw$}",
-        "field",
-        "state",
-        clip(&format!("ancestor v{}", view.ancestor_version), vw),
-        clip(&format!("theirs v{}", view.head_version), vw),
-        clip("mine", vw),
+        "{}{}{} {} {}",
+        cells::fit("field", LABEL_WIDTH),
+        cells::fit("state", STATE_WIDTH),
+        cells::fit(&format!("ancestor v{}", view.ancestor_version), vw),
+        cells::fit(&format!("theirs v{}", view.head_version), vw),
+        cells::fit("mine", vw),
     );
 
     let mut table: Vec<Line<'static>> = view
@@ -478,7 +479,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, theme: &Them
     ])
     .areas(inner);
     frame.render_widget(
-        Paragraph::new(Line::styled(clip(&headings, width), theme.dim)),
+        Paragraph::new(Line::styled(cells::clip(&headings, width), theme.dim)),
         headings_at,
     );
     frame.render_widget(Paragraph::new(table), table_at);
@@ -497,7 +498,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, theme: &Them
         ] {
             frame.render_widget(
                 Paragraph::new(Line::styled(
-                    clip(&text, usize::from(at.width)),
+                    cells::clip(&text, usize::from(at.width)),
                     theme.title,
                 )),
                 at,
@@ -530,7 +531,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, theme: &Them
     }
 
     frame.render_widget(
-        Paragraph::new(Line::styled(clip(&view.hint(), width), theme.dim)),
+        Paragraph::new(Line::styled(cells::clip(&view.hint(), width), theme.dim)),
         hint_at,
     );
 }
@@ -538,7 +539,9 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, theme: &Them
 /// A unified diff as the rows it draws in a `width`-wide column, each beside the diff line it
 /// came from (its style); [`diff::NO_DIFFERENCES`] for an empty diff, as [`diff::lines`] draws.
 /// Wrapped here rather than by `Paragraph`'s `Wrap`, so the scroll clamp counts the same rows the
-/// view draws (MOD-13 review M1). A `width` of `0` (never drawn) leaves every line one row.
+/// view draws (MOD-13 review M1). Each row is `cells::wrap`'s, measured in terminal cells, so a
+/// row of wide characters (CJK, emoji) is never wider than its column (MOD-13 M3 review verify
+/// round 1, MOD-60 D4). A `width` of `0` (never drawn) leaves every line one row.
 fn diff_rows(unified: &str, width: u16) -> Vec<(&str, String)> {
     let lines: Vec<&str> = if unified.is_empty() {
         vec![diff::NO_DIFFERENCES]
@@ -554,68 +557,20 @@ fn diff_rows(unified: &str, width: u16) -> Vec<(&str, String)> {
     lines
         .into_iter()
         .flat_map(|line| {
-            wrap_row(line, usize::from(width))
+            cells::wrap(line, usize::from(width))
                 .into_iter()
                 .map(move |row| (line, row))
         })
         .collect()
 }
 
-/// `line` in rows of at most `width` terminal cells, measured with [`cell_width`] over grapheme
-/// clusters, so a row of wide characters (CJK, emoji) is never wider than the column the view
-/// draws it in unwrapped (MOD-13 M3 review verify round 1). A row breaks at a space where one
-/// fits, and inside a word only when the word alone is wider. Only a cluster wider than the whole
-/// column overflows it, alone on its row. An empty line is one empty row, and the spaces a line
-/// starts with are kept (a context line's gutter). `detail::runs`' `wrap_line` rule, which is
-/// private to the detail pane, measured in cells rather than chars.
-fn wrap_row(line: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut rows = vec![String::new()];
-    for (at, word) in line.split(' ').enumerate() {
-        let used = rows.last().map_or(0, |row| cell_width(row));
-        if at > 0 {
-            if used + 1 + cell_width(word) <= width {
-                if let Some(row) = rows.last_mut() {
-                    row.push(' ');
-                    row.push_str(word);
-                }
-                continue;
-            }
-            if word.is_empty() {
-                // A space that does not fit is the break itself.
-                continue;
-            }
-            if used > 0 {
-                rows.push(String::new());
-            }
-        }
-        for cluster in graphemes(word) {
-            // A control character draws as one blank cell.
-            let cluster = if cluster.chars().any(char::is_control) {
-                " "
-            } else {
-                cluster
-            };
-            let cells = cell_width(cluster);
-            if rows
-                .last()
-                .is_some_and(|row| !row.is_empty() && cell_width(row) + cells > width)
-            {
-                rows.push(String::new());
-            }
-            if let Some(row) = rows.last_mut() {
-                row.push_str(cluster);
-            }
-        }
-    }
-    rows
-}
-
 /// One row's lines: each value wrapped in its `vw`-wide cell (D4: the short fields wrap, never
-/// clip), the label and state on the first line only.
+/// clip), the label and state on the first line only. Every column is fitted to exactly its width
+/// in cells (MOD-60 D8, B2), so a line is `LABEL_WIDTH + STATE_WIDTH + 3·vw + 2` cells whatever
+/// the values hold.
 fn row_lines(row: &Row, vw: usize, theme: &Theme) -> Vec<Line<'static>> {
-    let cells = [&row.ancestor, &row.theirs, &row.mine].map(|value| notice_lines(value, vw));
-    let height = cells.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    let values = [&row.ancestor, &row.theirs, &row.mine].map(|value| wrapped(value, vw));
+    let height = values.iter().map(Vec::len).max().unwrap_or(0).max(1);
     let state_style = match row.state {
         FieldState::Conflict => theme.error,
         FieldState::Theirs | FieldState::Mine => theme.accent,
@@ -629,15 +584,15 @@ fn row_lines(row: &Row, vw: usize, theme: &Theme) -> Vec<Line<'static>> {
                 ("", "")
             };
             let mut spans = vec![
-                Span::styled(format!("{label:<LABEL_WIDTH$}"), theme.base),
-                Span::styled(format!("{state:<STATE_WIDTH$}"), state_style),
+                Span::styled(cells::fit(label, LABEL_WIDTH), theme.base),
+                Span::styled(cells::fit(state, STATE_WIDTH), state_style),
             ];
-            for (index, cell) in cells.iter().enumerate() {
+            for (index, value) in values.iter().enumerate() {
                 if index > 0 {
                     spans.push(Span::raw(" "));
                 }
-                let text = cell.get(at).map_or("", String::as_str);
-                spans.push(Span::styled(format!("{text:<vw$}"), theme.base));
+                let text = value.get(at).map_or("", String::as_str);
+                spans.push(Span::styled(cells::fit(text, vw), theme.base));
             }
             Line::from(spans)
         })
@@ -649,6 +604,7 @@ mod tests {
     use super::*;
     use crate::item_writes;
     use crate::store_worker::{StoreReply, StoreRequest};
+    use crate::ui::cells::cell_width;
     use crate::ui::layout::chrome;
     use crossterm::event::KeyModifiers;
     use htui_core::fixtures::ids;
@@ -1065,7 +1021,7 @@ mod tests {
             "\u{1}\u{7f}x".to_owned(),
         ] {
             for width in [1, 2, 3, 7, 20, 48] {
-                let rows = wrap_row(&line, width);
+                let rows = cells::wrap(&line, width);
                 // A wide cluster alone on a row is the one overflow a 1-cell column allows.
                 let room = width.max(2);
                 for row in &rows {
@@ -1078,6 +1034,38 @@ mod tests {
                     .filter(|c| *c != ' ' && !c.is_control())
                     .collect();
                 assert_eq!(kept, wanted, "nothing dropped from {line:?} at {width}");
+            }
+        }
+    }
+
+    /// MOD-60 D8, B2: every value cell is fitted to exactly `vw` cells, so a table line is
+    /// `LABEL + STATE + 3·vw + 2` cells whatever the values hold — CJK, a ZWJ family, or a
+    /// cluster wider than a one-cell column.
+    #[tokio::test]
+    async fn every_table_line_is_the_table_width_with_wide_values() {
+        const FAMILY: &str = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        let view = view(
+            |_| ItemPatch {
+                title: Some("\u{6f22}".repeat(40)),
+                ..patch()
+            },
+            |spec| spec.title = FAMILY.repeat(5),
+        )
+        .await;
+        for vw in [1, 2, 3, 7, 25] {
+            for row in view.rows() {
+                for line in row_lines(row, vw, &Theme::default()) {
+                    let used: usize = line
+                        .spans
+                        .iter()
+                        .map(|span| cell_width(&span.content))
+                        .sum();
+                    assert_eq!(
+                        used,
+                        LABEL_WIDTH + STATE_WIDTH + 3 * vw + 2,
+                        "{line:?} at {vw}"
+                    );
+                }
             }
         }
     }
@@ -1124,14 +1112,14 @@ mod tests {
             [HINT_SIDES, HINT_TAB, HINT_BACK].join("  "),
             [HINT_NO_CONFLICT, HINT_TAB, HINT_BACK].join("  "),
         ] {
-            assert!(hint.chars().count() <= room, "{hint:?} against {room}");
+            assert!(cell_width(&hint) <= room, "{hint:?} against {room}");
         }
     }
 
     #[tokio::test]
     async fn a_long_title_wraps_inside_its_column() {
         let title = "A deliberately long title that has to wrap inside its value column, ok";
-        assert_eq!(title.chars().count(), 70);
+        assert_eq!(cell_width(title), 70);
         let view = view(
             |_| ItemPatch {
                 title: Some(title.to_owned()),
