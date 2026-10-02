@@ -129,7 +129,9 @@ impl WorkspaceSwitcher {
     ) -> Line<'static> {
         let selected = index == self.selected;
         let marker = if selected { CURSOR } else { NO_CURSOR };
-        let name = format!("{marker}{}{GAP}", cells::pad(&workspace.name, column));
+        // `fit`, not `pad`: `column` is the widest name, so nothing is cut, but `fit` clips first
+        // and clipping flattens a control to the blank cell `cell_width` counted it as (D3).
+        let name = format!("{marker}{}{GAP}", cells::fit(&workspace.name, column));
         let style = if selected { theme.accent } else { theme.base };
         Line::from(vec![
             Span::styled(name, style),
@@ -265,6 +267,28 @@ mod tests {
             .map(|line| cell_width(&line.spans[0].content))
             .collect();
         assert_eq!(first[0], first[1], "{lines:?}");
+    }
+
+    /// MOD-60 D3: `cell_width` counts a control as one cell but ratatui draws nothing for it, so
+    /// the name is flattened before it is padded. Measured where ratatui stops drawing each row:
+    /// every row ends with the same label, so equal ends mean one count column.
+    #[test]
+    fn a_control_char_in_a_workspace_name_keeps_the_counts_in_one_column() {
+        let switcher = WorkspaceSwitcher {
+            workspaces: vec![
+                workspace("Platform"),
+                workspace("a\tb"),
+                workspace("a\u{1}b"),
+            ],
+            selected: 0,
+            loaded: true,
+        };
+        let lines = switcher.lines(&Theme::default());
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 80, 3));
+        let ends: Vec<u16> = (0u16..3)
+            .map(|y| buffer.set_line(0, y, &lines[usize::from(y)], 80).0)
+            .collect();
+        assert_eq!(ends, vec![ends[0]; 3], "{lines:?}");
     }
 
     /// MOD-60 B3: the box is as wide as the widest row in cells. `ｶﾞ` is two cells and one to
