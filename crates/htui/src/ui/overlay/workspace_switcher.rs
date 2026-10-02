@@ -16,6 +16,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use crate::app::{Action, Ctx, Handled, OverlayAction};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
+use crate::ui::cells::{self, cell_width};
 use crate::ui::layout::centered;
 use crate::ui::overlay::registry::{Overlay, OverlayId};
 use crossterm::event::{KeyCode, KeyEvent};
@@ -95,7 +96,7 @@ impl WorkspaceSwitcher {
             let column = self
                 .workspaces
                 .iter()
-                .map(|w| w.name.chars().count())
+                .map(|w| cell_width(&w.name))
                 .max()
                 .unwrap_or(0);
             self.workspaces
@@ -128,8 +129,7 @@ impl WorkspaceSwitcher {
     ) -> Line<'static> {
         let selected = index == self.selected;
         let marker = if selected { CURSOR } else { NO_CURSOR };
-        let padding = " ".repeat(column.saturating_sub(workspace.name.chars().count()));
-        let name = format!("{marker}{}{padding}{GAP}", workspace.name);
+        let name = format!("{marker}{}{GAP}", cells::pad(&workspace.name, column));
         let style = if selected { theme.accent } else { theme.base };
         Line::from(vec![
             Span::styled(name, style),
@@ -189,7 +189,18 @@ impl Overlay for WorkspaceSwitcher {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let lines = self.lines(ctx.theme);
-        let widest = lines.iter().map(Line::width).max().unwrap_or(0);
+        // Measured in cells as the rows were padded: `Line::width` skips the halfwidth sound mark
+        // rule, so a name the column pads by cells would come out a cell short (MOD-60 B3).
+        let widest = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| cell_width(&span.content))
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0);
         let width = u16::try_from(widest)
             .unwrap_or(u16::MAX)
             .saturating_add(CHROME);
@@ -216,5 +227,38 @@ fn projects_label(count: usize) -> String {
         0 => "no projects".to_owned(),
         1 => "1 project".to_owned(),
         n => format!("{n} projects"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use htui_core::model::WorkspaceId;
+
+    use super::*;
+
+    fn workspace(name: &str) -> WorkspaceSummary {
+        WorkspaceSummary {
+            workspace_id: WorkspaceId::default(),
+            slug: "w".to_owned(),
+            name: name.to_owned(),
+            projects: Vec::new(),
+        }
+    }
+
+    /// MOD-60: the name column is measured and padded in cells, so a CJK name's project count
+    /// lines up with an ASCII one's.
+    #[test]
+    fn a_wide_workspace_name_keeps_the_counts_in_one_column() {
+        let switcher = WorkspaceSwitcher {
+            workspaces: vec![workspace("Platform"), workspace("\u{5e73}\u{53f0}")],
+            selected: 0,
+            loaded: true,
+        };
+        let lines = switcher.lines(&Theme::default());
+        let first: Vec<usize> = lines[..2]
+            .iter()
+            .map(|line| cell_width(&line.spans[0].content))
+            .collect();
+        assert_eq!(first[0], first[1], "{lines:?}");
     }
 }
