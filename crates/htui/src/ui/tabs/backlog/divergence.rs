@@ -17,6 +17,8 @@
 //! `2 paths`), and [`Divergence`]'s `Debug` is hand-written to print the rows' fields and states
 //! only.
 
+use core::cell::Cell;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use htui_core::model::item_merge::{self, FieldState, Side, SpecField, SpecMerge};
 use htui_core::model::item_spec;
@@ -24,7 +26,7 @@ use htui_core::model::{Item, ItemKindId, ItemSpec, StepGraphId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::item_form::{ctrl_s, notice_lines};
 use crate::item_writes::{ItemDivergence, ItemFormContext};
@@ -139,8 +141,11 @@ pub struct Divergence {
     rows: Vec<Row>,
     /// The text the diffs show; `None` when body and paths are both `Same`.
     pane: Option<DiffPane>,
-    /// The diffs' first line.
+    /// The diffs' first row.
     scroll: u16,
+    /// The two diff columns' widths at the last draw, which the next scroll key wraps at (the
+    /// `render_artifact` precedent); `0` before the first draw, which counts unwrapped lines.
+    widths: Cell<(u16, u16)>,
 }
 
 /// The key, the versions, the rows' fields and states, the pane and the scroll; never the merge
@@ -161,6 +166,7 @@ impl core::fmt::Debug for Divergence {
             )
             .field("pane", &self.pane)
             .field("scroll", &self.scroll)
+            .field("widths", &self.widths.get())
             .finish_non_exhaustive()
     }
 }
@@ -211,6 +217,7 @@ impl Divergence {
             rows,
             pane,
             scroll: 0,
+            widths: Cell::new((0, 0)),
         }
     }
 
@@ -312,16 +319,17 @@ impl Divergence {
             && self.merge.state(SpecField::Paths) != FieldState::Same
     }
 
-    /// Moves the diffs `by` lines, clamped to the longer diff's logical line count minus one
-    /// (blueprint E7: a lower bound on the wrapped count, so the view never scrolls blank).
+    /// Moves the diffs `by` rows, clamped to the longer diff's row count minus one, wrapped at the
+    /// widths of the last draw (MOD-13 review M1: a prose body wraps several rows a line, and a
+    /// clamp on its lines left the tail unreachable). The view never scrolls blank.
     fn scroll_by(&mut self, by: usize, down: bool) {
         let Some((theirs, mine)) = self.diffs() else {
             return;
         };
-        let last = theirs
-            .lines()
-            .count()
-            .max(mine.lines().count())
+        let (left, right) = self.widths.get();
+        let last = diff_rows(&theirs, left)
+            .len()
+            .max(diff_rows(&mine, right).len())
             .saturating_sub(1);
         let at = usize::from(self.scroll);
         let next = if down {
@@ -489,13 +497,24 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, theme: &Them
             );
         }
         let [left, gap, right] = columns.areas(diffs_at);
-        for (unified, at) in [(theirs, left), (mine, right)] {
-            frame.render_widget(
-                Paragraph::new(diff::lines(&unified, theme))
-                    .wrap(Wrap { trim: false })
-                    .scroll((view.scroll, 0)),
-                at,
-            );
+        view.widths.set((left.width, right.width));
+        let sides = [(theirs, left), (mine, right)].map(|(unified, at)| {
+            let lines: Vec<Line<'static>> = diff_rows(&unified, at.width)
+                .into_iter()
+                .map(|(line, row)| Line::styled(row, diff::diff_style(line, theme)))
+                .collect();
+            (lines, at)
+        });
+        // A pane that widened since the last key has fewer rows than the offset assumed.
+        let last = sides
+            .iter()
+            .map(|(lines, _)| lines.len())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let scroll = view.scroll.min(u16::try_from(last).unwrap_or(u16::MAX));
+        for (lines, at) in sides {
+            frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), at);
         }
         let bar: Vec<Line<'static>> = (0..gap.height)
             .map(|_| Line::styled("\u{2502}", theme.dim))
@@ -507,6 +526,69 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, theme: &Them
         Paragraph::new(Line::styled(clip(&view.hint(), width), theme.dim)),
         hint_at,
     );
+}
+
+/// A unified diff as the rows it draws in a `width`-wide column, each beside the diff line it
+/// came from (its style); [`diff::NO_DIFFERENCES`] for an empty diff, as [`diff::lines`] draws.
+/// Wrapped here rather than by `Paragraph`'s `Wrap`, so the scroll clamp counts the same rows the
+/// view draws (MOD-13 review M1). A `width` of `0` (never drawn) leaves every line one row.
+fn diff_rows(unified: &str, width: u16) -> Vec<(&str, String)> {
+    let lines: Vec<&str> = if unified.is_empty() {
+        vec![diff::NO_DIFFERENCES]
+    } else {
+        unified.lines().collect()
+    };
+    if width == 0 {
+        return lines
+            .into_iter()
+            .map(|line| (line, line.to_owned()))
+            .collect();
+    }
+    lines
+        .into_iter()
+        .flat_map(|line| {
+            wrap_row(line, usize::from(width))
+                .into_iter()
+                .map(move |row| (line, row))
+        })
+        .collect()
+}
+
+/// `line` in rows of at most `width` characters: broken at a space where one fits, inside a word
+/// only when the word alone is wider. An empty line is one empty row, and the spaces a line
+/// starts with are kept (a context line's gutter). `detail::runs`' `wrap_line`, which is private
+/// to the detail pane; the same rule `Paragraph`'s `Wrap { trim: false }` drew the diffs with.
+fn wrap_row(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = vec![String::new()];
+    for (at, word) in line.split(' ').enumerate() {
+        let used = rows.last().map_or(0, |row| row.chars().count());
+        if at > 0 {
+            if used + 1 + word.chars().count() <= width {
+                if let Some(row) = rows.last_mut() {
+                    row.push(' ');
+                    row.push_str(word);
+                }
+                continue;
+            }
+            if word.is_empty() {
+                // A space that does not fit is the break itself.
+                continue;
+            }
+            if used > 0 {
+                rows.push(String::new());
+            }
+        }
+        for c in word.chars() {
+            if rows.last().is_some_and(|row| row.chars().count() >= width) {
+                rows.push(String::new());
+            }
+            if let Some(row) = rows.last_mut() {
+                row.push(if c.is_control() { ' ' } else { c });
+            }
+        }
+    }
+    rows
 }
 
 /// One row's lines: each value wrapped in its `vw`-wide cell (D4: the short fields wrap, never
@@ -815,6 +897,35 @@ mod tests {
         assert_eq!(view.scroll(), 0);
         view.on_key(key(KeyCode::Char('k')));
         assert_eq!(view.scroll(), 0, "k at the top stays");
+    }
+
+    /// MOD-13 review M1: the clamp counts the rows the diffs wrap to at the drawn width, not the
+    /// diff's lines, so the tail of a long prose body is reachable.
+    #[tokio::test]
+    async fn a_long_wrapping_body_shows_its_last_line_after_scrolling_to_the_end() {
+        let paragraph = |n: usize| {
+            let words: String = (0..45).map(|w| format!("word{w} ")).collect();
+            format!("paragraph {n} {words}end-of-{n}\n")
+        };
+        let long: String = (0..40).map(paragraph).collect();
+        let mut view = view(
+            move |_| ItemPatch {
+                body: Some(long),
+                ..patch()
+            },
+            |_| {},
+        )
+        .await;
+        let top = drawn(&view).join("\n");
+        assert!(!top.contains("end-of-39"), "{top}");
+        for _ in 0..100 {
+            view.on_key(key(KeyCode::PageDown));
+        }
+        let end = view.scroll();
+        let bottom = drawn(&view).join("\n");
+        assert!(bottom.contains("end-of-39"), "{bottom}");
+        view.on_key(key(KeyCode::Char('j')));
+        assert_eq!(view.scroll(), end, "clamped at the last wrapped row");
     }
 
     #[tokio::test]
