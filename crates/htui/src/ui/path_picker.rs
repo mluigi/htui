@@ -154,11 +154,14 @@ impl PathPicker {
             },
             KeyCode::Char('h') | KeyCode::Backspace => match parent(&self.path) {
                 Some(up) => {
-                    self.reselect = Path::new(&self.path)
+                    let came_from = Path::new(&self.path)
                         .file_name()
                         .and_then(|name| name.to_str())
                         .map(str::to_owned);
-                    PickerOutcome::Request(self.ask(up))
+                    let request = self.ask(up);
+                    // After `ask`, which forgets any older one (review N-1).
+                    self.reselect = came_from;
+                    PickerOutcome::Request(request)
                 }
                 None => PickerOutcome::None,
             },
@@ -257,9 +260,13 @@ impl PathPicker {
     /// `ask(p)`: remember `p` as the newest path asked for (P9) and build its request. `.` and
     /// `..` are resolved lexically first (review L-1), so the kernel never resolves a `..` after a
     /// link and lists the link target's parent (P5, `R-BOX-4`).
+    ///
+    /// Every request forgets the place an older one meant to reselect (review N-1): going up sets
+    /// it again after asking, so it only ever applies to the parent it was set for.
     fn ask(&mut self, path: String) -> StoreRequest {
         let path = lexical(path);
         self.asked.clone_from(&path);
+        self.reselect = None;
         StoreRequest::ListDir {
             path,
             show_hidden: self.show_hidden,
