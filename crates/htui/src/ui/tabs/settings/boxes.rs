@@ -1279,6 +1279,7 @@ mod tests {
         let out = list_label(&record, &snapshot, room);
 
         assert!(cell_width(&out) <= room, "{out:?} against {room}");
-        assert!(out.ends_with(" (this box)"), "{out:?}");
+        // ` (this box)` takes 11 cells and leaves the hostname 13: six two-cell clusters and `…`.
+        assert_eq!(out, format!("{}\u{2026} (this box)", "\u{6f22}".repeat(6)));
     }
 }

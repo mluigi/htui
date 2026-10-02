@@ -1259,4 +1259,26 @@ mod tests {
             assert_eq!(row.source, source, "{stored:?}");
         }
     }
+
+    /// MOD-60: the hint line measures the notice in cells, so a CJK notice that fits by `char`
+    /// count but not on screen takes the line alone rather than overrunning it.
+    #[test]
+    fn a_wide_notice_takes_the_hint_line_alone() {
+        let k = 10;
+        let notice = "\u{6f22}".repeat(k);
+        let section = PromptSection {
+            notice: Some(Notice::Error(notice.clone())),
+            ..PromptSection::new()
+        };
+        let keys = section.hint_text();
+        let width = cell_width(&keys) + k + 3;
+
+        let line = section.hint(
+            u16::try_from(width).expect("a hint this narrow fits u16"),
+            &Theme::default(),
+        );
+
+        assert_eq!(line.spans.len(), 1, "{line:?} against {width}");
+        assert_eq!(line.spans[0].content, notice);
+    }
 }
