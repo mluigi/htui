@@ -364,7 +364,8 @@ impl BacklogTab {
     /// A key while the item form is open (D8, A7).
     ///
     /// Every plain key is consumed, used by the form or not: a passed `q`, digit, `w`, `?` or
-    /// `Tab` would act globally (blueprint §8). The form itself passes chords but Ctrl+S (A6).
+    /// `Tab` would act globally (blueprint §8). The form itself passes chords but Ctrl+S (A6) and
+    /// Ctrl+E (milestone 4 D1).
     fn on_item_form_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let Some(form) = self.item_form.as_mut() else {
             return Handled::Pass;
@@ -378,6 +379,7 @@ impl BacklogTab {
                 item: None,
             }),
             ItemFormOutcome::Save(request) => ctx.request(request),
+            ItemFormOutcome::External(edit) => ctx.emit(Action::EditExternally(edit)),
         }
         Handled::Consumed
     }

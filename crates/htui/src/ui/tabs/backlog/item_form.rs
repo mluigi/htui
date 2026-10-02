@@ -17,6 +17,10 @@
 //! - **A stale save opens the three-way view** (milestone 3 D3–D5, [`super::divergence`]).
 //!   `m`/`t` rebase the form on the head, with a new token and reason `divergence_resolution`.
 //!   `Esc` returns to it unchanged.
+//! - **Ctrl+E hands Body or Paths to `$EDITOR`** (milestone 4 D1–D5): the form answers
+//!   [`ItemFormOutcome::External`] and records the field; [`ItemForm::on_external_edit`] puts the
+//!   text back, minus a final newline the editor added (D5). Saving is still Ctrl+S's
+//!   compare-and-set.
 //! - **The new form's project picker re-reads that project's catalogue** (blueprint E7): kinds,
 //!   graphs and repos are per project. Keys are swallowed until the reply re-targets the form.
 //!
@@ -34,6 +38,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::divergence::{Divergence, ViewOutcome, rebased_on, still_behind};
+use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG};
 use crate::item_writes::{ItemDivergence, ItemFormContext};
 use crate::store_worker::StoreRequest;
 use crate::ui::tabs::backlog::filter;
@@ -49,6 +54,10 @@ pub const HINT_TEXT: &str = "Tab field  Ctrl+S save  Esc cancel";
 
 /// The hint under a picker. It fits the detail pane's inner width at 100x30 (43 columns).
 pub const HINT_PICK: &str = "\u{2190}/\u{2192} choose  Tab field  Esc cancel";
+
+/// The hint under the paths and body areas (milestone 4 D7): 39 columns against the detail
+/// pane's 43, so `Tab field` gives way to Ctrl+E (Tab still cycles).
+pub const HINT_AREA: &str = "Ctrl+E $EDITOR  Ctrl+S save  Esc cancel";
 
 /// The refusal of a save in a project without item kinds: an item needs one.
 pub const NO_KINDS: &str = "this project has no item kinds; Settings \u{2192} Kinds adds one";
@@ -124,6 +133,9 @@ pub enum ItemFormOutcome {
     Reload(ProjectId),
     /// Checked and ready; the form is already `busy`.
     Save(StoreRequest),
+    /// Ctrl+E on Body or Paths (milestone 4 D3): hand this text to `$EDITOR`. The outcome comes
+    /// back through [`ItemForm::on_external_edit`]; the tab emits `Action::EditExternally`.
+    External(ExternalEdit),
 }
 
 /// The open item form, new or edit.
@@ -163,6 +175,9 @@ pub struct ItemForm {
     /// The open three-way view (milestone 3 D3): while `Some`, every key and paste goes to it,
     /// not the fields.
     resolving: Option<Divergence>,
+    /// The field handed to `$EDITOR` (milestone 4 D3) until its outcome comes back. A field, never
+    /// text, so `Debug` may print it.
+    external: Option<Field>,
 }
 
 /// The widgets' texts right after open.
@@ -213,6 +228,7 @@ impl core::fmt::Debug for ItemForm {
                 "resolving",
                 &self.resolving.as_ref().map(Divergence::head_version),
             )
+            .field("external", &self.external)
             .finish_non_exhaustive()
     }
 }
@@ -256,6 +272,12 @@ pub(super) fn ctrl_s(key: &KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char('s' | 'S'))
 }
 
+/// Ctrl+E, with or without `SHIFT` (milestone 4 D1; the Templates editor's rule).
+fn ctrl_e(key: &KeyEvent) -> bool {
+    key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL
+        && matches!(key.code, KeyCode::Char('e' | 'E'))
+}
+
 /// One step through `len` options from `at`, wrapping.
 const fn wrap(at: usize, len: usize, forward: bool) -> usize {
     if len == 0 {
@@ -278,6 +300,18 @@ fn field<T: Clone>(
     match stored {
         Some(stored) if typed == opened => Ok(stored.clone()),
         _ => parse(typed),
+    }
+}
+
+/// D5: `returned` without the one final `\n` an editor adds on save (vim's `fixeol`, nano, VS
+/// Code), when `handed`, the text the field handed out, had none. Exactly one is dropped:
+/// `"abc\n\n"` back from `"abc"` is `"abc\n"`. When `handed` ends in `\n`, `returned` is kept
+/// whole. `returned` is already LF-only (`editor::run` normalises it).
+fn strip_added_newline<'a>(handed: &str, returned: &'a str) -> &'a str {
+    if handed.ends_with('\n') {
+        returned
+    } else {
+        returned.strip_suffix('\n').unwrap_or(returned)
     }
 }
 
@@ -384,6 +418,7 @@ impl ItemForm {
             notice: None,
             reason: EditReason::Edited,
             resolving: None,
+            external: None,
         }
     }
 
@@ -472,12 +507,91 @@ impl ItemForm {
         self.notice = notice;
     }
 
+    /// D4: the `$EDITOR` handoff came back. No field out (`external` is `None`): ignored.
+    /// `Edited` replaces only the handed-out field's text (after D5), focuses it and says `EDITED`;
+    /// the token, reason, `opened` and every other field are untouched, so A4's "unchanged" still
+    /// compares against what the form opened with. `Unchanged` says `NO_CHANGES` (+ `WAIT_FLAG`
+    /// when quick); `Failed` says its sentence; neither touches the text.
+    pub fn on_external_edit(&mut self, outcome: ExternalEditOutcome) {
+        let Some(field) = self.external.take() else {
+            return;
+        };
+        match outcome {
+            ExternalEditOutcome::Edited(returned) => {
+                // Unreachable `None`: only an area is handed out.
+                let Some(area) = self.area_mut(field) else {
+                    return;
+                };
+                // D5's baseline is the widget: nothing reaches the form between the handoff and
+                // its outcome (the event loop runs them back to back).
+                let text = strip_added_newline(area.text(), &returned);
+                if text == area.text() {
+                    self.notice = Some(NO_CHANGES.to_owned());
+                } else {
+                    *area = TextArea::with_text(text);
+                    self.focus = field;
+                    self.notice = Some(EDITED.to_owned());
+                }
+            }
+            ExternalEditOutcome::Unchanged { quick } => {
+                let wait = if quick { WAIT_FLAG } else { "" };
+                self.notice = Some(format!("{NO_CHANGES}{wait}"));
+            }
+            ExternalEditOutcome::Failed(message) => self.notice = Some(message),
+        }
+    }
+
+    /// The text area behind `field`: Paths or Body; `None` for a one-line field or a picker.
+    fn area_mut(&mut self, field: Field) -> Option<&mut TextArea> {
+        match field {
+            Field::Paths => Some(&mut self.paths),
+            Field::Body => Some(&mut self.body),
+            Field::Project
+            | Field::Kind
+            | Field::Title
+            | Field::Priority
+            | Field::Tags
+            | Field::Graph => None,
+        }
+    }
+
+    /// The temp-file stem (D3): `<key>-body` / `<key>-paths`, `new-body` / `new-paths` on a new
+    /// form. `editor::run` sanitises it (D25).
+    fn stem(&self, field: Field) -> String {
+        let owner = self
+            .context
+            .item
+            .as_ref()
+            .map_or("new", |item| item.key.as_str());
+        let part = if field == Field::Paths {
+            "paths"
+        } else {
+            "body"
+        };
+        format!("{owner}-{part}")
+    }
+
+    /// Ctrl+E while idle (D1, D3): Body or Paths answer `External` with that field's text and
+    /// record it in `external`; any other field swallows it (`Stay`). The notice is left alone,
+    /// as the Templates handoff leaves it: the outcome always sets it.
+    fn hand_off(&mut self) -> ItemFormOutcome {
+        let field = self.focus;
+        let stem = self.stem(field);
+        let Some(area) = self.area_mut(field) else {
+            return ItemFormOutcome::Stay;
+        };
+        let text = area.text().to_owned();
+        self.external = Some(field);
+        ItemFormOutcome::External(ExternalEdit { text, stem })
+    }
+
     /// Feeds one key.
     ///
     /// In order: an open divergence view takes every key, Ctrl+S included (milestone 3 D5);
-    /// Ctrl+S saves (A6; swallowed while busy); any other chord passes; while busy everything else
-    /// is swallowed, `Esc` included (D8); `Tab`/`BackTab` cycle the focus; then the focused field
-    /// takes the key.
+    /// Ctrl+S saves (A6; swallowed while busy); Ctrl+E hands Body or Paths to `$EDITOR`
+    /// (milestone 4 D1, D2; swallowed on any other field and while busy); any other chord passes;
+    /// while busy everything else is swallowed, `Esc` included (D8); `Tab`/`BackTab` cycle the
+    /// focus; then the focused field takes the key.
     pub fn on_key(&mut self, key: KeyEvent) -> ItemFormOutcome {
         if self.resolving.is_some() {
             return self.on_view_key(key);
@@ -486,6 +600,13 @@ impl ItemForm {
             return match self.busy {
                 Some(_) => ItemFormOutcome::Stay,
                 None => self.save(),
+            };
+        }
+        // Milestone 4 D1: before the chord pass, which would hand it to the tab.
+        if ctrl_e(&key) {
+            return match self.busy {
+                Some(_) => ItemFormOutcome::Stay,
+                None => self.hand_off(),
             };
         }
         if key.modifiers.intersects(filter::CHORD) {
@@ -966,7 +1087,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme)
     );
     let text = match form.focus {
         Field::Project | Field::Kind | Field::Graph => HINT_PICK,
-        Field::Title | Field::Priority | Field::Tags | Field::Paths | Field::Body => HINT_TEXT,
+        Field::Title | Field::Priority | Field::Tags => HINT_TEXT,
+        Field::Paths | Field::Body => HINT_AREA,
     };
     frame.render_widget(
         Paragraph::new(Line::styled(clip(text, usize::from(width)), theme.dim)),
@@ -1427,7 +1549,7 @@ mod tests {
     fn the_hints_fit_the_detail_pane() {
         let (width, height) = DEFAULT_SIZE;
         let room = panes(chrome(Rect::new(0, 0, width, height)).body)[1].width - 2;
-        for hint in [HINT_TEXT, HINT_PICK] {
+        for hint in [HINT_TEXT, HINT_PICK, HINT_AREA] {
             assert!(
                 hint.chars().count() <= usize::from(room),
                 "{hint:?} is {} columns against {room}",
@@ -1924,5 +2046,296 @@ mod tests {
             }
             assert!(printed.contains("resolving"), "{printed}");
         }
+    }
+
+    // $EDITOR round-trip (milestone 4, plan D1-D8).
+
+    /// Ctrl+E on `form`'s focused field: the `ExternalEdit` it answered, or a panic naming the
+    /// outcome.
+    fn handed(form: &mut ItemForm) -> ExternalEdit {
+        match form.on_key(ctrl('e')) {
+            ItemFormOutcome::External(edit) => edit,
+            other => panic!("an external edit: {other:?} ({:?})", form.notice()),
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_e_on_the_body_or_paths_hands_out_that_text_with_the_item_key_stem() {
+        let store = MemStore::demo();
+        let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
+        focus_on(&mut form, Field::Body);
+        assert_eq!(
+            handed(&mut form),
+            ExternalEdit {
+                text: form.opened.body.clone(),
+                stem: "ANA-1-body".to_owned(),
+            }
+        );
+        assert_eq!(form.external, Some(Field::Body));
+        assert_eq!(form.busy(), None);
+
+        focus_on(&mut form, Field::Paths);
+        form.on_paste("src/**");
+        let outcome = form.on_key(KeyEvent::new(
+            KeyCode::Char('E'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert!(
+            matches!(
+                &outcome,
+                ItemFormOutcome::External(edit)
+                    if edit.text == "src/**" && edit.stem == "ANA-1-paths"
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(form.external, Some(Field::Paths));
+    }
+
+    #[tokio::test]
+    async fn ctrl_e_on_a_new_form_uses_the_new_stem() {
+        let mut form = new_form().await;
+        focus_on(&mut form, Field::Body);
+        form.on_paste("draft");
+        assert_eq!(
+            handed(&mut form),
+            ExternalEdit {
+                text: "draft".to_owned(),
+                stem: "new-body".to_owned(),
+            }
+        );
+    }
+
+    /// D1: a one-line field or a picker swallows Ctrl+E; it never passes to the tab.
+    #[tokio::test]
+    async fn ctrl_e_on_a_one_line_field_or_a_picker_is_swallowed() {
+        let store = MemStore::demo();
+        let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
+        for field in [
+            Field::Kind,
+            Field::Title,
+            Field::Priority,
+            Field::Tags,
+            Field::Graph,
+        ] {
+            focus_on(&mut form, field);
+            let outcome = form.on_key(ctrl('e'));
+            assert!(
+                matches!(outcome, ItemFormOutcome::Stay),
+                "{field:?}: {outcome:?}"
+            );
+            assert_eq!(form.external, None, "{field:?}");
+            assert_eq!(form.focus(), field);
+        }
+        let mut form = new_form().await;
+        focus_on(&mut form, Field::Project);
+        let outcome = form.on_key(ctrl('e'));
+        assert!(matches!(outcome, ItemFormOutcome::Stay), "{outcome:?}");
+        assert_eq!(form.external, None);
+        assert_eq!(form.focus(), Field::Project);
+    }
+
+    /// D2: while a save is in flight, Ctrl+E is swallowed, as Ctrl+S is.
+    #[tokio::test]
+    async fn ctrl_e_while_busy_is_swallowed() {
+        let mut form = new_form().await;
+        type_text(&mut form, "Fresh item");
+        focus_on(&mut form, Field::Body);
+        assert!(matches!(form.on_key(ctrl('s')), ItemFormOutcome::Save(_)));
+        assert_eq!(form.busy(), Some(Busy::Minting));
+        assert!(matches!(form.on_key(ctrl('e')), ItemFormOutcome::Stay));
+        assert_eq!(form.external, None);
+    }
+
+    /// D2: the open three-way view passes Ctrl+E as a chord, as any other.
+    #[tokio::test]
+    async fn ctrl_e_in_the_divergence_view_passes() {
+        let store = MemStore::demo();
+        let mut form = resolving(&store, retitled("Theirs")).await;
+        assert!(matches!(form.on_key(ctrl('e')), ItemFormOutcome::Pass));
+        assert_eq!(form.external, None);
+    }
+
+    /// D4: only the body moves; the token, reason and other fields stay, so the save is the
+    /// compare-and-set at the opened version with the body alone.
+    #[tokio::test]
+    async fn an_edited_body_replaces_only_the_body_and_saves_it_at_the_opened_version() {
+        let store = MemStore::demo();
+        let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
+        focus_on(&mut form, Field::Body);
+        handed(&mut form);
+        // Stands in for the move D4 undoes; the loop never does it.
+        form.focus = Field::Title;
+        let (title, paths) = (
+            form.title.text().map(str::to_owned),
+            form.paths.text().to_owned(),
+        );
+        form.on_external_edit(ExternalEditOutcome::Edited("New body.\n".to_owned()));
+        assert_eq!(
+            form.body.text(),
+            "New body.",
+            "D5 dropped the editor's newline"
+        );
+        assert_eq!(form.focus(), Field::Body);
+        assert_eq!(form.notice(), Some(EDITED));
+        assert_eq!(form.title.text().map(str::to_owned), title);
+        assert_eq!(form.paths.text(), paths);
+        assert_eq!(form.token(), Some(1));
+        assert_eq!(form.reason(), EditReason::Edited);
+        assert_eq!(form.external, None);
+        assert_eq!(
+            edit_sent(&mut form),
+            (
+                1,
+                SpecChanges {
+                    body: Some("New body.".to_owned()),
+                    ..SpecChanges::default()
+                },
+                EditReason::Edited,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edited_paths_area_lands_in_paths() {
+        let store = MemStore::demo();
+        let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
+        let body = form.body.text().to_owned();
+        focus_on(&mut form, Field::Paths);
+        handed(&mut form);
+        form.on_external_edit(ExternalEditOutcome::Edited("src/**\nlib/**\n".to_owned()));
+        assert_eq!(form.paths.text(), "src/**\nlib/**");
+        assert_eq!(form.body.text(), body);
+        assert_eq!(form.focus(), Field::Paths);
+        assert_eq!(form.notice(), Some(EDITED));
+    }
+
+    /// A4: "unchanged" compares against what the form opened with, not what was handed out.
+    #[tokio::test]
+    async fn an_edit_back_to_the_opened_text_has_nothing_to_save() {
+        let store = MemStore::demo();
+        let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
+        focus_on(&mut form, Field::Body);
+        type_text(&mut form, "x");
+        handed(&mut form);
+        form.on_external_edit(ExternalEditOutcome::Edited(form.opened.body.clone()));
+        assert_eq!(form.notice(), Some(EDITED));
+        assert!(matches!(form.on_key(ctrl('s')), ItemFormOutcome::Stay));
+        assert_eq!(form.notice(), Some(NOTHING_TO_SAVE));
+    }
+
+    #[tokio::test]
+    async fn unchanged_and_failed_keep_the_text() {
+        let store = MemStore::demo();
+        let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
+        focus_on(&mut form, Field::Body);
+        let body = form.body.text().to_owned();
+        for (outcome, notice) in [
+            (
+                ExternalEditOutcome::Unchanged { quick: true },
+                format!("{NO_CHANGES}{WAIT_FLAG}"),
+            ),
+            (
+                ExternalEditOutcome::Unchanged { quick: false },
+                NO_CHANGES.to_owned(),
+            ),
+            (
+                ExternalEditOutcome::Failed("boom".to_owned()),
+                "boom".to_owned(),
+            ),
+        ] {
+            handed(&mut form);
+            form.on_external_edit(outcome);
+            assert_eq!(form.notice(), Some(notice.as_str()));
+            assert_eq!(form.body.text(), body);
+            assert_eq!(form.external, None);
+        }
+    }
+
+    #[test]
+    fn strip_added_newline_drops_exactly_one_editor_newline() {
+        for (handed, returned, result) in [
+            ("abc", "abc\n", "abc"),
+            ("abc", "abd\n", "abd"),
+            ("abc", "abc\n\n", "abc\n"),
+            ("abc\n", "abc\n\n", "abc\n\n"),
+            ("", "\n", ""),
+            ("abc", "abc", "abc"),
+        ] {
+            assert_eq!(
+                strip_added_newline(handed, returned),
+                result,
+                "{handed:?} -> {returned:?}"
+            );
+        }
+    }
+
+    /// D5 through the form: `:wq` on a body without a final newline is no change.
+    #[tokio::test]
+    async fn an_editor_added_final_newline_is_no_change() {
+        let store = MemStore::demo();
+        let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
+        form.body = TextArea::with_text("abc");
+        focus_on(&mut form, Field::Body);
+        handed(&mut form);
+        form.on_external_edit(ExternalEditOutcome::Edited("abc\n".to_owned()));
+        assert_eq!(form.notice(), Some(NO_CHANGES));
+        assert_eq!(form.body.text(), "abc");
+
+        handed(&mut form);
+        form.on_external_edit(ExternalEditOutcome::Edited("abd\n".to_owned()));
+        assert_eq!(form.body.text(), "abd");
+
+        form.body = TextArea::with_text("abc\n");
+        handed(&mut form);
+        form.on_external_edit(ExternalEditOutcome::Edited("abc\n\n".to_owned()));
+        assert_eq!(form.body.text(), "abc\n\n");
+        assert_eq!(form.notice(), Some(EDITED));
+    }
+
+    #[tokio::test]
+    async fn an_outcome_with_no_edit_out_is_ignored() {
+        let store = MemStore::demo();
+        let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
+        let body = form.body.text().to_owned();
+        form.on_external_edit(ExternalEditOutcome::Edited("x".to_owned()));
+        assert_eq!(form.body.text(), body);
+        assert_eq!(form.notice(), None);
+
+        focus_on(&mut form, Field::Body);
+        handed(&mut form);
+        form.on_external_edit(ExternalEditOutcome::Failed("one".to_owned()));
+        form.on_external_edit(ExternalEditOutcome::Failed("two".to_owned()));
+        assert_eq!(form.notice(), Some("one"), "the second had no field out");
+    }
+
+    /// D7: the areas hint Ctrl+E, the one-line fields keep `Tab field`.
+    #[tokio::test]
+    async fn the_body_and_paths_areas_hint_ctrl_e() {
+        let mut form = new_form().await;
+        for field in [Field::Body, Field::Paths] {
+            focus_on(&mut form, field);
+            let text = drawn(&form).join("\n");
+            assert!(text.contains(HINT_AREA), "{field:?} in\n{text}");
+            assert!(!text.contains("Tab field"), "{field:?} in\n{text}");
+        }
+        focus_on(&mut form, Field::Title);
+        let text = drawn(&form).join("\n");
+        assert!(text.contains(HINT_TEXT), "{text}");
+    }
+
+    #[tokio::test]
+    async fn debug_prints_no_body_while_an_edit_is_out() {
+        let mut form = new_form().await;
+        focus_on(&mut form, Field::Body);
+        form.on_paste("SECRET-BODY");
+        let outcome = form.on_key(ctrl('e'));
+        let printed = format!("{outcome:?}");
+        assert!(printed.contains("text_len"), "{printed}");
+        assert!(!printed.contains("SECRET-BODY"), "{printed}");
+        for printed in [format!("{form:?}"), format!("{form:#?}")] {
+            assert!(!printed.contains("SECRET-BODY"), "{printed}");
+        }
+        let printed = format!("{form:?}");
+        assert!(printed.contains("external: Some(Body)"), "{printed}");
     }
 }
