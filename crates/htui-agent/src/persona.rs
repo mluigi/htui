@@ -1,10 +1,12 @@
 //! MOD-26 D10: a persona narrows a step's tool exposure and permission policy, never widens them
 //! (I-1). Pure: no store, no transport, no clock.
 
-use htui_core::model::persona::SnapshotPersona;
+use htui_core::model::persona::{PersonaAnswer, PersonaDefault, PersonaMatch, SnapshotPersona};
 
-use crate::driver::{PermissionPolicy, ToolExposure};
-use crate::event::ToolKind;
+use crate::driver::{
+    PermissionDefault, PermissionMatch, PermissionPolicy, PermissionRule, ToolExposure,
+};
+use crate::event::{PermissionOptionKind, ToolKind};
 
 /// The [`ToolKind`] spelled `text`, `None` outside the ten (`wire_enum!` has no `FromStr`).
 #[must_use]
@@ -34,9 +36,128 @@ pub fn narrow(
     policy: &PermissionPolicy,
     persona: &SnapshotPersona,
 ) -> (ToolExposure, PermissionPolicy) {
-    // MOD-26 T2: red - the identity; the I-1 clauses land in the green commit.
-    let _ = persona;
-    (base.clone(), policy.clone())
+    let own = &persona.tools;
+
+    let mut deny: Vec<String> = Vec::new();
+    for name in base.deny.iter().chain(&own.deny) {
+        push_unique(&mut deny, name);
+    }
+    let allow = if base.allow.is_empty() {
+        own.allow.clone()
+    } else if own.allow.is_empty() {
+        base.allow.clone()
+    } else {
+        let (kept, dropped): (Vec<&String>, Vec<&String>) =
+            base.allow.iter().partition(|name| own.allow.contains(name));
+        for name in dropped {
+            push_unique(&mut deny, name);
+        }
+        if kept.is_empty() {
+            // B-8: `[]` reads as "no allow-list" (everything). The base list stays, and every
+            // entry of it is now denied: no tool, never all.
+            base.allow.clone()
+        } else {
+            kept.into_iter().cloned().collect()
+        }
+    };
+
+    // B-19: a string this build cannot read is still a denial, of `other`, never dropped.
+    let own_kinds: Vec<ToolKind> = own
+        .deny_kinds
+        .iter()
+        .map(|text| tool_kind_of(text).unwrap_or(ToolKind::Other))
+        .collect();
+    let mut deny_kinds = base.deny_kinds.clone();
+    for kind in &own_kinds {
+        if !deny_kinds.contains(kind) {
+            deny_kinds.push(*kind);
+        }
+    }
+
+    let exposure = ToolExposure {
+        allow,
+        deny,
+        command_run: base.command_run && own.command_run,
+        deny_kinds,
+    };
+
+    let mut rules: Vec<PermissionRule> = persona
+        .permission
+        .rules
+        .iter()
+        .map(|rule| PermissionRule {
+            matcher: matcher(&rule.matcher),
+            answer: answer_kind(rule.answer),
+            reason: if rule.reason.is_empty() {
+                format!("persona {}", persona.name)
+            } else {
+                rule.reason.clone()
+            },
+        })
+        .collect();
+    rules.extend(own_kinds.iter().map(|kind| PermissionRule {
+        matcher: PermissionMatch {
+            tool_kind: Some(kind.as_str().to_owned()),
+            ..PermissionMatch::default()
+        },
+        answer: PermissionOptionKind::RejectOnce,
+        reason: format!("persona {} denies {kind}", persona.name),
+    }));
+    rules.extend(policy.rules.iter().cloned());
+
+    let default = match persona.permission.default.map(persona_default) {
+        Some(own) if strictness(own) > strictness(policy.default) => own,
+        _ => policy.default,
+    };
+
+    let narrowed = PermissionPolicy {
+        default,
+        rules,
+        remembered: policy.remembered.clone(),
+    };
+    (exposure, narrowed)
+}
+
+/// `Allow` 0, `Ask` 1, `Deny` 2: I-1's order for `default`.
+const fn strictness(default: PermissionDefault) -> u8 {
+    match default {
+        PermissionDefault::Allow => 0,
+        PermissionDefault::Ask => 1,
+        PermissionDefault::Deny => 2,
+    }
+}
+
+/// A persona's `default`, which is never `allow` by type.
+const fn persona_default(default: PersonaDefault) -> PermissionDefault {
+    match default {
+        PersonaDefault::Ask => PermissionDefault::Ask,
+        PersonaDefault::Deny => PermissionDefault::Deny,
+    }
+}
+
+/// A persona rule's answer, which is a reject by type.
+const fn answer_kind(answer: PersonaAnswer) -> PermissionOptionKind {
+    match answer {
+        PersonaAnswer::RejectOnce => PermissionOptionKind::RejectOnce,
+        PersonaAnswer::RejectAlways => PermissionOptionKind::RejectAlways,
+    }
+}
+
+/// Core's matcher as the policy's: the same four fields.
+fn matcher(m: &PersonaMatch) -> PermissionMatch {
+    PermissionMatch {
+        tool_kind: m.tool_kind.clone(),
+        tool_name: m.tool_name.clone(),
+        path_prefix: m.path_prefix.clone(),
+        command_prefix: m.command_prefix.clone(),
+    }
+}
+
+/// Appends `name` unless `list` already holds it.
+fn push_unique(list: &mut Vec<String>, name: &str) {
+    if !list.iter().any(|kept| kept == name) {
+        list.push(name.to_owned());
+    }
 }
 
 #[cfg(test)]

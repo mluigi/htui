@@ -1462,8 +1462,6 @@ async fn on_inbound(
     deny_kinds: &[ToolKind],
     request: Inbound,
 ) -> bool {
-    // MOD-26 T2: red - threaded, not yet read; the guarded arms land in the green commit.
-    let _ = deny_kinds;
     match request {
         Inbound::Permission(request, responder) => {
             let id = client::request_id(responder.id());
@@ -1485,6 +1483,31 @@ async fn on_inbound(
                 events,
                 DriverEvent::PermissionRequest(event),
                 Some(raw),
+            )
+            .await
+        }
+        // MOD-26 D11 (B-12): a denied kind is refused first, whatever the path.
+        Inbound::ReadFile(request, responder) if deny_kinds.contains(&ToolKind::Read) => {
+            let _ = responder.respond_with_error(agent_client_protocol::Error::invalid_params());
+            denied(
+                state,
+                events,
+                ToolKind::Read,
+                "fs/read_text_file",
+                &request.path,
+            )
+            .await
+        }
+        Inbound::WriteFile(request, responder) if deny_kinds.contains(&ToolKind::Edit) => {
+            // Before `guard`, the read of the old text and the `EditProposal`: nothing touches the
+            // file and no proposal is recorded for an edit that never happens.
+            let _ = responder.respond_with_error(agent_client_protocol::Error::invalid_params());
+            denied(
+                state,
+                events,
+                ToolKind::Edit,
+                "fs/write_text_file",
+                &request.path,
             )
             .await
         }
@@ -1558,10 +1581,6 @@ async fn on_inbound(
 }
 
 /// Records a request the step's persona denies (MOD-26 D11), `refused`'s shape.
-#[expect(
-    dead_code,
-    reason = "MOD-26 T2: red - the guarded arms that call it land in the green commit"
-)]
 async fn denied(
     state: &mut TaskState,
     events: &mpsc::Sender<DriverEnvelope>,

@@ -478,9 +478,18 @@ pub fn tool_kind(name: &str) -> ToolKind {
 /// name a given CLI release lacks is harmless to deny (probed on 2.1.286, plan R-1).
 #[must_use]
 pub const fn tool_names(kind: ToolKind) -> &'static [&'static str] {
-    // MOD-26 T2: red - no kind inverts yet.
-    let _ = kind;
-    &[]
+    match kind {
+        ToolKind::Read => &["Read", "NotebookRead"],
+        ToolKind::Edit => &["Edit", "Write", "MultiEdit", "NotebookEdit"],
+        ToolKind::Execute => &["Bash", "BashOutput", "KillShell"],
+        ToolKind::Search => &["Glob", "Grep"],
+        ToolKind::Fetch => &["WebFetch", "WebSearch"],
+        ToolKind::Delete
+        | ToolKind::Move
+        | ToolKind::Think
+        | ToolKind::SwitchMode
+        | ToolKind::Other => &[],
+    }
 }
 
 /// `terminal_reason` (and `subtype` behind it) → the turn's [`StopReason`].
