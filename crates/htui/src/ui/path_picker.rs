@@ -668,6 +668,42 @@ mod tests {
         ));
     }
 
+    /// MOD-49 review L-1 (`R-BOX-4`, P5): `..` in a typed path is resolved lexically before it
+    /// is asked for. The kernel resolves `..` after following a link, so `/srv/shared/..` with
+    /// `shared` a link would list the link target's parent and show the target among its siblings.
+    #[test]
+    fn go_to_resolves_dot_dot_lexically() {
+        for (typed, asked_for) in [
+            ("srv/shared/..", "/srv"),
+            ("srv/./shared/../notes", "/srv/notes"),
+            ("../..", "/"),
+            ("srv/shared/../", "/srv"),
+        ] {
+            let mut picker = at_srv();
+            picker.on_key(ch('/'));
+            for c in typed.chars() {
+                picker.on_key(ch(c));
+            }
+            assert_eq!(
+                asked(picker.on_key(key(KeyCode::Enter))),
+                (asked_for.to_owned(), false),
+                "`/{typed}`"
+            );
+        }
+    }
+
+    /// A path with no `.` or `..` component is asked for exactly as typed, trailing slash and all:
+    /// the header shows what was typed, and the write's guard is what canonicalises.
+    #[test]
+    fn go_to_keeps_a_plain_path_as_typed() {
+        let mut picker = at_srv();
+        picker.on_paste("/srv/htui/");
+        assert_eq!(
+            asked(picker.on_key(key(KeyCode::Enter))),
+            ("/srv/htui/".to_owned(), false)
+        );
+    }
+
     /// An empty go-to submit closes go-to and asks for nothing.
     #[test]
     fn an_empty_go_to_asks_for_nothing() {
