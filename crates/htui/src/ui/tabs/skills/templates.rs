@@ -29,8 +29,8 @@ use crate::app::{Action, Ctx, Handled};
 use crate::editor::{ExternalEdit, ExternalEditOutcome};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot};
-use crate::ui::tabs::backlog::detail::Scroll;
 use crate::ui::cells::{self, cell_width};
+use crate::ui::tabs::backlog::detail::Scroll;
 use crate::ui::tabs::settings::wrapped;
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -992,7 +992,8 @@ impl TemplatesView {
         let theme = ctx.theme;
         if let Mode::Naming { project, field } = &self.mode {
             let prompt = format!("new template in {}: ", slug(ctx, *project));
-            let budget = width.saturating_sub(u16::try_from(cell_width(&prompt)).unwrap_or(u16::MAX));
+            let budget =
+                width.saturating_sub(u16::try_from(cell_width(&prompt)).unwrap_or(u16::MAX));
             let mut spans = vec![Span::styled(prompt, theme.base)];
             spans.extend(field.line(budget, true, theme).spans);
             return (" new template ".to_owned(), vec![Line::from(spans)]);
@@ -1176,7 +1177,11 @@ mod tests {
         ] {
             let row = template_row(&name, 3, "plan");
             let at = row.find(" v3").expect("the head is on the row");
-            assert_eq!(cell_width(&row[..at]), 2 + NAME_WIDTH, "{row:?} for {name:?}");
+            assert_eq!(
+                cell_width(&row[..at]),
+                2 + NAME_WIDTH,
+                "{row:?} for {name:?}"
+            );
             assert!(row.ends_with(" v3   plan"), "{row:?} keeps the role");
         }
     }

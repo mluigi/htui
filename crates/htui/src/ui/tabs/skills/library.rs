@@ -41,8 +41,8 @@ use crate::skill_import::ImportOutcome;
 use crate::skills::{READ_NAME, REQUEST_NAMES, SkillWrite, SkillsSnapshot, StaleWhat};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::TemplateBody;
-use crate::ui::tabs::backlog::detail::Scroll;
 use crate::ui::cells::{self, cell_width};
+use crate::ui::tabs::backlog::detail::Scroll;
 use crate::ui::tabs::settings::wrapped;
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1492,7 +1492,8 @@ impl LibraryView {
     fn pane(&self, width: u16, ctx: &Ctx<'_>) -> (String, Vec<Line<'static>>) {
         let theme = ctx.theme;
         let prompt = |prompt: String, field: &TextField| {
-            let budget = width.saturating_sub(u16::try_from(cell_width(&prompt)).unwrap_or(u16::MAX));
+            let budget =
+                width.saturating_sub(u16::try_from(cell_width(&prompt)).unwrap_or(u16::MAX));
             let mut spans = vec![Span::styled(prompt, theme.base)];
             spans.extend(field.line(budget, true, theme).spans);
             (" new skill ".to_owned(), vec![Line::from(spans)])
@@ -1742,7 +1743,11 @@ mod tests {
         ] {
             let row = browse_row(&name, 7);
             let at = row.find(" v7").expect("the version is on the row");
-            assert_eq!(cell_width(&row[..at]), 2 + NAME_WIDTH, "{row:?} for {name:?}");
+            assert_eq!(
+                cell_width(&row[..at]),
+                2 + NAME_WIDTH,
+                "{row:?} for {name:?}"
+            );
         }
     }
 

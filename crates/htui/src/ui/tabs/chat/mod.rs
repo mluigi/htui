@@ -1210,7 +1210,10 @@ mod tests {
         assert_eq!(cell_width(&phase), 20);
         let text = promoted_text(&phase, "scripted", 40);
         assert!(cell_width(&text) <= 40, "{text:?} against 40");
-        assert!(text.ends_with(" · live-1"), "{text:?} keeps the session ref");
+        assert!(
+            text.ends_with(" · live-1"),
+            "{text:?} keeps the session ref"
+        );
     }
 
     /// MOD-60 D9: the header is cut at a grapheme boundary, so a ZWJ family is drawn whole or not
@@ -1225,7 +1228,10 @@ mod tests {
                 !text.replace(FAMILY, "").contains('\u{200d}'),
                 "{text:?} splits a family at {width}"
             );
-            assert!(cell_width(&text) <= usize::from(width), "{text:?} against {width}");
+            assert!(
+                cell_width(&text) <= usize::from(width),
+                "{text:?} against {width}"
+            );
         }
     }
 
