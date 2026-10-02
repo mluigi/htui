@@ -41,9 +41,9 @@ use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
 };
 use htui_core::prompt::{
-    AssembledPrompt, DiffBlock, InputDocument, JudgeCandidate, PromptSpec, SectionName,
-    TemplateRef, TemplateRole, TokenEstimator, TrimStrategy, VerifyFailure, assemble, settings,
-    withhold_unmaskable_notes,
+    AssembledPrompt, DiffBlock, InputDocument, JudgeCandidate, PersonaBlock, PromptSpec,
+    SectionName, TemplateRef, TemplateRole, TokenEstimator, TrimStrategy, VerifyFailure, assemble,
+    settings, withhold_unmaskable_notes,
 };
 use htui_core::scrub::Scrubber;
 use htui_core::store::{StepFence, StoreError};
@@ -3451,8 +3451,14 @@ where
                 return self.refuse_prompt(run, step, phase, reason).await.map(Some);
             }
         };
-        // MOD-26 T4: red — stage 3 does not look the persona up yet.
-        let persona: Option<&SnapshotPersona> = None;
+        // MOD-26 D12: stage 3 passed, so the snapshot carries the persona; `Err` is unreachable
+        // and refuses rather than run un-narrowed.
+        let persona = snapshot
+            .persona_for(phase)
+            .map_err(|reason| EngineError::Snapshot {
+                run: run.id,
+                reason,
+            })?;
         // `unwrap_or(Value::Null)` here once wrote a **null** `trim_record` and said nothing: the
         // row that records which sections were dropped and why would silently become "there was
         // no record", which is the one thing `run_step.trim_record` exists to rule out. That is
@@ -3834,8 +3840,14 @@ where
                     .map(Some);
             }
         };
-        // MOD-26 T4: red — stage 3 does not look the persona up yet.
-        let persona: Option<&SnapshotPersona> = None;
+        // MOD-26 D12: stage 3 passed, so the snapshot carries the persona; `Err` is unreachable
+        // and refuses rather than run un-narrowed.
+        let persona = snapshot
+            .persona_for(phase)
+            .map_err(|reason| EngineError::Snapshot {
+                run: run.id,
+                reason,
+            })?;
 
         let settled = futures::future::join_all(pending.iter().map(|step| {
             self.run_candidate(CandidateStage {
@@ -5257,6 +5269,9 @@ where
     /// the sentence lives in `run.failure` and the item's note. Then [`Self::block_and_fail`]. No
     /// recorder is opened: stage 4 is never reached. A step another writer moved first is plan
     /// D125's `StaleWrite`, and nothing else is written.
+    ///
+    /// `reason` is the refusal's sentence: `assemble`'s own, or MOD-26 I-4's
+    /// `persona_not_in_snapshot` for a phase whose persona the snapshot does not carry (B-5).
     async fn refuse_prompt(
         &self,
         run: &Run,
@@ -5432,6 +5447,14 @@ where
         item: ItemId,
         strict: bool,
     ) -> Result<Result<PromptSpec, StageThree>, EngineError> {
+        // MOD-26 D12: stage 3's persona lookup, in the run's own snapshot (I-3). A promoted step's
+        // handoff (not strict) opens without one (OQ-5); a phase step whose snapshot does not carry
+        // its persona is refused (I-4) and never runs un-narrowed.
+        let persona = match snapshot.persona_for(phase) {
+            Ok(persona) => persona,
+            Err(_) if !strict => None,
+            Err(reason) => return Ok(Err(StageThree::NoPersona(reason))),
+        };
         let row = self.item(item).await?;
         let project = self.project(row.project_id).await?;
         let resolved = self
@@ -5531,13 +5554,15 @@ where
             // not here: this builder is also the promote/handoff path's, and a handoff never reads
             // a file. So the caps are recorded and nothing else, and `with_excerpts` replaces this
             // for a phase prompt.
-            // MOD-26 D13: the phase's persona frame; T4 looks it up in the run's snapshot.
-            persona: None,
+            // MOD-26 D13: the phase's persona frame, from the run's snapshot.
+            persona: persona.map(PersonaBlock::from),
             excerpts: no_excerpts(caps),
             // MOD-9 D117: reaches no repo here, for the same reason as `excerpts`: the handoff
             // matches nothing, and `with_excerpts` replaces it for a phase prompt.
             step_files: StepFiles::default(),
-            command_queue: phase.command_queue != htui_core::model::CommandQueue::Off,
+            // MOD-26 D13: the one place `command_run` acts before MOD-11.
+            command_queue: phase.command_queue != htui_core::model::CommandQueue::Off
+                && persona.is_none_or(|persona| persona.tools.command_run),
             // Plan D67: what the previous attempt's winner left — its failed verify and its diff —
             // forwarded to a phase step's next attempt; `None` on attempt 1 and for a judge.
             verify_failure,
@@ -5711,6 +5736,11 @@ where
     /// [`open_recorder`](Self::open_recorder), one [`drive_once`](Self::drive_once) and the
     /// recorder's `finish`: the judge (plan D52) is the same three with a second `drive_once` in
     /// between, under the one recorder.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the step's three coordinates, the persona stage 3 froze (MOD-26 D12), the prompt \
+                  and stage 2's two directories, all handed straight to `drive_once`"
+    )]
     async fn session(
         &self,
         run: &Run,
@@ -5835,9 +5865,14 @@ where
         // MOD-42 D9: the agent's own policy (a judge call's is the judge agent's: `candidate_of`
         // over the judge phase).
         let policy = (self.parts.policy)(candidate.agent_id);
-        // MOD-26 T4: red — the persona does not narrow the session yet.
-        let tools = ToolExposure::default();
-        let _ = persona;
+        // MOD-26 D10, D12: the persona narrows the agent's exposure and policy, never widens them
+        // (I-1); a persona-less step is exactly today's (I-7).
+        let (tools, policy) = match persona {
+            Some(persona) => {
+                htui_agent::persona::narrow(&ToolExposure::default(), &policy, persona)
+            }
+            None => (ToolExposure::default(), policy),
+        };
         let driver = (self.parts.driver)(&candidate, key);
 
         let spec = SessionSpec {

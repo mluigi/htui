@@ -16,12 +16,13 @@ use std::collections::BTreeMap;
 use htui_core::model::{
     Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, GraphSnapshot,
     Isolation, Item, ItemId, ItemPatch, NewStepGraph, PhaseAgent, PhaseId, Project, ProjectId,
-    ProjectSettings, PromptTemplate, RepoId, ResolvedGraph, RunMode, SkillBinding, SkillBindingKey,
-    SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPhase, SnapshotSettings,
-    SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
+    ProjectSettings, PromptTemplate, RepoId, ResolvedGraph, ResolvedPhase, RunMode, SkillBinding,
+    SkillBindingKey, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPersona,
+    SnapshotPhase, SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WriteStore, check_attachment,
+    references_no_row,
 };
 use serde_json::Value;
 
@@ -326,6 +327,8 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
     rows.sort_by_key(|row| row.phase.position);
 
     let mut phases = Vec::with_capacity(rows.len());
+    // MOD-26 D9 (B-18): each bound persona frozen once, by name and content.
+    let mut personas: Vec<SnapshotPersona> = Vec::new();
     for (dense, row) in rows.iter().enumerate() {
         let position = i32::try_from(dense).map_err(|_| {
             StoreError::Constraint(format!(
@@ -333,20 +336,21 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
                 resolved.graph.id
             ))
         })?;
-        phases.push(
-            snapshot_phase(
-                source,
-                &row.phase,
-                &row.agents,
-                position,
-                project.id,
-                &settings,
-                app,
-                box_id,
-            )
-            .await?,
-        );
+        let mut phase = snapshot_phase(
+            source,
+            &row.phase,
+            &row.agents,
+            position,
+            project.id,
+            &settings,
+            app,
+            box_id,
+        )
+        .await?;
+        phase.persona = frozen_persona(row, &mut personas)?;
+        phases.push(phase);
     }
+    personas.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
 
     let settings = SnapshotSettings {
         default_isolation: settings.default_isolation,
@@ -375,13 +379,39 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
         phases,
         settings,
         scope: Some(scope),
-        personas: Vec::new(),
+        personas,
     };
 
     Ok(Resolved {
         snapshot,
         repo_scope,
     })
+}
+
+/// MOD-26 D9: the name of the persona `row` binds, frozen once into `personas`. A `persona_id`
+/// with no row is refused (unreachable under the FK and MemStore's write check) rather than
+/// frozen un-narrowed.
+fn frozen_persona(
+    row: &ResolvedPhase,
+    personas: &mut Vec<SnapshotPersona>,
+) -> std::result::Result<Option<String>, ResolveError> {
+    let Some(id) = row.phase.persona_id else {
+        return Ok(None);
+    };
+    let Some(persona) = &row.persona else {
+        return Err(ResolveError::Store(StoreError::Constraint(
+            references_no_row("step_graph_phase.persona_id", id, "persona"),
+        )));
+    };
+    if !personas.iter().any(|frozen| frozen.name == persona.name) {
+        personas.push(SnapshotPersona::freeze(persona).map_err(|err| {
+            ResolveError::Store(StoreError::Constraint(format!(
+                "persona `{}` does not serialise: {err}",
+                persona.name
+            )))
+        })?);
+    }
+    Ok(Some(persona.name.clone()))
 }
 
 /// `<item.key>-override`: a clone deep over `step_graph_phase` **and** over the source phases'
