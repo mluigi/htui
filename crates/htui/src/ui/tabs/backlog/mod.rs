@@ -381,6 +381,10 @@ impl BacklogTab {
 
     /// An `ItemForm` reply: a reloading form re-targets (E7); otherwise it opens a form only when
     /// it answers the read `N`/`e` sent (E8) and nothing else captures meanwhile.
+    ///
+    /// Review M1: an edit opens only while its item is still the selected one. The cursor may
+    /// have moved while the read was out, and a form on the old item would sit under the new
+    /// selection's header.
     fn on_item_form(&mut self, context: &ItemFormContext, ctx: &Ctx<'_>) {
         if let Some(form) = self.item_form.as_mut() {
             if form.busy() == Some(Busy::Reloading(context.project)) && context.item.is_none() {
@@ -393,7 +397,8 @@ impl BacklogTab {
         };
         let answers = opening.project == context.project
             && opening.item == context.item.as_ref().map(|item| item.id);
-        if !answers || self.form.is_some() || self.detail.captures_input() {
+        let moved = opening.item.is_some() && opening.item != self.selected_item();
+        if !answers || moved || self.form.is_some() || self.detail.captures_input() {
             return;
         }
         self.item_form = match opening.item {
@@ -409,7 +414,10 @@ impl BacklogTab {
     /// An applied write lands only on the write in flight (MOD-59's self-naming rule).
     ///
     /// An edit closes the form and re-reads the item and the list under the active filter (D9,
-    /// A5). A mint closes it and reveals the new item, whose miss branch clears the filter (A5).
+    /// A5). The item's reads go out only while it is still selected (review M1): a list that
+    /// moved the cursor off it would otherwise put its fresh Body under another item's header,
+    /// and the list re-read alone carries the edit then. A mint closes it and reveals the new
+    /// item, whose miss branch clears the filter (A5).
     fn on_item_written(&mut self, item: ItemId, outcome: &ItemWrite, ctx: &mut Ctx<'_>) {
         let Some(form) = self.item_form.as_ref() else {
             return;
@@ -419,7 +427,9 @@ impl BacklogTab {
                 if form.busy() == Some(Busy::Editing) && form.item_id() == Some(item) =>
             {
                 self.item_form = None;
-                self.read_item(item, ctx);
+                if self.selected == Some(Selection::Item(item)) {
+                    self.read_item(item, ctx);
+                }
                 ctx.request(self.filter.to_request(ctx.scope));
             }
             ItemWrite::Minted { key } if form.busy() == Some(Busy::Minting) => {
@@ -2041,6 +2051,82 @@ mod tests {
         assert_eq!(
             items_reads(&requests.into_iter().map(Action::Store).collect::<Vec<_>>()).len(),
             1
+        );
+    }
+
+    /// How many of `requests` are per-item reads (the seven `read_item` sends) of `id`.
+    fn per_item_reads(requests: &[StoreRequest], id: ItemId) -> usize {
+        requests
+            .iter()
+            .filter(|request| match request {
+                StoreRequest::Item(read)
+                | StoreRequest::Runs(read)
+                | StoreRequest::Documents(read)
+                | StoreRequest::Notes(read)
+                | StoreRequest::ItemRequirements(read)
+                | StoreRequest::Links { id: read, .. }
+                | StoreRequest::PromptPreview { item: read, .. } => *read == id,
+                _ => false,
+            })
+            .count()
+    }
+
+    /// Review M1: an `e` whose reply lands after the cursor moved opens nothing, so the form
+    /// cannot edit an item the header no longer names.
+    #[tokio::test]
+    async fn an_edit_reply_after_the_cursor_moved_opens_nothing() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        press(&mut tab, &bench, KeyCode::Char('e'));
+        let requests = sent(&bench);
+        let [read @ StoreRequest::ItemForm { .. }] = requests.as_slice() else {
+            panic!("one form read: {requests:?}")
+        };
+        press(&mut tab, &bench, KeyCode::Char('j'));
+        assert_ne!(tab.selected, Some(bench.first), "the cursor moved");
+        let _ = sent(&bench);
+
+        let reply = served(&store, read).await;
+        tab.on_reply(&reply, &mut bench.ctx());
+        assert!(tab.item_form.is_none(), "no form for the old item");
+        assert!(tab.opening.is_none(), "the opening is spent");
+        assert!(bench.actions().is_empty(), "nothing read, nothing reported");
+    }
+
+    /// Review M1: an applied edit re-reads the item only while it is still selected; once a list
+    /// moved the cursor off it, the list re-read alone follows, so the Body cannot show the
+    /// edited item under the new selection's header.
+    #[tokio::test]
+    async fn an_applied_edit_after_the_selection_moved_reads_only_the_list() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let Selection::Item(first) = bench.first else {
+            panic!("the first row is an item")
+        };
+        let mut tab = bench.tab();
+        let request = an_edit_saved(&mut tab, &bench, &store).await;
+        let others: Vec<ItemSummary> = bench
+            .items
+            .iter()
+            .filter(|item| item.id != first)
+            .cloned()
+            .collect();
+        tab.on_reply(&StoreReply::Items(others), &mut bench.ctx());
+        assert_ne!(tab.selected, Some(bench.first), "the list moved the cursor");
+        let _ = sent(&bench);
+
+        let reply = served(&store, &request).await;
+        assert!(matches!(reply, StoreReply::ItemWritten { .. }), "{reply:?}");
+        tab.on_reply(&reply, &mut bench.ctx());
+        assert!(tab.item_form.is_none(), "the form closed");
+        let requests = sent(&bench);
+        let names: Vec<&str> = requests.iter().map(StoreRequest::name).collect();
+        assert_eq!(per_item_reads(&requests, first), 0, "{names:?}");
+        assert_eq!(
+            items_reads(&requests.into_iter().map(Action::Store).collect::<Vec<_>>()).len(),
+            1,
+            "{names:?}"
         );
     }
 
