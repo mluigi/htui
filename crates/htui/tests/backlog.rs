@@ -1659,66 +1659,6 @@ async fn e_edits_the_title_and_the_body_shows_version_2() {
     assert_eq!(harness.app().status, None, "an edit raises nothing");
 }
 
-/// D6 (A13): a write through a held clone between `e` and `Ctrl+S` makes the save stale. The form
-/// stays open on its token with its text, says so, and never overwrites the head, not even on a
-/// second `Ctrl+S`. Review L3: a third write before that second save moves the head to v3, so
-/// the notice naming v3 proves the second save went out and diverged again.
-#[tokio::test]
-async fn a_stale_edit_keeps_the_form_and_never_overwrites_the_head() {
-    let store = MemStore::demo();
-    let mut harness = backlog_over(store.clone()).await;
-    keys(&mut harness, &["e"]).await;
-    let outcome = store
-        .update_item(ids::HTUI_ANA_1, 1, retitled("Theirs"))
-        .await
-        .expect("the memory store never fails");
-    assert!(
-        matches!(outcome, UpdateOutcome::Updated(_)),
-        "the other write is at the head: {outcome:?}"
-    );
-
-    type_text(&mut harness, " mine");
-    keys(&mut harness, &["ctrl-s"]).await;
-    let frame = harness.render();
-    assert!(
-        frame.contains("now v2"),
-        "the notice names the head:\n{frame}"
-    );
-    assert!(
-        frame.contains(" Edit ANA-1 (v1) "),
-        "the form stays open on its token:\n{frame}"
-    );
-    let head = store
-        .item(ids::HTUI_ANA_1)
-        .await
-        .expect("the memory store never fails")
-        .expect("the demo item exists");
-    assert_eq!((head.title.as_str(), head.version), ("Theirs", 2));
-
-    let outcome = store
-        .update_item(ids::HTUI_ANA_1, 2, retitled("Theirs again"))
-        .await
-        .expect("the memory store never fails");
-    assert!(
-        matches!(outcome, UpdateOutcome::Updated(_)),
-        "the third write is at the head: {outcome:?}"
-    );
-    keys(&mut harness, &["ctrl-s"]).await;
-    let frame = harness.render();
-    assert!(frame.contains("now v3"), "it diverges again:\n{frame}");
-    assert!(frame.contains(" Edit ANA-1 (v1) "), "{frame}");
-    let head = store
-        .item(ids::HTUI_ANA_1)
-        .await
-        .expect("the memory store never fails")
-        .expect("the demo item exists");
-    assert_eq!(
-        (head.title.as_str(), head.version),
-        ("Theirs again", 3),
-        "the second save wrote nothing either"
-    );
-}
-
 /// D4: a touched path naming no repo of the project is refused by the form, by name, before
 /// anything is sent; nothing is written and the status line stays clean.
 #[tokio::test]
@@ -1878,4 +1818,192 @@ async fn the_edit_item_form_renders_in_the_detail_pane() {
         "an edit has no project row:\n{frame}"
     );
     insta::assert_snapshot!("item_form_edit", frame);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Divergence (MOD-13 milestone 3, plan D1-D9).
+// ---------------------------------------------------------------------------------------------
+
+/// From the item form's Title, `Tab` five times to Body: Priority, Tags, Graph, Paths, Body.
+const TITLE_TO_BODY: [&str; 5] = ["tab"; 5];
+
+/// `ANA-1`'s head as `(title, version)`.
+async fn ana_1_head(store: &MemStore) -> (String, i32) {
+    let head = store
+        .item(ids::HTUI_ANA_1)
+        .await
+        .expect("the memory store never fails")
+        .expect("the demo item exists");
+    (head.title, head.version)
+}
+
+/// `patch` written at version 1 through a held clone, as another process would: the head moves
+/// to version 2 under the open form.
+async fn their_write(store: &MemStore, patch: ItemPatch) {
+    let outcome = store
+        .update_item(ids::HTUI_ANA_1, 1, patch)
+        .await
+        .expect("the memory store never fails");
+    assert!(
+        matches!(outcome, UpdateOutcome::Updated(_)),
+        "the other write is at the head: {outcome:?}"
+    );
+}
+
+/// `e`, their write, ` mine` typed after the title and `Ctrl+S`: the stale save opens the view.
+async fn diverged_on(store: &MemStore, theirs: ItemPatch) -> Harness {
+    let mut harness = backlog_over(store.clone()).await;
+    keys(&mut harness, &["e"]).await;
+    their_write(store, theirs).await;
+    type_text(&mut harness, " mine");
+    keys(&mut harness, &["ctrl-s"]).await;
+    harness
+}
+
+/// D1, D3-D5, D9 (rewrites milestone 2's stale-edit case): a stale `Ctrl+S` opens the three-way
+/// view and writes nothing; `m` rebases the form on the head with my title; `Ctrl+S` then lands
+/// it at version 3 and the Body shows the re-read head (E4: `version 3`).
+#[tokio::test]
+async fn a_stale_edit_opens_the_view_and_m_lands_mine_at_version_3() {
+    let store = MemStore::demo();
+    let mut harness = diverged_on(&store, retitled("Theirs")).await;
+    let frame = harness.render();
+    for wanted in ["ANA-1  v1 \u{2192} theirs v2", "Theirs", "conflict", "mine"] {
+        assert!(frame.contains(wanted), "{wanted:?} in the view:\n{frame}");
+    }
+    assert_eq!(
+        ana_1_head(&store).await,
+        ("Theirs".to_owned(), 2),
+        "the stale save wrote nothing"
+    );
+
+    keys(&mut harness, &["m"]).await;
+    let frame = harness.render();
+    assert!(
+        frame.contains(" Edit ANA-1 (v2) "),
+        "the form is rebased on the head:\n{frame}"
+    );
+    assert!(frame.contains("rebased on v2"), "and says so:\n{frame}");
+
+    keys(&mut harness, &["ctrl-s"]).await;
+    assert_eq!(
+        ana_1_head(&store).await,
+        (format!("{ANA_1_TITLE} mine"), 3),
+        "mine lands on top of theirs"
+    );
+    let detail = detail_pane(&harness.render());
+    assert!(detail.contains("version 3"), "the new version:\n{detail}");
+    assert!(
+        !detail.contains(" Edit "),
+        "the form closed on the write:\n{detail}"
+    );
+    assert_eq!(harness.app().status, None, "a resolution raises nothing");
+}
+
+/// D2 end to end: their priority and my title do not conflict, so `m` keeps both.
+#[tokio::test]
+async fn a_resolution_keeps_their_priority_and_my_title() {
+    let store = MemStore::demo();
+    let theirs = ItemPatch {
+        priority: Some(9),
+        author_id: ids::USER,
+        box_id: Some(ids::BOX),
+        reason: "edited".to_owned(),
+        ..ItemPatch::default()
+    };
+    let mut harness = diverged_on(&store, theirs).await;
+    let frame = harness.render();
+    assert!(frame.contains("priority"), "a priority row:\n{frame}");
+    assert!(frame.contains("theirs"), "its state:\n{frame}");
+
+    keys(&mut harness, &["m", "ctrl-s"]).await;
+    let head = store
+        .item(ids::HTUI_ANA_1)
+        .await
+        .expect("the memory store never fails")
+        .expect("the demo item exists");
+    assert_eq!(head.priority, 9, "their priority");
+    assert_eq!(head.title, format!("{ANA_1_TITLE} mine"), "my title");
+    assert_eq!(head.version, 3);
+    assert_eq!(harness.app().status, None, "a resolution raises nothing");
+}
+
+/// D5: `Esc` in the view returns to the form with its token and its text; a second `Ctrl+S`
+/// compares again and still writes nothing, and the form then closes as ever.
+#[tokio::test]
+async fn esc_from_the_view_keeps_the_text_and_the_head() {
+    let store = MemStore::demo();
+    let mut harness = diverged_on(&store, retitled("Theirs")).await;
+
+    keys(&mut harness, &["esc"]).await;
+    let frame = harness.render();
+    assert!(
+        frame.contains(" Edit ANA-1 (v1) "),
+        "the form keeps its token:\n{frame}"
+    );
+    assert!(frame.contains("still behind v2"), "and says so:\n{frame}");
+    // The title row scrolls inside its `TextField`, so only the typed tail is sure to show.
+    assert!(frame.contains("mine"), "the typed text is kept:\n{frame}");
+    assert_eq!(ana_1_head(&store).await, ("Theirs".to_owned(), 2));
+
+    keys(&mut harness, &["ctrl-s"]).await;
+    let frame = harness.render();
+    assert!(frame.contains("theirs v2"), "the view is back:\n{frame}");
+    assert_eq!(
+        ana_1_head(&store).await,
+        ("Theirs".to_owned(), 2),
+        "the second save wrote nothing either"
+    );
+
+    keys(&mut harness, &["esc", "esc"]).await;
+    let frame = harness.render();
+    assert!(!frame.contains(" Edit "), "the form is closed:\n{frame}");
+    assert_eq!(ana_1_head(&store).await, ("Theirs".to_owned(), 2));
+}
+
+/// D4: the view over the whole tab, list pane included: the header, the field rows with their
+/// states, the body's two diffs side by side and the hint. Paths are the same on all three
+/// sides, so there is no `Tab body/paths`.
+#[tokio::test]
+async fn the_divergence_view_renders_over_the_whole_tab() {
+    let store = MemStore::demo();
+    let mut harness = backlog_over(store.clone()).await;
+    keys(&mut harness, &["e"]).await;
+    their_write(
+        &store,
+        ItemPatch {
+            body: Some("Their body.".to_owned()),
+            ..retitled("Theirs")
+        },
+    )
+    .await;
+    type_text(&mut harness, " mine");
+    keys(&mut harness, &TITLE_TO_BODY).await;
+    // The body's cursor starts at byte 0, so this prepends.
+    type_text(&mut harness, "Mine first. ");
+    keys(&mut harness, &["ctrl-s"]).await;
+    let frame = harness.render();
+    for wanted in [
+        "ANA-1  v1 \u{2192} theirs v2",
+        "--- ancestor v1",
+        "+++ theirs v2",
+        "+++ mine",
+        "t theirs wins  m mine wins  Esc back",
+    ] {
+        assert!(frame.contains(wanted), "{wanted:?} in the view:\n{frame}");
+    }
+    let conflicts = frame
+        .lines()
+        .filter(|line| line.contains("conflict"))
+        .collect::<Vec<_>>();
+    assert!(
+        conflicts.iter().any(|line| line.contains("title"))
+            && conflicts.iter().any(|line| line.contains("body")),
+        "title and body conflict:\n{frame}"
+    );
+    assert!(
+        !frame.contains("Tab body/paths"),
+        "paths are the same:\n{frame}"
+    );
+    insta::assert_snapshot!("item_divergence", frame);
 }

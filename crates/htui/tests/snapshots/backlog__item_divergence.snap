@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/backlog.rs
+expression: frame
+---
+Platform · DESKTOP-HTUI · memory · 1 run
+ 1 Backlog
+┌ ANA-1  v1 → theirs v2 ───────────────────────────────────────────────────────────────────────────┐
+│field     state     ancestor v1               theirs v2                 mine                      │
+│title     conflict  Data model, box registry  Theirs                    Data model, box registry  │
+│                    and sync topology                                   and sync topology mine    │
+│body      conflict  8 lines                   1 line                    8 lines                   │
+│body  ancestor → theirs                           body  ancestor → mine                           │
+│--- ancestor v1                                  │--- ancestor v1                                 │
+│+++ theirs v2                                    │+++ mine                                        │
+│@@ -1,8 +1 @@                                    │@@ -1,4 +1,4 @@                                 │
+│-The store seam is the one interface every other │-The store seam is the one interface every other│
+│module reaches through, so it is settled first.  │module reaches through, so it is settled first. │
+│-                                                │+Mine first. The store seam is the one interface│
+│-Postgres holds the truth; every box keeps a     │every other module reaches through, so it is    │
+│read-only cache it refreshes on connect. Writes  │settled first.                                  │
+│are                                              │                                                │
+│-compare-and-set on a version column, so a losing│ Postgres holds the truth; every box keeps a    │
+│edit is shown against its common ancestor rather │read-only cache it refreshes on connect. Writes │
+│-than silently dropped.                          │are                                             │
+│-                                                │ compare-and-set on a version column, so a      │
+│-Item keys are minted from a per-project counter │losing edit is shown against its common ancestor│
+│table, which keeps numbers gapless and lets the  │rather                                          │
+│-legacy importer align the counter above the     │                                                │
+│numbers it brings in.                            │                                                │
+│\ No newline at end of file                      │                                                │
+│+Their body.                                     │                                                │
+│t theirs wins  m mine wins  Esc back                                                              │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help
