@@ -1947,7 +1947,7 @@ pub fn prompt_template_refusal(name: &str, body: &str) -> Option<String> {
 pub use crate::model::persona::{
     BLANK_PERSONA_BODY, MODEL_REFUSED, PersonaNotInSnapshot, RULE_MATCHES_EVERYTHING,
     allow_names_an_mcp_tool, invalid_persona_name, kind_not_narrowable, new_persona_refusal,
-    not_a_tool_name, persona_patch_refusal, persona_refusal,
+    not_a_tool_name, persona_patch_refusal, persona_refusal, rule_kind_unknown,
 };
 
 // ---- MOD-9 milestone 3: the skill writers' refusals (plan D71-D79, blueprint D88) -------------

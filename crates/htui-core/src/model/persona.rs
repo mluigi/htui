@@ -325,6 +325,17 @@ pub fn kind_not_narrowable(kind: &str) -> String {
     )
 }
 
+/// MOD-26 milestone 2 D18: a rule's `tool_kind` outside [`TOOL_KINDS`]. A misspelt kind matches
+/// nothing (`permission.rs` compares the text), so the rule would silently do nothing.
+#[must_use]
+pub fn rule_kind_unknown(kind: &str) -> String {
+    format!(
+        "persona.permission.rules entry kind `{}` is not one of read, edit, delete, move, search, \
+         execute, think, fetch, switch_mode, other",
+        kind.escape_debug()
+    )
+}
+
 /// I-4 (plan D12; MOD-26 milestone 2 D16, review N4): a phase names a persona its run's snapshot
 /// does not carry. `Display` is the sentence `RunFailure::PromptRefused.reason` stores, byte for
 /// byte as milestone 1 wrote it; the name is `escape_debug`'d so a stored reason is one line.
@@ -423,7 +434,9 @@ fn tools_refusal(tools: &PersonaTools) -> Option<String> {
 }
 
 /// One rule at a time: the all-`None` matcher, then a NUL in any matcher string or the reason
-/// (B-9: Postgres `JSONB` refuses `\u0000` inside a string, so MemStore must refuse it too).
+/// (B-9: Postgres `JSONB` refuses `\u0000` inside a string, so MemStore must refuse it too); then
+/// (MOD-26 M2 D18, B-1) a `tool_kind` outside [`TOOL_KINDS`], checked once every rule has passed
+/// the two checks above, so a rule set milestone 1 refused keeps its sentence.
 fn permission_refusal(permission: &PersonaPermission) -> Option<String> {
     for rule in &permission.rules {
         let matcher = &rule.matcher;
@@ -445,7 +458,12 @@ fn permission_refusal(permission: &PersonaPermission) -> Option<String> {
             return Some(has_nul("persona.permission.rules"));
         }
     }
-    None
+    permission
+        .rules
+        .iter()
+        .filter_map(|rule| rule.matcher.tool_kind.as_deref())
+        .find(|kind| !TOOL_KINDS.contains(kind))
+        .map(rule_kind_unknown)
 }
 
 /// Non-empty, no `char::is_whitespace`, no `,`, no `\0`: one entry of one argv value (D11).
@@ -1059,6 +1077,67 @@ mod tests {
             })
         });
         assert_eq!(base.refusal(), Some(has_nul("persona.permission.rules")));
+
+        // MOD-26 M2 D18: a misspelt rule kind matches nothing, so it is refused.
+        let mut base = Base::new();
+        base.permission.rules.push(rule(PersonaMatch {
+            tool_kind: Some("exec".to_owned()),
+            ..PersonaMatch::default()
+        }));
+        assert_eq!(base.refusal(), Some(rule_kind_unknown("exec")));
+    }
+
+    /// MOD-26 M2 D18, B-1: a rule's `tool_kind` must be one of all ten [`TOOL_KINDS`]; the check
+    /// is a second pass, so a rule set milestone 1 refused keeps its older sentence.
+    #[test]
+    fn a_misspelt_rule_kind_is_refused_after_the_older_sentences() {
+        let kind = |kind: &str| {
+            rule(PersonaMatch {
+                tool_kind: Some(kind.to_owned()),
+                ..PersonaMatch::default()
+            })
+        };
+        let refusal = |rules: Vec<PersonaRule>| {
+            permission_refusal(&PersonaPermission {
+                default: None,
+                rules,
+            })
+        };
+
+        assert_eq!(refusal(vec![kind("exec")]), Some(rule_kind_unknown("exec")));
+        assert_eq!(
+            refusal(vec![kind("exec"), rule(PersonaMatch::default())]),
+            Some(RULE_MATCHES_EVERYTHING.to_owned()),
+            "rule 2's empty match beats rule 1's kind (B-1)"
+        );
+        assert_eq!(
+            refusal(vec![kind("ex\0ec")]),
+            Some(has_nul("persona.permission.rules")),
+            "a NUL in a kind keeps the NUL sentence"
+        );
+        assert_eq!(refusal(vec![kind("")]), Some(rule_kind_unknown("")));
+        for accepted in TOOL_KINDS {
+            assert_eq!(refusal(vec![kind(accepted)]), None, "{accepted}");
+        }
+        assert_eq!(
+            refusal(TOOL_KINDS.iter().map(|accepted| kind(accepted)).collect()),
+            None
+        );
+
+        assert_eq!(
+            rule_kind_unknown("exec"),
+            "persona.permission.rules entry kind `exec` is not one of read, edit, delete, move, \
+             search, execute, think, fetch, switch_mode, other"
+        );
+        for odd in ["e`x", "e\nx"] {
+            let sentence = rule_kind_unknown(odd);
+            assert!(!sentence.contains('\n'), "one line: {sentence:?}");
+            assert!(
+                sentence.contains(&format!("`{}`", odd.escape_debug())),
+                "the kind is escape_debug'd: {sentence}"
+            );
+        }
+        assert!(rule_kind_unknown("e\nx").contains("`e\\nx`"));
     }
 
     #[test]
@@ -1113,6 +1192,19 @@ mod tests {
                     ..PersonaPatch::default()
                 },
                 RULE_MATCHES_EVERYTHING.to_owned(),
+            ),
+            (
+                PersonaPatch {
+                    permission: Some(PersonaPermission {
+                        default: None,
+                        rules: vec![rule(PersonaMatch {
+                            tool_kind: Some("exec".to_owned()),
+                            ..PersonaMatch::default()
+                        })],
+                    }),
+                    ..PersonaPatch::default()
+                },
+                rule_kind_unknown("exec"),
             ),
         ];
         for (patch, sentence) in cases {
