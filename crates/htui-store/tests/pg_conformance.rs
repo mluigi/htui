@@ -20,16 +20,17 @@ use htui_store::testkit as common;
 /// executor edit cases (plan D10) make it 104, MOD-51's two `box_probe_spec` cases (plan D7)
 /// make it 106, MOD-42 T0's twelve relay cases (plan D1-D5, D12, D13) make it 118, and MOD-24's
 /// graph-only sweep case (plan D3b) makes it 119, MOD-37's `queued_at` microsecond case (R-29)
-/// makes it 120, and MOD-37's `phase_agent` writer case (R-6) makes it 121.
-const EXPECTED_CASES: usize = 121;
+/// makes it 120, MOD-37's `phase_agent` writer case (R-6) makes it 121, and MOD-37's pass and
+/// park cases (R-5) make it 123.
+const EXPECTED_CASES: usize = 123;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (121 since MOD-37's \
-         `phase_agent` writer case)"
+        "every conformance case must run against PgStore too (123 since MOD-37's \
+         pass and park cases)"
     );
 }
 

@@ -41,8 +41,8 @@ use htui_core::model::{
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
-    CasOutcome, DeleteReach, DeleteTarget, MemStore, ReadStore, Result, SettingRung, StepFence,
-    StoredSetting, UpdateOutcome, WriteStore,
+    CasOutcome, DeleteReach, DeleteTarget, MemStore, ParkOutcome, ReadStore, Result, SettingRung,
+    StepFence, StoredSetting, UpdateOutcome, WriteStore,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -1045,6 +1045,26 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.promote_step(step, at).await,
             Self::Online(pg) => pg.promote_step(step, at).await,
+        }
+    }
+
+    async fn pass_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        note: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.pass_step(fence, step, note, at).await,
+            Self::Online(pg) => pg.pass_step(fence, step, note, at).await,
+        }
+    }
+
+    async fn park_step(&self, fence: StepFence, step: StepId) -> Result<ParkOutcome> {
+        match self {
+            Self::Memory(store) => store.park_step(fence, step).await,
+            Self::Online(pg) => pg.park_step(fence, step).await,
         }
     }
 

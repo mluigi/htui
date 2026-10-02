@@ -34,7 +34,7 @@ async fn demo_store_loads_the_fixture() {
     );
     assert_eq!(
         conformance::CASES.len(),
-        121,
+        123,
         "B.9's fifteen cases, MOD-2's five store-seam cases (plan D3), milestone 7's two quota \
          cases (plans D67 and D74), milestone 9's `set_step_prompt`, MOD-15 milestone 1's \
          twelve, one per entity group (plan D12), milestone 2's seed case (plan D7), MOD-4 \
@@ -55,7 +55,7 @@ async fn demo_store_loads_the_fixture() {
          MOD-51's two for the `box_probe_spec` writer (plan D7), and MOD-42 T0's twelve relay \
          cases (plan D1-D5, D12, D13), MOD-24's one for the sweep's graph-only adoption \
          (plan D3b), MOD-37's one for `queued_at`'s microsecond (R-29), and MOD-37's one for \
-         the `phase_agent` writer (R-6)"
+         the `phase_agent` writer (R-6), and MOD-37's two for the gate's pass and park (R-5)"
     );
     assert_eq!(
         conformance::READ_CASES.len(),

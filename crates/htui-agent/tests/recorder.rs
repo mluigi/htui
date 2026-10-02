@@ -51,8 +51,8 @@ use htui_core::model::{
 use htui_core::prompt::settings::SettingKey;
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{
-    CasOutcome, DeleteReach, DeleteTarget, MemStore, ReadStore, Result as StoreResult, SettingRung,
-    StepFence, StoreError, StoredSetting, UpdateOutcome, WriteStore,
+    CasOutcome, DeleteReach, DeleteTarget, MemStore, ParkOutcome, ReadStore, Result as StoreResult,
+    SettingRung, StepFence, StoreError, StoredSetting, UpdateOutcome, WriteStore,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -923,6 +923,18 @@ impl WriteStore for SpyStore {
     }
     async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> StoreResult<()> {
         self.inner.promote_step(step, at).await
+    }
+    async fn pass_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        note: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        self.inner.pass_step(fence, step, note, at).await
+    }
+    async fn park_step(&self, fence: StepFence, step: StepId) -> StoreResult<ParkOutcome> {
+        self.inner.park_step(fence, step).await
     }
     async fn fail_run(&self, run: RunId, failure: &str, at: DateTime<Utc>) -> StoreResult<()> {
         self.inner.fail_run(run, failure, at).await

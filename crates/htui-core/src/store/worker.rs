@@ -12,7 +12,7 @@
 //! [`WriteStore`] method of the same name by path (UFCS): this module defines the new traits, so
 //! both families are in scope here and a method-call body would be ambiguous.
 //!
-//! `WorkerStore` is 46 methods: 13 [`ReadStore`] reads, 6 [`WriteStore`] reads, 23 writes,
+//! `WorkerStore` is 48 methods: 13 [`ReadStore`] reads, 6 [`WriteStore`] reads, 25 writes,
 //! `write_document` and MOD-42's three command methods; [`RelayStore`] is four (MOD-42 plan D2).
 //! `WorkerHost` is `writer` plus 20 reads (blueprint F-5); MOD-41 T7 adds the 22nd,
 //! `queued_runs_on_box`.
@@ -37,7 +37,7 @@ use crate::model::{
 };
 use crate::store::error::Result;
 use crate::store::mem::MemStore;
-use crate::store::traits::{ReadStore, StepFence, WriteStore};
+use crate::store::traits::{ParkOutcome, ReadStore, StepFence, WriteStore};
 
 /// What a session recorder writes (`htui_agent::record`, plan D4).
 pub trait RecorderStore: Send + Sync {
@@ -293,6 +293,20 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         step: StepId,
         at: DateTime<Utc>,
     ) -> impl Future<Output = Result<()>> + Send;
+    /// [`WriteStore::pass_step`].
+    fn pass_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        note: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// [`WriteStore::park_step`].
+    fn park_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+    ) -> impl Future<Output = Result<ParkOutcome>> + Send;
     /// [`WriteStore::finish_run`].
     fn finish_run(
         &self,
@@ -654,6 +668,18 @@ impl WorkerStore for MemStore {
     }
     async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> Result<()> {
         WriteStore::promote_step(self, step, at).await
+    }
+    async fn pass_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        note: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        WriteStore::pass_step(self, fence, step, note, at).await
+    }
+    async fn park_step(&self, fence: StepFence, step: StepId) -> Result<ParkOutcome> {
+        WriteStore::park_step(self, fence, step).await
     }
     async fn finish_run(
         &self,

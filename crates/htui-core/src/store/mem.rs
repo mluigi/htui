@@ -51,8 +51,8 @@ use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
-    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, ReadStore,
-    SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore, already_exists,
+    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, ParkOutcome,
+    ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore, already_exists,
     chat_step_status, check_attachment, citation_key, close_out_needs_a_summary, expected_on_row,
     failure_disagrees_with_status, finish_run_item_mirror, finish_run_needs_a_terminal_status,
     graph_not_in_project, invalid_area_code, invalid_prefix, item_has_a_live_run,
@@ -4651,6 +4651,37 @@ impl State {
         Ok(true)
     }
 
+    /// MOD-37 R-5: `running -> done` with `gate_outcome = skipped`, under `fence`. Existence,
+    /// then the fence, then the status, as Postgres decides them.
+    fn pass_step(
+        &mut self,
+        fence: StepFence,
+        step: StepId,
+        note: Option<&str>,
+        at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let row = self
+            .steps
+            .get_mut(&step)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            })?;
+        Self::fence_holds(&self.lease_owners, row, fence)?;
+        if row.status != StepStatus::Running {
+            return Ok(false);
+        }
+        row.status = StepStatus::Done;
+        row.gate_outcome = Some(GateOutcome::Skipped);
+        if let Some(note) = note {
+            row.gate_note = Some(note.to_owned());
+        }
+        row.finished_at = row.finished_at.or(Some(at));
+        row.updated_at = now;
+        Ok(true)
+    }
+
     /// `R-ORCH-2`'s four answers, a compare-and-set on `awaiting_approval`.
     fn answer_gate(
         &mut self,
@@ -5008,6 +5039,45 @@ impl State {
             self.transition(item, Status::InProgress, Status::AwaitingApproval, now)?;
         }
         Ok(())
+    }
+
+    /// MOD-37 R-5: the gate's park, `promote_step`'s shape. Every check runs before the first
+    /// write, in Postgres's order: the step, the fence, the step's status, the run's status.
+    fn park_step(
+        &mut self,
+        fence: StepFence,
+        step: StepId,
+        now: DateTime<Utc>,
+    ) -> Result<ParkOutcome> {
+        let row = self.require_step(step)?;
+        Self::fence_holds(&self.lease_owners, row, fence)?;
+        if row.status != StepStatus::Running {
+            return Ok(ParkOutcome::StepMoved);
+        }
+        let run_id = row.run_id;
+        let run = self.require_run(run_id)?;
+        if run.status != RunStatus::Running {
+            return Ok(ParkOutcome::RunMoved);
+        }
+        let item_id = run.item_id;
+
+        if let Some(row) = self.steps.get_mut(&step) {
+            row.status = StepStatus::AwaitingApproval;
+            row.updated_at = now;
+        }
+        if let Some(row) = self.runs.get_mut(&run_id) {
+            row.status = RunStatus::AwaitingApproval;
+            row.updated_at = now;
+        }
+        if let Some(item) = item_id
+            && self
+                .items
+                .get(&item)
+                .is_some_and(|row| row.status == Status::InProgress)
+        {
+            self.transition(item, Status::InProgress, Status::AwaitingApproval, now)?;
+        }
+        Ok(ParkOutcome::Parked)
     }
 
     /// §4.3's failure row, from any non-terminal status.
@@ -6836,6 +6906,22 @@ impl WriteStore for MemStore {
     async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> Result<()> {
         let now = self.now();
         self.write(|state| state.promote_step(step, at, now))
+    }
+
+    async fn pass_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        note: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let now = self.now();
+        self.write(|state| state.pass_step(fence, step, note, at, now))
+    }
+
+    async fn park_step(&self, fence: StepFence, step: StepId) -> Result<ParkOutcome> {
+        let now = self.now();
+        self.write(|state| state.park_step(fence, step, now))
     }
 
     async fn fail_run(&self, run: RunId, failure: &str, at: DateTime<Utc>) -> Result<()> {

@@ -21,7 +21,7 @@ use htui_core::model::{
     StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId,
     WorkspaceSummary,
 };
-use htui_core::store::{ReadStore, Result, StepFence, WriteStore};
+use htui_core::store::{ParkOutcome, ReadStore, Result, StepFence, WriteStore};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -262,6 +262,18 @@ impl htui_core::store::WorkerStore for PgStore {
     }
     async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> Result<()> {
         WriteStore::promote_step(self, step, at).await
+    }
+    async fn pass_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        note: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        WriteStore::pass_step(self, fence, step, note, at).await
+    }
+    async fn park_step(&self, fence: StepFence, step: StepId) -> Result<ParkOutcome> {
+        WriteStore::park_step(self, fence, step).await
     }
     async fn finish_run(
         &self,
@@ -541,6 +553,18 @@ impl htui_core::store::WorkerStore for Writer {
     }
     async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> Result<()> {
         WriteStore::promote_step(self, step, at).await
+    }
+    async fn pass_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        note: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        WriteStore::pass_step(self, fence, step, note, at).await
+    }
+    async fn park_step(&self, fence: StepFence, step: StepId) -> Result<ParkOutcome> {
+        WriteStore::park_step(self, fence, step).await
     }
     async fn finish_run(
         &self,

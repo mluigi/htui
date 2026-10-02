@@ -1413,6 +1413,37 @@ pub trait WriteStore: ReadStore {
     /// any other, or its run is terminal.
     async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> Result<()>;
 
+    /// MOD-37 R-5, ANA-2 §4.2's "done + skipped" cell: the step `running -> done` with
+    /// `gate_outcome = 'skipped'`, `gate_note = note` when `note` is `Some` (kept otherwise) and
+    /// the first `finished_at` (`COALESCE(finished_at, at)`). One statement, under `fence`.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`, then
+    /// [`StoreError::Fenced`](crate::store::StoreError::Fenced) when the step's run does not carry
+    /// `fence`'s lease. `Ok(false)`: the step is not `running`, and nothing is written.
+    async fn pass_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        note: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<bool>;
+
+    /// MOD-37 R-5, ANA-2 §4.2's park, one transaction and [`promote_step`](Self::promote_step)'s
+    /// shape: the step and its run `running -> awaiting_approval`, its item
+    /// `in_progress -> awaiting_approval`. An item at any other status is left alone and the answer
+    /// is still [`ParkOutcome::Parked`] (plan D17); a chat run has no item. No instant moves:
+    /// `running -> awaiting_approval` stamps nothing, and `updated_at` is the store's.
+    ///
+    /// Decided before the first write, in this order: the step exists, its run carries `fence`'s
+    /// lease, the step is `running` ([`ParkOutcome::StepMoved`]), the run is `running`
+    /// ([`ParkOutcome::RunMoved`]). A refusal writes nothing.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`;
+    /// [`StoreError::Fenced`](crate::store::StoreError::Fenced).
+    async fn park_step(&self, fence: StepFence, step: StepId) -> Result<ParkOutcome>;
+
     /// `status = failed, failure = failure, finished_at = COALESCE(finished_at, at)` from any
     /// non-terminal status (the law allows `queued | running | awaiting_approval -> failed`).
     ///
@@ -2333,7 +2364,8 @@ impl<T> CasOutcome<T> {
 ///
 /// [`WriteStore::append_events`], [`WriteStore::set_step_usage`], [`WriteStore::finish_step`]
 /// (MOD-40), [`WriteStore::set_step_prompt`], [`WriteStore::upsert_step_tree`] and
-/// [`WriteStore::record_commits`] (MOD-41 plan D1) take one and write only while the step's run carries exactly that lease:
+/// [`WriteStore::record_commits`] (MOD-41 plan D1), [`WriteStore::pass_step`] and
+/// [`WriteStore::park_step`] (MOD-37 R-5) take one and write only while the step's run carries exactly that lease:
 /// `run.lease_owner IS NOT DISTINCT FROM` [`StepFence::owner`]. A process whose run another process
 /// adopted ([`WriteStore::adopt_runs`], [`WriteStore::take_lease`]) still holds its old `Lease`,
 /// and the store answers it with [`StoreError::Fenced`](crate::store::StoreError::Fenced) and
@@ -2359,6 +2391,17 @@ impl StepFence {
             Self::Unleased => None,
         }
     }
+}
+
+/// What [`WriteStore::park_step`] found (MOD-37 R-5). A refusal writes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkOutcome {
+    /// The step and its run are `awaiting_approval`, and its item too when it was `in_progress`.
+    Parked,
+    /// The step was not `running`: another writer moved it first.
+    StepMoved,
+    /// The step was `running` and its run was not: another writer moved the run first.
+    RunMoved,
 }
 
 /// What [`WriteStore::delete_reach`] counts for (D4).
