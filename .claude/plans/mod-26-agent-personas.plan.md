@@ -412,7 +412,9 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 - [x] Close-out restates moved counts from a fresh count: store `CASES` (119 → N), `READ_CASES`
       (14), htui-orch `CASES` (86 → N), `.sqlx`, snapshots, migrations (11 → 12, next `0013`),
       `TABLES` (41 → 42)
-- [ ] ANA-27's precedence sentence corrected where it is quoted (HANDOFF MOD-26 entry, DECISIONS)
+- [x] ANA-27's precedence sentence corrected where it is quoted — restated in the HANDOFF MOD-26
+      phase note ("agent row, then the persona narrows; the model is the phase candidate's");
+      DECISIONS does not quote it; `docs/ANA-27.md` stays as concluded (the PRD records Q-model)
 
 ### Close-out counts
 
