@@ -26,8 +26,15 @@ const CURSOR: &str = "> ";
 /// The marker's width, in front of every other line, so names stay in one column.
 const NO_CURSOR: &str = "  ";
 
-/// The popup's last line: every key the picker binds (P8).
-const HINT: &str = "j/k move \u{b7} Enter open \u{b7} h up \u{b7} s choose \u{b7} S this dir \u{b7} / go to \u{b7} . hidden \u{b7} Esc cancel";
+/// The first half of the hint under the entries: the keys that move and choose (P8). The two
+/// halves share one line when it fits and take one line each when it doesn't (review L-2).
+const HINT_MOVE: &str = "j/k move \u{b7} Enter open \u{b7} h up \u{b7} s choose \u{b7} S this dir";
+
+/// The hint's second half: the keys that change what is listed, and the way out.
+const HINT_MORE: &str = "/ go to \u{b7} . hidden \u{b7} Esc cancel";
+
+/// Between the two halves when they share a line.
+const HINT_GAP: &str = " \u{b7} ";
 
 /// The label in front of the go-to field (P6).
 const GOTO: &str = "go to: ";
@@ -281,23 +288,35 @@ impl PathPicker {
             footer.push(Line::from(spans));
         }
         footer.push(Line::raw(""));
-        footer.push(Line::styled(format!("{NO_CURSOR}{HINT}"), theme.dim));
+        let one_line = format!("{NO_CURSOR}{HINT_MOVE}{HINT_GAP}{HINT_MORE}");
+        if cell_width(&one_line) <= usize::from(width) {
+            footer.push(Line::styled(one_line, theme.dim));
+        } else {
+            footer.push(Line::styled(format!("{NO_CURSOR}{HINT_MOVE}"), theme.dim));
+            footer.push(Line::styled(format!("{NO_CURSOR}{HINT_MORE}"), theme.dim));
+        }
 
         let rows = height.saturating_sub(1 + footer.len());
         let mut lines = vec![Line::styled(
             clip_left(&self.path, usize::from(width)),
             theme.accent,
         )];
-        lines.extend(self.body(rows, theme));
+        lines.extend(self.body(width, rows, theme));
         lines.extend(footer);
         lines
     }
 
     /// The entries in a window of `rows` lines that always holds the cursor, then `+N more`; or
     /// the error, "reading…", or the empty text — three different screens (the switcher's rule).
-    fn body(&self, rows: usize, theme: &Theme) -> Vec<Line<'static>> {
+    /// The error is wrapped to `width` (review L-2): it names a path, and a long one would push
+    /// the reason off the edge.
+    fn body(&self, width: u16, rows: usize, theme: &Theme) -> Vec<Line<'static>> {
         if let Some(error) = &self.error {
-            return vec![Line::styled(format!("{NO_CURSOR}{error}"), theme.error)];
+            let room = usize::from(width).saturating_sub(cell_width(NO_CURSOR));
+            return wrap(error, room)
+                .into_iter()
+                .map(|line| Line::styled(format!("{NO_CURSOR}{line}"), theme.error))
+                .collect();
         }
         let Some(listing) = &self.listing else {
             return vec![Line::styled(
@@ -384,6 +403,56 @@ fn lexical(path: String) -> String {
         }
     }
     resolved.to_string_lossy().into_owned()
+}
+
+/// `text` in lines of at most `width` cells (MOD-49 review L-2): broken at spaces, and inside a
+/// word only when the word alone is wider than a line (a long path usually is).
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        let mut word = word.to_owned();
+        loop {
+            let room = if line.is_empty() {
+                width
+            } else {
+                width.saturating_sub(cell_width(&line) + 1)
+            };
+            if cell_width(&word) <= room {
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(&word);
+                break;
+            }
+            if !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                continue;
+            }
+            // Alone and still too wide: as many clusters as fit (at least one, so this ends).
+            let clusters: Vec<&str> = graphemes(&word).collect();
+            let mut used = 0;
+            let mut cut = 0;
+            for cluster in &clusters {
+                let w = cell_width(cluster);
+                if cut > 0 && used + w > width {
+                    break;
+                }
+                used += w;
+                cut += 1;
+            }
+            lines.push(clusters[..cut].concat());
+            word = clusters[cut..].concat();
+            if word.is_empty() {
+                break;
+            }
+        }
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// `text` in at most `width` cells, cut from the **left** behind a `…`: the end of a path is the
