@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/personas.rs
+expression: frame
+---
+architect · Designs the change before it is built, stud… · deny edit,delete,move · allow 0 · rules 0
+    allow all · disallowed none · command-run y · default inherit
+reviewer · Reviews the step's inputs and code for corre… · deny edit,delete,move · allow 0 · rules 0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+j/k select · n new · e edit · b body · r rules · d delete · I import
