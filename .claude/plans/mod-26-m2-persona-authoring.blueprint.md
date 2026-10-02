@@ -124,6 +124,7 @@ shapes (2.1–2.13) · §3 T6 · §4 T7 · §5 T8 · §6 T9 · §7 T10 · §8 la
 | **D-8** | T7 Validate | F-8 | Adds `htui-agent` tests to G-T7 |
 | **D-9** | D21 refusals "the store's sentence" | F-14 | `Constraint` → bare `Failed` (B-11) |
 | **D-10** | §3.3(b) "the sentence for ``"e`x"`` is one line with the backtick escaped" | §2.2 and D18 use `escape_debug` (as `kind_not_narrowable`), which never escapes a backtick | The backtick stays raw; only `escape_debug`'s escapes apply, so the sentence stays on one line; the test pins the literal sentence (commit 8884a86d) |
+| **D-11** | §2.7 "in full": one guarded `DELETE`, then an unconditional holders read and refusal | F-7/B-5 judged a zero-phase "bound" sentence unreachable on Pg, but the guard and the holders read are two READ COMMITTED snapshots: an unbind, phase delete or graph delete committing between them empties the holders read | The Pg guard runs in a loop: an empty holders read re-runs the guarded `DELETE` (holders only shrink under the persona's `FOR UPDATE`, so it ends); the same three statements, so the `.sqlx` count stays 321; pinned by `pg_criteria.rs::an_unbind_racing_a_persona_delete_lets_it_delete` (commit f4f9e9bc) |
 
 ---
 
@@ -642,6 +643,9 @@ CREATE INDEX idx_step_graph_phase_persona ON step_graph_phase(persona_id);   -- 
         Ok(())
     }
 ```
+
+As built, the guarded `DELETE` and the holders read sit in a loop that re-runs the guard when the
+holders read comes back empty (D-11).
 
 Three new statements → three new `.sqlx` files (318 → **321**; restate from
 `ls crates/htui-store/.sqlx | wc -l`). No existing query text changes (auto-memory
