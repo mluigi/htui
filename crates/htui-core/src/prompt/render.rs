@@ -34,7 +34,8 @@ use crate::prompt::defaults::COMMAND_QUEUE_TEXT;
 use crate::prompt::excerpt::{Excerpt, RepoRoot};
 use crate::prompt::template::ParsedTemplate;
 use crate::prompt::{
-    DiffBlock, InputDocument, JudgeCandidate, PromptSpec, SectionName, StepSummary, VerifyFailure,
+    DiffBlock, InputDocument, JudgeCandidate, PersonaBlock, PromptSpec, SectionName, StepSummary,
+    VerifyFailure,
 };
 
 /// §4.2 rule 4's cap on a rendered `title` attribute, in bytes of the title itself.
@@ -632,6 +633,16 @@ pub fn command_queue() -> Rendered {
     }
 }
 
+/// MOD-26 D13: `<section name="persona" persona="…">` then the persona's body (B-20).
+#[must_use]
+pub fn persona(block: &PersonaBlock) -> Rendered {
+    Rendered {
+        name: SectionName::Persona,
+        attrs: vec![("persona", attr(&block.name))],
+        content: content_of(&block.body),
+    }
+}
+
 /// §4.6a's `judge_task`: the judged step's own stored prompt text, replayed verbatim.
 #[must_use]
 pub fn judge_task(text: &str) -> Rendered {
@@ -1053,6 +1064,21 @@ mod tests {
             "&amp;amp;",
             "one pass: the escape is not re-escaped, and an input that already looked escaped is \
              not silently accepted"
+        );
+    }
+
+    /// MOD-26 B-20: the persona's name is an attribute, escaped by §4.2 rule 4; the body is
+    /// content, LF-normalised with its trailing LFs removed.
+    #[test]
+    fn the_persona_section_escapes_its_name() {
+        let rendered = persona(&PersonaBlock {
+            name: "a\"b&c".to_owned(),
+            body: "You are the reviewer.\r\n\n".to_owned(),
+        });
+        assert_eq!(rendered.name, SectionName::Persona);
+        assert_eq!(
+            wrap(&rendered),
+            "<section name=\"persona\" persona=\"a&quot;b&amp;c\">\nYou are the reviewer.\n</section>"
         );
     }
 
