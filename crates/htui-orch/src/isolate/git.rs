@@ -1406,7 +1406,11 @@ pub fn open(path: &Path) -> Result<gix::Repository, IsolateError> {
 /// [`IsolateError::Refused`] with [`unborn_head`] for a repository with no commit;
 /// [`IsolateError::Git`] for anything else.
 pub fn head(path: &Path) -> Result<String, IsolateError> {
-    let repo = open(path)?;
+    head_in(&open(path)?, path)
+}
+
+/// [`head`] over an open `repo`; `path` names it in the messages only (R-37).
+fn head_in(repo: &gix::Repository, path: &Path) -> Result<String, IsolateError> {
     let head = repo.head().map_err(|err| {
         IsolateError::Git(format!("cannot read HEAD of {}: {err}", path.display()))
     })?;
@@ -1430,7 +1434,11 @@ pub fn head(path: &Path) -> Result<String, IsolateError> {
 /// [`IsolateError::Git`] when the repository cannot be opened, `hex` is not a hash, or the lookup
 /// fails.
 pub fn has_commit(path: &Path, hex: &str) -> Result<bool, IsolateError> {
-    let repo = open(path)?;
+    has_commit_in(&open(path)?, hex)
+}
+
+/// [`has_commit`] over an open `repo` (R-37).
+fn has_commit_in(repo: &gix::Repository, hex: &str) -> Result<bool, IsolateError> {
     let id = parse_oid(hex)?;
     let object = repo
         .try_find_object(id)
@@ -1471,12 +1479,16 @@ pub fn head_parents(path: &Path) -> Result<Vec<String>, IsolateError> {
 /// # Errors
 /// [`IsolateError::Git`] when either hash is not a hash, or the walk cannot read a commit.
 pub fn is_ancestor(path: &Path, ancestor: &str, descendant: &str) -> Result<bool, IsolateError> {
-    ancestor_walk(path, ancestor, descendant).map(|(found, _)| found)
+    // The old order: both hashes parse, and a commit is its own ancestor, before anything opens.
+    if parse_oid(ancestor)? == parse_oid(descendant)? {
+        return Ok(true);
+    }
+    ancestor_walk(&open(path)?, ancestor, descendant).map(|(found, _)| found)
 }
 
 /// [`is_ancestor`]'s answer and the number of commits its walk yielded (plan D142's pin).
 fn ancestor_walk(
-    path: &Path,
+    repo: &gix::Repository,
     ancestor: &str,
     descendant: &str,
 ) -> Result<(bool, usize), IsolateError> {
@@ -1484,10 +1496,9 @@ fn ancestor_walk(
     if wanted == tip {
         return Ok((true, 0));
     }
-    if !has_commit(path, ancestor)? {
+    if !has_commit_in(repo, ancestor)? {
         return Ok((false, 0));
     }
-    let repo = open(path)?;
     let fail = |err: &dyn std::fmt::Display| {
         IsolateError::Git(format!("cannot walk from {descendant}: {err}"))
     };
@@ -1527,18 +1538,21 @@ pub fn merge_of(
     base: &str,
     after: &str,
 ) -> Result<Option<String>, IsolateError> {
-    merge_walk(path, head, base, after).map(|(merge, _)| merge)
+    // The old order: every hash parses before the repository opens.
+    for hex in [head, base, after] {
+        parse_oid(hex)?;
+    }
+    merge_walk(&open(path)?, head, base, after).map(|(merge, _)| merge)
 }
 
 /// [`merge_of`]'s answer and the number of commits its walk read (plan D142's pin).
 fn merge_walk(
-    path: &Path,
+    repo: &gix::Repository,
     head: &str,
     base: &str,
     after: &str,
 ) -> Result<(Option<String>, usize), IsolateError> {
     let (tip, base, after) = (parse_oid(head)?, parse_oid(base)?, parse_oid(after)?);
-    let repo = open(path)?;
     let fail =
         |err: &dyn std::fmt::Display| IsolateError::Git(format!("cannot walk from {head}: {err}"));
     let walk = repo
@@ -1600,10 +1614,10 @@ pub fn reconcile_parent(
     step: StepId,
 ) -> Result<Option<String>, IsolateError> {
     let id = parse_oid(after)?;
-    if !has_commit(checkout, after)? {
+    let repo = open(checkout)?;
+    if !has_commit_in(&repo, after)? {
         return Ok(None);
     }
-    let repo = open(checkout)?;
     let commit = repo
         .find_commit(id)
         .map_err(|err| IsolateError::Git(format!("cannot find commit {after}: {err}")))?;
@@ -1615,11 +1629,11 @@ pub fn reconcile_parent(
         return Ok(None);
     }
     let (first, second) = (first.to_hex().to_string(), second.to_hex().to_string());
-    if !is_ancestor(checkout, before, &first)? {
+    if !ancestor_walk(&repo, before, &first)?.0 {
         return Ok(None);
     }
-    let head = head(checkout)?;
-    let merge = merge_of(checkout, &head, before, &second)?;
+    let head = head_in(&repo, checkout)?;
+    let (merge, _) = merge_walk(&repo, &head, before, &second)?;
     Ok((merge == Some(id.to_hex().to_string())).then_some(first))
 }
 
@@ -2408,14 +2422,15 @@ mod tests {
         let side = commit_at(dir.path(), &[&base], 41);
         let above = commit_at(dir.path(), &[&base], 42);
         let head = commit_at(dir.path(), &[&above], 43);
+        let repo = super::open(dir.path()).expect("the repository opens");
 
-        let (found, yielded) = ancestor_walk(dir.path(), &base, &head).expect("the walk");
+        let (found, yielded) = ancestor_walk(&repo, &base, &head).expect("the walk");
         assert!(found, "the base is under HEAD");
         assert!(
             yielded <= 2,
             "the walk stopped at the base: {yielded} commits"
         );
-        let (found, yielded) = ancestor_walk(dir.path(), &side, &head).expect("the walk");
+        let (found, yielded) = ancestor_walk(&repo, &side, &head).expect("the walk");
         assert!(!found, "a commit beside HEAD's line is not under it");
         assert!(
             yielded <= 2,
@@ -2434,11 +2449,12 @@ mod tests {
         let tip = commit_at(dir.path(), &[&base], 42);
         let head = commit_at(dir.path(), &[&fork], 43);
         let merge = commit_at(dir.path(), &[&base, &tip], 44);
+        let repo = super::open(dir.path()).expect("the repository opens");
 
-        let (found, read) = merge_walk(dir.path(), &head, &base, &tip).expect("the walk");
+        let (found, read) = merge_walk(&repo, &head, &base, &tip).expect("the walk");
         assert_eq!(found, None, "HEAD's line holds no merge of the tip");
         assert!(read <= 1, "the walk stopped at the fork: {read} commits");
-        let (found, read) = merge_walk(dir.path(), &merge, &base, &tip).expect("the walk");
+        let (found, read) = merge_walk(&repo, &merge, &base, &tip).expect("the walk");
         assert_eq!(found.as_deref(), Some(merge.as_str()), "the merge is found");
         assert!(read <= 1, "and nothing under it is read: {read} commits");
     }
