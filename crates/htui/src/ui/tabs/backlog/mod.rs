@@ -466,9 +466,9 @@ impl BacklogTab {
     ///
     /// Review L4, the one case: such a mint `Failed` that finds no minting form (a scope change
     /// dropped it, and a form opened since is not the mint's) has nowhere to show its hedge, so
-    /// the tab emits the hedge as an `Action::Error`. It is drained after `App`'s plain report, so the hedge is what the status
-    /// line keeps. Nothing is re-read: the item would be the old scope's. A refused mint stays
-    /// silent there, `App`'s report says it all.
+    /// the tab emits the hedge as an `Action::Error`. It is drained after `App`'s plain report,
+    /// so the hedge is what the status line keeps. Nothing is re-read: the item would be the old
+    /// scope's. A refused mint stays silent there, `App`'s report says it all.
     fn on_item_failed(&mut self, request: &str, message: &str, ctx: &Ctx<'_>) {
         let busy = self.item_form.as_ref().and_then(ItemForm::busy);
         match (request, busy) {
@@ -2306,8 +2306,9 @@ mod tests {
             &mut bench.ctx(),
         );
         let actions = bench.actions();
+        let hedge = mint_may_have_landed(&why);
         assert!(
-            matches!(actions.as_slice(), [Action::Error(sentence)] if *sentence == mint_may_have_landed(&why)),
+            matches!(actions.as_slice(), [Action::Error(sentence)] if *sentence == hedge),
             "{actions:?}"
         );
         assert!(tab.item_form.is_none());
