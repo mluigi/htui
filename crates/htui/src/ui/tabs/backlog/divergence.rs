@@ -726,6 +726,31 @@ mod tests {
             .collect()
     }
 
+    /// MOD-13 review L2: on the headings and every table line of a frame [`drawn`] at 100x30,
+    /// the one-space gaps after the ancestor and theirs cells are blank and the value cells sit
+    /// between the borders. A value wider than its cell would push its neighbours across a gap.
+    fn cells_stay_in_their_columns(rows: &[String], view: &Divergence) {
+        let inner = usize::from(chrome(Rect::new(0, 0, 100, 30)).body.width) - 2;
+        let vw = (inner - LABEL_WIDTH - STATE_WIDTH - 2) / 3;
+        let table: usize = view
+            .rows()
+            .iter()
+            .map(|row| row_lines(row, vw, &Theme::default()).len())
+            .sum();
+        assert!(table > 0, "a table to check");
+        // Rows 0 to 2 are the status line, the tab bar and the block's top; 3 is the headings.
+        let ancestor_at = 1 + LABEL_WIDTH + STATE_WIDTH;
+        let gaps = [ancestor_at + vw, ancestor_at + 2 * vw + 1];
+        for row in &rows[3..4 + table] {
+            let cells: Vec<char> = row.chars().collect();
+            assert_eq!(cells.len(), 100, "{row:?}");
+            assert_eq!((cells[0], cells[99]), ('\u{2502}', '\u{2502}'), "{row:?}");
+            for gap in gaps {
+                assert_eq!(cells[gap], ' ', "the gap at {gap} in {row:?}");
+            }
+        }
+    }
+
     fn states(view: &Divergence) -> Vec<(SpecField, FieldState)> {
         view.rows()
             .iter()
@@ -829,9 +854,7 @@ mod tests {
         ] {
             assert!(text.contains(wanted), "{wanted:?} in\n{text}");
         }
-        for row in &rows {
-            assert!(row.chars().count() <= 100, "{row:?}");
-        }
+        cells_stay_in_their_columns(&rows, &view);
     }
 
     #[tokio::test]
@@ -1015,6 +1038,7 @@ mod tests {
         )
         .await;
         let rows = drawn(&view);
+        cells_stay_in_their_columns(&rows, &view);
         let inner = usize::from(chrome(Rect::new(0, 0, 100, 30)).body.width) - 2;
         let vw = (inner - LABEL_WIDTH - STATE_WIDTH - 2) / 3;
         let start = 1 + LABEL_WIDTH + STATE_WIDTH + vw + 1;
@@ -1032,9 +1056,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(column.contains(title), "{column:?} in\n{}", rows.join("\n"));
-        for row in &rows {
-            assert!(row.chars().count() <= 100, "{row:?}");
-        }
     }
 
     #[tokio::test]
