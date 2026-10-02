@@ -525,13 +525,14 @@ mod tests {
     fn pad_and_pad_left_draw_a_control_char_as_a_blank_cell() {
         assert_eq!(pad("a\u{1}", 3), "a  ");
         assert_eq!(pad("a\r\nb", 4), "a b ", "one cluster, one blank cell");
-        assert_eq!(pad("a\tbcd", 2), "a bcd", "flattened, and still never clipped");
+        assert_eq!(
+            pad("a\tbcd", 2),
+            "a bcd",
+            "flattened, and still never clipped"
+        );
         assert_eq!(pad_left("a\u{1}", 3), " a ");
         assert_eq!(pad_left("\u{7f}bc", 2), " bc", "never clips");
-        for (out, width) in [
-            (pad("a\u{1}", 3), 3),
-            (pad_left("\u{1}\u{7f}", 4), 4),
-        ] {
+        for (out, width) in [(pad("a\u{1}", 3), 3), (pad_left("\u{1}\u{7f}", 4), 4)] {
             assert_eq!(drawn(&out), width, "{out:?} against {width}");
         }
     }

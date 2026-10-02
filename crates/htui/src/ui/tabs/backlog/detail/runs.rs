@@ -151,10 +151,6 @@ const PENDING: &str = "\u{2014}";
 /// The duration of a step that has not finished: no clock is read in `render` (D170).
 const RUNNING: &str = "\u{2026}";
 
-/// Marks a cut: `cells::ELLIPSIS`, which every `cells` op cuts with (MOD-60 D2), named here for
-/// the execution graph's `clip` and the tests that look for it.
-const CUT: char = cells::ELLIPSIS;
-
 /// Marks the step the cursor is on. Unselected step rows carry a space of the same width, so the
 /// columns do not shift as the cursor moves.
 const CURSOR: &str = "\u{25b8}";
@@ -1904,7 +1900,8 @@ mod tests {
         );
     }
 
-    /// R-3: the reason line is the pane's 43 columns whatever the note holds, cut with `CUT`.
+    /// R-3: the reason line is the pane's 43 columns whatever the note holds, cut with
+    /// `cells::ELLIPSIS`.
     #[tokio::test]
     async fn a_reason_line_is_forty_three_columns_whatever_the_note() {
         let theme = Theme::default();
@@ -1914,7 +1911,7 @@ mod tests {
         step.gate_note = Some(note);
         let line = note_line(&step, &theme).expect("a parked step with a note has a line");
         assert_eq!(line.width(), PANE);
-        assert!(text(&line).ends_with(CUT), "{:?}", text(&line));
+        assert!(text(&line).ends_with(cells::ELLIPSIS), "{:?}", text(&line));
         assert!(text(&line).chars().all(|c| !c.is_control()));
         step.gate_note = Some(String::new());
         assert!(note_line(&step, &theme).is_none(), "an empty note is none");

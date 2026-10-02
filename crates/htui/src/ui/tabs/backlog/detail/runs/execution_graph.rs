@@ -19,7 +19,7 @@ use ratatui::style::Style;
 use ratatui::widgets::{Block, Widget as _};
 
 use crate::ui::Theme;
-use crate::ui::cells::{cell_width, graphemes};
+use crate::ui::cells;
 
 /// Plan D10: a node's width in cells at zoom 1. Two candidates and the gap are 41 columns, which a
 /// reveal's 1-cell margins keep inside the 43-column pane (fact-check R8; 21 cuts a border).
@@ -242,41 +242,11 @@ impl NodeContent for StepNode {
             buf.set_string(
                 inner.x,
                 inner.y + row,
-                clip(line, usize::from(inner.width)),
+                cells::clip(line, usize::from(inner.width)),
                 self.text(),
             );
         }
     }
-}
-
-/// `text` in at most `width` terminal cells, by grapheme, cut with `…` (blueprint E11).
-///
-/// A control character reads as a space, so one line stays one line (`cells::fit`'s rule). A
-/// wide glyph that would straddle the last cell is dropped, so the result may be a cell short; it
-/// is never a cell long.
-fn clip(text: &str, width: usize) -> String {
-    let flat: String = text
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    if cell_width(&flat) <= width {
-        return flat;
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for grapheme in graphemes(&flat) {
-        let w = cell_width(grapheme);
-        if used + w > width - 1 {
-            break;
-        }
-        out.push_str(grapheme);
-        used += w;
-    }
-    out.push(super::CUT);
-    out
 }
 
 /// Plan D9: one source on the bottom and one target on the top, both hidden. Baked into every
@@ -531,6 +501,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::ui::cells::cell_width;
 
     /// A settled step at `(position, attempt, fanout_index)`, id `0x100 + n` (the `htui-orch`
     /// `closeout.rs` idiom).
@@ -998,6 +969,16 @@ mod tests {
         assert_eq!(buf[(x + 1, y + 1)].fg, Color::DarkGray);
     }
 
+    /// MOD-60 review L3: a node's text is `cells::clip`'s, flattened per cluster, so `"\r\n"` is
+    /// one blank cell, not the two a per-`char` rule drew.
+    #[test]
+    fn a_crlf_in_a_phase_draws_as_one_blank_cell() {
+        let run = run(1, vec![phased(step(1, 0, 1, 0), "x\r\nyz")]);
+        let mut graph = synced(&run, Some(id(1)));
+        let rows = rows(&draw(&mut graph));
+        assert!(rows.iter().any(|row| row.contains("x yz")), "{rows:#?}");
+    }
+
     #[test]
     fn a_promoted_winner_reads_star_then_check() {
         let promoted = RunStepSummary {
@@ -1016,9 +997,9 @@ mod tests {
     #[test]
     fn text_is_clipped_by_display_width() {
         let wide = "\u{8abf}\u{67fb}\u{30d5}\u{30a7}\u{30fc}\u{30ba}\u{306e}\u{9577}\u{3044}\u{540d}\u{524d}\u{3067}\u{3059}";
-        let cut = clip(wide, 18);
+        let cut = cells::clip(wide, 18);
         assert!(cell_width(&cut) <= 18, "{cut}");
-        assert!(cut.ends_with(super::super::CUT), "{cut}");
+        assert!(cut.ends_with(cells::ELLIPSIS), "{cut}");
 
         let run = run(1, vec![phased(step(1, 0, 1, 0), wide)]);
         let mut graph = synced(&run, Some(id(1)));
@@ -1031,11 +1012,14 @@ mod tests {
             assert_eq!(buf[(right, row)].symbol(), "\u{2502}", "row {row}");
         }
 
-        assert_eq!(clip("ab", 5), "ab");
-        assert_eq!(clip("abcdef", 4), "abc\u{2026}");
-        assert_eq!(clip("\u{65e5}\u{672c}\u{8a9e}", 4), "\u{65e5}\u{2026}");
-        assert_eq!(clip("a\nb", 3), "a b");
-        assert_eq!(clip("abc", 0), "");
+        assert_eq!(cells::clip("ab", 5), "ab");
+        assert_eq!(cells::clip("abcdef", 4), "abc\u{2026}");
+        assert_eq!(
+            cells::clip("\u{65e5}\u{672c}\u{8a9e}", 4),
+            "\u{65e5}\u{2026}"
+        );
+        assert_eq!(cells::clip("a\nb", 3), "a b");
+        assert_eq!(cells::clip("abc", 0), "");
     }
 
     #[test]

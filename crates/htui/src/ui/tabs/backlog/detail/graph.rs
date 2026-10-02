@@ -20,7 +20,7 @@ use ratatui::widgets::Paragraph;
 use crate::app::{Action, Ctx, Handled, RevealTarget};
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
-use crate::ui::cells::{cell_width, graphemes};
+use crate::ui::cells::{self, cell_width, graphemes};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, PAGE, message};
 use crate::ui::tabs::backlog::list;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -597,42 +597,25 @@ fn line(
 ///
 /// Whole when it fits `room`; then the slug clipped, while it keeps two cells; then the key alone,
 /// in `bare_room`, clipped only if even that is too little. The degradation order is title, kind
-/// padding, slug, status, key: the key is what names the item.
+/// padding, slug, status, key: the key is what names the item. Every part goes through
+/// `cells::clip`, so a control character draws as one blank cell even when nothing is cut.
 fn fit_label(key: &str, slug: Option<&str>, room: usize, bare_room: usize) -> String {
     let key_width = cell_width(key);
     if let Some(slug) = slug {
         if cell_width(slug) + 1 + key_width <= room {
-            return format!("{slug}:{key}");
+            return cells::clip(&format!("{slug}:{key}"), room);
         }
         if let Some(slug_room) = room.checked_sub(key_width + 1)
             && slug_room >= 2
         {
-            return format!("{}:{key}", clip(slug, slug_room));
+            return format!(
+                "{}:{}",
+                cells::clip(slug, slug_room),
+                cells::clip(key, key_width)
+            );
         }
     }
-    clip(key, bare_room.max(room))
-}
-
-/// `text` in at most `room` cells, cut at a grapheme boundary and ended with `…` when it is cut.
-/// No room is no text: a lone `…` would be a cell over.
-fn clip(text: &str, room: usize) -> String {
-    if cell_width(text) <= room {
-        return text.to_owned();
-    }
-    let Some(room) = room.checked_sub(1) else {
-        return String::new();
-    };
-    let mut out = String::new();
-    let mut used = 0;
-    for grapheme in graphemes(text) {
-        used += cell_width(grapheme);
-        if used > room {
-            break;
-        }
-        out.push_str(grapheme);
-    }
-    out.push('\u{2026}');
-    out
+    cells::clip(key, bare_room.max(room))
 }
 
 /// Appends `' ' + title`, clipped to what is left of `width`, when at least [`TITLE_MIN`]
@@ -642,7 +625,7 @@ fn push_title(spans: &mut Vec<Span<'static>>, title: &str, width: usize, style: 
     let room = width.saturating_sub(used + 1);
     if room >= TITLE_MIN {
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(clip(title, room), style));
+        spans.push(Span::styled(cells::clip(title, room), style));
     }
 }
 
@@ -1201,6 +1184,23 @@ mod tests {
         assert_eq!(fit_label("FEAT-1", None, 0, 6), "FEAT-1");
         assert_eq!(fit_label("FEAT-1", Some("vulkan"), 0, 13), "FEAT-1");
         assert_eq!(fit_label("FEAT-1", Some("vulkan"), 0, 4), "FEA…");
+    }
+
+    /// MOD-60 review L3: the label and the title are `cells::clip`'s, so a control character in a
+    /// key, slug or title draws as one blank cell (D3) rather than as nothing, which would leave
+    /// the row a cell short of what it was measured at.
+    #[test]
+    fn a_control_char_in_a_label_or_title_draws_as_a_blank_cell() {
+        assert_eq!(fit_label("FEAT\u{1}1", None, 6, 6), "FEAT 1");
+        assert_eq!(fit_label("FEAT-1", Some("a\u{1}y"), 10, 10), "a y:FEAT-1");
+        assert_eq!(
+            fit_label("FEAT-1", Some("v\u{1}lkan"), 10, 10),
+            "v \u{2026}:FEAT-1"
+        );
+        assert_eq!(fit_label("F\u{7f}AT-1", None, 4, 4), "F A\u{2026}");
+        let mut spans = vec![Span::raw("ab")];
+        push_title(&mut spans, "a\r\nb title", 40, Style::new());
+        assert_eq!(spans[2].content, "a b title");
     }
 
     #[tokio::test]
