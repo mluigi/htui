@@ -36,7 +36,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use super::attach::{AttachOutcome, AttachPane};
 use crate::app::{Action, Ctx, Handled};
-use crate::editor::{ExternalEdit, ExternalEditOutcome};
+use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG};
 use crate::skill_import::ImportOutcome;
 use crate::skills::{READ_NAME, REQUEST_NAMES, SkillWrite, SkillsSnapshot, StaleWhat};
 use crate::store_worker::{StoreReply, StoreRequest};
@@ -77,15 +77,6 @@ const UNSAVED: &str = "unsaved changes \u{2014} Esc again discards";
 
 /// A write went out.
 const SAVING: &str = "saving\u{2026}";
-
-/// An `$EDITOR` return with text in it.
-const EDITED: &str = "edited in $EDITOR \u{2014} Ctrl+S saves";
-
-/// An `$EDITOR` return that changed nothing, and a rename that changes nothing.
-const NO_CHANGES: &str = "no changes";
-
-/// Appended to [`NO_CHANGES`] when the editor returned within `QUICK_EXIT` (milestone 1 D24).
-const WAIT_FLAG: &str = " \u{2014} a GUI editor needs its wait flag, e.g. `code --wait`";
 
 /// A `SkillsStale` for a skill the library no longer holds.
 const SKILL_GONE: &str = "the skill is gone";

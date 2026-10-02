@@ -26,7 +26,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{Action, Ctx, Handled};
-use crate::editor::{ExternalEdit, ExternalEditOutcome};
+use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot};
 use crate::ui::tabs::backlog::detail::Scroll;
@@ -70,15 +70,6 @@ const UNSAVED: &str = "unsaved changes \u{2014} Esc again discards";
 
 /// A save went out.
 const SAVING: &str = "saving\u{2026}";
-
-/// An `$EDITOR` return that `parse` accepts.
-const EDITED: &str = "edited in $EDITOR \u{2014} Ctrl+S saves";
-
-/// An `$EDITOR` return that changed nothing.
-const NO_CHANGES: &str = "no changes";
-
-/// Appended to [`NO_CHANGES`] when the editor returned within `QUICK_EXIT` (blueprint D24, R-3).
-const WAIT_FLAG: &str = " \u{2014} a GUI editor needs its wait flag, e.g. `code --wait`";
 
 /// The hint row in Browse (plan D13).
 const BROWSE_HINT: &str = "j/k move  ,/. version  b base  d diff  D default  e edit  E $EDITOR  \

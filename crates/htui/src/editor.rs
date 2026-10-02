@@ -15,6 +15,18 @@ use htui_core::prompt::render::normalise_newlines;
 /// GUI editor started without `--wait`, which returns at once and leaves the file untouched.
 pub const QUICK_EXIT: Duration = Duration::from_secs(1);
 
+/// The notice after an `$EDITOR` return with text in it: the view holds the text, unsaved (MOD-9;
+/// shared by the Skills views and the Backlog item form, MOD-13 milestone 4 D8).
+pub const EDITED: &str = "edited in $EDITOR \u{2014} Ctrl+S saves";
+
+/// The notice after an `$EDITOR` return that changed nothing (MOD-13 milestone 4 D8). The
+/// Library also gives it for a rename that changes nothing.
+pub const NO_CHANGES: &str = "no changes";
+
+/// Appended to [`NO_CHANGES`] when the editor returned within [`QUICK_EXIT`] (MOD-9 blueprint
+/// D24, R-3).
+pub const WAIT_FLAG: &str = " \u{2014} a GUI editor needs its wait flag, e.g. `code --wait`";
+
 /// The longest temp-file stem [`run`] keeps (blueprint D25), in chars.
 const STEM_MAX: usize = 32;
 
