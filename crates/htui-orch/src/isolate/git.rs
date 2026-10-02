@@ -1477,9 +1477,11 @@ pub fn head_parents(path: &Path) -> Result<Vec<String>, IsolateError> {
 /// `descendant` is read to its root. An `ancestor` this repository does not hold is not one.
 ///
 /// # Errors
-/// [`IsolateError::Git`] when either hash is not a hash, or the walk cannot read a commit.
+/// [`IsolateError::Git`] when either hash is not a hash, the repository cannot be opened, or the
+/// walk cannot read a commit.
 pub fn is_ancestor(path: &Path, ancestor: &str, descendant: &str) -> Result<bool, IsolateError> {
-    // The old order: both hashes parse, and a commit is its own ancestor, before anything opens.
+    // Both hashes parse, and a commit is its own ancestor, before the repository opens: a bad
+    // hash outranks a bad path, and equal hashes need no repository.
     if parse_oid(ancestor)? == parse_oid(descendant)? {
         return Ok(true);
     }
@@ -1531,14 +1533,15 @@ fn ancestor_walk(
 /// `head` is still read to its root.
 ///
 /// # Errors
-/// [`IsolateError::Git`] when a hash is not a hash or a commit on the walk cannot be read.
+/// [`IsolateError::Git`] when a hash is not a hash, the repository cannot be opened, or a commit on
+/// the walk cannot be read.
 pub fn merge_of(
     path: &Path,
     head: &str,
     base: &str,
     after: &str,
 ) -> Result<Option<String>, IsolateError> {
-    // The old order: every hash parses before the repository opens.
+    // Every hash parses before the repository opens: a bad hash outranks a bad path.
     for hex in [head, base, after] {
         parse_oid(hex)?;
     }
@@ -1606,7 +1609,8 @@ fn reconcile_message(step: StepId) -> String {
 /// `None` too, and the caller then diffs `before..after`, a superset (R-33's residual).
 ///
 /// # Errors
-/// [`IsolateError::Git`] when a hash is not a hash, or a commit or `HEAD` cannot be read.
+/// [`IsolateError::Git`] when a hash is not a hash, the checkout cannot be opened, or a commit or
+/// `HEAD` cannot be read; [`IsolateError::Refused`] with [`unborn_head`] when `HEAD` is unborn.
 pub fn reconcile_parent(
     checkout: &Path,
     before: &str,
@@ -1629,7 +1633,8 @@ pub fn reconcile_parent(
         return Ok(None);
     }
     let (first, second) = (first.to_hex().to_string(), second.to_hex().to_string());
-    if !ancestor_walk(&repo, before, &first)?.0 {
+    let (held, _) = ancestor_walk(&repo, before, &first)?;
+    if !held {
         return Ok(None);
     }
     let head = head_in(&repo, checkout)?;
@@ -2486,8 +2491,8 @@ mod tests {
         assert_eq!(super::OPENS.get(), 1, "one open of the checkout");
     }
 
-    /// R-37: a commit the checkout does not hold answers `None` after that one open, before any
-    /// commit is read.
+    /// R-37: a commit the checkout does not hold answers `None` before any commit is read (the
+    /// early `None`: a `find_commit` first would be an error), after the one open.
     #[test]
     fn reconcile_parent_opens_once_for_a_commit_it_does_not_hold() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -2502,6 +2507,26 @@ mod tests {
             super::reconcile_parent(dir.path(), &before, &elsewhere, step).expect("it reads");
         assert_eq!(parent, None, "the checkout does not hold it");
         assert_eq!(super::OPENS.get(), 1, "one open, then the early None");
+    }
+
+    /// R-37: `is_ancestor` and `merge_of` parse their hashes before they open the repository, so a
+    /// commit is its own ancestor without one and a bad hash outranks a bad path.
+    #[test]
+    fn hashes_are_read_before_the_repository_opens() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let missing = dir.path().join("no-repository-here");
+        let hex = "0123456789abcdef0123456789abcdef01234567";
+
+        assert!(super::is_ancestor(&missing, hex, hex).expect("no repository is needed"));
+        for err in [
+            super::is_ancestor(&missing, "zz", hex).expect_err("a bad hash"),
+            super::merge_of(&missing, hex, hex, "zz").expect_err("a bad hash"),
+        ] {
+            assert!(
+                matches!(&err, IsolateError::Git(text) if text.contains("is not an object id")),
+                "the hash is refused before the path: {err:?}"
+            );
+        }
     }
 
     /// `gix::init` alone makes a repository with an unborn `HEAD`, and `before_hash` is `NOT NULL`
