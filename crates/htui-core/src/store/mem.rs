@@ -57,12 +57,13 @@ use crate::store::traits::{
     chat_step_status, check_attachment, citation_key, close_out_needs_a_summary, expected_on_row,
     failure_disagrees_with_status, finish_run_item_mirror, finish_run_needs_a_terminal_status,
     graph_not_in_project, invalid_area_code, invalid_prefix, item_has_a_live_run,
-    item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move, new_skill_refusal,
-    not_a_fanout_candidate, not_a_terminal_status, prompt_template_key, prompt_template_refusal,
-    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
-    row_names_another_step, run_is_terminal, skill_body_refusal, skill_patch_refusal,
-    skill_version_key, step_is_not_promotable, step_slot_is_taken, summary_names_another_item,
-    winner_is_not_settled, withdrawn_requirement_cited,
+    item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move, new_persona_refusal,
+    new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status, persona_patch_refusal,
+    prompt_template_key, prompt_template_refusal, references_no_row, requirement_withdrawn,
+    reserved_phase_name, resolution_not_closable, row_names_another_step, run_is_terminal,
+    skill_body_refusal, skill_patch_refusal, skill_version_key, step_is_not_promotable,
+    step_slot_is_taken, summary_names_another_item, winner_is_not_settled,
+    withdrawn_requirement_cited,
 };
 use uuid::Uuid;
 
@@ -166,6 +167,10 @@ struct State {
     /// [`WriteStore::skills`], written by [`WriteStore::create_skill`] and
     /// [`WriteStore::update_skill`] (MOD-9 milestone 3).
     skills: HashMap<SkillId, Skill>,
+    /// `persona` (MOD-26 D1), read by [`WriteStore::personas`] and `resolve_graph`, written by
+    /// [`WriteStore::create_persona`] and [`WriteStore::update_persona`]; global, so
+    /// `delete_project` leaves it.
+    personas: HashMap<PersonaId, Persona>,
     /// `skill_version`, resolved through [`SkillBinding::version_in_force`], read by
     /// [`WriteStore::skill_versions`] and appended to by [`WriteStore::create_skill`] and
     /// [`WriteStore::add_skill_version`].
@@ -310,6 +315,7 @@ impl MemStore {
             phases: data.phases,
             templates: data.templates,
             skills: data.skills.into_iter().map(|row| (row.id, row)).collect(),
+            personas: data.personas.into_iter().map(|row| (row.id, row)).collect(),
             skill_versions: data.skill_versions,
             skill_bindings: data.skill_bindings,
             box_tools: data.box_tools,
@@ -2911,6 +2917,10 @@ impl State {
                 phase.id
             )));
         }
+        // MOD-26 D5: Postgres's order, the unique indexes at insert and the foreign key after.
+        if let Some(persona) = phase.persona_id {
+            self.require_persona(persona)?;
+        }
         let mut row = phase.clone();
         row.updated_at = now;
         self.phases.push(row.clone());
@@ -2942,6 +2952,9 @@ impl State {
             patch.name.as_deref().unwrap_or(&current.name),
             Some(id),
         )?;
+        if let Some(Some(persona)) = patch.persona {
+            self.require_persona(persona)?;
+        }
         let row = self
             .phase_mut(id)
             .expect("the row was read a statement ago under the same lock");
@@ -2959,6 +2972,9 @@ impl State {
         }
         if let Some(input_kinds) = patch.input_kinds {
             row.input_kinds = input_kinds;
+        }
+        if let Some(persona) = patch.persona {
+            row.persona_id = persona;
         }
         row.updated_at = now;
         Ok(CasOutcome::Applied(row.clone()))
@@ -3152,6 +3168,109 @@ impl State {
         }
         row.updated_at = now;
         Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    // ---- MOD-26 milestone 1: the persona registry (plan D3-D5, blueprint §2.9) -------------
+
+    /// Plan D4: name byte order (`COLLATE "C"`).
+    fn persona_rows(&self) -> Vec<Persona> {
+        let mut rows: Vec<Persona> = self.personas.values().cloned().collect();
+        rows.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+        rows
+    }
+
+    /// Order: `new_persona_refusal`; a taken id → `already_exists("persona", id)`; a taken name
+    /// → `already_exists("persona", name)`. Both stamps are `now`.
+    fn create_persona(&mut self, new: NewPersona, now: DateTime<Utc>) -> Result<Persona> {
+        if let Some(refusal) = new_persona_refusal(&new) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if self.personas.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists("persona", new.id)));
+        }
+        if self.personas.values().any(|row| row.name == new.name) {
+            return Err(StoreError::Constraint(already_exists("persona", &new.name)));
+        }
+        let persona = Persona {
+            id: new.id,
+            name: new.name,
+            description: new.description,
+            body: new.body,
+            tools: new.tools,
+            permission: new.permission,
+            created_at: now,
+            updated_at: now,
+        };
+        self.personas.insert(persona.id, persona.clone());
+        Ok(persona)
+    }
+
+    /// `update_skill`'s shape: `NotFound("persona")` → `Stale(current)` →
+    /// `persona_patch_refusal` → a name another row holds → apply every `Some` field and stamp
+    /// `now` (an all-`None` patch still stamps, as the Postgres trigger does).
+    fn update_persona(
+        &mut self,
+        id: PersonaId,
+        expected: DateTime<Utc>,
+        patch: PersonaPatch,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<Persona>> {
+        let current = self
+            .personas
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "persona",
+                id: id.to_string(),
+            })?;
+        if current.updated_at != expected {
+            return Ok(CasOutcome::Stale(current));
+        }
+        if let Some(refusal) = persona_patch_refusal(&patch) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if let Some(name) = &patch.name
+            && self
+                .personas
+                .values()
+                .any(|row| row.id != id && row.name == *name)
+        {
+            return Err(StoreError::Constraint(already_exists("persona", name)));
+        }
+        let row = self
+            .personas
+            .get_mut(&id)
+            .expect("the row was read a statement ago under the same lock");
+        if let Some(name) = patch.name {
+            row.name = name;
+        }
+        if let Some(description) = patch.description {
+            row.description = description;
+        }
+        if let Some(body) = patch.body {
+            row.body = body;
+        }
+        if let Some(tools) = patch.tools {
+            row.tools = tools;
+        }
+        if let Some(permission) = patch.permission {
+            row.permission = permission;
+        }
+        row.updated_at = now;
+        Ok(CasOutcome::Applied(row.clone()))
+    }
+
+    /// MOD-26 D5: `fk_step_graph_phase_persona` in `references_no_row`'s words.
+    fn require_persona(&self, id: PersonaId) -> Result<()> {
+        if self.personas.contains_key(&id) {
+            Ok(())
+        } else {
+            Err(StoreError::Constraint(references_no_row(
+                "step_graph_phase.persona_id",
+                id,
+                "persona",
+            )))
+        }
     }
 
     /// D89's order; pushes version `expected + 1` stamped `now`.
@@ -5166,7 +5285,10 @@ impl State {
                     phase: phase.clone(),
                     // `phase_agent` is not a table this store holds (blueprint F-N).
                     agents: Vec::new(),
-                    persona: None,
+                    // MOD-26 D6: the row the binding names; `require_persona` keeps it present.
+                    persona: phase
+                        .persona_id
+                        .and_then(|id| self.personas.get(&id).cloned()),
                 })
                 .collect(),
         })
@@ -6564,20 +6686,22 @@ impl WriteStore for MemStore {
     }
 
     async fn personas(&self) -> Result<Vec<Persona>> {
-        Err(StoreError::Backend("MOD-26 T1: red".into()))
+        Ok(self.read(State::persona_rows))
     }
 
-    async fn create_persona(&self, _new: NewPersona) -> Result<Persona> {
-        Err(StoreError::Backend("MOD-26 T1: red".into()))
+    async fn create_persona(&self, new: NewPersona) -> Result<Persona> {
+        let now = self.now();
+        self.write(|state| state.create_persona(new, now))
     }
 
     async fn update_persona(
         &self,
-        _id: PersonaId,
-        _expected: DateTime<Utc>,
-        _patch: PersonaPatch,
+        id: PersonaId,
+        expected: DateTime<Utc>,
+        patch: PersonaPatch,
     ) -> Result<CasOutcome<Persona>> {
-        Err(StoreError::Backend("MOD-26 T1: red".into()))
+        let now = self.now();
+        self.write(|state| state.update_persona(id, expected, patch, now))
     }
 
     async fn set_setting(
@@ -8977,8 +9101,10 @@ mod tests {
                     && !state.users.is_empty()
                     && !state.boxes.is_empty()
                     && !state.box_tools.is_empty()
-                    && !state.agents.is_empty(),
-                "skill, skill_version, app_user, box, box_tool and agent are not below a project"
+                    && !state.agents.is_empty()
+                    && !state.personas.is_empty(),
+                "skill, skill_version, app_user, box, box_tool, agent and persona are not below a \
+                 project"
             );
         });
     }
