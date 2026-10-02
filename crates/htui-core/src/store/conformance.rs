@@ -17,19 +17,19 @@ use crate::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Attachment, Billing,
     BindingChange, BoxEdit, BoxId, BoxProbe, BoxRow, CancelRequest, ChatRunSpec, CitationKind,
     Claim, CommandQueue, CommandRun, CommandRunId, CommandRunStatus, CoverageRow,
-    DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EventKind, EventRole, Executor, Gate, GateOutcome,
-    GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKindId, ItemKindPatch,
-    ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote,
-    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, NoteId, OpenPermission, OverlapRule,
-    PermissionChoice, PermissionId, PermissionStatus, PhaseId, PhasePatch, Priority, ProbedTool,
-    ProjectId, ProjectPatch, PromptScope, PromptTemplate, PromptTemplateId, RelayOption,
-    RelayOptionKind, RelaySessionId, RelayView, RepoBoxPath, RepoId, RepoPatch, RepoScope,
-    Requirement, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementState, RequirementUpdate, Resolution, Run, RunCommandId,
-    RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunScope, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, Scope, SessionEvent, Skill, SkillBindingKey, SkillId, SkillPatch,
-    SkillVersion, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch,
+    DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EditReason, EventKind, EventRole, Executor, Gate,
+    GateOutcome, GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKindId,
+    ItemKindPatch, ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem,
+    NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
+    NoteId, OpenPermission, OverlapRule, PermissionChoice, PermissionId, PermissionStatus, PhaseId,
+    PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate,
+    PromptTemplateId, RelayOption, RelayOptionKind, RelaySessionId, RelayView, RepoBoxPath, RepoId,
+    RepoPatch, RepoScope, Requirement, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementState, RequirementUpdate, Resolution, Run,
+    RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunScope, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, Skill, SkillBindingKey, SkillId,
+    SkillPatch, SkillVersion, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch,
     StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
     UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
     WorkspaceProject, canonical_declared_tags, missing_tags_failure,
@@ -166,6 +166,7 @@ pub const CASES: &[&str] = &[
     "deleting_a_project_takes_its_relay_rows",
     "adopt_runs_never_leases_a_chat_run",
     "update_spec_columns_roundtrip",
+    "item_edit_reason_lands_in_revision",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -419,6 +420,7 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "adopt_runs_never_leases_a_chat_run" => adopt_runs_never_leases_a_chat_run(store).await,
         "update_spec_columns_roundtrip" => update_spec_columns_roundtrip(store).await,
+        "item_edit_reason_lands_in_revision" => item_edit_reason_lands_in_revision(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -949,6 +951,73 @@ async fn update_spec_columns_roundtrip<S: WriteStore>(store: &S) {
         cleared.required_tags, tags,
         "{CASE}: required_tags survives the clear"
     );
+}
+
+/// MOD-13 milestone 3 D9: an edit's `reason` is the revision's, on both stores (ANA-9 §4.2 step 3).
+/// No trait reads a revision (plan C9), so the reason is read back as the ancestor of a deliberately
+/// stale edit, `status_cas_keeps_version`'s trick.
+async fn item_edit_reason_lands_in_revision<S: WriteStore>(store: &S) {
+    const CASE: &str = "item_edit_reason_lands_in_revision";
+    let before = store
+        .item(ids::HTUI_ANA_2)
+        .await
+        .unwrap_or_else(|error| panic!("{CASE}: read must not fail: {error}"))
+        .unwrap_or_else(|| panic!("{CASE}: the fixture item exists"));
+
+    let resolution = store
+        .update_item(
+            before.id,
+            before.version,
+            title_patch("Resolved", EditReason::DivergenceResolution.as_str()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{CASE}: the resolution must not fail: {error}"));
+    let UpdateOutcome::Updated(resolved) = resolution else {
+        panic!("{CASE}: the resolution lands at the current version")
+    };
+    assert_eq!(
+        resolved.version,
+        before.version + 1,
+        "{CASE}: the resolution bumps the version"
+    );
+
+    let edit = store
+        .update_item(before.id, resolved.version, title_patch("After", "edited"))
+        .await
+        .unwrap_or_else(|error| panic!("{CASE}: the edit must not fail: {error}"));
+    let UpdateOutcome::Updated(after) = edit else {
+        panic!("{CASE}: the edit lands at the resolution's version")
+    };
+    assert_eq!(
+        after.version,
+        resolved.version + 1,
+        "{CASE}: the edit bumps the version"
+    );
+
+    // Stale at the resolution's version: the ancestor it answers is the resolution's revision.
+    let stale = store
+        .update_item(before.id, resolved.version, title_patch("Stale", "edited"))
+        .await
+        .unwrap_or_else(|error| panic!("{CASE}: the stale edit must not fail: {error}"));
+    let UpdateOutcome::Diverged { head, ancestor } = stale else {
+        panic!("{CASE}: the stale edit must diverge")
+    };
+    assert_eq!(
+        ancestor.version, resolved.version,
+        "{CASE}: ancestor version"
+    );
+    assert_eq!(
+        ancestor.reason, "divergence_resolution",
+        "{CASE}: the resolution's revision keeps its reason"
+    );
+    assert_eq!(ancestor.title, "Resolved", "{CASE}: ancestor title");
+    assert_eq!(ancestor.author_id, ids::USER, "{CASE}: ancestor author");
+    assert_eq!(ancestor.box_id, Some(ids::BOX), "{CASE}: ancestor box");
+    assert_eq!(
+        head.version, after.version,
+        "{CASE}: the stale edit wrote nothing"
+    );
+    assert_eq!(head.title, "After", "{CASE}: head title");
 }
 
 /// A status move is its own compare-and-set: it never bumps `version` (§4.2).

@@ -12,11 +12,14 @@
 //! MOD-13 milestone 2 adds the writes: `N` opens an [`ItemForm`] for a new item and `e` one for
 //! the selected item, drawn in the detail pane's place (D8). Both first read the form's catalogue
 //! through the worker (D3), which refuses offline (D2). An applied edit re-reads the item and the
-//! list (D9); an applied mint is revealed, which clears the filter (A5). A stale edit keeps the
-//! form and its token (D6); a mint's `Failed` that may follow a COMMIT is hedged and the whole list
-//! re-read (D11, §10).
+//! list (D9); an applied mint is revealed, which clears the filter (A5). A mint's `Failed` that may
+//! follow a COMMIT is hedged and the whole list re-read (D11, §10).
+//!
+//! A stale edit opens the three-way view in the whole tab area (milestone 3). `m`/`t` rebase the
+//! form on the head, and Ctrl+S then lands a `divergence_resolution` revision.
 
 pub mod detail;
+pub mod divergence;
 pub mod filter;
 pub mod item_form;
 pub mod list;
@@ -33,8 +36,7 @@ use crate::ui::tabs::backlog::detail::{
 };
 use crate::ui::tabs::backlog::filter::{BacklogFilter, FilterForm, FormOutcome};
 use crate::ui::tabs::backlog::item_form::{
-    Busy, ItemForm, ItemFormOutcome, item_changed_elsewhere, mint_may_have_landed,
-    mint_may_have_landed_in_the_old_scope,
+    Busy, ItemForm, ItemFormOutcome, mint_may_have_landed, mint_may_have_landed_in_the_old_scope,
 };
 use crate::ui::tabs::backlog::list::{ListView, Selection};
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
@@ -448,13 +450,17 @@ impl BacklogTab {
         }
     }
 
-    /// D6: a stale edit keeps the form, its text and its token; only the notice changes.
+    /// Milestone 3 D1, D3: a stale edit opens the three-way view, only on the form whose save it
+    /// answers: busy editing this item, and the reply's ancestor at this form's token. A late reply
+    /// from an earlier token (a resolution has since moved it) is dropped, as one for another item
+    /// is.
     fn on_item_diverged(&mut self, divergence: &ItemDivergence) {
         if let Some(form) = self.item_form.as_mut()
             && form.busy() == Some(Busy::Editing)
             && form.item_id() == Some(divergence.head.id)
+            && form.token() == Some(divergence.ancestor.version)
         {
-            form.settle(Some(item_changed_elsewhere(divergence.head.version)));
+            form.open_divergence(divergence);
         }
     }
 
@@ -688,6 +694,11 @@ impl Tab for BacklogTab {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+        // MOD-13 milestone 3 D4: the divergence view takes the whole tab area, list pane included.
+        if let Some(view) = self.item_form.as_ref().and_then(ItemForm::resolving) {
+            divergence::render(frame, area, view, ctx.theme);
+            return;
+        }
         let [left, right] = panes(area);
         // MOD-13 D1: the open form takes the bottom of the list pane.
         let (list_area, form_area) = match self.form {
@@ -2017,8 +2028,12 @@ mod tests {
         assert!(
             matches!(
                 &request,
-                StoreRequest::EditItem { id, expected_version: 1, changes }
-                    if *id == first && *changes == htui_core::model::SpecChanges {
+                StoreRequest::EditItem {
+                    id,
+                    expected_version: 1,
+                    changes,
+                    reason: htui_core::model::EditReason::Edited,
+                } if *id == first && *changes == htui_core::model::SpecChanges {
                         title: Some(title.clone()),
                         ..htui_core::model::SpecChanges::default()
                     }
@@ -2179,15 +2194,91 @@ mod tests {
         assert!(errors(&bench.actions()).is_empty());
     }
 
-    /// D6: a stale edit keeps the form, its text and its token; a second save diverges again.
-    #[tokio::test]
-    async fn a_diverged_edit_keeps_the_form_its_text_and_its_token() {
-        let bench = Bench::new().await;
-        let store = MemStore::demo();
+    // ---- MOD-13 milestone 3: the divergence view -------------------------------------------
+
+    /// `e` on the first item, `Theirs` written through the store at v1, ` mine` typed and the
+    /// stale save answered: the view is open. The first item's id and key.
+    async fn in_the_view(
+        tab: &mut BacklogTab,
+        bench: &Bench,
+        store: &MemStore,
+    ) -> (ItemId, String) {
         let Selection::Item(first) = bench.first else {
             panic!("the first row is an item")
         };
+        open_with(tab, bench, store, KeyCode::Char('e')).await;
+        store
+            .update_item(
+                first,
+                1,
+                htui_core::model::ItemPatch {
+                    title: Some("Theirs".to_owned()),
+                    author_id: htui_core::fixtures::ids::USER,
+                    reason: "elsewhere".to_owned(),
+                    ..htui_core::model::ItemPatch::default()
+                },
+            )
+            .await
+            .expect("their edit");
+        type_into(tab, bench, " mine");
+        let request = saved(tab, bench);
+        let reply = served(store, &request).await;
+        assert!(matches!(reply, StoreReply::ItemDiverged(_)), "{reply:?}");
+        tab.on_reply(&reply, &mut bench.ctx());
+        assert!(view(tab).is_some(), "the view opened");
+        let key = store
+            .item(first)
+            .await
+            .expect("read")
+            .expect("the item")
+            .key;
+        (first, key)
+    }
+
+    /// The open divergence view, if any.
+    fn view(tab: &BacklogTab) -> Option<&divergence::Divergence> {
+        tab.item_form.as_ref().and_then(ItemForm::resolving)
+    }
+
+    /// Milestone 3 D3, D5: a stale edit opens the view; `Esc` returns to the form with its text
+    /// and its token, and the next save is the same stale one.
+    #[tokio::test]
+    async fn a_diverged_edit_opens_the_view_and_esc_keeps_the_text_and_token() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
         let mut tab = bench.tab();
+        in_the_view(&mut tab, &bench, &store).await;
+        assert!(errors(&bench.actions()).is_empty());
+
+        assert_eq!(press(&mut tab, &bench, KeyCode::Esc), Handled::Consumed);
+        assert!(view(&tab).is_none(), "the view closed");
+        assert!(tab.item_form.is_some(), "the form stays");
+        assert_eq!(notice(&tab), Some(divergence::still_behind(2)));
+
+        let again = saved(&mut tab, &bench);
+        assert!(
+            matches!(
+                &again,
+                StoreRequest::EditItem {
+                    expected_version: 1,
+                    changes,
+                    reason: htui_core::model::EditReason::Edited,
+                    ..
+                } if changes.title.as_deref().is_some_and(|title| title.ends_with(" mine"))
+            ),
+            "the token never moved and the text is kept: {again:?}"
+        );
+    }
+
+    /// D1: a divergence opens the view only on the form whose save it answers.
+    #[tokio::test]
+    async fn a_divergence_for_another_item_or_token_is_dropped() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        let Selection::Item(first) = bench.first else {
+            panic!("the first row is an item")
+        };
         open_with(&mut tab, &bench, &store, KeyCode::Char('e')).await;
         store
             .update_item(
@@ -2204,23 +2295,166 @@ mod tests {
             .expect("their edit");
         type_into(&mut tab, &bench, " mine");
         let request = saved(&mut tab, &bench);
-        let reply = served(&store, &request).await;
-        assert!(matches!(reply, StoreReply::ItemDiverged(_)), "{reply:?}");
-        tab.on_reply(&reply, &mut bench.ctx());
-        assert!(tab.item_form.is_some(), "the form stays");
-        let shown = notice(&tab).expect("a notice");
-        assert!(shown.contains("now v2"), "{shown}");
-        assert!(errors(&bench.actions()).is_empty());
+        let StoreReply::ItemDiverged(real) = served(&store, &request).await else {
+            panic!("a divergence")
+        };
+        let mut late = real.as_ref().clone();
+        late.ancestor.version = 7;
+        let mut other = real.as_ref().clone();
+        other.head.id = ItemId::new();
+        for stray in [late, other] {
+            tab.on_reply(&StoreReply::ItemDiverged(Box::new(stray)), &mut bench.ctx());
+            assert!(view(&tab).is_none());
+            assert_eq!(
+                tab.item_form.as_ref().and_then(ItemForm::busy),
+                Some(Busy::Editing)
+            );
+        }
+        tab.on_reply(&StoreReply::ItemDiverged(real), &mut bench.ctx());
+        assert!(view(&tab).is_some(), "the real one still opens it");
+    }
 
-        let again = saved(&mut tab, &bench);
+    /// D5, D6: `m` rebases the form on the head, and Ctrl+S lands a resolution there.
+    #[tokio::test]
+    async fn m_rebases_and_ctrl_s_sends_a_resolution_at_the_head() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        in_the_view(&mut tab, &bench, &store).await;
+        assert_eq!(
+            press(&mut tab, &bench, KeyCode::Char('m')),
+            Handled::Consumed
+        );
+        assert!(view(&tab).is_none());
+        assert_eq!(notice(&tab), Some(divergence::rebased_on(2)));
+        let request = saved(&mut tab, &bench);
         assert!(
             matches!(
-                &again,
-                StoreRequest::EditItem { expected_version: 1, changes, .. }
-                    if changes.title.as_deref().is_some_and(|title| title.ends_with(" mine"))
+                &request,
+                StoreRequest::EditItem {
+                    expected_version: 2,
+                    changes,
+                    reason: htui_core::model::EditReason::DivergenceResolution,
+                    ..
+                } if changes.title.as_deref().is_some_and(|title| title.ends_with(" mine"))
+                    && *changes == htui_core::model::SpecChanges {
+                        title: changes.title.clone(),
+                        ..htui_core::model::SpecChanges::default()
+                    }
             ),
-            "the token never moved and the text is kept: {again:?}"
+            "{request:?}"
         );
+        let reply = served(&store, &request).await;
+        assert!(
+            matches!(
+                &reply,
+                StoreReply::ItemWritten {
+                    outcome: ItemWrite::Edited { version: 3, .. },
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        tab.on_reply(&reply, &mut bench.ctx());
+        assert!(tab.item_form.is_none(), "the form closed");
+    }
+
+    /// D8: a resolution that is itself stale re-opens the view, its ancestor the rebased head.
+    #[tokio::test]
+    async fn a_second_divergence_after_a_rebase_reopens_the_view() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        let (first, _) = in_the_view(&mut tab, &bench, &store).await;
+        press(&mut tab, &bench, KeyCode::Char('m'));
+        store
+            .update_item(
+                first,
+                2,
+                htui_core::model::ItemPatch {
+                    priority: Some(42),
+                    author_id: htui_core::fixtures::ids::USER,
+                    reason: "elsewhere again".to_owned(),
+                    ..htui_core::model::ItemPatch::default()
+                },
+            )
+            .await
+            .expect("their second edit");
+        let request = saved(&mut tab, &bench);
+        let reply = served(&store, &request).await;
+        let StoreReply::ItemDiverged(divergence) = &reply else {
+            panic!("a second divergence: {reply:?}")
+        };
+        assert_eq!(divergence.ancestor.version, 2);
+        assert_eq!(
+            tab.item_form.as_ref().and_then(ItemForm::token),
+            Some(2),
+            "the reply answers this token"
+        );
+        tab.on_reply(&reply, &mut bench.ctx());
+        let open = view(&tab).expect("the view re-opened");
+        assert_eq!((open.ancestor_version(), open.head_version()), (2, 3));
+    }
+
+    /// D4: the view draws over the whole tab area, the list pane included.
+    #[tokio::test]
+    async fn the_view_takes_the_whole_tab_area() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        let (_, key) = in_the_view(&mut tab, &bench, &store).await;
+        let frame = drawn(&tab, &bench);
+        assert!(
+            frame.contains(&divergence::header(&key, 1, 2)),
+            "the header in\n{frame}"
+        );
+        let other = &bench.items[1].key;
+        assert_ne!(*other, key);
+        assert!(!frame.contains(other.as_str()), "no list row in\n{frame}");
+        let slug = &bench.projects[0].slug;
+        assert!(
+            !frame.contains(&format!("{slug} ")),
+            "no list header in\n{frame}"
+        );
+
+        press(&mut tab, &bench, KeyCode::Esc);
+        let frame = drawn(&tab, &bench);
+        assert!(
+            frame.contains(&format!(" Edit {key} (v1) ")),
+            "the form again in\n{frame}"
+        );
+        assert!(frame.contains(slug.as_str()), "the list again in\n{frame}");
+    }
+
+    #[tokio::test]
+    async fn a_scope_change_closes_the_open_view() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        in_the_view(&mut tab, &bench, &store).await;
+        tab.on_scope_change(&bench.scope);
+        assert!(tab.item_form.is_none());
+    }
+
+    /// A reveal would drop the half-resolved edit, as it would the form.
+    #[tokio::test]
+    async fn a_reveal_while_the_view_is_open_asks_to_close_it_first() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        in_the_view(&mut tab, &bench, &store).await;
+        let target = RevealTarget::Item {
+            id: htui_core::fixtures::ids::HTUI_ANA_2,
+            key: "ANA-2".to_owned(),
+        };
+        assert!(tab.reveal(&target, &mut bench.ctx()));
+        let actions = bench.actions();
+        assert!(
+            matches!(actions.as_slice(), [Action::Error(sentence)] if sentence == CLOSE_THE_FIELD_FIRST),
+            "{actions:?}"
+        );
+        assert!(view(&tab).is_some(), "the view stays");
+        assert_eq!(tab.selected, Some(bench.first));
     }
 
     /// §10.1, §10.2: a mint `Failed` that may follow a COMMIT keeps the text, hedges and re-reads

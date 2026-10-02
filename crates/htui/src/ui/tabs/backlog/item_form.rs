@@ -14,8 +14,9 @@
 //! - **An edit sends only what changed** (D5, A4): a widget whose text is still what it opened
 //!   with keeps the item's stored value unparsed, so a legacy tag never blocks a title fix; no
 //!   change at all is `NOTHING_TO_SAVE`.
-//! - **The token is the opened item's `version` and never moves** (D6): a stale save diverges, and
-//!   a second save diverges again.
+//! - **A stale save opens the three-way view** (milestone 3 D3–D5, [`super::divergence`]).
+//!   `m`/`t` rebase the form on the head, with a new token and reason `divergence_resolution`.
+//!   `Esc` returns to it unchanged.
 //! - **The new form's project picker re-reads that project's catalogue** (blueprint E7): kinds,
 //!   graphs and repos are per project. Keys are swallowed until the reply re-targets the form.
 //!
@@ -24,14 +25,16 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use htui_core::model::item_spec::{self, NOTHING_TO_SAVE};
 use htui_core::model::{
-    ItemId, ItemKindId, ItemSpec, ProjectId, ProjectRef, SpecChanges, SpecError, StepGraphId,
+    EditReason, ItemId, ItemKindId, ItemSpec, ProjectId, ProjectRef, SpecChanges, SpecError,
+    StepGraphId,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::item_writes::ItemFormContext;
+use super::divergence::{Divergence, ViewOutcome, rebased_on, still_behind};
+use crate::item_writes::{ItemDivergence, ItemFormContext};
 use crate::store_worker::StoreRequest;
 use crate::ui::tabs::backlog::filter;
 use crate::ui::tabs::backlog::list::clip;
@@ -56,8 +59,9 @@ const LABEL: usize = 9;
 /// Rows the paths area takes.
 const PATHS_HEIGHT: u16 = 3;
 
-/// Rows the notice takes at least: the D6 sentence wraps to two at the detail pane's width. A
-/// longer notice (a D11 hedge after a long store message) grows into the body's rows.
+/// Rows the notice takes at least: a notice (a refusal or `still_behind`) wraps to two at the
+/// detail pane's width. A longer notice (a D11 hedge after a long store message) grows into the
+/// body's rows.
 const NOTICE_HEIGHT: u16 = 2;
 
 /// Rows the body keeps when a long notice grows.
@@ -153,6 +157,12 @@ pub struct ItemForm {
     busy: Option<Busy>,
     /// The last refusal or reply, above the hint.
     notice: Option<String>,
+    /// The revision reason a save sends: `Edited`, or `DivergenceResolution` once rebased
+    /// (milestone 3 D6).
+    reason: EditReason,
+    /// The open three-way view (milestone 3 D3): while `Some`, every key and paste goes to it,
+    /// not the fields.
+    resolving: Option<Divergence>,
 }
 
 /// The widgets' texts right after open.
@@ -198,21 +208,50 @@ impl core::fmt::Debug for ItemForm {
             .field("notice_len", &self.notice.as_ref().map(String::len))
             .field("body_len", &self.body.len())
             .field("paths_len", &self.paths.len())
+            .field("reason", &self.reason)
+            .field(
+                "resolving",
+                &self.resolving.as_ref().map(Divergence::head_version),
+            )
             .finish_non_exhaustive()
     }
 }
 
 /// The text each widget opens with.
-struct Texts<'a> {
-    title: &'a str,
-    priority: &'a str,
-    tags: &'a str,
-    paths: &'a str,
-    body: &'a str,
+struct Texts {
+    title: String,
+    priority: String,
+    tags: String,
+    paths: String,
+    body: String,
+}
+
+impl Texts {
+    /// A new form's: priority `0`, the rest empty.
+    fn blank() -> Self {
+        Self {
+            title: String::new(),
+            priority: "0".to_owned(),
+            tags: String::new(),
+            paths: String::new(),
+            body: String::new(),
+        }
+    }
+
+    /// A stored spec's, through `tags_text`/`paths_text`.
+    fn of(spec: &ItemSpec) -> Self {
+        Self {
+            title: spec.title.clone(),
+            priority: spec.priority.to_string(),
+            tags: item_spec::tags_text(&spec.required_tags),
+            paths: item_spec::paths_text(&spec.touched_paths),
+            body: spec.body.clone(),
+        }
+    }
 }
 
 /// Ctrl+S, with or without `SHIFT` (the Requirements tab's rule).
-fn ctrl_s(key: &KeyEvent) -> bool {
+pub(super) fn ctrl_s(key: &KeyEvent) -> bool {
     key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL
         && matches!(key.code, KeyCode::Char('s' | 'S'))
 }
@@ -254,14 +293,8 @@ impl ItemForm {
         let kind = kind
             .filter(|hint| context.kinds.iter().any(|known| known.id == *hint))
             .or_else(|| context.kinds.first().map(|first| first.id));
-        let texts = Texts {
-            title: "",
-            priority: "0",
-            tags: "",
-            paths: "",
-            body: "",
-        };
-        Self::build(context, projects.to_vec(), kind, None, &texts)
+        let texts = Texts::blank();
+        Self::build(context, projects.to_vec(), kind, None, &texts, &texts)
     }
 
     /// `e`: every widget from the item's stored spec, through `tags_text`/`paths_text`, focus
@@ -269,50 +302,71 @@ impl ItemForm {
     #[must_use]
     pub fn open_edit(context: ItemFormContext) -> Option<Self> {
         let spec = ItemSpec::of(context.item.as_ref()?);
-        let (priority, tags, paths) = (
-            spec.priority.to_string(),
-            item_spec::tags_text(&spec.required_tags),
-            item_spec::paths_text(&spec.touched_paths),
-        );
-        let texts = Texts {
-            title: &spec.title,
-            priority: &priority,
-            tags: &tags,
-            paths: &paths,
-            body: &spec.body,
-        };
+        let texts = Texts::of(&spec);
         Some(Self::build(
             context,
             Vec::new(),
             Some(spec.kind_id),
             spec.step_graph_id,
             &texts,
+            &texts,
         ))
     }
 
-    /// The form over `texts`, with `opened` read back from the widgets it built.
+    /// D5: the form rebased on the head after `m`/`t`. `opened` holds the head's texts, so A4's
+    /// "unchanged keeps the stored value" now means "unchanged from the head"; the widgets hold
+    /// `resolved`'s texts; kind and graph are `resolved`'s; the token is `head.version`; the reason
+    /// `DivergenceResolution`; focus Title; the notice `rebased_on(head.version)`. `None` when
+    /// `context.item` is `None` (`open_edit`'s rule).
+    #[must_use]
+    pub fn open_resolution(context: ItemFormContext, resolved: &ItemSpec) -> Option<Self> {
+        let head = context.item.as_ref()?;
+        let (opened, version) = (Texts::of(&ItemSpec::of(head)), head.version);
+        let mut form = Self::build(
+            context,
+            Vec::new(),
+            Some(resolved.kind_id),
+            resolved.step_graph_id,
+            &opened,
+            &Texts::of(resolved),
+        );
+        form.reason = EditReason::DivergenceResolution;
+        form.notice = Some(rebased_on(version));
+        Some(form)
+    }
+
+    /// The form with its widgets over `shown`, and `opened` read back from throwaway widgets
+    /// over `opened`, so the `\r` normalisation applies to both sides alike.
     fn build(
         context: ItemFormContext,
         projects: Vec<ProjectRef>,
         kind: Option<ItemKindId>,
         graph: Option<StepGraphId>,
-        texts: &Texts<'_>,
+        opened: &Texts,
+        shown: &Texts,
     ) -> Self {
         let (title, priority, tags) = (
-            TextField::with_text(texts.title),
-            TextField::with_text(texts.priority),
-            TextField::with_text(texts.tags),
+            TextField::with_text(&shown.title),
+            TextField::with_text(&shown.priority),
+            TextField::with_text(&shown.tags),
         );
         let (paths, body) = (
-            TextArea::with_text(texts.paths),
-            TextArea::with_text(texts.body),
+            TextArea::with_text(&shown.paths),
+            TextArea::with_text(&shown.body),
         );
+        let line = |text: &str| {
+            TextField::with_text(text)
+                .text()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let area = |text: &str| TextArea::with_text(text).text().to_owned();
         let opened = Opened {
-            title: title.text().unwrap_or_default().to_owned(),
-            priority: priority.text().unwrap_or_default().to_owned(),
-            tags: tags.text().unwrap_or_default().to_owned(),
-            paths: paths.text().to_owned(),
-            body: body.text().to_owned(),
+            title: line(&opened.title),
+            priority: line(&opened.priority),
+            tags: line(&opened.tags),
+            paths: area(&opened.paths),
+            body: area(&opened.body),
         };
         Self {
             projects,
@@ -328,6 +382,8 @@ impl ItemForm {
             focus: Field::Title,
             busy: None,
             notice: None,
+            reason: EditReason::Edited,
+            resolving: None,
         }
     }
 
@@ -370,6 +426,46 @@ impl ItemForm {
         self.notice.as_deref()
     }
 
+    /// The compare-and-set token: `context.item`'s version; `None` on a new form.
+    #[must_use]
+    pub fn token(&self) -> Option<i32> {
+        self.context.item.as_ref().map(|item| item.version)
+    }
+
+    /// The reason the next save sends.
+    #[must_use]
+    pub const fn reason(&self) -> EditReason {
+        self.reason
+    }
+
+    /// The open three-way view, if any (the tab draws it over the whole area, D4).
+    #[must_use]
+    pub const fn resolving(&self) -> Option<&Divergence> {
+        self.resolving.as_ref()
+    }
+
+    /// D1, D3: a divergence the tab matched to this form's save opens the view. `mine` is
+    /// `typed_spec()`, which `busy` kept equal to what was sent. On an `Err` (unreachable: the
+    /// sent spec passed it), the form settles with that sentence instead. Busy clears, the notice
+    /// clears. A new form, which cannot be `Editing`, is left alone.
+    pub fn open_divergence(&mut self, divergence: &ItemDivergence) {
+        if self.context.item.is_none() {
+            return;
+        }
+        self.busy = None;
+        self.notice = None;
+        let mine = match self.typed_spec() {
+            Ok(mine) => mine,
+            Err(sentence) => {
+                self.notice = Some(sentence);
+                return;
+            }
+        };
+        if let Some(ancestor) = self.context.item.as_ref() {
+            self.resolving = Some(Divergence::open(ancestor, &self.context, mine, divergence));
+        }
+    }
+
     /// A reply ended the flight: busy cleared, the notice set (or cleared with `None`).
     pub fn settle(&mut self, notice: Option<String>) {
         self.busy = None;
@@ -378,10 +474,14 @@ impl ItemForm {
 
     /// Feeds one key.
     ///
-    /// In order: Ctrl+S saves (A6; swallowed while busy); any other chord passes; while busy
-    /// everything else is swallowed, `Esc` included (D8); `Tab`/`BackTab` cycle the focus; then
-    /// the focused field takes the key.
+    /// In order: an open divergence view takes every key, Ctrl+S included (milestone 3 D5);
+    /// Ctrl+S saves (A6; swallowed while busy); any other chord passes; while busy everything else
+    /// is swallowed, `Esc` included (D8); `Tab`/`BackTab` cycle the focus; then the focused field
+    /// takes the key.
     pub fn on_key(&mut self, key: KeyEvent) -> ItemFormOutcome {
+        if self.resolving.is_some() {
+            return self.on_view_key(key);
+        }
         if ctrl_s(&key) {
             return match self.busy {
                 Some(_) => ItemFormOutcome::Stay,
@@ -442,9 +542,9 @@ impl ItemForm {
         }
     }
 
-    /// Into the focused text widget; dropped on a picker or while busy.
+    /// Into the focused text widget; dropped on a picker, while busy or while the view is open.
     pub fn on_paste(&mut self, text: &str) {
-        if self.busy.is_some() {
+        if self.busy.is_some() || self.resolving.is_some() {
             return;
         }
         match self.focus {
@@ -455,6 +555,32 @@ impl ItemForm {
             Field::Paths => self.paths.on_paste(text),
             Field::Body => self.body.on_paste(text),
             Field::Project | Field::Kind | Field::Graph => {}
+        }
+    }
+
+    /// A key while the view is open (D5). `Esc` closes it and keeps the text, focus, token and
+    /// reason; `m`/`t` rebase the form on the head with the resolved spec.
+    fn on_view_key(&mut self, key: KeyEvent) -> ItemFormOutcome {
+        let Some(view) = self.resolving.as_mut() else {
+            return ItemFormOutcome::Stay;
+        };
+        match view.on_key(key) {
+            ViewOutcome::Stay => ItemFormOutcome::Stay,
+            ViewOutcome::Pass => ItemFormOutcome::Pass,
+            ViewOutcome::Back => {
+                self.notice = Some(still_behind(view.head_version()));
+                self.resolving = None;
+                ItemFormOutcome::Stay
+            }
+            ViewOutcome::Resolve(side) => {
+                if let Some(view) = self.resolving.take() {
+                    let (context, resolved) = view.resolve(side);
+                    if let Some(form) = Self::open_resolution(context, &resolved) {
+                        *self = form;
+                    }
+                }
+                ItemFormOutcome::Stay
+            }
         }
     }
 
@@ -565,12 +691,14 @@ impl ItemForm {
                 }
                 let changes =
                     item_spec::check_changes(&changes, &ctx).map_err(|err| err.to_string())?;
-                // D6: the version the form's text came from, never moved.
+                // The version the form's text came from: the opened item's, or the head's once
+                // rebased (milestone 3 D5), with the matching reason (D6).
                 Ok((
                     StoreRequest::EditItem {
                         id: item.id,
                         expected_version: item.version,
                         changes,
+                        reason: self.reason,
                     },
                     Busy::Editing,
                 ))
@@ -850,7 +978,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme)
 /// when the word alone is wider (a long path in a refusal). Wrapped here rather than by
 /// `Paragraph`'s `Wrap`, because the layout sizes the notice from this count before drawing it
 /// (the `settings::wrapped` precedent), and a count that disagreed would cut off the D11 hedge.
-fn notice_lines(sentence: &str, width: usize) -> Vec<String> {
+pub(super) fn notice_lines(sentence: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
     for line in wrapped(sentence, width) {
@@ -862,14 +990,6 @@ fn notice_lines(sentence: &str, width: usize) -> Vec<String> {
         );
     }
     lines
-}
-
-/// D6: a stale edit's notice. The text and the token are kept, so a second save diverges again.
-#[must_use]
-pub fn item_changed_elsewhere(head: i32) -> String {
-    format!(
-        "changed elsewhere \u{2014} now v{head}; your text is kept. Esc and `e` reopen on the head"
-    )
 }
 
 /// D11: a mint's `Failed` that may have followed a COMMIT whose answer was lost.
@@ -900,7 +1020,7 @@ mod tests {
     use crate::ui::layout::chrome;
     use crate::ui::tabs::backlog::panes;
     use htui_core::fixtures::ids;
-    use htui_core::model::{ItemPatch, NewStepGraph};
+    use htui_core::model::{ItemPatch, NewItemKind, NewStepGraph};
     use htui_core::store::{MemStore, WriteStore as _};
     use htui_store::Backend;
 
@@ -1092,6 +1212,7 @@ mod tests {
                     id,
                     expected_version: 1,
                     changes,
+                    reason: EditReason::Edited,
                 }) if *id == ids::HTUI_ANA_1
                     && *changes == SpecChanges { title: Some(title.clone()), ..SpecChanges::default() }
             ),
@@ -1463,5 +1584,345 @@ mod tests {
             .map(|row| row.trim_matches(|c| c == ' ' || c == '\u{2502}'))
             .collect::<String>();
         assert!(flowed.contains(&"a/".repeat(40)), "{}", rows.join("\n"));
+    }
+
+    // ---- MOD-13 milestone 3: the divergence view -------------------------------------------
+
+    /// Ctrl+S on `form`, its `Save` served over `store`: the divergence it answered.
+    async fn diverged(store: &MemStore, form: &mut ItemForm) -> ItemDivergence {
+        let outcome = form.on_key(ctrl('s'));
+        let ItemFormOutcome::Save(request) = outcome else {
+            panic!("a save: {outcome:?} ({:?})", form.notice())
+        };
+        let backend = Backend::memory(store.clone());
+        match item_writes::serve(&backend, &request).await {
+            Ok(StoreReply::ItemDiverged(divergence)) => *divergence,
+            other => panic!("the stale save answered {other:?}"),
+        }
+    }
+
+    /// The edit form on ANA-1, then `theirs` written through the store at v1.
+    async fn behind(store: &MemStore, theirs: ItemPatch) -> ItemForm {
+        let form = edit_form(store, ids::HTUI_ANA_1).await;
+        store
+            .update_item(ids::HTUI_ANA_1, 1, theirs)
+            .await
+            .expect("their edit");
+        form
+    }
+
+    /// `behind`, ` mine` typed into the title, the stale save answered: the view is open.
+    async fn resolving(store: &MemStore, theirs: ItemPatch) -> ItemForm {
+        let mut form = behind(store, theirs).await;
+        type_text(&mut form, " mine");
+        let divergence = diverged(store, &mut form).await;
+        form.open_divergence(&divergence);
+        assert!(form.resolving().is_some(), "the view opened");
+        assert_eq!(form.busy(), None);
+        form
+    }
+
+    fn retitled(title: &str) -> ItemPatch {
+        ItemPatch {
+            title: Some(title.to_owned()),
+            ..patch()
+        }
+    }
+
+    /// The `EditItem` a Ctrl+S sent, or a panic naming what it answered.
+    fn edit_sent(form: &mut ItemForm) -> (i32, SpecChanges, EditReason) {
+        match form.on_key(ctrl('s')) {
+            ItemFormOutcome::Save(StoreRequest::EditItem {
+                expected_version,
+                changes,
+                reason,
+                ..
+            }) => (expected_version, changes, reason),
+            other => panic!("an edit: {other:?} ({:?})", form.notice()),
+        }
+    }
+
+    #[tokio::test]
+    async fn open_resolution_opens_on_the_head_with_the_resolved_text() {
+        let store = MemStore::demo();
+        let mut form = behind(&store, retitled("Theirs")).await;
+        type_text(&mut form, " mine");
+        let divergence = diverged(&store, &mut form).await;
+        let head = divergence.head.clone();
+        let resolved = ItemSpec {
+            title: "Resolved".to_owned(),
+            ..ItemSpec::of(&head)
+        };
+        let rebased = ItemForm::open_resolution(divergence.context.clone(), &resolved)
+            .expect("a context with an item");
+        assert_eq!(rebased.token(), Some(head.version));
+        assert_eq!(rebased.reason(), EditReason::DivergenceResolution);
+        assert_eq!(rebased.notice(), Some(rebased_on(head.version).as_str()));
+        assert_eq!(rebased.opened.title, head.title, "unchanged means the head");
+        assert_eq!(rebased.title.text(), Some("Resolved"));
+        assert_eq!(rebased.focus(), Field::Title);
+        assert!(rebased.resolving().is_none());
+
+        let mut same = ItemForm::open_resolution(divergence.context.clone(), &ItemSpec::of(&head))
+            .expect("a context with an item");
+        assert!(matches!(same.on_key(ctrl('s')), ItemFormOutcome::Stay));
+        assert_eq!(same.notice(), Some(NOTHING_TO_SAVE));
+
+        let mut new = divergence.context;
+        new.item = None;
+        assert!(ItemForm::open_resolution(new, &resolved).is_none());
+    }
+
+    /// D2, D5: my title wins its conflict, their priority is kept, and the save is a resolution
+    /// at the head's version.
+    #[tokio::test]
+    async fn m_takes_mine_for_conflicts_and_theirs_elsewhere() {
+        let store = MemStore::demo();
+        let mut form = resolving(
+            &store,
+            ItemPatch {
+                title: Some("Theirs".to_owned()),
+                priority: Some(7),
+                ..patch()
+            },
+        )
+        .await;
+        assert_ne!(
+            form.opened.priority, "7",
+            "the ancestor's priority is not theirs"
+        );
+        let mine = format!("{} mine", form.opened.title);
+        assert!(matches!(
+            form.on_key(key(KeyCode::Char('m'))),
+            ItemFormOutcome::Stay
+        ));
+        assert!(form.resolving().is_none());
+        assert_eq!(form.priority.text(), Some("7"), "their priority is kept");
+        let (version, changes, reason) = edit_sent(&mut form);
+        assert_eq!(version, 2);
+        assert_eq!(reason, EditReason::DivergenceResolution);
+        assert_eq!(
+            changes,
+            SpecChanges {
+                title: Some(mine),
+                ..SpecChanges::default()
+            }
+        );
+    }
+
+    /// Blueprint §6 (MOD-13 review L4): a legacy head value never blocks the resolution save.
+    /// Their edit wrote a tag and a path the parsers refuse (through the store, past the
+    /// validator); `m` keeps them as the head stores them, and Ctrl+S sends my title only.
+    #[tokio::test]
+    async fn a_legacy_head_value_does_not_block_the_resolution_save() {
+        let store = MemStore::demo();
+        let mut form = resolving(
+            &store,
+            ItemPatch {
+                required_tags: Some(vec!["Rust".to_owned()]),
+                touched_paths: Some(vec!["nope:x".to_owned()]),
+                ..patch()
+            },
+        )
+        .await;
+        let mine = format!("{} mine", form.opened.title);
+        assert!(matches!(
+            form.on_key(key(KeyCode::Char('m'))),
+            ItemFormOutcome::Stay
+        ));
+        assert!(form.resolving().is_none());
+        assert_eq!(form.tags.text(), Some("Rust"), "the head's legacy tag");
+        let (version, changes, reason) = edit_sent(&mut form);
+        assert_eq!(version, 2);
+        assert_eq!(reason, EditReason::DivergenceResolution);
+        assert_eq!(
+            changes,
+            SpecChanges {
+                title: Some(mine),
+                ..SpecChanges::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn t_takes_theirs_for_conflicts_and_keeps_my_other_changes() {
+        let store = MemStore::demo();
+        let mut form = behind(&store, retitled("Theirs")).await;
+        type_text(&mut form, " mine");
+        form.priority = TextField::with_text("9");
+        let divergence = diverged(&store, &mut form).await;
+        form.open_divergence(&divergence);
+        form.on_key(key(KeyCode::Char('t')));
+        assert_eq!(form.title.text(), Some("Theirs"));
+        let (version, changes, reason) = edit_sent(&mut form);
+        assert_eq!((version, reason), (2, EditReason::DivergenceResolution));
+        assert_eq!(
+            changes,
+            SpecChanges {
+                priority: Some(9),
+                ..SpecChanges::default()
+            }
+        );
+    }
+
+    /// D8: `t` when every change of mine conflicted resolves to the head itself.
+    #[tokio::test]
+    async fn t_with_every_change_conflicting_has_nothing_to_save() {
+        let store = MemStore::demo();
+        let mut form = resolving(&store, retitled("Theirs")).await;
+        form.on_key(key(KeyCode::Char('t')));
+        assert!(matches!(form.on_key(ctrl('s')), ItemFormOutcome::Stay));
+        assert_eq!(form.notice(), Some(NOTHING_TO_SAVE));
+        assert_eq!(form.busy(), None);
+    }
+
+    /// E5: the head already holds my edit, so `m` resolves to it and there is nothing to save.
+    #[tokio::test]
+    async fn my_edit_already_in_the_head_has_nothing_to_save() {
+        let store = MemStore::demo();
+        let opened = edit_form(&store, ids::HTUI_ANA_1).await.opened.title;
+        let mut form = resolving(&store, retitled(&format!("{opened} mine"))).await;
+        let view = form.resolving().expect("the view");
+        assert!(view.rows().is_empty(), "{view:?}");
+        form.on_key(key(KeyCode::Char('m')));
+        assert!(matches!(form.on_key(ctrl('s')), ItemFormOutcome::Stay));
+        assert_eq!(form.notice(), Some(NOTHING_TO_SAVE));
+    }
+
+    /// D5: `Esc` closes the view and keeps everything; the next save is the same stale one.
+    #[tokio::test]
+    async fn esc_in_the_view_returns_to_the_form_unchanged() {
+        let store = MemStore::demo();
+        let mut form = resolving(&store, retitled("Theirs")).await;
+        assert!(matches!(
+            form.on_key(key(KeyCode::Esc)),
+            ItemFormOutcome::Stay
+        ));
+        assert!(form.resolving().is_none());
+        assert_eq!(form.token(), Some(1));
+        assert_eq!(form.reason(), EditReason::Edited);
+        assert!(
+            form.title
+                .text()
+                .is_some_and(|text| text.ends_with(" mine")),
+            "{:?}",
+            form.title.text()
+        );
+        assert_eq!(form.notice(), Some(still_behind(2).as_str()));
+
+        let (version, changes, reason) = edit_sent(&mut form);
+        assert_eq!((version, reason), (1, EditReason::Edited));
+        assert!(changes.title.is_some());
+        form.settle(None);
+        assert!(matches!(
+            form.on_key(key(KeyCode::Esc)),
+            ItemFormOutcome::Cancel
+        ));
+    }
+
+    /// D7: the rebased form opens on the reply's catalogue, so a kind and a graph made after the
+    /// form opened are labelled, not `?` or `override`.
+    #[tokio::test]
+    async fn the_rebased_pickers_label_a_kind_and_graph_only_the_new_catalogue_has() {
+        let store = MemStore::demo();
+        let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
+        let graph = store
+            .create_step_graph(NewStepGraph {
+                id: StepGraphId::new(),
+                project_id: ids::PROJECT_HTUI,
+                name: "after the form".to_owned(),
+                description: String::new(),
+                is_override: false,
+            })
+            .await
+            .expect("a graph");
+        let kind = store
+            .create_item_kind(NewItemKind {
+                id: ItemKindId::new(),
+                project_id: ids::PROJECT_HTUI,
+                prefix: "NEW".to_owned(),
+                name: "Newcomer".to_owned(),
+                description: String::new(),
+                default_graph_id: graph.id,
+                position: 99,
+            })
+            .await
+            .expect("a kind");
+        store
+            .update_item(
+                ids::HTUI_ANA_1,
+                1,
+                ItemPatch {
+                    kind_id: Some(kind.id),
+                    step_graph_id: Some(Some(graph.id)),
+                    ..patch()
+                },
+            )
+            .await
+            .expect("their move");
+        type_text(&mut form, " mine");
+        let divergence = diverged(&store, &mut form).await;
+        form.open_divergence(&divergence);
+        form.on_key(key(KeyCode::Char('t')));
+        assert!(form.resolving().is_none());
+        assert_eq!(form.picker_label(Field::Kind), "NEW Newcomer");
+        assert_eq!(form.picker_label(Field::Graph), graph.name);
+    }
+
+    #[tokio::test]
+    async fn the_view_swallows_letters_and_ctrl_s_but_passes_ctrl_c() {
+        let store = MemStore::demo();
+        let mut form = resolving(&store, retitled("Theirs")).await;
+        let title = form.title.text().map(str::to_owned);
+        for event in [
+            key(KeyCode::Char('x')),
+            key(KeyCode::Tab),
+            key(KeyCode::Enter),
+            ctrl('s'),
+        ] {
+            assert!(
+                matches!(form.on_key(event), ItemFormOutcome::Stay),
+                "{event:?}"
+            );
+        }
+        assert!(matches!(form.on_key(ctrl('c')), ItemFormOutcome::Pass));
+        assert!(form.resolving().is_some(), "still open");
+        assert_eq!(form.busy(), None, "Ctrl+S sent nothing");
+        assert_eq!(form.title.text().map(str::to_owned), title);
+        assert_eq!(form.focus(), Field::Title);
+    }
+
+    #[tokio::test]
+    async fn a_paste_while_the_view_is_open_is_dropped() {
+        let store = MemStore::demo();
+        let mut form = resolving(&store, retitled("Theirs")).await;
+        let title = form.title.text().map(str::to_owned);
+        form.on_paste("PASTED");
+        assert_eq!(form.title.text().map(str::to_owned), title);
+    }
+
+    #[tokio::test]
+    async fn debug_prints_no_body_while_resolving() {
+        let store = MemStore::demo();
+        let mut form = behind(
+            &store,
+            ItemPatch {
+                body: Some("SECRET-THEIRS".to_owned()),
+                // Through the store, around the validator: the demo project has no repo.
+                touched_paths: Some(vec!["secret/dir/**".to_owned()]),
+                ..patch()
+            },
+        )
+        .await;
+        form.body = TextArea::with_text("SECRET-BODY");
+        let divergence = diverged(&store, &mut form).await;
+        form.open_divergence(&divergence);
+        assert!(form.resolving().is_some());
+        for printed in [format!("{form:?}"), format!("{form:#?}")] {
+            for secret in ["SECRET-BODY", "SECRET-THEIRS", "secret/dir"] {
+                assert!(!printed.contains(secret), "{secret} in {printed}");
+            }
+            assert!(printed.contains("resolving"), "{printed}");
+        }
     }
 }
