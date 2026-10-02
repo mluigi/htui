@@ -93,13 +93,14 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
          MOD-7 milestone 1's 0005_box_identity.sql, MOD-38's 0006_requirements.sql, MOD-9 \
          milestone 2's 0007_skill_attachments.sql, MOD-9 milestone 5's 0008_trim_record_v3.sql, \
          MOD-23's 0009_agent_box_user_off.sql, MOD-33's 0010_prompt_digest_undigested.sql, \
-         MOD-42's 0011_permission_relay.sql and MOD-26's 0012_persona.sql, in ordinal order"
+         MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-26 milestone 2's \
+         0013_persona_phase_index.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -505,6 +506,33 @@ const MOD26_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
          and content into run.graph_snapshot (phases[].persona, personas[]); ON DELETE RESTRICT.",
     ),
 ];
+
+/// MOD-26 milestone 2 D15 (M1 review N5): `0013_persona_phase_index.sql` indexes
+/// `step_graph_phase.persona_id`, the lookup `delete_persona`'s guard and the `ON DELETE RESTRICT`
+/// check both make. `pg_indexes` prints the definition Postgres normalised.
+#[tokio::test]
+async fn the_persona_phase_index_exists() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let definition: Option<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' \
+         AND indexname = 'idx_step_graph_phase_persona'",
+    )
+    .fetch_optional(&db.pool)
+    .await
+    .expect("read pg_indexes");
+    assert_eq!(
+        definition.as_deref(),
+        Some(
+            "CREATE INDEX idx_step_graph_phase_persona ON public.step_graph_phase USING btree \
+             (persona_id)"
+        ),
+        "0013 indexes step_graph_phase.persona_id"
+    );
+
+    db.drop_db().await;
+}
 
 /// The one `COMMENT ON TABLE` of `0003_orchestration.sql` (ANA-2 §9), verbatim. Kept beside
 /// [`ANA_COLUMN_COMMENTS`] rather than in it: `col_description` cannot read it, because a table
@@ -986,8 +1014,9 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(12),
-        "twelve embedded migrations, none applied (through MOD-26's 0012_persona.sql)"
+        MigrationState::Pending(13),
+        "thirteen embedded migrations, none applied (through MOD-26 milestone 2's \
+         0013_persona_phase_index.sql)"
     );
 
     db.drop_db().await;
@@ -1085,12 +1114,12 @@ async fn a_headless_connect_never_migrates() {
     let Some(db) = common::bare_db().await else {
         return;
     };
-    assert_eq!(db.migrations_at_connect, MigrationState::Pending(12));
+    assert_eq!(db.migrations_at_connect, MigrationState::Pending(13));
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
         .await
         .expect_err("a pending schema is refused");
-    assert_eq!(refused, HeadlessError::MigrationsPending(12));
+    assert_eq!(refused, HeadlessError::MigrationsPending(13));
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
         0,
@@ -1109,7 +1138,7 @@ async fn a_headless_connect_never_migrates() {
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
         .await
         .expect_err("no migrations table is every migration pending");
-    assert_eq!(refused, HeadlessError::MigrationsPending(12));
+    assert_eq!(refused, HeadlessError::MigrationsPending(13));
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
         .await
@@ -1259,9 +1288,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        12,
-        "the later applies migrate nothing: the twelve embedded migrations (through MOD-26's \
-         0012_persona.sql) are applied once"
+        13,
+        "the later applies migrate nothing: the thirteen embedded migrations (through MOD-26 \
+         milestone 2's 0013_persona_phase_index.sql) are applied once"
     );
 
     db.drop_db().await;
