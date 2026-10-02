@@ -832,13 +832,61 @@ pub enum PersonaFileError {
     /// A D3 refusal of the parsed persona.
     #[error("{0}")]
     Refused(String),
+    /// MOD-26 M2 OQ-7's exception, import only: a non-empty `tools` whose every entry is an MCP
+    /// tool would import as an empty `allow`, which keeps every built-in tool.
+    #[error(
+        "every `tools` entry is an MCP tool; htui's `allow` keeps built-in tools only, so this \
+         file would keep all of them \u{2014} write `disallowed-tools` or `deny-kinds` instead"
+    )]
+    OnlyMcpTools,
 }
 
-/// Reads one persona file (plan D8): the seeds now, M2's import later.
+/// A persona file as the import reads it (MOD-26 M2 D19, OQ-7): the file, which has passed the
+/// save rules, and the `tools` entries dropped because they name MCP tools, in file order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Imported {
+    /// The file, `allow` without its `mcp__` entries.
+    pub file: PersonaFile,
+    /// The dropped entries, as written.
+    pub dropped: Vec<String>,
+}
+
+/// Reads one persona file (plan D8): the seeds; the import reads through [`parse_import`].
 ///
 /// # Errors
-/// Every [`PersonaFileError`] variant; nothing is half-read.
+/// Every [`PersonaFileError`] variant but [`PersonaFileError::OnlyMcpTools`]; nothing is
+/// half-read.
 pub fn parse_file(text: &str) -> Result<PersonaFile, PersonaFileError> {
+    read_file(text).and_then(checked)
+}
+
+/// Reads one file for the Settings › Personas import (MOD-26 M2 D19): [`parse_file`]'s reader,
+/// then every `tools` entry starting with [`MCP_PREFIX`] is moved to `dropped` (`--tools` never
+/// filtered MCP tools, so the file meant nothing htui can enforce through it), then a `tools`
+/// that was non-empty and is now empty is [`PersonaFileError::OnlyMcpTools`], then the save
+/// rules. The seed path keeps [`parse_file`], which still refuses `mcp__` in `tools`.
+///
+/// # Errors
+/// Every [`PersonaFileError`] variant.
+pub fn parse_import(text: &str) -> Result<Imported, PersonaFileError> {
+    let mut file = read_file(text)?;
+    let written = std::mem::take(&mut file.tools.allow);
+    let had_tools = !written.is_empty();
+    let (dropped, kept): (Vec<String>, Vec<String>) = written
+        .into_iter()
+        .partition(|name| name.starts_with(MCP_PREFIX));
+    if had_tools && kept.is_empty() {
+        return Err(PersonaFileError::OnlyMcpTools);
+    }
+    file.tools.allow = kept;
+    Ok(Imported {
+        file: checked(file)?,
+        dropped,
+    })
+}
+
+/// The reader half of [`parse_file`]: every D8 key rule, no D3 save rule.
+fn read_file(text: &str) -> Result<PersonaFile, PersonaFileError> {
     let split = frontmatter::split(text)?;
     if let Some(issue) = split.issues.first() {
         return Err(PersonaFileError::Unreadable {
@@ -923,13 +971,17 @@ pub fn parse_file(text: &str) -> Result<PersonaFile, PersonaFileError> {
         .body
         .strip_prefix('\n')
         .map_or_else(|| split.body.clone(), str::to_owned);
-    let file = PersonaFile {
+    Ok(PersonaFile {
         name,
         description,
         body,
         tools,
         permission,
-    };
+    })
+}
+
+/// The save-rule half of [`parse_file`]: [`persona_refusal`] as [`PersonaFileError::Refused`].
+fn checked(file: PersonaFile) -> Result<PersonaFile, PersonaFileError> {
     persona_refusal(
         &file.name,
         &file.description,
@@ -951,9 +1003,11 @@ fn is_block_scalar(text: &str, line: usize) -> bool {
         .is_some_and(|(_, rest)| rest.trim_start_matches([' ', '\t']).starts_with(['|', '>']))
 }
 
-/// A one-line list value (plan D8): comma-separated, each item trimmed, empty items dropped, so
+/// A one-line list value (plan D8), the grammar of a persona file **and** of the Settings ›
+/// Personas form (MOD-26 M2 B-3): comma-separated, each item trimmed, empty items dropped, so
 /// `tools:` alone is the empty list.
-fn list_of(value: &str) -> Vec<String> {
+#[must_use]
+pub fn list_of(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
@@ -2033,5 +2087,163 @@ mod tests {
         );
         assert!(!text.ends_with('\n'));
         assert_eq!(text.split('\n').count(), 3);
+    }
+
+    /// `.claude/agents/code-architect.md`'s frontmatter, verbatim (copied; no test reads a real
+    /// agent file), then a one-line body.
+    const CODE_ARCHITECT: &str = "---\n\
+        name: code-architect\n\
+        description: Designs feature architectures by analyzing existing codebase patterns and \
+        conventions, then providing implementation blueprints with concrete files, interfaces, \
+        data flow, and build order.\n\
+        tools: Read, Grep, Glob, Bash, mcp__gortex__capabilities, mcp__gortex__explore, \
+        mcp__gortex__search, mcp__gortex__read, mcp__gortex__relations, mcp__gortex__trace, \
+        mcp__gortex__analyze, mcp__gortex__recall, mcp__gortex__workspace\n\
+        ---\n\nYou design.\n";
+
+    /// `.claude/agents/rust-reviewer.md`'s frontmatter, verbatim, then a one-line body.
+    const RUST_REVIEWER: &str = "---\n\
+        name: rust-reviewer\n\
+        description: Expert Rust code reviewer specializing in ownership, lifetimes, error \
+        handling, unsafe usage, and idiomatic patterns. Use for all Rust code changes. MUST BE \
+        USED for Rust projects.\n\
+        tools: Read, Grep, Glob, Bash, mcp__gortex__capabilities, mcp__gortex__explore, \
+        mcp__gortex__search, mcp__gortex__read, mcp__gortex__relations, mcp__gortex__trace, \
+        mcp__gortex__analyze, mcp__gortex__recall, mcp__gortex__workspace\n\
+        ---\n\nYou review.\n";
+
+    /// `~/.claude/agents/gortex-impact.md`'s frontmatter, verbatim, then a one-line body.
+    const GORTEX_IMPACT: &str = "---\n\
+        name: gortex-impact\n\
+        description: \"Assess a change's blast radius, contracts, guards, and tests.\"\n\
+        tools: mcp__gortex__capabilities, mcp__gortex__explore, mcp__gortex__search, \
+        mcp__gortex__read, mcp__gortex__relations, mcp__gortex__trace, mcp__gortex__analyze, \
+        mcp__gortex__change, mcp__gortex__recall, mcp__gortex__workspace\n\
+        ---\n\nYou assess.\n";
+
+    /// `~/.claude/agents/gortex-search.md`'s frontmatter, verbatim, then a one-line body.
+    const GORTEX_SEARCH: &str = "---\n\
+        name: gortex-search\n\
+        description: \"Locate code, trace call paths, or map architecture in a fresh context.\"\n\
+        tools: mcp__gortex__capabilities, mcp__gortex__explore, mcp__gortex__search, \
+        mcp__gortex__read, mcp__gortex__relations, mcp__gortex__trace, mcp__gortex__analyze, \
+        mcp__gortex__recall, mcp__gortex__workspace\n\
+        ---\n\nYou search.\n";
+
+    /// The nine `mcp__gortex__*` entries both repo agent files carry, in file order.
+    const REPO_AGENT_MCP_TOOLS: [&str; 9] = [
+        "mcp__gortex__capabilities",
+        "mcp__gortex__explore",
+        "mcp__gortex__search",
+        "mcp__gortex__read",
+        "mcp__gortex__relations",
+        "mcp__gortex__trace",
+        "mcp__gortex__analyze",
+        "mcp__gortex__recall",
+        "mcp__gortex__workspace",
+    ];
+
+    fn file_refusal(file: &PersonaFile) -> Option<String> {
+        persona_refusal(
+            &file.name,
+            &file.description,
+            &file.body,
+            &file.tools,
+            &file.permission,
+        )
+    }
+
+    /// MOD-26 M2 D19, OQ-7: the import drops `mcp__` entries from `tools` and names them.
+    #[test]
+    fn parse_import_drops_mcp_tools_and_names_them() {
+        let imported = parse_import(CODE_ARCHITECT).expect("the repo's architect imports");
+        assert_eq!(imported.file.name, "code-architect");
+        assert_eq!(
+            imported.file.description,
+            "Designs feature architectures by analyzing existing codebase patterns and \
+             conventions, then providing implementation blueprints with concrete files, \
+             interfaces, data flow, and build order."
+        );
+        assert_eq!(imported.file.tools.allow, ["Read", "Grep", "Glob", "Bash"]);
+        assert_eq!(imported.dropped, REPO_AGENT_MCP_TOOLS);
+        assert_eq!(imported.file.body, "You design.\n");
+    }
+
+    #[test]
+    fn parse_import_accepts_both_repo_agent_files() {
+        let architect = parse_import(CODE_ARCHITECT).expect("the repo's architect imports");
+        let reviewer = parse_import(RUST_REVIEWER).expect("the repo's reviewer imports");
+        assert_eq!(reviewer.file.name, "rust-reviewer");
+        assert_eq!(
+            reviewer.file.description,
+            "Expert Rust code reviewer specializing in ownership, lifetimes, error handling, \
+             unsafe usage, and idiomatic patterns. Use for all Rust code changes. MUST BE USED \
+             for Rust projects."
+        );
+        assert_eq!(reviewer.file.tools.allow, ["Read", "Grep", "Glob", "Bash"]);
+        assert_eq!(reviewer.dropped, REPO_AGENT_MCP_TOOLS);
+        for imported in [&architect, &reviewer] {
+            assert_eq!(file_refusal(&imported.file), None, "{}", imported.file.name);
+        }
+    }
+
+    #[test]
+    fn parse_import_refuses_an_all_mcp_tools_file() {
+        for text in [GORTEX_IMPACT, GORTEX_SEARCH] {
+            assert_eq!(
+                parse_import(text),
+                Err(PersonaFileError::OnlyMcpTools),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            PersonaFileError::OnlyMcpTools.to_string(),
+            "every `tools` entry is an MCP tool; htui's `allow` keeps built-in tools only, so \
+             this file would keep all of them \u{2014} write `disallowed-tools` or `deny-kinds` \
+             instead"
+        );
+    }
+
+    /// The seed path is unchanged: `parse_file` still refuses an `mcp__` entry in `tools`.
+    #[test]
+    fn parse_file_still_refuses_every_mcp_tools_file() {
+        for text in [CODE_ARCHITECT, RUST_REVIEWER, GORTEX_IMPACT, GORTEX_SEARCH] {
+            assert_eq!(
+                parse_file(text),
+                Err(PersonaFileError::Refused(allow_names_an_mcp_tool(
+                    "mcp__gortex__capabilities"
+                ))),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_import_keeps_parse_files_other_refusals() {
+        let import = |front: &str| parse_import(&format!("---\n{front}---\n\nbody\n"));
+        assert_eq!(
+            import("name: reviewer\nmodel: opus\n"),
+            Err(PersonaFileError::Model)
+        );
+        assert_eq!(
+            parse_import("name: reviewer\n---\nbody\n"),
+            Err(PersonaFileError::Fence(FrontmatterError::NoFence))
+        );
+        let empty = import("name: reviewer\ntools:\n").expect("an empty `tools` imports");
+        assert!(empty.file.tools.allow.is_empty());
+        assert!(empty.dropped.is_empty());
+        assert_eq!(
+            import("name: reviewer\ntools: Read, Bad Name\n"),
+            Err(PersonaFileError::Refused(not_a_tool_name(
+                "allow", "Bad Name"
+            )))
+        );
+    }
+
+    /// MOD-26 M2 B-3: one list grammar for the file and the Settings › Personas form.
+    #[test]
+    fn list_of_is_the_forms_list_grammar() {
+        assert_eq!(list_of(" a, ,b ,"), ["a", "b"]);
+        assert!(list_of("").is_empty());
     }
 }
