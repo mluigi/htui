@@ -115,6 +115,7 @@ pub mod fake;
 pub mod install;
 pub mod launch;
 pub mod permission;
+pub mod persona;
 pub mod probe;
 pub mod record;
 pub mod registry;

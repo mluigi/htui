@@ -46,13 +46,15 @@ use chrono::Utc;
 use htui_agent::acp::AcpDriver;
 use htui_agent::acp::Handshake;
 #[cfg(unix)]
-use htui_agent::acp::{AcpIo, SessionOptions, Stamp, open_session};
+use htui_agent::acp::{AcpIo, SessionOptions, Stamp, TOOL_KIND_DENIED, open_session};
 use htui_agent::driver::DriverFuture;
 #[cfg(unix)]
 use htui_agent::driver::{AgentDriver, AgentSession};
 use htui_agent::driver::{PermissionPolicy, SessionSpec, ToolExposure};
 #[cfg(unix)]
 use htui_agent::error::DriverError;
+#[cfg(unix)]
+use htui_agent::event::{DriverEvent, EditProposalEvent, ErrorEvent, ToolKind};
 use htui_agent::launch::AcpSettings;
 use htui_agent::launch::ResolvedLaunch;
 #[cfg(unix)]
@@ -68,6 +70,8 @@ use htui_core::model::{Agent as AgentRow, AgentBox, AgentId, Billing, BoxId, Ste
 use serde_json::{Value, json};
 #[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
+use tokio::sync::oneshot;
 
 /// The buffer each half of the in-process pipe gets, as `acp_conformance.rs` sizes it.
 #[cfg(unix)]
@@ -459,6 +463,275 @@ async fn a_refused_session_new_answers_with_the_agents_own_message() {
     // The connection future owns the guard on this path and kills through it after it has
     // answered, so the exit is as complete as the one above.
     assert_reaped(pid, "the session's child").await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-26 D11 (B-12): a persona's denied kinds at `htui`'s own `fs/*` handlers
+// ---------------------------------------------------------------------------------------------
+
+/// The session id [`fs_agent`] mints.
+#[cfg(unix)]
+const FS_SESSION: &str = "fs-session";
+
+/// The JSON-RPC id of [`fs_agent`]'s one request to the client.
+#[cfg(unix)]
+const FS_REQUEST_ID: i64 = 100;
+
+/// How long a case waits for an event or an answer before calling the driver stuck. Never spent:
+/// the transport is an in-process duplex.
+#[cfg(unix)]
+const EVENT_WINDOW: Duration = Duration::from_secs(10);
+
+/// An agent that, on `session/prompt`, sends the client `request` (an `fs/*` call) as id
+/// [`FS_REQUEST_ID`] with its `sessionId` filled in, forwards the client's response line to
+/// `answered`, then ends the turn `end_turn`.
+///
+/// Raw newline-delimited JSON-RPC in [`refuse_session_new`]'s style: answers `initialize` and
+/// `session/new`, ignores every notification.
+#[cfg(unix)]
+async fn fs_agent(
+    stream: tokio::io::DuplexStream,
+    mut request: Value,
+    answered: oneshot::Sender<Value>,
+) {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut lines = BufReader::new(reader).lines();
+    let mut answered = Some(answered);
+    let mut prompt: Option<Value> = None;
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let id = message.get("id").cloned();
+        let reply = match message.get("method").and_then(Value::as_str) {
+            // A response: the client's answer to the `fs/*` request.
+            None if id == Some(json!(FS_REQUEST_ID)) => {
+                if let Some(answered) = answered.take() {
+                    let _ = answered.send(message);
+                }
+                prompt.take().map(|prompt| {
+                    json!({ "jsonrpc": "2.0", "id": prompt, "result": { "stopReason": "end_turn" } })
+                })
+            }
+            Some("initialize") => {
+                Some(json!({ "jsonrpc": "2.0", "id": id, "result": { "protocolVersion": 1 } }))
+            }
+            Some("session/new") => {
+                Some(json!({ "jsonrpc": "2.0", "id": id, "result": { "sessionId": FS_SESSION } }))
+            }
+            Some("session/prompt") => {
+                prompt = id;
+                request["jsonrpc"] = json!("2.0");
+                request["id"] = json!(FS_REQUEST_ID);
+                request["params"]["sessionId"] = json!(FS_SESSION);
+                Some(request.clone())
+            }
+            _ => None,
+        };
+        let Some(reply) = reply else {
+            continue;
+        };
+        let mut text = serde_json::to_string(&reply).expect("the reply serialises");
+        text.push('\n');
+        if writer.write_all(text.as_bytes()).await.is_err() || writer.flush().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// What one [`fs_agent`] turn left behind: the session's events up to its `done`, and the
+/// client's JSON-RPC response to the `fs/*` request.
+#[cfg(unix)]
+struct FsTurn {
+    events: Vec<DriverEvent>,
+    response: Value,
+}
+
+/// Opens a session over [`fs_agent`] in `cwd` with `deny_kinds` on the spec (the default
+/// settings advertise fs read and write), pulls one turn, then ends the session and the agent.
+#[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fakes run under no TUI panic hook"
+)]
+async fn fs_turn(cwd: &Path, deny_kinds: Vec<ToolKind>, request: Value) -> FsTurn {
+    let (client_end, agent_end) = tokio::io::duplex(DUPLEX_BYTES);
+    let (reader, writer) = tokio::io::split(client_end);
+    let (answered, response) = oneshot::channel();
+    let agent = tokio::spawn(fs_agent(agent_end, request, answered));
+    let io = AcpIo {
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        child: None,
+    };
+    let mut spec = spec(cwd.to_path_buf());
+    spec.tools.deny_kinds = deny_kinds;
+
+    let mut session = open_session(io, spec, "hi".to_owned(), options(PATIENT_HANDSHAKE))
+        .await
+        .expect("the fs agent opens a session");
+    let mut events = Vec::new();
+    loop {
+        let next = tokio::time::timeout(EVENT_WINDOW, session.next_event())
+            .await
+            .expect("the turn ends within the window")
+            .expect("the transport stays healthy");
+        let Some(envelope) = next else {
+            break;
+        };
+        let done = matches!(envelope.event, DriverEvent::Done(_));
+        events.push(envelope.event);
+        if done {
+            break;
+        }
+    }
+    let response = tokio::time::timeout(EVENT_WINDOW, response)
+        .await
+        .expect("the client answered within the window")
+        .expect("the agent forwarded the client's answer");
+
+    drop(session);
+    agent.abort();
+    let _ = agent.await;
+    FsTurn { events, response }
+}
+
+/// An `fs/*` request with a path and, for a write, its content.
+#[cfg(unix)]
+fn fs_request(method: &str, path: &Path, content: Option<&str>) -> Value {
+    let mut params = json!({ "path": path });
+    if let Some(content) = content {
+        params["content"] = json!(content);
+    }
+    json!({ "method": method, "params": params })
+}
+
+#[cfg(unix)]
+fn denials(events: &[DriverEvent]) -> Vec<&ErrorEvent> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            DriverEvent::Error(error) if error.code == TOOL_KIND_DENIED => Some(error),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn proposals(events: &[DriverEvent]) -> Vec<&EditProposalEvent> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            DriverEvent::EditProposal(proposal) => Some(proposal),
+            _ => None,
+        })
+        .collect()
+}
+
+/// D11, B-12: under a denied `edit`, `fs/write_text_file` is refused before `guard`, the read of
+/// the old text and the `EditProposal`: the file keeps its bytes, the agent gets `invalid_params`
+/// and the step records `tool_kind_denied`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_denied_write_is_refused_before_any_edit_proposal() {
+    let tmp = tempfile::tempdir().expect("temp cwd");
+    let file = tmp.path().join("notes.txt");
+    std::fs::write(&file, "before\n").expect("the fixture file");
+
+    let turn = fs_turn(
+        tmp.path(),
+        vec![ToolKind::Edit],
+        fs_request("fs/write_text_file", &file, Some("after\n")),
+    )
+    .await;
+
+    assert_eq!(
+        turn.response["error"]["code"], -32602,
+        "invalid_params: {}",
+        turn.response
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("the file is still there"),
+        "before\n",
+        "nothing touched the file"
+    );
+    let denials = denials(&turn.events);
+    assert_eq!(denials.len(), 1, "{:?}", turn.events);
+    assert!(
+        denials[0].message.contains("edit") && denials[0].message.contains("fs/write_text_file"),
+        "{}",
+        denials[0].message
+    );
+    assert!(
+        proposals(&turn.events).is_empty(),
+        "no proposal for an edit that never happens: {:?}",
+        turn.events
+    );
+}
+
+/// D11, B-12: under a denied `read`, `fs/read_text_file` is refused whatever the path.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_denied_read_is_refused() {
+    let tmp = tempfile::tempdir().expect("temp cwd");
+    let file = tmp.path().join("notes.txt");
+    std::fs::write(&file, "secret plans\n").expect("the fixture file");
+
+    let turn = fs_turn(
+        tmp.path(),
+        vec![ToolKind::Read],
+        fs_request("fs/read_text_file", &file, None),
+    )
+    .await;
+
+    assert_eq!(
+        turn.response["error"]["code"], -32602,
+        "invalid_params: {}",
+        turn.response
+    );
+    assert!(
+        !turn.response.to_string().contains("secret plans"),
+        "the content never reaches the agent: {}",
+        turn.response
+    );
+    let denials = denials(&turn.events);
+    assert_eq!(denials.len(), 1, "{:?}", turn.events);
+    assert!(
+        denials[0].message.contains("read") && denials[0].message.contains("fs/read_text_file"),
+        "{}",
+        denials[0].message
+    );
+}
+
+/// D11: a kind the persona does not deny is untouched — a write under a denied `read` lands and
+/// is proposed accepted, as before MOD-26.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_undenied_write_still_lands() {
+    let tmp = tempfile::tempdir().expect("temp cwd");
+    let file = tmp.path().join("notes.txt");
+    std::fs::write(&file, "before\n").expect("the fixture file");
+
+    let turn = fs_turn(
+        tmp.path(),
+        vec![ToolKind::Read],
+        fs_request("fs/write_text_file", &file, Some("after\n")),
+    )
+    .await;
+
+    assert!(
+        turn.response.get("error").is_none(),
+        "the write is answered: {}",
+        turn.response
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("the file is there"),
+        "after\n"
+    );
+    assert!(denials(&turn.events).is_empty(), "{:?}", turn.events);
+    let proposals = proposals(&turn.events);
+    assert_eq!(proposals.len(), 1, "{:?}", turn.events);
+    assert_eq!(proposals[0].accepted, Some(true));
 }
 
 // ---------------------------------------------------------------------------------------------

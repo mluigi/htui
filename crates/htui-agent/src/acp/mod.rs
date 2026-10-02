@@ -54,7 +54,7 @@ use crate::driver::{
 use crate::error::{DriverError, Result};
 use crate::event::{
     DoneEvent, DriverEnvelope, DriverEvent, EditProposalEvent, ErrorEvent, OtherEvent,
-    PermissionOptionKind, StopReason, TerminalReason, ToolResultEvent, ToolResultStatus,
+    PermissionOptionKind, StopReason, TerminalReason, ToolKind, ToolResultEvent, ToolResultStatus,
 };
 // The three pieces this transport shares with every other one, published under the paths its own
 // callers have always used: the capture clock and the two wire strings live in `crate::event`, the
@@ -74,6 +74,10 @@ pub const MODEL_UNAVAILABLE: &str = "model_unavailable";
 
 /// `error.code` of a refused `fs/*` path (plan D22, [`fs::PathOutside`]).
 pub const PATH_OUTSIDE_SESSION: &str = "path_outside_session";
+
+/// `error.code` of an `fs/*` request the step's persona denies (MOD-26 D11):
+/// `fs/read_text_file` under a denied `read`, `fs/write_text_file` under a denied `edit`.
+pub const TOOL_KIND_DENIED: &str = "tool_kind_denied";
 
 /// Depth of the session task's event channel (plan D18).
 ///
@@ -1069,6 +1073,7 @@ async fn session_main(
     child: &Mutex<ChildGuard>,
 ) {
     let mut state = TaskState::new(options.stamp, spec.retain_raw);
+    let deny_kinds = spec.tools.deny_kinds.clone();
     let filesystem = match fs::SessionFs::new(&spec.cwd, &spec.extra_dirs).await {
         Ok(filesystem) => filesystem,
         Err(err) => {
@@ -1262,7 +1267,7 @@ async fn session_main(
                 break;
             }
             Step::Inbound(Some(request)) => {
-                if !on_inbound(&mut state, &events, &filesystem, request).await {
+                if !on_inbound(&mut state, &events, &filesystem, &deny_kinds, request).await {
                     break;
                 }
             }
@@ -1454,8 +1459,11 @@ async fn on_inbound(
     state: &mut TaskState,
     events: &mpsc::Sender<DriverEnvelope>,
     filesystem: &fs::SessionFs,
+    deny_kinds: &[ToolKind],
     request: Inbound,
 ) -> bool {
+    // MOD-26 T2: red - threaded, not yet read; the guarded arms land in the green commit.
+    let _ = deny_kinds;
     match request {
         Inbound::Permission(request, responder) => {
             let id = client::request_id(responder.id());
@@ -1547,6 +1555,29 @@ async fn on_inbound(
             }
         }
     }
+}
+
+/// Records a request the step's persona denies (MOD-26 D11), `refused`'s shape.
+#[expect(
+    dead_code,
+    reason = "MOD-26 T2: red - the guarded arms that call it land in the green commit"
+)]
+async fn denied(
+    state: &mut TaskState,
+    events: &mpsc::Sender<DriverEnvelope>,
+    kind: ToolKind,
+    method: &str,
+    path: &Path,
+) -> bool {
+    tracing::warn!(%kind, method, "an fs request the step's persona denies");
+    let event = DriverEvent::Error(ErrorEvent {
+        code: TOOL_KIND_DENIED.to_owned(),
+        message: format!(
+            "the step's persona denies `{kind}`: {method} of `{}` refused",
+            path.display()
+        ),
+    });
+    emit(state, events, event, None).await
 }
 
 /// Records a refused path.

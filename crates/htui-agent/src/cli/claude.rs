@@ -473,6 +473,16 @@ pub fn tool_kind(name: &str) -> ToolKind {
     }
 }
 
+/// MOD-26 D11: [`tool_kind`] inverted — the tool names one ACP kind covers in this dialect, for
+/// `--disallowedTools`. `delete`, `move`, `think`, `switch_mode` and `other` name no tool. A
+/// name a given CLI release lacks is harmless to deny (probed on 2.1.286, plan R-1).
+#[must_use]
+pub const fn tool_names(kind: ToolKind) -> &'static [&'static str] {
+    // MOD-26 T2: red - no kind inverts yet.
+    let _ = kind;
+    &[]
+}
+
 /// `terminal_reason` (and `subtype` behind it) → the turn's [`StopReason`].
 ///
 /// Every row here was measured rather than guessed (F-2, F-8, F-10): `completed`,
@@ -705,4 +715,39 @@ fn saturating_micros(amount: f64) -> i64 {
         return 0;
     }
     micros as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tool_kind, tool_names};
+    use crate::event::ToolKind;
+
+    /// D11: the inversion is exact — every name a kind denies maps back to that kind, every kind
+    /// with a tool in this dialect names at least one, and the five with none name nothing.
+    #[test]
+    fn every_inverted_name_maps_back_to_its_kind() {
+        for kind in ToolKind::ALL {
+            for name in tool_names(*kind) {
+                assert_eq!(tool_kind(name), *kind, "{name} under {kind}");
+            }
+        }
+        for kind in [
+            ToolKind::Read,
+            ToolKind::Edit,
+            ToolKind::Execute,
+            ToolKind::Search,
+            ToolKind::Fetch,
+        ] {
+            assert!(!tool_names(kind).is_empty(), "{kind} has tools to deny");
+        }
+        for kind in [
+            ToolKind::Delete,
+            ToolKind::Move,
+            ToolKind::Think,
+            ToolKind::SwitchMode,
+            ToolKind::Other,
+        ] {
+            assert!(tool_names(kind).is_empty(), "{kind} names no tool");
+        }
+    }
 }

@@ -33,6 +33,7 @@ use htui_agent::driver::{AgentSession, PermissionAnswer, PermissionRequestId};
 use htui_agent::driver::{AgentSessionRef, PermissionPolicy, SessionSpec, ToolExposure};
 #[cfg(unix)]
 use htui_agent::error::DriverError;
+use htui_agent::event::ToolKind;
 #[cfg(unix)]
 use htui_agent::event::{DriverEvent, Stamp, StopReason, TerminalReason, ToolResultStatus};
 use htui_agent::launch::CliSettings;
@@ -212,6 +213,125 @@ fn usd_is_six_places_of_integer_arithmetic() {
     assert_eq!(usd(0), "0.000000");
     assert_eq!(usd(1), "0.000001", "the smallest cap the flag can express");
     assert_eq!(usd(1_000_000), "1.000000");
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-26 D11: a persona's narrowing on the command line
+// ---------------------------------------------------------------------------------------------
+
+fn tool_names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|name| (*name).to_owned()).collect()
+}
+
+/// An exposure naming `allow`, `deny` and `deny_kinds`, `command_run` off.
+fn exposure(allow: &[&str], deny: &[&str], deny_kinds: &[ToolKind]) -> ToolExposure {
+    ToolExposure {
+        allow: tool_names(allow),
+        deny: tool_names(deny),
+        command_run: false,
+        deny_kinds: deny_kinds.to_vec(),
+    }
+}
+
+/// [`argv`] over a bare spec carrying `tools`, with `extra_args`.
+fn narrowed_argv(tools: ToolExposure, extra_args: &[&str]) -> Vec<String> {
+    let mut spec = spec(PathBuf::from("/scratch"));
+    spec.tools = tools;
+    argv(&[], &cli_settings("", extra_args), &spec, "minted-id")
+}
+
+/// D11's position: both flags come right after the last pair and before the operator's
+/// `extra_args`, each as one `=`-joined argument, and `deny_kinds` is inverted onto the deny list
+/// after the names it already carries.
+#[test]
+fn persona_flags_follow_the_pairs_and_precede_extra_args() {
+    let args = narrowed_argv(
+        exposure(&["Read", "Grep"], &["mcp__x__y"], &[ToolKind::Execute]),
+        &["--foo"],
+    );
+    assert_eq!(
+        args,
+        vec![
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--session-id",
+            "minted-id",
+            "--tools=Read,Grep",
+            "--disallowedTools=mcp__x__y,Bash,BashOutput,KillShell",
+            "--foo",
+        ],
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--session-id", "minted-id"]),
+        "the last pair is intact: {args:?}"
+    );
+}
+
+/// I-1: `--allowedTools` auto-approves (probed), so no exposure ever produces it.
+#[test]
+fn allowed_tools_is_never_emitted() {
+    let grid = [
+        ToolExposure::default(),
+        exposure(&["Read"], &[], &[]),
+        exposure(&[], &["Bash"], &[]),
+        exposure(&[], &[], &[ToolKind::Edit, ToolKind::Delete]),
+        exposure(&["Read", "Grep"], &["mcp__x__y"], ToolKind::ALL),
+    ];
+    for tools in grid {
+        let args = narrowed_argv(tools.clone(), &[]);
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("--allowedTools")),
+            "{tools:?} → {args:?}"
+        );
+    }
+}
+
+/// D11: `--tools=""` would disable every tool, so an empty allow-list passes no `--tools` at all.
+#[test]
+fn tools_is_absent_when_allow_is_empty() {
+    let args = narrowed_argv(exposure(&[], &["Bash"], &[ToolKind::Read]), &[]);
+    assert!(
+        !args.iter().any(|arg| arg.starts_with("--tools")),
+        "{args:?}"
+    );
+    assert!(
+        args.iter().any(|arg| arg.starts_with("--disallowedTools=")),
+        "the deny list still travels: {args:?}"
+    );
+}
+
+/// D11: `deny_kinds: [edit]` is the four claude names that edit a file.
+#[test]
+fn deny_kinds_edit_yields_the_four_claude_names() {
+    let args = narrowed_argv(exposure(&[], &[], &[ToolKind::Edit]), &[]);
+    assert_eq!(
+        args.last().map(String::as_str),
+        Some("--disallowedTools=Edit,Write,MultiEdit,NotebookEdit"),
+        "{args:?}"
+    );
+}
+
+/// I-7: a step with no persona gets exactly today's command line.
+#[test]
+fn a_default_exposure_adds_no_flag() {
+    let args = narrowed_argv(ToolExposure::default(), &[]);
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.starts_with("--tools") || arg.starts_with("--disallowedTools")),
+        "{args:?}"
+    );
+    assert_eq!(
+        args.last().map(String::as_str),
+        Some("minted-id"),
+        "{args:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
