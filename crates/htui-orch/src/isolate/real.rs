@@ -149,7 +149,7 @@ pub fn already_reset(rows: &[(RepoId, &Path, &str, &str)]) -> String {
 }
 
 /// D138: `err` in its own variant with [`already_reset`] appended, when `done` names any row; an
-/// `Io` failure has no text of its own to extend and is carried as `Git`.
+/// `Io` failure keeps its kind (`git::is_lock_error` reads it), with the text appended.
 fn part_way(err: IsolateError, done: &[(RepoId, PathBuf, String, String)]) -> IsolateError {
     if done.is_empty() {
         return err;
@@ -162,7 +162,9 @@ fn part_way(err: IsolateError, done: &[(RepoId, PathBuf, String, String)]) -> Is
     match err {
         IsolateError::Refused(text) => IsolateError::Refused(format!("{text}; {named}")),
         IsolateError::Git(text) => IsolateError::Git(format!("{text}; {named}")),
-        IsolateError::Io(io) => IsolateError::Git(format!("{io}; {named}")),
+        IsolateError::Io(io) => {
+            IsolateError::Io(std::io::Error::new(io.kind(), format!("{io}; {named}")))
+        }
     }
 }
 
@@ -1762,6 +1764,7 @@ mod tests {
 
     use super::{
         GixIsolator, IsolatorConfig, RepoCheckout, already_reset, label_conflict, local_moved,
+        part_way,
     };
 
     /// A repository at `<dir>/<name>` with one commit, and the pieces a config map wants.
@@ -4969,6 +4972,48 @@ mod tests {
             ]),
             format!("already reset: {a} /src/core from h1 to b1, {b} /src/docs from h2 to b2")
         );
+    }
+
+    /// R-32b: an `Io` failure part way through keeps its variant and kind, so
+    /// `git::is_lock_error` still reads a held lock as one, with the rows appended to its text.
+    #[test]
+    fn part_way_keeps_an_io_error_as_io() {
+        use std::io::{Error, ErrorKind};
+
+        use crate::isolate::IsolateError;
+
+        let repo = RepoId::new();
+        let done = [(
+            repo,
+            PathBuf::from("/src/core"),
+            "h1".to_owned(),
+            "b1".to_owned(),
+        )];
+        let err = part_way(
+            IsolateError::Io(Error::new(ErrorKind::AlreadyExists, "held")),
+            &done,
+        );
+        let IsolateError::Io(io) = &err else {
+            panic!("an `Io` failure stays `Io`: {err:?}");
+        };
+        assert_eq!(io.kind(), ErrorKind::AlreadyExists);
+        let named = already_reset(&[(repo, Path::new("/src/core"), "h1", "b1")]);
+        assert!(
+            io.to_string().ends_with(&named),
+            "the rows are appended: {io}"
+        );
+        assert!(crate::isolate::git::is_lock_error(&err));
+
+        // Nothing reset yet: the error comes back untouched.
+        let err = part_way(
+            IsolateError::Io(Error::new(ErrorKind::AlreadyExists, "held")),
+            &[],
+        );
+        let IsolateError::Io(io) = &err else {
+            panic!("an `Io` failure stays `Io`: {err:?}");
+        };
+        assert_eq!(io.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(io.to_string(), "held");
     }
 
     /// Plan D138 (review L1): `core` is labelled and reset, then `docs`'s `reset --hard` fails on

@@ -130,28 +130,41 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   `.claude/plans/mod-37-run-state.plan.md` and `.claude/plans/mod-37-run-state.blueprint.md`. The review left one LOW unfixed: the Chat
   tab's `followed` stays set after a failed bind until the next `Promoted` overwrites it, which is
   harmless.
+  **Phase 2 landed (`1d1118f3`..`7df69d33`, 2026-10-02):** store and engine correctness. R-5, R-6,
+  R-29, R-30 and the R-31 remainder are closed; R-32 is half closed (D138's `part_way`) and its
+  D131 half is re-deferred. Plan and blueprint are `.claude/plans/mod-37-store-engine.plan.md` and
+  `.claude/plans/mod-37-store-engine.blueprint.md`. Maintainer-accepted side effect of R-31:
+  `Unblock` on a followed review-loop escalation now resumes it, re-runs the loop and, with nothing
+  changed, escalates again (it used to be refused); a test pins it. rust-reviewer approved; its
+  three LOWs and one NIT were applied. Two NITs were left: `unblock_enabled`'s bare `bool` and a
+  `Vec<String>` copy in the `phase_agent` insert.
   - ~~**R-3**~~: closed by MOD-37 phase 1. `RunStepSummary` carries `gate_note` from all three
     builders (Mem, Pg, cache mirror), and the Runs pane shows a parked step's reason on a third
     line. `run.failure` stays NULL on a park, as before.
-  - **R-5**: the gate park is three compare-and-sets (step, run, item), not one transaction on
-    Postgres; milestone 5's D96 closed its crash half. Nothing writes `gate_outcome = skipped`, so a
-    `never`/`on_failure` pass leaves the gate NULL and the step list renders `—` (engine blueprint
-    F-K, H-9, H-10; drive plan, "What this milestone touches").
-  - **R-6**: nothing writes `phase_agent` for an override graph copy: `WriteStore` has no
-    `phase_agent` writer at all. The `is_override` half is closed, since MOD-9 milestone 3's
-    (`docs/decisions/mod/mod-9.md`) `override_graph` (`crates/htui-orch/src/graph.rs`) writes it on every copy. The plans
-    named MOD-15's phase editor as its owner, but MOD-15 closed on 2026-09-17, so it lands here
-    (engine blueprint F-J; drive plan, "What this milestone touches").
-  - **R-29**: Postgres stores `queued_at` in microseconds and `MemStore` in nanoseconds, so a
-    sub-microsecond tie can name a different `Overlaps.with` (lease blueprint §21.2).
-  - **R-30**: `recover::classify` counts a step as finished only when every `run_scope` repo has an
-    `after_hash`. A step that changed only some repos and crashed after capture is retried rather
-    than adopted. The failure is safe, a retry and never a wrong merge (lease blueprint §21.2).
-  - **R-31, the rejected-crash remainder**: a crash right after `AnswerGate(Rejected)` stays parked
-    on a failed step with no resume path. The rest of R-31 was closed by milestone 6's D180 (lease
-    blueprint §22.3; drive plan D180).
-  - **R-32**: D131's not-reset park loses its labelled detail, and D138's `part_way` turns an `Io`
-    error into a `Git` error. Both are diagnostics only (lease blueprint §22.3).
+  - ~~**R-5**~~: closed by MOD-37 phase 2. The gate parks through one fenced `park_step` (step, run
+    and item in one transaction, `promote_step`'s shape), and a `never`/`on_failure` pass goes
+    through `pass_step`, which writes `gate_outcome = 'skipped'` as ANA-2 §4.2's table says. D96's
+    recovery stays for rows written before.
+  - ~~**R-6**~~: closed by MOD-37 phase 2. `WriteStore::create_phase_agents` writes a phase's agent
+    rows, `override_graph` copies each phase's agents onto its clone, and `MemStore` now holds
+    `phase_agent` rows instead of always answering empty.
+  - ~~**R-29**~~: closed by MOD-37 phase 2. `MemStore` truncates a graph run's `queued_at` to the
+    microsecond, as Postgres does, so a tie inside one microsecond breaks on `id` in both stores.
+    `open_chat` still stores a chat run's `queued_at`/`started_at` untruncated (review NIT, outside
+    R-29's graph-run scope).
+  - ~~**R-30**~~: closed by MOD-37 phase 2. `classify` adopts a step whose capture changed only some
+    repos: one `after_hash` on a scope repo proves the one-transaction capture landed. Candidates
+    keep the every-repo rule (a failing candidate's trees are captured too), and a step that changed
+    nothing and crashed before `finish_step` is still retried, safely.
+  - ~~**R-31, the rejected-crash remainder**~~: closed by MOD-37 phase 2. `status::resumable`
+    (D196's one predicate, widened) treats a parked run over a `failed` + `rejected` step as
+    resumable, so `Unblock` unparks it and runs the rejection's tail; the worker-box hand-back does
+    the same. Side effect accepted by the maintainer: see the phase 2 note.
+  - **R-32** (D138 half closed by MOD-37 phase 2: `part_way` keeps an `Io` error as `Io`, kind
+    included): D131's not-reset park loses its detail. Re-deferred: `labelled` is always empty on a
+    refusal, and the lost part is the reason text, which only `never_reset` holds in memory;
+    keeping it needs a new column or a change to `gate_note`, which the engine and four tests match
+    exactly. Diagnostics only (lease blueprint §22.3).
   - **R-37**: `git::reconcile_parent` opens the checkout up to six times per diff row, and `merge_of`
     walks the primary's first-parent history back to the step's base. This costs speed only. The
     fix is to open the repository once and pass `&gix::Repository` to private `*_in` variants (lease

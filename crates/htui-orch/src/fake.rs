@@ -7,11 +7,11 @@
 //! orchestrator is what the Runs tab's `insta` snapshots run against, "so snapshots stay
 //! byte-stable with no sleeps" (`docs/ANA-2.md:1764-1768`).
 //!
-//! Note for whoever reads `FakeGraphSource`: `MemStore::phase_agents` returns `Vec::new()`
-//! unconditionally (`crates/htui-core/src/store/mem.rs:470-473`) and the demo fixture seeds no
-//! `agent_box` row (`crates/htui-core/src/store/mem.rs:109`), so rungs 1 and 3 of ANA-2 §4.1's
-//! candidate chain are both empty on `MemStore::demo()` — the fake carries an explicit per-phase candidates map as
-//! its documented stand-in (plan D20, blueprint A-1).
+//! Note for whoever reads `FakeGraphSource`: the demo fixture seeds no `phase_agent` row, so
+//! `MemStore::phase_agents` answers empty until something calls `create_phase_agents` (MOD-37
+//! R-6), and it seeds no `agent_box` row either. Rungs 1 and 3 of ANA-2 §4.1's candidate chain
+//! are both empty on `MemStore::demo()`, so the fake carries an explicit per-phase candidates map
+//! as its documented stand-in (plan D20, blueprint A-1).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -919,9 +919,9 @@ impl GraphSource for MemStore {
 
 /// A [`GraphSource`] over `MemStore` with a per-phase candidates map (plan D20).
 ///
-/// **Rungs 1 and 3 of ANA-2 §4.1's candidate chain are both structurally empty here**, which is why
-/// this type exists. Rung 1 is `phase_agent`, and `MemStore` holds no such table — `phase_agents`
-/// returns `Vec::new()` unconditionally (`crates/htui-core/src/store/mem.rs:470-473`). Rung 3 is
+/// **Rungs 1 and 3 of ANA-2 §4.1's candidate chain are both empty on the demo fixture**, which is
+/// why this type exists. Rung 1 is `phase_agent`: `MemStore` holds the table since MOD-37 R-6, but
+/// the fixture seeds no row, and this source answers rung 1 from its own map regardless. Rung 3 is
 /// "the single enabled agent on the box" (plan D62), read from `agent_box`, and the demo fixture
 /// seeds no `agent_box` row at all, so a resolution finds no enabled agent on the box.
 /// Rung 2 — `project.settings.default_agent_id` — stays real in `graph.rs` and is empty on the
@@ -2413,7 +2413,7 @@ mod tests {
                 .await
                 .expect("MemStore never fails a read")
                 .is_empty(),
-            "`MemStore` holds no `phase_agent` table (blueprint H-3)"
+            "the fixture seeds no `phase_agent` row (blueprint H-3)"
         );
         assert!(
             GraphSource::prompt_template(&store, ids::PROJECT_HTUI, "prd", None)

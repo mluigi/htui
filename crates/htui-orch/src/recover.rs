@@ -227,9 +227,14 @@ pub enum Adjudication {
 
 /// D90/D92/D93 over one `running` step. Seven arguments, which is clippy's limit.
 ///
-/// Finished when the output document exists **and** either `finished_at` is set or every repo of
-/// `run_scope` has a `run_step_commit` row with an `after_hash` (vacuous for an empty scope, the
-/// demo fixture's). Otherwise resettable when every tree row is `worktree | copy`, or
+/// Finished when the output document exists **and** either `finished_at` is set or the capture
+/// landed. For a plain step or a judge the capture landed when every repo of `run_scope` has a
+/// `run_step_commit` row and at least one of them has an `after_hash`: stage 2 gives every scope
+/// repo a row, and stage 5's capture batch lands in one transaction, so one `after_hash` proves
+/// the batch. Every row without one stays unfinished, since a capture that never landed and one
+/// that changed nothing look alike and retrying is safe. A candidate keeps the every-repo rule:
+/// every scope repo needs an `after_hash`. Both are vacuous for an empty scope, the demo
+/// fixture's. Otherwise resettable when every tree row is `worktree | copy`, or
 /// `shared_serialized | local` with `dirty = false`. The rows passed are the step's own. A judge
 /// is classified as well; the engine ignores the answer (D95).
 #[must_use]
@@ -243,11 +248,15 @@ pub fn classify(
     command_runs: &[CommandRun],
 ) -> (StepKind, Adjudication) {
     let kind = StepKind::of(step, phase);
-    let captured = run_scope.iter().all(|repo| {
-        commits
-            .iter()
-            .any(|row| row.repo_id == *repo && row.after_hash.is_some())
-    });
+    let row = |repo: &RepoId| commits.iter().find(|row| row.repo_id == *repo);
+    let changed = |repo: &RepoId| row(repo).is_some_and(|row| row.after_hash.is_some());
+    let captured = match kind {
+        StepKind::Candidate => run_scope.iter().all(changed),
+        StepKind::Plain | StepKind::Judge => {
+            run_scope.iter().all(|repo| row(repo).is_some())
+                && (run_scope.is_empty() || run_scope.iter().any(changed))
+        }
+    };
     if output_present && (step.finished_at.is_some() || captured) {
         let (verify, verify_exit_code) = verify_of(step, command_runs);
         return (
@@ -990,15 +999,16 @@ mod tests {
     }
 
     #[test]
-    fn classify_not_finished_with_one_repo_missing() {
+    fn classify_finished_when_the_capture_changed_some_repos() {
         let step = running();
         let (first, second) = (RepoId::new(), RepoId::new());
         let trees = [
             tree(&step, first, Isolation::Worktree, false),
             tree(&step, second, Isolation::Worktree, false),
         ];
-        // The second repo's row exists with no `after_hash` (capture died between them) …
-        let half = [
+        // The capture batch lands in one transaction, so one `after_hash` proves it landed; the
+        // second repo's `None` is a repo the step did not change.
+        let some = [
             commit(&step, first, Some("after-1")),
             commit(&step, second, None),
         ];
@@ -1007,12 +1017,31 @@ mod tests {
             &implement(),
             &[first, second],
             &trees,
-            &half,
+            &some,
             true,
             &[],
         );
-        assert_eq!(answer.1, Adjudication::Reset);
-        // … or has no row at all.
+        assert_eq!(
+            answer,
+            (
+                StepKind::Plain,
+                Adjudication::Finished {
+                    verify: None,
+                    verify_exit_code: None,
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn classify_not_finished_with_one_repo_missing() {
+        let step = running();
+        let (first, second) = (RepoId::new(), RepoId::new());
+        let trees = [
+            tree(&step, first, Isolation::Worktree, false),
+            tree(&step, second, Isolation::Worktree, false),
+        ];
+        // The second repo has no row at all …
         let one = [commit(&step, first, Some("after-1"))];
         let answer = classify(
             &step,
@@ -1035,6 +1064,19 @@ mod tests {
             &[first, second],
             &trees,
             &stranger,
+            true,
+            &[],
+        );
+        assert_eq!(answer.1, Adjudication::Reset);
+        // … and every row without an `after_hash` is a capture that never landed or one that
+        // changed nothing; the two look alike, and retrying is safe.
+        let none = [commit(&step, first, None), commit(&step, second, None)];
+        let answer = classify(
+            &step,
+            &implement(),
+            &[first, second],
+            &trees,
+            &none,
             true,
             &[],
         );
@@ -1098,6 +1140,59 @@ mod tests {
         let first = step(2, 1, 0, StepStatus::Running);
         assert_eq!(StepKind::of(&first, &fanned), StepKind::Candidate);
         assert_eq!(StepKind::of(&first, &implement()), StepKind::Plain);
+    }
+
+    #[test]
+    fn classify_a_candidate_keeps_the_every_repo_rule() {
+        let mut fanned = implement();
+        fanned.fan_out = 3;
+        let candidate = step(2, 1, 1, StepStatus::Running);
+        let (first, second) = (RepoId::new(), RepoId::new());
+        let trees = [
+            tree(&candidate, first, Isolation::Worktree, false),
+            tree(&candidate, second, Isolation::Worktree, false),
+        ];
+        let some = [
+            commit(&candidate, first, Some("after-1")),
+            commit(&candidate, second, None),
+        ];
+        let answer = classify(
+            &candidate,
+            &fanned,
+            &[first, second],
+            &trees,
+            &some,
+            true,
+            &[],
+        );
+        assert_eq!(
+            answer,
+            (StepKind::Candidate, Adjudication::Reset),
+            "a candidate is finished only when every scope repo has an `after_hash`"
+        );
+        let every = [
+            commit(&candidate, first, Some("after-1")),
+            commit(&candidate, second, Some("after-2")),
+        ];
+        let answer = classify(
+            &candidate,
+            &fanned,
+            &[first, second],
+            &trees,
+            &every,
+            true,
+            &[],
+        );
+        assert_eq!(
+            answer,
+            (
+                StepKind::Candidate,
+                Adjudication::Finished {
+                    verify: None,
+                    verify_exit_code: None,
+                },
+            )
+        );
     }
 
     #[test]

@@ -1644,8 +1644,8 @@ impl PgStore {
     /// A phase's candidate agents in `position` order (`R-ORCH-1`, `R-AGT-8`).
     ///
     /// `(phase_id, position)` is the table's primary key, so the order is total without a
-    /// tie-break. `MemStore` answers empty here whatever the phase: it holds no `phase_agent`
-    /// table, and the snapshot builder falls back to `project.settings.default_agent_id`.
+    /// tie-break. `MemStore` answers the same rows since MOD-37 R-6 gave it the table, and the
+    /// snapshot builder falls back to `project.settings.default_agent_id` for a phase with none.
     ///
     /// # Errors
     ///

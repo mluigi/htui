@@ -29,20 +29,20 @@ use htui_core::model::{
     NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo,
     NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
     NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
-    PermissionStatus, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope,
-    PromptTemplate, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
-    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run,
-    RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId,
-    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
-    StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch,
+    PromptScope, PromptTemplate, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
+    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding,
+    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
+    UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
-    CasOutcome, DeleteReach, DeleteTarget, MemStore, ReadStore, Result, SettingRung, StepFence,
-    StoredSetting, UpdateOutcome, WriteStore,
+    CasOutcome, DeleteReach, DeleteTarget, MemStore, ParkOutcome, ReadStore, Result, SettingRung,
+    StepFence, StoredSetting, UpdateOutcome, WriteStore,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -690,6 +690,13 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn create_phase_agents(&self, phase: PhaseId, agents: &[PhaseAgent]) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.create_phase_agents(phase, agents).await,
+            Self::Online(pg) => pg.create_phase_agents(phase, agents).await,
+        }
+    }
+
     async fn update_phase(
         &self,
         id: PhaseId,
@@ -1038,6 +1045,26 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.promote_step(step, at).await,
             Self::Online(pg) => pg.promote_step(step, at).await,
+        }
+    }
+
+    async fn pass_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        note: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.pass_step(fence, step, note, at).await,
+            Self::Online(pg) => pg.pass_step(fence, step, note, at).await,
+        }
+    }
+
+    async fn park_step(&self, fence: StepFence, step: StepId) -> Result<ParkOutcome> {
+        match self {
+            Self::Memory(store) => store.park_step(fence, step).await,
+            Self::Online(pg) => pg.park_step(fence, step).await,
         }
     }
 

@@ -22,26 +22,27 @@ use crate::model::{
     ItemKindPatch, ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem,
     NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
     NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    NoteId, OpenPermission, OverlapRule, PermissionChoice, PermissionId, PermissionStatus, PhaseId,
-    PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate,
-    PromptTemplateId, RelayOption, RelayOptionKind, RelaySessionId, RelayView, RepoBoxPath, RepoId,
-    RepoPatch, RepoScope, Requirement, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementState, RequirementUpdate, Resolution, Run,
-    RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunScope, RunStatus,
-    RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, Skill, SkillBindingKey, SkillId,
-    SkillPatch, SkillVersion, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, Transport,
-    UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject, canonical_declared_tags, missing_tags_failure,
+    NoteId, OpenPermission, OverlapRule, PermissionChoice, PermissionId, PermissionStatus,
+    PhaseAgent, PhaseId, PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope,
+    PromptTemplate, PromptTemplateId, RelayOption, RelayOptionKind, RelaySessionId, RelayView,
+    RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementState, RequirementUpdate,
+    Resolution, Run, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode,
+    RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, Skill,
+    SkillBindingKey, SkillId, SkillPatch, SkillVersion, SnapshotGraph, SnapshotSettings, Status,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
+    TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
 use crate::store::error::StoreError;
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, CasOutcome, DeleteReach,
-    DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL, ReadStore, SettingRung, StepFence,
-    StoredSetting, UpdateOutcome, WriteStore, already_exists, citation_key, illegal_move,
-    invalid_area_code, requirement_withdrawn, resolution_not_closable, withdrawn_requirement_cited,
+    DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL, ParkOutcome, ReadStore, SettingRung,
+    StepFence, StoredSetting, UpdateOutcome, WriteStore, already_exists, citation_key,
+    illegal_move, invalid_area_code, requirement_withdrawn, resolution_not_closable,
+    withdrawn_requirement_cited,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -167,6 +168,10 @@ pub const CASES: &[&str] = &[
     "adopt_runs_never_leases_a_chat_run",
     "update_spec_columns_roundtrip",
     "item_edit_reason_lands_in_revision",
+    "queued_at_ties_inside_a_microsecond_break_on_id",
+    "phase_agents_are_written_whole_and_counted",
+    "pass_step_writes_done_and_skipped_under_the_fence",
+    "park_step_moves_step_run_and_item_or_nothing",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -421,6 +426,18 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "adopt_runs_never_leases_a_chat_run" => adopt_runs_never_leases_a_chat_run(store).await,
         "update_spec_columns_roundtrip" => update_spec_columns_roundtrip(store).await,
         "item_edit_reason_lands_in_revision" => item_edit_reason_lands_in_revision(store).await,
+        "queued_at_ties_inside_a_microsecond_break_on_id" => {
+            queued_at_ties_inside_a_microsecond_break_on_id(store).await;
+        }
+        "phase_agents_are_written_whole_and_counted" => {
+            phase_agents_are_written_whole_and_counted(store).await;
+        }
+        "pass_step_writes_done_and_skipped_under_the_fence" => {
+            pass_step_writes_done_and_skipped_under_the_fence(store).await;
+        }
+        "park_step_moves_step_run_and_item_or_nothing" => {
+            park_step_moves_step_run_and_item_or_nothing(store).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -5183,6 +5200,573 @@ async fn claim_run_applies_the_isolation_and_path_rules<S: WriteStore>(store: &S
         RunStatus::Queued,
         "{CASE}: and J stays queued"
     );
+}
+
+/// MOD-37 R-29: `queued_at` is kept to the microsecond, as `timestamptz` keeps it, so two runs
+/// queued inside one microsecond tie and the tie breaks on `id`.
+///
+/// Mirrors `claim_run_applies_the_isolation_and_path_rules`. The lower `RunId` is queued 500 ns
+/// after the higher one, inside the same microsecond: a store that kept the nanoseconds would put
+/// the higher id first in `(queued_at, id)` order, and C's overlap would name it.
+async fn queued_at_ties_inside_a_microsecond_break_on_id<S: WriteStore>(store: &S) {
+    const CASE: &str = "queued_at_ties_inside_a_microsecond_break_on_id";
+    let core = store
+        .create_repo(new_repo(ids::PROJECT_HTUI, "core", true))
+        .await
+        .expect(CASE)
+        .id;
+    let isolated = |prefix: &str| RepoScope {
+        isolated: true,
+        local: false,
+        prefixes: vec![prefix.to_owned()],
+    };
+    // `seam_clock` is on a whole microsecond, so `base + 500ns` is inside the same one.
+    let base = seam_clock();
+    let (low, high) = {
+        let (one, two) = (RunId::new(), RunId::new());
+        (one.min(two), two.max(one))
+    };
+    let legs = [
+        (
+            'A',
+            low,
+            base + TimeDelta::nanoseconds(500),
+            isolated("src/"),
+        ),
+        ('B', high, base, isolated("docs/")),
+        (
+            'C',
+            RunId::new(),
+            base + TimeDelta::seconds(1),
+            RepoScope::default(),
+        ),
+    ];
+    let mut runs = Vec::new();
+    for (leg, id, queued_at, repo) in legs {
+        let item = store
+            .mint_item(new_item(
+                ids::PROJECT_HTUI,
+                ids::KIND_HTUI_FEAT,
+                &format!("Leg {leg}"),
+            ))
+            .await
+            .expect(CASE)
+            .id;
+        let run = store
+            .create_run(NewRun {
+                id,
+                graph_snapshot: GraphSnapshot {
+                    scope: Some(RunScope {
+                        repos: [(core, repo)].into_iter().collect(),
+                    }),
+                    ..run_snapshot()
+                },
+                queued_at,
+                ..new_run(ids::PROJECT_HTUI, item, vec![core])
+            })
+            .await
+            .expect(CASE)
+            .id;
+        runs.push(run);
+    }
+    let [_, _, c] = runs[..] else {
+        panic!("{CASE}: three runs were queued")
+    };
+
+    assert_eq!(
+        run_row(CASE, store, low).await.queued_at,
+        base,
+        "{CASE}: the 500 ns past the microsecond are not kept (R-29)"
+    );
+    assert_eq!(
+        run_row(CASE, store, high).await.queued_at,
+        base,
+        "{CASE}: the higher id's queued_at reads back as written"
+    );
+
+    let owner = Uuid::now_v7();
+    let claimed_at = base + TimeDelta::minutes(1);
+    let claim = |run: RunId| store.claim_run(run, ids::BOX, owner, claimed_at, LEASE);
+    for run in [low, high] {
+        assert_eq!(
+            claim(run).await.expect(CASE),
+            Claim::Admitted,
+            "{CASE}: the two isolated runs on disjoint paths both run"
+        );
+        assert!(
+            store
+                .transition_run(
+                    run,
+                    RunStatus::Running,
+                    RunStatus::AwaitingApproval,
+                    claimed_at
+                )
+                .await
+                .expect(CASE),
+            "{CASE}: the admitted run parks at a gate and frees its slot"
+        );
+    }
+
+    assert_eq!(
+        claim(c).await.expect(CASE),
+        Claim::Overlaps {
+            with: low,
+            rule: OverlapRule::NotIsolated
+        },
+        "{CASE}: the two runs tie on queued_at, so the lower id is the first overlap"
+    );
+}
+
+/// MOD-37 R-6: [`WriteStore::create_phase_agents`] writes a phase's candidates all or nothing,
+/// and a project's delete reach counts what it wrote.
+///
+/// The rows are read back through `delete_reach` because `phase_agents` and `resolve_graph` are
+/// inherent reads, on neither trait. `written_phase_agents_answer_every_reader` reads them back
+/// on `MemStore`, and `pg_criteria.rs::inherent_orchestration_reads_answer_the_fixture` compares
+/// Postgres with it.
+async fn phase_agents_are_written_whole_and_counted<S: WriteStore>(store: &S) {
+    const CASE: &str = "phase_agents_are_written_whole_and_counted";
+    let implement = ids::PHASE_HTUI_IMPLEMENT;
+    let row = |phase: PhaseId, position: i32, agent_id: AgentId, model: &str| PhaseAgent {
+        phase_id: phase,
+        position,
+        agent_id,
+        model: model.to_owned(),
+    };
+    assert_eq!(
+        phase_agent_count(CASE, store).await,
+        0,
+        "{CASE}: the fixture seeds no phase_agent row"
+    );
+
+    store
+        .create_phase_agents(
+            implement,
+            &[
+                row(implement, 1, ids::AGENT_AGY, "opus"),
+                row(implement, 0, ids::AGENT_CLAUDE, "sonnet"),
+            ],
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        phase_agent_count(CASE, store).await,
+        2,
+        "{CASE}: two rows written out of position order are both stored"
+    );
+
+    let other = store
+        .phases(ids::GRAPH_HTUI_FEAT)
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|phase| phase.id != implement)
+        .unwrap_or_else(|| panic!("{CASE}: the FEAT graph has another phase"))
+        .id;
+    let unknown = PhaseId::new();
+    let refusals = [
+        (
+            "a row that names another phase",
+            implement,
+            vec![row(other, 5, ids::AGENT_CLAUDE, "sonnet")],
+        ),
+        (
+            "a phase that names no row",
+            unknown,
+            vec![row(unknown, 0, ids::AGENT_CLAUDE, "sonnet")],
+        ),
+        (
+            "an agent that names no row",
+            implement,
+            vec![row(implement, 5, AgentId::new(), "sonnet")],
+        ),
+        (
+            "a taken position",
+            implement,
+            vec![row(implement, 0, ids::AGENT_AGY, "opus")],
+        ),
+        (
+            "a good row beside a taken one",
+            implement,
+            vec![
+                row(implement, 5, ids::AGENT_CLAUDE, "sonnet"),
+                row(implement, 1, ids::AGENT_CLAUDE, "sonnet"),
+            ],
+        ),
+        (
+            "one position twice in the batch",
+            implement,
+            vec![
+                row(implement, 6, ids::AGENT_CLAUDE, "sonnet"),
+                row(implement, 6, ids::AGENT_AGY, "opus"),
+            ],
+        ),
+    ];
+    for (what, phase, rows) in refusals {
+        let answer = store.create_phase_agents(phase, &rows).await;
+        assert!(
+            matches!(answer, Err(StoreError::Constraint(_))),
+            "{CASE}: {what} is a constraint refusal, not {answer:?}"
+        );
+        assert_eq!(
+            phase_agent_count(CASE, store).await,
+            2,
+            "{CASE}: {what} writes nothing"
+        );
+    }
+
+    store
+        .create_phase_agents(unknown, &[])
+        .await
+        .unwrap_or_else(|err| panic!("{CASE}: an empty slice checks nothing, not {err:?}"));
+    assert_eq!(
+        phase_agent_count(CASE, store).await,
+        2,
+        "{CASE}: and writes nothing"
+    );
+}
+
+/// MOD-37 R-5 (ANA-2 §4.2 "done + skipped"): [`WriteStore::pass_step`] moves a `running` step
+/// to `done` with `gate_outcome = 'skipped'`, under the walk's fence. A step that is not
+/// `running` answers `Ok(false)`; a fence the run does not carry is `Fenced`; both write nothing.
+async fn pass_step_writes_done_and_skipped_under_the_fence<S: WriteStore>(store: &S) {
+    const CASE: &str = "pass_step_writes_done_and_skipped_under_the_fence";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let later = at + TimeDelta::minutes(3);
+    let (run, step) = leased_step(CASE, store, a, at).await;
+    let running = |position: i32| async move {
+        let id = store
+            .create_step(new_run_step(run, position, 1, 0))
+            .await
+            .expect(CASE)
+            .id;
+        assert!(
+            store
+                .transition_step(id, StepStatus::Pending, StepStatus::Running, at)
+                .await
+                .expect(CASE),
+            "{CASE}: step {position} starts"
+        );
+        id
+    };
+    assert!(
+        store
+            .transition_step(step, StepStatus::Pending, StepStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the step starts"
+    );
+
+    assert!(
+        store
+            .pass_step(StepFence::Lease(a), step, Some("verdict: odd"), later)
+            .await
+            .expect(CASE),
+        "{CASE}: a running step passes under its run's lease"
+    );
+    let row = step_row(CASE, store, run, step).await;
+    assert_eq!(
+        (
+            row.status,
+            row.gate_outcome,
+            row.gate_note.as_deref(),
+            row.finished_at
+        ),
+        (
+            StepStatus::Done,
+            Some(GateOutcome::Skipped),
+            Some("verdict: odd"),
+            Some(later),
+        ),
+        "{CASE}: done, skipped, the note and the instant"
+    );
+    assert!(
+        !store
+            .pass_step(
+                StepFence::Lease(a),
+                step,
+                Some("again"),
+                later + TimeDelta::minutes(1)
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: a second pass finds the step `done`"
+    );
+    assert_eq!(
+        step_row(CASE, store, run, step).await,
+        row,
+        "{CASE}: the refused pass wrote nothing"
+    );
+    // Review L3: the fence is checked before the status, so a stale lease is told it lost the
+    // run even over a step that is no longer `running`, rather than "not running".
+    let stale = store
+        .pass_step(StepFence::Lease(b), step, Some("stale"), later)
+        .await;
+    assert!(
+        matches!(stale, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: a pass of a `done` step under another lease is fenced, got {stale:?}"
+    );
+    assert_eq!(
+        step_row(CASE, store, run, step).await,
+        row,
+        "{CASE}: the fenced pass of a `done` step wrote nothing"
+    );
+
+    let quiet = running(1).await;
+    assert!(
+        store
+            .pass_step(StepFence::Lease(a), quiet, None, later)
+            .await
+            .expect(CASE),
+        "{CASE}: a pass with nothing to say passes"
+    );
+    let row = step_row(CASE, store, run, quiet).await;
+    assert_eq!(
+        (row.status, row.gate_outcome, row.gate_note),
+        (StepStatus::Done, Some(GateOutcome::Skipped), None),
+        "{CASE}: no note keeps `gate_note` NULL"
+    );
+
+    let pending = store
+        .create_step(new_run_step(run, 2, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let before = step_row(CASE, store, run, pending).await;
+    assert!(
+        !store
+            .pass_step(StepFence::Lease(a), pending, None, later)
+            .await
+            .expect(CASE),
+        "{CASE}: a pending step does not pass"
+    );
+    assert_eq!(step_row(CASE, store, run, pending).await, before);
+
+    let live = running(3).await;
+    let before = step_row(CASE, store, run, live).await;
+    for fence in [StepFence::Lease(b), StepFence::Unleased] {
+        let refused = store.pass_step(fence, live, Some("stale"), later).await;
+        assert!(
+            matches!(refused, Err(StoreError::Fenced { step: s }) if s == live),
+            "{CASE}: a pass under {fence:?} is fenced, got {refused:?}"
+        );
+    }
+    assert_eq!(
+        step_row(CASE, store, run, live).await,
+        before,
+        "{CASE}: the fenced passes wrote nothing"
+    );
+
+    let unknown = StepId::new();
+    let missing = store
+        .pass_step(StepFence::Lease(a), unknown, None, later)
+        .await;
+    assert!(
+        matches!(
+            missing,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an unknown step is NotFound, got {missing:?}"
+    );
+}
+
+/// MOD-37 R-5: [`WriteStore::park_step`] moves the step, its run and its item to
+/// `awaiting_approval` in one transaction, or writes nothing. The run moved first is
+/// [`ParkOutcome::RunMoved`], the step moved first [`ParkOutcome::StepMoved`]; an item another
+/// writer moved first is left where it is and the park still lands (plan D17).
+async fn park_step_moves_step_run_and_item_or_nothing<S: WriteStore>(store: &S) {
+    const CASE: &str = "park_step_moves_step_run_and_item_or_nothing";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let item = ids::HTUI_ANA_2;
+    let (run, pending) = leased_step(CASE, store, a, at).await;
+    let running = |position: i32| async move {
+        let id = store
+            .create_step(new_run_step(run, position, 1, 0))
+            .await
+            .expect(CASE)
+            .id;
+        assert!(
+            store
+                .transition_step(id, StepStatus::Pending, StepStatus::Running, at)
+                .await
+                .expect(CASE),
+            "{CASE}: step {position} starts"
+        );
+        id
+    };
+    let item_status = || async {
+        store
+            .item(item)
+            .await
+            .expect(CASE)
+            .unwrap_or_else(|| panic!("{CASE}: the item exists"))
+            .status
+    };
+    let rows = |step: StepId| async move {
+        (
+            step_row(CASE, store, run, step).await.status,
+            run_row(CASE, store, run).await.status,
+            item_status().await,
+        )
+    };
+    let live = running(1).await;
+    assert_eq!(
+        rows(live).await,
+        (StepStatus::Running, RunStatus::Running, Status::InProgress),
+        "{CASE}: the claim put the item in progress"
+    );
+
+    let unknown = StepId::new();
+    let missing = store.park_step(StepFence::Lease(a), unknown).await;
+    assert!(
+        matches!(
+            missing,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an unknown step is NotFound, got {missing:?}"
+    );
+    for fence in [StepFence::Lease(b), StepFence::Unleased] {
+        let refused = store.park_step(fence, live).await;
+        assert!(
+            matches!(refused, Err(StoreError::Fenced { step: s }) if s == live),
+            "{CASE}: a park under {fence:?} is fenced, got {refused:?}"
+        );
+    }
+    assert_eq!(
+        rows(live).await,
+        (StepStatus::Running, RunStatus::Running, Status::InProgress),
+        "{CASE}: the fenced parks wrote nothing"
+    );
+    // Review L3: the fence is checked before the step's status, so a stale lease is `Fenced`
+    // over a `pending` step too, not `StepMoved`.
+    let stale = store.park_step(StepFence::Lease(b), pending).await;
+    assert!(
+        matches!(stale, Err(StoreError::Fenced { step: s }) if s == pending),
+        "{CASE}: a park of a `pending` step under another lease is fenced, got {stale:?}"
+    );
+    assert_eq!(
+        rows(pending).await,
+        (StepStatus::Pending, RunStatus::Running, Status::InProgress),
+        "{CASE}: the fenced park of a `pending` step wrote nothing"
+    );
+
+    assert_eq!(
+        store
+            .park_step(StepFence::Lease(a), pending)
+            .await
+            .expect(CASE),
+        ParkOutcome::StepMoved,
+        "{CASE}: a step that is not running is refused"
+    );
+    assert_eq!(
+        rows(pending).await,
+        (StepStatus::Pending, RunStatus::Running, Status::InProgress),
+        "{CASE}: the refused park wrote nothing"
+    );
+
+    assert!(
+        store
+            .transition_run(run, RunStatus::Running, RunStatus::AwaitingApproval, at)
+            .await
+            .expect(CASE),
+        "{CASE}: another writer parks the run first"
+    );
+    assert_eq!(
+        store
+            .park_step(StepFence::Lease(a), live)
+            .await
+            .expect(CASE),
+        ParkOutcome::RunMoved,
+        "{CASE}: a run that is not running is refused"
+    );
+    assert_eq!(
+        rows(live).await,
+        (
+            StepStatus::Running,
+            RunStatus::AwaitingApproval,
+            Status::InProgress
+        ),
+        "{CASE}: the step stays running and the item in progress"
+    );
+    assert!(
+        store
+            .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the run resumes"
+    );
+
+    assert_eq!(
+        store
+            .park_step(StepFence::Lease(a), live)
+            .await
+            .expect(CASE),
+        ParkOutcome::Parked,
+        "{CASE}: a running step of a running run parks"
+    );
+    assert_eq!(
+        rows(live).await,
+        (
+            StepStatus::AwaitingApproval,
+            RunStatus::AwaitingApproval,
+            Status::AwaitingApproval,
+        ),
+        "{CASE}: the step, the run and the item move together"
+    );
+
+    // The item moved first: D17's "already moved", the park lands and the item stays.
+    assert!(
+        store
+            .transition_run(run, RunStatus::AwaitingApproval, RunStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the run resumes again"
+    );
+    for (from, to) in [
+        (Status::AwaitingApproval, Status::InProgress),
+        (Status::InProgress, Status::Blocked),
+    ] {
+        assert!(
+            store.transition(item, from, to).await.expect(CASE),
+            "{CASE}: the item moves {from} -> {to}"
+        );
+    }
+    let next = running(2).await;
+    assert_eq!(
+        store
+            .park_step(StepFence::Lease(a), next)
+            .await
+            .expect(CASE),
+        ParkOutcome::Parked,
+        "{CASE}: an item another writer moved does not refuse the park"
+    );
+    assert_eq!(
+        rows(next).await,
+        (
+            StepStatus::AwaitingApproval,
+            RunStatus::AwaitingApproval,
+            Status::Blocked,
+        ),
+        "{CASE}: the item is left where the other writer put it"
+    );
+}
+
+/// `phase_agent` rows the `htui` project's delete would take.
+async fn phase_agent_count<S: WriteStore>(case: &str, store: &S) -> u64 {
+    store
+        .delete_reach(DeleteTarget::Project(ids::PROJECT_HTUI))
+        .await
+        .expect(case)
+        .unwrap_or_else(|| panic!("{case}: the fixture project has a reach"))
+        .phase_agents
 }
 
 /// A tag list from string literals, in the order given (the store cases pass tags out of byte

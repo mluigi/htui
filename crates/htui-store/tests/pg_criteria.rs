@@ -3661,11 +3661,11 @@ async fn step_tree_rows_cascade_with_their_step() {
 /// so this is the **only** thing in the tree that pins Postgres's answers against the `MemStore`
 /// the suite pins — which is what makes them one seam rather than two implementations.
 ///
-/// Three reads are compared against seeded rows rather than against `MemStore`, because the
-/// fixture has no `phase_agent`, `agent_box` or `repo_box_path` row and equality on two empty
-/// vectors pins nothing. `phase_agents` stays deliberately divergent: `MemStore` holds no such
-/// table and answers empty whatever the phase, which is the blueprint's F-N note and the reason
-/// the snapshot builder falls back to `project.settings.default_agent_id`.
+/// Three reads are compared against written rows, because the fixture has no `phase_agent`,
+/// `agent_box` or `repo_box_path` row and equality on two empty vectors pins nothing.
+/// `phase_agents` is no longer divergent (MOD-37 R-6): the same two rows go through
+/// `create_phase_agents` on both stores, and `phase_agents` and `resolve_graph` answer them alike.
+/// `agent_box` and `repo_box_path` are seeded on Postgres alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn inherent_orchestration_reads_answer_the_fixture() {
     let Some(db) = common::demo_db().await else {
@@ -3931,17 +3931,24 @@ async fn inherent_orchestration_reads_answer_the_fixture() {
         "nor an unknown box"
     );
 
-    // ---- phase_agents, agent_boxes, repo_paths: seeded, because the fixture has no such row ---
-    sqlx::query!(
-        "INSERT INTO phase_agent (phase_id, position, agent_id, model) \
-         VALUES ($1, 1, $2, 'opus'), ($1, 0, $3, 'sonnet')",
-        ids::PHASE_HTUI_IMPLEMENT.as_uuid(),
-        ids::AGENT_AGY.as_uuid(),
-        ids::AGENT_CLAUDE.as_uuid(),
-    )
-    .execute(&db.pool)
-    .await
-    .expect("seed two phase_agent rows out of position order");
+    // ---- phase_agents, agent_boxes, repo_paths: written, because the fixture has no such row --
+    let written = [
+        (1, ids::AGENT_AGY, "opus"),
+        (0, ids::AGENT_CLAUDE, "sonnet"),
+    ]
+    .map(|(position, agent_id, model)| htui_core::model::PhaseAgent {
+        phase_id: ids::PHASE_HTUI_IMPLEMENT,
+        position,
+        agent_id,
+        model: model.to_owned(),
+    });
+    db.store
+        .create_phase_agents(ids::PHASE_HTUI_IMPLEMENT, &written)
+        .await
+        .expect("write two phase_agent rows out of position order");
+    mem.create_phase_agents(ids::PHASE_HTUI_IMPLEMENT, &written)
+        .await
+        .expect("and the same two on MemStore");
 
     let candidates = db
         .store
@@ -3959,25 +3966,40 @@ async fn inherent_orchestration_reads_answer_the_fixture() {
         ],
         "candidates come back in `position` order, not insertion order"
     );
-    assert!(
+    assert_eq!(
         mem.phase_agents(ids::PHASE_HTUI_IMPLEMENT)
             .await
-            .expect("MemStore::phase_agents")
-            .is_empty(),
-        "`MemStore` holds no `phase_agent` table and says so (blueprint F-N)"
+            .expect("MemStore::phase_agents"),
+        candidates,
+        "`MemStore` answers the same rows in the same order (MOD-37 R-6)"
     );
-    assert_eq!(
+    let implement_agents = |graph: Option<htui_core::model::ResolvedGraph>| {
+        graph
+            .expect("the graph")
+            .phases
+            .into_iter()
+            .find(|row| row.phase.id == ids::PHASE_HTUI_IMPLEMENT)
+            .map(|row| row.agents)
+    };
+    let pg_resolved = implement_agents(
         db.store
             .resolve_graph(ids::HTUI_FEAT_1)
             .await
-            .expect("resolve_graph")
-            .expect("the graph")
-            .phases
-            .iter()
-            .find(|row| row.phase.id == ids::PHASE_HTUI_IMPLEMENT)
-            .map(|row| row.agents.len()),
-        Some(2),
+            .expect("resolve_graph"),
+    );
+    assert_eq!(
+        pg_resolved.as_deref(),
+        Some(&candidates[..]),
         "and `resolve_graph` carries the candidates it now has"
+    );
+    assert_eq!(
+        implement_agents(
+            mem.resolve_graph(ids::HTUI_FEAT_1)
+                .await
+                .expect("MemStore::resolve_graph")
+        ),
+        pg_resolved,
+        "on both stores"
     );
 
     sqlx::query!(

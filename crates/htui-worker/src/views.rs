@@ -12,9 +12,9 @@ use htui_core::model::{
 };
 use htui_core::store::{Result as StoreResult, StoreError};
 use htui_orch::command::{answer_gate_enabled, cancel_enabled, select_enabled};
-use htui_orch::status::group_at;
+use htui_orch::status::{group_at, resumable};
 use htui_orch::{
-    Command, CommandOutcome, Cursor, EngineError, GateAnswer, Rest, SessionKey, SessionSink,
+    Command, CommandOutcome, EngineError, GateAnswer, Rest, SessionKey, SessionSink,
     accept_enabled, cleanup_enabled, close_out_enabled, cursor, phase_at, promote_enabled,
     retry_admitted, snapshot_of, start_enabled, unblock_enabled,
 };
@@ -341,7 +341,7 @@ fn verdicts(
         steps: BTreeMap::new(),
     };
 
-    let mut active: Vec<(Run, Cursor)> = Vec::new();
+    let mut active: Vec<(Run, bool)> = Vec::new();
     let mut unblock_refusal = None;
     for (run, steps) in runs {
         // D212: while a step of this run is chatted with, the verbs that would move the run grey
@@ -370,7 +370,7 @@ fn verdicts(
             }
         };
         if run.status.is_active() {
-            active.push((run.clone(), cursor(&snapshot, steps)));
+            active.push((run.clone(), resumable(&cursor(&snapshot, steps), steps)));
         }
         for step in steps {
             let phase = match phase_at(run.id, &snapshot, step.position) {
@@ -575,5 +575,175 @@ impl AgentDriver for RefusedDriver {
     ) -> DriverFuture<'a, Box<dyn AgentSession>> {
         let refusal = self.0.clone();
         Box::pin(async move { Err(refusal) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use htui_core::fixtures::ids;
+    use htui_core::model::{GateOutcome, ItemId, RunId, RunMode, RunStatus, Status, StepStatus};
+    use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+    use htui_orch::conformance::Orchestrate as _;
+    use htui_orch::fake::{FakeOrchestrator, ScriptedStep};
+    use htui_orch::{Clock as _, Command, CommandOutcome, GateAnswer, UnblockCase};
+
+    use super::{Enabled, LiveChats, verdicts};
+
+    /// [`verdicts`]' `u` for `item`, over the rows [`super::actions`] reads.
+    async fn unblock_verdict(store: &MemStore, item: ItemId) -> Enabled {
+        let read = "MemStore never fails a read";
+        let row = store.item(item).await.expect(read).expect("a seeded item");
+        let heads = store.documents(item).await.expect(read);
+        let mut runs = Vec::new();
+        for summary in store.runs(item).await.expect(read) {
+            let run = store
+                .run(summary.id)
+                .await
+                .expect(read)
+                .expect("a listed run");
+            let steps = store.run_steps(run.id).await.expect(read);
+            runs.push((run, steps));
+        }
+        verdicts(&row, &runs, &heads, &LiveChats::default()).unblock
+    }
+
+    /// `FEAT-3` freed of its seeded `RUN_2` and started: the walk parks at `prd`'s gate.
+    async fn started(orch: &FakeOrchestrator) -> RunId {
+        orch.store()
+            .finish_run(ids::RUN_2, RunStatus::Cancelled, None, orch.clock().now())
+            .await
+            .expect("the seeded run is queued and cancellable");
+        let outcome = orch
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts");
+        let CommandOutcome::Started { run, .. } = outcome else {
+            panic!("`StartRun` answers `Started`, not {outcome:?}");
+        };
+        run
+    }
+
+    /// MOD-37 R-31 (review L2): `u` is enabled over a rejection a crash left parked (the run
+    /// `awaiting_approval`, its latest step `failed` + `rejected`), which `verdicts` tells by
+    /// `status::resumable` over the run's steps, while a real gate over the same run is refused.
+    #[tokio::test]
+    async fn unblock_is_enabled_over_a_crashed_rejection() {
+        let orch = FakeOrchestrator::demo();
+        let run = started(&orch).await;
+        let steps = orch.store().run_steps(run).await.expect("MemStore reads");
+        let [prd] = &steps[..] else {
+            panic!("the walk parked `prd` alone: {steps:?}");
+        };
+        assert_eq!(prd.status, StepStatus::AwaitingApproval);
+        assert!(
+            unblock_verdict(orch.store(), ids::HTUI_FEAT_3)
+                .await
+                .is_err_and(|why| why.contains("parked at a gate")),
+            "a real gate is answered, not unblocked"
+        );
+
+        assert!(
+            orch.store()
+                .answer_gate(
+                    prd.id,
+                    GateOutcome::Rejected,
+                    Some("not like this".to_owned()),
+                    orch.clock().now()
+                )
+                .await
+                .expect("MemStore takes the answer"),
+            "the rejection's first write landed and its unpark did not"
+        );
+        assert_eq!(
+            orch.store()
+                .run(run)
+                .await
+                .expect("read")
+                .map(|row| row.status),
+            Some(RunStatus::AwaitingApproval)
+        );
+        assert_eq!(
+            unblock_verdict(orch.store(), ids::HTUI_FEAT_3).await,
+            Ok(()),
+            "a crashed rejection is resumable"
+        );
+    }
+
+    /// MOD-37 milestone 2, maintainer-accepted (review L2): a review loop that escalated, once
+    /// `u` has followed the run, rests on the rows a crashed rejection leaves, so `u` stays
+    /// enabled (it resumes, re-runs the loop and escalates again) rather than naming the gate.
+    #[tokio::test]
+    async fn unblock_is_enabled_over_a_followed_escalation() {
+        let orch = FakeOrchestrator::demo();
+        orch.script("review", 1, ScriptedStep::review("approve", "first"));
+        orch.script("review", 2, ScriptedStep::review("approve", "second"));
+        let run = started(&orch).await;
+
+        // Approve every parked step and reject each review; the second rejection escalates.
+        let mut rejections = 0;
+        while rejections < 2 {
+            let steps = orch.store().run_steps(run).await.expect("MemStore reads");
+            let step = steps
+                .iter()
+                .find(|step| step.status == StepStatus::AwaitingApproval)
+                .expect("a parked step");
+            let answer = if step.phase_name == "review" {
+                rejections += 1;
+                GateAnswer::Rejected {
+                    note: "no tests".to_owned(),
+                }
+            } else {
+                GateAnswer::Approved
+            };
+            orch.dispatch(Command::AnswerGate {
+                run,
+                step: step.id,
+                answer,
+            })
+            .await
+            .expect("the gate takes the answer");
+        }
+        let item = || async {
+            orch.store()
+                .item(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore reads")
+                .expect("seeded")
+                .status
+        };
+        assert_eq!(item().await, Status::Blocked, "the loop escalated");
+        assert_eq!(
+            unblock_verdict(orch.store(), ids::HTUI_FEAT_3).await,
+            Ok(()),
+            "`FollowRun`"
+        );
+
+        let followed = orch
+            .dispatch(Command::Unblock {
+                item: ids::HTUI_FEAT_3,
+            })
+            .await
+            .expect("a blocked item follows its parked run");
+        assert!(
+            matches!(
+                followed,
+                CommandOutcome::Unblocked {
+                    case: UnblockCase::FollowRun(id),
+                    rest: None,
+                    ..
+                } if id == run
+            ),
+            "{followed:?}"
+        );
+        assert_eq!(item().await, Status::AwaitingApproval);
+        assert_eq!(
+            unblock_verdict(orch.store(), ids::HTUI_FEAT_3).await,
+            Ok(()),
+            "the followed escalation reads as a crashed rejection and is resumed"
+        );
     }
 }

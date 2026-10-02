@@ -68,8 +68,8 @@ use crate::promote::{self, OpeningKind};
 use crate::recover::{self, Adjudication, Heartbeat, LeaseTimes, StepKind};
 use crate::select::{self, SelectInput, Skipped, Walk};
 use crate::status::{
-    Cursor, RunFailure, cursor, group_at, judge_at, latest_at, may_attempt, next_attempt,
-    resumable_park, winner_at,
+    Cursor, RunFailure, crashed_rejection, cursor, group_at, judge_at, latest_at, may_attempt,
+    next_attempt, resumable, winner_at,
 };
 use crate::verify::{Verifier, VerifyReport, VerifyRequest};
 
@@ -2128,7 +2128,7 @@ where
             if row.status == RunStatus::AwaitingApproval {
                 let snapshot = Self::snapshot_of(&row)?;
                 let steps = self.parts.store.run_steps(run).await?;
-                if resumable_park(&cursor(&snapshot, &steps))
+                if resumable(&cursor(&snapshot, &steps), &steps)
                     && !self.unpark(&row, self.now()).await?
                 {
                     return Err(stale_run(
@@ -2305,7 +2305,8 @@ where
     }
 
     /// MOD-4 plan D161: which of `Unblock`'s three cases `item` is in, read-only — the item, then
-    /// each of its active runs with its cursor, handed to [`crate::command::unblock_enabled`].
+    /// each of its active runs with whether it is [`resumable`] (over its cursor and its steps,
+    /// MOD-37 R-31), handed to [`crate::command::unblock_enabled`].
     ///
     /// # Errors
     /// [`EngineError::NotBlocked`], and the store's and the snapshot's own.
@@ -2319,8 +2320,8 @@ where
             }
             let snapshot = Self::snapshot_of(&run)?;
             let steps = self.parts.store.run_steps(run.id).await?;
-            let at = cursor(&snapshot, &steps);
-            active.push((run, at));
+            let resumable = resumable(&cursor(&snapshot, &steps), &steps);
+            active.push((run, resumable));
         }
         crate::command::unblock_enabled(&row, &active)
     }
@@ -3042,6 +3043,11 @@ where
     /// would have reconciled is reconciled (plan D97; a refusal parks the run again), and the walk
     /// goes on. A run parked at a real rest (`Rest`), or at a fan-out slot a human has to route
     /// (`Fan`, `Select`), is left where it is.
+    ///
+    /// MOD-37 R-31: a `Rest` at a `failed` + `rejected` step ([`crashed_rejection`]) is a
+    /// rejection whose unpark a crash cut off. It is unparked the same way and its tail is
+    /// `settle_failed`'s (plan D131), which is the rejection's own: the end of the run, or the
+    /// review loop. A rejection merges nothing, so no frontier is reconciled.
     async fn walk_resumed(&self, run: RunId) -> Result<Rest, EngineError> {
         let row = self.run(run).await?;
         self.walk_resumed_from(&row).await
@@ -3053,8 +3059,10 @@ where
         if row.status == RunStatus::AwaitingApproval {
             let snapshot = Self::snapshot_of(row)?;
             let steps = self.parts.store.run_steps(run).await?;
-            // Blueprint D196: the one predicate `Unblock`'s third case reads too.
-            if resumable_park(&cursor(&snapshot, &steps)) {
+            let at = cursor(&snapshot, &steps);
+            // Blueprint D196 (widened by MOD-37 R-31): the one predicate `Unblock`'s third case
+            // reads too.
+            if resumable(&at, &steps) {
                 // MOD-4 plan D180 (R-31): the unpark is this walk's first compare-and-set, and a
                 // run another command unparked first is not this walk's to merge or walk.
                 if !self.unpark(row, self.now()).await? {
@@ -3063,6 +3071,16 @@ where
                         RunStatus::AwaitingApproval,
                         RunStatus::Running,
                     ));
+                }
+                // MOD-37 R-31: the tail `answer_guarded` would have run, by plan D131's settle.
+                // Boxed: `settle_failed` holds `admit`'s and `review_loop`'s futures, and this
+                // walk sits under `resume`, under `Unblock`.
+                if let Some(rejected) = crashed_rejection(&at, &steps) {
+                    let row = self.run(run).await?;
+                    return match Box::pin(self.settle_failed(&row, &snapshot, rejected)).await? {
+                        Some(rest) => Ok(rest),
+                        None => self.run_to_rest(run).await,
+                    };
                 }
                 if let Some(winner) = recover::frontier(&snapshot, &steps)
                     && let Some(done) = steps.iter().find(|step| step.id == winner)
@@ -5868,6 +5886,7 @@ where
             snapshot,
             user: self.parts.user,
             box_id: self.parts.box_id,
+            fence: StepFence::Lease(self.parts.owner),
         }
     }
 
@@ -12281,6 +12300,211 @@ mod tests {
             "nothing was merged"
         );
         assert_eq!(harness.orch.steps(run).await.len(), 1, "nothing was walked");
+    }
+
+    /// MOD-37 R-31: `answer_gate(Rejected)` landed and the process died before its unpark, so the
+    /// run and the item stay `awaiting_approval` over a `failed` + `rejected` step no gate verb
+    /// takes. Another process's `Unblock` resumes it, and the resumed walk runs the tail the
+    /// rejection owed (plan D131's `settle_failed`): `prd` cannot loop, so the run fails
+    /// `Rejected`, and the item follows it (plan D7's mirror after the unpark).
+    #[tokio::test]
+    async fn a_crash_between_a_rejection_and_the_unpark_is_resumed_by_unblock() {
+        let harness = Harness::new().await;
+        let (run, prd) = started(&harness).await;
+        assert!(
+            harness
+                .orch
+                .store
+                .answer_gate(
+                    prd,
+                    GateOutcome::Rejected,
+                    Some("not like this".to_owned()),
+                    harness.orch.clock.now()
+                )
+                .await
+                .expect("MemStore takes the answer"),
+            "the rejection's first write landed and its unpark did not"
+        );
+        assert_eq!(
+            harness.orch.run(run).await.status,
+            RunStatus::AwaitingApproval
+        );
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::AwaitingApproval
+        );
+
+        let other = harness.orch.restarted();
+        let unblocked = super::dispatch_fake(
+            &other,
+            Command::Unblock {
+                item: ids::HTUI_FEAT_3,
+            },
+        )
+        .await
+        .expect("a crashed rejection is resumable");
+        assert_eq!(
+            unblocked,
+            CommandOutcome::Unblocked {
+                item: ids::HTUI_FEAT_3,
+                case: crate::command::UnblockCase::Resume(run),
+                rest: Some(crate::command::Rest {
+                    run: RunStatus::Failed,
+                    position: Some(0),
+                    failure: Some(RunFailure::Rejected {
+                        phase: "prd".to_owned(),
+                    }),
+                }),
+            }
+        );
+        assert_eq!(harness.orch.run(run).await.status, RunStatus::Failed);
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Failed,
+            "plan D7: the item mirrors the run's `failed` after the unpark"
+        );
+        let steps = harness.orch.steps(run).await;
+        assert_eq!(
+            steps.len(),
+            1,
+            "a rejection walks nothing further: {steps:?}"
+        );
+        assert_eq!(steps[0].status, StepStatus::Failed);
+        assert_eq!(steps[0].gate_outcome, Some(GateOutcome::Rejected));
+        assert_eq!(steps[0].gate_note.as_deref(), Some("not like this"));
+    }
+
+    /// MOD-37 milestone 2, maintainer-accepted (2026-10-02; the blueprint's claim 2): a review
+    /// loop that escalated, once `Unblock` has followed the run (`FollowRun`), leaves exactly the
+    /// rows a crash between a review's rejection and its unpark leaves, so a second `Unblock`
+    /// answers `Resume` rather than `NotBlocked` ("parked at a gate"). The resumed walk re-runs
+    /// the review loop, which with nothing changed escalates again: the run is back at
+    /// `awaiting_approval`, the item `blocked`, one more escalation note, and no step is written.
+    #[tokio::test]
+    async fn unblock_on_a_followed_escalation_reruns_the_loop_and_escalates_again() {
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness
+            .orch
+            .script("review", 1, ScriptedStep::review("approve", "first"));
+        harness
+            .orch
+            .script("review", 2, ScriptedStep::review("approve", "second"));
+        let CommandOutcome::Started { run, .. } = harness
+            .dispatch(Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            })
+            .await
+            .expect("the walk starts")
+        else {
+            panic!("`StartRun` answers `Started`");
+        };
+
+        // Approve every parked step and reject each review; the second rejection escalates.
+        let mut rejections = 0;
+        while rejections < 2 {
+            let steps = harness.orch.steps(run).await;
+            let step = steps
+                .iter()
+                .find(|step| step.status == StepStatus::AwaitingApproval)
+                .expect("a parked step");
+            let answer = if step.phase_name == "review" {
+                rejections += 1;
+                GateAnswer::Rejected {
+                    note: "no tests".to_owned(),
+                }
+            } else {
+                GateAnswer::Approved
+            };
+            harness
+                .dispatch(Command::AnswerGate {
+                    run,
+                    step: step.id,
+                    answer,
+                })
+                .await
+                .expect("the gate takes the answer");
+        }
+        assert_eq!(
+            harness.orch.run(run).await.status,
+            RunStatus::AwaitingApproval
+        );
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Blocked,
+            "the loop escalated"
+        );
+        let escalations = || async {
+            harness
+                .orch
+                .store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .iter()
+                .filter(|note| note.body.contains("review loop exhausted after 2 attempts"))
+                .count()
+        };
+        assert_eq!(escalations().await, 1);
+
+        let followed = harness
+            .dispatch(Command::Unblock {
+                item: ids::HTUI_FEAT_3,
+            })
+            .await
+            .expect("a blocked item follows its parked run");
+        assert!(
+            matches!(
+                followed,
+                CommandOutcome::Unblocked {
+                    case: crate::command::UnblockCase::FollowRun(id),
+                    rest: None,
+                    ..
+                } if id == run
+            ),
+            "{followed:?}"
+        );
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::AwaitingApproval
+        );
+        let steps_before = harness.orch.steps(run).await;
+
+        let resumed = harness
+            .dispatch(Command::Unblock {
+                item: ids::HTUI_FEAT_3,
+            })
+            .await
+            .expect("the followed escalation reads as a crashed rejection");
+        assert_eq!(
+            resumed,
+            CommandOutcome::Unblocked {
+                item: ids::HTUI_FEAT_3,
+                case: crate::command::UnblockCase::Resume(run),
+                rest: Some(crate::command::Rest {
+                    run: RunStatus::AwaitingApproval,
+                    position: Some(3),
+                    failure: Some(RunFailure::ReviewLoopExhausted(2)),
+                }),
+            }
+        );
+        assert_eq!(
+            harness.orch.run(run).await.status,
+            RunStatus::AwaitingApproval
+        );
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Blocked,
+            "the loop escalated again"
+        );
+        assert_eq!(escalations().await, 2, "one more escalation note");
+        assert_eq!(
+            harness.orch.steps(run).await,
+            steps_before,
+            "nothing changed, so the loop wrote no step"
+        );
     }
 
     /// Plan D132's retry path (MOD-4 plan D180): `RetryStep` superseded the parked step and the

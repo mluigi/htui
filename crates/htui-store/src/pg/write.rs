@@ -27,12 +27,12 @@ use htui_core::model::{
     ItemPatch, ItemRequirement, ItemRevision, NewCommandRun, NewDocument, NewItem, NewItemKind,
     NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
     NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission,
-    PermissionChoice, PermissionId, PermissionStatus, PhaseId, PhasePatch, Priority, Project,
-    ProjectId, ProjectPatch, PromptTemplate, PromptTemplateId, RelaySessionId, RelayView, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
-    Resolution, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Skill, SkillBinding,
+    PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Priority,
+    Project, ProjectId, ProjectPatch, PromptTemplate, PromptTemplateId, RelaySessionId, RelayView,
+    Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementState,
+    RequirementUpdate, Resolution, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind,
+    RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Skill, SkillBinding,
     SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
     StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
     UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
@@ -46,16 +46,17 @@ use htui_core::store::traits::{
     EXECUTOR_MUST_BE_KNOWN,
 };
 use htui_core::store::{
-    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ReadStore as _, Result, SettingRung,
-    StepFence, StoreError, StoredSetting, TransitionLaw, UpdateOutcome, WriteStore, already_exists,
-    chat_step_status, check_attachment, citation_key, close_out_needs_a_summary, expected_on_row,
-    failure_disagrees_with_status, finish_run_item_mirror, finish_run_needs_a_terminal_status,
-    graph_not_in_project, illegal_move, invalid_area_code, invalid_prefix, item_has_a_live_run,
-    item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move, new_skill_refusal,
-    not_a_fanout_candidate, not_a_terminal_status, prompt_template_key, prompt_template_refusal,
-    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
-    row_names_another_step, run_is_terminal, skill_body_refusal, skill_patch_refusal,
-    skill_version_key, step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
+    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, ReadStore as _, Result,
+    SettingRung, StepFence, StoreError, StoredSetting, TransitionLaw, UpdateOutcome, WriteStore,
+    already_exists, chat_step_status, check_attachment, citation_key, close_out_needs_a_summary,
+    expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
+    finish_run_needs_a_terminal_status, graph_not_in_project, illegal_move, invalid_area_code,
+    invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros,
+    legal_move, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
+    prompt_template_key, prompt_template_refusal, references_no_row, requirement_withdrawn,
+    reserved_phase_name, resolution_not_closable, row_names_another_phase, row_names_another_step,
+    run_is_terminal, skill_body_refusal, skill_patch_refusal, skill_version_key,
+    step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
     withdrawn_requirement_cited,
 };
 use serde_json::Value;
@@ -228,6 +229,16 @@ async fn fenced_or_missing(pool: &sqlx::PgPool, step: StepId) -> StoreError {
         Ok(()) => StoreError::Fenced { step },
         Err(err) => err,
     }
+}
+
+/// MOD-37 R-5: why a fenced compare-and-set of `step` matched no row. [`step_fence`] answers
+/// [`StoreError::NotFound`] and then [`StoreError::Fenced`]; a step that passes both is simply not
+/// at the status the write wanted, `Ok(false)`. Boxed by its callers for [`fenced_or_missing`]'s
+/// stack reason.
+async fn fenced_miss(pool: &sqlx::PgPool, step: StepId, fence: StepFence) -> Result<bool> {
+    let mut conn = pool.acquire().await.map_err(map_sqlx)?;
+    step_fence(&mut conn, step, fence).await?;
+    Ok(false)
 }
 
 /// The `document` insert [`WriteStore::write_document`] and [`WriteStore::close_out`] share, on
@@ -2754,6 +2765,45 @@ impl WriteStore for PgStore {
         .map_err(map_sqlx)
     }
 
+    /// One `UNNEST` insert (MOD-37 R-6), so the batch lands whole or not at all. A row naming
+    /// another phase is refused before the statement; everything else is the schema's.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] for a row whose `phase_id` is not `phase`, a `phase` or an
+    /// `agent_id` that names no row (`23503`), or a taken `(phase_id, position)`, stored or
+    /// within the batch (`23505`).
+    async fn create_phase_agents(&self, phase: PhaseId, agents: &[PhaseAgent]) -> Result<()> {
+        if agents.is_empty() {
+            return Ok(());
+        }
+        if let Some(row) = agents.iter().find(|row| row.phase_id != phase) {
+            return Err(StoreError::Constraint(row_names_another_phase(
+                "phase_agent",
+                row.phase_id,
+                phase,
+            )));
+        }
+        let positions: Vec<i32> = agents.iter().map(|row| row.position).collect();
+        let agent_ids: Vec<Uuid> = agents.iter().map(|row| row.agent_id.as_uuid()).collect();
+        let models: Vec<String> = agents.iter().map(|row| row.model.clone()).collect();
+        sqlx::query!(
+            r#"
+            INSERT INTO phase_agent (phase_id, position, agent_id, model)
+            SELECT $1, t.position, t.agent_id, t.model
+              FROM UNNEST($2::int4[], $3::uuid[], $4::text[]) AS t(position, agent_id, model)
+            "#,
+            phase.as_uuid(),
+            &positions,
+            &agent_ids,
+            &models,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
     /// The compare-and-set of D3 over [`PhasePatch`]'s five columns.
     ///
     /// `token_budget` is not among them and cannot be: the `Phase` rung of
@@ -5100,6 +5150,121 @@ impl WriteStore for PgStore {
         }
 
         tx.commit().await.map_err(map_sqlx)
+    }
+
+    /// MOD-37 R-5: one fenced compare-and-set, `running -> done` with `gate_outcome = 'skipped'`.
+    /// `FOR SHARE` on the run for `finish_step`'s reason.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run_step" }`, then [`StoreError::Fenced`], told apart
+    /// from "not running" by `fenced_miss` on a miss.
+    async fn pass_step(
+        &self,
+        fence: StepFence,
+        step: StepId,
+        note: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let moved = sqlx::query!(
+            "UPDATE run_step \
+                SET status = 'done', gate_outcome = 'skipped', \
+                    gate_note = COALESCE($2, gate_note), \
+                    finished_at = COALESCE(finished_at, $3) \
+              WHERE id = $1 AND status = 'running' \
+                AND EXISTS (SELECT 1 FROM run r \
+                             WHERE r.id = run_step.run_id \
+                               AND r.lease_owner IS NOT DISTINCT FROM $4 \
+                               FOR SHARE)",
+            step.as_uuid(),
+            note,
+            at,
+            fence.owner(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+
+        if moved == 1 {
+            return Ok(true);
+        }
+        Box::pin(fenced_miss(&self.pool, step, fence)).await
+    }
+
+    /// MOD-37 R-5: the gate's park, one transaction in `promote_step`'s shape. The step and its
+    /// run are read under `FOR UPDATE`, and every refusal is decided before the first `UPDATE`,
+    /// so a refused park rolls back having written nothing. The run and item statements are
+    /// `promote_step`'s.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Fenced`].
+    async fn park_step(&self, fence: StepFence, step: StepId) -> Result<ParkOutcome> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let Some(row) = sqlx::query!(
+            r#"
+            SELECT s.status      AS "step_status: StepStatus",
+                   r.id          AS "run_id: RunId",
+                   r.status      AS "run_status: RunStatus",
+                   r.item_id     AS "item_id: ItemId",
+                   r.lease_owner AS "lease_owner?"
+              FROM run_step s JOIN run r ON r.id = s.run_id
+             WHERE s.id = $1
+               FOR UPDATE OF s, r
+            "#,
+            step.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        else {
+            return Err(StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            });
+        };
+
+        if row.lease_owner != fence.owner() {
+            return Err(StoreError::Fenced { step });
+        }
+        if row.step_status != StepStatus::Running {
+            return Ok(ParkOutcome::StepMoved);
+        }
+        if row.run_status != RunStatus::Running {
+            return Ok(ParkOutcome::RunMoved);
+        }
+
+        sqlx::query!(
+            "UPDATE run_step SET status = 'awaiting_approval' WHERE id = $1",
+            step.as_uuid(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        sqlx::query!(
+            "UPDATE run SET status = 'awaiting_approval' WHERE id = $1 AND status = 'running'",
+            row.run_id.as_uuid(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        if let Some(item) = row.item_id {
+            sqlx::query!(
+                "UPDATE item SET status = 'awaiting_approval', closed_at = NULL \
+                  WHERE id = $1 AND status = 'in_progress'",
+                item.as_uuid(),
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(ParkOutcome::Parked)
     }
 
     /// §4.3's failure row: `queued | running | awaiting_approval -> failed`, with the reason and
