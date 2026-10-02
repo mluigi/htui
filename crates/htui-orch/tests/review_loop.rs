@@ -20,7 +20,7 @@ use htui_core::model::{
     GraphSnapshot, ItemId, NewRun, NewRunStep, Run, RunId, RunMode, SnapshotPhase, StepId,
     StepStatus,
 };
-use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+use htui_core::store::{MemStore, ReadStore as _, StepFence, WriteStore as _};
 use htui_orch::command::EngineError;
 use htui_orch::fake::TestClock;
 use htui_orch::gate::{GateContext, LoopOutcome, LoopStop, review_loop};
@@ -170,6 +170,7 @@ async fn a_sparse_snapshot_does_not_index_past_the_phase_array() {
         snapshot: &snapshot,
         user: store.this_user().expect("the fixture seeds one `app_user`"),
         box_id: ids::BOX,
+        fence: StepFence::Unleased,
     };
     let outcome = review_loop(&ctx, &row(&store, run.id, review).await)
         .await
@@ -228,6 +229,7 @@ async fn an_unsorted_snapshot_picks_the_phase_whose_position_matches() {
         snapshot: &snapshot,
         user: store.this_user().expect("the fixture seeds one `app_user`"),
         box_id: ids::BOX,
+        fence: StepFence::Unleased,
     };
     let outcome = review_loop(&ctx, &row(&store, run.id, review).await)
         .await
@@ -280,6 +282,7 @@ async fn a_sparse_snapshot_with_no_predecessor_refuses_by_name() {
         snapshot: &snapshot,
         user: store.this_user().expect("the fixture seeds one `app_user`"),
         box_id: ids::BOX,
+        fence: StepFence::Unleased,
     };
     let outcome = review_loop(&ctx, &row(&store, run.id, step).await)
         .await
@@ -324,6 +327,7 @@ async fn an_escalation_on_a_run_another_writer_moved_is_a_stale_write() {
         snapshot: &snapshot,
         user: store.this_user().expect("the fixture seeds one `app_user`"),
         box_id: ids::BOX,
+        fence: StepFence::Unleased,
     };
     let refused = review_loop(&ctx, &row(&store, run.id, review).await)
         .await

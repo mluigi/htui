@@ -16,7 +16,7 @@ use htui_core::model::{
     RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus, UserId, VerifyOutcome,
 };
 use htui_core::prompt::digest::{canonical, sha256_hex};
-use htui_core::store::StoreError;
+use htui_core::store::{StepFence, StoreError};
 
 use crate::command::{EngineError, Rest, stale_run, stale_step};
 use crate::isolate::Clock;
@@ -295,8 +295,8 @@ fn deadline_elapsed(input: &SettleInput<'_>) -> bool {
 
 /// What the walk holds while it writes a gate answer or runs the loop.
 ///
-/// A borrowed bundle rather than seven arguments repeated across [`apply`] and [`review_loop`]:
-/// both need the same six things, and the engine builds it once per iteration.
+/// A borrowed bundle rather than eight arguments repeated across [`apply`] and [`review_loop`]:
+/// both need the same seven things, and the engine builds it once per iteration.
 #[derive(Debug)]
 pub struct GateContext<'a, S: htui_core::store::WorkerStore, C: Clock + ?Sized> {
     /// The store every write goes through.
@@ -311,6 +311,9 @@ pub struct GateContext<'a, S: htui_core::store::WorkerStore, C: Clock + ?Sized> 
     pub user: UserId,
     /// `item_note.box_id`.
     pub box_id: BoxId,
+    /// The walk's lease, `StepFence::Lease(parts.owner)`, which the gate's pass and park write
+    /// under (MOD-37 R-5).
+    pub fence: StepFence,
 }
 
 impl<S: htui_core::store::WorkerStore, C: Clock + ?Sized> GateContext<'_, S, C> {
@@ -1522,6 +1525,7 @@ mod tests {
             snapshot: &snapshot,
             user: ids::USER,
             box_id: ids::BOX,
+            fence: StepFence::Unleased,
         };
         let third = step(&store, 1, 2, &[]).await;
         let judge = step(&store, 1, -1, &[StepStatus::Running, StepStatus::Done]).await;
@@ -1557,6 +1561,7 @@ mod tests {
             snapshot: &snapshot,
             user: ids::USER,
             box_id: ids::BOX,
+            fence: StepFence::Unleased,
         };
         let live = step(&store, 2, 0, &[StepStatus::Running]).await;
         let failed = step(&store, 2, 1, &[StepStatus::Running, StepStatus::Failed]).await;
@@ -1608,6 +1613,7 @@ mod tests {
             snapshot: &snapshot,
             user: ids::USER,
             box_id: ids::BOX,
+            fence: StepFence::Unleased,
         };
         let settled = [StepStatus::Running, StepStatus::Done];
         let loser = step(&store, 2, 0, &settled).await;
@@ -1681,6 +1687,7 @@ mod tests {
             snapshot: &snapshot,
             user: ids::USER,
             box_id: ids::BOX,
+            fence: StepFence::Unleased,
         };
         let first = review_at(&store, 1, GateOutcome::Rejected).await;
         let second = review_at(&store, 2, GateOutcome::Rejected).await;
@@ -1725,6 +1732,7 @@ mod tests {
             snapshot: &snapshot,
             user: ids::USER,
             box_id: ids::BOX,
+            fence: StepFence::Unleased,
         };
         let first = review_at(&store, 1, GateOutcome::Rejected).await;
         let second = review_at(&store, 2, GateOutcome::Rejected).await;
@@ -1805,6 +1813,7 @@ mod tests {
             snapshot: &snapshot,
             user: ids::USER,
             box_id: ids::BOX,
+            fence: StepFence::Unleased,
         };
         let first = review_at(&store, 1, GateOutcome::Rejected).await;
         produce(&store, "review", Some(&first), "no tests").await;
@@ -1866,6 +1875,7 @@ mod tests {
             snapshot: &snapshot,
             user: ids::USER,
             box_id: ids::BOX,
+            fence: StepFence::Unleased,
         };
         let failed = step(&store, 2, 0, &[StepStatus::Running, StepStatus::Failed]).await;
         let refused = super::apply(

@@ -5868,6 +5868,7 @@ where
             snapshot,
             user: self.parts.user,
             box_id: self.parts.box_id,
+            fence: StepFence::Lease(self.parts.owner),
         }
     }
 
