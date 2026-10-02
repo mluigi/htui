@@ -14524,6 +14524,19 @@ async fn persona_named<S: WriteStore>(case: &str, store: &S, name: &str) -> Pers
         .unwrap_or_else(|| panic!("{case}: the registry holds `{name}`"))
 }
 
+/// The sentence of a `Constraint` refusal, or a panic naming the case and what was tried: a
+/// backend's own wording for a clash, which another write is then held to.
+fn clash_sentence<T: core::fmt::Debug>(
+    case: &str,
+    outcome: Result<T, StoreError>,
+    what: &str,
+) -> String {
+    match outcome {
+        Err(StoreError::Constraint(message)) => message,
+        other => panic!("{case}: {what} is Constraint, got {other:?}"),
+    }
+}
+
 /// A `Constraint` carrying exactly `sentence`, or a panic naming the case and what was tried.
 fn constraint_exactly<T: core::fmt::Debug>(
     case: &str,
@@ -14870,7 +14883,9 @@ async fn persona_writers_refuse_every_widening_shape<S: WriteStore>(store: &S) {
 }
 
 /// MOD-26 plan D5: a phase that names no persona row is refused with `references_no_row`'s
-/// sentence by both phase writers, after the position and name clashes; nothing is written.
+/// sentence by both phase writers, after the position and name clashes: a write that both clashes
+/// and names no persona is refused with the clash's own sentence, the one the same write naming
+/// no persona at all gets (MOD-26 review L3); nothing is written.
 async fn a_phase_naming_no_persona_is_refused<S: WriteStore>(store: &S) {
     const CASE: &str = "a_phase_naming_no_persona_is_refused";
     let unknown = PersonaId::new();
@@ -14888,18 +14903,26 @@ async fn a_phase_naming_no_persona_is_refused<S: WriteStore>(store: &S) {
         &sentence,
         "a create naming no persona",
     );
-    match store
-        .create_phase(&StepGraphPhase {
-            persona_id: Some(unknown),
-            ..new_phase(ids::GRAPH_HTUI_FEAT, 0, "cut")
-        })
-        .await
-    {
-        Err(StoreError::Constraint(message)) => assert_ne!(
-            message, sentence,
-            "{CASE}: a taken position is refused before the persona is looked up (D5)"
-        ),
-        other => panic!("{CASE}: a taken position is Constraint, got {other:?}"),
+    for (position, name, what) in [(0, "cut", "a taken position"), (9, "prd", "a taken name")] {
+        let clash = clash_sentence(
+            CASE,
+            store
+                .create_phase(&new_phase(ids::GRAPH_HTUI_FEAT, position, name))
+                .await,
+            what,
+        );
+        assert_ne!(clash, sentence, "{CASE}: {what} is not the persona refusal");
+        constraint_exactly(
+            CASE,
+            store
+                .create_phase(&StepGraphPhase {
+                    persona_id: Some(unknown),
+                    ..new_phase(ids::GRAPH_HTUI_FEAT, position, name)
+                })
+                .await,
+            &clash,
+            &format!("a create with {what} naming no persona (D5: the clash first)"),
+        );
     }
 
     let phase = before
@@ -14921,6 +14944,46 @@ async fn a_phase_naming_no_persona_is_refused<S: WriteStore>(store: &S) {
         &sentence,
         "an update naming no persona",
     );
+    for (patch, what) in [
+        (
+            PhasePatch {
+                position: Some(0),
+                ..PhasePatch::default()
+            },
+            "a taken position",
+        ),
+        (
+            PhasePatch {
+                name: Some("prd".to_owned()),
+                ..PhasePatch::default()
+            },
+            "a taken name",
+        ),
+    ] {
+        let clash = clash_sentence(
+            CASE,
+            store
+                .update_phase(phase.id, phase.updated_at, patch.clone())
+                .await,
+            what,
+        );
+        assert_ne!(clash, sentence, "{CASE}: {what} is not the persona refusal");
+        constraint_exactly(
+            CASE,
+            store
+                .update_phase(
+                    phase.id,
+                    phase.updated_at,
+                    PhasePatch {
+                        persona: Some(Some(unknown)),
+                        ..patch
+                    },
+                )
+                .await,
+            &clash,
+            &format!("an update to {what} naming no persona (D5: the clash first)"),
+        );
+    }
     assert_eq!(
         store.phases(ids::GRAPH_HTUI_FEAT).await.expect(CASE),
         before,
