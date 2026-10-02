@@ -230,16 +230,54 @@ impl StepNode {
 }
 
 impl NodeContent for StepNode {
+    /// The border, then the head and the phase inside it. `ctx.area` is the node's full size
+    /// at the current zoom; a node too small for an interior (zoom 0.5) is a bare box.
     fn render(&self, ctx: &NodeRenderContext, buf: &mut Buffer) {
-        let _ = (ctx, buf, Block::bordered());
-        todo!("MOD-28 T2")
+        let block = Block::bordered().border_style(self.border(ctx.selected));
+        let inner = block.inner(ctx.area);
+        block.render(ctx.area, buf);
+        for (row, line) in (0u16..).zip([&self.head, &self.phase]) {
+            if row >= inner.height {
+                break;
+            }
+            buf.set_string(
+                inner.x,
+                inner.y + row,
+                clip(line, usize::from(inner.width)),
+                self.text(),
+            );
+        }
     }
 }
 
 /// `text` in at most `width` terminal cells, by grapheme, cut with `…` (blueprint E11).
+///
+/// A control character reads as a space, so one line stays one line (the list's `fit` rule). A
+/// wide glyph that would straddle the last cell is dropped, so the result may be a cell short; it
+/// is never a cell long.
 fn clip(text: &str, width: usize) -> String {
-    let _ = (text, width, cell_width(""), graphemes(""));
-    todo!("MOD-28 T2")
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if cell_width(&flat) <= width {
+        return flat;
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for grapheme in graphemes(&flat) {
+        let w = cell_width(grapheme);
+        if used + w > width - 1 {
+            break;
+        }
+        out.push_str(grapheme);
+        used += w;
+    }
+    out.push(super::CUT);
+    out
 }
 
 /// Plan D9: one source on the bottom and one target on the top, both hidden. Baked into every
@@ -319,9 +357,72 @@ impl Default for ExecutionGraph {
 
 impl ExecutionGraph {
     /// Plan D7/D12: rebuilds the flow from `run`, `cursor` selected. `None` clears it.
+    ///
+    /// The selection and the hidden handles are baked into every node builder, because
+    /// `set_nodes` clears both (fact-check R2); the viewport survives it, so a re-read of the same
+    /// run keeps the canvas still, and only a new run resets it (blueprint E4).
     pub(super) fn sync(&mut self, run: Option<&RunSummary>, cursor: Option<StepId>, theme: &Theme) {
-        let _ = (run, cursor, theme, handles(), MARGIN);
-        todo!("MOD-28 T2")
+        let Some(run) = run else {
+            self.clear();
+            return;
+        };
+        let projection = project(run);
+        let nodes = projection
+            .positions
+            .iter()
+            .filter_map(|(id, (x, y))| {
+                let step = run.steps.iter().find(|step| step.id == *id)?;
+                Some(
+                    Node::new(
+                        id.to_string(),
+                        (*x, *y),
+                        (NODE_W, NODE_H),
+                        StepNode::new(step, &run.steps, theme),
+                    )
+                    .with_selected(Some(*id) == cursor)
+                    .with_draggable(false)
+                    .with_connectable(false)
+                    .with_deletable(false)
+                    .with_handles(handles()),
+                )
+            })
+            .collect();
+        let edges = projection
+            .edges
+            .iter()
+            .map(|(source, target, label)| edge(*source, *target, *label, theme))
+            .collect();
+        // Blueprint B-5: a projection never repeats an id or loops, so neither call fails; if one
+        // did, the canvas is drawn empty rather than the render path panicking.
+        if self
+            .flow
+            .set_nodes(nodes)
+            .and_then(|()| self.flow.set_edges(edges))
+            .is_err()
+        {
+            self.clear();
+            return;
+        }
+        let next = if self.run == Some(run.id) {
+            Reveal::Cursor
+        } else {
+            Reveal::Reset
+        };
+        self.run = Some(run.id);
+        self.cursor = cursor;
+        self.width = projection.width;
+        self.reveal = self.reveal.max(next);
+    }
+
+    /// An empty canvas that remembers no run.
+    fn clear(&mut self) {
+        // Neither call can fail on an empty list: nothing duplicates and nothing dangles.
+        let _ = self.flow.set_edges(Vec::new());
+        let _ = self.flow.set_nodes(Vec::new());
+        self.run = None;
+        self.cursor = None;
+        self.width = 0.0;
+        self.reveal = Reveal::None;
     }
 
     /// Plan D8: `+`, one step (1.2) in, clamped to 2.0. The cursor stays on screen (E9).
@@ -344,8 +445,25 @@ impl ExecutionGraph {
 
     /// Plan D7, blueprint B-2/E6: draws `area`, revealing first when a reveal is pending.
     pub(super) fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let _ = (frame, area, Viewport::default());
-        todo!("MOD-28 T2")
+        let reveal = core::mem::take(&mut self.reveal);
+        if reveal != Reveal::None {
+            // The canvas size is known only after a draw (`rataflow` `state/viewport.rs:288-291`),
+            // so the first pass goes to a throwaway buffer: drawing twice into the frame would
+            // leave the first pass's borders behind wherever the second does not overwrite them.
+            let mut scratch = Buffer::empty(area);
+            (&mut self.flow).render(area, &mut scratch);
+            if reveal == Reveal::Reset {
+                // Plan D12, blueprint B-1/E5: zoom 1, the widest layer centred, a row of margin.
+                let x = ((f64::from(area.width) - self.width) / 2.0)
+                    .floor()
+                    .max(MARGIN);
+                self.flow.viewport = Viewport::new(x, MARGIN, 1.0);
+            }
+            if let Some(cursor) = self.cursor {
+                self.flow.ensure_node_visible(&cursor.to_string());
+            }
+        }
+        frame.render_widget(&mut self.flow, area);
     }
 
     /// The run on the canvas, for the tests.
@@ -971,6 +1089,28 @@ mod tests {
         assert!(!graph.flow.edges().is_empty());
         assert!(graph.flow.edges().iter().all(|edge| !edge.deletable));
         assert!(!graph.flow.edges_reconnectable);
+    }
+
+    #[test]
+    fn zoom_is_clamped_and_fit_zooms_out_to_a_tall_run() {
+        let steps = (0..8)
+            .map(|n| step(n, i32::try_from(n).expect("small"), 1, 0))
+            .collect();
+        let mut graph = synced(&run(1, steps), Some(id(0)));
+        draw(&mut graph);
+        for _ in 0..10 {
+            graph.zoom_out();
+        }
+        draw(&mut graph);
+        assert!((graph.zoom() - 0.5).abs() < 1e-9, "{}", graph.zoom());
+        for _ in 0..10 {
+            graph.zoom_in();
+        }
+        draw(&mut graph);
+        assert!((graph.zoom() - 2.0).abs() < 1e-9, "{}", graph.zoom());
+        graph.fit();
+        draw(&mut graph);
+        assert!(graph.zoom() < 1.0, "{}", graph.zoom());
     }
 
     #[test]
