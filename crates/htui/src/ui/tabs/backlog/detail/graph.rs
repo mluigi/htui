@@ -556,7 +556,10 @@ fn line(
     ];
 
     let Some(link) = row.link else {
-        spans.push(Span::styled(node.key.clone(), label_style));
+        // Clipped to its own width, so never cut, only flattened (D3): `cut` measures a control
+        // at one cell that `ratatui` would draw as nothing.
+        let key = cells::clip(&node.key, cell_width(&node.key));
+        spans.push(Span::styled(key, label_style));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(status, status_style));
         push_title(&mut spans, &node.title, width, title_style);
@@ -1201,6 +1204,25 @@ mod tests {
         let mut spans = vec![Span::raw("ab")];
         push_title(&mut spans, "a\r\nb title", 40, Style::new());
         assert_eq!(spans[2].content, "a b title");
+    }
+
+    /// MOD-60 review round 1: the root row's key is not a label (no `fit_label`), so it is
+    /// flattened on its own; unflattened, `cut` measures its control at one cell that `ratatui`
+    /// draws as nothing, and the status and title land a cell left of where they were measured.
+    #[tokio::test]
+    async fn a_control_char_in_the_root_key_draws_as_a_blank_cell() {
+        let shell = Shell::platform().await;
+        let graph = demo(ids::HTUI_FEAT_1).await;
+        let root = rows(&graph, 2)[0];
+        assert!(root.link.is_none(), "row 0 is the root");
+        let mut node = root.node.clone();
+        node.key = "FEAT\u{1}1".to_owned();
+        let row = GraphRow {
+            node: &node,
+            ..root
+        };
+        let drawn = line(&row, false, node.project_id, true, false, 43, &shell.theme);
+        assert_eq!(text(&drawn), "  FEAT 1 in_progress TUI scaffold");
     }
 
     #[tokio::test]
