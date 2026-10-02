@@ -8,13 +8,13 @@ use htui::app::Action;
 use htui::persona_import::{NO_FRONTMATTER, PersonaImports, PersonaOutcome};
 use htui::persona_settings::PersonaWrite;
 use htui::store_worker::{StoreReply, StoreRequest};
-use htui::testkit::SectionBench;
+use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::personas::{
     COMMAND_RUN_IS_Y_OR_N, ENTER_A_PATH, HINT_BROWSE, HINT_DELETING, HINT_EDITOR, HINT_FORM_EDIT,
     HINT_REPORT, IMPORTING, UNCHANGED, UNSAVED,
 };
-use htui::ui::tabs::settings::{PersonasSection, SettingsSection};
+use htui::ui::tabs::settings::{PersonasSection, SettingsSection, SettingsTab};
 use htui_core::fixtures::ids;
 use htui_core::model::persona::{
     BLANK_PERSONA_BODY, RULE_MATCHES_EVERYTHING, allow_names_an_mcp_tool, rule_kind_unknown,
@@ -24,6 +24,7 @@ use htui_core::model::{
     PersonaPermission, PersonaRule, PersonaTools,
 };
 use htui_core::store::{MemStore, WriteStore as _, persona_is_bound};
+use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -1108,5 +1109,84 @@ async fn an_import_landing_over_an_editor_says_the_counts() {
         error_text(&bench, &section).contains("imported 1 \u{b7} refused 2 \u{b7} skipped 1"),
         "{}",
         frame(&bench, &section)
+    );
+}
+
+// ---- 9.5: registration and offline ---------------------------------------------------------------
+
+/// Personas are not mirrored: offline the read is refused, the section says so in `theme.error`
+/// and offers no key but navigation.
+#[tokio::test]
+async fn offline_the_section_says_unavailable_and_offers_no_keys() {
+    // `App::start` issues `ConnectionInfo`, which over a non-`Memory` backend reaches the keyring.
+    let _keyring = htui_store::testkit::mock_keyring().await;
+    // The mirror outlives the harness: dropping the directory deletes it mid-test.
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let cache = CacheStore::open(root.path(), "personas-section", PgStore::schema_version())
+        .await
+        .expect("a fresh mirror");
+    let mut harness = Harness::over_backend(Backend::Offline {
+        cache,
+        since: Some(chrono::Utc::now()),
+    })
+    .with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
+        PersonasSection::new(),
+    )])))
+    // `offline · 3s` would age between the render and the next tick.
+    .with_store_state("offline \u{b7} 0s", None);
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(frame.contains(" Personas "), "{frame}");
+    assert!(
+        shows(&frame, "personas unavailable: store unreachable:"),
+        "{frame}"
+    );
+    assert!(shows(&frame, DATABASE_UNREACHABLE), "{frame}");
+    assert!(!frame.contains(HINT_BROWSE), "no keys are offered: {frame}");
+
+    // The last line is the shell's: the refused read's status gives way to the key help on the
+    // first key, so the section's rows are what must not move.
+    let pane = |frame: &str| -> Vec<String> {
+        let lines: Vec<String> = frame.lines().map(str::to_owned).collect();
+        lines[..lines.len() - 1].to_vec()
+    };
+    for key in ["n", "e", "d", "I"] {
+        harness.key(key);
+        harness.settle().await;
+        assert_eq!(
+            pane(&harness.render()),
+            pane(&frame),
+            "`{key}` changes nothing on screen"
+        );
+    }
+    insta::assert_snapshot!("offline", frame);
+}
+
+/// D22: the product registers `Personas` last, so the strip reads eight sections and seven `l`
+/// reach it, over the demo registry.
+#[tokio::test]
+async fn the_product_registers_personas_last() {
+    let mut harness = Harness::demo();
+    htui::app::register_all(harness.app());
+    harness.settle().await;
+    // Settings is the fourth tab.
+    harness.key("4");
+    harness.settle().await;
+    for _ in 0..7 {
+        harness.key("l");
+    }
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        frame.contains(" Boxes  Personas "),
+        "Personas follows Boxes: {frame}"
+    );
+    assert!(frame.contains("architect \u{b7} "), "{frame}");
+    assert!(frame.contains("reviewer \u{b7} "), "{frame}");
+    assert!(
+        frame.contains(HINT_BROWSE),
+        "the active section is Personas: {frame}"
     );
 }
