@@ -778,6 +778,8 @@ mod tests {
         assert_eq!(new.body, file.body);
     }
 
+    /// MOD-26 I-5 (no model, `R-AGT-8`): a persona file cannot carry a model — `model` is refused
+    /// with [`MODEL_REFUSED`], before any later key, so the phase candidate's model is the step's.
     #[test]
     fn the_model_key_is_refused_with_its_sentence() {
         assert_eq!(
@@ -1170,6 +1172,8 @@ mod tests {
         assert_eq!(permission, PersonaPermission::default());
     }
 
+    /// MOD-26 I-6 (row is the truth, `R-ID-3`): the seed rows are the two `include_str!`'d seed
+    /// files, parsed once into rows; nothing reads a persona file at run time.
     #[test]
     fn seed_rows_are_the_two_seed_files() {
         let now = at(7);

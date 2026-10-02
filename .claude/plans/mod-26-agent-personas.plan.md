@@ -403,10 +403,9 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 
 ## Acceptance
 
-- [ ] I-1…I-7 hold, each with a test naming it — I-1, I-2, I-3, I-4 and I-7 are named by tests;
-      I-5 is pinned by `the_model_key_is_refused_with_its_sentence` (`MODEL_REFUSED`, documented
-      I-5) and I-6 is structural (`include_str!` seeds, `seed_rows_are_the_two_seed_files`), but no
-      test names either invariant
+- [x] I-1…I-7 hold, each with a test naming it — I-1, I-2, I-3, I-4 and I-7 are named by tests;
+      review R1 named the last two: I-5 on `the_model_key_is_refused_with_its_sentence` (and
+      `the_model_key_is_refused_in_any_case`), I-6 on `seed_rows_are_the_two_seed_files`
 - [x] PRD metrics pinned per the test plan
 - [ ] Validation passes; reviewer gate (`rust-reviewer`) findings applied or deferred with the
       maintainer
