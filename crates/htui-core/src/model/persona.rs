@@ -1485,15 +1485,22 @@ mod tests {
             "persona.permission.rules entry kind `exec` is not one of read, edit, delete, move, \
              search, execute, think, fetch, switch_mode, other"
         );
+        // The §2.2 shape is `escape_debug`, as `kind_not_narrowable`: it keeps the sentence one
+        // line but leaves a backtick raw, so the literal sentence is pinned for each odd kind.
+        assert_eq!(
+            rule_kind_unknown("e`x"),
+            "persona.permission.rules entry kind `e`x` is not one of read, edit, delete, move, \
+             search, execute, think, fetch, switch_mode, other"
+        );
+        assert_eq!(
+            rule_kind_unknown("e\nx"),
+            "persona.permission.rules entry kind `e\\nx` is not one of read, edit, delete, move, \
+             search, execute, think, fetch, switch_mode, other"
+        );
         for odd in ["e`x", "e\nx"] {
             let sentence = rule_kind_unknown(odd);
             assert!(!sentence.contains('\n'), "one line: {sentence:?}");
-            assert!(
-                sentence.contains(&format!("`{}`", odd.escape_debug())),
-                "the kind is escape_debug'd: {sentence}"
-            );
         }
-        assert!(rule_kind_unknown("e\nx").contains("`e\\nx`"));
     }
 
     #[test]
