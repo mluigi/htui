@@ -133,7 +133,8 @@ revision). Moved counts: store conformance `CASES` 119 → 124 (`READ_CASES` 14)
 column comments 35 → 44, `.sqlx` files 307 → 315. Operator guide: `docs/personas.md`.
 
 Milestone 2 also carries two items the milestone 1 review deferred (`rust-reviewer`, approve with
-fixes, 2026-10-02; the maintainer fixed L1, L3, N1-N3 and N6-N8 in R1 and deferred these):
+fixes, 2026-10-02; in R1 the maintainer fixed L1, L3, N1-N3 and N6-N8, documented L2 and L4 in
+`docs/personas.md`, and deferred these):
 
 - [ ] **N4** — a typed `PersonaNotInSnapshot` error for `GraphSnapshot::persona_for` in place of
   its `String` (`persona_not_in_snapshot`'s sentence), so the engine's I-4 arms match a type
