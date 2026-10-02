@@ -177,7 +177,8 @@ pair has disjoint file sets. One implementer, TDD, committing per task.
 - **Action**: Add the `External` arm in `on_item_form_key` (`ctx.emit(Action::EditExternally(
   edit))`), and `fn on_external_edit` in `impl Tab for BacklogTab`, routing to
   `item_form.on_external_edit`.
-- **Validate**: `cargo test -p htui --all-features --test backlog`.
+- **Validate**: `cargo test -p htui --all-features --test backlog` and
+  `cargo test -p htui --all-features --lib ui::tabs::backlog` (blueprint deviation 5).
 
 ### Task 4: close-out
 - PRD row 4 → `complete`, this plan's status line, the HANDOFF MOD-13 phase-4 note
@@ -229,4 +230,6 @@ Fact-checked against the tree on 2026-10-02 (handoff-run step 3.5).
 - [ ] Patterns mirrored, not reinvented (MOD-9 handoff reused; no event-loop change)
 - [ ] An external edit saves only through the §7.2 compare-and-set, and a stale one opens the
       divergence view
-- [ ] No editor action reachable while `Offline`
+- [ ] No form, so no Ctrl+E, opens while `Offline`. A form opened before a runtime drop to
+      `Offline` keeps Ctrl+E (local only), and its Ctrl+S is refused, as milestone 2's save is
+      (PRD metric "absent or refused"; blueprint deviation 2)
