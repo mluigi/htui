@@ -121,11 +121,11 @@ the implementer's first failing test.
 ## Proposed re-deferral (needs maintainer decision)
 - **R-32a** (D131's not-reset park loses its labelled detail): `labelled` is always empty on a refusal, so what is actually lost is the reason text. It lives only in memory in `never_reset` and is never persisted; `interrupt_step` stores the constant `NOT_RESET`. Recovering it needs either a new column or a change to `gate_note`, which is matched exactly in the engine (`engine.rs:2741`) and in four tests. Calling `reset` again to rebuild it is unsafe, because it can move trees. This is diagnostics only. Re-defer to whoever next touches the park's note format.
 
-## Open choices
-1. **R-5 transaction half**: build the park composite (recommended; the store fan-out already exists for the pass op, and `promote_step` is the template), or close only the `skipped` half and re-defer the composite. D96 already closes the crash half.
-2. **R-31 fix side**: recovery-side through `Unblock` (recommended; it also rescues runs already stuck), or an `answer_gate`-plus-unpark store transaction (closes the window, but leaves any existing stuck rows stuck).
-3. **R-30 and candidates**: keep today's rule for candidates, as planned, or let the blueprint prove the relaxed rule safe for them.
-4. **R-32a**: re-defer as proposed?
+## Open choices (settled 2026-10-02: maintainer CONFIRM, all as recommended)
+1. **R-5 transaction half**: build the park composite. The store fan-out already exists for the pass op, and `promote_step` is the template. Rejected: close only the `skipped` half and re-defer the composite (D96 already closes the crash half).
+2. **R-31 fix side**: recovery-side through `Unblock`. It also rescues runs already stuck. Rejected: an `answer_gate`-plus-unpark store transaction, which closes the window but leaves existing stuck rows stuck.
+3. **R-30 and candidates**: candidates keep today's every-repo rule. Rejected: let the blueprint prove the relaxed rule safe for them.
+4. **R-32a**: re-deferred as proposed.
 
 ## Validation
 ```bash
@@ -153,4 +153,4 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 - [ ] HANDOFF R-lines updated: closed, or re-deferred with a reason
 
 ---
-*Status: DRAFT (2026-10-02), awaiting CONFIRM.*
+*Status: CONFIRMED (2026-10-02); blueprint next.*
