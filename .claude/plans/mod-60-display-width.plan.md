@@ -1,7 +1,8 @@
 # Plan: MOD-60 — display width in every hand-laid-out row
 
-> **Status: CONFIRMED 2026-10-02** by the maintainer, OQ-1 answered **yes** (the default). Fact-checked,
-> 13/13 claims verified (see "Verified claims"). Cleared for the implementation phase.
+> **Status: complete (2026-10-03).** CONFIRMED 2026-10-02 (OQ-1 yes); implemented T0 `33046f2b`..`932ed356`,
+> lanes T1-T4 merged `30c4a4cc`..`326b74a0`, T5 `444d5dc0`; rust-reviewer approve-with-fixes, every
+> finding applied (`80173bb0`..`9b58ebe0`). Deviations B1-B13 in the blueprint.
 
 **Source**: `HANDOFF.md:303-317`, MOD-60 (from MOD-54, plan D18), plus the MOD-13 milestone 3 review
 L3 deferral (`HANDOFF.md:449-451`: the divergence view's notice, clip and column padding) and the
@@ -197,7 +198,7 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 | V12 | T1–T4 file sets are pairwise disjoint | ✓ | Files to Change table: settings/* minus mod.rs ∩ backlog/* ∩ requirements/* ∩ {skills, overlay, chat/mod.rs, path_picker} = ∅; T0 owns cells.rs + settings/mod.rs alone |
 | V13 | `tree::pad` cuts the last span (the marker) and returns `…` at keep 0 | ✓ | `tree.rs:297-316` + `list::clip` width-0 branch |
 
-## Allowlist (D11, written at T5 on the merged tree `444d5dc0`)
+## Allowlist (D11, re-derived after the review round, at `9b58ebe0`)
 
 Sweep (repo root):
 
@@ -205,19 +206,19 @@ Sweep (repo root):
 rg -n 'chars\(\)\.count\(\)|chars\(\)\.take\(|\.repeat\(|:<\w+\$\}|:>\w+\$\}|:<\d+\}|:>\d+\}' crates/htui/src/ui
 ```
 
-**151 hits**: 37 in production code, each listed below; 114 inside `#[cfg(test)] mod tests` (CJK/emoji fixtures built with `.repeat(n)`, ASCII row readers, and the expected `format!` padding of test oracles), counted per file after the table. No production hit pads, clips or wraps runtime text by `char`.
+**155 hits**: 37 in production code, each listed below; 118 inside `#[cfg(test)] mod tests` (CJK/emoji fixtures built with `.repeat(n)`, ASCII row readers, test-oracle `format!` padding), counted per file after the table. No production hit pads, clips or wraps runtime text by `char`.
 
 | Site | Hit | Reason |
 |---|---|---|
-| `cells.rs:152` | `out.push_str(&" ".repeat(width.saturating_sub(cell_width(text))));` | `pad`: row fill after a `cell_width` measure |
-| `cells.rs:160` | `let mut out = " ".repeat(width.saturating_sub(cell_width(text)));` | `pad_left`: row fill after a `cell_width` measure |
-| `text_area.rs:124` | `/// How many chars, the `\n` between lines included (so `len() == text` | not layout: `TextArea::len` char-count API (doc) |
+| `cells.rs:158` | `out.push_str(&" ".repeat(width.saturating_sub(cell_width(&out))));` | `pad`/`pad_left`: fill after a `cell_width` measure |
+| `cells.rs:167` | `let mut out = " ".repeat(width.saturating_sub(cell_width(&flat)));` | `pad`/`pad_left`: fill after a `cell_width` measure |
+| `text_area.rs:124` | `/// How many chars, the `\n` between lines included (so `len() == text` | not layout: `TextArea::len` char-count API |
 | `text_area.rs:131` | `self.text.chars().count()` | not layout: `TextArea::len` char-count API |
-| `tabs/skills/templates.rs:1139` | `\\|\\| project.to_string().chars().take(8).collect(),` | not layout: UUID prefix |
+| `tabs/skills/templates.rs:1139` | `\|\| project.to_string().chars().take(8).collect(),` | not layout: UUID prefix |
 | `tabs/skills/templates.rs:1147` | `format!("  {} v{head:<3} {role}", cells::fit(name, NAME_WIDTH))` | D6: integer `v{head:<3}`; the name is `cells::fit` |
 | `tabs/skills/library.rs:1605` | `let mut spans = vec![Span::styled(format!("{label:<INFO_LABEL$}"), the` | D6: `format!` width on a compile-time ASCII label/key |
 | `tabs/skills/library.rs:1711` | `format!("  {} v{head:<3}", cells::fit(name, NAME_WIDTH))` | D6: integer `v{head:<3}`; the name is `cells::fit` |
-| `tabs/skills/attach.rs:930` | `\\|\\| project.to_string().chars().take(8).collect(),` | not layout: UUID prefix |
+| `tabs/skills/attach.rs:930` | `\|\| project.to_string().chars().take(8).collect(),` | not layout: UUID prefix |
 | `tabs/skills/attach.rs:1013` | `let mut spans = vec![Span::styled(format!("{name:<FORM_LABEL$}"), them` | D6: `format!` width on a compile-time ASCII label/key |
 | `tabs/skills/attach.rs:1024` | `Span::styled(format!("{:<FORM_LABEL$}", "activation"), theme.base),` | D6: `format!` width on a compile-time ASCII label/key |
 | `tabs/skills/attach.rs:1035` | `let label = Span::styled(format!("{:<FORM_LABEL$}", "effective:"), the` | D6: `format!` width on a compile-time ASCII label/key |
@@ -227,30 +228,42 @@ rg -n 'chars\(\)\.count\(\)|chars\(\)\.take\(|\.repeat\(|:<\w+\$\}|:>\w+\$\}|:<\
 | `tabs/settings/connection.rs:554` | `format!("  {label:<label_width$}  {chunk}"),` | D6: `format!` width on a compile-time ASCII label/key |
 | `tabs/settings/boxes.rs:1114` | `Span::styled(format!("{name:<LABEL_WIDTH$}"), theme.dim)` | D6: `format!` width on a compile-time ASCII label/key |
 | `tabs/settings/boxes.rs:1209` | `let digest: String = spec.digest.chars().take(DIGEST_SHOWN).collect();` | not layout: digest prefix (hex) |
-| `tabs/requirements/tree.rs:224` | `cells::clip(&format!("{}no areas", " ".repeat(AREA_INDENT)), width),` | spaces: constant indent/gap (`" ".repeat(CONST)`), one cell each |
-| `tabs/requirements/tree.rs:233` | `" ".repeat(AREA_INDENT),` | spaces: constant indent/gap (`" ".repeat(CONST)`), one cell each |
-| `tabs/requirements/tree.rs:309` | `format!("{}{WITHDRAWN_MARK} ", " ".repeat(AREA_INDENT))` | spaces: constant indent/gap (`" ".repeat(CONST)`), one cell each |
-| `tabs/requirements/tree.rs:311` | `" ".repeat(ROW_INDENT)` | spaces: constant indent/gap (`" ".repeat(CONST)`), one cell each |
-| `tabs/requirements/tree.rs:316` | `Span::styled(" ".repeat(GAP), style),` | spaces: constant indent/gap (`" ".repeat(CONST)`), one cell each |
-| `tabs/requirements/tree.rs:321` | `Span::styled(" ".repeat(GAP), style),` | spaces: constant indent/gap (`" ".repeat(CONST)`), one cell each |
-| `tabs/requirements/tree.rs:339` | `spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));` | row fill after a `cell_width` measure |
-| `tabs/backlog/list.rs:205` | `Span::raw(" ".repeat(INDENT)),` | spaces: constant indent/gap (`" ".repeat(CONST)`), one cell each |
-| `tabs/backlog/list.rs:207` | `Span::raw(" ".repeat(GAP)),` | spaces: constant indent/gap (`" ".repeat(CONST)`), one cell each |
-| `tabs/backlog/list.rs:212` | `Span::raw(" ".repeat(GAP)),` | spaces: constant indent/gap (`" ".repeat(CONST)`), one cell each |
+| `tabs/backlog/list.rs:205` | `Span::raw(" ".repeat(INDENT)),` | spaces: constant indent/gap, one cell each |
+| `tabs/backlog/list.rs:207` | `Span::raw(" ".repeat(GAP)),` | spaces: constant indent/gap, one cell each |
+| `tabs/backlog/list.rs:212` | `Span::raw(" ".repeat(GAP)),` | spaces: constant indent/gap, one cell each |
 | `tabs/backlog/list.rs:232` | `spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));` | row fill after a `cell_width` measure |
-| `tabs/backlog/detail/runs.rs:925` | `" ".repeat(width)` | `blank`: spaces (one cell each) |
 | `tabs/backlog/item_form.rs:846` | `let head = format!("{}{label:<LABEL$}", marker(focused));` | D6: `format!` width on a compile-time ASCII label/key |
+| `tabs/backlog/filter.rs:341` | `let head = format!("{} {label:<LABEL$}", if focused { '>' } else { ' '` | D6: `format!` width on a compile-time ASCII label/key |
+| `tabs/requirements/tree.rs:224` | `cells::clip(&format!("{}no areas", " ".repeat(AREA_INDENT)), width),` | spaces: constant indent/gap, one cell each |
+| `tabs/requirements/tree.rs:233` | `" ".repeat(AREA_INDENT),` | spaces: constant indent/gap, one cell each |
+| `tabs/requirements/tree.rs:307` | `format!("{}{WITHDRAWN_MARK} ", " ".repeat(AREA_INDENT))` | spaces: constant indent/gap, one cell each |
+| `tabs/requirements/tree.rs:309` | `" ".repeat(ROW_INDENT)` | spaces: constant indent/gap, one cell each |
+| `tabs/requirements/tree.rs:314` | `Span::styled(" ".repeat(GAP), style),` | spaces: constant indent/gap, one cell each |
+| `tabs/requirements/tree.rs:319` | `Span::styled(" ".repeat(GAP), style),` | spaces: constant indent/gap, one cell each |
+| `tabs/requirements/tree.rs:337` | `spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));` | row fill after a `cell_width` measure |
+| `tabs/backlog/detail/graph.rs:571` | `format!("{kind:<KIND_WIDTH$}")` | D6: link-kind enum (ASCII) |
+| `tabs/backlog/detail/graph.rs:581` | `spans.push(Span::raw(" ".repeat(indent(row.level))));` | spaces: constant indent/gap, one cell each |
 | `tabs/backlog/detail/prompt.rs:272` | `"{:<24}{:>8}{:>8}  {}",` | D6: ASCII header literals |
 | `tabs/backlog/detail/prompt.rs:279` | `"{}{:>8}{:>8}  {}",` | D6: integer columns; the name is `cells::pad` |
 | `tabs/backlog/detail/prompt.rs:307` | `format!("{label:<LABEL$}{value}")` | D6: `format!` width on a compile-time ASCII label/key |
-| `tabs/backlog/filter.rs:341` | `let head = format!("{} {label:<LABEL$}", if focused { '>' } else { ' '` | D6: `format!` width on a compile-time ASCII label/key |
-| `tabs/backlog/detail/graph.rs:568` | `format!("{kind:<KIND_WIDTH$}")` | D6: link-kind enum (ASCII) |
-| `tabs/backlog/detail/graph.rs:578` | `spans.push(Span::raw(" ".repeat(indent(row.level))));` | spaces: constant indent/gap (`" ".repeat(CONST)`), one cell each |
+| `tabs/backlog/detail/runs.rs:921` | `" ".repeat(width)` | `blank`: spaces (one cell each) |
 
-Test-module hits per file: `cells.rs` 21, `overlay/concepts_search.rs` 4, `overlay/workspace_switcher.rs` 1, `tabs/backlog/detail/graph.rs` 3, `tabs/backlog/detail/requirements.rs` 2, `tabs/backlog/detail/runs.rs` 10, `tabs/backlog/detail/runs/execution_graph.rs` 1, `tabs/backlog/divergence.rs` 6, `tabs/backlog/filter.rs` 1, `tabs/backlog/item_form.rs` 6, `tabs/backlog/list.rs` 1, `tabs/chat/mod.rs` 3, `tabs/requirements/tree.rs` 6, `tabs/settings/agents.rs` 4, `tabs/settings/boxes.rs` 2, `tabs/settings/connection.rs` 1, `tabs/settings/hierarchy.rs` 4, `tabs/settings/kinds.rs` 1, `tabs/settings/mod.rs` 3, `tabs/settings/prompt.rs` 1, `tabs/settings/qdrant.rs` 1, `tabs/skills/attach.rs` 4, `tabs/skills/library.rs` 6, `tabs/skills/templates.rs` 6, `text_area.rs` 11, `text_field.rs` 5.
+Test-module hits per file: `cells.rs` 25, `overlay/concepts_search.rs` 4, `overlay/workspace_switcher.rs` 1, `tabs/backlog/detail/graph.rs` 3, `tabs/backlog/detail/requirements.rs` 2, `tabs/backlog/detail/runs.rs` 10, `tabs/backlog/detail/runs/execution_graph.rs` 1, `tabs/backlog/divergence.rs` 6, `tabs/backlog/filter.rs` 1, `tabs/backlog/item_form.rs` 6, `tabs/backlog/list.rs` 1, `tabs/chat/mod.rs` 3, `tabs/requirements/tree.rs` 6, `tabs/settings/agents.rs` 4, `tabs/settings/boxes.rs` 2, `tabs/settings/connection.rs` 1, `tabs/settings/hierarchy.rs` 4, `tabs/settings/kinds.rs` 1, `tabs/settings/mod.rs` 3, `tabs/settings/prompt.rs` 1, `tabs/settings/qdrant.rs` 1, `tabs/skills/attach.rs` 4, `tabs/skills/library.rs` 6, `tabs/skills/templates.rs` 6, `text_area.rs` 11, `text_field.rs` 5.
+
+**`Line::width()` measures** (review L4: the regex above cannot see them; ratatui's `Line::width` is a whole-span measure that skips the halfwidth sound-mark rule). Production uses, each a deliberate estimate, not a layout budget:
+
+| Site | Reason |
+|---|---|
+| `tabs/skills/templates.rs:971` | row estimate for a wrapped `Paragraph`: documented lower bound (plan Correction, V4) |
+| `tabs/skills/library.rs:1472` | same lower-bound row estimate (skill body/diff pane) |
+| `tabs/skills/library.rs:1652` | same lower-bound row estimate (info pane) |
+| `tabs/backlog/detail/runs.rs:1427` | footer height estimate for a wrapped `Paragraph`; same lower-bound rule |
+| `overlay/migration_prompt.rs:120` | box width over fixed prompt lines (ASCII text plus a pending count); no runtime string |
+
+Found with `rg -n 'Line::width|\b(line|l|row)\.width\(\)' crates/htui/src/ui`; the remaining hits are tests and the switcher's doc comments (B3).
 
 ## Acceptance
-- [ ] T0–T5 complete, each lane red→green
-- [ ] Validation passes; no snapshot moved beyond OQ-1's accepted set
-- [ ] D11 sweep allowlist written and every remaining hit on it
-- [ ] Patterns mirrored, not reinvented (14 local helpers → `ui::cells`)
+- [x] T0–T5 complete, each lane red→green
+- [x] Validation passes; no snapshot moved beyond OQ-1's accepted set
+- [x] D11 sweep allowlist written and every remaining hit on it
+- [x] Patterns mirrored, not reinvented (14 local helpers → `ui::cells`)
