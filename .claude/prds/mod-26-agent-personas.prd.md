@@ -54,7 +54,7 @@ Read at `04eeb7c9` (branch `hr/MOD-26`). Paths relative to the repo root.
 
 ## Hypothesis
 
-We believe **named personas stored as registry rows and bound to a phase's candidate agent**
+We believe **named personas stored as registry rows and bound to a step-graph phase**
 will **let specialist steps run with their own instructions and a narrower, enforced tool and
 permission posture** for **the operator authoring step graphs**.
 We'll know we're right when **a run's review phase executes under the seeded `reviewer` persona,
@@ -83,8 +83,9 @@ the recorded step shows the persona's block in its prompt and its narrowed expos
    `command_run` can only be turned off; permission rules are no looser than the agent's policy
    (a persona can add `deny`/`ask` rules, never an `allow` the base would not grant, never a
    looser default).
-3. **Binding on the phase candidate**: a phase's candidate row may name one persona. Each
-   candidate of a phase can carry a different one.
+3. **Binding on the step-graph phase**: a `step_graph_phase` may name one persona, applied to
+   whichever candidate wins the phase (rungs 1-3 alike). Per-candidate binding is deferred (Out of
+   scope).
 4. **Fixed, written-down precedence** for the keys a persona carries: agent row (base exposure and
    policy) → persona (narrows) → result on the step. Model stays the phase candidate's (`R-AGT-8`).
 5. **Body inlined into the step prompt** as an htui-owned block (`R-ID-5`, `R-PRM-1`), never a file
@@ -112,8 +113,9 @@ the recorded step shows the persona's block in its prompt and its narrowed expos
   typed exits.
 - Change push of persona rows to other boxes — MOD-48; rows are read from Postgres like every
   other registry row.
-- Phase-level (as opposed to candidate-level) binding — not needed for the hypothesis; can be added
-  later as one more precedence rung.
+- Per-candidate binding (`phase_agent.persona_id`) — `phase_agent` has no writer (HANDOFF R-6) and
+  most runs resolve their candidate on rung 2 or 3 without a `phase_agent` row; lands later as one
+  more precedence rung (candidate over phase) once R-6's writer exists.
 - Export of a persona back to a Markdown file.
 
 ## Delivery Milestones
@@ -122,21 +124,28 @@ the recorded step shows the persona's block in its prompt and its narrowed expos
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Personas in the registry, applied by the engine | A persona row (seeded `reviewer`/`architect`) bound to a phase candidate changes that step's prompt block, exposure and policy; narrow-only refused at save; snapshot-stable; out-of-list calls refused by the relay and by `claude` CLI flags | pending | — |
-| 2 | Authoring in the TUI | Settings > Personas lists, edits, validates and saves personas; frontmatter `.md` import; a phase candidate's persona is picked in the step-graph editor | pending | — |
+| 1 | Personas in the registry, applied by the engine | A persona row (seeded `reviewer`/`architect`) bound to a phase candidate changes that step's prompt block, exposure and policy; narrow-only refused at save; snapshot-stable; out-of-list calls refused by the relay and by `claude` CLI flags | in-progress | `.claude/plans/mod-26-agent-personas.plan.md` |
+| 2 | Authoring in the TUI | Settings > Personas lists, edits, validates and saves personas; frontmatter `.md` import; a phase's persona is picked in the step-graph editor | pending | — |
 
 ## Open Questions
 
 - [x] Where do personas live? — **Postgres registry rows** (maintainer, 2026-10-02; `R-ID-3`).
 - [x] Can a persona set the model? — **No** (maintainer, 2026-10-02). ANA-27's precedence sentence
   is restated in this PRD without the model rung; DECISIONS/ANA-27 note to be corrected at close-out.
-- [x] Where is a persona bound? — **On the phase candidate** (`phase_agent`), nullable
-  (maintainer, 2026-10-02).
+- [x] Where is a persona bound? — **On the step-graph phase** (`step_graph_phase`), nullable
+  (maintainer, 2026-10-02, revised at `/plan`: the first answer, the phase candidate, was taken
+  before it was known that `phase_agent` has no writer, HANDOFF R-6, and that rung 2/3 runs have
+  no `phase_agent` row; per-candidate binding is deferred).
 - [x] Authoring surface? — **Settings tab + `.md` import** (maintainer, 2026-10-02).
 - [x] Seeds? — **`reviewer` + `architect`** (maintainer, 2026-10-02).
 - [x] Tool enforcement? — **Both layers**: transport flags where supported, relay denial for all
   (maintainer, 2026-10-02).
-- [ ] Which transports accept an allow/deny list, and in what syntax? `claude` CLI is assumed
+- [x] Tool vocabulary / transport syntax — settled at `/plan` (fact-checked): `deny_kinds`
+  (agent-neutral, every transport) plus agent-native names enforced on `claude-cli` only, via
+  `--tools=` / `--disallowedTools=` (never `--allowedTools`, which auto-approves); the step's
+  "layers in force" is documented as a per-transport matrix instead of recorded per step. See the
+  plan's OQ-1, OQ-6 and D11.
+- [ ] ~~Which transports accept an allow/deny list, and in what syntax?~~ (settled above) `claude` CLI is assumed
   (`--allowedTools`/`--disallowedTools`); `agy` over ACP is TBD — needs validation via a probe of
   the installed binaries at plan fact-check.
 - [ ] Does every tool call surface to the relay? ACP agents may run some tools without a
