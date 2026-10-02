@@ -330,6 +330,42 @@ mod tests {
         );
     }
 
+    /// MOD-60 D12: the `by` column is padded by cells, so a wide deciding key does not push its
+    /// row's stamp right of the others'.
+    #[tokio::test]
+    async fn a_wide_deciding_key_keeps_the_stamp_column() {
+        use crate::ui::cells::cell_width;
+
+        let theme = Theme::default();
+        let mut detail = r_ent_1().await;
+        let revisions = detail.revisions.as_mut().expect("the demo has revisions");
+        assert!(revisions.len() >= 2, "R-ENT-1 has two revisions");
+        revisions[0].deciding_key = Some("\u{6f22}\u{5b57}-1".to_owned());
+        revisions[1].deciding_key = Some("ANA-2".to_owned());
+        let offsets: Vec<(String, usize)> = revisions
+            .iter()
+            .map(|row| {
+                let line = super::revision(row, &theme);
+                let drawn: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                let stamp = line.spans.last().expect("the stamp is drawn");
+                let before: usize = line.spans[..line.spans.len() - 1]
+                    .iter()
+                    .map(|span| cell_width(&span.content))
+                    .sum();
+                assert!(!stamp.content.is_empty(), "{drawn:?} shows its stamp");
+                (drawn, before)
+            })
+            .collect();
+        assert!(
+            offsets.windows(2).all(|pair| pair[0].1 == pair[1].1),
+            "the stamp starts at one cell offset on every row: {offsets:#?}"
+        );
+    }
+
     /// Blueprint F-14: the mirror holds no revisions, and the pane says so.
     #[tokio::test]
     async fn revisions_none_says_they_need_the_database() {

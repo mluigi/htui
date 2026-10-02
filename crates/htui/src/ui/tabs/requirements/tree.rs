@@ -494,6 +494,58 @@ mod tests {
         }
     }
 
+    /// MOD-60 D12: the key column is measured in cells, so a key of wide glyphs (6 chars,
+    /// 10 cells) does not push its row's priority right of its neighbours' (7 chars, 7 cells).
+    #[tokio::test]
+    async fn a_wide_key_keeps_the_priority_column() {
+        let (mut snapshot, projects, _) = platform().await;
+        let mut priorities = Vec::new();
+        for entry in snapshot
+            .projects
+            .iter_mut()
+            .filter(|entry| entry.project_id == ids::PROJECT_HTUI)
+        {
+            for row in &mut entry.requirements {
+                if row.id == ids::REQ_ENT_1 {
+                    row.key = "\u{6f22}\u{5b57}\u{6f22}\u{5b57}-1".to_owned();
+                }
+                priorities.push((row.id, row.priority.as_str()));
+            }
+        }
+        let drawn = tree_lines(&snapshot, &projects, 80);
+        let offsets: Vec<(String, usize)> = rows(&snapshot, &projects, &[], "")
+            .iter()
+            .zip(&drawn)
+            .filter_map(|(row, line)| match row {
+                Row::Requirement(id) => Some((*id, line_text(line))),
+                _ => None,
+            })
+            .map(|(id, text)| {
+                let (_, priority) = priorities
+                    .iter()
+                    .find(|(row, _)| *row == id)
+                    .expect("every drawn requirement is htui's");
+                let at = text
+                    .find(priority)
+                    .unwrap_or_else(|| panic!("{text:?} shows its priority"));
+                let offset = cell_width(&text[..at]);
+                (text, offset)
+            })
+            .collect();
+        assert!(
+            offsets.len() >= 3,
+            "the wide key and its ASCII neighbours are drawn: {offsets:#?}"
+        );
+        assert!(
+            offsets.iter().any(|(text, _)| text.contains('\u{6f22}')),
+            "the wide key is drawn: {offsets:#?}"
+        );
+        assert!(
+            offsets.windows(2).all(|pair| pair[0].1 == pair[1].1),
+            "the priority starts at one cell offset on every row: {offsets:#?}"
+        );
+    }
+
     #[tokio::test]
     async fn the_filter_keeps_matching_rows_and_their_headers() {
         let (snapshot, projects, _) = platform().await;
