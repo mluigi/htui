@@ -8,7 +8,7 @@
 > the plan left open or reads it differently (B1–B9). Each one is adopted unless the main thread
 > voids it.
 
-## 0. Deviations and clarifications (B1–B10)
+## 0. Deviations and clarifications (B1–B12)
 
 | # | What | Why | Plan text it touches |
 |---|---|---|---|
@@ -22,6 +22,8 @@
 | B8 | `cells::wrap` flattens control clusters in **both** push paths. `wrap_row`/`wrap_line` flattened only in the grapheme path: a non-first word that fits after a space was pushed raw. Splitting stays on U+0020 only, so a tab is not a new break opportunity. | D3: every `clip`/`fit`/`wrap` output draws a control as one blank cell. Widths are unchanged, since a control cluster is 1 cell either way. | D4 "`wrap_row` promoted" |
 | B9 | `item_form::notice_lines` is **deleted**, not kept as a wrapper. Its two callers (`item_form::render`, `divergence::row_lines`) call `settings::wrapped` directly. Its doc reasoning (why pre-wrap instead of `Paragraph::wrap`) moves to the `item_form::render` call site. | "becomes a call to `wrapped`" (D5) read as the call sites becoming calls. A one-line forwarding fn is the kind of local copy D1 removes. | D5, D8 wording |
 | B10 | **Added during T0 (adversarial verify, round 1; commit `5e54774f`).** `cell_width` is the **sum of per-grapheme widths** (`graphemes(s).map(cluster_width).sum()`, where `cluster_width` is the old body applied to one cluster: `UnicodeWidthStr::width` + one per halfwidth sound mark), not `UnicodeWidthStr::width` over the whole string. | `unicode-width` 0.2.2 applies ligature/ZWJ rules across cluster boundaries (Arabic lam-alef U+0644 U+0627 measures 1, Tifinagh/Lisu/Khmer sequences likewise), while ratatui's `Buffer::set_stringn` advances one grapheme at a time (`ratatui-core-0.1.2/src/buffer/buffer.rs:350-353`), so lam-alef draws 2. With the whole-string measure, `clip(salam, 3)` drew 4 cells and `wrapped` regressed against its old char count. Per-cluster summing equals the renderer by construction. Single-cluster results are unchanged, so MOD-54's `TextField`/`TextArea` (which measure per cluster) do not move; no snapshot moved (gate: 1835 passed). Pinned by `a_string_is_as_wide_as_ratatui_draws_it` and `no_op_draws_wider_than_its_width`. | MOD-54 D2 (`cell_width` definition); plan D1 |
+| B11 | **Added during T3 (adversarial verify, round 2; commit `f487d354`).** D7's name minimum counts the **drawn** name, not the room: the tail ` · read-only` is kept only when the clipped name still draws at least `NAME_MIN` cells of glyphs (not merely 2 cells of room). | With a wide first cluster, 2 cells of room plus the ellipsis reserve drew `…` alone — the marker kept, no name glyph at all. Dropping the tail first shows the name. ASCII output is unchanged. | Blueprint §5.1 `fits`; plan D7 |
+| B12 | **Added during T4 (adversarial verify, round 1; commit `64b10a00`).** The promoted chat header's middle part takes no room once the lead is cut: `middle` is empty when `cell_width(lead) > room`, otherwise clipped to `room - cell_width(lead)`. | `cells::clip` dropping a straddling wide cluster left the lead one cell short, and the middle was clipped into that cell — a doubled `……`. Width was within budget either way; ASCII output is unchanged. Pinned by `a_wide_phase_cut_short_marks_the_cut_once`. | Blueprint §6 chat row (one-for-one substitution); plan D9 |
 
 Plan claims re-checked and holding: V5 (`mod cells;` private), V6 (5 outside importers of `wrapped`:
 `templates.rs:33`, `library.rs:45`, `requirements/mod.rs:51`, `requirements/detail.rs:15`,
