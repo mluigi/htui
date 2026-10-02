@@ -79,9 +79,10 @@ pub(crate) fn is_error(notice: &str) -> bool {
 /// last line of a warning — the one line that says nothing can be undone.
 ///
 /// Shared by the hierarchy, kinds, prompt, connection, qdrant and boxes sections, and imported by
-/// the backlog, requirements and skills tabs (M5 O-5 promoted it). The rows are `cells::wrap`'s, so there is one break
-/// rule in `ui/`; the whitespace `split_whitespace` drops covers the whitespace controls, and any
-/// other control stays inside its word for `cells::wrap` to flatten.
+/// the backlog, requirements and skills tabs. M5 O-5 argued a three-line helper was cheaper to
+/// copy than to promote; the third copy was the price it named, so it was promoted. The rows are
+/// `cells::wrap`'s, so there is one break rule in `ui/`; `split_whitespace` drops the whitespace
+/// controls, and any other control stays inside its word for `cells::wrap` to flatten.
 pub(crate) fn wrapped(text: &str, width: usize) -> Vec<String> {
     let words: Vec<&str> = text.split_whitespace().collect();
     if words.is_empty() {
