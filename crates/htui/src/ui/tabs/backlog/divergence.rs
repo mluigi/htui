@@ -1024,7 +1024,6 @@ mod tests {
             for _ in 0..200 {
                 view.on_key(key(KeyCode::PageDown));
             }
-            let narrow_end = view.scroll();
             let before = drawn_at(&view, 200, 30);
             view.on_key(key(code));
             let after = drawn_at(&view, 200, 30);
