@@ -21,6 +21,7 @@ pub mod connection;
 pub mod editor;
 pub mod event_loop;
 pub mod hierarchy;
+pub mod item_writes;
 pub mod keymap;
 pub mod preview;
 pub mod prompt_settings;

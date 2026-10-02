@@ -223,7 +223,7 @@ impl SkillGlobs {
 
 /// The one builder (D72): `literal_separator(true)`, `backslash_escape(true)`,
 /// `empty_alternates(false)`.
-fn matcher(glob: &str) -> Result<globset::GlobMatcher, GlobError> {
+pub(crate) fn matcher(glob: &str) -> Result<globset::GlobMatcher, GlobError> {
     globset::GlobBuilder::new(glob)
         .literal_separator(true)
         .backslash_escape(true)

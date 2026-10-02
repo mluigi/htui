@@ -396,8 +396,31 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   offline mirror answers it too (`Items { ready_here }`). With no filter set, the screen is
   byte-identical. PRD `.claude/prds/mod-13-backlog-editing.prd.md` (5 milestones, all in MVP),
   plan `.claude/plans/mod-13-filters.plan.md`, blueprint
-  `.claude/plans/mod-13-filters.blueprint.md`. Next: milestone 2,
-  `new`/`edit`.
+  `.claude/plans/mod-13-filters.blueprint.md`.
+  **Phase 2 landed (`7b32f86`..`ac7c989`, 2026-10-02):** New and edit. In the Backlog, `N` opens a
+  new-item form and `e` an edit form, in the detail pane. A new item is minted through §7.1.
+  An edit is one §7.2 compare-and-set that carries only the changed fields, and an edit that
+  changes nothing is refused.
+  - **Offline.** The worker refuses all three requests (`ItemForm`, `MintItem`, `EditItem`) with
+    `DATABASE_UNREACHABLE` before any read, so an offline box never opens a form.
+  - **Validation.** One shared validator, `htui_core::model::item_spec`, checks title, body,
+    tags, kind and step graph (including the graph's project). It also checks `touched_paths`
+    using `PathPrefix::parse`'s own `repo:glob` split: an unknown repo, a bare glob with no
+    primary repo, a bad glob, and `/`, `./` or `..` entries are refused, naming the entry.
+  - **Stale edit (D6).** The form keeps the text and **never moves its token**, so a second save
+    diverges again rather than overwriting. Milestone 3 replaces this branch with the three-way
+    view.
+  - **Failed mint (D11/§10).** A failed mint after a possible COMMIT is hedged ("may have been
+    written") and re-read unfiltered. A refusal is plain.
+  - **Counts.** It adds 3 `StoreRequest` and 3 `StoreReply` variants, conformance case 119
+    (`update_spec_columns_roundtrip`) and 2 snapshots.
+  - **Deferred** (maintainer, review): splitting `item_form::render` and `item_writes::serve`,
+    moving `settings::wrapped` to a shared `ui` util, the paths/body indent in the form, and the
+    wording after a lost edit answer.
+
+  Plan `.claude/plans/mod-13-new-edit.plan.md`, blueprint
+  `.claude/plans/mod-13-new-edit.blueprint.md`. Next: milestone 3, the three-way divergence
+  view.
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
   `R-NF-3`, `R-HIS-1`. **This is now the only Windows check** (TOOL-3 decided 2026-09-28,
   `docs/decisions/tool/tool-3.md`): the maintainer accepted that

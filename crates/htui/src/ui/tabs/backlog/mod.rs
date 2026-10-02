@@ -8,21 +8,34 @@
 //! MOD-13 milestone 1's filters are the exception, because they narrow the list itself: the
 //! active [`BacklogFilter`] lives here, `f` opens its [`FilterForm`] as a capturing panel at the
 //! bottom of the list pane and `F` clears it (D1).
+//!
+//! MOD-13 milestone 2 adds the writes: `N` opens an [`ItemForm`] for a new item and `e` one for
+//! the selected item, drawn in the detail pane's place (D8). Both first read the form's catalogue
+//! through the worker (D3), which refuses offline (D2). An applied edit re-reads the item and the
+//! list (D9); an applied mint is revealed, which clears the filter (A5). A stale edit keeps the
+//! form and its token (D6); a mint's `Failed` that may follow a COMMIT is hedged and the whole list
+//! re-read (D11, §10).
 
 pub mod detail;
 pub mod filter;
+pub mod item_form;
 pub mod list;
 
-use htui_core::model::{ItemId, ItemSummary, ProjectId, Scope};
+use htui_core::model::{ItemId, ItemKindId, ItemSummary, ProjectId, Scope};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 
 use crate::app::{Action, Ctx, Handled, RevealTarget};
+use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::backlog::detail::{
     BodyTab, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab, RunsTab,
 };
 use crate::ui::tabs::backlog::filter::{BacklogFilter, FilterForm, FormOutcome};
+use crate::ui::tabs::backlog::item_form::{
+    Busy, ItemForm, ItemFormOutcome, item_changed_elsewhere, mint_may_have_landed,
+    mint_may_have_landed_in_the_old_scope,
+};
 use crate::ui::tabs::backlog::list::{ListView, Selection};
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -78,6 +91,24 @@ pub struct BacklogTab {
     shown: BacklogFilter,
     /// The open filter form, capturing every key while `Some`.
     form: Option<FilterForm>,
+    /// MOD-13 milestone 2 D8 (A7): the open item form, capturing every key but chords while
+    /// `Some`.
+    item_form: Option<ItemForm>,
+    /// Blueprint E8: the `ItemForm` read `N`/`e` is waiting on; a reply opens a form only when it
+    /// answers this.
+    opening: Option<Opening>,
+}
+
+/// What `N` or `e` asked for, so only the answer to it opens a form (blueprint E8): a tab's
+/// staleness entry survives a scope change, so a late reply could otherwise open on the old one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Opening {
+    /// The project the read went out for.
+    project: ProjectId,
+    /// The edited item; `None` for `N`.
+    item: Option<ItemId>,
+    /// `N`'s kind hint: the selected item's kind (§9 decision 4).
+    kind: Option<ItemKindId>,
 }
 
 impl Default for BacklogTab {
@@ -112,6 +143,8 @@ impl BacklogTab {
             filter: BacklogFilter::default(),
             shown: BacklogFilter::default(),
             form: None,
+            item_form: None,
+            opening: None,
         }
     }
 
@@ -155,6 +188,13 @@ impl BacklogTab {
         };
         self.detail.on_item_change(item);
         let Some(id) = item else { return };
+        self.read_item(id, ctx);
+    }
+
+    /// The seven per-item reads [`go`](Self::go) sends, factored out so an applied edit can send
+    /// them for an unchanged selection (MOD-13 milestone 2 A5). It does not reset the sub-tabs:
+    /// they keep their state and take the fresh replies.
+    fn read_item(&self, id: ItemId, ctx: &Ctx<'_>) {
         ctx.request(StoreRequest::Item(id));
         ctx.request(StoreRequest::Runs(id));
         ctx.request(StoreRequest::Links { id, hops: HOPS });
@@ -275,6 +315,197 @@ impl BacklogTab {
         }
         ctx.request(self.filter.to_request(ctx.scope));
     }
+
+    /// MOD-13 milestone 2 D7: `N` reads the form's catalogue for the selected item's project, a
+    /// selected header's project, else the first scope project. The selected item's kind is the
+    /// hint (§9 decision 4).
+    fn open_new(&mut self, ctx: &Ctx<'_>) {
+        let target = match self.selected {
+            Some(Selection::Item(_)) => self
+                .item()
+                .map(|item| (item.project_id, Some(item.kind_id))),
+            Some(Selection::Project(project)) => Some((project, None)),
+            None => None,
+        }
+        .or_else(|| ctx.projects.first().map(|first| (first.project_id, None)));
+        let Some((project, kind)) = target else {
+            return;
+        };
+        self.opening = Some(Opening {
+            project,
+            item: None,
+            kind,
+        });
+        ctx.request(StoreRequest::ItemForm {
+            project,
+            item: None,
+        });
+    }
+
+    /// D7: `e` reads the selected item fresh with its project's catalogue; with no item
+    /// selected nothing is sent.
+    fn open_edit(&mut self, ctx: &Ctx<'_>) {
+        let Some((project, id)) = self.item().map(|item| (item.project_id, item.id)) else {
+            return;
+        };
+        self.opening = Some(Opening {
+            project,
+            item: Some(id),
+            kind: None,
+        });
+        ctx.request(StoreRequest::ItemForm {
+            project,
+            item: Some(id),
+        });
+    }
+
+    /// A key while the item form is open (D8, A7).
+    ///
+    /// Every plain key is consumed, used by the form or not: a passed `q`, digit, `w`, `?` or
+    /// `Tab` would act globally (blueprint §8). The form itself passes chords but Ctrl+S (A6).
+    fn on_item_form_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+        let Some(form) = self.item_form.as_mut() else {
+            return Handled::Pass;
+        };
+        match form.on_key(key) {
+            ItemFormOutcome::Pass => return Handled::Pass,
+            ItemFormOutcome::Stay => {}
+            ItemFormOutcome::Cancel => self.item_form = None,
+            ItemFormOutcome::Reload(project) => ctx.request(StoreRequest::ItemForm {
+                project,
+                item: None,
+            }),
+            ItemFormOutcome::Save(request) => ctx.request(request),
+        }
+        Handled::Consumed
+    }
+
+    /// An `ItemForm` reply: a reloading form re-targets (E7); otherwise it opens a form only when
+    /// it answers the read `N`/`e` sent (E8) and nothing else captures meanwhile.
+    ///
+    /// Review M1: an edit opens only while its item is still the selected one. The cursor may
+    /// have moved while the read was out, and a form on the old item would sit under the new
+    /// selection's header.
+    fn on_item_form(&mut self, context: &ItemFormContext, ctx: &Ctx<'_>) {
+        if let Some(form) = self.item_form.as_mut() {
+            if form.busy() == Some(Busy::Reloading(context.project)) && context.item.is_none() {
+                form.retarget(context.clone());
+            }
+            return;
+        }
+        let Some(opening) = self.opening.take() else {
+            return;
+        };
+        let answers = opening.project == context.project
+            && opening.item == context.item.as_ref().map(|item| item.id);
+        let moved = opening.item.is_some() && opening.item != self.selected_item();
+        if !answers || moved || self.form.is_some() || self.detail.captures_input() {
+            return;
+        }
+        self.item_form = match opening.item {
+            None => Some(ItemForm::open_new(
+                context.clone(),
+                ctx.projects,
+                opening.kind,
+            )),
+            Some(_) => ItemForm::open_edit(context.clone()),
+        };
+    }
+
+    /// An applied write lands only on the write in flight (MOD-59's self-naming rule).
+    ///
+    /// An edit closes the form and re-reads the item and the list under the active filter (D9,
+    /// A5). The item's reads go out only while it is still selected (review M1): a list that
+    /// moved the cursor off it would otherwise put its fresh Body under another item's header,
+    /// and the list re-read alone carries the edit then. A mint closes it and reveals the new
+    /// item, whose miss branch clears the filter (A5).
+    fn on_item_written(&mut self, item: ItemId, outcome: &ItemWrite, ctx: &mut Ctx<'_>) {
+        let Some(form) = self.item_form.as_ref() else {
+            return;
+        };
+        match outcome {
+            ItemWrite::Edited { .. }
+                if form.busy() == Some(Busy::Editing) && form.item_id() == Some(item) =>
+            {
+                self.item_form = None;
+                if self.selected == Some(Selection::Item(item)) {
+                    self.read_item(item, ctx);
+                }
+                ctx.request(self.filter.to_request(ctx.scope));
+            }
+            ItemWrite::Minted { key } if form.busy() == Some(Busy::Minting) => {
+                self.item_form = None;
+                Tab::reveal(
+                    self,
+                    &RevealTarget::Item {
+                        id: item,
+                        key: key.clone(),
+                    },
+                    ctx,
+                );
+            }
+            ItemWrite::Edited { .. } | ItemWrite::Minted { .. } => {}
+        }
+    }
+
+    /// D6: a stale edit keeps the form, its text and its token; only the notice changes.
+    fn on_item_diverged(&mut self, divergence: &ItemDivergence) {
+        if let Some(form) = self.item_form.as_mut()
+            && form.busy() == Some(Busy::Editing)
+            && form.item_id() == Some(divergence.head.id)
+        {
+            form.settle(Some(item_changed_elsewhere(divergence.head.version)));
+        }
+    }
+
+    /// An item request's `Failed`. `App::on_reply` already reports every `Failed` on the status
+    /// line (A8), so the tab adds no `Action::Error` of its own but in one case below.
+    ///
+    /// A refused form read opens nothing (D2). A mint that may have followed a COMMIT is hedged
+    /// and the whole list re-read, the filter cleared so it cannot hide the item (D11, §10.1,
+    /// §10.2); a refusal given before the insert is said plainly with nothing re-read.
+    ///
+    /// Review L4, the one case: such a mint `Failed` that finds no minting form (a scope change
+    /// dropped it, and a form opened since is not the mint's) has nowhere to show its hedge, so
+    /// the tab emits a status-line hedge as an `Action::Error`. It is drained after `App`'s plain
+    /// report, so the hedge is what the status line keeps. Nothing is re-read: the item would be
+    /// the old scope's, so the hedge promises no re-read and no Ctrl+S, and names that scope. A
+    /// refused mint stays silent there, `App`'s report says it all.
+    fn on_item_failed(&mut self, request: &str, message: &str, ctx: &Ctx<'_>) {
+        let busy = self.item_form.as_ref().and_then(ItemForm::busy);
+        match (request, busy) {
+            (item_writes::FORM_NAME, Some(Busy::Reloading(_))) => {
+                if let Some(form) = self.item_form.as_mut() {
+                    form.settle(Some(message.to_owned()));
+                }
+            }
+            (item_writes::FORM_NAME, _) => self.opening = None,
+            (item_writes::MINT_NAME, Some(Busy::Minting)) => {
+                let refused = item_writes::mint_refused(message);
+                if let Some(form) = self.item_form.as_mut() {
+                    form.settle(Some(if refused {
+                        message.to_owned()
+                    } else {
+                        mint_may_have_landed(message)
+                    }));
+                }
+                if !refused {
+                    self.apply(BacklogFilter::default(), ctx);
+                }
+            }
+            (item_writes::MINT_NAME, _) if !item_writes::mint_refused(message) => {
+                ctx.emit(Action::Error(mint_may_have_landed_in_the_old_scope(
+                    message,
+                )));
+            }
+            (item_writes::EDIT_NAME, Some(Busy::Editing)) => {
+                if let Some(form) = self.item_form.as_mut() {
+                    form.settle(Some(message.to_owned()));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Tab for BacklogTab {
@@ -303,6 +534,10 @@ impl Tab for BacklogTab {
         self.filter.retain_projects(scope);
         self.shown.retain_projects(scope);
         self.form = None;
+        // MOD-13 milestone 2 A7, E8: the item form's catalogue and a read in flight were the old
+        // scope's.
+        self.item_form = None;
+        self.opening = None;
     }
 
     /// A capturing sub-tab (a typed note, a typed-back key, a `y`/`n`) gets every key first: the
@@ -312,7 +547,13 @@ impl Tab for BacklogTab {
     /// the list never takes one.
     /// MOD-13 D1: the open filter form captures ahead of the sub-tabs; a paste goes to its tag
     /// field.
+    /// MOD-13 milestone 2 D8: the open item form captures ahead of both; a paste goes to its
+    /// focused text field.
     fn on_paste(&mut self, text: &str, ctx: &mut Ctx<'_>) -> Handled {
+        if let Some(form) = self.item_form.as_mut() {
+            form.on_paste(text);
+            return Handled::Consumed;
+        }
         if let Some(form) = self.form.as_mut() {
             form.on_paste(text);
             return Handled::Consumed;
@@ -325,6 +566,11 @@ impl Tab for BacklogTab {
         // no sub-tab captures (`f` is below that guard).
         if self.form.is_some() {
             return self.on_form_key(key, ctx);
+        }
+        // MOD-13 milestone 2 D8 (A7): the item form, likewise. It only opens while neither the
+        // filter form nor a sub-tab captures.
+        if self.item_form.is_some() {
+            return self.on_item_form_key(key, ctx);
         }
         if self.detail.captures_input() {
             return self.detail.on_key(key, ctx);
@@ -357,6 +603,11 @@ impl Tab for BacklogTab {
                     self.apply(BacklogFilter::default(), ctx);
                 }
             }
+            // MOD-13 milestone 2 D7: `N` new item, `e` edit the selected one. Each reads the
+            // form's catalogue first (D3); the reply opens the form. `N` arrives with or without
+            // SHIFT, both as `Char('N')` here (blueprint E4).
+            KeyCode::Char('N') => self.open_new(ctx),
+            KeyCode::Char('e') => self.open_edit(ctx),
             // A project header folds; on an item row there is nothing to fold, and `Enter` is
             // the detail pane's — the Runs pane replays the step under its cursor with it
             // (MOD-2 D39). Without this the pane would never see the key at all.
@@ -372,6 +623,18 @@ impl Tab for BacklogTab {
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
+        // MOD-13 milestone 2: the item form's read and writes, before the list's.
+        match reply {
+            StoreReply::ItemForm(context) => return self.on_item_form(context, ctx),
+            StoreReply::ItemWritten { item, outcome } => {
+                return self.on_item_written(*item, outcome, ctx);
+            }
+            StoreReply::ItemDiverged(divergence) => return self.on_item_diverged(divergence),
+            StoreReply::Failed { request, message } if item_writes::is_item_request(request) => {
+                return self.on_item_failed(request, message, ctx);
+            }
+            _ => {}
+        }
         if let StoreReply::Items(items) = reply {
             self.items.clone_from(items);
             // MOD-13 review M1: the newest read is the only one delivered, and it went out under
@@ -450,13 +713,17 @@ impl Tab for BacklogTab {
         if let (Some(form), Some(at)) = (&self.form, form_area) {
             filter::render(frame, at, form, ctx.theme);
         }
-        detail::render(
-            frame,
-            right,
-            &self.detail,
-            self.item().map(|item| item.key.as_str()),
-            ctx,
-        );
+        // MOD-13 milestone 2 D8: the open item form takes the detail pane's place.
+        match &self.item_form {
+            Some(form) => item_form::render(frame, right, form, ctx.theme),
+            None => detail::render(
+                frame,
+                right,
+                &self.detail,
+                self.item().map(|item| item.key.as_str()),
+                ctx,
+            ),
+        }
     }
 
     fn reveal(&mut self, target: &RevealTarget, ctx: &mut Ctx<'_>) -> bool {
@@ -464,8 +731,8 @@ impl Tab for BacklogTab {
             return false;
         };
         // A half-typed note or reject reason would be lost by the move (`go` resets the sub-tabs),
-        // and so would a half-edited filter.
-        if self.form.is_some() || self.detail.captures_input() {
+        // and so would a half-edited filter or a half-typed item.
+        if self.form.is_some() || self.item_form.is_some() || self.detail.captures_input() {
             ctx.emit(Action::Error(CLOSE_THE_FIELD_FIRST.to_owned()));
             return true;
         }
@@ -518,7 +785,7 @@ mod tests {
     use crate::ui::layout::chrome;
     use crate::ui::tabs::backlog::detail::{DetailId, DetailTab};
     use htui_core::model::ItemFilter;
-    use htui_core::store::{MemStore, ReadStore as _};
+    use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 
     /// A sub-tab that records every key it is offered and captures while `capturing` is set (the
     /// `tests/settings.rs` probe, one level down).
@@ -593,6 +860,8 @@ mod tests {
             filter: BacklogFilter::default(),
             shown: BacklogFilter::default(),
             form: None,
+            item_form: None,
+            opening: None,
         };
 
         let (top_bar, keymap, theme, emit) = (
@@ -766,6 +1035,8 @@ mod tests {
             filter: BacklogFilter::default(),
             shown: BacklogFilter::default(),
             form: None,
+            item_form: None,
+            opening: None,
         };
         let (top_bar, keymap, theme, emit) = (
             TopBarState::default(),
@@ -814,6 +1085,8 @@ mod tests {
             filter: BacklogFilter::default(),
             shown: BacklogFilter::default(),
             form: None,
+            item_form: None,
+            opening: None,
         };
         let (top_bar, keymap, theme, emit) = (
             TopBarState::default(),
@@ -1481,5 +1754,781 @@ mod tests {
             strip.width(),
             inner.width
         );
+    }
+
+    // ---- MOD-13 milestone 2: new and edit ----------------------------------------------------
+
+    /// The store requests among everything emitted since the last drain.
+    fn sent(bench: &Bench) -> Vec<StoreRequest> {
+        bench
+            .actions()
+            .into_iter()
+            .filter_map(|action| match action {
+                Action::Store(request) => Some(request),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The worker's answer to `request` over `store` (clones share state).
+    async fn served(store: &MemStore, request: &StoreRequest) -> StoreReply {
+        crate::store_worker::serve(&htui_store::Backend::memory(store.clone()), request).await
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn type_into(tab: &mut BacklogTab, bench: &Bench, text: &str) {
+        for c in text.chars() {
+            press(tab, bench, KeyCode::Char(c));
+        }
+    }
+
+    /// `N` or `e` on `tab`, its one `ItemForm` read answered from `store`: the form is open.
+    async fn open_with(tab: &mut BacklogTab, bench: &Bench, store: &MemStore, code: KeyCode) {
+        press(tab, bench, code);
+        let requests = sent(bench);
+        let [read @ StoreRequest::ItemForm { .. }] = requests.as_slice() else {
+            panic!("one form read: {requests:?}")
+        };
+        let reply = served(store, read).await;
+        tab.on_reply(&reply, &mut bench.ctx());
+        assert!(
+            tab.item_form.is_some(),
+            "the reply opened the form: {reply:?}"
+        );
+    }
+
+    /// The single request a Ctrl+S sent.
+    fn saved(tab: &mut BacklogTab, bench: &Bench) -> StoreRequest {
+        assert_eq!(tab.on_key(ctrl('s'), &mut bench.ctx()), Handled::Consumed);
+        let mut requests = sent(bench);
+        assert_eq!(requests.len(), 1, "one write: {requests:?}");
+        requests.remove(0)
+    }
+
+    fn notice(tab: &BacklogTab) -> Option<String> {
+        tab.item_form
+            .as_ref()
+            .and_then(|form| form.notice().map(str::to_owned))
+    }
+
+    fn errors(actions: &[Action]) -> Vec<&Action> {
+        actions
+            .iter()
+            .filter(|action| matches!(action, Action::Error(_)))
+            .collect()
+    }
+
+    /// Blueprint E4: a terminal's `N` may or may not carry SHIFT; both read the form.
+    #[tokio::test]
+    async fn n_reads_the_item_form_on_the_selected_project_with_and_without_shift() {
+        use htui_core::fixtures::ids::PROJECT_HTUI;
+        let bench = Bench::new().await;
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            let mut tab = bench.tab();
+            assert_eq!(
+                tab.on_key(
+                    KeyEvent::new(KeyCode::Char('N'), modifiers),
+                    &mut bench.ctx()
+                ),
+                Handled::Consumed
+            );
+            let requests = sent(&bench);
+            assert!(
+                matches!(
+                    requests.as_slice(),
+                    [StoreRequest::ItemForm { project, item: None }] if *project == PROJECT_HTUI
+                ),
+                "{modifiers:?}: {requests:?}"
+            );
+        }
+    }
+
+    /// D7: `e` reads the selected item's form; with nothing selected it sends nothing.
+    #[tokio::test]
+    async fn e_reads_the_selected_item_and_nothing_without_a_selection() {
+        use htui_core::fixtures::ids::PROJECT_HTUI;
+        let bench = Bench::new().await;
+        let Selection::Item(first) = bench.first else {
+            panic!("the first row is an item")
+        };
+        let mut tab = bench.tab();
+        assert_eq!(
+            press(&mut tab, &bench, KeyCode::Char('e')),
+            Handled::Consumed
+        );
+        let requests = sent(&bench);
+        assert!(
+            matches!(
+                requests.as_slice(),
+                [StoreRequest::ItemForm { project, item: Some(id) }]
+                    if *project == PROJECT_HTUI && *id == first
+            ),
+            "{requests:?}"
+        );
+
+        let mut empty = BacklogTab::new();
+        assert_eq!(
+            press(&mut empty, &bench, KeyCode::Char('e')),
+            Handled::Consumed
+        );
+        assert!(sent(&bench).is_empty());
+        assert!(empty.opening.is_none());
+    }
+
+    /// D8: the reply opens the form in the detail pane, and it captures the list's and the
+    /// shell's letters.
+    #[tokio::test]
+    async fn the_item_form_reply_opens_the_form_and_it_captures() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        let before = drawn(&tab, &bench);
+        open_with(&mut tab, &bench, &store, KeyCode::Char('N')).await;
+        for code in [KeyCode::Char('j'), KeyCode::Char('q'), KeyCode::Char('3')] {
+            assert_eq!(press(&mut tab, &bench, code), Handled::Consumed, "{code:?}");
+        }
+        assert_eq!(tab.selected, Some(bench.first), "the cursor did not move");
+        assert!(sent(&bench).is_empty(), "nothing was read");
+        let frame = drawn(&tab, &bench);
+        assert!(frame.contains(" New item \u{b7} htui "), "{frame}");
+        assert_ne!(frame, before);
+
+        press(&mut tab, &bench, KeyCode::Esc);
+        assert!(tab.item_form.is_none(), "Esc closes it");
+        assert_eq!(
+            drawn(&tab, &bench),
+            before,
+            "and the pane is the detail again"
+        );
+    }
+
+    /// Blueprint E8: a form opens only on the answer to the read `N`/`e` sent.
+    #[tokio::test]
+    async fn an_item_form_reply_nobody_asked_for_opens_nothing() {
+        use htui_core::fixtures::ids::{PROJECT_AGY, PROJECT_HTUI};
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        let unasked = served(
+            &store,
+            &StoreRequest::ItemForm {
+                project: PROJECT_HTUI,
+                item: None,
+            },
+        )
+        .await;
+        tab.on_reply(&unasked, &mut bench.ctx());
+        assert!(tab.item_form.is_none(), "no `N`, no form");
+
+        press(&mut tab, &bench, KeyCode::Char('N'));
+        let _ = sent(&bench);
+        let other = served(
+            &store,
+            &StoreRequest::ItemForm {
+                project: PROJECT_AGY,
+                item: None,
+            },
+        )
+        .await;
+        tab.on_reply(&other, &mut bench.ctx());
+        assert!(
+            tab.item_form.is_none(),
+            "another project's answer opens nothing"
+        );
+        assert!(errors(&bench.actions()).is_empty());
+    }
+
+    /// MOD-22 review M-1: a paste reaches the open item form's focused field.
+    #[tokio::test]
+    async fn a_paste_goes_to_the_open_item_form() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        open_with(&mut tab, &bench, &store, KeyCode::Char('N')).await;
+        assert_eq!(tab.on_paste("Pasted", &mut bench.ctx()), Handled::Consumed);
+        let request = saved(&mut tab, &bench);
+        assert!(
+            matches!(&request, StoreRequest::MintItem { spec, .. } if spec.title == "Pasted"),
+            "{request:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_s_on_a_blank_title_refuses_in_the_form_and_sends_nothing() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        open_with(&mut tab, &bench, &store, KeyCode::Char('N')).await;
+        assert_eq!(tab.on_key(ctrl('s'), &mut bench.ctx()), Handled::Consumed);
+        let actions = bench.actions();
+        assert!(
+            actions.is_empty(),
+            "nothing sent, nothing reported: {actions:?}"
+        );
+        assert_eq!(
+            notice(&tab),
+            Some(htui_core::model::SpecError::BlankTitle.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_edit_says_nothing_to_save_and_sends_nothing() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        open_with(&mut tab, &bench, &store, KeyCode::Char('e')).await;
+        assert_eq!(tab.on_key(ctrl('s'), &mut bench.ctx()), Handled::Consumed);
+        assert!(bench.actions().is_empty());
+        assert_eq!(
+            notice(&tab).as_deref(),
+            Some(htui_core::model::item_spec::NOTHING_TO_SAVE)
+        );
+    }
+
+    /// The edit form on the first item with ` v2` typed and saved: the one `EditItem` sent.
+    async fn an_edit_saved(tab: &mut BacklogTab, bench: &Bench, store: &MemStore) -> StoreRequest {
+        open_with(tab, bench, store, KeyCode::Char('e')).await;
+        type_into(tab, bench, " v2");
+        saved(tab, bench)
+    }
+
+    /// D5, D6: only the title, at the version the form's read carried.
+    #[tokio::test]
+    async fn a_changed_title_sends_edit_item_with_only_the_title_at_the_read_version() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let Selection::Item(first) = bench.first else {
+            panic!("the first row is an item")
+        };
+        let title = format!(
+            "{} v2",
+            store
+                .item(first)
+                .await
+                .expect("read")
+                .expect("the item")
+                .title
+        );
+        let mut tab = bench.tab();
+        let request = an_edit_saved(&mut tab, &bench, &store).await;
+        assert!(
+            matches!(
+                &request,
+                StoreRequest::EditItem { id, expected_version: 1, changes }
+                    if *id == first && *changes == htui_core::model::SpecChanges {
+                        title: Some(title.clone()),
+                        ..htui_core::model::SpecChanges::default()
+                    }
+            ),
+            "{request:?}"
+        );
+    }
+
+    /// D9, A5: the form closes, the item's seven reads go out again and the list re-reads,
+    /// with the cursor where it was.
+    #[tokio::test]
+    async fn an_applied_edit_closes_the_form_and_re_reads_the_item_keeping_the_selection() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let Selection::Item(first) = bench.first else {
+            panic!("the first row is an item")
+        };
+        let mut tab = bench.tab();
+        let request = an_edit_saved(&mut tab, &bench, &store).await;
+        let reply = served(&store, &request).await;
+        assert!(matches!(reply, StoreReply::ItemWritten { .. }), "{reply:?}");
+        tab.on_reply(&reply, &mut bench.ctx());
+        assert!(tab.item_form.is_none(), "the form closed");
+        assert_eq!(tab.selected, Some(bench.first));
+
+        let requests = sent(&bench);
+        let names: Vec<&str> = requests.iter().map(StoreRequest::name).collect();
+        assert_eq!(requests.len(), 8, "{names:?}");
+        let per_item = requests
+            .iter()
+            .filter(|request| match request {
+                StoreRequest::Item(id)
+                | StoreRequest::Runs(id)
+                | StoreRequest::Documents(id)
+                | StoreRequest::Notes(id)
+                | StoreRequest::ItemRequirements(id)
+                | StoreRequest::Links { id, .. }
+                | StoreRequest::PromptPreview { item: id, .. } => *id == first,
+                _ => false,
+            })
+            .count();
+        assert_eq!(per_item, 7, "{names:?}");
+        assert_eq!(
+            items_reads(&requests.into_iter().map(Action::Store).collect::<Vec<_>>()).len(),
+            1
+        );
+    }
+
+    /// How many of `requests` are per-item reads (the seven `read_item` sends) of `id`.
+    fn per_item_reads(requests: &[StoreRequest], id: ItemId) -> usize {
+        requests
+            .iter()
+            .filter(|request| match request {
+                StoreRequest::Item(read)
+                | StoreRequest::Runs(read)
+                | StoreRequest::Documents(read)
+                | StoreRequest::Notes(read)
+                | StoreRequest::ItemRequirements(read)
+                | StoreRequest::Links { id: read, .. }
+                | StoreRequest::PromptPreview { item: read, .. } => *read == id,
+                _ => false,
+            })
+            .count()
+    }
+
+    /// Review M1: an `e` whose reply lands after the cursor moved opens nothing, so the form
+    /// cannot edit an item the header no longer names.
+    #[tokio::test]
+    async fn an_edit_reply_after_the_cursor_moved_opens_nothing() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        press(&mut tab, &bench, KeyCode::Char('e'));
+        let requests = sent(&bench);
+        let [read @ StoreRequest::ItemForm { .. }] = requests.as_slice() else {
+            panic!("one form read: {requests:?}")
+        };
+        press(&mut tab, &bench, KeyCode::Char('j'));
+        assert_ne!(tab.selected, Some(bench.first), "the cursor moved");
+        let _ = sent(&bench);
+
+        let reply = served(&store, read).await;
+        tab.on_reply(&reply, &mut bench.ctx());
+        assert!(tab.item_form.is_none(), "no form for the old item");
+        assert!(tab.opening.is_none(), "the opening is spent");
+        assert!(bench.actions().is_empty(), "nothing read, nothing reported");
+    }
+
+    /// Review M1: an applied edit re-reads the item only while it is still selected; once a list
+    /// moved the cursor off it, the list re-read alone follows, so the Body cannot show the
+    /// edited item under the new selection's header.
+    #[tokio::test]
+    async fn an_applied_edit_after_the_selection_moved_reads_only_the_list() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let Selection::Item(first) = bench.first else {
+            panic!("the first row is an item")
+        };
+        let mut tab = bench.tab();
+        let request = an_edit_saved(&mut tab, &bench, &store).await;
+        let others: Vec<ItemSummary> = bench
+            .items
+            .iter()
+            .filter(|item| item.id != first)
+            .cloned()
+            .collect();
+        tab.on_reply(&StoreReply::Items(others), &mut bench.ctx());
+        assert_ne!(tab.selected, Some(bench.first), "the list moved the cursor");
+        let _ = sent(&bench);
+
+        let reply = served(&store, &request).await;
+        assert!(matches!(reply, StoreReply::ItemWritten { .. }), "{reply:?}");
+        tab.on_reply(&reply, &mut bench.ctx());
+        assert!(tab.item_form.is_none(), "the form closed");
+        let requests = sent(&bench);
+        let names: Vec<&str> = requests.iter().map(StoreRequest::name).collect();
+        assert_eq!(per_item_reads(&requests, first), 0, "{names:?}");
+        assert_eq!(
+            items_reads(&requests.into_iter().map(Action::Store).collect::<Vec<_>>()).len(),
+            1,
+            "{names:?}"
+        );
+    }
+
+    /// The new form on the first item's project with `Fresh item` typed and saved.
+    async fn a_mint_saved(tab: &mut BacklogTab, bench: &Bench, store: &MemStore) -> StoreRequest {
+        open_with(tab, bench, store, KeyCode::Char('N')).await;
+        type_into(tab, bench, "Fresh item");
+        saved(tab, bench)
+    }
+
+    /// D9, A5: a minted item is never in the loaded rows, so the reveal clears the filter and
+    /// the next list selects it.
+    #[tokio::test]
+    async fn an_applied_mint_closes_the_form_clears_the_filter_and_reveals_it() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = BacklogTab {
+            filter: done_only(),
+            ..bench.tab()
+        };
+        let request = a_mint_saved(&mut tab, &bench, &store).await;
+        let reply = served(&store, &request).await;
+        let StoreReply::ItemWritten { item: minted, .. } = reply else {
+            panic!("a mint answers ItemWritten, not {reply:?}")
+        };
+        tab.on_reply(&reply, &mut bench.ctx());
+        assert!(tab.item_form.is_none(), "the form closed");
+        assert!(tab.filter.is_empty(), "the filter is cleared");
+        assert_eq!(tab.pending_reveal, Some((minted, "ANA-3".to_owned())));
+        let actions = bench.actions();
+        assert_eq!(items_reads(&actions), [(ItemFilter::default(), false)]);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+
+        let list = served(&store, &tab.filter.to_request(&bench.scope)).await;
+        tab.on_reply(&list, &mut bench.ctx());
+        assert_eq!(tab.selected, Some(Selection::Item(minted)));
+        assert!(errors(&bench.actions()).is_empty());
+    }
+
+    /// D6: a stale edit keeps the form, its text and its token; a second save diverges again.
+    #[tokio::test]
+    async fn a_diverged_edit_keeps_the_form_its_text_and_its_token() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let Selection::Item(first) = bench.first else {
+            panic!("the first row is an item")
+        };
+        let mut tab = bench.tab();
+        open_with(&mut tab, &bench, &store, KeyCode::Char('e')).await;
+        store
+            .update_item(
+                first,
+                1,
+                htui_core::model::ItemPatch {
+                    title: Some("Theirs".to_owned()),
+                    author_id: htui_core::fixtures::ids::USER,
+                    reason: "elsewhere".to_owned(),
+                    ..htui_core::model::ItemPatch::default()
+                },
+            )
+            .await
+            .expect("their edit");
+        type_into(&mut tab, &bench, " mine");
+        let request = saved(&mut tab, &bench);
+        let reply = served(&store, &request).await;
+        assert!(matches!(reply, StoreReply::ItemDiverged(_)), "{reply:?}");
+        tab.on_reply(&reply, &mut bench.ctx());
+        assert!(tab.item_form.is_some(), "the form stays");
+        let shown = notice(&tab).expect("a notice");
+        assert!(shown.contains("now v2"), "{shown}");
+        assert!(errors(&bench.actions()).is_empty());
+
+        let again = saved(&mut tab, &bench);
+        assert!(
+            matches!(
+                &again,
+                StoreRequest::EditItem { expected_version: 1, changes, .. }
+                    if changes.title.as_deref().is_some_and(|title| title.ends_with(" mine"))
+            ),
+            "the token never moved and the text is kept: {again:?}"
+        );
+    }
+
+    /// §10.1, §10.2: a mint `Failed` that may follow a COMMIT keeps the text, hedges and re-reads
+    /// the whole list, so the filter cannot hide the item the notice asks to look for.
+    #[tokio::test]
+    async fn a_store_failed_mint_keeps_the_text_hedges_and_re_reads_unfiltered() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = BacklogTab {
+            filter: done_only(),
+            ..bench.tab()
+        };
+        let _ = a_mint_saved(&mut tab, &bench, &store).await;
+        let why =
+            htui_core::store::StoreError::Backend("the server went away".to_owned()).to_string();
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: item_writes::MINT_NAME,
+                message: why.clone(),
+            },
+            &mut bench.ctx(),
+        );
+        let form = tab.item_form.as_ref().expect("the form stays");
+        assert_eq!(form.busy(), None);
+        assert_eq!(notice(&tab), Some(mint_may_have_landed(&why)));
+        assert!(tab.filter.is_empty(), "the filter is cleared");
+        let actions = bench.actions();
+        assert_eq!(items_reads(&actions), [(ItemFilter::default(), false)]);
+        assert_eq!(
+            actions.len(),
+            1,
+            "one read, no error of the tab's own: {actions:?}"
+        );
+
+        let retry = saved(&mut tab, &bench);
+        assert!(
+            matches!(&retry, StoreRequest::MintItem { spec, .. } if spec.title == "Fresh item"),
+            "the text is kept: {retry:?}"
+        );
+    }
+
+    /// §10.1: a refusal given before the insert wrote nothing; it is said plainly, nothing is
+    /// re-read and the filter stays.
+    #[tokio::test]
+    async fn a_refused_mint_keeps_the_text_and_says_why_without_hedging_or_re_reading() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = BacklogTab {
+            filter: done_only(),
+            ..bench.tab()
+        };
+        let _ = a_mint_saved(&mut tab, &bench, &store).await;
+        let why =
+            htui_core::store::StoreError::Constraint("that kind is gone".to_owned()).to_string();
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: item_writes::MINT_NAME,
+                message: why.clone(),
+            },
+            &mut bench.ctx(),
+        );
+        assert_eq!(notice(&tab), Some(why));
+        assert_eq!(tab.item_form.as_ref().and_then(ItemForm::busy), None);
+        assert_eq!(tab.filter, done_only(), "the filter stays");
+        assert!(
+            bench.actions().is_empty(),
+            "nothing re-read, nothing reported"
+        );
+    }
+
+    /// Review L4: a store-failed mint that lands after a scope change closed its form keeps its
+    /// hedge, on the status line, as the one error the tab raises of its own; nothing is re-read.
+    #[tokio::test]
+    async fn a_store_failed_mint_with_its_form_gone_is_hedged_on_the_status_line() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        let _ = a_mint_saved(&mut tab, &bench, &store).await;
+        tab.on_scope_change(&bench.scope);
+        let why =
+            htui_core::store::StoreError::Backend("the server went away".to_owned()).to_string();
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: item_writes::MINT_NAME,
+                message: why.clone(),
+            },
+            &mut bench.ctx(),
+        );
+        let actions = bench.actions();
+        let [Action::Error(sentence)] = actions.as_slice() else {
+            panic!("one status-line hedge, nothing re-read: {actions:?}");
+        };
+        assert!(sentence.starts_with(&why), "{sentence:?}");
+        assert!(sentence.contains("may have been written"), "{sentence:?}");
+        // Round 2: nothing is re-read and no form is open, so neither is promised.
+        assert!(!sentence.contains("re-read"), "{sentence:?}");
+        assert!(!sentence.contains("Ctrl+S"), "{sentence:?}");
+        assert_eq!(*sentence, mint_may_have_landed_in_the_old_scope(&why));
+        assert!(tab.item_form.is_none());
+    }
+
+    /// Review L4: a refused mint wrote nothing, and `App` already reports its `Failed`, so with
+    /// its form gone the tab adds nothing.
+    #[tokio::test]
+    async fn a_refused_mint_with_its_form_gone_adds_nothing() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        let _ = a_mint_saved(&mut tab, &bench, &store).await;
+        tab.on_scope_change(&bench.scope);
+        let why =
+            htui_core::store::StoreError::Constraint("that kind is gone".to_owned()).to_string();
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: item_writes::MINT_NAME,
+                message: why,
+            },
+            &mut bench.ctx(),
+        );
+        assert!(bench.actions().is_empty());
+    }
+
+    /// D2, A8: a refused form read opens nothing, and the tab adds no error to the one `App`
+    /// already reports.
+    #[tokio::test]
+    async fn a_failed_item_form_read_opens_nothing_and_adds_no_error() {
+        use htui_core::fixtures::ids::PROJECT_HTUI;
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        press(&mut tab, &bench, KeyCode::Char('N'));
+        let _ = sent(&bench);
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: item_writes::FORM_NAME,
+                message: format!("store unreachable: {}", htui_store::DATABASE_UNREACHABLE),
+            },
+            &mut bench.ctx(),
+        );
+        assert!(tab.item_form.is_none());
+        assert!(tab.opening.is_none(), "the opening is forgotten");
+        assert!(
+            bench.actions().is_empty(),
+            "no Action::Error of the tab's own"
+        );
+
+        let late = served(
+            &store,
+            &StoreRequest::ItemForm {
+                project: PROJECT_HTUI,
+                item: None,
+            },
+        )
+        .await;
+        tab.on_reply(&late, &mut bench.ctx());
+        assert!(tab.item_form.is_none(), "a late answer opens nothing");
+    }
+
+    /// A7, E8: a scope change closes the form and forgets a read in flight.
+    #[tokio::test]
+    async fn a_scope_change_closes_the_item_form_and_forgets_the_opening() {
+        use htui_core::fixtures::ids::PROJECT_HTUI;
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        open_with(&mut tab, &bench, &store, KeyCode::Char('N')).await;
+        tab.on_scope_change(&bench.scope);
+        assert!(tab.item_form.is_none(), "the form closed");
+
+        let mut tab = bench.tab();
+        press(&mut tab, &bench, KeyCode::Char('N'));
+        let _ = sent(&bench);
+        tab.on_scope_change(&bench.scope);
+        assert!(tab.opening.is_none());
+        let late = served(
+            &store,
+            &StoreRequest::ItemForm {
+                project: PROJECT_HTUI,
+                item: None,
+            },
+        )
+        .await;
+        tab.on_reply(&late, &mut bench.ctx());
+        assert!(
+            tab.item_form.is_none(),
+            "the old scope's answer opens nothing"
+        );
+    }
+
+    /// `N` with `Fresh item` typed, the focus moved back to the project picker and `l` pressed:
+    /// the one `ItemForm` read the move sent (E7).
+    async fn a_project_moved(tab: &mut BacklogTab, bench: &Bench, store: &MemStore) {
+        use htui_core::fixtures::ids::PROJECT_AGY;
+        open_with(tab, bench, store, KeyCode::Char('N')).await;
+        type_into(tab, bench, "Fresh item");
+        for _ in 0..2 {
+            press(tab, bench, KeyCode::BackTab);
+        }
+        assert_eq!(
+            tab.item_form.as_ref().map(ItemForm::focus),
+            Some(item_form::Field::Project)
+        );
+        assert_eq!(press(tab, bench, KeyCode::Char('l')), Handled::Consumed);
+        let requests = sent(bench);
+        assert!(
+            matches!(
+                requests.as_slice(),
+                [StoreRequest::ItemForm { project, item: None }] if *project == PROJECT_AGY
+            ),
+            "one reload for the picked project: {requests:?}"
+        );
+        assert_eq!(
+            tab.item_form.as_ref().and_then(ItemForm::busy),
+            Some(Busy::Reloading(PROJECT_AGY))
+        );
+    }
+
+    /// Review M2, E7: the project picker's reload re-targets the open form; the typed text stays.
+    #[tokio::test]
+    async fn the_project_picker_reloads_and_the_reply_retargets_keeping_the_text() {
+        use htui_core::fixtures::ids::PROJECT_AGY;
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        a_project_moved(&mut tab, &bench, &store).await;
+
+        let reply = served(
+            &store,
+            &StoreRequest::ItemForm {
+                project: PROJECT_AGY,
+                item: None,
+            },
+        )
+        .await;
+        tab.on_reply(&reply, &mut bench.ctx());
+        let form = tab.item_form.as_ref().expect("the form stays");
+        assert_eq!(form.busy(), None);
+        assert_eq!(form.project(), PROJECT_AGY);
+        assert!(bench.actions().is_empty(), "nothing else is read");
+
+        let request = saved(&mut tab, &bench);
+        assert!(
+            matches!(
+                &request,
+                StoreRequest::MintItem { project, spec }
+                    if *project == PROJECT_AGY && spec.title == "Fresh item"
+            ),
+            "the text is kept: {request:?}"
+        );
+    }
+
+    /// Review M2, E7: a refused reload settles the form with the reason; `Esc` then closes it.
+    #[tokio::test]
+    async fn a_refused_reload_settles_the_form_with_a_notice_and_esc_closes_it() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        a_project_moved(&mut tab, &bench, &store).await;
+
+        let why = format!("store unreachable: {}", htui_store::DATABASE_UNREACHABLE);
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: item_writes::FORM_NAME,
+                message: why.clone(),
+            },
+            &mut bench.ctx(),
+        );
+        let form = tab.item_form.as_ref().expect("the form stays");
+        assert_eq!(form.busy(), None);
+        assert_eq!(notice(&tab), Some(why));
+        assert!(
+            bench.actions().is_empty(),
+            "no Action::Error of the tab's own"
+        );
+
+        assert_eq!(press(&mut tab, &bench, KeyCode::Esc), Handled::Consumed);
+        assert!(tab.item_form.is_none(), "Esc closes it");
+    }
+
+    /// A reveal would drop the half-typed item, as it would a half-edited filter.
+    #[tokio::test]
+    async fn a_reveal_while_the_item_form_is_open_asks_to_close_it_first() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        open_with(&mut tab, &bench, &store, KeyCode::Char('N')).await;
+        let target = RevealTarget::Item {
+            id: htui_core::fixtures::ids::HTUI_ANA_2,
+            key: "ANA-2".to_owned(),
+        };
+        assert!(tab.reveal(&target, &mut bench.ctx()));
+        let actions = bench.actions();
+        assert!(
+            matches!(actions.as_slice(), [Action::Error(sentence)] if sentence == CLOSE_THE_FIELD_FIRST),
+            "{actions:?}"
+        );
+        assert!(tab.item_form.is_some());
+        assert_eq!(tab.selected, Some(bench.first));
+    }
+
+    /// MOD-52: `ctrl-c` quits from inside the item form, as from every text field.
+    #[tokio::test]
+    async fn ctrl_c_passes_through_the_open_item_form() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        open_with(&mut tab, &bench, &store, KeyCode::Char('N')).await;
+        assert_eq!(tab.on_key(ctrl('c'), &mut bench.ctx()), Handled::Pass);
+        assert!(tab.item_form.is_some());
     }
 }

@@ -22,12 +22,12 @@ use htui_agent::fake::FakeAdapter;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::{demo_at, edit_agent, ids};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, CitationKind, Claim, DocumentId, EXECUTOR_GONE, ItemId,
-    NewDocument, NewItem, NewRunStep, OpenPermission, PermissionId, PermissionStatus, RelayOption,
-    RelayOptionKind, RelaySessionId, Resolution, RunStatus, RunStep, Scope, SnapshotPhase, Status,
-    StepId, Transport, WorkspaceSummary,
+    Agent, AgentBox, AgentId, Billing, CitationKind, Claim, DocumentId, EXECUTOR_GONE, Item,
+    ItemFilter, ItemId, ItemPatch, NewDocument, NewItem, NewRunStep, OpenPermission, PermissionId,
+    PermissionStatus, RelayOption, RelayOptionKind, RelaySessionId, Resolution, RunStatus, RunStep,
+    Scope, SnapshotPhase, Status, StepId, Transport, WorkspaceSummary,
 };
-use htui_core::store::{MAX_LEASE_TTL, MemStore, ReadStore as _, WriteStore as _};
+use htui_core::store::{MAX_LEASE_TTL, MemStore, ReadStore as _, UpdateOutcome, WriteStore as _};
 use htui_orch::Clock;
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
@@ -1583,4 +1583,299 @@ async fn offline_the_runs_pane_asks_for_no_error() {
         status.starts_with("answer_permission: ") && status.ends_with(DATABASE_UNREACHABLE),
         "an answer offline is refused before anything is sent: {status:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// New and edit (MOD-13 milestone 2, plan D1-D11, blueprint §5).
+// ---------------------------------------------------------------------------------------------
+
+/// From the item form's Title, `Tab` four times to Paths: Priority, Tags, Graph, Paths.
+const TITLE_TO_PATHS: [&str; 4] = ["tab", "tab", "tab", "tab"];
+
+/// The arrival row's title, the one `e` opens on.
+const ANA_1_TITLE: &str = "Data model, box registry and sync topology";
+
+/// A title-only patch, as another process would write it.
+fn retitled(title: &str) -> ItemPatch {
+    ItemPatch {
+        title: Some(title.to_owned()),
+        author_id: ids::USER,
+        box_id: Some(ids::BOX),
+        reason: "edited".to_owned(),
+        ..ItemPatch::default()
+    }
+}
+
+/// D1, A5: `N`, a title and `Ctrl+S` mint the item; the list re-reads, selects it and the Body
+/// shows it. List selection is style-only, so the detail pane is what proves the selection.
+#[tokio::test]
+async fn n_mints_an_item_and_reveals_it() {
+    let mut harness = backlog().await;
+    keys(&mut harness, &["N"]).await;
+    type_text(&mut harness, "Fresh item");
+    keys(&mut harness, &["ctrl-s"]).await;
+    let detail = detail_pane(&harness.render());
+    assert!(detail.contains("ANA-3"), "the minted key:\n{detail}");
+    assert!(detail.contains("Fresh item"), "its title:\n{detail}");
+    assert!(
+        !detail.contains("New item"),
+        "the form closed on the write:\n{detail}"
+    );
+    assert_eq!(harness.app().status, None, "a mint raises nothing");
+}
+
+/// D5, D9 (blueprint E3): `e`, a changed title and `Ctrl+S` land version 2, and the Body shows the
+/// re-read head. The new title is 45 characters, so the Body wraps it inside the 43-column pane.
+#[tokio::test]
+async fn e_edits_the_title_and_the_body_shows_version_2() {
+    let store = MemStore::demo();
+    let mut harness = backlog_over(store.clone()).await;
+    keys(&mut harness, &["e"]).await;
+    type_text(&mut harness, " v2");
+    keys(&mut harness, &["ctrl-s"]).await;
+    let head = store
+        .item(ids::HTUI_ANA_1)
+        .await
+        .expect("the memory store never fails")
+        .expect("the demo item exists");
+    assert_eq!(head.title, format!("{ANA_1_TITLE} v2"));
+    assert_eq!(head.version, 2);
+    let detail = detail_pane(&harness.render());
+    // The pane's rows, border and padding dropped, joined: the wrapped title reads whole again.
+    let text = detail
+        .lines()
+        .map(|line| line.trim_end_matches('\u{2502}').trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains(&format!("{ANA_1_TITLE} v2")),
+        "the new title:\n{detail}"
+    );
+    assert!(detail.contains("version 2"), "the new version:\n{detail}");
+    assert!(
+        !detail.contains(" Edit "),
+        "the form closed on the write:\n{detail}"
+    );
+    assert_eq!(harness.app().status, None, "an edit raises nothing");
+}
+
+/// D6 (A13): a write through a held clone between `e` and `Ctrl+S` makes the save stale. The form
+/// stays open on its token with its text, says so, and never overwrites the head, not even on a
+/// second `Ctrl+S`. Review L3: a third write before that second save moves the head to v3, so
+/// the notice naming v3 proves the second save went out and diverged again.
+#[tokio::test]
+async fn a_stale_edit_keeps_the_form_and_never_overwrites_the_head() {
+    let store = MemStore::demo();
+    let mut harness = backlog_over(store.clone()).await;
+    keys(&mut harness, &["e"]).await;
+    let outcome = store
+        .update_item(ids::HTUI_ANA_1, 1, retitled("Theirs"))
+        .await
+        .expect("the memory store never fails");
+    assert!(
+        matches!(outcome, UpdateOutcome::Updated(_)),
+        "the other write is at the head: {outcome:?}"
+    );
+
+    type_text(&mut harness, " mine");
+    keys(&mut harness, &["ctrl-s"]).await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("now v2"),
+        "the notice names the head:\n{frame}"
+    );
+    assert!(
+        frame.contains(" Edit ANA-1 (v1) "),
+        "the form stays open on its token:\n{frame}"
+    );
+    let head = store
+        .item(ids::HTUI_ANA_1)
+        .await
+        .expect("the memory store never fails")
+        .expect("the demo item exists");
+    assert_eq!((head.title.as_str(), head.version), ("Theirs", 2));
+
+    let outcome = store
+        .update_item(ids::HTUI_ANA_1, 2, retitled("Theirs again"))
+        .await
+        .expect("the memory store never fails");
+    assert!(
+        matches!(outcome, UpdateOutcome::Updated(_)),
+        "the third write is at the head: {outcome:?}"
+    );
+    keys(&mut harness, &["ctrl-s"]).await;
+    let frame = harness.render();
+    assert!(frame.contains("now v3"), "it diverges again:\n{frame}");
+    assert!(frame.contains(" Edit ANA-1 (v1) "), "{frame}");
+    let head = store
+        .item(ids::HTUI_ANA_1)
+        .await
+        .expect("the memory store never fails")
+        .expect("the demo item exists");
+    assert_eq!(
+        (head.title.as_str(), head.version),
+        ("Theirs again", 3),
+        "the second save wrote nothing either"
+    );
+}
+
+/// D4: a touched path naming no repo of the project is refused by the form, by name, before
+/// anything is sent; nothing is written and the status line stays clean.
+#[tokio::test]
+async fn an_unknown_repo_in_touched_paths_is_refused_by_name() {
+    let store = MemStore::demo();
+    let before = store.item_count();
+    let mut harness = backlog_over(store.clone()).await;
+    keys(&mut harness, &["N"]).await;
+    type_text(&mut harness, "Fresh item");
+    keys(&mut harness, &TITLE_TO_PATHS).await;
+    type_text(&mut harness, "nope:src");
+    keys(&mut harness, &["ctrl-s"]).await;
+    let frame = harness.render();
+    assert!(frame.contains("`nope`"), "the refusal names it:\n{frame}");
+    assert!(frame.contains("New item"), "the form stays open:\n{frame}");
+    assert_eq!(store.item_count(), before, "nothing was written");
+    assert_eq!(harness.app().status, None, "a form-side refusal");
+}
+
+/// A11: the demo's items in the mirror's `item` table, with its encodings (TEXT uuids, JSON
+/// arrays, microsecond stamps, `0001_mirror.sql`'s `item` plus `0004`'s `resolution`).
+async fn seed_mirror_items(cache: &CacheStore, items: &[Item]) {
+    for item in items {
+        sqlx::query(
+            "INSERT INTO item (id, project_id, kind_id, key_prefix, key_number, key, title, body, \
+                               status, priority, required_tags, touched_paths, step_graph_id, \
+                               version, created_by, created_at, updated_at, closed_at, resolution) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(item.id.to_string())
+        .bind(item.project_id.to_string())
+        .bind(item.kind_id.to_string())
+        .bind(&item.key_prefix)
+        .bind(i64::from(item.key_number))
+        .bind(&item.key)
+        .bind(&item.title)
+        .bind(&item.body)
+        .bind(item.status.as_str())
+        .bind(i64::from(item.priority))
+        .bind(serde_json::to_string(&item.required_tags).expect("tags serialise"))
+        .bind(serde_json::to_string(&item.touched_paths).expect("paths serialise"))
+        .bind(item.step_graph_id.map(|id| id.to_string()))
+        .bind(i64::from(item.version))
+        .bind(item.created_by.to_string())
+        .bind(item.created_at.timestamp_micros())
+        .bind(item.updated_at.timestamp_micros())
+        .bind(item.closed_at.map(|at| at.timestamp_micros()))
+        .bind(item.resolution.map(Resolution::as_str))
+        .execute(cache.pool())
+        .await
+        .expect("a mirror item row");
+    }
+}
+
+/// D2, A11 (blueprint E11): offline, `N` and `e` are refused by the worker before anything is
+/// read. The status line carries the read-only sentence under `item_form`, no form opens, and
+/// the mirror is untouched.
+///
+/// With item rows in the mirror the first `Items` reply selects `ANA-1` and sends its detail
+/// reads, so the status line is not clean on arrival; it is cleared before each key instead.
+#[tokio::test]
+async fn offline_n_and_e_are_refused_with_the_read_only_notice() {
+    let _keyring = htui_store::testkit::mock_keyring().await;
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let cache = CacheStore::open(
+        root.path(),
+        "backlog-items-offline",
+        PgStore::schema_version(),
+    )
+    .await
+    .expect("a fresh mirror");
+    let demo = htui_core::fixtures::demo_data();
+    htui_store::testkit::seed_mirror(&cache, &demo)
+        .await
+        .expect("the mirror is seeded");
+    seed_mirror_items(&cache, &demo.items).await;
+    let mut harness = Harness::over_backend(Backend::Offline {
+        cache: cache.clone(),
+        since: Some(Utc::now()),
+    })
+    .with_tab(Box::new(BacklogTab::new()))
+    .with_store_state("offline \u{b7} 0s", None);
+    harness.drive_to_end().await;
+    harness.app().update(Action::SetScope {
+        workspace: workspace("platform").await,
+    });
+    harness.drive_to_end().await;
+    assert!(
+        harness.render().contains("┌ ANA-1"),
+        "the mirror's items are listed and the first is selected"
+    );
+    let refused = format!("item_form: store unreachable: {DATABASE_UNREACHABLE}");
+
+    harness.app().status = None;
+    keys(&mut harness, &["N"]).await;
+    assert_eq!(harness.app().status, Some(refused.clone()), "`N` offline");
+    let frame = harness.render();
+    assert!(!frame.contains("New item"), "no form opened:\n{frame}");
+
+    harness.app().status = None;
+    keys(&mut harness, &["e"]).await;
+    assert_eq!(harness.app().status, Some(refused), "`e` offline");
+    let frame = harness.render();
+    assert!(!frame.contains(" Edit "), "no form opened:\n{frame}");
+
+    let ana_1 = cache
+        .item(ids::HTUI_ANA_1)
+        .await
+        .expect("the mirror answers")
+        .expect("the seeded item");
+    assert_eq!(ana_1.version, 1, "nothing was written");
+    let platform = Scope::from_workspace(&workspace("platform").await);
+    let items = cache
+        .items(&platform, &ItemFilter::default())
+        .await
+        .expect("the mirror answers");
+    assert_eq!(items.len(), 11, "nothing was minted");
+}
+
+/// D8: `N` and `e` are on the Backlog's help line.
+#[tokio::test]
+async fn n_and_e_are_on_the_backlog_help_line() {
+    let mut harness = Harness::demo();
+    htui::app::register_all(harness.app());
+    let help = harness
+        .app()
+        .keymap
+        .help_line(&KeyScope::Tab(BacklogTab::ID));
+    assert!(help.contains("N new item"), "{help}");
+    assert!(help.contains("e edit item"), "{help}");
+}
+
+/// D8: the new form in the detail pane, a title typed: the project picker, the hinted kind, the
+/// kind-default graph.
+#[tokio::test]
+async fn the_new_item_form_renders_in_the_detail_pane() {
+    let mut harness = backlog().await;
+    keys(&mut harness, &["N"]).await;
+    type_text(&mut harness, "Fresh item");
+    let frame = harness.render();
+    assert!(frame.contains(" New item \u{b7} htui "), "{frame}");
+    assert!(frame.contains("> title"), "the focus is on Title:\n{frame}");
+    assert!(frame.contains("\u{2039}ANA "), "the hinted kind:\n{frame}");
+    assert!(frame.contains("kind default"), "{frame}");
+    insta::assert_snapshot!("item_form_new", frame);
+}
+
+/// D8: the edit form opens on the item at its version, with no project picker.
+#[tokio::test]
+async fn the_edit_item_form_renders_in_the_detail_pane() {
+    let mut harness = backlog().await;
+    keys(&mut harness, &["e"]).await;
+    let frame = harness.render();
+    assert!(frame.contains(" Edit ANA-1 (v1) "), "{frame}");
+    assert!(
+        !frame.contains("project  \u{2039}"),
+        "an edit has no project row:\n{frame}"
+    );
+    insta::assert_snapshot!("item_form_edit", frame);
 }

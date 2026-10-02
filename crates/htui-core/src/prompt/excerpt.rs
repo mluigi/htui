@@ -42,6 +42,19 @@ const SECRET_KEYSTORE: &str = ".keystore";
 /// §4.5's last rule (`:1075`): high token cost, near-zero signal.
 const NOISE_SUFFIX: [&str; 4] = [".lock", ".min.js", ".min.css", ".map"];
 
+/// ANA-2 §4.7's qualifier rule, `PathPrefix::parse`'s own (`docs/ANA-2.md:1025`): the text before
+/// the **first** `:` when it is non-empty and holds no `/`. A qualified entry answers
+/// `(Some(repo), glob)`, a bare one `(None, touched)`. Nothing is trimmed: the validator refuses
+/// whitespace next to the `:` (MOD-13 A2), and `SkillGlob::parse`'s trimming split is a different
+/// rule.
+#[must_use]
+pub fn split_qualifier(touched: &str) -> (Option<&str>, &str) {
+    match touched.split_once(':') {
+        Some((repo, rest)) if !repo.is_empty() && !repo.contains('/') => (Some(repo), rest),
+        _ => (None, touched),
+    }
+}
+
 /// One repo-qualified, wildcard-free path prefix, derived from a `touched_paths` glob.
 ///
 /// ANA-2 §4.7's truncation (`docs/ANA-2.md:1074-1077`): the glob is cut at its first `*?[{` and
@@ -68,9 +81,9 @@ impl PathPrefix {
     /// `:` after a path separator is part of a file name rather than a qualifier.
     #[must_use]
     pub fn parse(touched: &str, primary_repo: &str) -> Self {
-        let (repo, glob) = match touched.split_once(':') {
-            Some((repo, rest)) if !repo.is_empty() && !repo.contains('/') => (repo, rest),
-            _ => (primary_repo, touched),
+        let (repo, glob) = match split_qualifier(touched) {
+            (Some(repo), glob) => (repo, glob),
+            (None, glob) => (primary_repo, glob),
         };
         let prefix = match glob.find(GLOB_META) {
             // No metacharacter: the whole path is the prefix and stays whole.
@@ -2620,6 +2633,21 @@ mod tests {
         let all = PathPrefix::parse("**", "htui");
         assert!(all.matches("htui", "anything/at/all"));
         assert!(!all.matches("agy", "anything/at/all"));
+    }
+
+    /// MOD-13 D4: `split_qualifier` is `PathPrefix::parse`'s qualifier rule, untrimmed.
+    #[test]
+    fn split_qualifier_is_the_parse_rule() {
+        for (touched, expected) in [
+            ("web:src/**", (Some("web"), "src/**")),
+            ("a/b:c", (None, "a/b:c")),
+            (":src", (None, ":src")),
+            ("web:", (Some("web"), "")),
+            ("web: src", (Some("web"), " src")),
+            ("src/**", (None, "src/**")),
+        ] {
+            assert_eq!(split_qualifier(touched), expected, "`{touched}`");
+        }
     }
 
     #[test]

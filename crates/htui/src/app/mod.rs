@@ -50,6 +50,8 @@ use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsT
 ///    arm selects the Graph sub-tab; the binding only puts `m open graph` on the help line.
 /// 9. The Backlog tab's `f` and `F` are bound to their `filter` and `clear filter` help texts
 ///    (MOD-13 D1), for the same reason: the tab's own arms open and clear the filter.
+/// 10. The Backlog tab's `N` and `e` are bound to their `new item` and `edit item` help texts
+///     (MOD-13 milestone 2 D7), for the same reason: the tab's own arms read the item form.
 ///
 /// Calling this twice would stack a second switcher; the shell calls it exactly once, between
 /// [`App::new`] and [`App::start`].
@@ -127,6 +129,17 @@ pub fn register_all(app: &mut App) {
     // MOD-13 D1: `f` opens the filter form and `F` clears the filter, in the Backlog's own arms,
     // which always consume the key; these rows are the help box's half, as the `m` row is.
     for (key, help) in [('f', "filter"), ('F', "clear filter")] {
+        app.keymap.bind(Binding {
+            scope: KeyScope::Tab(BacklogTab::ID),
+            key: KeyChord::new(KeyCode::Char(key), KeyModifiers::NONE),
+            action: Action::Tab(TabAction::Focus(BacklogTab::ID)),
+            help,
+        });
+    }
+    // MOD-13 milestone 2 D7: `N` opens the new-item form and `e` the edit form, in the Backlog's
+    // own arms, which always consume the key; these rows are the help box's half, as the `f` row
+    // is.
+    for (key, help) in [('N', "new item"), ('e', "edit item")] {
         app.keymap.bind(Binding {
             scope: KeyScope::Tab(BacklogTab::ID),
             key: KeyChord::new(KeyCode::Char(key), KeyModifiers::NONE),
