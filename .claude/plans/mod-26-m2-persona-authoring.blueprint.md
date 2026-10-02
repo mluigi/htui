@@ -123,6 +123,7 @@ shapes (2.1–2.13) · §3 T6 · §4 T7 · §5 T8 · §6 T9 · §7 T10 · §8 la
 | **D-7** | D17 escape list | F-2 | Five escapes kept; other controls raw inside quotes (B-2) — a clarification, not a widening |
 | **D-8** | T7 Validate | F-8 | Adds `htui-agent` tests to G-T7 |
 | **D-9** | D21 refusals "the store's sentence" | F-14 | `Constraint` → bare `Failed` (B-11) |
+| **D-10** | §3.3(b) "the sentence for ``"e`x"`` is one line with the backtick escaped" | §2.2 and D18 use `escape_debug` (as `kind_not_narrowable`), which never escapes a backtick | The backtick stays raw; only `escape_debug`'s escapes apply, so the sentence stays on one line; the test pins the literal sentence (commit 8884a86d) |
 
 ---
 
@@ -1389,7 +1390,7 @@ An empty `description` drops its ` · {description}` segment from the Browse lin
 | Test | Asserts |
 |---|---|
 | `every_widening_shape_is_refused` (extended) | one more shape: a rule with `tool_kind: Some("exec")` → `Some(rule_kind_unknown("exec"))` [accepted today] |
-| `a_misspelt_rule_kind_is_refused_after_the_older_sentences` | `[kind "exec"]` → `rule_kind_unknown("exec")`; `[kind "exec", PersonaMatch::default()]` → `RULE_MATCHES_EVERYTHING` (B-1); `[kind "ex\0ec"]` → `has_nul("persona.permission.rules")`; `kind ""` → `rule_kind_unknown("")`; each of the ten `TOOL_KINDS` (incl. `think`, `switch_mode`, `other`) accepted; the sentence for ``"e`x"`` is one line with the backtick escaped [no kind check] |
+| `a_misspelt_rule_kind_is_refused_after_the_older_sentences` | `[kind "exec"]` → `rule_kind_unknown("exec")`; `[kind "exec", PersonaMatch::default()]` → `RULE_MATCHES_EVERYTHING` (B-1); `[kind "ex\0ec"]` → `has_nul("persona.permission.rules")`; `kind ""` → `rule_kind_unknown("")`; each of the ten `TOOL_KINDS` (incl. `think`, `switch_mode`, `other`) accepted; the sentence for ``"e`x"`` is one line with the backtick raw (D-10) [no kind check] |
 | `a_patch_is_checked_field_by_field` (extended) | `PersonaPatch { permission: Some(… kind "exec" …) }` → the same sentence |
 
 (c) D17 — `model/persona.rs`:
