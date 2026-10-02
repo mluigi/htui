@@ -102,8 +102,49 @@ pub struct DirListing {
 /// # Errors
 /// [`RootRefusal`], carrying `path` as given.
 pub fn list_dirs(path: &Path, show_hidden: bool, cap: usize) -> Result<DirListing, RootRefusal> {
-    let _ = (path, show_hidden, cap);
-    todo!("MOD-49 T1")
+    let typed = || path.to_path_buf();
+    if !path.is_absolute() {
+        return Err(RootRefusal::Relative(typed()));
+    }
+    let link = std::fs::symlink_metadata(path).map_err(|_| RootRefusal::Missing(typed()))?;
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err(RootRefusal::NotADirectory(typed())),
+        Err(_) if link.is_symlink() => return Err(RootRefusal::Dangling(typed())),
+        Err(_) => return Err(RootRefusal::Missing(typed())),
+    }
+    let read = std::fs::read_dir(path).map_err(|_| RootRefusal::Unreadable(typed()))?;
+
+    let mut entries: Vec<DirEntry> = read
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if !show_hidden && name.starts_with('.') {
+                return None;
+            }
+            let kind = entry.file_type().ok()?;
+            // Only a link is followed, and only to ask whether it ends at a directory: what it
+            // points at is never kept (`R-BOX-4`).
+            let is_link = if kind.is_dir() {
+                false
+            } else if kind.is_symlink()
+                && std::fs::metadata(entry.path()).is_ok_and(|meta| meta.is_dir())
+            {
+                true
+            } else {
+                return None;
+            };
+            Some(DirEntry { name, is_link })
+        })
+        .collect();
+    entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    let more = entries.len().saturating_sub(cap);
+    entries.truncate(cap);
+    Ok(DirListing {
+        path: path.to_string_lossy().into_owned(),
+        entries,
+        more,
+    })
 }
 
 #[cfg(test)]
