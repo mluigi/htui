@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-24](docs/decisions/mod/mod-24.md)** - Crash recovery of runs under the headless worker (done, 2026-10-02)
 - **[MOD-68](docs/decisions/mod/mod-68.md)** - Replace `fastembed`/`ort` with an `rten` embedder and a pinned weight fetch (done, 2026-10-01)
 - **[MOD-66](docs/decisions/mod/mod-66.md)** - Per-box manual tool paths in Settings > Agents (done, 2026-10-01)
 - **[MOD-42](docs/decisions/mod/mod-42.md)** - Permission and control relay through Postgres (done, 2026-10-01)

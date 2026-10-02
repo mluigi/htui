@@ -164,6 +164,7 @@ pub const CASES: &[&str] = &[
     "pending_commands_are_the_owners_and_the_boxs_free_runs",
     "relay_view_lists_live_pending_requests_and_pending_cancels",
     "deleting_a_project_takes_its_relay_rows",
+    "adopt_runs_never_leases_a_chat_run",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -415,6 +416,7 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "deleting_a_project_takes_its_relay_rows" => {
             deleting_a_project_takes_its_relay_rows(store).await
         }
+        "adopt_runs_never_leases_a_chat_run" => adopt_runs_never_leases_a_chat_run(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -14229,6 +14231,64 @@ async fn pending_commands_are_the_owners_and_the_boxs_free_runs<S: WriteStore>(s
         pending_ids(CASE, store, c, ids::BOX).await,
         vec![x],
         "{CASE}: a terminal run on the box is listed, so its pending row can be refused (B-4)"
+    );
+}
+
+/// MOD-24 D3b: the sweep adopts graph runs only. A chat run is `running` on its box with no lease,
+/// and a sweep that leased it fenced the chat's unleased writes; a free graph run beside it is
+/// still adopted.
+async fn adopt_runs_never_leases_a_chat_run<S: WriteStore>(store: &S) {
+    const CASE: &str = "adopt_runs_never_leases_a_chat_run";
+    let (x, y) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let chat = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        ids::BOX,
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        Some("sonnet".to_owned()),
+    );
+    store.start_chat_run(&chat).await.expect(CASE);
+    let graph = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(graph, ids::BOX, x, at, TimeDelta::minutes(5))
+            .await
+            .expect(CASE),
+        Claim::Admitted,
+        "{CASE}: X claims the graph run"
+    );
+    assert!(
+        store.release_lease(graph, x).await.expect(CASE),
+        "{CASE}: and frees it"
+    );
+    let before = run_row(CASE, store, chat.run_id).await;
+
+    let adopted = store
+        .adopt_runs(ids::BOX, y, TimeDelta::minutes(10))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        adopted.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![graph],
+        "{CASE}: the free graph run, never the chat"
+    );
+    assert_eq!(
+        run_row(CASE, store, chat.run_id).await,
+        before,
+        "{CASE}: the chat run is untouched: no lease box, no expiry"
+    );
+    assert_eq!(
+        store
+            .append_events(StepFence::Unleased, &[chat_event(chat.step_id, 0)])
+            .await
+            .expect(CASE),
+        1,
+        "{CASE}: the chat still writes unleased after the sweep"
     );
 }
 

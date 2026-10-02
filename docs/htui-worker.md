@@ -149,6 +149,30 @@ Two consequences of recovering "as after a crash":
 item. This is a re-read, not a liveness signal: a run queued on a worker box with no worker running
 stays `queued`, and the pane cannot tell you why (MOD-43).
 
+## If the worker crashes
+
+A worker killed mid-run (`kill -9`, an OOM kill, a power cut) loses **at most the step it was
+walking**. Nothing is resumed inside the agent's session: the session, its process and any
+permission request it was parked on die with the worker. Once the run's lease lapses (its
+time-to-live, `lease_ttl_seconds`, 120 s by default), the next worker or TUI on the box that sweeps
+adopts the run and decides from what reached Postgres and the step's tree:
+
+| The worker died | What recovery does |
+|---|---|
+| after the step's session started, before or after some of its log was written | The step fails `interrupted` (its log so far is kept), the item gets a note "… did not finish; … retrying as attempt N", and a new attempt runs in a fresh tree. With the retry budget spent, the run parks instead. |
+| after the step's output document was written, before its work was captured | As above: the document alone does not finish a step. |
+| after the step's work was captured (every repository's commit recorded) and its document written | The step is settled `done` without a new session, and the run walks on. |
+
+A step whose checkout was used in place and was not clean when the step started is never reset:
+the run parks with the tree's path and its starting commit in the note.
+
+**A cancel survives a crash.** A cancel requested while the worker was walking the run, and not yet
+applied when it died, is applied by the restarted worker **before** it recovers anything: the run
+ends `cancelled`, never walked on and never finished by the recovery itself.
+
+These outcomes are pinned by `crates/htui/tests/worker_crash_pg.rs`, which kills a real worker
+process at each of these points and restarts it (MOD-24).
+
 ## Permission requests on worker steps
 
 An ACP agent may ask for permission before it runs a tool. On a step the worker walks, as on one
@@ -197,7 +221,8 @@ applies it:
 - **A request whose executor is not running waits.** It stays pending, with no timeout, and the
   Runs pane keeps showing `cancel requested`. If the worker died holding the run, the request waits
   until the run's lease lapses; from then on the next process on the run's box that reads cancel
-  requests applies it: the worker when it starts again, or a TUI open on that box. A run walked on
+  requests applies it: the worker when it starts again (before it recovers the run, see
+  [If the worker crashes](#if-the-worker-crashes)), or a TUI open on that box. A run walked on
   another box is cancelled only by a process on that box.
 - **A run that ended first is not cancelled.** If the run reached `done` (or failed) before its
   executor read the request, the request is refused with the run's actual status and the run is

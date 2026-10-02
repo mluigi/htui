@@ -14,7 +14,15 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-01):** **MOD-68 is done** (`docs/decisions/mod/mod-68.md`): the
+**Current status (2026-10-02):** **MOD-24 is done** (`docs/decisions/mod/mod-24.md`): a worker killed
+mid-run loses at most the step it was walking, now pinned by `crates/htui/tests/worker_crash_pg.rs`,
+which `SIGKILL`s a real worker process at five seeded kill points (`htui_orch::kill_point`, armed only
+under `test-support`) and restarts it: a step killed before its work is captured is retried, one
+killed after capture settles `done`. A cancel requested before the crash is applied before recovery
+(it used to lose to it); the sweep adopts graph runs only (it leased live chats each sweep, fencing
+their writes); a chat that panics closes its run `failed`. The review round also fixed a MOD-42
+deadlock in the command guard. No migration.
+Before it, **MOD-68 is done** (`docs/decisions/mod/mod-68.md`): the
 concepts index embeds with `rten`, a pure-Rust ONNX runtime, instead of `fastembed`/`ort`. Nothing is
 downloaded at build time, and the embedder needs no C compiler. The BGE-small weights are fetched on
 first use from the pinned `Xenova/bge-small-en-v1.5` commit `ea104dac`, sha256-checked per file
@@ -45,13 +53,13 @@ Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
 (MOD-38), `0007_skill_attachments` (MOD-9 milestone 2), `0008_trim_record_v3` (MOD-9 milestone 5,
-comment only) `0009_agent_box_user_off` (MOD-23) and `0010_prompt_digest_undigested` (MOD-33, comment only;
-cache: `0001`..`0004`), so **the next migration is `0011`** (cache: `0005`).
+comment only) `0009_agent_box_user_off` (MOD-23), `0010_prompt_digest_undigested` (MOD-33, comment only)
+and `0011_permission_relay` (MOD-42; cache: `0001`..`0004`), so **the next migration is `0012`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
 (done, all four milestones), MOD-38, MOD-9 (done, all five milestones), MOD-40, MOD-39, MOD-64,
-MOD-23, MOD-22, MOD-41 and MOD-59 (re-counted 2026-10-01; `StoreReply` 2026-09-30): store conformance `CASES` 104, `READ_CASES` 14, `htui-orch` `CASES` 86,
+MOD-23, MOD-22, MOD-41, MOD-59 and MOD-24 (re-counted 2026-10-01; `StoreReply` 2026-09-30; `CASES`, `.sqlx` and snapshots 2026-10-02): store conformance `CASES` 119, `READ_CASES` 14, `htui-orch` `CASES` 86,
 `GraphSource` 7 methods, `StoreRequest` 91, `StoreReply` 52, `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
-`skills::REQUEST_NAMES` 6, `TABLES` 39, 291 `.sqlx` files, 121
+`skills::REQUEST_NAMES` 6, `TABLES` 39, 307 `.sqlx` files, 127
 `crates/htui/tests/snapshots`, six workspace members (`htui-worker` since MOD-41),
 `MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 35 pinned commented
 columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 4` (MOD-33 `undigested`) with `skill_choices` (a
@@ -466,35 +474,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   rename onto a file another process may hold open, and the golden tests
   (`cargo test -p htui-store --features local-embed --lib embed -- --ignored`) run on that platform.
 
-- [ ] **MOD-24 - Crash recovery of runs under the headless worker.** `R-HIS-1`, `R-ORCH-11`.
-  **Rescoped by maintainer decision, 2026-09-25:** a run survives a crash through ANA-2 §4.9's
-  reset-and-retry resume, not by re-hydrating the agent's context and continuing the exact step. The
-  original ask (checkpoint agent memory to Postgres, re-hydrate from the last `SessionEvent`, resume
-  mid-step) is **dropped**: after a crash the child process, the ACP connection and the parked
-  permission responders are gone, the step may have half-mutated its tree (ANA-2 §4.9 options table),
-  and `session_event` holds the transcript, not the agent's context window. What §4.9 already gives,
-  as built by MOD-4 M6 (`crates/htui-orch/src/engine.rs` `sweep`/`recover_step`, conformance cases in
-  `crates/htui-orch/src/conformance.rs`): a crash costs at most the interrupted step, which is reset
-  to `before_hash` and retried, or marked `done` when its `after_hash` and output document exist.
-  **What is left for this item:** MOD-41 is done (`docs/decisions/mod/mod-41.md`): `htui worker`
-  hosts run supervision, and on a box whose executor is `worker` (1) a TUI exit or crash no longer
-  interrupts a run the worker owns (pinned by `crates/htui/tests/worker_pg.rs`). Left: (2) an end-to-end test kills the `htui worker`
-  process mid-step and after a step's artefacts are written, restarts it, and checks that the sweep
-  resets-and-retries the first and marks the second `done`. **Not in scope:** continuing an
-  interrupted step inside the agent's own session (`claude --resume <id>`, ACP `session/load` once
-  MOD-37 carries it) on the unreset tree; it would need an ANA-2 §4.9 amendment, works only on the
-  box that holds the agent's transcript, and can be raised again after MOD-37. Continuing across a
-  worker-to-TUI re-attach of a live agent is MOD-46/MOD-47 territory, not this item's.
-  MOD-53 left one more case here (`docs/decisions/mod/mod-53.md`): a chat that panics mid-turn
-  leaves its run row open, and closing it is recovery work.
-  Not blocked (MOD-41 is done). Relates to ANA-16 (`docs/ANA-16.md` §8), which flagged the
-  conflict this decision settles.
-  **ANA-27 note (2026-10-01, `docs/ANA-27.md` §5.1 T11):** run (2) at fixed kill points reached
-  through a `testkit` hook, not after a sleep: after the session starts and before its first flush;
-  after a flush; after capture and before the output document; and after the document. Once MOD-42
-  lands, add a kill between a command row's commit and its notification, which the poll backstop
-  must still apply.
-
 - [ ] **MOD-70 - Follow-up command rows for engine steps** (from MOD-42, PRD Q9;
   `docs/decisions/mod/mod-42.md`). `R-AGT-1`, `R-HIS-1`. MOD-42's `run_command` table carries only
   `kind = 'cancel'`; a follow-up typed in any TUI for a step an engine walks (in process or on a
@@ -628,6 +607,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 26 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-24 worker crash recovery, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 25 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-26 personas, MOD-27 swarm, MOD-28 rataflow, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-49 path picker, MOD-60 display width, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

@@ -17,10 +17,11 @@ use htui_agent::record::{Control, Signal};
 use htui_agent::registry::DriverFactory;
 use htui_core::model::{
     AgentId, AgentSummary, BoxId, BoxProfile, CancelRequest, Executor, ItemId, RepoId, Run,
-    RunCommandId, RunCommandStatus, RunId, RunStatus, SnapshotCandidate, UserId,
+    RunCommandId, RunCommandStatus, RunId, RunKind, RunStatus, SnapshotCandidate, UserId,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{Result as StoreResult, StoreError};
+use htui_orch::kill_point::{KillPoint, Site};
 use htui_orch::{
     Adopted, Clock, Command, CommandOutcome, DeadWalks, DriverFor, Engine, EngineError,
     EngineParts, FirstCandidate, GixIsolator, Isolator, IsolatorConfig, LeaseTimes, Next,
@@ -29,7 +30,7 @@ use htui_orch::{
 };
 use htui_store::{DATABASE_UNREACHABLE, identity};
 use serde_json::Value;
-use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
+use tokio::sync::{Notify, OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -214,6 +215,12 @@ struct Shared<P: ReplySink> {
     /// MOD-42 B-5: the run commands a task of this process is applying now, so the poll never
     /// applies a row the inline path (or an earlier tick) is still applying.
     applying: StdMutex<HashSet<RunCommandId>>,
+    /// MOD-24 D3 (B5): the live chats the last command poll was handed; the sweep's own cancels
+    /// honour them as the poll does (D212). Always empty for the worker.
+    last_live: StdMutex<LiveChats>,
+    /// MOD-24 D3: notified whenever an `Applying` guard drops, so the sweep can await a row the
+    /// poll is applying.
+    applied: Notify,
     /// MOD-42 plan D11, B-19: the grace a graceful preempt gives a session's cancel.
     cancel_grace: Duration,
 }
@@ -465,15 +472,21 @@ impl<P: ReplySink> Shared<P> {
 
     /// MOD-42 B-5: `id` claimed for this task until the guard drops; `None` while another task of
     /// this process applies it.
+    ///
+    /// The set's lock is released before any guard exists: a guard built under it (an eager
+    /// `then_some`) and dropped on a refusal would lock the set again in its `Drop`, deadlocking
+    /// the thread, and free the holder's id besides.
     fn applying(&self, id: RunCommandId) -> Option<Applying<'_>> {
-        self.applying
+        let inserted = self
+            .applying
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(id)
-            .then_some(Applying {
-                set: &self.applying,
-                id,
-            })
+            .insert(id);
+        inserted.then(|| Applying {
+            set: &self.applying,
+            done: &self.applied,
+            id,
+        })
     }
 
     /// MOD-42 B-5: whether a task of this process applies `id` now.
@@ -483,11 +496,26 @@ impl<P: ReplySink> Shared<P> {
             .unwrap_or_else(PoisonError::into_inner)
             .contains(&id)
     }
+
+    /// MOD-24 D3: until no task of this process applies `id` (B-5's guard is free).
+    async fn until_applied(&self, id: RunCommandId) {
+        loop {
+            let mut notified = std::pin::pin!(self.applied.notified());
+            // Registered before the check, so a guard dropped in between is never missed.
+            notified.as_mut().enable();
+            if !self.is_applying(id) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
-/// MOD-42 B-5: one run command a task is applying; dropping it frees the id for the next poll.
+/// MOD-42 B-5: one run command a task is applying; dropping it frees the id for the next poll
+/// and wakes whoever awaits it (MOD-24 D3).
 struct Applying<'a> {
     set: &'a StdMutex<HashSet<RunCommandId>>,
+    done: &'a Notify,
     id: RunCommandId,
 }
 
@@ -497,6 +525,7 @@ impl Drop for Applying<'_> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&self.id);
+        self.done.notify_waiters();
     }
 }
 
@@ -1082,6 +1111,8 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 backoff: StdMutex::default(),
                 polling: AtomicBool::new(false),
                 applying: StdMutex::default(),
+                last_live: StdMutex::default(),
+                applied: Notify::new(),
                 cancel_grace: CANCEL_GRACE,
             }),
             events: Some(receiver),
@@ -1158,6 +1189,19 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
     /// already being applied (B-5), runs as an internal cancel (D12 steps 3-5, no second row).
     /// `live` is the loop's [`LiveChats`]: a cancel a live chat refuses stays pending, silently.
     pub fn poll_commands_with(&mut self, host: &H, sink: &P, live: LiveChats) {
+        // H-17: the worker runs no chats, so its loop hands an empty set (`worker.rs`), and the
+        // sweep's cancels it stores below refuse nothing there.
+        debug_assert!(
+            self.shared.role != Role::Worker || live.is_empty(),
+            "a worker runtime is polled with live chats"
+        );
+        // MOD-24 D3 (B5): every tick, even one the in-flight check skips, so the sweep's cancels
+        // refuse what this poll would.
+        *self
+            .shared
+            .last_live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = live.clone();
         // Every tick, like a sweep's: the poll's own finished handles never pile up between the
         // sweeps (the TUI's sweep period is the lease TTL).
         self.shared.prune_tasks();
@@ -1826,9 +1870,17 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
     }
 }
 
-/// D158, D189: the sweep's adoption: every lapsed lease on the box adopted, and each run that
-/// owes a walk resumed on its own task.
+/// D158, D189: the sweep's adoption: first the pending cancels of free runs (MOD-24 D3), then
+/// every lapsed lease on the box adopted, and each run that owes a walk resumed on its own task.
+/// A tick whose pending cancels could not be read adopts nothing.
 async fn adopt<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P>) {
+    // Before `Kit::read`: `cancel_run` builds its own kit, and a failed read here must not skip
+    // the cancels. Their own read failing skips this tick's recovery instead: a cancel it could
+    // not see may be pending, and the next tick tries again.
+    if !cancels_first(ctx).await {
+        tracing::debug!("the sweep skips its recovery this tick: the pending cancels went unread");
+        return;
+    }
     let host = &ctx.host;
     let kit = match Kit::read(&ctx.shared, host, false).await {
         Ok(kit) => kit,
@@ -1871,6 +1923,94 @@ async fn adopt<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P
             Next::Error(sentence) => frame(FrameKind::Error(sentence)),
         }
     }
+}
+
+/// MOD-24 D3 (OQ-2): before the sweep recovers anything, every pending cancel this process may
+/// apply (`pending_commands(owner, box)`, B-4) whose run is `running` and not walked here is
+/// applied, through the poll's own `cancel_run`, and then awaited under B-5's guard: a row the
+/// poll took first is waited for, never applied twice. A row the poll holds is awaited before the
+/// walked-run skip (H-16): the poll's `cancel_run` mints a walk child on the run before it awaits
+/// the run lock, so its run reads as walked here. Such a run is cancelled without recovery
+/// (`cancel_leased` takes the lapsed lease) instead of being walked on, or finished by the
+/// recovery itself, which used to lose the user's cancel to the crash.
+///
+/// Only a graph run (`kind == RunKind::Graph`) that reads `running` is applied: a chat run is
+/// never adopted by the sweep (D3b), so its cancel has no recovery to beat and stays the poll's.
+/// Left to the poll too: a run this process walks (a graceful preempt), and parked or terminal
+/// runs (the sweep never adopts them, so nothing races them). A run whose lease is live elsewhere
+/// is not in `pending_commands` at all. Failures are logged as the poll's are: the pending rows'
+/// read at `warn`, a run's read and a refused cancel at `debug` (the row stays pending for the
+/// poll, and recovery proceeds as before). The live chats are the last poll's (B5, D212), so a
+/// cancel the poll would refuse is refused here too.
+///
+/// Answers whether the pending rows were read: when they were not (no writer, this box's row or
+/// the rows themselves unreadable), a pending cancel may be waiting unseen, and the caller skips
+/// this tick's recovery rather than recover a run whose cancel it could not see.
+async fn cancels_first<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P>) -> bool {
+    let Some(writer) = ctx.host.writer() else {
+        return false;
+    };
+    let box_id = match registered_box(&ctx.host).await {
+        Ok(box_id) => box_id,
+        Err(err) => {
+            tracing::debug!(%err, "the sweep could not read this box for its cancels");
+            return false;
+        }
+    };
+    let rows =
+        match htui_core::store::WorkerStore::pending_commands(&writer, ctx.shared.owner, box_id)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(%err, "the sweep could not read the pending run commands");
+                return false;
+            }
+        };
+    let live = ctx
+        .shared
+        .last_live
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    for row in rows {
+        // H-16: the poll's `cancel_run` takes B-5's guard and then a walk child on the run before
+        // it awaits the run lock, so a row it holds reads as a walked run's below. Waited for
+        // first: skipped, `sweep_fenced` could recover the run before the poll's cancel lands.
+        if ctx.shared.is_applying(row.id) {
+            ctx.shared.until_applied(row.id).await;
+            continue;
+        }
+        if ctx.shared.walks.is_live(row.run_id) {
+            continue;
+        }
+        let run = match htui_core::store::WorkerStore::run(&writer, row.run_id).await {
+            Ok(Some(run)) => run,
+            Ok(None) => continue,
+            Err(err) => {
+                tracing::debug!(
+                    run = %row.run_id,
+                    %err,
+                    "the sweep could not read a pending cancel's run; the poll retries it"
+                );
+                continue;
+            }
+        };
+        if run.kind != RunKind::Graph || run.status != RunStatus::Running {
+            continue;
+        }
+        Box::pin(cancel_run(
+            ctx.unaddressed("cancel_run"),
+            row.run_id,
+            &live,
+            Some(row.id),
+        ))
+        .await;
+        // B-5: if the poll took the row first, `cancel_run` returned at once; its application
+        // ends here.
+        ctx.shared.until_applied(row.id).await;
+    }
+    true
 }
 
 /// Plan D14, OQ-5: this box's queued rows join the claim queue in `(queued_at, id)` order and are
@@ -2476,6 +2616,8 @@ async fn poll_once<H: htui_core::store::WorkerHost, P: ReplySink>(
         if ctx.shared.is_applying(row.id) {
             continue;
         }
+        // MOD-24 D1 (K5): this process will apply the row; nothing has applied it yet.
+        htui_orch::kill_point::reached(KillPoint::CommandPicked, Site::NONE);
         let task = ctx.unaddressed("cancel_run");
         let live = live.clone();
         spawn_supervised(task.clone(), async move {
@@ -2591,6 +2733,19 @@ pub mod testing {
     /// A handle on a runtime's shared state (MOD-41 plan D8).
     pub struct Probe<P: ReplySink>(Arc<Shared<P>>);
 
+    /// B-5's guard held by a case ([`Probe::hold_applying`]); dropping it frees the row and wakes
+    /// whoever awaits it.
+    #[must_use = "the guard frees the row when dropped"]
+    pub struct Held<'a> {
+        _guard: super::Applying<'a>,
+    }
+
+    impl core::fmt::Debug for Held<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("Held").finish_non_exhaustive()
+        }
+    }
+
     /// MOD-41 blueprint F-12: hand-written, so no `P: Debug` is asked of a sink.
     impl<P: ReplySink> core::fmt::Debug for Probe<P> {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -2623,6 +2778,13 @@ pub mod testing {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .contains(&id)
+        }
+
+        /// B-5's guard on the run command `id`, as a task applying it holds it (MOD-24 H-16);
+        /// `None` while a task of this process applies it already.
+        #[must_use]
+        pub fn hold_applying(&self, id: htui_core::model::RunCommandId) -> Option<Held<'_>> {
+            self.0.applying(id).map(|guard| Held { _guard: guard })
         }
 
         /// `run`'s lock when nobody holds it.

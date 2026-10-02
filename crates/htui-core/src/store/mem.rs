@@ -4317,8 +4317,10 @@ impl State {
         Ok(true)
     }
 
-    /// ANA-2 §4.9's sweep: every abandoned lease on the box that is not already `owner`'s becomes
-    /// `owner`'s (plan D88). Expiry is judged by this handle's clock (MOD-40 plan D10).
+    /// ANA-2 §4.9's sweep: every abandoned lease of a graph run on the box that is not already
+    /// `owner`'s becomes `owner`'s (plan D88). Expiry is judged by this handle's clock (MOD-40
+    /// plan D10). A chat run is never the sweep's: the engine cannot recover it, and leasing it
+    /// fenced the chat's own unleased writes (MOD-24 D3b).
     fn adopt_runs(
         &mut self,
         box_id: BoxId,
@@ -4331,6 +4333,7 @@ impl State {
             .values()
             .filter(|row| {
                 row.status == RunStatus::Running
+                    && row.kind == RunKind::Graph
                     && row.executing_box_id == Some(box_id)
                     && row.lease_expires_at.is_none_or(|until| until <= now)
                     // Plan D88: never this process's own lease, even an expired one.

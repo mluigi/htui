@@ -20,6 +20,8 @@
 //! repo-path inference's pure half: remote-URL normalisation, a bounded checkout walk and the
 //! remote-first, name-second choice (plan D111–D113). `queue.rs`, also named
 //! by ANA-2 §8, remains MOD-12's and is deliberately not created, not even empty (plan D1).
+//! MOD-24 adds [`kill_point`], the crash tests' hook at three seams of a walk and the command
+//! poll; without `test-support` it compiles to nothing.
 #![warn(missing_docs)]
 
 pub mod closeout;
@@ -34,6 +36,7 @@ pub mod gate;
 pub mod graph;
 pub mod infer;
 pub mod isolate;
+pub mod kill_point;
 pub mod overlap;
 pub mod promote;
 pub mod recover;
