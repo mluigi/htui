@@ -1751,6 +1751,43 @@ mod tests {
         }
     }
 
+    /// MOD-60: the description prompt carries the runtime skill name, so the field's budget is
+    /// the pane less the prompt in cells. A CJK name measured in chars leaves the field 5 cells
+    /// too many and the prompt line runs past the pane.
+    #[test]
+    fn a_wide_skill_name_keeps_the_description_prompt_within_the_pane() {
+        let (top_bar, keymap, theme, emit) = (
+            TopBarState::default(),
+            Keymap::default_global(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let scope = vulkan();
+        let ctx = Ctx::new(
+            &scope,
+            &[],
+            &top_bar,
+            &keymap,
+            &theme,
+            Origin::Tab(SkillsTab::ID),
+            &emit,
+        );
+        let view = LibraryView {
+            mode: Mode::Describing {
+                name: "\u{6f22}".repeat(5),
+                field: TextField::with_text(&"x".repeat(80)),
+            },
+            ..LibraryView::default()
+        };
+        let (_, lines) = view.pane(40, &ctx);
+        let drawn: usize = lines[0]
+            .spans
+            .iter()
+            .map(|span| cell_width(&span.content))
+            .sum();
+        assert_eq!(drawn, 40, "{lines:?}");
+    }
+
     /// The Harness's startup scope: the Graphics workspace and its one project.
     fn vulkan() -> Scope {
         Scope {

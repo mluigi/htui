@@ -1186,6 +1186,49 @@ mod tests {
         }
     }
 
+    /// MOD-60: the name prompt carries the runtime project slug, so the field's budget is the
+    /// pane less the prompt in cells. A CJK slug measured in chars leaves the field 5 cells too
+    /// many and the prompt line runs past the pane.
+    #[test]
+    fn a_wide_project_slug_keeps_the_name_prompt_within_the_pane() {
+        let (top_bar, keymap, theme, emit) = (
+            TopBarState::default(),
+            Keymap::default_global(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let scope = vulkan();
+        let projects = [htui_core::model::ProjectRef {
+            project_id: ids::PROJECT_VULKAN,
+            slug: "\u{6f22}".repeat(5),
+            name: "Vulkan".to_owned(),
+            position: 0,
+        }];
+        let ctx = Ctx::new(
+            &scope,
+            &projects,
+            &top_bar,
+            &keymap,
+            &theme,
+            Origin::Tab(SkillsTab::ID),
+            &emit,
+        );
+        let view = TemplatesView {
+            mode: Mode::Naming {
+                project: ids::PROJECT_VULKAN,
+                field: TextField::with_text(&"x".repeat(80)),
+            },
+            ..TemplatesView::default()
+        };
+        let (_, lines) = view.pane(40, &ctx);
+        let drawn: usize = lines[0]
+            .spans
+            .iter()
+            .map(|span| cell_width(&span.content))
+            .sum();
+        assert_eq!(drawn, 40, "{lines:?}");
+    }
+
     /// The Harness's startup scope: the Graphics workspace and its one project.
     fn vulkan() -> Scope {
         Scope {
