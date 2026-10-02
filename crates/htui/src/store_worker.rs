@@ -1782,8 +1782,14 @@ fn runnable_here(rows: Vec<ItemSummary>, info: Option<&BoxInfo>) -> Vec<ItemSumm
 /// `canonical_root`. A refusal becomes [`StoreError::Constraint`], so it reads
 /// ``list_dir: constraint violated: `/x` does not exist on this box``.
 async fn list_dir(path: &str, show_hidden: bool) -> StoreResult<StoreReply> {
-    let _ = (path, show_hidden);
-    todo!("MOD-49 T2")
+    let typed = path.to_owned();
+    let listing = tokio::task::spawn_blocking(move || {
+        list_dirs(std::path::Path::new(&typed), show_hidden, LIST_CAP)
+    })
+    .await
+    .map_err(|err| StoreError::Backend(err.to_string()))?
+    .map_err(|refusal| StoreError::Constraint(refusal.to_string()))?;
+    Ok(StoreReply::DirListing(listing))
 }
 
 /// Renders a store error into the reply the asking view receives.
