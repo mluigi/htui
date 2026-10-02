@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE step_graph_phase SET\n                name          = COALESCE($3, name),\n                position      = COALESCE($4, position),\n                template_name = COALESCE($5, template_name),\n                gate_hard     = COALESCE($6, gate_hard),\n                input_kinds   = COALESCE($7, input_kinds)\n             WHERE id = $1 AND updated_at = $2\n            RETURNING id               AS \"id: PhaseId\",\n                      graph_id         AS \"graph_id: StepGraphId\",\n                      position,\n                      name,\n                      fan_out,\n                      gate             AS \"gate: htui_core::model::Gate\",\n                      gate_hard,\n                      retry_limit,\n                      input_kinds,\n                      output_kind,\n                      isolation        AS \"isolation: Isolation\",\n                      command_queue    AS \"command_queue: htui_core::model::CommandQueue\",\n                      verify_command,\n                      template_name,\n                      template_version,\n                      token_budget,\n                      updated_at\n            ",
+  "query": "\n            SELECT id               AS \"id: PhaseId\",\n                   graph_id         AS \"graph_id: StepGraphId\",\n                   position,\n                   name,\n                   fan_out,\n                   gate             AS \"gate: Gate\",\n                   gate_hard,\n                   retry_limit,\n                   input_kinds,\n                   output_kind,\n                   isolation        AS \"isolation: Isolation\",\n                   command_queue    AS \"command_queue: CommandQueue\",\n                   verify_command,\n                   template_name,\n                   template_version,\n                   token_budget,\n                   persona_id       AS \"persona_id: PersonaId\",\n                   updated_at\n              FROM step_graph_phase\n             WHERE graph_id = $1\n             ORDER BY position\n            ",
   "describe": {
     "columns": [
       {
@@ -60,7 +60,7 @@
       },
       {
         "ordinal": 5,
-        "name": "gate: htui_core::model::Gate",
+        "name": "gate: Gate",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -126,7 +126,7 @@
       },
       {
         "ordinal": 11,
-        "name": "command_queue: htui_core::model::CommandQueue",
+        "name": "command_queue: CommandQueue",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -181,6 +181,17 @@
       },
       {
         "ordinal": 16,
+        "name": "persona_id: PersonaId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "persona_id"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -193,13 +204,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Timestamptz",
-        "Text",
-        "Int4",
-        "Text",
-        "Bool",
-        "TextArray"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -219,8 +224,9 @@
       false,
       true,
       true,
+      true,
       false
     ]
   },
-  "hash": "6572649f3c5d24bb5ef0472e7fe050bc2de2b7faa6186a4419c7a9539ce6c7d0"
+  "hash": "6e954b5f2a4de555515e062f9eb54c44c5fd3dd01e9274ff187d372cdf83a05f"
 }

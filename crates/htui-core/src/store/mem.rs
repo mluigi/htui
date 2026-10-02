@@ -29,20 +29,21 @@ use crate::model::{
     DocumentId, Executor, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
     ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement, ItemRevision, ItemSummary,
     LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem, NewItemKind,
-    NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
-    NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission,
-    PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Project,
-    ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId,
-    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
-    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput,
-    ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind,
-    RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
-    SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch,
-    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary, canonical_declared_tags,
-    missing_tags_failure, overlaps, prompt_summary, scope_of,
+    NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
+    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
+    PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
+    PromptScope, PromptTemplate, PromptTemplateId, RelaySessionId, RelayView, Repo, RepoBoxPath,
+    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementState,
+    RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunCommand,
+    RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
+    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission,
+    StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject, WorkspaceSummary, canonical_declared_tags, missing_tags_failure, overlaps,
+    prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -5165,6 +5166,7 @@ impl State {
                     phase: phase.clone(),
                     // `phase_agent` is not a table this store holds (blueprint F-N).
                     agents: Vec::new(),
+                    persona: None,
                 })
                 .collect(),
         })
@@ -6559,6 +6561,23 @@ impl WriteStore for MemStore {
     ) -> Result<CasOutcome<Option<SkillBinding>>> {
         let now = self.now();
         self.write(|state| state.set_skill_binding(key, expected, change, now))
+    }
+
+    async fn personas(&self) -> Result<Vec<Persona>> {
+        Err(StoreError::Backend("MOD-26 T1: red".into()))
+    }
+
+    async fn create_persona(&self, _new: NewPersona) -> Result<Persona> {
+        Err(StoreError::Backend("MOD-26 T1: red".into()))
+    }
+
+    async fn update_persona(
+        &self,
+        _id: PersonaId,
+        _expected: DateTime<Utc>,
+        _patch: PersonaPatch,
+    ) -> Result<CasOutcome<Persona>> {
+        Err(StoreError::Backend("MOD-26 T1: red".into()))
     }
 
     async fn set_setting(
@@ -11364,6 +11383,106 @@ mod tests {
             (v1.skill_id, v1.version, v1.body.as_str()),
             (id, 1, "one"),
             "the first version of a bare skill is v1"
+        );
+    }
+
+    /// MOD-26 plan D6: `resolve_graph` carries the persona row a phase names, and `None` for every
+    /// phase that names none.
+    #[tokio::test]
+    async fn resolve_graph_fills_the_bound_persona() {
+        let store = MemStore::demo();
+        let resolved = store
+            .resolve_graph(ids::HTUI_FEAT_3)
+            .await
+            .expect("the graph resolves")
+            .expect("FEAT items have a default graph");
+        assert_eq!(resolved.graph.id, ids::GRAPH_HTUI_FEAT);
+        assert!(
+            resolved.phases.iter().all(|row| row.persona.is_none()),
+            "no fixture phase is bound"
+        );
+        let first = resolved.phases[0].phase.clone();
+        let reviewer = store
+            .personas()
+            .await
+            .expect("the registry reads")
+            .into_iter()
+            .find(|row| row.name == "reviewer")
+            .expect("the demo registry holds reviewer");
+        let CasOutcome::Applied(bound) = store
+            .update_phase(
+                first.id,
+                first.updated_at,
+                crate::model::PhasePatch {
+                    persona: Some(Some(reviewer.id)),
+                    ..crate::model::PhasePatch::default()
+                },
+            )
+            .await
+            .expect("the binding is a valid edit")
+        else {
+            panic!("the token was read from the store");
+        };
+
+        let resolved = store
+            .resolve_graph(ids::HTUI_FEAT_3)
+            .await
+            .expect("the graph resolves")
+            .expect("FEAT items have a default graph");
+        assert_eq!(resolved.phases[0].phase, bound, "the row as bound");
+        assert_eq!(
+            resolved.phases[0].persona.as_ref(),
+            Some(&reviewer),
+            "the bound phase carries the persona row"
+        );
+        assert!(
+            resolved.phases[1..].iter().all(|row| row.persona.is_none()),
+            "every other phase carries none"
+        );
+    }
+
+    /// MOD-26 plan D4: a persona's two stamps are the handle's clock, on create and on update.
+    #[tokio::test]
+    async fn persona_times_are_the_handles_clock() {
+        let t = Utc::now() - TimeDelta::days(2);
+        let clock = TestClock::at(t);
+        let store = MemStore::demo().with_clock(Arc::new(clock.clone()));
+        let created = store
+            .create_persona(crate::model::NewPersona {
+                id: crate::model::PersonaId::new(),
+                name: "scout".to_owned(),
+                description: String::new(),
+                body: "You scout.\n".to_owned(),
+                tools: crate::model::PersonaTools::default(),
+                permission: crate::model::PersonaPermission::default(),
+            })
+            .await
+            .expect("a valid persona is created");
+        assert_eq!(
+            (created.created_at, created.updated_at),
+            (t, t),
+            "both stamps are the handle's clock"
+        );
+
+        clock.advance(TimeDelta::minutes(5));
+        let CasOutcome::Applied(edited) = store
+            .update_persona(
+                created.id,
+                created.updated_at,
+                crate::model::PersonaPatch {
+                    body: Some("You scout ahead.\n".to_owned()),
+                    ..crate::model::PersonaPatch::default()
+                },
+            )
+            .await
+            .expect("a valid edit")
+        else {
+            panic!("the token was read from the store");
+        };
+        assert_eq!(
+            (edited.created_at, edited.updated_at),
+            (t, clock.now()),
+            "an edit stamps updated_at only, with the handle's clock"
         );
     }
 }

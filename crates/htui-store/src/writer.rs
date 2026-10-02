@@ -26,18 +26,18 @@ use htui_core::model::{
     BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow, Document,
     DocumentHead, DocumentId, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
     ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemSummary, LinkGraph, NewCommandRun,
-    NewDocument, NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo,
+    NewDocument, NewItem, NewItemKind, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
     NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
     NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
-    PermissionStatus, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope,
-    PromptTemplate, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
-    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run,
-    RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId,
-    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
-    StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseId, PhasePatch, Project, ProjectId,
+    ProjectPatch, PromptScope, PromptTemplate, RelaySessionId, RelayView, Repo, RepoBoxPath,
+    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate,
+    Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding,
+    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
+    UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
@@ -781,6 +781,32 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.set_skill_binding(key, expected, change).await,
             Self::Online(pg) => pg.set_skill_binding(key, expected, change).await,
+        }
+    }
+
+    async fn personas(&self) -> Result<Vec<Persona>> {
+        match self {
+            Self::Memory(store) => store.personas().await,
+            Self::Online(pg) => pg.personas().await,
+        }
+    }
+
+    async fn create_persona(&self, new: NewPersona) -> Result<Persona> {
+        match self {
+            Self::Memory(store) => store.create_persona(new).await,
+            Self::Online(pg) => pg.create_persona(new).await,
+        }
+    }
+
+    async fn update_persona(
+        &self,
+        id: PersonaId,
+        expected: DateTime<Utc>,
+        patch: PersonaPatch,
+    ) -> Result<CasOutcome<Persona>> {
+        match self {
+            Self::Memory(store) => store.update_persona(id, expected, patch).await,
+            Self::Online(pg) => pg.update_persona(id, expected, patch).await,
         }
     }
 

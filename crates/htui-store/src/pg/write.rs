@@ -25,18 +25,19 @@ use htui_core::model::{
     CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS,
     Document, Executor, GateOutcome, Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch,
     ItemPatch, ItemRequirement, ItemRevision, NewCommandRun, NewDocument, NewItem, NewItemKind,
-    NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
-    NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission,
-    PermissionChoice, PermissionId, PermissionStatus, PhaseId, PhasePatch, Priority, Project,
-    ProjectId, ProjectPatch, PromptTemplate, PromptTemplateId, RelaySessionId, RelayView, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
-    Resolution, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Skill, SkillBinding,
-    SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
-    UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject, canonical_declared_tags, missing_tags_failure, overlaps, scope_of,
+    NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
+    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
+    PersonaPatch, PhaseId, PhasePatch, Priority, Project, ProjectId, ProjectPatch, PromptTemplate,
+    PromptTemplateId, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run, RunCommand,
+    RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
+    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
+    StepId, StepOutcome, StepPermission, StepStatus, UserId, VerifyOutcome, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, canonical_declared_tags,
+    missing_tags_failure, overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -2712,8 +2713,8 @@ impl WriteStore for PgStore {
             INSERT INTO step_graph_phase (id, graph_id, position, name, fan_out, gate, gate_hard,
                                           retry_limit, input_kinds, output_kind, isolation,
                                           command_queue, verify_command, template_name,
-                                          template_version, token_budget)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                                          template_version, token_budget, persona_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             RETURNING id               AS "id: PhaseId",
                       graph_id         AS "graph_id: StepGraphId",
                       position,
@@ -2730,6 +2731,7 @@ impl WriteStore for PgStore {
                       template_name,
                       template_version,
                       token_budget,
+                      persona_id       AS "persona_id: PersonaId",
                       updated_at
             "#,
             phase.id.as_uuid(),
@@ -2748,6 +2750,7 @@ impl WriteStore for PgStore {
             phase.template_name,
             phase.template_version,
             phase.token_budget,
+            phase.persona_id.map(PersonaId::as_uuid),
         )
         .fetch_one(&self.pool)
         .await
@@ -2788,6 +2791,9 @@ impl WriteStore for PgStore {
             return Err(StoreError::Constraint(reserved_phase_name(name)));
         }
 
+        // MOD-26 D5: `COALESCE` cannot clear, so the binding is a flag and a value; read before
+        // the macro, which moves the patch's other fields.
+        let persona = patch.persona;
         let updated = sqlx::query_as!(
             StepGraphPhase,
             r#"
@@ -2796,7 +2802,8 @@ impl WriteStore for PgStore {
                 position      = COALESCE($4, position),
                 template_name = COALESCE($5, template_name),
                 gate_hard     = COALESCE($6, gate_hard),
-                input_kinds   = COALESCE($7, input_kinds)
+                input_kinds   = COALESCE($7, input_kinds),
+                persona_id    = CASE WHEN $8::bool THEN $9::uuid ELSE persona_id END
              WHERE id = $1 AND updated_at = $2
             RETURNING id               AS "id: PhaseId",
                       graph_id         AS "graph_id: StepGraphId",
@@ -2814,6 +2821,7 @@ impl WriteStore for PgStore {
                       template_name,
                       template_version,
                       token_budget,
+                      persona_id       AS "persona_id: PersonaId",
                       updated_at
             "#,
             id.as_uuid(),
@@ -2823,6 +2831,8 @@ impl WriteStore for PgStore {
             patch.template_name,
             patch.gate_hard,
             patch.input_kinds.as_deref(),
+            persona.is_some(),
+            persona.flatten().map(PersonaId::as_uuid),
         )
         .fetch_optional(&self.pool)
         .await
@@ -3278,6 +3288,25 @@ impl WriteStore for PgStore {
             Some(row) => Ok(CasOutcome::Applied(Some(row))),
             None => Ok(CasOutcome::Stale(self.skill_binding_row(key).await?)),
         }
+    }
+
+    // persona (MOD-26 milestone 1, plan D4)
+
+    async fn personas(&self) -> Result<Vec<Persona>> {
+        Err(StoreError::Backend("MOD-26 T1: red".into()))
+    }
+
+    async fn create_persona(&self, _new: NewPersona) -> Result<Persona> {
+        Err(StoreError::Backend("MOD-26 T1: red".into()))
+    }
+
+    async fn update_persona(
+        &self,
+        _id: PersonaId,
+        _expected: DateTime<Utc>,
+        _patch: PersonaPatch,
+    ) -> Result<CasOutcome<Persona>> {
+        Err(StoreError::Backend("MOD-26 T1: red".into()))
     }
 
     // settings (D7, D8)

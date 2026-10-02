@@ -18,15 +18,15 @@ use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile,
     BoxRow, BoxTool, CitationKind, CommandQueue, CoverageRow, Document, DocumentHead, DocumentId,
     Gate, GateOutcome, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
-    ItemSummary, LinkEdge, LinkGraph, LinkKind, Note, PhaseAgent, PhaseId, Priority, Project,
-    ProjectId, ProjectRef, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId, Requirement,
-    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementRevision,
-    RequirementSpec, RequirementState, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase,
-    Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree,
-    RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
-    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus,
-    UpstreamEntry, UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspaceProject, WorkspaceSummary,
+    ItemSummary, LinkEdge, LinkGraph, LinkKind, Note, PersonaId, PhaseAgent, PhaseId, Priority,
+    Project, ProjectId, ProjectRef, PromptScope, PromptTemplate, Repo, RepoBoxPath, RepoId,
+    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementRevision, RequirementSpec, RequirementState, Resolution, ResolvedGraph,
+    ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
+    RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding,
+    SkillBindingId, SkillBindingKey, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPhase, StepId, StepStatus, UpstreamEntry, UserId, VerifyOutcome, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -1747,7 +1747,11 @@ impl PgStore {
         let mut phases = Vec::new();
         for phase in self.phase_rows(graph_id).await? {
             let agents = self.phase_agents(phase.id).await?;
-            phases.push(ResolvedPhase { phase, agents });
+            phases.push(ResolvedPhase {
+                phase,
+                agents,
+                persona: None,
+            });
         }
         Ok(Some(ResolvedGraph { graph, phases }))
     }
@@ -2243,6 +2247,7 @@ impl PgStore {
                    template_name,
                    template_version,
                    token_budget,
+                   persona_id       AS "persona_id: PersonaId",
                    updated_at
               FROM step_graph_phase WHERE id = $1
             "#,
@@ -2388,6 +2393,7 @@ impl PgStore {
                    template_name,
                    template_version,
                    token_budget,
+                   persona_id       AS "persona_id: PersonaId",
                    updated_at
               FROM step_graph_phase
              WHERE graph_id = $1

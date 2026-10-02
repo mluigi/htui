@@ -5882,3 +5882,126 @@ async fn an_unknown_actor_is_refused_before_the_status() {
 
     db.drop_db().await;
 }
+
+/// The `step_graph_phase` row at `position` 0 of the FEAT graph, bound to `persona` through
+/// [`update_phase`](htui_core::store::WriteStore::update_phase) on `store`.
+async fn bind_feat_first_phase<S: htui_core::store::WriteStore>(
+    store: &S,
+    persona: htui_core::model::PersonaId,
+) -> htui_core::model::StepGraphPhase {
+    let first = store
+        .phases(ids::GRAPH_HTUI_FEAT)
+        .await
+        .expect("the FEAT graph's phases read")
+        .into_iter()
+        .next()
+        .expect("the FEAT graph has phases");
+    match store
+        .update_phase(
+            first.id,
+            first.updated_at,
+            htui_core::model::PhasePatch {
+                persona: Some(Some(persona)),
+                ..htui_core::model::PhasePatch::default()
+            },
+        )
+        .await
+        .expect("binding a fixture persona is a valid edit")
+    {
+        CasOutcome::Applied(row) => row,
+        CasOutcome::Stale(row) => panic!("the token was read a statement ago, got Stale({row:?})"),
+    }
+}
+
+/// MOD-26 plan D6 (blueprint B-14): `resolve_graph` is inherent on both stores, so the store
+/// conformance suite cannot reach it. The same binding on Postgres and on `MemStore::demo()`
+/// resolves to the same graph: the bound phase carries the `persona` row, byte for byte, and
+/// every other phase carries none.
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_graph_carries_the_bound_persona_as_mem_store_does() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let mem = htui_core::store::MemStore::demo();
+
+    let on_pg = bind_feat_first_phase(&db.store, ids::PERSONA_REVIEWER).await;
+    let on_mem = bind_feat_first_phase(&mem, ids::PERSONA_REVIEWER).await;
+    assert_eq!(
+        (on_pg.id, on_pg.persona_id),
+        (on_mem.id, on_mem.persona_id),
+        "the same phase is bound to the same persona on both stores"
+    );
+    assert_eq!(on_pg.persona_id, Some(ids::PERSONA_REVIEWER));
+
+    let resolved = db
+        .store
+        .resolve_graph(ids::HTUI_FEAT_3)
+        .await
+        .expect("resolve_graph must not fail")
+        .expect("FEAT-3's kind has a default graph");
+    let reference = mem
+        .resolve_graph(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore::resolve_graph")
+        .expect("FEAT-3's kind has a default graph");
+    let personas = |graph: &htui_core::model::ResolvedGraph| {
+        graph
+            .phases
+            .iter()
+            .map(|row| (row.phase.persona_id, row.persona.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        personas(&resolved),
+        personas(&reference),
+        "phase.persona_id and ResolvedPhase.persona agree on both backends"
+    );
+    let reviewer = resolved.phases[0]
+        .persona
+        .as_ref()
+        .expect("the bound phase carries its persona");
+    assert_eq!(
+        (reviewer.id, reviewer.name.as_str()),
+        (ids::PERSONA_REVIEWER, "reviewer"),
+        "the row the binding names"
+    );
+    assert!(
+        resolved.phases[1..].iter().all(|row| row.persona.is_none()),
+        "every other phase carries none"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-26 plan D1, D5: `fk_step_graph_phase_persona` is `ON DELETE RESTRICT`, so a persona a
+/// phase is bound to cannot vanish under the graph (milestone 1 has no delete; this is the raw
+/// statement M2's delete will meet).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bound_persona_cannot_be_deleted() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    bind_feat_first_phase(&db.store, ids::PERSONA_REVIEWER).await;
+
+    let refused = sqlx::query("DELETE FROM persona WHERE id = $1")
+        .bind(ids::PERSONA_REVIEWER.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect_err("a bound persona is not deleted");
+    let sqlx::Error::Database(error) = &refused else {
+        panic!("a constraint refusal, got {refused:?}");
+    };
+    assert_eq!(
+        (error.code().as_deref(), error.constraint()),
+        (Some("23503"), Some("fk_step_graph_phase_persona")),
+        "the foreign key refuses, by name"
+    );
+    let survivors: i64 = sqlx::query_scalar("SELECT count(*) FROM persona WHERE id = $1")
+        .bind(ids::PERSONA_REVIEWER.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count the row");
+    assert_eq!(survivors, 1, "the row survives");
+
+    db.drop_db().await;
+}
