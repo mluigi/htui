@@ -10,6 +10,8 @@
     expect(dead_code, reason = "MOD-28 T3 wires the flow view into RunsTab")
 )]
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use htui_core::model::{RunStepSummary, RunSummary, StepId};
 
 /// Plan D10: a node's width in cells at zoom 1. Two candidates and the gap are 41 columns, which a
@@ -58,14 +60,92 @@ pub(super) struct Projection {
 
 /// Plan D6: a run's steps grouped into layers, each id once (blueprint B-5, H-4).
 pub(super) fn layers(steps: &[RunStepSummary]) -> Vec<Layer> {
-    let _ = steps;
-    todo!("MOD-28 T1")
+    /// The candidates and the judges of one `(position, attempt)`.
+    type Group<'a> = (Vec<&'a RunStepSummary>, Vec<&'a RunStepSummary>);
+    let mut seen = BTreeSet::new();
+    let mut groups: BTreeMap<(i32, i32), Group<'_>> = BTreeMap::new();
+    for step in steps {
+        // Blueprint B-5: a reply is data, so a repeated id keeps its first step only.
+        if !seen.insert(step.id) {
+            continue;
+        }
+        let (candidates, judges) = groups.entry((step.position, step.attempt)).or_default();
+        // `-1` is the judge (`engine.rs`); `< 0` keeps the split total over `i32` (E2).
+        if step.fanout_index < 0 {
+            judges.push(step);
+        } else {
+            candidates.push(step);
+        }
+    }
+    let mut out = Vec::new();
+    for ((position, attempt), (candidates, judges)) in groups {
+        // The judge layer goes after its candidates, although `-1` sorts first (plan D6).
+        for (judge, mut members) in [(false, candidates), (true, judges)] {
+            if members.is_empty() {
+                continue;
+            }
+            members.sort_by_key(|step| (step.fanout_index, step.id));
+            out.push(Layer {
+                position,
+                attempt,
+                judge,
+                steps: members.iter().map(|step| step.id).collect(),
+                winner: members
+                    .iter()
+                    .find(|step| step.selected == Some(true))
+                    .map(|step| step.id),
+            });
+        }
+    }
+    out
+}
+
+/// The width in world units of a layer of `n` nodes (`n >= 1`).
+fn span(n: usize) -> f64 {
+    let n = f64::from(u32::try_from(n).unwrap_or(u32::MAX));
+    n * NODE_W + (n - 1.0) * H_GAP
 }
 
 /// Plan D6: a run as layers, edges and positions. Rataflow-free, so T1 tests it alone.
 pub(super) fn project(run: &RunSummary) -> Projection {
-    let _ = (run, X_STEP, Y_STEP, RETRY, V_GAP);
-    todo!("MOD-28 T1")
+    let layers = layers(&run.steps);
+    let width = layers
+        .iter()
+        .map(|layer| span(layer.steps.len()))
+        .fold(0.0, f64::max);
+    let mut positions = Vec::new();
+    let mut y = 0.0;
+    for layer in &layers {
+        // Centred on the widest layer, in whole cells (blueprint E7).
+        let mut x = ((width - span(layer.steps.len())) / 2.0).floor();
+        for step in &layer.steps {
+            positions.push((*step, (x, y)));
+            x += X_STEP;
+        }
+        y += Y_STEP;
+    }
+    let mut edges = Vec::new();
+    for pair in layers.windows(2) {
+        let [from, to] = pair else { continue };
+        let same_slot = (to.position, to.attempt) == (from.position, from.attempt);
+        // The judge reads every candidate; past a judge or an `s`, only the winner feeds on.
+        let sources = match from.winner {
+            Some(winner) if !(to.judge && same_slot) => vec![winner],
+            _ => from.steps.clone(),
+        };
+        let label = (to.position == from.position && to.attempt > from.attempt).then_some(RETRY);
+        for source in &sources {
+            for target in &to.steps {
+                edges.push((*source, *target, label));
+            }
+        }
+    }
+    Projection {
+        layers,
+        edges,
+        positions,
+        width,
+    }
 }
 
 #[cfg(test)]
