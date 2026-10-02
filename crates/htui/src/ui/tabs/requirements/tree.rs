@@ -268,23 +268,21 @@ fn project_header(group: &Group<'_>, folded: bool, width: usize, theme: &Theme) 
     } else {
         0
     };
-    let fits =
-        |room: usize| cell_width(name) <= room || cell_width(&cells::clip(name, room)) >= NAME_MIN;
+    // The name clipped to `room`, kept when it fits whole or still draws [`NAME_MIN`] cells (B11).
+    let clipped = |room: usize| {
+        let cut = cells::clip(name, room);
+        (cell_width(name) <= room || cell_width(&cut) >= NAME_MIN).then_some(cut)
+    };
     let title = |name: &str| Span::styled(format!("{head}{name}{count}"), theme.title);
     let tail = || Span::styled(READ_ONLY_TAIL, theme.dim);
-    if let Some(room) = width.checked_sub(fixed + tail_width)
-        && fits(room)
-    {
-        let mut spans = vec![title(&cells::clip(name, room))];
+    if let Some(cut) = width.checked_sub(fixed + tail_width).and_then(clipped) {
+        let mut spans = vec![title(&cut)];
         if read_only {
             spans.push(tail());
         }
         Line::from(spans)
-    } else if read_only
-        && let Some(room) = width.checked_sub(fixed)
-        && fits(room)
-    {
-        Line::from(title(&cells::clip(name, room)))
+    } else if read_only && let Some(cut) = width.checked_sub(fixed).and_then(clipped) {
+        Line::from(title(&cut))
     } else {
         let mut spans = vec![title(name)];
         if read_only {

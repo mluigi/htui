@@ -220,6 +220,7 @@ mod tests {
     use super::{REVISIONS_NEED_THE_DATABASE, lines};
     use crate::requirements::{self, RequirementDetail};
     use crate::ui::Theme;
+    use crate::ui::cells::cell_width;
     use htui_core::fixtures::ids;
     use htui_core::store::MemStore;
     use htui_store::Backend;
@@ -302,8 +303,6 @@ mod tests {
     /// a cell right of the others'.
     #[tokio::test]
     async fn a_wide_key_keeps_the_kind_column() {
-        use crate::ui::cells::cell_width;
-
         let theme = Theme::default();
         let mut detail = r_ent_1().await;
         assert!(detail.coverage.len() >= 2, "R-ENT-1 has two citing items");
@@ -334,8 +333,6 @@ mod tests {
     /// row's stamp right of the others'.
     #[tokio::test]
     async fn a_wide_deciding_key_keeps_the_stamp_column() {
-        use crate::ui::cells::cell_width;
-
         let theme = Theme::default();
         let mut detail = r_ent_1().await;
         let revisions = detail.revisions.as_mut().expect("the demo has revisions");
