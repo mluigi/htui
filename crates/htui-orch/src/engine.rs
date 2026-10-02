@@ -11814,6 +11814,125 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no driver was built");
     }
 
+    /// MOD-26 I-4 at `drive_group` (B-5): a claimed run whose fan-out phase names a persona its
+    /// snapshot lost fails the whole group before a token, blocks the item and settles — every
+    /// candidate `failed` with no prompt, `claim` answers `Ok`, and no driver is ever built.
+    #[tokio::test]
+    async fn a_claimed_fanout_group_whose_snapshot_lost_its_persona_fails_before_a_token() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                if phase.name == "prd" {
+                    phase.fan_out = 2;
+                }
+            })
+            .await;
+        bind_persona(
+            &harness.orch,
+            ids::HTUI_FEAT_3,
+            "prd",
+            ids::PERSONA_REVIEWER,
+        )
+        .await;
+        let item = harness.orch.item(ids::HTUI_FEAT_3).await;
+        let mut resolved = crate::graph::resolve(
+            &harness.orch.store,
+            &harness.orch.graphs(),
+            &item,
+            RunMode::Manual,
+            &BTreeMap::new(),
+            None,
+            harness.orch.box_id(),
+        )
+        .await
+        .expect("the bound graph resolves");
+        assert_eq!(
+            (
+                resolved.snapshot.phases[0].fan_out,
+                resolved.snapshot.phases[0].persona.as_deref()
+            ),
+            (2, Some("reviewer")),
+            "the freeze named the persona on a fanned-out phase"
+        );
+        resolved.snapshot.personas.clear();
+        let run = htui_core::model::RunId::new();
+        harness
+            .orch
+            .store
+            .create_run(htui_core::model::NewRun {
+                id: run,
+                project_id: item.project_id,
+                item_id: item.id,
+                mode: RunMode::Manual,
+                target_box_id: harness.orch.box_id(),
+                started_by: harness.orch.user(),
+                graph_snapshot: resolved.snapshot,
+                repo_scope: resolved.repo_scope,
+                queued_at: harness.orch.clock.now(),
+            })
+            .await
+            .expect("MemStore creates the run");
+
+        let calls = AtomicUsize::new(0);
+        let graphs = harness.orch.graphs();
+        let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            harness.orch.driver_for_key(key)
+        };
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let engine = crate::engine::Engine::new(
+            crate::engine::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
+                .await
+                .expect("the harness has a box"),
+        );
+        let outcome = Box::pin(engine.claim(run))
+            .await
+            .expect("an I-4 refusal settles the run; it is not an engine error");
+
+        let CommandOutcome::Started { rest, .. } = outcome else {
+            panic!("`claim` answers `Started`, not {outcome:?}");
+        };
+        assert_eq!(
+            (rest.run, rest.position),
+            (RunStatus::Failed, Some(0)),
+            "the run failed at the group"
+        );
+        assert_eq!(
+            rest.failure,
+            Some(RunFailure::PromptRefused {
+                phase: "prd".to_owned(),
+                reason: htui_core::model::persona::persona_not_in_snapshot("reviewer"),
+            })
+        );
+        let steps = harness.orch.steps(run).await;
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| (
+                    step.fanout_index,
+                    step.status,
+                    step.prompt_digest.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            [(0, StepStatus::Failed, None), (1, StepStatus::Failed, None),],
+            "every candidate failed before a prompt was written"
+        );
+        assert_eq!(
+            harness.orch.run(run).await.status,
+            RunStatus::Failed,
+            "the run settled"
+        );
+        assert_eq!(
+            harness.orch.item(ids::HTUI_FEAT_3).await.status,
+            Status::Blocked,
+            "the group's refusal blocks the item"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no driver was built");
+    }
+
     /// MOD-26 D9, I-3: rebinding a phase's persona under a parked run moves the topology, so a
     /// resume parks on it; editing the bound persona's body does not.
     #[tokio::test]
@@ -12180,7 +12299,7 @@ mod tests {
     /// `StartRun` on `FEAT-3` under a [`SpecSpy`]: what stage 4 handed the driver, spec and
     /// prompt. The spy refuses to start, so the walk ends there.
     async fn spied_start(orch: &FakeOrchestrator) -> (htui_agent::driver::SessionSpec, String) {
-        let seen: SpySlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen: SpySlot = SpySlot::default();
         let graphs = orch.graphs();
         let spy = seen.clone();
         let driver = move |_candidate: &SnapshotCandidate,
@@ -12204,10 +12323,9 @@ mod tests {
             .expect_err("the spy refuses to start");
         assert!(matches!(refused, EngineError::Driver(_)), "{refused}");
 
-        seen.lock()
-            .expect("no panic holds the spy's lock")
-            .clone()
-            .expect("stage 4 built a spec")
+        let mut seen = seen.lock().expect("no panic holds the spy's lock").clone();
+        assert_eq!(seen.len(), 1, "one step, one start");
+        seen.pop().expect("stage 4 built a spec")
     }
 
     /// MOD-26: binds `persona` to `item`'s phase `phase` through `update_phase` (plan D5).
@@ -12347,9 +12465,91 @@ mod tests {
         assert!(!prompt.contains("name=\"persona\""), "{prompt}");
     }
 
-    /// What a [`SpecSpy`] saw: stage 4's spec and the prompt it was started with.
-    type SpySlot =
-        std::sync::Arc<std::sync::Mutex<Option<(htui_agent::driver::SessionSpec, String)>>>;
+    /// MOD-26 D12, I-1 at `run_candidate`: every candidate of a `reviewer`-bound fan-out group
+    /// opens a narrowed session — the group's frozen persona reaches each candidate's
+    /// `drive_once`, not only the single-step `session` path's — and each prompt opens with the
+    /// frame.
+    #[tokio::test]
+    async fn a_persona_narrows_every_fanout_candidate_s_session() {
+        use htui_agent::event::ToolKind;
+
+        let harness = Harness::new().await;
+        harness.free_feat_3().await;
+        harness
+            .repoint(ids::HTUI_FEAT_3, |phase| {
+                if phase.name == "prd" {
+                    phase.fan_out = 2;
+                }
+            })
+            .await;
+        let orch = &harness.orch;
+        let policy = agent_policy();
+        orch.set_policy(ids::AGENT_CLAUDE, policy.clone());
+        bind_persona(orch, ids::HTUI_FEAT_3, "prd", ids::PERSONA_REVIEWER).await;
+
+        let seen = SpySlot::default();
+        let graphs = orch.graphs();
+        let spy = seen.clone();
+        let driver = move |_candidate: &SnapshotCandidate,
+                           _key: &SessionKey<'_>|
+              -> Box<dyn htui_agent::driver::AgentDriver> {
+            Box::new(SpecSpy { seen: spy.clone() })
+        };
+        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let engine = super::Engine::new(
+            super::fake_parts(orch, &graphs, &driver, &scrubber)
+                .await
+                .expect("the fixture holds a box"),
+        );
+        let outcome = Box::pin(engine.dispatch(Command::StartRun {
+            item: ids::HTUI_FEAT_3,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        }))
+        .await
+        .expect("a candidate the spy refuses fails on its own; the group settles");
+        assert!(
+            matches!(outcome, CommandOutcome::Started { .. }),
+            "{outcome:?}"
+        );
+
+        let seen = seen.lock().expect("no panic holds the spy's lock").clone();
+        assert_eq!(seen.len(), 2, "both candidates reached stage 4");
+        for (index, (spec, prompt)) in seen.iter().enumerate() {
+            assert_eq!(
+                spec.tools.deny_kinds,
+                [ToolKind::Edit, ToolKind::Delete, ToolKind::Move],
+                "candidate {index}'s exposure is narrowed"
+            );
+            assert!(spec.tools.allow.is_empty(), "{:?}", spec.tools.allow);
+            assert_eq!(
+                spec.permission
+                    .rules
+                    .iter()
+                    .take(3)
+                    .map(|rule| rule.reason.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "persona reviewer denies edit",
+                    "persona reviewer denies delete",
+                    "persona reviewer denies move",
+                ],
+                "candidate {index}: the persona's kind rejects come first"
+            );
+            assert_eq!(
+                spec.permission.rules.get(3..),
+                Some(policy.rules.as_slice()),
+                "candidate {index}: the agent's own rules follow"
+            );
+            assert!(
+                prompt.starts_with("<section name=\"persona\" persona=\"reviewer\">\n"),
+                "candidate {index}'s prompt opens with the persona frame:\n{prompt}"
+            );
+        }
+    }
+
+    /// What a [`SpecSpy`] saw: stage 4's spec and the prompt of every start, in start order.
+    type SpySlot = std::sync::Arc<std::sync::Mutex<Vec<(htui_agent::driver::SessionSpec, String)>>>;
 
     /// An [`AgentDriver`](htui_agent::driver::AgentDriver) that records its `SessionSpec` and its
     /// prompt and then refuses, so a test can read stage 4's arguments without opening a session.
@@ -12374,7 +12574,10 @@ mod tests {
         ) -> htui_agent::driver::DriverFuture<'a, Box<dyn htui_agent::driver::AgentSession>>
         {
             Box::pin(async move {
-                *self.seen.lock().expect("no panic holds the spy's lock") = Some((spec, prompt));
+                self.seen
+                    .lock()
+                    .expect("no panic holds the spy's lock")
+                    .push((spec, prompt));
                 Err(DriverError::Spawn("the spy never starts".to_owned()))
             })
         }
