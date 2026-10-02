@@ -530,7 +530,8 @@ pub fn parse_file(text: &str) -> Result<PersonaFile, PersonaFileError> {
     let mut permission = PersonaPermission::default();
     for entry in &split.frontmatter {
         let key = entry.key.as_str();
-        if key == "model" {
+        // I-5, review N7: `Model:` is the same refusal, not an unknown key.
+        if key.eq_ignore_ascii_case("model") {
             return Err(PersonaFileError::Model);
         }
         if !FRONTMATTER_KEYS.contains(&key) {
@@ -807,6 +808,19 @@ mod tests {
              un-narrowed (MOD-26 I-4)",
             "a plain name reads as before"
         );
+    }
+
+    /// MOD-26 review N7: `model` is refused with its own sentence whatever its ASCII case, so
+    /// `Model:` does not read as an unknown key (I-5).
+    #[test]
+    fn the_model_key_is_refused_in_any_case() {
+        for key in ["Model", "MODEL", "mOdEl"] {
+            assert_eq!(
+                parse(&format!("name: reviewer\n{key}: opus\n"), "body\n"),
+                Err(PersonaFileError::Model),
+                "`{key}` gets the model sentence"
+            );
+        }
     }
 
     #[test]
