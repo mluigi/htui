@@ -428,7 +428,7 @@ pub fn demo_data() -> DemoData {
         phases,
         templates,
         agents: agents(),
-        personas: Vec::new(),
+        personas: personas(),
         skills: skills(),
         skill_versions: skill_versions(),
         skill_bindings: skill_bindings(),
@@ -521,6 +521,27 @@ fn agents() -> Vec<Agent> {
         .into_iter()
         .zip(ids)
         .map(|(agent, id)| Agent { id, ..agent })
+        .collect()
+}
+
+/// `persona` (MOD-26 D7, B-3): every persona the seed installs, re-stamped with the fixture's ids
+/// and epoch exactly as [`agents`] re-stamps the agent seeds.
+///
+/// # Panics
+/// When the id array and the seed no longer have the same length, for [`agents`]' reason: a seed
+/// persona without a fixture id must fail here rather than vanish from the demo registry.
+fn personas() -> Vec<Persona> {
+    let ids = [ids::PERSONA_REVIEWER, ids::PERSONA_ARCHITECT];
+    let seeds = crate::model::persona::seed_rows(epoch());
+    assert_eq!(
+        seeds.len(),
+        ids.len(),
+        "every seed persona owns a fixture id, or `zip` would drop it"
+    );
+    seeds
+        .into_iter()
+        .zip(ids)
+        .map(|(persona, id)| Persona { id, ..persona })
         .collect()
 }
 

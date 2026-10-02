@@ -252,9 +252,11 @@ pub enum ResolveError {
 ///
 /// ANA-2 defines the hash as "over the canonical serialisation of `phases[]`" (`:1479`) and never
 /// defines "canonical", so this is where it is defined: the envelope (`v`, `graph`, `mode`,
-/// `settings`) is excluded, field order is [`SnapshotPhase`]'s declaration order, and nulls are
-/// emitted because no field carries `skip_serializing_if`. Adding a `SnapshotPhase` field changes
-/// every digest and is therefore a `GraphSnapshot::V` question.
+/// `settings`, `scope`, `personas`) is excluded, field order is [`SnapshotPhase`]'s declaration
+/// order and nulls are emitted, **except `persona`** (MOD-26 D9), which is skipped when `None`, so
+/// a persona-less phase serialises exactly as before and only a bound phase's digest names its
+/// persona. Any other field added to `SnapshotPhase` changes every digest and is a
+/// `GraphSnapshot::V` question.
 ///
 /// **Never route this through `serde_json::Value`.** `serde_json`'s `preserve_order` feature is
 /// enabled in a whole-workspace build — `schemars` ← `agent-client-protocol-schema` ←

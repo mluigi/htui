@@ -9,8 +9,11 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::model::frontmatter::FrontmatterError;
+use crate::model::frontmatter::{self, FrontmatterError, Value};
 use crate::model::ids::PersonaId;
+use crate::model::skill::validate_name;
+use crate::prompt::digest::sha256_hex;
+use crate::store::has_nul;
 
 /// The ten ACP tool kinds, spelled and ordered as `htui_agent::event::ToolKind::ALL` spells them.
 /// Core cannot name the agent crate (`htui-agent → htui-core`); `htui_agent::persona`'s
@@ -53,7 +56,7 @@ pub const MCP_PREFIX: &str = "mcp__";
 pub struct Persona {
     /// `persona.id`.
     pub id: PersonaId,
-    /// `persona.name`: unique, `validate_name`'s alphabet.
+    /// `persona.name`: unique, [`validate_name`]'s alphabet.
     pub name: String,
     /// `persona.description`: the picker's one-liner; never rendered into a prompt.
     pub description: String,
@@ -214,14 +217,32 @@ impl SnapshotPersona {
     /// # Errors
     /// The serialiser's own, which these types cannot produce (no map keys, no floats).
     pub fn freeze(persona: &Persona) -> Result<Self, serde_json::Error> {
+        let canonical = Canonical {
+            name: &persona.name,
+            body: &persona.body,
+            tools: &persona.tools,
+            permission: &persona.permission,
+        };
+        let digest = format!("sha256:{}", sha256_hex(&serde_json::to_string(&canonical)?));
         Ok(Self {
             name: persona.name.clone(),
-            digest: "sha256:red".to_owned(),
+            digest,
             body: persona.body.clone(),
             tools: persona.tools.clone(),
             permission: persona.permission.clone(),
         })
     }
+}
+
+/// The digest's input, serialised **typed** in this field order — never through `Value`, whose
+/// key order is a feature flag away from changing (`graph.rs`'s `preserve_order` trap). The id and
+/// the stamps are left out: two rows with the same content freeze to the same digest.
+#[derive(Serialize)]
+struct Canonical<'a> {
+    name: &'a str,
+    body: &'a str,
+    tools: &'a PersonaTools,
+    permission: &'a PersonaPermission,
 }
 
 /// A persona file read by [`parse_file`]: a [`NewPersona`] without its id.
@@ -265,7 +286,7 @@ pub const BLANK_PERSONA_BODY: &str = "a persona needs a prompt body";
 pub const RULE_MATCHES_EVERYTHING: &str =
     "a persona rule with an empty match would deny every request; use `default: deny` instead";
 
-/// Plan D3: a name `validate_name` refuses.
+/// Plan D3: a name [`validate_name`] refuses.
 #[must_use]
 pub fn invalid_persona_name(name: &str) -> String {
     format!(
@@ -322,22 +343,112 @@ pub fn persona_refusal(
     tools: &PersonaTools,
     permission: &PersonaPermission,
 ) -> Option<String> {
-    let _ = (name, description, body, tools, permission);
-    None
+    if !validate_name(name) {
+        return Some(invalid_persona_name(name));
+    }
+    if description.contains('\0') {
+        return Some(has_nul("persona.description"));
+    }
+    body_refusal(body)
+        .or_else(|| tools_refusal(tools))
+        .or_else(|| permission_refusal(permission))
 }
 
 /// [`persona_refusal`] over a [`NewPersona`] (`create_persona`).
 #[must_use]
 pub fn new_persona_refusal(new: &NewPersona) -> Option<String> {
-    let _ = new;
-    None
+    persona_refusal(
+        &new.name,
+        &new.description,
+        &new.body,
+        &new.tools,
+        &new.permission,
+    )
 }
 
 /// Plan D3 over a [`PersonaPatch`]: each `Some` field through the same rule, in the same order.
 #[must_use]
 pub fn persona_patch_refusal(patch: &PersonaPatch) -> Option<String> {
-    let _ = patch;
+    if let Some(name) = &patch.name
+        && !validate_name(name)
+    {
+        return Some(invalid_persona_name(name));
+    }
+    if patch
+        .description
+        .as_deref()
+        .is_some_and(|description| description.contains('\0'))
+    {
+        return Some(has_nul("persona.description"));
+    }
+    patch
+        .body
+        .as_deref()
+        .and_then(body_refusal)
+        .or_else(|| patch.tools.as_ref().and_then(tools_refusal))
+        .or_else(|| patch.permission.as_ref().and_then(permission_refusal))
+}
+
+/// A blank body first, then a NUL (`persona.body`).
+fn body_refusal(body: &str) -> Option<String> {
+    if body.trim().is_empty() {
+        return Some(BLANK_PERSONA_BODY.to_owned());
+    }
+    body.contains('\0').then(|| has_nul("persona.body"))
+}
+
+/// allow entries (tool name, then MCP prefix), deny entries (tool name), deny_kinds (closed list).
+fn tools_refusal(tools: &PersonaTools) -> Option<String> {
+    for name in &tools.allow {
+        if !is_tool_name(name) {
+            return Some(not_a_tool_name("allow", name));
+        }
+        if name.starts_with(MCP_PREFIX) {
+            return Some(allow_names_an_mcp_tool(name));
+        }
+    }
+    if let Some(name) = tools.deny.iter().find(|name| !is_tool_name(name)) {
+        return Some(not_a_tool_name("deny", name));
+    }
+    tools
+        .deny_kinds
+        .iter()
+        .find(|kind| !NARROWABLE_KINDS.contains(&kind.as_str()))
+        .map(|kind| kind_not_narrowable(kind))
+}
+
+/// One rule at a time: the all-`None` matcher, then a NUL in any matcher string or the reason
+/// (B-9: Postgres `JSONB` refuses `\u0000` inside a string, so MemStore must refuse it too).
+fn permission_refusal(permission: &PersonaPermission) -> Option<String> {
+    for rule in &permission.rules {
+        let matcher = &rule.matcher;
+        let strings = [
+            &matcher.tool_kind,
+            &matcher.tool_name,
+            &matcher.path_prefix,
+            &matcher.command_prefix,
+        ];
+        if strings.iter().all(|string| string.is_none()) {
+            return Some(RULE_MATCHES_EVERYTHING.to_owned());
+        }
+        if strings
+            .iter()
+            .filter_map(|string| string.as_deref())
+            .chain([rule.reason.as_str()])
+            .any(|string| string.contains('\0'))
+        {
+            return Some(has_nul("persona.permission.rules"));
+        }
+    }
     None
+}
+
+/// Non-empty, no `char::is_whitespace`, no `,`, no `\0`: one entry of one argv value (D11).
+fn is_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name
+            .chars()
+            .any(|c| c.is_whitespace() || c == ',' || c == '\0')
 }
 
 /// Why a persona file was refused (B-24). `Display` is the sentence.
@@ -403,8 +514,115 @@ pub enum PersonaFileError {
 /// # Errors
 /// Every [`PersonaFileError`] variant; nothing is half-read.
 pub fn parse_file(text: &str) -> Result<PersonaFile, PersonaFileError> {
-    let _ = text;
-    Err(PersonaFileError::Refused("MOD-26 T0: red".to_owned()))
+    let split = frontmatter::split(text)?;
+    if let Some(issue) = split.issues.first() {
+        return Err(PersonaFileError::Unreadable {
+            line: issue.line,
+            message: issue.message.clone(),
+        });
+    }
+
+    let mut seen: Vec<&str> = Vec::new();
+    let mut name: Option<String> = None;
+    let mut description = String::new();
+    let mut tools = PersonaTools::default();
+    let mut permission = PersonaPermission::default();
+    for entry in &split.frontmatter {
+        let key = entry.key.as_str();
+        if key == "model" {
+            return Err(PersonaFileError::Model);
+        }
+        if !FRONTMATTER_KEYS.contains(&key) {
+            return Err(PersonaFileError::UnknownKey {
+                key: key.to_owned(),
+            });
+        }
+        if seen.contains(&key) {
+            return Err(PersonaFileError::Duplicate {
+                key: key.to_owned(),
+            });
+        }
+        seen.push(key);
+        let not_one_line = || PersonaFileError::NotOneLine {
+            key: key.to_owned(),
+        };
+        let Value::Scalar(value) = &entry.value else {
+            return Err(not_one_line());
+        };
+        if value.contains('\n') {
+            return Err(not_one_line());
+        }
+        match key {
+            "name" => name = Some(value.clone()),
+            "description" => description.clone_from(value),
+            "tools" => tools.allow = list_of(value),
+            "disallowed-tools" => tools.deny = list_of(value),
+            "deny-kinds" => tools.deny_kinds = list_of(value),
+            "command-run" => {
+                tools.command_run = match value.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(PersonaFileError::CommandRun {
+                            value: value.clone(),
+                        });
+                    }
+                };
+            }
+            "permission-default" => {
+                permission.default = Some(match value.as_str() {
+                    "ask" => PersonaDefault::Ask,
+                    "deny" => PersonaDefault::Deny,
+                    _ => {
+                        return Err(PersonaFileError::PermissionDefault {
+                            value: value.clone(),
+                        });
+                    }
+                });
+            }
+            // Unreachable after the `FRONTMATTER_KEYS` check; refused rather than ignored, so a
+            // key added to the list without an arm here fails closed.
+            _ => {
+                return Err(PersonaFileError::UnknownKey {
+                    key: key.to_owned(),
+                });
+            }
+        }
+    }
+
+    let name = name.ok_or(PersonaFileError::MissingName)?;
+    // B-16: the reader already dropped the fence's own newline, normalised CRLF and ended the body
+    // with exactly one LF; the blank line conventionally written after the fence goes too.
+    let body = split
+        .body
+        .strip_prefix('\n')
+        .map_or_else(|| split.body.clone(), str::to_owned);
+    let file = PersonaFile {
+        name,
+        description,
+        body,
+        tools,
+        permission,
+    };
+    persona_refusal(
+        &file.name,
+        &file.description,
+        &file.body,
+        &file.tools,
+        &file.permission,
+    )
+    .map_or(Ok(file), |refusal| Err(PersonaFileError::Refused(refusal)))
+}
+
+/// A one-line list value (plan D8): comma-separated, each item trimmed, empty items dropped, so
+/// `tools:` alone is the empty list.
+fn list_of(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The two seed personas (plan D7, OQ-4), parsed from the compiled-in files with fresh ids.
@@ -414,8 +632,25 @@ pub fn parse_file(text: &str) -> Result<PersonaFile, PersonaFileError> {
 /// `seed_rows_are_the_two_seed_files` parses both.
 #[must_use]
 pub fn seed_rows(now: DateTime<Utc>) -> Vec<Persona> {
-    let _ = now;
-    Vec::new()
+    [
+        include_str!("../../seeds/persona_reviewer.md"),
+        include_str!("../../seeds/persona_architect.md"),
+    ]
+    .into_iter()
+    .map(|text| {
+        let file = parse_file(text).expect("a compiled-in persona seed parses");
+        Persona {
+            id: PersonaId::new(),
+            name: file.name,
+            description: file.description,
+            body: file.body,
+            tools: file.tools,
+            permission: file.permission,
+            created_at: now,
+            updated_at: now,
+        }
+    })
+    .collect()
 }
 
 #[cfg(test)]
@@ -424,7 +659,6 @@ mod tests {
     use serde::de::DeserializeOwned;
 
     use super::*;
-    use crate::store::has_nul;
 
     fn parse(front: &str, body: &str) -> Result<PersonaFile, PersonaFileError> {
         parse_file(&format!("---\n{front}---\n{body}"))

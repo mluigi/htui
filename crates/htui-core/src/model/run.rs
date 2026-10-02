@@ -470,8 +470,14 @@ impl GraphSnapshot {
         &self,
         phase: &SnapshotPhase,
     ) -> Result<Option<&crate::model::persona::SnapshotPersona>, String> {
-        let _ = phase;
-        Ok(None)
+        let Some(name) = phase.persona.as_deref() else {
+            return Ok(None);
+        };
+        self.personas
+            .iter()
+            .find(|persona| persona.name == name)
+            .map(Some)
+            .ok_or_else(|| crate::model::persona::persona_not_in_snapshot(name))
     }
 }
 
