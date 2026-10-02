@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 
 use crate::requirements::{ProjectRequirements, RequirementDetail, RevisionRow};
 use crate::ui::Theme;
+use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::detail::STAMP;
 use crate::ui::tabs::settings::wrapped;
 
@@ -51,16 +52,6 @@ fn paragraph(text: &str, width: usize, style: ratatui::style::Style) -> Vec<Line
         })
         .map(|row| Line::styled(row, style))
         .collect()
-}
-
-/// `text` padded with spaces to `width` chars.
-fn padded(text: &str, width: usize) -> String {
-    let mut out = text.to_owned();
-    out.extend(std::iter::repeat_n(
-        ' ',
-        width.saturating_sub(text.chars().count()),
-    ));
-    out
 }
 
 /// One requirement, `width` columns wide (plan P7): the body; its rationale, when it has one;
@@ -111,12 +102,12 @@ pub(super) fn lines(detail: &RequirementDetail, width: u16, theme: &Theme) -> Ve
 fn coverage(rows: &[CoverageRow], theme: &Theme) -> Vec<Line<'static>> {
     let key_width = rows
         .iter()
-        .map(|row| row.item.key.chars().count())
+        .map(|row| cell_width(&row.item.key))
         .max()
         .unwrap_or(0);
     let status_width = rows
         .iter()
-        .map(|row| row.item.status.as_str().len())
+        .map(|row| cell_width(row.item.status.as_str()))
         .max()
         .unwrap_or(0);
     let any_suspect = rows.iter().any(|row| row.suspect);
@@ -127,12 +118,12 @@ fn coverage(rows: &[CoverageRow], theme: &Theme) -> Vec<Line<'static>> {
                 |resolution| resolution.to_string(),
             );
             let mut spans = vec![
-                Span::styled(padded(&row.item.key, key_width), theme.accent),
+                Span::styled(cells::pad(&row.item.key, key_width), theme.accent),
                 Span::raw("  "),
-                Span::styled(padded(row.kind.as_str(), KIND_WIDTH), theme.base),
+                Span::styled(cells::pad(row.kind.as_str(), KIND_WIDTH), theme.base),
                 Span::raw(" "),
                 Span::styled(
-                    padded(&format!("v{}", row.requirement_version), 3),
+                    cells::pad(&format!("v{}", row.requirement_version), 3),
                     theme.base,
                 ),
                 Span::raw(" "),
@@ -141,10 +132,10 @@ fn coverage(rows: &[CoverageRow], theme: &Theme) -> Vec<Line<'static>> {
                 spans.push(Span::styled(SUSPECT, theme.error));
                 spans.push(Span::raw("  "));
             } else if any_suspect {
-                spans.push(Span::raw(padded("", SUSPECT.len() + 2)));
+                spans.push(Span::raw(cells::pad("", cell_width(SUSPECT) + 2)));
             }
             spans.push(Span::styled(
-                padded(row.item.status.as_str(), status_width),
+                cells::pad(row.item.status.as_str(), status_width),
                 theme.status_style(row.item.status),
             ));
             spans.push(Span::raw("  "));
@@ -161,11 +152,14 @@ fn revision(row: &RevisionRow, theme: &Theme) -> Line<'static> {
         .as_ref()
         .map_or_else(String::new, |key| format!("by {key}"));
     Line::from(vec![
-        Span::styled(padded(&format!("v{}", row.revision.version), 4), theme.base),
+        Span::styled(
+            cells::pad(&format!("v{}", row.revision.version), 4),
+            theme.base,
+        ),
         Span::raw(" "),
-        Span::styled(padded(&row.revision.reason, REASON_WIDTH), theme.base),
+        Span::styled(cells::pad(&row.revision.reason, REASON_WIDTH), theme.base),
         Span::raw(" "),
-        Span::styled(padded(&by, 12), theme.accent),
+        Span::styled(cells::pad(&by, 12), theme.accent),
         Span::raw(" "),
         Span::styled(row.revision.created_at.format(STAMP).to_string(), theme.dim),
     ])
@@ -302,6 +296,38 @@ mod tests {
             .find(|line| line.starts_with("ANA-1"))
             .unwrap_or_else(|| panic!("ANA-1 is drawn: {drawn:#?}"));
         assert!(suspect.contains("! suspect"), "{suspect}");
+    }
+
+    /// MOD-60: the key column is measured in cells, so a wide key does not push its row's kind
+    /// a cell right of the others'.
+    #[tokio::test]
+    async fn a_wide_key_keeps_the_kind_column() {
+        use crate::ui::cells::cell_width;
+
+        let theme = Theme::default();
+        let mut detail = r_ent_1().await;
+        assert!(detail.coverage.len() >= 2, "R-ENT-1 has two citing items");
+        detail.coverage[0].item.key = "\u{6f22}\u{5b57}-1".to_owned();
+        let rows = super::coverage(&detail.coverage, &theme);
+        let offsets: Vec<usize> = rows
+            .iter()
+            .zip(&detail.coverage)
+            .map(|(line, row)| {
+                let drawn: String = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                let at = drawn
+                    .find(row.kind.as_str())
+                    .unwrap_or_else(|| panic!("{drawn:?} shows its kind"));
+                cell_width(&drawn[..at])
+            })
+            .collect();
+        assert!(
+            offsets.windows(2).all(|pair| pair[0] == pair[1]),
+            "the kind starts at one cell offset on every row: {offsets:?}"
+        );
     }
 
     /// Blueprint F-14: the mirror holds no revisions, and the pane says so.
