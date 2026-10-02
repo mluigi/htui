@@ -36,6 +36,8 @@
 //! the item's status (`Resolution::closes_from`), starting on `Resolution::default_for` (MOD-39
 //! plan P13).
 
+mod execution_graph;
+
 use core::cell::Cell;
 use std::collections::BTreeSet;
 

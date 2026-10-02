@@ -166,6 +166,11 @@ shell-words            = "1.1"
 # URL's query and compares loopback hosts. 2.5.8 is already compiled as a dependency of `reqwest`
 # and `tower-http`, so this promotes a transitive crate and adds nothing.
 url                    = "2.5"
+# MOD-28 D4: the Runs pane's flow view (ANA-12). No default features: `sugiyama` would pull in
+# rust-sugiyama, petgraph and second copies of hashbrown/foldhash, and our layered layout sets
+# every position itself. `crossterm` is for the mouse follow-up. Adds one crate; its two
+# dependencies (`ratatui`, `thiserror`) are already locked.
+rataflow               = { version = "0.1", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code                   = "forbid"

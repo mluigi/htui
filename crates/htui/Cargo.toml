@@ -70,6 +70,8 @@ shell-words            = { workspace = true }
 # MOD-45 D293: the payload's hash, compared with the remote binary's. 0.10.9 is already in htui's
 # graph (via htui-store), so nothing new is compiled.
 sha2                   = { workspace = true }
+# MOD-28 D4: the flow view of the Runs pane (`runs/execution_graph.rs`).
+rataflow               = { workspace = true }
 
 [dev-dependencies]
 # The chat tab's snapshots drive the fake transport through the same registry the ACP one uses.
