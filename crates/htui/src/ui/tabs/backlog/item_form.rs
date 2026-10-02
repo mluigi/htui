@@ -1607,6 +1607,24 @@ mod tests {
         );
     }
 
+    /// MOD-60 B9: the notice wraps by clusters, so a run of combining-mark clusters exactly as
+    /// wide as the pane fills one row. A per-char cut after the wrap (the deleted `notice_lines`)
+    /// would halve it, and at an odd width strand an accent at the start of the next row.
+    #[tokio::test]
+    async fn a_combining_notice_fills_its_row_by_clusters() {
+        let mut form = new_form().await;
+        let [_, right] = panes(chrome(Rect::new(0, 0, DEFAULT_SIZE.0, DEFAULT_SIZE.1)).body);
+        let inner = usize::from(right.width - 2);
+        let accented = "e\u{301}".repeat(inner);
+        form.settle(Some(accented.clone()));
+        let rows = drawn(&form);
+        assert!(
+            rows.iter().any(|row| row.contains(&accented)),
+            "{inner} accented cells in one row of\n{}",
+            rows.join("\n")
+        );
+    }
+
     // ---- MOD-13 milestone 3: the divergence view -------------------------------------------
 
     /// Ctrl+S on `form`, its `Save` served over `store`: the divergence it answered.
