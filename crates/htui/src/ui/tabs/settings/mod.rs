@@ -78,8 +78,8 @@ pub(crate) fn is_error(notice: &str) -> bool {
 /// *before* the pane is drawn and a count that disagreed with the widget's wrapping would clip the
 /// last line of a warning — the one line that says nothing can be undone.
 ///
-/// Shared by the hierarchy, kinds and prompt sections, and imported by the backlog and
-/// requirements tabs (M5 O-5 promoted it). The rows are `cells::wrap`'s, so there is one break
+/// Shared by the hierarchy, kinds, prompt, connection, qdrant and boxes sections, and imported by
+/// the backlog, requirements and skills tabs (M5 O-5 promoted it). The rows are `cells::wrap`'s, so there is one break
 /// rule in `ui/`; the whitespace `split_whitespace` drops covers the whitespace controls, and any
 /// other control stays inside its word for `cells::wrap` to flatten.
 pub(crate) fn wrapped(text: &str, width: usize) -> Vec<String> {
@@ -460,6 +460,18 @@ mod tests {
             wrapped("abcdefg hi", 5),
             ["abcde", "fg hi"],
             "the next word joins the broken word's last piece (B7)"
+        );
+    }
+
+    /// Arabic "salam" holds a lam-alef, which `unicode-width` measures as one ligature cell across
+    /// two clusters; `ratatui` draws it as two, so the word is 4 cells and two of them need 9.
+    #[test]
+    fn a_ligature_is_measured_as_drawn() {
+        let salam = "\u{633}\u{644}\u{627}\u{645}";
+        assert_eq!(wrapped(&format!("{salam} {salam}"), 7), [salam, salam]);
+        assert_eq!(
+            wrapped(&format!("{salam} {salam}"), 9),
+            [format!("{salam} {salam}")]
         );
     }
 

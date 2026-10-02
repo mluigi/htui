@@ -11,10 +11,12 @@
 //! **own string**: `UnicodeWidthStr::width`, never a sum of `UnicodeWidthChar::width` over the code
 //! points. A family emoji is one cluster of five code points; summed per `char` it is 6, and
 //! measured as a string it is 2. The crate documents the same asymmetry for `"\r\n"` and for emoji
-//! modifier and presentation sequences. Second, a per-`char` sum is *also* simply wrong for control
-//! characters: `UnicodeWidthChar::width('\u{1}')` is `None` while `UnicodeWidthStr::width("\u{1}")`
-//! is `1`, so the natural `.unwrap_or(0)` undercounts every C0 control and `DEL` by one — and a body
-//! that came back from `$EDITOR` can hold those.
+//! modifier and presentation sequences. A string of several clusters is the sum of its clusters'
+//! widths, never `UnicodeWidthStr::width` over the whole string, which joins ligatures across
+//! cluster boundaries that `ratatui` draws one at a time (see [`cell_width`]). Second, a per-`char`
+//! sum is *also* simply wrong for control characters: `UnicodeWidthChar::width('\u{1}')` is `None`
+//! while `UnicodeWidthStr::width("\u{1}")` is `1`, so the natural `.unwrap_or(0)` undercounts every
+//! C0 control and `DEL` by one — and a body that came back from `$EDITOR` can hold those.
 //!
 //! The non-CJK `width()` is used, never `width_cjk()`. East Asian **Ambiguous** characters — `…`,
 //! `•`, `U+FFFD`, every box-drawing char — are 1 cell under `width()` and 2 under `width_cjk()`,
@@ -49,10 +51,23 @@ const SEMI_VOICED_SOUND_MARK: char = '\u{FF9F}';
 /// unconditionally, which gives `"あﾞ"` 3; because both marks are `Grapheme_Extend` they always
 /// attach to the preceding cluster, so counting per cluster gives the same answer. The test below
 /// pins `"あﾞ"` at 3 so that equivalence is tested rather than assumed.
+///
+/// A string of several clusters is the **sum of its clusters**, each measured alone, because that
+/// is how `ratatui` draws it: `Buffer::set_stringn` advances one grapheme at a time
+/// (`ratatui-core-0.1.2/src/buffer/buffer.rs:350-353`). `UnicodeWidthStr::width` over the whole
+/// string applies ligature and ZWJ rules *across* cluster boundaries — Arabic lam + alef is two
+/// clusters it measures as one cell, and `ratatui` draws two — so a whole-string measure would
+/// let a clipped or wrapped row draw wider than its budget.
 #[must_use]
 pub(crate) fn cell_width(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
-        + s.chars()
+    graphemes(s).map(cluster_width).sum()
+}
+
+/// One cluster's cells: its own string's width, plus `ratatui`'s halfwidth sound mark cell.
+fn cluster_width(cluster: &str) -> usize {
+    UnicodeWidthStr::width(cluster)
+        + cluster
+            .chars()
             .filter(|c| matches!(*c, VOICED_SOUND_MARK | SEMI_VOICED_SOUND_MARK))
             .count()
 }
@@ -665,6 +680,70 @@ mod tests {
             spans(&[("ab", a), ("\u{2026}", b)]),
             "a cut on a span boundary marks the first dropped span (B1)"
         );
+    }
+
+    /// How many cells `ratatui` advances drawing `s` in one line: the renderer, as the oracle.
+    fn drawn(s: &str) -> usize {
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 1));
+        let (x, _) = buffer.set_stringn(0, 0, s, usize::MAX, Style::new());
+        usize::from(x)
+    }
+
+    /// Lam + alef, two clusters: `unicode-width` measures the pair as one ligature cell.
+    const LAM_ALEF: &str = "\u{644}\u{627}";
+    /// Arabic "salam": four clusters holding a lam-alef.
+    const SALAM: &str = "\u{633}\u{644}\u{627}\u{645}";
+
+    /// Strings `UnicodeWidthStr::width` measures across cluster boundaries — ligatures, and a ZWJ
+    /// after a cluster that is not an emoji — while `ratatui` draws one cluster at a time.
+    fn cross_cluster_inputs() -> Vec<String> {
+        vec![
+            LAM_ALEF.to_owned(),
+            LAM_ALEF.repeat(3),
+            SALAM.to_owned(),
+            format!("{SALAM} {SALAM}"),
+            "\u{2d5c}\u{2d7f}\u{2d5c}".to_owned(),
+            "\u{a4f8}\u{a4fc}".to_owned(),
+            "\u{17d2}\u{1780}".to_owned(),
+            format!("{ELLIPSIS}\u{1f3fb}\u{200d}{FAMILY}"),
+        ]
+    }
+
+    /// A string is as wide as its clusters, each measured alone: what `ratatui` draws, even where
+    /// `unicode-width` would join two clusters into one ligature or ZWJ sequence.
+    #[test]
+    fn a_string_is_as_wide_as_ratatui_draws_it() {
+        assert_eq!(cell_width(LAM_ALEF), 2, "two clusters, two cells");
+        assert_eq!(cell_width(SALAM), 4);
+        for input in cross_cluster_inputs().into_iter().chain(table_inputs()) {
+            if input.chars().any(char::is_control) {
+                continue; // ratatui skips a control; flatten is what makes those agree (D3)
+            }
+            assert_eq!(cell_width(&input), drawn(&input), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn no_op_draws_wider_than_its_width() {
+        for input in cross_cluster_inputs() {
+            for w in 0..=10 {
+                let clipped = clip(&input, w);
+                assert!(drawn(&clipped) <= w, "clip {clipped:?} against {w}");
+                let fitted = fit(&input, w);
+                assert_eq!(drawn(&fitted), w, "fit {fitted:?} against {w}");
+                let cut = clip_spans(&[Span::raw(input.clone())], w);
+                let cells: usize = cut.iter().map(|span| drawn(&span.content)).sum();
+                assert!(cells <= w, "clip_spans {cut:?} against {w}");
+                for row in wrap(&input, w) {
+                    // A cluster wider than the width alone on its row is wrap's one overflow.
+                    let alone = graphemes(&row).count() == 1;
+                    assert!(drawn(&row) <= w.max(1) || alone, "wrap {row:?} against {w}");
+                }
+            }
+        }
+        assert_eq!(clip(SALAM, 3), "\u{633}\u{644}\u{2026}");
+        assert_eq!(pad(LAM_ALEF, 3), format!("{LAM_ALEF} "));
+        assert_eq!(pad_left(LAM_ALEF, 3), format!(" {LAM_ALEF}"));
     }
 
     #[test]
