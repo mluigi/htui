@@ -836,6 +836,30 @@ mod tests {
             parse("name: reviewer\ndescription: |\n  two\n  lines\n", "body\n"),
             not_one_line("description")
         );
+        // A chomped block scalar resolves to a newline-free string; it is still refused by key.
+        assert_eq!(
+            parse(
+                "name: reviewer\ndescription: >-\n  two\n  lines\n",
+                "body\n"
+            ),
+            not_one_line("description")
+        );
+        assert_eq!(
+            parse("name: reviewer\ndescription: >-\n  one\n", "body\n"),
+            not_one_line("description")
+        );
+        assert_eq!(
+            parse("name: reviewer\ntools: |-\n  Read, Grep\n", "body\n"),
+            not_one_line("tools")
+        );
+        assert_eq!(
+            parse("name: reviewer\ntools: |-\n", "body\n"),
+            not_one_line("tools")
+        );
+        assert_eq!(
+            parse("name: reviewer\r\ndescription: >+\r\n  one\r\n", "body\n"),
+            not_one_line("description")
+        );
         assert_eq!(
             parse("name: reviewer\ndescription:\n  nested: map\n", "body\n"),
             not_one_line("description")
