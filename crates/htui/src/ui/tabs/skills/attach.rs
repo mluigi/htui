@@ -45,7 +45,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// on the row and in one column.
 const LABEL_WIDTH: usize = 28;
 
-/// The form's label column, in chars (`description` is the longest label, `effective:` is 10).
+/// The form's label column, in cells: the labels are static ASCII, so a char is a cell
+/// (`description` is the longest label, `effective:` is 10).
 const FORM_LABEL: usize = 12;
 
 /// The form panel's height, borders included: seven lines.
