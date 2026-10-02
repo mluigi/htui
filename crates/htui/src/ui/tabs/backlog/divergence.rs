@@ -342,7 +342,9 @@ impl Divergence {
             .len()
             .max(diff_rows(mine, right).len())
             .saturating_sub(1);
-        let at = usize::from(self.scroll);
+        // The draw clamps only its copy, so after a widening the stored offset can sit past the
+        // last row; start from the row actually drawn (MOD-13 M3 review verify round 2).
+        let at = usize::from(self.scroll).min(last);
         let next = if down {
             at.saturating_add(by)
         } else {
@@ -722,8 +724,14 @@ mod tests {
 
     /// The view drawn at 100x30 into the tab area, one string per row of the whole frame.
     fn drawn(view: &Divergence) -> Vec<String> {
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
-            .expect("a test terminal");
+        drawn_at(view, 100, 30)
+    }
+
+    /// [`drawn`] on a `width`x`height` terminal.
+    fn drawn_at(view: &Divergence, width: u16, height: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("a test terminal");
         terminal
             .draw(|frame| {
                 let area = chrome(frame.area()).body;
@@ -991,6 +999,37 @@ mod tests {
         assert!(bottom.contains("end-of-39"), "{bottom}");
         view.on_key(key(KeyCode::Char('j')));
         assert_eq!(view.scroll(), end, "clamped at the last wrapped row");
+    }
+
+    /// MOD-13 M3 review verify round 2: after the window widens, the stored offset can sit past
+    /// the new last row (the draw only clamps a copy), so the first `k`/`PageUp` must move from
+    /// the row actually drawn, not from the stale offset.
+    #[tokio::test]
+    async fn the_first_scroll_up_after_widening_moves_the_drawn_rows() {
+        let paragraph = |n: usize| {
+            let words: String = (0..45).map(|w| format!("word{w} ")).collect();
+            format!("paragraph {n} {words}end-of-{n}\n")
+        };
+        let long: String = (0..40).map(paragraph).collect();
+        let mut view = view(
+            move |_| ItemPatch {
+                body: Some(long),
+                ..patch()
+            },
+            |_| {},
+        )
+        .await;
+        for code in [KeyCode::Char('k'), KeyCode::PageUp] {
+            drawn_at(&view, 60, 30);
+            for _ in 0..200 {
+                view.on_key(key(KeyCode::PageDown));
+            }
+            let narrow_end = view.scroll();
+            let before = drawn_at(&view, 200, 30);
+            view.on_key(key(code));
+            let after = drawn_at(&view, 200, 30);
+            assert_ne!(after, before, "{code:?} moved the drawn rows");
+        }
     }
 
     /// MOD-13 M3 review verify round 1: the diff rows wrap by terminal cells, not by chars, so a
