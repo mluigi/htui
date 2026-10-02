@@ -1710,6 +1710,40 @@ mod tests {
         );
     }
 
+    /// Blueprint §6 (MOD-13 review L4): a legacy head value never blocks the resolution save.
+    /// Their edit wrote a tag and a path the parsers refuse (through the store, past the
+    /// validator); `m` keeps them as the head stores them, and Ctrl+S sends my title only.
+    #[tokio::test]
+    async fn a_legacy_head_value_does_not_block_the_resolution_save() {
+        let store = MemStore::demo();
+        let mut form = resolving(
+            &store,
+            ItemPatch {
+                required_tags: Some(vec!["Rust".to_owned()]),
+                touched_paths: Some(vec!["nope:x".to_owned()]),
+                ..patch()
+            },
+        )
+        .await;
+        let mine = format!("{} mine", form.opened.title);
+        assert!(matches!(
+            form.on_key(key(KeyCode::Char('m'))),
+            ItemFormOutcome::Stay
+        ));
+        assert!(form.resolving().is_none());
+        assert_eq!(form.tags.text(), Some("Rust"), "the head's legacy tag");
+        let (version, changes, reason) = edit_sent(&mut form);
+        assert_eq!(version, 2);
+        assert_eq!(reason, EditReason::DivergenceResolution);
+        assert_eq!(
+            changes,
+            SpecChanges {
+                title: Some(mine),
+                ..SpecChanges::default()
+            }
+        );
+    }
+
     #[tokio::test]
     async fn t_takes_theirs_for_conflicts_and_keeps_my_other_changes() {
         let store = MemStore::demo();

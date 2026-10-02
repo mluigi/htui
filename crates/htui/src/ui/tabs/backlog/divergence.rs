@@ -1058,6 +1058,42 @@ mod tests {
         assert!(column.contains(title), "{column:?} in\n{}", rows.join("\n"));
     }
 
+    /// MOD-13 review L4: a terminal far too small for the view, down to nothing at all, draws
+    /// without a panic, and a scroll key after such a draw clamps without one too.
+    #[tokio::test]
+    async fn tiny_areas_draw_without_a_panic() {
+        let mut view = view(
+            |_| ItemPatch {
+                title: Some("Theirs, and long enough to wrap in any narrow column".to_owned()),
+                body: Some("one\ntheirs\n".to_owned()),
+                ..patch()
+            },
+            |spec| {
+                spec.title = "Mine".to_owned();
+                spec.body = "one\nmine\n".to_owned();
+                spec.touched_paths = vec!["src/mine/**".to_owned()];
+            },
+        )
+        .await;
+        for (width, height) in [(20, 6), (12, 4), (3, 3), (1, 1), (0, 0)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                    .expect("a test terminal");
+            for area in [
+                |frame: &Frame<'_>| chrome(frame.area()).body,
+                |frame: &Frame<'_>| frame.area(),
+                |_: &Frame<'_>| Rect::default(),
+            ] {
+                terminal
+                    .draw(|frame| render(frame, area(frame), &view, &Theme::default()))
+                    .unwrap_or_else(|err| panic!("{width}x{height}: {err}"));
+                for code in [KeyCode::PageDown, KeyCode::Char('j'), KeyCode::Tab] {
+                    view.on_key(key(code));
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn keys_map_to_outcomes() {
         let mut view = view(
